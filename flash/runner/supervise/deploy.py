@@ -620,13 +620,27 @@ def _refresh_cancellation_result(run_id: str, effective_spec) -> None:
         persist_attempt_artifacts,
         read_attempt_artifacts,
     )
-    from flash.runner.lifecycle.protocol import AttemptRecord
+    from flash.runner.lifecycle.protocol import AttemptRecord, receipt
     from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
 
     status = get_status(run_id)
     attempt = AttemptRecord.from_dict(status.attempt)
     existing = status.result if isinstance(status.result, dict) else {}
-    if existing.get("attempt_id") == attempt.attempt_id and existing.get("fence") == attempt.fence:
+    existing_receipt = existing.get("receipt")
+    try:
+        valid_existing_receipt = receipt(
+            existing_receipt["path"],
+            existing_receipt["revision"],
+            existing_receipt["digest"],
+        )
+    except (KeyError, TypeError, ValueError):
+        valid_existing_receipt = None
+    if (
+        existing.get("attempt_id") == attempt.attempt_id
+        and existing.get("fence") == attempt.fence
+        and existing.get("outcome") == "cancelled"
+        and valid_existing_receipt == existing_receipt
+    ):
         return
     try:
         source_snapshot = source_snapshot_from_status(status, required=True)
@@ -653,6 +667,11 @@ def _refresh_cancellation_result(run_id: str, effective_spec) -> None:
         if artifacts is not None:
             persist_attempt_artifacts(run_id, artifacts)
             if artifacts.result is not None:
+                persisted = get_status(run_id).result
+                if not isinstance(persisted, dict) or persisted.get(
+                    "receipt"
+                ) != artifacts.result.get("receipt"):
+                    raise RuntimeError("verified cancellation result was not durably persisted")
                 return
         remaining = deadline_at - time.time()
         if remaining <= 0:

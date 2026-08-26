@@ -175,7 +175,6 @@ class _PreparedAttempt:
 class _PreparationOutcome:
     prepared: _PreparedAttempt | None = None
     completed_metrics: dict | None = None
-    failed_result: object | None = None
 
 
 @dataclass(frozen=True)
@@ -258,20 +257,18 @@ def _require_opd_configuration(ctx: _SubmitContext) -> None:
 
 
 def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int):
+    """reread authority and prove the current worker ended before retry disposition."""
     if not ctx.last_handle:
         return None
     try:
         observed_result = _lifecycle._attempt_result(ctx.spec.run_id, ctx.last_handle)
     except Exception:
         observed_result = None
-    if observed_result is not None:
+    if observed_result is not None and observed_result.ok:
         return observed_result
     from flash.providers.core.base import JobHandle
     from flash.providers.core.registry import get_provider
-    from flash.runner.accounting.reconciliation import (
-        _compare_and_clear_remote,
-        _record_cleanup_remote,
-    )
+    from flash.runner.accounting.reconciliation import _record_cleanup_remote
 
     resource_deleted = False
     teardown_error: Exception | None = None
@@ -283,28 +280,19 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int):
         teardown_error = exc
     resource_kind = "endpoint" if ctx.last_handle.get("endpoint_id") else "instance"
     resource_id = ctx.last_handle.get("endpoint_id") or ctx.last_handle.get("instance_id")
+    if not resource_deleted and not _record_cleanup_remote(ctx.spec.run_id, ctx.last_handle):
+        raise RuntimeError(
+            f"seed {ctx.seed}: terminal worker's leaked {resource_kind} cleanup target "
+            "could not be persisted"
+        )
     worker_gone = teardown_error is None or _lifecycle._worker_provably_gone(
         ctx.spec.run_id, ctx.last_handle
     )
-    if (
-        worker_gone
-        and ctx.last_handle.get("provider") == "runpod"
-        and not resource_deleted
-        and not _record_cleanup_remote(ctx.spec.run_id, ctx.last_handle)
-    ):
-        raise RuntimeError(
-            f"seed {ctx.seed}: terminal worker's leaked endpoint cleanup target could not be persisted"
-        )
     if worker_gone:
-        if not _compare_and_clear_remote(ctx.spec.run_id, ctx.last_handle):
-            raise RuntimeError(
-                f"seed {ctx.seed}: previous attempt's persisted remote changed before clear; "
-                "aborting replacement to avoid double-provisioning"
-            )
         message = (
             "terminated"
             if resource_deleted
-            else "teardown unconfirmed but worker terminal; proceeding, leaked resource persisted for cleanup"
+            else "teardown unconfirmed but worker terminal; cleanup identity persisted"
         )
         print(
             f"retry {attempt}: {ctx.last_handle.get('provider')} {resource_kind} "
@@ -312,8 +300,7 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int):
             file=ctx.log,
             flush=True,
         )
-        ctx.last_handle.clear()
-        return None
+        return observed_result
     with contextlib.suppress(Exception):
         get_provider(ctx.last_handle["provider"]).gc(ctx.spec)
     ctx.gc_seen_endpoints()
@@ -365,12 +352,6 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
 
     attempt = ctx.attempt_start + local_attempt
     ctx.raise_if_cancelled()
-    if local_attempt > 0:
-        observed_result = _cleanup_previous_attempt(ctx, attempt)
-        if observed_result is not None:
-            if observed_result.ok:
-                return _PreparationOutcome(completed_metrics=observed_result.metrics)
-            return _PreparationOutcome(failed_result=observed_result)
     try:
         attempt_spec = _spec_with_remaining_wall(ctx.spec, require_provider_minimum=True)
     except RuntimeError:
@@ -801,23 +782,14 @@ def _handle_failure(
     ctx: _SubmitContext,
     prepared: _PreparedAttempt,
     outcome: _AttemptOutcome,
+    *,
+    authoritative_result: bool = False,
 ) -> _FailureDecision:
     from flash.providers.core.registry import get_provider
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
     # cancel wins over any retry-shaped failure.
     ctx.raise_if_cancelled()
-    if ctx.last_handle:
-        try:
-            observed_result = _lifecycle._attempt_result(ctx.spec.run_id, ctx.last_handle)
-        except Exception:
-            observed_result = None
-        if observed_result is not None:
-            if not observed_result.ok:
-                ctx.last_detail = _lifecycle._result_failure_detail(observed_result)
-                return _FailureDecision(None, False)
-            recovered = replace(outcome, result=observed_result)
-            return _FailureDecision(_return_success_metrics(ctx, recovered), False)
     result = outcome.result
     ctx.last_detail = f"{result.failure}: {result.detail}"
     if outcome.chosen is not None and result.failure in ("job_preempted", "oom"):
@@ -883,6 +855,15 @@ def _handle_failure(
         flush=True,
     )
     if not will_retry:
+        if authoritative_result:
+            from flash.runner.accounting.reconciliation import _compare_and_fail_remote
+
+            if not _compare_and_fail_remote(
+                ctx.spec.run_id,
+                ctx.last_handle or None,
+                _lifecycle._result_failure_detail(result),
+            ):
+                raise RuntimeError("authoritative result failure could not be settled")
         return _FailureDecision(None, False)
     if first_cache_drop:
         ctx.drop_weight_cache = True
@@ -924,19 +905,39 @@ def submit_seed_supervised(
         preparation = _prepare_attempt(ctx, local_attempt)
         if preparation.completed_metrics is not None:
             return ctx.return_completed_runpod_metrics(preparation.completed_metrics)
-        if preparation.failed_result is not None:
-            ctx.last_detail = _lifecycle._result_failure_detail(preparation.failed_result)
-            break
         prepared = preparation.prepared
         outcome = _run_attempt(ctx, prepared)
         if outcome.stop:
             break
         if outcome.result.ok:
             return _return_success_metrics(ctx, outcome)
-        decision = _handle_failure(ctx, prepared, outcome)
+        observed_result = None
+        if ctx.last_handle:
+            observed_result = _cleanup_previous_attempt(ctx, prepared.attempt + 1)
+        authoritative_result = observed_result is not None and not observed_result.ok
+        if observed_result is not None:
+            recovered = replace(outcome, result=observed_result)
+            if observed_result.ok:
+                return _return_success_metrics(ctx, recovered)
+            outcome = recovered
+        decision = _handle_failure(
+            ctx,
+            prepared,
+            outcome,
+            authoritative_result=authoritative_result,
+        )
         if decision.metrics is not None:
             return decision.metrics
         if not decision.retry:
             break
+        if ctx.last_handle:
+            from flash.runner.accounting.reconciliation import _compare_and_clear_remote
+
+            if not _compare_and_clear_remote(ctx.spec.run_id, ctx.last_handle):
+                raise RuntimeError(
+                    f"seed {ctx.seed}: previous attempt's persisted remote changed before clear; "
+                    "aborting replacement to avoid double-provisioning"
+                )
+            ctx.last_handle.clear()
     ctx.gc_seen_endpoints()
     raise RuntimeError(f"seed {seed} failed after retries: {ctx.last_detail}")

@@ -460,6 +460,51 @@ def test_run_job_background_persists_failed_when_not_yet_terminal(monkeypatch, c
         assert raw_message not in caplog.text
 
 
+def test_run_job_inner_does_not_clobber_persisted_failure(monkeypatch):
+    from flash.core.spec import JobSpec
+    from flash.runner.lifecycle.state import RunStatus
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RESULTS_DIR", os.path.join(tmp, "results"))
+        os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+        spec = JobSpec(run_id="inner-failed", model="Qwen/Qwen3.5-9B", algorithm="sft")
+        runner_state._save_status(
+            RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                error=None,
+            ),
+            _run_deadline_at=1000.0,
+        )
+        monkeypatch.setattr(
+            "flash.runner.accounting.artifacts.stage_environment_package",
+            lambda value, **_kwargs: value,
+        )
+        monkeypatch.setattr(
+            "flash.runner.lifecycle.deadlines._load_run_deadline_at",
+            lambda _run_id: 1000.0,
+        )
+
+        def fail_with_authoritative_result(*_args, **_kwargs):
+            assert runner_status._update(
+                spec.run_id,
+                "failed",
+                error="job_failed: exact worker failure",
+            )
+            raise RuntimeError("seed 0 failed after retries")
+
+        monkeypatch.setattr(runner_lifecycle, "_run_training", fail_with_authoritative_result)
+
+        with pytest.raises(RuntimeError, match="seed 0 failed"):
+            runner_lifecycle._run_job_inner(spec, os.path.join(tmp, "run.log"))
+
+        status = runner_status.get_status(spec.run_id)
+        assert status.state == "failed"
+        assert status.error == "job_failed: exact worker failure"
+
+
 def test_run_job_background_does_not_clobber_persisted_failure(monkeypatch):
     """If the run is ALREADY terminal (e.g. _run_job_inner persisted the real, detailed failure
     before the re-raise), the wrapper must NOT overwrite its error with the caught exception."""

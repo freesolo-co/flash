@@ -1294,27 +1294,318 @@ def test_supervisor_adopts_provider_completion_before_retry(monkeypatch, cancel_
         assert calls["n"] == 1
 
 
-def test_supervisor_does_not_retry_authoritative_failed_result(monkeypatch):
-    from flash.runner.supervise import seed_submission
-
-    ctx = SimpleNamespace(
-        spec=SimpleNamespace(run_id="failed-before-retry"),
+def _failure_context(*, infra_retries=1, oom_retries=1):
+    return SimpleNamespace(
+        spec=SimpleNamespace(
+            run_id="failed-before-retry",
+            gpu=SimpleNamespace(
+                network_volume=None,
+                type="",
+                provider="",
+                count=1,
+            ),
+        ),
+        seed=0,
+        log=io.StringIO(),
         last_handle={"provider": "runpod"},
         last_detail=None,
+        retry_budget=runner_lifecycle._RetryBudget(infra_retries, oom_retries, 0),
+        capacity_refusals={},
+        oom_vram_floor=0.0,
+        drop_weight_cache=False,
+        started_with_shared_cache=False,
+        failed_providers=set(),
+        tried_classes=set(),
+        current_on_last_gpu=False,
         raise_if_cancelled=lambda: None,
     )
-    observed = PollResult(False, failure="oom", detail="cuda out of memory")
-    monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args: observed)
-    outcome = seed_submission._AttemptOutcome(
-        result=PollResult(False, failure="poll_error", detail="status unavailable")
-    )
-    prepared = SimpleNamespace(attempt=0)
 
-    decision = seed_submission._handle_failure(ctx, prepared, outcome)
+
+@pytest.mark.parametrize(
+    ("failure", "counter"),
+    [("oom", "oom_used"), ("artifact_transport", "infra_used")],
+)
+def test_authoritative_failed_result_uses_retry_budget(monkeypatch, failure, counter):
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Candidate
+    from flash.runner.supervise import seed_submission
+
+    monkeypatch.setattr(
+        providers,
+        "get_provider",
+        lambda _name: SimpleNamespace(supports_weight_cache=False),
+    )
+    ctx = _failure_context()
+    candidate = Candidate("runpod", "A100 SXM 40GB", 1.0, 40)
+    outcome = seed_submission._AttemptOutcome(
+        result=PollResult(False, failure=failure, detail=f"authoritative {failure}"),
+        chosen=candidate,
+        candidates=(candidate,),
+        run_spec=SimpleNamespace(gpu=SimpleNamespace(network_volume=None)),
+    )
+
+    decision = seed_submission._handle_failure(
+        ctx,
+        SimpleNamespace(attempt=0),
+        outcome,
+        authoritative_result=True,
+    )
 
     assert decision.metrics is None
+    assert decision.retry
+    assert getattr(ctx.retry_budget, counter) == 1
+    if failure == "oom":
+        assert ctx.oom_vram_floor > 0
+    else:
+        assert ctx.oom_vram_floor == 0
+
+
+@pytest.mark.parametrize("failure", ["oom", "artifact_transport", "job_failed"])
+def test_authoritative_failed_result_settles_exactly_when_not_retryable(monkeypatch, failure):
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Candidate
+    from flash.runner.accounting import reconciliation
+    from flash.runner.supervise import seed_submission
+
+    monkeypatch.setattr(
+        providers,
+        "get_provider",
+        lambda _name: SimpleNamespace(supports_weight_cache=False),
+    )
+    settled = []
+    monkeypatch.setattr(
+        reconciliation,
+        "_compare_and_fail_remote",
+        lambda run_id, remote, detail: settled.append((run_id, remote, detail)) or True,
+    )
+    ctx = _failure_context(infra_retries=0, oom_retries=0)
+    ctx.last_handle = {"provider": "runpod", "attempt": 0, "fence": 1}
+    candidate = Candidate("runpod", "A100 SXM 40GB", 1.0, 40)
+    outcome = seed_submission._AttemptOutcome(
+        result=PollResult(False, failure=failure, detail=f"authoritative {failure}"),
+        chosen=candidate,
+        candidates=(candidate,),
+        run_spec=SimpleNamespace(gpu=SimpleNamespace(network_volume=None)),
+    )
+
+    decision = seed_submission._handle_failure(
+        ctx,
+        SimpleNamespace(attempt=0),
+        outcome,
+        authoritative_result=True,
+    )
+
     assert not decision.retry
-    assert ctx.last_detail == "oom: cuda out of memory"
+    assert settled == [
+        (
+            "failed-before-retry",
+            ctx.last_handle,
+            f"{failure}: authoritative {failure}",
+        )
+    ]
+    assert ctx.retry_budget.infra_used == 0
+    assert ctx.retry_budget.oom_used == 0
+
+
+def test_authoritative_result_is_reread_before_teardown_and_cleanup_tracking(monkeypatch):
+    import flash.providers.runpod.execution.jobs as jobs
+    from flash.runner.accounting import reconciliation
+    from flash.runner.supervise import seed_submission
+
+    events = []
+    observed = PollResult(False, failure="artifact_transport", detail="upload failed")
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args: events.append("result") or observed,
+    )
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args: events.append("teardown") or False,
+    )
+    monkeypatch.setattr(
+        reconciliation,
+        "_record_cleanup_remote",
+        lambda *_args: events.append("cleanup") or True,
+    )
+    ctx = _failure_context()
+    ctx.last_handle = _runpod_handle_dict(jobs)
+
+    result = seed_submission._cleanup_previous_attempt(ctx, 1)
+
+    assert result is observed
+    assert events == ["result", "teardown", "cleanup"]
+    assert ctx.last_handle
+
+
+def test_authoritative_failure_does_not_bypass_uncertain_teardown(monkeypatch):
+    import flash.providers.runpod.execution.jobs as jobs
+    from flash.runner.accounting import reconciliation
+    from flash.runner.supervise import seed_submission
+
+    events = []
+    observed = PollResult(False, failure="artifact_transport", detail="upload failed")
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args: events.append("result") or observed,
+    )
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args: (
+            events.append("teardown") or (_ for _ in ()).throw(RuntimeError("delete unavailable"))
+        ),
+    )
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_worker_provably_gone",
+        lambda *_args: events.append("absence") or False,
+    )
+    monkeypatch.setattr(
+        reconciliation,
+        "_record_cleanup_remote",
+        lambda *_args: events.append("cleanup") or True,
+    )
+    monkeypatch.setattr(
+        "flash.providers.core.registry.get_provider",
+        lambda _name: SimpleNamespace(gc=lambda _spec: None),
+    )
+    ctx = _failure_context()
+    ctx.last_handle = _runpod_handle_dict(jobs)
+    ctx.gc_seen_endpoints = lambda: None
+
+    with pytest.raises(RuntimeError, match="teardown could not be confirmed"):
+        seed_submission._cleanup_previous_attempt(ctx, 1)
+
+    assert events == ["result", "teardown", "cleanup", "absence"]
+    assert ctx.last_handle
+
+
+def test_uncertain_authoritative_cleanup_identity_is_persisted(monkeypatch):
+    import flash.providers.runpod.execution.jobs as jobs
+    from flash.runner.supervise import seed_submission
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        spec = _spec("authoritative-cleanup-ledger")
+        remote = _runpod_handle_dict(jobs)
+        runner_state._save_status(
+            provisioned_status(spec, state="running", remote=remote),
+        )
+        observed = PollResult(False, failure="artifact_transport", detail="upload failed")
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args: observed)
+        monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", lambda *_args: False)
+        ctx = _failure_context()
+        ctx.spec = spec
+        ctx.last_handle = dict(remote)
+
+        assert seed_submission._cleanup_previous_attempt(ctx, 1) is observed
+
+        assert runner_reconciliation._snapshot_cleanup_remotes(spec.run_id) == [remote]
+        assert runner_status.get_status(spec.run_id).remote == remote
+
+
+def test_supervisor_reclassifies_provider_failure_from_authoritative_oom(monkeypatch):
+    from dataclasses import replace
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
+        import flash.providers.core.allocator as allocator
+        import flash.providers.runpod.execution.jobs as jobs
+        from flash.providers.core.base import Allocation, Candidate
+
+        candidates = (
+            Candidate("runpod", "A100 SXM 40GB", 1.0, 40),
+            Candidate("runpod", "A100 PCIe", 1.4, 80),
+        )
+        monkeypatch.setattr(
+            allocator,
+            "allocate",
+            lambda *_args, **_kwargs: Allocation(
+                provider="runpod",
+                gpu="A100 SXM 40GB",
+                hourly_usd=1.0,
+                min_vram_gb=40,
+                candidates=candidates,
+            ),
+        )
+        submitted = []
+
+        def submit(spec, seed, log=None, on_handle=None, attempt=0, fence=1, **_kwargs):
+            submitted.append(spec.gpu.type)
+            if on_handle:
+                on_handle(
+                    _runpod_handle_dict(
+                        jobs,
+                        job_id=f"job-{attempt}",
+                        attempt=attempt,
+                    )
+                    | {"fence": fence}
+                )
+            if attempt == 0:
+                return PollResult(False, failure="poll_error", detail="provider status unavailable")
+            return PollResult(True, metrics={"cost_usd": 0.1})
+
+        monkeypatch.setattr(job_execution, "submit_run", submit)
+        observations = iter((PollResult(False, failure="oom", detail="cuda out of memory"),))
+        monkeypatch.setattr(
+            runner_lifecycle,
+            "_attempt_result",
+            lambda *_args, **_kwargs: next(observations),
+        )
+        base_spec = _spec("authoritative-oom-retry")
+        spec = replace(base_spec, gpu=replace(base_spec.gpu, max_retries=1))
+
+        runner_submit.submit_job(spec, dry_run=False, background=False)
+
+        assert submitted == ["A100 SXM 40GB", "A100 PCIe"]
+        assert runner_status.get_status(spec.run_id).state == "done"
+
+
+def test_supervisor_preserves_exact_authoritative_failure_after_retry_exhaustion(monkeypatch):
+    from dataclasses import replace
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        _confirm_runpod_retry_teardown(monkeypatch)
+        import flash.providers.runpod.execution.jobs as jobs
+
+        submissions = []
+
+        def submit(spec, seed, log=None, on_handle=None, attempt=0, fence=1, **_kwargs):
+            submissions.append(attempt)
+            if on_handle:
+                on_handle(
+                    _runpod_handle_dict(jobs, job_id="job-failed", attempt=attempt)
+                    | {"fence": fence}
+                )
+            return PollResult(False, failure="poll_error", detail="provider status unavailable")
+
+        monkeypatch.setattr(job_execution, "submit_run", submit)
+        monkeypatch.setattr(
+            runner_lifecycle,
+            "_attempt_result",
+            lambda *_args, **_kwargs: PollResult(
+                False,
+                failure="job_failed",
+                detail="worker validation failed",
+            ),
+        )
+        base_spec = _spec("authoritative-terminal")
+        spec = replace(base_spec, gpu=replace(base_spec.gpu, max_retries=0))
+
+        with pytest.raises(RuntimeError, match="worker validation failed"):
+            runner_submit.submit_job(spec, dry_run=False, background=False)
+
+        status = runner_status.get_status(spec.run_id)
+        assert submissions == [0]
+        assert status.state == "failed"
+        assert status.error == "job_failed: worker validation failed"
+        assert runner_status._current_attempt(status).state == "settled"
+        assert status.remote["job_id"] == "job-failed"
 
 
 def test_supervisor_retries_on_provider_loss_then_succeeds(monkeypatch):
@@ -3032,9 +3323,14 @@ def test_cancellation_billing_prefers_newer_verified_current_fence_result(monkey
         result = {
             "attempt_id": 0,
             "fence": 1,
+            "outcome": "cancelled",
             "completed_steps": 7,
             "training_entered": True,
-            "receipt": {"path": "attempt/result.json", "digest": "a" * 64},
+            "receipt": {
+                "path": "attempt/result.json",
+                "revision": "revision",
+                "digest": "a" * 64,
+            },
         }
         observations = iter((result,))
 
@@ -3047,6 +3343,7 @@ def test_cancellation_billing_prefers_newer_verified_current_fence_result(monkey
         monkeypatch.setattr(
             runner_costs, "charge_usd_for_spec", lambda _spec, **kwargs: kwargs["steps"]
         )
+        assert runner_status._update(spec.run_id, "cancelled")
 
         runner_deploy._refresh_cancellation_result(spec.run_id, spec)
         charge, diagnostic = runner_deploy._cancellation_billing(
@@ -3058,7 +3355,124 @@ def test_cancellation_billing_prefers_newer_verified_current_fence_result(monkey
 
         assert charge == 7
         assert diagnostic == {}
-        assert runner_status.get_status(spec.run_id).result["completed_steps"] == 7
+        persisted = runner_status.get_status(spec.run_id)
+        assert persisted.state == "cancelled"
+        assert persisted.result["completed_steps"] == 7
+        assert runner_status._current_attempt(persisted).state == "active"
+
+
+def test_cancellation_refresh_rejects_preexisting_failed_result(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        from flash.providers.artifacts import attempts as artifact_attempts
+
+        spec = _spec("cancel-preexisting-failed")
+        failed_result = {
+            "attempt_id": 0,
+            "fence": 1,
+            "outcome": "failed",
+            "completed_steps": 99,
+            "training_entered": True,
+            "receipt": {
+                "path": "attempt/failed-result.json",
+                "revision": "failed-revision",
+                "digest": "b" * 64,
+            },
+        }
+        runner_state._save_status(
+            runner_state.RunStatus(
+                run_id=spec.run_id,
+                state="cancelled",
+                spec=spec.to_dict(),
+                billing_context={"org_id": "org-a"},
+                attempt=_attempt_record().to_dict(),
+                result=failed_result,
+                source_snapshot=_SOURCE_SNAPSHOT,
+            )
+        )
+        cancelled_result = {
+            "attempt_id": 0,
+            "fence": 1,
+            "outcome": "cancelled",
+            "completed_steps": 7,
+            "training_entered": True,
+            "receipt": {
+                "path": "attempt/cancelled-result.json",
+                "revision": "cancelled-revision",
+                "digest": "c" * 64,
+            },
+        }
+        reads = []
+        monkeypatch.setattr(
+            artifact_attempts,
+            "read_attempt_artifacts",
+            lambda *_args, **_kwargs: (
+                reads.append(True)
+                or artifact_attempts.AttemptArtifacts(
+                    "cancelled-revision", 100.0, None, cancelled_result
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            runner_costs, "charge_usd_for_spec", lambda _spec, **kwargs: kwargs["steps"]
+        )
+
+        runner_deploy._refresh_cancellation_result(spec.run_id, spec)
+        charge, diagnostic = runner_deploy._cancellation_billing(
+            spec.run_id,
+            spec,
+            bill_cancel=True,
+            rented_remote={"provider": "runpod", "gpu_type": "B200", "gpu_count": 1},
+        )
+
+        assert reads == [True]
+        assert charge == 7
+        assert diagnostic == {}
+        persisted = runner_status.get_status(spec.run_id)
+        assert persisted.result == cancelled_result
+        assert persisted.state == "cancelled"
+
+
+def test_cancellation_result_refresh_rejects_unpersisted_projection(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+        from flash.providers.artifacts import attempts as artifact_attempts
+
+        spec = _spec("cancel-result-rejected")
+        runner_state._save_status(
+            runner_state.RunStatus(
+                run_id=spec.run_id,
+                state="cancelled",
+                spec=spec.to_dict(),
+                attempt=_attempt_record().to_dict(),
+                source_snapshot=_SOURCE_SNAPSHOT,
+            )
+        )
+        result = {
+            "attempt_id": 0,
+            "fence": 1,
+            "outcome": "failed",
+            "completed_steps": 7,
+            "receipt": {
+                "path": "attempt/result.json",
+                "revision": "revision",
+                "digest": "b" * 64,
+            },
+        }
+        monkeypatch.setattr(
+            artifact_attempts,
+            "read_attempt_artifacts",
+            lambda *_args, **_kwargs: artifact_attempts.AttemptArtifacts(
+                "revision", 100.0, None, result
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="not durably persisted"):
+            runner_deploy._refresh_cancellation_result(spec.run_id, spec)
+
+        persisted = runner_status.get_status(spec.run_id)
+        assert persisted.state == "cancelled"
+        assert persisted.result is None
 
 
 def test_cancel_prices_and_cleans_up_with_effective_warmstart_spec(monkeypatch):

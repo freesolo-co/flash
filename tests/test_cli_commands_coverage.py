@@ -449,12 +449,20 @@ def test_snapshot_distinguishes_teardown_from_an_unknown_attempt() -> None:
                 raise self._payload
             return self._payload
 
-    torn_down = {
-        "state": "running",
-        "remote": None,
-        "attempt": {"attempt_id": 0, "fence": 1},
-    }
-    assert _snapshot_live_attempt(_Run(torn_down), "flash-1") == _NO_LIVE_WORKER
+    for state in ("provisioning", "running"):
+        handleless = {
+            "state": state,
+            "remote": None,
+            "attempt": {"attempt_id": 0, "fence": 1},
+        }
+        assert _snapshot_live_attempt(_Run(handleless), "flash-1") == 0
+    for state in ("done", "failed", "cancelled", "dry_run"):
+        torn_down = {
+            "state": state,
+            "remote": None,
+            "attempt": {"attempt_id": 0, "fence": 1},
+        }
+        assert _snapshot_live_attempt(_Run(torn_down), "flash-1") == _NO_LIVE_WORKER
     live = {
         "state": "running",
         "remote": {"provider": "runpod"},
@@ -462,8 +470,6 @@ def test_snapshot_distinguishes_teardown_from_an_unknown_attempt() -> None:
     }
     assert _snapshot_live_attempt(_Run(live), "flash-1") == 1
     assert _snapshot_live_attempt(_Run(ClientError("boom")), "flash-1") is None
-    no_remote = {
-        "state": "running",
-        "attempt": {"attempt_id": 2, "fence": 3},
-    }
-    assert _snapshot_live_attempt(_Run(no_remote), "flash-1") == 2
+    for attempt in (None, {"attempt_id": -1, "fence": 3}):
+        unknown = {"state": "running", "remote": None, "attempt": attempt}
+        assert _snapshot_live_attempt(_Run(unknown), "flash-1") is None

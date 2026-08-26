@@ -197,7 +197,7 @@ def test_transient_bootstrap_failure_result_remains_retriable(monkeypatch, tmp_p
     projection = poll_result_from_manifest(manifest.to_dict())
 
     assert manifest.failure_class == "artifact_transport"
-    assert projection.failure == "job_preempted"
+    assert projection.failure == "artifact_transport"
     assert projection.detail == "index unavailable"
 
 

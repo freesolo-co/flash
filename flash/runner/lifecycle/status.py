@@ -427,27 +427,40 @@ def record_resource(
 
 def record_result(run_id: str, value: dict, *, attempt_id: int, fence: int) -> bool:
     """atomically persist a result and advance its exact fenced attempt."""
-    from flash.runner.lifecycle.protocol import bounded_json
+    from flash.runner.lifecycle.protocol import bounded_json, receipt
 
     with state._status_guard(run_id):
         status = get_status(run_id)
         attempt = _current_attempt(status)
         if attempt.attempt_id != attempt_id or attempt.fence != fence:
             return False
-        if status.state in state.TERMINAL_STATES or attempt.state == "settled":
-            return False
         incoming = bounded_json(value)
         if incoming.get("attempt_id") != attempt_id or incoming.get("fence") != fence:
             return False
         result_receipt = incoming.get("receipt")
-        if not isinstance(result_receipt, dict):
+        try:
+            valid_receipt = receipt(
+                result_receipt["path"],
+                result_receipt["revision"],
+                result_receipt["digest"],
+            )
+        except (KeyError, TypeError, ValueError):
             return False
-        status.result = incoming
-        status.attempt = replace(
-            attempt,
-            state="result_pending",
-            result_receipt=result_receipt,
-        ).to_dict()
+        if valid_receipt != result_receipt:
+            return False
+        if status.state == "cancelled":
+            if incoming.get("outcome") != "cancelled":
+                return False
+            status.result = incoming
+        else:
+            if status.state in state.TERMINAL_STATES or attempt.state == "settled":
+                return False
+            status.result = incoming
+            status.attempt = replace(
+                attempt,
+                state="result_pending",
+                result_receipt=result_receipt,
+            ).to_dict()
         status.updated_at = time.time()
         state._save_status_unlocked(status)
     reporting._report_status(status)

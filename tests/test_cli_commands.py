@@ -1859,7 +1859,9 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
     assert err.endswith("\r")
 
 
-def test_poll_logs_returns_the_live_attempt_from_the_terminal_status(capsys) -> None:
+def test_poll_logs_returns_no_live_worker_from_terminal_status(capsys) -> None:
+    from flash.cli.commands.ops.worker_output import _NO_LIVE_WORKER
+
     class _AttemptClient(_FakeClient):
         def get_logs(self, run_id: str, offset: int = 0) -> dict:
             return {"run_id": run_id, "logs": "", "offset": 0, "state": "done"}
@@ -1868,13 +1870,14 @@ def test_poll_logs_returns_the_live_attempt_from_the_terminal_status(capsys) -> 
             return {
                 "run_id": run_id,
                 "state": "done",
+                "remote": None,
                 "attempt": {"attempt_id": 1, "fence": 5, "state": "result_committed"},
             }
 
     result = run_commands._poll_logs(_AttemptClient(), "flash-attempt", interval=0)
 
-    assert result == run_commands._LogPollResult("done", False, 1)
-    assert result.live_attempt == 1
+    assert result == run_commands._LogPollResult("done", False, _NO_LIVE_WORKER)
+    assert result.live_attempt == _NO_LIVE_WORKER
     assert capsys.readouterr().out == ""
 
 

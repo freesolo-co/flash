@@ -12,7 +12,9 @@ from flash.core.spec import JobSpec, gpu_count_of, require_matching_seed
 # Floor so a streak of broken/busy GPUs doesn't kill a run that left retries enabled.
 # max_retries==0 (single-shot) is always respected; floor only applies when retries are on.
 INFRA_RETRY_FLOOR = 5
-INFRA_RETRY_FAILURES = frozenset({"no_capacity", "poll_error", "job_preempted"})
+INFRA_RETRY_FAILURES = frozenset(
+    {"no_capacity", "poll_error", "job_preempted", "artifact_transport"}
+)
 RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 _STAGED_ENVIRONMENT_RETRY_S = 5.0
 
@@ -238,7 +240,7 @@ def _run_job_inner(
 
         if isinstance(exc, StagedEnvironmentTransientError):
             raise
-        if get_status(spec.run_id).state != "cancelled":
+        if get_status(spec.run_id).state not in {"cancelled", "failed"}:
             _update(spec.run_id, "failed", error=_terminal_failure_detail(exc))
         raise
 

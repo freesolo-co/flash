@@ -708,11 +708,9 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
         "repo_info",
         "list_repo_files",
         "repo_info",
-        "list_repo_files",
-        "repo_info",
         "get_paths_info",
     ]
-    assert private_hf.calls[5][1]["paths"] == [opd_optimizer_start_marker_path(spec.run_id, 0)]
+    assert private_hf.calls[3][1]["paths"] == [opd_optimizer_start_marker_path(spec.run_id, 0)]
 
 
 def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch, tmp_path):

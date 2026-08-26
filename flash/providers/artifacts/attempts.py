@@ -231,8 +231,10 @@ def poll_result_from_manifest(projection: dict) -> PollResult:
         return PollResult(False, failure="job_failed", detail="worker reported cancellation")
     if manifest.failure_class == "oom":
         failure = "oom"
-    elif manifest.failure_class in {"provider_preempted", "artifact_transport"}:
+    elif manifest.failure_class == "provider_preempted":
         failure = "job_preempted"
+    elif manifest.failure_class == "artifact_transport":
+        failure = "artifact_transport"
     else:
         failure = "job_failed"
     detail = str(manifest.diagnostics.get("error") or manifest.failure_class or manifest.outcome)

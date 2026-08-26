@@ -16,9 +16,10 @@ if TYPE_CHECKING:
     from flash.client import ApiClient
 
 
-# stands in for the live attempt during the teardown window, when the plane has PROVEN there is no
-# live worker (an explicitly null ``remote``). distinct from ``None``, which means UNKNOWN.
+# stands in for a terminal run whose missing remote proves no worker remains. distinct from
+# ``None``, which means the live attempt is unknown.
 _NO_LIVE_WORKER = "no-live-worker"
+_TERMINAL_RUN_STATES = frozenset({"done", "failed", "cancelled", "dry_run"})
 
 
 def _artifact_attempt(name: str) -> int | None:
@@ -50,10 +51,13 @@ def _worker_sections(client: ApiClient, run_id: str) -> dict[str, str]:
 
 
 def live_attempt_of(run: Mapping[str, object]) -> int | str | None:
-    """return the live attempt, the teardown sentinel, or none when identity is unknown."""
-    if run.get("remote", False) is None:
+    """return the live attempt, confirmed teardown, or none when identity is unknown."""
+    payload = dict(run)
+    identity = lifecycle_ui.live_attempt(payload)
+    if run.get("remote") is not None:
+        return identity[0] if identity is not None else None
+    if run.get("state") in _TERMINAL_RUN_STATES:
         return _NO_LIVE_WORKER
-    identity = lifecycle_ui.live_attempt(dict(run))
     return identity[0] if identity is not None else None
 
 

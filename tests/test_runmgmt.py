@@ -576,7 +576,11 @@ def test_result_projection_rejects_stale_attempt_or_fence(monkeypatch, tmp_path,
     result = {
         "attempt_id": attempt_id,
         "fence": fence,
-        "receipt": {"path": "attempt/result.json", "digest": "b" * 64},
+        "receipt": {
+            "path": "attempt/result.json",
+            "revision": "rev",
+            "digest": "b" * 64,
+        },
     }
 
     assert not runner_status.record_result(
@@ -589,6 +593,111 @@ def test_result_projection_rejects_stale_attempt_or_fence(monkeypatch, tmp_path,
     persisted = runner_status.get_status(spec.run_id)
     assert persisted.result is None
     assert persisted.attempt == before.attempt
+
+
+def test_cancelled_result_projection_preserves_terminal_attempt_state(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="cancelled-result", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote("endpoint-cancelled", "job-cancelled", attempt=2, fence=9)
+    status = provisioned_status(spec, remote=remote, created_at=100.0)
+    status.state = "cancelled"
+    runner_state._save_status(status)
+    before_attempt = runner_status._current_attempt(status)
+    result = {
+        "attempt_id": 2,
+        "fence": 9,
+        "outcome": "cancelled",
+        "completed_steps": 7,
+        "receipt": {
+            "path": "attempt/result.json",
+            "revision": "rev",
+            "digest": "c" * 64,
+        },
+    }
+
+    assert runner_status.record_result(spec.run_id, result, attempt_id=2, fence=9)
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.state == "cancelled"
+    assert persisted.result == result
+    assert runner_status._current_attempt(persisted) == before_attempt
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {
+            "attempt_id": 2,
+            "fence": 9,
+            "outcome": "failed",
+            "receipt": {
+                "path": "attempt/result.json",
+                "revision": "rev",
+                "digest": "d" * 64,
+            },
+        },
+        {
+            "attempt_id": 2,
+            "fence": 9,
+            "outcome": "cancelled",
+            "receipt": {"path": "attempt/result.json", "digest": "e" * 64},
+        },
+    ],
+)
+def test_cancelled_result_projection_rejects_other_outcomes_and_invalid_receipts(
+    monkeypatch, tmp_path, result
+):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="cancelled-result-rejected", model="Qwen/Qwen3.5-9B")
+    remote = _runpod_remote("endpoint-cancelled", "job-cancelled", attempt=2, fence=9)
+    status = provisioned_status(spec, remote=remote, created_at=100.0)
+    status.state = "cancelled"
+    runner_state._save_status(status)
+
+    assert not runner_status.record_result(spec.run_id, result, attempt_id=2, fence=9)
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.state == "cancelled"
+    assert persisted.result is None
+
+
+@pytest.mark.parametrize(("attempt_id", "fence"), [(1, 9), (2, 8)])
+def test_cancelled_result_projection_rejects_stale_identity(
+    monkeypatch, tmp_path, attempt_id, fence
+):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="cancelled-result-stale", model="Qwen/Qwen3.5-9B")
+    remote = _runpod_remote("endpoint-cancelled", "job-cancelled", attempt=2, fence=9)
+    status = provisioned_status(spec, remote=remote, created_at=100.0)
+    status.state = "cancelled"
+    runner_state._save_status(status)
+    result = {
+        "attempt_id": attempt_id,
+        "fence": fence,
+        "outcome": "cancelled",
+        "receipt": {
+            "path": "attempt/result.json",
+            "revision": "rev",
+            "digest": "f" * 64,
+        },
+    }
+
+    assert not runner_status.record_result(
+        spec.run_id,
+        result,
+        attempt_id=attempt_id,
+        fence=fence,
+    )
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.state == "cancelled"
+    assert persisted.result is None
 
 
 def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
