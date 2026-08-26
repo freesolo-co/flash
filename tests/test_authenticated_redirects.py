@@ -1,0 +1,159 @@
+"""high-level authenticated clients reject redirects without contacting the sink."""
+
+from __future__ import annotations
+
+import logging
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+
+from flash.client.freesolo_api import _freesolo_request, verify_freesolo_key
+from flash.client.http import ApiClient, ApiError
+from flash.server.billing.charges import BillingError, _post_billing
+from flash.server.platform import auth
+from flash.server.platform import internal_client as ic
+
+
+@pytest.fixture
+def redirect_servers():
+    source_seen: list[tuple[str, str | None]] = []
+    sink_seen: list[tuple[str, str | None]] = []
+
+    class SinkHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            sink_seen.append((self.command, self.headers.get("Authorization")))
+            self.send_response(200)
+            self.end_headers()
+
+        do_POST = do_GET
+
+        def log_message(self, *_args):
+            pass
+
+    sink = ThreadingHTTPServer(("127.0.0.1", 0), SinkHandler)
+    sink_url = f"http://127.0.0.1:{sink.server_address[1]}"
+
+    class SourceHandler(BaseHTTPRequestHandler):
+        def _redirect(self):
+            source_seen.append((self.command, self.headers.get("Authorization")))
+            self.send_response(302)
+            self.send_header("Location", f"{sink_url}/steal")
+            self.end_headers()
+
+        do_GET = _redirect
+        do_POST = _redirect
+        do_DELETE = _redirect
+
+        def log_message(self, *_args):
+            pass
+
+    source = ThreadingHTTPServer(("127.0.0.1", 0), SourceHandler)
+    source_url = f"http://127.0.0.1:{source.server_address[1]}"
+    threads = [
+        threading.Thread(target=sink.serve_forever, daemon=True),
+        threading.Thread(target=source.serve_forever, daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        yield source_url, source_seen, sink_seen
+    finally:
+        source.shutdown()
+        sink.shutdown()
+        source.server_close()
+        sink.server_close()
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda client: client.health(),
+        lambda client: client._request_bytes("GET", "/bytes"),
+        lambda client: list(client.chat_stream("run-a", [])),
+    ],
+    ids=["json", "bytes", "chat-stream"],
+)
+def test_api_client_paths_keep_api_error_classification_and_do_not_reach_redirect_sink(
+    redirect_servers, call
+) -> None:
+    source_url, source_seen, sink_seen = redirect_servers
+    client = ApiClient(source_url, "client-secret")
+
+    with pytest.raises(ApiError) as exc_info:
+        call(client)
+
+    assert exc_info.value.status == 302
+    assert source_seen[-1][1] == "Bearer client-secret"
+    assert sink_seen == []
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda source_url: verify_freesolo_key("freesolo-secret", source_url),
+        lambda source_url: _freesolo_request(
+            "POST", "/api/projects", "freesolo-secret", source_url, body={"name": "n"}
+        ),
+    ],
+    ids=["verify", "json"],
+)
+def test_freesolo_client_paths_keep_api_error_classification_and_do_not_reach_redirect_sink(
+    redirect_servers, call
+) -> None:
+    source_url, source_seen, sink_seen = redirect_servers
+
+    with pytest.raises(ApiError) as exc_info:
+        call(source_url)
+
+    assert exc_info.value.status == 302
+    assert source_seen[-1][1] == "Bearer freesolo-secret"
+    assert sink_seen == []
+
+
+def test_server_verifier_returns_false_and_does_not_reach_redirect_sink(
+    monkeypatch, redirect_servers
+) -> None:
+    source_url, source_seen, sink_seen = redirect_servers
+    monkeypatch.setenv(auth.FREESOLO_BASE_URL_ENV, source_url)
+    auth._verify_cache.clear()
+    auth._verify_inflight.clear()
+
+    assert auth._freesolo_verify("server-secret") is False
+    assert source_seen == [("GET", "Bearer server-secret")]
+    assert sink_seen == []
+
+
+def test_internal_client_returns_false_and_does_not_reach_redirect_sink(
+    monkeypatch, redirect_servers
+) -> None:
+    source_url, source_seen, sink_seen = redirect_servers
+    monkeypatch.setenv(auth.FREESOLO_BASE_URL_ENV, source_url)
+    monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "internal-secret")
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+
+    assert (
+        ic.post_internal_json(
+            "/api/internal",
+            {"ok": True},
+            subject="report test",
+            logger=logging.getLogger("test.authenticated_redirects"),
+        )
+        is False
+    )
+    assert source_seen == [("POST", "Bearer internal-secret")]
+    assert sink_seen == []
+
+
+def test_billing_keeps_billing_error_classification_and_does_not_reach_redirect_sink(
+    monkeypatch, redirect_servers
+) -> None:
+    source_url, source_seen, sink_seen = redirect_servers
+    monkeypatch.setenv(auth.FREESOLO_BASE_URL_ENV, source_url)
+
+    with pytest.raises(BillingError) as exc_info:
+        _post_billing(token="billing-secret", path="/api/billing", body={"runId": "run-a"})
+
+    assert exc_info.value.status_code == 302
+    assert source_seen == [("POST", "Bearer billing-secret")]
+    assert sink_seen == []

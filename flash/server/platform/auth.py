@@ -11,6 +11,7 @@ import urllib.request
 from concurrent.futures import Future
 from typing import Any
 
+from flash._internal.http import _urlopen_no_redirect
 from flash.server.platform import db
 
 INTERNAL_KEY_ENV = "FREESOLO_INTERNAL_KEY"
@@ -186,7 +187,7 @@ def _freesolo_verify(token: str) -> bool:
         identity: dict[str, Any] = {}
         cache_result = True
         try:
-            with urllib.request.urlopen(req, timeout=_VERIFY_TIMEOUT_S) as resp:
+            with _urlopen_no_redirect(req, timeout=_VERIFY_TIMEOUT_S) as resp:
                 verified = resp.status == 200
                 if verified:
                     identity = _identity_from_verify_body(_response_body(resp))

@@ -6,6 +6,7 @@ import json
 import urllib.error
 import urllib.request
 
+from flash._internal.http import _urlopen_no_redirect
 from flash.core.spec import attributed_gpu_type
 from flash.cost.currency import usd_cents as _cents
 from flash.server.platform.internal_client import (
@@ -55,7 +56,7 @@ def _post_billing(*, token: str, path: str, body: dict) -> dict:
     """POST a JSON body to the backend billing path; raises BillingError on failure."""
     req = build_internal_request(path, body, token=token)
     try:
-        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
+        with _urlopen_no_redirect(req, timeout=DEFAULT_TIMEOUT_S) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         raise BillingError(exc.code, _http_error_detail(exc)) from exc
