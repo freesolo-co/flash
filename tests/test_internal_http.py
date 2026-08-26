@@ -430,6 +430,92 @@ def test_generic_redirect_error_handler_cannot_reach_sink(status: int) -> None:
     assert redirect_calls == []
 
 
+@pytest.mark.parametrize("protocol", ["http", "https"])
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_early_response_processor_cannot_follow_redirect(protocol: str, status: int) -> None:
+    source = f"{protocol}://source.invalid/data"
+    target = f"{protocol}://sink.invalid/steal"
+    observed: list[str] = []
+    processor_calls: list[str] = []
+
+    class RedirectSource(urllib.request.BaseHandler):
+        def default_open(self, request):
+            observed.append(request.full_url)
+            if request.full_url == source:
+                headers = email.message.Message()
+                headers["Location"] = target
+                response = urllib.response.addinfourl(
+                    io.BytesIO(b""), headers, request.full_url, code=status
+                )
+                response.msg = "redirect"
+                return response
+            return _response(request.full_url)
+
+    class EarlyResponseProcessor(urllib.request.BaseHandler):
+        handler_order = -1000
+
+        def process(self, request, response):
+            processor_calls.append(request.full_url)
+            if response.code in (301, 302, 303, 307, 308):
+                return self.parent.open(response.headers["Location"], timeout=request.timeout)
+            return response
+
+        http_response = process
+        https_response = process
+
+    opener = urllib.request.build_opener(RedirectSource(), EarlyResponseProcessor())
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        _urlopen_no_redirect(
+            urllib.request.Request(source, headers={"Authorization": "Bearer secret"}),
+            timeout=1.0,
+        )
+
+    assert exc_info.value.code == status
+    assert observed == [source]
+    assert processor_calls == []
+
+
+@pytest.mark.parametrize("protocol", ["http", "https"])
+def test_success_response_processors_keep_their_relative_order(protocol: str) -> None:
+    observed: list[str] = []
+
+    class TerminalHandler(urllib.request.BaseHandler):
+        def default_open(self, request):
+            return _response(request.full_url)
+
+    class FirstProcessor(urllib.request.BaseHandler):
+        handler_order = -1000
+
+        def process(self, request, response):
+            observed.append("first")
+            return response
+
+        http_response = process
+        https_response = process
+
+    class SecondProcessor(urllib.request.BaseHandler):
+        handler_order = -2000
+
+        def process(self, request, response):
+            observed.append("second")
+            return response
+
+        http_response = process
+        https_response = process
+
+    opener = urllib.request.build_opener(TerminalHandler(), FirstProcessor(), SecondProcessor())
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(
+        urllib.request.Request(f"{protocol}://source.invalid/data"), timeout=1.0
+    ) as response:
+        assert response.read() == b"ok"
+
+    assert observed == ["second", "first"]
+
+
 def test_concurrent_custom_opener_cache_construction_is_singleton() -> None:
     barrier = threading.Barrier(8)
     seen_parents: list[object] = []

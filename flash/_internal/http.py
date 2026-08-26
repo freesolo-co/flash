@@ -24,11 +24,23 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def http_error_redirect(self, req, fp, code, msg, headers):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
+    def http_response(self, request, response):
+        if response.code in _REDIRECT_STATUSES:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                response.code,
+                response.msg,
+                response.info(),
+                response,
+            )
+        return response
+
     http_error_301 = http_error_redirect
     http_error_302 = http_error_redirect
     http_error_303 = http_error_redirect
     http_error_307 = http_error_redirect
     http_error_308 = http_error_redirect
+    https_response = http_response
 
 
 @dataclass(frozen=True)
@@ -42,7 +54,14 @@ class _InstalledOpenerCache:
 def _build_no_redirect_opener(*handlers: object) -> urllib.request.OpenerDirector:
     """build a private opener that returns redirects as httperrors."""
 
-    return urllib.request.build_opener(_NoRedirectHandler(), *handlers)
+    blocker = _NoRedirectHandler()
+    opener = urllib.request.build_opener(blocker, *handlers)
+    for protocol in ("http", "https"):
+        processors = opener.process_response.get(protocol)
+        if processors is not None:
+            processors.remove(blocker)
+            processors.insert(0, blocker)
+    return opener
 
 
 _OPENER_LOCK = threading.Lock()
