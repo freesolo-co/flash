@@ -1073,6 +1073,7 @@ def test_cancel_revokes_inflight_checkpoint_deployment(tmp_path, monkeypatch):
                 "checkpoint_id": revision,
                 "checkpoint_step": 40,
             },
+            billing_context={"org_id": "org-a"},
         )
     )
     runner_verified_revisions.add_verified_checkpoint(
@@ -1082,11 +1083,15 @@ def test_cancel_revokes_inflight_checkpoint_deployment(tmp_path, monkeypatch):
     )
     undeployed = []
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeployed.append(target))
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda target, *, org_id: undeployed.append((org_id, target)),
+    )
 
     out = runner_deploy.cancel_run(run_id)
 
-    assert undeployed == [revision]
+    assert undeployed == [("org-a", revision)]
     assert out.deployment["state"] == "undeployed"
     assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
@@ -1213,7 +1218,7 @@ def test_repeated_cancel_preserves_checkpoint_serving(tmp_path, monkeypatch):
     )
 
 
-def test_cancel_preserved_checkpoint_prunes_other_verified_revisions(tmp_path, monkeypatch):
+def test_cancel_preserved_checkpoint_keeps_verified_ready_siblings(tmp_path, monkeypatch):
     import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
@@ -1241,57 +1246,7 @@ def test_cancel_preserved_checkpoint_prunes_other_verified_revisions(tmp_path, m
     assert out.state == "cancelled"
     assert out.deployment == preserved
     assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset(
-        {preserved["checkpoint_id"]}
-    )
-
-
-def test_cancel_checkpoint_prune_failure_is_retryable_without_revocation(tmp_path, monkeypatch):
-    import flash.runner.results.verified_revisions as verified_revisions
-    import flash.serve.deployment.deploy as deploy
-    from flash.runner.supervise.deploy import DeploymentStatePersistenceError
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-checkpoint-prune-retry"
-    preserved = _ready_checkpoint(run_id, 40, remote=None)
-    older_revision = _checkpoint_id(run_id, 20, "b")
-    runner_verified_revisions.add_verified_checkpoint(
-        run_id,
-        older_revision,
-        expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
-    )
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        deploy,
-        "undeploy_adapter",
-        lambda _target: pytest.fail("ledger persistence failure must not revoke serving"),
-    )
-    real_write = verified_revisions._write_unlocked
-
-    def fail_prune(runs_dir, path, generation, revisions):
-        if revisions == [preserved["checkpoint_id"]]:
-            raise OSError("verified checkpoint ledger unavailable")
-        return real_write(runs_dir, path, generation, revisions)
-
-    monkeypatch.setattr(verified_revisions, "_write_unlocked", fail_prune)
-
-    with pytest.raises(DeploymentStatePersistenceError) as excinfo:
-        runner_deploy.cancel_run(run_id)
-
-    assert excinfo.value.backend_outcome == "not_required"
-    failed = runner_status.get_status(run_id)
-    assert failed.state == "running"
-    assert failed.deployment == preserved
-    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset(
-        {older_revision, preserved["checkpoint_id"]}
-    )
-
-    monkeypatch.setattr(verified_revisions, "_write_unlocked", real_write)
-    retried = runner_deploy.cancel_run(run_id)
-
-    assert retried.state == "cancelled"
-    assert retried.deployment == preserved
-    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset(
-        {preserved["checkpoint_id"]}
+        {*older_revisions, preserved["checkpoint_id"]}
     )
 
 

@@ -194,13 +194,10 @@ def adapter_artifact_metadata(
     files = _verify_adapter_artifact_tensors(
         hf_repo, subfolder, artifact_revision=artifact_revision
     )
-    fingerprint = json.dumps(
+    content = json.dumps(
         {
-            "artifact_revision": artifact_revision,
             "config": config,
             "files": files,
-            "repo_id": hf_repo,
-            "subfolder": subfolder,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -210,5 +207,5 @@ def adapter_artifact_metadata(
         # non-fatal by construction: an unmarked or malformed marker reads as text-only, so modality
         # uncertainty weakens the smoke rather than stranding an otherwise usable deployment.
         targets_images=config_targets_images(config),
-        artifact_digest=hashlib.sha256(fingerprint).hexdigest(),
+        artifact_digest=hashlib.sha256(content).hexdigest(),
     )

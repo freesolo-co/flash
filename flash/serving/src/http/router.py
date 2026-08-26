@@ -53,7 +53,7 @@ def build_serving_app(
     deployment_sha: str = "",
     deployment_id: str = "",
     reload_records: Callable[[], list[AdapterRecord]] | None = None,
-    lookup_record: Callable[[str], AdapterRecord | None] | None = None,
+    lookup_record: Callable[[str, str], AdapterRecord | None] | None = None,
     reload_interval_seconds: float = 30.0,
     usage_store: UsageStore,
     chat_authorizer: Callable[[str, str], Awaitable["str | None"]] | None = None,

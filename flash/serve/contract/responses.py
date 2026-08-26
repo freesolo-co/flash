@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from flash.serve.contract.errors import ServingError
+from flash.serving.src.store.identity import immutable_binding_fingerprint
 
 if TYPE_CHECKING:
     import httpx
@@ -35,32 +36,11 @@ def serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
 
 
 def matches_revision_identity(record: dict, expected: dict) -> bool:
-    """compare every immutable checkpoint binding fact after an ambiguous registration."""
+    """compare the canonical immutable checkpoint fingerprint after ambiguous registration."""
 
-    scalar_fields = (
-        "adapter_id",
-        "repo_id",
-        "repo_type",
-        "subfolder",
-        "base_model",
-        "checkpoint",
-        "thinking",
-    )
-    if any(record.get(field) != expected.get(field) for field in scalar_fields):
+    try:
+        return record.get("artifact_fingerprint") == expected.get(
+            "artifact_fingerprint"
+        ) and immutable_binding_fingerprint(record) == immutable_binding_fingerprint(expected)
+    except (TypeError, ValueError):
         return False
-    if (record.get("org_id") or None) != (expected.get("org_id") or None):
-        return False
-    if (record.get("structured_outputs") or None) != (expected.get("structured_outputs") or None):
-        return False
-    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    expected_metadata = expected["metadata"]
-    return all(
-        metadata.get(field) == expected_metadata.get(field)
-        for field in (
-            "record_type",
-            "run_id",
-            "checkpoint_step",
-            "artifact_revision",
-            "artifact_digest",
-        )
-    )

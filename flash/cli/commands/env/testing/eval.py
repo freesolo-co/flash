@@ -548,27 +548,22 @@ def _print_report(report: EvalSuiteReport) -> None:
 def _resolve_evaluation_target(
     args, client, parsed, api_error, client_error
 ) -> tuple[str, int | None]:
-    """require the exact requested checkpoint to be the ready managed deployment."""
+    """require the exact requested checkpoint to have verified ready authority."""
+
     run_id, _ = parsed
     try:
-        deployment = _live_deployment(client, run_id)
+        run = client.get_run(run_id)
     except (api_error, client_error) as exc:
         if getattr(args, "debug", False):
             raise
-        _err(f"env eval failed: could not resolve deployed checkpoint for {run_id}: {exc}")
+        _err(f"env eval failed: could not resolve verified checkpoints for {run_id}: {exc}")
         return args.target, _err("overall: FAIL")
-    if deployment is None:
-        _err(f"env eval failed: checkpoint {args.target} is not deployed")
+    verified = run.get("verified_checkpoints") if isinstance(run, dict) else None
+    if not isinstance(verified, list) or any(not isinstance(item, str) for item in verified):
+        _err(f"env eval failed: control plane returned invalid checkpoint authority for {run_id}")
         return args.target, _err("overall: FAIL")
-    state = deployment.get("state")
-    if state not in _READY_DEPLOYMENT_STATES:
-        _err(
-            f"env eval failed: checkpoint {args.target} deployment is {state or 'unknown'}; "
-            f"run `{CLI_NAME} models deploy {args.target}` first"
-        )
-        return args.target, _err("overall: FAIL")
-    if deployment.get("checkpoint_id") != args.target:
-        _err(f"env eval failed: checkpoint {args.target} is not the ready managed deployment")
+    if args.target not in verified:
+        _err(f"env eval failed: checkpoint {args.target} has not passed deployment verification")
         return args.target, _err("overall: FAIL")
     return args.target, None
 

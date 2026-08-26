@@ -16,7 +16,6 @@ from flash.serve.request.openai import OpenAIRequestError, parse_chat_request
 from flash.server.asgi import app as _app
 
 _DEPLOYMENT_BUSY_STATES = {"queued", "smoke_testing"}
-_DEPLOYMENT_READY_STATES = {"ready"}
 
 
 def _verified_checkpoints(status) -> set[str]:
@@ -62,14 +61,8 @@ def _authorized_chat_checkpoint(
             status_code=409,
             detail=f"checkpoint {checkpoint_id} has not passed a successful deployment smoke",
         )
-    if deployment.get("state") not in _DEPLOYMENT_READY_STATES:
-        state = deployment.get("state") or "undeployed"
-        raise HTTPException(status_code=409, detail=f"checkpoint deployment is {state}")
-    if deployment.get("checkpoint_id") != checkpoint_id:
-        raise HTTPException(
-            status_code=409,
-            detail=f"checkpoint {checkpoint_id} is not the active managed deployment record",
-        )
+    # verification is checkpoint-scoped. a newer sibling may queue or fail without revoking this
+    # ready checkpoint, so the mutable run-level deployment summary is not an authorization source.
     return checkpoint_id
 
 

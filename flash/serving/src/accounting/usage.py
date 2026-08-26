@@ -137,7 +137,7 @@ def build_usage_session(
         public_model_id=public_model_id,
         base_model=target.base_model,
         checkpoint_id=target.adapter_id if target.is_checkpoint else None,
-        artifact_fingerprint=target.artifact_digest,
+        artifact_fingerprint=target.artifact_fingerprint,
     )
     price = (
         CapturedPrice(
@@ -190,8 +190,11 @@ def principal_for_external_org(org_id: str) -> FreesoloOrgTrafficPrincipal:
     return FreesoloOrgTrafficPrincipal(orgId=org_id)
 
 
-def principal_for_trusted_internal() -> TrustedInternalTrafficPrincipal:
-    return TrustedInternalTrafficPrincipal()
+def principal_for_trusted_internal(org_id: str | None = None) -> TrustedInternalTrafficPrincipal:
+    return TrustedInternalTrafficPrincipal(
+        orgId=org_id,
+        billingAttributionExplicit=org_id is not None,
+    )
 
 
 def captured_now() -> datetime:

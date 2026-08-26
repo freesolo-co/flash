@@ -459,6 +459,7 @@ def _bounded_smoke_chat(
     serving_model: str,
     thinking: bool,
     expected_checkpoint: str,
+    org_id: str,
     messages: list[dict] | None = None,
     structured_outputs: dict | None = None,
     max_tokens: int,
@@ -485,6 +486,7 @@ def _bounded_smoke_chat(
                     "max_tokens": max_tokens,
                     "thinking": thinking,
                     "expected_checkpoint": expected_checkpoint,
+                    "org_id": org_id,
                     "timeout_s": timeout_s,
                     "retry_unavailable": True,
                     "stop": stop_sequences,
@@ -513,6 +515,7 @@ def _run_deployment_smoke(
     *,
     serving_model: str,
     expected_checkpoint: str,
+    org_id: str,
     # these facts were captured before the smoke; re-fetching inside the paid deadline can disagree
     # with the deployment that was actually registered or consume its verification budget.
     advertised_capabilities: frozenset[str] | None = None,
@@ -532,6 +535,7 @@ def _run_deployment_smoke(
         serving_model=serving_model,
         thinking=spec.thinking,
         expected_checkpoint=expected_checkpoint,
+        org_id=org_id,
         messages=image_messages if use_image_challenge else None,
         structured_outputs={} if use_image_challenge and constraint is not None else None,
         max_tokens=max_tokens,
@@ -544,6 +548,7 @@ def _run_deployment_smoke(
         spec,
         serving_model=serving_model,
         expected_checkpoint=expected_checkpoint,
+        org_id=org_id,
     )
     verify_turns = 1
     attested_checkpoint_id: str | None = None
@@ -561,6 +566,7 @@ def _run_deployment_smoke(
                 serving_model=serving_model,
                 thinking=spec.thinking,
                 expected_checkpoint=expected_checkpoint,
+                org_id=org_id,
                 max_tokens=max_tokens,
                 stop_sequences=stop_sequences,
                 deadline=deadline,
@@ -571,6 +577,7 @@ def _run_deployment_smoke(
                 spec,
                 serving_model=serving_model,
                 expected_checkpoint=expected_checkpoint,
+                org_id=org_id,
             )
             _smoke_lora_request_adapter(
                 structured_result, serving_model, attestation_advertised=attestation_advertised

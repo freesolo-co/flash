@@ -177,6 +177,7 @@ def _finish_deployment_unlocked(
                 spec,
                 serving_model=checkpoint_id,
                 expected_checkpoint=checkpoint,
+                org_id=str(deploy_kwargs["org_id"]),
                 advertised_capabilities=advertised_capabilities,
                 adapter_targets_images=adapter_targets_images,
             )

@@ -22,6 +22,7 @@ from flash.serve.request.openai import (
 from flash.serve.request.transport import RawChatStream, is_event_stream_content_type
 from flash.server.asgi import app as _app
 from flash.server.platform.deps import manageable_run
+from flash.server.platform.internal_client import run_org_id
 from flash.server.routes.serving_revisions import (
     _DEPLOYMENT_BUSY_STATES,
     _authorized_chat_checkpoint,
@@ -116,7 +117,10 @@ def _resolve_chat_request(
         )
     except OpenAIRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return request, messages, effective_spec, authorized_checkpoint
+    org_id = run_org_id(status)
+    if not org_id:
+        raise HTTPException(status_code=409, detail=f"run {run_id} has no organization scope")
+    return request, messages, effective_spec, authorized_checkpoint, org_id
 
 
 def _require_active_deployment(
@@ -164,10 +168,12 @@ def _forward_stream(
     stop_sequences: list[str] | None,
     chat_template_kwargs: dict[str, Any],
     provenance: CheckpointProvenance,
+    org_id: str,
 ) -> _UpstreamStreamingResponse:
     upstream: RawChatStream = _app.serve_chat_sse(
         run_id=run_id,
         messages=messages,
+        org_id=org_id,
         temperature=request.temperature,
         max_tokens=request.max_tokens,
         thinking=thinking,
@@ -217,7 +223,7 @@ def managed_chat(
     x_freesolo_org_id: str | None,
     x_freesolo_project_id: str | None,
 ) -> Any:
-    request, messages, effective_spec, authorized_checkpoint = _resolve_chat_request(
+    request, messages, effective_spec, authorized_checkpoint, org_id = _resolve_chat_request(
         run_id,
         payload,
         key,
@@ -241,10 +247,12 @@ def managed_chat(
                 stop_sequences=stop_sequences,
                 chat_template_kwargs=chat_template_kwargs,
                 provenance=provenance,
+                org_id=org_id,
             )
         response = _app.serve_chat(
             run_id=authorized_checkpoint,
             messages=messages,
+            org_id=org_id,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             thinking=effective_spec.thinking,

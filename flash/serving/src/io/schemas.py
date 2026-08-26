@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from pathlib import PurePosixPath
 from typing import Any, Literal
@@ -22,8 +21,11 @@ from flash.serve.runtime.types import (
 )
 from flash.serving.src.engine.model_config import reasoning_parser_for
 from flash.serving.src.io.structured_outputs import normalize_structured_outputs
-
-_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+from flash.serving.src.store.identity import (
+    CheckpointKey,
+    immutable_binding_fingerprint,
+    record_key,
+)
 
 
 def _require_non_empty(value: str) -> str:
@@ -44,18 +46,6 @@ def normalize_adapter_subfolder(value: str | None) -> str | None:
         raise ValueError("subfolder must be a relative POSIX path")
     if ".." in path.parts:
         raise ValueError("subfolder must not contain '..'")
-    return cleaned
-
-
-def normalize_run_id(value: str) -> str:
-    cleaned = value.strip()
-    if not _RUN_ID_RE.fullmatch(cleaned):
-        raise ValueError(
-            "run_id must be 1-96 characters, start with a letter or number, and contain only "
-            "letters, numbers, '.', '_', or '-'"
-        )
-    if cleaned.endswith((".", "-")):
-        raise ValueError("run_id must not end with '.' or '-'")
     return cleaned
 
 
@@ -123,7 +113,6 @@ class AdapterRecord(BaseModel):
             return self
         if self.run_id is None or self.org_id is None:
             raise ValueError("checkpoint records require run_id and org_id")
-        normalize_run_id(self.run_id)
         expected = format_checkpoint_ref(self.run_id, self.checkpoint_step)
         if self.adapter_id != expected or self.checkpoint != expected:
             raise ValueError("checkpoint identity does not match run_id and checkpoint_step")
@@ -148,23 +137,12 @@ class AdapterRecord(BaseModel):
     def is_checkpoint(self) -> bool:
         return not self.serve_base_model and parse_checkpoint_ref(self.adapter_id) is not None
 
-    def immutable_fingerprint(self) -> tuple[Any, ...]:
-        return (
-            self.adapter_id,
-            self.run_id,
-            self.checkpoint_step,
-            self.repo_id,
-            self.repo_type,
-            self.artifact_revision,
-            self.artifact_digest,
-            self.artifact_fingerprint,
-            self.subfolder,
-            self.base_model,
-            self.lora_rank,
-            self.org_id,
-            self.thinking,
-            json.dumps(self.structured_outputs, sort_keys=True, separators=(",", ":")),
-        )
+    @property
+    def storage_key(self) -> CheckpointKey:
+        return record_key(self)
+
+    def immutable_fingerprint(self) -> str:
+        return immutable_binding_fingerprint(self)
 
 
 class ImmutableCheckpointRegistration(BaseModel):
@@ -207,7 +185,6 @@ class ImmutableCheckpointRegistration(BaseModel):
 
     @model_validator(mode="after")
     def validate_identity(self) -> ImmutableCheckpointRegistration:
-        normalize_run_id(self.run_id)
         expected = format_checkpoint_ref(self.run_id, self.checkpoint_step)
         if self.adapter_id != expected or self.checkpoint != expected:
             raise ValueError(
@@ -218,6 +195,8 @@ class ImmutableCheckpointRegistration(BaseModel):
         for name in ("artifact_digest", "artifact_fingerprint"):
             if re.fullmatch(r"[0-9a-f]{64}", getattr(self, name)) is None:
                 raise ValueError(f"{name} must be a canonical sha-256 digest")
+        if self.artifact_fingerprint != immutable_binding_fingerprint(self):
+            raise ValueError("artifact_fingerprint does not match the immutable binding")
         if isinstance(self.checkpoint_step, bool) or (
             self.checkpoint_step is not None and self.checkpoint_step < 0
         ):

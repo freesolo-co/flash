@@ -6,11 +6,11 @@ state, so they are testable without constructing an engine.
 """
 
 import hashlib
-import re
 import time
 from pathlib import Path
 from typing import Any
 
+from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
 from flash.serve.request.runtime_support import (
     argument_names,
     is_adapter_tensor_file,
@@ -209,21 +209,11 @@ def _engine_is_dead(engine: Any) -> bool:
 
 
 def active_checkpoint_ref(record: Any) -> str:
-    """Which checkpoint an adapter record is actually serving.
+    """return the canonical permanent checkpoint the record explicitly serves."""
 
-    Prefers the record's explicit checkpoint; otherwise recovers `step-N` from a
-    `checkpoints/step-N` subfolder so a step-pinned deploy is identifiable from the path alone.
-    """
     checkpoint = str(getattr(record, "checkpoint", "") or "").strip()
-    if checkpoint:
-        return checkpoint
-    subfolder = str(getattr(record, "subfolder", "") or "").strip().strip("/")
-    if not subfolder:
-        return ""
-    match = re.search(r"(?:^|/)checkpoints/(step-\d+)(?:/|$)", subfolder)
-    if match:
-        return f"{record.adapter_id}/{match.group(1)}"
-    return str(record.adapter_id)
+    parsed = parse_checkpoint_ref(checkpoint)
+    return "" if parsed is None else format_checkpoint_ref(*parsed)
 
 
 def enforce_expected_checkpoint(record: Any, expected_checkpoint: str | None) -> str:

@@ -118,16 +118,16 @@ def apply_teardown(
     cleanup_records: list[tuple[AdapterRecord, str | None]] = []
     for candidate, current, expected_generation in pending_teardown:
         if current is None:
-            router.remove(candidate.adapter_id)
+            router.remove(candidate.adapter_id, org_id=candidate.org_id)
         else:
             router.upsert(current)
         cleanup_records.append((current or candidate, expected_generation))
     return cleanup_records
 
 
-async def get_authoritative(adapter_id: str) -> AdapterRecord | None:
+async def get_authoritative(org_id: str, adapter_id: str) -> AdapterRecord | None:
     try:
-        return await _get_stored(adapter_id)
+        return await _get_stored(org_id, adapter_id)
     except PersistenceRecordError as exc:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -135,11 +135,11 @@ async def get_authoritative(adapter_id: str) -> AdapterRecord | None:
         ) from exc
 
 
-async def list_authoritative_run(run_id: str) -> list[AdapterRecord]:
+async def list_authoritative_run(org_id: str, run_id: str) -> list[AdapterRecord]:
     """internal administrative listing for exact checkpoint cleanup."""
 
     try:
-        return await _list_run_stored(run_id)
+        return await _list_run_stored(org_id, run_id)
     except PersistenceRecordError as exc:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -148,8 +148,8 @@ async def list_authoritative_run(run_id: str) -> list[AdapterRecord]:
 
 
 async def resolve_undeploy_target(
-    router: AdapterRouter, checkpoint_id: str
-) -> tuple[AdapterRecord | None, AdapterRecord]:
+    router: AdapterRouter, org_id: str, checkpoint_id: str
+) -> tuple[AdapterRecord | None, AdapterRecord | None]:
     """resolve one public exact-checkpoint undeploy target."""
 
     if parse_checkpoint_ref(checkpoint_id) is None:
@@ -157,20 +157,24 @@ async def resolve_undeploy_target(
             status.HTTP_404_NOT_FOUND,
             f"Unknown adapter id: {checkpoint_id}",
         )
-    record = router.get(checkpoint_id)
+    record = router.get(checkpoint_id, org_id=org_id)
     if record is None:
-        record = await get_authoritative(checkpoint_id)
+        record = await get_authoritative(org_id, checkpoint_id)
     if record is not None and record.status == "ready" and record.serve_base_model:
         return record, record
-    if record is None or not record.is_checkpoint:
+    if record is None:
+        return None, None
+    if not record.is_checkpoint:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {checkpoint_id}")
     return None, record
 
 
-async def resolve_run_cleanup_targets(run_id: str) -> list[AdapterRecord]:
-    """enumerate exact run checkpoints for internal administrative cleanup."""
+async def resolve_run_cleanup_targets(org_id: str, run_id: str) -> list[AdapterRecord]:
+    """enumerate exact tenant run checkpoints for internal administrative cleanup."""
 
-    return [record for record in await list_authoritative_run(run_id) if record.is_checkpoint]
+    return [
+        record for record in await list_authoritative_run(org_id, run_id) if record.is_checkpoint
+    ]
 
 
 def undeploy_body(

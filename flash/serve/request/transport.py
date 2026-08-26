@@ -25,6 +25,7 @@ from flash.serve.contract.urls import (
 )
 
 _INTERNAL_KEY_HEADER_NAME = "X-Freesolo-Internal-Key"
+_ORG_ID_HEADER_NAME = "X-Freesolo-Org-Id"
 _MAX_REDIRECTS = 100
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
 _SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
@@ -52,19 +53,25 @@ def _configured_serving_origin() -> tuple[str, str, int | None] | None:
     return _url_origin(url)
 
 
-def _internal_key_header() -> dict[str, str]:
-    """Return the serving credential header when a key is configured."""
+def _internal_key_header(*, org_id: str | None = None) -> dict[str, str]:
+    """return serving credentials with an explicit tenant scope when required."""
+
     key = (os.environ.get("FREESOLO_INTERNAL_KEY") or "").strip()
-    return {_INTERNAL_KEY_HEADER_NAME: key} if key else {}
+    headers = {_INTERNAL_KEY_HEADER_NAME: key} if key else {}
+    normalized_org = (org_id or "").strip()
+    if normalized_org:
+        headers[_ORG_ID_HEADER_NAME] = normalized_org
+    return headers
 
 
 def _strip_internal_key_off_origin(request: httpx.Request) -> None:
-    """Drop the plane credential from requests that leave the serving origin."""
-    if _INTERNAL_KEY_HEADER_NAME not in request.headers:
-        return
+    """drop internal serving authority from requests that leave the serving origin."""
+
     origin = _configured_serving_origin()
-    if origin is None or _url_origin(request.url) != origin:
-        del request.headers[_INTERNAL_KEY_HEADER_NAME]
+    if origin is not None and _url_origin(request.url) == origin:
+        return
+    for name in (_INTERNAL_KEY_HEADER_NAME, _ORG_ID_HEADER_NAME):
+        request.headers.pop(name, None)
 
 
 def _new_serving_client(**kwargs) -> httpx.Client:
@@ -118,13 +125,14 @@ def serving_request(
     json: dict | None = None,
     ok_statuses: tuple[int, ...] = (),
     timeout_s: float | None = None,
+    org_id: str | None = None,
 ) -> httpx.Response:
     """Issue a serving request and translate transport failures."""
     import httpx
 
     timeout = 60.0 if timeout_s is None else min(60.0, max(0.0, float(timeout_s)))
     kwargs: dict = {
-        "headers": _internal_key_header(),
+        "headers": _internal_key_header(org_id=org_id),
         "timeout": timeout,
         "follow_redirects": True,
     }

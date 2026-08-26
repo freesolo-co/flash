@@ -38,6 +38,7 @@ from flash.serve.runtime.sampling import (
     validate_logprobs,
     validate_top_logprobs,
 )
+from flash.serving.src.store.identity import immutable_binding_fingerprint
 
 logger = get_logger(__name__)
 
@@ -207,19 +208,23 @@ def deploy_adapter(
         "checkpoint_step": checkpoint_step,
         "artifact_revision": artifact_revision,
         "artifact_digest": artifact_metadata.artifact_digest,
-        "artifact_fingerprint": artifact_metadata.artifact_digest,
         "lora_rank": artifact_metadata.lora_rank,
         "thinking": bool(thinking),
     }
     if so_default is not None:
         body["structured_outputs"] = so_default
     normalized_org_id = (org_id or "").strip()
-    if normalized_org_id:
-        body["org_id"] = normalized_org_id
+    if not normalized_org_id:
+        raise ValueError("org_id is required for hosted checkpoint deployment")
+    body["org_id"] = normalized_org_id
+    body["artifact_fingerprint"] = immutable_binding_fingerprint(body)
 
     try:
         registration = transport.serving_request(
-            "POST", f"{serving_urls.serving_base_url()}/adapters", json=body
+            "POST",
+            f"{serving_urls.serving_base_url()}/adapters",
+            json=body,
+            org_id=normalized_org_id,
         )
         if registration.status_code not in {200, 202}:
             raise serving_errors.ServingError(
@@ -229,7 +234,7 @@ def deploy_adapter(
         if exc.status_code is not None and exc.status_code < 500:
             raise
         try:
-            record = _registered_adapter(checkpoint_id)
+            record = _registered_adapter(normalized_org_id, checkpoint_id)
         except serving_errors.ServingError as read_exc:
             raise exc from read_exc
         if record is None or not _matches_revision_identity(record, body):
@@ -240,6 +245,7 @@ def deploy_adapter(
         )
 
     _wait_checkpoint_ready(
+        normalized_org_id,
         checkpoint_id,
         subfolder,
         expected_identity=body,
@@ -264,7 +270,7 @@ def _adapter_url(adapter_id: str) -> str:
 
 
 def _registered_adapter_response(
-    adapter_id: str, *, timeout_s: float | None = None
+    org_id: str, adapter_id: str, *, timeout_s: float | None = None
 ) -> tuple[dict | None, httpx.Response]:
     """Read one authoritative adapter record and retain its polling headers."""
     resp = transport.serving_request(
@@ -272,6 +278,7 @@ def _registered_adapter_response(
         _adapter_url(adapter_id),
         ok_statuses=(404,),
         timeout_s=timeout_s,
+        org_id=org_id,
     )
     if resp.status_code == 404:
         return None, resp
@@ -291,9 +298,12 @@ def _registered_adapter_response(
     return record, resp
 
 
-def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> dict | None:
-    """Read one authoritative adapter record, including disabled records."""
-    record, _ = _registered_adapter_response(adapter_id, timeout_s=timeout_s)
+def _registered_adapter(
+    org_id: str, adapter_id: str, *, timeout_s: float | None = None
+) -> dict | None:
+    """read one tenant-scoped authoritative adapter record, including disabled records."""
+
+    record, _ = _registered_adapter_response(org_id, adapter_id, timeout_s=timeout_s)
     return record
 
 
@@ -358,6 +368,7 @@ def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
 
 
 def _wait_checkpoint_ready(
+    org_id: str,
     revision: str,
     subfolder: str,
     *,
@@ -388,7 +399,7 @@ def _wait_checkpoint_ready(
                 break
         first_read = False
         try:
-            record, response = _registered_adapter_response(revision, timeout_s=remaining)
+            record, response = _registered_adapter_response(org_id, revision, timeout_s=remaining)
         except serving_errors.ServingError as exc:
             if exc.status_code is not None and exc.status_code < 500:
                 raise
@@ -493,12 +504,13 @@ def _wait_checkpoint_ready(
     )
 
 
-def undeploy_adapter(checkpoint_id: str) -> dict:
+def undeploy_adapter(checkpoint_id: str, *, org_id: str) -> dict:
     """disable one exact permanent checkpoint."""
     response = transport.serving_request(
         "DELETE",
         _adapter_url(checkpoint_id),
         ok_statuses=(404,),
+        org_id=org_id,
     )
     if response.status_code == 404:
         return {
@@ -545,6 +557,8 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
 def chat_sse(
     run_id: str,
     messages: list[dict],
+    *,
+    org_id: str,
     temperature: float = 0.0,
     max_tokens: int = 512,
     thinking: bool = False,
@@ -567,7 +581,7 @@ def chat_sse(
     return transport.request_chat_sse(
         transport._chat_http_client(),
         url=f"{transport.serving_openai_base_url()}/chat/completions",
-        headers=transport._internal_key_header(),
+        headers=transport._internal_key_header(org_id=org_id),
         run_id=run_id,
         messages=messages,
         temperature=temperature,
@@ -591,6 +605,8 @@ def chat_sse(
 def chat_stream(
     run_id: str,
     messages: list[dict],
+    *,
+    org_id: str,
     temperature: float = 0.0,
     max_tokens: int = 512,
     thinking: bool = False,
@@ -624,7 +640,7 @@ def chat_stream(
     return transport.request_chat_stream(
         transport._chat_http_client(),
         url=f"{transport.serving_openai_base_url()}/chat/completions",
-        headers=transport._internal_key_header(),
+        headers=transport._internal_key_header(org_id=org_id),
         run_id=run_id,
         messages=messages,
         temperature=temperature,
@@ -645,6 +661,8 @@ def chat_stream(
 def chat(
     run_id: str,
     messages: list[dict],
+    *,
+    org_id: str,
     temperature: float = 0.0,
     max_tokens: int = 512,
     thinking: bool = False,
@@ -674,7 +692,7 @@ def chat(
     # before the result is ready, bounded by the transport redirect limit on the serving origin.
     if parse_checkpoint_ref(run_id) is None:
         raise ValueError("chat target must be `<run_id>/final` or `<run_id>/step-N`")
-    headers = transport._internal_key_header()
+    headers = transport._internal_key_header(org_id=org_id)
     if expected_checkpoint:
         headers["X-Freesolo-Expected-Checkpoint"] = expected_checkpoint
     timeout = 30 * 60.0 if timeout_s is None else max(0.0, float(timeout_s))

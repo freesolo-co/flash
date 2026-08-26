@@ -115,7 +115,6 @@ def commit_verified_checkpoint(
     *,
     expected_generation: int,
     commit: Callable[[], None],
-    retain_only_checkpoint: bool = False,
     advance_generation: bool = False,
 ) -> bool:
     """persist verified membership before committing its ready status."""
@@ -134,8 +133,8 @@ def commit_verified_checkpoint(
         if generation != expected_generation:
             return False
         retained_generation = generation + 1 if advance_generation else generation
-        retained = [checkpoint_id] if retain_only_checkpoint else list(checkpoints)
-        if not retain_only_checkpoint and checkpoint_id not in retained:
+        retained = list(checkpoints)
+        if checkpoint_id not in retained:
             retained.append(checkpoint_id)
         retained.sort()
         if retained_generation != generation or retained != checkpoints:

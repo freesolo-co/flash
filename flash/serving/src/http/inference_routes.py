@@ -46,7 +46,9 @@ inference_router = APIRouter()
 async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
     context = ServingContext.of(request)
     traffic = await context.authorize_inference(request, payload.adapter_id)
-    requested, target = await context.lookup.resolve(payload.adapter_id)
+    requested, target = await context.lookup.resolve(
+        payload.adapter_id, org_id=context.traffic_org_id(traffic)
+    )
     context.reject_unsettleable_thinking(payload, target)
     await _prepare_generate_request(payload, target)
     identity = new_request_identity(request, traffic=traffic)
@@ -71,15 +73,17 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
     return _inference_json_response(result, target)
 
 
-@inference_router.post("/adapters/{adapter_id}/generate", tags=["inference"])
+@inference_router.post("/adapters/{adapter_id:path}/generate", tags=["inference"])
 async def generate_for_adapter(
     adapter_id: str, payload: dict[str, Any], request: Request
 ) -> JSONResponse:
     context = ServingContext.of(request)
     normalized_adapter_id = _path_adapter_id(adapter_id)
     traffic = await context.authorize_inference(request, normalized_adapter_id)
-    req = _parse_generate({**payload, "adapter_id": adapter_id})
-    requested, target = await context.lookup.resolve(req.adapter_id)
+    req = _parse_generate({**payload, "adapter_id": normalized_adapter_id})
+    requested, target = await context.lookup.resolve(
+        req.adapter_id, org_id=context.traffic_org_id(traffic)
+    )
     context.reject_unsettleable_thinking(req, target)
     await _prepare_generate_request(req, target)
     identity = new_request_identity(request, traffic=traffic)
@@ -138,7 +142,9 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
             else status.HTTP_422_UNPROCESSABLE_ENTITY
         )
         raise HTTPException(request_status, str(exc)) from exc
-    requested, target = await context.lookup.resolve(adapter_id)
+    requested, target = await context.lookup.resolve(
+        adapter_id, org_id=context.traffic_org_id(traffic)
+    )
     effective_thinking = target.thinking
     if target.serve_base_model:
         override = normalized.chat_template_kwargs.get("enable_thinking")

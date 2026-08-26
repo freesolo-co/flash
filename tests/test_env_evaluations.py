@@ -41,11 +41,12 @@ class _EvalClient:
 
     def get_run(self, run_id):
         return {
+            "verified_checkpoints": [_EXPLICIT_TARGET],
             "spec": {
                 "thinking": False,
                 "project": _PROJECT_ID,
                 "environment": {"id": _PUBLISHED_SLUG},
-            }
+            },
         }
 
     def deployments(self):
@@ -448,14 +449,7 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys) 
 def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    """The exemption above is `failed` only, because that is the state that spares the ledger.
-
-    `mark_deployment_revocation_failed` and the undeploy paths call
-    `invalidate_verified_checkpoints` (`flash/runner/supervise/deploy.py`), so under those states there
-    is no ledger left for `RUN/step-N` to resolve against and every case 409s -- the wasted suite of
-    generation failures this check exists to avoid. Exempting every terminal state for a pinned step
-    let `revocation_failed` through.
-    """
+    """a pinned checkpoint without verified membership must fail before evaluation starts."""
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
     class Client(_EvalClient):

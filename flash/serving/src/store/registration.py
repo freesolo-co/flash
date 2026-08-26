@@ -23,7 +23,9 @@ async def persist_checkpoint(checkpoint: AdapterRecord) -> AdapterRecord:
     """insert one checkpoint binding or return the identical existing record."""
 
     try:
-        existing = await _get_stored(checkpoint.adapter_id)
+        if checkpoint.org_id is None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "checkpoint requires org_id")
+        existing = await _get_stored(checkpoint.org_id, checkpoint.adapter_id)
     except PersistenceRecordError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, "checkpoint namespace is occupied") from exc
     if existing is not None:

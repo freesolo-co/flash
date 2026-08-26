@@ -385,27 +385,18 @@ def _commit_preserved_checkpoint(run_id: str, status, preserved_checkpoint: dict
             return status, None
 
     preserved_revision = preserved_checkpoint.get("checkpoint_id")
-    owner_deployment = status.deployment if isinstance(status.deployment, dict) else None
-    try:
-        status = mark_checkpoint_deployed(
-            run_id,
-            preserved_checkpoint,
-            verification_generation=verified_checkpoint_generation(run_id),
-            owner_deployment=owner_deployment,
-            retain_only_checkpoint=True,
-        )
-        if (
-            status.deployment != preserved_checkpoint
-            or not isinstance(preserved_revision, str)
-            or read_verified_checkpoints(run_id) != frozenset({preserved_revision})
-        ):
-            raise RuntimeError(
-                "authoritative checkpoint preservation did not prune verified checkpoints"
-            )
-    except Exception as exc:
+    if (
+        status.deployment != preserved_checkpoint
+        or not isinstance(preserved_revision, str)
+        or preserved_revision not in read_verified_checkpoints(run_id)
+    ):
         raise DeploymentStatePersistenceError(
-            run_id, str(exc), backend_outcome="not_required"
-        ) from exc
+            run_id,
+            "authoritative checkpoint preservation lost its verified checkpoint",
+            backend_outcome="not_required",
+        )
+    # verified siblings are independent serving authorities. cancellation preserves the complete
+    # ledger unless each sibling is exact-undeployed successfully by its own lifecycle operation.
     return status, preserved_checkpoint
 
 
@@ -458,8 +449,12 @@ def _revoke_serving(
             ) from exc
     try:
         from flash.serve.deployment.deploy import undeploy_adapter
+        from flash.server.platform.internal_client import run_org_id
 
-        undeploy_adapter(checkpoint_id)
+        org_id = run_org_id(status)
+        if not org_id:
+            raise ValueError(f"run {run_id} has no organization scope")
+        undeploy_adapter(checkpoint_id, org_id=org_id)
     except Exception as exc:
         with contextlib.suppress(Exception):
             mark_deployment_revocation_failed(run_id, str(exc))

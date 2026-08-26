@@ -45,20 +45,24 @@ def load_adapters(settings: Settings) -> list[AdapterRecord]:
         return []
     return _list_adapters(
         settings,
-        {"status": "eq.ready", "order": "checkpoint_id.asc"},
+        {"status": "eq.ready", "order": "org_id.asc,checkpoint_id.asc"},
         "load hosted checkpoints",
         skip_invalid=True,
     )
 
 
-def list_run_adapters(run_id: str, settings: Settings) -> list[AdapterRecord]:
-    """load every exact checkpoint for one run, regardless of lifecycle status."""
+def list_run_adapters(org_id: str, run_id: str, settings: Settings) -> list[AdapterRecord]:
+    """load every exact checkpoint for one tenant run, regardless of lifecycle status."""
 
     if not settings.has_supabase:
         return []
     return _list_adapters(
         settings,
-        {"run_id": f"eq.{run_id}", "order": "checkpoint_id.asc"},
+        {
+            "org_id": f"eq.{org_id}",
+            "run_id": f"eq.{run_id}",
+            "order": "checkpoint_id.asc",
+        },
         "load hosted run checkpoints",
     )
 
@@ -72,12 +76,10 @@ def _list_adapters(
 ) -> list[AdapterRecord]:
     params = {"select": PERSISTED_COLUMNS, "limit": str(_ADAPTER_PAGE), **filters}
     records: list[AdapterRecord] = []
-    cursor: str | None = None
+    offset = 0
     with httpx.Client(timeout=30.0) as client:
         while True:
-            page_params = dict(params)
-            if cursor is not None:
-                page_params["checkpoint_id"] = f"gt.{cursor}"
+            page_params = {**params, "offset": str(offset)}
             response = client.get(
                 supabase_table_url(settings, ADAPTER_TABLE),
                 params=page_params,
@@ -90,13 +92,10 @@ def _list_adapters(
             records.extend(_records_from_response(response, operation, skip_invalid=skip_invalid))
             if len(rows) < _ADAPTER_PAGE:
                 return records
-            last = rows[-1]
-            if not isinstance(last, dict) or not isinstance(last.get("checkpoint_id"), str):
-                raise PersistenceRecordError("Supabase checkpoint page has no cursor authority")
-            cursor = last["checkpoint_id"]
+            offset += len(rows)
 
 
-def get_adapter(adapter_id: str, settings: Settings) -> AdapterRecord | None:
+def get_adapter(org_id: str, adapter_id: str, settings: Settings) -> AdapterRecord | None:
     if not settings.has_supabase:
         return None
     with httpx.Client(timeout=30.0) as client:
@@ -104,6 +103,7 @@ def get_adapter(adapter_id: str, settings: Settings) -> AdapterRecord | None:
             supabase_table_url(settings, ADAPTER_TABLE),
             params={
                 "select": PERSISTED_COLUMNS,
+                "org_id": f"eq.{org_id}",
                 "checkpoint_id": f"eq.{adapter_id}",
                 "limit": "1",
             },

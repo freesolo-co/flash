@@ -12,6 +12,7 @@ from typing import Any, TypeGuard
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 
+from flash.schema import parse_checkpoint_ref
 from flash.serving.src.engine.model_config import is_supported_base_model
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.io.requests import _assert_supported_base_model
@@ -56,7 +57,9 @@ async def _claim_loading_generation(stored: AdapterRecord) -> tuple[AdapterRecor
     )
     if claimed is not None:
         return claimed, True
-    return (await get_authoritative(stored.adapter_id) or stored), False
+    if stored.org_id is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "checkpoint requires org_id")
+    return (await get_authoritative(stored.org_id, stored.adapter_id) or stored), False
 
 
 @adapter_router.post("/adapters")
@@ -66,7 +69,11 @@ async def add_adapter(
     background: BackgroundTasks,
 ) -> AdapterRecord:
     context = ServingContext.of(request)
-    context.assert_internal(request)
+    org_id = context.internal_org_id(request)
+    if org_id != registration.org_id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "checkpoint org scope does not match request"
+        )
     _assert_supported_base_model(registration.base_model)
     checkpoint = registration.to_record()
 
@@ -108,7 +115,7 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
     """Keep a failed promotion from orphaning its loaded gpu adapter."""
 
     try:
-        current = await get_authoritative(registration.adapter_id)
+        current = await get_authoritative(registration.org_id or "", registration.adapter_id)
         if _is_same_generation_winner(current, registration):
             # another attempt from this shared lifecycle generation won the promotion. adopt its
             # durable row instead of unloading the gpu registration that now legitimately backs it.
@@ -127,7 +134,9 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
                 expected_updated_at=expected_updated_at,
             )
             if fenced is None:
-                current = await get_authoritative(registration.adapter_id)
+                current = await get_authoritative(
+                    registration.org_id or "", registration.adapter_id
+                )
                 if _is_same_generation_winner(current, registration):
                     context.router.upsert(current, revive=True)
                     return
@@ -149,6 +158,7 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
 
     await context.unregister_safe(
         registration.base_model,
+        registration.org_id or "",
         registration.adapter_id,
         registration.deployment_generation,
     )
@@ -185,11 +195,13 @@ async def _register_revision(context: ServingContext, stored: AdapterRecord) -> 
     context.router.upsert(committed, revive=True)
 
 
-@adapter_router.get("/adapters/{adapter_id}")
+@adapter_router.get("/adapters/{adapter_id:path}")
 async def get_adapter(adapter_id: str, request: Request) -> dict[str, Any]:
     context = ServingContext.of(request)
-    context.assert_internal(request)
-    record = await context.lookup.get_exact(adapter_id)
+    org_id = context.internal_org_id(request)
+    if parse_checkpoint_ref(adapter_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+    record = await context.lookup.get_exact(org_id, adapter_id)
     lifecycle_state = record.status
     if record.status == "disabled" and record.deployment_generation is not None:
         lifecycle_state = "loading"
@@ -203,17 +215,27 @@ async def get_adapter(adapter_id: str, request: Request) -> dict[str, Any]:
     }
 
 
-@adapter_router.delete("/adapters/{adapter_id}")
+@adapter_router.delete("/adapters/{adapter_id:path}")
 async def remove_adapter(
     adapter_id: str,
     request: Request,
     background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     context = ServingContext.of(request)
-    context.assert_internal(request)
+    org_id = context.internal_org_id(request)
     await context.reload_if_configured()
 
-    base_record, checkpoint = await resolve_undeploy_target(context.router, adapter_id)
+    base_record, checkpoint = await resolve_undeploy_target(context.router, org_id, adapter_id)
+    if checkpoint is None:
+        parsed = parse_checkpoint_ref(adapter_id)
+        assert parsed is not None
+        return {
+            "ok": True,
+            "removed": adapter_id,
+            "checkpoint_id": adapter_id,
+            "run_id": parsed[0],
+            "disabled_checkpoints": [],
+        }
     if base_record is not None:
         # a base-model serve has no durable row: `_base_model_records()` seeds it in memory and
         # every replica re-adds it on each reload. removing it here would clear one replica's
@@ -226,7 +248,10 @@ async def remove_adapter(
 
     # phase 1: compare-and-swap every matched row to "disabled" in persistence first, collecting
     # the rows that durably converged.
-    result = await disable_matched([checkpoint], get_authoritative=get_authoritative)
+    async def authoritative(checkpoint_id: str) -> AdapterRecord | None:
+        return await get_authoritative(org_id, checkpoint_id)
+
+    result = await disable_matched([checkpoint], get_authoritative=authoritative)
 
     # phase 2: remove every durably disabled row from routing immediately. active hosted models
     # schedule exact gpu eviction after the response. retired models have no engine to start, so their
@@ -238,6 +263,7 @@ async def remove_adapter(
             background_tasks.add_task(
                 context.unregister_safe,
                 cleanup_record.base_model,
+                org_id,
                 cleanup_record.adapter_id,
                 expected_generation,
             )

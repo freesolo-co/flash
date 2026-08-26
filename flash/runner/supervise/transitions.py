@@ -35,7 +35,6 @@ def _commit_verified_deployment(
     *,
     verification_generation: int | None,
     commit: Callable[[], None],
-    retain_only_checkpoint: bool = False,
     advance_generation: bool = False,
 ) -> bool:
     if deployment.get("state") not in _RESTORABLE_DEPLOYMENT_STATES:
@@ -55,7 +54,6 @@ def _commit_verified_deployment(
         checkpoint_id,
         expected_generation=verification_generation,
         commit=commit,
-        retain_only_checkpoint=retain_only_checkpoint,
         advance_generation=advance_generation,
     )
 
@@ -110,7 +108,6 @@ def mark_checkpoint_deployed(
     *,
     verification_generation: int | None = None,
     owner_deployment: dict | None = None,
-    retain_only_checkpoint: bool = False,
     advance_generation: bool = False,
 ) -> RunStatus:
     from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
@@ -139,7 +136,6 @@ def mark_checkpoint_deployed(
             deployment,
             verification_generation=verification_generation,
             commit=_commit,
-            retain_only_checkpoint=retain_only_checkpoint,
             advance_generation=advance_generation,
         ):
             return get_status(run_id)
@@ -210,24 +206,19 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
 def mark_deployment_revocation_failed(run_id: str, error: str) -> RunStatus:
     from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
     from flash.runner.lifecycle.status import get_status
-    from flash.runner.results.verified_revisions import invalidate_verified_checkpoints
 
     with _status_guard(run_id):
         status = get_status(run_id)
-
-        def _commit() -> None:
-            deployment = status.deployment if isinstance(status.deployment, dict) else {}
-            status.deployment = {
-                **deployment,
-                "state": "revocation_failed",
-                "error": error,
-                "retryable": True,
-                "updated_at": time.time(),
-            }
-            status.updated_at = time.time()
-            _save_status_unlocked(status)
-
-        invalidate_verified_checkpoints(run_id, commit=_commit)
+        deployment = status.deployment if isinstance(status.deployment, dict) else {}
+        status.deployment = {
+            **deployment,
+            "state": "revocation_failed",
+            "error": error,
+            "retryable": True,
+            "updated_at": time.time(),
+        }
+        status.updated_at = time.time()
+        _save_status_unlocked(status)
         return status
 
 
@@ -261,26 +252,4 @@ def mark_undeployed(run_id: str, checkpoint_id: str | None = None) -> RunStatus:
             _save_status_unlocked(status)
 
         remove_verified_checkpoint(run_id, target, commit=_commit)
-        return status
-
-
-def mark_deployment_undeployed(run_id: str) -> RunStatus:
-    from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
-    from flash.runner.lifecycle.status import get_status
-    from flash.runner.results.verified_revisions import invalidate_verified_checkpoints
-
-    with _status_guard(run_id):
-        status = get_status(run_id)
-
-        def _commit() -> None:
-            if status.deployment is not None:
-                deployment = status.deployment if isinstance(status.deployment, dict) else {}
-                deployment = dict(deployment)
-                for field in ("error", "retryable", "updated_at"):
-                    deployment.pop(field, None)
-                status.deployment = {**deployment, "state": "undeployed"}
-                status.updated_at = time.time()
-                _save_status_unlocked(status)
-
-        invalidate_verified_checkpoints(run_id, commit=_commit)
         return status
