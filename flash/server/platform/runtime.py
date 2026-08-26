@@ -10,6 +10,7 @@ import contextlib
 import logging
 import os
 import threading
+from dataclasses import dataclass
 
 from flash.adapters.artifacts import attempt_scoped_artifact_name
 from flash.core.spec import JobSpec
@@ -150,6 +151,13 @@ def _append_run_log(run_id: str, message: str) -> None:
 _DEFERRED_RECOVERY_RETRY_S = 120.0
 
 
+@dataclass(frozen=True)
+class _HandlelessRetry:
+    retry_budget: object
+    retry_placement: object
+    expected_attempt: tuple[int, int]
+
+
 def _confirm_run_clear(spec) -> bool:
     """Force-reap this run's label and confirm no instance remains.
 
@@ -288,13 +296,19 @@ def _start_resubmit(
     from flash.runner.supervise.lifecycle import _run_job_background
 
     result_state = _adopt_handleless_result(spec)
-    if result_state is not False:
+    if result_state is True or result_state is None:
         return False
+    retry = result_state if isinstance(result_state, _HandlelessRetry) else None
     try:
-        source_snapshot_from_status(get_status(spec.run_id), required=True)
+        status = get_status(spec.run_id)
+        source_snapshot_from_status(status, required=True)
     except Exception as exc:
         _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
         return False
+    expected_attempt = (
+        retry.expected_attempt if retry is not None else _status_attempt_identity(status)
+    )
+    expected_no_attempt = expected_attempt is None
     reason = _recovery_block_reason(spec)
     if reason is not None:
         if _recovery_wall_deadline_is_open(spec):
@@ -311,6 +325,8 @@ def _start_resubmit(
         spec.run_id,
         expected_remote,
         expected_state=expected_state,
+        expected_attempt=expected_attempt,
+        expected_no_attempt=expected_no_attempt,
     ):
         return False
     with contextlib.suppress(Exception):
@@ -318,7 +334,10 @@ def _start_resubmit(
             spec.run_id,
             "control plane restarted without a durable handle; resubmitting",
         )
-    threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
+    thread_args = (
+        (spec, None, retry.retry_budget, retry.retry_placement) if retry is not None else (spec,)
+    )
+    threading.Thread(target=_run_job_background, args=thread_args, daemon=True).start()
     return True
 
 
@@ -332,11 +351,60 @@ def _status_attempt_identity(status) -> tuple[int, int] | None:
     return attempt.attempt_id, attempt.fence
 
 
-def _adopt_handleless_result(spec) -> bool | None:
-    """adopt current fenced result, report absence, or defer an unavailable read."""
+def _recovered_retry_placement(status, failure: str | None):
+    from flash.cost.facts import gpu_vram_gb
+    from flash.cost.spec import sft_ranking_overrides
+    from flash.providers.core.allocator import _executed_gpu_count, _overridden_train
+    from flash.providers.core.sharding import combined_vram_gb
+    from flash.runner.lifecycle.protocol import AttemptRecord
+    from flash.runner.lifecycle.status import effective_spec_from_status
+    from flash.runner.supervise.lifecycle import _RetryPlacement
+
+    attempt = AttemptRecord.from_dict(status.attempt)
+    resource = attempt.resource if isinstance(attempt.resource, dict) else {}
+    provider = attempt.provider or resource.get("provider")
+    gpu = resource.get("allocated_gpu")
+    gpu_count = resource.get("allocated_gpu_count")
+    if (
+        not isinstance(provider, str)
+        or not provider
+        or not isinstance(gpu, str)
+        or not gpu
+        or isinstance(gpu_count, bool)
+        or not isinstance(gpu_count, int)
+        or gpu_count < 1
+    ):
+        return _RetryPlacement()
+    shape = (provider, gpu, gpu_count)
+    if failure == "oom":
+        effective_spec = effective_spec_from_status(status)
+        overrides = sft_ranking_overrides(effective_spec)
+        sized_train = _overridden_train(effective_spec.train, overrides)
+        executed_gpu_count = _executed_gpu_count(
+            effective_spec.algorithm,
+            sized_train,
+            overrides,
+            gpu_count,
+        )
+        return _RetryPlacement(
+            tried_classes=frozenset({shape}),
+            oom_vram_floor=combined_vram_gb(gpu_vram_gb(gpu), executed_gpu_count),
+        )
+    return _RetryPlacement(
+        failed_providers=frozenset({provider}),
+        tried_classes=frozenset({shape}),
+    )
+
+
+def _adopt_handleless_result(spec) -> bool | _HandlelessRetry | None:
+    """adopt current fenced result, report absence, or retain retry authority."""
     from flash.runner.accounting.reconciliation import _compare_and_fail_remote
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
-    from flash.runner.supervise.lifecycle import _adopt_completed_attempt, _attempt_result
+    from flash.runner.supervise.lifecycle import (
+        _adopt_completed_attempt,
+        _attempt_result,
+        _retry_budget_for_spec,
+    )
 
     try:
         status = get_status(spec.run_id)
@@ -346,6 +414,8 @@ def _adopt_handleless_result(spec) -> bool | None:
         return False
     try:
         expected_attempt = _status_attempt_identity(status)
+        if expected_attempt is None:
+            return None
         _load_run_deadline_at(spec.run_id)
         result = _attempt_result(spec.run_id)
     except Exception:
@@ -363,6 +433,14 @@ def _adopt_handleless_result(spec) -> bool | None:
                 expected_attempt=expected_attempt,
             )
         else:
+            retry_budget = _retry_budget_for_spec(spec)
+            if retry_budget.can_retry(result.failure, cache_drop=False):
+                retry_budget.record_retry(result.failure, cache_drop=False)
+                return _HandlelessRetry(
+                    retry_budget,
+                    _recovered_retry_placement(status, result.failure),
+                    expected_attempt,
+                )
             reason = f"{result.failure or 'job_failed'}: {result.detail or 'worker attempt failed'}"
             applied = _compare_and_fail_remote(
                 spec.run_id,
@@ -815,7 +893,7 @@ def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
 
     for spec, prior_state in resubmit:
         result_state = _adopt_handleless_result(spec)
-        if result_state is not False:
+        if result_state is True or result_state is None:
             if result_state is None:
                 threading.Thread(target=_deferred_resubmit_loop, args=(spec,), daemon=True).start()
             continue

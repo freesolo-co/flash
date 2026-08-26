@@ -456,6 +456,16 @@ def _stepped_clock(start=0.0, step=10.0):
     return now
 
 
+def _manual_poll_clock(start):
+    clock = {"now": start, "sleeps": []}
+
+    def sleep(seconds):
+        clock["sleeps"].append(seconds)
+        clock["now"] += seconds
+
+    return clock, lambda: clock["now"], sleep
+
+
 def _wire_runpod_poll(monkeypatch, *, attempt=None, results=()):
     from flash.providers.runpod.execution import polling
 
@@ -519,27 +529,152 @@ def test_poll_attempt_returns_manifest_failure_without_provider_reclassification
     assert result.detail == detail
 
 
-def test_poll_attempt_terminal_resource_waits_for_result_deadline(monkeypatch):
+@pytest.mark.parametrize(
+    ("work_deadline", "result_deadline", "expected_return"),
+    [(900.0, 1_000.0, 220.0), (140.0, 150.0, 150.0)],
+)
+def test_poll_attempt_terminal_resource_uses_bounded_result_visibility(
+    monkeypatch, work_deadline, result_deadline, expected_return
+):
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import jobs
 
     polling = _wire_runpod_poll(
         monkeypatch,
-        attempt=_attempt_record(work_deadline_at=20.0, result_deadline_at=30.0),
-        results=[None, None],
+        attempt=_attempt_record(work_deadline_at=work_deadline, result_deadline_at=result_deadline),
     )
-    monkeypatch.setattr(polling.time, "time", _stepped_clock())
+    clock, now, sleep = _manual_poll_clock(100.0)
+    monkeypatch.setattr(polling.time, "time", now)
+    monkeypatch.setattr(polling.time, "sleep", sleep)
+    status_calls = []
+
+    def terminal_once(*_args, **_kwargs):
+        status_calls.append(clock["now"])
+        if len(status_calls) > 1:
+            raise runpod_api.RunpodApiError("status must not be polled after terminal evidence")
+        return {"status": "FAILED"}
+
+    monkeypatch.setattr(runpod_api, "job_status", terminal_once)
+
+    result = polling.poll_attempt(_runpod_handle(jobs), _poll_spec(), interval_s=30.0)
+
+    assert status_calls == [100.0]
+    assert result.failure == "job_preempted"
+    assert "FAILED" in result.detail
+    assert "without a result manifest" in result.detail
+    assert clock["now"] == expected_return
+
+
+def test_poll_attempt_terminal_window_starts_after_slow_status_observation(monkeypatch):
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(work_deadline_at=900.0, result_deadline_at=1_000.0),
+    )
+    clock, now, sleep = _manual_poll_clock(100.0)
+    monkeypatch.setattr(polling.time, "time", now)
+    monkeypatch.setattr(polling.time, "sleep", sleep)
+    status_calls = []
+
+    def slow_terminal(*_args, **_kwargs):
+        status_calls.append(clock["now"])
+        clock["now"] += 80.0
+        return {"status": "FAILED"}
+
+    monkeypatch.setattr(runpod_api, "job_status", slow_terminal)
+
+    result = polling.poll_attempt(_runpod_handle(jobs), _poll_spec(), interval_s=30.0)
+
+    assert status_calls == [100.0]
+    assert result.failure == "job_preempted"
+    assert clock["now"] == 300.0
+
+
+def test_poll_attempt_rejects_result_first_observed_after_terminal_cutoff(monkeypatch):
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(work_deadline_at=900.0, result_deadline_at=1_000.0),
+    )
+    clock, now, sleep = _manual_poll_clock(100.0)
+    monkeypatch.setattr(polling.time, "time", now)
+    monkeypatch.setattr(polling.time, "sleep", sleep)
+    observations = {"count": 0}
+
+    def observe(_context):
+        observations["count"] += 1
+        if observations["count"] == 2:
+            clock["now"] = 221.0
+            return PollResult(True, metrics={"optimizer_steps": 2})
+        return None
+
+    monkeypatch.setattr(polling, "_observe_artifacts", observe)
     monkeypatch.setattr(
         runpod_api,
         "job_status",
         lambda *_args, **_kwargs: {"status": "FAILED"},
     )
 
-    result = polling.poll_attempt(_runpod_handle(jobs), _poll_spec(), interval_s=0)
+    result = polling.poll_attempt(_runpod_handle(jobs), _poll_spec(), interval_s=30.0)
+
+    assert observations["count"] == 2
+    assert result.failure == "job_preempted"
+    assert clock["now"] == 221.0
+
+
+def test_poll_attempt_accepts_result_inside_terminal_visibility_window(monkeypatch):
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(work_deadline_at=900.0, result_deadline_at=1_000.0),
+        results=[None, PollResult(True, metrics={"optimizer_steps": 2})],
+    )
+    clock, now, sleep = _manual_poll_clock(100.0)
+    monkeypatch.setattr(polling.time, "time", now)
+    monkeypatch.setattr(polling.time, "sleep", sleep)
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda *_args, **_kwargs: {"status": "FAILED"},
+    )
+
+    result = polling.poll_attempt(_runpod_handle(jobs), _poll_spec(), interval_s=30.0)
+
+    assert result.ok
+    assert result.metrics == {"optimizer_steps": 2}
+    assert clock["now"] == 130.0
+
+
+def test_poll_attempt_without_terminal_evidence_preserves_result_deadline(monkeypatch):
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(work_deadline_at=150.0, result_deadline_at=270.0),
+    )
+    clock, now, sleep = _manual_poll_clock(100.0)
+    monkeypatch.setattr(polling.time, "time", now)
+    monkeypatch.setattr(polling.time, "sleep", sleep)
+    monkeypatch.setattr(
+        runpod_api,
+        "job_status",
+        lambda *_args, **_kwargs: {"status": "IN_PROGRESS"},
+    )
+
+    result = polling.poll_attempt(_runpod_handle(jobs), _poll_spec(), interval_s=30.0)
 
     assert result.failure == "job_preempted"
-    assert "FAILED" in result.detail
-    assert "without a result manifest" in result.detail
+    assert "work deadline expired" in result.detail
+    assert clock["now"] == 270.0
 
 
 def test_poll_attempt_running_without_progress_uses_fixed_attempt_deadline(monkeypatch):

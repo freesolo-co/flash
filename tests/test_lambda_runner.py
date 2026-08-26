@@ -1925,6 +1925,16 @@ def _instance_clock(start=0.0, step=10.0):
     return now
 
 
+def _manual_instance_clock(start):
+    clock = {"now": start, "sleeps": []}
+
+    def sleep(seconds):
+        clock["sleeps"].append(seconds)
+        clock["now"] += seconds
+
+    return clock, lambda: clock["now"], sleep
+
+
 def _wire_lambda_poll(monkeypatch, *, attempt=None, results=(), instances=()):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers._lifecycle.instances import poll_instance
@@ -2034,20 +2044,132 @@ def test_poll_lambda_retries_result_download_and_costs_manifest_finished_at(monk
     assert result.metrics["notes"]["lambda_region"] == "us-east-1"
 
 
-def test_poll_lambda_dead_instance_waits_for_result_deadline(monkeypatch):
+@pytest.mark.parametrize(
+    ("work_deadline", "result_deadline", "expected_return"),
+    [(900.0, 1_000.0, 220.0), (140.0, 150.0, 150.0)],
+)
+def test_poll_lambda_dead_instance_uses_bounded_result_visibility(
+    monkeypatch, work_deadline, result_deadline, expected_return
+):
+    from flash.providers.lambda_.client import api as lambda_api
+
     jobs, poll_instance = _wire_lambda_poll(
         monkeypatch,
-        attempt=_instance_attempt(provider="lambda", work=20.0, result=30.0),
-        results=[None, None],
+        attempt=_instance_attempt(provider="lambda", work=work_deadline, result=result_deadline),
         instances=[{"status": "terminated"}],
     )
-    monkeypatch.setattr(poll_instance.time, "time", _instance_clock())
+    clock, now, sleep = _manual_instance_clock(100.0)
+    monkeypatch.setattr(poll_instance.time, "time", now)
+    monkeypatch.setattr(poll_instance.time, "sleep", sleep)
+    status_calls = []
 
-    result = jobs.poll_lambda_attempt(_handle(), _spec(), interval_s=0)
+    def terminal_once(*_args, **_kwargs):
+        status_calls.append(clock["now"])
+        if len(status_calls) > 1:
+            raise lambda_api.LambdaApiError("status must not be polled after terminal evidence")
+        return {"status": "terminated"}
 
+    monkeypatch.setattr(lambda_api, "get_instance", terminal_once)
+
+    result = jobs.poll_lambda_attempt(_handle(), _spec(), interval_s=30.0)
+
+    assert status_calls == [100.0]
     assert result.failure == "job_preempted"
     assert "terminated" in result.detail
     assert "result manifest" in result.detail
+    assert clock["now"] == expected_return
+
+
+def test_poll_lambda_terminal_window_starts_after_slow_status_observation(monkeypatch):
+    from flash.providers.lambda_.client import api as lambda_api
+
+    jobs, poll_instance = _wire_lambda_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="lambda", work=900.0, result=1_000.0),
+    )
+    clock, now, sleep = _manual_instance_clock(100.0)
+    monkeypatch.setattr(poll_instance.time, "time", now)
+    monkeypatch.setattr(poll_instance.time, "sleep", sleep)
+    status_calls = []
+
+    def slow_terminal(*_args, **_kwargs):
+        status_calls.append(clock["now"])
+        clock["now"] += 80.0
+        return {"status": "terminated"}
+
+    monkeypatch.setattr(lambda_api, "get_instance", slow_terminal)
+
+    result = jobs.poll_lambda_attempt(_handle(), _spec(), interval_s=30.0)
+
+    assert status_calls == [100.0]
+    assert result.failure == "job_preempted"
+    assert clock["now"] == 300.0
+
+
+def test_poll_lambda_rejects_result_first_observed_after_terminal_cutoff(monkeypatch):
+    from flash.providers.core.base import PollResult
+
+    jobs, poll_instance = _wire_lambda_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="lambda", work=900.0, result=1_000.0),
+        instances=[{"status": "terminated"}],
+    )
+    clock, now, sleep = _manual_instance_clock(100.0)
+    monkeypatch.setattr(poll_instance.time, "time", now)
+    monkeypatch.setattr(poll_instance.time, "sleep", sleep)
+    observations = {"count": 0}
+
+    def observe(_adapter):
+        observations["count"] += 1
+        if observations["count"] == 2:
+            clock["now"] = 221.0
+            return PollResult(True, metrics={"wall_seconds": 5.0})
+        return None
+
+    monkeypatch.setattr(poll_instance, "_observe_result", observe)
+
+    result = jobs.poll_lambda_attempt(_handle(), _spec(), interval_s=30.0)
+
+    assert observations["count"] == 2
+    assert result.failure == "job_preempted"
+    assert clock["now"] == 221.0
+
+
+def test_poll_lambda_accepts_result_inside_terminal_visibility_window(monkeypatch):
+    from flash.providers.core.base import PollResult
+
+    jobs, poll_instance = _wire_lambda_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="lambda", work=900.0, result=1_000.0),
+        results=[None, PollResult(True, metrics={"wall_seconds": 5.0})],
+        instances=[{"status": "terminated"}],
+    )
+    clock, now, sleep = _manual_instance_clock(100.0)
+    monkeypatch.setattr(poll_instance.time, "time", now)
+    monkeypatch.setattr(poll_instance.time, "sleep", sleep)
+
+    result = jobs.poll_lambda_attempt(_handle(), _spec(), interval_s=30.0)
+
+    assert result.ok
+    assert result.metrics == {"wall_seconds": 5.0}
+    assert clock["now"] == 130.0
+
+
+def test_poll_lambda_without_terminal_evidence_preserves_result_deadline(monkeypatch):
+    jobs, poll_instance = _wire_lambda_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="lambda", work=150.0, result=270.0),
+        instances=[{"status": "active"}],
+    )
+    clock, now, sleep = _manual_instance_clock(100.0)
+    monkeypatch.setattr(poll_instance.time, "time", now)
+    monkeypatch.setattr(poll_instance.time, "sleep", sleep)
+
+    result = jobs.poll_lambda_attempt(_handle(), _spec(), interval_s=30.0)
+
+    assert result.failure == "job_preempted"
+    assert "work deadline expired" in result.detail
+    assert clock["now"] == 270.0
 
 
 def test_poll_lambda_dead_instance_before_grant_waits_for_result_deadline(monkeypatch):

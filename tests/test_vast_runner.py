@@ -1026,6 +1026,16 @@ def _instance_clock(start=0.0, step=10.0):
     return now
 
 
+def _manual_instance_clock(start):
+    clock = {"now": start, "sleeps": []}
+
+    def sleep(seconds):
+        clock["sleeps"].append(seconds)
+        clock["now"] += seconds
+
+    return clock, lambda: clock["now"], sleep
+
+
 def _wire_vast_poll(monkeypatch, *, attempt=None, results=(), instances=()):
     from flash.providers._lifecycle.instances import poll_instance
     from flash.providers.vast import jobs as vast
@@ -1135,20 +1145,65 @@ def test_poll_vast_retries_result_download_and_costs_manifest_finished_at(monkey
     assert result.metrics["notes"]["vast_instance_wall_seconds"] == 100.0
 
 
-def test_poll_vast_dead_instance_waits_for_result_deadline(monkeypatch):
+@pytest.mark.parametrize(
+    ("work_deadline", "result_deadline", "expected_return"),
+    [(900.0, 1_000.0, 220.0), (140.0, 150.0, 150.0)],
+)
+def test_poll_vast_dead_instance_uses_bounded_result_visibility(
+    monkeypatch, work_deadline, result_deadline, expected_return
+):
     vast, poll_instance = _wire_vast_poll(
         monkeypatch,
-        attempt=_instance_attempt(provider="vast", work=20.0, result=30.0),
-        results=[None, None],
+        attempt=_instance_attempt(provider="vast", work=work_deadline, result=result_deadline),
         instances=[{"actual_status": "exited"}],
     )
-    monkeypatch.setattr(poll_instance.time, "time", _instance_clock())
+    clock, now, sleep = _manual_instance_clock(100.0)
+    monkeypatch.setattr(poll_instance.time, "time", now)
+    monkeypatch.setattr(poll_instance.time, "sleep", sleep)
 
-    result = vast.poll_vast_attempt(_handle(), _spec(), interval_s=0)
+    result = vast.poll_vast_attempt(_handle(), _spec(), interval_s=30.0)
 
     assert result.failure == "job_preempted"
     assert "exited" in result.detail
     assert "result manifest" in result.detail
+    assert clock["now"] == expected_return
+
+
+def test_poll_vast_accepts_result_inside_terminal_visibility_window(monkeypatch):
+    from flash.providers.core.base import PollResult
+
+    vast, poll_instance = _wire_vast_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="vast", work=900.0, result=1_000.0),
+        results=[None, PollResult(True, metrics={"wall_seconds": 5.0})],
+        instances=[{"actual_status": "exited"}],
+    )
+    clock, now, sleep = _manual_instance_clock(100.0)
+    monkeypatch.setattr(poll_instance.time, "time", now)
+    monkeypatch.setattr(poll_instance.time, "sleep", sleep)
+
+    result = vast.poll_vast_attempt(_handle(), _spec(), interval_s=30.0)
+
+    assert result.ok
+    assert result.metrics == {"wall_seconds": 5.0}
+    assert clock["now"] == 130.0
+
+
+def test_poll_vast_without_terminal_evidence_preserves_result_deadline(monkeypatch):
+    vast, poll_instance = _wire_vast_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="vast", work=150.0, result=270.0),
+        instances=[{"actual_status": "running"}],
+    )
+    clock, now, sleep = _manual_instance_clock(100.0)
+    monkeypatch.setattr(poll_instance.time, "time", now)
+    monkeypatch.setattr(poll_instance.time, "sleep", sleep)
+
+    result = vast.poll_vast_attempt(_handle(), _spec(), interval_s=30.0)
+
+    assert result.failure == "job_preempted"
+    assert "work deadline expired" in result.detail
+    assert clock["now"] == 270.0
 
 
 def test_poll_vast_dead_instance_before_grant_waits_for_result_deadline(monkeypatch):

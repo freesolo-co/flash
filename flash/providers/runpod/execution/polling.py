@@ -21,6 +21,7 @@ from flash.providers.runpod.execution.jobs import (
     GraceTimer,
     capacity_escalation_note,
 )
+from flash.runner.lifecycle.deadlines import _RESULT_VISIBILITY_ALLOWANCE_S
 from flash.runner.lifecycle.protocol import AttemptRecord
 
 if TYPE_CHECKING:
@@ -165,6 +166,22 @@ def _queue_failure(
     return None
 
 
+def _missing_result(terminal_status: str | None, artifact_error: str | None) -> PollResult:
+    state_detail = (
+        f"resource ended with {terminal_status}"
+        if terminal_status is not None
+        else "work deadline expired"
+    )
+    return PollResult(
+        False,
+        failure="job_preempted",
+        detail=(
+            f"RunPod {state_detail} without a result manifest"
+            + (f"; artifact read failed with {artifact_error}" if artifact_error else "")
+        ),
+    )
+
+
 def poll_attempt(
     handle,
     spec,
@@ -197,9 +214,29 @@ def poll_attempt(
     state = _PollState(None, False, GraceTimer(), GraceTimer(), GraceTimer())
     poll_errors = PollErrorTracker(context.say, interval_s)
     terminal_status: str | None = None
+    terminal_result_deadline_at: float | None = None
     artifact_error: str | None = None
     while True:
-        now = time.time()
+        if terminal_result_deadline_at is not None:
+            if time.time() >= terminal_result_deadline_at:
+                return _missing_result(terminal_status, artifact_error)
+            try:
+                result = _observe_artifacts(context)
+                artifact_error = None
+            except AttemptArtifactError as exc:
+                return PollResult(False, failure="job_failed", detail=str(exc))
+            except Exception as exc:
+                result = None
+                artifact_error = type(exc).__name__
+            observed_at = time.time()
+            if observed_at >= terminal_result_deadline_at:
+                return _missing_result(terminal_status, artifact_error)
+            if result is not None:
+                return result
+            delay = min(interval_s, terminal_result_deadline_at - observed_at)
+            if delay > 0:
+                time.sleep(delay)
+            continue
         try:
             result = _observe_artifacts(context)
             artifact_error = None
@@ -210,22 +247,11 @@ def poll_attempt(
             artifact_error = type(exc).__name__
         if result is not None:
             return result
+        now = time.time()
         if now >= attempt.result_deadline_at:
-            state_detail = (
-                f"resource ended with {terminal_status}"
-                if terminal_status is not None
-                else "work deadline expired"
-            )
-            return PollResult(
-                False,
-                failure="job_preempted",
-                detail=(
-                    f"RunPod {state_detail} without a result manifest"
-                    + (f"; artifact read failed with {artifact_error}" if artifact_error else "")
-                ),
-            )
+            return _missing_result(None, artifact_error)
         if now >= attempt.work_deadline_at:
-            delay = min(interval_s, max(0.0, attempt.result_deadline_at - time.time()))
+            delay = min(interval_s, attempt.result_deadline_at - now)
             if delay > 0:
                 time.sleep(delay)
             continue
@@ -244,7 +270,9 @@ def poll_attempt(
                 return PollResult(
                     False, failure="poll_error", detail="RunPod status transport failed"
                 )
-            time.sleep(min(interval_s, max(0.0, attempt.work_deadline_at - time.time())))
+            delay = min(interval_s, max(0.0, attempt.work_deadline_at - time.time()))
+            if delay > 0:
+                time.sleep(delay)
             continue
         if status != state.last_status:
             context.say(f"job {handle.job_id}: {status}")
@@ -253,10 +281,19 @@ def poll_attempt(
             state.granted = True
         if status in TERMINAL_OK | TERMINAL_FAIL:
             terminal_status = status
+            terminal_observed_at = time.time()
+            terminal_result_deadline_at = min(
+                attempt.result_deadline_at,
+                terminal_observed_at + _RESULT_VISIBILITY_ALLOWANCE_S,
+            )
+            delay = min(interval_s, max(0.0, terminal_result_deadline_at - terminal_observed_at))
+            if delay > 0:
+                time.sleep(delay)
+            continue
+        now = time.time()
         failure = _queue_failure(context, state, status, now)
         if failure is not None:
             return failure
-        sleep_until = attempt.result_deadline_at if terminal_status else attempt.work_deadline_at
-        delay = min(interval_s, max(0.0, sleep_until - time.time()))
+        delay = min(interval_s, max(0.0, attempt.work_deadline_at - now))
         if delay > 0:
             time.sleep(delay)

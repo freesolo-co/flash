@@ -14,6 +14,7 @@ from flash.providers.artifacts.attempts import (
     read_attempt_artifacts,
 )
 from flash.providers.core.base import PollResult
+from flash.runner.lifecycle.deadlines import _RESULT_VISIBILITY_ALLOWANCE_S
 from flash.runner.lifecycle.protocol import AttemptRecord
 
 
@@ -102,6 +103,21 @@ def _observe_result(adapter: InstancePollAdapter) -> PollResult | None:
     return result
 
 
+def _missing_result(adapter: InstancePollAdapter, terminal_status: str | None) -> PollResult:
+    if terminal_status is not None and adapter.record_resource_loss is not None:
+        adapter.record_resource_loss(terminal_status)
+    state_detail = (
+        f"resource ended with {terminal_status}"
+        if terminal_status is not None
+        else "work deadline expired"
+    )
+    return PollResult(
+        False,
+        failure="job_preempted",
+        detail=f"{adapter.provider} {state_detail} without a result manifest",
+    )
+
+
 def poll_instance_job(
     adapter: InstancePollAdapter,
     *,
@@ -117,8 +133,27 @@ def poll_instance_job(
     poll_errors = PollErrorTracker(say, interval_s)
     last_status: str | None = None
     terminal_status: str | None = None
+    terminal_result_deadline_at: float | None = None
     missing_streak = 0
     while True:
+        if terminal_result_deadline_at is not None:
+            if time.time() >= terminal_result_deadline_at:
+                return _missing_result(adapter, terminal_status)
+            try:
+                result = _observe_result(adapter)
+            except AttemptArtifactError as exc:
+                return PollResult(False, failure="job_failed", detail=str(exc))
+            except Exception:
+                result = None
+            observed_at = time.time()
+            if observed_at >= terminal_result_deadline_at:
+                return _missing_result(adapter, terminal_status)
+            if result is not None:
+                return result
+            delay = min(interval_s, terminal_result_deadline_at - observed_at)
+            if delay > 0:
+                time.sleep(delay)
+            continue
         try:
             result = _observe_result(adapter)
         except AttemptArtifactError as exc:
@@ -129,20 +164,9 @@ def poll_instance_job(
             return result
         now = time.time()
         if now >= attempt.result_deadline_at:
-            if terminal_status is not None and adapter.record_resource_loss is not None:
-                adapter.record_resource_loss(terminal_status)
-            state_detail = (
-                f"resource ended with {terminal_status}"
-                if terminal_status is not None
-                else "work deadline expired"
-            )
-            return PollResult(
-                False,
-                failure="job_preempted",
-                detail=f"{adapter.provider} {state_detail} without a result manifest",
-            )
+            return _missing_result(adapter, None)
         if now >= attempt.work_deadline_at:
-            delay = min(interval_s, max(0.0, attempt.result_deadline_at - time.time()))
+            delay = min(interval_s, attempt.result_deadline_at - now)
             if delay > 0:
                 time.sleep(delay)
             continue
@@ -155,10 +179,7 @@ def poll_instance_job(
                 return PollResult(
                     False, failure="poll_error", detail="provider status transport failed"
                 )
-            wait_deadline = (
-                attempt.result_deadline_at if terminal_status else attempt.work_deadline_at
-            )
-            delay = min(interval_s, max(0.0, wait_deadline - time.time()))
+            delay = min(interval_s, max(0.0, attempt.work_deadline_at - time.time()))
             if delay > 0:
                 time.sleep(delay)
             continue
@@ -173,17 +194,22 @@ def poll_instance_job(
             last_status = status
         if status in adapter.dead_states or missing_streak >= adapter.missing_dead_threshold:
             terminal_status = status
-        if (
-            terminal_status is None
-            and status != adapter.running_status
-            and now >= attempt.grant_deadline_at
-        ):
+            terminal_observed_at = time.time()
+            terminal_result_deadline_at = min(
+                attempt.result_deadline_at,
+                terminal_observed_at + _RESULT_VISIBILITY_ALLOWANCE_S,
+            )
+            delay = min(interval_s, max(0.0, terminal_result_deadline_at - terminal_observed_at))
+            if delay > 0:
+                time.sleep(delay)
+            continue
+        now = time.time()
+        if status != adapter.running_status and now >= attempt.grant_deadline_at:
             return PollResult(
                 False,
                 failure="job_preempted",
                 detail=f"{adapter.provider} resource did not become active before its grant deadline",
             )
-        wait_deadline = attempt.result_deadline_at if terminal_status else attempt.work_deadline_at
-        delay = min(interval_s, max(0.0, wait_deadline - time.time()))
+        delay = min(interval_s, max(0.0, attempt.work_deadline_at - now))
         if delay > 0:
             time.sleep(delay)

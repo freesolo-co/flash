@@ -169,6 +169,8 @@ def _compare_and_prepare_resubmit(
     expected_remote: dict | None,
     *,
     expected_state: str | None = None,
+    expected_attempt: tuple[int, int] | None = None,
+    expected_no_attempt: bool = False,
 ) -> bool:
     """Claim a nonterminal recovery launch only while its expected remote still owns the run."""
     report_status: RunStatus | None = None
@@ -179,6 +181,12 @@ def _compare_and_prepare_resubmit(
         if expected_state is not None and status.state != expected_state:
             return False
         if not _expected_remote_matches(status.remote, expected_remote):
+            return False
+        if not _attempt_identity_matches(
+            status,
+            expected_attempt,
+            expected_no_attempt=expected_no_attempt,
+        ):
             return False
         status.state = "provisioning"
         status.updated_at = time.time()

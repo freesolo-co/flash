@@ -208,6 +208,8 @@ def _build_context(
     runtime_secrets: dict[str, str] | None,
     source_snapshot: dict | None,
     attempt_start: int,
+    retry_budget=None,
+    retry_placement=None,
 ) -> _SubmitContext:
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
     from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
@@ -217,15 +219,12 @@ def _build_context(
         source_snapshot or source_snapshot_from_status(get_status(spec.run_id), required=True)
     ).to_dict()
     attempt_start = max(0, int(attempt_start))
-    max_retries = int(spec.gpu.max_retries)
-    infra_budget = max(max_retries, _lifecycle.INFRA_RETRY_FLOOR) if max_retries else 0
-    # one cache-less fallback is available only when the user enabled retries; max_retries=0 is
-    # exactly one provider submission. a non-shared per-org volume earns no bonus.
+    retry_budget = retry_budget or _lifecycle._retry_budget_for_spec(spec)
+    infra_budget = retry_budget.infra_retries
     started_with_shared_cache = (
         getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
     )
-    cache_fallback_attempts = 1 if started_with_shared_cache and max_retries > 0 else 0
-    retry_budget = _lifecycle._RetryBudget(infra_budget, max_retries, cache_fallback_attempts)
+    retry_placement = retry_placement or _lifecycle._RetryPlacement()
     # environment transport is already pinned and staged by the controller before allocation.
     return _SubmitContext(
         spec=spec,
@@ -236,6 +235,9 @@ def _build_context(
         infra_budget=infra_budget,
         retry_budget=retry_budget,
         started_with_shared_cache=started_with_shared_cache,
+        failed_providers=set(retry_placement.failed_providers),
+        tried_classes=set(retry_placement.tried_classes),
+        oom_vram_floor=retry_placement.oom_vram_floor,
         current_attempt=attempt_start,
     )
 
@@ -892,6 +894,8 @@ def run_attempts_supervised(
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     attempt_start: int = 0,
+    retry_budget=None,
+    retry_placement=None,
 ) -> dict:
     """Run one run through bounded attempts on infra-shaped failures."""
     if spec.algorithm == "opd":
@@ -900,7 +904,15 @@ def run_attempts_supervised(
         # policy and plane configuration are spec-level gates and must fail before durable run state
         # or source identity is consulted. the deadline-dependent gate still runs after context load.
         preflight_validate_managed_teacher(spec)
-    ctx = _build_context(spec, log, runtime_secrets, source_snapshot, attempt_start)
+    ctx = _build_context(
+        spec,
+        log,
+        runtime_secrets,
+        source_snapshot,
+        attempt_start,
+        retry_budget,
+        retry_placement,
+    )
     _require_opd_configuration(ctx)
     for invocation_ordinal in range(ctx.retry_budget.max_attempts):
         preparation = _prepare_attempt(ctx, invocation_ordinal)

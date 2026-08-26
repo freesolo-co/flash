@@ -2640,6 +2640,362 @@ def test_recovered_handleless_run_adopts_result_before_phantom_check(monkeypatch
     assert len(adopted) == 1
 
 
+@pytest.mark.parametrize(
+    (
+        "failure",
+        "expected_infra_used",
+        "expected_oom_used",
+        "expected_provider",
+        "expected_gpu",
+    ),
+    [
+        ("job_preempted", 1, 0, "vast", "RTX 4090"),
+        ("oom", 0, 1, "runpod", "A100"),
+    ],
+)
+def test_recovered_handleless_retryable_result_resubmits_with_remaining_budget(
+    monkeypatch,
+    tmp_path,
+    failure,
+    expected_infra_used,
+    expected_oom_used,
+    expected_provider,
+    expected_gpu,
+):
+    import io
+    from dataclasses import replace
+
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.base import Allocation, Candidate, PollResult
+    from flash.runner.supervise import attempt_supervision
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id=f"handleless-retry-{failure}",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1),
+    )
+    status = runner_state.RunStatus(
+        run_id=spec.run_id,
+        state="provisioning",
+        spec=spec.to_dict(),
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+    runner_state._save_status(status, _next_attempt=0)
+    observed = runner_attempts._reserve_attempt_record(spec.run_id)
+    persisted_resource = {
+        **_runpod_remote(
+            endpoint_id="endpoint-failed",
+            job_id="job-failed",
+            attempt=observed.attempt_id,
+            fence=observed.fence,
+        ),
+        "allocated_gpu": "RTX 4090",
+        "allocated_gpu_count": 1,
+    }
+    with runner_state._status_guard(spec.run_id):
+        persisted = runner_status.get_status(spec.run_id)
+        attempt = runner_status._current_attempt(persisted)
+        persisted.attempt = replace(
+            attempt,
+            state="active",
+            provider="runpod",
+            resource=persisted_resource,
+        ).to_dict()
+        runner_state._save_status_unlocked(persisted)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(False, failure=failure, detail="retry me"),
+    )
+    monkeypatch.setattr(runtime, "_recovery_block_reason", lambda _spec: None)
+    monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: True)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    launched = {}
+
+    def run_background(
+        _spec,
+        _runtime_secrets=None,
+        retry_budget=None,
+        retry_placement=None,
+    ):
+        launched["budget"] = retry_budget
+        launched["placement"] = retry_placement
+        launched["attempt"] = runner_attempts._reserve_attempt_record(spec.run_id)
+
+    monkeypatch.setattr(runner_lifecycle, "_run_job_background", run_background)
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target = target
+            self._args = args
+
+        def start(self):
+            self._target(*self._args)
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime._resubmit_recovered_runs([(spec, "provisioning")])
+
+    replacement = launched["attempt"]
+    budget = launched["budget"]
+    placement = launched["placement"]
+    assert (observed.attempt_id, observed.fence) == (0, 1)
+    assert (replacement.attempt_id, replacement.fence) == (1, 2)
+    assert budget.infra_used == expected_infra_used
+    assert budget.oom_used == expected_oom_used
+    candidates = (
+        Candidate("runpod", "RTX 4090", 0.5, 24),
+        Candidate(expected_provider, expected_gpu, 1.0, 40),
+    )
+    context = attempt_supervision._build_context(
+        spec,
+        io.StringIO(),
+        None,
+        _SOURCE_SNAPSHOT,
+        replacement.attempt_id,
+        budget,
+        placement,
+    )
+    plan = attempt_supervision._build_candidate_plan(
+        context,
+        attempt_supervision._PreparedAttempt(
+            0,
+            replacement.attempt_id,
+            replacement.fence,
+            spec,
+            {},
+        ),
+        Allocation(
+            provider="runpod",
+            gpu="RTX 4090",
+            hourly_usd=0.5,
+            min_vram_gb=24,
+            candidates=candidates,
+        ),
+    )
+    assert plan is not None
+    assert (plan.chosen.provider, plan.chosen.gpu) == (expected_provider, expected_gpu)
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._NEXT_ATTEMPT_KEY] == 2
+    assert raw["attempt"] == replacement.to_dict()
+    assert raw["state"] == "provisioning"
+
+
+def test_recovered_handleless_multicard_sft_oom_uses_executed_width(monkeypatch, tmp_path):
+    import io
+    from dataclasses import replace
+
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core.base import Allocation, Candidate, PollResult
+    from flash.providers.core.sharding import combined_vram_gb
+    from flash.runner.lifecycle.submit import _persist_effective_worker_spec
+    from flash.runner.supervise import attempt_supervision
+    from tests._helpers.profile import attach_sft_profile
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="handleless-multicard-sft-oom",
+            model="Qwen/Qwen3.5-9B",
+            algorithm="sft",
+            train=TrainSpec(batch_size=2, max_examples=2),
+            gpu=GpuSpec(count=4, max_retries=1),
+        )
+    )
+    status = runner_state.RunStatus(
+        run_id=spec.run_id,
+        state="provisioning",
+        spec=spec.to_dict(),
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+    runner_state._save_status(status, _next_attempt=0)
+    assert _persist_effective_worker_spec(spec) is True
+    observed = runner_attempts._reserve_attempt_record(spec.run_id)
+    persisted_resource = {
+        **_runpod_remote(
+            endpoint_id="endpoint-failed",
+            job_id="job-failed",
+            attempt=observed.attempt_id,
+            fence=observed.fence,
+        ),
+        "allocated_gpu": "RTX 4090",
+        "allocated_gpu_count": 4,
+    }
+    with runner_state._status_guard(spec.run_id):
+        persisted = runner_status.get_status(spec.run_id)
+        attempt = runner_status._current_attempt(persisted)
+        persisted.attempt = replace(
+            attempt,
+            state="active",
+            provider="runpod",
+            resource=persisted_resource,
+        ).to_dict()
+        runner_state._save_status_unlocked(persisted)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(False, failure="oom", detail="retry me"),
+    )
+
+    retry = runtime._adopt_handleless_result(spec)
+
+    assert isinstance(retry, runtime._HandlelessRetry)
+    assert retry.retry_placement.oom_vram_floor == pytest.approx(combined_vram_gb(24, 2))
+    replacement = runner_attempts._reserve_attempt_record(spec.run_id)
+    context = attempt_supervision._build_context(
+        spec,
+        io.StringIO(),
+        None,
+        _SOURCE_SNAPSHOT,
+        replacement.attempt_id,
+        retry.retry_budget,
+        retry.retry_placement,
+    )
+    plan = attempt_supervision._build_candidate_plan(
+        context,
+        attempt_supervision._PreparedAttempt(
+            0,
+            replacement.attempt_id,
+            replacement.fence,
+            spec,
+            {},
+        ),
+        Allocation(
+            provider="runpod",
+            gpu="RTX 4090",
+            hourly_usd=0.5,
+            min_vram_gb=24,
+            candidates=(
+                Candidate("runpod", "RTX 4090", 0.5, 24, 4, executed_gpu_count=2),
+                Candidate("runpod", "A100 SXM 40GB", 1.0, 40),
+            ),
+        ),
+    )
+
+    assert plan is not None
+    assert (plan.chosen.provider, plan.chosen.gpu, plan.chosen.gpu_count) == (
+        "runpod",
+        "A100 SXM 40GB",
+        1,
+    )
+
+
+def test_recovered_handleless_retryable_result_rejects_attempt_replacement_race(
+    monkeypatch, tmp_path
+):
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.base import PollResult
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="handleless-retry-race",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1),
+    )
+    status = runner_state.RunStatus(
+        run_id=spec.run_id,
+        state="provisioning",
+        spec=spec.to_dict(),
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+    runner_state._save_status(status, _next_attempt=0)
+    observed = runner_attempts._reserve_attempt_record(spec.run_id)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(False, failure="job_preempted", detail="retry me"),
+    )
+    replacement = None
+
+    def replace_before_prepare(_spec):
+        nonlocal replacement
+        replacement = runner_attempts._reserve_attempt_record(spec.run_id)
+        return
+
+    monkeypatch.setattr(runtime, "_recovery_block_reason", replace_before_prepare)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    started = []
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            started.append((target, args, daemon))
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    assert (
+        runtime._start_resubmit(spec, expected_remote=None, expected_state="provisioning") is False
+    )
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert replacement is not None
+    assert (observed.attempt_id, observed.fence) == (0, 1)
+    assert (replacement.attempt_id, replacement.fence) == (1, 2)
+    assert persisted.attempt == replacement.to_dict()
+    assert persisted.state == "provisioning"
+    assert started == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "max_retries", "attempt_id"),
+    [
+        ("job_failed", 2, 0),
+        ("job_preempted", 0, 0),
+        ("oom", 0, 0),
+    ],
+)
+def test_recovered_handleless_nonretryable_or_exhausted_result_fails_terminally(
+    monkeypatch, tmp_path, failure, max_retries, attempt_id
+):
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.base import PollResult
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id=f"handleless-terminal-{failure}-{max_retries}-{attempt_id}",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=max_retries),
+    )
+    status = runner_state.RunStatus(
+        run_id=spec.run_id,
+        state="provisioning",
+        spec=spec.to_dict(),
+        source_snapshot=_SOURCE_SNAPSHOT,
+    )
+    runner_state._save_status(status, _next_attempt=0)
+    observed = runner_attempts._reserve_attempt_record(spec.run_id, minimum_attempt=attempt_id)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(False, failure=failure, detail="stop"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_confirm_run_clear",
+        lambda _spec: pytest.fail("terminal result must not reach replacement cleanup"),
+    )
+
+    runtime._resubmit_recovered_runs([(spec, "provisioning")])
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert (observed.attempt_id, observed.fence) == (attempt_id, 1)
+    assert persisted.state == "failed"
+    assert persisted.attempt["attempt_id"] == attempt_id
+    assert persisted.attempt["fence"] == observed.fence
+    assert persisted.attempt["state"] == "settled"
+    assert persisted.error == f"{failure}: stop"
+
+
 def test_handleless_success_rejects_result_after_attempt_replacement(monkeypatch, tmp_path):
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
