@@ -17,8 +17,12 @@ from flash.serving.src.stream_channel import client
 from flash.serving.src.stream_channel import engine as channel_engine
 from flash.serving.src.stream_channel.engine import stream_generate_call
 from flash.serving.src.stream_channel.protocol import (
+    CALL_RESULT_MARGIN_SECONDS,
+    CALL_RESULT_SECONDS,
+    CLEANUP_SECONDS,
     CONTROL_PARTITION,
     DATA_PARTITION,
+    ENGINE_CLEANUP_STEPS,
     PROTOCOL_VERSION,
     ChannelErrorCode,
     ControlEnvelope,
@@ -86,8 +90,8 @@ class _FakeQueue:
         if not block:
             try:
                 return queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return None
+            except asyncio.QueueEmpty as exc:
+                raise stdlib_queue.Empty from exc
         if timeout is None:
             value = await queue.get()
         else:
@@ -884,6 +888,26 @@ def test_router_timed_empty_polls_allow_first_event_after_250ms() -> None:
     assert cancel_count == 0
 
 
+def test_post_terminal_empty_is_normal_and_final_is_completed() -> None:
+    async def scenario() -> tuple[list[dict[str, Any]], int, list[str]]:
+        queue = _FakeQueue()
+        final = {"type": "final", "ok": True}
+        manifest = TerminalManifest(
+            "generation-1", "nonce-1", "fc-1", "replica-1", 0, "event", 1
+        ).to_dict()
+        events, call, _context, _spawn_count = await _channel_with_preloaded_data(
+            queue,
+            [_data(0, event=final)],
+            manifest,
+        )
+        return events, call.cancel_count, queue.clear_calls
+
+    events, cancel_count, clear_calls = asyncio.run(scenario())
+    assert events == [{"type": "final", "ok": True}]
+    assert cancel_count == 0
+    assert clear_calls == [DATA_PARTITION, CONTROL_PARTITION]
+
+
 def test_router_channel_preserves_fifo_multi_choice_events_and_cleans_partitions() -> None:
     async def scenario() -> Any:
         queue = _FakeQueue()
@@ -1038,6 +1062,49 @@ def test_router_channel_rejects_manifest_mismatch_without_respawn() -> None:
     assert asyncio.run(scenario()) == (1, 1)
 
 
+def test_manifest_wait_covers_sequential_remote_cleanup_budget() -> None:
+    async def scenario() -> tuple[list[dict[str, Any]], int]:
+        queue = _FakeQueue()
+        final = {"type": "final", "ok": True}
+        manifest = TerminalManifest(
+            "generation-1", "nonce-1", "fc-1", "replica-1", 0, "event", 1
+        ).to_dict()
+        delay = ENGINE_CLEANUP_STEPS * CLEANUP_SECONDS + 0.05
+        assert CALL_RESULT_SECONDS == (
+            ENGINE_CLEANUP_STEPS * CLEANUP_SECONDS + CALL_RESULT_MARGIN_SECONDS
+        )
+        assert delay < CALL_RESULT_SECONDS
+
+        async def delayed_manifest() -> dict[str, Any]:
+            await asyncio.sleep(delay)
+            return manifest
+
+        call = _FakeCall("fc-1", delayed_manifest())
+        method = _FakeSpawnMethod(None)
+
+        async def spawn(*_args: Any) -> _FakeCall:
+            method.spawn_count += 1
+            await queue._put(_data(0, event=final), partition=DATA_PARTITION)
+            return call
+
+        method.spawn.aio = spawn
+        channel = client.CancellableStreamChannel(
+            spawn_method=method,
+            payload_dict={},
+            record_dict=None,
+            expected_checkpoint=None,
+            generation_id="generation-1",
+            dispatch_deadline_unix=time.time() + 5,
+            invocation_nonce="nonce-1",
+            queue_context=lambda: _QueueContext(queue),
+        )
+        return [event async for event in channel], call.cancel_count
+
+    events, cancel_count = asyncio.run(scenario())
+    assert events == [{"type": "final", "ok": True}]
+    assert cancel_count == 0
+
+
 def test_function_success_gets_bounded_terminal_drain(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> tuple[int, int]:
         monkeypatch.setattr(client, "TERMINAL_DRAIN_SECONDS", 0.03)
@@ -1070,6 +1137,45 @@ def test_function_success_gets_bounded_terminal_drain(monkeypatch: pytest.Monkey
         return call.cancel_count, method.spawn_count
 
     assert asyncio.run(scenario()) == (1, 1)
+
+
+def test_channel_is_direct_async_iterator_with_one_spawn_and_idempotent_close() -> None:
+    async def scenario() -> tuple[dict[str, Any], int, int, list[str], bool]:
+        queue = _FakeQueue()
+        pending = asyncio.Event()
+        call = _FakeCall("fc-1", pending.wait())
+        method = _FakeSpawnMethod(None)
+
+        async def spawn(*_args: Any) -> _FakeCall:
+            method.spawn_count += 1
+            await queue._put(_data(0, event={"type": "ready"}), partition=DATA_PARTITION)
+            return call
+
+        method.spawn.aio = spawn
+        channel = client.CancellableStreamChannel(
+            spawn_method=method,
+            payload_dict={},
+            record_dict=None,
+            expected_checkpoint=None,
+            generation_id="generation-1",
+            dispatch_deadline_unix=time.time() + 5,
+            invocation_nonce="nonce-1",
+            queue_context=lambda: _QueueContext(queue),
+        )
+        assert channel.__aiter__() is channel
+        event = await anext(channel)
+        await channel.aclose()
+        await channel.aclose()
+        with pytest.raises(StopAsyncIteration):
+            await anext(channel)
+        return event, method.spawn_count, call.cancel_count, queue.clear_calls, channel._closed
+
+    event, spawn_count, cancel_count, clear_calls, closed = asyncio.run(scenario())
+    assert event == {"type": "ready"}
+    assert spawn_count == 1
+    assert cancel_count == 1
+    assert clear_calls == [DATA_PARTITION, CONTROL_PARTITION]
+    assert closed
 
 
 def test_iterator_close_sends_tombstone_and_exact_call_cancel() -> None:

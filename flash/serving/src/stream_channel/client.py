@@ -165,9 +165,36 @@ class CancellableStreamChannel:
         self._dispatch_deadline_unix = dispatch_deadline_unix
         self._invocation_nonce = invocation_nonce
         self._queue_context = queue_context
+        self._iterator: AsyncIterator[dict[str, Any]] | None = None
+        self._closed = False
 
-    def __aiter__(self) -> AsyncIterator[dict[str, Any]]:
-        return self._run()
+    def __aiter__(self) -> CancellableStreamChannel:
+        return self
+
+    async def __anext__(self) -> dict[str, Any]:
+        if self._closed:
+            raise StopAsyncIteration
+        if self._iterator is None:
+            self._iterator = self._run()
+        try:
+            return await anext(self._iterator)
+        except (StopAsyncIteration, asyncio.CancelledError):
+            self._closed = True
+            self._iterator = None
+            raise
+        except Exception:
+            self._closed = True
+            self._iterator = None
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed and self._iterator is None:
+            return
+        self._closed = True
+        iterator = self._iterator
+        self._iterator = None
+        if iterator is not None:
+            await iterator.aclose()
 
     async def _run(self) -> AsyncIterator[dict[str, Any]]:
         import modal
@@ -231,7 +258,12 @@ class CancellableStreamChannel:
                         if envelope.terminal:
                             manifest = await self._terminal_manifest(call_result_task)
                             validator.reconcile(manifest)
-                            extra = await queue.get.aio(block=False, partition=DATA_PARTITION)
+                            extra = None
+                            with contextlib.suppress(stdlib_queue.Empty):
+                                extra = await queue.get.aio(
+                                    block=False,
+                                    partition=DATA_PARTITION,
+                                )
                             if extra is not None:
                                 validator.accept(extra)
                             completed = True
