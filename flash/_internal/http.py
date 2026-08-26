@@ -23,7 +23,8 @@ from .http_refs import (
     _function_global_reference_values,
     _function_reference_values,
     _getattr_type_static,
-    _slot_names,
+    _slot_entries,
+    _source_function_code,
 )
 from .http_refs import (
     _references_target as _find_references_target,
@@ -326,12 +327,23 @@ def _function_implementation_signature(function: types.FunctionType) -> tuple[ob
     )
 
 
+def _stdlib_function_signature(function: types.FunctionType) -> tuple[object, ...]:
+    qualname = object.__getattribute__(function, "__qualname__")
+    if type(qualname) is not str or type(urllib.request.__file__) is not str:
+        raise TypeError
+    return (
+        _source_function_code(urllib.request.__file__, qualname),
+        _snapshot_value(None),
+        _snapshot_value(None),
+        (),
+    )
+
+
 _STDLIB_HANDLER_CALLBACK_SIGNATURES = tuple(
-    (callback, _function_implementation_signature(callback))
-    for callback in _STDLIB_HANDLER_CALLBACKS
+    (callback, _stdlib_function_signature(callback)) for callback in _STDLIB_HANDLER_CALLBACKS
 )
 _STANDARD_DO_OPEN = urllib.request.AbstractHTTPHandler.do_open
-_STANDARD_DO_OPEN_SIGNATURE = _function_implementation_signature(_STANDARD_DO_OPEN)
+_STANDARD_DO_OPEN_SIGNATURE = _stdlib_function_signature(_STANDARD_DO_OPEN)
 _STANDARD_PROXY_CALLBACK_CODE = next(
     value
     for value in urllib.request.ProxyHandler.__init__.__code__.co_consts
@@ -339,47 +351,12 @@ _STANDARD_PROXY_CALLBACK_CODE = next(
 )
 
 
-def _mangled_slot_name(owner: type, name: str) -> str:
-    if name.startswith("__") and not name.endswith("__"):
-        class_name = type.__getattribute__(owner, "__name__").lstrip("_")
-        if class_name:
-            return f"_{class_name}{name}"
-    return name
-
-
-def _slot_entries(
-    handler: urllib.request.BaseHandler,
-) -> tuple[tuple[int, str, types.MemberDescriptorType, object], ...]:
-    found = []
-    seen: set[int] = set()
-    handler_type = type(handler)
-    for owner in type.__getattribute__(handler_type, "__mro__"):
-        namespace = type.__getattribute__(owner, "__dict__")
-        declaration = namespace.get("__slots__", ())
-        for declared_name in _slot_names(declaration):
-            if declared_name in {"__dict__", "__weakref__", "parent"}:
-                continue
-            slot_name = _mangled_slot_name(owner, declared_name)
-            descriptor = namespace.get(slot_name)
-            if type(descriptor) is not types.MemberDescriptorType:
-                raise TypeError
-            if id(descriptor) in seen:
-                continue
-            seen.add(id(descriptor))
-            try:
-                value = types.MemberDescriptorType.__get__(descriptor, handler, handler_type)
-            except AttributeError:
-                value = _ABSENT_SLOT
-            found.append((id(owner), slot_name, descriptor, value))
-    return tuple(found)
-
-
 def _slot_values(
     handler: urllib.request.BaseHandler,
 ) -> tuple[tuple[int, str, object], ...]:
     return tuple(
         (owner_id, slot_name, value)
-        for owner_id, slot_name, _descriptor, value in _slot_entries(handler)
+        for owner_id, slot_name, _descriptor, value in _slot_entries(handler, _ABSENT_SLOT)
     )
 
 
@@ -387,7 +364,7 @@ def _copy_slot_state(
     handler: urllib.request.BaseHandler,
     copied: urllib.request.BaseHandler,
 ) -> None:
-    for _owner_id, _slot_name, descriptor, value in _slot_entries(handler):
+    for _owner_id, _slot_name, descriptor, value in _slot_entries(handler, _ABSENT_SLOT):
         if value is not _ABSENT_SLOT:
             types.MemberDescriptorType.__set__(descriptor, copied, value)
 
@@ -482,6 +459,7 @@ def _references_target(
     active: set[int] | None = None,
     budget: list[int] | None = None,
     inspect_global_object: bool = False,
+    inspect_method_receiver: bool = False,
     trusted_objects: tuple[object, ...] = (),
 ) -> bool:
     return _find_references_target(
@@ -491,6 +469,7 @@ def _references_target(
         active,
         budget,
         inspect_global_object,
+        inspect_method_receiver,
         _TRAVERSAL_NODES_MAX,
         trusted_objects,
     )
@@ -682,6 +661,7 @@ def _validate_instance_callbacks(
             seen=seen,
             active=active,
             budget=budget,
+            inspect_method_receiver=True,
         ):
             raise TypeError
         if private_targets and type(callback) is types.MethodType:

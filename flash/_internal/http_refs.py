@@ -22,6 +22,25 @@ _FAST_LOAD_OPNAMES = frozenset({"LOAD_FAST", "LOAD_FAST_CHECK"})
 _STATELESS_TERMINAL_TYPES = (object, _thread.LockType, _thread.RLock)
 
 
+def _source_function_code(filename: str, qualname: str) -> types.CodeType:
+    with builtins.open(filename, encoding="utf-8") as source_file:
+        root = compile(source_file.read(), filename, "exec", dont_inherit=True)
+    pending = [root]
+    matches = []
+    while pending:
+        code = pending.pop()
+        if object.__getattribute__(code, "co_qualname") == qualname:
+            matches.append(code)
+        pending.extend(
+            item
+            for item in object.__getattribute__(code, "co_consts")
+            if type(item) is types.CodeType
+        )
+    if len(matches) != 1:
+        raise ValueError
+    return matches[0]
+
+
 def _slot_names(declaration: object) -> tuple[str, ...]:
     if type(declaration) is str:
         names = (declaration,)
@@ -34,6 +53,41 @@ def _slot_names(declaration: object) -> tuple[str, ...]:
     if any(type(name) is not str for name in names):
         raise TypeError
     return names
+
+
+def _mangled_slot_name(owner: type, name: str) -> str:
+    if name.startswith("__") and not name.endswith("__"):
+        class_name = type.__getattribute__(owner, "__name__").lstrip("_")
+        if class_name:
+            return f"_{class_name}{name}"
+    return name
+
+
+def _slot_entries(
+    value: object,
+    absent: object,
+) -> tuple[tuple[int, str, types.MemberDescriptorType, object], ...]:
+    found = []
+    seen: set[int] = set()
+    value_type = type(value)
+    for owner in type.__getattribute__(value_type, "__mro__"):
+        namespace = type.__getattribute__(owner, "__dict__")
+        for declared_name in _slot_names(namespace.get("__slots__", ())):
+            if declared_name in {"__dict__", "__weakref__", "parent"}:
+                continue
+            slot_name = _mangled_slot_name(owner, declared_name)
+            descriptor = namespace.get(slot_name)
+            if type(descriptor) is not types.MemberDescriptorType:
+                raise TypeError
+            if id(descriptor) in seen:
+                continue
+            seen.add(id(descriptor))
+            try:
+                slot_value = types.MemberDescriptorType.__get__(descriptor, value, value_type)
+            except AttributeError:
+                slot_value = absent
+            found.append((id(owner), slot_name, descriptor, slot_value))
+    return tuple(found)
 
 
 def _getattr_type_static(owner: type, name: str, default: object) -> object:
@@ -75,9 +129,43 @@ def _nested_default_origins(
     return mapped
 
 
+def _is_direct_method_load(instruction: dis.Instruction, name: str) -> bool:
+    return (instruction.opname == "LOAD_METHOD" and instruction.argval == name) or (
+        instruction.opname == "LOAD_ATTR"
+        and instruction.argval == name
+        and instruction.argrepr.startswith("NULL|self + ")
+    )
+
+
+def _is_direct_method_call(
+    instructions: tuple[dis.Instruction, ...],
+    root_index: int,
+    name: str,
+) -> bool:
+    if root_index + 1 >= len(instructions):
+        return False
+    root = instructions[root_index]
+    if not _is_direct_method_load(instructions[root_index + 1], name):
+        return False
+    root_position = root.positions
+    if root_position.lineno is None or root_position.col_offset is None:
+        return False
+    for following in instructions[root_index + 2 :]:
+        if following.opname != "CALL":
+            continue
+        position = following.positions
+        if (
+            position.lineno == root_position.lineno
+            and position.col_offset == root_position.col_offset
+        ):
+            return following.arg == 1
+    return False
+
+
 def _loaded_reference_paths(
     code: types.CodeType,
     root_origins: dict[str, tuple[str, str]],
+    safe_parent_offsets: frozenset[tuple[int, int]] = frozenset(),
 ) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
     pending = [(code, root_origins)]
     seen: set[int] = set()
@@ -117,6 +205,12 @@ def _loaded_reference_paths(
                     raise ValueError
                 attributes.append(attribute)
             if root_kind == "bound" and not attributes:
+                raise ValueError
+            if (
+                root_kind == "bound"
+                and attributes == ["parent"]
+                and (current_id, instruction.offset) not in safe_parent_offsets
+            ):
                 raise ValueError
             paths.add((root_kind, root_name, tuple(attributes)))
         constants = object.__getattribute__(current, "co_consts")
@@ -228,7 +322,7 @@ def _resolve_reference_path(value: object, attributes: tuple[str, ...]) -> objec
     for attribute in attributes:
         if attribute in _DYNAMIC_NAMESPACE_NAMES:
             raise ValueError
-        if type(resolved) in (
+        if resolved is None or type(resolved) in (
             object,
             bool,
             int,
@@ -346,11 +440,7 @@ def _function_append_only_capture_values(function: types.FunctionType) -> tuple[
             if root_kind not in {"default", "binding"}:
                 continue
             usage[root_name][0] = True
-            if index + 1 >= len(instructions):
-                usage[root_name][1] = False
-                continue
-            following = instructions[index + 1]
-            if following.opname not in {"LOAD_ATTR", "LOAD_METHOD"} or following.argval != "append":
+            if not _is_direct_method_call(instructions, index, "append"):
                 usage[root_name][1] = False
         constants = object.__getattribute__(current, "co_consts")
         if type(constants) is not tuple:
@@ -370,8 +460,60 @@ def _function_append_only_capture_values(function: types.FunctionType) -> tuple[
             child_origins.update(_nested_default_origins(instructions, code_index, child, origins))
             pending.append((child, child_origins))
     return tuple(
-        captures[name] for name, (loaded, append_only) in usage.items() if loaded and append_only
+        captures[name]
+        for name, (loaded, append_only) in usage.items()
+        if loaded
+        and append_only
+        and not any(
+            other_loaded and not other_append_only and captures[other_name] is captures[name]
+            for other_name, (other_loaded, other_append_only) in usage.items()
+        )
     )
+
+
+def _direct_parent_observation_offsets(
+    function: types.FunctionType,
+    bound_self: object,
+) -> frozenset[tuple[int, int]]:
+    code = object.__getattribute__(function, "__code__")
+    roots = _function_reference_roots(function, bound_self)
+    append_only = _function_append_only_capture_values(function)
+    observers = {
+        (root_kind, name)
+        for root_kind in ("default", "binding")
+        for name, value in roots[root_kind].items()
+        if type(value) is list and any(value is observer for observer in append_only)
+    }
+    instructions = tuple(dis.get_instructions(code))
+    offsets = set()
+    for index, instruction in enumerate(instructions):
+        if instruction.opname not in _FAST_LOAD_OPNAMES or instruction.argval not in roots["bound"]:
+            continue
+        if index < 2 or index + 2 >= len(instructions):
+            continue
+        parent = instructions[index + 1]
+        receiver = instructions[index - 2]
+        method = instructions[index - 1]
+        receiver_name = receiver.argval
+        if (
+            parent.opname != "LOAD_ATTR"
+            or parent.argval != "parent"
+            or not _is_direct_method_load(method, "append")
+            or receiver.opname not in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}
+            or type(receiver_name) is not str
+            or not any(
+                (root_kind, receiver_name) in observers for root_kind in ("default", "binding")
+            )
+        ):
+            continue
+        call = instructions[index + 2]
+        if call.opname == "PRECALL":
+            if call.arg != 1 or index + 3 >= len(instructions):
+                continue
+            call = instructions[index + 3]
+        if call.opname == "CALL" and call.arg == 1:
+            offsets.add((id(code), instruction.offset))
+    return frozenset(offsets)
 
 
 def _function_global_reference_values(function: types.FunctionType) -> tuple[object, ...]:
@@ -396,13 +538,16 @@ def _function_bound_reference_values(
     code = object.__getattribute__(function, "__code__")
     roots = _function_reference_roots(function, bound_self)
     root_origins = {name: ("bound", name) for name in roots["bound"]}
+    safe_parent_offsets = _direct_parent_observation_offsets(function, bound_self)
     values = []
-    for root_kind, name, attributes in _loaded_reference_paths(code, root_origins):
+    for root_kind, name, attributes in _loaded_reference_paths(
+        code, root_origins, safe_parent_offsets
+    ):
         if root_kind != "bound":
             continue
         root_value = roots["bound"][name]
         if attributes[:1] == ("parent",):
-            if not _has_rebound_parent_field(root_value):
+            if not _has_rebound_parent_field(root_value) or len(attributes) != 1:
                 raise ValueError
             continue
         values.append(_resolve_reference_path(root_value, attributes))
@@ -420,8 +565,15 @@ def _function_reference_values(
         for root_kind in ("default", "binding", "bound")
         for name in roots[root_kind]
     }
+    safe_parent_offsets = (
+        frozenset()
+        if bound_self is _ABSENT_SLOT
+        else _direct_parent_observation_offsets(function, bound_self)
+    )
     values = [*roots["default"].values(), *roots["binding"].values()]
-    for root_kind, name, attributes in _loaded_reference_paths(code, root_origins):
+    for root_kind, name, attributes in _loaded_reference_paths(
+        code, root_origins, safe_parent_offsets
+    ):
         if root_kind == "global" and name in _DYNAMIC_NAMESPACE_NAMES:
             raise ValueError
         root = roots[root_kind]
@@ -429,7 +581,7 @@ def _function_reference_values(
             continue
         root_value = root[name]
         if root_kind == "bound" and attributes[:1] == ("parent",):
-            if not _has_rebound_parent_field(root_value):
+            if not _has_rebound_parent_field(root_value) or len(attributes) != 1:
                 raise ValueError
             continue
         if not attributes and type(root_value) in (types.ModuleType, type):
@@ -531,6 +683,7 @@ def _references_target(
     active: set[int] | None = None,
     budget: list[int] | None = None,
     inspect_global_object: bool = False,
+    inspect_method_receiver: bool = False,
     max_nodes: int = _TRAVERSAL_NODES_MAX,
     trusted_objects: tuple[object, ...] = (),
 ) -> bool:
@@ -568,10 +721,13 @@ def _references_target(
             method_self = object.__getattribute__(value, "__self__")
             if any(method_self is target for target in targets):
                 return True
-            related = (
-                object.__getattribute__(value, "__func__"),
-                method_self,
-            )
+            method_function = object.__getattribute__(value, "__func__")
+            related = (method_function, method_self)
+            if inspect_method_receiver:
+                related = (
+                    *related,
+                    *_function_bound_reference_values(method_function, method_self),
+                )
         elif value_type is functools.partial:
             related = (
                 object.__getattribute__(value, "func"),
@@ -602,7 +758,12 @@ def _references_target(
         elif value_type is types.BuiltinMethodType:
             related = (object.__getattribute__(value, "__self__"),)
         elif value_type is types.ModuleType:
-            return False
+            if inspect_global_object:
+                return False
+            state = types.ModuleType.__getattribute__(value, "__dict__")
+            if type(state) is not dict or len(state) > _SNAPSHOT_ITEMS_MAX:
+                raise ValueError
+            related = state.values()
         elif (
             any(
                 owner is container_type
@@ -634,6 +795,7 @@ def _references_target(
                         active,
                         budget,
                         inspect_global_object or item_is_global,
+                        inspect_method_receiver and value_type is not types.MethodType,
                         max_nodes,
                         trusted_objects,
                     )
