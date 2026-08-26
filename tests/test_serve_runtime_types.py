@@ -588,6 +588,48 @@ def _unicode_property_tools():
     )
 
 
+def _runtime_tool_history(call_id: str) -> list[dict[str, Any]]:
+    return [
+        {"role": "user", "content": "weather"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": call_id, "content": "ok"},
+    ]
+
+
+@pytest.mark.parametrize("field", ["call", "result"])
+def test_packaged_tool_history_rejects_surrogate_call_ids_before_cache(field: str) -> None:
+    messages = _runtime_tool_history("call_1")
+    if field == "call":
+        messages[1]["tool_calls"][0]["id"] = "call_\ud800"
+    else:
+        messages[2]["tool_call_id"] = "call_\ud800"
+
+    with pytest.raises(RuntimeConfigurationError, match="cannot contain an unpaired surrogate"):
+        GenerationRequest(messages=messages)
+
+
+def test_packaged_prompt_cache_key_accepts_non_bmp_tool_call_ids() -> None:
+    messages = _runtime_tool_history("call_🌦")
+    request = GenerationRequest(messages=messages)
+    preparer = PromptPreparer(EngineConfig(model="model", prompt_cache_size=1), _Tokenizer(), None)
+
+    key = preparer._cache_key(request, request.messages, False)
+
+    assert key is not None
+    assert key == preparer._cache_key(request, request.messages, False)
+    assert messages == _runtime_tool_history("call_🌦")
+
+
 def test_packaged_prompt_cache_key_utf8_encodes_accepted_tool_declarations() -> None:
     request = GenerationRequest(
         messages=[{"role": "user", "content": "weather"}],
@@ -953,6 +995,26 @@ def test_qwen3_coder_stream_parser_buffers_candidates_and_falls_back_exactly() -
     assert parsed.calls[0].name == "weather"
 
 
+def test_historical_integer_lexeme_limit_detaches_exactly_and_rejects_overflow() -> None:
+    literal = "9" * 1024
+    messages = _runtime_tool_history("call_1")
+    messages[1]["tool_calls"][0]["function"]["arguments"] = '{"value":' + literal + "}"
+    request = GenerationRequest(messages=messages)
+
+    converted = detached_template_messages(request.messages)
+
+    assert str(converted[1]["tool_calls"][0]["function"]["arguments"]["value"]) == literal
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == '{"value":' + literal + "}"
+
+    for digits in (1025, 5000):
+        rejected = _runtime_tool_history("call_1")
+        rejected[1]["tool_calls"][0]["function"]["arguments"] = '{"value":' + "9" * digits + "}"
+        with pytest.raises(RuntimeConfigurationError) as raised:
+            GenerationRequest(messages=rejected)
+        assert "1024-digit limit" in str(raised.value)
+        assert "Exceeds the limit (4300 digits)" not in str(raised.value)
+
+
 def test_detached_history_arguments_are_objects_without_caller_mutation() -> None:
     messages = [
         {
@@ -1019,7 +1081,12 @@ def test_detached_history_arguments_preserve_exact_decimals() -> None:
 def test_cached_qwen35_template_renders_boundary_nested_history_without_mutation() -> None:
     from transformers import AutoTokenizer
 
-    arguments = '{"exact":9007199254740993.0,"nested":{"items":[{"values":[{"leaf":[[0]]}]}]}}'
+    integer = "9" * 1024
+    arguments = (
+        '{"exact":9007199254740993.0,"integer":'
+        + integer
+        + ',"nested":{"items":[{"values":[{"leaf":[[0]]}]}]}}'
+    )
     messages = [
         {"role": "user", "content": "weather"},
         {
@@ -1051,6 +1118,7 @@ def test_cached_qwen35_template_renders_boundary_nested_history_without_mutation
     )
 
     assert "<parameter=exact>\n9007199254740993.0\n</parameter>" in rendered
+    assert f"<parameter=integer>\n{integer}\n</parameter>" in rendered
     assert '"leaf": [[0]]' in rendered
     assert messages == original
 

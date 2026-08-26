@@ -38,7 +38,8 @@ _MAX_SCHEMA_DEPTH = 8
 _MAX_SCHEMA_NODES = 512
 _MAX_ENUM_VALUES = 128
 _MAX_ENUM_NODES = _MAX_ENUM_VALUES * _MAX_SCHEMA_NODES
-_MAX_FIXED_DECIMAL_DIGITS = 1024
+_MAX_FIXED_DECIMAL_DIGITS = _MAX_NUMERIC_LITERAL_DIGITS = 1024
+_NUMERIC_LITERAL_ERROR = f"numeric literal exceeds {_MAX_NUMERIC_LITERAL_DIGITS}-digit limit"
 _MAX_TOOL_STOP_COMPARISON_CHARS = 16 * 1024 * 1024
 _SCHEMA_TYPES = frozenset({"array", "boolean", "integer", "null", "number", "object", "string"})
 _SCHEMA_KEYS = frozenset(
@@ -55,7 +56,7 @@ class FunctionTool:
     parameters: dict[str, Any]
 
     def wire(self) -> dict[str, Any]:
-        function: dict[str, Any] = {"name": self.name, "parameters": self.parameters}
+        function = {"name": self.name, "parameters": self.parameters}
         if self.description is not None:
             function["description"] = self.description
         return {"type": "function", "function": function}
@@ -135,7 +136,6 @@ class ToolCallStreamParser:
 
     def finish(self) -> ToolParseResult:
         """parse a complete candidate or return every retained byte as content."""
-
         pending, self._pending = self._pending, ""
         if not pending:
             return ToolParseResult(content=None, calls=())
@@ -151,7 +151,6 @@ def normalize_tools(
     value: object, *, error_type: type[Exception] = ValueError
 ) -> tuple[FunctionTool, ...]:
     """validate and detach the supported closed function-tool declaration list."""
-
     if type(value) is not list or not value:
         raise error_type("tools must be a nonempty array of function declarations")
     if len(value) > _MAX_TOOLS:
@@ -199,9 +198,7 @@ def normalize_tools(
 
 def tools_wire(tools: Sequence[FunctionTool] | None) -> list[dict[str, Any]] | None:
     """return a detached OpenAI wire representation."""
-    if tools is None:
-        return None
-    return [tool.wire() for tool in tools]
+    return None if tools is None else [tool.wire() for tool in tools]
 
 
 def tools_active(tools: object, tool_choice: str | None) -> bool:
@@ -486,6 +483,8 @@ def _validate_history_calls(
         call_id = raw["id"]
         if type(call_id) is not str or not call_id or call_id != call_id.strip():
             raise error_type(f"{path} id must be a nonempty unpadded string")
+        if _contains_unpaired_surrogate(call_id):
+            raise error_type(f"{path} id cannot contain an unpaired surrogate")
         if call_id in all_ids:
             raise error_type(f"{path} id is duplicated")
         all_ids.add(call_id)
@@ -503,6 +502,8 @@ def _validate_history_calls(
         except RecursionError as exc:
             raise error_type(f"{path} exceeds the supported tool argument complexity") from exc
         except ValueError as exc:
+            if str(exc).startswith("numeric literal exceeds"):
+                raise error_type(f"{path} {exc}") from exc
             raise error_type(f"{path} function arguments must encode a JSON object") from exc
         _validate_json_value_complexity(
             decoded,
@@ -529,6 +530,10 @@ def _validate_tool_result(
     call_id = message.get("tool_call_id")
     if type(call_id) is not str or not call_id:
         raise error_type(f"message {message_index} tool_call_id must be a nonempty string")
+    if _contains_unpaired_surrogate(call_id):
+        raise error_type(
+            f"message {message_index} tool_call_id cannot contain an unpaired surrogate"
+        )
     if call_id not in pending:
         raise error_type(f"message {message_index} references an unknown tool call id")
     if call_id in resolved:
@@ -706,7 +711,7 @@ def _coerce_value(value: str, schema_type: str) -> Any:
     if schema_type in {"array", "integer", "number", "object"}:
         try:
             return _load_exact_json(value)
-        except (TypeError, ValueError):
+        except (RecursionError, TypeError, ValueError):
             return value
     return value
 
@@ -770,18 +775,15 @@ def _decimal_is_integral(value: Decimal) -> bool:
     if not value.is_finite():
         return False
     digits, exponent = value.as_tuple().digits, value.as_tuple().exponent
-    if exponent >= 0:
-        return True
-    fractional_digits = -exponent
-    return all(digit == 0 for digit in digits[-fractional_digits:])
+    return exponent >= 0 or all(digit == 0 for digit in digits[exponent:])
 
 
 def _load_exact_json(value: str) -> Any:
     try:
         decoded = json.loads(
             value,
-            parse_float=Decimal,
-            parse_int=int,
+            parse_float=_parse_decimal_literal,
+            parse_int=_parse_integer_literal,
             parse_constant=_raise_nonfinite,
             object_pairs_hook=_unique_json_object,
         )
@@ -793,8 +795,7 @@ def _load_exact_json(value: str) -> Any:
 
 
 def _decode_json_object(value: str) -> dict[str, Any]:
-    decoded = _load_exact_json(value)
-    if type(decoded) is not dict:
+    if type(decoded := _load_exact_json(value)) is not dict:
         raise ValueError("arguments are not an object")
     return decoded
 
@@ -813,11 +814,8 @@ def _template_json_object(value: str) -> dict[str, Any]:
 def _contains_decimal(value: Any) -> bool:
     if type(value) is Decimal:
         return True
-    if type(value) is list:
-        return any(_contains_decimal(nested) for nested in value)
-    if type(value) is dict:
-        return any(_contains_decimal(nested) for nested in value.values())
-    return False
+    nested = value if type(value) is list else value.values() if type(value) is dict else ()
+    return any(_contains_decimal(item) for item in nested)
 
 
 def _contains_unpaired_surrogate(value: Any) -> bool:
@@ -830,9 +828,19 @@ def _contains_unpaired_surrogate(value: Any) -> bool:
         elif type(nested) is list:
             stack.extend(nested)
         elif type(nested) is dict:
-            stack.extend(nested)
-            stack.extend(nested.values())
+            stack.extend((*nested, *nested.values()))
     return False
+
+
+def _parse_decimal_literal(value: str) -> Decimal:
+    digits = value.lower().lstrip("-").partition("e")[0].replace(".", "")
+    if len(digits) > _MAX_NUMERIC_LITERAL_DIGITS:
+        raise ValueError(_NUMERIC_LITERAL_ERROR)
+    return Decimal(value)
+
+
+def _parse_integer_literal(value: str) -> int:
+    return int(_parse_decimal_literal(value))
 
 
 def _raise_nonfinite(value: str) -> None:
@@ -854,10 +862,7 @@ def _json_value_fingerprint(value: Any) -> tuple[Any, ...]:
     if type(value) is list:
         return ("array", *(_json_value_fingerprint(item) for item in value))
     if type(value) is dict:
-        return (
-            "object",
-            *((key, _json_value_fingerprint(value[key])) for key in sorted(value)),
-        )
+        return ("object", *((key, _json_value_fingerprint(value[key])) for key in sorted(value)))
     return (type(value).__name__, value)
 
 
@@ -883,9 +888,7 @@ def _is_json_number(value: Any) -> bool:
 
 
 def _as_decimal(value: Decimal | float) -> Decimal:
-    if type(value) is Decimal:
-        return value
-    if type(value) is int:
+    if type(value) in {Decimal, int}:
         return Decimal(value)
     return Decimal(json.dumps(value, allow_nan=False))
 
@@ -911,14 +914,11 @@ def _dump_exact_json(value: Any) -> str:
     if type(value) is list:
         return "[" + ",".join(_dump_exact_json(item) for item in value) + "]"
     if type(value) is dict:
-        return (
-            "{"
-            + ",".join(
-                f"{json.dumps(key, ensure_ascii=False)}:{_dump_exact_json(item)}"
-                for key, item in value.items()
-            )
-            + "}"
+        members = (
+            f"{json.dumps(key, ensure_ascii=False)}:{_dump_exact_json(item)}"
+            for key, item in value.items()
         )
+        return "{" + ",".join(members) + "}"
     raise TypeError(f"unsupported exact JSON value {type(value).__name__}")
 
 
@@ -955,9 +955,9 @@ def _json_copy(value: Any, path: str, error_type: type[Exception]) -> Any:
 
 
 def _identifier_name(value: object, path: str, error_type: type[Exception]) -> str:
-    if type(value) is not str or _NAME_RE.fullmatch(value) is None:
-        raise error_type(f"{path} is invalid")
-    return value
+    if type(value) is str and _NAME_RE.fullmatch(value) is not None:
+        return value
+    raise error_type(f"{path} is invalid")
 
 
 def _string_enum_conflicts_with_tool_grammar(value: str) -> bool:

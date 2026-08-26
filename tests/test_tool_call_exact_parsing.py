@@ -929,3 +929,71 @@ def test_valid_non_bmp_surrogate_pairs_remain_structured(
     assert json.loads(result.calls[0].arguments) == {parameter_name: expected}
     assert "😀" in result.calls[0].arguments
     result.calls[0].arguments.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("parameter_name", "raw_value"),
+    [
+        ("nested", '{"text":' + '{"child":' * 1100 + '"leaf"' + "}" * 1100 + "}"),
+        ("values", "[" * 1100 + '"leaf"' + "]" * 1100),
+    ],
+    ids=["object", "array"],
+)
+def test_generated_decoder_recursion_falls_back_exactly_buffered_and_streaming(
+    parameter_name: str,
+    raw_value: str,
+) -> None:
+    text = (
+        "<tool_call><function=store>"
+        f"<parameter={parameter_name}>{raw_value}</parameter>"
+        "</function></tool_call>"
+    )
+
+    buffered = parse_qwen3_coder_output(text, _delimiter_tools())
+    parser = ToolCallStreamParser(_delimiter_tools())
+    assert all(parser.feed(character) == "" for character in text)
+    streamed = parser.finish()
+
+    assert buffered == streamed
+    assert buffered.content == text
+    assert buffered.calls == ()
+
+
+@pytest.mark.parametrize("schema_parameter", ["scalar", "count"], ids=["number", "integer"])
+def test_generated_integer_lexeme_digit_boundary_is_exact_buffered_and_streaming(
+    schema_parameter: str,
+) -> None:
+    literal = "9" * 1024
+    original = "9007199254740993.0" if schema_parameter == "scalar" else "2"
+    text = _exact_call().replace(
+        f"<parameter={schema_parameter}>{original}</parameter>",
+        f"<parameter={schema_parameter}>{literal}</parameter>",
+    )
+
+    buffered = parse_qwen3_coder_output(text, _exact_tools(), id_factory=lambda: "call_fixed")
+    parser = ToolCallStreamParser(_exact_tools(), id_factory=lambda: "call_fixed")
+    assert all(parser.feed(character) == "" for character in text)
+    streamed = parser.finish()
+
+    assert buffered == streamed
+    assert f'"{schema_parameter}":{literal}' in buffered.calls[0].arguments
+
+
+@pytest.mark.parametrize("digits", [1025, 5000], ids=["first-over-limit", "python-cap-proof"])
+def test_generated_oversize_integer_lexemes_fall_back_without_interpreter_errors(
+    digits: int,
+) -> None:
+    literal = "9" * digits
+    text = _exact_call().replace(
+        "<parameter=count>2</parameter>",
+        f"<parameter=count>{literal}</parameter>",
+    )
+
+    buffered = parse_qwen3_coder_output(text, _exact_tools())
+    parser = ToolCallStreamParser(_exact_tools())
+    assert all(parser.feed(character) == "" for character in text)
+    streamed = parser.finish()
+
+    assert buffered == streamed
+    assert buffered.content == text
+    assert buffered.calls == ()

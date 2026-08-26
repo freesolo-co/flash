@@ -160,20 +160,20 @@ def _tool_payload() -> list[dict[str, Any]]:
     ]
 
 
-def _historical_tool_messages(argument: str) -> list[dict[str, Any]]:
+def _historical_tool_messages(argument: str, call_id: str = "call_1") -> list[dict[str, Any]]:
     return [
         {
             "role": "assistant",
             "content": None,
             "tool_calls": [
                 {
-                    "id": "call_1",
+                    "id": call_id,
                     "type": "function",
                     "function": {"name": "weather", "arguments": argument},
                 }
             ],
         },
-        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        {"role": "tool", "tool_call_id": call_id, "content": "ok"},
     ]
 
 
@@ -496,6 +496,59 @@ def test_hosted_tool_history_accepts_valid_non_bmp_pair_and_serializes() -> None
     request = OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
 
     request.model_dump_json()
+
+
+@pytest.mark.parametrize("field", ["call", "result"])
+def test_hosted_tool_history_rejects_surrogate_call_ids_before_cache(field: str) -> None:
+    messages = _historical_tool_messages("{}")
+    if field == "call":
+        messages[0]["tool_calls"][0]["id"] = "call_\ud800"
+    else:
+        messages[1]["tool_call_id"] = "call_\ud800"
+
+    with pytest.raises(ValidationError, match="cannot contain an unpaired surrogate"):
+        OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
+
+
+def test_hosted_tool_history_accepts_non_bmp_call_ids_and_serializes() -> None:
+    messages = _historical_tool_messages("{}", call_id="call_🌦")
+
+    request = OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
+
+    assert request.messages == messages
+    request.model_dump_json().encode("utf-8")
+    engine = _engine(_BufferedChoiceEngine())
+    engine._prompt_cache_size = 1
+    assert engine._prompt_cache_key(request, thinking_default=False) is not None
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"value":' + "[" * 1100 + "0" + "]" * 1100 + "}",
+        '{"value":' + '{"child":' * 1100 + "0" + "}" * 1100 + "}",
+    ],
+    ids=["array", "object"],
+)
+def test_hosted_historical_decoder_recursion_is_a_request_error(argument: str) -> None:
+    with pytest.raises(ValidationError, match="supported tool argument complexity"):
+        OpenAIGenerateRequest.model_validate(
+            {"adapter_id": "adapter", "messages": _historical_tool_messages(argument)}
+        )
+
+
+@pytest.mark.parametrize("digits", [1025, 5000], ids=["first-over-limit", "python-cap-proof"])
+def test_hosted_historical_integer_limit_is_explicit(digits: int) -> None:
+    argument = '{"value":' + "9" * digits + "}"
+
+    with pytest.raises(ValidationError) as raised:
+        OpenAIGenerateRequest.model_validate(
+            {"adapter_id": "adapter", "messages": _historical_tool_messages(argument)}
+        )
+
+    message = str(raised.value)
+    assert "1024-digit limit" in message
+    assert "Exceeds the limit (4300 digits)" not in message
 
 
 def test_hosted_message_validation_preserves_non_tool_and_active_tool_requests() -> None:
