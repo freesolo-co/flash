@@ -86,12 +86,11 @@ def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypat
         "cleanupComplete": False,
     }
 
-    status.last_heartbeat = {
-        "attempt": 0,
-        "stage": "sft_step",
-        "step": 1,
-    }
-    runner_state._save_status(status)
+    runner_status.record_heartbeat(
+        status.run_id,
+        {"attempt": 0, "stage": "sft_step", "step": 1},
+    )
+    status = runner_status.get_status(status.run_id)
     assert _report(monkeypatch, status)["lifecycle"] == {
         "started": True,
         "progressed": True,
@@ -121,14 +120,20 @@ def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypat
 
     status.state = "deployed"
     runner_state._save_status(status)
-    assert _report(monkeypatch, status)["lifecycle"]["artifactsComplete"] is True
+    deployed_lifecycle = _report(monkeypatch, status)["lifecycle"]
+    assert deployed_lifecycle["artifactsComplete"] is True
+    assert deployed_lifecycle["cleanupComplete"] is False
 
     status.state = "done"
     status.lifecycle_started_attempt = 0
+    status.lifecycle_progressed_attempt = 0
+    status.cleanup_confirmed_remote = status.remote
     status.realized_cost_remote = status.remote
     status.remote = None
     runner_state._save_status(status, _cleanup_remotes=None)
     assert "lifecycle_started_attempt" not in status.to_dict()
+    assert "lifecycle_progressed_attempt" not in status.to_dict()
+    assert "cleanup_confirmed_remote" not in status.to_dict()
     assert "realized_cost_remote" not in status.to_dict()
     assert _report(monkeypatch, status)["lifecycle"] == {
         "started": True,
@@ -136,6 +141,10 @@ def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypat
         "artifactsComplete": True,
         "cleanupComplete": True,
     }
+
+    status.state = "deployed"
+    runner_state._save_status(status)
+    assert _report(monkeypatch, status)["lifecycle"]["cleanupComplete"] is True
 
     runner_costs.record_realized_cost(
         status.run_id,
@@ -167,8 +176,12 @@ def test_progress_projects_each_training_algorithm(
     status = _status(spec)
     status.state = "running"
     status.remote = _remote()
-    status.last_heartbeat = {"attempt": 0, "stage": stage, "step": 1}
     runner_state._save_status(status)
+    runner_status.record_heartbeat(
+        status.run_id,
+        {"attempt": 0, "stage": stage, "step": 1},
+    )
+    status = runner_status.get_status(status.run_id)
 
     lifecycle = _report(monkeypatch, status)["lifecycle"]
     assert lifecycle["started"] is True
@@ -227,6 +240,37 @@ def test_checkpoint_heartbeat_preserves_exact_progress_evidence(monkeypatch, tmp
     persisted = runner_status.get_status(spec.run_id)
     assert _report(monkeypatch, persisted)["lifecycle"]["progressed"] is True
     assert "lifecycle_progress" not in persisted.to_dict()["last_heartbeat"]
+
+
+def test_progress_remains_true_across_provider_retry(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    spec = _spec(algorithm="sft")
+    status = _status(spec)
+    status.state = "running"
+    status.remote = _remote(attempt=0)
+    status.lifecycle_started_attempt = 0
+    runner_state._save_status(status)
+
+    runner_status.record_heartbeat(
+        spec.run_id,
+        {"attempt": 0, "stage": "sft_step", "step": 1},
+    )
+    assert runner_status._update(
+        spec.run_id,
+        "running",
+        remote=_remote(attempt=1, endpoint_id="endpoint-2"),
+        lifecycle_started_attempt=1,
+    )
+    runner_status.record_heartbeat(
+        spec.run_id,
+        {"attempt": 1, "stage": "booting"},
+    )
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.lifecycle_started_attempt == 0
+    assert persisted.lifecycle_progressed_attempt == 0
+    assert _report(monkeypatch, persisted)["lifecycle"]["progressed"] is True
 
 
 def test_checkpoint_heartbeat_rejects_stale_or_mismatched_progress_evidence(monkeypatch, tmp_path):

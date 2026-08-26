@@ -1239,8 +1239,8 @@ def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monke
     )
     assert metrics["train_tokens"] == 4096
     assert submitted_gpus == ["RTX 4090", "H100"]
-    assert cancelled == [("ep1", "j1")]
-    assert "ep1" in deleted
+    assert cancelled == [("ep1", "j1"), ("ep2", "j2")]
+    assert deleted == ["ep1", "ep2"]
     assert "walking past the cheapest class" in log.getvalue()
 
 
@@ -1780,7 +1780,9 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     assert lam_gpus == ["A10"]  # broken Lambda instance tried once...
     assert rp_gpus == ["H100"]  # ...then escaped cross-provider to RunPod
     assert "i-broken" in terminated  # sick instance torn down before the retry
-    assert runner_status.get_status(spec.run_id).remote["provider"] == "runpod"
+    status = runner_status.get_status(spec.run_id)
+    assert status.remote is None
+    assert status.realized_cost_remote["provider"] == "runpod"
 
 
 def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
@@ -1831,7 +1833,9 @@ def test_no_liveness_stalled_escapes_to_other_provider(orch, monkeypatch):
     assert metrics["train_tokens"] == 4096
     assert lam_gpus == ["H100"]  # sick region tried once...
     assert rp_gpus == ["H100"]  # ...then escaped cross-provider to RunPod
-    assert runner_status.get_status(spec.run_id).remote["provider"] == "runpod"
+    status = runner_status.get_status(spec.run_id)
+    assert status.remote is None
+    assert status.realized_cost_remote["provider"] == "runpod"
 
 
 def test_genuine_worker_error_does_not_retry(orch, monkeypatch):

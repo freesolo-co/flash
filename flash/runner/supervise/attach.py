@@ -806,7 +806,8 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     status = get_status(run_id)
     if status.state in TERMINAL_STATES:
         return status
-    if not status.remote:
+    confirmed_teardown = status.remote is None and status.cleanup_confirmed_remote is not None
+    if not status.remote and not confirmed_teardown:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
 
     # seed from the lossy public view so the except/finally handlers always have a spec, then
@@ -816,7 +817,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     except Exception as exc:
         # this parse is above the try below, so a raise here escapes every handler.
         return _fail_unparseable_attach(run_id, status, exc, log_stream or sys.stderr)
-    persisted_remote = dict(status.remote)
+    persisted_remote = dict(status.remote or status.cleanup_confirmed_remote)
     next_attempt = 0
     source_snapshot = None
     log = log_stream or sys.stderr
@@ -828,6 +829,16 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         context = _build_attach_context(worker_spec, persisted_remote)
         next_attempt = context.next_attempt
         source_snapshot = context.source_snapshot
+        if confirmed_teardown:
+            return _resume_after_confirmed_teardown(
+                run_id,
+                worker_spec,
+                persisted_remote,
+                next_attempt,
+                source_snapshot,
+                log,
+                failure="persisted cleanup confirmed the worker was torn down",
+            )
         try:
             poll_spec = _spec_with_remaining_wall(worker_spec, require_provider_minimum=False)
         except RuntimeError as exc:

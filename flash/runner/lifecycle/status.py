@@ -299,18 +299,28 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             prev_metrics = prev.get("metrics_last") if isinstance(prev, dict) else None
             if same_attempt and isinstance(prev_metrics, list) and prev_metrics:
                 hb["metrics_last"] = prev_metrics
-        if isinstance(hb, dict) and same_attempt:
-            previous_progress = prev.get(state._LIFECYCLE_PROGRESS_KEY)
-            if isinstance(previous_progress, dict):
-                hb[state._LIFECYCLE_PROGRESS_KEY] = previous_progress
-        if isinstance(hb, dict) and hb.get("stage") in state._TRAINING_STAGES:
+        if isinstance(hb, dict) and status.lifecycle_progressed_attempt is None:
+            expected_stage = {
+                "sft": "sft_step",
+                "grpo": "rl_step",
+                "opd": "opd_step",
+            }.get(status.spec.get("algorithm"))
+            attempt = hb.get("attempt")
+            remote_attempt = (
+                status.remote.get("attempt") if isinstance(status.remote, dict) else None
+            )
             step = hb.get("step")
-            if isinstance(step, int) and not isinstance(step, bool) and step >= 1:
-                hb[state._LIFECYCLE_PROGRESS_KEY] = {
-                    "attempt": hb.get("attempt"),
-                    "stage": hb.get("stage"),
-                    "step": step,
-                }
+            if (
+                hb.get("stage") == expected_stage
+                and attempt == remote_attempt
+                and isinstance(attempt, int)
+                and not isinstance(attempt, bool)
+                and attempt >= 0
+                and isinstance(step, int)
+                and not isinstance(step, bool)
+                and step >= 1
+            ):
+                status.lifecycle_progressed_attempt = attempt
         status.last_heartbeat = hb
         # carried forward on the same rule as the metric backlog above, and for the same reason: most
         # heartbeats carry no `gpu` at all -- only the periodic liveness tick and the terminal ones do
@@ -442,6 +452,11 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
         if not was_terminal and new_state in state.TERMINAL_STATES and status.finished_at is None:
             status.finished_at = status.updated_at
         for key, value in updates.items():
+            if (
+                key in {"lifecycle_started_attempt", "lifecycle_progressed_attempt"}
+                and getattr(status, key) is not None
+            ):
+                continue
             setattr(status, key, value)
         state._save_status_unlocked(status)
         report_status = status

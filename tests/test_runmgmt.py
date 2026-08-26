@@ -808,7 +808,10 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
 
     assert metrics["wall_seconds"] == 1.0
     assert provider.attempts == [0, 1]
-    assert runner_status.get_status(spec.run_id).remote["attempt"] == 1
+    status = runner_status.get_status(spec.run_id)
+    assert status.remote is None
+    assert status.cleanup_confirmed_remote["attempt"] == 1
+    assert status.realized_cost_remote["attempt"] == 1
 
 
 def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monkeypatch, tmp_path):
@@ -1799,6 +1802,74 @@ def test_reserved_attempt_survives_handleless_restart_without_reusing_zero(monke
     raw = runner_status._load_status_json(spec.run_id)
     assert raw[runner_state._NEXT_ATTEMPT_KEY] == 2
     assert raw[runner_state._RUN_DEADLINE_AT_KEY] == 300.0
+
+
+def test_attach_resumes_after_cleanup_drain_clears_classified_remote(monkeypatch, tmp_path):
+    import io
+
+    from flash.core.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(
+        run_id="attach-cleanup-race",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1, max_wall_seconds=200),
+    )
+    remote = _runpod_remote("endpoint-old", "job-old", attempt=0)
+    status = provisioned_status(spec, state="running", created_at=100.0, remote=remote)
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    status.cleanup_confirmed_remote = remote
+    status.realized_cost_remote = remote
+    status.remote = None
+    runner_state._save_status(
+        status,
+        _run_deadline_at=300.0,
+        _next_attempt=1,
+    )
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 100.0)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+    resumed = []
+
+    def fake_run_training(_spec, _log, **kwargs):
+        resumed.append(kwargs["attempt_start"])
+
+    monkeypatch.setattr(runner_lifecycle, "_run_training", fake_run_training)
+
+    attached = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert resumed == [1]
+    assert attached.state == "running"
+    assert attached.remote is None
+    assert attached.cleanup_confirmed_remote is None
+    assert attached.realized_cost_remote is None
+
+
+def test_confirmed_cleanup_can_fail_a_nonretryable_run(monkeypatch, tmp_path):
+    from flash.core.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-cleanup-no-retry",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=0, max_wall_seconds=200),
+    )
+    remote = _runpod_remote("endpoint-old", "job-old", attempt=0)
+    status = provisioned_status(spec, state="running", remote=None)
+    status.cleanup_confirmed_remote = remote
+    runner_state._save_status(status)
+
+    assert runner_reconciliation._compare_and_fail_remote(
+        spec.run_id,
+        remote,
+        "persisted cleanup confirmed the worker was torn down",
+    )
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.state == "failed"
+    assert persisted.remote is None
+    assert persisted.cleanup_confirmed_remote == remote
 
 
 def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tmp_path):

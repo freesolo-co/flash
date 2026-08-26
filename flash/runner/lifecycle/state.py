@@ -114,7 +114,6 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
 # GRPO rollout can be ~17 min, an opd step waits on the teacher round-trips) streams one of these
 # stages with NO step yet -- still real GPU time.
 _TRAINING_STAGES = frozenset({"rl_step", "sft_step", "opd_step"})
-_LIFECYCLE_PROGRESS_KEY = "lifecycle_progress"
 
 
 @dataclass
@@ -134,8 +133,11 @@ class RunStatus:
     adapter_ref: str | None = None
     deployment: dict | None = None
     remote: dict | None = None
-    # private canonical attempt proof stamped only with the first durable provider-handle write.
+    # private canonical attempt proofs stamped once when each lifecycle milestone is first observed.
     lifecycle_started_attempt: int | None = None
+    lifecycle_progressed_attempt: int | None = None
+    # exact provider handle whose teardown was confirmed independently of retained billing identity.
+    cleanup_confirmed_remote: dict | None = None
     # exact torn-down provider handle retained only until delayed realized-cost reconciliation. it is
     # private, is not an active resource, and is cleared when reconciliation succeeds.
     realized_cost_remote: dict | None = None
@@ -180,13 +182,14 @@ class RunStatus:
         data["spec"] = _public_status_spec(data.get("spec"))
         data.pop("report_sequence", None)
         data.pop("lifecycle_started_attempt", None)
+        data.pop("lifecycle_progressed_attempt", None)
+        data.pop("cleanup_confirmed_remote", None)
         data.pop("realized_cost_remote", None)
         # internal warm-start preparation (storage locators, digests) never leaves the server
         data.pop("effective_preparation", None)
         heartbeat = data.get("last_heartbeat")
         if isinstance(heartbeat, dict):
             heartbeat.pop("source_provenance", None)
-            heartbeat.pop(_LIFECYCLE_PROGRESS_KEY, None)
         source_snapshot = data.pop("source_snapshot", None)
         data.pop("source_verified_attempt", None)
         if source_snapshot is not None:

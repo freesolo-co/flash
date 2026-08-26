@@ -94,38 +94,10 @@ def _canonical_remote_attempt(remote: object) -> int | None:
     return attempt
 
 
-def _progressed(raw: dict[str, Any], remote_attempt: int | None) -> bool:
-    if remote_attempt is None:
-        return False
-    spec = raw.get("spec")
-    heartbeat = raw.get("last_heartbeat")
-    if not isinstance(spec, dict) or not isinstance(heartbeat, dict):
-        return False
-    expected_stage = {
-        "sft": "sft_step",
-        "grpo": "rl_step",
-        "opd": "opd_step",
-    }.get(spec.get("algorithm"))
-    if expected_stage is None:
-        return False
-    from flash.runner.lifecycle.state import _LIFECYCLE_PROGRESS_KEY
-
-    evidence = heartbeat.get(_LIFECYCLE_PROGRESS_KEY, heartbeat)
-    if not isinstance(evidence, dict) or evidence.get("stage") != expected_stage:
-        return False
-    attempt = evidence.get("attempt")
-    try:
-        from flash.providers._lifecycle.instances.poll import is_training_heartbeat
-
-        step_complete = is_training_heartbeat(expected_stage, evidence.get("step"))
-    except Exception:
-        return False
-    return (
-        step_complete
-        and isinstance(attempt, int)
-        and not isinstance(attempt, bool)
-        and attempt == remote_attempt
-    )
+def _valid_attempt(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _validated_terminal_source(raw: dict[str, Any]) -> bool:
@@ -157,15 +129,12 @@ def _lifecycle_projection(status: Any, public_status: dict[str, Any]) -> dict[st
         return lifecycle
 
     remote_attempt = _canonical_remote_attempt(raw.get("remote") or raw.get("realized_cost_remote"))
-    started_attempt = raw.get("lifecycle_started_attempt")
-    if (
-        isinstance(started_attempt, bool)
-        or not isinstance(started_attempt, int)
-        or started_attempt < 0
-    ):
+    started_attempt = _valid_attempt(raw.get("lifecycle_started_attempt"))
+    if started_attempt is None:
         started_attempt = remote_attempt
+    progressed_attempt = _valid_attempt(raw.get("lifecycle_progressed_attempt"))
     lifecycle["started"] = started_attempt is not None
-    lifecycle["progressed"] = _progressed(raw, started_attempt)
+    lifecycle["progressed"] = started_attempt is not None and progressed_attempt is not None
 
     adapter_ref = public_status.get("adapter_ref")
     artifacts_dir = raw.get("artifacts_dir")
@@ -180,7 +149,7 @@ def _lifecycle_projection(status: Any, public_status: dict[str, Any]) -> dict[st
 
     cleanup_remotes = raw.get("cleanup_remotes", [])
     lifecycle["cleanupComplete"] = (
-        raw.get("state") in {"done", "failed", "cancelled", "dry_run"}
+        raw.get("state") in {"done", "failed", "cancelled", "dry_run", "deployed"}
         and raw.get("remote") is None
         and isinstance(cleanup_remotes, list)
         and not cleanup_remotes

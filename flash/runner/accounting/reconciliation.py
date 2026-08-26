@@ -15,7 +15,6 @@ from flash.runner.lifecycle.state import RunStatus
 # above: runpod carries `endpoint_id`, lambda and vast carry `instance_id`. a record holding one of
 # these still has something to delete even when the rest of it fails strict validation.
 _RESOURCE_ID_FIELDS = ("endpoint_id", "instance_id")
-_REALIZED_COST_STATES = frozenset({"done", "failed", "cancelled", "deployed"})
 
 
 def _remote_resource_identity(remote: object) -> tuple | None:
@@ -80,9 +79,16 @@ def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
         status = status_ops.get_status(run_id)
         if status.state in state.TERMINAL_STATES:
             return False
-        if not _expected_remote_matches(status.remote, expected_remote):
+        if _expected_remote_matches(status.remote, expected_remote):
+            status.remote = None
+        elif status.remote is None and _expected_remote_matches(
+            status.cleanup_confirmed_remote, expected_remote
+        ):
+            status.cleanup_confirmed_remote = None
+            if _expected_remote_matches(status.realized_cost_remote, expected_remote):
+                status.realized_cost_remote = None
+        else:
             return False
-        status.remote = None
         status.updated_at = time.time()
         state._save_status_unlocked(status)
         report_status = status
@@ -127,7 +133,10 @@ def _compare_and_fail_remote(
         status = status_ops.get_status(run_id)
         if status.state in state.TERMINAL_STATES:
             return False
-        if not _expected_remote_matches(status.remote, expected_remote):
+        if not _expected_remote_matches(status.remote, expected_remote) and not (
+            status.remote is None
+            and _expected_remote_matches(status.cleanup_confirmed_remote, expected_remote)
+        ):
             return False
         status.state = "failed"
         status.error = error
@@ -138,11 +147,11 @@ def _compare_and_fail_remote(
         report_status = status
     confirmed = status_ops.get_status(run_id)
     expected_after = expected_remote
-    if (
-        confirmed.state != "failed"
-        or not _expected_remote_matches(confirmed.remote, expected_after)
-        or confirmed.error != error
-    ):
+    expected_still_owned = _expected_remote_matches(confirmed.remote, expected_after) or (
+        confirmed.remote is None
+        and _expected_remote_matches(confirmed.cleanup_confirmed_remote, expected_after)
+    )
+    if confirmed.state != "failed" or not expected_still_owned or confirmed.error != error:
         raise RuntimeError("terminal recovery failure was not durably confirmed")
     if report_status is not None:
         reporting._report_status(report_status)
@@ -280,7 +289,8 @@ def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bo
             if len(remaining) == len(records):
                 return False
         if _teardown_removal_key(status.remote) == expected_key:
-            if status.state in _REALIZED_COST_STATES and status.reconciled_at is None:
+            status.cleanup_confirmed_remote = dict(status.remote)
+            if status.reconciled_at is None:
                 status.realized_cost_remote = dict(status.remote)
             status.remote = None
         status.updated_at = time.time()

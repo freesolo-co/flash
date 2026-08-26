@@ -274,6 +274,33 @@ def test_terminal_charge_uses_the_selected_fallback_after_remote_cleanup(monkeyp
     assert captured["body"]["gpu"] == "A100 PCIe"
 
 
+def test_terminal_charge_uses_retained_remote_after_confirmed_cleanup(monkeypatch):
+    from flash.runner.lifecycle.state import RunStatus
+    from flash.server.billing import charges
+
+    captured: dict[str, object] = {}
+
+    def post_billing(*, token, path, body):
+        captured.update(token=token, path=path, body=body)
+        return {"ok": True}
+
+    monkeypatch.setattr(charges, "_post_billing", post_billing)
+    status = RunStatus(
+        run_id="flash-billed-cleanup",
+        state="done",
+        spec={"algorithm": "sft", "model": "m", "gpu": {"type": "RTX 5090"}},
+        remote=None,
+        realized_cost_remote={"provider": "runpod", "allocated_gpu": "A100 PCIe"},
+        billing_context={"org_id": "org-1"},
+        cost_usd=1.25,
+    )
+
+    charges.charge_completed_run(internal_key="internal", status=status)
+
+    assert captured["body"]["provider"] == "runpod"
+    assert captured["body"]["gpu"] == "A100 PCIe"
+
+
 def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
     # Cancelling a deployed run tears down its serve endpoint; the deployment record
     # must flip to "undeployed" so /v1/deployments and /chat stop treating the

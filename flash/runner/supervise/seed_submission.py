@@ -140,7 +140,7 @@ class _SubmitContext:
 
     def return_completed_runpod_metrics(self, metrics: dict) -> dict:
         self.raise_if_cancelled()
-        self.gc_seen_endpoints()
+        _settle_success_remote(self)
         if self.current_gpu.get("name"):
             metrics.setdefault("allocated_gpu", self.current_gpu["name"])
         if self.current_gpu.get("provider"):
@@ -743,10 +743,34 @@ def _run_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt) -> _AttemptOut
     )
 
 
+def _settle_success_remote(ctx: _SubmitContext) -> None:
+    """Track and clear a successful attempt only after exact teardown is confirmed."""
+    if not ctx.last_handle:
+        return
+    from flash.providers.core.base import JobHandle
+    from flash.runner.accounting.reconciliation import (
+        _compare_and_remove_cleanup_remote,
+        _record_cleanup_remote,
+    )
+
+    remote = dict(ctx.last_handle)
+    if not _record_cleanup_remote(ctx.spec.run_id, remote):
+        raise RuntimeError("successful attempt cleanup identity could not be persisted")
+    try:
+        deleted = _lifecycle._strict_teardown_handle(JobHandle.from_dict(remote), ctx.spec.run_id)
+    except Exception:
+        return
+    if deleted:
+        _compare_and_remove_cleanup_remote(ctx.spec.run_id, remote)
+        endpoint_id = remote.get("endpoint_id")
+        if isinstance(endpoint_id, str):
+            ctx.seen_endpoints.pop(endpoint_id, None)
+
+
 def _return_success_metrics(ctx: _SubmitContext, outcome: _AttemptOutcome) -> dict:
     # a late worker success must not resurrect a cancelled run.
     ctx.raise_if_cancelled()
-    ctx.gc_seen_endpoints()
+    _settle_success_remote(ctx)
     metrics = outcome.result.metrics
     if outcome.chosen is not None and isinstance(metrics, dict):
         metrics.setdefault("allocated_gpu", outcome.chosen.gpu)
