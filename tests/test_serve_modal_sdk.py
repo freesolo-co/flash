@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import signal
+import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -619,7 +624,8 @@ def test_fixed_wrapper_uses_packaged_secret_scrubbing_child_boundary(monkeypatch
     from flash.serve.app import launch
 
     class _Exited:
-        def wait(self) -> int:
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout is not None
             return 0
 
     calls = []
@@ -648,7 +654,8 @@ def test_wrapper_returns_while_the_child_still_runs(monkeypatch) -> None:
     class _Running:
         wait_calls = 0
 
-        def wait(self) -> int:
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout is not None
             self.wait_calls += 1
             raise AssertionError("the caller thread waited on a live child")
 
@@ -673,7 +680,8 @@ def _assert_modal_wrapper_signals_parent(monkeypatch, exit_code: int) -> None:
     signals = []
 
     class _Exited:
-        def wait(self) -> int:
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout is not None
             return exit_code
 
     watchers = _defer_modal_watcher(monkeypatch)
@@ -692,6 +700,122 @@ def test_wrapper_signals_parent_after_nonzero_child_exit(monkeypatch) -> None:
 
 def test_wrapper_signals_parent_after_zero_child_exit(monkeypatch) -> None:
     _assert_modal_wrapper_signals_parent(monkeypatch, 0)
+
+
+@pytest.mark.parametrize("failure_stage", ["creation", "start"])
+def test_wrapper_reaps_child_when_watcher_startup_fails(monkeypatch, failure_stage: str) -> None:
+    from flash.serve.app import launch
+    from flash.serve.provisioning.modal.planning import wrapper as _modal_wrapper
+
+    class _Process:
+        def __init__(self) -> None:
+            self.terminated = False
+            self.wait_calls: list[float] = []
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            raise AssertionError("cooperative child must not be killed")
+
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout is not None
+            self.wait_calls.append(timeout)
+            return -signal.SIGTERM
+
+    process = _Process()
+    watcher_failure = RuntimeError(f"watcher {failure_stage} failed")
+
+    class _BrokenThread:
+        def __init__(self, **_kwargs) -> None:
+            if failure_stage == "creation":
+                raise watcher_failure
+
+        def start(self) -> None:
+            raise watcher_failure
+
+    monkeypatch.setattr(launch, "start_launcher_process", lambda: process)
+    monkeypatch.setattr(_modal_wrapper, "Thread", _BrokenThread)
+
+    with pytest.raises(RuntimeError, match=f"watcher {failure_stage} failed") as exc_info:
+        launch_modal_server()
+
+    assert exc_info.value is watcher_failure
+    assert process.terminated is True
+    assert process.wait_calls == [launch._CHILD_STOP_TIMEOUT_SECONDS]
+
+
+def test_wrapper_watcher_failure_retains_unreaped_child_and_original_cause(monkeypatch) -> None:
+    from flash.serve.app import launch
+    from flash.serve.provisioning.modal.planning import wrapper as _modal_wrapper
+
+    class _UnreapedProcess:
+        def terminate(self) -> None:
+            pass
+
+        def kill(self) -> None:
+            pass
+
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout is not None
+            raise subprocess.TimeoutExpired("launcher", timeout)
+
+    process = _UnreapedProcess()
+    watcher_failure = RuntimeError("watcher creation failed")
+
+    def fail_thread(**_kwargs):
+        raise watcher_failure
+
+    monkeypatch.setattr(launch, "start_launcher_process", lambda: process)
+    monkeypatch.setattr(_modal_wrapper, "Thread", fail_thread)
+
+    with pytest.raises(launch.ChildReapUnconfirmed) as exc_info:
+        launch_modal_server()
+
+    assert exc_info.value.process is process
+    assert exc_info.value.__cause__ is watcher_failure
+
+
+def test_wrapper_real_subprocess_is_reaped_when_real_thread_start_fails(monkeypatch) -> None:
+    from flash.serve.app import launch
+    from flash.serve.provisioning.modal.planning import wrapper as _modal_wrapper
+
+    state_root = Path(tempfile.mkdtemp(prefix="flash-wrapper-", dir="/dev/shm"))
+    pid_path = state_root / "child.pid"
+    script = (
+        "import os, pathlib, signal, time; "
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(60)"
+    )
+    process = subprocess.Popen([sys.executable, "-c", script])
+    deadline = time.monotonic() + 1
+    while not pid_path.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert pid_path.is_file()
+
+    class _BrokenThread:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            raise RuntimeError("real thread start sabotage")
+
+    monkeypatch.setattr(launch, "start_launcher_process", lambda: process)
+    monkeypatch.setattr(launch, "_CHILD_STOP_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(launch, "_CHILD_REAP_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(_modal_wrapper, "Thread", _BrokenThread)
+    try:
+        with pytest.raises(RuntimeError, match="real thread start sabotage"):
+            launch_modal_server()
+        assert process.poll() == -signal.SIGKILL
+        assert pid_path.read_text(encoding="utf-8") == str(process.pid)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+        pid_path.unlink(missing_ok=True)
+        state_root.rmdir()
 
 
 def test_pinned_sdk_binds_exact_client_workspace_environment_and_secret_sinks() -> None:

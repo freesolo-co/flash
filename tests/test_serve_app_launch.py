@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import gc
 import hashlib
 import inspect
@@ -371,6 +372,190 @@ def test_secret_descriptor_chains_the_original_write_failure(monkeypatch) -> Non
         assert os.read(token_fd, 1) == b""
 
     assert exc_info.value.__cause__ is failure
+
+
+def test_secret_descriptor_retains_a_stuck_writer_ownership_handle(monkeypatch) -> None:
+    real_pipe = os.pipe
+    read_fd, write_fd = real_pipe()
+    join_calls: list[float | None] = []
+
+    class StuckWriter:
+        ident = 1
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout: float | None = None) -> None:
+            join_calls.append(timeout)
+
+        def is_alive(self) -> bool:
+            return True
+
+    monkeypatch.setattr(launch.os, "pipe", lambda: (read_fd, write_fd))
+    monkeypatch.setattr(launch.threading, "Thread", StuckWriter)
+    try:
+        with (
+            pytest.raises(
+                launch.CredentialWriterCleanupUnconfirmed,
+                match=r"^credential writer cleanup could not be confirmed$",
+            ) as exc_info,
+            launch._secret_descriptor(INFERENCE_TOKEN),
+        ):
+            pass
+    finally:
+        os.close(write_fd)
+
+    assert exc_info.value.writer.__class__ is StuckWriter
+    assert join_calls == [launch._CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS]
+    assert INFERENCE_TOKEN not in str(exc_info.value)
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(read_fd)
+
+
+def test_secret_descriptor_join_failure_retains_owner_and_chains_body_failure(monkeypatch) -> None:
+    read_fd, write_fd = os.pipe()
+    body_failure = RuntimeError("body failed")
+
+    class BrokenJoinWriter:
+        ident = 1
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout: float | None = None) -> None:
+            assert timeout == launch._CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS
+            raise RuntimeError("join failed")
+
+        def is_alive(self) -> bool:
+            return True
+
+    def fail_body() -> None:
+        with launch._secret_descriptor(INFERENCE_TOKEN):
+            raise body_failure
+
+    monkeypatch.setattr(launch.os, "pipe", lambda: (read_fd, write_fd))
+    monkeypatch.setattr(launch.threading, "Thread", BrokenJoinWriter)
+    try:
+        with pytest.raises(launch.CredentialWriterCleanupUnconfirmed) as exc_info:
+            fail_body()
+    finally:
+        os.close(write_fd)
+
+    assert exc_info.value.writer.__class__ is BrokenJoinWriter
+    assert exc_info.value.__cause__ is body_failure
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(read_fd)
+
+
+def test_secret_descriptor_closes_both_descriptors_when_real_thread_start_fails(
+    monkeypatch,
+) -> None:
+    opened: tuple[int, int] | None = None
+    real_pipe = os.pipe
+    real_start = launch.threading.Thread.start
+
+    def tracked_pipe() -> tuple[int, int]:
+        nonlocal opened
+        opened = real_pipe()
+        return opened
+
+    def fail_start(_thread: launch.threading.Thread) -> None:
+        raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(launch.os, "pipe", tracked_pipe)
+    monkeypatch.setattr(launch.threading.Thread, "start", fail_start)
+
+    with (
+        pytest.raises(RuntimeError, match="thread start failed"),
+        launch._secret_descriptor(INFERENCE_TOKEN),
+    ):
+        pytest.fail("body must not run")
+
+    monkeypatch.setattr(launch.threading.Thread, "start", real_start)
+    assert opened is not None
+    for fd in opened:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(fd)
+
+
+def test_secret_descriptor_real_thread_cleanup_chains_the_body_failure(monkeypatch) -> None:
+    started = launch.threading.Event()
+    release = launch.threading.Event()
+    body_failure = RuntimeError("body failed")
+
+    def block_write(_fd: int, _value: str) -> None:
+        started.set()
+        release.wait()
+
+    def fail_body() -> None:
+        with launch._secret_descriptor(INFERENCE_TOKEN):
+            assert started.wait(1)
+            raise body_failure
+
+    monkeypatch.setattr(launch, "_write_all", block_write)
+    monkeypatch.setattr(launch, "_CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(launch.CredentialWriterCleanupUnconfirmed) as exc_info:
+        fail_body()
+
+    writer = exc_info.value.writer
+    assert writer.is_alive()
+    assert exc_info.value.__cause__ is body_failure
+    release.set()
+    writer.join(timeout=1)
+    assert not writer.is_alive()
+    assert INFERENCE_TOKEN not in str(exc_info.value)
+
+
+def test_secret_descriptor_writer_deadline_survives_subprocess_sabotage() -> None:
+    secret = f"subprocess-secret-{uuid.uuid4().hex}"
+    script = f"""
+import threading
+from flash.serve.app import launch
+
+started = threading.Event()
+release = threading.Event()
+
+
+def ignore_descriptor_closure(_fd, _value):
+    started.set()
+    release.wait()
+
+
+launch._write_all = ignore_descriptor_closure
+launch._CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS = 0.01
+try:
+    with launch._secret_descriptor({secret!r}):
+        if not started.wait(1):
+            raise RuntimeError("credential writer did not start")
+except launch.CredentialWriterCleanupUnconfirmed as exc:
+    if not exc.writer.is_alive():
+        raise RuntimeError("stuck credential writer ownership was lost")
+    release.set()
+    exc.writer.join(timeout=1)
+    if exc.writer.is_alive():
+        raise RuntimeError("owned credential writer could not be released")
+else:
+    raise RuntimeError("stuck credential writer was accepted")
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert secret not in completed.stdout
+    assert secret not in completed.stderr
 
 
 def test_explicit_launcher_drops_the_artifact_token_before_the_server_loop(
@@ -935,11 +1120,17 @@ def test_atomic_manifest_write_replaces_complete_file_and_cleans_failure(
 
 
 class _FakeProcess:
-    def __init__(self, *, resist_terminate: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        resist_terminate: bool = False,
+        resist_kill_reap: bool = False,
+    ) -> None:
         self.terminated = False
         self.killed = False
         self.resist_terminate = resist_terminate
-        self.wait_calls: list[float | None] = []
+        self.resist_kill_reap = resist_kill_reap
+        self.wait_calls: list[float] = []
 
     def terminate(self) -> None:
         self.terminated = True
@@ -948,10 +1139,50 @@ class _FakeProcess:
         self.killed = True
 
     def wait(self, timeout: float | None = None) -> int:
+        assert timeout is not None, "launcher child waits must always have a deadline"
         self.wait_calls.append(timeout)
-        if self.resist_terminate and not self.killed:
+        if self.resist_kill_reap or (self.resist_terminate and not self.killed):
             raise launch.subprocess.TimeoutExpired("launcher", timeout)
         return -9 if self.killed else -15
+
+
+def test_terminate_and_reap_confirms_normal_shutdown() -> None:
+    process = _FakeProcess()
+
+    launch._terminate_and_reap(process)
+
+    assert process.terminated is True
+    assert process.killed is False
+    assert process.wait_calls == [launch._CHILD_STOP_TIMEOUT_SECONDS]
+
+
+def test_packaged_launcher_ownership_modules_have_no_unbounded_wait() -> None:
+    root = Path(__file__).resolve().parents[1]
+    ownership_modules = (
+        root / "serve_launch.py",
+        root / "flash/serve/app/launch.py",
+        root / "flash/serve/provisioning/modal/planning/wrapper.py",
+    )
+    waits: list[tuple[Path, ast.Call]] = []
+    for path in ownership_modules:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        waits.extend(
+            (path, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"join", "wait"}
+        )
+
+    assert waits
+    for path, wait in waits:
+        timeout = next(
+            (keyword.value for keyword in wait.keywords if keyword.arg == "timeout"), None
+        )
+        assert timeout is not None, f"unbounded ownership wait in {path}:{wait.lineno}"
+        assert not (isinstance(timeout, ast.Constant) and timeout.value is None), (
+            f"explicitly unbounded ownership wait in {path}:{wait.lineno}"
+        )
 
 
 def test_parent_helper_scrubs_environment_argv_and_closes_descriptors(tmp_path: Path) -> None:
@@ -1087,6 +1318,40 @@ def test_parent_helper_kills_and_reaps_a_termination_resistant_child(
         launch._CHILD_STOP_TIMEOUT_SECONDS,
         launch._CHILD_STOP_TIMEOUT_SECONDS,
     ]
+    assert INFERENCE_TOKEN not in str(exc_info.value)
+    assert ARTIFACT_TOKEN not in str(exc_info.value)
+
+
+def test_parent_helper_surfaces_unconfirmed_reap_without_releasing_child(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    environment = _environment(tmp_path)
+    process = _FakeProcess(resist_kill_reap=True)
+
+    monkeypatch.setattr(
+        launch,
+        "_write_all",
+        lambda *_args: (_ for _ in ()).throw(launch.LaunchError("pipe failed")),
+    )
+
+    with pytest.raises(
+        launch.ChildReapUnconfirmed,
+        match=r"^launcher child reap could not be confirmed after terminate and kill deadlines$",
+    ) as exc_info:
+        launch.start_launcher_process(environment, popen_factory=lambda *_args, **_kwargs: process)
+
+    assert exc_info.value.process is process
+    assert isinstance(exc_info.value.__cause__, launch.LaunchError)
+    assert str(exc_info.value.__cause__) == "pipe failed"
+    assert process.terminated is True
+    assert process.killed is True
+    assert process.wait_calls == [
+        launch._CHILD_STOP_TIMEOUT_SECONDS,
+        launch._CHILD_STOP_TIMEOUT_SECONDS,
+        launch._CHILD_REAP_TIMEOUT_SECONDS,
+    ]
+    assert all(timeout is not None for timeout in process.wait_calls)
     assert INFERENCE_TOKEN not in str(exc_info.value)
     assert ARTIFACT_TOKEN not in str(exc_info.value)
 

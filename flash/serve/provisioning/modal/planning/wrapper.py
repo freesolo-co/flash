@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from os import getpid, kill
 from signal import SIGTERM
+from subprocess import TimeoutExpired
 from threading import Thread
+
+_CHILD_WATCH_POLL_SECONDS = 5.0
 
 
 def launch_modal_server() -> None:
@@ -32,12 +35,29 @@ def launch_modal_server() -> None:
     handler performs its normal container cleanup and replacement.
     """
 
-    from flash.serve.app.launch import start_launcher_process
+    from flash.serve.app.launch import (
+        ChildReapUnconfirmed,
+        _terminate_and_reap,
+        start_launcher_process,
+    )
 
     process = start_launcher_process()
 
     def stop_parent_when_child_exits() -> None:
-        process.wait()
-        kill(getpid(), SIGTERM)
+        while True:
+            try:
+                process.wait(timeout=_CHILD_WATCH_POLL_SECONDS)
+            except TimeoutExpired:
+                continue
+            kill(getpid(), SIGTERM)
+            return
 
-    Thread(target=stop_parent_when_child_exits, daemon=True).start()
+    try:
+        watcher = Thread(target=stop_parent_when_child_exits, daemon=True)
+        watcher.start()
+    except BaseException as startup_error:
+        try:
+            _terminate_and_reap(process)
+        except ChildReapUnconfirmed as cleanup_error:
+            raise cleanup_error from startup_error
+        raise

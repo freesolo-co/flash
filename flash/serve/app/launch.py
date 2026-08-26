@@ -32,7 +32,9 @@ _DEFAULT_CACHE_ROOT = "/var/lib/flash-serving"
 _VLLM_CACHE_DIRNAME = "vllm"
 _DEFAULT_HOST = "0.0.0.0"
 _DEFAULT_PORT = 8000
+_CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS = 5.0
 _CHILD_STOP_TIMEOUT_SECONDS = 5.0
+_CHILD_REAP_TIMEOUT_SECONDS = 5.0
 _BOOTSTRAP_PATH = "/app/serve_launch.py"
 _SAFE_CHILD_COPIED_ENV_NAMES = frozenset(
     {
@@ -107,6 +109,24 @@ class StartupTerminated(LaunchError):
     def __init__(self, exit_code: int) -> None:
         self.exit_code = exit_code
         super().__init__("serving startup was terminated")
+
+
+class ChildReapUnconfirmed(LaunchError):
+    """the packaged child still has to be treated as owned after shutdown deadlines."""
+
+    def __init__(self, process: subprocess.Popen[Any]) -> None:
+        self.process = process
+        super().__init__(
+            "launcher child reap could not be confirmed after terminate and kill deadlines"
+        )
+
+
+class CredentialWriterCleanupUnconfirmed(LaunchError):
+    """the secret writer remains explicitly owned after its bounded cleanup failed."""
+
+    def __init__(self, writer: threading.Thread) -> None:
+        self.writer = writer
+        super().__init__("credential writer cleanup could not be confirmed")
 
 
 class _PopenFactory(Protocol):
@@ -363,14 +383,34 @@ def _secret_descriptor(value: str):
             with contextlib.suppress(OSError):
                 os.close(write_fd)
 
-    writer = threading.Thread(target=populate, name="flash-secret-pipe", daemon=True)
-    writer.start()
+    writer: threading.Thread | None = None
+    operation_error: BaseException | None = None
     try:
+        writer = threading.Thread(target=populate, name="flash-secret-pipe", daemon=True)
+        writer.start()
         yield read_fd
+    except BaseException as exc:
+        operation_error = exc
+        raise
     finally:
         with contextlib.suppress(OSError):
             os.close(read_fd)
-        writer.join()
+        if writer is None or (writer.ident is None and not writer.is_alive()):
+            with contextlib.suppress(OSError):
+                os.close(write_fd)
+        else:
+            try:
+                writer.join(timeout=_CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS)
+            except BaseException as join_error:
+                cleanup_error = CredentialWriterCleanupUnconfirmed(writer)
+                if operation_error is not None:
+                    raise cleanup_error from operation_error
+                raise cleanup_error from join_error
+            if writer.is_alive():
+                cleanup_error = CredentialWriterCleanupUnconfirmed(writer)
+                if operation_error is not None:
+                    raise cleanup_error from operation_error
+                raise cleanup_error
     if errors:
         raise LaunchError("secret descriptor could not be populated") from errors[0]
 
@@ -613,23 +653,25 @@ def _close_descriptors(descriptors: list[int]) -> None:
             os.close(fd)
 
 
+def _wait_for_child(process: subprocess.Popen[Any], timeout: float) -> bool:
+    try:
+        process.wait(timeout=timeout)
+    except BaseException:
+        return False
+    return True
+
+
 def _terminate_and_reap(process: subprocess.Popen[Any]) -> None:
     with contextlib.suppress(Exception):
         process.terminate()
-    try:
-        process.wait(timeout=_CHILD_STOP_TIMEOUT_SECONDS)
+    if _wait_for_child(process, _CHILD_STOP_TIMEOUT_SECONDS):
         return
-    except Exception:
-        pass
     with contextlib.suppress(Exception):
         process.kill()
-    try:
-        process.wait(timeout=_CHILD_STOP_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(Exception):
-            process.wait()
-    except Exception:
-        pass
+    if _wait_for_child(process, _CHILD_STOP_TIMEOUT_SECONDS):
+        return
+    if not _wait_for_child(process, _CHILD_REAP_TIMEOUT_SECONDS):
+        raise ChildReapUnconfirmed(process)
 
 
 def start_launcher_process(
@@ -673,9 +715,12 @@ def start_launcher_process(
         if artifact_token is not None:
             _write_all(write_fds[1], artifact_token)
         return process
-    except BaseException:
+    except BaseException as launch_error:
         if process is not None:
-            _terminate_and_reap(process)
+            try:
+                _terminate_and_reap(process)
+            except ChildReapUnconfirmed as reap_error:
+                raise reap_error from launch_error
         raise
     finally:
         _close_descriptors(read_fds)
