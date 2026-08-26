@@ -310,7 +310,10 @@ def _start_resubmit(
 
 
 def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | None:
-    del status, deadline_at
+    del deadline_at
+    if not status.attempt:
+        return None
+
     from flash.runner.supervise.lifecycle import _attempt_result_metrics
 
     return _attempt_result_metrics(spec.run_id)

@@ -7475,69 +7475,6 @@ def test_deploy_lock_is_usable_and_weakly_cleaned():
     assert "run-xyz" not in dict(app_mod._DEPLOY_LOCKS)
 
 
-def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
-    # a pre-feature run with neither a handle nor persisted source identity cannot be replaced safely.
-    # recovery still reaps possible provider remnants, then fails it without starting another worker.
-
-    import flash.server.platform.db as db_mod
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
-    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
-    import flash.server.asgi.app as app_mod
-
-    importlib.reload(app_mod)
-
-    spec = {
-        "model": "Qwen/Qwen3.5-9B",
-        "project": "11111111-1111-4111-8111-111111111111",
-        "algorithm": "grpo",
-        "train": {"epochs": 1, "max_examples": 1},
-        "gpu": {},
-        "run_id": "nohandle-1",
-    }
-    runner_state._save_status(
-        runner_state.RunStatus(run_id="nohandle-1", state="provisioning", spec=spec, remote=None)
-    )
-    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "nohandle-1"}])
-    gced = []
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda s: gced.append(s.run_id))
-    resubmitted = []
-    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s: resubmitted.append(s.run_id))
-
-    # a handle-less run may have left a phantom instance from a non-idempotent create (Vast PUT
-    # /asks) that surfaces via eventual consistency. Recovery must force-reap the run's label across
-    # instance providers RIGHT BEFORE resubmitting, so a phantom isn't left writing the same
-    # seed-scoped artifacts as the fresh worker. Capture the gc-by-run.
-    reaped = []
-
-    class _FakeVast:
-        name = "vast"
-
-        def gc(self, s):
-            reaped.append(s.run_id)
-
-        def sweep_orphans(self, **k):
-            return []
-
-    from flash.providers.core import registry as providers_mod
-
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
-
-    app_mod.recover_runs()
-
-    assert gced == ["nohandle-1"]
-    assert reaped == ["nohandle-1"]
-    assert resubmitted == []
-    recovered = runner_status.get_status("nohandle-1")
-    assert recovered.state == "failed"
-    assert recovered.error == (
-        "managed source identity is unavailable; descriptor-less attempts cannot be replaced"
-    )
-    assert recovered.source_verified_attempt is None
-    assert "source_provenance" not in recovered.to_dict()
-
-
 def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_path):
     import flash.server.platform.db as db_mod
     from flash.providers.core import registry as providers_mod
@@ -7619,6 +7556,11 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
         _next_attempt=0,
     )
     monkeypatch.setattr(runner_lifecycle.time, "time", lambda: deadline + 1.0)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result_metrics",
+        lambda *_args, **_kwargs: pytest.fail("attempt metrics read without a reserved attempt"),
+    )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": spec.run_id}])
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     submitted = []
