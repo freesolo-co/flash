@@ -582,14 +582,30 @@ def test_instance_terminal_resource_uses_bounded_result_visibility_window(monkey
     assert clock["now"] == 220.0
 
 
-@pytest.mark.parametrize("provider", ["lambda", "vast"])
-def test_instance_terminal_latch_clears_after_provider_recovers(monkeypatch, provider):
+@pytest.mark.parametrize(
+    ("provider", "running_status", "dead_status", "intermediate_status"),
+    [
+        ("lambda", "active", "terminated", "booting"),
+        ("vast", "running", "exited", "loading"),
+    ],
+)
+def test_instance_terminal_latch_survives_intermediate_recovery_state(
+    monkeypatch,
+    provider,
+    running_status,
+    dead_status,
+    intermediate_status,
+):
     from flash.providers._lifecycle.instances import poll_instance
     from flash.providers.core.base import PollResult
 
-    attempt = _attempt_record(work_deadline_at=10_000.0, result_deadline_at=10_120.0)
-    observations = iter([None] * 7 + [PollResult(True, metrics={"optimizer_steps": 11})])
-    statuses = iter(["terminated"] + ["running"] * 6)
+    attempt = _attempt_record(
+        grant_deadline_at=90.0,
+        work_deadline_at=10_000.0,
+        result_deadline_at=10_120.0,
+    )
+    observations = iter([None] * 4 + [PollResult(True, metrics={"optimizer_steps": 11})])
+    statuses = iter([running_status, dead_status, intermediate_status, running_status])
     monkeypatch.setattr(poll_instance, "_current_attempt", lambda _adapter: attempt)
     monkeypatch.setattr(poll_instance, "_record_resource", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(poll_instance, "_observe_result", lambda _adapter: next(observations))
@@ -613,8 +629,8 @@ def test_instance_terminal_latch_clears_after_provider_recovers(monkeypatch, pro
         fetch_instance=lambda: {"status": next(statuses)},
         poll_error_exceptions=(RuntimeError,),
         status_field="status",
-        running_status="running",
-        dead_states=frozenset({"terminated"}),
+        running_status=running_status,
+        dead_states=frozenset({dead_status}),
         missing_dead_threshold=2,
         stamp_cost_and_notes=lambda *_args, **_kwargs: None,
     )
@@ -623,7 +639,7 @@ def test_instance_terminal_latch_clears_after_provider_recovers(monkeypatch, pro
 
     assert result.ok
     assert result.metrics == {"optimizer_steps": 11}
-    assert clock["now"] == 240.0
+    assert clock["now"] == 180.0
 
 
 def test_instance_terminal_manifest_inside_visibility_window_wins(monkeypatch):
