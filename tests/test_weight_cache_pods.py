@@ -505,14 +505,230 @@ def test_prefetch_heartbeat_proves_real_under_mount_weights(tmp_path, monkeypatc
     assert str(tmp_path) not in json.dumps(cache)
 
 
-def test_bootstrap_rejects_partial_index_even_with_standalone_weight(tmp_path):
+def test_bootstrap_accepts_indexed_shard_symlinks_within_model_repo(tmp_path):
+    from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
+
+    cache = tmp_path / "hf-cache" / "hub"
+    model_root = cache / "models--org--model"
+    snapshot = model_root / "snapshots" / "abc"
+    blobs = model_root / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir()
+    (blobs / "first").write_bytes(b"first")
+    (blobs / "second").write_bytes(b"second")
+    os.symlink("../../blobs/first", snapshot / "model-00001-of-00002.safetensors")
+    os.symlink("../../blobs/second", snapshot / "model-00002-of-00002.safetensors")
+    (snapshot / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "layer.0": "model-00001-of-00002.safetensors",
+                    "layer.1": "model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+
+    assert preload_snapshot_evidence(str(snapshot), str(cache)) == (
+        "models--org--model/snapshots/abc"
+    )
+
+
+def test_bootstrap_accepts_unsharded_weight_symlink_within_model_repo(tmp_path):
+    from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
+
+    cache = tmp_path / "hf-cache" / "hub"
+    model_root = cache / "models--org--model"
+    snapshot = model_root / "snapshots" / "abc"
+    blobs = model_root / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir()
+    (blobs / "weights").write_bytes(b"weights")
+    os.symlink("../../blobs/weights", snapshot / "model.safetensors")
+
+    assert preload_snapshot_evidence(str(snapshot), str(cache)) == (
+        "models--org--model/snapshots/abc"
+    )
+
+
+def test_bootstrap_rejects_nested_fake_canonical_layout_symlink_escape(tmp_path):
+    from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
+
+    cache = tmp_path / "hf-cache" / "hub"
+    model_root = cache / "staging" / "models--org--model"
+    snapshot = model_root / "snapshots" / "abc"
+    blobs = model_root / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir()
+    (blobs / "weights").write_bytes(b"weights")
+    os.symlink("../../blobs/weights", snapshot / "model.safetensors")
+
+    with pytest.raises(RuntimeError, match="complete model weights"):
+        preload_snapshot_evidence(str(snapshot), str(cache))
+
+
+def test_bootstrap_rejects_noncanonical_snapshot_symlink_boundary(tmp_path):
+    from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
+
+    cache = tmp_path / "hf-cache" / "hub"
+    snapshot = cache / "custom" / "abc"
+    blobs = cache / "custom" / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir()
+    (blobs / "weights").write_bytes(b"weights")
+    os.symlink("../blobs/weights", snapshot / "model.safetensors")
+
+    with pytest.raises(RuntimeError, match="complete model weights"):
+        preload_snapshot_evidence(str(snapshot), str(cache))
+
+
+def test_bootstrap_rejects_empty_model_repo_name_symlink_escape(tmp_path):
+    from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
+
+    cache = tmp_path / "hf-cache" / "hub"
+    model_root = cache / "models--"
+    snapshot = model_root / "snapshots" / "abc"
+    blobs = model_root / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir()
+    (blobs / "weights").write_bytes(b"weights")
+    os.symlink("../../blobs/weights", snapshot / "model.safetensors")
+
+    with pytest.raises(RuntimeError, match="complete model weights"):
+        preload_snapshot_evidence(str(snapshot), str(cache))
+
+
+def test_bootstrap_accepts_index_symlink_within_model_repo(tmp_path):
+    from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
+
+    cache = tmp_path / "hf-cache" / "hub"
+    model_root = cache / "models--org--model"
+    snapshot = model_root / "snapshots" / "abc"
+    blobs = model_root / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir()
+    (blobs / "weights").write_bytes(b"weights")
+    os.symlink("../../blobs/weights", snapshot / "model-00001-of-00001.safetensors")
+    (blobs / "index").write_text(
+        json.dumps({"weight_map": {"layer.0": "model-00001-of-00001.safetensors"}})
+    )
+    os.symlink("../../blobs/index", snapshot / "model.safetensors.index.json")
+
+    assert preload_snapshot_evidence(str(snapshot), str(cache)) == (
+        "models--org--model/snapshots/abc"
+    )
+
+
+def test_bootstrap_rejects_index_symlink_outside_model_repo(tmp_path):
+    from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
+
+    cache = tmp_path / "hf-cache" / "hub"
+    snapshot = cache / "models--org--model" / "snapshots" / "abc"
+    outside = cache / "models--other--model" / "blobs" / "index"
+    snapshot.mkdir(parents=True)
+    outside.parent.mkdir(parents=True)
+    outside.write_text(json.dumps({"weight_map": {"layer.0": "model.safetensors"}}))
+    os.symlink(os.path.relpath(outside, snapshot), snapshot / "model.safetensors.index.json")
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+
+    with pytest.raises(RuntimeError, match="weight index is malformed"):
+        preload_snapshot_evidence(str(snapshot), str(cache))
+
+
+@pytest.mark.parametrize(
+    "shard_name",
+    [
+        "../../blobs/weights",
+        "../other-revision/model.safetensors",
+        pytest.param("absolute", id="absolute-path"),
+    ],
+)
+def test_bootstrap_rejects_indexed_shard_path_traversal(tmp_path, shard_name):
     from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
 
     cache = tmp_path / "hf-cache" / "hub"
     snapshot = cache / "models--org--model" / "snapshots" / "abc"
     snapshot.mkdir(parents=True)
+    if shard_name == "absolute":
+        shard_name = str(tmp_path / "model.safetensors")
+    (snapshot / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"layer.0": shard_name}})
+    )
+
+    with pytest.raises(RuntimeError, match="weight index is malformed"):
+        preload_snapshot_evidence(str(snapshot), str(cache))
+
+
+def test_bootstrap_rejects_dangling_indexed_weight_symlink(tmp_path):
+    from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
+
+    cache = tmp_path / "hf-cache" / "hub"
+    snapshot = cache / "models--org--model" / "snapshots" / "abc"
+    snapshot.mkdir(parents=True)
+    os.symlink("../../blobs/missing", snapshot / "model-00001-of-00001.safetensors")
+    (snapshot / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"layer.0": "model-00001-of-00001.safetensors"}})
+    )
+
+    with pytest.raises(RuntimeError, match="complete model weights"):
+        preload_snapshot_evidence(str(snapshot), str(cache))
+
+
+def test_bootstrap_rejects_model_repo_prefix_collision(tmp_path):
+    from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
+
+    cache = tmp_path / "hf-cache" / "hub"
+    model_root = cache / "models--org--model"
+    snapshot = model_root / "snapshots" / "abc"
+    outside = cache / "models--org--model-escape" / "blobs" / "weights"
+    snapshot.mkdir(parents=True)
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"weights")
+    os.symlink(os.path.relpath(outside, snapshot), snapshot / "model.safetensors")
+
+    with pytest.raises(RuntimeError, match="complete model weights"):
+        preload_snapshot_evidence(str(snapshot), str(cache))
+
+
+def test_bootstrap_rejects_dangling_weight_symlink(tmp_path):
+    from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
+
+    cache = tmp_path / "hf-cache" / "hub"
+    snapshot = cache / "models--org--model" / "snapshots" / "abc"
+    snapshot.mkdir(parents=True)
+    os.symlink("../../blobs/missing", snapshot / "model.safetensors")
+
+    with pytest.raises(RuntimeError, match="complete model weights"):
+        preload_snapshot_evidence(str(snapshot), str(cache))
+
+
+def test_bootstrap_rejects_weight_symlink_outside_model_repo(tmp_path):
+    from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
+
+    cache = tmp_path / "hf-cache" / "hub"
+    snapshot = cache / "models--org--model" / "snapshots" / "abc"
+    outside = cache / "models--other--model" / "blobs" / "weights"
+    snapshot.mkdir(parents=True)
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"weights")
+    os.symlink(os.path.relpath(outside, snapshot), snapshot / "model.safetensors")
+
+    with pytest.raises(RuntimeError, match="complete model weights"):
+        preload_snapshot_evidence(str(snapshot), str(cache))
+
+
+def test_bootstrap_rejects_partial_index_even_with_standalone_weight(tmp_path):
+    from flash.providers._lifecycle.bootstrapping.preload import preload_snapshot_evidence
+
+    cache = tmp_path / "hf-cache" / "hub"
+    model_root = cache / "models--org--model"
+    snapshot = model_root / "snapshots" / "abc"
+    blobs = model_root / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir()
     (snapshot / "model.safetensors").write_bytes(b"standalone")
-    (snapshot / "model-00001-of-00002.safetensors").write_bytes(b"first")
+    (blobs / "first").write_bytes(b"first")
+    os.symlink("../../blobs/first", snapshot / "model-00001-of-00002.safetensors")
     (snapshot / "model.safetensors.index.json").write_text(
         json.dumps(
             {
