@@ -152,7 +152,21 @@ def resume_after_confirmed_teardown(
             if current_remote is not None:
                 with contextlib.suppress(Exception):
                     _record_cleanup_remote(run_id, current_remote)
-            _compare_and_fail_remote(run_id, current_remote, str(exc))
+            identity_kwargs = {}
+            if current_remote is None:
+                from flash.runner.lifecycle.protocol import AttemptRecord
+
+                attempt = AttemptRecord.from_dict(current.attempt)
+                identity_kwargs = {
+                    "expected_attempt_id": attempt.attempt_id,
+                    "expected_fence": attempt.fence,
+                }
+            _compare_and_fail_remote(
+                run_id,
+                current_remote,
+                str(exc),
+                **identity_kwargs,
+            )
         raise
     return get_status(run_id)
 
@@ -245,7 +259,18 @@ def reconcile_absent_remote(
             return True
         if current.remote is None:
             try:
-                return bool(_compare_and_fail_remote(run_id, None, str(exc)))
+                from flash.runner.lifecycle.protocol import AttemptRecord
+
+                attempt = AttemptRecord.from_dict(current.attempt)
+                return bool(
+                    _compare_and_fail_remote(
+                        run_id,
+                        None,
+                        str(exc),
+                        expected_attempt_id=attempt.attempt_id,
+                        expected_fence=attempt.fence,
+                    )
+                )
             except Exception:
                 time.sleep(reconcile_interval_s)
                 return False

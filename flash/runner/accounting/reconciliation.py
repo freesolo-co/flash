@@ -128,15 +128,39 @@ def _compare_and_prepare_resubmit(
     return True
 
 
-def _settled_attempt(status: RunStatus, expected_remote: dict | None) -> tuple[bool, dict | None]:
+def _expected_attempt_identity(
+    expected_remote: dict | None,
+    *,
+    expected_attempt_id: int | None,
+    expected_fence: int | None,
+) -> tuple[int | None, int | None]:
+    """return the exact fenced attempt identity required for terminal settlement."""
+    if expected_remote is not None:
+        expected_attempt_id = expected_remote.get("attempt")
+        expected_fence = expected_remote.get("fence")
+    if (
+        isinstance(expected_attempt_id, bool)
+        or not isinstance(expected_attempt_id, int)
+        or expected_attempt_id < 0
+        or isinstance(expected_fence, bool)
+        or not isinstance(expected_fence, int)
+        or expected_fence < 1
+    ):
+        raise ValueError("terminal settlement requires an exact attempt id and fence")
+    return expected_attempt_id, expected_fence
+
+
+def _settled_attempt(
+    status: RunStatus,
+    expected_remote: dict | None,
+    expected_attempt_id: int | None,
+    expected_fence: int | None,
+) -> tuple[bool, dict | None]:
     """return the settled current attempt only when the expected fence still matches."""
     if status.attempt is None:
-        return True, None
+        return expected_remote is not None, None
     attempt = status_ops._current_attempt(status)
-    if expected_remote is not None and (
-        expected_remote.get("attempt") != attempt.attempt_id
-        or expected_remote.get("fence") != attempt.fence
-    ):
+    if attempt.attempt_id != expected_attempt_id or attempt.fence != expected_fence:
         return False, None
     return True, replace(attempt, state="settled").to_dict()
 
@@ -149,8 +173,16 @@ def _compare_and_fail_remote(
     run_id: str,
     expected_remote: dict | None,
     error: str,
+    *,
+    expected_attempt_id: int | None = None,
+    expected_fence: int | None = None,
 ) -> bool:
     """CAS a nonterminal expected remote to failed and confirm the durable write."""
+    expected_attempt_id, expected_fence = _expected_attempt_identity(
+        expected_remote,
+        expected_attempt_id=expected_attempt_id,
+        expected_fence=expected_fence,
+    )
     report_status: RunStatus | None = None
     with state._status_guard(run_id):
         status = status_ops.get_status(run_id)
@@ -158,7 +190,12 @@ def _compare_and_fail_remote(
             return False
         if not _expected_remote_matches(status.remote, expected_remote):
             return False
-        attempt_matches, settled_attempt = _settled_attempt(status, expected_remote)
+        attempt_matches, settled_attempt = _settled_attempt(
+            status,
+            expected_remote,
+            expected_attempt_id,
+            expected_fence,
+        )
         if not attempt_matches:
             return False
         status.state = "failed"
@@ -188,8 +225,16 @@ def _compare_and_complete_remote(
     expected_remote: dict | None,
     spec: JobSpec,
     metrics: dict,
+    *,
+    expected_attempt_id: int | None = None,
+    expected_fence: int | None = None,
 ) -> bool:
     """Adopt strict completed artifacts only while the captured remote still owns the run."""
+    expected_attempt_id, expected_fence = _expected_attempt_identity(
+        expected_remote,
+        expected_attempt_id=expected_attempt_id,
+        expected_fence=expected_fence,
+    )
     report_status: RunStatus | None = None
     with state._status_guard(run_id):
         status = status_ops.get_status(run_id)
@@ -197,12 +242,18 @@ def _compare_and_complete_remote(
             return False
         if not _expected_remote_matches(status.remote, expected_remote):
             return False
-    expected_attempt = expected_remote.get("attempt") if isinstance(expected_remote, dict) else None
-    expected_fence = expected_remote.get("fence") if isinstance(expected_remote, dict) else None
+        attempt_matches, _settled = _settled_attempt(
+            status,
+            expected_remote,
+            expected_attempt_id,
+            expected_fence,
+        )
+        if not attempt_matches:
+            return False
     metrics, verified_attempt = status_ops.validate_terminal_source_metrics(
         status,
         metrics,
-        expected_attempt=expected_attempt,
+        expected_attempt=expected_attempt_id,
         expected_fence=expected_fence,
     )
     if expected_remote is not None and not _record_cleanup_remote(run_id, expected_remote):
@@ -214,7 +265,12 @@ def _compare_and_complete_remote(
             return False
         if not _expected_remote_matches(status.remote, expected_remote):
             return False
-        attempt_matches, settled_attempt = _settled_attempt(status, expected_remote)
+        attempt_matches, settled_attempt = _settled_attempt(
+            status,
+            expected_remote,
+            expected_attempt_id,
+            expected_fence,
+        )
         if not attempt_matches:
             return False
         measured = float(status.cost_usd or 0.0) + recovered_cost

@@ -181,9 +181,15 @@ class RunStatus:
             projection = data.get(lifecycle_field)
             if isinstance(projection, dict):
                 projection.pop("source_provenance", None)
-                receipt = projection.get("receipt")
-                if isinstance(receipt, dict):
-                    receipt.pop("revision", None)
+                receipt_keys = (
+                    ("receipt", "progress_receipt", "result_receipt")
+                    if lifecycle_field == "attempt"
+                    else ("receipt",)
+                )
+                for receipt_key in receipt_keys:
+                    receipt = projection.get(receipt_key)
+                    if isinstance(receipt, dict):
+                        receipt.pop("revision", None)
         result = data.get("result")
         if isinstance(result, dict):
             result.pop("source_attestation", None)

@@ -237,11 +237,13 @@ def _fail_blocked_recovery(
     from flash.runner.supervise.lifecycle import _adopt_completed_attempt
 
     status = get_status(spec.run_id)
+    identity_kwargs = _attempt_identity_kwargs(status.attempt) if expected_remote is None else {}
     if status.remote is None:
-        result, pending, _attempt = _handleless_attempt_resolution(spec, status)
+        result, pending, attempt = _handleless_attempt_resolution(spec, status)
         if pending:
             return False
         if result is not None:
+            identity_kwargs = _attempt_identity_kwargs(attempt)
             if not result.ok:
                 from flash.runner.supervise.lifecycle import _result_failure_detail
 
@@ -249,6 +251,7 @@ def _fail_blocked_recovery(
                     spec.run_id,
                     None,
                     _result_failure_detail(result),
+                    **identity_kwargs,
                 )
             applied = _adopt_completed_attempt(
                 spec.run_id,
@@ -256,6 +259,7 @@ def _fail_blocked_recovery(
                 None,
                 result.metrics,
                 log=None,
+                **identity_kwargs,
             )
             if applied:
                 with contextlib.suppress(Exception):
@@ -265,7 +269,12 @@ def _fail_blocked_recovery(
                     )
             return applied
 
-    applied = _compare_and_fail_remote(spec.run_id, expected_remote, reason)
+    applied = _compare_and_fail_remote(
+        spec.run_id,
+        expected_remote,
+        reason,
+        **identity_kwargs,
+    )
     if applied:
         with contextlib.suppress(Exception):
             _append_run_log(spec.run_id, reason)
@@ -330,6 +339,18 @@ def _handleless_attempt_result(spec, status, deadline_at: float):
     return _attempt_result(spec.run_id)
 
 
+def _attempt_identity_kwargs(attempt: object) -> dict[str, int]:
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    if attempt is None:
+        return {}
+    record = attempt if isinstance(attempt, AttemptRecord) else AttemptRecord.from_dict(attempt)
+    return {
+        "expected_attempt_id": record.attempt_id,
+        "expected_fence": record.fence,
+    }
+
+
 def _handleless_attempt_resolution(spec, status):
     """resolve the current-fence result or report that authoritative observation is pending."""
     from flash.runner.lifecycle.protocol import AttemptRecord
@@ -368,16 +389,33 @@ def _resolve_handleless_before_resubmit(spec, status) -> bool:
     except Exception as exc:
         if _result_transport_is_transient(exc):
             return False
-        _compare_and_fail_remote(spec.run_id, None, str(exc))
+        _compare_and_fail_remote(
+            spec.run_id,
+            None,
+            str(exc),
+            **_attempt_identity_kwargs(status.attempt),
+        )
         return False
     if result is None:
         return True
     if not result.ok:
         from flash.runner.supervise.lifecycle import _result_failure_detail
 
-        _compare_and_fail_remote(spec.run_id, None, _result_failure_detail(result))
+        _compare_and_fail_remote(
+            spec.run_id,
+            None,
+            _result_failure_detail(result),
+            **_attempt_identity_kwargs(attempt),
+        )
         return False
-    _adopt_completed_attempt(spec.run_id, spec, None, result.metrics, log=None)
+    _adopt_completed_attempt(
+        spec.run_id,
+        spec,
+        None,
+        result.metrics,
+        log=None,
+        **_attempt_identity_kwargs(attempt),
+    )
     return False
 
 
@@ -398,11 +436,17 @@ def _deferred_resubmit_loop(spec) -> None:
             continue
         if status.state in TERMINAL_STATES or status.remote is not None:
             return
+        identity_kwargs = _attempt_identity_kwargs(status.attempt)
         try:
             deadline_at = _load_run_deadline_at(spec.run_id)
         except Exception as exc:
             try:
-                if _compare_and_fail_remote(spec.run_id, None, str(exc)):
+                if _compare_and_fail_remote(
+                    spec.run_id,
+                    None,
+                    str(exc),
+                    **identity_kwargs,
+                ):
                     return
             except Exception:
                 time.sleep(_DEFERRED_RECOVERY_RETRY_S)
@@ -410,7 +454,7 @@ def _deferred_resubmit_loop(spec) -> None:
             return
         if time.time() >= deadline_at:
             try:
-                result, pending, _attempt = _handleless_attempt_resolution(spec, status)
+                result, pending, attempt = _handleless_attempt_resolution(spec, status)
             except Exception as exc:
                 from flash.runner.supervise.attach import _result_transport_is_transient
 
@@ -418,7 +462,12 @@ def _deferred_resubmit_loop(spec) -> None:
                     time.sleep(_DEFERRED_RECOVERY_RETRY_S)
                     continue
                 try:
-                    if _compare_and_fail_remote(spec.run_id, None, str(exc)):
+                    if _compare_and_fail_remote(
+                        spec.run_id,
+                        None,
+                        str(exc),
+                        **identity_kwargs,
+                    ):
                         return
                 except Exception:
                     time.sleep(_DEFERRED_RECOVERY_RETRY_S)
@@ -436,6 +485,7 @@ def _deferred_resubmit_loop(spec) -> None:
                             spec.run_id,
                             None,
                             _result_failure_detail(result),
+                            **_attempt_identity_kwargs(attempt),
                         ):
                             return
                     else:
@@ -445,6 +495,7 @@ def _deferred_resubmit_loop(spec) -> None:
                             None,
                             result.metrics,
                             log=None,
+                            **_attempt_identity_kwargs(attempt),
                         )
                 except Exception:
                     time.sleep(_DEFERRED_RECOVERY_RETRY_S)
@@ -452,7 +503,12 @@ def _deferred_resubmit_loop(spec) -> None:
                 return
             reason = "run wall deadline exhausted while provider teardown remained unconfirmed"
             try:
-                if _compare_and_fail_remote(spec.run_id, None, reason):
+                if _compare_and_fail_remote(
+                    spec.run_id,
+                    None,
+                    reason,
+                    **_attempt_identity_kwargs(attempt),
+                ):
                     with contextlib.suppress(Exception):
                         _append_run_log(spec.run_id, reason)
                     return

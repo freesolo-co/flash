@@ -461,6 +461,28 @@ def test_progress_occurred_at_never_moves_backward(monkeypatch) -> None:
     assert records[2].previous_digest == digest_record(records[1].to_dict())
 
 
+def test_cadence_expiry_publishes_latest_step_without_duplicate_flush(monkeypatch) -> None:
+    _reset(monkeypatch)
+    now = {"value": 0.0}
+    records = []
+    monkeypatch.setattr(progress_io.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(
+        progress_io,
+        "_upload_record",
+        lambda record, *, required: records.append(record) or True,
+    )
+
+    assert progress_io.publish_progress("rl_step", step=1, loss=1.0) is False
+    now["value"] = progress_io._PROGRESS_STEP_CADENCE_S
+    assert progress_io.publish_progress("rl_step", step=2, loss=2.0) is False
+
+    assert len(records) == 1
+    assert records[0].completed_steps == 2
+    assert records[0].metrics["loss"] == 2.0
+    assert progress_io.flush_progress() is True
+    assert len(records) == 1
+
+
 def test_step_progress_coalesces_by_window_and_terminal_stays_dedicated(monkeypatch) -> None:
     _reset(monkeypatch)
     now = {"value": 0.0}

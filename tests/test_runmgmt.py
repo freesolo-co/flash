@@ -541,6 +541,39 @@ def test_resource_projection_rejects_older_observations_in_both_delivery_orders(
         assert projected["observed_at"] == 20.0
 
 
+def test_public_status_redacts_nested_attempt_receipt_revisions_without_mutation():
+    from flash.core.spec import JobSpec
+
+    spec = JobSpec(run_id="public-receipts", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote("endpoint-receipts", "job-receipts", attempt=2, fence=9)
+    status = provisioned_status(spec, remote=remote, created_at=100.0)
+    result_receipt = {
+        "path": "attempt/result.json",
+        "digest": "a" * 64,
+        "revision": "result-revision",
+    }
+    progress_receipt = {
+        "path": "attempt/progress.json",
+        "digest": "b" * 64,
+        "revision": "progress-revision",
+    }
+    status.attempt["result_receipt"] = result_receipt
+    status.attempt["progress_receipt"] = progress_receipt
+
+    public = status.to_dict()
+
+    assert public["attempt"]["result_receipt"] == {
+        "path": "attempt/result.json",
+        "digest": "a" * 64,
+    }
+    assert public["attempt"]["progress_receipt"] == {
+        "path": "attempt/progress.json",
+        "digest": "b" * 64,
+    }
+    assert status.attempt["result_receipt"] == result_receipt
+    assert status.attempt["progress_receipt"] == progress_receipt
+
+
 def test_result_projection_updates_matching_attempt_receipt_atomically(monkeypatch, tmp_path):
     from flash.core.spec import JobSpec
 
@@ -1542,6 +1575,87 @@ def test_record_cleanup_remote_does_not_revive_cleared_remote(monkeypatch, tmp_p
     assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
         remote
     ]
+
+
+@pytest.mark.parametrize("settlement", ["completion", "failure"])
+def test_handleless_terminal_settlement_rejects_replaced_attempt(monkeypatch, tmp_path, settlement):
+    from flash.core.spec import JobSpec
+    from flash.runner.lifecycle.protocol import AttemptRecord
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(run_id=f"handleless-{settlement}", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(_handleless_status(spec), _next_attempt=1, _next_fence=2)
+    observed = runner_status._current_attempt(runner_status.get_status(spec.run_id))
+    replacement = replace(observed, attempt_id=1, fence=2, state="active")
+
+    def install_replacement() -> None:
+        with runner_state._status_guard(spec.run_id):
+            current = runner_status.get_status(spec.run_id)
+            current.attempt = replacement.to_dict()
+            runner_state._save_status_unlocked(current)
+
+    if settlement == "completion":
+        monkeypatch.setattr(
+            runner_status,
+            "_persist_metrics",
+            lambda *_args, **_kwargs: install_replacement() or 0.0,
+        )
+        applied = runner_reconciliation._compare_and_complete_remote(
+            spec.run_id,
+            None,
+            spec,
+            _fenced_success_metrics(spec),
+            expected_attempt_id=observed.attempt_id,
+            expected_fence=observed.fence,
+        )
+    else:
+        install_replacement()
+        applied = runner_reconciliation._compare_and_fail_remote(
+            spec.run_id,
+            None,
+            "attempt failed",
+            expected_attempt_id=observed.attempt_id,
+            expected_fence=observed.fence,
+        )
+
+    assert applied is False
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.state not in runner_state.TERMINAL_STATES
+    assert AttemptRecord.from_dict(persisted.attempt) == replacement
+    assert AttemptRecord.from_dict(persisted.attempt).state == "active"
+
+
+@pytest.mark.parametrize("settlement", ["completion", "failure"])
+def test_handleless_terminal_settlement_requires_attempt_identity(
+    monkeypatch, tmp_path, settlement
+):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(run_id=f"identity-free-{settlement}", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    )
+    if settlement == "completion":
+
+        def settle():
+            return runner_reconciliation._compare_and_complete_remote(spec.run_id, None, spec, {})
+
+    else:
+
+        def settle():
+            return runner_reconciliation._compare_and_fail_remote(
+                spec.run_id, None, "attempt failed"
+            )
+
+    with pytest.raises(ValueError, match="exact attempt id and fence"):
+        settle()
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.state == "provisioning"
+    assert persisted.attempt is None
 
 
 def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, tmp_path):

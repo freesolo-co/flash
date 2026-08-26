@@ -158,12 +158,25 @@ def test_recovery_completion_requires_attestation_before_done(monkeypatch, tmp_p
 
     with pytest.raises(RuntimeError):
         runner_reconciliation._compare_and_complete_remote(
-            "run-1", None, spec, {"wall_seconds": 1.0}
+            "run-1",
+            None,
+            spec,
+            {"wall_seconds": 1.0},
+            expected_attempt_id=2,
+            expected_fence=9,
         )
     assert runner_status.get_status("run-1").state == "running"
 
     assert (
-        runner_reconciliation._compare_and_complete_remote("run-1", None, spec, _metrics()) is True
+        runner_reconciliation._compare_and_complete_remote(
+            "run-1",
+            None,
+            spec,
+            _metrics(),
+            expected_attempt_id=2,
+            expected_fence=9,
+        )
+        is True
     )
     completed = runner_status.get_status("run-1")
     assert completed.state == "done"

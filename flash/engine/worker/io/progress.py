@@ -466,10 +466,10 @@ def _publish_progress(
                 _PROGRESS_COALESCED = pending
                 target = _PROGRESS_QUEUE[0] if _PROGRESS_QUEUE else None
             else:
-                target = _PROGRESS_COALESCED
-                _PROGRESS_QUEUE.append(target)
-                _PROGRESS_COALESCED = pending
-                _PROGRESS_COALESCE_STARTED_AT = now
+                _PROGRESS_COALESCED = None
+                _PROGRESS_COALESCE_STARTED_AT = None
+                _PROGRESS_QUEUE.append(pending)
+                target = pending
         else:
             _queue_coalesced_progress()
             _PROGRESS_QUEUE.append(pending)

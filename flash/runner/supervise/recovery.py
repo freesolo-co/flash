@@ -253,11 +253,20 @@ def _adopt_completed_attempt(
     metrics: dict,
     *,
     log,
+    expected_attempt_id: int | None = None,
+    expected_fence: int | None = None,
 ) -> bool:
     """Finalize a phantom-completed attempt through the expected-remote CAS."""
     from flash.runner.accounting.reconciliation import _compare_and_complete_remote
 
-    applied = _compare_and_complete_remote(run_id, expected_remote, spec, metrics)
+    applied = _compare_and_complete_remote(
+        run_id,
+        expected_remote,
+        spec,
+        metrics,
+        expected_attempt_id=expected_attempt_id,
+        expected_fence=expected_fence,
+    )
     if applied:
         _charge_completed_run_by_id(spec.run_id, log)
         _lifecycle()._register_checkpoints_best_effort(spec, log)
