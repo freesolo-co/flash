@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import os
 import struct
 import threading
 import types
@@ -14,8 +15,32 @@ from dataclasses import dataclass
 from typing import Any
 
 _UrlOpen = Callable[..., Any]
-_ORIGINAL_URLOPEN = urllib.request.urlopen
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_STDLIB_URLOPEN_ARGUMENTS = (
+    "url",
+    "data",
+    "timeout",
+    "cafile",
+    "capath",
+    "cadefault",
+    "context",
+)
+_STDLIB_URLOPEN_NAMES = (
+    "warnings",
+    "warn",
+    "DeprecationWarning",
+    "ValueError",
+    "_have_ssl",
+    "ssl",
+    "create_default_context",
+    "Purpose",
+    "SERVER_AUTH",
+    "set_alpn_protocols",
+    "HTTPSHandler",
+    "build_opener",
+    "_opener",
+    "open",
+)
 _HANDLER_COPY_ERROR = "installed urllib handler cannot be copied safely"
 _OPENER_COPY_ERROR = "installed urllib opener cannot be copied safely"
 _SNAPSHOT_DEPTH_MAX = 8
@@ -30,7 +55,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
     def http_response(self, request, response):
-        if response.code in _REDIRECT_STATUSES:
+        if 300 <= response.code < 400:
             raise urllib.error.HTTPError(
                 request.full_url,
                 response.code,
@@ -309,6 +334,29 @@ def _active_no_redirect_opener() -> urllib.request.OpenerDirector:
         raise urllib.error.URLError(_OPENER_COPY_ERROR)
 
 
+def _is_stdlib_urlopen(transport: object) -> bool:
+    if type(transport) is not types.FunctionType:
+        return False
+    try:
+        code = object.__getattribute__(transport, "__code__")
+        module_file = os.path.realpath(urllib.request.__file__)
+        code_file = os.path.realpath(code.co_filename)
+        arguments = code.co_varnames[: code.co_argcount + code.co_kwonlyargcount]
+        return (
+            object.__getattribute__(transport, "__module__") == urllib.request.__name__
+            and object.__getattribute__(transport, "__name__") == "urlopen"
+            and object.__getattribute__(transport, "__qualname__") == "urlopen"
+            and code_file == module_file
+            and code.co_name == "urlopen"
+            and code.co_argcount == 3
+            and code.co_kwonlyargcount == 4
+            and arguments == _STDLIB_URLOPEN_ARGUMENTS
+            and code.co_names == _STDLIB_URLOPEN_NAMES
+        )
+    except Exception:
+        return False
+
+
 def _urlopen_no_redirect(
     request: urllib.request.Request,
     *,
@@ -318,7 +366,7 @@ def _urlopen_no_redirect(
     """open one authenticated request without allowing a credential-bearing redirect."""
 
     transport = urllib.request.urlopen if urlopen is None else urlopen
-    if transport is not _ORIGINAL_URLOPEN:
+    if not _is_stdlib_urlopen(transport):
         return transport(request, timeout=timeout)
     opener = _active_no_redirect_opener()
     return opener.open(request, timeout=timeout)

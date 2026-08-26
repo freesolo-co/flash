@@ -6,6 +6,9 @@ import email.message
 import io
 import os
 import ssl
+import subprocess
+import sys
+import textwrap
 import threading
 import urllib.error
 import urllib.request
@@ -722,7 +725,7 @@ def test_generic_redirect_error_handler_cannot_reach_sink(status: int) -> None:
 
 
 @pytest.mark.parametrize("protocol", ["http", "https"])
-@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize("status", [300, 301, 302, 303, 304, 305, 306, 307, 308, 399])
 def test_early_response_processor_cannot_follow_redirect(protocol: str, status: int) -> None:
     source = f"{protocol}://source.invalid/data"
     target = f"{protocol}://sink.invalid/steal"
@@ -747,8 +750,12 @@ def test_early_response_processor_cannot_follow_redirect(protocol: str, status: 
 
         def process(self, request, response):
             processor_calls.append(request.full_url)
-            if response.code in (301, 302, 303, 307, 308):
-                return self.parent.open(response.headers["Location"], timeout=request.timeout)
+            if 300 <= response.code < 400:
+                redirected = urllib.request.Request(
+                    response.headers["Location"],
+                    headers={"Authorization": request.get_header("Authorization")},
+                )
+                return self.parent.open(redirected, timeout=request.timeout)
             return response
 
         http_response = process
@@ -805,6 +812,40 @@ def test_success_response_processors_keep_their_relative_order(protocol: str) ->
         assert response.read() == b"ok"
 
     assert observed == ["second", "first"]
+
+
+@pytest.mark.parametrize("protocol", ["http", "https"])
+def test_non_redirect_error_reaches_later_response_processors(protocol: str) -> None:
+    processor_calls: list[int] = []
+
+    class ErrorSource(urllib.request.BaseHandler):
+        def default_open(self, request):
+            response = urllib.response.addinfourl(
+                io.BytesIO(b"error"), email.message.Message(), request.full_url, code=418
+            )
+            response.msg = "teapot"
+            return response
+
+    class ErrorProcessor(urllib.request.BaseHandler):
+        handler_order = -1000
+
+        def process(self, request, response):
+            processor_calls.append(response.code)
+            return response
+
+        http_response = process
+        https_response = process
+
+    opener = urllib.request.build_opener(ErrorSource(), ErrorProcessor())
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        _urlopen_no_redirect(
+            urllib.request.Request(f"{protocol}://source.invalid/error"), timeout=1.0
+        )
+
+    assert exc_info.value.code == 418
+    assert processor_calls == [418]
 
 
 def test_concurrent_custom_opener_cache_construction_is_singleton() -> None:
@@ -967,6 +1008,67 @@ def test_replaced_installed_opener_is_observed() -> None:
     assert observed == ["first", "second"]
     assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
     assert urllib.request._opener is second
+
+
+@pytest.mark.parametrize(
+    ("replacement_kind", "spoof_metadata"),
+    [("function", False), ("lambda", False), ("function", True)],
+)
+def test_urlopen_replaced_before_helper_import_is_called(
+    replacement_kind: str, spoof_metadata: bool
+) -> None:
+    script = textwrap.dedent(
+        f"""
+        import urllib.request
+
+        calls = []
+
+        class UnexpectedTransport(urllib.request.BaseHandler):
+            def https_open(self, request):
+                calls.append(("unexpected", request.full_url))
+                raise AssertionError("real transport was used")
+
+        urllib.request.install_opener(urllib.request.build_opener(UnexpectedTransport()))
+
+        def replacement_function(request, timeout):
+            calls.append(("replacement", request.full_url, timeout))
+            return "replacement-response"
+
+        replacement_lambda = lambda request, timeout: (
+            calls.append(("replacement", request.full_url, timeout)),
+            "replacement-response",
+        )[1]
+        replacement = (
+            replacement_function
+            if {replacement_kind!r} == "function"
+            else replacement_lambda
+        )
+
+        if {spoof_metadata!r}:
+            replacement.__module__ = urllib.request.__name__
+            replacement.__name__ = "urlopen"
+
+        urllib.request.urlopen = replacement
+
+        from flash._internal.http import _urlopen_no_redirect
+
+        response = _urlopen_no_redirect(
+            urllib.request.Request("https://source.invalid/data"), timeout=3.0
+        )
+        assert response == "replacement-response"
+        assert calls == [("replacement", "https://source.invalid/data", 3.0)]
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=os.path.dirname(os.path.dirname(__file__)),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_urlopen_helper_preserves_late_bound_monkeypatch(monkeypatch) -> None:
