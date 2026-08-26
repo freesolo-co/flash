@@ -5616,20 +5616,24 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
     revision = f"{run_id}/final"
-    runner_verified_revisions.add_verified_checkpoint(
-        run_id,
-        revision,
-        expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
-    )
+    sibling = f"{run_id}/step-20"
+    status = runner_status.get_status(run_id)
+    status.state = "deployed"
+    status.deployment = {"state": "ready", "checkpoint_id": revision}
+    runner_state._save_status(status)
+    for checkpoint_id in (revision, sibling):
+        runner_verified_revisions.add_verified_checkpoint(
+            run_id,
+            checkpoint_id,
+            expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
+        )
 
     def boom(_run_id, **_):
         raise ServingError("serving backend unreachable: could not delete endpoint")
 
     monkeypatch.setattr(app_mod, "undeploy_adapter", boom)
 
-    resp = api.delete(
-        f"/v1/runs/{run_id}/deploy?checkpoint_id={run_id}/final", headers=_bearer(key)
-    )
+    resp = api.delete(f"/v1/runs/{run_id}/deploy?checkpoint_id={sibling}", headers=_bearer(key))
     assert resp.status_code == 502, resp.text
     detail = resp.json()["detail"]
     assert detail["code"] == "deployment_revocation_failed"
@@ -5638,6 +5642,7 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
     assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset({revision})
     deployment = runner_status.get_status(run_id).deployment
     assert deployment["state"] == "revocation_failed"
+    assert deployment["checkpoint_id"] == revision
     assert deployment["retryable"] is True
 
 

@@ -203,7 +203,9 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
         return status
 
 
-def mark_deployment_revocation_failed(run_id: str, error: str) -> RunStatus:
+def mark_deployment_revocation_failed(
+    run_id: str, error: str, checkpoint_id: str | None = None
+) -> RunStatus:
     from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
     from flash.runner.lifecycle.status import get_status
     from flash.runner.results.verified_revisions import remove_verified_checkpoint
@@ -211,8 +213,8 @@ def mark_deployment_revocation_failed(run_id: str, error: str) -> RunStatus:
     with _status_guard(run_id):
         status = get_status(run_id)
         deployment = status.deployment if isinstance(status.deployment, dict) else {}
-        checkpoint_id = deployment.get("checkpoint_id")
-        parsed = parse_checkpoint_ref(checkpoint_id) if isinstance(checkpoint_id, str) else None
+        target = checkpoint_id or deployment.get("checkpoint_id")
+        parsed = parse_checkpoint_ref(target) if isinstance(target, str) else None
 
         def _commit() -> None:
             now = time.time()
@@ -227,7 +229,7 @@ def mark_deployment_revocation_failed(run_id: str, error: str) -> RunStatus:
             _save_status_unlocked(status)
 
         if parsed is not None and parsed[0] == run_id:
-            remove_verified_checkpoint(run_id, checkpoint_id, commit=_commit)
+            remove_verified_checkpoint(run_id, target, commit=_commit)
         else:
             _commit()
         return status

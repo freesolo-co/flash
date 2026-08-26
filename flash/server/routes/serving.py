@@ -447,7 +447,9 @@ def undeploy(
                 )
             result = _app.undeploy_adapter(checkpoint_id, org_id=org_id)
         except ServingError as exc:
-            marked = mark_deployment_revocation_failed(run_id, str(exc))
+            marked = mark_deployment_revocation_failed(
+                run_id, str(exc), checkpoint_id=checkpoint_id
+            )
             persisted = isinstance(marked.deployment, dict) and (
                 marked.deployment.get("state") == "revocation_failed"
                 and marked.deployment.get("error") == str(exc)
