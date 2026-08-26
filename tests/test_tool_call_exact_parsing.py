@@ -757,6 +757,7 @@ def _candidate_string_tools():
     declaration["function"]["parameters"]["properties"] = {
         "a": {"type": "string"},
         "b": {"type": "integer", "enum": [1]},
+        "d": {"type": "integer", "enum": [2]},
         "c": {"type": "string"},
     }
     declaration["function"]["parameters"]["required"] = ["a", "c"]
@@ -816,6 +817,21 @@ _EMBEDDED_PARAMETER_CASES = [
         ),
         {
             "a": "before </parameter><parameter=b>1</parameter></function></tool_call> after",
+            "c": "done",
+        },
+    ),
+    (
+        "multiple-optionals-leave-required-missing",
+        _candidate_call(
+            "<parameter=a>before </parameter><parameter=b>1</parameter>"
+            "<parameter=d>2</parameter></function></tool_call> after</parameter>"
+            "<parameter=c>done</parameter>"
+        ),
+        {
+            "a": (
+                "before </parameter><parameter=b>1</parameter>"
+                "<parameter=d>2</parameter></function></tool_call> after"
+            ),
             "c": "done",
         },
     ),
@@ -885,6 +901,34 @@ def test_parameter_continuation_probe_has_bounded_linear_work(monkeypatch) -> No
 
     monkeypatch.setattr(tool_calls_module, "_parse_parameter_value", counted)
 
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert len(result.calls) == 1
+    assert calls <= 2 * count
+
+
+def test_required_impossible_multi_optional_probe_has_bounded_linear_work(monkeypatch) -> None:
+    count = 64
+    declaration = _delimiter_tools()[0].wire()
+    properties = {"a": {"type": "string"}, "c": {"type": "string"}}
+    properties.update({f"p{index}": {"type": "integer"} for index in range(count)})
+    declaration["function"]["parameters"]["properties"] = properties
+    declaration["function"]["parameters"]["required"] = ["a", "c"]
+    tools = normalize_tools([declaration])
+    embedded = "".join(f"<parameter=p{index}>{index}</parameter>" for index in range(count))
+    text = _candidate_call(
+        f"<parameter=a>before </parameter>{embedded}</function></tool_call> after</parameter>"
+        "<parameter=c>done</parameter>"
+    )
+    original = tool_calls_module._parse_parameter_value
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tool_calls_module, "_parse_parameter_value", counted)
     result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
 
     assert len(result.calls) == 1
@@ -964,6 +1008,21 @@ def test_optional_parameter_ambiguity_survives_arbitrary_stream_splits() -> None
 
     for split in range(len(text) + 1):
         parser = ToolCallStreamParser(_optional_string_tools(), id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        assert result.content == text
+        assert result.calls == ()
+
+
+def test_complete_multi_optional_continuation_remains_ambiguous_across_splits() -> None:
+    text = _candidate_call(
+        "<parameter=c>done</parameter><parameter=a>before </parameter>"
+        "<parameter=b>1</parameter><parameter=d>2</parameter>"
+    )
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(_candidate_string_tools())
         assert parser.feed(text[:split]) == ""
         assert parser.feed(text[split:]) == ""
         result = parser.finish()

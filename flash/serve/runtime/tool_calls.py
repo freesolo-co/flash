@@ -59,8 +59,6 @@ class FunctionTool:
 
 @dataclass(frozen=True, slots=True)
 class ParsedToolCall:
-    """one schema-valid parsed function call."""
-
     id: str
     name: str
     arguments: str
@@ -78,8 +76,6 @@ class ParsedToolCall:
 
 @dataclass(frozen=True, slots=True)
 class ToolParseResult:
-    """parsed calls and visible content, or exact fallback text when unmatched."""
-
     content: str | None
     calls: tuple[ParsedToolCall, ...]
 
@@ -568,13 +564,13 @@ def _parse_tool_call(
     if name_end < 0:
         return None
     name = text[cursor + len(_FUNCTION_START) : name_end]
-    tool = tools.get(name)
-    if tool is None:
+    if (tool := tools.get(name)) is None:
         return None
-    parsed_parameters = _parse_parameters(text, name_end + 1, tool)
-    if parsed_parameters is None:
+    if (parsed_parameters := _parse_parameters(text, name_end + 1, tool)) is None:
         return None
-    cursor, values = parsed_parameters
+    cursor, values, ambiguous, missing = parsed_parameters
+    if ambiguous or missing:
+        return None
     cursor = _skip_whitespace(text, cursor)
     if not text.startswith(TOOL_CALL_END, cursor):
         return None
@@ -586,10 +582,10 @@ def _parse_parameters(
     cursor: int,
     tool: FunctionTool,
     initial_values: Mapping[str, Any] | None = None,
-    probe: bool = False,
-    reject_ambiguity: bool = True,
-) -> tuple[int, dict[str, Any]] | None:
+    probe: int = 0,
+) -> tuple[int, dict[str, Any], bool, bool] | None:
     values = dict(initial_values or {})
+    ambiguous = False
     optional = set(tool.parameters["properties"]) - set(tool.parameters["required"])
     optional_markers = tuple(f"{_PARAMETER_START}{name}>" for name in optional)
     while True:
@@ -607,29 +603,28 @@ def _parse_parameters(
         if schema is None or parameter_name in values:
             return None
         free_string = schema["type"] == "string" and "enum" not in schema
-        follow = (tool, values, parameter_name) if free_string and not probe else None
-        parsed_value = _parse_parameter_value(text, name_end + 1, schema, follow)
-        if parsed_value is None:
+        follow = (tool, values, parameter_name, probe + 1) if free_string and probe < 2 else None
+        if (parsed_value := _parse_parameter_value(text, name_end + 1, schema, follow)) is None:
             return None
-        cursor, values[parameter_name] = parsed_value
+        cursor, values[parameter_name], continuation = parsed_value
         following = _skip_whitespace(text, cursor)
-        if probe and text.startswith(_PARAMETER_START, following):
-            return cursor, values
-        if reject_ambiguity and free_string and text.startswith(optional_markers, following):
-            return None
-    if set(tool.parameters["required"]) - set(values) or not _validate_value(
-        values, tool.parameters
-    ):
+        ambiguous |= free_string and text.startswith(optional_markers, following)
+        if probe == 2 and text.startswith(_PARAMETER_START, following):
+            return cursor, values, ambiguous, False
+        if continuation is not None:
+            return continuation[0], continuation[1], ambiguous or continuation[2], continuation[3]
+    missing = bool(set(tool.parameters["required"]) - set(values))
+    if not missing and not _validate_value(values, tool.parameters):
         return None
-    return cursor, values
+    return cursor, values, ambiguous, missing
 
 
 def _parse_parameter_value(
     text: str,
     value_start: int,
     schema: Mapping[str, Any],
-    follow: tuple[FunctionTool, Mapping[str, Any], str] | None = None,
-) -> tuple[int, Any] | None:
+    follow: tuple[FunctionTool, Mapping[str, Any], str, int] | None = None,
+) -> tuple[int, Any, tuple[int, dict[str, Any], bool, bool] | None] | None:
     search_from = value_start
     while True:
         value_end = (
@@ -662,13 +657,19 @@ def _parse_parameter_value(
                 return None
             cursor = value_end + len(_PARAMETER_END)
             if follow is None:
-                return cursor, value
-            tool, values, name = follow
-            parsed = _parse_parameters(text, cursor, tool, {**values, name: value}, True, False)
-            if parsed is not None and text.startswith(
-                (_PARAMETER_START, TOOL_CALL_END), _skip_whitespace(text, parsed[0])
-            ):
-                return cursor, value
+                return cursor, value, None
+            tool, values, name, probe = follow
+            if (
+                parsed := _parse_parameters(text, cursor, tool, {**values, name: value}, probe)
+            ) is not None:
+                after_probe = _skip_whitespace(text, parsed[0])
+                if probe == 2 and text.startswith(_PARAMETER_START, after_probe):
+                    return cursor, value, None
+                if text.startswith(TOOL_CALL_END, after_probe):
+                    if not parsed[3]:
+                        return cursor, value, None if probe == 2 else parsed
+                    search_from = after_probe + len(TOOL_CALL_END)
+                    continue
         search_from = value_end + len(_PARAMETER_END)
 
 
