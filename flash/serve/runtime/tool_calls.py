@@ -637,7 +637,11 @@ def _parse_parameter_value(
 ) -> tuple[int, Any] | None:
     search_from = value_start
     while True:
-        value_end = text.find(_PARAMETER_END, search_from)
+        value_end = (
+            _find_json_container_end(text, search_from)
+            if schema["type"] in {"array", "object"}
+            else text.find(_PARAMETER_END, search_from)
+        )
         if value_end < 0:
             return None
         following = _skip_whitespace(text, value_end + len(_PARAMETER_END))
@@ -667,6 +671,23 @@ def _parse_parameter_value(
         search_from = value_end + len(_PARAMETER_END)
 
 
+def _find_json_container_end(text: str, cursor: int) -> int:
+    in_string = False
+    escaped = False
+    while cursor < len(text):
+        character = text[cursor]
+        if escaped:
+            escaped = False
+        elif in_string and character == "\\":
+            escaped = True
+        elif character == '"':
+            in_string = not in_string
+        elif not in_string and text.startswith(_PARAMETER_END, cursor):
+            return cursor
+        cursor += 1
+    return -1
+
+
 def _coerce_value(value: str, schema_type: str) -> Any:
     if schema_type == "string":
         return value
@@ -690,6 +711,8 @@ def _coerce_value(value: str, schema_type: str) -> Any:
 def _validate_value(value: Any, schema: Mapping[str, Any]) -> bool:
     schema_type = schema["type"]
     if not _matches_type(value, schema_type):
+        return False
+    if schema_type == "string" and _contains_unpaired_surrogate(value):
         return False
     if "enum" in schema and not any(_json_values_equal(value, item) for item in schema["enum"]):
         return False
@@ -753,7 +776,7 @@ def _decimal_is_integral(value: Decimal) -> bool:
 
 def _load_exact_json(value: str) -> Any:
     try:
-        return json.loads(
+        decoded = json.loads(
             value,
             parse_float=Decimal,
             parse_int=int,
@@ -762,6 +785,9 @@ def _load_exact_json(value: str) -> Any:
         )
     except DecimalException as exc:
         raise ValueError("invalid decimal number") from exc
+    if _contains_unpaired_surrogate(decoded):
+        raise ValueError("json contains an unpaired surrogate")
+    return decoded
 
 
 def _decode_json_object(value: str) -> dict[str, Any]:
@@ -789,6 +815,21 @@ def _contains_decimal(value: Any) -> bool:
         return any(_contains_decimal(nested) for nested in value)
     if type(value) is dict:
         return any(_contains_decimal(nested) for nested in value.values())
+    return False
+
+
+def _contains_unpaired_surrogate(value: Any) -> bool:
+    stack = [value]
+    while stack:
+        nested = stack.pop()
+        if type(nested) is str:
+            if any(0xD800 <= ord(character) <= 0xDFFF for character in nested):
+                return True
+        elif type(nested) is list:
+            stack.extend(nested)
+        elif type(nested) is dict:
+            stack.extend(nested)
+            stack.extend(nested.values())
     return False
 
 

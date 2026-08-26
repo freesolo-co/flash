@@ -482,6 +482,22 @@ def test_hosted_tool_free_history_accepts_argument_complexity_boundary(argument:
     assert messages == original
 
 
+@pytest.mark.parametrize("argument", ['{"text":"\\ud800"}', '{"text":"\\udc00"}'])
+def test_hosted_tool_history_rejects_unpaired_surrogates(argument: str) -> None:
+    messages = _historical_tool_messages(argument)
+
+    with pytest.raises(ValidationError, match="arguments must encode a JSON object"):
+        OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
+
+
+def test_hosted_tool_history_accepts_valid_non_bmp_pair_and_serializes() -> None:
+    messages = _historical_tool_messages('{"text":"\\ud83d\\ude00"}')
+
+    request = OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
+
+    request.model_dump_json()
+
+
 def test_hosted_message_validation_preserves_non_tool_and_active_tool_requests() -> None:
     plain_messages = [{"role": "user", "content": "weather"}]
     plain_request = OpenAIGenerateRequest.model_validate(

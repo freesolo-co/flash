@@ -564,3 +564,156 @@ def test_tool_call_outer_closer_survives_arbitrary_stream_splits_and_multiple_ca
     assert len(result.calls) == 2
     assert "before </tool_call> after" in result.calls[0].arguments
     assert "second </tool_call> value" in result.calls[1].arguments
+
+
+@pytest.mark.parametrize(
+    ("parameter_name", "raw_value", "expected"),
+    [
+        (
+            "nested",
+            '{"text":"abc</parameter></function> and </tool_call>"}',
+            {"text": "abc</parameter></function> and </tool_call>"},
+        ),
+        (
+            "values",
+            '["abc</parameter></function> and </tool_call>"]',
+            ["abc</parameter></function> and </tool_call>"],
+        ),
+    ],
+    ids=["object", "array"],
+)
+def test_container_values_continue_past_structural_text_inside_json_strings(
+    parameter_name: str,
+    raw_value: str,
+    expected: object,
+) -> None:
+    text = (
+        "<tool_call><function=store>"
+        f"<parameter={parameter_name}>{raw_value}</parameter>"
+        "</function></tool_call>"
+    )
+
+    result = parse_qwen3_coder_output(text, _delimiter_tools(), id_factory=lambda: "call_fixed")
+
+    assert json.loads(result.calls[0].arguments) == {parameter_name: expected}
+
+
+@pytest.mark.parametrize(
+    ("parameter_name", "raw_value", "expected"),
+    [
+        (
+            "nested",
+            '{"text":"abc</parameter></function> and </tool_call>"}',
+            {"text": "abc</parameter></function> and </tool_call>"},
+        ),
+        (
+            "values",
+            '["abc</parameter></function> and </tool_call>"]',
+            ["abc</parameter></function> and </tool_call>"],
+        ),
+    ],
+    ids=["object", "array"],
+)
+def test_container_structural_text_survives_arbitrary_stream_splits(
+    parameter_name: str,
+    raw_value: str,
+    expected: object,
+) -> None:
+    text = (
+        "<tool_call><function=store>"
+        f"<parameter={parameter_name}>{raw_value}</parameter>"
+        "</function></tool_call>"
+    )
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(_delimiter_tools(), id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        assert json.loads(result.calls[0].arguments) == {parameter_name: expected}
+
+
+@pytest.mark.parametrize(
+    "raw_value",
+    [
+        '{"text":"abc</parameter></function>"',
+        '["abc</parameter></tool_call>"',
+    ],
+    ids=["object", "array"],
+)
+def test_malformed_container_delimiter_candidates_fall_back_exactly(raw_value: str) -> None:
+    parameter_name = "nested" if raw_value.startswith("{") else "values"
+    text = (
+        "<tool_call><function=store>"
+        f"<parameter={parameter_name}>{raw_value}</parameter>"
+        "</function></tool_call>"
+    )
+
+    result = parse_qwen3_coder_output(text, _delimiter_tools())
+
+    assert result.content == text
+    assert result.calls == ()
+
+
+@pytest.mark.parametrize("parameter_name", ["nested", "values"])
+def test_unpaired_surrogate_generated_container_arguments_fall_back_exactly(
+    parameter_name: str,
+) -> None:
+    raw_value = '{"text":"\\ud800"}' if parameter_name == "nested" else '["\\ud800"]'
+    text = (
+        "<tool_call><function=store>"
+        f"<parameter={parameter_name}>{raw_value}</parameter>"
+        "</function></tool_call>"
+    )
+
+    result = parse_qwen3_coder_output(text, _delimiter_tools())
+
+    assert result.content == text
+    assert result.calls == ()
+    json.dumps(result.content, ensure_ascii=False).encode("utf-8")
+
+
+@pytest.mark.parametrize("parameter_name", ["nested", "values"])
+def test_unpaired_surrogate_fallback_survives_arbitrary_stream_splits(
+    parameter_name: str,
+) -> None:
+    raw_value = '{"text":"\\ud800"}' if parameter_name == "nested" else '["\\ud800"]'
+    text = (
+        "<tool_call><function=store>"
+        f"<parameter={parameter_name}>{raw_value}</parameter>"
+        "</function></tool_call>"
+    )
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(_delimiter_tools(), id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        assert result.content == text
+        assert result.calls == ()
+
+
+@pytest.mark.parametrize(
+    ("parameter_name", "raw_value", "expected"),
+    [
+        ("nested", '{"text":"\\ud83d\\ude00"}', {"text": "😀"}),
+        ("values", '["\\ud83d\\ude00"]', ["😀"]),
+    ],
+    ids=["object", "array"],
+)
+def test_valid_non_bmp_surrogate_pairs_remain_structured(
+    parameter_name: str,
+    raw_value: str,
+    expected: object,
+) -> None:
+    text = (
+        "<tool_call><function=store>"
+        f"<parameter={parameter_name}>{raw_value}</parameter>"
+        "</function></tool_call>"
+    )
+
+    result = parse_qwen3_coder_output(text, _delimiter_tools(), id_factory=lambda: "call_fixed")
+
+    assert json.loads(result.calls[0].arguments) == {parameter_name: expected}
+    assert "😀" in result.calls[0].arguments
+    result.calls[0].arguments.encode("utf-8")

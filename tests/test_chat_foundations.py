@@ -691,6 +691,30 @@ def test_duplicate_object_keys_in_tool_history_are_a_request_error(argument: str
         )
 
 
+@pytest.mark.parametrize("argument", ['{"text":"\\ud800"}', '{"text":"\\udc00"}'])
+def test_unpaired_surrogate_in_tool_history_is_a_request_error(argument: str) -> None:
+    messages = _historical_tool_messages(argument)
+
+    with pytest.raises(OpenAIRequestError, match="arguments must encode a JSON object"):
+        parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+def test_valid_non_bmp_surrogate_pair_in_tool_history_is_accepted() -> None:
+    messages = _historical_tool_messages('{"text":"\\ud83d\\ude00"}')
+
+    request = parse_chat_request(
+        {"messages": messages},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    assert request.messages == messages
+
+
 def test_authorized_revision_resolver_prefers_ready_revision_for_ambiguous_step() -> None:
     run_id = "run-1"
     older = f"{run_id}@step-7." + "a" * 40
