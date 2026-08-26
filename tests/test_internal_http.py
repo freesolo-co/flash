@@ -455,11 +455,174 @@ def test_concurrent_installed_configuration_refresh_is_singleton() -> None:
     assert observed[0][1] is not first_private
 
 
+def test_installed_slot_configuration_change_rebuilds_private_opener() -> None:
+    observed: list[str] = []
+
+    class SlotGatewayHandler(urllib.request.BaseHandler):
+        __slots__ = ("token",)
+
+        def custom_open(self, request):
+            observed.append(self.token)
+            return _response(request.full_url)
+
+    handler = SlotGatewayHandler()
+    handler.token = "token-a"
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/a"), timeout=1.0):
+        pass
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+    handler.token = "token-b"
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/b"), timeout=1.0):
+        pass
+
+    assert observed == ["token-a", "token-b"]
+    assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
+    assert handler.parent is opener
+    assert handler.token == "token-b"
+
+
+def test_installed_slot_container_mutation_rebuilds_private_opener() -> None:
+    observed: list[tuple[str, ...]] = []
+
+    class SlotGatewayHandler(urllib.request.BaseHandler):
+        __slots__ = ("config",)
+
+        def custom_open(self, request):
+            observed.append(tuple(self.config["tokens"]))
+            return _response(request.full_url)
+
+    handler = SlotGatewayHandler()
+    handler.config = {"tokens": ["token-a"]}
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/a"), timeout=1.0):
+        pass
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+    handler.config["tokens"].append("token-b")
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/b"), timeout=1.0):
+        pass
+
+    assert observed == [("token-a",), ("token-a", "token-b")]
+    assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
+    assert handler.parent is opener
+    assert handler.config == {"tokens": ["token-a", "token-b"]}
+
+
+def test_inherited_and_mangled_slot_changes_rebuild_private_opener() -> None:
+    observed: list[tuple[str, str]] = []
+
+    class BaseGatewayHandler(urllib.request.BaseHandler):
+        __slots__ = ("__base_token",)
+
+    class SlotGatewayHandler(BaseGatewayHandler):
+        __slots__ = ("token",)
+
+        def custom_open(self, request):
+            observed.append((self._BaseGatewayHandler__base_token, self.token))
+            return _response(request.full_url)
+
+    handler = SlotGatewayHandler()
+    handler._BaseGatewayHandler__base_token = "base-a"
+    handler.token = "token-a"
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/a"), timeout=1.0):
+        pass
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+    handler._BaseGatewayHandler__base_token = "base-b"
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/b"), timeout=1.0):
+        pass
+    second_private = http_transport._INSTALLED_OPENER_CACHE.private
+    handler.token = "token-b"
+    with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/c"), timeout=1.0):
+        pass
+
+    assert observed == [
+        ("base-a", "token-a"),
+        ("base-b", "token-a"),
+        ("base-b", "token-b"),
+    ]
+    assert second_private is not first_private
+    assert http_transport._INSTALLED_OPENER_CACHE.private is not second_private
+
+
+def test_unchanged_installed_slot_configuration_reuses_private_opener() -> None:
+    class SlotGatewayHandler(urllib.request.BaseHandler):
+        __slots__ = ("token",)
+
+        def custom_open(self, request):
+            return _response(request.full_url, self.token.encode())
+
+    handler = SlotGatewayHandler()
+    handler.token = "token-a"
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+    private_openers: list[object] = []
+
+    for suffix in ("a", "b"):
+        with _urlopen_no_redirect(
+            urllib.request.Request(f"custom://source.invalid/{suffix}"), timeout=1.0
+        ) as response:
+            assert response.read() == b"token-a"
+        private_openers.append(http_transport._INSTALLED_OPENER_CACHE.private)
+
+    assert private_openers[0] is private_openers[1]
+    assert handler.parent is opener
+    assert handler.token == "token-a"
+
+
+def test_unsupported_slot_descriptor_fails_before_transport() -> None:
+    contacted: list[str] = []
+    descriptor_calls: list[str] = []
+
+    class SlotGatewayHandler(urllib.request.BaseHandler):
+        __slots__ = ("token",)
+
+        def custom_open(self, request):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    handler = SlotGatewayHandler()
+    handler.token = "token-a"
+
+    def malicious(_self):
+        descriptor_calls.append("called")
+        return "malicious"
+
+    SlotGatewayHandler.token = property(malicious)
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+    original_parent = handler.parent
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+    assert descriptor_calls == []
+    assert urllib.request._opener is opener
+    assert handler.parent is original_parent
+
+
 def test_installed_digest_handler_state_survives_across_requests() -> None:
     password_manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
     password_manager.add_password("realm", "https://source.invalid", "user", "pass")
     digest = urllib.request.HTTPDigestAuthHandler(password_manager)
     seen_nonce_counts: list[int] = []
+
+    class SlotConfiguration(urllib.request.BaseHandler):
+        __slots__ = ("token",)
+
+        def https_request(self, request):
+            return request
+
+    slot_configuration = SlotConfiguration()
+    slot_configuration.token = "unchanged"
 
     class DigestSource(urllib.request.BaseHandler):
         handler_order = 100
@@ -486,7 +649,7 @@ def test_installed_digest_handler_state_survives_across_requests() -> None:
             if isinstance(item, urllib.request.HTTPDigestAuthHandler)
         )
 
-    opener = urllib.request.build_opener(DigestSource(), digest)
+    opener = urllib.request.build_opener(DigestSource(), slot_configuration, digest)
     urllib.request.install_opener(opener)
 
     private_openers: list[object] = []
@@ -508,6 +671,7 @@ def test_installed_digest_handler_state_survives_across_requests() -> None:
     assert private_digest.last_nonce == "nonce-a"
     assert digest.nonce_count == 0
     assert digest.last_nonce is None
+    assert slot_configuration.token == "unchanged"
 
 
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
@@ -707,6 +871,71 @@ def test_installed_redirect_handler_cannot_reach_sink() -> None:
     assert exc_info.value.code == 302
     assert observed == [source]
     assert redirect.parent is original_parent
+    assert urllib.request._opener is opener
+
+
+def test_installed_opener_subclass_override_fails_before_transport() -> None:
+    contacted: list[str] = []
+
+    class OverrideOpener(urllib.request.OpenerDirector):
+        def open(self, fullurl, data=None, timeout=None):
+            contacted.append(str(fullurl))
+            return _response("custom://source.invalid/data")
+
+    opener = OverrideOpener()
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib opener cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+    assert urllib.request._opener is opener
+
+
+def test_installed_opener_instance_override_fails_before_transport() -> None:
+    contacted: list[str] = []
+    opener = urllib.request.build_opener()
+
+    def override(fullurl, data=None, timeout=None):
+        contacted.append(str(fullurl))
+        return _response("custom://source.invalid/data")
+
+    opener.open = override
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib opener cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
+    assert urllib.request._opener is opener
+    assert opener.open is override
+
+
+def test_installed_opener_inheriting_standard_open_is_supported() -> None:
+    observed: list[str] = []
+
+    class StandardOpener(urllib.request.OpenerDirector):
+        pass
+
+    class TerminalHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            observed.append(request.full_url)
+            return _response(request.full_url)
+
+    opener = StandardOpener()
+    opener.add_handler(TerminalHandler())
+    urllib.request.install_opener(opener)
+
+    with _urlopen_no_redirect(
+        urllib.request.Request("custom://source.invalid/data"), timeout=1.0
+    ) as response:
+        assert response.read() == b"ok"
+
+    assert observed == ["custom://source.invalid/data"]
     assert urllib.request._opener is opener
 
 

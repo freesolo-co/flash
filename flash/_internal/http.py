@@ -6,6 +6,7 @@ import copy
 import inspect
 import struct
 import threading
+import types
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -19,6 +20,7 @@ _HANDLER_COPY_ERROR = "installed urllib handler cannot be copied safely"
 _OPENER_COPY_ERROR = "installed urllib opener cannot be copied safely"
 _SNAPSHOT_DEPTH_MAX = 8
 _SNAPSHOT_ITEMS_MAX = 256
+_ABSENT_SLOT = object()
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -111,16 +113,69 @@ def _snapshot_value(value: object, depth: int = 0) -> object:
     return ("opaque", id(value_type), id(value))
 
 
+def _slot_names(declaration: object) -> tuple[str, ...]:
+    if type(declaration) is str:
+        names = (declaration,)
+    elif type(declaration) in (list, tuple, set, frozenset):
+        names = tuple(declaration)
+    elif type(declaration) is dict:
+        names = tuple(declaration.keys())
+    else:
+        raise TypeError
+    if any(type(name) is not str for name in names):
+        raise TypeError
+    return names
+
+
+def _mangled_slot_name(owner: type, name: str) -> str:
+    if name.startswith("__") and not name.endswith("__"):
+        class_name = type.__getattribute__(owner, "__name__").lstrip("_")
+        if class_name:
+            return f"_{class_name}{name}"
+    return name
+
+
+def _slot_config_signature(handler: urllib.request.BaseHandler) -> tuple[object, ...]:
+    try:
+        found = []
+        seen: set[int] = set()
+        handler_type = type(handler)
+        for owner in type.__getattribute__(handler_type, "__mro__"):
+            namespace = type.__getattribute__(owner, "__dict__")
+            declaration = namespace.get("__slots__", ())
+            for declared_name in _slot_names(declaration):
+                if declared_name in {"__dict__", "__weakref__", "parent"}:
+                    continue
+                slot_name = _mangled_slot_name(owner, declared_name)
+                descriptor = namespace.get(slot_name)
+                if type(descriptor) is not types.MemberDescriptorType:
+                    raise TypeError
+                if id(descriptor) in seen:
+                    continue
+                seen.add(id(descriptor))
+                try:
+                    value = types.MemberDescriptorType.__get__(descriptor, handler, handler_type)
+                except AttributeError:
+                    snapshot = _ABSENT_SLOT
+                else:
+                    snapshot = _snapshot_value(value)
+                found.append((id(owner), slot_name, snapshot))
+        return tuple(found)
+    except Exception:
+        raise urllib.error.URLError(_HANDLER_COPY_ERROR) from None
+
+
 def _handler_config_signature(handler: urllib.request.BaseHandler) -> object:
     try:
         state = object.__getattribute__(handler, "__dict__")
         if type(state) is not dict or any(type(name) is not str for name in state):
             raise TypeError
-        return frozenset(
+        dictionary = frozenset(
             (name, _snapshot_value(value)) for name, value in state.items() if name != "parent"
         )
     except Exception:
         raise urllib.error.URLError(_OPENER_COPY_ERROR) from None
+    return (dictionary, _slot_config_signature(handler))
 
 
 def _copy_installed_handler(
@@ -144,6 +199,23 @@ def _copy_installed_handler(
     return copied
 
 
+def _validate_installed_opener(opener: urllib.request.OpenerDirector) -> None:
+    try:
+        state = object.__getattribute__(opener, "__dict__")
+        class_open = inspect.getattr_static(type(opener), "open", None)
+        instance_open = inspect.getattr_static(opener, "open", None)
+    except Exception:
+        raise urllib.error.URLError(_OPENER_COPY_ERROR) from None
+    standard_open = urllib.request.OpenerDirector.open
+    if (
+        type(state) is not dict
+        or "open" in state
+        or class_open is not standard_open
+        or instance_open is not standard_open
+    ):
+        raise urllib.error.URLError(_OPENER_COPY_ERROR)
+
+
 def _installed_config(
     opener: urllib.request.OpenerDirector,
 ) -> tuple[
@@ -152,6 +224,7 @@ def _installed_config(
     tuple[int, tuple[tuple[int, object], ...]],
     tuple[int, tuple[tuple[str, str], ...]],
 ]:
+    _validate_installed_opener(opener)
     try:
         handlers = tuple(opener.handlers)
         addheaders = []
