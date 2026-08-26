@@ -1870,6 +1870,14 @@ def test_provider_destroy_rejects_incomplete_handle_before_api_call(monkeypatch)
 # ---------------------------------------------------------------------------
 # labels, handle, sweep, gc
 # ---------------------------------------------------------------------------
+def test_instance_prefix_uses_collision_resistant_digest():
+    from flash.providers.vast.jobs import run_label_prefix
+
+    first = "flash-" + "x" * 50 + "042449"
+    second = "flash-" + "x" * 50 + "043430"
+    assert run_label_prefix(first) != run_label_prefix(second)
+
+
 def test_instance_label_and_handle_roundtrip():
     from flash.providers.vast.jobs import instance_label, run_label_prefix
     from flash.providers.vast.jobs.builders import VastJobHandle
@@ -1908,12 +1916,12 @@ def test_destroy_run_instances_matches_forced_prefix(monkeypatch):
     from flash.providers.vast.client import api as vast_api
 
     instances = [
-        {"id": 1, "label": "flash-run1-a0"},  # ours
-        {
-            "id": 2,
-            "label": "flash-run10-a0",
-        },  # a DIFFERENT run (prefix boundary) — must NOT match
-        {"id": 3, "label": "someone-else"},  # not ours
+        {"id": 1, "label": "flash-run1-a0"},
+        {"id": 2, "label": "flash-run10-a0"},
+        {"id": 3, "label": "someone-else"},
+        {"id": 4, "label": "flash-run1"},
+        {"id": 5, "label": "flash-run1-audit-a0"},
+        {"id": 6, "label": "flash-run1-a00"},
     ]
     monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
     destroyed = []
@@ -1932,9 +1940,11 @@ def test_run_instances_remaining_confirms_clear_and_raises_on_listing_failure(mo
     from flash.providers.vast.client import api as vast_api
 
     instances = [
-        {"id": 9, "label": "flash-run1-a0"},  # ours -> remaining
-        {"id": 10, "label": "flash-run10-a0"},  # different run (boundary) -> NOT ours
-        {"id": 11, "label": "someone-else"},  # not ours
+        {"id": 9, "label": "flash-run1-a0"},
+        {"id": 10, "label": "flash-run10-a0"},
+        {"id": 11, "label": "someone-else"},
+        {"id": 12, "label": "flash-run1"},
+        {"id": 13, "label": "flash-run1-audit-a0"},
     ]
     monkeypatch.setattr(vast_api, "list_instances", lambda strict=False: instances)
     assert vast.run_instances_remaining("run1") == [9]
@@ -2001,16 +2011,18 @@ def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
     from flash.providers.vast.client import api as vast_api
 
     instances = [
-        {"id": 1, "label": "flash-runA-a0"},  # active -> protected
-        {"id": 2, "label": "flash-runB-a0"},  # orphan -> reaped
-        {"id": 3, "label": "flash-runA10-a0"},  # NOT runA (boundary) -> orphan, reaped
-        {"id": 4, "label": "not-ours"},  # untouched
+        {"id": 1, "label": "flash-runA-a0"},
+        {"id": 2, "label": "flash-runB-a0"},
+        {"id": 3, "label": "flash-runA10-a0"},
+        {"id": 4, "label": "not-ours"},
+        {"id": 5, "label": "flash-runB"},
+        {"id": 6, "label": "flash-runB-audit-a0"},
     ]
     monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
     out = vast.sweep_orphans(active_labels={"runA"})  # raw active id; prefix forced internally
-    assert sorted(out) == [2, 3]
+    assert sorted(out) == [2, 3, 6]
     assert 1 not in destroyed  # the active run's box survived
     assert 4 not in destroyed  # non-flash box untouched
 

@@ -7,6 +7,7 @@ from typing import ClassVar
 
 from flash.providers._lifecycle.instances.instance import (
     InstanceJobHandle,
+    canonical_instance_label,
     instance_label,
     label_matches_run,
     run_label_prefix,
@@ -23,6 +24,7 @@ __all__ = [
     "LambdaJobHandle",
     "build_payload",
     "build_user_data",
+    "canonical_instance_label",
     "instance_label",
     "label_matches_run",
     "lambda_image",

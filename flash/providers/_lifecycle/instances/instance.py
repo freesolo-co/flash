@@ -7,9 +7,11 @@ import hashlib
 import io
 import json
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from flash.adapters.artifacts import MAX_ATTEMPT_ID
 from flash.providers._lifecycle.instances.poll import _attempt_int
 from flash.providers._lifecycle.net.deadline import remaining_seconds, require_deadline_at
 from flash.runtime_capsule import build_capsule, sha256_bytes
@@ -21,8 +23,9 @@ _INSTANCE_CAPSULE: tuple[str, str] | None = None
 
 # Bounded so the name is never truncated at launch — truncation desyncs the sweep-matched prefix.
 _MAX_NAME = 60
-_SUFFIX_BUDGET = 12
+_SUFFIX_BUDGET = len(f"-a{MAX_ATTEMPT_ID}")
 _PREFIX_BUDGET = _MAX_NAME - _SUFFIX_BUDGET
+_RUN_DIGEST_BYTES = 16
 
 # The provider-aligned user_data ceiling (cloud-init limits run ~16KB on AWS to 64KB elsewhere) less
 # a stated margin for provider-side framing. This budget is the BINDING spill check: build_user_data
@@ -50,13 +53,41 @@ def run_label_prefix(run_id: str) -> str:
     base = run_id if run_id.startswith("flash-") else f"flash-{run_id}"
     if len(base) <= _PREFIX_BUDGET:
         return base
-    h = hashlib.sha1(base.encode()).hexdigest()[:8]
-    return f"{base[: _PREFIX_BUDGET - 9]}-{h}"
+    digest = (
+        base64.urlsafe_b64encode(
+            hashlib.blake2b(base.encode(), digest_size=_RUN_DIGEST_BYTES).digest()
+        )
+        .decode()
+        .rstrip("=")
+    )
+    readable_budget = _PREFIX_BUDGET - len("flash-") - len(digest)
+    deadline = re.search(r"-d(\d{10,})-", base)
+    readable = (
+        f"d{deadline.group(1)[:10]}"
+        if deadline is not None
+        else re.sub(r"[^A-Za-z0-9_-]", "", base.removeprefix("flash-"))[:readable_budget]
+    )
+    return f"flash-{readable}{digest}"
+
+
+def _canonical_attempt_match(label: str, pattern: str):
+    match = re.fullmatch(pattern, label)
+    if match is None:
+        return None
+    attempt = _attempt_int(int(match.group(1)))
+    if attempt is None or match.group(1) != str(attempt):
+        return None
+    return match
+
+
+def canonical_instance_label(label: str) -> bool:
+    """Return whether a provider label has a canonical flash run and attempt identity."""
+    return _canonical_attempt_match(label, r"flash-.+-a([0-9]+)") is not None
 
 
 def label_matches_run(label: str, prefix: str) -> bool:
-    """Return whether a label is the exact run prefix or uses its attempt boundary."""
-    return label == prefix or label.startswith(prefix + "-a")
+    """Return whether a label carries the exact run prefix and a canonical attempt suffix."""
+    return _canonical_attempt_match(label, re.escape(prefix) + r"-a([0-9]+)") is not None
 
 
 def instance_label(run_id: str, attempt: int) -> str:

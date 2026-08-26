@@ -371,6 +371,52 @@ def test_status_projection_sanitizer_bounds_lists():
     assert sanitized["other"] == list(range(64))
 
 
+@pytest.mark.parametrize("terminal_state", ["done", "failed", "cancelled"])
+def test_terminal_run_settles_current_attempt_across_status_api_and_cli(
+    monkeypatch, tmp_path, terminal_state
+):
+    from flash.cli.ui import render
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id=f"terminal-{terminal_state}", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
+    )
+    attempt = runner_attempts._reserve_attempt_record(spec.run_id)
+    handle = _lambda_remote(
+        instance_id=f"instance-{terminal_state}",
+        attempt=attempt.attempt_id,
+        fence=attempt.fence,
+    )
+    assert runner_status.record_attempt_handle(
+        spec.run_id,
+        handle,
+        attempt_id=attempt.attempt_id,
+        fence=attempt.fence,
+    )
+    assert runner_status.record_result(
+        spec.run_id,
+        {
+            "attempt_id": attempt.attempt_id,
+            "fence": attempt.fence,
+            "outcome": terminal_state,
+        },
+        attempt_id=attempt.attempt_id,
+        fence=attempt.fence,
+    )
+    assert runner_status.get_status(spec.run_id).attempt["state"] == "result_pending"
+
+    assert runner_status._update(spec.run_id, terminal_state)
+    stored = runner_status.get_status(spec.run_id)
+    public = stored.to_dict()
+
+    assert stored.state == terminal_state
+    assert stored.attempt["state"] == "settled"
+    assert public["attempt"]["state"] == "settled"
+    assert "settled" in render.run_status(public)
+
+
 def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypatch):
     """finished_at remains fixed after later resource observations and terminal rewrites."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -1285,15 +1331,27 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id=f"recovered-{terminal_state}", model="Qwen/Qwen3.5-9B", algorithm="sft")
-    remote = _runpod_remote("endpoint-cost", "job-cost", attempt=0, started_ts=100.0)
     runner_state._save_status(
         runner_state.RunStatus(
             run_id=spec.run_id,
             state="running",
             spec=spec.to_dict(),
-            created_at=90.0,
-            remote=remote,
+            created_at=runner_state.time.time() - 10.0,
         )
+    )
+    attempt = runner_attempts._reserve_attempt_record(spec.run_id)
+    remote = _runpod_remote(
+        "endpoint-cost",
+        "job-cost",
+        attempt=attempt.attempt_id,
+        fence=attempt.fence,
+        started_ts=100.0,
+    )
+    assert runner_status.record_attempt_handle(
+        spec.run_id,
+        remote,
+        attempt_id=attempt.attempt_id,
+        fence=attempt.fence,
     )
     if terminal_state == "done":
         monkeypatch.setattr(runner_status, "_persist_metrics", lambda *_args, **_kwargs: 0.5)
@@ -1309,6 +1367,7 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
 
     status = runner_status.get_status(spec.run_id)
     assert status.state == terminal_state
+    assert status.attempt["state"] == "settled"
     assert status.remote == remote
     assert reconcile._due(status, status.finished_at + reconcile._SETTLE_SECONDS + 1.0)
 

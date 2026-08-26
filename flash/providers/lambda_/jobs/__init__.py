@@ -17,7 +17,11 @@ from typing import Any
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash._internal.logging import get_logger
-from flash.providers._lifecycle.instances.poll import make_say, preload_box_reap_due
+from flash.providers._lifecycle.instances.poll import (
+    is_preload_instance_label,
+    make_say,
+    preload_box_reap_due,
+)
 from flash.providers._lifecycle.instances.poll_instance import (
     InstancePollAdapter,
     poll_instance_job,
@@ -39,6 +43,7 @@ from flash.providers.lambda_.jobs.builders import (
     LambdaJobHandle,
     build_payload,
     build_user_data,
+    canonical_instance_label,
     instance_label,
     label_matches_run,
     run_label_prefix,
@@ -861,10 +866,10 @@ def sweep_orphans(
     orphans: list[str] = []
     for inst in instances:
         name = str(inst.get("name") or "")
-        if not name.startswith("flash-"):
+        if not canonical_instance_label(name):
             continue
         # Preload boxes are exempt (driver-owned, not in run DB) UNLESS past their wall deadline + grace.
-        if name.startswith("flash-preload-"):
+        if is_preload_instance_label(name):
             if preload_box_reap_due(name, now):
                 iid = inst.get("id")
                 if iid:

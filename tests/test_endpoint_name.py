@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 
+from flash.adapters.artifacts import MAX_ATTEMPT_ID
 from flash.providers.runpod.serverless.endpoints import (
     _endpoint_name_matches_run,
     _run_suffix,
@@ -45,20 +46,27 @@ def test_endpoint_name_sanitizes_suffix():
     assert name.startswith("flash-5090-")
     tail = name.rsplit("-", 1)[-1]
     assert tail.isalnum()
-    assert len(tail) <= 24
+    assert len(name) <= 64
 
 
 def test_attempt_suffix_is_bounded_and_old_names_do_not_match():
     run_id = "flash-" + "x" * 200
-    suffix = attempt_suffix(run_id, 987654321)
-    assert suffix.endswith("-a987654321")
-    assert len(suffix) <= 24
+    suffix = attempt_suffix(run_id, MAX_ATTEMPT_ID)
+    assert suffix.endswith(f"-a{MAX_ATTEMPT_ID}")
+    assert len(endpoint_name("RTX 5090", suffix)) <= 64
     target = endpoint_name("RTX 5090", _run_suffix(run_id))
     assert _endpoint_name_matches_run(endpoint_name("RTX 5090", suffix), target)
     assert not _endpoint_name_matches_run(target, target)
     assert not _endpoint_name_matches_run(f"{target}r1", target)
-    with pytest.raises(ValueError, match="exceeds the endpoint name budget"):
-        attempt_suffix(run_id, 999999999999)
+    with pytest.raises(ValueError, match="attempt identity is invalid"):
+        attempt_suffix(run_id, MAX_ATTEMPT_ID + 1)
+
+
+def test_run_suffix_resists_supplied_sha1_collision():
+    first = "flash-run-00043377-zzz"
+    second = "flash-run-00048965-zzz"
+    assert _run_suffix(first) != _run_suffix(second)
+    assert len(_run_suffix(first)) == len(_run_suffix(second)) == 16
 
 
 def test_run_suffix_none_safe():

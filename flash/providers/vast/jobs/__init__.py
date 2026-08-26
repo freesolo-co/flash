@@ -43,6 +43,7 @@ from flash.providers.vast.jobs.builders import (
     VastOffer,
     build_onstart,
     build_payload,
+    canonical_instance_label,
     instance_label,
     label_matches_run,
     run_label_prefix,
@@ -829,7 +830,7 @@ def sweep_orphans(
     destroyed: list[int] = []
     for inst in instances:
         label = str(inst.get("label") or "")
-        if not label.startswith("flash-"):
+        if not canonical_instance_label(label):
             continue
         if _matches(active, label):
             continue  # a live run owns this box — protected

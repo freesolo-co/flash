@@ -356,9 +356,11 @@ def _save_status_unlocked(
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import reporting
-    from flash.runner.lifecycle.status import _load_status_json
+    from flash.runner.lifecycle.status import _load_status_json, settle_current_attempt
 
     os.makedirs(RUNS_DIR, exist_ok=True)
+    if status.state in {"done", "failed", "cancelled"}:
+        settle_current_attempt(status)
     # write-then-rename so concurrent readers never see a half-written file.
     path = runs_file_path(status.run_id, ".json")
     existing = _load_status_json(status.run_id) if os.path.exists(path) else {}

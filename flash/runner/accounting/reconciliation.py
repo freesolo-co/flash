@@ -129,6 +129,7 @@ def _compare_and_fail_remote(
         if not _expected_remote_matches(status.remote, expected_remote):
             return False
         status.state = "failed"
+        status_ops.settle_current_attempt(status)
         status.error = error
         status.updated_at = time.time()
         if status.finished_at is None:
@@ -182,6 +183,7 @@ def _compare_and_complete_remote(
         measured = float(status.cost_usd or 0.0) + recovered_cost
         charge_usd = costs._status_estimated_charge(status, spec, fallback=measured)
         status.state = "done"
+        status_ops.settle_current_attempt(status)
         status.cost_usd = charge_usd
         status.artifacts_dir = state.artifacts_dir(spec)
         status.source_verified_attempt = verified_attempt

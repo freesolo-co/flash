@@ -2322,20 +2322,30 @@ def test_instance_label_always_sweepable():
 
 
 def test_instance_label_preserves_complete_attempt_suffix():
+    from flash.adapters.artifacts import MAX_ATTEMPT_ID
     from flash.providers._lifecycle.instances.instance import _MAX_NAME, run_label_prefix
     from flash.providers.lambda_.jobs.builders import instance_label
 
     run_id = "flash-1700000000-abcd1234"
     assert instance_label(run_id, 0) == f"{run_id}-a0"
-    assert instance_label(run_id, 987654321) == f"{run_id}-a987654321"
+    assert instance_label(run_id, MAX_ATTEMPT_ID) == f"{run_id}-a{MAX_ATTEMPT_ID}"
     long_run_id = "flash-" + "x" * 80
     label = instance_label(long_run_id, 7777777)
     assert label == f"{run_label_prefix(long_run_id)}-a7777777"
     assert len(label) <= _MAX_NAME
-    with pytest.raises(ValueError, match="exceeds the provider name budget"):
-        instance_label(run_id, 999999999999)
+    with pytest.raises(ValueError, match="attempt identity is invalid"):
+        instance_label(run_id, MAX_ATTEMPT_ID + 1)
     with pytest.raises(ValueError, match="attempt identity is invalid"):
         instance_label(run_id, "bad")
+
+
+def test_instance_prefix_uses_collision_resistant_digest():
+    from flash.providers._lifecycle.instances.instance import run_label_prefix
+
+    first = "flash-" + "x" * 50 + "042449"
+    second = "flash-" + "x" * 50 + "043430"
+    assert run_label_prefix(first) != run_label_prefix(second)
+    assert len(run_label_prefix(first)) == len(run_label_prefix(second)) == 39
 
 
 def test_terminate_run_instances_matches_forced_prefix(monkeypatch):
@@ -2343,8 +2353,11 @@ def test_terminate_run_instances_matches_forced_prefix(monkeypatch):
     from flash.providers.lambda_.client import api as lambda_api
 
     instances = [
-        {"id": "i-1", "name": "flash-fail-fast-a0"},  # forced-prefix name
-        {"id": "i-2", "name": "flash-other-run-a0"},  # different run -> keep
+        {"id": "i-1", "name": "flash-fail-fast-a0"},
+        {"id": "i-2", "name": "flash-other-run-a0"},
+        {"id": "i-bare", "name": "flash-fail-fast"},
+        {"id": "i-audit", "name": "flash-fail-fast-audit-a0"},
+        {"id": "i-leading-zero", "name": "flash-fail-fast-a00"},
     ]
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
@@ -2367,6 +2380,8 @@ def test_run_instances_remaining_uses_exact_labels_and_exact_lookup(monkeypatch)
         {"id": "i-live", "name": jobs.instance_label(run_id, 0)},
         {"id": "i-gone", "name": jobs.instance_label(run_id, 0)},
         {"id": "i-other", "name": jobs.instance_label("flash-1000", 0)},
+        {"id": "i-bare", "name": jobs.run_label_prefix(run_id)},
+        {"id": "i-audit", "name": f"{jobs.run_label_prefix(run_id)}-audit-a0"},
     ]
     lookups = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda *, strict: rows)
@@ -2444,7 +2459,9 @@ def test_sweep_orphans_label_safety(monkeypatch):
         {"id": "i-1", "name": "flash-1700-aaaa-a0"},  # orphan -> terminate
         {"id": "i-2", "name": "flash-1700-bbbb-a1"},  # active run -> keep
         {"id": "i-3", "name": "someone-elses-workload"},  # not ours -> NEVER touch
-        {"id": "i-4", "name": ""},  # unnamed -> NEVER touch
+        {"id": "i-4", "name": ""},
+        {"id": "i-5", "name": "flash-orphan"},
+        {"id": "i-6", "name": "flash-orphan-audit-a0"},
     ]
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
@@ -2452,8 +2469,8 @@ def test_sweep_orphans_label_safety(monkeypatch):
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels={"flash-1700-bbbb"})
-    assert out == ["i-1"]
-    assert terminated == ["i-1"]
+    assert out == ["i-1", "i-6"]
+    assert terminated == ["i-1", "i-6"]
 
 
 def test_sweep_orphans_prefix_not_shielded_by_longer_run_id(monkeypatch):

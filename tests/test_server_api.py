@@ -2244,7 +2244,7 @@ def _private_lifecycle_projections() -> dict[str, dict]:
     identity = {"attempt_id": 2, "fence": 7}
     provenance = {"repository": "private/source", "path": "training/config.toml"}
     return {
-        "attempt": {**identity, "state": "active", "source_provenance": provenance},
+        "attempt": {**identity, "state": "settled", "source_provenance": provenance},
         "progress": {
             **identity,
             "sequence": 3,
@@ -2268,11 +2268,50 @@ def test_run_status_to_dict_sanitizes_every_lifecycle_projection() -> None:
     public = status.to_dict()
 
     assert "source_provenance" not in json.dumps(public)
-    assert public["attempt"] == {"attempt_id": 2, "fence": 7, "state": "active"}
+    assert public["attempt"] == {"attempt_id": 2, "fence": 7, "state": "settled"}
     assert public["progress"]["sequence"] == 3
     assert public["resource"]["state"] == "running"
     assert public["result"]["outcome"] == "done"
     assert all("source_provenance" in value for value in projections.values())
+
+
+def test_run_status_api_reports_terminal_attempt_settled(api) -> None:
+    import flash.runner.lifecycle.attempts as runner_attempts
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner_status.get_status(run_id)
+    status.state = "running"
+    status.finished_at = None
+    runner_state._save_status(status)
+    attempt = runner_attempts._reserve_attempt_record(run_id)
+    handle = {
+        "provider": "lambda",
+        "instance_id": "api-terminal-instance",
+        "instance_type": "gpu_1x_a100",
+        "region": "us-east-1",
+        "name": "flash-api-terminal-a0",
+        "gpu": "A100",
+        "hourly_usd": 1.0,
+        "attempt": attempt.attempt_id,
+        "fence": attempt.fence,
+        "started_ts": time.time(),
+    }
+    assert runner_status.record_attempt_handle(
+        run_id,
+        handle,
+        attempt_id=attempt.attempt_id,
+        fence=attempt.fence,
+    )
+    assert runner_status._update(run_id, "done")
+
+    public = api.get(f"/v1/runs/{run_id}", headers=_bearer(key)).json()
+    assert public["state"] == "done"
+    assert public["attempt"]["attempt_id"] == attempt.attempt_id
+    assert public["attempt"]["fence"] == attempt.fence
+    assert public["attempt"]["state"] == "settled"
 
 
 def test_status_list_and_logs_sanitize_every_lifecycle_projection(api) -> None:

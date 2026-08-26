@@ -252,6 +252,50 @@ def _current_attempt(status: RunStatus):
     return AttemptRecord.from_dict(status.attempt)
 
 
+def transition_attempt_state(
+    status: RunStatus,
+    new_state: str,
+    *,
+    expected_attempt_id: int,
+    expected_fence: int,
+) -> bool:
+    """Transition only the owning fenced attempt and preserve its immutable identity."""
+    from flash.runner.lifecycle.protocol import ATTEMPT_STATES
+
+    if new_state not in ATTEMPT_STATES:
+        raise ValueError("invalid attempt state transition target")
+    order = {
+        "reserved": 0,
+        "provisioning": 1,
+        "active": 2,
+        "result_pending": 3,
+        "settling": 4,
+        "settled": 5,
+    }
+    attempt = _current_attempt(status)
+    if attempt.attempt_id != expected_attempt_id or attempt.fence != expected_fence:
+        return False
+    if order[new_state] < order[attempt.state]:
+        return False
+    if attempt.state == new_state:
+        return True
+    status.attempt = replace(attempt, state=new_state).to_dict()
+    return True
+
+
+def settle_current_attempt(status: RunStatus) -> bool:
+    """Settle the exact current fenced attempt on the same terminal status write."""
+    if not status.attempt:
+        return False
+    attempt = _current_attempt(status)
+    return transition_attempt_state(
+        status,
+        "settled",
+        expected_attempt_id=attempt.attempt_id,
+        expected_fence=attempt.fence,
+    )
+
+
 def _record_projection(
     run_id: str,
     field: str,
@@ -260,6 +304,7 @@ def _record_projection(
     attempt_id: int,
     fence: int,
     resource_identity: tuple | None = None,
+    attempt_state: str | None = None,
 ) -> bool:
     """Persist a projection only for the exact current attempt, fence, and resource."""
     from flash.runner.accounting.reconciliation import _remote_resource_identity
@@ -276,6 +321,13 @@ def _record_projection(
         ):
             return False
         setattr(status, field, bounded_json(value))
+        if attempt_state is not None and not transition_attempt_state(
+            status,
+            attempt_state,
+            expected_attempt_id=attempt_id,
+            expected_fence=fence,
+        ):
+            return False
         status.updated_at = time.time()
         state._save_status_unlocked(status)
     reporting._report_status(status)
@@ -337,7 +389,14 @@ def record_resource(
 
 
 def record_result(run_id: str, value: dict, *, attempt_id: int, fence: int) -> bool:
-    return _record_projection(run_id, "result", value, attempt_id=attempt_id, fence=fence)
+    return _record_projection(
+        run_id,
+        "result",
+        value,
+        attempt_id=attempt_id,
+        fence=fence,
+        attempt_state="result_pending",
+    )
 
 
 def validate_terminal_source_metrics(
@@ -452,6 +511,8 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
         status.updated_at = time.time()
         if not was_terminal and new_state in state.TERMINAL_STATES and status.finished_at is None:
             status.finished_at = status.updated_at
+        if new_state in {"done", "failed", "cancelled"}:
+            settle_current_attempt(status)
         for key, value in updates.items():
             setattr(status, key, value)
         state._save_status_unlocked(status)

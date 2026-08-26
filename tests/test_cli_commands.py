@@ -1868,7 +1868,7 @@ def test_poll_logs_returns_the_live_attempt_from_the_terminal_status(capsys) -> 
             return {
                 "run_id": run_id,
                 "state": "done",
-                "attempt": {"attempt_id": 1, "fence": 5, "state": "result_committed"},
+                "attempt": {"attempt_id": 1, "fence": 5, "state": "settled"},
             }
 
     result = run_commands._poll_logs(_AttemptClient(), "flash-attempt", interval=0)
@@ -1912,7 +1912,7 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
                         "attempt": {
                             "attempt_id": 2,
                             "fence": 9,
-                            "state": "result_committed",
+                            "state": "settled",
                         },
                         "result": {"attempt_id": 2, "fence": 9, "outcome": "done"},
                         "realized_cost_usd": 1.5,
@@ -2002,7 +2002,7 @@ def test_follow_logs_prints_current_progress_metrics_once_per_sequence(monkeypat
                     {
                         "run_id": "flash-metrics",
                         "state": "done",
-                        "attempt": {**identity, "state": "result_committed"},
+                        "attempt": {**identity, "state": "settled"},
                         "progress": {
                             **identity,
                             "sequence": 2,
