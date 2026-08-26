@@ -24,6 +24,14 @@ _FUNCTION_END = "</function>"
 _PARAMETER_START = "<parameter="
 _PARAMETER_END = "</parameter>"
 _NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_TOOL_GRAMMAR_MARKERS = (
+    TOOL_CALL_START,
+    TOOL_CALL_END,
+    _FUNCTION_START,
+    _FUNCTION_END,
+    _PARAMETER_START,
+    _PARAMETER_END,
+)
 _MAX_TOOLS = 128
 _MAX_SCHEMA_DEPTH = 8
 _MAX_SCHEMA_NODES = 512
@@ -164,7 +172,7 @@ def normalize_tools(
             raise error_type(f"tools[{index}].function.strict must be a boolean")
         if strict:
             raise error_type("strict function tools are not supported")
-        name = _function_name(function["name"], f"tools[{index}].function.name", error_type)
+        name = _identifier_name(function["name"], f"tools[{index}].function.name", error_type)
         if name in names:
             raise error_type(f"duplicate tool function name {name!r}")
         names.add(name)
@@ -190,6 +198,27 @@ def tools_wire(tools: Sequence[FunctionTool] | None) -> list[dict[str, Any]] | N
     if tools is None:
         return None
     return [tool.wire() for tool in tools]
+
+
+def validate_tool_stop_sequences(
+    stop: Sequence[str],
+    *,
+    tools: Sequence[FunctionTool] | None,
+    tool_choice: str | None,
+    error_type: type[Exception] = ValueError,
+) -> None:
+    """reject stop sequences that can consume active qwen tool grammar markers."""
+
+    if tools is None or tool_choice != "auto":
+        return
+    markers = list(_TOOL_GRAMMAR_MARKERS)
+    for tool in tools:
+        markers.append(f"{_FUNCTION_START}{tool.name}>")
+        markers.extend(f"{_PARAMETER_START}{name}>" for name in tool.parameters["properties"])
+    if any(_strings_overlap(stop_value, marker) for stop_value in stop for marker in markers):
+        raise error_type(
+            "stop sequences cannot overlap qwen tool-call grammar markers when tool_choice='auto'"
+        )
 
 
 def validate_tool_history(
@@ -352,7 +381,10 @@ def _normalize_schema(
             raise error_type(f"{path}.properties must be an object and required must be an array")
         if raw.get("additionalProperties") is not False:
             raise error_type(f"{path}.additionalProperties must be false")
-        if any(type(name) is not str or not name for name in properties):
+        if root:
+            for name in properties:
+                _identifier_name(name, f"{path}.properties key", error_type)
+        elif any(type(name) is not str or not name for name in properties):
             raise error_type(f"{path}.properties keys must be nonempty strings")
         if any(type(name) is not str for name in required) or len(required) != len(set(required)):
             raise error_type(f"{path}.required must contain unique property names")
@@ -410,7 +442,7 @@ def _validate_history_calls(
         function = raw["function"]
         if type(function) is not dict or set(function) != {"name", "arguments"}:
             raise error_type(f"{path} function must contain exactly name and arguments")
-        name = _function_name(function["name"], f"{path} function name", error_type)
+        name = _identifier_name(function["name"], f"{path} function name", error_type)
         arguments = function["arguments"]
         if type(arguments) is not str:
             raise error_type(f"{path} function arguments must be a JSON string")
@@ -517,10 +549,13 @@ def _coerce_value(value: str, schema_type: str) -> Any:
             return value
     if schema_type == "number":
         try:
-            number = float(value)
-            return int(number) if math.isfinite(number) and number.is_integer() else number
+            return int(value)
         except ValueError:
-            return value
+            try:
+                number = float(value)
+                return int(number) if math.isfinite(number) and number.is_integer() else number
+            except ValueError:
+                return value
     if schema_type in {"array", "object"}:
         try:
             return json.loads(value)
@@ -553,7 +588,7 @@ def _matches_type(value: Any, schema_type: str) -> bool:
     if schema_type == "integer":
         return type(value) is int
     if schema_type == "number":
-        return type(value) in {int, float} and math.isfinite(float(value))
+        return type(value) is int or (type(value) is float and math.isfinite(value))
     if schema_type == "string":
         return type(value) is str
     if schema_type == "array":
@@ -579,10 +614,19 @@ def _json_copy(value: Any, path: str, error_type: type[Exception]) -> Any:
         raise error_type(f"{path} must contain only finite JSON values") from exc
 
 
-def _function_name(value: object, path: str, error_type: type[Exception]) -> str:
+def _identifier_name(value: object, path: str, error_type: type[Exception]) -> str:
     if type(value) is not str or _NAME_RE.fullmatch(value) is None:
         raise error_type(f"{path} is invalid")
     return value
+
+
+def _strings_overlap(left: str, right: str) -> bool:
+    if left in right or right in left:
+        return True
+    limit = min(len(left), len(right))
+    return any(
+        left[-size:] == right[:size] or right[-size:] == left[:size] for size in range(1, limit)
+    )
 
 
 def _validated_call_id(value: object) -> str:

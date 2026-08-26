@@ -21,7 +21,7 @@ from flash.serve.request.openai import (
     reject_tool_capability,
 )
 from flash.serve.request.transport import RawChatStream, is_event_stream_content_type
-from flash.serve.runtime.tool_calls import qualified_tool_parser
+from flash.serve.runtime.tool_calls import qualified_tool_parser, validate_tool_stop_sequences
 from flash.server.asgi import app as _app
 from flash.server.platform.deps import manageable_run
 from flash.server.routes.serving_revisions import (
@@ -245,6 +245,15 @@ def managed_chat(
     )
     mandatory_stops = tuple(getattr(effective_spec.train, "stop_sequences", ()) or ())
     stop_sequences = merge_stop_sequences(mandatory_stops, request.stop)
+    try:
+        validate_tool_stop_sequences(
+            stop_sequences or (),
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            error_type=OpenAIRequestError,
+        )
+    except OpenAIRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     chat_template_kwargs = {
         **request.chat_template_kwargs,
         "enable_thinking": effective_spec.thinking,

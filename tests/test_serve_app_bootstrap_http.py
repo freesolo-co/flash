@@ -311,6 +311,40 @@ def test_engine_death_handler_reaches_the_runtime(monkeypatch, tmp_path: Path) -
     asyncio.run(owner.close())
 
 
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
+def test_packaged_chat_rejects_active_tool_stop_marker_collisions(stream: bool) -> None:
+    owner, runtime = _published_owner()
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            headers=_auth(),
+            json=_chat_body(tools=tools, stop="</tool_call>", stream=stream),
+        )
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert runtime.generation_requests == []
+
+
 def test_health_auth_models_and_no_model_fallback() -> None:
     owner, _ = _published_owner()
     app = create_app(owner, bearer_token=AUTH_TOKEN)

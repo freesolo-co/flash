@@ -18,6 +18,23 @@ from tests.test_server_api import SPEC, _bearer, _login
 pytest_plugins = ("tests._helpers.server_api_plugin",)
 
 
+def _tool_payload():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+
 def test_managed_stream_response_closes_upstream_before_first_body_byte() -> None:
     from flash.server.routes.serving import _UpstreamStreamingResponse
 
@@ -403,6 +420,77 @@ def test_chat_rejects_conflicting_structured_forms_and_invalid_stop(api, monkeyp
     assert response.status_code == 400
 
 
+def test_managed_chat_rejects_mandatory_stop_that_collides_with_active_tool_grammar(
+    api, monkeypatch
+):
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    import flash.runner.results.verified_revisions as runner_verified_revisions
+    import flash.runner.supervise.transitions as runner_transitions
+    import flash.server.asgi.app as app_mod
+
+    key = _login()
+    spec = json.loads(json.dumps(SPEC))
+    spec["train"] = {**spec["train"], "stop_sequences": ["</tool_call>"]}
+    run_id = api.post(
+        "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner_status.get_status(run_id)
+    status.state = "done"
+    runner_state._save_status(status)
+    revision = f"{run_id}@final." + "a" * 40
+    runner_transitions.mark_deployed(
+        run_id,
+        {"state": "ready", "endpoint_name": "https://serve.example", "adapter_revision": revision},
+        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            run_id
+        ),
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat",
+        lambda **_kwargs: pytest.fail("mandatory colliding stop must not reach serving"),
+    )
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "messages": [{"role": "user", "content": "weather"}],
+            "tools": _tool_payload(),
+        },
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 400
+    assert "grammar markers" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
+def test_managed_chat_rejects_active_tool_stop_marker_collision_before_forwarding(
+    api, monkeypatch, stream
+):
+    import flash.server.asgi.app as app_mod
+
+    key, run_id = _deployed_chat_run(api)
+    monkeypatch.setattr(
+        app_mod,
+        "serve_chat_sse" if stream else "serve_chat",
+        lambda **_kwargs: pytest.fail("colliding stop must not reach serving"),
+    )
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "messages": [{"role": "user", "content": "weather"}],
+            "tools": _tool_payload(),
+            "stop": "</tool_call>",
+            "stream": stream,
+        },
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 400
+    assert "grammar markers" in response.json()["detail"]
+
+
 def test_managed_chat_forwards_normalized_tools_without_parsing_output(api, monkeypatch):
     import flash.server.asgi.app as app_mod
 
@@ -430,23 +518,12 @@ def test_managed_chat_forwards_normalized_tools_without_parsing_output(api, monk
         return result
 
     monkeypatch.setattr(app_mod, "serve_chat", fake_chat)
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "weather",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-    ]
     response = api.post(
         f"/v1/runs/{run_id}/chat",
-        json={"messages": [{"role": "user", "content": "weather"}], "tools": tools},
+        json={
+            "messages": [{"role": "user", "content": "weather"}],
+            "tools": _tool_payload(),
+        },
         headers=_bearer(key),
     )
     assert response.status_code == 200, response.text

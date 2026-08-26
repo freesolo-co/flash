@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -608,6 +609,22 @@ def test_generation_request_revalidates_tools_and_rejects_tool_images() -> None:
             tool_choice="auto",
             parallel_tool_calls=True,
         )
+    with pytest.raises(RuntimeConfigurationError, match=r"grammar markers.*tool_choice='auto'"):
+        GenerationRequest(
+            messages=[{"role": "user", "content": "weather"}],
+            tools=_runtime_tools(),
+            tool_choice="auto",
+            parallel_tool_calls=True,
+            stop="</tool_call>",
+        )
+    request = GenerationRequest(
+        messages=[{"role": "user", "content": "weather"}],
+        tools=_runtime_tools(),
+        tool_choice="none",
+        parallel_tool_calls=True,
+        stop="</tool_call>",
+    )
+    assert request.stop == ("</tool_call>",)
 
 
 def test_qwen3_coder_parser_validates_schema_and_exact_fallback() -> None:
@@ -626,6 +643,73 @@ def test_qwen3_coder_parser_validates_schema_and_exact_fallback() -> None:
     }
     malformed = valid.replace("<parameter=days>", "<parameter=unknown>")
     assert parse_qwen3_coder_output(malformed, _runtime_tools()).content == malformed
+
+
+def test_qwen3_coder_parser_accepts_boundary_property_names() -> None:
+    longest = "x" * 64
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "boundaries",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "a": {"type": "string"},
+                            longest: {"type": "integer"},
+                        },
+                        "required": ["a", longest],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+    text = (
+        "<tool_call><function=boundaries>"
+        "<parameter=a>first</parameter>"
+        f"<parameter={longest}>2</parameter>"
+        "</function></tool_call>"
+    )
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+    assert result.calls[0].arguments == json.dumps(
+        {"a": "first", longest: 2}, separators=(",", ":")
+    )
+
+
+def test_qwen3_coder_number_preserves_exact_integer_lexemes() -> None:
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "measure",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "exact": {"type": "number"},
+                            "decimal": {"type": "number"},
+                            "exponent": {"type": "number"},
+                        },
+                        "required": ["exact", "decimal", "exponent"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+    text = (
+        "<tool_call><function=measure>"
+        "<parameter=exact>9007199254740993</parameter>"
+        "<parameter=decimal>1.25</parameter>"
+        "<parameter=exponent>1e3</parameter>"
+        "</function></tool_call>"
+    )
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+    assert result.calls[0].arguments == (
+        '{"exact":9007199254740993,"decimal":1.25,"exponent":1000}'
+    )
 
 
 def test_qwen3_coder_stream_parser_buffers_candidates_and_falls_back_exactly() -> None:

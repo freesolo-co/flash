@@ -38,6 +38,23 @@ def _payload(**updates):
     }
 
 
+def _tools():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -115,6 +132,28 @@ def test_thinking_logprobs_guard_is_post_resolution_policy():
     reject_thinking_logprobs(thinking=False, logprobs=True)
     with pytest.raises(OpenAIRequestError, match="thinking-enabled"):
         reject_thinking_logprobs(thinking=True, logprobs=True)
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
+@pytest.mark.parametrize(
+    "stop", ["tool_call", "weather", "prefix</tool_call>", "answer<", ">suffix"]
+)
+def test_canonical_active_tools_reject_stop_sequences_that_overlap_qwen_markers(stream, stop):
+    with pytest.raises(OpenAIRequestError, match=r"grammar markers.*tool_choice='auto'"):
+        parse_chat_request(
+            _payload(tools=_tools(), stop=stop, stream=stream),
+            require_model=True,
+            allow_managed_selectors=False,
+        )
+
+
+def test_canonical_tool_choice_none_allows_tool_marker_stop_sequences():
+    request = parse_chat_request(
+        _payload(tools=_tools(), tool_choice="none", stop="</tool_call>"),
+        require_model=True,
+        allow_managed_selectors=False,
+    )
+    assert request.stop == ("</tool_call>",)
 
 
 @pytest.mark.parametrize(

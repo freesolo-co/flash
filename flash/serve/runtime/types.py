@@ -19,7 +19,13 @@ from .sampling import (
     validate_top_logprobs,
 )
 from .structured_outputs import normalize_structured_outputs
-from .tool_calls import FunctionTool, ParsedToolCall, normalize_tools, tools_wire
+from .tool_calls import (
+    FunctionTool,
+    ParsedToolCall,
+    normalize_tools,
+    tools_wire,
+    validate_tool_stop_sequences,
+)
 
 _REVISION_RE = re.compile(r"[0-9a-f]{40}")
 _RESERVED_MODEL_LOAD_KWARGS = frozenset({"revision", "token", "trust_remote_code"})
@@ -506,7 +512,14 @@ class GenerationRequest:
                     "tools cannot be combined with logprobs or structured outputs"
                 )
         # an empty sequence and none both mean "no stop sequences", so they normalize together.
-        object.__setattr__(self, "stop", _normalize_stop(self.stop, "stop"))
+        stop = _normalize_stop(self.stop, "stop")
+        validate_tool_stop_sequences(
+            stop,
+            tools=self.tools,
+            tool_choice=self.tool_choice,
+            error_type=RuntimeConfigurationError,
+        )
+        object.__setattr__(self, "stop", stop)
 
 
 @dataclass(frozen=True, slots=True)

@@ -23,7 +23,11 @@ from flash.serve.runtime.sampling import (
     validate_seed,
     validate_top_logprobs,
 )
-from flash.serve.runtime.tool_calls import FunctionTool, normalize_tools
+from flash.serve.runtime.tool_calls import (
+    FunctionTool,
+    normalize_tools,
+    validate_tool_stop_sequences,
+)
 
 DEFAULT_MAX_TOKENS = 1024
 _ALLOWED_REQUEST_KEYS = frozenset(
@@ -152,6 +156,13 @@ def parse_chat_request(
         raise OpenAIRequestError(str(exc)) from exc
     structured_outputs = _structured_outputs(payload)
     tools, tool_choice, parallel_tool_calls = _tool_controls(payload)
+    stop = _stop_values(payload.get("stop"))
+    validate_tool_stop_sequences(
+        stop,
+        tools=tools,
+        tool_choice=tool_choice,
+        error_type=OpenAIRequestError,
+    )
     if tools is not None:
         if logprobs:
             raise OpenAIRequestError("tools cannot be combined with logprobs")
@@ -175,7 +186,7 @@ def parse_chat_request(
         presence_penalty=presence_penalty,
         logprobs=logprobs,
         top_logprobs=top_logprobs,
-        stop=_stop_values(payload.get("stop")),
+        stop=stop,
         chat_template_kwargs=_chat_template_kwargs(payload.get("chat_template_kwargs")),
         structured_outputs=structured_outputs,
         tools=tools,

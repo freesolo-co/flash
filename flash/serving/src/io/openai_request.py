@@ -15,7 +15,11 @@ from flash.serve.runtime.sampling import (
     validate_seed,
     validate_top_logprobs,
 )
-from flash.serve.runtime.tool_calls import normalize_tools, tools_wire
+from flash.serve.runtime.tool_calls import (
+    normalize_tools,
+    tools_wire,
+    validate_tool_stop_sequences,
+)
 from flash.serving.src.io.schemas import GenerateRequest
 
 
@@ -97,4 +101,9 @@ class OpenAIGenerateRequest(GenerateRequest):
                 raise ValueError("tools cannot be combined with image messages")
             if self.logprobs or self.structured_outputs:
                 raise ValueError("tools cannot be combined with logprobs or structured outputs")
+        validate_tool_stop_sequences(
+            () if self.stop is None else (self.stop,) if isinstance(self.stop, str) else self.stop,
+            tools=None if self.tools is None else normalize_tools(self.tools),
+            tool_choice=self.tool_choice,
+        )
         return self

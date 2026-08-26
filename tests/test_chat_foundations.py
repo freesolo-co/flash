@@ -419,6 +419,17 @@ def test_tool_names_and_schema_container_keywords_are_exact() -> None:
                 allow_managed_selectors=True,
             )
 
+    for name in ("city.name", "city>", "x" * 65):
+        invalid = _function_tools()
+        invalid[0]["function"]["parameters"]["properties"] = {name: {"type": "string"}}
+        invalid[0]["function"]["parameters"]["required"] = [name]
+        with pytest.raises(OpenAIRequestError, match=r"properties key is invalid"):
+            parse_chat_request(
+                {"messages": [{"role": "user", "content": "weather"}], "tools": invalid},
+                require_model=False,
+                allow_managed_selectors=True,
+            )
+
     invalid_schema = _function_tools()
     invalid_schema[0]["function"]["parameters"]["items"] = {"type": "string"}
     with pytest.raises(OpenAIRequestError, match="object schema contains array-only keywords"):

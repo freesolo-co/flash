@@ -402,6 +402,58 @@ class _UsageSession:
         return None
 
 
+def test_hosted_private_tool_envelope_rejects_active_stop_marker_collision() -> None:
+    with pytest.raises(ValueError, match=r"grammar markers.*tool_choice='auto'"):
+        OpenAIGenerateRequest.model_validate(
+            {
+                "adapter_id": "adapter",
+                "messages": [{"role": "user", "content": "weather"}],
+                "tools": _tool_payload(),
+                "tool_choice": "auto",
+                "parallel_tool_calls": True,
+                "stop": "</tool_call>",
+            }
+        )
+    request = OpenAIGenerateRequest.model_validate(
+        {
+            "adapter_id": "adapter",
+            "messages": [{"role": "user", "content": "weather"}],
+            "tools": _tool_payload(),
+            "tool_choice": "none",
+            "parallel_tool_calls": True,
+            "stop": "</tool_call>",
+        }
+    )
+    assert request.stop == "</tool_call>"
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["buffered", "streaming"])
+def test_hosted_generation_rejects_active_stop_marker_collision_before_dispatch(
+    streaming: bool,
+) -> None:
+    vllm_engine = _BufferedChoiceEngine()
+    engine = _engine(vllm_engine)
+    payload = {
+        "adapter_id": "adapter",
+        "messages": [{"role": "user", "content": "weather"}],
+        "tools": _tool_payload(),
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+        "stop": "<parameter=city>",
+    }
+
+    async def exercise() -> None:
+        if streaming:
+            async for _event in engine._stream_generate(payload):
+                pass
+        else:
+            await engine._generate(payload)
+
+    with pytest.raises(ValueError, match=r"grammar markers.*tool_choice='auto'"):
+        asyncio.run(exercise())
+    assert vllm_engine.sampling_params is None
+
+
 def test_hosted_private_tool_envelope_requires_text_chat_messages() -> None:
     controls = {
         "adapter_id": "adapter",
