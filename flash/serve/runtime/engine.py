@@ -110,8 +110,8 @@ class _StreamState:
             if chunk_logprobs is not None:
                 choice.logprobs.extend(chunk_logprobs)
             chunk_text = str(getattr(output, "text", "") or "")
-            choice.text += chunk_text
             visible = choice.tool_parser.feed(chunk_text) if choice.tool_parser else chunk_text
+            choice.text += visible
             if visible or chunk_logprobs:
                 events.append(
                     (StreamDelta(index=index, text=visible, logprobs=chunk_logprobs), None)
@@ -129,6 +129,7 @@ class _StreamState:
                     finish_reason = "tool_calls"
                     events.append((StreamDelta(index=index, text="", tool_calls=tool_calls), None))
                 elif parsed.content:
+                    choice.text += parsed.content
                     events.append((StreamDelta(index=index, text=parsed.content), None))
             choice.finish_reason = finish_reason
             choice.tool_calls = tool_calls

@@ -19,6 +19,7 @@ from flash.serve.runtime import (
     GenerationRequest,
     PromptError,
     RuntimeNotReadyError,
+    StreamChoiceFinished,
     StreamDelta,
     StreamFinished,
     StreamReady,
@@ -27,6 +28,20 @@ from flash.serve.runtime import (
 from flash.serve.runtime import engine as engine_module
 
 SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}}
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": False,
+            },
+        },
+    }
+]
 MODEL_REVISION = "a" * 40
 TOKENIZER_REVISION = "b" * 40
 
@@ -40,13 +55,15 @@ class _Tokenizer:
         self.eos_token = "<eos>"
         self.eos_token_id = 9
         self.template_calls: list[dict[str, Any]] = []
+        self.template_messages: list[Any] = []
 
     @classmethod
     def from_pretrained(cls, model: str, **kwargs: Any):
         cls.calls.append((model, kwargs))
         return cls()
 
-    def apply_chat_template(self, _messages, **kwargs: Any):
+    def apply_chat_template(self, messages, **kwargs: Any):
+        self.template_messages.append(messages)
         self.template_calls.append(kwargs)
         return [10, 11, 12]
 
@@ -653,6 +670,50 @@ def test_stream_trusts_pinned_delta_output_and_counts_chunks() -> None:
     asyncio.run(runtime.close())
 
 
+def test_stream_tool_choices_hide_raw_xml_in_terminals_and_final_choices() -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model", tool_parser="qwen3_coder"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    engine.responses.append(
+        [
+            _output(
+                "I will check. <tool_call>\n<function=weather>\n",
+                [1, 2],
+                finish_reason=None,
+            ),
+            _output(
+                "<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+                [3, 4],
+            ),
+        ]
+    )
+    request = GenerationRequest(
+        messages=[{"role": "user", "content": "weather"}],
+        tools=TOOLS,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    )
+
+    async def collect():
+        return [event async for event in runtime.stream(request)]
+
+    events = asyncio.run(collect())
+    terminal = next(event for event in events if isinstance(event, StreamChoiceFinished))
+    final = events[-1]
+    assert isinstance(final, StreamFinished)
+    assert terminal.text == "I will check. "
+    assert terminal.token_ids == (1, 2, 3, 4)
+    assert terminal.finish_reason == "tool_calls"
+    assert terminal.tool_calls[0].name == "weather"
+    assert terminal.tool_calls[0].arguments == '{"city":"Paris"}'
+    assert final.choices[0].text == "I will check. "
+    assert final.choices[0].token_ids == (1, 2, 3, 4)
+    assert final.choices[0].tool_calls == terminal.tool_calls
+    assert all("<tool_call>" not in event.text for event in events if hasattr(event, "text"))
+    asyncio.run(runtime.close())
+
+
 def _delta_without_prompt_metadata(text: str, token_ids: list[int], finish_reason: str | None):
     """a delta carrying no prompt or cache metadata, as vllm emits after the first one."""
     return SimpleNamespace(
@@ -814,6 +875,62 @@ def test_engine_failure_is_not_reclassified_as_a_prompt_error() -> None:
     with pytest.raises(TypeError, match="engine-side defect"):
         asyncio.run(runtime.generate(GenerationRequest(prompt="hello")))
     assert isinstance(engine.responses, list)
+    asyncio.run(runtime.close())
+
+
+def test_multimodal_template_detaches_and_decodes_historical_tool_arguments(monkeypatch) -> None:
+    closed: list[bool] = []
+
+    class _Image:
+        def close(self) -> None:
+            closed.append(True)
+
+    image = _Image()
+
+    def prepare(messages, **_kwargs):
+        return list(messages), [image]
+
+    monkeypatch.setattr("flash.serve.runtime.prompt.prepare_multimodal_request", prepare)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                {"type": "text", "text": "check the weather"},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "sunny",
+            "tool_call_id": "call_1",
+            "name": "weather",
+        },
+    ]
+    runtime = VllmLoraRuntime(EngineConfig(model="model", image_limit=1))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    engine.responses.append([_output("ok", [1])])
+
+    result = asyncio.run(runtime.generate(GenerationRequest(messages=messages)))
+
+    assert result.text == "ok"
+    processor = runtime._processor
+    template_messages = processor.template_calls[0][0]
+    assert template_messages[1]["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}'
+    assert closed == [True]
     asyncio.run(runtime.close())
 
 

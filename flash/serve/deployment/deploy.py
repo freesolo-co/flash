@@ -667,9 +667,6 @@ def chat_sse(
     stop: list[str] | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
     structured_outputs: dict[str, Any] | None = None,
-    tools: list[dict[str, Any]] | None = None,
-    tool_choice: str | None = None,
-    parallel_tool_calls: bool | None = None,
     stream_options: dict[str, bool] | None = None,
     n: int = 1,
     seed: int | None = None,
@@ -677,6 +674,9 @@ def chat_sse(
     presence_penalty: float = 0.0,
     logprobs: bool = False,
     top_logprobs: int = 0,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
 ) -> transport.OpenAIStreamResponse:
     """open a raw openai stream while preserving status, headers, and sse bytes."""
 
@@ -774,9 +774,6 @@ def chat(
     retry_unavailable: bool = False,
     stop: list[str] | None = None,
     structured_outputs: dict | None = None,
-    tools: list[dict[str, Any]] | None = None,
-    tool_choice: str | None = None,
-    parallel_tool_calls: bool | None = None,
     top_p: float = 0.95,
     chat_template_kwargs: dict | None = None,
     n: int = 1,
@@ -785,6 +782,9 @@ def chat(
     presence_penalty: float = 0.0,
     logprobs: bool = False,
     top_logprobs: int = 0,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 

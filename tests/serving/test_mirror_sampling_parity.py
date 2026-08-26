@@ -159,7 +159,12 @@ def _tool_payload() -> list[dict[str, Any]]:
     ]
 
 
-def _engine(vllm_engine: Any, *, thinking: bool = False) -> _LoraEngineImpl:
+def _engine(
+    vllm_engine: Any,
+    *,
+    thinking: bool = False,
+    structured_outputs: dict[str, Any] | None = None,
+) -> _LoraEngineImpl:
     engine = object.__new__(_LoraEngineImpl)
     engine.base_model = QWEN
     engine.reasoning_parser = reasoning_parser_for(QWEN)
@@ -175,6 +180,7 @@ def _engine(vllm_engine: Any, *, thinking: bool = False) -> _LoraEngineImpl:
                 serve_base_model=True,
                 thinking=thinking,
                 status="ready",
+                structured_outputs=structured_outputs,
             )
         ]
     )
@@ -246,6 +252,43 @@ def test_hosted_stream_reports_hidden_tool_usage_before_structured_delta() -> No
     assert tool_delta["completion_tokens"] == 2
     assert tool_delta["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}'
     assert events[-1]["completion_tokens"] == 2
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["buffered", "streaming"])
+def test_hosted_tools_reject_effective_persisted_structured_default_after_resolution(
+    streaming: bool,
+) -> None:
+    vllm_engine = _BufferedChoiceEngine()
+    engine = _engine(vllm_engine, structured_outputs={"choice": ["sunny", "rainy"]})
+    resolved: list[str] = []
+    original_resolve = engine._lora_request
+
+    async def resolve(adapter_id: str, record_dict: dict[str, Any] | None = None):
+        result = await original_resolve(adapter_id, record_dict)
+        resolved.append(result[1].adapter_id)
+        return result
+
+    engine._lora_request = resolve
+    payload = {
+        "adapter_id": "adapter",
+        "messages": [{"role": "user", "content": "weather"}],
+        "tools": _tool_payload(),
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+
+    async def exercise() -> None:
+        if streaming:
+            async for _event in engine._stream_generate(payload):
+                pass
+        else:
+            await engine._generate(payload)
+
+    with pytest.raises(ValueError, match=r"tools cannot be combined.*structured outputs"):
+        asyncio.run(exercise())
+
+    assert resolved == ["adapter"]
+    assert vllm_engine.sampling_params is None
 
 
 def _buffered_result(

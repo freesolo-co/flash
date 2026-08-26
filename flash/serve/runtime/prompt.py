@@ -228,6 +228,9 @@ class PromptPreparer:
                 # is about releasing decoded images, not classifying failures, so without this an
                 # unrenderable multimodal request escapes unclassified and answers 503 exactly as
                 # the text path used to.
+                template_messages = messages_for_chat_template(
+                    detached_template_messages(template_messages)
+                )
                 rendered = await asyncio.to_thread(
                     self._processor.apply_chat_template,
                     template_messages,

@@ -263,7 +263,7 @@ def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkey
     assert second["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
 
 
-def test_chat_sse_preserves_raw_frames_and_forwards_supported_fields(monkeypatch):
+def test_chat_sse_preserves_pre_tool_positional_order(monkeypatch):
     import flash.serve.deployment.deploy as d
 
     seen = {}
@@ -286,13 +286,20 @@ def test_chat_sse_preserves_raw_frames_and_forwards_supported_fields(monkeypatch
     response = d.chat_sse(
         "run-1",
         [{"role": "user", "content": "hi"}],
-        temperature=0.2,
-        max_tokens=9,
-        top_p=0.7,
-        stop=["end"],
-        chat_template_kwargs={"enable_thinking": False, "custom": 1},
-        structured_outputs={"json_object": True},
-        stream_options={"include_usage": True},
+        0.2,
+        9,
+        False,
+        0.7,
+        ["end"],
+        {"enable_thinking": False, "custom": 1},
+        {"json_object": True},
+        {"include_usage": True},
+        2,
+        42,
+        -0.5,
+        0.75,
+        True,
+        3,
     )
 
     frames = list(response.iter_bytes())
@@ -309,12 +316,12 @@ def test_chat_sse_preserves_raw_frames_and_forwards_supported_fields(monkeypatch
         "max_tokens": 9,
         "temperature": 0.2,
         "top_p": 0.7,
-        "n": 1,
-        "seed": None,
-        "frequency_penalty": 0.0,
-        "presence_penalty": 0.0,
-        "logprobs": False,
-        "top_logprobs": 0,
+        "n": 2,
+        "seed": 42,
+        "frequency_penalty": -0.5,
+        "presence_penalty": 0.75,
+        "logprobs": True,
+        "top_logprobs": 3,
         "chat_template_kwargs": {"enable_thinking": False, "custom": 1},
         "stream": True,
         "stop": ["end"],
@@ -471,6 +478,14 @@ def test_chat_preserves_pre_managed_parity_positional_order(monkeypatch):
         False,
         ["end"],
         {"regex": "[ab]+"},
+        0.6,
+        {"custom": 1},
+        2,
+        42,
+        -0.5,
+        0.75,
+        True,
+        3,
     )
 
     assert seen["timeout"] == 9.0
@@ -479,14 +494,14 @@ def test_chat_preserves_pre_managed_parity_positional_order(monkeypatch):
         "messages": [{"role": "user", "content": "hi"}],
         "max_tokens": 17,
         "temperature": 0.2,
-        "top_p": 0.95,
-        "n": 1,
-        "seed": None,
-        "frequency_penalty": 0.0,
-        "presence_penalty": 0.0,
-        "logprobs": False,
-        "top_logprobs": 0,
-        "chat_template_kwargs": {"enable_thinking": True},
+        "top_p": 0.6,
+        "n": 2,
+        "seed": 42,
+        "frequency_penalty": -0.5,
+        "presence_penalty": 0.75,
+        "logprobs": True,
+        "top_logprobs": 3,
+        "chat_template_kwargs": {"custom": 1},
         "stop": ["end"],
         "structured_outputs": {"regex": "[ab]+"},
     }

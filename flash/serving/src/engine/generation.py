@@ -119,6 +119,11 @@ def _active_tools(payload: OpenAIGenerateRequest) -> Any:
     return normalize_tools(payload.tools)
 
 
+def _reject_tools_with_structured_outputs(payload: OpenAIGenerateRequest, structured: Any) -> None:
+    if payload.tools is not None and structured is not None:
+        raise ValueError("tools cannot be combined with logprobs or structured outputs")
+
+
 def _usage_fields(
     request_output: Any,
     completion_token_ids: list[int],
@@ -170,6 +175,7 @@ async def generate(
     structured, reasoning_ended, parser_kwargs = owner._structured_outputs_state(
         payload, record, thinking
     )
+    _reject_tools_with_structured_outputs(payload, structured)
     sampling = _sampling_params(payload, structured, RequestOutputKind.FINAL_ONLY)
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
     start = time.time()
@@ -350,6 +356,7 @@ async def stream_generate(
     structured, reasoning_ended, parser_kwargs = owner._structured_outputs_state(
         payload, record, thinking
     )
+    _reject_tools_with_structured_outputs(payload, structured)
     sampling = _sampling_params(payload, structured, RequestOutputKind.DELTA)
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
     start = time.time()
