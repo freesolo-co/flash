@@ -109,11 +109,7 @@ async def generate_once(
     require_generation_id: bool,
     expected_checkpoint: str | None = None,
 ) -> dict[str, Any]:
-    """Dispatch one non-streaming generation and meter it.
-
-    The result echoes the REQUESTED adapter id rather than the resolved target's, so an alias
-    caller sees the id it asked for instead of the revision behind it.
-    """
+    """dispatch one non-streaming generation and echo the authorized checkpoint id."""
     engine_payload = payload.model_copy(
         update={"adapter_id": target.adapter_id, "generation_id": generation_id}
     )

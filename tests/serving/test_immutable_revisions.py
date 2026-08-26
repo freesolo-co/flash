@@ -8,50 +8,44 @@ from fastapi import HTTPException
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.schemas import ImmutableCheckpointRegistration
 from flash.serving.src.store import registration, undeploy
+from flash.serving.src.store.identity import immutable_binding_fingerprint
 
 RUN_ID = "flash-1234567890-abcdef12"
 SOURCE_REVISION = "a" * 40
 ARTIFACT_DIGEST = "b" * 64
-ARTIFACT_FINGERPRINT = "c" * 64
 
 
-def _record(
-    step: int | None = 20,
-    *,
-    org_id: str = "org-1",
-    artifact_digest: str = ARTIFACT_DIGEST,
-    thinking: bool = False,
-):
+def _record(step: int | None = 20, **overrides):
     selector = "final" if step is None else f"step-{step}"
     checkpoint_id = f"{RUN_ID}/{selector}"
-    return ImmutableCheckpointRegistration.model_validate(
-        {
-            "adapter_id": checkpoint_id,
-            "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-9B",
-            "subfolder": f"checkpoints/{selector}",
-            "repo_type": "model",
-            "org_id": org_id,
-            "url": "https://huggingface.co/org/run",
-            "checkpoint": checkpoint_id,
-            "private": True,
-            "thinking": thinking,
-            "structured_outputs": None,
-            "run_id": RUN_ID,
-            "checkpoint_step": step,
-            "artifact_revision": SOURCE_REVISION,
-            "artifact_digest": artifact_digest,
-            "artifact_fingerprint": ARTIFACT_FINGERPRINT,
-            "lora_rank": 16,
-        }
-    ).to_record()
+    payload = {
+        "adapter_id": checkpoint_id,
+        "repo_id": "org/run",
+        "base_model": "Qwen/Qwen3.5-9B",
+        "subfolder": f"checkpoints/{selector}",
+        "repo_type": "model",
+        "org_id": "org-1",
+        "url": "https://huggingface.co/org/run",
+        "checkpoint": checkpoint_id,
+        "private": True,
+        "thinking": False,
+        "structured_outputs": None,
+        "run_id": RUN_ID,
+        "checkpoint_step": step,
+        "artifact_revision": SOURCE_REVISION,
+        "artifact_digest": ARTIFACT_DIGEST,
+        "lora_rank": 16,
+    }
+    payload.update(overrides)
+    payload["artifact_fingerprint"] = immutable_binding_fingerprint(payload)
+    return ImmutableCheckpointRegistration.model_validate(payload).to_record()
 
 
 def test_first_registration_inserts_one_exact_checkpoint(monkeypatch) -> None:
     checkpoint = _record()
     inserted = []
 
-    async def get_stored(_checkpoint_id: str):
+    async def get_stored(_org_id: str, _checkpoint_id: str):
         return None
 
     async def insert_or_read(record):
@@ -69,7 +63,9 @@ def test_first_registration_inserts_one_exact_checkpoint(monkeypatch) -> None:
 
 def test_identical_registration_retry_is_idempotent(monkeypatch) -> None:
     checkpoint = _record()
-    monkeypatch.setattr(registration, "_get_stored", lambda _checkpoint_id: _async(checkpoint))
+    monkeypatch.setattr(
+        registration, "_get_stored", lambda _org_id, _checkpoint_id: _async(checkpoint)
+    )
 
     stored = asyncio.run(registration.persist_checkpoint(_record()))
 
@@ -85,7 +81,9 @@ def test_identical_registration_retry_is_idempotent(monkeypatch) -> None:
 )
 def test_changed_immutable_registration_conflicts(monkeypatch, changed) -> None:
     existing = _record()
-    monkeypatch.setattr(registration, "_get_stored", lambda _checkpoint_id: _async(existing))
+    monkeypatch.setattr(
+        registration, "_get_stored", lambda _org_id, _checkpoint_id: _async(existing)
+    )
 
     with pytest.raises(HTTPException) as raised:
         asyncio.run(registration.persist_checkpoint(changed))
@@ -95,7 +93,9 @@ def test_changed_immutable_registration_conflicts(monkeypatch, changed) -> None:
 
 def test_equal_checkpoint_string_cannot_cross_org_authorization(monkeypatch) -> None:
     existing = _record(org_id="org-a")
-    monkeypatch.setattr(registration, "_get_stored", lambda _checkpoint_id: _async(existing))
+    monkeypatch.setattr(
+        registration, "_get_stored", lambda _org_id, _checkpoint_id: _async(existing)
+    )
 
     with pytest.raises(HTTPException) as raised:
         asyncio.run(registration.persist_checkpoint(_record(org_id="org-b")))
@@ -108,8 +108,8 @@ def test_router_resolves_only_ready_exact_checkpoints() -> None:
     disabled = _record(40)
     router = AdapterRouter([ready, disabled])
 
-    assert router.resolve(ready.adapter_id) == (ready, ready)
-    assert router.resolve(disabled.adapter_id) is None
+    assert router.resolve(ready.adapter_id, org_id=ready.org_id) == (ready, ready)
+    assert router.resolve(disabled.adapter_id, org_id=disabled.org_id) is None
     assert router.resolve(RUN_ID) is None
 
 
@@ -117,7 +117,7 @@ def test_public_undeploy_requires_exact_checkpoint(monkeypatch) -> None:
     router = AdapterRouter()
 
     with pytest.raises(HTTPException) as raised:
-        asyncio.run(undeploy.resolve_undeploy_target(router, RUN_ID))
+        asyncio.run(undeploy.resolve_undeploy_target(router, "org-1", RUN_ID))
 
     assert raised.value.status_code == 404
 
@@ -161,9 +161,13 @@ def test_exact_undeploy_preserves_ready_sibling(monkeypatch) -> None:
 
 def test_internal_run_cleanup_enumerates_exact_checkpoint_bindings(monkeypatch) -> None:
     checkpoints = [_record(), _record(40)]
-    monkeypatch.setattr(undeploy, "list_authoritative_run", lambda _run_id: _async(checkpoints))
+    monkeypatch.setattr(
+        undeploy,
+        "list_authoritative_run",
+        lambda _org_id, _run_id: _async(checkpoints),
+    )
 
-    assert asyncio.run(undeploy.resolve_run_cleanup_targets(RUN_ID)) == checkpoints
+    assert asyncio.run(undeploy.resolve_run_cleanup_targets("org-1", RUN_ID)) == checkpoints
 
 
 async def _async(value):

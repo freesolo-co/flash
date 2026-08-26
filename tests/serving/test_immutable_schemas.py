@@ -8,12 +8,12 @@ from flash.serving.src.io.schemas import (
     ImmutableCheckpointRegistration,
     PersistedAdapterRecord,
 )
+from flash.serving.src.store.identity import immutable_binding_fingerprint
 
 RUN_ID = "flash-1234567890-abcdef12"
 CHECKPOINT_ID = f"{RUN_ID}/step-20"
 SOURCE_REVISION = "a" * 40
 ARTIFACT_DIGEST = "b" * 64
-ARTIFACT_FINGERPRINT = "c" * 64
 
 
 def _payload(**overrides: object) -> dict[str, object]:
@@ -33,10 +33,18 @@ def _payload(**overrides: object) -> dict[str, object]:
         "checkpoint_step": 20,
         "artifact_revision": SOURCE_REVISION,
         "artifact_digest": ARTIFACT_DIGEST,
-        "artifact_fingerprint": ARTIFACT_FINGERPRINT,
         "lora_rank": 16,
     }
+    fallback_fingerprint = immutable_binding_fingerprint(payload)
     payload.update(overrides)
+    binding = payload.copy()
+    if isinstance(subfolder := binding.get("subfolder"), str):
+        binding["subfolder"] = subfolder.strip() or None
+    try:
+        fingerprint = immutable_binding_fingerprint(binding)
+    except ValueError:
+        fingerprint = fallback_fingerprint
+    payload.setdefault("artifact_fingerprint", fingerprint)
     return payload
 
 
