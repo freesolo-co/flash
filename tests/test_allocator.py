@@ -47,6 +47,88 @@ def test_runpod_allocation_lands_on_full_validated_cards():
     )  # colocated GRPO (trainer + vLLM rollout = two ~54GB copies) needs B200
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"provider": ""},
+        {"provider": "   "},
+        {"provider": None},
+        {"gpu": ""},
+        {"gpu": "   "},
+        {"gpu": None},
+        {"hourly_usd": 0},
+        {"hourly_usd": -1},
+        {"hourly_usd": True},
+        {"hourly_usd": float("nan")},
+        {"hourly_usd": float("inf")},
+        {"vram_gb": 0},
+        {"vram_gb": -1},
+        {"vram_gb": True},
+        {"vram_gb": 24.0},
+        {"gpu_count": 0},
+        {"gpu_count": -1},
+        {"gpu_count": True},
+        {"gpu_count": 1.0},
+        {"executed_gpu_count": 0},
+        {"executed_gpu_count": -1},
+        {"executed_gpu_count": True},
+        {"executed_gpu_count": 1.0},
+        {"gpu_count": 2, "executed_gpu_count": 3},
+    ],
+)
+def test_candidate_rejects_invalid_invariants(kwargs):
+    from flash.providers.core.base import Candidate
+
+    values = {
+        "provider": "runpod",
+        "gpu": "RTX 4090",
+        "hourly_usd": 0.69,
+        "vram_gb": 24,
+        "gpu_count": 1,
+        "executed_gpu_count": None,
+    }
+    values.update(kwargs)
+    with pytest.raises(ValueError, match="candidate"):
+        Candidate(**values)
+
+
+def test_candidate_accepts_valid_executed_count():
+    from flash.providers.core.base import Candidate
+
+    candidate = Candidate("runpod", "H100", 3.29, 80, 4, 2)
+    assert candidate.executed_gpu_count == 2
+
+
+def test_numeric_decoder_normalizes_conversion_failures():
+    from flash.providers.core._decoding import (
+        MalformedProviderFieldError,
+        decode_finite_number,
+    )
+
+    class BadFloat(float):
+        def __float__(self):
+            raise ValueError("bad float")
+
+    class BadInt(int):
+        def __float__(self):
+            raise OverflowError("bad int")
+
+    for value in (BadFloat(1.0), BadInt(1), 10**10000):
+        with pytest.raises(MalformedProviderFieldError, match="finite number"):
+            decode_finite_number(value, provider="test", field="value")
+
+
+def test_positive_integer_decoder_rejects_all_strings_without_conversion():
+    from flash.providers.core._decoding import (
+        MalformedProviderFieldError,
+        decode_positive_int,
+    )
+
+    for value in ("1", "9" * 5000, "1e2"):
+        with pytest.raises(MalformedProviderFieldError, match="positive integer"):
+            decode_positive_int(value, provider="test", field="value")
+
+
 def test_total_cost_ranking_beats_hourly_rate():
     """A card that costs more per hour wins when it finishes enough sooner to pay for itself.
 

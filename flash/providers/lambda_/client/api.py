@@ -12,6 +12,11 @@ from typing import Any
 from flash._internal.logging import get_logger
 from flash.providers._lifecycle.net.deadline import require_create_allowance, require_deadline_at
 from flash.providers._lifecycle.net.http import RestClient, is_not_found
+from flash.providers.core._decoding import (
+    MISSING_PROVIDER_FIELD,
+    MalformedProviderFieldError,
+    decode_finite_number,
+)
 
 logger = get_logger(__name__)
 
@@ -108,12 +113,30 @@ def instance_type_price_usd_hr(
     *,
     deadline_at: float | None = None,
 ) -> float | None:
-    """Live $/hr for a Lambda instance type (``price_cents_per_hour`` / 100), or None."""
-    info = (list_instance_types(deadline_at=deadline_at).get(instance_type) or {}).get(
-        "instance_type"
-    ) or {}
-    cents = info.get("price_cents_per_hour")
-    return float(cents) / 100.0 if cents else None
+    """Live $/hr for a Lambda instance type, or None only when price is absent or null."""
+    entry = list_instance_types(deadline_at=deadline_at).get(instance_type)
+    if entry is None:
+        return None
+    if not isinstance(entry, dict):
+        raise MalformedProviderFieldError("lambda", instance_type, "an instance-type object")
+    info = entry.get("instance_type", MISSING_PROVIDER_FIELD)
+    if info is MISSING_PROVIDER_FIELD or info is None:
+        return None
+    if not isinstance(info, dict):
+        raise MalformedProviderFieldError(
+            "lambda", f"{instance_type}.instance_type", "an object or null"
+        )
+    field = f"{instance_type}.price_cents_per_hour"
+    cents = decode_finite_number(
+        info.get("price_cents_per_hour", MISSING_PROVIDER_FIELD),
+        provider="lambda",
+        field=field,
+    )
+    if cents is MISSING_PROVIDER_FIELD or cents is None:
+        return None
+    if cents <= 0:
+        raise MalformedProviderFieldError("lambda", field, "a positive finite number")
+    return cents / 100.0
 
 
 def list_ssh_keys(*, deadline_at: float | None = None) -> list[dict]:

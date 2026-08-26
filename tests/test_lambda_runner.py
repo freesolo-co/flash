@@ -1211,6 +1211,29 @@ def test_ambiguous_filesystem_create_adopts_single_exact_match(monkeypatch):
     assert listings["count"] == 2
 
 
+def test_instance_type_for_normalizes_digit_limit_failures():
+    from flash.providers.core._decoding import MalformedProviderFieldError
+    from flash.providers.lambda_.client.gpus import instance_type_for
+
+    huge_digits = "9" * 5000
+    with pytest.raises(MalformedProviderFieldError, match="gpu_count"):
+        instance_type_for(
+            "H100",
+            8,
+            {f"gpu_{huge_digits}x_h100_sxm5": {"instance_type": {}}},
+        )
+    with pytest.raises(MalformedProviderFieldError, match="gpu_description"):
+        instance_type_for(
+            "H100",
+            8,
+            {
+                "gpu_8x_h100_sxm5": {
+                    "instance_type": {"gpu_description": f"NVIDIA H100 {huge_digits} GB"}
+                }
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # gpu.disk_gb: Lambda sells a FIXED disk per instance type (no launch-time parameter)
 # ---------------------------------------------------------------------------
@@ -1230,6 +1253,52 @@ def test_instance_type_disk_gb_reads_catalog_storage_or_reports_unknown():
     assert instance_type_disk_gb(None, "gpu_1x_a10") is None
 
 
+@pytest.mark.parametrize("value", [None, pytest.param("missing", id="absent")])
+def test_instance_type_disk_gb_maps_only_absent_or_null_to_unknown(value):
+    from flash.providers.lambda_.client.gpus import instance_type_disk_gb
+
+    specs = {} if value == "missing" else {"storage_gib": value}
+    catalog = {"gpu_1x_a10": {"instance_type": {"specs": specs}}}
+    assert instance_type_disk_gb(catalog, "gpu_1x_a10") is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        0,
+        -1,
+        True,
+        float("nan"),
+        float("inf"),
+        pytest.param(10**10000, id="huge-json-int"),
+        "512",
+        "NaN",
+        "1e2",
+        " 512",
+        {},
+        [],
+    ],
+)
+def test_instance_type_disk_gb_rejects_present_malformed_storage(value):
+    from flash.providers.core._decoding import MalformedProviderFieldError
+    from flash.providers.lambda_.client.gpus import instance_type_disk_gb
+
+    catalog = {"gpu_1x_a10": {"instance_type": {"specs": {"storage_gib": value}}}}
+    with pytest.raises(MalformedProviderFieldError, match="storage_gib"):
+        instance_type_disk_gb(catalog, "gpu_1x_a10")
+
+
+def test_instance_type_disk_gb_rejects_malformed_secondary_storage_alias():
+    from flash.providers.core._decoding import MalformedProviderFieldError
+    from flash.providers.lambda_.client.gpus import instance_type_disk_gb
+
+    catalog = {
+        "gpu_1x_a10": {"instance_type": {"specs": {"storage_gib": 512, "storage_gb": float("nan")}}}
+    }
+    with pytest.raises(MalformedProviderFieldError, match="storage_gb"):
+        instance_type_disk_gb(catalog, "gpu_1x_a10")
+
+
 def test_usable_instances_carries_the_sku_disk(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
@@ -1242,6 +1311,37 @@ def test_usable_instances_carries_the_sku_disk(monkeypatch):
     monkeypatch.setattr(lambda_api, "regions_with_capacity", lambda *a, **k: ["us-east-1"])
     monkeypatch.setattr("flash.providers.lambda_.client.pricing.hourly_rate", lambda *a, **k: 1.29)
     assert jobs.usable_instances("A10")[0].disk_gb == 512.0
+
+
+@pytest.mark.parametrize(
+    "price",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(10**10000, id="huge-json-int"),
+        pytest.param("9" * 5000, id="digit-limit-string"),
+    ],
+)
+def test_submit_rejects_malformed_price_before_launch(monkeypatch, price):
+    import flash.providers.lambda_.jobs as jobs
+    from flash.providers.core._decoding import MalformedProviderFieldError
+    from flash.providers.lambda_.client import api as lambda_api
+
+    catalog = {
+        "gpu_1x_a10": {
+            "instance_type": {"price_cents_per_hour": price},
+            "regions_with_capacity_available": [{"name": "us-east-1"}],
+        }
+    }
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: catalog)
+    launched = []
+    monkeypatch.setattr(
+        lambda_api, "launch_instance", lambda **kwargs: launched.append(kwargs) or "i-1"
+    )
+
+    with pytest.raises(MalformedProviderFieldError, match="price_cents_per_hour"):
+        _submit(jobs, _spec(), seed=0)
+
+    assert launched == []
 
 
 def test_launch_refuses_an_instance_type_below_the_run_disk_floor(monkeypatch):

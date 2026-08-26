@@ -813,6 +813,32 @@ class Candidate:
     # constructed by providers or tests before the allocator stamps the run-specific width.
     executed_gpu_count: int | None = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.provider, str) or not self.provider.strip():
+            raise ValueError("candidate provider must be a nonempty string")
+        if not isinstance(self.gpu, str) or not self.gpu.strip():
+            raise ValueError("candidate gpu must be a nonempty string")
+        if (
+            isinstance(self.hourly_usd, bool)
+            or not isinstance(self.hourly_usd, (int, float))
+            or not math.isfinite(float(self.hourly_usd))
+            or self.hourly_usd <= 0
+        ):
+            raise ValueError("candidate hourly rate must be a finite positive number")
+        for field_name, value in (("vram_gb", self.vram_gb), ("gpu_count", self.gpu_count)):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"candidate {field_name} must be a positive integer")
+        executed = self.executed_gpu_count
+        if executed is not None and (
+            isinstance(executed, bool)
+            or not isinstance(executed, int)
+            or executed <= 0
+            or executed > self.gpu_count
+        ):
+            raise ValueError(
+                "candidate executed_gpu_count must be a positive integer no greater than gpu_count"
+            )
+
     @property
     def total_hourly_usd(self) -> float:
         return self.gpu_count * self.hourly_usd

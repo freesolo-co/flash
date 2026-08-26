@@ -43,10 +43,6 @@ from flash.providers.core.base import (
     PollResult,
     RunExhaustedProviderPoolError,
     UnreconciledCreateError,
-    UnsupportedGpuError,
-    canonical_gpu,
-    min_cuda_modern,
-    vast_gpu_for_offer,
 )
 from flash.providers.vast.client import api as vast_api
 from flash.providers.vast.jobs.builders import (
@@ -59,19 +55,12 @@ from flash.providers.vast.jobs.builders import (
     run_label_prefix,
     vast_image,
 )
+from flash.providers.vast.jobs.offers import _SEARCH_VRAM_SLACK as _SEARCH_VRAM_SLACK
+from flash.providers.vast.jobs.offers import MIN_DISK_GB, usable_offers
 
 logger = get_logger(__name__)
 
-# Offer-quality floors (on top of the non-negotiable verified+datacenter gate). reliability2 is Vast's
-# host-uptime score: 0.995 (~1-in-200) nearly eliminates mid-run host deaths while keeping supply usable.
-RELIABILITY_FLOOR = 0.995
-MIN_INET_MBPS = 200.0
 # setup and training use separate poll graces; LOAD_TIMEOUT_S remains a test seam.
-# vast boards under-report VRAM, so search gets slack while vast_gpu_for_offer remains exact.
-_SEARCH_VRAM_SLACK = 0.92
-# Minimum disk every instance is provisioned with (bootstrap + worker + weights need headroom). The
-# offer search MUST use the same floor so a thin-disk offer can't pass search then fail at create.
-MIN_DISK_GB = 60.0
 
 # Vast states meaning "the container is gone / won't progress". ``frozen`` is paused-but-still-billing
 # yet emits no DONE/heartbeat, so classify it dead for fast failover. Unlike ``unknown`` it is never
@@ -155,22 +144,6 @@ def _effective_disk_gb(spec) -> float:
     return max(float(spec.gpu.disk_gb), MIN_DISK_GB)
 
 
-def _exact_search_aliases(info) -> tuple[str, ...]:
-    """Return Vast aliases safe for an exact-class search.
-
-    Keep only aliases that canonicalize to the pinned class, or ``verify_gpu`` rejects the rented
-    board. Drop ambiguous and unknown spellings.
-    """
-    kept: list[str] = []
-    for alias in info.vast_aliases:
-        try:
-            if canonical_gpu(alias) == info.name:
-                kept.append(alias)
-        except UnsupportedGpuError:
-            pass
-    return tuple(kept)
-
-
 def _rent_duration_floor(spec, deadline_at: float, *, now: float | None = None) -> float:
     """Return the minimum offer duration from rent time to the launch deadline.
 
@@ -182,99 +155,6 @@ def _rent_duration_floor(spec, deadline_at: float, *, now: float | None = None) 
     if not math.isfinite(remaining) or remaining <= 0:
         return grant
     return max(grant, remaining)
-
-
-def usable_offers(
-    min_vram_gb: int,
-    disk_gb: float,
-    exclude_machine_ids: set[int] | frozenset[int] = frozenset(),
-    limit: int = 256,
-    max_wall_seconds: float = 0,
-    gpu_type: str = "",
-    num_gpus: int = 1,
-    deadline_at: float | None = None,
-) -> list[VastOffer]:
-    """Return fitting verified-datacenter offers, cheapest first.
-    ``num_gpus`` must match one-machine shape because create has no count parameter. Recheck all
-    load-bearing filters client-side; positive wall time adds an offer-duration floor.
-    """
-    min_duration = (
-        max(60.0, float(max_wall_seconds)) if max_wall_seconds and max_wall_seconds > 0 else 0
-    )
-    exact_info = GPU_INFO.get(gpu_type) if gpu_type else None
-    if gpu_type and exact_info is None:
-        raise ValueError(f"unknown exact Vast GPU class {gpu_type!r}")
-    # Seed an exact search only with spellings that will attest as this class on the box (the ambiguous
-    # vast_name itself is always kept and disambiguated by the max_vram_mb ceiling below); a cross-
-    # architecture capacity alias would rent a board that live-device attestation then rejects.
-    gpu_names = (
-        (exact_info.vast_name, *_exact_search_aliases(exact_info))
-        if exact_info is not None and exact_info.vast_name
-        else ()
-    )
-    search_vram_gb = max(min_vram_gb, exact_info.vram_gb if exact_info is not None else 0)
-    search_kwargs = {"gpu_names": gpu_names} if gpu_names else {}
-    if exact_info is not None:
-        search_kwargs["max_vram_mb"] = int(exact_info.vram_gb * 1024)
-    cards = max(1, int(num_gpus))
-    rows = vast_api.search_offers(
-        int(search_vram_gb * 1024 * _SEARCH_VRAM_SLACK),
-        min_disk_gb=disk_gb,
-        min_reliability=RELIABILITY_FLOOR,
-        min_duration_seconds=min_duration,
-        limit=int(limit),
-        num_gpus=cards,
-        **search_kwargs,
-        **deadline_kwargs(vast_api.search_offers, deadline_at),
-    )
-    out: list[VastOffer] = []
-    for r in rows:
-        gpu = vast_gpu_for_offer(str(r.get("gpu_name") or ""), float(r.get("gpu_ram") or 0))
-        if gpu is None:  # not a managed class (Ampere+ floor)
-            continue
-        info = GPU_INFO[gpu]
-        dph = float(r.get("dph_total") or 0)
-        cuda = float(r.get("cuda_max_good") or 0)
-        # Accept ONLY verified DATACENTER hosts (hosting_type==1): the onstart ships run secrets to the box.
-        _bad_host = r.get("hosting_type") != 1
-        if (
-            _bad_host
-            or r.get("verification") != "verified"
-            # Exact class gate: the server-side gpu_ram filter only carries slack, so re-check nominal VRAM.
-            or info.vram_gb < min_vram_gb
-            or (gpu_type and gpu != gpu_type)
-            or float(r.get("reliability2") or 0) < RELIABILITY_FLOOR
-            or float(r.get("disk_space") or 0) < float(disk_gb)
-            or float(r.get("inet_down") or 0) < MIN_INET_MBPS
-            or cuda < float(min_cuda_modern(gpu))  # Blackwell needs CUDA-13 drivers
-            or dph <= 0
-            # the card count is load-bearing twice over (it sizes the rented box AND divides
-            # dph_total into the per-card rate), so re-check it rather than trusting the server
-            # honoured the num_gpus filter.
-            or int(r.get("num_gpus") or 0) != cards
-            or int(r.get("machine_id") or 0) in exclude_machine_ids
-        ):
-            continue
-        out.append(
-            VastOffer(
-                offer_id=int(r["id"]),
-                machine_id=int(r.get("machine_id") or 0),
-                gpu=gpu,
-                vram_gb=info.vram_gb,
-                # dph_total prices the WHOLE offer (all `cards` GPUs); every consumer of dph_total
-                # treats it as one card's rate, so divide here at the single boundary where the
-                # count is known. Skipping this prices an N-card box N times over and the allocator
-                # would never choose one.
-                dph_total=dph / cards,
-                cuda_max_good=cuda,
-                disk_space=float(r.get("disk_space") or 0),
-                reliability=float(r.get("reliability2") or 0),
-                inet_down=float(r.get("inet_down") or 0),
-                geolocation=str(r.get("geolocation") or ""),
-                gpu_count=cards,
-            )
-        )
-    return sorted(out, key=lambda o: (o.dph_total, o.vram_gb))
 
 
 def _adopt_instance_by_label(

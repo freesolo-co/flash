@@ -6,6 +6,7 @@ never fall back to ``GpuClass.hourly_usd``; that is a runpod snapshot and prices
 from __future__ import annotations
 
 from flash._internal.logging import get_logger
+from flash.providers.core._decoding import MalformedProviderFieldError
 
 logger = get_logger(__name__)
 
@@ -50,8 +51,10 @@ def hourly_rate(gpu_name: str, *, gpu_count: int = 1, deadline_at: float | None 
             live = instance_type_price_usd_hr(
                 instance_type_for(name, count, catalog), deadline_at=deadline_at
             )
-            if live:
+            if live is not None:
                 return live
+        except MalformedProviderFieldError:
+            raise
         except Exception as exc:
             logger.debug("live lambda pricing unavailable for %s (%s); using static", name, exc)
     return static_hourly_rate(name) * count

@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import re
 
+from flash.providers.core._decoding import (
+    MISSING_PROVIDER_FIELD,
+    MalformedProviderFieldError,
+    decode_finite_number,
+)
 from flash.providers.core.base import UnsupportedGpuError, get_gpu_info, providers_for
 
 __all__ = ["instance_type_disk_gb", "instance_type_for"]
@@ -12,6 +17,16 @@ __all__ = ["instance_type_disk_gb", "instance_type_for"]
 # parameter, so an N-card type is found by matching the count segment against the live catalog.
 _COUNT_PREFIX = re.compile(r"^gpu_(\d+)x_")
 _VRAM_GB = re.compile(r"(\d+)\s*GB", re.IGNORECASE)
+
+
+def _catalog_positive_int(text: str, field: str) -> int:
+    try:
+        value = int(text)
+    except (OverflowError, ValueError) as exc:
+        raise MalformedProviderFieldError("lambda", field, "a positive integer") from exc
+    if value <= 0:
+        raise MalformedProviderFieldError("lambda", field, "a positive integer")
+    return value
 
 
 def _catalog_vram_gb(entry: object) -> int | None:
@@ -24,7 +39,7 @@ def _catalog_vram_gb(entry: object) -> int | None:
     for key in ("gpu_description", "description"):
         match = _VRAM_GB.search(str(instance.get(key) or ""))
         if match:
-            return int(match.group(1))
+            return _catalog_positive_int(match.group(1), key)
     return None
 
 
@@ -40,16 +55,35 @@ def instance_type_disk_gb(catalog, instance_type: str) -> float | None:
     """
     if not isinstance(catalog, dict):
         return None
-    entry = catalog.get(instance_type)
-    instance = entry.get("instance_type") if isinstance(entry, dict) else None
-    specs = instance.get("specs") if isinstance(instance, dict) else None
-    if not isinstance(specs, dict):
+    entry = catalog.get(instance_type, MISSING_PROVIDER_FIELD)
+    if entry is MISSING_PROVIDER_FIELD or entry is None:
         return None
+    if not isinstance(entry, dict):
+        raise MalformedProviderFieldError("lambda", instance_type, "an instance-type object")
+    instance = entry.get("instance_type", MISSING_PROVIDER_FIELD)
+    if instance is MISSING_PROVIDER_FIELD or instance is None:
+        return None
+    if not isinstance(instance, dict):
+        raise MalformedProviderFieldError(
+            "lambda", f"{instance_type}.instance_type", "an object or null"
+        )
+    specs = instance.get("specs", MISSING_PROVIDER_FIELD)
+    if specs is MISSING_PROVIDER_FIELD or specs is None:
+        return None
+    if not isinstance(specs, dict):
+        raise MalformedProviderFieldError("lambda", f"{instance_type}.specs", "an object or null")
+    decoded: list[float] = []
     for key in ("storage_gib", "storage_gb"):
-        storage = specs.get(key)
-        if not isinstance(storage, bool) and isinstance(storage, (int, float)) and storage > 0:
-            return float(storage)
-    return None
+        raw = specs.get(key, MISSING_PROVIDER_FIELD)
+        if raw is MISSING_PROVIDER_FIELD or raw is None:
+            continue
+        field = f"{instance_type}.{key}"
+        storage = decode_finite_number(raw, provider="lambda", field=field)
+        assert isinstance(storage, float)
+        if storage <= 0:
+            raise MalformedProviderFieldError("lambda", field, "a positive finite number")
+        decoded.append(storage)
+    return decoded[0] if decoded else None
 
 
 def instance_type_for(name: str, gpu_count: int = 1, catalog=None) -> str:
@@ -90,7 +124,7 @@ def instance_type_for(name: str, gpu_count: int = 1, catalog=None) -> str:
         match = _COUNT_PREFIX.match(entry)
         if (
             match
-            and int(match.group(1)) == count
+            and _catalog_positive_int(match.group(1), f"{entry}.gpu_count") == count
             and _COUNT_PREFIX.sub("", entry, count=1).split("_")[0] == family
         ):
             family_matches.append((entry, _catalog_vram_gb(entry_info)))
