@@ -1,8 +1,7 @@
-"""report the proved state of one exact customer-owned serving deployment.
+"""report the proved state of one exact customer-owned modal deployment.
 
-This is the user-facing read-only path into ``reconcile_modal_deployment`` and
-``reconcile_runpod_deployment``. It never mutates provider resources and never turns an unproved
-state into ready or absent.
+This is the user-facing read-only path into ``reconcile_modal_deployment``. It never mutates provider
+resources and never turns an unproved state into ready or absent.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ from flash.cli.commands.serving.deploy import (
     _err,
     _optional_env,
     _report_handle,
+    _require_modal_provider,
 )
 from flash.cli.commands.serving.identity import existing_deployment_bundle
 
@@ -56,17 +56,16 @@ def _report_status(result) -> int:
 
 
 def cmd_serve_status(args) -> int:
-    provider = args.provider
     try:
+        _require_modal_provider(args.provider)
         bundle = existing_deployment_bundle(args)
-        # bundle construction only validates the generic placement type. the provider plan applies
-        # the exact hostname contract before reconciliation can contact the provider.
-        _build_provider_plan(provider, bundle)
+        # the provider plan applies the exact hostname contract before provider access.
+        _build_provider_plan(bundle)
     except (ValueError, TypeError) as exc:
         return _err(str(exc))
 
     try:
-        credentials = _credentials(provider)
+        credentials = _credentials()
         inference_token = _optional_env(INFERENCE_KEY_ENV)
         from flash.serve.provisioning import ServingRuntimeSecrets
 
@@ -76,27 +75,15 @@ def cmd_serve_status(args) -> int:
     except (ValueError, TypeError) as exc:
         return _err(
             f"{exc}. credentials are read from the environment for this one request and are never "
-            f"stored"
+            "stored"
         )
     deadline_at = time.monotonic() + float(args.timeout)
-    if provider == "modal":
-        from flash.serve.provisioning.modal.execution.operations import (
-            reconcile_modal_deployment,
-        )
+    from flash.serve.provisioning.modal.execution.operations import reconcile_modal_deployment
 
-        result = reconcile_modal_deployment(
-            bundle,
-            credentials,
-            runtime_secrets,
-            deadline_at=deadline_at,
-        )
-    else:
-        from flash.serve.provisioning.runpod.operations import reconcile_runpod_deployment
-
-        result = reconcile_runpod_deployment(
-            bundle,
-            credentials,
-            runtime_secrets,
-            deadline_at=deadline_at,
-        )
+    result = reconcile_modal_deployment(
+        bundle,
+        credentials,
+        runtime_secrets,
+        deadline_at=deadline_at,
+    )
     return _report_status(result)

@@ -42,12 +42,29 @@ def test_sft_max_context_tokens_at_cap_allowed():
     )
 
 
-def test_inactive_hosted_candidate_does_not_constrain_training_context():
-    for spec in (
-        _spec(model="Qwen/Qwen3.8-27B", algorithm="sft", max_context_tokens=32769),
-        _spec(model="Qwen/Qwen3.8-27B", algorithm="grpo", max_completion_tokens=40000),
-    ):
-        preflight_train_context_within_serving(spec)
+@pytest.mark.parametrize(
+    ("algorithm", "kwargs"),
+    [
+        ("sft", {"max_context_tokens": 32768}),
+        ("grpo", {"max_completion_tokens": 30720}),
+        ("opd", {"max_completion_tokens": 31744}),
+    ],
+)
+def test_qwen38_context_at_approved_serving_cap_allowed(algorithm: str, kwargs: dict):
+    preflight_train_context_within_serving(
+        _spec(model="Qwen/Qwen3.8-27B", algorithm=algorithm, **kwargs)
+    )
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_qwen38_context_above_approved_serving_cap_rejected(algorithm: str):
+    kwargs = (
+        {"max_context_tokens": 32769} if algorithm == "sft" else {"max_completion_tokens": 31745}
+    )
+    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
+        preflight_train_context_within_serving(
+            _spec(model="Qwen/Qwen3.8-27B", algorithm=algorithm, **kwargs)
+        )
 
 
 def test_sft_unset_max_context_tokens_allowed():

@@ -232,8 +232,8 @@ def provision_modal_deployment(
         # Ctrl-C derives from BaseException, so neither handler above sees it. Without this the
         # app, its volume, and its secrets stay live in the customer's Modal account and keep
         # billing, with nothing but a traceback that reads like nothing happened.
-        # Bounded by `not reached_ready` for the same reason as the RunPod path: once the probe has
-        # answered, tearing down would destroy a working deployment, and a half-finalized app is
+        # bounded by `not reached_ready`: once the probe has answered, tearing down would destroy a
+        # working deployment, and a half-finalized app is
         # recoverable by re-running the command.
         if (
             sdk is not None
