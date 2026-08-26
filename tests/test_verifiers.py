@@ -2353,7 +2353,7 @@ def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monke
     )
     monkeypatch.setattr(
         prompt_preparation,
-        "liveness_heartbeat",
+        "observe_phase",
         lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
     import flash.engine.worker.teacher.client as teacher_client

@@ -510,25 +510,16 @@ def _build_child_callbacks(
         _worker_progress.publish_progress("opd_step", **payload)
 
     child_tail = _backend.ChildOutputTail()
-    # one instance for the whole run: it measures silence across ticks, so it cannot live inside
-    # the per-tick callback.
-    tail_staleness = _backend.ChildTailStaleness()
     silence_observer = _backend.VerlChildSilenceObserver(
         child_tail,
         baseline_step=resume_step,
         parent_work=bridge.parent_work,
     )
 
-    def liveness_fields() -> dict[str, object]:
-        return _backend.stall_tail_fields(
-            int(progress["step"] or 0), child_tail, staleness=tail_staleness
-        )
-
     return _ChildCallbacks(
         on_line,
         on_step,
         None,
-        liveness_fields,
         progress,
         wandb_link,
         child_tail,
@@ -578,8 +569,6 @@ def _run_child(
                 "opd_step",
                 progress=lambda: int(callbacks.progress["step"] or 0),
                 progress_step=True,
-                fields=callbacks.liveness_fields,
-                sample_off_thread=True,
             ):
                 return_code = _backend.run_verl_training(
                     command,

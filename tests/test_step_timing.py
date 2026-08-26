@@ -1,4 +1,3 @@
-
 import pytest
 
 from flash.engine.worker.train.core.lifecycle.step_timing import StepTiming
@@ -43,9 +42,7 @@ def test_overflowing_diagnostic_is_omitted_through_step_ingestion(monkeypatch) -
         calls.append((stage, fields))
         return True
 
-    monkeypatch.setattr(
-        rl_train_runner._worker_progress, "publish_progress", publish_progress
-    )
+    monkeypatch.setattr(rl_train_runner._worker_progress, "publish_progress", publish_progress)
     monkeypatch.setattr(
         rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
     )
@@ -62,9 +59,9 @@ def test_overflowing_diagnostic_is_omitted_through_step_ingestion(monkeypatch) -
             lambda: rl_train_runner._step_timing_fields(inp, state),
         )
 
-    assert len(calls) == 1
-    assert "step_duration_s" not in calls[0][1]
-    assert "projected_remaining_s" not in calls[0][1]
+    assert [fields["step"] for _, fields in calls] == [1, 2, 3]
+    assert all("step_duration_s" not in fields for _, fields in calls)
+    assert all("projected_remaining_s" not in fields for _, fields in calls)
     assert (
         state.step_timing.progress_fields(
             current_step=3,
@@ -104,7 +101,7 @@ def test_overrun_flag_uses_actual_remaining_wall_allowance() -> None:
 
 
 def test_non_step_and_validation_lines_do_not_consume_warmup() -> None:
-    state = _StepMetricState(sent_first_metrics=True)
+    state = _StepMetricState()
     inp = {"max_completion": 512, "steps": 3}
     for line in (
         "global_step:1 - critic/rewards/mean:0.4 - timing_s/step:900.0",
@@ -131,7 +128,7 @@ def test_non_step_and_validation_lines_do_not_consume_warmup() -> None:
 
 
 def test_step_metrics_keep_numeric_census_fields_and_leave_exact_steps_for_terminal_notes() -> None:
-    state = _StepMetricState(sent_first_metrics=True)
+    state = _StepMetricState()
     state.host_census = {
         "available": 1,
         "peak_processes": 7,
@@ -145,132 +142,33 @@ def test_step_metrics_keep_numeric_census_fields_and_leave_exact_steps_for_termi
     assert "host_census/steps" not in metrics
 
 
-def test_first_usable_pace_is_forced_after_first_metrics_commit(monkeypatch) -> None:
+def test_each_step_publishes_current_timing_when_available(monkeypatch) -> None:
     calls = []
 
     def publish_progress(stage, **fields):
         calls.append((stage, fields))
         return True
 
-    monkeypatch.setattr(
-        rl_train_runner._worker_progress, "publish_progress", publish_progress
-    )
+    monkeypatch.setattr(rl_train_runner._worker_progress, "publish_progress", publish_progress)
     monkeypatch.setattr(
         rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
     )
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
-    inp = {"max_completion": 512, "steps": 190}
+    inputs = {"max_completion": 512, "steps": 190}
 
     def observability():
         return {
             "reward_metrics": {"quality": 0.5},
-            **rl_train_runner._step_timing_fields(inp, state),
+            **rl_train_runner._step_timing_fields(inputs, state),
         }
 
-    state.progress["step"] = 1
-    _ingest_step_metrics(_line(1, 515.0), inp, state, observability)
-    state.progress["step"] = 2
-    _ingest_step_metrics(_line(2, 92.0), inp, state, observability)
-    state.progress["step"] = 3
-    _ingest_step_metrics(_line(3, 93.0), inp, state, observability)
+    for step, duration in ((1, 515.0), (2, 92.0), (3, 93.0)):
+        state.progress["step"] = step
+        _ingest_step_metrics(_line(step, duration), inputs, state, observability)
 
-    assert len(calls) == 2
-    assert calls[0][1]["force"] is True
-    assert "step_duration_s" not in calls[0][1]
-    assert calls[1][1]["force"] is True
-    assert calls[1][1]["step_duration_s"] == 92.0
-    assert calls[1][1]["projected_remaining_s"] == pytest.approx(17296.0)
-    assert state.sent_first_metrics is True
-    assert state.sent_first_timing is True
-
-
-def test_failed_first_timing_commit_retries_on_next_step(monkeypatch) -> None:
-    calls = []
-    outcomes = iter([True, False, True])
-
-    def publish_progress(stage, **fields):
-        calls.append((stage, fields))
-        return next(outcomes)
-
-    monkeypatch.setattr(
-        rl_train_runner._worker_progress, "publish_progress", publish_progress
-    )
-    monkeypatch.setattr(
-        rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
-    )
-    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
-    state = _StepMetricState()
-    inp = {"max_completion": 512, "steps": 190}
-
-    def observability():
-        return {
-            "reward_metrics": {"quality": 0.5},
-            **rl_train_runner._step_timing_fields(inp, state),
-        }
-
-    state.progress["step"] = 1
-    _ingest_step_metrics(_line(1, 515.0), inp, state, observability)
-    assert state.sent_first_metrics is True
-    assert state.sent_first_timing is False
-
-    state.progress["step"] = 2
-    _ingest_step_metrics(_line(2, 92.0), inp, state, observability)
-    assert state.sent_first_metrics is True
-    assert state.sent_first_timing is False
-
-    state.progress["step"] = 3
-    _ingest_step_metrics(_line(3, 93.0), inp, state, observability)
-    assert state.sent_first_timing is True
-
-    state.progress["step"] = 4
-    _ingest_step_metrics(_line(4, 94.0), inp, state, observability)
-
-    assert len(calls) == 3
     assert [fields["step"] for _, fields in calls] == [1, 2, 3]
     assert "step_duration_s" not in calls[0][1]
     assert calls[1][1]["step_duration_s"] == 92.0
     assert calls[2][1]["step_duration_s"] == 92.5
-
-
-def test_forced_first_metrics_retry_carries_pace_once_available(monkeypatch) -> None:
-    calls = []
-
-    def publish_progress(stage, **fields):
-        calls.append((stage, fields))
-        return len(calls) > 1
-
-    monkeypatch.setattr(
-        rl_train_runner._worker_progress, "publish_progress", publish_progress
-    )
-    monkeypatch.setattr(
-        rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
-    )
-    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
-    state = _StepMetricState()
-    inp = {"max_completion": 512, "steps": 190}
-
-    def observability():
-        return {
-            "reward_metrics": {"quality": 0.5},
-            **rl_train_runner._step_timing_fields(inp, state),
-        }
-
-    state.progress["step"] = 1
-    _ingest_step_metrics(_line(1, 515.0), inp, state, observability)
-    assert state.sent_first_metrics is False
-    assert state.sent_first_timing is False
-
-    state.progress["step"] = 2
-    _ingest_step_metrics(_line(2, 92.0), inp, state, observability)
-    state.progress["step"] = 3
-    _ingest_step_metrics(_line(3, 93.0), inp, state, observability)
-
-    assert len(calls) == 2
-    assert calls[0][1]["force"] is True
-    assert "step_duration_s" not in calls[0][1]
-    assert calls[1][1]["reward_metrics"] == {"quality": 0.5}
-    assert calls[1][1]["step_duration_s"] == 92.0
-    assert calls[1][1]["projected_remaining_s"] == pytest.approx(17296.0)
-    assert state.sent_first_metrics is True
-    assert state.sent_first_timing is True
+    assert all(fields["reward_metrics"] == {"quality": 0.5} for _, fields in calls)

@@ -79,13 +79,17 @@ def _progress_sections(fields: dict) -> tuple[dict, list, dict, dict, dict, dict
     gpu = dict(gpu) if isinstance(gpu, dict) else {}
     samples = fields.get("sampled_completions")
     samples = list(samples) if isinstance(samples, list) else []
-    known = metrics_keys | timing_keys | {
-        "checkpoint_failure",
-        "gpu",
-        "reward_metrics",
-        "sampled_completions",
-        "step",
-    }
+    known = (
+        metrics_keys
+        | timing_keys
+        | {
+            "checkpoint_failure",
+            "gpu",
+            "reward_metrics",
+            "sampled_completions",
+            "step",
+        }
+    )
     diagnostics = {key: value for key, value in fields.items() if key not in known}
     return metrics, samples, timing, checkpoint, gpu, diagnostics
 
@@ -121,21 +125,10 @@ def _upload_record(record: ProgressRecord, *, required: bool) -> bool:
     return hf_io.hf_upload_absolute(local, progress_path(record), required=required)
 
 
-def publish_progress(
-    stage: str,
-    *,
-    liveness: bool = False,
-    force: bool = False,
-    initial: bool = False,
-    first_timing: bool = False,
-    **fields,
-):
+def publish_progress(stage: str, *, initial: bool = False, **fields):
     """Publish one immutable cumulative progress record for observed work only."""
-    del force, first_timing
     global _PROGRESS_COMPLETED_STEPS, _PROGRESS_PENDING_CHECKPOINT_FAILURE
     global _PROGRESS_PREVIOUS_DIGEST, _PROGRESS_SEQUENCE, _PROGRESS_TRAINING_ENTERED
-    if liveness:
-        return False
     with _PROGRESS_LOCK:
         step = fields.get("step")
         if isinstance(step, (int, float)) and not isinstance(step, bool) and step >= 0:
@@ -411,8 +404,8 @@ def _bounded_reward_metrics(metrics) -> dict[str, float]:
             score = float(value)
         except (TypeError, ValueError, OverflowError):
             # an int too large for a float raises OverflowError, not ValueError. this runs on the
-            # progress thread over a caller-supplied dict, so letting it out kills liveness
-            # reporting for the rest of the run.
+            # progress publication over a caller-supplied dict must not fail because one metric is
+            # not representable as a finite float.
             continue
         if not math.isfinite(score):
             continue
@@ -436,16 +429,8 @@ def _bounded_reward_metrics(metrics) -> dict[str, float]:
 
 
 @contextlib.contextmanager
-def observe_phase(
-    stage,
-    progress=None,
-    fields=None,
-    progress_step=False,
-    keepalive=False,
-    sample_off_thread=False,
-):
+def observe_phase(stage, progress=None, fields=None, progress_step=False):
     """Record a phase transition and any cumulative work observed when it completes."""
-    del keepalive, sample_off_thread
     initial_fields = fields() if callable(fields) else {}
     if not isinstance(initial_fields, dict):
         initial_fields = {}

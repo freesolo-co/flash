@@ -189,8 +189,6 @@ class _StepMetricState:
     rollout_identity_evidence: dict[str, list] = field(
         default_factory=lambda: {"steps": [], "validation": []}
     )
-    sent_first_metrics: bool = False
-    sent_first_timing: bool = False
 
     def set_prior_positive_step(self, step: int | None, *, checkpoint_step: int) -> None:
         """install the strict durable positive-gradient fact before uploader start."""
@@ -618,24 +616,13 @@ def _ingest_step_metrics(
         # still reports the steps it did complete (worker/__init__.py:_err_metrics).
         LATEST_GRPO_METRICS[:] = state.metrics_last
         progress_fields = _reward_observability()
-        has_step_timing = "step_duration_s" in progress_fields
-        # rl_train_start arms a 900s throttle, so force until both the first backlog and the first
-        # usable timing payload commit. the backlog commit also arms the force floor, so mark the first
-        # timing attempt for the wrapper's dedicated floor bypass until that upload succeeds.
-        if not state.sent_first_metrics or (has_step_timing and not state.sent_first_timing):
-            progress_committed = _worker_progress.publish_progress(
-                "rl_step",
-                force=True,
-                first_timing=has_step_timing and not state.sent_first_timing,
-                step=step_metrics["step"],
-                metrics_last=list(state.metrics_last),
-                **progress_fields,
-                gpu=gpu_diagnostics(include_torch=False),
-            )
-            if progress_committed:
-                state.sent_first_metrics = True
-                if has_step_timing:
-                    state.sent_first_timing = True
+        _worker_progress.publish_progress(
+            "rl_step",
+            step=step_metrics["step"],
+            metrics_last=list(state.metrics_last),
+            **progress_fields,
+            gpu=gpu_diagnostics(include_torch=False),
+        )
         # per-step series for train_meta observability parity. these live on the same
         # line as everything else: verl's only console metric sink is LocalLogger,
         # which always prints "step:N - ..." (verl/utils/logger/aggregate_logger.py),

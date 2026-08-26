@@ -302,20 +302,19 @@ def test_run_rl_train_reaches_the_executable_grpo_subprocess_stream():
 
 
 def test_verl_uses_canonical_progress_stage_contracts():
-    from flash.runner.lifecycle.state import _TRAINING_STAGES
-
     source = inspect.getsource(rl_train.run_rl_train)
     assert '_worker_progress.publish_progress("rl_step", step=0, initial=True)' in source
     assert 'with observe_phase( "rl_step"' in " ".join(source.split())
     assert 'with observe_phase( "rl_finalizing"' in " ".join(source.split())
-    assert "rl_step" in _TRAINING_STAGES
 
 
-def test_reward_observability_uses_progress_without_periodic_liveness_records():
+def test_reward_observability_reaches_progress_records():
     source = " ".join(inspect.getsource(rl_train.run_rl_train).split())
     assert "reward_runtime.observability.progress_fields()" in source
-    assert 'fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()}' in source
-    assert "liveness_heartbeat" not in source
+    assert (
+        'fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()}' in source
+    )
+    assert "publish_progress" in inspect.getsource(rl_runner._ingest_step_metrics)
 
 
 # ------------------------------- data conversion -------------------------------
@@ -6488,7 +6487,7 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
     )
 
 
-# ---------------- reward observability: the buffer and the heartbeat drain ----------------
+# ---------------- reward observability: buffer and progress snapshots ----------------
 def _score_buffer(env, *, prompts=None, examples=None, generation_size=0):
     """`_score`'s grade-then-record pair, against a real buffer and fake env.
 
@@ -6647,7 +6646,7 @@ def test_both_signals_pass_their_wire_bounds_before_publication():
 @pytest.mark.usefixtures("_identity_graded")
 def test_a_reward_that_is_not_a_float_is_coerced_at_the_boundary():
     # rewards arrive from user grading code and go out as json. coercing on the way IN keeps a
-    # numpy scalar or a bool from reaching the serializer a heartbeat away from the call site.
+    # numpy scalar or a bool from reaching the progress serializer after the call site.
     buffer = RewardObservabilityBuffer()
     buffer.record("prompt-0", "completion-0", np.float32(0.25))
 
@@ -6670,7 +6669,7 @@ def test_a_scalar_reward_run_publishes_no_named_metrics_at_all():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_the_heartbeat_publishes_averaged_metrics_and_bounded_samples():
+def test_progress_publishes_averaged_metrics_and_bounded_samples():
     score, buffer = _score_buffer(
         _NamedBreakdownEnv(),
         prompts=["p0", "p1", "p2", "p3"],
@@ -6690,13 +6689,12 @@ def test_the_heartbeat_publishes_averaged_metrics_and_bounded_samples():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_a_heartbeat_landing_mid_generation_republishes_the_last_complete_one():
-    """A 30s liveness tick is not a generation boundary, and publishing on it is latency-biased.
+def test_progress_mid_generation_reuses_the_last_complete_generation():
+    """a progress observation is not a generation boundary, and partial publication is biased.
 
-    The completions that finish first are the fast ones -- short outputs, cache hits, envs that
-    grade without i/o. A drain on the heartbeat cadence therefore reports THAT subset's mean as the
-    step's reward, systematically over-representing whatever is cheap to produce. The reading has to
-    stay pinned to the last whole generation until the next boundary seals a new one.
+    completions that finish first are the fast ones: short outputs, cache hits, and envs that grade
+    without i/o. publishing that subset would over-represent whatever is cheap to produce. the
+    reading stays pinned to the last whole generation until the next boundary seals a new one.
     """
     score, buffer = _score_buffer(
         _NamedBreakdownEnv(),
@@ -6818,7 +6816,7 @@ def test_the_step_preview_reads_the_generation_that_step_published():
 
     A late `step:N` line arrives with generation N+1 already scoring, so the newest recorded sample
     belongs to N+1. Previewing that labels N+1's completion as step N -- the mislabelling the queue
-    exists to prevent, reintroduced one line later, and disagreeing with the heartbeat about the
+    exists to prevent, reintroduced one line later, and disagreeing with progress about the
     very same step.
     """
     buffer = RewardObservabilityBuffer(generation_size=2)
@@ -6829,7 +6827,7 @@ def test_the_step_preview_reads_the_generation_that_step_published():
     buffer.close_generation(1)
 
     assert buffer.latest()[1] == "gen1-b", "the preview labelled the next generation as this step"
-    # and the heartbeat agrees with it, which is the point of reading the published generation.
+    # progress agrees with it because both read the published generation.
     fields = buffer.progress_fields()
     assert [s["completion"] for s in fields["sampled_completions"]] == ["gen1-a", "gen1-b"]
 
@@ -6858,8 +6856,8 @@ def test_a_component_too_large_to_be_a_float_does_not_fail_the_reward_request():
 
 
 def test_the_published_metric_bound_survives_a_value_too_large_to_be_a_float():
-    # the same coercion runs again on the publish side, on the heartbeat thread, over a dict the
-    # trl callback takes from its caller. escaping there kills liveness reporting for the whole run.
+    # the same coercion runs again at publication over a caller-supplied dict. an unusable
+    # component must not prevent the remaining progress fields from being serialized.
     from flash.engine.worker.io.progress import _bounded_reward_metrics
 
     assert _bounded_reward_metrics({"huge": 10**400, "fine": 0.25}) == {"fine": 0.25}
@@ -6878,9 +6876,7 @@ def test_the_step_line_names_the_generation_the_count_already_sealed():
     # verl resumed from a checkpoint: its first logged step is 41, not the buffer's internal 1.
     buffer.close_generation(41)
 
-    assert {s["generated_at_step"] for s in buffer.progress_fields()["sampled_completions"]} == {
-        41
-    }
+    assert {s["generated_at_step"] for s in buffer.progress_fields()["sampled_completions"]} == {41}
 
 
 @pytest.mark.usefixtures("_identity_graded")
@@ -6996,7 +6992,7 @@ def test_one_non_finite_score_cannot_poison_a_whole_components_mean():
     """Summing a NaN in makes the running total NaN forever: every later completion adds to it and
     the name publishes NaN for the rest of the generation. One diverged grading would take out a
     component that scored fine on every other completion -- and `json.dumps` writes bare `NaN`,
-    which is not JSON, so a strict reader rejects the whole heartbeat over it."""
+    which is not json, so a strict reader rejects the whole progress record over it."""
     buffer = RewardObservabilityBuffer()
     buffer.record("p", "a", 1.0, [{"quality": 1.0, "total": 1.0}])
     buffer.record("p", "b", 1.0, [{"quality": float("nan"), "total": 1.0}])
@@ -7056,7 +7052,7 @@ def test_samples_carry_the_step_they_were_generated_at_not_the_current_one():
 @pytest.mark.usefixtures("_identity_graded")
 def test_the_drain_clears_pending_breakdowns_and_then_repeats_the_last_reading():
     # the drain CLEARS the pending list. between generations there is nothing new to average, and
-    # reporting {} there would blank the metric on every heartbeat that lands mid-generation rather
+    # reporting {} there would blank the metric on every progress observation mid-generation rather
     # than holding the last real reading.
     score, buffer = _score_buffer(_NamedBreakdownEnv())
     score(0, "7")
@@ -7128,13 +7124,16 @@ def test_metrics_and_samples_in_one_payload_describe_the_same_gradings():
     assert [sample["reward"] for sample in fields["sampled_completions"]] == [1.0]
 
 
-def test_the_first_sample_bearing_progress_is_published():
+def test_each_step_progress_includes_reward_samples_and_timing():
     source = inspect.getsource(rl_runner._ingest_step_metrics)
-    publication = source[source.index("if not state.sent_first_metrics or") :]
-    publication = publication[: publication.index("gpu=gpu_diagnostics")]
-    assert "progress_fields = _reward_observability()" in source
-    assert "publish_progress(" in publication
+    publication = source[source.index("progress_fields = _reward_observability()") :]
+    publication = publication[: publication.index("# per-step series")]
+    assert 'publish_progress(\n            "rl_step"' in publication
+    assert "metrics_last=list(state.metrics_last)" in publication
     assert "**progress_fields" in publication
+    assert "gpu=gpu_diagnostics(include_torch=False)" in publication
+    assert "sent_first" not in publication
+    assert "force=" not in publication
 
 
 def test_a_step_whose_generation_was_dropped_previews_nothing_rather_than_older_text():
@@ -7161,7 +7160,7 @@ def test_a_step_whose_generation_was_dropped_previews_nothing_rather_than_older_
     assert buffer.latest_for_step(11) is None, (
         "step 11 previewed rows that belong to an earlier generation"
     )
-    # the stale reading is still reachable, deliberately: the heartbeat reports it as step 10's.
+    # the stale reading is still reachable, deliberately: progress reports it as step 10's.
     assert buffer.latest()[1] == "gen-A-b"
 
 
@@ -8069,7 +8068,7 @@ def test_grpo_final_driver_env_scrubs_declared_prefixed_secrets_before_ray(monke
 def test_grpo_finalization_carries_the_completed_step():
     """Regression (rl_train.py): write_train_meta emits `<phase>_train_done` and then the
     terminal `done`. Called without `step`, both land stepless and overwrite the stepped `rl_trained`
-    heartbeat above them, and actual_steps_run() deliberately returns 0 for a non-training stage with
+    progress record above them, and actual_steps_run() deliberately returns 0 for a non-training stage with
     no step -- so a cancel arriving between finalization and DONE reprices a fully trained run at
     zero steps and bills $0. The sft and opd finalizers already pass their final step; grpo was the
     only one that did not.
@@ -8585,10 +8584,10 @@ def test_a_failed_score_does_not_inflate_the_turn_accounting():
     assert accounting["mean_turns_per_episode"] is None
 
 
-def test_turn_accounting_reaches_the_durable_notes_not_only_the_heartbeat():
+def test_turn_accounting_reaches_durable_notes_beyond_live_progress():
     """The counters have to land in `metrics.json` notes, which is what a terminal proof reads.
 
-    The heartbeat's `metrics_last` row is a live view that a completed run's artifact bundle does
+    the `metrics_last` progress row is a live view that a completed run's artifact bundle does
     not carry, so publishing there alone leaves the evidence unreadable after the fact. Assert both
     that the terminal writer forwards the bridge totals and that the notes builder keeps them.
     """

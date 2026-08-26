@@ -531,10 +531,9 @@ def run_sft_train(spec=None) -> None:
         data = _prepare_sft_data(options)
     model = _prepare_sft_model(options, data)
 
-    # provisioning the verl interpreter builds a venv and installs the whole training stack when the
-    # run has no prebuilt worker image, which is minutes of silence with no training step to report
-    # and no liveness thread otherwise running here -- long enough for the stall watchdog to fail a
-    # healthy run. no progress= : there is no monotonic counter to read, only the keepalive.
+    # provisioning the verl interpreter can build a venv and install the training stack before any
+    # optimizer step exists. publish the phase boundary for visibility without treating silence as a
+    # lifecycle signal.
     with observe_phase("sft_configuring"):
         python_bin = resolve_verl_python(
             options.paths.workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
@@ -649,7 +648,6 @@ def run_sft_train(spec=None) -> None:
         "sft_finalizing",
         progress=lambda: final_step,
         progress_step=True,
-        keepalive=True,
     ):
         adapter_dir = os.path.join(options.paths.workdir, "adapter")
         _export_checkpoint_adapter(

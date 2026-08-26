@@ -117,7 +117,9 @@ def run_opd_train(spec=None) -> None:
         _validate_multimodal_opd(request, spec, model_id)
     started_at = time.time()
     capability, control_panel_url = _validate_teacher_transport()
-    _worker_progress.publish_progress("opd_start", gpu=_worker_perf.gpu_diagnostics(include_torch=False))
+    _worker_progress.publish_progress(
+        "opd_start", gpu=_worker_perf.gpu_diagnostics(include_torch=False)
+    )
     _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
@@ -129,7 +131,8 @@ def run_opd_train(spec=None) -> None:
     download_seconds, eos_token_ids = _load_opd_model(model_id, model_revision, prompt_state)
     workload = _prepare_workload(request, prompt_state, multimodal)
     update_horizon, prompts_per_step = workload.update_horizon, workload.prompts_per_step
-    # same silent boundary the sft path guards: with no prebuilt worker image this builds a venv and installs the training stack, minutes long with nothing to report and no liveness thread running.
+    # with no prebuilt worker image this can build a venv and install the training stack before an
+    # optimizer step exists. publish the phase boundary for visibility only.
     with observe_phase("opd_configuring"):
         python_bin = resolve_verl_python(
             workload.workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
@@ -186,9 +189,7 @@ def run_opd_train(spec=None) -> None:
                 "not cover every update"
             )
         _validate_aligned_sequences(final_accounting)
-        with observe_phase(
-            "opd_finalizing", progress=lambda: final_step, progress_step=True, keepalive=True
-        ):
+        with observe_phase("opd_finalizing", progress=lambda: final_step, progress_step=True):
             adapter_dir = _export_and_upload_adapter(request, workload, runtime, result)
             # preserve the final checkpoint only when save_at_steps is empty, matching grpo. watcher
             # and final-save paths are disjoint, so the watcher's lifecycle must not suppress it.
