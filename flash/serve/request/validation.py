@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
 import io
 import json
 import re
 import warnings
+from collections.abc import Mapping
 from typing import Any
 
 from flash.serve.contract.protocol import reject_non_finite_json_constant
@@ -18,6 +20,7 @@ MAX_TOTAL_COMPRESSED_BYTES = 16 * 1024 * 1024
 MAX_DIMENSION = 8192
 MAX_TOTAL_DECODED_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_CHARS = len("data:image/webp;base64,") + 4 * ((MAX_COMPRESSED_BYTES + 2) // 3)
+MAX_MESSAGE_NODES = 4096
 IMAGE_TYPES = frozenset({"image_url", "input_image", "image"})
 TEXT_TYPES = frozenset({"text", "input_text"})
 ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
@@ -67,6 +70,40 @@ ALLOWED_KEYS_HINT = (
 )
 
 ErrorType = type[Exception]
+
+
+def detached_messages(
+    messages: Any,
+    *,
+    sequence_types: type | tuple[type, ...],
+    sequence_error: str,
+    error_type: ErrorType,
+) -> list[dict[str, Any]]:
+    if not isinstance(messages, sequence_types):
+        raise error_type(sequence_error)
+    active: set[int] = set()
+    stack: list[tuple[Any, bool]] = [(messages, False)]
+    nodes = 0
+    while stack:
+        value, exiting = stack.pop()
+        if exiting:
+            active.remove(id(value))
+            continue
+        nodes += 1
+        if nodes > MAX_MESSAGE_NODES:
+            raise error_type("messages exceed the supported complexity")
+        if isinstance(value, Mapping | list | tuple):
+            identity = id(value)
+            if identity in active:
+                raise error_type("messages must not contain recursive containers")
+            active.add(identity)
+            stack.append((value, True))
+            nested = value.values() if isinstance(value, Mapping) else value
+            stack.extend((item, False) for item in nested)
+    try:
+        return copy.deepcopy(messages)
+    except RecursionError as exc:
+        raise error_type("messages exceed the supported complexity") from exc
 
 
 def has_image_blocks(messages: Any, *, sequence_types: type | tuple[type, ...]) -> bool:

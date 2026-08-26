@@ -430,14 +430,22 @@ class GenerationRequest:
         if self.messages is not None:
             if isinstance(self.messages, str) or not isinstance(self.messages, Sequence):
                 raise RuntimeConfigurationError("messages must be a sequence of mappings")
-            try:
-                messages = tuple(dict(message) for message in self.messages)
-            except (TypeError, ValueError) as exc:
-                raise RuntimeConfigurationError("messages must be a sequence of mappings") from exc
+            from flash.serve.request.validation import (
+                MAX_SOURCE_CHARS,
+                detached_messages,
+                normalize_messages,
+            )
+
+            messages = tuple(
+                detached_messages(
+                    self.messages,
+                    sequence_types=Sequence,
+                    sequence_error="messages must be a sequence of mappings",
+                    error_type=RuntimeConfigurationError,
+                )
+            )
             if not messages:
                 raise RuntimeConfigurationError("messages must not be empty")
-            from flash.serve.request.validation import MAX_SOURCE_CHARS, normalize_messages
-
             normalize_messages(
                 messages,
                 sequence_types=tuple,

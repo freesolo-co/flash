@@ -12,9 +12,37 @@ from flash.serve.runtime.tool_calls import (
     ToolCallStreamParser,
     normalize_tools,
     parse_qwen3_coder_output,
+    tools_wire,
     validate_tool_history,
     validate_tool_stop_sequences,
 )
+
+
+def test_tools_wire_recursively_detaches_the_normalized_schema() -> None:
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "store",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"value": {"type": "integer"}},
+                        "required": ["value"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+
+    wire = tools_wire(tools)
+    wire[0]["function"]["parameters"]["properties"]["value"]["type"] = "string"
+    wire[0]["function"]["parameters"]["required"].clear()
+
+    assert tools[0].parameters["properties"]["value"]["type"] == "integer"
+    assert tools[0].parameters["required"] == ["value"]
+    assert tools_wire(tools) != wire
 
 
 def _exact_tools():

@@ -53,7 +53,8 @@ class FunctionTool:
     parameters: dict[str, Any]
 
     def wire(self) -> dict[str, Any]:
-        function = {"name": self.name, "parameters": self.parameters}
+        parameters = _json_copy(self.parameters, "parameters", ValueError)
+        function = {"name": self.name, "parameters": parameters}
         if self.description is not None:
             function["description"] = self.description
         return {"type": "function", "function": function}

@@ -618,6 +618,43 @@ def test_packaged_tool_history_rejects_surrogate_call_ids_before_cache(field: st
         GenerationRequest(messages=messages)
 
 
+def test_generation_request_recursively_detaches_caller_messages() -> None:
+    metadata = {"nested": {"value": 1}}
+    content = [{"type": "text", "text": "hello"}]
+    messages = [{"role": "user", "content": content, "metadata": metadata}]
+
+    request = GenerationRequest(messages=messages)
+    metadata["nested"]["value"] = 2
+    content[0]["text"] = "changed"
+
+    assert isinstance(request.messages, tuple)
+    assert isinstance(request.messages[0], dict)
+    assert request.messages[0]["metadata"] == {"nested": {"value": 1}}
+    assert request.messages[0]["content"] == [{"type": "text", "text": "hello"}]
+
+
+def test_generation_request_rejects_recursive_and_over_complex_metadata() -> None:
+    recursive: dict[str, object] = {}
+    recursive["self"] = recursive
+    with pytest.raises(RuntimeConfigurationError, match="recursive containers"):
+        GenerationRequest(messages=[{"role": "user", "content": "hello", "metadata": recursive}])
+
+    with pytest.raises(RuntimeConfigurationError, match="messages exceed the supported complexity"):
+        GenerationRequest(
+            messages=[{"role": "user", "content": "hello", "metadata": {"values": [0] * 4096}}]
+        )
+
+
+def test_generation_request_accepts_and_detaches_normal_tool_history() -> None:
+    messages = _runtime_tool_history("call_1")
+
+    request = GenerationRequest(messages=messages)
+    messages[1]["tool_calls"][0]["function"]["name"] = "changed"
+
+    assert request.messages[1]["tool_calls"][0]["function"]["name"] == "weather"
+    assert request.messages[2]["tool_call_id"] == "call_1"
+
+
 def test_packaged_prompt_cache_key_accepts_non_bmp_tool_call_ids() -> None:
     messages = _runtime_tool_history("call_🌦")
     request = GenerationRequest(messages=messages)
