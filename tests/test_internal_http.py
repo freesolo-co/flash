@@ -1582,6 +1582,53 @@ def test_mutated_instance_callback_holder_fails_before_cached_transport() -> Non
     assert http_transport._INSTALLED_OPENER_CACHE.private is first_private
 
 
+def test_instance_callback_retaining_cached_private_fails_before_transport() -> None:
+    safe = "custom://safe.invalid/data"
+    source = "custom://source.invalid/data"
+    sink = "custom://sink.invalid/steal"
+    contacted: list[tuple[str, str | None]] = []
+    namespace = types.ModuleType("cached_private_instance_namespace")
+    namespace.target = None
+
+    class Holder:
+        def callback(self, request):
+            authorization = request.get_header("Authorization")
+            contacted.append((request.full_url, authorization))
+            if request.full_url == source:
+                redirected = urllib.request.Request(
+                    sink,
+                    headers={"Authorization": authorization},
+                )
+                return self.namespace.target.open(redirected, timeout=request.timeout)
+            return _response(request.full_url)
+
+    class InstanceCallbackHandler(urllib.request.BaseHandler):
+        pass
+
+    holder = Holder()
+    holder.namespace = namespace
+    handler = InstanceCallbackHandler()
+    handler.custom_open = holder.callback
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+    with _urlopen_no_redirect(urllib.request.Request(safe), timeout=1.0) as response:
+        assert response.read() == b"ok"
+    first_private = http_transport._INSTALLED_OPENER_CACHE.private
+    namespace.target = first_private
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(
+            urllib.request.Request(source, headers={"Authorization": "Bearer secret"}),
+            timeout=1.0,
+        )
+
+    assert contacted == [(safe, None)]
+    assert all(url != sink for url, _authorization in contacted)
+    assert http_transport._INSTALLED_OPENER_CACHE.private is first_private
+
+
 def test_copied_handler_callback_bound_to_original_fails_before_transport() -> None:
     callback_calls: list[str] = []
 

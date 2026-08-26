@@ -22,6 +22,20 @@ _FAST_LOAD_OPNAMES = frozenset({"LOAD_FAST", "LOAD_FAST_CHECK"})
 _STATELESS_TERMINAL_TYPES = (object, _thread.LockType, _thread.RLock)
 
 
+def _slot_names(declaration: object) -> tuple[str, ...]:
+    if type(declaration) is str:
+        names = (declaration,)
+    elif type(declaration) in (list, tuple, set, frozenset):
+        names = tuple(declaration)
+    elif type(declaration) is dict:
+        names = tuple(declaration.keys())
+    else:
+        raise TypeError
+    if any(type(name) is not str for name in names):
+        raise TypeError
+    return names
+
+
 def _getattr_type_static(owner: type, name: str, default: object) -> object:
     for base in type.__getattribute__(owner, "__mro__"):
         namespace = type.__getattribute__(base, "__dict__")

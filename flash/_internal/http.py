@@ -23,6 +23,7 @@ from .http_refs import (
     _function_global_reference_values,
     _function_reference_values,
     _getattr_type_static,
+    _slot_names,
 )
 from .http_refs import (
     _references_target as _find_references_target,
@@ -336,20 +337,6 @@ _STANDARD_PROXY_CALLBACK_CODE = next(
     for value in urllib.request.ProxyHandler.__init__.__code__.co_consts
     if type(value) is types.CodeType and value.co_name == "<lambda>"
 )
-
-
-def _slot_names(declaration: object) -> tuple[str, ...]:
-    if type(declaration) is str:
-        names = (declaration,)
-    elif type(declaration) in (list, tuple, set, frozenset):
-        names = tuple(declaration)
-    elif type(declaration) is dict:
-        names = tuple(declaration.keys())
-    else:
-        raise TypeError
-    if any(type(name) is not str for name in names):
-        raise TypeError
-    return names
 
 
 def _mangled_slot_name(owner: type, name: str) -> str:
@@ -683,6 +670,7 @@ def _validate_instance_callbacks(
     handler: urllib.request.BaseHandler,
     state: dict[str, object],
     targets: tuple[object, ...],
+    private_targets: tuple[object, ...] = (),
 ) -> None:
     seen: set[int] = set()
     active: set[int] = set()
@@ -690,12 +678,18 @@ def _validate_instance_callbacks(
     for callback in _registered_instance_callbacks(handler, state):
         if _references_target(
             callback,
-            targets,
+            (*targets, *private_targets),
             seen=seen,
             active=active,
             budget=budget,
         ):
             raise TypeError
+        if private_targets and type(callback) is types.MethodType:
+            function = object.__getattribute__(callback, "__func__")
+            callback_self = object.__getattribute__(callback, "__self__")
+            for reference in _function_bound_reference_values(function, callback_self):
+                if _references_target(reference, private_targets):
+                    raise TypeError
 
 
 def _validate_class_callbacks(
@@ -906,13 +900,19 @@ def _active_no_redirect_opener() -> urllib.request.OpenerDirector:
                     for handler in handlers:
                         if not _handles_redirect_error(handler):
                             state = _handler_state(handler)
-                            _validate_instance_callbacks(handler, state, (handler, installed))
+                            private_targets = (cached.private, *cached.private.handlers)
+                            _validate_instance_callbacks(
+                                handler,
+                                state,
+                                (handler, installed),
+                                private_targets,
+                            )
                             _validate_class_callbacks(
                                 handler,
                                 state,
                                 (handler, installed),
-                                (cached.private, *cached.private.handlers),
-                                (cached.private, *cached.private.handlers),
+                                private_targets,
+                                private_targets,
                             )
                 except Exception:
                     raise urllib.error.URLError(_HANDLER_COPY_ERROR) from None
