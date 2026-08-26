@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tomllib
 import zipfile
 from pathlib import Path
@@ -77,7 +78,7 @@ def test_wheel_contains_runtime_and_declares_extra(tmp_path: Path) -> None:
     output = tmp_path / "dist"
     env = os.environ.copy()
     result = subprocess.run(
-        ["uv", "build", "--wheel", "--out-dir", str(output)],
+        ["uv", "build", "--out-dir", str(output)],
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -91,8 +92,36 @@ def test_wheel_contains_runtime_and_declares_extra(tmp_path: Path) -> None:
     with zipfile.ZipFile(wheels[0]) as wheel:
         names = set(wheel.namelist())
         assert names >= APP_FILES | RUNTIME_FILES | CONTROL_FILES
+        # derive the complete python module inventory from the source tree, so lazy imports cannot
+        # hide omitted wheel files and the same test works from a checkout or an extracted sdist.
+        source_modules = {
+            path.relative_to(ROOT).as_posix() for path in (ROOT / "flash").rglob("*.py")
+        }
+        assert names >= source_modules
         metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
         metadata = wheel.read(metadata_name).decode()
+
+    # import the changed cli and profile paths from the built wheel with site packages disabled,
+    # so the relocation cannot pass by leaking modules in from the editable checkout.
+    import_env = {
+        "PATH": "/usr/bin:/bin",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": str(wheels[0].resolve()),
+    }
+    imported = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            "import flash.cli.commands.serving.deploy; import flash.serve.deployment.profiles",
+        ],
+        cwd=tmp_path,
+        env=import_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert imported.returncode == 0, imported.stdout + imported.stderr
 
     assert "Provides-Extra: serve-runtime" in metadata
     for dependency in ("fastapi", "uvicorn", "huggingface-hub", "safetensors"):
