@@ -19,6 +19,7 @@ from flash.serve.contract.protocol import (
     ServingHealthError,
     parse_serving_health,
 )
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serve.contract.urls import serving_base_url
 from flash.serve.deployment.deploy import Deployment, deploy_adapter, undeploy_adapter
 
@@ -147,7 +148,13 @@ def test_real_deploy_translates_serving_5xx_to_serving_error(monkeypatch) -> Non
     monkeypatch.setattr(httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(serving_errors.ServingError) as exc_info:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-9B", "repo", "rl/r1/seed0")
+        deploy_adapter(
+            "flash-1-abc",
+            "Qwen/Qwen3.5-9B",
+            "repo",
+            "rl/r1/seed0",
+            org_id="org-1",
+        )
     assert exc_info.value.status_code == 500
     assert "no base-model engines loaded" in str(exc_info.value)
 
@@ -162,7 +169,13 @@ def test_real_deploy_4xx_hint_points_at_client(monkeypatch) -> None:
     monkeypatch.setattr(httpx, "post", lambda *a, **k: resp)
 
     with pytest.raises(serving_errors.ServingError) as exc_info:
-        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-9B", "repo", "rl/r1/seed0")
+        deploy_adapter(
+            "flash-1-abc",
+            "Qwen/Qwen3.5-9B",
+            "repo",
+            "rl/r1/seed0",
+            org_id="org-1",
+        )
     assert exc_info.value.status_code == 401
     assert "FREESOLO_INTERNAL_KEY" in str(exc_info.value)
 
@@ -204,7 +217,7 @@ def test_deploy_registers_one_exact_checkpoint_without_activation(monkeypatch) -
     method, url, body = requests[0]
     assert method == "POST"
     assert url.endswith("/adapters")
-    assert body == {
+    expected = {
         "adapter_id": "flash-1/step-20",
         "repo_id": "org/repo",
         "base_model": "Qwen/Qwen3.5-9B",
@@ -215,10 +228,13 @@ def test_deploy_registers_one_exact_checkpoint_without_activation(monkeypatch) -
         "checkpoint_step": 20,
         "artifact_revision": "a" * 40,
         "artifact_digest": "b" * 64,
-        "artifact_fingerprint": "b" * 64,
         "lora_rank": 32,
         "thinking": False,
         "org_id": "org-1",
+    }
+    assert body == {
+        **expected,
+        "artifact_fingerprint": immutable_binding_fingerprint(expected),
     }
 
 
@@ -240,6 +256,7 @@ def test_registration_conflict_is_not_masked(monkeypatch) -> None:
             "Qwen/Qwen3.5-9B",
             "org/repo",
             "sft/flash-1/seed0",
+            org_id="org-1",
         )
 
 
@@ -263,7 +280,7 @@ def test_undeploy_calls_exact_checkpoint_delete(monkeypatch) -> None:
         return _Response()
 
     monkeypatch.setattr(serving_transport, "serving_request", request)
-    result = undeploy_adapter("flash-1/final")
+    result = undeploy_adapter("flash-1/final", org_id="org-1")
 
     assert result["checkpoint_id"] == "flash-1/final"
     assert result["disabled_checkpoints"] == ["flash-1/final"]
@@ -276,7 +293,7 @@ def test_undeploy_404_is_clean(monkeypatch) -> None:
         status_code = 404
 
     monkeypatch.setattr(serving_transport, "serving_request", lambda *a, **k: _Response())
-    assert undeploy_adapter("flash-1/final") == {
+    assert undeploy_adapter("flash-1/final", org_id="org-1") == {
         "checkpoint_id": "flash-1/final",
         "disabled_checkpoints": [],
         "serving_deregistered": False,
