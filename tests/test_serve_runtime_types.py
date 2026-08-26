@@ -7,6 +7,7 @@ import io
 import json
 import subprocess
 import sys
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -887,6 +888,50 @@ def test_detached_history_arguments_are_objects_without_caller_mutation() -> Non
     converted = detached_template_messages(messages)
     assert converted[0]["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
     assert messages[0]["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}'
+
+
+def test_detached_tool_result_text_parts_flatten_only_for_templates() -> None:
+    content = [
+        {"type": "text", "text": "sun"},
+        {"type": "text", "text": "ny"},
+    ]
+    messages = [{"role": "tool", "tool_call_id": "call_1", "content": content}]
+
+    converted = detached_template_messages(messages)
+
+    assert converted[0]["content"] == "sunny"
+    assert messages[0]["content"] == content
+
+
+def test_detached_history_arguments_preserve_exact_decimals() -> None:
+    arguments = (
+        '{"large":9007199254740993.0,"tiny":1e-400,'
+        '"nested":{"value":9007199254740993.0},"values":[1e-400]}'
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": arguments},
+                }
+            ],
+        }
+    ]
+
+    converted = detached_template_messages(messages)
+    detached = converted[0]["tool_calls"][0]["function"]["arguments"]
+
+    assert detached == {
+        "large": Decimal("9007199254740993.0"),
+        "tiny": Decimal("1e-400"),
+        "nested": '{"value":9007199254740993.0}',
+        "values": "[1e-400]",
+    }
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == arguments
 
 
 def test_a_multimodal_template_rejection_is_a_client_error_not_an_unavailable_engine(

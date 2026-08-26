@@ -223,6 +223,48 @@ def _delimiter_calls() -> str:
     )
 
 
+def _structural_string_call() -> str:
+    return (
+        "<tool_call><function=store>"
+        "<parameter=scalar>before </parameter></function> after</parameter>"
+        "</function></tool_call>"
+    )
+
+
+def test_unconstrained_string_preserves_structural_function_close_text() -> None:
+    result = parse_qwen3_coder_output(
+        _structural_string_call(),
+        _delimiter_tools(),
+        id_factory=lambda: "call_fixed",
+    )
+
+    assert json.loads(result.calls[0].arguments) == {
+        "scalar": "before </parameter></function> after"
+    }
+
+
+def test_unconstrained_structural_string_survives_arbitrary_stream_splits() -> None:
+    parser = ToolCallStreamParser(_delimiter_tools(), id_factory=lambda: "call_fixed")
+
+    assert all(parser.feed(character) == "" for character in _structural_string_call())
+    result = parser.finish()
+
+    assert json.loads(result.calls[0].arguments)["scalar"] == (
+        "before </parameter></function> after"
+    )
+
+
+def test_complete_structural_candidate_inside_string_falls_back_exactly() -> None:
+    malformed = _structural_string_call().replace(
+        "</function> after", "</function></tool_call> after"
+    )
+
+    result = parse_qwen3_coder_output(malformed, _delimiter_tools())
+
+    assert result.content == malformed
+    assert result.calls == ()
+
+
 def test_tool_call_outer_closer_is_owned_after_function_grammar() -> None:
     text = "visible " + _delimiter_calls()
     result = parse_qwen3_coder_output(text, _delimiter_tools(), id_factory=lambda: "call_fixed")

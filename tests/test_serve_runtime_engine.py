@@ -1045,13 +1045,19 @@ def test_multimodal_template_detaches_and_decodes_historical_tool_arguments(monk
                 {
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+                    "function": {
+                        "name": "weather",
+                        "arguments": '{"large":9007199254740993.0,"tiny":1e-400}',
+                    },
                 }
             ],
         },
         {
             "role": "tool",
-            "content": "sunny",
+            "content": [
+                {"type": "text", "text": "sun"},
+                {"type": "text", "text": "ny"},
+            ],
             "tool_call_id": "call_1",
             "name": "weather",
         },
@@ -1067,8 +1073,14 @@ def test_multimodal_template_detaches_and_decodes_historical_tool_arguments(monk
     assert result.text == "ok"
     processor = runtime._processor
     template_messages = processor.template_calls[0][0]
-    assert template_messages[1]["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
-    assert messages[1]["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}'
+    arguments = template_messages[1]["tool_calls"][0]["function"]["arguments"]
+    assert str(arguments["large"]) == "9007199254740993.0"
+    assert str(arguments["tiny"]) == "1E-400"
+    assert template_messages[2]["content"] == "sunny"
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == (
+        '{"large":9007199254740993.0,"tiny":1e-400}'
+    )
+    assert isinstance(messages[2]["content"], list)
     assert closed == [True]
     asyncio.run(runtime.close())
 

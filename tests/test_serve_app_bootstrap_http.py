@@ -1327,6 +1327,68 @@ def test_a_malformed_message_is_rejected_before_the_runtime_is_reached(
     )
 
 
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
+def test_tool_result_text_parts_reach_follow_up_generation(stream: bool) -> None:
+    owner, runtime = _published_owner(thinking_default=False)
+    revision = owner.models["run-1"].adapter.adapter_revision
+    incarnation = owner.models["run-1"].adapter.aggregate_sha256
+    if stream:
+        choice = GenerationChoice(0, "answer", "stop", (1,))
+        runtime.stream_events = [
+            StreamReady("request-history", "runtime", revision, incarnation, False),
+            StreamDelta(0, "answer"),
+            StreamChoiceFinished(0, "answer", "stop", (1,)),
+            StreamFinished(
+                request_id="request-history",
+                runtime_id="runtime",
+                adapter_id=revision,
+                incarnation=incarnation,
+                choices=(choice,),
+                prompt_tokens=3,
+                completion_tokens=1,
+                cached_tokens=0,
+                cached_tokens_reported=False,
+                thinking=False,
+            ),
+        ]
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": [
+                {"type": "input_text", "text": "sun"},
+                {"type": "text", "text": "ny"},
+            ],
+        },
+        {"role": "user", "content": "summarize"},
+    ]
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            headers=_auth(),
+            json=_chat_body(messages=messages, stream=stream),
+        )
+    )
+
+    assert response.status_code == 200, response.text
+    assert runtime.generation_requests[-1].messages == tuple(messages)
+
+
 @pytest.mark.parametrize(
     ("label", "messages"),
     [

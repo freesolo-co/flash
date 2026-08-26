@@ -531,21 +531,27 @@ def test_tool_history_is_strict_and_does_not_mutate_caller_messages() -> None:
             allow_managed_selectors=True,
         )
 
-    with pytest.raises(OpenAIRequestError, match="tool result content must be a string"):
-        parse_chat_request(
-            {
-                "messages": [
-                    messages[0],
-                    {
-                        "role": "tool",
-                        "tool_call_id": "call_1",
-                        "content": [{"type": "text", "text": "sunny"}],
-                    },
-                ]
-            },
-            require_model=False,
-            allow_managed_selectors=True,
-        )
+    text_parts = parse_chat_request(
+        {
+            "messages": [
+                messages[0],
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": [
+                        {"type": "input_text", "text": "sun"},
+                        {"type": "text", "text": "ny"},
+                    ],
+                },
+            ]
+        },
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+    assert text_parts.messages[1]["content"] == [
+        {"type": "input_text", "text": "sun"},
+        {"type": "text", "text": "ny"},
+    ]
 
 
 def test_authorized_revision_resolver_prefers_ready_revision_for_ambiguous_step() -> None:

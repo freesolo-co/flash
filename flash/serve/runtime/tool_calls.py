@@ -293,16 +293,27 @@ def detached_template_messages(messages: Sequence[Mapping[str, Any]]) -> list[di
         copied = dict(message)
         content = copied.get("content")
         if isinstance(content, list):
-            copied["content"] = [
+            detached_content = [
                 dict(block) if isinstance(block, dict) else block for block in content
             ]
+            copied["content"] = (
+                "".join(block["text"] for block in detached_content)
+                if copied.get("role") == "tool"
+                and all(
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                    for block in detached_content
+                )
+                else detached_content
+            )
         calls = copied.get("tool_calls")
         if isinstance(calls, list):
             converted = []
             for call in calls:
                 cloned = dict(call)
                 function = dict(cloned["function"])
-                function["arguments"] = _decode_json_object(function["arguments"])
+                function["arguments"] = _template_json_object(function["arguments"])
                 cloned["function"] = function
                 converted.append(cloned)
             copied["tool_calls"] = converted
@@ -495,8 +506,19 @@ def _validate_tool_result(
     if name is not None and name != pending[call_id]:
         raise error_type(f"message {message_index} tool result name does not match its call")
     content = message.get("content")
-    if type(content) is not str:
-        raise error_type(f"message {message_index} tool result content must be a string")
+    if type(content) is not str and not (
+        type(content) is list
+        and all(
+            type(block) is dict
+            and set(block) == {"type", "text"}
+            and block["type"] == "text"
+            and type(block["text"]) is str
+            for block in content
+        )
+    ):
+        raise error_type(
+            f"message {message_index} tool result content must be a string or text blocks"
+        )
     resolved.add(call_id)
 
 
@@ -569,6 +591,15 @@ def _parse_parameter_value(
         if value_end < 0:
             return None
         following = _skip_whitespace(text, value_end + len(_PARAMETER_END))
+        if (
+            schema["type"] == "string"
+            and "enum" not in schema
+            and text.startswith(_FUNCTION_END, following)
+        ):
+            after_function = _skip_whitespace(text, following + len(_FUNCTION_END))
+            if not text.startswith(TOOL_CALL_END, after_function):
+                search_from = value_end + len(_PARAMETER_END)
+                continue
         if text.startswith((_PARAMETER_START, _FUNCTION_END), following):
             raw_value = text[value_start:value_end]
             if raw_value.startswith("\n"):
@@ -646,10 +677,31 @@ def _load_exact_json(value: str) -> Any:
 
 
 def _decode_json_object(value: str) -> dict[str, Any]:
-    decoded = json.loads(value, parse_constant=_raise_nonfinite)
+    decoded = _load_exact_json(value)
     if type(decoded) is not dict:
         raise ValueError("arguments are not an object")
     return decoded
+
+
+def _template_json_object(value: str) -> dict[str, Any]:
+    return {
+        key: (
+            _dump_exact_json(nested)
+            if type(nested) in {dict, list} and _contains_decimal(nested)
+            else nested
+        )
+        for key, nested in _decode_json_object(value).items()
+    }
+
+
+def _contains_decimal(value: Any) -> bool:
+    if type(value) is Decimal:
+        return True
+    if type(value) is list:
+        return any(_contains_decimal(nested) for nested in value)
+    if type(value) is dict:
+        return any(_contains_decimal(nested) for nested in value.values())
+    return False
 
 
 def _raise_nonfinite(value: str) -> None:
