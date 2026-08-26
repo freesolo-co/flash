@@ -864,6 +864,44 @@ def test_spawn_cancellation_is_bounded_when_handle_never_arrives() -> None:
     assert asyncio.run(scenario()) == (True, False)
 
 
+def test_spawn_cancellation_cancels_handle_returned_during_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[int, int]:
+        monkeypatch.setattr(client, "CLEANUP_SECONDS", 0.1)
+        spawn_started = asyncio.Event()
+        cancellation_received = asyncio.Event()
+        handle = object()
+        cancelled: list[Any] = []
+
+        async def spawn() -> Any:
+            spawn_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_received.set()
+                return handle
+
+        async def cancel(value: Any) -> None:
+            cancelled.append(value)
+
+        task = asyncio.create_task(
+            client._spawn_cancellation_safe(
+                spawn,
+                cancel,
+                dispatch_deadline_unix=time.time() + 0.01,
+            )
+        )
+        await spawn_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.2)
+        await cancellation_received.wait()
+        return len(cancelled), int(cancelled[0] is handle)
+
+    assert asyncio.run(scenario()) == (1, 1)
+
+
 def test_bounded_cancel_timeout_cancels_and_awaits_local_rpc_task() -> None:
     async def scenario() -> tuple[bool, bool]:
         started = asyncio.Event()
@@ -1141,6 +1179,49 @@ def test_router_channel_preserves_original_function_exception(failure: Exception
         return call.cancel_count, method.spawn_count
 
     assert asyncio.run(scenario()) == (0, 1)
+
+
+def test_terminal_error_result_timeout_cancels_exact_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[int, list[str]]:
+        monkeypatch.setattr(client, "CALL_RESULT_SECONDS", 0.01)
+        queue = _FakeQueue()
+        terminal = DataEnvelope(
+            kind="error",
+            generation_id="generation-1",
+            invocation_nonce="nonce-1",
+            function_call_id="fc-1",
+            engine_replica_id="replica-1",
+            sequence=0,
+            terminal=True,
+            error_code=ChannelErrorCode.ENGINE_ERROR,
+        ).to_dict()
+        call = _FakeCall("fc-1", asyncio.Event().wait())
+        method = _FakeSpawnMethod(None)
+
+        async def spawn(*_args: Any) -> _FakeCall:
+            method.spawn_count += 1
+            await queue._put(terminal, partition=DATA_PARTITION)
+            return call
+
+        method.spawn.aio = spawn
+        channel = client.CancellableStreamChannel(
+            spawn_method=method,
+            payload_dict={},
+            record_dict=None,
+            expected_checkpoint=None,
+            generation_id="generation-1",
+            dispatch_deadline_unix=time.time() + 5,
+            invocation_nonce="nonce-1",
+            queue_context=lambda: _QueueContext(queue),
+        )
+        with pytest.raises(StreamChannelError, match="result timed out"):
+            async for _ in channel:
+                pass
+        return call.cancel_count, queue.clear_calls
+
+    assert asyncio.run(scenario()) == (1, [DATA_PARTITION, CONTROL_PARTITION])
 
 
 def test_router_channel_rejects_post_terminal_data_without_respawn() -> None:

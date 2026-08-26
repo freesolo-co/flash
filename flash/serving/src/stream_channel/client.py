@@ -31,6 +31,26 @@ def _consume_task_result(task: asyncio.Task[Any]) -> None:
         task.exception()
 
 
+async def _cancel_spawn_task_result(
+    task: asyncio.Task[Any],
+    cancel: Callable[[Any], Awaitable[None]],
+) -> None:
+    try:
+        call = task.result()
+    except (asyncio.CancelledError, Exception):
+        return
+    with contextlib.suppress(Exception):
+        await _bounded_shield(cancel(call), CALL_RESULT_SECONDS)
+
+
+def _schedule_spawn_result_cancel(
+    task: asyncio.Task[Any],
+    cancel: Callable[[Any], Awaitable[None]],
+) -> None:
+    cleanup = asyncio.create_task(_cancel_spawn_task_result(task, cancel))
+    cleanup.add_done_callback(_consume_task_result)
+
+
 async def _bounded_shield(operation: Awaitable[Any], deadline_seconds: float) -> None:
     task = asyncio.ensure_future(operation)
     try:
@@ -59,9 +79,11 @@ async def _spawn_cancellation_safe(
             task.cancel()
             done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
             if done:
-                await asyncio.gather(task, return_exceptions=True)
+                await _cancel_spawn_task_result(task, cancel)
             else:
-                task.add_done_callback(_consume_task_result)
+                task.add_done_callback(
+                    lambda completed: _schedule_spawn_result_cancel(completed, cancel)
+                )
             raise cancellation from None
         with contextlib.suppress(Exception):
             await _bounded_shield(cancel(call), CALL_RESULT_SECONDS)
@@ -273,8 +295,14 @@ class CancellableStreamChannel:
                         envelope = validator.accept(raw)
                         if envelope.terminal:
                             if envelope.kind == "error":
+                                try:
+                                    await self._call_result(call_result_task)
+                                except StreamChannelError:
+                                    raise
+                                except Exception:
+                                    completed = True
+                                    raise
                                 completed = True
-                                await self._call_result(call_result_task)
                                 raise StreamChannelError(
                                     envelope.error_code or ChannelErrorCode.CHANNEL_FAULT,
                                     "remote stream failed without a function exception",
