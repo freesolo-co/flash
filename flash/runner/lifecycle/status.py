@@ -17,7 +17,7 @@ import json
 import os
 import time
 
-from flash.core.catalog import validate_model_for_algorithm
+from flash.core.catalog import serving_lora_rank_cap, validate_model_for_algorithm
 from flash.core.spec import JobSpec
 from flash.core.spec_persistence import validate_persisted_spec_envelope
 from flash.runner.lifecycle import attempts, preparation, reporting, state
@@ -70,8 +70,23 @@ def source_snapshot_from_status(status: RunStatus, *, required: bool = False) ->
     return parse_descriptor(raw).to_dict()
 
 
+def _validate_activation_catalog(spec: JobSpec) -> None:
+    """Require the current catalog contract before any run activation or provider work."""
+    info = validate_model_for_algorithm(spec.model, spec.algorithm)
+    if spec.thinking and info.thinking == "none":
+        raise ValueError(f"{spec.model} does not support thinking mode")
+    if not spec.thinking and info.thinking == "always":
+        raise ValueError(f"{spec.model} requires thinking mode")
+    rank_cap = serving_lora_rank_cap(info)
+    if rank_cap is not None and spec.train.lora_rank > rank_cap:
+        raise ValueError(
+            f"train.lora_rank={spec.train.lora_rank} exceeds {spec.model}'s current "
+            f"serving max_lora_rank={rank_cap}"
+        )
+
+
 def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
-    """Load the private prepared worker spec, optionally revalidating its source artifact."""
+    """Load and validate the worker spec for activation-sensitive lifecycle work."""
     managed_revision_keys = {
         "model_revision",
         "model_revision_auto",
@@ -84,51 +99,38 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             + ", ".join(leaked_revision_keys)
         )
     public_spec = JobSpec.from_dict(status.spec)
-    validate_model_for_algorithm(public_spec.model, public_spec.algorithm)
     snapshot = status.effective_preparation
+    if snapshot is None:
+        snapshot = {}
     if not isinstance(snapshot, dict):
+        raise ValueError("persisted effective preparation is malformed")
+    if "worker_spec" not in snapshot:
         if public_spec.train.init_from_adapter:
             raise ValueError(
                 f"warm-start source {public_spec.train.init_from_adapter!r} cannot be recovered "
                 "because its original preparation snapshot is unavailable"
             )
+        _validate_activation_catalog(public_spec)
         return public_spec
-    raw_worker = snapshot.get("worker_spec")
+    raw_worker = snapshot["worker_spec"]
     if not isinstance(raw_worker, dict):
-        raise ValueError("persisted effective preparation is malformed")
+        raise ValueError("persisted effective preparation worker_spec must be an object")
     worker_spec = JobSpec.from_dict(raw_worker)
-    validate_model_for_algorithm(worker_spec.model, worker_spec.algorithm)
+    if worker_spec.model != public_spec.model or worker_spec.algorithm != public_spec.algorithm:
+        raise ValueError("persisted public and worker model/algorithm do not match")
     preparation._validate_effective_spec(public_spec, worker_spec)
     expected = snapshot.get("adapter_identity")
     stored_digest = snapshot.get("preparation_digest")
-    if stored_digest is not None:
-        validate_persisted_spec_envelope(snapshot)
+    validate_persisted_spec_envelope(snapshot)
     has_workload_profile = bool(
         worker_spec.workload_profile_input_digest or worker_spec.workload_profile
     )
-    # a runner-managed revision exists only in the worker half, so bind it and its provenance marker
-    # to the preparation digest. a plain grpo or opd run otherwise reaches neither digest branch.
     if has_workload_profile and snapshot.get("workload_profile") != (
         worker_spec.workload_profile or None
     ):
         raise ValueError("persisted workload profile does not match the worker spec")
-    # `gpu_count_auto` is deliberately NOT a trigger here, unlike `model_revision_auto`. the digest
-    # covers the whole public spec including `gpu.type`, which the allocator legitimately rewrites
-    # onto the stored status when a run is provisioned -- so gating on the marker made the digest
-    # reject ordinary provisioned runs at deploy. Measured: two specs differing only in whether
-    # gpu.count was authored deployed differently, the auto-sized one failing integrity validation
-    # (tests/test_server_api.py::test_deploy_ignores_stored_training_gpu). Since an omitted count is
-    # the DEFAULT, that is nearly every run. The marker's integrity does not need this trigger: it
-    # is bounded by `_validate_effective_spec`, which caps an auto-sized count at
-    # MAX_COMBINATION_CARDS, and unlike `model_revision_auto` it cannot relax a deploy-time
-    # rejection -- a forged marker only widens the allocator's ceiling, which the VRAM fit check and
-    # the geometry cap still constrain.
-    if (has_workload_profile or worker_spec.model_revision_auto) and (
-        not isinstance(stored_digest, str)
-        or stored_digest
-        != preparation._preparation_digest(
-            public_spec, worker_spec, expected, stored_public=status.spec
-        )
+    if not isinstance(stored_digest, str) or stored_digest != preparation._preparation_digest(
+        public_spec, worker_spec, expected, stored_public=status.spec
     ):
         raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
@@ -141,6 +143,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             public_spec, worker_spec, expected, stored_public=status.spec
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
+    _validate_activation_catalog(worker_spec)
     if verify_source and public_spec.train.init_from_adapter:
         try:
             from flash.adapters.lora_rank import (

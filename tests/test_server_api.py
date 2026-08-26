@@ -3411,6 +3411,84 @@ def test_serving_routes_map_leaked_revision_decode_failures_to_conflict(api, rou
     assert "platform-managed model revision key" in response.json()["detail"]
 
 
+def test_deploy_maps_strict_worker_type_errors_to_conflict(api):
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner_status.get_status(run_id)
+    status.effective_preparation["worker_spec"]["train"]["epochs"] = "1"
+    runner_state._save_status(status)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/deploy",
+        json={"dry_run": True},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "train.epochs must be an integer or null"
+
+
+def test_chat_maps_strict_worker_type_errors_to_conflict(api):
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner_status.get_status(run_id)
+    status.effective_preparation["worker_spec"]["train"]["epochs"] = "1"
+    runner_state._save_status(status)
+
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+        headers=_bearer(key),
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "train.epochs must be an integer or null"
+
+
+def test_deployment_completion_uses_authoritative_model_revision(api, monkeypatch):
+    import flash.server.asgi.app as app_mod
+    from flash.core.spec import JobSpec
+    from flash.server.routes import serving
+
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    status = runner_status.get_status(run_id)
+    snapshot = status.effective_preparation
+    model_revision = "a" * 40
+    snapshot["worker_spec"]["model_revision"] = model_revision
+    snapshot["worker_spec"]["model_revision_auto"] = True
+    snapshot["preparation_digest"] = runner_preparation._preparation_digest(
+        JobSpec.from_dict(status.spec),
+        JobSpec.from_dict(snapshot["worker_spec"]),
+        snapshot.get("adapter_identity"),
+    )
+    runner_state._save_status(status)
+    revision = f"{run_id}@final." + "b" * 40
+    seen = {}
+
+    def fake_deploy(**kwargs):
+        kwargs["before_activate"](revision, run_id)
+        return _FakeDeployment(kwargs["adapter_prefix"])
+
+    def fake_smoke(_run_id, spec, **_kwargs):
+        seen["model_revision"] = spec.model_revision
+        return {"verified_at": time.time(), "thinking_tag": False}
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(serving, "_run_deployment_smoke", fake_smoke)
+
+    response = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "ready"
+    assert seen["model_revision"] == model_revision
+    assert "model_revision" not in json.dumps(response.json())
+
+
 def test_deploy_dry_run_does_not_reconcile_unknown_alias(api, monkeypatch):
     import flash.server.asgi.app as app_mod
 
@@ -6886,9 +6964,13 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
     ).json()["run_id"]
     status = runner_status.get_status(run_id)
     status.state = "done"
-    status.spec["gpu"]["type"] = "H200"
-    # keep the internal worker-spec carrier: hf_repo + run_id (adapter identity) are platform-managed
-    # and stripped from the public spec, so deploy resolves them from effective_preparation.
+    snapshot = status.effective_preparation
+    snapshot["worker_spec"]["gpu"]["type"] = "H200"
+    snapshot["preparation_digest"] = runner_preparation._preparation_digest(
+        runner_spec.JobSpec.from_dict(status.spec),
+        runner_spec.JobSpec.from_dict(snapshot["worker_spec"]),
+        snapshot.get("adapter_identity"),
+    )
     runner_state._save_status(status)
     seen: dict = {}
 
@@ -6931,8 +7013,13 @@ def test_deploy_works_the_same_whether_or_not_gpu_count_was_authored(api, monkey
         ).json()["run_id"]
         status = runner_status.get_status(run_id)
         status.state = "done"
-        # the allocator writes the class it actually rented onto the public status.
-        status.spec["gpu"]["type"] = "H200"
+        snapshot = status.effective_preparation
+        snapshot["worker_spec"]["gpu"]["type"] = "H200"
+        snapshot["preparation_digest"] = runner_preparation._preparation_digest(
+            runner_spec.JobSpec.from_dict(status.spec),
+            runner_spec.JobSpec.from_dict(snapshot["worker_spec"]),
+            snapshot.get("adapter_identity"),
+        )
         runner_state._save_status(status)
 
         resp = api.post(f"/v1/runs/{run_id}/deploy", json={}, headers=_bearer(key))
@@ -7510,9 +7597,12 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
             # run_id is platform-managed and stripped from the public spec; a provisioned run always
             # carries the internal worker-spec carrier, which is where recovery resolves its identity.
             effective_preparation={
+                "version": 1,
                 "worker_spec": spec.to_internal_dict(),
                 "adapter_identity": None,
-                "preparation_digest": None,
+                "preparation_digest": runner_preparation._preparation_digest(
+                    JobSpec.from_dict(spec.to_dict()), spec, None
+                ),
             },
         ),
         _run_deadline_at=deadline,

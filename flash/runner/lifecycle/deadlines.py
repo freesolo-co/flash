@@ -30,7 +30,7 @@ def _canonical_run_deadline(raw: dict) -> tuple[RunStatus, float]:
     status = status_ops._runstatus_from_json(raw)
     # max_wall_seconds is platform-managed and stripped from the public status.spec, so source the
     # run-global wall budget from the internal worker spec (the same value submit recorded).
-    spec = state._internal_spec_from_status(status)
+    spec = status_ops.effective_spec_from_status(status)
     created_at = _require_valid_deadline(status.created_at)
     max_wall_seconds = _require_valid_deadline(spec.gpu.max_wall_seconds)
     return status, _require_valid_deadline(created_at + max_wall_seconds)

@@ -100,7 +100,7 @@ def _resolve_chat_request(
     )
     try:
         effective_spec = effective_spec_from_status(status)
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     authorized_revision = _require_active_deployment(
         run_id, status.state, deployment, authorized_revision

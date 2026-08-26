@@ -73,7 +73,7 @@ def weight_cache_volumes(spec) -> list:
         return []
     from runpod_flash import NetworkVolume
 
-    from flash.core.spec_persistence import volume_gb
+    from flash.core.spec_persistence import persisted_int
     from flash.runner.accounting.weight_cache import (
         WEIGHT_CACHE_VOLUME_GB,
         WEIGHT_CACHE_VOLUME_NAME,
@@ -83,7 +83,13 @@ def weight_cache_volumes(spec) -> list:
     # whatever the spec happens to carry: a stale/round-tripped spec can still hold a pre-bump size,
     # and honoring that would create (or attach) an undersized volume. Custom volumes are the
     # caller's to size, so those keep the spec value.
-    size = volume_gb(getattr(spec.gpu, "network_volume_gb", WEIGHT_CACHE_VOLUME_GB))
+    size = persisted_int(
+        getattr(spec.gpu, "network_volume_gb", WEIGHT_CACHE_VOLUME_GB),
+        name="gpu.network_volume_gb",
+    )
+    assert size is not None
+    if size <= 0:
+        raise ValueError("gpu.network_volume_gb must be positive")
     if str(base) == WEIGHT_CACHE_VOLUME_NAME:
         size = max(size, WEIGHT_CACHE_VOLUME_GB)
     return [

@@ -222,6 +222,41 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
     assert out.state == "cancelled"
 
 
+def test_cancel_remains_available_when_private_worker_spec_is_malformed(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
+    from flash.core.spec import JobSpec
+    from flash.runner.supervise import lifecycle
+
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-9B",
+            "algorithm": "grpo",
+            "gpu": {"type": "RTX 5090"},
+            "run_id": "flash-malformed-private-cancel",
+        }
+    )
+    status = provisioned_status(
+        spec,
+        state="running",
+        remote=_remote("endpoint-1", "job-1", 0),
+    )
+    runner_state._save_status(status)
+    path = runner_state.runs_file_path(spec.run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["effective_preparation"]["worker_spec"]["gpu"]["max_retries"] = "5"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    monkeypatch.setattr(lifecycle, "_strict_teardown_handle", lambda _handle, _run_id: True)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+
+    cancelled = runner_deploy.cancel_run(spec.run_id)
+
+    assert cancelled.state == "cancelled"
+    assert cancelled.remote is None
+
+
 def test_cancel_tears_down_every_acceptable_class_of_an_ordered_pin(tmp_path, monkeypatch):
     """Cancellation tears down every endpoint name an ordered pin could select."""
 

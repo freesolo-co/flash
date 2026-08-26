@@ -126,23 +126,28 @@ def test_stale_datacenter_key_rejected():
         JobSpec.from_dict({"model": "m", "gpu": {"datacenter": "EU-RO-1", "network_volume": "v"}})
 
 
-def test_network_volume_gb_tolerant_of_bad_values():
-    # Platform-managed field: null/empty/"0"/0/negative/non-numeric/missing -> default 100 (never
-    # crash int(), never round-trip a nonsensical size). Valid positive sizes pass through.
-    for raw in (None, "", 0, "0", -5, "-5", "abc", True, False):
-        spec = JobSpec.from_dict(
-            {"model": "m", "gpu": {"network_volume": "v", "network_volume_gb": raw}}
-        )
-        assert spec.gpu.network_volume_gb == 100, f"{raw!r} should default to 100"
+def test_network_volume_gb_defaults_only_when_absent_and_rejects_malformed_values():
+    # the documented persisted default applies only when the key is absent.
     assert (
         JobSpec.from_dict({"model": "m", "gpu": {"network_volume": "v"}}).gpu.network_volume_gb
         == 100
     )
-    for raw in (200, "150"):
-        spec = JobSpec.from_dict(
-            {"model": "m", "gpu": {"network_volume": "v", "network_volume_gb": raw}}
-        )
-        assert spec.gpu.network_volume_gb == int(raw)
+    for raw in (None, "", "0", "-5", "abc", True, False, 1.5):
+        with pytest.raises(TypeError, match="network_volume_gb must be an integer"):
+            JobSpec.from_dict(
+                {"model": "m", "gpu": {"network_volume": "v", "network_volume_gb": raw}}
+            )
+    for raw in (0, -5):
+        with pytest.raises(ValueError, match="network_volume_gb must be positive"):
+            JobSpec.from_dict(
+                {"model": "m", "gpu": {"network_volume": "v", "network_volume_gb": raw}}
+            )
+    assert (
+        JobSpec.from_dict(
+            {"model": "m", "gpu": {"network_volume": "v", "network_volume_gb": 200}}
+        ).gpu.network_volume_gb
+        == 200
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -190,17 +195,15 @@ def test_weight_cache_volumes_distinct_name_per_dc():
     assert {v.size for v in vols} == {runner_weight_cache.WEIGHT_CACHE_VOLUME_GB}
 
 
-def test_weight_cache_volumes_size_tolerant_of_bad_values():
-    # weight_cache_volumes builds NetworkVolumes from spec.gpu.network_volume_gb directly (a GpuSpec
-    # can carry a raw value that bypassed JobSpec.from_dict's parse). A non-numeric/"0"/negative size
-    # must never raise (best-effort would silently drop the cache) or create a 0-GB volume; on the
-    # shared cache it lands on the managed size.
-
-    for raw in ("0", 0, -5, "abc", None, True):
-        vols = runpod_resources.weight_cache_volumes(_vol_spec(gb=raw))
-        assert {v.size for v in vols} == {runner_weight_cache.WEIGHT_CACHE_VOLUME_GB}, (
-            f"{raw!r} rejected"
-        )
+def test_weight_cache_volumes_reject_malformed_sizes_even_from_direct_specs():
+    # direct GpuSpec construction can bypass JobSpec.from_dict, so the runtime boundary repeats the
+    # exact integer type check rather than turning malformed persisted sizes into a managed default.
+    for raw in ("0", "abc", None, True, 1.5):
+        with pytest.raises(TypeError, match="network_volume_gb must be an integer"):
+            runpod_resources.weight_cache_volumes(_vol_spec(gb=raw))
+    for raw in (0, -5):
+        with pytest.raises(ValueError, match="network_volume_gb must be positive"):
+            runpod_resources.weight_cache_volumes(_vol_spec(gb=raw))
     # an oversized request on the shared cache still passes through: the floor only raises.
     big = runner_weight_cache.WEIGHT_CACHE_VOLUME_GB + 50
     assert {v.size for v in runpod_resources.weight_cache_volumes(_vol_spec(gb=big))} == {big}

@@ -285,25 +285,24 @@ def test_entropy_knobs_parse_from_toml_roundtrip_and_override(tmp_path, monkeypa
     assert worker_grpo_config.grpo_overrides() == {"entropy_quantile": 0.2}
 
 
-def test_opt_int_float_reject_bools() -> None:
-    """A JSON boolean must NOT silently coerce to a numeric train knob: bool is an int
-    subclass in Python, so ``int(True)`` would become 1. JobSpec.from_dict (via
-    opt_int/opt_float) rejects it, matching schema._opt_num."""
+def test_persisted_numeric_decoders_reject_bool_and_string_coercion() -> None:
+    """Persisted numeric values retain only their documented JSON number forms."""
     import pytest
 
-    from flash.core.spec_persistence import opt_float, opt_int
+    from flash.core.spec_persistence import persisted_float, persisted_int
 
-    for bad in (True, False):
+    for bad in (True, False, "4", 4.0):
         with pytest.raises(TypeError):
-            opt_int(bad)
+            persisted_int(bad, name="value", optional=True)
+    for bad in (True, False, "0.7"):
         with pytest.raises(TypeError):
-            opt_float(bad)
+            persisted_float(bad, name="value", optional=True)
 
-    # Genuine numbers (and None) still parse.
-    assert opt_int(None) is None
-    assert opt_int(4) == 4
-    assert opt_float(None) is None
-    assert opt_float(0.7) == 0.7
+    assert persisted_int(None, name="value", optional=True) is None
+    assert persisted_int(4, name="value", optional=True) == 4
+    assert persisted_float(None, name="value", optional=True) is None
+    assert persisted_float(4, name="value", optional=True) == 4.0
+    assert persisted_float(0.7, name="value", optional=True) == 0.7
 
     # A bool train knob propagates through JobSpec.from_dict as an error, not a 0/1 coercion.
     with pytest.raises(TypeError):

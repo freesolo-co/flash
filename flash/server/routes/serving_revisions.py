@@ -15,8 +15,8 @@ import re
 from fastapi import HTTPException
 
 from flash.content.multimodal import messages_with_image_data_uris, normalize_prompt_images
-from flash.core.spec import JobSpec
 from flash.runner.lifecycle.state import adapter_prefix
+from flash.runner.lifecycle.status import effective_spec_from_status
 from flash.runner.results.checkpoints import checkpoint_adapter_prefix
 from flash.runner.results.verified_revisions import read_verified_adapter_revisions
 from flash.schema import parse_adapter_revision
@@ -237,13 +237,9 @@ def _authorized_chat_revision(
 
 
 def _spec_is_unservable(status) -> bool:
-    """Whether the serving routes' own `JobSpec.from_dict` would reject this run's persisted spec.
-
-    Asked with the same call the chat and deploy routes make, so the answer cannot drift from what
-    they will actually do with the record.
-    """
+    """whether activation-sensitive serving would reject this run's persisted spec."""
     try:
-        JobSpec.from_dict(status.spec)
+        effective_spec_from_status(status)
     except Exception:
         return True
     return False

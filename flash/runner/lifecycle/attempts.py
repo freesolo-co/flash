@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from flash.adapters.artifacts import MAX_ATTEMPT_ID
 from flash.adapters.fused_experts import lora_target_parameters
-from flash.core.spec import JobSpec
 from flash.engine.support.verl_policy import _resolve_fsdp_generation
 from flash.providers._lifecycle.instances.poll import _attempt_int
 from flash.runner.lifecycle import state
@@ -60,7 +59,7 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]
         status = status_ops._runstatus_from_json(raw)
         # hf_repo is platform-managed and stripped from the public status.spec; the opd replacement
         # locates its resume checkpoint by hf_repo, so source the complete internal worker spec.
-        spec = state._internal_spec_from_status(status)
+        spec = status_ops.effective_spec_from_status(status)
         if spec.algorithm != "opd":
             raise RuntimeError("opd retry verification requires an opd run")
         try:
@@ -120,7 +119,7 @@ def _reserve_attempt(
         current = _infer_next_attempt(raw)
         if expected is not None and current != expected:
             raise RuntimeError("stored next attempt identity changed after retry verification")
-        spec = JobSpec.from_dict(status.spec)
+        spec = status_ops.effective_spec_from_status(status)
         if spec.algorithm == "opd":
             try:
                 require_opd_retry_contract_version(raw.get(state._OPD_RETRY_CONTRACT_KEY))

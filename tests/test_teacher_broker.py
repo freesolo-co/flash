@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -1835,8 +1836,8 @@ def test_current_nonterminal_attempt_is_checked_on_every_admission(monkeypatch):
     monkeypatch.setattr(
         runner_status, "get_status", lambda _run_id: SimpleNamespace(state="running")
     )
+    monkeypatch.setattr(runner_status, "effective_spec_from_status", lambda _status: spec)
     monkeypatch.setattr(runner_attempts, "_latest_reserved_attempt", lambda _run_id: 2)
-    monkeypatch.setattr(runner_state, "_internal_spec_from_status", lambda _status: spec)
     teacher_broker._require_current_attempt(capability)
 
     monkeypatch.setattr(runner_attempts, "_latest_reserved_attempt", lambda _run_id: 3)
@@ -1847,6 +1848,41 @@ def test_current_nonterminal_attempt_is_checked_on_every_admission(monkeypatch):
         runner_status, "get_status", lambda _run_id: SimpleNamespace(state="cancelled")
     )
     with pytest.raises(teacher_broker.TeacherBrokerError, match="run_not_active"):
+        teacher_broker._require_current_attempt(capability)
+
+
+def test_teacher_authorization_rejects_public_worker_disagreement(monkeypatch):
+    from flash.runner.lifecycle import preparation
+    from flash.runner.lifecycle.state import RunStatus
+
+    public = JobSpec(
+        model="Qwen/Qwen3.5-9B",
+        algorithm="opd",
+        train=TrainSpec(teacher_model="glm-5.2"),
+        run_id="run-mismatch",
+    )
+    worker = replace(public, algorithm="grpo")
+    status = RunStatus(
+        run_id=public.run_id,
+        state="running",
+        spec=public.to_dict(),
+        effective_preparation={
+            "worker_spec": worker.to_internal_dict(),
+            "preparation_digest": preparation._preparation_digest(public, worker, None),
+        },
+    )
+    capability = {
+        "run_id": public.run_id,
+        "attempt": 0,
+        "teacher_alias": "glm-5.2",
+        "provider": teacher_broker.PARASAIL_PROVIDER,
+        "model": "parasail-glm-52",
+        "scoring_mode": teacher_broker.PARASAIL_SCORING_MODE,
+    }
+    monkeypatch.setattr(runner_status, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(runner_attempts, "_latest_reserved_attempt", lambda _run_id: 0)
+
+    with pytest.raises(teacher_broker.TeacherBrokerError, match="run_scope_invalid"):
         teacher_broker._require_current_attempt(capability)
 
 

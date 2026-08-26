@@ -44,6 +44,7 @@ def provisioned_status(spec, *, state="running", **kwargs):
         "effective_preparation",
         {
             "worker_spec": spec.to_internal_dict(),
+            "workload_profile": spec.workload_profile or None,
             "version": 1,
             "preparation_digest": runner_preparation._preparation_digest(
                 runner_spec.JobSpec.from_dict(public), spec, None
