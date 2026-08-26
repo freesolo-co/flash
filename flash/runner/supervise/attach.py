@@ -19,25 +19,19 @@ from typing import TYPE_CHECKING
 from flash.core.spec import JobSpec
 from flash.envs.loading.staged import StagedEnvironmentTransientError
 from flash.providers._lifecycle.instances.poll import _attempt_int
+from flash.runner.supervise.attach_reconcile import (
+    carry_allocation_stamp as _carry_allocation_stamp,
+)
+from flash.runner.supervise.attach_reconcile import (
+    completed_metrics_for_remote as _completed_metrics_for_remote,
+)
+from flash.runner.supervise.attach_reconcile import (
+    teardown_reconciled_remote as _teardown_reconciled_remote,
+)
 
 _ATTACH_RECONCILE_INTERVAL_S = 120.0
 _ATTACH_RECONCILING: set[str] = set()
 _ATTACH_RECONCILING_LOCK = threading.Lock()
-
-
-def _carry_allocation_stamp(metrics: dict, remote: dict | None) -> None:
-    """carry the persisted allocation stamp onto adopted metrics."""
-    if not isinstance(metrics, dict) or not isinstance(remote, dict):
-        return
-    allocated_gpu = remote.get("allocated_gpu")
-    if allocated_gpu:
-        metrics.setdefault("allocated_gpu", allocated_gpu)
-    allocated_count = remote.get("allocated_gpu_count")
-    if allocated_count:
-        metrics.setdefault("allocated_gpu_count", int(allocated_count))
-    provider = remote.get("provider")
-    if provider:
-        metrics.setdefault("allocated_provider", provider)
 
 
 if TYPE_CHECKING:
@@ -314,12 +308,9 @@ def _reconcile_attached_remote(
     log,
     failure: str,
 ) -> None:
-    """Reconcile one exact maybe-live attempt until it is gone or the wall deadline expires."""
     from flash.providers.core.base import JobHandle
     from flash.runner.accounting.reconciliation import (
-        _compare_and_confirm_remote_teardown,
         _compare_and_fail_remote,
-        _record_cleanup_remote,
         _remote_resource_identity,
     )
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
@@ -327,11 +318,7 @@ def _reconcile_attached_remote(
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.lifecycle import (
         _RECOVERY_MARKER_GRACE_S,
-        _completed_attempt_metrics,
         _CompletedAttemptPending,
-        _runpod_completed_metrics,
-        _strict_teardown_handle,
-        _worker_provably_gone,
     )
 
     expected_identity = _remote_resource_identity(expected_remote)
@@ -362,20 +349,14 @@ def _reconcile_attached_remote(
                 continue
             return
         try:
-            completed_metrics = _runpod_completed_metrics(
+            completed_metrics = _completed_metrics_for_remote(
+                worker_spec,
                 expected_remote,
+                provider=handle.provider,
+                attempt=next_attempt - 1,
                 deadline_at=deadline_at,
+                log=log,
             )
-            started_ts = expected_remote.get("started_ts")
-            if completed_metrics is None and started_ts is not None:
-                completed_metrics = _completed_attempt_metrics(
-                    worker_spec,
-                    provider=handle.provider,
-                    attempt=next_attempt - 1,
-                    launch_floor=float(started_ts),
-                    deadline_at=deadline_at,
-                    log=log,
-                )
         except _CompletedAttemptPending:
             # the queue job already completed but its metrics are still landing; keep
             # reconciling (do not tear it down) until they are readable -- but do not sleep
@@ -390,7 +371,6 @@ def _reconcile_attached_remote(
             time.sleep(pending_interval)
             continue
         if completed_metrics is not None:
-            _carry_allocation_stamp(completed_metrics, expected_remote)
             if _reconcile_completed_remote(
                 run_id,
                 worker_spec,
@@ -416,26 +396,19 @@ def _reconcile_attached_remote(
             continue
         if _wait_for_replacement_window(worker_spec, deadline_at):
             continue
-        if confirmed_teardown:
-            resource_deleted = True
-            worker_gone = True
-        else:
-            try:
-                resource_deleted = _strict_teardown_handle(handle, run_id)
-                worker_gone = True
-            except Exception:
-                resource_deleted = False
-                worker_gone = _worker_provably_gone(run_id, handle)
-        if not worker_gone:
+        may_continue, resource_deleted = _teardown_reconciled_remote(
+            run_id,
+            expected_remote,
+            handle,
+            confirmed_teardown=confirmed_teardown,
+        )
+        if not may_continue:
             continue
-        if handle.provider == "runpod" and not resource_deleted:
-            try:
-                cleanup_preserved = _record_cleanup_remote(run_id, expected_remote)
-            except Exception:
-                cleanup_preserved = False
-            if not cleanup_preserved:
-                continue
         if resource_deleted and not confirmed_teardown:
+            from flash.runner.accounting.reconciliation import (
+                _compare_and_confirm_remote_teardown,
+            )
+
             try:
                 confirmed_teardown = _compare_and_confirm_remote_teardown(run_id, expected_remote)
             except Exception:
@@ -824,6 +797,49 @@ def _adopt_attached_poll_result(
         )
 
 
+def _recover_confirmed_remote(
+    run_id: str,
+    context: _AttachContext,
+    source_snapshot: dict | None,
+    log,
+) -> RunStatus:
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+    from flash.runner.supervise.lifecycle import (
+        _adopt_completed_attempt,
+        _CompletedAttemptPending,
+    )
+
+    metrics = _completed_metrics_for_remote(
+        context.worker_spec,
+        context.persisted_remote,
+        provider=context.handle.provider,
+        attempt=context.recovered_attempt,
+        deadline_at=_load_run_deadline_at(run_id),
+        log=log,
+    )
+    if metrics is not None:
+        if _adopt_completed_attempt(
+            run_id,
+            context.worker_spec,
+            context.persisted_remote,
+            metrics,
+            log=log,
+        ):
+            from flash.runner.lifecycle.status import get_status
+
+            return get_status(run_id)
+        raise _CompletedAttemptPending("completed attempt adoption is pending durable confirmation")
+    return _resume_after_confirmed_teardown(
+        run_id,
+        context.worker_spec,
+        context.persisted_remote,
+        context.next_attempt,
+        source_snapshot,
+        log,
+        failure="persisted cleanup confirmed the worker was torn down",
+    )
+
+
 def attach_run(run_id: str, log_stream=None) -> RunStatus:
     """Re-attach to a run's remote job from any process (after a client crash/restart)."""
     import sys
@@ -836,12 +852,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import effective_spec_from_status, get_status
     from flash.runner.supervise.errors import _RunCancelled
-    from flash.runner.supervise.lifecycle import (
-        _adopt_completed_attempt,
-        _completed_attempt_metrics,
-        _CompletedAttemptPending,
-        _runpod_completed_metrics,
-    )
+    from flash.runner.supervise.lifecycle import _CompletedAttemptPending
     from flash.runner.supervise.recovery import _gc_run_endpoints
 
     cleanup_terminal = False
@@ -879,43 +890,9 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         next_attempt = context.next_attempt
         source_snapshot = context.source_snapshot
         if confirmed_teardown:
-            deadline_at = _load_run_deadline_at(run_id)
-            completed_metrics = _runpod_completed_metrics(
-                persisted_remote,
-                deadline_at=deadline_at,
-            )
-            started_ts = persisted_remote.get("started_ts")
-            if completed_metrics is None and started_ts is not None:
-                completed_metrics = _completed_attempt_metrics(
-                    worker_spec,
-                    provider=context.handle.provider,
-                    attempt=context.recovered_attempt,
-                    launch_floor=float(started_ts),
-                    deadline_at=deadline_at,
-                    log=log,
-                )
-            if completed_metrics is not None:
-                _carry_allocation_stamp(completed_metrics, persisted_remote)
-                if _adopt_completed_attempt(
-                    run_id,
-                    worker_spec,
-                    persisted_remote,
-                    completed_metrics,
-                    log=log,
-                ):
-                    return status_for_return()
-                raise _CompletedAttemptPending(
-                    "completed attempt adoption is pending durable confirmation"
-                )
-            return _resume_after_confirmed_teardown(
-                run_id,
-                worker_spec,
-                persisted_remote,
-                next_attempt,
-                source_snapshot,
-                log,
-                failure="persisted cleanup confirmed the worker was torn down",
-            )
+            recovered = _recover_confirmed_remote(run_id, context, source_snapshot, log)
+            cleanup_terminal = recovered.state in TERMINAL_STATES
+            return recovered
         try:
             poll_spec = _spec_with_remaining_wall(worker_spec, require_provider_minimum=False)
         except RuntimeError as exc:
