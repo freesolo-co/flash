@@ -569,8 +569,9 @@ def deployed(dep: dict) -> str:
     """`flash models deploy`: the endpoint and serving URL as an aligned card (not a JSON dump)."""
     endpoint = str(dep.get("endpoint_name") or "")
     url = str(dep.get("openai_base_url") or "")
+    checkpoint_id = str(dep.get("checkpoint_id") or dep.get("run_id") or "")
     pairs = [
-        ("run", _paint(dep.get("run_id", ""), _ACCENT2)),
+        ("checkpoint", _paint(checkpoint_id, _ACCENT2)),
         ("endpoint", _paint(endpoint, _GREEN) if endpoint else None),
         ("url", _paint(url, _ACCENT2) if url else None),
     ]

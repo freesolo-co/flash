@@ -462,11 +462,9 @@ class _ModalEnginePool:
 
     @staticmethod
     def _record_payload(record: Any) -> dict[str, Any]:
-        payload = record.model_dump(by_alias=True)
-        generation = getattr(record, "deployment_generation", None)
-        if generation is not None:
-            payload["deployment_generation"] = generation
-        return payload
+        from flash.serving.src.io.schemas import internal_adapter_payload
+
+        return internal_adapter_payload(record)
 
     async def generate(
         self,

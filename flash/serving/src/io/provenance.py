@@ -20,10 +20,17 @@ def require_attested_checkpoint(result: dict[str, Any], target: AdapterRecord) -
     metered: billing a caller for a generation we then reject with a 502 charges them for nothing.
     """
 
-    if target.is_checkpoint and result.get("lora_request_adapter") != target.adapter_id:
+    if not target.is_checkpoint:
+        return
+    if result.get("lora_request_adapter") != target.adapter_id:
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
             "The serving engine did not attest the resolved immutable adapter.",
+        )
+    if result.get("checkpoint") != target.adapter_id:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "The serving engine did not attest the resolved immutable checkpoint.",
         )
 
 
@@ -37,7 +44,7 @@ def _checkpoint_provenance(target: AdapterRecord, active_checkpoint: Any) -> dic
 
 
 def _provenance_headers(
-    provenance: dict[str, str] | None, active_checkpoint: Any
+    provenance: dict[str, str] | None, _active_checkpoint: Any
 ) -> dict[str, str]:
-    checkpoint = (provenance or {}).get("checkpoint_id") or str(active_checkpoint or "").strip()
+    checkpoint = (provenance or {}).get("checkpoint_id", "")
     return _checkpoint_headers(checkpoint)

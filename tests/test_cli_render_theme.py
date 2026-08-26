@@ -268,6 +268,7 @@ def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
     dep = render.deployed(
         {
             "run_id": "flash-1",
+            "checkpoint_id": "flash-1/step-20",
             "state": "deployed",
             "endpoint_name": "ep",
             "openai_base_url": "https://x",
@@ -275,6 +276,7 @@ def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
     )
     # curated card, not a raw json dump
     assert "deployed" in dep
+    assert "flash-1/step-20" in dep
     assert "endpoint" in dep
     assert "{" not in dep
 

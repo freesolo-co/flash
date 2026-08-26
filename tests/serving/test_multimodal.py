@@ -961,6 +961,27 @@ def test_a_refused_attestation_is_never_metered(monkeypatch) -> None:
     assert store.failed == []
 
 
+def test_mismatched_checkpoint_attestation_is_a_bad_gateway(monkeypatch) -> None:
+    original = _Pool.generate
+
+    async def wrong_checkpoint(self, base_model, payload, record, *, expected_checkpoint=None):
+        result = await original(
+            self, base_model, payload, record, expected_checkpoint=expected_checkpoint
+        )
+        result["checkpoint"] = "flash-9999999999-99999999/step-1"
+        return result
+
+    monkeypatch.setattr(_Pool, "generate", wrong_checkpoint)
+    client, _pool = _client(QWEN)
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": REVISION_ID, "messages": _messages()},
+    )
+    assert response.status_code == 502
+    assert "immutable checkpoint" in response.json()["detail"]
+    assert "X-Freesolo-Checkpoint" not in response.headers
+
+
 def test_mismatched_attestation_on_a_revision_is_a_bad_gateway(monkeypatch) -> None:
     # sabotage: attesting a DIFFERENT adapter is the failure the header exists to catch - the
     # engine served weights that are not the ones the caller pinned.
