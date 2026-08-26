@@ -570,6 +570,38 @@ def test_dispatch_deadline_refuses_before_hydration(monkeypatch: pytest.MonkeyPa
     assert manifest["terminal_kind"] == "error"
 
 
+def test_dispatch_deadline_expiring_during_hydration_cannot_start_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[int, int, ChannelErrorCode]:
+        queue = _FakeQueue()
+        _patch_modal(monkeypatch, queue)
+        await queue.control(_control(0, call_id=None))
+        await queue.control(_control(1))
+        owner = _Owner([], pause_before_precheck=True)
+        task = asyncio.create_task(
+            stream_generate_call(
+                owner,
+                {},
+                None,
+                None,
+                "generation-1",
+                time.time() + 0.02,
+                queue.object_id,
+                "nonce-1",
+            )
+        )
+        await owner.precheck_ready.wait()
+        await asyncio.sleep(0.03)
+        owner.precheck_release.set()
+        manifest = await asyncio.wait_for(task, timeout=1)
+        terminal = await queue._get(partition=DATA_PARTITION)
+        assert manifest["terminal_kind"] == "error"
+        return owner.hydrated, owner.started, terminal["error_code"]
+
+    assert asyncio.run(scenario()) == (1, 0, ChannelErrorCode.DISPATCH_DEADLINE)
+
+
 def test_running_cancel_closes_and_aborts_exact_generation_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2087,9 +2119,11 @@ def test_channel_is_direct_async_iterator_with_one_spawn_and_idempotent_close() 
         pending_result = asyncio.create_task(pending.wait())
         call = _FakeCall("fc-1", pending_result)
         method = _FakeSpawnMethod(None)
+        deadline = time.time() + 5
 
-        async def spawn(*_args: Any) -> _FakeCall:
+        async def spawn(*args: Any) -> _FakeCall:
             method.spawn_count += 1
+            assert args[4] == deadline
             await queue._put(_data(0, event={"type": "ready"}), partition=DATA_PARTITION)
             return call
 
@@ -2100,7 +2134,7 @@ def test_channel_is_direct_async_iterator_with_one_spawn_and_idempotent_close() 
             record_dict=None,
             expected_checkpoint=None,
             generation_id="generation-1",
-            dispatch_deadline_unix=time.time() + 5,
+            dispatch_deadline_unix=deadline,
             invocation_nonce="nonce-1",
             queue_context=lambda: _QueueContext(queue),
         )
@@ -2667,7 +2701,7 @@ def test_channel_writes_only_protocol_envelopes_without_credentials() -> None:
             validate_data(value)
 
 
-def test_installed_modal_154_contract_and_legacy_generator_coexistence() -> None:
+def test_installed_modal_154_contract_uses_only_spawned_channel_transport() -> None:
     assert modal.__version__ == "1.5.4"
     assert hasattr(modal.Queue.ephemeral, "aio")
     assert "queue_id" in inspect.signature(modal.Queue.from_id).parameters
@@ -2678,10 +2712,12 @@ def test_installed_modal_154_contract_and_legacy_generator_coexistence() -> None
 
     module = __import__("flash.serving.app.modal_app", fromlist=["_build_engine"])
     source = inspect.getsource(module)
-    assert "@modal.method(is_generator=True)\n        async def stream_generate(" in source
+    assert "@modal.method(is_generator=True)\n        async def stream_generate(" not in source
     assert "@modal.method()\n        async def stream_generate_call(" in source
+    assert ".remote_gen" not in source
+    assert "stream_generate_cancellable" not in source
 
     base_model = module.base_models()[0]
-    instance = module._engine_cls_for(base_model)(base_model=base_model)
+    instance = module._engine_cls_for(base_model)()
     assert hasattr(instance.stream_generate_call.spawn, "aio")
-    assert hasattr(instance.stream_generate.remote_gen, "aio")
+    assert not hasattr(instance, "stream_generate")

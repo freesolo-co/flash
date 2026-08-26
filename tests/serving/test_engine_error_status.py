@@ -19,6 +19,7 @@ from flash.client.http import ClientError
 from flash.serve.request.streaming import _openai_stream_content
 from flash.serving.src.engine.dispatch import PreHeaderDispatchExpired
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
+from flash.serving.src.stream_channel.protocol import ChannelErrorCode, StreamChannelError
 
 
 class VLLMValidationError(ValueError):
@@ -93,11 +94,10 @@ class _CleanlyTruncatedPool(_FailingPool):
 
 
 class _SyncRaisingStreamPool(_FailingPool):
-    """A conforming pool whose ``stream_generate`` raises while BUILDING the iterator.
+    """A conforming pool whose ``stream_generate`` raises while building the iterator.
 
-    ``EnginePool`` declares ``stream_generate`` as an ordinary method returning an AsyncIterator.
-    The Modal pool happens to be an async generator, deferring its body to the first ``anext``, but
-    the protocol does not require that -- so dispatch failure must map the same way for both.
+    ``EnginePool`` declares ``stream_generate`` as an ordinary method returning an AsyncIterator, so
+    dispatch failure must map the same way during construction and first advance.
     """
 
     def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
@@ -151,6 +151,39 @@ def test_expired_pre_header_dispatch_is_retryable_503(stream: bool) -> None:
         "type": "server_error",
         "code": "serving_capacity_unavailable",
     }
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_channel_dispatch_deadline_is_retryable_503(stream: bool) -> None:
+    exc = StreamChannelError(
+        ChannelErrorCode.DISPATCH_DEADLINE,
+        "dispatch deadline expired before generation",
+    )
+    resp = _chat(_client(exc), stream=stream)
+    assert resp.status_code == 503
+    assert resp.headers["Retry-After"] == "1"
+    assert resp.json()["error"] == {
+        "message": "dispatch deadline expired before generation",
+        "type": "server_error",
+        "code": "serving_capacity_unavailable",
+    }
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "code",
+    [
+        ChannelErrorCode.CHANNEL_FAULT,
+        ChannelErrorCode.LEASE_EXPIRED,
+        ChannelErrorCode.PROTOCOL_ERROR,
+        ChannelErrorCode.ENGINE_ERROR,
+    ],
+)
+def test_channel_faults_are_non_sensitive_502(stream: bool, code: ChannelErrorCode) -> None:
+    resp = _chat(_client(StreamChannelError(code, "sensitive internal detail")), stream=stream)
+    assert resp.status_code == 502
+    assert "sensitive internal detail" not in resp.text
+    assert "stream transport failed" in resp.text
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -237,13 +270,24 @@ def test_clean_iterator_end_without_final_is_a_consumer_visible_error() -> None:
         next(stream)
 
 
-def test_midstream_failure_terminates_the_stream_with_an_error_event() -> None:
+@pytest.mark.parametrize(
+    ("exc", "expected_code"),
+    [
+        (FunctionTimeoutError("Task's current input hit its timeout of 600s"), 504),
+        (
+            StreamChannelError(ChannelErrorCode.CHANNEL_FAULT, "sensitive channel failure"),
+            502,
+        ),
+    ],
+)
+def test_midstream_failure_terminates_the_stream_with_an_error_event(
+    exc: Exception, expected_code: int
+) -> None:
     """A failure after the 200 cannot change the status, so it must be visible in the body.
 
     Without this the caller gets a well-formed but silently truncated stream -- no error, no
     ``[DONE]`` -- which is indistinguishable from a short completion.
     """
-    exc = FunctionTimeoutError("Task's current input hit its timeout of 600s")
     resp = _chat(_client(exc, mid_stream=True), stream=True)
 
     assert resp.status_code == 200  # headers already sent; the status cannot carry the failure
@@ -251,5 +295,7 @@ def test_midstream_failure_terminates_the_stream_with_an_error_event() -> None:
     assert '"finish_reason":"error"' in resp.text.replace(" ", "")
     assert "engine_error" in resp.text
     # the status the request would have gotten travels in the body, since the header cannot carry it
-    assert '"code":504' in resp.text.replace(" ", "")
+    assert f'"code":{expected_code}' in resp.text.replace(" ", "")
+    if expected_code == 502:
+        assert "sensitive channel failure" not in resp.text
     assert resp.text.rstrip().endswith("data: [DONE]")  # protocol terminated, not truncated

@@ -44,10 +44,9 @@ async def prepare_stream(
     events: AsyncIterator[dict[str, Any]] | None = None
     try:
         # construction is inside the try with the first advance: ``EnginePool.stream_generate``
-        # is declared as an ordinary method returning an AsyncIterator, so a conforming pool may
-        # raise while building the iterator rather than on first advance. The current Modal pool
-        # is an async generator (whose body is deferred to ``anext``), but the protocol does not
-        # require that, and a dispatch failure must map identically either way.
+        # is an ordinary method returning an AsyncIterator, so a conforming pool may raise while
+        # building the iterator rather than on first advance. dispatch failures map identically in
+        # either phase.
         events = pool.stream_generate(
             target.base_model,
             engine_payload,
@@ -57,10 +56,9 @@ async def prepare_stream(
         first = await anext(events)
         require_attested_revision(first, target)
     except BaseException as exc:
-        # cancellation while waiting for the first engine event must still enter the pool iterator's
-        # finally block and release its local stream resources. Modal 1.5.4 exposes no supported
-        # FunctionCall cancellation handle for generator methods, so iterator closure alone must not
-        # be described as cancelling the remote gpu invocation.
+        # cancellation while waiting for the first engine event closes the pool iterator. the hosted
+        # channel owns the exact FunctionCall, so closure cancels that call and publishes cancellation
+        # through its lease before releasing channel resources.
         if events is not None:
             with contextlib.suppress(Exception):
                 await _close_async_iterator(events)

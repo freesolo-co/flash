@@ -28,9 +28,9 @@ The `start_all` entrypoint (`uv run
 modal run flash/serving/app/modal_app.py`) remains an explicit manual diagnostic that checks the warm
 engines and blocks until each reports healthy. Pass `--base-model ...` to check one model.
 
-The routing layer (`src/router.py`) carries no `modal`/`vllm` imports and is exhaustively
-unit-tested in `tests/serving/test_router.py` (multi-base-model dispatch, shared-GPU multi-LoRA,
-register-routing, OpenAI shape, auth, 404s) — run with `uv run pytest tests/serving/`.
+The routing layer carries no `modal` or `vllm` imports and is tested in
+`tests/serving/test_router.py` for multi-base-model dispatch, shared-GPU multi-LoRA,
+register-routing, OpenAI shape, auth, and 404s. Run it with `uv run pytest tests/serving/test_router.py`.
 
 Persistence is only for hydration and recovery. On startup each base model's engine loads
 _its_ ready adapters from the `hosted_lora_adapters` Supabase table; `POST /adapters`
@@ -53,12 +53,20 @@ inputs and targets six before scale-out. Each router replica admits at most 36 i
 those router values do not change with engine fleet size. Flash does not maintain a process-local
 application queue or use function statistics to authorize or deny a request. The router authors one
 private 120-second absolute pre-header deadline and forwards it unchanged to the engine. Non-streaming
-enqueue and result waits consume the remaining budget. The current legacy generator transport bounds
-only its first remote event; after that event, normal streaming is governed by the request timeout.
-The worker checks the same deadline before adapter hydration and immediately before GPU generation, so
-abandoned queued work cannot start late. Modal resource exhaustion and pre-header expiry return
-retryable `503 serving_capacity_unavailable` responses with `Retry-After: 1`; caller rate or quota
-limits remain the only reason for a 429.
+enqueue and result waits consume the remaining budget. Hosted streaming uses only the
+`CancellableStreamChannel` transport over a non-generator `stream_generate_call`. The channel owns the
+exact Modal `FunctionCall`, queue partitions, heartbeat lease, and cancellation tombstone. Closing the
+response iterator cancels that exact call; if vLLM generation started, the engine aborts the exact
+generation id once. The worker checks the same deadline before adapter hydration and, together with the
+live lease, immediately before vLLM generation, so expired or abandoned work cannot start late. Modal
+resource exhaustion and pre-header expiry return retryable `503 serving_capacity_unavailable` responses
+with `Retry-After: 1`; channel, lease, and protocol faults return a non-sensitive 502. Caller rate or
+quota limits remain the only reason for a 429. The router remains the sole owner of request accounting:
+the stream channel transports attested engine events but never settles usage itself.
+
+Deploy the router and every exact-model engine atomically in one maintenance window. Every component in
+a release must use the channel transport. Roll back the whole serving release, including the router and
+all engine classes, as one unit.
 
 ### Production
 

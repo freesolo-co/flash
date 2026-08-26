@@ -8,9 +8,11 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import os
 import time
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -371,24 +373,6 @@ def _build_engine(base_model: str, class_name: str, policy: HostedTrafficPolicy)
                 pre_header_dispatch_deadline,
             )
 
-        @modal.method(is_generator=True)
-        async def stream_generate(
-            self,
-            payload_dict: dict[str, Any],
-            record_dict: dict[str, Any] | None = None,
-            expected_checkpoint: str | None = None,
-            generation_id: str | None = None,
-            pre_header_dispatch_deadline: float | None = None,
-        ):
-            async for event in self._stream_generate(
-                payload_dict,
-                record_dict,
-                expected_checkpoint,
-                generation_id,
-                pre_header_dispatch_deadline,
-            ):
-                yield event
-
         @modal.method()
         async def stream_generate_call(
             self,
@@ -542,13 +526,23 @@ async def _await_modal_call(call: Any, deadline: float) -> Any:
         raise
 
 
-async def _close_remote_iterator(remote_stream: Any, iterator: Any) -> None:
-    close = getattr(iterator, "aclose", None)
-    if close is None:
-        close = getattr(remote_stream, "aclose", None)
-    if close is not None:
-        with contextlib.suppress(BaseException):
-            await close()
+def _required_stream_identity(payload: Any) -> tuple[str, float]:
+    generation_id = getattr(payload, "generation_id", None)
+    if (
+        not isinstance(generation_id, str)
+        or not generation_id
+        or len(generation_id) > 512
+        or generation_id != generation_id.strip()
+    ):
+        raise RuntimeError("valid generation id is required before modal dispatch")
+    deadline = getattr(payload, "_pre_header_dispatch_deadline", None)
+    if (
+        isinstance(deadline, bool)
+        or not isinstance(deadline, (int, float))
+        or not math.isfinite(deadline)
+    ):
+        raise RuntimeError("valid pre-header dispatch deadline is required before modal dispatch")
+    return generation_id, deadline
 
 
 class _ModalEnginePool:
@@ -588,65 +582,18 @@ class _ModalEnginePool:
         )
         return await _await_modal_call(call, deadline)
 
-    async def stream_generate(
+    def stream_generate(
         self,
         base_model: str,
         payload: Any,
         record: Any,
         *,
         expected_checkpoint: str | None = None,
-    ):
-        generation_id = payload.generation_id
-        if not generation_id:
-            raise RuntimeError("generation id is required before modal dispatch")
-        deadline = payload._pre_header_dispatch_deadline
-        if deadline is None:
-            raise RuntimeError("pre-header dispatch deadline is required before modal dispatch")
-        engine = _engine_cls_for(base_model)()
-        remote_stream = engine.stream_generate.remote_gen.aio(
-            payload.model_dump(by_alias=True),
-            self._record_payload(record),
-            expected_checkpoint,
-            generation_id,
-            deadline,
-        )
-        iterator = remote_stream.__aiter__()
-        first = asyncio.create_task(anext(iterator))
-        try:
-            try:
-                yield await _await_task_before_deadline(first, deadline)
-            except StopAsyncIteration:
-                return
-            except BaseException:
-                first.cancel()
-                first.add_done_callback(_consume_task_result)
-                raise
-            async for event in iterator:
-                yield event
-        finally:
-            await _close_remote_iterator(remote_stream, iterator)
-
-    def stream_generate_cancellable(
-        self,
-        base_model: str,
-        payload: Any,
-        record: Any,
-        *,
-        expected_checkpoint: str | None = None,
-        dispatch_deadline_unix: float | None = None,
-    ) -> Any:
-        """Build the additive channel transport without changing the rolling default."""
+    ) -> AsyncIterator[dict[str, Any]]:
         from flash.serving.src.stream_channel.client import CancellableStreamChannel
 
-        generation_id = payload.generation_id
-        if not generation_id:
-            raise RuntimeError("generation id is required before modal dispatch")
-        engine = _engine_cls_for(base_model)(base_model=base_model)
-        deadline = (
-            dispatch_deadline_unix
-            if dispatch_deadline_unix is not None
-            else time.time() + ROUTER_TIMEOUT_SECONDS
-        )
+        generation_id, deadline = _required_stream_identity(payload)
+        engine = _engine_cls_for(base_model)()
         return CancellableStreamChannel(
             spawn_method=engine.stream_generate_call,
             payload_dict=payload.model_dump(by_alias=True),

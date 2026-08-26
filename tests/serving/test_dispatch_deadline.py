@@ -16,6 +16,7 @@ from flash.serving.src.engine.dispatch import (
 )
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.io.schemas import GenerateRequest
+from flash.serving.src.stream_channel.protocol import ChannelErrorCode, StreamChannelError
 
 
 def test_dispatch_deadline_is_absolute_bounded_and_not_public() -> None:
@@ -68,6 +69,80 @@ def test_expired_dispatch_never_hydrates_adapter_or_starts_generation(stream: bo
 
     with pytest.raises(PreHeaderDispatchExpired):
         asyncio.run(scenario())
+
+
+def test_channel_pre_generate_check_replaces_local_stream_deadline_fallback(
+    monkeypatch,
+) -> None:
+    sampling_params = types.ModuleType("vllm.sampling_params")
+    sampling_params.RequestOutputKind = types.SimpleNamespace(DELTA="delta")
+    vllm = types.ModuleType("vllm")
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sampling_params)
+
+    payload = types.SimpleNamespace(
+        adapter_id="run-a",
+        logprobs=False,
+        generation_id="request-1",
+        n=1,
+        top_logprobs=0,
+    )
+    monkeypatch.setattr(generation, "_payload", lambda _payload: (payload, False))
+    monkeypatch.setattr(generation, "_sampling_params", lambda *_args: object())
+
+    class Engine:
+        def generate(self, *_args, **_kwargs):
+            raise AssertionError("expired channel work started gpu generation")
+
+    class Owner:
+        engine = Engine()
+
+        async def _lora_request(self, *_args):
+            return None, object()
+
+        def _lora_request_attestation(self, *_args):
+            return None
+
+        def _enforce_expected_checkpoint(self, *_args):
+            return "run-a"
+
+        def _thinking_default(self, *_args):
+            return False
+
+        def _replica_identifier(self):
+            return "replica-1"
+
+        def _structured_outputs_state(self, *_args):
+            return None, True, None
+
+        async def _prepare_prompt_input(self, *_args):
+            return {"prompt_token_ids": [1]}
+
+        def _close_prompt_images(self, *_args):
+            return None
+
+    checked = False
+
+    async def pre_generate_check() -> None:
+        nonlocal checked
+        checked = True
+        raise StreamChannelError(
+            ChannelErrorCode.DISPATCH_DEADLINE,
+            "dispatch deadline expired before generation",
+        )
+
+    async def scenario() -> None:
+        events = generation.stream_generate(
+            Owner(),
+            {"adapter_id": "run-a", "prompt": "hi"},
+            pre_generate_check=pre_generate_check,
+        )
+        await anext(events)
+
+    with pytest.raises(StreamChannelError) as exc_info:
+        asyncio.run(scenario())
+    assert checked
+    assert exc_info.value.code == ChannelErrorCode.DISPATCH_DEADLINE
 
 
 def test_deadline_is_rechecked_immediately_before_generation(monkeypatch) -> None:

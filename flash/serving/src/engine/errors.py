@@ -67,6 +67,22 @@ def engine_error_http(
         return ServingCapacityUnavailable(str(exc))
     if isinstance(exc, ValueError):
         return value_error_http(router, adapter_id, exc)
+
+    from flash.serving.src.stream_channel.protocol import (
+        ChannelErrorCode,
+        StreamChannelError,
+    )
+
+    if isinstance(exc, StreamChannelError):
+        if exc.code == ChannelErrorCode.DISPATCH_DEADLINE:
+            return ServingCapacityUnavailable(str(exc))
+        if exc.code != ChannelErrorCode.CANCELLED:
+            return HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                "The serving stream transport failed to handle this request.",
+            )
+        return None
+
     from modal.exception import Error as ModalError
     from modal.exception import FunctionTimeoutError, ResourceExhaustedError
 

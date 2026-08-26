@@ -220,7 +220,8 @@ async def stream_generate(
     *,
     pre_generate_check: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    require_pre_header_dispatch_time(pre_header_dispatch_deadline)
+    if pre_generate_check is None:
+        require_pre_header_dispatch_time(pre_header_dispatch_deadline)
 
     from vllm.sampling_params import RequestOutputKind
 

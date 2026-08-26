@@ -461,8 +461,16 @@ def test_model_classes_inherit_the_shared_impl(modal_app_module):
             "_health",
         ):
             assert hasattr(engine, impl)
-        for entry in ("load", "register", "generate", "stream_generate", "unregister", "health"):
+        for entry in (
+            "load",
+            "register",
+            "generate",
+            "stream_generate_call",
+            "unregister",
+            "health",
+        ):
             assert entry in engine.__dict__
+        assert "stream_generate" not in engine.__dict__
 
 
 def test_model_class_identity_is_fixed_before_decoration(modal_app_module):
@@ -700,16 +708,36 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
         generate_calls.append((payload, record, checkpoint, generation_id, deadline))
         return {"ok": True}
 
-    async def _stream_generate(
-        payload: dict,
-        record: dict,
-        checkpoint: str | None,
-        generation_id: str,
-        deadline: float,
-    ):
-        stream_calls.append((payload, record, checkpoint, generation_id, deadline))
-        yield {"delta": "hello"}
-        yield {"delta": " world"}
+    class _Channel:
+        def __init__(
+            self,
+            *,
+            spawn_method: Any,
+            payload_dict: dict,
+            record_dict: dict,
+            expected_checkpoint: str | None,
+            generation_id: str,
+            dispatch_deadline_unix: float,
+            invocation_nonce: str,
+        ) -> None:
+            assert spawn_method is stream_call_method
+            assert invocation_nonce
+            stream_calls.append(
+                (
+                    payload_dict,
+                    record_dict,
+                    expected_checkpoint,
+                    generation_id,
+                    dispatch_deadline_unix,
+                )
+            )
+
+        def __aiter__(self):
+            return self._events()
+
+        async def _events(self):
+            yield {"delta": "hello"}
+            yield {"delta": " world"}
 
     async def _register(record: dict, deployment_generation: str | None) -> None:
         register_calls.append((record, deployment_generation))
@@ -730,11 +758,15 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
     async def _spawn_generate(*args: Any) -> _Call:
         return _Call(await _generate(*args))
 
+    stream_call_method = types.SimpleNamespace(spawn=types.SimpleNamespace(aio=None))
+    monkeypatch.setattr(
+        "flash.serving.src.stream_channel.client.CancellableStreamChannel",
+        _Channel,
+    )
+
     class _FakeEngine:
         generate = types.SimpleNamespace(spawn=types.SimpleNamespace(aio=_spawn_generate))
-        stream_generate = types.SimpleNamespace(
-            remote_gen=types.SimpleNamespace(aio=_stream_generate)
-        )
+        stream_generate_call = stream_call_method
         register = types.SimpleNamespace(remote=types.SimpleNamespace(aio=_register))
 
     engine = _FakeEngine()
@@ -810,147 +842,97 @@ def test_warm_pool_dispatches_inference_and_registration(modal_app_module, monke
     ]
 
 
-def test_modal_stream_midstream_close_closes_owned_remote_iterator(
+def test_modal_stream_returns_channel_directly_and_close_reaches_channel(
     modal_app_module, monkeypatch
 ) -> None:
     closed = 0
+    captured: dict[str, Any] = {}
+    stream_call_method = types.SimpleNamespace(spawn=types.SimpleNamespace(aio=None))
 
-    class _RemoteStream:
-        def __init__(self) -> None:
+    class _Channel:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
             self.sent = False
 
         def __aiter__(self):
             return self
 
         async def __anext__(self) -> dict[str, str]:
-            if not self.sent:
-                self.sent = True
-                return {"type": "ready"}
-            await asyncio.Event().wait()
-            raise StopAsyncIteration
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return {"type": "ready"}
 
         async def aclose(self) -> None:
             nonlocal closed
             closed += 1
 
     class _Engine:
-        stream_generate = types.SimpleNamespace(
-            remote_gen=types.SimpleNamespace(aio=lambda *_args: _RemoteStream())
-        )
+        stream_generate_call = stream_call_method
 
+    monkeypatch.setattr(
+        "flash.serving.src.stream_channel.client.CancellableStreamChannel",
+        _Channel,
+    )
     monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _base_model: lambda: _Engine())
+    deadline = time.time() + 60
     payload = types.SimpleNamespace(
         generation_id="fsgen-00000000000000000000000000000001",
-        _pre_header_dispatch_deadline=time.time() + 60,
+        _pre_header_dispatch_deadline=deadline,
         model_dump=lambda **_kwargs: {"adapter_id": "revision"},
     )
     record = types.SimpleNamespace(
-        deployment_generation=None,
+        deployment_generation="generation-1",
         model_dump=lambda **_kwargs: {"adapter_id": "revision"},
     )
 
+    stream = modal_app_module._ModalEnginePool().stream_generate(
+        "Qwen/Qwen3.5-9B", payload, record, expected_checkpoint="run/step-1"
+    )
+    assert isinstance(stream, _Channel)
+
     async def scenario() -> None:
-        stream = modal_app_module._ModalEnginePool().stream_generate(
-            "Qwen/Qwen3.5-9B", payload, record
-        )
         assert await anext(stream) == {"type": "ready"}
         await stream.aclose()
 
     asyncio.run(scenario())
 
     assert closed == 1
+    assert captured == {
+        "spawn_method": stream_call_method,
+        "payload_dict": {"adapter_id": "revision"},
+        "record_dict": {
+            "adapter_id": "revision",
+            "deployment_generation": "generation-1",
+        },
+        "expected_checkpoint": "run/step-1",
+        "generation_id": payload.generation_id,
+        "dispatch_deadline_unix": deadline,
+        "invocation_nonce": captured["invocation_nonce"],
+    }
+    assert captured["invocation_nonce"]
 
 
-def test_modal_stream_first_event_expires_and_closes_iterator(
-    modal_app_module, monkeypatch
+@pytest.mark.parametrize("generation_id", [None, "", " spaced ", "x" * 513])
+def test_modal_stream_rejects_missing_or_invalid_generation_id(
+    modal_app_module, generation_id: Any
 ) -> None:
-    closed = 0
+    payload = types.SimpleNamespace(
+        generation_id=generation_id,
+        _pre_header_dispatch_deadline=time.time() + 60,
+    )
+    with pytest.raises(RuntimeError, match="valid generation id"):
+        modal_app_module._ModalEnginePool().stream_generate("Qwen/Qwen3.5-9B", payload, object())
 
-    class _RemoteStream:
-        def __aiter__(self):
-            return self
 
-        async def __anext__(self) -> dict[str, str]:
-            await asyncio.Event().wait()
-            return {"type": "ready"}
-
-        async def aclose(self) -> None:
-            nonlocal closed
-            closed += 1
-            raise RuntimeError("cleanup failed")
-
-    class _Engine:
-        stream_generate = types.SimpleNamespace(
-            remote_gen=types.SimpleNamespace(aio=lambda *_args: _RemoteStream())
-        )
-
-    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _base_model: lambda: _Engine())
-    deadline = time.time() + 0.01
+@pytest.mark.parametrize("deadline", [None, True, float("nan"), float("inf"), "123"])
+def test_modal_stream_rejects_missing_or_invalid_deadline(modal_app_module, deadline: Any) -> None:
     payload = types.SimpleNamespace(
         generation_id="fsgen-00000000000000000000000000000001",
         _pre_header_dispatch_deadline=deadline,
-        model_dump=lambda **_kwargs: {"adapter_id": "revision"},
     )
-    record = types.SimpleNamespace(
-        deployment_generation=None,
-        model_dump=lambda **_kwargs: {"adapter_id": "revision"},
-    )
-
-    async def scenario() -> None:
-        stream = modal_app_module._ModalEnginePool().stream_generate(
-            "Qwen/Qwen3.5-9B", payload, record
-        )
-        with pytest.raises(modal_app_module.PreHeaderDispatchExpired):
-            await anext(stream)
-
-    asyncio.run(scenario())
-
-    assert closed == 1
-    assert payload._pre_header_dispatch_deadline == deadline
-
-
-def test_modal_stream_deadline_applies_only_to_first_event(modal_app_module, monkeypatch) -> None:
-    deadline = 123.0
-    remaining_calls: list[float] = []
-    forwarded_deadlines: list[float] = []
-
-    def remaining(value: float) -> float:
-        remaining_calls.append(value)
-        if len(remaining_calls) > 1:
-            raise AssertionError("pre-header deadline was reapplied after the first event")
-        return 60.0
-
-    async def remote_stream(*args: Any):
-        forwarded_deadlines.append(args[-1])
-        yield {"type": "ready"}
-        yield {"type": "delta"}
-
-    class _Engine:
-        stream_generate = types.SimpleNamespace(remote_gen=types.SimpleNamespace(aio=remote_stream))
-
-    monkeypatch.setattr(modal_app_module, "_remaining_pre_header_dispatch_time", remaining)
-    monkeypatch.setattr(modal_app_module, "_engine_cls_for", lambda _base_model: lambda: _Engine())
-    payload = types.SimpleNamespace(
-        generation_id="fsgen-00000000000000000000000000000001",
-        _pre_header_dispatch_deadline=deadline,
-        model_dump=lambda **_kwargs: {"adapter_id": "revision"},
-    )
-    record = types.SimpleNamespace(
-        deployment_generation=None,
-        model_dump=lambda **_kwargs: {"adapter_id": "revision"},
-    )
-
-    async def scenario() -> list[dict[str, str]]:
-        return [
-            event
-            async for event in modal_app_module._ModalEnginePool().stream_generate(
-                "Qwen/Qwen3.5-9B", payload, record
-            )
-        ]
-
-    assert asyncio.run(scenario()) == [{"type": "ready"}, {"type": "delta"}]
-    assert remaining_calls == [deadline]
-    assert forwarded_deadlines == [deadline]
+    with pytest.raises(RuntimeError, match="valid pre-header dispatch deadline"):
+        modal_app_module._ModalEnginePool().stream_generate("Qwen/Qwen3.5-9B", payload, object())
 
 
 def test_blocked_modal_spawn_expires_with_absolute_deadline(modal_app_module) -> None:

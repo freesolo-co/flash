@@ -1,6 +1,6 @@
 """The vLLM multi-LoRA engine implementation for the Modal serving app, plus its pure helpers.
 
-``_LoraEngineImpl`` is the non-Modal base that ``modal_app._build_engine`` wraps per GPU tier.
+``_LoraEngineImpl`` is the non-Modal base that ``modal_app._build_engine`` wraps per exact model.
 This stays import-light: importing it triggers no Modal registration, and vllm/transformers remain
 lazy inside engine methods; only pure serving support modules are imported at module scope.
 """
@@ -50,7 +50,7 @@ class _LoraEngineImpl:
 
     Plain base class: each generated Modal subclass bakes one exact base-model identity and its GPU
     policy at decoration time. The router dispatches each model to that immutable class variant. The
-    Modal entrypoints (load/register/generate/stream_generate/unregister/health) live on the thin
+    Modal entrypoints (load/register/generate/stream_generate_call/unregister/health) live on the thin
     per-model subclass and forward to the ``_``-prefixed methods here."""
 
     base_model: str  # immutable class identity set by the per-model modal subclass
