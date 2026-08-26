@@ -880,21 +880,43 @@ class _FakePipProc:
         import io
 
         self.stdout = io.StringIO(output)
-        self._returncode = returncode
+        self.returncode = returncode
+        self.pid = 12345
 
-    def wait(self) -> int:
-        return self._returncode
+    def wait(self, timeout=None) -> int:
+        del timeout
+        return self.returncode
+
+    def kill(self) -> None:
+        self.returncode = -9
 
 
 def _extra_pip_input(monkeypatch) -> dict:
+    import importlib.util
+    from pathlib import Path
+
     import huggingface_hub
 
+    repo_root = Path(__file__).resolve().parents[1]
+    original_spec = importlib.util.spec_from_file_location
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **_kwargs: "/source.zip")
     monkeypatch.setattr(
         "flash.snapshot.archive.materialize_verified_archive_file",
         lambda *_args: None,
     )
-    monkeypatch.setattr("importlib.util.spec_from_file_location", lambda *_args: None)
+    monkeypatch.setattr(
+        "flash.snapshot.archive.attempt_materialization_path",
+        lambda *_args: repo_root,
+    )
+    monkeypatch.setattr(
+        importlib.util,
+        "spec_from_file_location",
+        lambda name, path: (
+            original_spec(name, path)
+            if str(path).endswith(("processes.py", "result_publication.py"))
+            else None
+        ),
+    )
     return {
         "phase": "sft",
         "seed": 0,
@@ -1036,6 +1058,9 @@ def _wire_train_body_pip(monkeypatch, results):
     queue = list(results)
 
     def fake_popen(cmd, *, env=None, **_kwargs):
+        del env
+        if "pip" not in cmd:
+            return _FakePipProc()
         calls.append(cmd)
         output, rc = queue.pop(0) if queue else ("", 0)
         return _FakePipProc(output, rc)
@@ -1065,17 +1090,41 @@ def test_train_body_extra_pip_retries_a_transient_index_failure(monkeypatch):
     assert len(calls) == 2
 
 
-def test_train_body_extra_pip_resolution_error_stays_terminal(monkeypatch):
-    # A bad package spec reached the index fine; retrying it would just burn another attempt.
+def test_train_body_extra_pip_resolution_error_publishes_fenced_worker_result(monkeypatch):
     import flash.providers.runpod.serverless.endpoints as endpoints
 
-    calls = _wire_train_body_pip(
-        monkeypatch,
-        [("ERROR: No matching distribution found for definitely-not-a-package\n", 1)],
-    )
-    with pytest.raises(RuntimeError, match="extra_pip install failed"):
-        endpoints._train_body(_extra_pip_input(monkeypatch))
-    assert len(calls) == 1  # fails fast, never walks the retry ladder
+    calls = []
+    publications = []
+
+    def fake_popen(cmd, *, env=None, **_kwargs):
+        if "pip" in cmd:
+            calls.append(cmd)
+            return _FakePipProc(
+                "ERROR: Invalid requirement: 'invalid requirement @@@'\n",
+                1,
+            )
+        publications.append({"cmd": cmd, "env": env})
+        return _FakePipProc()
+
+    input_data = _extra_pip_input(monkeypatch)
+    input_data["extra_pip"] = ["invalid requirement @@@"]
+    input_data["env"]["FLASH_SECRET_ENV_KEYS"] = "PRIVATE_TOKEN"
+    input_data["env"]["PRIVATE_TOKEN"] = "sensitive-token"
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    with pytest.raises(RuntimeError, match="extra_pip install failed") as raised:
+        endpoints._train_body(input_data)
+
+    assert len(calls) == 1
+    assert len(publications) == 1
+    publication = publications[0]
+    assert "publish_bootstrap_failure_result" in publication["cmd"][-1]
+    assert publication["env"]["ATTEMPT"] == "0"
+    assert publication["env"]["FENCE"] == "1"
+    assert publication["env"]["FLASH_SOURCE_SNAPSHOT_JSON"]
+    assert publication["env"]["FLASH_BOOTSTRAP_FAILURE_CLASS"] == "worker"
+    assert "sensitive-token" not in publication["env"]["FLASH_BOOTSTRAP_ERROR"]
+    assert getattr(raised.value, "flash_retriable", False) is False
 
 
 def test_train_body_extra_pip_build_failure_outranks_earlier_transient_text(monkeypatch):
@@ -1173,8 +1222,9 @@ def test_train_body_extra_pip_stops_after_the_bounded_retries(monkeypatch):
     import flash.providers.runpod.serverless.endpoints as endpoints
 
     calls = _wire_train_body_pip(monkeypatch, [("read timed out\n", 1)] * 4)
-    with pytest.raises(RuntimeError, match="could not reach the package index"):
+    with pytest.raises(RuntimeError, match="could not reach the package index") as raised:
         endpoints._train_body(_extra_pip_input(monkeypatch))
+    assert getattr(raised.value, "flash_retriable", False) is True
     assert len(calls) == 4  # one attempt plus the three bounded retries
 
 
@@ -1324,6 +1374,11 @@ def test_train_body_uploads_console_on_missing_metrics(
             "    return subprocess.Popen(command, **kwargs), 1\n"
             "def terminate_process_group(process, *, process_group_id):\n"
             "    return None\n"
+        )
+        results = target / "flash/providers/_lifecycle/bootstrapping/result_publication.py"
+        results.write_text(
+            "def publish_bootstrap_failure_result(*args, **kwargs):\n"
+            "    raise AssertionError('bootstrap result is only for pip failure')\n"
         )
         artifacts = target / "flash/adapters/artifacts.py"
         artifacts.parent.mkdir(parents=True, exist_ok=True)

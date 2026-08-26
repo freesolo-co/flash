@@ -179,6 +179,9 @@ def poll_instance_job(
                     now + RESULT_VISIBILITY_ALLOWANCE_S,
                 )
             terminal_status = status
+        elif instance is not None:
+            terminal_status = None
+            terminal_result_deadline_at = None
         if (
             terminal_status is None
             and status != adapter.running_status

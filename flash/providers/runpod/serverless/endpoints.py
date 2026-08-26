@@ -66,7 +66,7 @@ def _train_body(input_data: dict) -> dict:
     except ModuleNotFoundError:
         from flash.snapshot import archive as _source_snapshot
 
-    class _TransientSourceFetchError(RuntimeError):
+    class _TransientBootstrapError(RuntimeError):
         flash_retriable = True
 
     def _percent_pattern(needle):
@@ -296,12 +296,12 @@ def _train_body(input_data: dict) -> dict:
         overrides["FLASH_RUN_DEADLINE_AT"] = str(deadline_at)
 
         def _extra_pip_env() -> tuple[dict[str, str], str | None]:
-            env = dict(os.environ)
-            env.update(overrides)
-            env.pop("GIT_ASKPASS", None)
-            env["GIT_TERMINAL_PROMPT"] = "0"
+            pip_env = dict(os.environ)
+            pip_env.update(overrides)
+            pip_env.pop("GIT_ASKPASS", None)
+            pip_env["GIT_TERMINAL_PROMPT"] = "0"
             askpass = None
-            if env.get("GITHUB_TOKEN"):
+            if pip_env.get("GITHUB_TOKEN"):
                 fd, askpass = tempfile.mkstemp(prefix="flash-github-askpass-", suffix=".sh")
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(
@@ -312,15 +312,12 @@ def _train_body(input_data: dict) -> dict:
                         "esac\n"
                     )
                 os.chmod(askpass, 0o700)
-                env["GIT_ASKPASS"] = askpass
-            return env, askpass
+                pip_env["GIT_ASKPASS"] = askpass
+            return pip_env, askpass
 
         def _install_extra_pip() -> None:
             extra_pip = input_data.get("extra_pip") or []
             if extra_pip:
-                # Network/index-shaped pip failures. A resolution failure ("no matching distribution",
-                # an unsatisfiable pin) reaches the index fine and carries NONE of these, so a bad
-                # package spec still fails fast; only a PyPI blip retries (as the instance bootstrap).
                 pip_transient_re = re.compile(
                     r"(?i)connection (?:broken|reset|aborted|refused|timed out)|read timed out"
                     r"|temporary failure in name resolution|failed to establish a new connection"
@@ -328,30 +325,13 @@ def _train_body(input_data: dict) -> dict:
                     r"|newconnectionerror|maxretryerror|ssleoferror|service unavailable|bad gateway"
                     r"|gateway time-?out|too many requests|retrying \(retry\("
                     r"|\b(?:429|5\d\d) (?:client|server) error"
-                    # a VCS pin fails through git, not urllib, so its blips carry git's own phrasing
-                    # and none of the shapes above: git says "could not resolve host" where urllib
-                    # says "temporary failure in name resolution", and reports an http status as
-                    # "returned error: NNN". On the status form, only 429/5xx: a 404 or 403 is a bad
-                    # pin or a missing token and must still fail fast rather than burn three backoffs.
                     r"|returned error: (?:429|5\d\d)|could not resolve (?:host|proxy)"
                 )
-                # Build/resolution failures, which name the cause and outrank a transient warning pip
-                # already recovered from in the same tail; without that precedence one early
-                # "Retrying (Retry(" makes a deterministic failure look retriable and this ladder
-                # repeats it for nothing. Kept identical to the instance bootstrap's _PIP_TERMINAL_RE:
-                # the two classifiers must agree on what is retriable, including excluding the bare
-                # subprocess-exited-with-error marker that a network-interrupted VCS `git clone` also
-                # prints.
                 pip_terminal_re = re.compile(
                     r"(?i)failed building wheel|metadata-generation-failed|could not build wheels"
                     r"|no matching distribution|could not find a version|resolutionimpossible"
                     r"|invalid requirement"
                 )
-                # The subset pip can print having downloaded NOTHING: an unreachable index yields no
-                # candidate versions, so it finishes with exactly the footer a typo'd name produces.
-                # When that footer is the only terminal evidence and the tail also carries a transient
-                # marker, the network explains it and the run retries. Mirrors the bootstrap's
-                # _PIP_NO_CANDIDATE_RE / _is_terminal.
                 pip_no_candidate_re = re.compile(
                     r"(?i)no matching distribution|could not find a version"
                 )
@@ -361,12 +341,9 @@ def _train_body(input_data: dict) -> dict:
                         return not pip_transient_re.search(output)
                     if not pip_transient_re.search(output):
                         return True
-                    # a build or resolver failure surviving the footer strip proves pip held real
-                    # content, so it stays deterministic; nothing left means the outage explains it.
                     return bool(pip_terminal_re.search(pip_no_candidate_re.sub("", output)))
 
                 pip_retry_delays = (3.0, 9.0, 27.0)
-                # held back from a deadline-clamped backoff so the retry it precedes has wall to run in
                 _PIP_RETRY_RESERVE_S = 1.0
                 extra_env, askpass = _extra_pip_env()
                 args = [sys.executable, "-m", "pip", "install", *extra_pip]
@@ -374,9 +351,6 @@ def _train_body(input_data: dict) -> dict:
                     for pip_attempt in range(len(pip_retry_delays) + 1):
                         _require_deadline_allowance()
                         tail = collections.deque(maxlen=400)
-                        # errors="replace": a build or VCS child can emit bytes invalid under the
-                        # container's locale, and strict decoding raises mid-stream, failing a paid
-                        # run whose install actually succeeded.
                         pip_proc = subprocess.Popen(
                             args,
                             env=extra_env,
@@ -386,12 +360,9 @@ def _train_body(input_data: dict) -> dict:
                             errors="replace",
                         )
                         try:
-                            with pip_proc.stdout:  # tee so a long install streams into the console
+                            with pip_proc.stdout:
                                 for line in pip_proc.stdout:
                                     tail.append(line)
-                                    # best-effort: a closed console must not end the drain, or pip is
-                                    # left running while the askpass helper below is deleted and the
-                                    # console error is reported in place of pip's own exit status.
                                     with contextlib.suppress(OSError, ValueError):
                                         print(line, end="", flush=True)
                             rc = pip_proc.wait()
@@ -405,13 +376,10 @@ def _train_body(input_data: dict) -> dict:
                         if _pip_is_terminal(pip_output):
                             raise RuntimeError(f"extra_pip install failed: pip exited {rc}")
                         if pip_attempt >= len(pip_retry_delays):
-                            raise RuntimeError(
+                            raise _TransientBootstrapError(
                                 f"extra_pip install could not reach the package index after "
                                 f"{pip_attempt + 1} attempts (pip exited {rc})"
                             )
-                        # reserve a slice for the attempt this backoff precedes: clamping to the
-                        # remaining wall alone sleeps the whole window, so the retry just announced
-                        # never issues and the next pass only fails the deadline precheck.
                         delay = max(
                             0.0,
                             min(
@@ -419,9 +387,6 @@ def _train_body(input_data: dict) -> dict:
                                 _require_deadline_allowance() - _PIP_RETRY_RESERVE_S,
                             ),
                         )
-                        # best-effort like the tee above: a console that closed between attempts must
-                        # not end the install with a terminal console error, losing the retry this
-                        # line only announces.
                         with contextlib.suppress(OSError, ValueError):
                             print(
                                 f"extra_pip install hit a transient index error; "
@@ -518,7 +483,7 @@ def _train_body(input_data: dict) -> dict:
                 )
             except Exception as exc:
                 error_type = (
-                    _TransientSourceFetchError
+                    _TransientBootstrapError
                     if _source_snapshot.is_transient_fetch_error(exc)
                     else RuntimeError
                 )
@@ -541,22 +506,24 @@ def _train_body(input_data: dict) -> dict:
         code_dir = _download_source_snapshot(
             input_data["hf_repo"], descriptor, overrides.get("HF_TOKEN")
         )
-        _install_extra_pip()
-        console_module = _load_exact_module(
-            code_dir,
-            "flash/providers/_lifecycle/bootstrapping/console.py",
-            "_flash_downloaded_bootstrap_console",
-        )
         process_module = _load_exact_module(
             code_dir,
             "flash/providers/_lifecycle/bootstrapping/processes.py",
             "_flash_downloaded_bootstrap_processes",
         )
-        artifact_module = _load_exact_module(
-            code_dir,
-            "flash/adapters/artifacts.py",
-            "_flash_downloaded_artifacts",
-        )
+        previous_process_module = sys.modules.get("bootstrap_processes")
+        sys.modules["bootstrap_processes"] = process_module
+        try:
+            result_module = _load_exact_module(
+                code_dir,
+                "flash/providers/_lifecycle/bootstrapping/result_publication.py",
+                "_flash_downloaded_bootstrap_results",
+            )
+        finally:
+            if previous_process_module is None:
+                sys.modules.pop("bootstrap_processes", None)
+            else:
+                sys.modules["bootstrap_processes"] = previous_process_module
 
         env = dict(os.environ)
         env.update(overrides)
@@ -581,6 +548,38 @@ def _train_body(input_data: dict) -> dict:
         )
         env["PYTHONPATH"] = code_dir + (
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+        )
+        try:
+            _install_extra_pip()
+        except _TransientBootstrapError as exc:
+            result_module.publish_bootstrap_failure_result(
+                input_data,
+                env,
+                code_dir=code_dir,
+                started_at=time.time(),
+                error=_safe_detail(exc, overrides, 1800),
+                failure_class="artifact_transport",
+            )
+            raise
+        except Exception as exc:
+            result_module.publish_bootstrap_failure_result(
+                input_data,
+                env,
+                code_dir=code_dir,
+                started_at=time.time(),
+                error=_safe_detail(exc, overrides, 1800),
+            )
+            raise
+
+        console_module = _load_exact_module(
+            code_dir,
+            "flash/providers/_lifecycle/bootstrapping/console.py",
+            "_flash_downloaded_bootstrap_console",
+        )
+        artifact_module = _load_exact_module(
+            code_dir,
+            "flash/adapters/artifacts.py",
+            "_flash_downloaded_artifacts",
         )
 
         console_teardown = threading.Event()

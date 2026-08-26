@@ -51,13 +51,20 @@ def terminate_process_group(
     with contextlib.suppress(ProcessLookupError):
         os.killpg(process_group_id, signal.SIGTERM)
     term_deadline = time.monotonic() + max(0.0, term_grace_s)
-    while _group_exists(process_group_id) and time.monotonic() < term_deadline:
+    while time.monotonic() < term_deadline:
+        process.poll()
+        if not _group_exists(process_group_id):
+            break
         time.sleep(_POLL_S)
+    process.poll()
     if _group_exists(process_group_id):
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process_group_id, signal.SIGKILL)
     kill_deadline = time.monotonic() + max(0.0, kill_grace_s)
-    while _group_exists(process_group_id) and time.monotonic() < kill_deadline:
+    while time.monotonic() < kill_deadline:
+        process.poll()
+        if not _group_exists(process_group_id):
+            break
         time.sleep(_POLL_S)
     with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=0)

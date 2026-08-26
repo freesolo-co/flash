@@ -36,7 +36,16 @@ _TRI_PROVIDER_GPU = "H100"
 
 
 def _install_attempt(monkeypatch, run_id: str) -> AttemptRecord:
-    attempt = AttemptRecord(0, 1, "reserved", 1.0, 2.0, 3.0, 5.0, 4.0)
+    attempt = AttemptRecord(
+        0,
+        1,
+        "reserved",
+        1.0,
+        2.0,
+        10_000_000_000.0,
+        10_000_000_120.0,
+        10_000_000_000.0,
+    )
     monkeypatch.setattr(
         runner_status,
         "get_status",

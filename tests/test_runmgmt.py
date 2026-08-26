@@ -2323,7 +2323,8 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="worker-attempt", model="Qwen/Qwen3.5-9B", algorithm="sft")
-    attempt = AttemptRecord(2, 3, "reserved", 1.0, 2.0, 3.0, 4.0, 3.0)
+    deadline = 10_000_000_000.0
+    attempt = AttemptRecord(2, 3, "reserved", 1.0, 2.0, deadline, deadline + 120, deadline)
     runner_state._save_status(
         runner_state.RunStatus(
             run_id=spec.run_id,
@@ -2358,7 +2359,7 @@ def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monke
         fence=3,
         source_snapshot=_SOURCE_SNAPSHOT,
         on_handle=handles.append,
-        deadline_at=10_000_000_000.0,
+        deadline_at=deadline,
     )
 
     assert payloads[0]["env"]["ATTEMPT"] == "2"

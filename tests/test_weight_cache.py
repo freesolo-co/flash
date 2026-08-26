@@ -34,7 +34,16 @@ _SOURCE_SNAPSHOT = valid_source_snapshot()
 def _install_attempt(monkeypatch, run_id: str, *, attempt_id: int = 0, fence: int = 1):
     from flash.runner.lifecycle.protocol import AttemptRecord
 
-    attempt = AttemptRecord(attempt_id, fence, "reserved", 1.0, 2.0, 3.0, 5.0, 4.0)
+    attempt = AttemptRecord(
+        attempt_id,
+        fence,
+        "reserved",
+        1.0,
+        2.0,
+        10_000_000_000.0,
+        10_000_000_120.0,
+        10_000_000_000.0,
+    )
     monkeypatch.setattr(
         runner_status,
         "get_status",

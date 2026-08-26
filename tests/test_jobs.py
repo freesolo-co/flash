@@ -582,6 +582,50 @@ def test_instance_terminal_resource_uses_bounded_result_visibility_window(monkey
     assert clock["now"] == 220.0
 
 
+@pytest.mark.parametrize("provider", ["lambda", "vast"])
+def test_instance_terminal_latch_clears_after_provider_recovers(monkeypatch, provider):
+    from flash.providers._lifecycle.instances import poll_instance
+    from flash.providers.core.base import PollResult
+
+    attempt = _attempt_record(work_deadline_at=10_000.0, result_deadline_at=10_120.0)
+    observations = iter([None] * 7 + [PollResult(True, metrics={"optimizer_steps": 11})])
+    statuses = iter(["terminated"] + ["running"] * 6)
+    monkeypatch.setattr(poll_instance, "_current_attempt", lambda _adapter: attempt)
+    monkeypatch.setattr(poll_instance, "_record_resource", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(poll_instance, "_observe_result", lambda _adapter: next(observations))
+    clock = {"now": 100.0}
+    monkeypatch.setattr(poll_instance.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(
+        poll_instance.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    adapter = poll_instance.InstancePollAdapter(
+        provider=provider,
+        instance_id="instance-1",
+        run_id="run-poll",
+        current_attempt=0,
+        fence=1,
+        launch_ts=1.0,
+        hf_repo="org/repo",
+        phase="sft",
+        source_snapshot=dict(_SOURCE_SNAPSHOT),
+        fetch_instance=lambda: {"status": next(statuses)},
+        poll_error_exceptions=(RuntimeError,),
+        status_field="status",
+        running_status="running",
+        dead_states=frozenset({"terminated"}),
+        missing_dead_threshold=2,
+        stamp_cost_and_notes=lambda *_args, **_kwargs: None,
+    )
+
+    result = poll_instance.poll_instance_job(adapter, interval_s=20.0)
+
+    assert result.ok
+    assert result.metrics == {"optimizer_steps": 11}
+    assert clock["now"] == 240.0
+
+
 def test_instance_terminal_manifest_inside_visibility_window_wins(monkeypatch):
     from flash.providers._lifecycle.instances import poll_instance
     from flash.providers.core.base import PollResult
@@ -5456,6 +5500,64 @@ def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
     assert submitted["endpoint_id"] == "ep"
     assert submitted["payload"]["source_snapshot"] == source_snapshot
     assert "code_prefix" not in submitted["payload"]
+
+
+def test_submit_run_endpoint_timeout_covers_result_visibility_window(monkeypatch):
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers._lifecycle.net import deadline as deadline_ops
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import job_execution, jobs
+
+    spec = JobSpec(
+        run_id="flash-result-window-timeout",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        train=TrainSpec(epochs=1, hf_repo="org/repo"),
+        gpu=GpuSpec(type=""),
+    )
+    attempt = _attempt_record(
+        grant_deadline_at=150.0,
+        work_deadline_at=200.0,
+        result_deadline_at=320.0,
+    )
+    runner_state._save_status(
+        provisioned_status(
+            spec,
+            state="running",
+            attempt=attempt.to_dict(),
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
+    )
+    deployed = {}
+    submitted = {}
+    monkeypatch.setattr(deadline_ops.time, "time", lambda: 100.0)
+    monkeypatch.setattr(
+        job_execution,
+        "deploy_train_endpoint",
+        lambda *args, **kwargs: (
+            deployed.update({"args": args, "kwargs": kwargs})
+            or ("ep", "endpoint-name", _RUNPOD_FINGERPRINT)
+        ),
+    )
+    monkeypatch.setattr(
+        runpod_api,
+        "submit_job",
+        lambda _endpoint_id, payload, **_kwargs: submitted.update(payload) or "job-1",
+    )
+    monkeypatch.setattr(polling, "poll_job", lambda *_args, **_kwargs: jobs.PollResult(True))
+
+    result = job_execution.submit_run(
+        spec,
+        seed=spec.seed,
+        source_snapshot=_SOURCE_SNAPSHOT,
+        deadline_at=200.0,
+    )
+
+    assert result.ok
+    assert deployed["kwargs"]["execution_timeout_ms"] == 220_000
+    assert deployed["kwargs"]["deadline_at"] == 200.0
+    assert submitted["work_deadline_at"] == 200.0
+    assert submitted["result_deadline_at"] == 320.0
 
 
 def test_submit_run_rejects_malformed_source_before_deploy(monkeypatch):

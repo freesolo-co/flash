@@ -2093,8 +2093,18 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
         "FLASH_TEACHER_CAPABILITY": "capability-worker-canary",
     }
     monkeypatch.setenv("PARASAIL_API_KEY", "parasail-control-plane-canary")
-    deadline = time.time() + 3600
-    attempt = AttemptRecord(0, 1, "reserved", 1.0, 2.0, 3.0, 5.0, 4.0)
+    reserved_at = time.time()
+    deadline = reserved_at + 3600
+    attempt = AttemptRecord(
+        0,
+        1,
+        "reserved",
+        reserved_at,
+        reserved_at + 60,
+        deadline,
+        deadline + 120,
+        deadline,
+    )
     monkeypatch.setattr(
         runner_status,
         "get_status",
