@@ -82,6 +82,19 @@ async def _bounded_shield(operation: Awaitable[Any], deadline_seconds: float) ->
         raise
 
 
+async def _cancel_or_retain_spawn(
+    task: asyncio.Task[Any],
+    cancel: Callable[[Any], Awaitable[None]],
+) -> None:
+    task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
+    if done:
+        await _cancel_spawn_task_result(task, cancel)
+        return
+    task.add_done_callback(lambda completed: _schedule_spawn_result_cancel(completed, cancel))
+    _retain_background_task(task)
+
+
 async def _spawn_cancellation_safe(
     spawn: Callable[[], Awaitable[Any]],
     cancel: Callable[[Any], Awaitable[None]],
@@ -89,23 +102,23 @@ async def _spawn_cancellation_safe(
     dispatch_deadline_unix: float,
 ) -> Any:
     task = asyncio.create_task(spawn())
+    remaining = max(0.0, dispatch_deadline_unix - time.time())
     try:
-        return await asyncio.shield(task)
+        done, _ = await asyncio.wait({task}, timeout=remaining)
+        if done:
+            return task.result()
+        await _cancel_or_retain_spawn(task, cancel)
+        raise StreamChannelError(
+            ChannelErrorCode.DISPATCH_DEADLINE,
+            "dispatch deadline expired while awaiting spawn",
+        )
     except asyncio.CancelledError as cancellation:
         remaining = max(0.0, dispatch_deadline_unix - time.time())
         handle_wait = min(LEASE_SECONDS, remaining)
         try:
             call = await asyncio.wait_for(asyncio.shield(task), timeout=handle_wait)
         except Exception:
-            task.cancel()
-            done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
-            if done:
-                await _cancel_spawn_task_result(task, cancel)
-            else:
-                task.add_done_callback(
-                    lambda completed: _schedule_spawn_result_cancel(completed, cancel)
-                )
-                _retain_background_task(task)
+            await _cancel_or_retain_spawn(task, cancel)
             raise cancellation from None
         with contextlib.suppress(Exception):
             await cancel(call)

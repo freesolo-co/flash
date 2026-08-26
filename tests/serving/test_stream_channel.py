@@ -23,6 +23,7 @@ from flash.serving.src.stream_channel.protocol import (
     CONTROL_PARTITION,
     DATA_PARTITION,
     ENGINE_CLEANUP_STEPS,
+    ENGINE_CLEANUP_WAITS_PER_STEP,
     PROTOCOL_VERSION,
     ChannelErrorCode,
     ControlEnvelope,
@@ -926,6 +927,67 @@ def test_spawn_cancellation_is_bounded_when_handle_never_arrives() -> None:
     assert asyncio.run(scenario()) == (True, False)
 
 
+def test_spawn_wait_enforces_dispatch_deadline_without_outer_cancellation() -> None:
+    async def scenario() -> tuple[bool, bool]:
+        spawn_started = asyncio.Event()
+        spawn_finished = asyncio.Event()
+
+        async def spawn() -> Any:
+            spawn_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                spawn_finished.set()
+
+        async def cancel(_value: Any) -> None:
+            raise AssertionError("no handle exists to cancel")
+
+        task = asyncio.create_task(
+            client._spawn_cancellation_safe(
+                spawn,
+                cancel,
+                dispatch_deadline_unix=time.time() + 0.02,
+            )
+        )
+        await spawn_started.wait()
+        with pytest.raises(StreamChannelError) as exc_info:
+            await asyncio.wait_for(task, timeout=0.2)
+        return exc_info.value.code == ChannelErrorCode.DISPATCH_DEADLINE, spawn_finished.is_set()
+
+    assert asyncio.run(scenario()) == (True, True)
+
+
+def test_spawn_deadline_cancels_handle_returned_during_cleanup() -> None:
+    async def scenario() -> tuple[ChannelErrorCode, int, bool]:
+        spawn_started = asyncio.Event()
+        handle = object()
+        cancelled: list[Any] = []
+
+        async def spawn() -> Any:
+            spawn_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return handle
+
+        async def cancel(value: Any) -> None:
+            cancelled.append(value)
+
+        task = asyncio.create_task(
+            client._spawn_cancellation_safe(
+                spawn,
+                cancel,
+                dispatch_deadline_unix=time.time() + 0.02,
+            )
+        )
+        await spawn_started.wait()
+        with pytest.raises(StreamChannelError) as exc_info:
+            await asyncio.wait_for(task, timeout=0.2)
+        return exc_info.value.code, len(cancelled), cancelled[0] is handle
+
+    assert asyncio.run(scenario()) == (ChannelErrorCode.DISPATCH_DEADLINE, 1, True)
+
+
 def test_deferred_spawn_cancel_retains_task_until_cleanup_finishes() -> None:
     async def scenario() -> tuple[bool, bool]:
         release = asyncio.Event()
@@ -1513,10 +1575,9 @@ def test_manifest_wait_covers_sequential_remote_cleanup_budget() -> None:
         manifest = TerminalManifest(
             "generation-1", "nonce-1", "fc-1", "replica-1", 0, "event", 1
         ).to_dict()
-        delay = ENGINE_CLEANUP_STEPS * CLEANUP_SECONDS + 0.05
-        assert CALL_RESULT_SECONDS == (
-            ENGINE_CLEANUP_STEPS * CLEANUP_SECONDS + CALL_RESULT_MARGIN_SECONDS
-        )
+        cleanup_budget = ENGINE_CLEANUP_STEPS * ENGINE_CLEANUP_WAITS_PER_STEP * CLEANUP_SECONDS
+        delay = cleanup_budget + 0.05
+        assert cleanup_budget + CALL_RESULT_MARGIN_SECONDS == CALL_RESULT_SECONDS
         assert delay < CALL_RESULT_SECONDS
 
         async def delayed_manifest() -> dict[str, Any]:
