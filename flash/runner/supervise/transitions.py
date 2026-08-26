@@ -218,13 +218,14 @@ def mark_deployment_revocation_failed(
 
         def _commit() -> None:
             now = time.time()
-            status.deployment = {
-                **deployment,
-                "state": "revocation_failed",
-                "error": error,
-                "retryable": True,
-                "updated_at": now,
-            }
+            if deployment.get("checkpoint_id") == target:
+                status.deployment = {
+                    **deployment,
+                    "state": "revocation_failed",
+                    "error": error,
+                    "retryable": True,
+                    "updated_at": now,
+                }
             status.updated_at = now
             _save_status_unlocked(status)
 

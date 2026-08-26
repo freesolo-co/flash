@@ -356,8 +356,9 @@ def test_sibling_revocation_failure_removes_only_failed_checkpoint(tmp_path, mon
         "run-sibling-failure", "backend unavailable", checkpoint_id=sibling
     )
 
-    assert failed.deployment["state"] == "revocation_failed"
+    assert failed.deployment["state"] == "ready"
     assert failed.deployment["checkpoint_id"] == current
+    assert "error" not in failed.deployment
     assert verified_revisions.read_verified_checkpoints("run-sibling-failure") == frozenset(
         {current}
     )
@@ -365,6 +366,8 @@ def test_sibling_revocation_failure_removes_only_failed_checkpoint(tmp_path, mon
         _authorized_chat_checkpoint("run-sibling-failure", failed.deployment, current, {current})
         == current
     )
+    retried = transitions.mark_undeployed("run-sibling-failure", sibling)
+    assert retried.deployment == failed.deployment
 
 
 def test_sibling_undeploy_preserves_deployed_summary_and_state(tmp_path, monkeypatch) -> None:
