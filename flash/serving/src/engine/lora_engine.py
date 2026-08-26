@@ -20,6 +20,7 @@ from typing import Any
 # _RESERVED_CHAT_TEMPLATE_KWARGS (the apply_chat_template args a caller must never re-supply) and
 # the vllm build probes engine_boot uses.
 from flash.content.thinking import messages_for_chat_template
+from flash.serve.contract.provenance import engine_adapter_name, record_key
 from flash.serving.src.engine.lora_entries import _LoraEntry, cached_lora_request, entries_for
 from flash.serving.src.engine.model_config import (
     engine_overrides_for,
@@ -40,7 +41,6 @@ from flash.serving.src.engine.support import (
     _safe_chat_template_kwargs,
     enforce_expected_checkpoint,
 )
-from flash.serving.src.store.identity import engine_adapter_name, record_key
 
 
 class _LoraEngineImpl:

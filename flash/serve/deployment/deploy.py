@@ -26,6 +26,7 @@ from flash.serve.contract.protocol import (
     ServingHealthError,
     parse_serving_health,
 )
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serve.contract.responses import (
     matches_revision_identity as _matches_revision_identity,
 )
@@ -38,7 +39,6 @@ from flash.serve.runtime.sampling import (
     validate_logprobs,
     validate_top_logprobs,
 )
-from flash.serving.src.store.identity import immutable_binding_fingerprint
 
 logger = get_logger(__name__)
 

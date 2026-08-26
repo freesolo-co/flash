@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl, _LoraEntry
 from flash.serving.src.engine.support import (
     _adapter_source_cache_dir,
@@ -13,7 +14,6 @@ from flash.serving.src.engine.support import (
     _load_adapters_for_base,
 )
 from flash.serving.src.io.schemas import AdapterRecord
-from flash.serving.src.store.identity import immutable_binding_fingerprint
 from flash.serving.src.store.registry import AdapterRegistry
 
 BASE_MODEL = "Qwen/Qwen3.5-9B"

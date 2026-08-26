@@ -3,12 +3,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serving.src.io.schemas import (
     AdapterRecord,
     ImmutableCheckpointRegistration,
     PersistedAdapterRecord,
 )
-from flash.serving.src.store.identity import immutable_binding_fingerprint
 
 RUN_ID = "flash-1234567890-abcdef12"
 CHECKPOINT_ID = f"{RUN_ID}/step-20"

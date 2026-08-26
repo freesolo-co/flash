@@ -5,10 +5,10 @@ import asyncio
 import pytest
 from fastapi import HTTPException
 
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.schemas import ImmutableCheckpointRegistration
 from flash.serving.src.store import registration, undeploy
-from flash.serving.src.store.identity import immutable_binding_fingerprint
 
 RUN_ID = "flash-1234567890-abcdef12"
 SOURCE_REVISION = "a" * 40

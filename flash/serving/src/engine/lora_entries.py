@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from flash.serve.contract.provenance import engine_adapter_name, record_key
 from flash.serving.src.engine.support import _adapter_source_ident
-from flash.serving.src.store.identity import engine_adapter_name, record_key
 
 
 @dataclass(frozen=True, slots=True)

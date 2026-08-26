@@ -14,6 +14,11 @@ from pydantic import (
 )
 
 from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
+from flash.serve.contract.provenance import (
+    CheckpointKey,
+    immutable_binding_fingerprint,
+    record_key,
+)
 from flash.serve.runtime.types import (
     validate_generation_max_tokens,
     validate_generation_temperature,
@@ -21,11 +26,6 @@ from flash.serve.runtime.types import (
 )
 from flash.serving.src.engine.model_config import reasoning_parser_for
 from flash.serving.src.io.structured_outputs import normalize_structured_outputs
-from flash.serving.src.store.identity import (
-    CheckpointKey,
-    immutable_binding_fingerprint,
-    record_key,
-)
 
 
 def _require_non_empty(value: str) -> str:

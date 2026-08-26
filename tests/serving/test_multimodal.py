@@ -12,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image, ImageOps
 
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl
 from flash.serving.src.engine.support import _num_prompt_tokens
 from flash.serving.src.http.router import AdapterRouter
@@ -25,7 +26,6 @@ from flash.serving.src.io.multimodal import (
     prepare_multimodal_request,
 )
 from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest, internal_adapter_payload
-from flash.serving.src.store.identity import immutable_binding_fingerprint
 from flash.serving.src.store.registry import AdapterRegistry
 from tests.serving.conftest import RecordingUsageStore
 

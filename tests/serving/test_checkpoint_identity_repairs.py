@@ -13,6 +13,7 @@ from flash.runner.lifecycle.state import RunStatus
 from flash.runner.results import verified_revisions
 from flash.runner.supervise import transitions
 from flash.schema import format_checkpoint_ref
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serve.contract.responses import matches_revision_identity
 from flash.server.routes import serving_smoke
 from flash.server.routes.serving_revisions import _authorized_chat_checkpoint
@@ -24,7 +25,6 @@ from flash.serving.src.io.schemas import (
     ImmutableCheckpointRegistration,
     internal_adapter_payload,
 )
-from flash.serving.src.store.identity import immutable_binding_fingerprint
 from flash.serving.src.store.persistence import get_adapter, list_run_adapters
 from flash.serving.src.store.settings import Settings
 

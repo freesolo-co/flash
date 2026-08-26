@@ -13,9 +13,9 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord, internal_adapter_payload
-from flash.serving.src.store.identity import immutable_binding_fingerprint
 from tests.serving.conftest import RecordingUsageStore, attest
 
 QWEN = "Qwen/Qwen3.5-9B"

@@ -5,8 +5,8 @@ import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
+from flash.serve.contract.provenance import CheckpointKey, checkpoint_key, record_key
 from flash.serving.src.io.schemas import AdapterRecord
-from flash.serving.src.store.identity import CheckpointKey, checkpoint_key, record_key
 
 RegistryKey = tuple[str | None, str]
 
