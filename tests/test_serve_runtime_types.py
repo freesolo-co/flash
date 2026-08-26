@@ -629,6 +629,17 @@ def _runtime_tools():
     )
 
 
+def test_packaged_generation_request_rejects_active_tool_whitespace_stop() -> None:
+    with pytest.raises(RuntimeConfigurationError, match="whitespace separators"):
+        GenerationRequest(
+            messages=[{"role": "user", "content": "weather"}],
+            tools=_runtime_tools(),
+            tool_choice="auto",
+            parallel_tool_calls=True,
+            stop="\t",
+        )
+
+
 def test_generation_request_revalidates_tools_and_rejects_tool_images() -> None:
     with pytest.raises(RuntimeConfigurationError, match="tools must be a nonempty array"):
         GenerationRequest(

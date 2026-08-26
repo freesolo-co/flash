@@ -12,6 +12,7 @@ from flash.serve.runtime.tool_calls import (
     ToolCallStreamParser,
     normalize_tools,
     parse_qwen3_coder_output,
+    validate_tool_stop_sequences,
 )
 
 
@@ -59,6 +60,19 @@ def _exact_tools():
             }
         ]
     )
+
+
+@pytest.mark.parametrize("stop", ["\n", " ", "\t", "\r\n", " \t\r\n"])
+def test_active_tool_stops_reject_parser_whitespace_separators(stop: str) -> None:
+    with pytest.raises(ValueError, match="whitespace separators"):
+        validate_tool_stop_sequences(stop=(stop,), tools=_exact_tools(), tool_choice="auto")
+
+
+def test_active_tool_stops_accept_ordinary_text_and_inactive_whitespace() -> None:
+    tools = _exact_tools()
+
+    validate_tool_stop_sequences(stop=("END", "not whitespace"), tools=tools, tool_choice="auto")
+    validate_tool_stop_sequences(stop=("\n",), tools=tools, tool_choice="none")
 
 
 def _exact_call() -> str:

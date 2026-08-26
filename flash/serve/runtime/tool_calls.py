@@ -231,7 +231,6 @@ def validate_tool_stop_sequences(
     error_type: type[Exception] = ValueError,
 ) -> None:
     """reject stop sequences that can consume active qwen tool grammar markers."""
-
     if not tools_active(tools, tool_choice):
         return
     markers = list(_TOOL_GRAMMAR_MARKERS)
@@ -242,9 +241,14 @@ def validate_tool_stop_sequences(
     stop_chars = sum(len(stop_value) for stop_value in stop)
     if len(stop) * marker_chars + len(markers) * stop_chars > _MAX_TOOL_STOP_COMPARISON_CHARS:
         raise error_type("active tool stop validation exceeds the supported complexity")
-    if any(_strings_overlap(stop_value, marker) for stop_value in stop for marker in markers):
+    if any(
+        _strings_overlap(stop_value, marker) for stop_value in stop for marker in markers
+    ) or any(
+        stop_value and _skip_whitespace(stop_value, 0) == len(stop_value) for stop_value in stop
+    ):
         raise error_type(
-            "stop sequences cannot overlap qwen tool-call grammar markers when tool_choice='auto'"
+            "stop sequences cannot overlap qwen tool-call grammar markers or whitespace separators "
+            "when tool_choice='auto'"
         )
 
 

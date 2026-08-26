@@ -182,9 +182,21 @@ def test_thinking_logprobs_guard_is_post_resolution_policy():
 
 @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
 @pytest.mark.parametrize(
-    "stop", ["tool_call", "weather", "prefix</tool_call>", "answer<", ">suffix"]
+    "stop",
+    [
+        "tool_call",
+        "weather",
+        "prefix</tool_call>",
+        "answer<",
+        ">suffix",
+        "\n",
+        " ",
+        "\t",
+        "\r\n",
+        " \t\r\n",
+    ],
 )
-def test_canonical_active_tools_reject_stop_sequences_that_overlap_qwen_markers(stream, stop):
+def test_canonical_active_tools_reject_stop_sequences_that_collide_with_qwen_grammar(stream, stop):
     with pytest.raises(OpenAIRequestError, match=r"grammar markers.*tool_choice='auto'"):
         parse_chat_request(
             _payload(tools=_tools(), stop=stop, stream=stream),
@@ -193,13 +205,23 @@ def test_canonical_active_tools_reject_stop_sequences_that_overlap_qwen_markers(
         )
 
 
-def test_canonical_tool_choice_none_allows_tool_marker_stop_sequences():
+@pytest.mark.parametrize("stop", ["</tool_call>", "\n"])
+def test_canonical_tool_choice_none_allows_tool_grammar_stop_sequences(stop):
     request = parse_chat_request(
-        _payload(tools=_tools(), tool_choice="none", stop="</tool_call>"),
+        _payload(tools=_tools(), tool_choice="none", stop=stop),
         require_model=True,
         allow_managed_selectors=False,
     )
-    assert request.stop == ("</tool_call>",)
+    assert request.stop == (stop,)
+
+
+def test_canonical_active_tools_accept_ordinary_stop_sequences():
+    request = parse_chat_request(
+        _payload(tools=_tools(), stop=["END", "not whitespace"]),
+        require_model=True,
+        allow_managed_selectors=False,
+    )
+    assert request.stop == ("END", "not whitespace")
 
 
 def _wide_tool() -> list[dict]:

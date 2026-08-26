@@ -420,9 +420,7 @@ def test_chat_rejects_conflicting_structured_forms_and_invalid_stop(api, monkeyp
     assert response.status_code == 400
 
 
-def test_managed_chat_rejects_mandatory_stop_that_collides_with_active_tool_grammar(
-    api, monkeypatch
-):
+def test_managed_chat_rejects_mandatory_whitespace_stop_for_active_tool_grammar(api, monkeypatch):
     import flash.runner.lifecycle.state as runner_state
     import flash.runner.lifecycle.status as runner_status
     import flash.runner.results.verified_revisions as runner_verified_revisions
@@ -431,7 +429,7 @@ def test_managed_chat_rejects_mandatory_stop_that_collides_with_active_tool_gram
 
     key = _login()
     spec = json.loads(json.dumps(SPEC))
-    spec["train"] = {**spec["train"], "stop_sequences": ["</tool_call>"]}
+    spec["train"] = {**spec["train"], "stop_sequences": [" \t\r\n"]}
     run_id = api.post(
         "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -449,7 +447,7 @@ def test_managed_chat_rejects_mandatory_stop_that_collides_with_active_tool_gram
     monkeypatch.setattr(
         app_mod,
         "serve_chat",
-        lambda **_kwargs: pytest.fail("mandatory colliding stop must not reach serving"),
+        lambda **_kwargs: pytest.fail("mandatory whitespace stop must not reach serving"),
     )
     response = api.post(
         f"/v1/runs/{run_id}/chat",
@@ -461,7 +459,7 @@ def test_managed_chat_rejects_mandatory_stop_that_collides_with_active_tool_gram
     )
 
     assert response.status_code == 400
-    assert "grammar markers" in response.json()["detail"]
+    assert "whitespace separators" in response.json()["detail"]
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])

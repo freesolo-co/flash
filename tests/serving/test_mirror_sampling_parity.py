@@ -518,7 +518,8 @@ def test_hosted_message_validation_preserves_non_tool_and_active_tool_requests()
     assert tool_request.tools == _tool_payload()
 
 
-def test_hosted_private_tool_envelope_rejects_active_stop_marker_collision() -> None:
+@pytest.mark.parametrize("stop", ["</tool_call>", " "])
+def test_hosted_private_tool_envelope_rejects_active_stop_grammar_collision(stop) -> None:
     with pytest.raises(ValueError, match=r"grammar markers.*tool_choice='auto'"):
         OpenAIGenerateRequest.model_validate(
             {
@@ -527,7 +528,7 @@ def test_hosted_private_tool_envelope_rejects_active_stop_marker_collision() -> 
                 "tools": _tool_payload(),
                 "tool_choice": "auto",
                 "parallel_tool_calls": True,
-                "stop": "</tool_call>",
+                "stop": stop,
             }
         )
     request = OpenAIGenerateRequest.model_validate(
