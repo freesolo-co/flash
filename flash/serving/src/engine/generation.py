@@ -6,7 +6,7 @@ import inspect
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, TypedDict
 
 from flash.serve.runtime.sampling import (
@@ -217,6 +217,8 @@ async def stream_generate(
     expected_checkpoint: str | None = None,
     generation_id: str | None = None,
     pre_header_dispatch_deadline: float | None = None,
+    *,
+    pre_generate_check: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     require_pre_header_dispatch_time(pre_header_dispatch_deadline)
 
@@ -249,7 +251,10 @@ async def stream_generate(
         "thinking": thinking,
     }
     try:
-        require_pre_header_dispatch_time(pre_header_dispatch_deadline)
+        if pre_generate_check is not None:
+            await pre_generate_check()
+        else:
+            require_pre_header_dispatch_time(pre_header_dispatch_deadline)
         try:
             output_stream = owner.engine.generate(
                 prompt_input,

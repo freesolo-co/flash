@@ -13,6 +13,7 @@ import os
 import shutil
 import uuid
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -651,6 +652,8 @@ class _LoraEngineImpl:
         expected_checkpoint: str | None = None,
         generation_id: str | None = None,
         pre_header_dispatch_deadline: float | None = None,
+        *,
+        pre_generate_check: Callable[[], Awaitable[None]] | None = None,
     ):
         from flash.serving.src.engine.generation import stream_generate
 
@@ -661,6 +664,7 @@ class _LoraEngineImpl:
             expected_checkpoint,
             generation_id,
             pre_header_dispatch_deadline,
+            pre_generate_check=pre_generate_check,
         )
         try:
             async for event in stream:
