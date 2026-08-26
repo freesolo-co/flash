@@ -782,8 +782,13 @@ def _handle_failure(
         except Exception:
             completed_metrics = None
         if completed_metrics is not None:
-            ctx.raise_if_cancelled()
-            return _FailureDecision(completed_metrics, False)
+            from flash.providers.core.base import PollResult
+
+            recovered = replace(
+                outcome,
+                result=PollResult(True, metrics=completed_metrics),
+            )
+            return _FailureDecision(_return_success_metrics(ctx, recovered), False)
     result = outcome.result
     ctx.last_detail = f"{result.failure}: {result.detail}"
     if outcome.chosen is not None and result.failure in ("job_preempted", "oom"):

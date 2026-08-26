@@ -6,6 +6,7 @@ The Vast API and HF readers are mocked; no API key is needed.
 from __future__ import annotations
 
 import base64
+import http.client
 import io
 import json
 import os
@@ -1060,6 +1061,70 @@ def test_poll_vast_returns_current_fenced_result_before_status(monkeypatch):
     assert result.metrics == {"wall_seconds": 12.0}
 
 
+def test_poll_vast_retries_result_download_and_costs_manifest_finished_at(monkeypatch):
+    from flash.providers._lifecycle.instances import poll_instance as poll_module
+    from flash.providers.artifacts.attempts import AttemptArtifacts
+    from flash.runner.lifecycle.protocol import ResultManifest
+    from flash.snapshot.archive import source_attestation
+
+    real_observe = poll_module._observe_result
+    vast, poll_instance = _wire_vast_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="vast", work=100.0, result=120.0),
+        instances=[{"actual_status": "running"}],
+    )
+    manifest = ResultManifest(
+        run_id=_spec().run_id,
+        phase_namespace="sft",
+        attempt_id=0,
+        fence=1,
+        outcome="succeeded",
+        failure_class=None,
+        started_at=9_000.0,
+        finished_at=9_100.0,
+        training_entered=True,
+        completed_steps=1,
+        metrics={"wall_seconds": 80.0},
+        checkpoint={},
+        artifacts={"adapter": "published"},
+        source_attestation=source_attestation(
+            SOURCE_SNAPSHOT,
+            run_id=_spec().run_id,
+            attempt=0,
+            fence=1,
+        ),
+        diagnostics={},
+    )
+    reads = iter(
+        [
+            OSError("temporary result download failure"),
+            AttemptArtifacts("revision", 9_101.0, None, manifest.to_dict()),
+        ]
+    )
+
+    def read_artifacts(*_args, **_kwargs):
+        observed = next(reads)
+        if isinstance(observed, Exception):
+            raise observed
+        return observed
+
+    monkeypatch.setattr(poll_instance, "_observe_result", real_observe)
+    monkeypatch.setattr(poll_instance, "read_attempt_artifacts", read_artifacts)
+    monkeypatch.setattr(poll_instance, "persist_attempt_artifacts", lambda *_args: None)
+    monkeypatch.setattr(poll_instance.time, "time", _instance_clock(step=1.0))
+
+    result = vast.poll_vast_job(
+        _handle(started_ts=9_000.0),
+        _spec(),
+        seed=0,
+        interval_s=0,
+    )
+
+    assert result.ok
+    assert result.metrics["cost_usd"] == round(80.0 / 3600.0 * 0.47, 6)
+    assert result.metrics["notes"]["vast_instance_wall_seconds"] == 100.0
+
+
 def test_poll_vast_dead_instance_waits_for_result_deadline(monkeypatch):
     vast, poll_instance = _wire_vast_poll(
         monkeypatch,
@@ -1127,6 +1192,36 @@ def test_poll_vast_preserves_provisioning_deadline(monkeypatch):
 
     assert result.failure == "job_preempted"
     assert "grant deadline" in result.detail
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        json.JSONDecodeError("expecting value", "<malformed>", 0),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        http.client.IncompleteRead(b"partial"),
+    ],
+)
+def test_poll_vast_malformed_status_reads_are_poll_errors(monkeypatch, error):
+    from flash.providers._lifecycle.instances import poll as poll_helpers
+    from flash.providers.vast.client import api as vast_api
+
+    vast, poll_instance = _wire_vast_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="vast", work=1_000.0, result=1_020.0),
+        results=[None] * 10,
+    )
+    monkeypatch.setattr(poll_instance.time, "time", _instance_clock(step=1.0))
+    monkeypatch.setattr(poll_helpers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        vast_api,
+        "get_instance",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    result = vast.poll_vast_job(_handle(), _spec(), seed=0, interval_s=0)
+
+    assert result.failure == "poll_error"
 
 
 def test_poll_vast_bounds_provider_status_failures(monkeypatch):
@@ -1769,6 +1864,14 @@ def test_instance_label_and_handle_roundtrip():
     assert back.to_dict()["provider"] == "vast"
     assert back.instance_id == h.instance_id
     assert back.offer_id == h.offer_id
+
+
+@pytest.mark.parametrize("started_ts", [0, -1, float("inf")])
+def test_handle_rejects_invalid_launch_timestamp(started_ts):
+    from flash.providers.vast.jobs.builders import VastJobHandle
+
+    with pytest.raises(ValueError, match="launch timestamp is invalid"):
+        VastJobHandle.from_dict({**_handle().to_dict(), "started_ts": started_ts})
 
 
 def test_handle_from_dict_corrupt_instance_id_raises_clear_error():

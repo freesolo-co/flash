@@ -103,6 +103,44 @@ def test_reads_latest_verified_progress_and_single_result(monkeypatch) -> None:
     assert observed.result["receipt"]["path"] == result_path(result)
 
 
+def test_result_download_transport_error_remains_retriable(monkeypatch) -> None:
+    result = _result()
+    path = result_path(result)
+    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: ("c" * 40, [path]))
+    monkeypatch.setattr(
+        attempts,
+        "_download_bytes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("temporary transport failure")),
+    )
+
+    with pytest.raises(OSError, match="temporary transport failure"):
+        attempts.read_attempt_artifacts(
+            "org/repo",
+            phase="rl",
+            run_id="run-1",
+            attempt_id=2,
+            fence=9,
+            source_snapshot=SOURCE,
+        )
+
+
+def test_downloaded_malformed_result_is_attempt_artifact_error(monkeypatch) -> None:
+    result = _result()
+    path = result_path(result)
+    monkeypatch.setattr(attempts, "_repo_snapshot", lambda _repo: ("c" * 40, [path]))
+    monkeypatch.setattr(attempts, "_download_bytes", lambda *_args, **_kwargs: b"not-json")
+
+    with pytest.raises(attempts.AttemptArtifactError, match="invalid or unverifiable"):
+        attempts.read_attempt_artifacts(
+            "org/repo",
+            phase="rl",
+            run_id="run-1",
+            attempt_id=2,
+            fence=9,
+            source_snapshot=SOURCE,
+        )
+
+
 def test_rejects_conflicting_results(monkeypatch) -> None:
     first = _result(outcome="failed", failure_class="worker", metrics={})
     second = _result(outcome="failed", failure_class="oom", metrics={})

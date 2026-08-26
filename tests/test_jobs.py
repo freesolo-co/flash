@@ -637,6 +637,65 @@ def test_poll_job_preserves_provider_health_observations(
     assert result.failure == failure
 
 
+def test_poll_job_recovers_transient_result_download_to_current_fenced_success(monkeypatch):
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(work_deadline_at=100.0, result_deadline_at=120.0),
+        results=[],
+    )
+    observations = iter(
+        [
+            OSError("temporary result download failure"),
+            PollResult(True, metrics={"optimizer_steps": 2}),
+        ]
+    )
+
+    def observe(_context):
+        observed = next(observations)
+        if isinstance(observed, Exception):
+            raise observed
+        return observed
+
+    monkeypatch.setattr(polling, "_observe_artifacts", observe)
+    monkeypatch.setattr(polling.time, "time", _stepped_clock(step=1.0))
+    monkeypatch.setattr(runpod_api, "job_status", lambda *_args, **_kwargs: {"status": "IN_PROGRESS"})
+
+    result = polling.poll_job(_runpod_handle(jobs), _poll_spec(), interval_s=0)
+
+    assert result.ok
+    assert result.metrics == {"optimizer_steps": 2}
+
+
+def test_poll_job_recovers_transient_status_errors_to_current_fenced_result(monkeypatch):
+    from flash.providers.core.base import PollResult
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(work_deadline_at=100.0, result_deadline_at=120.0),
+        results=[None, None, None, PollResult(True, metrics={"optimizer_steps": 2})],
+    )
+    monkeypatch.setattr(polling.time, "time", _stepped_clock(step=1.0))
+    calls = {"count": 0}
+
+    def transient_status(*_args, **_kwargs):
+        calls["count"] += 1
+        raise runpod_api.RunpodApiError("temporary status failure")
+
+    monkeypatch.setattr(runpod_api, "job_status", transient_status)
+
+    result = polling.poll_job(_runpod_handle(jobs), _poll_spec(), interval_s=0)
+
+    assert result.ok
+    assert result.metrics == {"optimizer_steps": 2}
+    assert calls["count"] == 3
+
+
 def test_poll_job_bounds_status_transport_failures(monkeypatch):
     from flash.providers._lifecycle.instances import poll as poll_helpers
     from flash.providers.runpod.client import api as runpod_api
@@ -658,6 +717,25 @@ def test_poll_job_bounds_status_transport_failures(monkeypatch):
     result = polling.poll_job(_runpod_handle(jobs), _poll_spec(), interval_s=0)
 
     assert result.failure == "poll_error"
+
+
+def test_runpod_provider_poll_rejects_endpoint_only_handle(monkeypatch):
+    from flash.providers.core.base import JobHandle
+    from flash.providers.runpod.execution import jobs
+    from flash.providers.runpod.execution.provider import RunpodProvider
+
+    monkeypatch.setattr(
+        polling,
+        "poll_job",
+        lambda *_args, **_kwargs: pytest.fail("endpoint-only handle must not reach polling"),
+    )
+    handle = JobHandle.from_dict(
+        _runpod_handle(jobs, job_id=None, started_ts=time.time()).to_dict()
+    )
+
+    spec = _spec("endpoint-only")
+    with pytest.raises(ValueError, match="endpoint-only"):
+        RunpodProvider().poll(handle, spec, seed=spec.seed)
 
 
 def test_current_attempt_rejects_a_stale_runpod_fence(monkeypatch):
@@ -770,7 +848,7 @@ def _adapter_config(*, rank=32, alpha=64):
 
 
 @pytest.mark.parametrize("cancel_during_status", [False, True])
-def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_during_status):
+def test_supervisor_adopts_provider_completion_before_retry(monkeypatch, cancel_during_status):
     from dataclasses import replace
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -781,21 +859,22 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_du
         from flash.providers.core.base import Allocation, Candidate, PollResult
 
         spec = _spec("completed-before-retry")
-        spec = replace(spec, gpu=replace(spec.gpu, max_retries=0))
+        spec = replace(spec, gpu=replace(spec.gpu, max_retries=0, count=4))
         runner_state._save_status(
             runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
             _next_attempt=0,
         )
-        candidate = Candidate("runpod", "RTX 4090", 0.5, 24)
+        candidate = Candidate("vast", "H100 SXM", 2.5, 80, gpu_count=4)
         monkeypatch.setattr(
             allocator,
             "allocate",
             lambda *args, **kwargs: Allocation(
-                provider="runpod",
-                gpu="RTX 4090",
-                hourly_usd=0.5,
-                min_vram_gb=24,
+                provider="vast",
+                gpu="H100 SXM",
+                hourly_usd=2.5,
+                min_vram_gb=80,
                 candidates=(candidate,),
+                gpu_count=4,
             ),
         )
         calls = {"n": 0}
@@ -808,11 +887,13 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_du
                 if on_handle:
                     on_handle(
                         {
-                            "provider": "runpod",
-                            "endpoint_id": "ep-completed",
-                            "endpoint_name": "completed",
-                            "key_fingerprint": _RUNPOD_FINGERPRINT,
-                            "job_id": "job-completed",
+                            "provider": "vast",
+                            "instance_id": 42,
+                            "offer_id": 7,
+                            "machine_id": 9,
+                            "label": "flash-completed-s0-a0",
+                            "gpu": "H100 SXM",
+                            "hourly_usd": 2.5,
                             "attempt": attempt,
                             "fence": 1,
                             "started_ts": 1.0,
@@ -854,6 +935,9 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_du
                 source_snapshot=_SOURCE_SNAPSHOT,
             )
             assert metrics["trained_eval_acc"] == 0.9
+            assert metrics["allocated_provider"] == "vast"
+            assert metrics["allocated_gpu"] == "H100 SXM"
+            assert metrics["allocated_gpu_count"] == 4
         assert calls["n"] == 1
 
 

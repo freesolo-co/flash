@@ -100,7 +100,7 @@ def arm_deadline_watchdog(
     deadline_at: float,
     payload: dict,
 ) -> tuple[threading.Timer, threading.Event]:
-    """Hard-stop setup or training that remains alive at the absolute cutoff."""
+    """hard-stop setup, training, or result publication at its fixed cutoff."""
     done = threading.Event()
 
     def _fire() -> None:
@@ -112,6 +112,20 @@ def arm_deadline_watchdog(
     timer.daemon = True
     timer.start()
     return timer, done
+
+
+def _transition_deadline_watchdog(
+    deadline_watchdog: list[object] | None,
+    deadline_at: float,
+    payload: dict,
+) -> None:
+    """replace the work watchdog after exact worker and uploader cleanup."""
+    if deadline_watchdog is None:
+        return
+    timer, done = deadline_watchdog
+    done.set()
+    timer.cancel()
+    deadline_watchdog[:] = arm_deadline_watchdog(deadline_at, payload)
 
 
 def load_payload() -> dict:
@@ -656,8 +670,15 @@ def _publish_cancelled_result(
     )
 
 
-def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
-    """Run one worker subprocess; tee console to a file and upload periodically for live logs."""
+def run_mode(
+    payload: dict,
+    env: dict,
+    mode: str,
+    deadline_ts: float,
+    *,
+    deadline_watchdog: list[object] | None = None,
+) -> int:
+    """run one worker subprocess and publish bounded terminal evidence."""
     console = f"/tmp/console_{mode}.txt"
     upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
     worker_deadline_at = min(
@@ -794,6 +815,14 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             f"console upload warn: {_safe_detail(exc, secrets=_payload_secrets(payload))}",
             flush=True,
         )
+    if timed_out or cancelled:
+        _transition_deadline_watchdog(
+            deadline_watchdog,
+            _finite_positive_number(
+                payload.get("result_deadline_at"), "result visibility deadline"
+            ),
+            payload,
+        )
     if timed_out:
         _publish_deadline_result(
             payload,
@@ -903,18 +932,24 @@ def main() -> int:
             print("hf_transfer setup skipped:", exc, flush=True)
         deadline = require_deadline_at(payload)
         if payload.get("mode") == "preload":
-            deadline_watchdog = _arm_preload_wall_cap(payload)
+            deadline_watchdog = list(_arm_preload_wall_cap(payload))
             result = run_preload(payload)
             with open("/tmp/preload_result.json", "w") as f:
                 json.dump(result, f)
             hf_upload(payload, "/tmp/preload_result.json", "preload_result.json")
             return 0 if not result.get("error") and not result.get("failed") else 1
-        deadline_watchdog = arm_deadline_watchdog(deadline, payload)
+        deadline_watchdog = list(arm_deadline_watchdog(deadline, payload))
         fetch_code(payload)
         install_extra_pip(payload)
         env = build_worker_env(payload)
         phase = payload["phase"]
-        rc = run_mode(payload, env, phase, deadline)
+        rc = run_mode(
+            payload,
+            env,
+            phase,
+            deadline,
+            deadline_watchdog=deadline_watchdog,
+        )
         if rc != 0:
             raise RetriableBootstrapError(
                 f"train phase '{phase}' exited non-zero ({rc}); the control plane will resolve "

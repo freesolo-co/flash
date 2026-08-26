@@ -133,10 +133,9 @@ def _decode_result(
         return None
     manifests: list[tuple[ResultManifest, str, str]] = []
     for path, expected_digest in candidates:
+        payload = _download_bytes(hf_repo, path, revision=revision)
         try:
-            manifest = ResultManifest.from_dict(
-                json.loads(_download_bytes(hf_repo, path, revision=revision))
-            )
+            manifest = ResultManifest.from_dict(json.loads(payload))
             if result_path(manifest) != path or digest_record(manifest.to_dict()) != expected_digest:
                 raise ValueError("result digest does not match its immutable path")
             validate_attestation(
