@@ -108,8 +108,18 @@ def _compare_and_prepare_resubmit(
     expected_remote: dict | None,
     *,
     expected_state: str | None = None,
+    expected_attempt_id: int | None = None,
+    expected_fence: int | None = None,
+    expected_attempt_state: str | None = None,
+    retry_counters: dict | None = None,
 ) -> bool:
-    """Claim a nonterminal recovery launch only while its expected remote still owns the run."""
+    """claim one exact nonterminal recovery launch and its consumed retry counters."""
+    if retry_counters is not None:
+        expected_categories = {"infra", "oom", "cache"}
+        if set(retry_counters) != expected_categories or any(
+            type(value) is not int or value < 0 for value in retry_counters.values()
+        ):
+            raise ValueError("retry counters must contain nonnegative exact categories")
     report_status: RunStatus | None = None
     with state._status_guard(run_id):
         status = status_ops.get_status(run_id)
@@ -119,6 +129,23 @@ def _compare_and_prepare_resubmit(
             return False
         if not _expected_remote_matches(status.remote, expected_remote):
             return False
+        if (
+            expected_attempt_id is not None
+            or expected_fence is not None
+            or expected_attempt_state is not None
+        ):
+            attempt = status_ops._current_attempt(status)
+            if expected_attempt_id is not None and attempt.attempt_id != expected_attempt_id:
+                return False
+            if expected_fence is not None and attempt.fence != expected_fence:
+                return False
+            if expected_attempt_state is not None and attempt.state != expected_attempt_state:
+                return False
+        if retry_counters is not None:
+            status.retry_counters = dict(retry_counters)
+            status.attempt = replace(
+                status_ops._current_attempt(status), state="settling"
+            ).to_dict()
         status.state = "provisioning"
         status.updated_at = time.time()
         state._save_status_unlocked(status)

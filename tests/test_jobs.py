@@ -1698,6 +1698,7 @@ def test_supervisor_retries_on_provider_loss_then_succeeds(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
         import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless.endpoints as flash_train
 
@@ -2710,10 +2711,11 @@ def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
 
 
 def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
-    # A "job_preempted" first attempt retries on a fresh endpoint and completes.
+    # a "job_preempted" first attempt retries on a fresh endpoint and completes.
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
         import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless.endpoints as flash_train
 
@@ -2860,6 +2862,7 @@ def test_shared_cache_zero_retry_budget_submits_exactly_once(monkeypatch, failur
 
 
 def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
+    monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
     # a managed gpu request that keeps hitting infra-shaped failures must walk
     # down the ranked candidate list, not burn every retry on the same capacity-starved
     # class. with static rates the validated >=24 gb pool for a 0.8b grpo run ranks

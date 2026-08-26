@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 import flash.engine.worker.entry.opd as opd_entry
 import flash.engine.worker.entry.sft as sft_entry
 import flash.engine.worker.entry.worker as worker
@@ -116,6 +118,64 @@ def test_direct_worker_module_emits_one_normal_traceback(tmp_path):
     assert result.returncode != 0
     assert combined.count("Traceback") == 1
     assert secret in combined
+
+
+def test_existing_current_fence_result_skips_gpu_setup_and_handler(monkeypatch):
+    def fake_exit(code=0):
+        raise _HardExit(code)
+
+    _patch_common(monkeypatch, fake_exit)
+    monkeypatch.setattr(worker.result_io, "preflight_existing_terminal_result", object)
+    monkeypatch.setattr(
+        worker,
+        "_preflight_gpu_occupancy_for_spec",
+        lambda: (_ for _ in ()).throw(AssertionError("gpu setup must be skipped")),
+    )
+    monkeypatch.setattr(
+        sft_entry,
+        "run_sft",
+        lambda: (_ for _ in ()).throw(AssertionError("handler must be skipped")),
+    )
+
+    with pytest.raises(_HardExit) as exc_info:
+        worker.main()
+
+    assert exc_info.value.code == 0
+
+
+def test_transient_result_preflight_prevents_training_as_artifact_transport(monkeypatch):
+    _patch_common(monkeypatch, lambda _code=0: None)
+    error = worker_perf.RetriableInfraError("result listing unavailable")
+    monkeypatch.setattr(
+        worker.result_io,
+        "preflight_existing_terminal_result",
+        lambda: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_preflight_gpu_occupancy_for_spec",
+        lambda: (_ for _ in ()).throw(AssertionError("gpu setup must be skipped")),
+    )
+    monkeypatch.setattr(
+        sft_entry,
+        "run_sft",
+        lambda: (_ for _ in ()).throw(AssertionError("handler must be skipped")),
+    )
+    published = []
+    monkeypatch.setattr(
+        worker.result_io,
+        "publish_result",
+        lambda **kwargs: published.append(kwargs),
+    )
+    monkeypatch.setattr(worker.hf_io, "hf_upload_file", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(worker.backend_common, "collect_ray_failure_logs", lambda **_kwargs: "")
+    monkeypatch.setattr(worker.worker_perf, "gpu_diagnostics", dict)
+
+    with pytest.raises(worker_perf.RetriableInfraError, match="result listing unavailable"):
+        worker.main()
+
+    assert published[0]["failure_class"] == "artifact_transport"
+    assert published[0]["training_entered"] is False
 
 
 def test_worker_hard_exits_zero_on_success(monkeypatch):

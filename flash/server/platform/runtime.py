@@ -17,6 +17,13 @@ from flash.core.spec import JobSpec
 from flash.runner.lifecycle.state import adapter_prefix, runs_file_path
 from flash.runner.lifecycle.status import get_status
 from flash.server.platform import db
+from flash.server.platform.handleless_retry import (
+    HandlelessResubmit,
+    ResubmitLaunch,
+    _attempt_identity_kwargs,
+    claimed_retry,
+    failure_retry,
+)
 
 _log = logging.getLogger("flash.server")
 
@@ -286,50 +293,75 @@ def _start_resubmit(
     *,
     expected_remote: dict | None = None,
     expected_state: str | None = None,
-    result_resolved: bool = False,
+    resolution: HandlelessResubmit | None = None,
+    confirmed_absent: bool = False,
 ) -> bool:
     from flash.runner.accounting.reconciliation import _compare_and_prepare_resubmit
     from flash.runner.lifecycle.attempts import _verified_opd_next_attempt
     from flash.runner.lifecycle.status import source_snapshot_from_status
     from flash.runner.supervise.lifecycle import _run_job_background
 
+    launch = ResubmitLaunch(spec.run_id)
+    if not launch.acquire():
+        return False
     try:
-        source_snapshot_from_status(get_status(spec.run_id), required=True)
-    except Exception as exc:
-        _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
-        return False
-    reason = _recovery_block_reason(spec)
-    if reason is not None:
-        if _recovery_wall_deadline_is_open(spec):
-            return False
-        _fail_blocked_recovery(spec, reason, expected_remote=expected_remote)
-        return False
-    if spec.algorithm == "opd":
         try:
-            _verified_opd_next_attempt(spec.run_id)
+            source_snapshot_from_status(get_status(spec.run_id), required=True)
         except Exception as exc:
             _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
             return False
-    current = get_status(spec.run_id)
-    if current.remote is not None or (
-        expected_state is not None and current.state != expected_state
-    ):
-        return False
-    if not result_resolved and not _resolve_handleless_before_resubmit(spec, current):
-        return False
-    if not _compare_and_prepare_resubmit(
-        spec.run_id,
-        expected_remote,
-        expected_state=expected_state,
-    ):
-        return False
-    with contextlib.suppress(Exception):
-        _append_run_log(
+        reason = _recovery_block_reason(spec)
+        if reason is not None:
+            if _recovery_wall_deadline_is_open(spec):
+                return False
+            _fail_blocked_recovery(spec, reason, expected_remote=expected_remote)
+            return False
+        if spec.algorithm == "opd":
+            try:
+                _verified_opd_next_attempt(spec.run_id)
+            except Exception as exc:
+                _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
+                return False
+        current = get_status(spec.run_id)
+        if current.remote is not None or (
+            expected_state is not None and current.state != expected_state
+        ):
+            return False
+        if resolution is None:
+            resolution = _resolve_handleless_before_resubmit(
+                spec,
+                current,
+                confirmed_absent=confirmed_absent,
+            )
+        if resolution is None:
+            return False
+        if not _compare_and_prepare_resubmit(
             spec.run_id,
-            "control plane restarted without a durable handle; resubmitting",
+            expected_remote,
+            expected_state=expected_state,
+            expected_attempt_id=resolution.attempt_id,
+            expected_fence=resolution.fence,
+            expected_attempt_state=resolution.attempt_state,
+            retry_counters=resolution.retry_counters,
+        ):
+            return False
+        with contextlib.suppress(Exception):
+            _append_run_log(
+                spec.run_id,
+                "control plane restarted without a durable handle; resubmitting",
+            )
+
+        launch.start(
+            lambda: _run_job_background(
+                spec,
+                None,
+                resolution.attempt_start,
+                resolution.oom_vram_floor,
+            )
         )
-    threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
-    return True
+        return True
+    finally:
+        launch.release_unstarted()
 
 
 def _handleless_attempt_result(spec, status, deadline_at: float):
@@ -337,18 +369,6 @@ def _handleless_attempt_result(spec, status, deadline_at: float):
     from flash.runner.supervise.lifecycle import _attempt_result
 
     return _attempt_result(spec.run_id)
-
-
-def _attempt_identity_kwargs(attempt: object) -> dict[str, int]:
-    from flash.runner.lifecycle.protocol import AttemptRecord
-
-    if attempt is None:
-        return {}
-    record = attempt if isinstance(attempt, AttemptRecord) else AttemptRecord.from_dict(attempt)
-    return {
-        "expected_attempt_id": record.attempt_id,
-        "expected_fence": record.fence,
-    }
 
 
 def _handleless_attempt_resolution(spec, status):
@@ -367,47 +387,66 @@ def _handleless_attempt_resolution(spec, status):
         from flash.runner.supervise.attach import _result_transport_is_transient
 
         if _result_transport_is_transient(exc):
-            return None, True, attempt
+            return None, time.time() < attempt.result_deadline_at, attempt
         raise
     if result is not None:
         return result, False, attempt
     return None, time.time() < attempt.result_deadline_at, attempt
 
 
-def _resolve_handleless_before_resubmit(spec, status) -> bool:
-    """adopt or defer the exact current result before permitting a replacement cas."""
+def _resolve_handleless_before_resubmit(
+    spec,
+    status,
+    *,
+    confirmed_absent: bool = False,
+) -> HandlelessResubmit | None:
+    """adopt, retry, or settle the exact current result before replacement."""
     from flash.runner.accounting.reconciliation import _compare_and_fail_remote
     from flash.runner.lifecycle.protocol import AttemptRecord
     from flash.runner.supervise.attach import _result_transport_is_transient
     from flash.runner.supervise.lifecycle import _adopt_completed_attempt
 
     if status.attempt is None:
-        return True
+        return HandlelessResubmit()
     try:
         attempt = AttemptRecord.from_dict(status.attempt)
         result = _handleless_attempt_result(spec, status, attempt.result_deadline_at)
     except Exception as exc:
         if _result_transport_is_transient(exc):
-            return False
+            return None
         _compare_and_fail_remote(
             spec.run_id,
             None,
             str(exc),
             **_attempt_identity_kwargs(status.attempt),
         )
-        return False
+        return None
     if result is None:
-        return True
+        identity = _attempt_identity_kwargs(attempt)
+        return HandlelessResubmit(
+            attempt_id=identity.get("expected_attempt_id"),
+            fence=identity.get("expected_fence"),
+            attempt_state=attempt.state,
+            attempt_start=int(identity.get("expected_attempt_id") or 0) + 1,
+        )
     if not result.ok:
+        if attempt.state == "settling":
+            return claimed_retry(status, result)
         from flash.runner.supervise.lifecycle import _result_failure_detail
 
+        try:
+            retry = failure_retry(spec, status, result) if confirmed_absent else None
+        except Exception:
+            retry = None
+        if retry is not None:
+            return retry
         _compare_and_fail_remote(
             spec.run_id,
             None,
             _result_failure_detail(result),
             **_attempt_identity_kwargs(attempt),
         )
-        return False
+        return None
     _adopt_completed_attempt(
         spec.run_id,
         spec,
@@ -416,7 +455,7 @@ def _resolve_handleless_before_resubmit(spec, status) -> bool:
         log=None,
         **_attempt_identity_kwargs(attempt),
     )
-    return False
+    return None
 
 
 def _deferred_resubmit_loop(spec) -> None:
@@ -521,7 +560,12 @@ def _deferred_resubmit_loop(spec) -> None:
         except Exception:
             clear = False
         if clear:
-            if not _resolve_handleless_before_resubmit(spec, status):
+            resolution = _resolve_handleless_before_resubmit(
+                spec,
+                status,
+                confirmed_absent=True,
+            )
+            if resolution is None:
                 try:
                     if get_status(spec.run_id).state in TERMINAL_STATES:
                         return
@@ -534,7 +578,7 @@ def _deferred_resubmit_loop(spec) -> None:
                     spec,
                     expected_remote=None,
                     expected_state=status.state,
-                    result_resolved=True,
+                    resolution=resolution,
                 )
             except Exception:
                 time.sleep(_DEFERRED_RECOVERY_RETRY_S)
@@ -906,20 +950,26 @@ def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
         # the guard for it — else a purely-queued run whose VAST_API_KEY was dropped after submit would
         # fail closed in _confirm_run_clear (unenumerable recorded Vast) and defer forever. The guard
         # still runs for `provisioning`/`running`, the states that could have attempted a create.
-        if prior_state == "queued" or _confirm_run_clear(spec):
+        confirmed_absent = prior_state != "queued" and _confirm_run_clear(spec)
+        if prior_state == "queued" or confirmed_absent:
             try:
                 current = get_status(spec.run_id)
             except Exception:
                 current = None
-            if (
-                current is not None
-                and _resolve_handleless_before_resubmit(spec, current)
-                and _start_resubmit(
+            resolution = (
+                _resolve_handleless_before_resubmit(
                     spec,
-                    expected_remote=None,
-                    expected_state=prior_state,
-                    result_resolved=True,
+                    current,
+                    confirmed_absent=confirmed_absent,
                 )
+                if current is not None
+                else None
+            )
+            if resolution is not None and _start_resubmit(
+                spec,
+                expected_remote=None,
+                expected_state=prior_state,
+                resolution=resolution,
             ):
                 continue
             try:

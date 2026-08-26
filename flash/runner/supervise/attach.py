@@ -805,10 +805,10 @@ def _handle_failed_attach_poll(
             file=log,
         )
         return get_status(run_id)
-    retry_plan = _attach_retry_plan(
-        context,
-        result.failure if result.failure in {"job_preempted", "poll_error"} else "job_preempted",
-    )
+    retry_failure = result.failure
+    if retry_failure not in {"no_capacity", "job_preempted", "poll_error"}:
+        retry_failure = "job_preempted"
+    retry_plan = _attach_retry_plan(context, retry_failure)
     try:
         resource_deleted = _strict_teardown_handle(context.handle, run_id)
         worker_gone = True

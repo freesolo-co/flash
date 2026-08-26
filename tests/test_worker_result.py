@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -48,6 +49,41 @@ def _set_identity(monkeypatch) -> None:
     monkeypatch.setattr(result_io.state, "FENCE", 9)
     monkeypatch.setattr(result_io.hf_io, "_require_hf_deadline_allowance", lambda: None)
     monkeypatch.setattr(result_io.hf_io, "_sleep_with_hf_deadline", lambda _delay: True)
+
+
+def test_current_fence_result_preflight_reuses_strict_artifact_validation(monkeypatch) -> None:
+    from flash.providers.artifacts import attempts
+    from tests._helpers.source_snapshot import valid_source_snapshot
+
+    _set_identity(monkeypatch)
+    snapshot = valid_source_snapshot()
+    monkeypatch.setenv("FLASH_SOURCE_SNAPSHOT_JSON", json.dumps(snapshot))
+    projection = {**_manifest().to_dict(), "observed_at": 123.0, "receipt": {}}
+    monkeypatch.setattr(
+        attempts,
+        "read_attempt_artifacts",
+        lambda *args, **kwargs: attempts.AttemptArtifacts("c" * 40, 123.0, None, projection),
+    )
+
+    assert result_io.preflight_existing_terminal_result() == _manifest()
+
+
+def test_current_fence_result_preflight_maps_transient_observation_to_retriable(
+    monkeypatch,
+) -> None:
+    from flash.providers.artifacts import attempts
+    from tests._helpers.source_snapshot import valid_source_snapshot
+
+    _set_identity(monkeypatch)
+    monkeypatch.setenv("FLASH_SOURCE_SNAPSHOT_JSON", json.dumps(valid_source_snapshot()))
+    monkeypatch.setattr(
+        attempts,
+        "read_attempt_artifacts",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("offline")),
+    )
+
+    with pytest.raises(result_io.hf_io.RetriableInfraError, match="temporarily unavailable"):
+        result_io.preflight_existing_terminal_result()
 
 
 def test_exactly_once_publish_adopts_matching_concurrent_result(monkeypatch, tmp_path) -> None:

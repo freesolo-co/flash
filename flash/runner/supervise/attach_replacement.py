@@ -9,20 +9,17 @@ from flash.core.spec import JobSpec
 from flash.providers._lifecycle.instances.poll import _attempt_int
 
 
-def oom_floor_from_remote(remote: dict, worker_spec: JobSpec) -> float:
+def _oom_floor(worker_spec: JobSpec, gpu: object, count: object, executed: object = None) -> float:
     from flash.cost.spec import sft_ranking_overrides
     from flash.providers.core.allocator import _executed_gpu_count
     from flash.providers.core.base import GPU_INFO, Candidate
     from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb
 
-    gpu = remote.get("allocated_gpu") or remote.get("gpu")
     gpu_class = GPU_INFO.get(gpu)
     if gpu_class is None:
         return 0.0
-    count = remote.get("allocated_gpu_count", 1)
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
         return 0.0
-    executed = remote.get("executed_gpu_count")
     if isinstance(executed, bool) or not isinstance(executed, int) or not 1 <= executed <= count:
         executed = _executed_gpu_count(
             worker_spec.algorithm,
@@ -30,9 +27,11 @@ def oom_floor_from_remote(remote: dict, worker_spec: JobSpec) -> float:
             sft_ranking_overrides(worker_spec),
             count,
         )
+    if isinstance(executed, bool) or not isinstance(executed, int) or not 1 <= executed <= count:
+        return 0.0
     return _candidate_usable_vram_gb(
         Candidate(
-            str(remote.get("provider") or ""),
+            "",
             gpu_class.name,
             0.0,
             gpu_class.vram_gb,
@@ -40,6 +39,17 @@ def oom_floor_from_remote(remote: dict, worker_spec: JobSpec) -> float:
             executed_gpu_count=executed,
         )
     )
+
+
+def oom_floor_from_remote(remote: dict, worker_spec: JobSpec) -> float:
+    gpu = remote.get("allocated_gpu") or remote.get("gpu")
+    count = remote.get("allocated_gpu_count", 1)
+    return _oom_floor(worker_spec, gpu, count, remote.get("executed_gpu_count"))
+
+
+def oom_floor_from_effective_spec(worker_spec: JobSpec) -> float:
+    """derive the executed allocation floor only from the persisted selected worker spec."""
+    return _oom_floor(worker_spec, worker_spec.gpu.type, worker_spec.gpu.count)
 
 
 def resume_after_confirmed_teardown(

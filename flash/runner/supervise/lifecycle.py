@@ -15,11 +15,15 @@ INFRA_RETRY_FLOOR = 5
 INFRA_RETRY_FAILURES = frozenset(
     {"no_capacity", "poll_error", "job_preempted", "artifact_transport"}
 )
-RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 _STAGED_ENVIRONMENT_RETRY_S = 5.0
 
 
-def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
+def _run_job_background(
+    spec: JobSpec,
+    runtime_secrets: dict[str, str] | None = None,
+    attempt_start: int = 0,
+    oom_vram_floor: float = 0.0,
+) -> None:
     """run a supervised job without leaking a daemon-thread traceback."""
     import logging
 
@@ -27,7 +31,15 @@ def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = 
     from flash.runner.lifecycle.status import _update, get_status
 
     try:
-        _run_job(spec, runtime_secrets=runtime_secrets) if runtime_secrets else _run_job(spec)
+        if runtime_secrets or attempt_start or oom_vram_floor:
+            _run_job(
+                spec,
+                runtime_secrets=runtime_secrets,
+                attempt_start=attempt_start,
+                oom_vram_floor=oom_vram_floor,
+            )
+        else:
+            _run_job(spec)
     except Exception as exc:
         detail = f"{type(exc).__name__}: background run failed"
         with contextlib.suppress(Exception):
@@ -55,21 +67,22 @@ class _RetryBudget:
         return self.infra_used >= self.infra_retries and not cache_fallback_available
 
     def can_retry(self, failure: str | None, *, cache_drop: bool) -> bool:
-        if failure not in RETRY_FAILURES:
-            return False
-        if cache_drop:
+        category = _retry_category(failure, cache_drop=cache_drop)
+        if category == "cache":
             return self.cache_used < self.cache_fallbacks
-        if failure == "oom":
+        if category == "oom":
             return self.oom_used < self.oom_retries
-        return self.infra_used < self.infra_retries
+        if category == "infra":
+            return self.infra_used < self.infra_retries
+        return False
 
     def record_retry(self, failure: str | None, *, cache_drop: bool) -> None:
-        if cache_drop:
+        category = _retry_category(failure, cache_drop=cache_drop)
+        if category == "cache":
             self.cache_used += 1
-            return
-        if failure == "oom":
+        elif category == "oom":
             self.oom_used += 1
-        elif failure in INFRA_RETRY_FAILURES:
+        elif category == "infra":
             self.infra_used += 1
 
     def counters(self) -> dict[str, int]:
@@ -107,6 +120,16 @@ def _reconstructed_retry_budget(
     return budget
 
 
+def _retry_category(failure: str | None, *, cache_drop: bool = False) -> str | None:
+    if failure == "oom":
+        category = "oom"
+    elif failure in INFRA_RETRY_FAILURES:
+        category = "infra"
+    else:
+        return None
+    return "cache" if cache_drop else category
+
+
 def _failure_disposition(
     budget: _RetryBudget,
     failure: str | None,
@@ -115,15 +138,7 @@ def _failure_disposition(
     allow_retry: bool = True,
 ) -> _FailureDisposition:
     """classify and consume one retry through the shared live/recovery policy boundary."""
-    category = (
-        "cache"
-        if cache_drop
-        else "oom"
-        if failure == "oom"
-        else "infra"
-        if failure in INFRA_RETRY_FAILURES
-        else None
-    )
+    category = _retry_category(failure, cache_drop=cache_drop)
     retry = allow_retry and budget.can_retry(failure, cache_drop=cache_drop)
     if retry:
         budget.record_retry(failure, cache_drop=cache_drop)
@@ -153,7 +168,13 @@ def _fail_permanent_result_artifact(
     return True
 
 
-def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
+def _run_job(
+    spec: JobSpec,
+    runtime_secrets: dict[str, str] | None = None,
+    *,
+    attempt_start: int = 0,
+    oom_vram_floor: float = 0.0,
+) -> None:
     from flash.content.multimodal import preflight_validate_image_opd
 
     preflight_validate_image_opd(spec)
@@ -171,7 +192,13 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
     try:
         while True:
             try:
-                _run_job_inner(spec, log_path, runtime_secrets=runtime_secrets)
+                _run_job_inner(
+                    spec,
+                    log_path,
+                    runtime_secrets=runtime_secrets,
+                    attempt_start=attempt_start,
+                    oom_vram_floor=oom_vram_floor,
+                )
                 break
             except Exception as exc:
                 from flash.envs.loading.staged import StagedEnvironmentTransientError
@@ -295,6 +322,9 @@ def _run_job_inner(
     spec: JobSpec,
     log_path: str,
     runtime_secrets: dict[str, str] | None = None,
+    *,
+    attempt_start: int = 0,
+    oom_vram_floor: float = 0.0,
 ) -> None:
     from flash.runner.accounting.artifacts import stage_environment_package
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
@@ -316,6 +346,8 @@ def _run_job_inner(
                 log,
                 prior_cost=0.0,
                 runtime_secrets=runtime_secrets,
+                attempt_start=attempt_start,
+                oom_vram_floor=oom_vram_floor,
             )
     except _RunCancelled:
         return  # cancel_run already set the terminal state

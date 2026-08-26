@@ -65,6 +65,10 @@ def _run_worker_mode() -> None:
     remaining = state._remaining_worker_wall_seconds()
     if remaining is not None and remaining <= 0:
         raise RuntimeError("worker run wall deadline exceeded")
+    if result_io.preflight_existing_terminal_result() is not None:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
     # these setups run in the parent; verl trains in FLASH_VERL_PYTHON.
     # only _force_fla_triton_gdn_on_sm100 propagates through FLA_* env vars. the install and the
     # monkeypatch are interpreter-local and must not be treated as child configuration. the tilelang

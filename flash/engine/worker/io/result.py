@@ -102,6 +102,47 @@ def _existing_result(api, *, revision: str) -> ResultManifest | None:
     return _download_result(paths[0], revision=revision)
 
 
+def preflight_existing_terminal_result() -> ResultManifest | None:
+    """return one strictly verified current-fence result before gpu work starts."""
+    if not state.HF_REPO:
+        return None
+    from flash.providers.artifacts.attempts import AttemptArtifactError, read_attempt_artifacts
+    from flash.snapshot.archive import parse_descriptor
+
+    try:
+        source_snapshot = parse_descriptor(
+            json.loads(os.environ.get("FLASH_SOURCE_SNAPSHOT_JSON", ""))
+        ).to_dict()
+    except Exception as exc:
+        raise AttemptArtifactError("worker source identity is unavailable or invalid") from exc
+    try:
+        hf_io._require_hf_deadline_allowance()
+        artifacts = read_attempt_artifacts(
+            state.HF_REPO,
+            phase=state.PHASE,
+            run_id=state.RUN_ID,
+            attempt_id=state.ATTEMPT,
+            fence=state.FENCE,
+            source_snapshot=source_snapshot,
+        )
+    except AttemptArtifactError:
+        raise
+    except Exception as exc:
+        detail = sanitize_diagnostic(exc, limit=500)
+        raise hf_io.RetriableInfraError(
+            f"current-fence result observation is temporarily unavailable: {detail}"
+        ) from exc
+    if artifacts.result is None:
+        return None
+    return ResultManifest.from_dict(
+        {
+            key: value
+            for key, value in artifacts.result.items()
+            if key in ResultManifest.__dataclass_fields__
+        }
+    )
+
+
 def _same_terminal_claim(existing: ResultManifest, proposed: ResultManifest) -> bool:
     existing_values = existing.to_dict()
     proposed_values = proposed.to_dict()
