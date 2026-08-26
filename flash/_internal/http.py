@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import enum
 import inspect
-import os
 import struct
 import threading
 import types
@@ -17,15 +16,14 @@ from typing import Any
 from .http_refs import (
     _SNAPSHOT_ITEMS_MAX,
     _TRAVERSAL_NODES_MAX,
-    _function_append_only_capture_values,
     _function_bound_reference_values,
     _function_capture_values,
     _function_global_reference_values,
     _function_reference_values,
     _getattr_type_static,
     _is_registered_callback_name,
+    _module_function_code,
     _slot_entries,
-    _source_function_code,
 )
 from .http_refs import (
     _references_target as _find_references_target,
@@ -45,27 +43,12 @@ _STDLIB_URLOPEN_ARGUMENTS = (
     "cadefault",
     "context",
 )
-_STDLIB_URLOPEN_NAMES = (
-    "warnings",
-    "warn",
-    "DeprecationWarning",
-    "ValueError",
-    "_have_ssl",
-    "ssl",
-    "create_default_context",
-    "Purpose",
-    "SERVER_AUTH",
-    "set_alpn_protocols",
-    "HTTPSHandler",
-    "build_opener",
-    "_opener",
-    "open",
-)
 _HANDLER_COPY_ERROR = "installed urllib handler cannot be copied safely"
 _OPENER_COPY_ERROR = "installed urllib opener cannot be copied safely"
 _URLOPEN_CLASSIFICATION_ERROR = "stdlib urllib transport cannot be classified safely"
 _HANDLER_COPY_METHODS = (
     "__copy__",
+    "__dir__",
     "__getattribute__",
     "__getattr__",
     "__getnewargs__",
@@ -333,21 +316,29 @@ def _function_implementation_signature(function: types.FunctionType) -> tuple[ob
 
 def _stdlib_function_signature(function: types.FunctionType) -> tuple[object, ...]:
     qualname = object.__getattribute__(function, "__qualname__")
-    if type(qualname) is not str or type(urllib.request.__file__) is not str:
+    if type(qualname) is not str:
         raise TypeError
-    return (
-        _source_function_code(urllib.request.__file__, qualname),
-        _snapshot_value(None),
-        _snapshot_value(None),
-        (),
-    )
+    implementation = _function_implementation_signature(function)
+    return (_module_function_code(urllib.request, qualname), *implementation[1:])
 
 
 _STDLIB_HANDLER_CALLBACK_SIGNATURES = tuple(
     (callback, _stdlib_function_signature(callback)) for callback in _STDLIB_HANDLER_CALLBACKS
 )
+_STDLIB_URLOPEN = urllib.request.urlopen
+_STDLIB_URLOPEN_CODE = _module_function_code(urllib.request, "urlopen")
 _STANDARD_DO_OPEN = urllib.request.AbstractHTTPHandler.do_open
 _STANDARD_DO_OPEN_SIGNATURE = _stdlib_function_signature(_STANDARD_DO_OPEN)
+_STANDARD_OPENER_METHOD_SIGNATURES = tuple(
+    (
+        name,
+        method,
+        _stdlib_function_signature(method),
+    )
+    for name in _OPENER_REQUEST_METHODS
+    for method in (_getattr_type_static(urllib.request.OpenerDirector, name, _ABSENT_SLOT),)
+    if type(method) is types.FunctionType
+)
 _STANDARD_PROXY_CALLBACK_CODE = next(
     value
     for value in urllib.request.ProxyHandler.__init__.__code__.co_consts
@@ -700,11 +691,8 @@ def _validate_class_callbacks(
                 raise TypeError
         if not private_targets:
             continue
-        append_only = _function_append_only_capture_values(callback)
         for capture in _function_capture_values(callback):
-            if _references_target(capture, private_targets) and not (
-                type(capture) is list and any(capture is observer for observer in append_only)
-            ):
+            if _references_target(capture, private_targets):
                 raise TypeError
         for reference in (
             *_function_global_reference_values(callback),
@@ -795,6 +783,13 @@ def _validate_installed_opener(opener: urllib.request.OpenerDirector) -> None:
             if (
                 inspect.getattr_static(type(opener), name, _ABSENT_SLOT) is not standard
                 or inspect.getattr_static(opener, name, _ABSENT_SLOT) is not standard
+            ):
+                raise TypeError
+        for name, standard, signature in _STANDARD_OPENER_METHOD_SIGNATURES:
+            if (
+                inspect.getattr_static(urllib.request.OpenerDirector, name, _ABSENT_SLOT)
+                is not standard
+                or _function_implementation_signature(standard) != signature
             ):
                 raise TypeError
     except Exception:
@@ -954,8 +949,6 @@ def _classify_urlopen(transport: object) -> _UrlopenKind:
         return _UrlopenKind.INJECTED
     try:
         code = object.__getattribute__(transport, "__code__")
-        module_file = os.path.realpath(urllib.request.__file__)
-        code_file = os.path.realpath(code.co_filename)
         arguments = code.co_varnames[: code.co_argcount + code.co_kwonlyargcount]
         shape_matches = (
             code.co_name == "urlopen"
@@ -967,7 +960,12 @@ def _classify_urlopen(transport: object) -> _UrlopenKind:
         return _UrlopenKind.UNKNOWN_STDLIB
     if not shape_matches:
         return _UrlopenKind.INJECTED
-    if code_file != module_file or code.co_names != _STDLIB_URLOPEN_NAMES:
+    if transport is not _STDLIB_URLOPEN:
+        return _UrlopenKind.UNKNOWN_STDLIB
+    try:
+        if code != _STDLIB_URLOPEN_CODE:
+            return _UrlopenKind.UNKNOWN_STDLIB
+    except Exception:
         return _UrlopenKind.UNKNOWN_STDLIB
     return _UrlopenKind.STDLIB
 

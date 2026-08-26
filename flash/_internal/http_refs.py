@@ -6,8 +6,11 @@ import _thread
 import builtins
 import dis
 import functools
+import importlib.machinery
+import itertools
 import operator
 import types
+import zipimport
 
 _SNAPSHOT_ITEMS_MAX = 256
 _TRAVERSAL_NODES_MAX = 1024
@@ -40,9 +43,25 @@ def _is_registered_callback_name(name: str) -> bool:
     )
 
 
-def _source_function_code(filename: str, qualname: str) -> types.CodeType:
-    with builtins.open(filename, encoding="utf-8") as source_file:
-        root = compile(source_file.read(), filename, "exec", dont_inherit=True)
+def _module_function_code(module: types.ModuleType, qualname: str) -> types.CodeType:
+    spec = types.ModuleType.__getattribute__(module, "__spec__")
+    if type(spec) is not importlib.machinery.ModuleSpec:
+        raise TypeError
+    loader = object.__getattribute__(spec, "loader")
+    name = types.ModuleType.__getattribute__(module, "__name__")
+    loader_type = type(loader)
+    if loader_type is importlib.machinery.SourceFileLoader:
+        root = importlib.machinery.SourceFileLoader.get_code(loader, name)
+    elif loader_type is importlib.machinery.SourcelessFileLoader:
+        root = importlib.machinery.SourcelessFileLoader.get_code(loader, name)
+    elif loader_type is zipimport.zipimporter:
+        root = zipimport.zipimporter.get_code(loader, name)
+    elif loader is importlib.machinery.FrozenImporter:
+        root = importlib.machinery.FrozenImporter.get_code(name)
+    else:
+        raise TypeError
+    if type(root) is not types.CodeType:
+        raise TypeError
     pending = [root]
     matches = []
     while pending:
@@ -147,39 +166,6 @@ def _nested_default_origins(
     return mapped
 
 
-def _is_direct_method_load(instruction: dis.Instruction, name: str) -> bool:
-    return (instruction.opname == "LOAD_METHOD" and instruction.argval == name) or (
-        instruction.opname == "LOAD_ATTR"
-        and instruction.argval == name
-        and instruction.argrepr.startswith("NULL|self + ")
-    )
-
-
-def _is_direct_method_call(
-    instructions: tuple[dis.Instruction, ...],
-    root_index: int,
-    name: str,
-) -> bool:
-    if root_index + 1 >= len(instructions):
-        return False
-    root = instructions[root_index]
-    if not _is_direct_method_load(instructions[root_index + 1], name):
-        return False
-    root_position = root.positions
-    if root_position.lineno is None or root_position.col_offset is None:
-        return False
-    for following in instructions[root_index + 2 :]:
-        if following.opname != "CALL":
-            continue
-        position = following.positions
-        if (
-            position.lineno == root_position.lineno
-            and position.col_offset == root_position.col_offset
-        ):
-            return following.arg == 1
-    return False
-
-
 def _loaded_reference_paths(
     code: types.CodeType,
     root_origins: dict[str, tuple[str, str]],
@@ -197,6 +183,26 @@ def _loaded_reference_paths(
         if len(seen) > _SNAPSHOT_ITEMS_MAX:
             raise ValueError
         instructions = tuple(dis.get_instructions(current))
+        current_origins = dict(origins)
+        changed = True
+        while changed:
+            changed = False
+            for source, target in itertools.pairwise(instructions):
+                if target.opname not in {"STORE_FAST", "STORE_DEREF"}:
+                    continue
+                source_name = source.argval
+                if source.opname in {"LOAD_GLOBAL", "LOAD_NAME"}:
+                    origin = ("global", source_name)
+                elif source.opname in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}:
+                    origin = current_origins.get(source_name)
+                else:
+                    continue
+                target_name = target.argval
+                if type(source_name) is not str or type(target_name) is not str:
+                    raise ValueError
+                if origin is not None and current_origins.get(target_name) != origin:
+                    current_origins[target_name] = origin
+                    changed = True
         for index, instruction in enumerate(instructions):
             if instruction.opname in {"IMPORT_NAME", "IMPORT_FROM", "IMPORT_STAR"}:
                 raise ValueError
@@ -204,10 +210,13 @@ def _loaded_reference_paths(
             if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}:
                 root_kind = "global"
                 root_name = name
-            elif instruction.opname in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"} and name in origins:
-                root_kind, root_name = origins[name]
-            elif instruction.opname == "LOAD_CLOSURE" and name in origins:
-                if origins[name][0] == "bound":
+            elif (
+                instruction.opname in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}
+                and name in current_origins
+            ):
+                root_kind, root_name = current_origins[name]
+            elif instruction.opname == "LOAD_CLOSURE" and name in current_origins:
+                if current_origins[name][0] == "bound":
                     raise ValueError
                 continue
             else:
@@ -241,9 +250,9 @@ def _loaded_reference_paths(
             if type(free_names) is not tuple:
                 raise ValueError
             child_origins = {
-                name: origins[name]
+                name: current_origins[name]
                 for name in free_names
-                if name in origins and origins[name][0] != "bound"
+                if name in current_origins and current_origins[name][0] != "bound"
             }
             code_index = next(
                 index
@@ -432,108 +441,6 @@ def _function_capture_values(function: types.FunctionType) -> tuple[object, ...]
     return (*roots["default"].values(), *roots["binding"].values())
 
 
-def _function_append_only_capture_values(function: types.FunctionType) -> tuple[object, ...]:
-    code = object.__getattribute__(function, "__code__")
-    roots = _function_reference_roots(function)
-    captures = {**roots["default"], **roots["binding"]}
-    root_origins = {
-        name: (root_kind, name) for root_kind in ("default", "binding") for name in roots[root_kind]
-    }
-    usage = {name: [False, True] for name in captures}
-    pending = [(code, root_origins)]
-    seen: set[int] = set()
-    while pending:
-        current, origins = pending.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        if len(seen) > _SNAPSHOT_ITEMS_MAX:
-            raise ValueError
-        instructions = tuple(dis.get_instructions(current))
-        for index, instruction in enumerate(instructions):
-            name = instruction.argval
-            if name not in origins or instruction.opname not in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}:
-                continue
-            root_kind, root_name = origins[name]
-            if root_kind not in {"default", "binding"}:
-                continue
-            usage[root_name][0] = True
-            if not _is_direct_method_call(instructions, index, "append"):
-                usage[root_name][1] = False
-        constants = object.__getattribute__(current, "co_consts")
-        if type(constants) is not tuple:
-            raise ValueError
-        for child in constants:
-            if type(child) is not types.CodeType:
-                continue
-            free_names = object.__getattribute__(child, "co_freevars")
-            if type(free_names) is not tuple:
-                raise ValueError
-            child_origins = {name: origins[name] for name in free_names if name in origins}
-            code_index = next(
-                index
-                for index, instruction in enumerate(instructions)
-                if instruction.opname == "LOAD_CONST" and instruction.argval is child
-            )
-            child_origins.update(_nested_default_origins(instructions, code_index, child, origins))
-            pending.append((child, child_origins))
-    return tuple(
-        captures[name]
-        for name, (loaded, append_only) in usage.items()
-        if loaded
-        and append_only
-        and not any(
-            other_loaded and not other_append_only and captures[other_name] is captures[name]
-            for other_name, (other_loaded, other_append_only) in usage.items()
-        )
-    )
-
-
-def _direct_parent_observation_offsets(
-    function: types.FunctionType,
-    bound_self: object,
-) -> frozenset[tuple[int, int]]:
-    code = object.__getattribute__(function, "__code__")
-    roots = _function_reference_roots(function, bound_self)
-    append_only = _function_append_only_capture_values(function)
-    observers = {
-        (root_kind, name)
-        for root_kind in ("default", "binding")
-        for name, value in roots[root_kind].items()
-        if type(value) is list and any(value is observer for observer in append_only)
-    }
-    instructions = tuple(dis.get_instructions(code))
-    offsets = set()
-    for index, instruction in enumerate(instructions):
-        if instruction.opname not in _FAST_LOAD_OPNAMES or instruction.argval not in roots["bound"]:
-            continue
-        if index < 2 or index + 2 >= len(instructions):
-            continue
-        parent = instructions[index + 1]
-        receiver = instructions[index - 2]
-        method = instructions[index - 1]
-        receiver_name = receiver.argval
-        if (
-            parent.opname != "LOAD_ATTR"
-            or parent.argval != "parent"
-            or not _is_direct_method_load(method, "append")
-            or receiver.opname not in _FAST_LOAD_OPNAMES | {"LOAD_DEREF"}
-            or type(receiver_name) is not str
-            or not any(
-                (root_kind, receiver_name) in observers for root_kind in ("default", "binding")
-            )
-        ):
-            continue
-        call = instructions[index + 2]
-        if call.opname == "PRECALL":
-            if call.arg != 1 or index + 3 >= len(instructions):
-                continue
-            call = instructions[index + 3]
-        if call.opname == "CALL" and call.arg == 1:
-            offsets.add((id(code), instruction.offset))
-    return frozenset(offsets)
-
-
 def _function_global_reference_values(function: types.FunctionType) -> tuple[object, ...]:
     code = object.__getattribute__(function, "__code__")
     roots = _function_reference_roots(function)
@@ -556,7 +463,7 @@ def _function_bound_reference_values(
     code = object.__getattribute__(function, "__code__")
     roots = _function_reference_roots(function, bound_self)
     root_origins = {name: ("bound", name) for name in roots["bound"]}
-    safe_parent_offsets = _direct_parent_observation_offsets(function, bound_self)
+    safe_parent_offsets = frozenset()
     values = []
     for root_kind, name, attributes in _loaded_reference_paths(
         code, root_origins, safe_parent_offsets
@@ -583,11 +490,7 @@ def _function_reference_values(
         for root_kind in ("default", "binding", "bound")
         for name in roots[root_kind]
     }
-    safe_parent_offsets = (
-        frozenset()
-        if bound_self is _ABSENT_SLOT
-        else _direct_parent_observation_offsets(function, bound_self)
-    )
+    safe_parent_offsets = frozenset()
     values = [*roots["default"].values(), *roots["binding"].values()]
     for root_kind, name, attributes in _loaded_reference_paths(
         code, root_origins, safe_parent_offsets

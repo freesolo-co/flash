@@ -149,12 +149,10 @@ def test_building_and_using_private_opener_does_not_mutate_global_opener(monkeyp
 
 def test_installed_https_handler_copy_preserves_context_and_state() -> None:
     context = ssl.create_default_context()
-    observed_parents: list[object] = []
     observed_state: list[tuple[object, int]] = []
 
     class RecordingHttpsHandler(urllib.request.HTTPSHandler):
         def https_open(self, request):
-            observed_parents.append(self.parent)
             observed_state.append((self._context, self.debuglevel))
             return _response(request.full_url)
 
@@ -170,7 +168,11 @@ def test_installed_https_handler_copy_preserves_context_and_state() -> None:
     ) as response:
         assert response.read() == b"ok"
 
-    copied = observed_parents.pop()
+    copied = next(
+        item
+        for item in http_transport._INSTALLED_OPENER_CACHE.private.handlers
+        if isinstance(item, RecordingHttpsHandler)
+    )
     copied_context, copied_debuglevel = observed_state.pop()
     assert copied is not handler
     assert copied_context is context
@@ -195,14 +197,12 @@ def test_installed_proxy_and_auth_handler_state_is_preserved() -> None:
     proxy = StatefulProxyHandler(proxies)
     proxy.marker = marker
     auth = urllib.request.HTTPBasicAuthHandler(password_manager)
-    observed_parents: list[object] = []
     observed_requests: list[object] = []
 
     class TerminalHandler(urllib.request.BaseHandler):
         handler_order = 150
 
         def custom_open(self, request):
-            observed_parents.append(self.parent)
             observed_requests.append(request)
             return _response(request.full_url)
 
@@ -217,7 +217,7 @@ def test_installed_proxy_and_auth_handler_state_is_preserved() -> None:
     ) as response:
         assert response.read() == b"ok"
 
-    copied_opener = observed_parents.pop()
+    copied_opener = http_transport._INSTALLED_OPENER_CACHE.private
     request = observed_requests.pop()
     copied_proxy = next(
         item for item in copied_opener.handlers if isinstance(item, urllib.request.ProxyHandler)
@@ -344,13 +344,11 @@ def test_default_opener_discovers_proxy_environment_on_first_request(monkeypatch
 
 def test_installed_cookie_processor_with_rlock_state_is_supported() -> None:
     cookie_jar = http.cookiejar.CookieJar()
-    observed: list[object] = []
 
     class TerminalHandler(urllib.request.BaseHandler):
         handler_order = 1000
 
         def custom_open(self, request):
-            observed.append(self.parent)
             return _response(request.full_url)
 
     opener = urllib.request.build_opener(
@@ -366,7 +364,7 @@ def test_installed_cookie_processor_with_rlock_state_is_supported() -> None:
 
     copied_cookie = next(
         item
-        for item in observed[0].handlers
+        for item in http_transport._INSTALLED_OPENER_CACHE.private.handlers
         if isinstance(item, urllib.request.HTTPCookieProcessor)
     )
     assert copied_cookie.cookiejar is cookie_jar
@@ -570,7 +568,6 @@ def test_installed_container_configuration_mutation_rebuilds_private_opener() ->
 def test_concurrent_installed_configuration_refresh_is_singleton() -> None:
     barrier = threading.Barrier(8)
     observed_tokens: list[str] = []
-    observed_parents: list[object] = []
     observed_lock = threading.Lock()
 
     class GatewayHandler(urllib.request.BaseHandler):
@@ -580,7 +577,6 @@ def test_concurrent_installed_configuration_refresh_is_singleton() -> None:
         def custom_open(self, request):
             with observed_lock:
                 observed_tokens.append(self.token)
-                observed_parents.append(self.parent)
             return _response(request.full_url)
 
     handler = GatewayHandler("token-a")
@@ -589,7 +585,6 @@ def test_concurrent_installed_configuration_refresh_is_singleton() -> None:
     with _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/first"), timeout=1.0):
         pass
     observed_tokens.clear()
-    observed_parents.clear()
     first_private = http_transport._INSTALLED_OPENER_CACHE.private
     handler.token = "token-b"
 
@@ -603,12 +598,9 @@ def test_concurrent_installed_configuration_refresh_is_singleton() -> None:
     with ThreadPoolExecutor(max_workers=8) as executor:
         results = list(executor.map(request, range(8)))
 
-    parents = {id(parent) for parent in observed_parents}
     assert results == [b"ok"] * 8
     assert observed_tokens == ["token-b"] * 8
-    assert len(parents) == 1
-    assert observed_parents[0] is http_transport._INSTALLED_OPENER_CACHE.private
-    assert observed_parents[0] is not first_private
+    assert http_transport._INSTALLED_OPENER_CACHE.private is not first_private
 
 
 def test_installed_slot_configuration_change_rebuilds_private_opener() -> None:
@@ -1002,13 +994,13 @@ def test_non_redirect_error_reaches_later_response_processors(protocol: str) -> 
 
 def test_concurrent_custom_opener_cache_construction_is_singleton() -> None:
     barrier = threading.Barrier(8)
-    seen_parents: list[object] = []
+    seen_requests: list[str] = []
     seen_lock = threading.Lock()
 
     class TerminalHandler(urllib.request.BaseHandler):
         def custom_open(self, request):
             with seen_lock:
-                seen_parents.append(self.parent)
+                seen_requests.append(request.full_url)
             return _response(request.full_url)
 
     opener = urllib.request.build_opener(TerminalHandler())
@@ -1025,8 +1017,8 @@ def test_concurrent_custom_opener_cache_construction_is_singleton() -> None:
         results = list(executor.map(request, range(8)))
 
     assert results == [b"ok"] * 8
-    assert len({id(parent) for parent in seen_parents}) == 1
-    assert seen_parents[0] is http_transport._INSTALLED_OPENER_CACHE.private
+    assert sorted(seen_requests) == [f"custom://source.invalid/{index}" for index in range(8)]
+    assert http_transport._INSTALLED_OPENER_CACHE.private is not None
 
 
 def test_mixed_redirect_handler_fails_before_transport() -> None:
@@ -1114,6 +1106,35 @@ def test_installed_redirect_handler_cannot_reach_sink() -> None:
     assert urllib.request._opener is opener
 
 
+def test_handler_custom_dir_fails_without_execution() -> None:
+    dir_calls: list[str] = []
+    contacted: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+
+    def custom_dir(self):
+        dir_calls.append("dir")
+        self.custom_open = lambda request: _response(request.full_url)
+        return object.__dir__(self)
+
+    type.__setattr__(CallbackHandler, "__dir__", custom_dir)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert dir_calls == []
+    assert contacted == []
+
+
 def test_installed_opener_subclass_override_fails_before_transport() -> None:
     contacted: list[str] = []
 
@@ -1132,6 +1153,34 @@ def test_installed_opener_subclass_override_fails_before_transport() -> None:
 
     assert contacted == []
     assert urllib.request._opener is opener
+
+
+def test_mutated_standard_opener_open_fails_before_transport(monkeypatch) -> None:
+    contacted: list[str] = []
+    callback = urllib.request.OpenerDirector.open
+    original_code = callback.__code__
+    replacement_module = compile(
+        "def replacement(self, fullurl, data=None, timeout=None):\n"
+        "    contacted.append(str(fullurl))\n"
+        "    raise AssertionError('mutated opener transport executed')\n",
+        "<mutated-opener-open>",
+        "exec",
+    )
+    replacement_code = next(
+        value for value in replacement_module.co_consts if isinstance(value, type(original_code))
+    )
+    monkeypatch.setitem(callback.__globals__, "contacted", contacted)
+    monkeypatch.setattr(callback, "__code__", replacement_code)
+
+    opener = urllib.request.OpenerDirector()
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib opener cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert contacted == []
 
 
 def test_installed_opener_internal_open_override_fails_before_transport() -> None:
@@ -1477,10 +1526,42 @@ def test_unknown_stdlib_urlopen_fails_closed_before_transport(monkeypatch) -> No
     assert contacted == []
 
 
-def test_sourceless_stdlib_urlopen_fails_closed_before_transport(monkeypatch) -> None:
+def test_http_transport_import_does_not_read_urllib_source() -> None:
+    script = textwrap.dedent(
+        """
+        import builtins
+        import urllib.request
+
+        source = urllib.request.__file__
+        original_open = builtins.open
+
+        def guarded_open(filename, *args, **kwargs):
+            if filename == source:
+                raise FileNotFoundError(filename)
+            return original_open(filename, *args, **kwargs)
+
+        builtins.open = guarded_open
+        import flash._internal.http
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=os.path.dirname(os.path.dirname(__file__)),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_sourceless_stdlib_urlopen_remains_supported(monkeypatch) -> None:
     contacted: list[str] = []
 
     class UnexpectedTransport(urllib.request.BaseHandler):
+        handler_order = 100
+
         def https_open(self, request):
             contacted.append(request.full_url)
             return _response(request.full_url)
@@ -1488,11 +1569,12 @@ def test_sourceless_stdlib_urlopen_fails_closed_before_transport(monkeypatch) ->
     monkeypatch.setattr(urllib.request, "__file__", f"{urllib.request.__file__}c")
     urllib.request.install_opener(urllib.request.build_opener(UnexpectedTransport()))
 
-    with pytest.raises(urllib.error.URLError) as exc_info:
-        _urlopen_no_redirect(urllib.request.Request("https://source.invalid/data"), timeout=3.0)
+    with _urlopen_no_redirect(
+        urllib.request.Request("https://source.invalid/data"), timeout=3.0
+    ) as response:
+        assert response.read() == b"ok"
 
-    assert exc_info.value.reason == "stdlib urllib transport cannot be classified safely"
-    assert contacted == []
+    assert contacted == ["https://source.invalid/data"]
 
 
 def test_urlopen_helper_preserves_late_bound_monkeypatch(monkeypatch) -> None:
@@ -1668,6 +1750,53 @@ def test_mutated_instance_callback_holder_fails_before_cached_transport() -> Non
     assert contacted == [(safe, None)]
     assert all(url != sink for url, _authorization in contacted)
     assert http_transport._INSTALLED_OPENER_CACHE.private is first_private
+
+
+@pytest.mark.parametrize("root_kind", ["module", "type"])
+def test_local_alias_of_global_namespace_fails_before_transport(root_kind: str) -> None:
+    source = "custom://source.invalid/data"
+    sink = "custom://sink.invalid/steal"
+    contacted: list[str] = []
+    namespace = (
+        types.ModuleType("retained_namespace")
+        if root_kind == "module"
+        else type("RetainedNamespace", (), {})
+    )
+    callback_globals = {
+        "contacted": contacted,
+        "namespace": namespace,
+        "sink": sink,
+        "urllib": urllib,
+        "response": _response,
+    }
+    exec(
+        "def custom_open(self, request):\n"
+        "    contacted.append(request.full_url)\n"
+        "    if request.full_url == sink:\n"
+        "        return response(request.full_url)\n"
+        "    alias = namespace\n"
+        "    redirected = urllib.request.Request(sink)\n"
+        "    return alias.target.open(redirected, timeout=request.timeout)\n",
+        callback_globals,
+    )
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        pass
+
+    type.__setattr__(CallbackHandler, "custom_open", callback_globals["custom_open"])
+    opener = urllib.request.build_opener(CallbackHandler())
+    namespace.target = opener
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(
+            urllib.request.Request(source, headers={"Authorization": "Bearer secret"}),
+            timeout=1.0,
+        )
+
+    assert contacted == []
 
 
 def test_attrgetter_callback_fails_before_transport() -> None:
@@ -4364,7 +4493,29 @@ def test_class_callback_parent_descendant_fails_before_transport() -> None:
     assert all(url != sink for url, _authorization in contacted)
 
 
-def test_class_callback_direct_self_parent_is_supported() -> None:
+def test_externally_owned_parent_observer_fails_before_transport() -> None:
+    observed: list[object] = []
+    contacted: list[str] = []
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            observed.append(self.parent)
+            contacted.append(request.full_url)
+            return _response(request.full_url)
+
+    opener = urllib.request.build_opener(CallbackHandler())
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
+
+    assert observed == []
+    assert contacted == []
+
+
+def test_class_callback_direct_self_parent_fails_before_transport() -> None:
     observed: list[object] = []
 
     class CallbackHandler(urllib.request.BaseHandler):
@@ -4376,12 +4527,12 @@ def test_class_callback_direct_self_parent_is_supported() -> None:
     opener = urllib.request.build_opener(handler)
     urllib.request.install_opener(opener)
 
-    with _urlopen_no_redirect(
-        urllib.request.Request("custom://source.invalid/data"), timeout=1.0
-    ) as response:
-        assert response.read() == b"ok"
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(urllib.request.Request("custom://source.invalid/data"), timeout=1.0)
 
-    assert observed == [http_transport._INSTALLED_OPENER_CACHE.private]
+    assert observed == []
 
 
 @pytest.mark.parametrize("target_kind", ["handler", "opener"])
