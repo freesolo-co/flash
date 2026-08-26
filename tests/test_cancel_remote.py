@@ -27,6 +27,7 @@ import flash.runner.supervise.lifecycle as runner_lifecycle
 import flash.runner.supervise.recovery as runner_recovery
 import flash.runner.supervise.transitions as runner_transitions
 import flash.serve.contract.errors as serving_errors
+from flash.adapters.artifacts import MAX_ATTEMPT_ID
 from flash.providers.runpod.serverless.endpoints import (
     _run_suffix,
     _select_endpoint_resources,
@@ -132,17 +133,22 @@ def test_isolate_flash_state_resets_runpod_flash_manager_on_scope_change(tmp_pat
     assert FakeRM._resources_initialized is True
 
 
-def test_select_matches_live_prefixed_endpoint():
+def test_select_matches_only_canonical_attempt_endpoints():
     run_id = "flash-123-c220526e"
     target = endpoint_name("RTX 5090", _run_suffix(run_id))
     resources = {
-        "u1": _res(f"live-{endpoint_name('RTX 5090', attempt_suffix(run_id, 0))}"),
-        "u2": _res(target),
-        "u3": _res(f"{target}-r1"),
-        "u4": _res("flash-5090-deadbeef-a0"),
-        "u5": _res(f"live-flash-4090-{attempt_suffix(run_id, 0)}"),
+        "u0": _res(f"live-{endpoint_name('RTX 5090', attempt_suffix(run_id, 0))}"),
+        "umax": _res(endpoint_name("RTX 5090", attempt_suffix(run_id, MAX_ATTEMPT_ID))),
+        "uleading": _res(f"{target}-a00"),
+        "uoverflow": _res(f"{target}-a{MAX_ATTEMPT_ID + 1}"),
+        "uprefix": _res(f"prefix-{target}-a0"),
+        "usuffix": _res(f"{target}-a0-suffix"),
+        "ubase": _res(target),
+        "ulegacy": _res(f"{target}-r1"),
+        "uother": _res("flash-5090-deadbeef-a0"),
+        "ugpu": _res(f"live-flash-4090-{attempt_suffix(run_id, 0)}"),
     }
-    assert _select_endpoint_resources(resources, target) == ["u1"]
+    assert _select_endpoint_resources(resources, target) == ["u0", "umax"]
 
 
 def test_select_empty_target_matches_nothing():
@@ -2177,6 +2183,31 @@ def _fake_sdk_with_orphan(monkeypatch, *, rest_find, rest_delete, resources=None
         lambda endpoint_id, _fingerprint: rest_delete(endpoint_id),
     )
     return target
+
+
+def test_terminate_deletes_only_canonical_rest_attempt_names(monkeypatch):
+    deleted = []
+
+    def discovered_endpoints(valid_name):
+        target = valid_name.rsplit("-a", 1)[0]
+        return [
+            {"id": "valid-zero", "name": valid_name},
+            {"id": "valid-max", "name": f"{target}-a{MAX_ATTEMPT_ID}"},
+            {"id": "leading-zero", "name": f"{target}-a00"},
+            {"id": "overflow", "name": f"{target}-a{MAX_ATTEMPT_ID + 1}"},
+            {"id": "prefix", "name": f"prefix-{target}-a0"},
+            {"id": "suffix", "name": f"{target}-a0-suffix"},
+        ]
+
+    _fake_sdk_with_orphan(
+        monkeypatch,
+        rest_find=discovered_endpoints,
+        rest_delete=lambda endpoint_id: deleted.append(endpoint_id) or True,
+    )
+
+    ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
+
+    assert deleted == ["valid-zero", "valid-max"]
 
 
 def test_terminate_deletes_a_rest_discovered_orphan(monkeypatch):

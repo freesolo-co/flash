@@ -50,7 +50,14 @@ def attempt_suffix(run_id: str, attempt: int) -> str:
 
 def _endpoint_name_matches_run(name: str, target: str) -> bool:
     canonical = str(name or "").removeprefix("live-")
-    return re.fullmatch(re.escape(target) + r"-a[0-9]+", canonical) is not None
+    if len(canonical) > _ENDPOINT_NAME_MAX:
+        return False
+    match = re.fullmatch(re.escape(target) + r"-a([0-9]+)", canonical)
+    if match is None:
+        return False
+    ordinal = match.group(1)
+    attempt = int(ordinal)
+    return ordinal == str(attempt) and attempt <= MAX_ATTEMPT_ID
 
 
 def _select_endpoint_resources(resources: dict, target: str) -> list[str]:

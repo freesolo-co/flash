@@ -1307,6 +1307,57 @@ def test_record_cleanup_remote_does_not_revive_cleared_remote(monkeypatch, tmp_p
     ]
 
 
+def test_recovered_failure_rejects_stale_fence_without_settling_attempt(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="failure-stale-fence", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote("endpoint-active", "job-active", attempt=0, fence=1)
+    _persist_active_attempt(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+        remote,
+    )
+    stale_remote = {**remote, "fence": 2}
+    before = runner_status._load_status_json(spec.run_id)
+
+    assert (
+        runner_reconciliation._compare_and_fail_remote(
+            spec.run_id,
+            stale_remote,
+            "stale provider failure",
+        )
+        is False
+    )
+    assert runner_status._load_status_json(spec.run_id) == before
+    assert runner_status.get_status(spec.run_id).attempt["state"] == "active"
+
+
+def test_recovered_completion_rejects_stale_fence_without_settling_attempt(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="completion-stale-fence", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote("endpoint-active", "job-active", attempt=0, fence=1)
+    _persist_active_attempt(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+        remote,
+    )
+    stale_remote = {**remote, "fence": 2}
+    before = runner_status._load_status_json(spec.run_id)
+    monkeypatch.setattr(
+        runner_status,
+        "_persist_metrics",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("metrics must not persist")),
+    )
+
+    assert (
+        runner_reconciliation._compare_and_complete_remote(spec.run_id, stale_remote, spec, {})
+        is False
+    )
+    assert runner_status._load_status_json(spec.run_id) == before
+    assert runner_status.get_status(spec.run_id).attempt["state"] == "active"
+
+
 def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, tmp_path):
     from flash.core.spec import JobSpec
 

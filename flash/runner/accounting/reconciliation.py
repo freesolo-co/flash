@@ -63,11 +63,38 @@ def _remote_resource_identity(remote: object) -> tuple | None:
     return None
 
 
+def _remote_attempt_identity(remote: object) -> tuple[int, int] | None:
+    if not isinstance(remote, dict) or _remote_resource_identity(remote) is None:
+        return None
+    return remote["attempt"], remote["fence"]
+
+
 def _expected_remote_matches(current: object, expected: dict | None) -> bool:
     if expected is None:
         return current is None
     expected_identity = _remote_resource_identity(expected)
     return expected_identity is not None and _remote_resource_identity(current) == expected_identity
+
+
+def _expected_terminal_remote_matches(current: object, expected: dict | None) -> bool:
+    return _expected_remote_matches(current, expected) and (
+        expected is None or _remote_attempt_identity(current) == _remote_attempt_identity(expected)
+    )
+
+
+def _settle_terminal_attempt(status: RunStatus, expected_remote: dict | None) -> bool:
+    if expected_remote is None:
+        status_ops.settle_current_attempt(status)
+        return True
+    expected_attempt = _remote_attempt_identity(expected_remote)
+    if expected_attempt is None or not status.attempt:
+        return False
+    return status_ops.transition_attempt_state(
+        status,
+        "settled",
+        expected_attempt_id=expected_attempt[0],
+        expected_fence=expected_attempt[1],
+    )
 
 
 def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
@@ -126,10 +153,11 @@ def _compare_and_fail_remote(
         status = status_ops.get_status(run_id)
         if status.state in state.TERMINAL_STATES:
             return False
-        if not _expected_remote_matches(status.remote, expected_remote):
+        if not _expected_terminal_remote_matches(status.remote, expected_remote):
+            return False
+        if not _settle_terminal_attempt(status, expected_remote):
             return False
         status.state = "failed"
-        status_ops.settle_current_attempt(status)
         status.error = error
         status.updated_at = time.time()
         if status.finished_at is None:
@@ -140,7 +168,7 @@ def _compare_and_fail_remote(
     expected_after = expected_remote
     if (
         confirmed.state != "failed"
-        or not _expected_remote_matches(confirmed.remote, expected_after)
+        or not _expected_terminal_remote_matches(confirmed.remote, expected_after)
         or confirmed.error != error
     ):
         raise RuntimeError("terminal recovery failure was not durably confirmed")
@@ -161,7 +189,7 @@ def _compare_and_complete_remote(
         status = status_ops.get_status(run_id)
         if status.state in state.TERMINAL_STATES:
             return False
-        if not _expected_remote_matches(status.remote, expected_remote):
+        if not _expected_terminal_remote_matches(status.remote, expected_remote):
             return False
     expected_attempt = expected_remote.get("attempt") if isinstance(expected_remote, dict) else None
     expected_fence = expected_remote.get("fence") if isinstance(expected_remote, dict) else None
@@ -178,12 +206,13 @@ def _compare_and_complete_remote(
         status = status_ops.get_status(run_id)
         if status.state in state.TERMINAL_STATES:
             return False
-        if not _expected_remote_matches(status.remote, expected_remote):
+        if not _expected_terminal_remote_matches(status.remote, expected_remote):
+            return False
+        if not _settle_terminal_attempt(status, expected_remote):
             return False
         measured = float(status.cost_usd or 0.0) + recovered_cost
         charge_usd = costs._status_estimated_charge(status, spec, fallback=measured)
         status.state = "done"
-        status_ops.settle_current_attempt(status)
         status.cost_usd = charge_usd
         status.artifacts_dir = state.artifacts_dir(spec)
         status.source_verified_attempt = verified_attempt
@@ -193,7 +222,9 @@ def _compare_and_complete_remote(
         state._save_status_unlocked(status)
         report_status = status
     confirmed = status_ops.get_status(run_id)
-    if confirmed.state != "done" or not _expected_remote_matches(confirmed.remote, expected_remote):
+    if confirmed.state != "done" or not _expected_terminal_remote_matches(
+        confirmed.remote, expected_remote
+    ):
         raise RuntimeError("terminal recovery completion was not durably confirmed")
     if report_status is not None:
         reporting._report_status(report_status)

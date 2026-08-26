@@ -55,7 +55,12 @@ def test_attempt_suffix_is_bounded_and_old_names_do_not_match():
     assert suffix.endswith(f"-a{MAX_ATTEMPT_ID}")
     assert len(endpoint_name("RTX 5090", suffix)) <= 64
     target = endpoint_name("RTX 5090", _run_suffix(run_id))
+    assert _endpoint_name_matches_run(endpoint_name("RTX 5090", attempt_suffix(run_id, 0)), target)
     assert _endpoint_name_matches_run(endpoint_name("RTX 5090", suffix), target)
+    assert not _endpoint_name_matches_run(f"{target}-a00", target)
+    assert not _endpoint_name_matches_run(f"{target}-a{MAX_ATTEMPT_ID + 1}", target)
+    assert not _endpoint_name_matches_run(f"prefix-{target}-a0", target)
+    assert not _endpoint_name_matches_run(f"{target}-a0-suffix", target)
     assert not _endpoint_name_matches_run(target, target)
     assert not _endpoint_name_matches_run(f"{target}r1", target)
     with pytest.raises(ValueError, match="attempt identity is invalid"):
