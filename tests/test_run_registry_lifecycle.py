@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+import copy
+import json
+
+import pytest
+
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+from flash.core.spec import JobSpec
+from flash.runner.lifecycle.state import RunStatus
+from flash.server.domain.registry import runs
+from tests._helpers.source_snapshot import valid_source_snapshot
+
+_PROJECT_ID = "11111111-1111-4111-8111-111111111111"
+_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
+
+
+def _spec(*, algorithm: str = "sft") -> JobSpec:
+    return JobSpec.from_dict(
+        {
+            "run_id": f"lifecycle-{algorithm}",
+            "model": "Qwen/Qwen3.5-9B",
+            "algorithm": algorithm,
+            "project": _PROJECT_ID,
+            "train": {"epochs": 1, "hf_repo": "org/artifacts"},
+            "gpu": {"max_wall_seconds": 3600},
+        }
+    )
+
+
+def _remote(*, attempt: int = 0, endpoint_id: str = "endpoint-1") -> dict:
+    return {
+        "provider": "runpod",
+        "endpoint_id": endpoint_id,
+        "endpoint_name": f"{endpoint_id}-name",
+        "key_fingerprint": _RUNPOD_FINGERPRINT,
+        "job_id": "job-1",
+        "attempt": attempt,
+        "started_ts": 1.0,
+    }
+
+
+def _status(spec: JobSpec) -> RunStatus:
+    return RunStatus(
+        run_id=spec.run_id,
+        state="queued",
+        spec=spec.to_dict(),
+        platform_context={"org_id": "org-1"},
+        effective_preparation={"worker_spec": spec.to_internal_dict()},
+        source_snapshot=valid_source_snapshot(),
+    )
+
+
+def _report(monkeypatch, status: RunStatus) -> dict:
+    bodies = []
+    monkeypatch.setattr(runs, "_post", lambda _path, body: bodies.append(body) or True)
+    assert runs.record_training_run(status=status) is True
+    return bodies[-1]
+
+
+def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _spec()
+    status = _status(spec)
+
+    runner_state._save_status(status)
+    body = _report(monkeypatch, status)
+    assert body["lifecycle"] == {
+        "started": False,
+        "progressed": False,
+        "artifactsComplete": False,
+        "cleanupComplete": False,
+    }
+
+    status.state = "running"
+    status.remote = _remote()
+    runner_state._save_status(status)
+    assert _report(monkeypatch, status)["lifecycle"] == {
+        "started": True,
+        "progressed": False,
+        "artifactsComplete": False,
+        "cleanupComplete": False,
+    }
+
+    status.last_heartbeat = {
+        "attempt": 0,
+        "stage": "sft_step",
+        "step": 1,
+    }
+    runner_state._save_status(status)
+    assert _report(monkeypatch, status)["lifecycle"] == {
+        "started": True,
+        "progressed": True,
+        "artifactsComplete": False,
+        "cleanupComplete": False,
+    }
+
+    status.state = "done"
+    status.artifacts_dir = "/private/artifacts/lifecycle-sft"
+    status.source_verified_attempt = 0
+    runner_state._save_status(status)
+    body = _report(monkeypatch, status)
+    assert body["adapterRef"] == spec.run_id
+    assert body["lifecycle"] == {
+        "started": True,
+        "progressed": True,
+        "artifactsComplete": True,
+        "cleanupComplete": False,
+    }
+    assert set(body["lifecycle"]) == {
+        "started",
+        "progressed",
+        "artifactsComplete",
+        "cleanupComplete",
+    }
+    assert all(isinstance(value, bool) for value in body["lifecycle"].values())
+
+    status.remote = None
+    runner_state._save_status(status, _cleanup_remotes=None)
+    assert _report(monkeypatch, status)["lifecycle"] == {
+        "started": False,
+        "progressed": False,
+        "artifactsComplete": True,
+        "cleanupComplete": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "stage"),
+    [("sft", "sft_step"), ("grpo", "rl_step"), ("opd", "opd_step")],
+)
+def test_progress_projects_each_training_algorithm(
+    monkeypatch,
+    tmp_path,
+    algorithm,
+    stage,
+):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / algorithm))
+    spec = _spec(algorithm=algorithm)
+    status = _status(spec)
+    status.state = "running"
+    status.remote = _remote()
+    status.last_heartbeat = {"attempt": 0, "stage": stage, "step": 1}
+    runner_state._save_status(status)
+
+    lifecycle = _report(monkeypatch, status)["lifecycle"]
+    assert lifecycle["started"] is True
+    assert lifecycle["progressed"] is True
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "heartbeat"),
+    [
+        ("sft", {"attempt": 0, "stage": "sft_step", "step": 0}),
+        ("sft", {"attempt": 0, "stage": "sft_step", "step": True}),
+        ("sft", {"attempt": 0, "stage": "sft_step", "step": 1.0}),
+        ("sft", {"attempt": 1, "stage": "sft_step", "step": 1}),
+        ("sft", {"attempt": 0, "stage": "rl_step", "step": 1}),
+        ("grpo", {"attempt": 0, "stage": "sft_step", "step": 1}),
+        ("opd", {"attempt": 0, "stage": "rl_step", "step": 1}),
+    ],
+)
+def test_progress_requires_exact_algorithm_attempt_and_positive_integer_step(
+    monkeypatch,
+    tmp_path,
+    algorithm,
+    heartbeat,
+):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / algorithm))
+    spec = _spec(algorithm=algorithm)
+    status = _status(spec)
+    status.state = "running"
+    status.remote = _remote()
+    status.last_heartbeat = heartbeat
+    runner_state._save_status(status)
+
+    lifecycle = _report(monkeypatch, status)["lifecycle"]
+    assert lifecycle["started"] is True
+    assert lifecycle["progressed"] is False
+
+
+def test_lifecycle_fails_closed_without_exact_durable_snapshot(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _spec()
+    status = _status(spec)
+    status.state = "done"
+    status.remote = _remote()
+    status.last_heartbeat = {"attempt": 0, "stage": "sft_step", "step": 1}
+    status.artifacts_dir = "/private/artifacts/lifecycle-sft"
+    status.source_verified_attempt = 0
+    runner_state._save_status(status)
+
+    stale = copy.deepcopy(status)
+    status.error = "newer durable write"
+    runner_state._save_status(status)
+
+    assert _report(monkeypatch, stale)["lifecycle"] == {
+        "started": False,
+        "progressed": False,
+        "artifactsComplete": False,
+        "cleanupComplete": False,
+    }
+
+
+def test_cleanup_requires_no_active_remote_and_an_empty_private_set(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _spec()
+    status = _status(spec)
+    status.state = "cancelled"
+    status.remote = _remote()
+    runner_state._save_status(status, _cleanup_remotes=[_remote()])
+
+    lifecycle = _report(monkeypatch, status)["lifecycle"]
+    assert lifecycle["cleanupComplete"] is False
+
+    status.remote = None
+    runner_state._save_status(status)
+    lifecycle = _report(monkeypatch, status)["lifecycle"]
+    assert lifecycle["cleanupComplete"] is False
+
+    raw = runner_status._load_status_json(status.run_id)
+    raw[runner_state._CLEANUP_REMOTES_KEY] = {"invalid": "shape"}
+    path = runner_state.runs_file_path(status.run_id, ".json")
+    with open(path, "w") as handle:
+        json.dump(raw, handle)
+    status.report_sequence = raw["report_sequence"]
+    lifecycle = _report(monkeypatch, status)["lifecycle"]
+    assert lifecycle["cleanupComplete"] is False

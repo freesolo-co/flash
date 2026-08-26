@@ -1509,6 +1509,8 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     for remote in (confirmed, endpoint_only, unconfirmed):
         assert runner_reconciliation._preserve_cleanup_remote(spec.run_id, remote) is True
 
+    reports = []
+    monkeypatch.setattr(runner_reporting, "_report_status", reports.append)
     events = []
 
     class Provider:
@@ -1542,7 +1544,8 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     ]
     raw = runner_status._load_status_json(spec.run_id)
     assert raw[runner_state._CLEANUP_REMOTES_KEY] == [unconfirmed]
-    assert raw["remote"] == confirmed
+    assert raw["remote"] is None
+    assert [report.remote for report in reports] == [None, None]
 
 
 def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
@@ -1690,7 +1693,7 @@ def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypat
         different_job,
         different_attempt,
     ]
-    assert raw["remote"] == confirmed
+    assert raw["remote"] is None
 
 
 def test_next_attempt_requires_persisted_integer_identity():

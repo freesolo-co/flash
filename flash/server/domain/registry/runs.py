@@ -63,6 +63,120 @@ def _managed_environment_slug(spec: dict[str, Any]) -> str | None:
         return None
 
 
+def _matching_persisted_status(status: Any) -> dict[str, Any] | None:
+    """Load the exact durable snapshot represented by this ordered report."""
+    sequence = getattr(status, "report_sequence", None)
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+        return None
+    try:
+        from flash.runner.lifecycle.status import _load_status_json
+
+        raw = _load_status_json(status.run_id)
+    except Exception:
+        return None
+    if raw.get("run_id") != status.run_id or raw.get("report_sequence") != sequence:
+        return None
+    return raw
+
+
+def _canonical_remote_attempt(remote: object) -> int | None:
+    try:
+        from flash.runner.accounting.reconciliation import _canonical_cleanup_remote
+
+        canonical = _canonical_cleanup_remote(remote)
+    except Exception:
+        return None
+    if canonical is None:
+        return None
+    attempt = canonical.get("attempt")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+        return None
+    return attempt
+
+
+def _progressed(raw: dict[str, Any], remote_attempt: int | None) -> bool:
+    if remote_attempt is None:
+        return False
+    spec = raw.get("spec")
+    heartbeat = raw.get("last_heartbeat")
+    if not isinstance(spec, dict) or not isinstance(heartbeat, dict):
+        return False
+    expected_stage = {
+        "sft": "sft_step",
+        "grpo": "rl_step",
+        "opd": "opd_step",
+    }.get(spec.get("algorithm"))
+    stage = heartbeat.get("stage")
+    attempt = heartbeat.get("attempt")
+    if expected_stage is None or stage != expected_stage:
+        return False
+    try:
+        from flash.providers._lifecycle.instances.poll import is_training_heartbeat
+
+        step_complete = is_training_heartbeat(stage, heartbeat.get("step"))
+    except Exception:
+        return False
+    return (
+        step_complete
+        and isinstance(attempt, int)
+        and not isinstance(attempt, bool)
+        and attempt == remote_attempt
+    )
+
+
+def _validated_terminal_source(raw: dict[str, Any]) -> bool:
+    verified_attempt = raw.get("source_verified_attempt")
+    if (
+        isinstance(verified_attempt, bool)
+        or not isinstance(verified_attempt, int)
+        or verified_attempt < 0
+    ):
+        return False
+    try:
+        from flash.snapshot.archive import parse_descriptor
+
+        parse_descriptor(raw.get("source_snapshot"))
+    except Exception:
+        return False
+    return True
+
+
+def _lifecycle_projection(status: Any, public_status: dict[str, Any]) -> dict[str, bool]:
+    lifecycle = {
+        "started": False,
+        "progressed": False,
+        "artifactsComplete": False,
+        "cleanupComplete": False,
+    }
+    raw = _matching_persisted_status(status)
+    if raw is None:
+        return lifecycle
+
+    remote_attempt = _canonical_remote_attempt(raw.get("remote"))
+    lifecycle["started"] = remote_attempt is not None
+    lifecycle["progressed"] = _progressed(raw, remote_attempt)
+
+    adapter_ref = public_status.get("adapter_ref")
+    artifacts_dir = raw.get("artifacts_dir")
+    lifecycle["artifactsComplete"] = (
+        raw.get("state") == "done"
+        and _validated_terminal_source(raw)
+        and isinstance(adapter_ref, str)
+        and bool(adapter_ref.strip())
+        and isinstance(artifacts_dir, str)
+        and bool(artifacts_dir.strip())
+    )
+
+    cleanup_remotes = raw.get("cleanup_remotes", [])
+    lifecycle["cleanupComplete"] = (
+        raw.get("state") in {"done", "failed", "cancelled", "dry_run"}
+        and raw.get("remote") is None
+        and isinstance(cleanup_remotes, list)
+        and not cleanup_remotes
+    )
+    return lifecycle
+
+
 def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bool:
     context = {**_context_from_status(status), **(key or {})}
     org_id = org_id_of(context)
@@ -96,6 +210,7 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "deployment": status.deployment,
         "lastHeartbeat": public_status.get("last_heartbeat"),
         "gpuStatus": status.gpu_status,
+        "lifecycle": _lifecycle_projection(status, public_status),
         "createdAt": _iso_from_epoch(status.created_at),
         "updatedAt": _iso_from_epoch(status.updated_at),
         "metadata": {"source": "flash.control_plane"},

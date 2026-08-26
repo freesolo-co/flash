@@ -253,38 +253,38 @@ def _snapshot_cleanup_remotes(run_id: str) -> list[dict]:
 
 
 def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bool:
+    """Remove one confirmed cleanup target and its exact active remote atomically."""
     expected_key = _teardown_removal_key(expected_remote)
     if expected_key is None:
         return False
+    report_status: RunStatus | None = None
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
+        status = status_ops._runstatus_from_json(raw)
         try:
             records = _cleanup_remotes_from_raw(raw)
         except Exception:
-            # the strict reader raises on the FIRST record it cannot canonicalize, and the drain
-            # suppresses that -- so one bad sibling made every CONFIRMED-DELETED record undeletable,
-            # and each sweep retried a resource that is already gone, forever. removing one record
-            # does not require understanding the others: keep the ones that cannot be parsed exactly
-            # as they are on disk, drop only the record whose teardown was confirmed. nothing is
-            # silently discarded, and the strict reader still guards every other write path.
+            # the strict reader raises on the first record it cannot canonicalize. preserve every
+            # unrecognized sibling verbatim and remove only the identity confirmed deleted.
             value = raw.get(state._CLEANUP_REMOTES_KEY, [])
             if not isinstance(value, list):
                 return False
             remaining = [item for item in value if _teardown_removal_key(item) != expected_key]
             if len(remaining) == len(value):
                 return False
-            state._save_status_unlocked(
-                status_ops._runstatus_from_json(raw),
-                _cleanup_remotes=remaining or None,
-            )
-            return True
-        remaining = [record for record in records if _teardown_removal_key(record) != expected_key]
-        if len(remaining) == len(records):
-            return False
-        state._save_status_unlocked(
-            status_ops._runstatus_from_json(raw),
-            _cleanup_remotes=remaining or None,
-        )
+        else:
+            remaining = [
+                record for record in records if _teardown_removal_key(record) != expected_key
+            ]
+            if len(remaining) == len(records):
+                return False
+        if _teardown_removal_key(status.remote) == expected_key:
+            status.remote = None
+        status.updated_at = time.time()
+        state._save_status_unlocked(status, _cleanup_remotes=remaining or None)
+        report_status = status
+    if report_status is not None:
+        reporting._report_status(report_status)
     return True
 
 
