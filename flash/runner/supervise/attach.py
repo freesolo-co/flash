@@ -199,68 +199,6 @@ def _resume_after_confirmed_teardown(
     return get_status(run_id)
 
 
-def _reconcile_completed_remote(
-    run_id: str,
-    worker_spec: JobSpec,
-    expected_remote: dict,
-    completed_metrics: dict,
-    deadline_at: float,
-    log,
-) -> bool:
-    """Retry completed-attempt adoption and decide whether reconciliation is finished."""
-    from flash.runner.accounting.reconciliation import (
-        _compare_and_fail_remote,
-        _record_cleanup_remote,
-    )
-    from flash.runner.lifecycle.protocol import AttemptRecord
-    from flash.runner.lifecycle.status import get_status
-    from flash.runner.supervise.lifecycle import _adopt_completed_attempt
-
-    result_deadline_at = AttemptRecord.from_dict(get_status(run_id).attempt).result_deadline_at
-
-    try:
-        if _adopt_completed_attempt(
-            run_id,
-            worker_spec,
-            expected_remote,
-            completed_metrics,
-            log=log,
-        ):
-            return True
-    except Exception:
-        pass
-    # the job completed with metrics; keep retrying adoption (e.g. across a
-    # transient cleanup failure) until it sticks -- but never past the wall
-    # deadline plus the recovery grace, or a persistently failing adoption
-    # would leave the run non-terminal forever. past the grace, preserve the
-    # remote for cost reconciliation and fail the run.
-    if time.time() >= result_deadline_at:
-        # best-effort: preserve the remote for cost reconciliation, but do NOT
-        # gate termination on it -- a persistently failing cleanup-persist must
-        # not leave the run non-terminal forever (the whole point of the grace
-        # cutoff). attempt the cleanup record, then fail the run regardless.
-        with contextlib.suppress(Exception):
-            _record_cleanup_remote(run_id, expected_remote)
-        try:
-            if _compare_and_fail_remote(
-                run_id,
-                expected_remote,
-                "completed attempt could not be adopted within the recovery grace window",
-            ):
-                return True
-        except Exception:
-            pass
-        # past the grace window the terminal CAS is the only exit; if it raised or
-        # lost the compare-and-swap, rate-limit the retry at the full reconcile
-        # interval. remaining grace is <= 0 here, so falling through to the shared
-        # sleep below would sleep 0 and busy-spin the reconciler.
-        time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-        return False
-    remaining_grace = result_deadline_at - time.time()
-    time.sleep(min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, remaining_grace)))
-    return False
-
-
 def _reconcile_attached_remote(
     run_id: str,
     expected_remote: dict,

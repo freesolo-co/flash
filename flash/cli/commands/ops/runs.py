@@ -81,16 +81,16 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
 class _LogPollResult(NamedTuple):
     state: str
     printed_any: bool
-    # `str` carries the teardown sentinel (`_NO_LIVE_WORKER`), which is not an attempt number but a
+    # `str` carries the teardown sentinel (`_NO_LIVE_WORKER`), which is not an attempt identity but a
     # proof there is no live worker -- see `live_attempt_of`.
-    live_attempt: int | str | None
+    live_attempt: tuple[int, int] | str | None
 
 
 def _poll_logs(client: ApiClient, run_id: str, interval: float) -> _LogPollResult:
     """Stream logs until terminal and return the final state, output, and attempt snapshot."""
     offset = 0
     printed_any = False
-    attempt: int | None = None
+    attempt: tuple[int, int] | str | None = None
     last_progress: str | None = None
     seen_metric_steps: set = set()
     spinner = _LogFollowSpinner(run_id)

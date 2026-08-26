@@ -28,9 +28,9 @@ def reconcile_terminal_result(
     from flash.runner.supervise.attach import (
         _ATTACH_RECONCILE_INTERVAL_S,
         _carry_allocation_stamp,
-        _reconcile_completed_remote,
         _resume_after_confirmed_teardown,
     )
+    from flash.runner.supervise.attach_reconcile import _reconcile_completed_remote
     from flash.runner.supervise.lifecycle import (
         _consume_recovered_retry_state,
         _strict_teardown_handle,

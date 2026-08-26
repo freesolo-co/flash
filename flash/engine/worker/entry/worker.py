@@ -168,7 +168,7 @@ def main():
                 completed_steps=progress_io._PROGRESS_COMPLETED_STEPS,
                 metrics={},
                 checkpoint={
-                    "failure": progress_io._PROGRESS_PENDING_CHECKPOINT_FAILURE,
+                    "failure": progress_io.pending_checkpoint_failure(),
                 },
                 artifacts={"error": err_name if "err_name" in locals() else None},
                 diagnostics={

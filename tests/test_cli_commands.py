@@ -1873,8 +1873,8 @@ def test_poll_logs_returns_the_live_attempt_from_the_terminal_status(capsys) -> 
 
     result = run_commands._poll_logs(_AttemptClient(), "flash-attempt", interval=0)
 
-    assert result == run_commands._LogPollResult("done", False, 1)
-    assert result.live_attempt == 1
+    assert result == run_commands._LogPollResult("done", False, (1, 5))
+    assert result.live_attempt == (1, 5)
     assert capsys.readouterr().out == ""
 
 

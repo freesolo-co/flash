@@ -478,6 +478,43 @@ def test_checkpoint_failure_is_sticky_until_a_successful_checkpoint(monkeypatch)
     assert records[-1].checkpoint == {}
 
 
+def test_success_result_uses_latched_checkpoint_failure_and_tombstone(monkeypatch) -> None:
+    _reset(monkeypatch)
+    monkeypatch.setattr(progress_io, "_upload_record", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        result_io,
+        "_source_attestation",
+        lambda: {"kind": "test", "revision": "a" * 40},
+    )
+    monkeypatch.setattr(result_io, "_write_immutable", lambda _payload: "/tmp/result.json")
+    monkeypatch.setattr(result_io, "_publish_exactly_once", lambda manifest, _path: manifest)
+    failure = {"step": 50, "operation": "final", "error": "quota denied"}
+
+    progress_io.publish_progress("checkpoint_upload_failed", checkpoint_failure=failure)
+    failed_checkpoint = result_io.publish_result(
+        outcome="succeeded",
+        failure_class=None,
+        started_at=1.0,
+        training_entered=True,
+        completed_steps=50,
+        metrics={"step": 50},
+        artifacts={"adapter": "published"},
+    )
+    assert failed_checkpoint.checkpoint == {"failure": failure}
+
+    progress_io.publish_progress("checkpoint_uploaded", step=50)
+    successful_checkpoint = result_io.publish_result(
+        outcome="succeeded",
+        failure_class=None,
+        started_at=1.0,
+        training_entered=True,
+        completed_steps=50,
+        metrics={"step": 50},
+        artifacts={"adapter": "published"},
+    )
+    assert successful_checkpoint.checkpoint == {"failure": None}
+
+
 def test_terminal_result_waits_for_final_progress(monkeypatch) -> None:
     _reset(monkeypatch)
     upload_started = threading.Event()

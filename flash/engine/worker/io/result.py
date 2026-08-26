@@ -288,7 +288,11 @@ def publish_result(
     diagnostics: dict | None = None,
 ) -> ResultManifest:
     """publish the only worker terminal authority for the current attempt."""
-    from flash.engine.worker.io.progress import flush_progress, progress_error
+    from flash.engine.worker.io.progress import (
+        flush_progress,
+        pending_checkpoint_failure,
+        progress_error,
+    )
 
     progress_flush_error: Exception | None = None
     try:
@@ -300,6 +304,9 @@ def publish_result(
     terminal_diagnostics = dict(diagnostics or {})
     if progress_flush_error is not None:
         terminal_diagnostics["progress_publication_error"] = progress_flush_error
+    terminal_checkpoint = dict(checkpoint or {})
+    if outcome == "succeeded":
+        terminal_checkpoint["failure"] = pending_checkpoint_failure()
     manifest = ResultManifest(
         run_id=state.RUN_ID,
         phase_namespace=state.PHASE,
@@ -312,7 +319,7 @@ def publish_result(
         training_entered=bool(training_entered),
         completed_steps=max(0, int(completed_steps)),
         metrics=dict(metrics or {}),
-        checkpoint=dict(checkpoint or {}),
+        checkpoint=terminal_checkpoint,
         artifacts=dict(artifacts or {}),
         source_attestation=_source_attestation(),
         diagnostics={

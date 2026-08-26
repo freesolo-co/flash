@@ -382,27 +382,50 @@ def test_chat_keeps_stdout_empty_when_a_styled_stream_carries_no_text(monkeypatc
     assert "no response text from flash-1" in captured.err
 
 
-def test_worker_output_labels_previous_attempt_without_rewriting_content(capsys) -> None:
+def test_worker_output_marks_previous_attempt_lines(capsys) -> None:
     commands._print_worker_output(
         {"console_rl_attempt0.txt": "worker: stage=rl_step step=76\n"},
         printed_any=True,
-        current_attempt=1,
+        current_attempt=(1, 7),
     )
 
     output = capsys.readouterr().out
     assert "attempt=0, previous attempt; current attempt=1" in output
-    assert "worker: stage=rl_step step=76" in output
+    assert (
+        "SUPERSEDED attempt_id=0 fence=unknown current_attempt_id=1 current_fence=7 | "
+        "worker: stage=rl_step step=76"
+    ) in output
 
 
 def test_worker_output_labels_current_attempt(capsys) -> None:
     commands._print_worker_output(
         {"console_rl_attempt1.txt": "worker: stage=rl_step step=4\n"},
         printed_any=True,
-        current_attempt=1,
+        current_attempt=(1, 7),
     )
 
     output = capsys.readouterr().out
     assert "attempt=1, current attempt" in output
+
+
+def test_worker_output_marks_only_superseded_fenced_progress(capsys) -> None:
+    current = 'PROGRESS {"attempt_id":1,"fence":7,"sequence":4}'
+    stale = 'PROGRESS {"attempt_id":1,"fence":6,"sequence":99}'
+    commands._print_worker_output(
+        {
+            "console_rl_attempt1.txt": current + "\n",
+            "console_rl.txt": stale + "\n",
+        },
+        current_attempt=(1, 7),
+    )
+
+    lines = capsys.readouterr().out.splitlines()
+    progress_lines = [line for line in lines if "PROGRESS" in line]
+    assert progress_lines == [current]
+    assert lines[-1] == (
+        "superseded_progress attempt_id=1 fence=6 current_attempt_id=1 current_fence=7 | "
+        '{"attempt_id":1,"fence":6,"sequence":99}'
+    )
 
 
 def test_worker_output_labels_teardown_window(capsys) -> None:
@@ -460,10 +483,10 @@ def test_snapshot_distinguishes_teardown_from_an_unknown_attempt() -> None:
         "remote": {"provider": "runpod"},
         "attempt": {"attempt_id": 1, "fence": 2},
     }
-    assert _snapshot_live_attempt(_Run(live), "flash-1") == 1
+    assert _snapshot_live_attempt(_Run(live), "flash-1") == (1, 2)
     assert _snapshot_live_attempt(_Run(ClientError("boom")), "flash-1") is None
     no_remote = {
         "state": "running",
         "attempt": {"attempt_id": 2, "fence": 3},
     }
-    assert _snapshot_live_attempt(_Run(no_remote), "flash-1") == 2
+    assert _snapshot_live_attempt(_Run(no_remote), "flash-1") == (2, 3)

@@ -380,6 +380,14 @@ def progress_error() -> BaseException | None:
         return _PROGRESS_ERROR
 
 
+def pending_checkpoint_failure() -> dict[str, int | str] | None:
+    """return the authoritative latched checkpoint failure for this attempt."""
+    with _PROGRESS_CONDITION:
+        if _PROGRESS_PENDING_CHECKPOINT_FAILURE is None:
+            return None
+        return dict(_PROGRESS_PENDING_CHECKPOINT_FAILURE)
+
+
 def flush_progress() -> None:
     """wait until the latest cumulative observation is durably published."""
     global _PROGRESS_FLUSH_REQUIRED
