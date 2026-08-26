@@ -35,9 +35,7 @@ Sleeper = Callable[[float], None]
 class LifecycleFailure:
     """one provider-neutral lifecycle failure.
 
-    Defined here rather than once per provider because both lifecycles produce it and six modules
-    across the two consume it: two identical definitions are two things to keep in step, and a
-    reader comparing the paths cannot tell at a glance that they are the same type.
+    Defined in the shared records module so lifecycle results and callers use one exact type.
     """
 
     code: DeploymentErrorCode
@@ -48,8 +46,7 @@ class LifecycleFailure:
 def validate_deadline(deadline_at: float, clock: Clock) -> None:
     """reject a deadline that cannot describe a future instant.
 
-    Neither the rule nor the clock is provider-specific, so the modal and runpod copies of this
-    were character-for-character identical.
+    Neither the rule nor the clock is provider-specific.
     """
 
     if type(deadline_at) not in {int, float} or not math.isfinite(float(deadline_at)):
@@ -68,12 +65,9 @@ _ENGINE_ID_RE = re.compile(r"[0-9a-f]{64}")
 _PROVIDER_NAME_RE = re.compile(r"[a-z][a-z0-9-]*[a-z0-9]")
 _ERROR_CODES = frozenset(
     {
-        "artifact_cleanup_timeout",
         "authentication_failed",
-        "capacity_unavailable",
         "conflict",
         "invalid_request",
-        "not_found",
         "provider_rejected",
         "readiness_failed",
         "resource_ambiguous",
@@ -81,12 +75,9 @@ _ERROR_CODES = frozenset(
     }
 )
 _ERROR_MESSAGES = {
-    "artifact_cleanup_timeout": "provider artifact cleanup deadline was exceeded",
     "authentication_failed": "provider authentication failed",
-    "capacity_unavailable": "provider capacity is unavailable",
     "conflict": "provider resource conflict",
     "invalid_request": "provider request is invalid",
-    "not_found": "provider resource was not found",
     "provider_rejected": "provider rejected the operation",
     "readiness_failed": "provider resource did not become ready",
     "resource_ambiguous": "provider resource outcome is ambiguous",
@@ -163,9 +154,9 @@ def reject_unreachable_registry(image: ServingImage) -> None:
     """reject a registry only the operator's machine can reach.
 
     `_validate_registry` accepts loopback and private hosts because a local registry is a
-    legitimate target for a locally executed pull. modal and runpod resolve the reference inside
-    their own build or pod infrastructure instead, and neither path uploads the image or opens a
-    tunnel back, so such a reference fails only after provider resources exist and bill. reject it
+    legitimate target for a locally executed pull. modal resolves the reference inside its build
+    infrastructure instead, and the path neither uploads the image nor opens a tunnel back, so such
+    a reference fails only after provider resources exist and bill. reject it
     while building the plan, before any provider call.
     """
 
@@ -440,8 +431,8 @@ class InterruptedProvisioning(KeyboardInterrupt):
     __slots__ = ("provider",)
 
     def __init__(self, provider: str) -> None:
-        if provider not in ("modal", "runpod"):
-            raise ValueError("interrupted provisioning requires a known provider")
+        if provider != "modal":
+            raise ValueError("interrupted provisioning requires modal")
         self.provider = provider
         super().__init__(
             f"interrupted before the {provider} deployment was ready, and its cleanup could not "
