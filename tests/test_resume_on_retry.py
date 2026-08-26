@@ -21,8 +21,8 @@ import shutil
 
 import pytest
 
-import flash.engine.worker.io.heartbeat as worker_heartbeat
 import flash.engine.worker.io.hf as worker_hf
+import flash.engine.worker.io.progress as worker_progress
 import flash.engine.worker.runtime.state as worker_state
 import flash.engine.worker.train.opd.orchestration.failures as opd_failures
 import flash.engine.worker.train.rl.launch.checkpoints as rl_checkpoints
@@ -33,9 +33,8 @@ from flash.core.spec import JobSpec
 from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 from tests._helpers.source_snapshot import valid_source_snapshot
 
-# Infra-shaped failure categories the retry loop resumes on (see lifecycle._submit_seed_supervised).
-# Mirrors the literal tuple in the source; this test is the guard that the set doesn't silently drift.
-INFRA_SHAPED = ("stalled", "no_capacity", "poll_error", "job_preempted")
+# infra-shaped failure categories the retry loop resumes on
+INFRA_SHAPED = ("no_capacity", "poll_error", "job_preempted")
 _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
@@ -62,7 +61,7 @@ def _prime_worker(monkeypatch, recorder, *, repo="org/test-runs", run="flash-res
     monkeypatch.setattr(worker_state, "RUN_ID", run)
     monkeypatch.setattr(worker_state, "SEED", 0)
     monkeypatch.setattr(worker_hf, "hf_api", lambda: recorder)
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(worker_progress, "publish_progress", lambda *a, **k: None)
 
 
 # ============================================================================================
@@ -957,6 +956,7 @@ def _runpod_handle(endpoint_id="ep", job_id="j", attempt=0):
         "key_fingerprint": _RUNPOD_FINGERPRINT,
         "job_id": job_id,
         "attempt": attempt,
+        "fence": attempt + 1,
         "started_ts": float(attempt + 1),
     }
 
@@ -971,6 +971,7 @@ def _vast_handle(attempt=0):
         "gpu": "RTX 4090",
         "hourly_usd": 0.5,
         "attempt": attempt,
+        "fence": attempt + 1,
         "started_ts": float(attempt + 1),
     }
 
@@ -985,6 +986,7 @@ def _lambda_handle(attempt=0):
         "gpu": "A10",
         "hourly_usd": 1.29,
         "attempt": attempt,
+        "fence": attempt + 1,
         "started_ts": float(attempt + 1),
     }
 
@@ -1077,7 +1079,7 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
         def submit_run(self, run_spec, seed, log=None, on_handle=None, attempt=0, **_):
             submits.append(attempt)
             on_handle(_vast_handle(attempt))
-            return PollResult(False, failure="stalled", detail="infra")
+            return PollResult(False, failure="job_preempted", detail="resource lost")
 
         def destroy(self, handle):
             from flash.providers.vast.client import api as vast_api
@@ -1129,7 +1131,7 @@ def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orc
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_kwargs):
         submits.append(attempt)
         on_handle(_lambda_handle(attempt))
-        return PollResult(False, failure="stalled", detail="infra")
+        return PollResult(False, failure="job_preempted", detail="resource lost")
 
     def unconfirmed(_instance_id):
         raise lambda_api.LambdaApiError("private provider termination response")
@@ -1173,7 +1175,7 @@ def test_terminal_runpod_job_allows_retry_and_persists_leaked_endpoint(
         submits.append(attempt)
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         if attempt == 0:
-            return PollResult(False, failure="stalled", detail="infra")
+            return PollResult(False, failure="job_preempted", detail="resource lost")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
@@ -1305,7 +1307,7 @@ def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         submits.append(attempt)
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
-        return PollResult(False, failure="stalled", detail="infra")
+        return PollResult(False, failure="job_preempted", detail="resource lost")
 
     def cancel_job(endpoint_id, job_id, **_kw):
         teardown_events.append(("cancel", endpoint_id, job_id))
@@ -1375,7 +1377,7 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         if attempt == 0:
             on_handle(_runpod_handle("ep0", "j0"))  # provisioned, then lost infra-shaped
-            return PollResult(False, failure="stalled", detail="infra")
+            return PollResult(False, failure="job_preempted", detail="resource lost")
         if attempt == 1:
             # Allocation/search-shaped failure BEFORE a new handle is recorded (on_handle never fires).
             # last_handle must already be EMPTY here (ep0's teardown was confirmed at the top of this
@@ -1470,7 +1472,7 @@ def test_a_retry_marks_where_the_previous_attempt_ends_in_the_log(orch, monkeypa
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         if attempt == 0:
             print("Traceback (most recent call last):\ntorch.OutOfMemoryError: CUDA OOM", file=log)
-            return PollResult(False, failure="stalled", detail="infra")
+            return PollResult(False, failure="job_preempted", detail="resource lost")
         print("worker: stage=rl_step attempt=1 step=1", file=log)
         return PollResult(True, metrics={"train_tokens": 4096})
 
@@ -1488,7 +1490,7 @@ def test_a_retry_marks_where_the_previous_attempt_ends_in_the_log(orch, monkeypa
         "the marker must sit after the failure it disowns, or it cannot separate the two attempts"
     )
     assert text.index(marker) < text.index("worker: stage=rl_step attempt=1 step=1"), (
-        "the replacement attempt's heartbeat must follow the boundary that assigns its provenance"
+        "the replacement attempt's output must follow the boundary that assigns its provenance"
     )
 
 
@@ -1505,7 +1507,7 @@ def test_the_marker_does_not_claim_one_previous_attempt_after_two_failures(orch,
     def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
         if attempt < 2:
             print(f"attempt {attempt} output", file=log)
-            return PollResult(False, failure="stalled", detail="infra")
+            return PollResult(False, failure="job_preempted", detail="resource lost")
         return PollResult(True, metrics={"train_tokens": 4096})
 
     monkeypatch.setattr(rp_jobs, "submit_run", fake_submit)
