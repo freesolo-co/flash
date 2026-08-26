@@ -36,7 +36,7 @@ def _write_stale_status(run_id: str, loaded, release) -> None:
     loaded.set()
     if not release.wait(timeout=10):
         raise TimeoutError("stale status writer was not released")
-    status.last_heartbeat = {"step": 1}
+    status.resource = {"state": "terminal", "observed_at": 1.0}
     runner_state._save_status(status)
 
 
@@ -182,7 +182,7 @@ def test_stale_status_process_cannot_erase_verified_revision(monkeypatch, tmp_pa
     process.join(timeout=10)
 
     assert process.exitcode == 0
-    assert runner_status.get_status(run_id).last_heartbeat == {"step": 1}
+    assert runner_status.get_status(run_id).resource == {"state": "terminal", "observed_at": 1.0}
     assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
         {revision}
     )

@@ -45,11 +45,11 @@ def test_ui_leaf_modules_import_cold() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_heartbeat_interpretation_does_not_import_rendering() -> None:
+def test_lifecycle_interpretation_does_not_import_rendering() -> None:
     script = (
-        "import sys; from flash.cli.ui import heartbeat; "
-        "heartbeat._heartbeat_pairs({'state': 'running', "
-        "'last_heartbeat': {'stage': 'sft_initializing', 'ts': 1}}); "
+        "import sys; from flash.cli.ui import lifecycle; "
+        "lifecycle._lifecycle_pairs({'state': 'running', "
+        "'attempt': {'attempt_id': 0, 'fence': 1}}); "
         "assert 'flash.cli.ui.render' not in sys.modules"
     )
     result = subprocess.run(
