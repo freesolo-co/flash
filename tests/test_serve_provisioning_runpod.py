@@ -13,13 +13,13 @@ from dataclasses import replace
 import pytest
 
 from flash.serve.app.manifest import build_serving_manifest
-from flash.serve.contract.profiles import get_profile, placement_for, supported_models
 from flash.serve.control import (
     DeploymentSpec,
     RunPodCredentials,
     RunPodPlacement,
     RunPodProviderHandle,
 )
+from flash.serve.deployment.profiles import get_profile, placement_for, supported_models
 from flash.serve.provisioning import (
     DeploymentBundle,
     FreshDeploymentArtifactTokenRequired,

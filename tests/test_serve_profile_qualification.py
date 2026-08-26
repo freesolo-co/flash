@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from flash.serve.contract.profiles import get_profile
+from flash.serve.deployment.profiles import get_profile
 from scripts.qualify_serving_profile import build_qualification_plan, main
 from tests.test_cli_serve_deploy import CERTIFIED_IMAGE, _args, _stub_resolution
 

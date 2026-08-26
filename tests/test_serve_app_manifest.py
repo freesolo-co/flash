@@ -17,7 +17,6 @@ from flash.serve.app.manifest import (
     build_serving_manifest,
     load_serving_manifest,
 )
-from flash.serve.contract.profiles import get_profile, supported_models
 from flash.serve.control import (
     AdapterAliasIntent,
     DeploymentRequest,
@@ -27,6 +26,7 @@ from flash.serve.control import (
     canonical_mapping_fingerprint,
     plan_deployment,
 )
+from flash.serve.deployment.profiles import get_profile, supported_models
 from flash.serve.provisioning import ServingImage
 
 MODEL_REVISION = "1" * 40

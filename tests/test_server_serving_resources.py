@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 
 from flash.serve.app import ManifestError
-from flash.serve.contract.profiles import get_profile, placement_for, supported_models
 from flash.serve.control import DeploymentRequest, DeploymentSpec, ModalPlacement
+from flash.serve.deployment.profiles import get_profile, placement_for, supported_models
 from flash.serve.provisioning import ServingImage, serving_resource_names
 from flash.server.domain.ops.serving_resources import dry_run_deployment, resolve_deployment_bundle
 from tests.test_serve_app_manifest import IMAGE_DIGEST, _profile_spec_and_inputs, _spec_and_inputs

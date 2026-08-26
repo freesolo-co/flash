@@ -7,7 +7,8 @@ from dataclasses import replace
 import pytest
 
 from flash.core.catalog import MODELS, get_model, supports_image_training
-from flash.serve.contract.profiles import (
+from flash.serve.control import ModalPlacement, RunPodPlacement
+from flash.serve.deployment.profiles import (
     SERVE_RUNTIME_FAMILY,
     ProfileError,
     ServingProfile,
@@ -15,7 +16,6 @@ from flash.serve.contract.profiles import (
     placement_for,
     supported_models,
 )
-from flash.serve.control import ModalPlacement, RunPodPlacement
 from flash.serve.provisioning import ServingImage
 from flash.serve.runtime.multimodal import _MAX_IMAGES
 from flash.serving.src.engine.model_config import reasoning_parser_for
@@ -171,7 +171,7 @@ def test_profile_drifting_from_the_catalog_is_rejected(
 ) -> None:
     # the catalog is the advertised serving capacity contract. a profile that quietly serves a
     # longer context or a higher rank than the catalog would deploy a shape no gate checked.
-    from flash.serve.contract import profiles
+    from flash.serve.deployment import profiles
 
     drifted = replace(get_profile(MODEL), **{field: value})
     monkeypatch.setitem(profiles._PROFILES, MODEL, drifted)
@@ -200,7 +200,7 @@ def test_structurally_invalid_profile_fails_the_whole_registry(
     value: object,
     message: str,
 ) -> None:
-    from flash.serve.contract import profiles
+    from flash.serve.deployment import profiles
 
     monkeypatch.setitem(profiles._PROFILES, MODEL, replace(get_profile(MODEL), **{field: value}))
 
@@ -221,7 +221,7 @@ def test_invalid_certified_image_digest_fails_the_whole_registry(
     monkeypatch: pytest.MonkeyPatch,
     digest: str,
 ) -> None:
-    from flash.serve.contract import profiles
+    from flash.serve.deployment import profiles
 
     monkeypatch.setitem(
         profiles._PROFILES,
@@ -238,7 +238,7 @@ def test_invalid_certified_image_digest_fails_the_whole_registry(
 def test_invalid_runpod_storage_fails_the_whole_registry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from flash.serve.contract import profiles
+    from flash.serve.deployment import profiles
 
     profile = get_profile(MODEL)
     monkeypatch.setitem(
@@ -252,7 +252,7 @@ def test_invalid_runpod_storage_fails_the_whole_registry(
 
 
 def test_missing_profile_fails_the_whole_registry(monkeypatch: pytest.MonkeyPatch) -> None:
-    from flash.serve.contract import profiles
+    from flash.serve.deployment import profiles
 
     monkeypatch.delitem(profiles._PROFILES, "Qwen/Qwen3.8-27B")
     with pytest.raises(ProfileError, match=r"missing=Qwen/Qwen3\.8-27B"):
@@ -260,7 +260,7 @@ def test_missing_profile_fails_the_whole_registry(monkeypatch: pytest.MonkeyPatc
 
 
 def test_extra_profile_fails_the_whole_registry(monkeypatch: pytest.MonkeyPatch) -> None:
-    from flash.serve.contract import profiles
+    from flash.serve.deployment import profiles
 
     monkeypatch.setitem(
         profiles._PROFILES, "extra/model", replace(get_profile(MODEL), model_id="extra/model")
@@ -270,7 +270,7 @@ def test_extra_profile_fails_the_whole_registry(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_profile_key_must_match_model_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    from flash.serve.contract import profiles
+    from flash.serve.deployment import profiles
 
     monkeypatch.setitem(
         profiles._PROFILES,

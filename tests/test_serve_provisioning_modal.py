@@ -18,13 +18,13 @@ from types import SimpleNamespace
 import pytest
 
 from flash.serve.app.manifest import build_serving_manifest
-from flash.serve.contract.profiles import get_profile, placement_for
 from flash.serve.control import (
     DeploymentSpec,
     ModalCredentials,
     ModalPlacement,
     ModalProviderHandle,
 )
+from flash.serve.deployment.profiles import get_profile, placement_for
 from flash.serve.provisioning import (
     DeploymentBundle,
     FreshDeploymentArtifactTokenRequired,

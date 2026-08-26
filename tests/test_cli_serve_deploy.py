@@ -14,7 +14,7 @@ from flash.cli.commands.serving import deploy as serve_deploy
 from flash.cli.commands.serving.deploy import cmd_serve_deploy
 from flash.cli.commands.serving.identity import encode_deployment_identity
 from flash.cli.parsing.serve_parser import _add_serve_commands
-from flash.serve.contract.profiles import get_profile, placement_for
+from flash.serve.deployment.profiles import get_profile, placement_for
 from flash.serve.provisioning import InterruptedProvisioning
 
 DIGEST = "sha256:" + "a" * 64
@@ -407,7 +407,7 @@ def test_registry_inconsistency_fails_before_artifact_resolution(
 ) -> None:
     from dataclasses import replace
 
-    from flash.serve.contract import profiles
+    from flash.serve.deployment import profiles
 
     def _explode(**_kwargs):
         raise AssertionError("artifact resolution ran with an inconsistent profile registry")
@@ -635,7 +635,7 @@ def test_synthetic_unqualified_modal_profile_still_fails_before_resolution(
 ) -> None:
     from dataclasses import replace
 
-    from flash.serve.contract import profiles
+    from flash.serve.deployment import profiles
 
     def _explode(**_kwargs):
         raise AssertionError("resolution ran before live qualification")
