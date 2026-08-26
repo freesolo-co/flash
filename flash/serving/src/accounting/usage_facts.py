@@ -1,5 +1,6 @@
 """Exact native usage facts for durable hosted-serving settlement."""
 
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -40,7 +41,7 @@ def usage_facts(result: Mapping[str, Any]) -> UsageFacts:
     duration = result.get("inference_time_seconds")
     if duration is not None:
         duration = float(duration)
-        if duration < 0:
+        if not math.isfinite(duration) or duration < 0:
             raise UsageOutboxError("usage_duration_invalid")
     replica = result.get("engine_replica_id")
     return UsageFacts(

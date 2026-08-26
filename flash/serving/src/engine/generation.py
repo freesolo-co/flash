@@ -105,7 +105,7 @@ def _usage_fields(
         "completion_tokens": len(completion_token_ids),
         "cached_tokens": _num_cached_tokens(request_output),
         "cached_tokens_reported": _cached_tokens_reported(request_output),
-        "inference_time_seconds": time.time() - start,
+        "inference_time_seconds": time.monotonic() - start,
         "request_id": request_id,
         "engine_replica_id": engine_replica_id,
         "checkpoint": checkpoint,
@@ -137,7 +137,7 @@ async def generate(
     )
     sampling = _sampling_params(payload, structured, RequestOutputKind.FINAL_ONLY)
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
-    start = time.time()
+    start = time.monotonic()
     final_output = None
     prompt_input = await owner._prepare_prompt_input(payload, thinking)
     try:
@@ -204,7 +204,7 @@ async def stream_generate(
     )
     sampling = _sampling_params(payload, structured, RequestOutputKind.DELTA)
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
-    start = time.time()
+    start = time.monotonic()
     prompt_input = await owner._prepare_prompt_input(payload, thinking)
     output_stream = None
     completion_ids: list[int] = []

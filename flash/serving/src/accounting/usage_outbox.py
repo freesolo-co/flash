@@ -6,8 +6,9 @@ import asyncio
 import contextlib
 import hashlib
 import re
+import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -363,8 +364,9 @@ class ProviderSettlementAdapter(Protocol):
 
 
 Jitter = Callable[[str, int, float], float]
-Sleep = Callable[[float], Awaitable[None]]
-Clock = Callable[[], datetime]
+Sleep = Callable[[float], Coroutine[Any, Any, None]]
+WallClock = Callable[[], datetime]
+MonotonicClock = Callable[[], float]
 
 
 def _deterministic_jitter(outbox_id: str, attempt: int, base: float) -> float:
@@ -389,7 +391,8 @@ class DurableUsageOutbox:
         poll_seconds: float = 2.0,
         jitter: Jitter = _deterministic_jitter,
         sleep: Sleep = asyncio.sleep,
-        clock: Clock = lambda: datetime.now(UTC),
+        clock: WallClock = lambda: datetime.now(UTC),
+        monotonic: MonotonicClock = time.monotonic,
         owner_epoch: uuid.UUID | None = None,
     ) -> None:
         if (
@@ -413,6 +416,7 @@ class DurableUsageOutbox:
         self._jitter = jitter
         self._sleep = sleep
         self._clock = clock
+        self._monotonic = monotonic
         self._wake = asyncio.Event()
         self._heartbeat_wake = asyncio.Event()
         self._stopping = asyncio.Event()
@@ -422,7 +426,8 @@ class DurableUsageOutbox:
         self._generation_lease_seconds: int | None = None
         self._active_generations: set[str] = set()
         self._terminal_generations: set[str] = set()
-        self._generation_lease_deadlines: dict[str, datetime] = {}
+        self._generation_lease_deadlines: dict[str, float] = {}
+        self._generation_lease_expiries: dict[str, datetime] = {}
         self._active_leases: set[str] = set()
         self._background_error: BaseException | None = None
 
@@ -437,14 +442,15 @@ class DurableUsageOutbox:
     async def capture(self, event: UsageEvent) -> None:
         self._raise_background_error()
         result = await self._generation_rpc("capture_serving_usage", event)
-        lease_started_at = self._clock()
+        lease_started_at = self._monotonic()
         timing = _generation_capture_result(result)
         self._set_generation_timing(timing["heartbeat_seconds"], timing["lease_seconds"])
         if timing["state"] == "in_progress":
             request_id = event.identity.request_id
             self._active_generations.add(request_id)
-            self._generation_lease_deadlines[request_id] = lease_started_at + timedelta(
-                seconds=timing["lease_seconds"]
+            self._generation_lease_expiries.pop(request_id, None)
+            self._generation_lease_deadlines[request_id] = (
+                lease_started_at + timing["lease_seconds"]
             )
             self._heartbeat_wake.set()
 
@@ -475,6 +481,7 @@ class DurableUsageOutbox:
         self._active_generations.discard(request_id)
         self._terminal_generations.discard(request_id)
         self._generation_lease_deadlines.pop(request_id, None)
+        self._generation_lease_expiries.pop(request_id, None)
         self._heartbeat_wake.set()
 
     async def snapshot(self) -> OutboxSnapshot:
@@ -651,7 +658,7 @@ class DurableUsageOutbox:
                 await asyncio.wait_for(self._wake.wait(), timeout=self._poll_seconds)
 
     async def _run_heartbeat_worker(self) -> None:
-        next_heartbeat_at: datetime | None = None
+        next_heartbeat_at: float | None = None
         while not self._stopping.is_set():
             self._heartbeat_wake.clear()
             heartbeat_seconds = self._heartbeat_seconds
@@ -660,8 +667,8 @@ class DurableUsageOutbox:
                 await self._heartbeat_wake.wait()
                 continue
             if next_heartbeat_at is None:
-                next_heartbeat_at = self._clock() + timedelta(seconds=heartbeat_seconds)
-            remaining = (next_heartbeat_at - self._clock()).total_seconds()
+                next_heartbeat_at = self._monotonic() + heartbeat_seconds
+            remaining = next_heartbeat_at - self._monotonic()
             if remaining > 0:
                 async with asyncio.TaskGroup() as group:
                     wake = group.create_task(self._heartbeat_wake.wait())
@@ -675,7 +682,7 @@ class DurableUsageOutbox:
                     continue
             try:
                 await self._heartbeat_active_generations_with_retry()
-                next_heartbeat_at = self._clock() + timedelta(seconds=heartbeat_seconds)
+                next_heartbeat_at = self._monotonic() + heartbeat_seconds
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -701,7 +708,7 @@ class DurableUsageOutbox:
                 ]
                 if not active_deadlines:
                     return
-                remaining = (min(active_deadlines) - self._clock()).total_seconds()
+                remaining = min(active_deadlines) - self._monotonic()
                 if remaining <= 0:
                     raise UsageOutboxError("generation_heartbeat_lease_expired") from exc
                 retry_delay = min(float(self._heartbeat_seconds or 1), remaining)
@@ -711,6 +718,7 @@ class DurableUsageOutbox:
         request_ids = sorted(self._active_generations)
         for offset in range(0, len(request_ids), _HEARTBEAT_BATCH_SIZE):
             batch = request_ids[offset : offset + _HEARTBEAT_BATCH_SIZE]
+            renewal_started_at = self._monotonic()
             result = await self._rpc(
                 "heartbeat_serving_generation",
                 {
@@ -727,7 +735,11 @@ class DurableUsageOutbox:
                 renewed.add(request_id)
                 expires_at = row.get("generation_lease_expires_at")
                 if request_id in self._active_generations and expires_at is not None:
-                    self._generation_lease_deadlines[request_id] = _parse_datetime(expires_at)
+                    self._generation_lease_expiries[request_id] = _parse_datetime(expires_at)
+                    if self._generation_lease_seconds is not None:
+                        self._generation_lease_deadlines[request_id] = (
+                            renewal_started_at + self._generation_lease_seconds
+                        )
             missing = (
                 (set(batch) - renewed) & self._active_generations
             ) - self._terminal_generations
@@ -735,6 +747,7 @@ class DurableUsageOutbox:
                 self._active_generations.difference_update(missing)
                 for request_id in missing:
                     self._generation_lease_deadlines.pop(request_id, None)
+                    self._generation_lease_expiries.pop(request_id, None)
                 raise UsageOutboxError("generation_heartbeat_lease_lost")
 
     async def _claim(self) -> list[dict[str, Any]]:
@@ -879,6 +892,7 @@ class DurableUsageOutbox:
             else:
                 self._active_generations.clear()
                 self._generation_lease_deadlines.clear()
+                self._generation_lease_expiries.clear()
 
         for outbox_id in tuple(self._active_leases):
             try:

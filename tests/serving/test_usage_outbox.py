@@ -633,6 +633,22 @@ async def _no_sleep(_seconds: float) -> None:
     return None
 
 
+class _MutableClocks:
+    def __init__(self, wall: datetime, monotonic: float = 0.0) -> None:
+        self.wall = wall
+        self.monotonic = monotonic
+
+    def wall_time(self) -> datetime:
+        return self.wall
+
+    def monotonic_time(self) -> float:
+        return self.monotonic
+
+    def advance(self, seconds: float) -> None:
+        self.wall += timedelta(seconds=seconds)
+        self.monotonic += seconds
+
+
 def test_capture_uses_deployment_owner_process_epoch_and_server_timing() -> None:
     client = _QueuedClient(
         [
@@ -669,11 +685,11 @@ def test_capture_uses_deployment_owner_process_epoch_and_server_timing() -> None
 
 def test_slow_capture_starts_full_heartbeat_lease_after_rpc_success() -> None:
     event = _usage_event()
-    now = [datetime(2026, 8, 24, 12, 0, tzinfo=UTC)]
+    clocks = _MutableClocks(datetime(2026, 8, 24, 12, 0, tzinfo=UTC), monotonic=1_000.0)
     sleeps: list[float] = []
 
     async def delayed_capture() -> tuple[int, Any]:
-        now[0] += timedelta(seconds=119)
+        clocks.advance(119)
         return (
             200,
             [
@@ -687,7 +703,7 @@ def test_slow_capture_starts_full_heartbeat_lease_after_rpc_success() -> None:
 
     async def advance_clock(seconds: float) -> None:
         sleeps.append(seconds)
-        now[0] += timedelta(seconds=seconds)
+        clocks.advance(seconds)
 
     client = _QueuedClient(
         [
@@ -712,14 +728,13 @@ def test_slow_capture_starts_full_heartbeat_lease_after_rpc_success() -> None:
         client=client,
         worker_id="worker-1",
         sleep=advance_clock,
-        clock=lambda: now[0],
+        clock=clocks.wall_time,
+        monotonic=clocks.monotonic_time,
     )
 
     async def run() -> None:
         await outbox.capture(event)
-        assert outbox._generation_lease_deadlines[event.identity.request_id] == datetime(
-            2026, 8, 24, 12, 3, 59, tzinfo=UTC
-        )
+        assert outbox._generation_lease_deadlines[event.identity.request_id] == 1_239.0
         await outbox._heartbeat_active_generations_with_retry()
         await outbox.finalize(event)
 
@@ -801,6 +816,7 @@ def test_transient_heartbeat_failure_recovers_without_poisoning_terminal_rpc(
 ) -> None:
     event = _usage_event()
     fixed_now = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+    fixed_monotonic = 1_000.0
     client = _QueuedClient(
         [
             *heartbeat_failures,
@@ -827,13 +843,12 @@ def test_transient_heartbeat_failure_recovers_without_poisoning_terminal_rpc(
         worker_id="worker-1",
         sleep=record_sleep,
         clock=lambda: fixed_now,
+        monotonic=lambda: fixed_monotonic,
     )
     outbox._heartbeat_seconds = 20
     outbox._generation_lease_seconds = 120
     outbox._active_generations.add(event.identity.request_id)
-    outbox._generation_lease_deadlines[event.identity.request_id] = fixed_now + timedelta(
-        seconds=120
-    )
+    outbox._generation_lease_deadlines[event.identity.request_id] = fixed_monotonic + 120
 
     async def run() -> None:
         await outbox._heartbeat_active_generations_with_retry()
@@ -848,7 +863,71 @@ def test_transient_heartbeat_failure_recovers_without_poisoning_terminal_rpc(
     assert event.identity.request_id not in outbox._active_generations
 
 
-def test_generation_churn_does_not_postpone_existing_heartbeat_deadline() -> None:
+@pytest.mark.parametrize(
+    "wall_jump",
+    [
+        pytest.param(timedelta(days=-1), id="backward"),
+        pytest.param(timedelta(days=1), id="forward"),
+    ],
+)
+def test_wall_clock_jump_does_not_change_heartbeat_retry_budget(
+    wall_jump: timedelta,
+) -> None:
+    event = _usage_event()
+    clocks = _MutableClocks(datetime(2026, 8, 25, 12, 0, tzinfo=UTC), monotonic=1_000.0)
+    sleeps: list[float] = []
+    client = _QueuedClient(
+        [
+            (
+                200,
+                [
+                    {
+                        "state": "in_progress",
+                        "lease_seconds": 25,
+                        "heartbeat_seconds": 20,
+                    }
+                ],
+            ),
+            (503, {"error": "temporarily unavailable"}),
+            (503, {"error": "temporarily unavailable"}),
+            (503, {"error": "temporarily unavailable"}),
+        ]
+    )
+
+    async def advance_with_jump(seconds: float) -> None:
+        sleeps.append(seconds)
+        clocks.advance(seconds)
+        if len(sleeps) == 1:
+            clocks.wall += wall_jump
+
+    outbox = DurableUsageOutbox(
+        _outbox_settings(),
+        client=client,
+        worker_id="worker-1",
+        sleep=advance_with_jump,
+        clock=clocks.wall_time,
+        monotonic=clocks.monotonic_time,
+    )
+
+    async def run() -> None:
+        await outbox.capture(event)
+        with pytest.raises(UsageOutboxError, match="generation_heartbeat_lease_expired"):
+            await outbox._heartbeat_active_generations_with_retry()
+
+    asyncio.run(run())
+
+    assert sleeps == [20.0, 5.0]
+    assert clocks.monotonic == 1_025.0
+
+
+@pytest.mark.parametrize(
+    "wall_jump",
+    [
+        pytest.param(timedelta(days=-1), id="backward"),
+        pytest.param(timedelta(days=1), id="forward"),
+    ],
+)
+def test_wall_clock_jump_does_not_change_heartbeat_cadence(wall_jump: timedelta) -> None:
     first = _usage_event()
     second = replace(
         first,
@@ -857,7 +936,7 @@ def test_generation_churn_does_not_postpone_existing_heartbeat_deadline() -> Non
             correlation_id="correlation-2",
         ),
     )
-    now = [datetime(2026, 8, 25, 12, 0, tzinfo=UTC)]
+    clocks = _MutableClocks(datetime(2026, 8, 25, 12, 0, tzinfo=UTC), monotonic=1_000.0)
     sleeps_started: asyncio.Queue[float] = asyncio.Queue()
     release_sleep = asyncio.Event()
 
@@ -865,7 +944,7 @@ def test_generation_churn_does_not_postpone_existing_heartbeat_deadline() -> Non
         await sleeps_started.put(seconds)
         await release_sleep.wait()
         release_sleep.clear()
-        now[0] += timedelta(seconds=seconds)
+        clocks.advance(seconds)
 
     capture_result = (
         200,
@@ -896,7 +975,8 @@ def test_generation_churn_does_not_postpone_existing_heartbeat_deadline() -> Non
         client=client,
         worker_id="worker-1",
         sleep=controlled_sleep,
-        clock=lambda: now[0],
+        clock=clocks.wall_time,
+        monotonic=clocks.monotonic_time,
     )
 
     async def run() -> None:
@@ -904,7 +984,9 @@ def test_generation_churn_does_not_postpone_existing_heartbeat_deadline() -> Non
         outbox._heartbeat_worker = asyncio.create_task(outbox._run_heartbeat_worker())
         assert await sleeps_started.get() == 20
         for remaining in (16, 12, 8, 4):
-            now[0] += timedelta(seconds=4)
+            clocks.advance(4)
+            if remaining == 16:
+                clocks.wall += wall_jump
             await outbox.capture(second)
             outbox.relinquish(second.identity.request_id)
             assert await sleeps_started.get() == remaining
@@ -930,9 +1012,10 @@ def test_generation_churn_does_not_postpone_existing_heartbeat_deadline() -> Non
 
     asyncio.run(run())
 
-    assert now[0] == datetime(2026, 8, 25, 12, 0, 20, tzinfo=UTC)
+    assert clocks.wall == datetime(2026, 8, 25, 12, 0, 20, tzinfo=UTC) + wall_jump
     assert first.identity.request_id in outbox._active_generations
-    assert outbox._generation_lease_deadlines[first.identity.request_id] == datetime(
+    assert outbox._generation_lease_deadlines[first.identity.request_id] == 1_140.0
+    assert outbox._generation_lease_expiries[first.identity.request_id] == datetime(
         2026, 8, 25, 12, 2, 20, tzinfo=UTC
     )
     assert outbox._background_error is None
