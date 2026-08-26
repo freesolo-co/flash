@@ -878,7 +878,7 @@ def _endpoint_name_matches_run(name: str, target: str) -> bool:
 
 
 def _select_endpoint_resources(resources: dict, target: str) -> list[str]:
-    """Return exact base and canonical retry endpoint resource ids for one run."""
+    """Return resource ids whose names carry the exact attempt identity for one run."""
     if not target:
         return []
     return [
@@ -967,7 +967,7 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
                 }
             ]
 
-    # registry-less cleanup must inspect every configured account and exact retry suffix.
+    # registry-less cleanup must inspect every configured account and exact attempt suffix.
     try:
         from flash.providers.runpod.client import api as runpod_api
 
