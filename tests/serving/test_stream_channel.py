@@ -233,6 +233,34 @@ def _patch_modal(monkeypatch: pytest.MonkeyPatch, queue: _FakeQueue, call_id: st
     monkeypatch.setattr(modal, "current_function_call_id", lambda: call_id)
 
 
+def test_dispatch_context_suppresses_exit_failure_but_preserves_cancellation() -> None:
+    class FailingExitContext:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *_args: object) -> None:
+            raise RuntimeError("queue cleanup failed")
+
+    class CancelledExitContext:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *_args: object) -> None:
+            raise asyncio.CancelledError
+
+    async def scenario() -> bool:
+        context = client._DispatchDeadlineContext(FailingExitContext(), time.time() + 5)
+        async with context:
+            pass
+        cancelled = client._DispatchDeadlineContext(CancelledExitContext(), time.time() + 5)
+        with pytest.raises(asyncio.CancelledError):
+            async with cancelled:
+                pass
+        return True
+
+    assert asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -697,6 +725,36 @@ def test_guarded_committed_operation_wins_simultaneous_watchdog_failure(
         return result, writes, sequence, terminal
 
     assert asyncio.run(scenario()) == ("committed", [(0, True)], 1, True)
+
+
+def test_guarded_cancels_invalid_operation_before_awaiting_abort() -> None:
+    async def scenario() -> tuple[bool, bool]:
+        queue = _FakeQueue()
+        watch = channel_engine._LeaseWatch(
+            queue,
+            generation_id="generation-1",
+            invocation_nonce="nonce-1",
+            function_call_id="fc-1",
+        )
+        watch._latest = watch._validator.accept(_control(0, call_id=None).to_dict())
+        watch._latest = watch._validator.accept(_control(1).to_dict())
+        watch._latest = watch._validator.accept(_control(2, kind="cancel").to_dict())
+        operation_started = asyncio.Event()
+        abort_observed_operation = False
+
+        async def operation() -> None:
+            operation_started.set()
+
+        async def abort() -> None:
+            nonlocal abort_observed_operation
+            await asyncio.sleep(0)
+            abort_observed_operation = operation_started.is_set()
+
+        with pytest.raises(StreamChannelError, match="cancelled"):
+            await watch.guarded(operation(), abort=abort)
+        return operation_started.is_set(), abort_observed_operation
+
+    assert asyncio.run(scenario()) == (False, False)
 
 
 def test_guarded_aborts_before_bounded_join_of_noncooperative_operation(
@@ -1780,6 +1838,53 @@ def test_function_success_gets_bounded_terminal_drain(monkeypatch: pytest.Monkey
         return call.cancel_count, method.spawn_count
 
     assert asyncio.run(scenario()) == (1, 1)
+
+
+def test_terminal_drain_deadline_resets_after_each_buffered_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> list[dict[str, Any]]:
+        monkeypatch.setattr(client, "TERMINAL_DRAIN_SECONDS", 0.01)
+        queue = _FakeQueue()
+        events = [
+            {"type": "delta", "text": "a"},
+            {"type": "delta", "text": "b"},
+            {"type": "final", "ok": True},
+        ]
+        manifest = TerminalManifest(
+            "generation-1", "nonce-1", "fc-1", "replica-1", 2, "event", 3
+        ).to_dict()
+        call = _FakeCall("fc-1", manifest)
+        method = _FakeSpawnMethod(None)
+
+        async def spawn(*_args: Any) -> _FakeCall:
+            for index, event in enumerate(events):
+                await queue._put(_data(index, event=event), partition=DATA_PARTITION)
+            return call
+
+        method.spawn.aio = spawn
+        channel = client.CancellableStreamChannel(
+            spawn_method=method,
+            payload_dict={},
+            record_dict=None,
+            expected_checkpoint=None,
+            generation_id="generation-1",
+            dispatch_deadline_unix=time.time() + 5,
+            invocation_nonce="nonce-1",
+            queue_context=lambda: _QueueContext(queue),
+        )
+        observed = [await anext(channel), await anext(channel)]
+        await asyncio.sleep(0.03)
+        observed.append(await anext(channel))
+        with pytest.raises(StopAsyncIteration):
+            await anext(channel)
+        return observed
+
+    assert asyncio.run(scenario()) == [
+        {"type": "delta", "text": "a"},
+        {"type": "delta", "text": "b"},
+        {"type": "final", "ok": True},
+    ]
 
 
 def test_channel_is_direct_async_iterator_with_one_spawn_and_idempotent_close() -> None:

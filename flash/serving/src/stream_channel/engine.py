@@ -45,14 +45,19 @@ def _retain_background_task(task: asyncio.Task[Any]) -> None:
     task.add_done_callback(finish)
 
 
-async def _stop_task(task: asyncio.Task[Any]) -> None:
+async def _join_task(task: asyncio.Task[Any]) -> None:
     if not task.done():
-        task.cancel()
         done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
         if not done:
             _retain_background_task(task)
             return
     _consume_task_result(task)
+
+
+async def _stop_task(task: asyncio.Task[Any]) -> None:
+    if not task.done():
+        task.cancel()
+    await _join_task(task)
 
 
 async def _bounded_operation(
@@ -168,10 +173,11 @@ class _LeaseWatch:
         operation_task = asyncio.ensure_future(operation)
 
         async def stop_operation() -> None:
+            operation_task.cancel()
             if abort is not None:
                 with contextlib.suppress(Exception):
                     await _bounded_operation(abort(), CLEANUP_SECONDS)
-            await _stop_task(operation_task)
+            await _join_task(operation_task)
 
         try:
             self.check()

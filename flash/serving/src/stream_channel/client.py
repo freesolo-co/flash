@@ -154,7 +154,7 @@ class _DispatchDeadlineContext:
                 self._context.__aexit__(*exc_info),
                 CLEANUP_SECONDS,
             )
-        except TimeoutError:
+        except Exception:
             return None
 
 
@@ -434,6 +434,7 @@ class CancellableStreamChannel:
                     control.check()
                     if raw is not None:
                         envelope = validator.accept(raw)
+                        drain_deadline = None
                         if envelope.terminal:
                             if envelope.kind == "error":
                                 try:
