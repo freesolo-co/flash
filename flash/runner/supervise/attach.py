@@ -23,6 +23,9 @@ from flash.runner.supervise.attach_reconcile import (
     carry_allocation_stamp as _carry_allocation_stamp,
 )
 from flash.runner.supervise.attach_reconcile import (
+    retry_confirmed_remote_recovery as _retry_confirmed_remote_recovery,
+)
+from flash.runner.supervise.attach_reconcile import (
     teardown_reconciled_remote as _teardown_reconciled_remote,
 )
 
@@ -261,17 +264,11 @@ def _reconcile_attached_remote(
             return
         result_deadline_at = attempt_record.result_deadline_at
         if confirmed_teardown:
-            try:
-                _recover_confirmed_remote(
-                    run_id, worker_spec, expected_remote, source_snapshot, log
-                )
-            except StagedEnvironmentTransientError:
-                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-                continue
-            except Exception:
-                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-                continue
-            return
+            if _retry_confirmed_remote_recovery(
+                run_id, worker_spec, expected_remote, source_snapshot, log
+            ):
+                return
+            continue
         try:
             terminal_result = _attempt_result(run_id, expected_remote)
         except Exception:

@@ -116,6 +116,27 @@ def _reconcile_completed_remote(
     return False
 
 
+def retry_confirmed_remote_recovery(
+    run_id: str,
+    worker_spec: JobSpec,
+    expected_remote: dict,
+    source_snapshot: dict | None,
+    log,
+) -> bool:
+    """retry recovery after teardown was durably confirmed."""
+    from flash.runner.supervise.attach import (
+        _ATTACH_RECONCILE_INTERVAL_S,
+        _recover_confirmed_remote,
+    )
+
+    try:
+        _recover_confirmed_remote(run_id, worker_spec, expected_remote, source_snapshot, log)
+    except Exception:
+        time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+        return False
+    return True
+
+
 def teardown_reconciled_remote(
     run_id: str,
     expected_remote: dict,
