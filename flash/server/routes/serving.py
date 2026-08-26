@@ -472,11 +472,20 @@ def undeploy(
         deployment = (
             marked.deployment if isinstance(marked.deployment, dict) else {"state": "undeployed"}
         )
-        response = _public_deployment({**deployment, "run_id": run_id})
+        removed_summary = (
+            deployment.get("state") == "undeployed"
+            and deployment.get("checkpoint_id") == checkpoint_id
+        )
+        response_state = (
+            deployment
+            if removed_summary
+            else {"state": "undeployed", "checkpoint_id": checkpoint_id}
+        )
+        response = _public_deployment({**response_state, "run_id": run_id})
         response.update(
             {
                 field: result[field]
-                for field in ("checkpoint_id", "disabled_checkpoints", "serving_deregistered")
+                for field in ("disabled_checkpoints", "serving_deregistered")
                 if field in result
             }
         )

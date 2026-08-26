@@ -119,13 +119,15 @@ def validate_body_provenance(
 
 def validate_header_provenance(headers: Mapping[str, str], expected: CheckpointProvenance) -> None:
     normalized = {key.lower(): value for key, value in headers.items()}
+    found = False
     if "x-freesolo-checkpoint" in normalized:
         expected.validate(decode_freesolo_headers(headers))
-        return
+        found = True
     if "x-flash-checkpoint-id" in normalized:
         expected.validate(decode_flash_headers(headers))
-        return
-    raise ValueError("serving backend omitted checkpoint provenance")
+        found = True
+    if not found:
+        raise ValueError("serving backend omitted checkpoint provenance")
 
 
 def _mapping(value: object, detail: str) -> Mapping[str, Any]:

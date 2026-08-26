@@ -604,7 +604,7 @@ def undeployed(result: dict) -> str:
 def exported(result: dict) -> str:
     """`flash models export`: where the adapter landed on HuggingFace, as an aligned card."""
     pairs = [
-        ("adapter", _paint(result.get("adapter_id", ""), _ACCENT2)),
+        ("checkpoint", _paint(result.get("checkpoint_id", ""), _ACCENT2)),
         ("repo", _paint(result.get("repository", ""), _ACCENT2)),
         ("url", _paint(result["url"], _ACCENT2) if result.get("url") else None),
         ("visibility", "private" if result.get("private") else "public"),

@@ -19,6 +19,7 @@ from flash.serve.contract.provenance import (
     decode_flash_headers,
     decode_freesolo_body,
     decode_freesolo_headers,
+    validate_header_provenance,
 )
 from flash.serve.request.openai import DEFAULT_MAX_TOKENS, OpenAIRequestError, parse_chat_request
 from flash.serve.request.streaming import _complete_sse_frames
@@ -328,6 +329,19 @@ def test_provenance_decoders_share_one_typed_value() -> None:
     assert decode_flash_body({"checkpoint_id": checkpoint_id, "deployment_id": "kept"}) == expected
     assert decode_freesolo_headers(expected.freesolo_headers()) == expected
     assert decode_flash_headers({"X-Flash-Checkpoint-Id": checkpoint_id}) == expected
+
+
+def test_header_provenance_validates_every_present_family() -> None:
+    expected = CheckpointProvenance("run-1/step-7")
+    matching = {
+        "X-Freesolo-Checkpoint": expected.checkpoint_id,
+        "X-Flash-Checkpoint-Id": expected.checkpoint_id,
+    }
+
+    validate_header_provenance(matching, expected)
+
+    with pytest.raises(ValueError, match="mismatched checkpoint provenance"):
+        validate_header_provenance({**matching, "X-Flash-Checkpoint-Id": "run-1/step-8"}, expected)
 
 
 def test_authorized_checkpoint_requires_one_explicit_verified_target() -> None:

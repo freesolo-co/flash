@@ -239,7 +239,9 @@ def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
             {"run_id": "r", "state": "deployed", "endpoint_name": "ep", "openai_base_url": "u"}
         ),
         render.undeployed({"run_id": "r", "deleted_endpoints": ["ep"]}),
-        render.exported({"adapter_id": "r", "repository": "acme/x", "url": "u", "private": True}),
+        render.exported(
+            {"checkpoint_id": "r/final", "repository": "acme/x", "url": "u", "private": True}
+        ),
         render.error("config invalid — bad [environment] id"),
         render.warn("FREESOLO_API_KEY is set — it will override the saved login"),
         render.note("exporting adapter — downloading then re-uploading…"),
@@ -277,9 +279,15 @@ def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
     assert "{" not in dep
 
     exp = render.exported(
-        {"adapter_id": "flash-1", "repository": "acme/x", "url": "https://x", "private": True}
+        {
+            "checkpoint_id": "flash-1/final",
+            "repository": "acme/x",
+            "url": "https://x",
+            "private": True,
+        }
     )
     assert "exported" in exp
+    assert "flash-1/final" in exp
     assert "acme/x" in exp
     assert "{" not in exp
 

@@ -2933,6 +2933,57 @@ def test_user_key_undeploy_returns_public_persisted_deployment(api, monkeypatch)
     assert body == api.get(f"/v1/runs/{run_id}/deploy", headers=_bearer(key)).json()
 
 
+def test_sibling_undeploy_returns_exact_removed_checkpoint(api, monkeypatch):
+    import flash.server.asgi.app as app_mod
+
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    current = f"{run_id}/final"
+    sibling = f"{run_id}/step-20"
+    status = runner_status.get_status(run_id)
+    status.deployment = {
+        "state": "ready",
+        "checkpoint_id": current,
+        "checkpoint_step": None,
+        "verified_at": 123.0,
+    }
+    runner_state._save_status(status)
+    for checkpoint_id in (current, sibling):
+        runner_verified_revisions.add_verified_checkpoint(
+            run_id,
+            checkpoint_id,
+            expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
+        )
+    monkeypatch.setattr(
+        app_mod,
+        "undeploy_adapter",
+        lambda target, **_: {
+            "checkpoint_id": target,
+            "disabled_checkpoints": [target],
+            "serving_deregistered": False,
+        },
+    )
+
+    response = api.delete(f"/v1/runs/{run_id}/deploy?checkpoint_id={sibling}", headers=_bearer(key))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body == {
+        "run_id": run_id,
+        "checkpoint_step": None,
+        "checkpoint_id": sibling,
+        "state": "undeployed",
+        "verified_at": None,
+        "openai_model": sibling,
+        "disabled_checkpoints": [sibling],
+        "serving_deregistered": False,
+    }
+    persisted = runner_status.get_status(run_id)
+    assert persisted.state == "deployed"
+    assert persisted.deployment["state"] == "ready"
+    assert persisted.deployment["checkpoint_id"] == current
+
+
 @pytest.mark.parametrize(
     "retired_model",
     ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"],
