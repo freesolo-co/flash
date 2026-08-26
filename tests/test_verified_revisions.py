@@ -43,7 +43,7 @@ def test_sibling_checkpoints_are_independent(monkeypatch, tmp_path) -> None:
         expected_generation=verified.verified_checkpoint_generation("run-a"),
     )
 
-    verified.remove_verified_checkpoint("run-a", "run-a/step-20", commit=lambda: None)
+    verified.remove_verified_checkpoint("run-a", "run-a/step-20", commit=lambda _retained: None)
 
     assert verified.read_verified_checkpoints("run-a") == frozenset({"run-a/step-40"})
 

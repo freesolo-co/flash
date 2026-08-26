@@ -159,6 +159,27 @@ def test_exact_undeploy_preserves_ready_sibling(monkeypatch) -> None:
     assert rows[sibling.adapter_id].deployment_generation == "generation-b"
 
 
+def test_already_disabled_checkpoint_is_an_idempotent_noop(monkeypatch) -> None:
+    disabled = _record().model_copy(
+        update={
+            "status": "disabled",
+            "updated_at": "2026-08-26T00:00:00+00:00",
+            "deployment_generation": None,
+        }
+    )
+
+    async def unexpected_authoritative(_checkpoint_id: str):
+        raise AssertionError("settled disabled checkpoint must not be written again")
+
+    result = asyncio.run(
+        undeploy.disable_matched([disabled], get_authoritative=unexpected_authoritative)
+    )
+
+    assert result.disabled_checkpoints == []
+    assert result.pending_teardown == []
+    assert result.stuck_ready == []
+
+
 def test_internal_run_cleanup_enumerates_exact_checkpoint_bindings(monkeypatch) -> None:
     checkpoints = [_record(), _record(40)]
     monkeypatch.setattr(

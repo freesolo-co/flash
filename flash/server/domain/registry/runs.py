@@ -204,9 +204,7 @@ def record_training_checkpoint(
         project_id = require_project_id(persisted_spec.get("project"))
     except (TypeError, ValueError):
         return False
-    raw_step = metrics.get("step")
-    step = raw_step if isinstance(raw_step, int) and not isinstance(raw_step, bool) else None
-    checkpoint_id = format_checkpoint_ref(spec.run_id, step)
+    checkpoint_id = format_checkpoint_ref(spec.run_id, None)
     body = {
         "orgId": org_id,
         "projectId": project_id,

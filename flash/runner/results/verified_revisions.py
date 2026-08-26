@@ -161,9 +161,9 @@ def remove_verified_checkpoint(
     run_id: str,
     checkpoint_id: str,
     *,
-    commit: Callable[[], None],
+    commit: Callable[[frozenset[str]], None],
 ) -> int:
-    """remove one checkpoint while preserving verified sibling checkpoints."""
+    """remove one checkpoint and commit against the retained verified membership."""
 
     parsed = parse_checkpoint_ref(checkpoint_id)
     if parsed is None or parsed[0] != run_id:
@@ -173,7 +173,7 @@ def remove_verified_checkpoint(
         generation += 1
         retained = [value for value in checkpoints if value != checkpoint_id]
         _write_unlocked(runs_dir, path, generation, retained)
-        commit()
+        commit(frozenset(retained))
         return generation
 
 

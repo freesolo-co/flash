@@ -216,7 +216,7 @@ def mark_deployment_revocation_failed(
         target = checkpoint_id or deployment.get("checkpoint_id")
         parsed = parse_checkpoint_ref(target) if isinstance(target, str) else None
 
-        def _commit() -> None:
+        def _commit(_retained: frozenset[str] = frozenset()) -> None:
             now = time.time()
             if deployment.get("checkpoint_id") == target:
                 status.deployment = {
@@ -251,7 +251,7 @@ def mark_undeployed(run_id: str, checkpoint_id: str | None = None) -> RunStatus:
         if not isinstance(target, str):
             raise ValueError("exact undeploy requires checkpoint_id")
 
-        def _commit() -> None:
+        def _commit(retained: frozenset[str]) -> None:
             removes_summary = (
                 isinstance(status.deployment, dict)
                 and status.deployment.get("checkpoint_id") == target
@@ -260,9 +260,19 @@ def mark_undeployed(run_id: str, checkpoint_id: str | None = None) -> RunStatus:
                 deployment = dict(status.deployment)
                 for field in ("error", "retryable", "updated_at"):
                     deployment.pop(field, None)
-                status.deployment = {**deployment, "state": "undeployed"}
-                if status.state == "deployed":
-                    status.state = "done"
+                if retained:
+                    checkpoint_id = min(retained)
+                    status.deployment = {
+                        **deployment,
+                        "state": "ready",
+                        "checkpoint_id": checkpoint_id,
+                    }
+                    if "openai_model" in deployment:
+                        status.deployment["openai_model"] = checkpoint_id
+                else:
+                    status.deployment = {**deployment, "state": "undeployed"}
+                    if status.state == "deployed":
+                        status.state = "done"
             status.updated_at = time.time()
             _save_status_unlocked(status)
 

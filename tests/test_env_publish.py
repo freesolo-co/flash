@@ -1308,7 +1308,7 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
         "orgId": "org-1",
         "projectId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         "runId": "flash-1",
-        "checkpointId": "flash-1/step-3",
+        "checkpointId": "flash-1/final",
         "phase": "rl",
         "artifactPath": "/tmp/artifacts",
         "metrics": {"cost_usd": 0.25, "step": 3},

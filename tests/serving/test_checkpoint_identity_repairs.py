@@ -384,6 +384,20 @@ def test_sibling_undeploy_preserves_deployed_summary_and_state(tmp_path, monkeyp
     assert verified_revisions.read_verified_checkpoints("run-sibling") == frozenset({current})
 
 
+def test_current_undeploy_promotes_remaining_verified_sibling(tmp_path, monkeypatch) -> None:
+    current, sibling = _save_ready_status(tmp_path, monkeypatch, "run-promote", "run-promote/final")
+
+    updated = transitions.mark_undeployed("run-promote", current)
+
+    assert updated.state == "deployed"
+    assert updated.deployment == {
+        "state": "ready",
+        "checkpoint_id": sibling,
+        "verified_at": 1.0,
+    }
+    assert verified_revisions.read_verified_checkpoints("run-promote") == frozenset({sibling})
+
+
 def test_checkpoint_registration_rejects_bare_managed_selector() -> None:
     client = _client()
     response = client.post(

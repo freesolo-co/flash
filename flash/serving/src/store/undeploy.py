@@ -87,6 +87,8 @@ async def disable_matched(
     pending_teardown: list[tuple[AdapterRecord, AdapterRecord | None, str | None]] = []
     storage_unavailable = False
     for candidate in matches:
+        if candidate.status == "disabled" and candidate.deployment_generation is None:
+            continue
         try:
             current, expected_generation = await _cas_row_to_disabled(
                 candidate, get_authoritative=get_authoritative
