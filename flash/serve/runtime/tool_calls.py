@@ -665,7 +665,7 @@ def _parse_parameter_value(
                     return cursor, value, None
                 if text.startswith(TOOL_CALL_END, after_probe):
                     if parsed[3]:
-                        if probe == 2:
+                        if probe == 2 and name not in tool.parameters["required"]:
                             return None
                         search_from = after_probe + len(TOOL_CALL_END)
                         continue

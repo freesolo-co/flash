@@ -905,6 +905,46 @@ def _optional_free_string_absorption_case() -> tuple[str, dict[str, str]]:
     return text, expected
 
 
+def _required_free_string_absorption_case():
+    declaration = _delimiter_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"] = {
+        name: {"type": "string"} for name in "abcd"
+    }
+    declaration["function"]["parameters"]["required"] = list("abcd")
+    tools = normalize_tools([declaration])
+    text = _candidate_call(
+        "<parameter=a>alpha</parameter>"
+        "<parameter=b>before </parameter><parameter=c>fake</parameter>"
+        "</function></tool_call> after</parameter>"
+        "<parameter=c>real-c</parameter><parameter=d>real-d</parameter>"
+    )
+    expected = {
+        "a": "alpha",
+        "b": ("before </parameter><parameter=c>fake</parameter></function></tool_call> after"),
+        "c": "real-c",
+        "d": "real-d",
+    }
+    return tools, text, expected
+
+
+def test_required_free_string_absorbs_fake_complete_continuation_buffered() -> None:
+    tools, text, expected = _required_free_string_absorption_case()
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert json.loads(result.calls[0].arguments) == expected
+
+
+def test_required_free_string_absorbs_fake_complete_continuation_across_splits() -> None:
+    tools, text, expected = _required_free_string_absorption_case()
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(tools, id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        assert json.loads(parser.finish().calls[0].arguments) == expected
+
+
 def test_optional_free_string_cannot_absorb_required_fields_buffered(monkeypatch) -> None:
     text, expected = _optional_free_string_absorption_case()
     original = tool_calls_module._parse_parameter_value
