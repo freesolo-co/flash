@@ -90,7 +90,7 @@ class OpenAIGenerateRequest(GenerateRequest):
             self.tool_choice,
             self.parallel_tool_calls,
         )
-        if self.tools is not None and self.messages is not None:
+        if self.messages is not None:
             normalize_messages(
                 self.messages,
                 sequence_types=list,

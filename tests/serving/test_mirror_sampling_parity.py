@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl
 from flash.serving.src.engine.model_config import reasoning_parser_for, tool_parser_for
@@ -156,6 +157,23 @@ def _tool_payload() -> list[dict[str, Any]]:
                 },
             },
         }
+    ]
+
+
+def _historical_tool_messages(argument: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": argument},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
     ]
 
 
@@ -426,6 +444,62 @@ class _UsageSession:
 
     def relinquish(self) -> None:
         return None
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"value":' + "[" * 600 + "0" + "]" * 600 + "}",
+        json.dumps({"values": [0] * 511}),
+    ],
+    ids=["depth", "aggregate-nodes"],
+)
+def test_hosted_tool_free_history_rejects_excessive_argument_complexity(argument: str) -> None:
+    messages = _historical_tool_messages(argument)
+    original = json.loads(json.dumps(messages))
+
+    with pytest.raises(ValidationError, match="tool argument complexity"):
+        OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
+
+    assert messages == original
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"value":' + "[" * 7 + "0" + "]" * 7 + "}",
+        json.dumps({"values": [0] * 510}),
+    ],
+    ids=["depth", "aggregate-nodes"],
+)
+def test_hosted_tool_free_history_accepts_argument_complexity_boundary(argument: str) -> None:
+    messages = _historical_tool_messages(argument)
+    original = json.loads(json.dumps(messages))
+
+    request = OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
+
+    assert request.messages == original
+    assert messages == original
+
+
+def test_hosted_message_validation_preserves_non_tool_and_active_tool_requests() -> None:
+    plain_messages = [{"role": "user", "content": "weather"}]
+    plain_request = OpenAIGenerateRequest.model_validate(
+        {"adapter_id": "adapter", "messages": plain_messages}
+    )
+    tool_request = OpenAIGenerateRequest.model_validate(
+        {
+            "adapter_id": "adapter",
+            "messages": plain_messages,
+            "tools": _tool_payload(),
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+        }
+    )
+
+    assert plain_request.messages == plain_messages
+    assert tool_request.messages == plain_messages
+    assert tool_request.tools == _tool_payload()
 
 
 def test_hosted_private_tool_envelope_rejects_active_stop_marker_collision() -> None:
