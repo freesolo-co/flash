@@ -114,9 +114,9 @@ class ScoreBatcher:
                 raise self._make_error(f"{self.label} shut down")
             if self._thread is not None:
                 return
-            self._thread = threading.Thread(target=self._run, name=self.thread_name, daemon=True)
-            thread = self._thread
-        thread.start()
+            thread = threading.Thread(target=self._run, name=self.thread_name, daemon=True)
+            thread.start()
+            self._thread = thread
 
     def submit(self, request: Any) -> Any:
         """Enqueue one request and block until its batch has been scored."""

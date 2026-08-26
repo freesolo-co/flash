@@ -29,6 +29,42 @@ def _identity_graded(monkeypatch):
     )
 
 
+class _ConditionContentionProbe(threading.Condition):
+    """report the target thread's first failed nonblocking acquisition."""
+
+    def __init__(self, contender_name):
+        super().__init__()
+        self._contender_name = contender_name
+        self._probed = False
+        self.contention_observed = threading.Event()
+
+    def __enter__(self):
+        if threading.current_thread().name == self._contender_name and not self._probed:
+            self._probed = True
+            if self.acquire(blocking=False):
+                self.release()
+                raise AssertionError("contender acquired _condition while consumer start was gated")
+            self.contention_observed.set()
+        return super().__enter__()
+
+
+def _make_test_score_batcher(score_batch, thread_name):
+    return ScoreBatcher(
+        score_batch,
+        max_batch_size=1,
+        flush_wait_s=0.01,
+        label="test",
+        thread_name=thread_name,
+    )
+
+
+def _assert_batcher_empty(batcher):
+    with batcher._condition:
+        assert batcher._thread is None
+        assert batcher._pending == []
+        assert batcher._in_flight == []
+
+
 def test_concurrent_single_turn_requests_are_batched_and_scattered_in_order(monkeypatch):
     calls = []
     live = 0
@@ -163,6 +199,199 @@ def test_score_batcher_close_releases_an_inflight_waiter_after_the_join_bound():
 
     assert not waiter.is_alive(), "shutdown left an in-flight waiter blocked"
     assert outcomes == ["test shut down"]
+
+
+def test_score_batcher_start_failure_is_transactional_and_retry_is_idempotent(monkeypatch):
+    consumer_name = "test-transactional-score-batcher"
+    original_start = threading.Thread.start
+    start_error = RuntimeError("consumer start failed")
+    consumer_start_calls = 0
+    scored = []
+
+    def controlled_start(thread):
+        nonlocal consumer_start_calls
+        if thread.name != consumer_name:
+            return original_start(thread)
+        consumer_start_calls += 1
+        if consumer_start_calls == 1:
+            raise start_error
+        return original_start(thread)
+
+    def score_batch(requests):
+        scored.append(list(requests))
+        return [f"scored:{request}" for request in requests]
+
+    monkeypatch.setattr(threading.Thread, "start", controlled_start)
+    batcher = _make_test_score_batcher(score_batch, consumer_name)
+
+    with pytest.raises(RuntimeError) as raised:
+        batcher.start()
+    assert raised.value is start_error
+    _assert_batcher_empty(batcher)
+
+    try:
+        assert batcher.submit("request") == "scored:request"
+        started_thread = batcher._thread
+        batcher.start()
+    finally:
+        batcher.close(1.0)
+
+    assert started_thread is not None
+    assert consumer_start_calls == 2
+    assert scored == [["request"]]
+
+
+def test_score_batcher_racing_submitter_retries_after_start_failure(monkeypatch):
+    consumer_name = "test-racing-score-batcher"
+    contender_name = "second-submitter"
+    original_start = threading.Thread.start
+    start_error = RuntimeError("first consumer start failed")
+    first_start_entered = threading.Event()
+    release_first_start = threading.Event()
+    consumer_start_calls = 0
+    scored = []
+    outcomes = {}
+
+    def controlled_start(thread):
+        nonlocal consumer_start_calls
+        if thread.name != consumer_name:
+            return original_start(thread)
+        consumer_start_calls += 1
+        if consumer_start_calls == 1:
+            first_start_entered.set()
+            assert release_first_start.wait(timeout=2.0)
+            raise start_error
+        return original_start(thread)
+
+    def score_batch(requests):
+        scored.append(list(requests))
+        return [f"result:{request}" for request in requests]
+
+    monkeypatch.setattr(threading.Thread, "start", controlled_start)
+    batcher = _make_test_score_batcher(score_batch, consumer_name)
+    condition = _ConditionContentionProbe(contender_name)
+    batcher._condition = condition
+
+    def submit(key, request):
+        try:
+            outcomes[key] = ("result", batcher.submit(request))
+        except Exception as error:
+            outcomes[key] = ("error", error)
+
+    first = threading.Thread(target=submit, args=("first", "first"), name="first-submitter")
+    second = threading.Thread(target=submit, args=("second", "second"), name=contender_name)
+    first.start()
+    assert first_start_entered.wait(timeout=2.0)
+    second.start()
+    try:
+        assert condition.contention_observed.wait(timeout=2.0)
+        assert outcomes == {}
+        assert first.is_alive()
+        assert second.is_alive()
+    finally:
+        release_first_start.set()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+    batcher.close(1.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert outcomes["first"] == ("error", start_error)
+    assert outcomes["second"] == ("result", "result:second")
+    assert consumer_start_calls == 2
+    assert scored == [["second"]]
+    with batcher._condition:
+        assert batcher._pending == []
+        assert batcher._in_flight == []
+
+
+def test_score_batcher_close_returns_when_never_started_or_after_start_failure(monkeypatch):
+    never_started = _make_test_score_batcher(
+        lambda requests: requests, "test-never-started-score-batcher"
+    )
+    never_started.close(0.0)
+    assert never_started._thread is None
+
+    consumer_name = "test-failed-start-score-batcher"
+    original_start = threading.Thread.start
+    start_error = RuntimeError("consumer start failed")
+
+    def fail_consumer_start(thread):
+        if thread.name == consumer_name:
+            raise start_error
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_consumer_start)
+    failed_start = _make_test_score_batcher(lambda requests: requests, consumer_name)
+    with pytest.raises(RuntimeError) as raised:
+        failed_start.start()
+    assert raised.value is start_error
+    failed_start.close(0.0)
+    assert failed_start._thread is None
+
+
+def test_score_batcher_close_racing_start_failure_never_joins_unstarted_thread(monkeypatch):
+    consumer_name = "test-gated-failure-score-batcher"
+    contender_name = "gated-failure-closer"
+    original_start = threading.Thread.start
+    original_join = threading.Thread.join
+    start_error = RuntimeError("gated consumer start failed")
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    joined_unstarted = []
+    outcomes = {}
+
+    def gated_start(thread):
+        if thread.name != consumer_name:
+            return original_start(thread)
+        start_entered.set()
+        assert release_start.wait(timeout=2.0)
+        raise start_error
+
+    def guarded_join(thread, timeout=None):
+        if thread.name == consumer_name:
+            joined_unstarted.append(thread)
+            raise AssertionError("close joined an unstarted consumer")
+        return original_join(thread, timeout)
+
+    monkeypatch.setattr(threading.Thread, "start", gated_start)
+    monkeypatch.setattr(threading.Thread, "join", guarded_join)
+    batcher = _make_test_score_batcher(lambda requests: requests, consumer_name)
+    condition = _ConditionContentionProbe(contender_name)
+    batcher._condition = condition
+
+    def submit():
+        try:
+            batcher.submit("request")
+        except Exception as error:
+            outcomes["submit"] = error
+
+    def close():
+        try:
+            batcher.close(0.0)
+        except Exception as error:
+            outcomes["close"] = error
+
+    submitter = threading.Thread(target=submit, name="gated-failure-submitter")
+    closer = threading.Thread(target=close, name=contender_name)
+    submitter.start()
+    assert start_entered.wait(timeout=2.0)
+    closer.start()
+    try:
+        assert condition.contention_observed.wait(timeout=2.0)
+        assert outcomes == {}
+        assert submitter.is_alive()
+        assert closer.is_alive()
+    finally:
+        release_start.set()
+    submitter.join(timeout=2.0)
+    closer.join(timeout=2.0)
+
+    assert not submitter.is_alive()
+    assert not closer.is_alive()
+    assert outcomes == {"submit": start_error}
+    assert joined_unstarted == []
+    _assert_batcher_empty(batcher)
 
 
 @pytest.mark.usefixtures("_identity_graded")
