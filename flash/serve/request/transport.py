@@ -169,7 +169,7 @@ def retryable_smoke_unavailable(
     response: httpx.Response,
     *,
     requested_model: str,
-    expected_adapter_revision: str,
+    expected_checkpoint_id: str,
     fallback_delay_seconds: float = _SMOKE_RETRY_FALLBACK_DELAY_SECONDS,
 ) -> serving_errors.RetryableServingUnavailable | None:
     if response.status_code != 503:
@@ -187,7 +187,7 @@ def retryable_smoke_unavailable(
         or error.get("retryable") is not True
         or code not in _RETRYABLE_SMOKE_503_CODES
         or error.get("requested_model") != requested_model
-        or error.get("adapter_revision") != expected_adapter_revision
+        or error.get("checkpoint_id") != expected_checkpoint_id
     ):
         return None
     raw_delay = response.headers.get("Retry-After") or error.get("retry_after_seconds")
@@ -499,9 +499,7 @@ def request_chat_json(
     if expected_checkpoint and isinstance(payload, dict):
         response_headers = {key.lower(): value for key, value in response.headers.items()}
         payload["_freesolo_headers"] = {
-            "adapter_revision": response_headers.get("x-freesolo-adapter-revision"),
-            "checkpoint": response_headers.get("x-freesolo-checkpoint"),
-            "hf_revision": response_headers.get("x-freesolo-hf-revision"),
+            "checkpoint_id": response_headers.get("x-freesolo-checkpoint"),
         }
         payload["_freesolo_lora_request_adapter"] = response_headers.get(
             "x-freesolo-lora-request-adapter"

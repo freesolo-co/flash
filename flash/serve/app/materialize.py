@@ -274,7 +274,7 @@ def _materialize_all(
     root = _prepare_cache_root(cache_root)
     hydrated: dict[str, Path] = {}
     for adapter in manifest.adapters:
-        hydrated[adapter.adapter_revision] = _materialize_adapter(
+        hydrated[adapter.checkpoint_id] = _materialize_adapter(
             adapter,
             manifest,
             root,
@@ -365,18 +365,18 @@ def locked_manifest_cache(
             lock_path = root / ".locks" / f"{adapter.aggregate_sha256}.lock"
             locks.enter_context(_digest_lock(lock_path))
         paths = {
-            adapter.adapter_revision: adapter_cache_path(root, adapter)
+            adapter.checkpoint_id: adapter_cache_path(root, adapter)
             for adapter in manifest.adapters
         }
         for adapter in manifest.adapters:
-            validate_materialized_adapter(adapter, manifest, paths[adapter.adapter_revision])
+            validate_materialized_adapter(adapter, manifest, paths[adapter.checkpoint_id])
         try:
             yield paths
         except BaseException:
             raise
         else:
             for adapter in manifest.adapters:
-                validate_materialized_adapter(adapter, manifest, paths[adapter.adapter_revision])
+                validate_materialized_adapter(adapter, manifest, paths[adapter.checkpoint_id])
 
 
 def validate_manifest_cache(

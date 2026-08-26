@@ -29,7 +29,8 @@ from flash.schema import (
     TRAIN_KEY_MIN_VERSIONS,
     TRAIN_SCHEMA_KEYS,
     ConfigError,
-    parse_adapter_revision,
+    format_checkpoint_ref,
+    parse_checkpoint_ref,
     spec_and_train_keys_from_file,
     spec_from_dict,
     train_schema_metadata,
@@ -71,11 +72,29 @@ def _job_from_dict(data: dict) -> JobSpec:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("step", ["00", "01"])
-def test_parse_adapter_revision_rejects_zero_padded_steps(step):
-    revision = f"run-a@step-{step}." + "a" * 40
+@pytest.mark.parametrize(
+    "checkpoint_id",
+    [
+        "run-a",
+        "run-a/step-00",
+        "run-a/step-01",
+        "run-a/current",
+        "run-a/final/extra",
+        " run-a/final",
+        "run-a/final ",
+        "run-a@final." + "a" * 40,
+    ],
+)
+def test_parse_checkpoint_ref_rejects_noncanonical_values(checkpoint_id):
+    assert parse_checkpoint_ref(checkpoint_id) is None
 
-    assert parse_adapter_revision(revision) is None
+
+def test_checkpoint_ref_round_trip_requires_explicit_checkpoint():
+    assert parse_checkpoint_ref("run-a/final") == ("run-a", None)
+    assert parse_checkpoint_ref("run-a/step-0") == ("run-a", 0)
+    assert parse_checkpoint_ref("run-a/step-42") == ("run-a", 42)
+    assert format_checkpoint_ref("run-a") == "run-a/final"
+    assert format_checkpoint_ref("run-a", 42) == "run-a/step-42"
 
 
 @pytest.mark.parametrize(
@@ -341,7 +360,7 @@ def test_init_from_adapter_parses_for_every_target_algorithm(algorithm) -> None:
     backend loads a warm-start adapter exactly like GRPO and OPD do, so all nine source/target
     combinations parse.
     """
-    raw = _raw(algorithm=algorithm, **{"train.init_from_adapter": "source-run"})
+    raw = _raw(algorithm=algorithm, **{"train.init_from_adapter": "source-run/final"})
     # the source adapter's rank/alpha metadata is authoritative for every warm start, so authoring
     # either alongside init_from_adapter stays rejected; BASE_RAW presets a rank.
     raw["train"].pop("lora_rank")
@@ -349,7 +368,7 @@ def test_init_from_adapter_parses_for_every_target_algorithm(algorithm) -> None:
     spec = spec_from_dict(raw)
 
     assert spec.algorithm == algorithm
-    assert spec.train.init_from_adapter == "source-run"
+    assert spec.train.init_from_adapter == "source-run/final"
 
 
 @pytest.mark.parametrize(
@@ -371,7 +390,7 @@ def test_warmstart_rejects_explicit_child_rank(lora_rank) -> None:
         ),
     ):
         spec_from_dict(
-            _raw(**{"train.init_from_adapter": "source-run", "train.lora_rank": lora_rank})
+            _raw(**{"train.init_from_adapter": "source-run/final", "train.lora_rank": lora_rank})
         )
 
 
@@ -387,7 +406,7 @@ def test_warmstart_rejects_explicit_child_rank(lora_rank) -> None:
 def test_warmstart_rejects_explicit_child_alpha(lora_alpha) -> None:
     # the source adapter's alpha is authoritative, so authoring one is rejected rather than
     # silently overwritten by the inherited value.
-    raw = _raw(**{"train.init_from_adapter": "source-run", "train.lora_alpha": lora_alpha})
+    raw = _raw(**{"train.init_from_adapter": "source-run/final", "train.lora_alpha": lora_alpha})
     raw["train"].pop("lora_rank")
     with pytest.raises(
         ConfigError,
@@ -472,12 +491,12 @@ def test_authored_lora_alpha_overrides_the_derived_default() -> None:
 
 
 def test_warmstart_accepts_omitted_child_rank_with_internal_placeholder() -> None:
-    raw = _raw(**{"train.init_from_adapter": "source-run"})
+    raw = _raw(**{"train.init_from_adapter": "source-run/final"})
     raw["train"].pop("lora_rank")
 
     spec = spec_from_dict(raw)
 
-    assert spec.train.init_from_adapter == "source-run"
+    assert spec.train.init_from_adapter == "source-run/final"
     assert spec.train.lora_rank == 32
 
 
@@ -493,7 +512,7 @@ def test_gpu_sizing_consumes_the_canonical_warmstart_reference() -> None:
     )
     raw["train"].pop("lora_rank")
 
-    with pytest.raises(ConfigError, match=r"train\.init_from_adapter must be `<run_id>`"):
+    with pytest.raises(ConfigError, match=r"train\.init_from_adapter must be `<run_id>/final`"):
         spec_from_dict(raw)
 
 
@@ -521,7 +540,7 @@ def test_warmstart_placeholder_rank_does_not_reject_a_source_rank_that_fits_b200
     warm = spec_from_dict(
         {
             **base,
-            "train": {**base["train"], "init_from_adapter": "source-rank-4"},
+            "train": {**base["train"], "init_from_adapter": "source-rank-4/final"},
         }
     )
     cold_rank4 = spec_from_dict({**base, "train": {**base["train"], "lora_rank": 4}})
@@ -590,7 +609,7 @@ def test_warmstart_still_rejects_a_shape_impossible_at_the_minimum_rank() -> Non
         model="Qwen/Qwen3.6-35B-A3B",
         **{
             "gpu.type": "B200",
-            "train.init_from_adapter": "source-run",
+            "train.init_from_adapter": "source-run/final",
             "train.max_context_tokens": 32768,
             "train.max_completion_tokens": 512,
             "train.prompts_per_step": 8,
@@ -615,7 +634,7 @@ def test_warmstart_still_validates_the_authored_card_at_the_minimum_rank() -> No
     """
     raw = _raw(
         model="Qwen/Qwen3.6-35B-A3B",
-        **{"gpu.type": "A100 PCIe", "train.init_from_adapter": "source-run"},
+        **{"gpu.type": "A100 PCIe", "train.init_from_adapter": "source-run/final"},
     )
     raw["train"].pop("lora_rank")
 
@@ -648,13 +667,13 @@ def test_public_warmstart_serialization_omits_resolved_internal_fields() -> None
 
 
 def test_public_warmstart_status_spec_round_trips_through_schema() -> None:
-    raw = _raw(**{"train.init_from_adapter": "source-run"})
+    raw = _raw(**{"train.init_from_adapter": "source-run/final"})
     raw["train"].pop("lora_rank")
     public = spec_from_dict(raw).to_dict()
 
     restored = spec_from_dict(public)
 
-    assert restored.train.init_from_adapter == "source-run"
+    assert restored.train.init_from_adapter == "source-run/final"
     assert restored.train.lora_rank == 32
 
 
@@ -2150,7 +2169,7 @@ def test_adapter_continuation_preparation_is_target_algorithm_agnostic(
         model="Qwen/Qwen3.5-9B",
         algorithm=algorithm,
         project="11111111-1111-4111-8111-111111111111",
-        train=TrainSpec(epochs=1, max_examples=8, init_from_adapter="source-run"),
+        train=TrainSpec(epochs=1, max_examples=8, init_from_adapter="source-run/final"),
     )
 
     with pytest.raises(ValueError, match="references unknown run 'source-run'"):

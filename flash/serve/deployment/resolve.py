@@ -18,12 +18,12 @@ import re
 from dataclasses import dataclass
 
 from flash.adapters.lora_rank import rank_from_adapter_config
-from flash.schema import format_adapter_revision
+from flash.schema import format_checkpoint_ref
 from flash.serve.app import AdapterExecutionInput, ArtifactFile, ExecutionInputs
 from flash.serve.app.materialize import MaterializationError, validate_adapter_weight_structure
 from flash.serve.contract.profiles import ServingProfile
 from flash.serve.contract.protocol import reject_non_finite_json_constant
-from flash.serve.control import AdapterAliasIntent, ResolvedAdapter
+from flash.serve.control import ResolvedAdapter
 from flash.serve.provisioning import ServingImage
 
 # a peft lora adapter is exactly these files. requiring the pair (rather than accepting whatever
@@ -351,15 +351,11 @@ def resolve_adapter(
     from flash.serve.app import aggregate_file_digest
 
     aggregate = aggregate_file_digest(files)
-    revision = format_adapter_revision(run_id, checkpoint_step, artifact_revision)
-    # the control record's `checkpoint` is the suffix of its own revision, not the `run/step`
-    # storage reference used elsewhere in flash. validate_resolved_adapter compares them directly.
-    checkpoint = "final" if checkpoint_step is None else f"step-{checkpoint_step}"
+    checkpoint_id = format_checkpoint_ref(run_id, checkpoint_step)
 
     adapter = ResolvedAdapter(
         run_id=run_id,
-        checkpoint=checkpoint,
-        adapter_revision=revision,
+        checkpoint_id=checkpoint_id,
         artifact_repo_id=artifact_repo_id,
         artifact_repo_type=artifact_repo_type,
         artifact_revision=artifact_revision,
@@ -370,14 +366,10 @@ def resolve_adapter(
         lora_rank=lora_rank,
         thinking_default=thinking_default,
         structured_outputs_default_json=structured_outputs_default_json,
-        alias_intent=AdapterAliasIntent(
-            activate=True,
-            expected_adapter_revision=None,
-        ),
     )
     return ResolvedDeploymentInputs(
         adapter=adapter,
-        execution=AdapterExecutionInput(adapter_revision=revision, files=files),
+        execution=AdapterExecutionInput(checkpoint_id=checkpoint_id, files=files),
     )
 
 

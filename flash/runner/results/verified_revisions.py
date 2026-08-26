@@ -1,4 +1,4 @@
-"""Cross-process persistence for verified immutable adapter revisions."""
+"""cross-process persistence for verified permanent checkpoints."""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ from contextlib import contextmanager
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - linux production fails closed below
+except ImportError:  # pragma: no cover
     fcntl = None
 
-from flash.schema import parse_adapter_revision
+from flash.schema import parse_checkpoint_ref
 
-_LEDGER_SUFFIX = ".verified-revisions"
-_LOCK_SUFFIX = ".verified-revisions.lock"
+_LEDGER_SUFFIX = ".verified-checkpoints"
+_LOCK_SUFFIX = ".verified-checkpoints.lock"
 
 
 def _paths(run_id: str) -> tuple[str, str, str]:
@@ -34,7 +34,7 @@ def _paths(run_id: str) -> tuple[str, str, str]:
 @contextmanager
 def _locked_ledger(run_id: str, *, exclusive: bool) -> Iterator[tuple[str, str]]:
     if fcntl is None:
-        raise RuntimeError("interprocess verified-revision locking is unavailable")
+        raise RuntimeError("interprocess verified-checkpoint locking is unavailable")
     runs_dir, ledger_path, lock_path = _paths(run_id)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     with os.fdopen(fd, "a+") as lock_file:
@@ -52,18 +52,18 @@ def _read_unlocked(path: str, run_id: str) -> tuple[int, list[str]]:
     except FileNotFoundError:
         return 0, []
     if not isinstance(raw, dict):
-        raise ValueError(f"invalid verified revision ledger: {path}")
+        raise ValueError(f"invalid verified checkpoint ledger: {path}")
     generation = raw.get("generation")
-    revisions = raw.get("revisions")
+    checkpoints = raw.get("checkpoints")
     if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
-        raise ValueError(f"invalid verified revision generation: {path}")
-    if not isinstance(revisions, list):
-        raise ValueError(f"invalid verified revision membership: {path}")
-    for revision in revisions:
-        parsed = parse_adapter_revision(revision) if isinstance(revision, str) else None
+        raise ValueError(f"invalid verified checkpoint generation: {path}")
+    if not isinstance(checkpoints, list):
+        raise ValueError(f"invalid verified checkpoint membership: {path}")
+    for checkpoint_id in checkpoints:
+        parsed = parse_checkpoint_ref(checkpoint_id) if isinstance(checkpoint_id, str) else None
         if parsed is None or parsed[0] != run_id:
-            raise ValueError(f"invalid verified adapter revision for run {run_id}: {revision!r}")
-    return generation, revisions
+            raise ValueError(f"invalid verified checkpoint for run {run_id}: {checkpoint_id!r}")
+    return generation, checkpoints
 
 
 def _fsync_directory(path: str) -> None:
@@ -74,12 +74,12 @@ def _fsync_directory(path: str) -> None:
         os.close(fd)
 
 
-def _write_unlocked(runs_dir: str, path: str, generation: int, revisions: list[str]) -> None:
+def _write_unlocked(runs_dir: str, path: str, generation: int, checkpoints: list[str]) -> None:
     fd, tmp = tempfile.mkstemp(dir=runs_dir, prefix=f"{os.path.basename(path)}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as ledger_file:
             json.dump(
-                {"generation": generation, "revisions": revisions},
+                {"generation": generation, "checkpoints": checkpoints},
                 ledger_file,
                 indent=2,
                 sort_keys=True,
@@ -93,74 +93,98 @@ def _write_unlocked(runs_dir: str, path: str, generation: int, revisions: list[s
             os.unlink(tmp)
 
 
-def read_verified_adapter_revisions(run_id: str) -> frozenset[str]:
-    """Read the authoritative verified revision membership for a run."""
+def read_verified_checkpoints(run_id: str) -> frozenset[str]:
+    """read the authoritative verified checkpoint membership for a run."""
+
     with _locked_ledger(run_id, exclusive=False) as (_, path):
-        _, revisions = _read_unlocked(path, run_id)
-        return frozenset(revisions)
+        _, checkpoints = _read_unlocked(path, run_id)
+        return frozenset(checkpoints)
 
 
-def verified_adapter_revision_generation(run_id: str) -> int:
-    """Read the current undeploy generation for a run."""
+def verified_checkpoint_generation(run_id: str) -> int:
+    """read the current lifecycle generation for a run's checkpoint membership."""
+
     with _locked_ledger(run_id, exclusive=False) as (_, path):
         generation, _ = _read_unlocked(path, run_id)
         return generation
 
 
-def commit_verified_adapter_revision(
+def commit_verified_checkpoint(
     run_id: str,
-    revision: str,
+    checkpoint_id: str,
     *,
     expected_generation: int,
     commit: Callable[[], None],
-    retain_only_revision: bool = False,
+    retain_only_checkpoint: bool = False,
     advance_generation: bool = False,
 ) -> bool:
-    """Persist verified membership before committing its ready status."""
-    parsed = parse_adapter_revision(revision)
+    """persist verified membership before committing its ready status."""
+
+    parsed = parse_checkpoint_ref(checkpoint_id)
     if parsed is None or parsed[0] != run_id:
-        raise ValueError(f"invalid verified adapter revision for run {run_id}: {revision!r}")
+        raise ValueError(f"invalid verified checkpoint for run {run_id}: {checkpoint_id!r}")
     if (
         isinstance(expected_generation, bool)
         or not isinstance(expected_generation, int)
         or expected_generation < 0
     ):
-        raise ValueError(f"invalid verified revision generation: {expected_generation!r}")
+        raise ValueError(f"invalid verified checkpoint generation: {expected_generation!r}")
     with _locked_ledger(run_id, exclusive=True) as (runs_dir, path):
-        generation, revisions = _read_unlocked(path, run_id)
+        generation, checkpoints = _read_unlocked(path, run_id)
         if generation != expected_generation:
             return False
         retained_generation = generation + 1 if advance_generation else generation
-        retained_revisions = [revision] if retain_only_revision else list(revisions)
-        if not retain_only_revision and revision not in retained_revisions:
-            retained_revisions.append(revision)
-        if retained_generation != generation or retained_revisions != revisions:
-            _write_unlocked(runs_dir, path, retained_generation, retained_revisions)
+        retained = [checkpoint_id] if retain_only_checkpoint else list(checkpoints)
+        if not retain_only_checkpoint and checkpoint_id not in retained:
+            retained.append(checkpoint_id)
+        retained.sort()
+        if retained_generation != generation or retained != checkpoints:
+            _write_unlocked(runs_dir, path, retained_generation, retained)
         commit()
         return True
 
 
-def add_verified_adapter_revision(
+def add_verified_checkpoint(
     run_id: str,
-    revision: str,
+    checkpoint_id: str,
     *,
     expected_generation: int,
 ) -> bool:
-    """Atomically add one canonical same-run immutable revision."""
-    return commit_verified_adapter_revision(
+    return commit_verified_checkpoint(
         run_id,
-        revision,
+        checkpoint_id,
         expected_generation=expected_generation,
         commit=lambda: None,
     )
 
 
-def invalidate_verified_adapter_revisions(
+def remove_verified_checkpoint(
+    run_id: str,
+    checkpoint_id: str,
+    *,
+    commit: Callable[[], None],
+) -> int:
+    """remove one checkpoint while preserving verified sibling checkpoints."""
+
+    parsed = parse_checkpoint_ref(checkpoint_id)
+    if parsed is None or parsed[0] != run_id:
+        raise ValueError(f"invalid verified checkpoint for run {run_id}: {checkpoint_id!r}")
+    with _locked_ledger(run_id, exclusive=True) as (runs_dir, path):
+        generation, checkpoints = _read_unlocked(path, run_id)
+        generation += 1
+        retained = [value for value in checkpoints if value != checkpoint_id]
+        _write_unlocked(runs_dir, path, generation, retained)
+        commit()
+        return generation
+
+
+def invalidate_verified_checkpoints(
     run_id: str,
     *,
     commit: Callable[[], None],
 ) -> int:
-    """Clear membership, advance the tombstone generation, then commit undeploy status."""
+    """clear run membership for internal administrative cleanup."""
+
     with _locked_ledger(run_id, exclusive=True) as (runs_dir, path):
         generation, _ = _read_unlocked(path, run_id)
         generation += 1

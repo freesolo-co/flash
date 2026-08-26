@@ -110,15 +110,12 @@ def _bundle(
 
 def _models_payload(bundle: DeploymentBundle) -> dict[str, object]:
     manifest = bundle.manifest
-    by_revision = {adapter.adapter_revision: adapter for adapter in manifest.adapters}
-    mapping = {revision: revision for revision in by_revision}
-    mapping.update(manifest.aliases)
     data = []
-    for model_id, revision in sorted(mapping.items()):
-        adapter = by_revision[revision]
+    for adapter in manifest.adapters:
+        checkpoint_id = adapter.checkpoint_id
         data.append(
             {
-                "id": model_id,
+                "id": checkpoint_id,
                 "flash_provenance": {
                     "deployment_id": bundle.spec.deployment_id,
                     "spec_id": bundle.spec.spec_id,
@@ -131,12 +128,8 @@ def _models_payload(bundle: DeploymentBundle) -> dict[str, object]:
                     "served_checkpoint_revision": manifest.engine.model_revision,
                     "tokenizer_model": manifest.engine.tokenizer_model,
                     "tokenizer_revision": manifest.engine.tokenizer_revision,
-                    "requested_model": model_id,
-                    "adapter_revision": revision,
-                    "checkpoint": adapter.checkpoint,
-                    "source_revision": adapter.source_revision,
-                    "source_subfolder": adapter.source_subfolder,
-                    "aggregate_sha256": adapter.aggregate_sha256,
+                    "requested_model": checkpoint_id,
+                    "checkpoint_id": checkpoint_id,
                 },
             }
         )
@@ -2142,7 +2135,7 @@ def test_modal_endpoint_probe_rejects_redirect_and_wrong_provenance() -> None:
     assert _provenance_matches(_models_payload(bundle), bundle) is True
 
 
-def test_modal_endpoint_provenance_requires_exact_ids_aliases_and_full_mapping() -> None:
+def test_modal_endpoint_provenance_requires_exact_checkpoint_ids_and_full_mapping() -> None:
     bundle = _bundle()
     valid = _models_payload(bundle)
     assert _provenance_matches(valid, bundle) is True
@@ -2167,9 +2160,9 @@ def test_modal_endpoint_provenance_requires_exact_ids_aliases_and_full_mapping()
     wrong_requested["data"][0]["flash_provenance"]["requested_model"] = "wrong"
     cases.append(wrong_requested)
 
-    wrong_revision = json.loads(json.dumps(valid))
-    wrong_revision["data"][0]["flash_provenance"]["adapter_revision"] = "wrong"
-    cases.append(wrong_revision)
+    wrong_checkpoint = json.loads(json.dumps(valid))
+    wrong_checkpoint["data"][0]["flash_provenance"]["checkpoint_id"] = "wrong"
+    cases.append(wrong_checkpoint)
 
     wrong_global = json.loads(json.dumps(valid))
     wrong_global["data"][0]["flash_provenance"]["logical_base_revision"] = "0" * 40

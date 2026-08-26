@@ -76,9 +76,9 @@ class _LoraEngineImpl:
         self.registry = AdapterRegistry()
         self._adapter_locks: dict[str, asyncio.Lock] = {}
         self._adapter_locks_guard = asyncio.Lock()
-        self._source_locks: dict[tuple[str, str, str, str | None], asyncio.Lock] = {}
+        self._source_locks: dict[tuple[str, str, str, str, str | None], asyncio.Lock] = {}
         self._source_locks_guard = asyncio.Lock()
-        self._source_paths: dict[tuple[str, str, str, str | None], Path] = {}
+        self._source_paths: dict[tuple[str, str, str, str, str | None], Path] = {}
         self._lora_entries: dict[str, _LoraEntry] = {}
         self._prompt_token_cache: OrderedDict[tuple[str, str], tuple[int, ...]] = OrderedDict()
         self._prompt_cache_size = cfg.PROMPT_TOKEN_CACHE_SIZE
@@ -302,7 +302,7 @@ class _LoraEngineImpl:
                         lambda: snapshot_download(
                             repo_id=record.repo_id,
                             repo_type=repo_type,
-                            revision=record.hf_revision,
+                            revision=record.artifact_revision,
                             local_dir=str(local_dir),
                             token=self.settings.hf_api_key,
                             allow_patterns=allow,
@@ -354,7 +354,7 @@ class _LoraEngineImpl:
             record = self.registry.get(adapter_id)
             if record is None or record.status != "ready":
                 raise ValueError(f"Unknown adapter id on {self.base_model}: {adapter_id}")
-            if not record.serve_base_model and not record.is_revision:
+            if not record.serve_base_model and not record.is_checkpoint:
                 raise ValueError(f"Unknown adapter id on {self.base_model}: {adapter_id}")
             if record.serve_base_model:
                 # No LoRA to resolve: generate against the base weights the engine already has.
@@ -586,7 +586,7 @@ class _LoraEngineImpl:
         record = AdapterRecord.model_validate(record_dict).model_copy(
             update={"deployment_generation": deployment_generation}
         )
-        if not record.serve_base_model and not record.is_revision:
+        if not record.serve_base_model and not record.is_checkpoint:
             raise ValueError("only immutable adapter revisions can be registered")
         lock = await self._adapter_lock(record.adapter_id)
         async with lock:  # _locked variant: we hold the lock (the public one would deadlock)
@@ -607,7 +607,7 @@ class _LoraEngineImpl:
         revision is attested. Returning the resolved name lets the router prove the weights it
         billed for came from the requested revision rather than trusting the id it sent.
         """
-        if not record.is_revision:
+        if not record.is_checkpoint:
             return None
         if lora_request is None:
             raise RuntimeError("immutable adapter resolved without a LoRARequest")

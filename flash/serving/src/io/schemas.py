@@ -14,6 +14,7 @@ from pydantic import (
     model_validator,
 )
 
+from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
 from flash.serve.runtime.types import (
     validate_generation_max_tokens,
     validate_generation_temperature,
@@ -59,78 +60,34 @@ def normalize_run_id(value: str) -> str:
 
 
 class AdapterRecord(BaseModel):
+    """one base model or one exact run-backed checkpoint used by hosted serving."""
+
     adapter_id: str
     repo_id: str
     base_model: str
-    # Path within ``repo_id`` to the directory that actually holds ``adapter_config.json``.
-    # AutoSLM runs upload the trained LoRA to ``<phase>/<run_id>/seed<N>/adapter`` inside the
-    # run's HF repo (see autoslm worker ``hf_upload_folder(adapter_dir, "adapter")``), so the
-    # served LoRA must point at that ``.../adapter`` subfolder, not the seed dir or repo root.
-    # None = repo root.
     subfolder: str | None = None
-    # HF repo kind for ``repo_id``. AutoSLM publishes run artifacts (including adapters) to
-    # *dataset* repos, so serving an AutoSLM adapter requires ``"dataset"`` — otherwise
-    # ``snapshot_download`` queries the model namespace and 404s. Plain model repos use "model".
     repo_type: Literal["model", "dataset"] = "model"
-    # Owning org for this adapter (``hosted_lora_adapters.org_id``). Used to authorize external
-    # chat callers: a request bearing a Freesolo API key may only reach an adapter its org owns.
-    # None = unattributed (legacy rows / a registrar that didn't send it); chat auth treats an
-    # unattributed adapter as not authorizable for a user key.
-    # exclude=True keeps it OUT of serialized responses: even though `GET /adapters` now requires
-    # the internal key, this is defense in depth so a listing never emits org ids (which would leak
-    # the adapter->tenant mapping). It's still accepted on input and persisted via the explicit row
-    # mapping in persistence.py.
     org_id: str | None = Field(default=None, exclude=True)
     url: str | None = None
     checkpoint: str | None = None
-    private: bool = True
-    # A base-model, no-LoRA serve: the engine generates against the base weights it already has
-    # loaded (no adapter is downloaded or applied). Any valid API key may reach it (not gated to an
-    # owner) and it is billed to the CALLING org. These records are pre-seeded into the router
-    # in-memory (one per served base model) — never persisted, never org-owned. Defaults False so
-    # LoRA records are unaffected.
+    private: StrictBool = True
     serve_base_model: bool = False
-    # Per-adapter thinking default: the ``enable_thinking`` value the run was trained with. The
-    # engine applies this value regardless of caller chat_template_kwargs, so raw OpenAI clients get
-    # the think/no-think behavior the adapter was trained for.
     thinking: StrictBool
-    # Per-adapter structured-outputs (guided decoding) DEFAULT: canonical StructuredOutputsParams
-    # kwargs (see src/structured_outputs.py), applied by the engine when a request doesn't carry its
-    # own spec. None = no default. Unlike ``thinking`` this is caller-overridable per request — a
-    # per-call spec replaces it, and a per-call ``{}`` explicitly disables it for that call.
     structured_outputs: dict[str, Any] | None = Field(default=None)
     status: Literal["ready", "disabled"] = "ready"
-    metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str | None = None
     updated_at: str | None = None
-    # internal lifecycle token used to reject stale background unregister work.
     deployment_generation: str | None = Field(default=None, exclude=True)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _strip_metadata_stored_fields(cls, data: Any) -> Any:
-        # ``metadata.thinking`` / ``metadata.structured_outputs`` are the database representation
-        # only (persistence packs the first-class fields into the metadata JSON column). API callers
-        # must send the first-class fields; strip duplicate metadata copies so the in-memory model
-        # has one authoritative source of truth — a stray metadata copy would otherwise be persisted
-        # verbatim and resurrected as the field value on the next hydration.
-        if not isinstance(data, dict):
-            return data
-        meta = data.get("metadata")
-        if not isinstance(meta, dict) or not ({"thinking", "structured_outputs"} & meta.keys()):
-            return data
-        new_meta = {k: v for k, v in meta.items() if k not in ("thinking", "structured_outputs")}
-        return {**data, "metadata": new_meta}
+    run_id: str | None = Field(default=None, exclude=True)
+    checkpoint_step: int | None = Field(default=None, exclude=True)
+    artifact_revision: str | None = Field(default=None, exclude=True)
+    artifact_digest: str | None = Field(default=None, exclude=True)
+    artifact_fingerprint: str | None = Field(default=None, exclude=True)
+    lora_rank: int | None = Field(default=None, exclude=True)
 
     @field_validator("structured_outputs", mode="before")
     @classmethod
     def normalize_structured_outputs_default(cls, value: Any) -> dict[str, Any] | None:
-        # mode="before": accept every flexible input form (raw schema, str, bool) ahead of the
-        # ``dict | None`` type check. Explicit-off ({}) collapses to None here:
-        # "no default" and "default: unconstrained" are the same thing for a record, and None keeps
-        # the persisted metadata free of a meaningless marker.
-        # StructuredOutputsError is a ValueError subclass, so pydantic already surfaces it as a
-        # field validation error (FastAPI -> 422) with the message intact — no re-raise needed.
         return normalize_structured_outputs(value) or None
 
     @field_validator("adapter_id", "repo_id", "base_model")
@@ -143,8 +100,16 @@ class AdapterRecord(BaseModel):
     def validate_subfolder(cls, value: str | None) -> str | None:
         return normalize_adapter_subfolder(value)
 
+    @field_validator("org_id")
+    @classmethod
+    def normalize_org_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
     @model_validator(mode="after")
-    def validate_thinking_structured_outputs(self) -> AdapterRecord:
+    def validate_record(self) -> AdapterRecord:
         if self.thinking and self.structured_outputs is not None:
             try:
                 parser = reasoning_parser_for(self.base_model)
@@ -154,124 +119,57 @@ class AdapterRecord(BaseModel):
                 raise ValueError(
                     "structured outputs with thinking require a base model with a reasoning parser"
                 )
+        if self.serve_base_model:
+            return self
+        if self.run_id is None or self.org_id is None:
+            raise ValueError("checkpoint records require run_id and org_id")
+        normalize_run_id(self.run_id)
+        expected = format_checkpoint_ref(self.run_id, self.checkpoint_step)
+        if self.adapter_id != expected or self.checkpoint != expected:
+            raise ValueError("checkpoint identity does not match run_id and checkpoint_step")
+        if (
+            self.artifact_revision is None
+            or re.fullmatch(r"[0-9a-f]{40}", self.artifact_revision) is None
+        ):
+            raise ValueError("artifact_revision must be a canonical 40-character commit sha")
+        for name in ("artifact_digest", "artifact_fingerprint"):
+            value = getattr(self, name)
+            if value is None or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(f"{name} must be a canonical sha-256 digest")
+        if (
+            isinstance(self.lora_rank, bool)
+            or not isinstance(self.lora_rank, int)
+            or self.lora_rank <= 0
+        ):
+            raise ValueError("lora_rank must be a positive integer")
         return self
 
-    @field_validator("org_id")
-    @classmethod
-    def normalize_org_id(cls, value: str | None) -> str | None:
-        # Treat a blank/whitespace-only org id as absent: persisting "   " into
-        # ``hosted_lora_adapters.org_id`` would read as "attributed" yet never match a real org,
-        # silently breaking auth + billing attribution. Strip; collapse empty to None.
-        if value is None:
-            return None
-        stripped = value.strip()
-        return stripped or None
-
     @property
-    def is_revision(self) -> bool:
-        try:
-            metadata = ImmutableRevisionMetadata.model_validate(self.metadata)
-        except ValueError:
-            return False
-        suffix = "final" if metadata.checkpoint_step is None else f"step-{metadata.checkpoint_step}"
-        checkpoint = (
-            metadata.run_id
-            if metadata.checkpoint_step is None
-            else f"{metadata.run_id}/step-{metadata.checkpoint_step}"
-        )
-        return (
-            self.adapter_id == f"{metadata.run_id}@{suffix}.{metadata.hf_revision}"
-            and self.checkpoint == checkpoint
-        )
-
-    @property
-    def is_alias(self) -> bool:
-        try:
-            metadata = ImmutableAliasMetadata.model_validate(self.metadata)
-        except ValueError:
-            return False
-        return self.adapter_id == metadata.run_id
-
-    @property
-    def run_id(self) -> str | None:
-        value = self.metadata.get("run_id")
-        return value if isinstance(value, str) and value else None
-
-    @property
-    def alias_of(self) -> str | None:
-        value = self.metadata.get("alias_of")
-        return value if isinstance(value, str) and value else None
-
-    @property
-    def hf_revision(self) -> str | None:
-        value = self.metadata.get("hf_revision")
-        return value if isinstance(value, str) and value else None
+    def is_checkpoint(self) -> bool:
+        return not self.serve_base_model and parse_checkpoint_ref(self.adapter_id) is not None
 
     def immutable_fingerprint(self) -> tuple[Any, ...]:
         return (
             self.adapter_id,
+            self.run_id,
+            self.checkpoint_step,
             self.repo_id,
-            self.base_model,
-            self.subfolder,
             self.repo_type,
+            self.artifact_revision,
+            self.artifact_digest,
+            self.artifact_fingerprint,
+            self.subfolder,
+            self.base_model,
+            self.lora_rank,
             self.org_id,
-            self.url,
-            self.checkpoint,
-            self.private,
             self.thinking,
             json.dumps(self.structured_outputs, sort_keys=True, separators=(",", ":")),
-            json.dumps(self.metadata, sort_keys=True, separators=(",", ":")),
         )
 
 
-class ImmutableRevisionMetadata(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class ImmutableCheckpointRegistration(BaseModel):
+    """strict internal registration input for one permanent checkpoint binding."""
 
-    record_type: Literal["revision"]
-    run_id: str
-    checkpoint_step: int | None
-    hf_revision: str
-
-    @field_validator("run_id")
-    @classmethod
-    def validate_run_id(cls, value: str) -> str:
-        return normalize_run_id(value)
-
-    @field_validator("checkpoint_step")
-    @classmethod
-    def validate_checkpoint_step(cls, value: int | None) -> int | None:
-        if value is not None and (isinstance(value, bool) or value < 0):
-            raise ValueError("checkpoint_step must be a non-negative integer or null")
-        return value
-
-    @field_validator("hf_revision")
-    @classmethod
-    def validate_hf_revision(cls, value: str) -> str:
-        stripped = value.strip()
-        if re.fullmatch(r"[0-9a-f]{40}", stripped) is None:
-            raise ValueError("hf_revision must be a canonical 40-character Hub commit SHA")
-        return stripped
-
-
-class ImmutableAliasMetadata(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    record_type: Literal["alias"]
-    run_id: str
-    alias_of: str
-
-    @field_validator("run_id")
-    @classmethod
-    def validate_run_id(cls, value: str) -> str:
-        return normalize_run_id(value)
-
-    @field_validator("alias_of")
-    @classmethod
-    def require_non_empty_alias_of(cls, value: str) -> str:
-        return _require_non_empty(value)
-
-
-class ImmutableAdapterRegistration(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     adapter_id: str
@@ -285,7 +183,12 @@ class ImmutableAdapterRegistration(BaseModel):
     private: StrictBool = True
     thinking: StrictBool
     structured_outputs: dict[str, Any] | None = Field(default=None)
-    metadata: ImmutableRevisionMetadata
+    run_id: str
+    checkpoint_step: int | None
+    artifact_revision: str
+    artifact_digest: str
+    artifact_fingerprint: str
+    lora_rank: int
 
     @field_validator("adapter_id", "repo_id", "base_model", "org_id", "checkpoint")
     @classmethod
@@ -303,40 +206,28 @@ class ImmutableAdapterRegistration(BaseModel):
         return normalize_structured_outputs(value) or None
 
     @model_validator(mode="after")
-    def validate_identity(self) -> ImmutableAdapterRegistration:
-        suffix = (
-            "final"
-            if self.metadata.checkpoint_step is None
-            else f"step-{self.metadata.checkpoint_step}"
-        )
-        expected_id = f"{self.metadata.run_id}@{suffix}.{self.metadata.hf_revision}"
-        if self.adapter_id != expected_id:
+    def validate_identity(self) -> ImmutableCheckpointRegistration:
+        normalize_run_id(self.run_id)
+        expected = format_checkpoint_ref(self.run_id, self.checkpoint_step)
+        if self.adapter_id != expected or self.checkpoint != expected:
             raise ValueError(
-                "adapter_id must match metadata run_id, checkpoint_step, and hf_revision"
+                "adapter_id and checkpoint must equal the canonical checkpoint identity"
             )
-        expected_checkpoint = (
-            self.metadata.run_id
-            if self.metadata.checkpoint_step is None
-            else f"{self.metadata.run_id}/step-{self.metadata.checkpoint_step}"
-        )
-        if self.checkpoint != expected_checkpoint:
-            raise ValueError("checkpoint must match metadata run_id and checkpoint_step")
+        if re.fullmatch(r"[0-9a-f]{40}", self.artifact_revision) is None:
+            raise ValueError("artifact_revision must be a canonical 40-character commit sha")
+        for name in ("artifact_digest", "artifact_fingerprint"):
+            if re.fullmatch(r"[0-9a-f]{64}", getattr(self, name)) is None:
+                raise ValueError(f"{name} must be a canonical sha-256 digest")
+        if isinstance(self.checkpoint_step, bool) or (
+            self.checkpoint_step is not None and self.checkpoint_step < 0
+        ):
+            raise ValueError("checkpoint_step must be a non-negative integer or null")
+        if isinstance(self.lora_rank, bool) or self.lora_rank <= 0:
+            raise ValueError("lora_rank must be a positive integer")
         return self
 
     def to_record(self) -> AdapterRecord:
-        return AdapterRecord.model_validate(
-            {
-                **self.model_dump(mode="json"),
-                "status": "disabled",
-                "metadata": self.metadata.model_dump(mode="json"),
-            }
-        )
-
-
-class AdapterActivationRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    expected_adapter_revision: str | None
+        return AdapterRecord.model_validate({**self.model_dump(mode="json"), "status": "disabled"})
 
 
 class PersistedAdapterRecord(AdapterRecord):
@@ -346,37 +237,23 @@ class PersistedAdapterRecord(AdapterRecord):
     def validate_persisted_identity(self) -> PersistedAdapterRecord:
         if self.serve_base_model:
             raise ValueError("base-model records must not be persisted")
-        if self.org_id is None:
-            raise ValueError("persisted adapter records require org_id")
         if not self.updated_at:
-            raise ValueError("persisted adapter records require updated_at")
-        if self.metadata.get("record_type") == "revision":
-            metadata = ImmutableRevisionMetadata.model_validate(self.metadata)
-            suffix = (
-                "final" if metadata.checkpoint_step is None else f"step-{metadata.checkpoint_step}"
-            )
-            if self.adapter_id != f"{metadata.run_id}@{suffix}.{metadata.hf_revision}":
-                raise ValueError("persisted revision adapter_id does not match metadata")
-            checkpoint = (
-                metadata.run_id
-                if metadata.checkpoint_step is None
-                else f"{metadata.run_id}/step-{metadata.checkpoint_step}"
-            )
-            if self.checkpoint != checkpoint:
-                raise ValueError("persisted revision checkpoint does not match metadata")
-        elif self.metadata.get("record_type") == "alias":
-            metadata = ImmutableAliasMetadata.model_validate(self.metadata)
-            if self.adapter_id != metadata.run_id:
-                raise ValueError("persisted alias adapter_id must equal metadata.run_id")
-            if self.checkpoint is not None:
-                raise ValueError("persisted alias checkpoint must be null")
-        else:
-            raise ValueError("persisted records require revision or alias metadata")
+            raise ValueError("persisted checkpoint records require updated_at")
         return self
 
 
 def internal_adapter_payload(record: AdapterRecord) -> dict[str, Any]:
-    return {**record.model_dump(mode="json"), "org_id": record.org_id}
+    return {
+        **record.model_dump(mode="json"),
+        "org_id": record.org_id,
+        "deployment_generation": record.deployment_generation,
+        "run_id": record.run_id,
+        "checkpoint_step": record.checkpoint_step,
+        "artifact_revision": record.artifact_revision,
+        "artifact_digest": record.artifact_digest,
+        "artifact_fingerprint": record.artifact_fingerprint,
+        "lora_rank": record.lora_rank,
+    }
 
 
 class GenerateRequest(BaseModel):
@@ -476,7 +353,6 @@ class GenerateRequest(BaseModel):
         # Normalize once so every entry point (/generate, /v1/chat/completions, the per-adapter
         # route) authorizes against and routes to the same adapter — a stray "  qa  " resolves to
         # "qa" rather than auth'ing one value and looking up another.
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("adapter_id must not be empty")
-        return stripped
+        if parse_checkpoint_ref(value) is None:
+            raise ValueError("adapter_id must be `<run_id>/final` or `<run_id>/step-N`")
+        return value

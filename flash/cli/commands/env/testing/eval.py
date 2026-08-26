@@ -202,12 +202,7 @@ def _score_case(
         )
 
 
-# the server's own names for a record that is serving traffic versus one still coming up
-# (flash/server/routes/serving.py). a busy record's `adapter_revision` is the INCOMING revision.
 _READY_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
-# a busy redeploy may still serve its predecessor, which the public listing hides.
-# `/v1/deployments` excludes only `undeployed`/`dry_run`, so only `ready` and `busy`
-# may answer; other returned states fail closed (flash/cli/commands/__init__.py).
 _BUSY_DEPLOYMENT_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 
 
@@ -328,10 +323,6 @@ def _generate_concurrently(
             pending.put((index, prompt))
     outstanding = pending.qsize()
     if outstanding:
-        # warm the step-selector capability once before workers start. only successful
-        # `/v1/health` checks are cached, so cold workers would multiply a transient or
-        # unsupported failure. failures propagate here; only `RUN/step-N` triggers the check.
-        client.warm_chat_step_selector(target)
         finished: queue.SimpleQueue = queue.SimpleQueue()
         aborted = threading.Event()
         abort_lock = threading.Lock()
@@ -555,82 +546,41 @@ def _print_report(report: EvalSuiteReport) -> None:
 
 
 def _resolve_evaluation_target(
-    args, client, parsed, parse_adapter_revision, api_error, client_error
+    args, client, parsed, api_error, client_error
 ) -> tuple[str, int | None]:
-    """Resolve the deployed evaluation target phase."""
-    evaluation_target = args.target
-    if parsed is None:
-        return evaluation_target, None
-
-    run_id, want_step = parsed
+    """require the exact requested checkpoint to be the ready managed deployment."""
+    run_id, _ = parsed
     try:
         deployment = _live_deployment(client, run_id)
     except (api_error, client_error) as exc:
         if getattr(args, "debug", False):
             raise
-        _err(f"env eval failed: could not resolve deployed revision for {run_id}: {exc}")
-        return evaluation_target, _err("overall: FAIL")
+        _err(f"env eval failed: could not resolve deployed checkpoint for {run_id}: {exc}")
+        return args.target, _err("overall: FAIL")
     if deployment is None:
-        _err(f"env eval failed: run {args.target} is not deployed")
-        return evaluation_target, _err("overall: FAIL")
-    deployment_state = deployment.get("state")
-    servable_states = _READY_DEPLOYMENT_STATES | _BUSY_DEPLOYMENT_STATES
-    if want_step is not None:
-        # pinned steps resolve through the verified ledger, not the deployment record
-        # (`flash/server/routes/serving.py`). allow `failed`, which preserves that ledger;
-        # revocation-failed and undeploy paths invalidate it in `flash/runner/supervise/deploy.py`.
-        servable_states = servable_states | {"failed"}
-    if deployment_state not in servable_states:
-        # having a record is not having a servable one: the listing keeps terminal states like
-        # `failed` and `revocation_failed`, and the chat route has no ready predecessor to fall
-        # back to for them, so every case 409s. that spends a whole suite of generation failures
-        # to learn what one target error says now. a step that genuinely is not in the ledger
-        # still gets one 409 naming the deployed steps, not a suite of them.
+        _err(f"env eval failed: checkpoint {args.target} is not deployed")
+        return args.target, _err("overall: FAIL")
+    state = deployment.get("state")
+    if state not in _READY_DEPLOYMENT_STATES:
         _err(
-            f"env eval failed: run {args.target} deployment is {deployment_state or 'unknown'}"
-            f"; run `{CLI_NAME} models deploy {run_id}` first"
+            f"env eval failed: checkpoint {args.target} deployment is {state or 'unknown'}; "
+            f"run `{CLI_NAME} models deploy {args.target}` first"
         )
-        return evaluation_target, _err("overall: FAIL")
-    # a busy record names the rollout target, not the hidden predecessor still serving.
-    # leave the user's target unpinned so the chat route can resolve private rollback state or
-    # return the correct 409 when nothing serves.
-    resolved = None
-    if deployment_state in _READY_DEPLOYMENT_STATES:
-        candidate = deployment.get("adapter_revision")
-        resolved = parse_adapter_revision(candidate) if isinstance(candidate, str) else None
-        if resolved is None or resolved[0] != run_id:
-            _err(
-                f"env eval failed: deployment for {run_id} has no valid immutable adapter revision"
-            )
-            return evaluation_target, _err("overall: FAIL")
-    # `RUN/step-N` is not immutable: multiple revisions may share a step. pin only when the
-    # live deployment is that step; otherwise the server-only verified ledger may still resolve
-    # an older step, and the chat route must decide ambiguity.
-    if resolved is not None and (want_step is None or resolved[1] == want_step):
-        evaluation_target = candidate.strip()
-        print(f"resolved evaluation target {args.target} to {evaluation_target}")
-    elif args.upload and want_step is not None:
-        # uploaded reports must name immutable weights. the CLI cannot resolve an ambiguous
-        # `RUN/step-N`: the verified ledger is server-only and chat does not echo the revision.
-        # refuse before generation; bare aliases remain valid because they mean the currently
-        # serving revision, including a busy predecessor.
-        _err(
-            f"env eval failed: cannot upload results for {args.target}: the immutable "
-            "revision that will answer it is not knowable here. re-run with the full "
-            f"revision from `{CLI_NAME} models deployments`, or pass --no-upload"
-        )
-        return evaluation_target, _err("overall: FAIL")
-    return evaluation_target, None
+        return args.target, _err("overall: FAIL")
+    if deployment.get("checkpoint_id") != args.target:
+        _err(f"env eval failed: checkpoint {args.target} is not the ready managed deployment")
+        return args.target, _err("overall: FAIL")
+    return args.target, None
 
 
 def _load_evaluation_run_spec(
-    args, client, revision, parsed, api_error, client_error
+    args, client, parsed, api_error, client_error
 ) -> tuple[object, int | None]:
-    """Load the target run specification phase."""
+    """load the target run specification phase."""
     # one run lookup supplies its training environment, reasoning mode, and owning project.
     # these are target-run properties, not fallbacks, and reading once avoids one lookup per case.
     spec = None
-    target_run_id = (revision or parsed or (None,))[0]
+    target_run_id = parsed[0]
     if not target_run_id:
         return spec, None
     try:
@@ -892,17 +842,16 @@ def cmd_env_eval(args) -> int:
         load_freesolo_environment,
     )
     from flash.envs.loading.pull import pull_environment_package_from_archive
-    from flash.schema import parse_adapter_revision, parse_checkpoint_ref
+    from flash.schema import parse_checkpoint_ref
 
     if args.project and not args.upload:
         return _err("--project cannot be combined with --no-upload")
 
-    revision = parse_adapter_revision(args.target)
-    parsed = parse_checkpoint_ref(args.target) if revision is None else None
-    if revision is None and parsed is None:
+    parsed = parse_checkpoint_ref(args.target)
+    if parsed is None:
         return _err(
             f"invalid evaluation target {args.target!r} "
-            "(expected a bare <run_id>, <run_id>/step-N, or full immutable adapter revision)"
+            "(expected <run_id>/final or <run_id>/step-N)"
         )
 
     # an explicitly named project is fully settled before anything else happens, including before a
@@ -926,14 +875,12 @@ def cmd_env_eval(args) -> int:
 
     client = client_from_config()
     evaluation_target, exit_code = _resolve_evaluation_target(
-        args, client, parsed, parse_adapter_revision, ApiError, ClientError
+        args, client, parsed, ApiError, ClientError
     )
     if exit_code is not None:
         return exit_code
 
-    spec, exit_code = _load_evaluation_run_spec(
-        args, client, revision, parsed, ApiError, ClientError
-    )
+    spec, exit_code = _load_evaluation_run_spec(args, client, parsed, ApiError, ClientError)
     if exit_code is not None:
         return exit_code
 

@@ -27,7 +27,7 @@ _PUBLISHED_SLUG = "acme/example-project/starter"
 # a full immutable revision: the one target shape that needs no resolution, so a test about
 # anything else does not have to stub `deployments()`. `RUN/step-N` is a shorthand the CLI now
 # pins first, which is its own contract (`test_env_eval_pins_a_step_shorthand_...`).
-_EXPLICIT_TARGET = "flash-1@step-3." + "a" * 40
+_EXPLICIT_TARGET = "flash-1/step-3"
 
 
 class _EvalClient:
@@ -47,6 +47,14 @@ class _EvalClient:
                 "environment": {"id": _PUBLISHED_SLUG},
             }
         }
+
+    def deployments(self):
+        return [
+            {
+                "run_id": "flash-1",
+                "deployment": {"state": "ready", "checkpoint_id": _EXPLICIT_TARGET},
+            }
+        ]
 
     def warm_chat_step_selector(self, target):
         return None
@@ -437,164 +445,20 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys) 
     assert "overall: PASS" in output
 
 
-def test_env_eval_pins_bare_run_alias_before_generating_and_uploading(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    # a bare run id is a mutable deployment alias. resolving it once prevents later cases from
-    # reaching a replacement adapter while one report claims every score came from one model.
-    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'pinned'\n"
-        "    def cases(self): return [\n"
-        "        EvalCase(id='first', input='first', expected='first'),\n"
-        "        EvalCase(id='second', input='second', expected='second'),\n"
-        "    ]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
-    revision = "flash-1@final." + "a" * 40
-
-    class Client(_EvalClient):
-        def __init__(self):
-            self.deployment_calls = []
-            self.targets = []
-
-        def deployments(self):
-            self.deployment_calls.append("deployments")
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {"state": "ready", "adapter_revision": revision},
-                }
-            ]
-
-        def chat_stream(self, target, messages, **kwargs):
-            self.targets.append(target)
-            yield messages[0]["content"]
-
-    client = Client()
-    uploader = _RecordingUpload()
-    monkeypatch.setattr(
-        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
-    )
-    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
-    _patch_upload(monkeypatch, uploader)
-
-    assert cli.main(["env", "eval", "flash-1", "--project", _PROJECT_ID]) == 0
-
-    # resolved exactly once, before any case ran: the whole report must come from one revision.
-    assert client.deployment_calls == ["deployments"]
-    assert client.targets == [revision, revision]
-    assert uploader.calls[0]["model"] == revision
-    assert f"resolved evaluation target flash-1 to {revision}" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize(
-    ("deployment", "reason"),
-    [
-        (None, "is not deployed"),
-        ({"state": "ready"}, "has no valid immutable adapter revision"),
-        (
-            {"state": "ready", "adapter_revision": "other-run@final." + "b" * 40},
-            "has no valid immutable adapter revision",
-        ),
-        # `/v1/deployments` excludes only undeployed/dry_run, so a terminal record is still listed
-        # and "has a record" was read as "has a servable one". The chat route has no ready
-        # predecessor for these, so every case 409s: a whole suite of generation failures to say
-        # what one target error says here.
-        ({"state": "failed"}, "deployment is failed"),
-        ({"state": "revocation_failed"}, "deployment is revocation_failed"),
-    ],
-    ids=[
-        "absent",
-        "no-revision",
-        "another-runs-revision",
-        "failed",
-        "revocation-failed",
-    ],
-)
-def test_env_eval_refuses_a_bare_alias_it_cannot_pin(
-    monkeypatch, tmp_path, capsys, deployment, reason
-) -> None:
-    # the counterpart to the test above: an alias that resolves to nothing immutable cannot be
-    # evaluated reproducibly. each case has to stop BEFORE generating -- grading against whatever
-    # the alias points at right now spends the whole suite on a model the report cannot name, and
-    # a revision belonging to another run is not this run's model at all.
-    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
-
-    class Client(_EvalClient):
-        def deployments(self):
-            if deployment is None:
-                return []
-            return [{"run_id": "flash-1", "deployment": dict(deployment)}]
-
-        def chat_stream(self, target, messages, **kwargs):
-            raise AssertionError("no case may generate against an unpinned alias")
-            yield ""
-
-    monkeypatch.setattr(
-        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
-    )
-    monkeypatch.setattr("flash.client.client_from_config", Client)
-
-    assert cli.main(["env", "eval", "flash-1"]) == 1
-    captured = capsys.readouterr().err
-    assert reason in captured
-    assert "overall: FAIL" in captured
-
-
-def test_env_eval_runs_a_pinned_step_whose_latest_deploy_failed(monkeypatch, tmp_path) -> None:
-    """A failed deployment record does not un-verify the steps already in the run's ledger.
-
-    Pinned steps resolve through the verified ledger, which only undeploy and revocation invalidate;
-    a later failed deploy must not block an earlier verified revision.
-    """
-    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
-
-    class Client(_EvalClient):
-        def __init__(self):
-            self.targets = []
-
-        def get_run(self, run_id):
-            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
-
-        def deployments(self):
-            # the newest attempt failed; step-3 was verified by an earlier, successful one.
-            return [{"run_id": "flash-1", "deployment": {"state": "failed"}}]
-
-        def warm_chat_step_selector(self, target):
-            return None
-
-        def chat_stream(self, target, messages, **kwargs):
-            self.targets.append(target)
-            yield "4"
-
-    client = Client()
-    monkeypatch.setattr(
-        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
-    )
-    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
-
-    assert cli.main(["env", "eval", "flash-1/step-3", "--no-upload"]) == 0
-    # forwarded as written: the ledger the server resolves it against is not readable from here.
-    assert client.targets == ["flash-1/step-3"]
-
-
 def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
     monkeypatch, tmp_path, capsys
 ) -> None:
     """The exemption above is `failed` only, because that is the state that spares the ledger.
 
     `mark_deployment_revocation_failed` and the undeploy paths call
-    `invalidate_verified_adapter_revisions` (`flash/runner/supervise/deploy.py`), so under those states there
+    `invalidate_verified_checkpoints` (`flash/runner/supervise/deploy.py`), so under those states there
     is no ledger left for `RUN/step-N` to resolve against and every case 409s -- the wasted suite of
     generation failures this check exists to avoid. Exempting every terminal state for a pinned step
     let `revocation_failed` through.
     """
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.targets = []
 
@@ -622,54 +486,6 @@ def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
     assert "deployment is revocation_failed" in captured.err
     # one failure up front, not one per case: no generation was attempted.
     assert client.targets == []
-
-
-def test_env_eval_never_pins_the_revision_a_rollout_is_heading_to(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    """A busy record is listed with the revision it is rolling OUT to, not the one serving.
-
-    Pinning it graded a revision that was not answering requests and filed the scores under it.
-    The predecessor still serving underneath cannot be read from here -- `/v1/deployments` strips
-    `previous_deployment` as private rollback state (tests/test_server_api.py asserts the public
-    body omits it) -- so the run id is forwarded and the chat route resolves it, exactly as
-    `flash chat RUN` does through the same predecessor.
-    """
-    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
-    incoming = "flash-1@final." + "b" * 40
-
-    class Client(_EvalClient):
-        def __init__(self):
-            self.targets = []
-
-        def deployments(self):
-            # the public listing shape: no `previous_deployment`, so a redeploy over a live
-            # revision and a first rollout are indistinguishable from this side.
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {"state": "queued", "adapter_revision": incoming},
-                }
-            ]
-
-        def chat_stream(self, target, messages, **kwargs):
-            self.targets.append(target)
-            yield "4"
-
-    client = Client()
-    uploader = _RecordingUpload()
-    monkeypatch.setattr(
-        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
-    )
-    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
-    _patch_upload(monkeypatch, uploader)
-
-    assert cli.main(["env", "eval", "flash-1", "--project", _PROJECT_ID]) == 0
-    # the run id is forwarded untouched: the incoming revision must never be substituted for it,
-    # in generation or in the uploaded report.
-    assert client.targets == ["flash-1"]
-    assert uploader.calls[0]["model"] == "flash-1"
-    assert incoming not in capsys.readouterr().out
 
 
 def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys) -> None:
@@ -706,140 +522,6 @@ def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys
     assert output.index("case first: PASS") < output.index("case second: PASS")
 
 
-def test_env_eval_settles_the_step_selector_capability_before_the_fan_out(
-    monkeypatch, tmp_path
-) -> None:
-    # warm the step-selector capability before workers start so a cold cache causes one health call.
-    # only surviving RUN/step-N shorthands need this; full and already-live revisions are pinned
-    # first.
-    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'many'\n"
-        "    def cases(self): return [\n"
-        "        EvalCase(id=f'c{i}', input='hi', expected='hi') for i in range(6)\n"
-        "    ]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
-    events: list[str] = []
-    lock = threading.Lock()
-
-    class Client(_EvalClient):
-        def get_run(self, run_id):
-            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
-
-        def deployments(self):
-            # step-20 is live, so the requested step-3 shorthand is NOT pinned to a revision and
-            # arrives at the fan-out still carrying its step selector.
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {
-                        "state": "ready",
-                        "checkpoint_step": 20,
-                        "adapter_revision": "flash-1@step-20." + "a" * 40,
-                    },
-                }
-            ]
-
-        def warm_chat_step_selector(self, target):
-            with lock:
-                events.append(f"warm:{target}")
-
-        def chat_stream(self, target, messages, **kwargs):
-            with lock:
-                events.append("chat")
-            yield "hi"
-
-    monkeypatch.setattr(
-        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
-    )
-    monkeypatch.setattr("flash.client.client_from_config", Client)
-
-    assert cli.main(["env", "eval", "flash-1/step-3", "--concurrency", "4", "--no-upload"]) == 0
-
-    # exactly one warm-up, and it precedes every chat -- a per-worker check would interleave.
-    assert events == ["warm:flash-1/step-3"] + ["chat"] * 6
-
-
-def test_env_eval_fails_the_target_when_the_capability_prewarm_fails(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    """A failed prewarm must end the eval, not be swallowed and re-raised once per case.
-
-    Suppressing it did not soften a transient blip, it multiplied it: the client caches only a
-    SUCCESSFUL check, so every worker then missed the same cold cache and re-ran it -- one bad
-    /v1/health became one per worker plus a generation error per case, burying the single line
-    that names the real cause. So assert the cascade is gone: nothing
-    is generated, and the cause is stated once at target level.
-    """
-    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'many'\n"
-        "    def cases(self): return [\n"
-        "        EvalCase(id=f'c{i}', input='hi', expected='hi') for i in range(6)\n"
-        "    ]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
-    from flash.client import ClientError
-
-    calls = {"warm": 0, "chat": 0}
-    lock = threading.Lock()
-
-    class Client(_EvalClient):
-        def get_run(self, run_id):
-            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
-
-        def deployments(self):
-            # step-20 is live, so the requested step-3 keeps its selector into the fan-out.
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {
-                        "state": "ready",
-                        "checkpoint_step": 20,
-                        "adapter_revision": "flash-1@step-20." + "a" * 40,
-                    },
-                }
-            ]
-
-        def _unsupported(self):
-            raise ClientError(
-                "chat checkpoint selectors require a control plane that advertises "
-                "chat_step_selector; use a full immutable adapter revision or upgrade the "
-                "control plane"
-            )
-
-        def warm_chat_step_selector(self, target):
-            with lock:
-                calls["warm"] += 1
-            self._unsupported()
-
-        def chat_stream(self, target, messages, **kwargs):
-            # what a worker really hits on a cold cache: the same check, failing the same way.
-            with lock:
-                calls["chat"] += 1
-            self._unsupported()
-            yield ""
-
-    monkeypatch.setattr(
-        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
-    )
-    monkeypatch.setattr("flash.client.client_from_config", Client)
-
-    assert cli.main(["env", "eval", "flash-1/step-3", "--concurrency", "4", "--no-upload"]) == 1
-
-    # settled once and never retried per worker, and no case bought a generation behind it.
-    assert calls == {"warm": 1, "chat": 0}
-    err = capsys.readouterr().err
-    # the cause reaches the user as one target-level error, not six per-case ones hiding it.
-    assert "chat checkpoint selectors require" in err
-    assert "generation failed" not in err
-
-
 def test_env_eval_rejects_invalid_target_before_loading(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         "flash.client.client_from_config",
@@ -866,7 +548,7 @@ def test_env_eval_rejects_a_local_directory_positional(tmp_path, capsys) -> None
 def test_env_eval_no_upload_still_requires_a_published_environment(monkeypatch, capsys) -> None:
     """Opting out of recording does not invent the environment whose suites should be graded."""
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.generated = 0
 
@@ -1006,7 +688,7 @@ def test_env_eval_refuses_to_record_a_run_whose_project_is_unknown(
     name both ways out."""
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def get_run(self, run_id):
             return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
 
@@ -1044,7 +726,7 @@ def test_env_eval_upload_rejects_a_non_uuid_project_before_paying(
     )
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    assert cli.main(["env", "eval", "flash-1", "--project", "proj-9"]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", "proj-9"]) == 1
     captured = capsys.readouterr().err
     assert "--project must be a valid PROJECT_ID" in captured
     assert "valid UUID" in captured
@@ -1080,7 +762,7 @@ def test_env_eval_upload_rejects_an_inaccessible_project_before_paying(
     monkeypatch.setattr("flash.client.get_project", _denied, raising=False)
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    assert cli.main(["env", "eval", "flash-1", "--project", _PROJECT_ID]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 1
     captured = capsys.readouterr().err
     assert "--project must be a valid PROJECT_ID" in captured
     assert "is not accessible" in captured
@@ -1141,7 +823,7 @@ def test_env_eval_upload_requires_credentials_before_paying(monkeypatch, tmp_pat
     )
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    assert cli.main(["env", "eval", "flash-1", "--project", _PROJECT_ID]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 1
     assert "not logged in" in capsys.readouterr().err
 
 
@@ -1305,7 +987,7 @@ def test_env_eval_records_the_hub_environment_the_run_trains_on(
 def test_env_eval_refuses_a_run_that_names_no_published_environment(monkeypatch, capsys) -> None:
     """An evaluation with nothing published to name is refused rather than recorded against a path."""
 
-    class Client:
+    class Client(_EvalClient):
         def get_run(self, run_id):
             return {"spec": {"thinking": False, "project": _PROJECT_ID}}
 
@@ -2230,7 +1912,7 @@ def test_env_eval_is_an_org_binding_command(monkeypatch, tmp_path, capsys) -> No
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
     # the warning lands even on the run that fails its preflight: it precedes every request.
-    cli.main(["env", "eval", "flash-1", "--project", "proj-9"])
+    cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", "proj-9"])
     assert "key belongs to other-org" in capsys.readouterr().err
 
 
@@ -2605,7 +2287,7 @@ def test_env_eval_rejects_a_non_finite_temperature_before_paying(monkeypatch, tm
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["env", "eval", "flash-1", "--temperature", bad])
+        cli.main(["env", "eval", _EXPLICIT_TARGET, "--temperature", bad])
 
     # argparse's own usage error, which is exit 2 rather than the CLI's 1
     assert excinfo.value.code == 2
@@ -2630,7 +2312,7 @@ def test_env_eval_rejects_a_negative_temperature_before_paying(monkeypatch, tmp_
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["env", "eval", "flash-1", "--temperature", bad])
+        cli.main(["env", "eval", _EXPLICIT_TARGET, "--temperature", bad])
 
     # argparse's own usage error, which is exit 2 rather than the CLI's 1
     assert excinfo.value.code == 2
@@ -2830,209 +2512,6 @@ def test_load_evaluations_receives_a_positional_only_environment_beside_var_kwar
     assert suites[0].environment is sentinel
     # and it arrived positionally, not duplicated into the kwargs bag.
     assert suites[0].options == {}
-
-
-def test_env_eval_pins_a_run_serving_a_step_checkpoint(monkeypatch, tmp_path, capsys) -> None:
-    """A bare run id must resolve whatever revision the run serves, not only the final adapter.
-
-    `deployment_for` filters on the requested checkpoint step, and a bare id parses to step None,
-    so a run deployed at `RUN/step-40` came back as absent and `flash env eval RUN` refused to run
-    against a model `flash chat RUN` answers from.
-    """
-    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'stepped'\n"
-        "    def cases(self): return [EvalCase(id='a', input='a', expected='a')]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
-    revision = "flash-1@step-40." + "b" * 40
-
-    class Client(_EvalClient):
-        def __init__(self):
-            self.targets = []
-
-        def deployment_for(self, run_id, timeout=None):
-            raise AssertionError("deployment_for cannot resolve a bare id to a step revision")
-
-        def deployments(self):
-            return [
-                {"run_id": "flash-other", "deployment": {"adapter_revision": "nope"}},
-                {
-                    "run_id": "flash-1",
-                    "deployment": {
-                        "state": "ready",
-                        "checkpoint_step": 40,
-                        "adapter_revision": revision,
-                    },
-                },
-            ]
-
-        def chat_stream(self, target, messages, **kwargs):
-            self.targets.append(target)
-            yield messages[-1]["content"]
-
-    client = Client()
-    monkeypatch.setattr(
-        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
-    )
-    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
-
-    assert cli.main(["env", "eval", "flash-1", "--no-upload"]) == 0
-
-    assert client.targets == [revision]
-    assert f"resolved evaluation target flash-1 to {revision}" in capsys.readouterr().out
-
-
-def test_env_eval_pins_a_step_shorthand_to_its_immutable_revision(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    """`RUN/step-N` names a step, not the weights that answer at it.
-
-    The chat route resolves a step against the run's whole verified ledger, which can hold several
-    revisions at one step, and picks the deployed one (`_resolve_explicit_chat_revision`). Sending
-    the shorthand therefore graded weights the report could not name, and a later rebuild of the
-    same step read as the same measurement.
-    """
-    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
-    shorthand = "flash-1/step-3"
-    revision = "flash-1@step-3." + "a" * 40
-
-    class Client(_EvalClient):
-        def __init__(self):
-            self.targets = []
-
-        def deployments(self):
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {
-                        "state": "ready",
-                        "checkpoint_step": 3,
-                        "adapter_revision": revision,
-                    },
-                }
-            ]
-
-        def chat_stream(self, target, messages, **kwargs):
-            self.targets.append(target)
-            yield "4"
-
-    client = Client()
-    uploader = _RecordingUpload()
-    monkeypatch.setattr(
-        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
-    )
-    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
-    _patch_upload(monkeypatch, uploader)
-
-    assert cli.main(["env", "eval", shorthand, "--project", _PROJECT_ID]) == 0
-
-    # both halves matter: generation must reach the immutable weights, and the uploaded report
-    # must name them, or the dashboard records a step whose contents can change underneath it.
-    assert client.targets == [revision]
-    assert uploader.calls[0]["model"] == revision
-    assert f"resolved evaluation target {shorthand} to {revision}" in capsys.readouterr().out
-
-
-def test_env_eval_keeps_a_step_shorthand_the_live_deployment_has_moved_past(
-    monkeypatch, tmp_path
-) -> None:
-    """A step the deployment has moved past is still servable, so it must still be evaluated.
-
-    A run keeps its earlier verified revisions after a newer step is deployed, and the chat route
-    serves them: asked for step-3 while step-40 is live, the server resolves the ledger's single
-    step-3 entry and answers 200 (tests/test_server_api.py). Only the live revision is visible from
-    here, so anything else stays the shorthand for the server to resolve -- refusing would fail an
-    evaluation that runs correctly, and the server answers a genuinely ambiguous step with a 409.
-    """
-    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'math'\n"
-        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
-
-    class Client(_EvalClient):
-        def __init__(self):
-            self.targets = []
-
-        def deployments(self):
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {
-                        "state": "ready",
-                        "checkpoint_step": 40,
-                        "adapter_revision": "flash-1@step-40." + "b" * 40,
-                    },
-                }
-            ]
-
-        def chat_stream(self, target, messages, **kwargs):
-            self.targets.append(target)
-            yield "4"
-
-    client = Client()
-    monkeypatch.setattr(
-        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
-    )
-    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
-
-    assert cli.main(["env", "eval", "flash-1/step-3", "--no-upload"]) == 0
-
-    # the shorthand is forwarded untouched: the step-40 revision must never be substituted for it.
-    assert client.targets == ["flash-1/step-3"]
-
-
-def test_env_eval_refuses_to_upload_a_step_it_cannot_name(monkeypatch, capsys) -> None:
-    """An uploaded report must name the weights it graded, so an unpinnable step cannot upload.
-
-    Evaluating it is right (the test above), but recording it is not: `RUN/step-N` is a shorthand
-    the server resolves against a ledger that can hold several revisions at one step, and a later
-    rebuild of that step reuses it -- so two different sets of weights file as one measurement
-    Only the live revision is visible from here, so refuse before buying
-    any generation rather than upload a result nobody can identify afterwards.
-    """
-
-    class Client(_EvalClient):
-        def deployments(self):
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {
-                        "state": "ready",
-                        "checkpoint_step": 40,
-                        "adapter_revision": "flash-1@step-40." + "b" * 40,
-                    },
-                }
-            ]
-
-        def chat_stream(self, target, messages, **kwargs):
-            raise AssertionError(f"bought a generation for an unrecordable target: {target}")
-
-    def _uploaded(**kwargs):
-        raise AssertionError("uploaded a result whose weights the report cannot name")
-
-    monkeypatch.setattr(
-        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
-    )
-    monkeypatch.setattr("flash.client.client_from_config", lambda: Client())
-    monkeypatch.setattr("flash.client.upload_eval_run", _uploaded, raising=False)
-    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
-    monkeypatch.setattr("flash.client.get_project", lambda pid, api_key: {"id": pid}, raising=False)
-
-    args = ["env", "eval", "flash-1/step-3", "--project", _PROJECT_ID]
-    assert cli.main(args) == 1
-
-    # the refusal names both ways out, so it is actionable rather than a dead end.
-    err = capsys.readouterr().err
-    assert "cannot upload results for flash-1/step-3" in err
-    assert "models deployments" in err
-    assert "--no-upload" in err
 
 
 def test_env_eval_sends_the_environments_own_prompt(monkeypatch, tmp_path) -> None:
@@ -3392,7 +2871,7 @@ def test_env_eval_refuses_to_grade_when_the_plane_never_answered(
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.generated = 0
 
@@ -3439,7 +2918,7 @@ def test_env_eval_refuses_on_run_spec_api_error(monkeypatch, capsys, status, mes
     """
     from flash.client import ApiError
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.generated = 0
 
@@ -3469,7 +2948,7 @@ def test_env_eval_refuses_on_run_spec_api_error(monkeypatch, capsys, status, mes
 def test_env_eval_refuses_when_the_run_spec_is_unreadable(monkeypatch, capsys) -> None:
     """An unreadable spec cannot supply the published environment, so grading is refused."""
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.generated = 0
 

@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 
 from flash.runner.lifecycle.status import effective_spec_from_status
 from flash.serve.contract.provenance import (
-    ImmutableProvenance,
+    CheckpointProvenance,
     validate_body_provenance,
     validate_header_provenance,
 )
@@ -24,9 +24,9 @@ from flash.server.asgi import app as _app
 from flash.server.platform.deps import manageable_run
 from flash.server.routes.serving_revisions import (
     _DEPLOYMENT_BUSY_STATES,
-    _authorized_chat_revision,
+    _authorized_chat_checkpoint,
     _managed_chat_messages,
-    _verified_adapter_revisions,
+    _verified_checkpoints,
 )
 
 _UPSTREAM_RESPONSE_HEADER_EXCLUSIONS = frozenset(
@@ -91,19 +91,18 @@ def _resolve_chat_request(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     messages = _managed_chat_messages(request.messages)
     deployment = status.deployment or {}
-    authorized_revision = _authorized_chat_revision(
+    authorized_checkpoint = _authorized_chat_checkpoint(
         run_id,
         deployment,
-        payload.get("adapter_revision"),
-        payload.get("step"),
-        _verified_adapter_revisions(status),
+        payload.get("checkpoint_id"),
+        _verified_checkpoints(status),
     )
     try:
         effective_spec = effective_spec_from_status(status)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    authorized_revision = _require_active_deployment(
-        run_id, status.state, deployment, authorized_revision
+    authorized_checkpoint = _require_active_deployment(
+        run_id, status.state, deployment, authorized_checkpoint
     )
     if not effective_spec.train.hf_repo:
         raise HTTPException(
@@ -117,17 +116,17 @@ def _resolve_chat_request(
         )
     except OpenAIRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return request, messages, effective_spec, authorized_revision
+    return request, messages, effective_spec, authorized_checkpoint
 
 
 def _require_active_deployment(
     run_id: str,
     run_state: str,
     deployment: dict[str, Any],
-    authorized_revision: str | None,
+    authorized_checkpoint: str | None,
 ) -> str:
-    if authorized_revision is not None:
-        return authorized_revision
+    if authorized_checkpoint is not None:
+        return authorized_checkpoint
     deployment_state = deployment.get("state")
     if deployment_state in _DEPLOYMENT_BUSY_STATES:
         raise HTTPException(
@@ -164,7 +163,7 @@ def _forward_stream(
     thinking: bool,
     stop_sequences: list[str] | None,
     chat_template_kwargs: dict[str, Any],
-    provenance: ImmutableProvenance,
+    provenance: CheckpointProvenance,
 ) -> _UpstreamStreamingResponse:
     upstream: RawChatStream = _app.serve_chat_sse(
         run_id=run_id,
@@ -194,7 +193,7 @@ def _forward_stream(
             attested_adapter = normalized_headers.get("x-freesolo-lora-request-adapter")
             if not attested_adapter:
                 raise ValueError("serving backend omitted LoRA request adapter attestation")
-            if attested_adapter != provenance.adapter_revision:
+            if attested_adapter != provenance.checkpoint_id:
                 raise ValueError(
                     "serving backend returned mismatched LoRA request adapter attestation"
                 )
@@ -218,7 +217,7 @@ def managed_chat(
     x_freesolo_org_id: str | None,
     x_freesolo_project_id: str | None,
 ) -> Any:
-    request, messages, effective_spec, authorized_revision = _resolve_chat_request(
+    request, messages, effective_spec, authorized_checkpoint = _resolve_chat_request(
         run_id,
         payload,
         key,
@@ -231,11 +230,11 @@ def managed_chat(
         **request.chat_template_kwargs,
         "enable_thinking": effective_spec.thinking,
     }
-    provenance = ImmutableProvenance.from_adapter_revision(authorized_revision)
+    provenance = CheckpointProvenance(authorized_checkpoint)
     try:
         if request.stream:
             return _forward_stream(
-                run_id=authorized_revision,
+                run_id=authorized_checkpoint,
                 request=request,
                 messages=messages,
                 thinking=effective_spec.thinking,
@@ -244,7 +243,7 @@ def managed_chat(
                 provenance=provenance,
             )
         response = _app.serve_chat(
-            run_id=authorized_revision,
+            run_id=authorized_checkpoint,
             messages=messages,
             temperature=request.temperature,
             max_tokens=request.max_tokens,

@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from flash.serve.control._canonical import canonical_json
 
 _IDENTITY_SCHEMA = "flash.cli.serving.deployment-identity"
-_IDENTITY_VERSION = 1
+_IDENTITY_VERSION = 2
 _MAX_IDENTITY_BYTES = 128 * 1024
 _BASE64URL_RE = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -148,7 +148,7 @@ def _placement(provider: object, value: object):
 
 
 def _resolved_adapters(manifest) -> tuple[object, ...]:
-    from flash.serve.control import AdapterAliasIntent, ResolvedAdapter
+    from flash.serve.control import ResolvedAdapter
     from flash.serve.control._serialization import canonical_adapter_sort_key
 
     adapters = []
@@ -161,8 +161,7 @@ def _resolved_adapters(manifest) -> tuple[object, ...]:
         adapters.append(
             ResolvedAdapter(
                 run_id=adapter.run_id,
-                checkpoint=adapter.checkpoint,
-                adapter_revision=adapter.adapter_revision,
+                checkpoint_id=adapter.checkpoint_id,
                 artifact_repo_id=adapter.repo_id,
                 artifact_repo_type=adapter.repo_type,
                 artifact_revision=adapter.source_revision,
@@ -173,10 +172,6 @@ def _resolved_adapters(manifest) -> tuple[object, ...]:
                 lora_rank=adapter.lora_rank,
                 thinking_default=adapter.thinking_default,
                 structured_outputs_default_json=structured,
-                alias_intent=AdapterAliasIntent(
-                    activate=manifest.aliases.get(adapter.run_id) == adapter.adapter_revision,
-                    expected_adapter_revision=None,
-                ),
             )
         )
     return tuple(sorted(adapters, key=canonical_adapter_sort_key))
@@ -222,10 +217,10 @@ def _validate_authored_identity(args, bundle) -> None:
     if len(spec.adapters) != 1:
         raise ValueError("--deployment-identity must contain exactly one adapter for this command")
     adapter = spec.adapters[0]
-    expected_checkpoint = (
-        "final"
-        if getattr(args, "checkpoint_step", None) is None
-        else f"step-{args.checkpoint_step}"
+    from flash.schema import format_checkpoint_ref
+
+    expected_checkpoint = format_checkpoint_ref(
+        adapter.run_id, getattr(args, "checkpoint_step", None)
     )
     comparisons = (
         ("provider", spec.provider, args.provider),
@@ -238,7 +233,7 @@ def _validate_authored_identity(args, bundle) -> None:
         ("artifact-repo-type", adapter.artifact_repo_type, args.artifact_repo_type),
         ("artifact-subfolder", adapter.artifact_subfolder, args.artifact_subfolder),
         ("lora-rank", adapter.lora_rank, args.lora_rank),
-        ("checkpoint-step", adapter.checkpoint, expected_checkpoint),
+        ("checkpoint-step", adapter.checkpoint_id, expected_checkpoint),
         ("thinking", adapter.thinking_default, bool(args.thinking)),
     )
     for flag, actual, expected in comparisons:

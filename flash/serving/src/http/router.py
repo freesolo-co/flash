@@ -31,9 +31,7 @@ THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY = "thinking_structured_outputs_d
 _CLEANUP_TIMEOUT_SECONDS = 10.0
 
 _CAPABILITIES = (
-    "immutable_adapter_revisions",
-    "alias_compare_and_swap",
-    "revision_provenance",
+    "permanent_checkpoint_identity",
     THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY,
 )
 

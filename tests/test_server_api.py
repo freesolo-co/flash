@@ -235,7 +235,7 @@ def test_requests_without_key_are_rejected(api):
     assert api.get("/v1/models", headers=_bearer("nope")).status_code == 401
     health = api.get("/v1/health")
     assert health.status_code == 200  # health stays open
-    assert "chat_step_selector_v1" in health.json()["capabilities"]
+    assert health.json()["capabilities"] == []
 
 
 def test_project_validation_blocks_before_run_preparation(api, monkeypatch) -> None:
@@ -3451,10 +3451,10 @@ def test_public_run_routes_redact_private_deployment_fields(api, monkeypatch):
         "adapter_revision": revision,
     }
     runner_state._save_status(status)
-    runner_verified_revisions.add_verified_adapter_revision(
+    runner_verified_revisions.add_verified_checkpoint(
         run_id,
         revision,
-        expected_generation=runner_verified_revisions.verified_adapter_revision_generation(run_id),
+        expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
 
     responses = [
@@ -3470,16 +3470,14 @@ def test_public_run_routes_redact_private_deployment_fields(api, monkeypatch):
     persisted = runner_status.get_status(run_id).deployment
     assert persisted["previous_deployment"]["endpoint_name"] == "https://old.example"
     assert persisted["openai_base_url"] == "https://serve.example/v1"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {revision}
-    )
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset({revision})
 
     monkeypatch.setattr(deploy_mod, "undeploy_adapter", lambda target: [target])
     cancelled = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
 
     assert cancelled.status_code == 200, cancelled.text
     assert cancelled.json()["deployment"]["state"] == "undeployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
 
@@ -5243,9 +5241,7 @@ def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatc
             "endpoint_name": "https://old.example",
             "adapter_revision": previous_revision,
         },
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
+        verification_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
     attempted_revision = f"{run_id}@final." + "a" * 40
     smoke_started = threading.Event()
@@ -5321,7 +5317,7 @@ def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatc
     final = runner_status.get_status(run_id)
     assert final.state == "cancelled"
     assert final.deployment["state"] == "undeployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
 
 @pytest.mark.parametrize("attempt_kind", ["final", "checkpoint"])
@@ -5349,11 +5345,9 @@ def test_contended_cancel_revokes_activation_completed_after_predecessor_restore
     runner_transitions.mark_checkpoint_deployed(
         run_id,
         previous,
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
+        verification_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
-    initial_generation = runner_verified_revisions.verified_adapter_revision_generation(run_id)
+    initial_generation = runner_verified_revisions.verified_checkpoint_generation(run_id)
     if attempt_kind == "final":
         attempted_revision = f"{run_id}@final." + "a" * 40
         expected_checkpoint = run_id
@@ -5466,8 +5460,7 @@ def test_contended_cancel_revokes_activation_completed_after_predecessor_restore
     assert cancellation_snapshotted.wait(timeout=5)
     assert predecessor_restored.wait(timeout=5)
     assert (
-        runner_verified_revisions.verified_adapter_revision_generation(run_id)
-        == initial_generation + 1
+        runner_verified_revisions.verified_checkpoint_generation(run_id) == initial_generation + 1
     )
     assert runner_status.get_status(run_id).deployment == previous
     release_activation.set()
@@ -5484,7 +5477,7 @@ def test_contended_cancel_revokes_activation_completed_after_predecessor_restore
     assert final.state == "cancelled"
     assert final.deployment["state"] == "undeployed"
     assert final.deployment.get("adapter_revision") != attempted_revision
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
 
 def test_cancel_local_persistence_failure_returns_structured_retryable_error(api, monkeypatch):
@@ -5536,9 +5529,7 @@ def test_cancel_double_undeploy_failure_returns_structured_retryable_error(api, 
             "endpoint_name": "https://serve.example",
             "adapter_revision": revision,
         },
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
+        verification_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
     attempts = []
 
@@ -5562,7 +5553,7 @@ def test_cancel_double_undeploy_failure_returns_structured_retryable_error(api, 
     assert status.state == "cancelled"
     assert status.deployment["state"] == "revocation_failed"
     assert status.deployment["retryable"] is True
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
 
 def test_deploy_recovers_ambiguous_ready_persistence_after_activation(api, monkeypatch):
@@ -5611,9 +5602,7 @@ def test_deploy_recovers_ambiguous_ready_persistence_after_activation(api, monke
     assert resp.json()["state"] == "ready"
     assert resp.json()["adapter_revision"] == revision
     assert runner_status.get_status(run_id).state == "deployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {revision}
-    )
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset({revision})
 
 
 def test_deploy_fails_when_the_activated_alias_serves_no_reasoning(api, monkeypatch):
@@ -5676,7 +5665,7 @@ def test_deploy_fails_when_the_activated_alias_serves_no_reasoning(api, monkeypa
     assert body["alias_activation_confirmed"] is True
     assert "activation_outcome_unknown" not in body
     assert "previous_deployment" not in body
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
 
 @pytest.mark.parametrize(
@@ -5745,7 +5734,7 @@ def test_deploy_persists_ordinary_post_activation_probe_failures(api, monkeypatc
     assert "alias_thinking_tag" not in deployment
     assert "activation_outcome_unknown" not in deployment
     assert "previous_deployment" not in deployment
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
 
 def test_post_activation_failure_persistence_error_records_divergence(monkeypatch, capsys):
@@ -5816,9 +5805,7 @@ def test_deploy_records_alias_thinking_on_a_healthy_thinking_deployment(api, mon
     assert resp.status_code == 200, resp.text
     assert resp.json()["state"] == "ready"
     assert resp.json()["alias_thinking_tag"] is True
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {revision}
-    )
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset({revision})
 
 
 def test_ready_commit_status_read_failure_records_divergence(api, monkeypatch, capsys):
@@ -6117,9 +6104,7 @@ def test_chat_forwards_trained_stop_sequences(api, monkeypatch):
     runner_transitions.mark_deployed(
         run_id,
         {"state": "ready", "endpoint_name": "https://serve.example", "adapter_revision": revision},
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
+        verification_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
 
     seen: dict = {}
@@ -6155,9 +6140,7 @@ def test_chat_sends_no_stop_when_run_configured_none(api, monkeypatch):
     runner_transitions.mark_deployed(
         run_id,
         {"state": "ready", "endpoint_name": "https://serve.example", "adapter_revision": revision},
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
+        verification_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
 
     seen: dict = {}
@@ -6206,12 +6189,12 @@ def test_failed_smoke_revision_cannot_be_exact_chatted(api, monkeypatch):
 
     assert deployment.status_code == 200, deployment.text
     assert deployment.json()["state"] == "failed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
     monkeypatch.setattr(
         app_mod,
         "serve_chat",
-        lambda **kwargs: pytest.fail("unverified revision must not reach serving"),
+        lambda **kwargs: pytest.fail("unverified checkpoint must not reach serving"),
     )
     response = api.post(
         f"/v1/runs/{run_id}/chat",
@@ -6408,7 +6391,7 @@ def test_confirmed_active_failed_redeploy_can_replace_the_live_revision(api, mon
     assert response.status_code == 200, response.text
     assert response.json()["state"] == "ready"
     assert response.json()["adapter_revision"] == replacement_revision
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset(
         {replacement_revision}
     )
 
@@ -6427,10 +6410,10 @@ def test_unknown_same_revision_preserves_confirmed_failed_predecessor_despite_le
         "alias_activation_confirmed": True,
         "error": "post-activation probe failed",
     }
-    runner_verified_revisions.add_verified_adapter_revision(
+    runner_verified_revisions.add_verified_checkpoint(
         run_id,
         active_revision,
-        expected_generation=runner_verified_revisions.verified_adapter_revision_generation(run_id),
+        expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
     status = runner_status.get_status(run_id)
     status.deployment = {
@@ -6469,7 +6452,7 @@ def test_unknown_same_revision_preserves_confirmed_failed_predecessor_despite_le
     assert restored["adapter_revision"] == active_revision
     assert restored["error"] == "post-activation probe failed"
     assert restored["last_deploy_error"] == "same-revision retry failed before activation"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset(
         {active_revision}
     )
     assert alias_reads == [run_id]
@@ -6591,9 +6574,7 @@ def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monke
     runner_transitions.mark_deployed(
         run_id,
         previous,
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
+        verification_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
     attempted_revision = f"{run_id}@final." + "a" * 40
     expected_revisions = []
@@ -6635,7 +6616,7 @@ def test_activation_unknown_preserves_previous_revision_for_retry_cas(api, monke
     assert deployment["adapter_revision"] == attempted_revision
     assert deployment["activation_outcome_unknown"] is True
     assert deployment["previous_deployment"] == previous
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset(
         {previous_revision}
     )
 
@@ -6726,10 +6707,10 @@ def test_activation_unknown_synthetic_checkpoint_predecessor_survives_cancel(api
         },
     }
     runner_state._save_status(status)
-    runner_verified_revisions.add_verified_adapter_revision(
+    runner_verified_revisions.add_verified_checkpoint(
         run_id,
         live_revision,
-        expected_generation=runner_verified_revisions.verified_adapter_revision_generation(run_id),
+        expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
 
     monkeypatch.setattr(app_mod, "adapter_alias_target", lambda _run_id: live_revision)
@@ -6771,9 +6752,7 @@ def test_activation_unknown_synthetic_checkpoint_predecessor_survives_cancel(api
     assert cancelled.deployment["state"] == "ready"
     assert cancelled.deployment["adapter_revision"] == live_revision
     assert cancelled.deployment["checkpoint_step"] == 20
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {live_revision}
-    )
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset({live_revision})
 
 
 def test_cancel_restores_owned_previous_checkpoint_and_bare_chat_authority(api, monkeypatch):
@@ -6792,9 +6771,7 @@ def test_cancel_restores_owned_previous_checkpoint_and_bare_chat_authority(api, 
     runner_transitions.mark_checkpoint_deployed(
         run_id,
         previous,
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
+        verification_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
     previous["requested_at"] = time.time() - 60
     status = runner_status.get_status(run_id)
@@ -6838,7 +6815,7 @@ def test_cancel_restores_owned_previous_checkpoint_and_bare_chat_authority(api, 
 
     assert chat.status_code == 200, chat.text
     assert served == [previous_revision]
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset(
         {previous_revision}
     )
 
@@ -7200,10 +7177,10 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
     revision = f"{run_id}@final." + "e" * 40
-    runner_verified_revisions.add_verified_adapter_revision(
+    runner_verified_revisions.add_verified_checkpoint(
         run_id,
         revision,
-        expected_generation=runner_verified_revisions.verified_adapter_revision_generation(run_id),
+        expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
 
     def boom(_run_id):
@@ -7217,7 +7194,7 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
     assert detail["code"] == "deployment_revocation_failed"
     assert detail["retryable"] is True
     assert "serving backend unreachable" in detail["message"]
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
     deployment = runner_status.get_status(run_id).deployment
     assert deployment["state"] == "revocation_failed"
     assert deployment["retryable"] is True
@@ -7230,8 +7207,8 @@ def test_undeploy_without_status_projection_invalidates_orphaned_ledger(api, mon
     key = _login()
     run_id = _make_run(api, key, "done")
     revision = f"{run_id}@final." + "f" * 40
-    generation = runner_verified_revisions.verified_adapter_revision_generation(run_id)
-    assert runner_verified_revisions.add_verified_adapter_revision(
+    generation = runner_verified_revisions.verified_checkpoint_generation(run_id)
+    assert runner_verified_revisions.add_verified_checkpoint(
         run_id,
         revision,
         expected_generation=generation,
@@ -7252,8 +7229,8 @@ def test_undeploy_without_status_projection_invalidates_orphaned_ledger(api, mon
     response = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
 
     assert response.status_code == 200, response.text
-    assert runner_verified_revisions.verified_adapter_revision_generation(run_id) == generation + 1
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.verified_checkpoint_generation(run_id) == generation + 1
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
     assert runner_status.get_status(run_id).deployment is None
     assert reports == []
 
@@ -7283,9 +7260,7 @@ def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
     out = runner_transitions.mark_deployed(
         "dep-1",
         deployment,
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            "dep-1"
-        ),
+        verification_generation=runner_verified_revisions.verified_checkpoint_generation("dep-1"),
     )
     assert out.state == "deployed"
     assert out.deployment == deployment
@@ -9307,7 +9282,7 @@ def test_deploy_checkpoint_preserves_final_deploy_that_wins_cas(api, monkeypatch
         runner_transitions.mark_deployed(
             run_id,
             final_deployment,
-            verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            verification_generation=runner_verified_revisions.verified_checkpoint_generation(
                 run_id
             ),
         )
@@ -9379,10 +9354,10 @@ def test_undeploy_checkpoint_of_running_run_keeps_training_state(api, monkeypatc
     r = api.post(f"/v1/runs/{run_id}/deploy", json={"step": 40}, headers=_bearer(key))
     assert r.status_code == 200, r.text
     revision = f"{run_id}@step-40." + "f" * 40
-    runner_verified_revisions.add_verified_adapter_revision(
+    runner_verified_revisions.add_verified_checkpoint(
         run_id,
         revision,
-        expected_generation=runner_verified_revisions.verified_adapter_revision_generation(run_id),
+        expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
 
     r = api.delete(f"/v1/runs/{run_id}/deploy", headers=_bearer(key))
@@ -9390,7 +9365,7 @@ def test_undeploy_checkpoint_of_running_run_keeps_training_state(api, monkeypatc
     status = runner_status.get_status(run_id)
     assert status.state == "running"
     assert status.deployment["state"] == "undeployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
 
 def test_deploy_cancelled_run_without_step_is_409(api):

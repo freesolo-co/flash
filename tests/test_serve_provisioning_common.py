@@ -172,13 +172,10 @@ def test_deployment_bundle_rejects_source_revision_and_aggregate_mutations() -> 
     new_revision = "9" * 40
 
     def mutate_revision(payload):
-        adapter = payload["adapters"][0]
-        adapter["adapter_revision"] = f"run-1@final.{new_revision}"
-        adapter["source"]["revision"] = new_revision
-        payload["aliases"]["run-1"] = adapter["adapter_revision"]
+        payload["adapters"][0]["source"]["revision"] = new_revision
 
     changed_revision = _mutated_manifest(manifest, mutate_revision)
-    with pytest.raises(ValueError, match="adapters do not exactly match"):
+    with pytest.raises(ValueError, match="adapter does not match"):
         DeploymentBundle(spec, changed_revision, _image())
 
     def mutate_aggregate(payload):
@@ -206,15 +203,6 @@ def test_deployment_bundle_rejects_adapter_default_mutations(field: str) -> None
 
     changed = _mutated_manifest(manifest, mutate)
     with pytest.raises(ValueError, match="adapter does not match"):
-        DeploymentBundle(spec, changed, _image())
-
-
-def test_deployment_bundle_rejects_activation_alias_mutation() -> None:
-    spec, inputs = _spec_and_inputs()
-    manifest = build_serving_manifest(spec, inputs)
-    changed = _mutated_manifest(manifest, lambda payload: payload["aliases"].clear())
-
-    with pytest.raises(ValueError, match="aliases do not match"):
         DeploymentBundle(spec, changed, _image())
 
 

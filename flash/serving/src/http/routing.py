@@ -80,21 +80,9 @@ class AdapterRouter:
             return None
         if requested.serve_base_model:
             return requested, requested
-        if requested.is_revision and requested.org_id is not None:
+        if requested.is_checkpoint and requested.org_id is not None:
             return requested, requested
-        if not requested.is_alias or requested.org_id is None or requested.alias_of is None:
-            return None
-        target = self._registry.get(requested.alias_of)
-        if target is None or target.status != "ready" or not target.is_revision:
-            return None
-        if (
-            target.org_id != requested.org_id
-            or target.base_model != requested.base_model
-            or target.run_id != requested.run_id
-            or requested.adapter_id != requested.run_id
-        ):
-            return None
-        return requested, target
+        return None
 
     def base_models(self) -> list[str]:
         return sorted({target.base_model for _, target in self._resolved_ready()})

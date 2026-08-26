@@ -1,4 +1,4 @@
-"""Adapter lifecycle routes: list, register, read, activate, undeploy.
+"""Adapter lifecycle routes: list, register, read, and undeploy.
 
 Split out of router.py's app builder, where these were nested handlers closing over a dozen app
 variables. They reach that state through ``ServingContext.of(request)`` instead, so each handler is
@@ -16,13 +16,12 @@ from flash.serving.src.engine.model_config import is_supported_base_model
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.io.requests import _assert_supported_base_model
 from flash.serving.src.io.schemas import (
-    AdapterActivationRequest,
     AdapterRecord,
-    ImmutableAdapterRegistration,
+    ImmutableCheckpointRegistration,
     internal_adapter_payload,
 )
 from flash.serving.src.store.access import _replace_stored_cas
-from flash.serving.src.store.registration import activate_revision, persist_revision
+from flash.serving.src.store.registration import persist_checkpoint
 from flash.serving.src.store.undeploy import (
     apply_teardown,
     disable_matched,
@@ -47,7 +46,7 @@ async def list_adapters(request: Request) -> dict[str, Any]:
 
 
 async def _claim_loading_generation(stored: AdapterRecord) -> tuple[AdapterRecord, bool]:
-    """Persist the exact generation before dispatching a disabled revision load."""
+    """Persist the exact generation before dispatching a disabled checkpoint load."""
 
     if stored.status == "ready" or stored.updated_at is None:
         return stored, False
@@ -62,19 +61,18 @@ async def _claim_loading_generation(stored: AdapterRecord) -> tuple[AdapterRecor
 
 @adapter_router.post("/adapters")
 async def add_adapter(
-    registration: ImmutableAdapterRegistration,
+    registration: ImmutableCheckpointRegistration,
     request: Request,
     background: BackgroundTasks,
 ) -> AdapterRecord:
     context = ServingContext.of(request)
     context.assert_internal(request)
     _assert_supported_base_model(registration.base_model)
-    revision = registration.to_record()
+    checkpoint = registration.to_record()
 
-    alias, stored = await persist_revision(context.router, revision)
+    stored = await persist_checkpoint(checkpoint)
     stored, claimed = await _claim_loading_generation(stored)
 
-    context.router.upsert(alias, revive=True)
     context.router.upsert(stored, revive=True)
 
     if claimed:
@@ -157,11 +155,11 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
 
 
 async def _register_revision(context: ServingContext, stored: AdapterRecord) -> None:
-    """Load the revision onto its gpu engine, then promote the durable row to ready.
+    """Load the checkpoint onto its gpu engine, then promote the durable row to ready.
 
     Deferred to a background task so registration returns as soon as the row is durable: the
     engine load may cold-start a scaled-to-zero container. A failed load simply leaves the
-    revision disabled, which a later registration retries.
+    checkpoint disabled, which a later registration retries.
     """
     if stored.status == "ready" or stored.updated_at is None:
         return
@@ -205,15 +203,6 @@ async def get_adapter(adapter_id: str, request: Request) -> dict[str, Any]:
     }
 
 
-@adapter_router.post("/adapters/{revision_id}/activate")
-async def activate_adapter(
-    revision_id: str, payload: AdapterActivationRequest, request: Request
-) -> dict[str, Any]:
-    context = ServingContext.of(request)
-    context.assert_internal(request)
-    return await activate_revision(context.router, revision_id, payload.expected_adapter_revision)
-
-
 @adapter_router.delete("/adapters/{adapter_id}")
 async def remove_adapter(
     adapter_id: str,
@@ -224,7 +213,7 @@ async def remove_adapter(
     context.assert_internal(request)
     await context.reload_if_configured()
 
-    base_record, run_id, matches = await resolve_undeploy_target(context.router, adapter_id)
+    base_record, checkpoint = await resolve_undeploy_target(context.router, adapter_id)
     if base_record is not None:
         # a base-model serve has no durable row: `_base_model_records()` seeds it in memory and
         # every replica re-adds it on each reload. removing it here would clear one replica's
@@ -237,13 +226,13 @@ async def remove_adapter(
 
     # phase 1: compare-and-swap every matched row to "disabled" in persistence first, collecting
     # the rows that durably converged.
-    result = await disable_matched(matches, get_authoritative=get_authoritative)
+    result = await disable_matched([checkpoint], get_authoritative=get_authoritative)
 
     # phase 2: remove every durably disabled row from routing immediately. active hosted models
     # schedule exact gpu eviction after the response. retired models have no engine to start, so their
     # durable disable and router removal are the complete teardown.
     cleanup_records = apply_teardown(context.router, result.pending_teardown)
-    active_gpu_cleanup = is_supported_base_model(matches[0].base_model)
+    active_gpu_cleanup = is_supported_base_model(checkpoint.base_model)
     if active_gpu_cleanup:
         for cleanup_record, expected_generation in cleanup_records:
             background_tasks.add_task(
@@ -253,14 +242,13 @@ async def remove_adapter(
                 expected_generation,
             )
 
-    if failure_response := result.failure_response(run_id, background_tasks):
+    if failure_response := result.failure_response(adapter_id, background_tasks):
         return failure_response
 
     return undeploy_body(
         adapter_id,
-        run_id,
-        matches[0].base_model,
-        result.disabled_aliases,
-        result.disabled_revisions,
+        checkpoint.run_id or "",
+        checkpoint.base_model,
+        result.disabled_checkpoints,
         gpu_cleanup=None if active_gpu_cleanup else "not_applicable_retired_model",
     )

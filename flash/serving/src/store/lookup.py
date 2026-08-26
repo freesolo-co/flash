@@ -84,12 +84,8 @@ class AdapterLookup:
     ) -> tuple[AdapterRecord, AdapterRecord]:
         resolved = self._router.resolve(adapter_id)
         stale = resolved is not None and self._is_stale()
-        if resolved is not None and self._reload_records is not None:
-            if resolved[0].is_alias:
-                if await self._reload_safe():
-                    resolved = self._router.resolve(adapter_id)
-            elif stale:
-                self._schedule_reload()
+        if resolved is not None and self._reload_records is not None and stale:
+            self._schedule_reload()
         elif resolved is None and self._reload_records is not None:
             await self.reload()
             resolved = self._router.resolve(adapter_id)
@@ -113,6 +109,6 @@ class AdapterLookup:
             record = self._router.get(adapter_id)
         if record is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
-        if not record.serve_base_model and not (record.is_alias or record.is_revision):
+        if not record.serve_base_model and not record.is_checkpoint:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
         return record

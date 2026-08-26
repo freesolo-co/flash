@@ -236,12 +236,12 @@ class ServingImage:
 
 
 def _validate_bundle_adapters(spec: DeploymentSpec, manifest: ServingManifest) -> None:
-    manifest_by_revision = {adapter.adapter_revision: adapter for adapter in manifest.adapters}
-    spec_by_revision = {adapter.adapter_revision: adapter for adapter in spec.adapters}
-    if set(manifest_by_revision) != set(spec_by_revision):
+    manifest_by_checkpoint = {adapter.checkpoint_id: adapter for adapter in manifest.adapters}
+    spec_by_checkpoint = {adapter.checkpoint_id: adapter for adapter in spec.adapters}
+    if set(manifest_by_checkpoint) != set(spec_by_checkpoint):
         raise ValueError("bundle manifest adapters do not exactly match the deployment spec")
-    for revision, planned in spec_by_revision.items():
-        actual = manifest_by_revision[revision]
+    for revision, planned in spec_by_checkpoint.items():
+        actual = manifest_by_checkpoint[revision]
         structured_default = (
             None
             if planned.structured_outputs_default_json is None
@@ -249,7 +249,7 @@ def _validate_bundle_adapters(spec: DeploymentSpec, manifest: ServingManifest) -
         )
         if (
             actual.run_id != planned.run_id
-            or actual.checkpoint != planned.checkpoint
+            or actual.checkpoint_id != planned.checkpoint_id
             or actual.repo_id != planned.artifact_repo_id
             or actual.repo_type != planned.artifact_repo_type
             or actual.source_revision != planned.artifact_revision
@@ -267,13 +267,6 @@ def _validate_bundle_adapters(spec: DeploymentSpec, manifest: ServingManifest) -
             != structured_default
         ):
             raise ValueError("bundle manifest adapter does not match the deployment spec")
-    aliases = {
-        adapter.run_id: adapter.adapter_revision
-        for adapter in spec.adapters
-        if adapter.alias_intent.activate
-    }
-    if dict(manifest.aliases) != dict(sorted(aliases.items())):
-        raise ValueError("bundle manifest aliases do not match the deployment spec")
 
 
 @dataclass(frozen=True, slots=True)

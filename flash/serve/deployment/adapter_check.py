@@ -10,6 +10,7 @@ Split out of `flash.serve.deployment.deploy` to keep that module under the file-
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from flash.serve.contract.errors import AdapterConfigMissing, AdapterTensorMissi
 class AdapterArtifactMetadata:
     lora_rank: int
     targets_images: bool
+    artifact_digest: str
 
 
 def _is_hf_not_found_error(exc: Exception) -> bool:
@@ -61,7 +63,9 @@ def validate_serving_lora_rank(model: str, lora_rank: int, *, rank_source: str =
         )
 
 
-def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str, *, hf_revision: str) -> None:
+def _verify_adapter_artifact_tensors(
+    hf_repo: str, subfolder: str, *, artifact_revision: str
+) -> tuple[dict[str, object], ...]:
     """Confirm the adapter has tensor weights before registering it with serving."""
     try:
         from huggingface_hub import HfApi
@@ -76,7 +80,7 @@ def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str, *, hf_revisio
                 path_in_repo=subfolder.rstrip("/"),
                 repo_type="dataset",
                 recursive=False,
-                revision=hf_revision,
+                revision=artifact_revision,
                 token=os.environ.get("HF_TOKEN"),
             )
         )
@@ -88,6 +92,7 @@ def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str, *, hf_revisio
 
     listed_paths: list[str] = []
     tensor_paths: list[str] = []
+    file_facts: list[dict[str, object]] = []
     zero_byte_tensor_paths: list[str] = []
     for entry in entries:
         path = str(getattr(entry, "path", "") or "")
@@ -96,6 +101,19 @@ def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str, *, hf_revisio
         # every listed name, because whether the shards form a loadable set is decided by the index
         # beside them -- and the index is not itself a weight file.
         listed_paths.append(path)
+        lfs = getattr(entry, "lfs", None)
+        file_facts.append(
+            {
+                "path": path,
+                "size": int(getattr(entry, "size", 0) or 0),
+                "oid": str(
+                    getattr(lfs, "sha256", None)
+                    or getattr(lfs, "oid", None)
+                    or getattr(entry, "blob_id", None)
+                    or ""
+                ),
+            }
+        )
         if not is_adapter_weight_filename(path):
             continue
         tensor_paths.append(path)
@@ -128,9 +146,12 @@ def _verify_adapter_artifact_tensors(hf_repo: str, subfolder: str, *, hf_revisio
             f"could not verify adapter tensors: {location} has adapter_model shard(s) but no "
             "complete index-referenced set, so there is nothing peft can load"
         )
+    return tuple(sorted(file_facts, key=lambda item: str(item["path"])))
 
 
-def _load_adapter_config(hf_repo: str, subfolder: str, *, hf_revision: str) -> tuple[dict, str]:
+def _load_adapter_config(
+    hf_repo: str, subfolder: str, *, artifact_revision: str
+) -> tuple[dict, str]:
     filename = f"{subfolder.rstrip('/')}/adapter_config.json"
     try:
         from huggingface_hub import hf_hub_download
@@ -143,7 +164,7 @@ def _load_adapter_config(hf_repo: str, subfolder: str, *, hf_revision: str) -> t
             repo_id=hf_repo,
             filename=filename,
             repo_type="dataset",
-            revision=hf_revision,
+            revision=artifact_revision,
             token=os.environ.get("HF_TOKEN"),
         )
     except Exception as exc:
@@ -166,14 +187,28 @@ def _load_adapter_config(hf_repo: str, subfolder: str, *, hf_revision: str) -> t
 
 
 def adapter_artifact_metadata(
-    hf_repo: str, subfolder: str, *, hf_revision: str
+    hf_repo: str, subfolder: str, *, artifact_revision: str
 ) -> AdapterArtifactMetadata:
     """Read adapter metadata and verify that tensor weights exist."""
-    config, filename = _load_adapter_config(hf_repo, subfolder, hf_revision=hf_revision)
-    _verify_adapter_artifact_tensors(hf_repo, subfolder, hf_revision=hf_revision)
+    config, filename = _load_adapter_config(hf_repo, subfolder, artifact_revision=artifact_revision)
+    files = _verify_adapter_artifact_tensors(
+        hf_repo, subfolder, artifact_revision=artifact_revision
+    )
+    fingerprint = json.dumps(
+        {
+            "artifact_revision": artifact_revision,
+            "config": config,
+            "files": files,
+            "repo_id": hf_repo,
+            "subfolder": subfolder,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return AdapterArtifactMetadata(
         lora_rank=rank_from_adapter_config(config, source=f"{hf_repo}:{filename}"),
         # non-fatal by construction: an unmarked or malformed marker reads as text-only, so modality
         # uncertainty weakens the smoke rather than stranding an otherwise usable deployment.
         targets_images=config_targets_images(config),
+        artifact_digest=hashlib.sha256(fingerprint).hexdigest(),
     )

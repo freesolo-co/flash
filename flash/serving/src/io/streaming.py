@@ -20,9 +20,9 @@ from flash.serving.src.io.openai_stream import (  # noqa: F401
 )
 from flash.serving.src.io.provenance import (
     _active_checkpoint_ref,
+    _checkpoint_provenance,
     _provenance_headers,
-    _revision_provenance,
-    require_attested_revision,
+    require_attested_checkpoint,
 )
 from flash.serving.src.io.schemas import AdapterRecord
 
@@ -55,7 +55,7 @@ async def prepare_stream(
             expected_checkpoint=expected_checkpoint,
         )
         first = await anext(events)
-        require_attested_revision(first, target)
+        require_attested_checkpoint(first, target)
     except BaseException as exc:
         # cancellation while waiting for the first engine event must still enter the pool iterator's
         # finally block, which aborts the remote generation. ordinary dispatch failures need the same
@@ -71,9 +71,9 @@ async def prepare_stream(
             raise RuntimeError("serving engine returned a mismatched generation id")
         if first.get("type") == "ready":
             active_checkpoint = first.get("checkpoint")
-            provenance = _revision_provenance(target, active_checkpoint)
+            provenance = _checkpoint_provenance(target, active_checkpoint)
             headers = _provenance_headers(provenance, active_checkpoint)
-            if target.is_revision:
+            if target.is_checkpoint:
                 headers["X-Freesolo-LoRA-Request-Adapter"] = first["lora_request_adapter"]
             return (
                 _replay_first_event(first, events),
@@ -83,9 +83,9 @@ async def prepare_stream(
             )
 
         active_checkpoint = _active_checkpoint_ref(target)
-        provenance = _revision_provenance(target, active_checkpoint)
+        provenance = _checkpoint_provenance(target, active_checkpoint)
         headers = _provenance_headers(provenance, active_checkpoint)
-        if target.is_revision:
+        if target.is_checkpoint:
             headers["X-Freesolo-LoRA-Request-Adapter"] = first["lora_request_adapter"]
         return (
             _replay_first_event(first, events),
@@ -126,7 +126,7 @@ async def generate_once(
         )
     except Exception as exc:
         raise_if_engine_error(router, requested.adapter_id, exc)
-    require_attested_revision(result, target)
+    require_attested_checkpoint(result, target)
     if require_generation_id and result.get("request_id") != generation_id:
         raise RuntimeError("serving engine returned a mismatched generation id")
     if "adapter_id" in result:

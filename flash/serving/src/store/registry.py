@@ -13,7 +13,7 @@ def _utc_now_iso() -> str:
 
 
 def _download_ident(record: AdapterRecord) -> tuple[str, str, str, str | None]:
-    return (record.repo_id, record.repo_type, record.hf_revision or "", record.subfolder)
+    return (record.repo_id, record.repo_type, record.artifact_revision or "", record.subfolder)
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -136,10 +136,9 @@ class AdapterRegistry:
             return removed
 
     def local_path_is_stale(self, record: AdapterRecord) -> bool:
-        if record.is_alias:
+        if not record.is_checkpoint:
             return False
-        # Cached path exists but was downloaded for a different repo/subfolder/repo_type — lets
-        # the engine evict the old vLLM LoRA before re-downloading. Fresh (uncached) -> False.
+        # cached path exists but was downloaded for a different private artifact identity.
         with self._lock:
             adapter_id = record.adapter_id
             if adapter_id not in self._local_paths:
@@ -147,17 +146,16 @@ class AdapterRegistry:
             return self._local_idents.get(adapter_id) != _download_ident(record)
 
     def set_local_path(self, record: AdapterRecord, path: Path) -> None:
-        if record.is_alias:
-            raise ValueError("alias records cannot acquire local adapter paths")
+        if not record.is_checkpoint:
+            raise ValueError("base-model records cannot acquire local adapter paths")
         with self._lock:
             self._local_paths[record.adapter_id] = path
             self._local_idents[record.adapter_id] = _download_ident(record)
 
     def local_path(self, record: AdapterRecord) -> Path | None:
-        if record.is_alias:
+        if not record.is_checkpoint:
             return None
-        # Cached path only if downloaded for the SAME identity; a changed source drops the stale
-        # entry and returns None so the caller re-downloads instead of serving stale weights.
+        # cached path only if downloaded for the same private artifact identity.
         with self._lock:
             adapter_id = record.adapter_id
             path = self._local_paths.get(adapter_id)
