@@ -253,6 +253,8 @@ def _in_flight_engine(record: AdapterRecord, tmp_path: Path) -> tuple[_LoraEngin
     engine._lora_entries = {}
     engine._adapter_locks = {}
     engine._adapter_locks_guard = asyncio.Lock()
+    engine._source_locks = {}
+    engine._source_locks_guard = asyncio.Lock()
     return engine, source
 
 
@@ -325,6 +327,116 @@ def test_in_flight_unregister_retains_id_and_first_output_marks_exact_source_loa
         assert loaded.tombstoned is True
         assert loaded.in_flight == 0
         assert engine._entries()[record.adapter_id].state == "loaded"
+        assert source.exists()
+
+    asyncio.run(scenario())
+
+
+def test_lazy_redeploy_reactivates_retained_loaded_lora_after_in_flight_unregister(
+    monkeypatch, tmp_path: Path
+) -> None:
+    record = _revision("a" * 40).model_copy(
+        update={
+            "deployment_generation": "generation-1",
+            "updated_at": "2026-08-26T00:00:01Z",
+        }
+    )
+    redeployed = record.model_copy(
+        update={
+            "deployment_generation": "generation-2",
+            "updated_at": "2026-08-26T00:00:02Z",
+        }
+    )
+    engine, source = _in_flight_engine(record, tmp_path)
+    forwarded_redeploy = redeployed.model_dump(by_alias=True)
+    forwarded_redeploy["deployment_generation"] = redeployed.deployment_generation
+
+    accepted = asyncio.Event()
+    release_output = asyncio.Event()
+
+    class _Engine:
+        def generate(self, *_args: object, **_kwargs: object):
+            accepted.set()
+
+            async def outputs():
+                await release_output.wait()
+                yield SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(
+                            index=0,
+                            text="done",
+                            finish_reason="stop",
+                            token_ids=[2],
+                            logprobs=None,
+                        )
+                    ],
+                    prompt_token_ids=[1],
+                    num_cached_tokens=0,
+                )
+
+            return outputs()
+
+    engine.engine = _Engine()
+    engine.reasoning_parser = None
+    engine._prompt_cache_size = 0
+
+    async def prompt_input(*_args: object) -> dict[str, list[int]]:
+        return {"prompt_token_ids": [1]}
+
+    engine._prepare_prompt_input = prompt_input  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "flash.serving.src.engine.generation._sampling_params",
+        lambda *_args: SimpleNamespace(),
+    )
+
+    async def scenario() -> None:
+        await engine._source_cache.bind_current(
+            record.adapter_id, _adapter_source_ident(record), source
+        )
+        generation = asyncio.create_task(
+            engine._generate({"adapter_id": record.adapter_id, "prompt": "hi"})
+        )
+        await accepted.wait()
+        request = engine._entries()[record.adapter_id].lora_request
+        int_id = request.lora_int_id
+        request_path = request.lora_path
+        source_ident = _adapter_source_ident(record)
+        await engine._unregister(record.adapter_id, "generation-1")
+        retained = engine._entries()[record.adapter_id]
+        assert retained.in_flight == 1
+        assert retained.tombstoned is True
+        assert source.exists()
+        with pytest.raises(RuntimeError, match="no longer current"):
+            await engine._generate(
+                {"adapter_id": record.adapter_id, "prompt": "hi"},
+                forwarded_redeploy,
+            )
+        still_in_flight = engine._entries()[record.adapter_id]
+        assert still_in_flight.lora_request is request
+        assert still_in_flight.in_flight == 1
+        assert still_in_flight.tombstoned is True
+        release_output.set()
+        result = await generation
+        assert result["text"] == "done"
+        loaded = engine._entries()[record.adapter_id]
+        assert loaded.state == "loaded"
+        assert loaded.tombstoned is True
+        assert loaded.in_flight == 0
+
+        redeployed_result = await engine._generate(
+            {"adapter_id": record.adapter_id, "prompt": "hi"},
+            forwarded_redeploy,
+        )
+        assert redeployed_result["text"] == "done"
+        reactivated = engine._entries()[record.adapter_id]
+        assert reactivated.state == "loaded"
+        assert reactivated.in_flight == 0
+        assert reactivated.tombstoned is False
+        assert reactivated.lora_request is request
+        assert reactivated.lora_request.lora_int_id == int_id
+        assert reactivated.lora_request.lora_path == request_path == str(source)
+        assert reactivated.source_ident == source_ident
+        assert engine.registry.local_path(redeployed) == source
         assert source.exists()
 
     asyncio.run(scenario())

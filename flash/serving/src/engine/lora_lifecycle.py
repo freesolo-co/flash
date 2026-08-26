@@ -634,7 +634,22 @@ class LoraLifecycleMixin:
                 # No LoRA to resolve: generate against the base weights the engine already has.
                 return None, record
             path = await self._ensure_adapter_local_locked(record)
-            return self._cached_lora_request_locked(record, path), record
+            lora_request = self._cached_lora_request_locked(record, path)
+            entry = self._entries().get(adapter_id)
+            if (
+                entry is not None
+                and entry.state == "loaded"
+                and entry.tombstoned
+                and entry.in_flight == 0
+            ):
+                self._entries()[adapter_id] = _LoraEntry(
+                    entry.source_ident,
+                    entry.lora_request,
+                    entry.state,
+                    entry.in_flight,
+                    False,
+                )
+            return lora_request, record
 
     @asynccontextmanager
     async def _lora_request_in_flight(
