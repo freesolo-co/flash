@@ -118,9 +118,8 @@ def _published_owner() -> tuple[ServingBootstrap, _FakeRuntime]:
     runtime.started = True
     owner = ServingBootstrap(manifest, runtime)
     adapter = manifest.adapters[0]
-    revision = PublishedAdapter(adapter.adapter_revision, adapter)
-    alias = PublishedAdapter("run-1", adapter)
-    owner._models = MappingProxyType({adapter.adapter_revision: revision, "run-1": alias})
+    checkpoint = PublishedAdapter(adapter.checkpoint_id, adapter)
+    owner._models = MappingProxyType({adapter.checkpoint_id: checkpoint})
     owner._ready = True
     return owner, runtime
 
@@ -139,7 +138,7 @@ def _auth() -> dict[str, str]:
 
 def _chat_body(**overrides):
     body = {
-        "model": "run-1",
+        "model": "run-1/final",
         "messages": [{"role": "user", "content": "hello"}],
     }
     body.update(overrides)
@@ -149,7 +148,9 @@ def _chat_body(**overrides):
 def _raw_chat_body(extra: str) -> str:
     """a chat body as raw text, because `json.dumps` emits the very tokens under test."""
 
-    return '{"model": "run-1", "messages": [{"role": "user", "content": "hi"}], ' + extra + "}"
+    return (
+        '{"model": "run-1/final", "messages": [{"role": "user", "content": "hi"}], ' + extra + "}"
+    )
 
 
 def _locked_paths(paths):
@@ -210,8 +211,7 @@ def test_bootstrap_registers_every_revision_before_atomic_publish(
 ) -> None:
     manifest = _manifest()
     paths = {
-        adapter.adapter_revision: tmp_path / adapter.adapter_revision
-        for adapter in manifest.adapters
+        adapter.checkpoint_id: tmp_path / adapter.checkpoint_id for adapter in manifest.adapters
     }
     monkeypatch.setattr(
         "flash.serve.app.bootstrap.locked_manifest_cache",
@@ -235,11 +235,9 @@ def test_bootstrap_registers_every_revision_before_atomic_publish(
     assert AUTH_TOKEN not in output
 
     assert owner.ready is True
-    assert [spec.adapter_id for spec in runtime.registered] == [
-        manifest.adapters[0].adapter_revision
-    ]
-    assert tuple(owner.models) == tuple(sorted((manifest.adapters[0].adapter_revision, "run-1")))
-    assert owner.models["run-1"].adapter.adapter_revision == manifest.adapters[0].adapter_revision
+    assert [spec.adapter_id for spec in runtime.registered] == [manifest.adapters[0].checkpoint_id]
+    assert tuple(owner.models) == (manifest.adapters[0].checkpoint_id,)
+    assert owner.models["run-1/final"].adapter.checkpoint_id == manifest.adapters[0].checkpoint_id
     assert not hasattr(owner, "token")
     asyncio.run(owner.close())
     assert runtime.closed is True
@@ -263,7 +261,7 @@ def test_bootstrap_validation_and_registration_fail_closed(monkeypatch, tmp_path
     runtime.closed = False
     monkeypatch.setattr(
         "flash.serve.app.bootstrap.locked_manifest_cache",
-        _locked_paths({manifest.adapters[0].adapter_revision: tmp_path / "adapter"}),
+        _locked_paths({manifest.adapters[0].checkpoint_id: tmp_path / "adapter"}),
     )
     runtime.fail_registration_at = 0
     with pytest.raises(RuntimeError, match="registration failed"):
@@ -279,7 +277,7 @@ def test_engine_death_handler_reaches_the_runtime(monkeypatch, tmp_path: Path) -
     manifest = _manifest()
     monkeypatch.setattr(
         "flash.serve.app.bootstrap.locked_manifest_cache",
-        _locked_paths({manifest.adapters[0].adapter_revision: tmp_path / "adapter"}),
+        _locked_paths({manifest.adapters[0].checkpoint_id: tmp_path / "adapter"}),
     )
     seen: list[object] = []
     runtime = _FakeRuntime()
@@ -626,8 +624,8 @@ def test_nonstream_reasoning_accounting_provenance_and_structured_precedence() -
         "prompt_tokens_details": {"cached_tokens": 3},
     }
     provenance = payload["flash_provenance"]
-    assert provenance["requested_model"] == "run-1"
-    assert provenance["adapter_revision"] == owner.models["run-1"].adapter.adapter_revision
+    assert provenance["requested_model"] == "run-1/final"
+    assert provenance["checkpoint_id"] == owner.models["run-1/final"].adapter.checkpoint_id
     assert provenance["logical_base_revision"] == owner.manifest.logical_base_revision
     assert provenance["served_checkpoint_revision"] == owner.manifest.engine.model_revision
     assert provenance["tokenizer_model"] == owner.manifest.engine.tokenizer_model
@@ -679,8 +677,8 @@ def test_reasoning_split_uses_first_close_and_preserves_non_thinking_literals() 
 
 def test_stream_primes_before_200_splits_reasoning_and_emits_one_real_finish() -> None:
     owner, runtime = _published_owner()
-    revision = owner.models["run-1"].adapter.adapter_revision
-    incarnation = owner.models["run-1"].adapter.aggregate_sha256
+    revision = owner.models["run-1/final"].adapter.checkpoint_id
+    incarnation = owner.models["run-1/final"].adapter.aggregate_sha256
     runtime.stream_events = [
         StreamReady("request-2", "runtime", revision, incarnation, True),
         StreamDelta(0, "why</thi"),
@@ -742,8 +740,8 @@ def test_stream_primes_before_200_splits_reasoning_and_emits_one_real_finish() -
 
 def test_stream_missing_duplicate_or_failed_terminal_is_sanitized_without_fake_stop() -> None:
     owner, runtime = _published_owner()
-    revision = owner.models["run-1"].adapter.adapter_revision
-    incarnation = owner.models["run-1"].adapter.aggregate_sha256
+    revision = owner.models["run-1/final"].adapter.checkpoint_id
+    incarnation = owner.models["run-1/final"].adapter.aggregate_sha256
     ready = StreamReady("request-3", "runtime", revision, incarnation, True)
     terminal = StreamFinished(
         request_id="request-3",
@@ -812,7 +810,7 @@ def test_a_chat_request_may_override_the_registered_grammar_for_its_own_call() -
     """
 
     owner, runtime = _published_owner()
-    assert owner.models["run-1"].adapter.structured_outputs_default == {"json_object": True}
+    assert owner.models["run-1/final"].adapter.structured_outputs_default == {"json_object": True}
     app = create_app(owner, bearer_token=AUTH_TOKEN)
 
     for override, expected in (
@@ -833,7 +831,7 @@ def test_a_chat_request_may_override_the_registered_grammar_for_its_own_call() -
         assert runtime.generation_requests[-1].structured_outputs == expected
 
     # the revision still carries its own default after every override above.
-    assert owner.models["run-1"].adapter.structured_outputs_default == {"json_object": True}
+    assert owner.models["run-1/final"].adapter.structured_outputs_default == {"json_object": True}
 
 
 @pytest.mark.parametrize(
@@ -934,7 +932,7 @@ def test_stream_failure_before_ready_returns_503_and_cancellation_closes_iterato
 
     iterator = ClosingIterator()
     ready = StreamReady("request-4", "runtime", None, None, False)
-    resolved = owner.models["run-1"]
+    resolved = owner.models["run-1/final"]
 
     async def cancel() -> None:
         body = _stream_body(iterator, ready, resolved, {}, include_usage=False)

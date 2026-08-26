@@ -346,8 +346,8 @@ def test_the_deploy_proceeds_once_a_token_is_present(
 def test_resolver_validation_failures_are_cli_errors_not_tracebacks(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # bad user input reaches validation below the resolver: a negative --checkpoint-step raises
-    # from format_adapter_revision and a nonimmutable revision raises from ResolvedAdapter, both
+    # bad user input reaches validation below the resolver: a negative --checkpoint-step and an
+    # invalid immutable checkpoint both raise from resolver-owned validation
     # as plain ValueError. catching only ResolveError let those escape as an unexpected-error
     # traceback after the artifact files had already been downloaded.
     _stub_environment(monkeypatch)
@@ -813,7 +813,7 @@ def _historical_identity(
         tokenizer_kwargs=current.manifest.tokenizer_kwargs,
         processor_kwargs=current.manifest.processor_kwargs,
         adapters=tuple(
-            AdapterExecutionInput(adapter_revision=entry.adapter_revision, files=entry.files)
+            AdapterExecutionInput(checkpoint_id=entry.checkpoint_id, files=entry.files)
             for entry in current.manifest.adapters
         ),
     )
