@@ -118,6 +118,9 @@ def _remote(*, attempt: int = 0) -> dict:
         "job_id": f"job-{attempt}",
         "attempt": attempt,
         "started_ts": float(attempt + 1),
+        "allocated_gpu": "RTX 4090",
+        "allocated_gpu_count": 1,
+        "allocated_usable_vram_gb": 24.0,
     }
 
 
@@ -629,6 +632,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     spec = _opd_spec("automatic-retry-absent")
     _save_status(spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    larger = Candidate("runpod", "H100", 3.29, 80)
     monkeypatch.setattr(
         allocator,
         "allocate",
@@ -637,7 +641,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
             gpu="RTX 4090",
             hourly_usd=0.69,
             min_vram_gb=24,
-            candidates=(candidate,),
+            candidates=(candidate, larger),
         ),
     )
     monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
@@ -675,7 +679,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
 
     assert metrics == {
         "train_tokens": 1,
-        "allocated_gpu": "RTX 4090",
+        "allocated_gpu": "H100",
         # stamped alongside the gpu so cost attribution prices the class on the substrate
         # that actually billed it.
         "allocated_provider": "runpod",
@@ -702,6 +706,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
     spec = _opd_spec("automatic-retry-pinned")
     _save_status(spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    larger = Candidate("runpod", "H100", 3.29, 80)
     monkeypatch.setattr(
         allocator,
         "allocate",
@@ -710,7 +715,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
             gpu="RTX 4090",
             hourly_usd=0.69,
             min_vram_gb=24,
-            candidates=(candidate,),
+            candidates=(candidate, larger),
         ),
     )
     monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
@@ -773,7 +778,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
 
     assert metrics == {
         "train_tokens": 1,
-        "allocated_gpu": "RTX 4090",
+        "allocated_gpu": "H100",
         # stamped alongside the gpu so cost attribution prices the class on the substrate
         # that actually billed it.
         "allocated_provider": "runpod",
@@ -1295,7 +1300,14 @@ def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
     rented_two_executes_one = Candidate("runpod", "h100", 1.0, 80, 2, 1)
     allocation = Allocation("runpod", "h100", 1.0, 80, (rented_two_executes_one,), gpu_count=2)
     filtered = _pinned_to_resume_width(allocation, 2)
-    ctx = SimpleNamespace(oom_vram_floor=0.0, last_detail=None, seed=42, log=io.StringIO())
+    from flash.runner.supervise.retry_decision import RetryState
+
+    ctx = SimpleNamespace(
+        retry_state=RetryState(1, 1, 0),
+        last_detail=None,
+        seed=42,
+        log=io.StringIO(),
+    )
     prepared = SimpleNamespace(resume_world_size=2)
 
     assert filtered.candidates == ()

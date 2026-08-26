@@ -12,10 +12,11 @@ from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
 from flash.runner.supervise import lifecycle as _lifecycle
 from flash.runner.supervise.retry_decision import (
-    _EXHAUSTED_CAPACITY_ACTION,
-    _capacity_exhausted,
-    _capacity_refusal_key,
-    _retry_target,
+    RetryState,
+    _candidate_usable_vram_gb,
+    _drop_weight_cache,
+    load_retry_state,
+    persist_retry_state,
 )
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
@@ -28,29 +29,17 @@ class _SubmitContext:
     runtime_secrets: dict[str, str] | None
     source_snapshot: dict
     attempt_start: int
-    infra_budget: int
-    retry_budget: object
-    started_with_shared_cache: bool
+    retry_state: RetryState
     last_handle: dict = field(default_factory=dict)
     current_gpu: dict = field(default_factory=dict)
+    current_usable_vram_gb: float = 0.0
     # persisted into the run handle so attach_run recovery polls with the same stall tuning.
     current_on_last_gpu: bool = False
     current_attempt: int = 0
     # tracks complete rN-suffixed retry handles that registry-less gc cannot reconstruct by name.
     seen_endpoints: dict[str, dict] = field(default_factory=dict)
     submission_lock: object | None = None
-    # grow only when an attempt actually provisioned a class and lost it to infra.
-    failed_providers: set[str] = field(default_factory=set)
-    tried_classes: set[tuple[str, str, int]] = field(default_factory=set)
-    # how many times each shape has refused capacity, so a second refusal of the SAME one is a
-    # repeat rather than a first look. counted per shape, not collected as a set of names: over
-    # several classes a set says "everything has refused" while one of them has been asked once.
-    # only capacity failures land here -- a stall or a preemption says nothing about rentability.
-    capacity_refusals: dict[tuple[str, str, int], int] = field(default_factory=dict)
-    oom_vram_floor: float = 0.0
     last_detail: str | None = None
-    # sticky: once dropped stays dropped so all remaining attempts run on the unrestricted all-dc pool.
-    drop_weight_cache: bool = False
 
     def on_handle(self, handle: dict) -> None:
         from flash.runner.accounting.reconciliation import _preserve_cleanup_remote
@@ -80,6 +69,7 @@ class _SubmitContext:
                 # learn the shape from what was persisted here. without the count a run adopted
                 # after a control-plane restart prices its wall as a single card.
                 "allocated_gpu_count": self.current_gpu.get("count"),
+                "allocated_usable_vram_gb": self.current_usable_vram_gb,
                 "on_last_gpu": bool(self.current_on_last_gpu),
             }
             if _update(self.spec.run_id, "running", remote=persisted_handle):
@@ -183,6 +173,7 @@ class _AttemptOutcome:
     chosen: object | None = None
     candidates: tuple = ()
     run_spec: JobSpec | None = None
+    candidate_not_started: bool = False
     stop: bool = False
 
 
@@ -190,6 +181,7 @@ class _AttemptOutcome:
 class _FailureDecision:
     metrics: dict | None
     retry: bool
+    retry_delay: float = 0.0
 
 
 def _build_context(
@@ -199,6 +191,7 @@ def _build_context(
     runtime_secrets: dict[str, str] | None,
     source_snapshot: dict | None,
     attempt_start: int,
+    retry_state: RetryState | None = None,
 ) -> _SubmitContext:
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
     from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
@@ -208,15 +201,33 @@ def _build_context(
         source_snapshot or source_snapshot_from_status(get_status(spec.run_id), required=True)
     ).to_dict()
     attempt_start = max(0, int(attempt_start))
-    max_retries = int(spec.gpu.max_retries)
-    infra_budget = max(max_retries, _lifecycle.INFRA_RETRY_FLOOR) if max_retries else 0
-    # one cache-less fallback is available only when the user enabled retries; max_retries=0 is
-    # exactly one provider submission. a non-shared per-org volume earns no bonus.
+    retry_state = retry_state or load_retry_state(spec.run_id, spec)
     started_with_shared_cache = (
         getattr(spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
     )
-    cache_fallback_attempts = 1 if started_with_shared_cache and max_retries > 0 else 0
-    retry_budget = _lifecycle._RetryBudget(infra_budget, max_retries, cache_fallback_attempts)
+    if (
+        retry_state.started_with_shared_cache != started_with_shared_cache
+        and retry_state.infra_used == 0
+        and retry_state.oom_used == 0
+        and retry_state.cache_used == 0
+        and retry_state.last_decision_attempt is None
+    ):
+        retry_state = RetryState.for_spec(
+            spec,
+            started_with_shared_cache=started_with_shared_cache,
+        )
+        if not persist_retry_state(spec.run_id, retry_state):
+            raise RuntimeError("initial retry state could not be persisted")
+    expected = RetryState.for_spec(
+        spec,
+        started_with_shared_cache=retry_state.started_with_shared_cache,
+    )
+    if (
+        retry_state.infra_retries != expected.infra_retries
+        or retry_state.oom_retries != expected.oom_retries
+        or retry_state.cache_retries != expected.cache_retries
+    ):
+        raise RuntimeError("persisted retry state does not match the current run spec")
     # environment transport is already pinned and staged by the controller before allocation.
     return _SubmitContext(
         spec=spec,
@@ -225,9 +236,7 @@ def _build_context(
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
         attempt_start=attempt_start,
-        infra_budget=infra_budget,
-        retry_budget=retry_budget,
-        started_with_shared_cache=started_with_shared_cache,
+        retry_state=retry_state,
         current_attempt=attempt_start,
     )
 
@@ -516,68 +525,58 @@ def _build_candidate_plan(
     from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
     from flash.runner.supervise.lifecycle import _spec_with_gpu
 
-    candidates = tuple(_lifecycle._oom_escalated(allocation.candidates, ctx.oom_vram_floor))
-    if not candidates:
-        # an exhausted list has two causes and they need different words. attributing the pinned-
-        # width one to OOM would send an operator to raise VRAM when the run is not out of memory
-        # at all: no fitting candidate executes at the resume checkpoint's world size.
-        if prepared.resume_world_size and not allocation.candidates:
-            width = prepared.resume_world_size
-            ctx.last_detail = (
-                f"no candidate executing at checkpoint world size {width} is available, and this "
-                "retry must preserve that executed rank width"
-            )
-            print(
-                f"seed={ctx.seed} no candidate executes at pinned OPD checkpoint world size "
-                f"{width}; not retrying",
-                file=ctx.log,
-                flush=True,
-            )
-            return None
-        ctx.last_detail = f"oom: exceeded the largest available GPU ({ctx.oom_vram_floor:g} GB)"
+    if prepared.resume_world_size and not allocation.candidates:
+        width = prepared.resume_world_size
+        ctx.last_detail = (
+            f"no candidate executing at checkpoint world size {width} is available, and this "
+            "retry must preserve that executed rank width"
+        )
         print(
-            f"seed={ctx.seed} OOM on the largest GPU class ({ctx.oom_vram_floor:g} GB); not retrying",
+            f"seed={ctx.seed} no candidate executes at pinned OPD checkpoint world size "
+            f"{width}; not retrying",
             file=ctx.log,
             flush=True,
         )
         return None
-    chosen = _lifecycle._select_candidate(candidates, ctx.failed_providers, ctx.tried_classes)
-    untried = [c for c in candidates if _lifecycle._shape_key(c) not in ctx.tried_classes]
+
+    candidates, chosen = ctx.retry_state.select_candidate(allocation.candidates)
+    if chosen is None:
+        floor = ctx.retry_state.usable_vram_floor
+        ctx.last_detail = f"no candidate has more than {floor:g} GB usable vram"
+        print(
+            f"seed={ctx.seed} no candidate is strictly larger than {floor:g} GB usable vram; "
+            "not retrying",
+            file=ctx.log,
+            flush=True,
+        )
+        return None
+
     cache_fallback_available = (
-        ctx.retry_budget.cache_used < ctx.retry_budget.cache_fallbacks
-        and ctx.started_with_shared_cache
-        and not ctx.drop_weight_cache
-        and chosen is not None
+        ctx.retry_state.cache_used < ctx.retry_state.cache_retries
+        and not ctx.retry_state.drop_weight_cache
         and getattr(get_provider(chosen.provider), "supports_weight_cache", False)
     )
-    on_last_gpu = len(untried) <= 1 or ctx.retry_budget.infra_exhausted(
-        cache_fallback_available=cache_fallback_available
+    on_last_gpu = ctx.retry_state.on_last_gpu(
+        chosen,
+        candidates,
+        cache_fallback_available=cache_fallback_available,
     )
     ctx.current_on_last_gpu = on_last_gpu
     print(allocation_summary(allocation), file=ctx.log, flush=True)
-    if (chosen.provider, chosen.gpu) != (allocation.provider, allocation.gpu):
+    if (chosen.provider, chosen.gpu, getattr(chosen, "gpu_count", 1)) != (
+        allocation.provider,
+        allocation.gpu,
+        getattr(allocation, "gpu_count", 1),
+    ):
         print(
-            f"retry {prepared.attempt}: walking past the cheapest class to {chosen.gpu} "
+            f"retry {prepared.attempt}: selected strictly larger {chosen.gpu} "
             f"@ {chosen.provider} ${chosen.hourly_usd:.2f}/hr",
             file=ctx.log,
             flush=True,
         )
-    elif prepared.attempt and not untried:
-        # every fitting class has been tried, so the picker re-selects the one that just
-        # failed -- correct (never strand a run with no candidates), but silent: a
-        # no_capacity retry then spends another full LAST_GPU_CAPACITY_GRACE_S waiting on
-        # the same unavailable class. say so, because the operator's fix is to unpin
-        # gpu.type rather than to keep waiting.
-        print(
-            f"retry {prepared.attempt}: no untried class left; re-selecting {chosen.gpu} "
-            f"@ {chosen.provider}"
-            + (" (gpu.type is pinned)" if getattr(ctx.spec.gpu, "type", None) else ""),
-            file=ctx.log,
-            flush=True,
-        )
     effective_spec = _spec_with_gpu(ctx.spec, chosen.gpu, getattr(chosen, "gpu_count", 1))
-    if ctx.drop_weight_cache:
-        effective_spec = _lifecycle._drop_weight_cache(effective_spec)
+    if ctx.retry_state.drop_weight_cache:
+        effective_spec = _drop_weight_cache(effective_spec)
     try:
         run_spec = _spec_with_remaining_wall(effective_spec, require_provider_minimum=True)
     except RuntimeError:
@@ -588,17 +587,18 @@ def _build_candidate_plan(
         provider=chosen.provider,
         count=int(getattr(chosen, "gpu_count", 1) or 1),
     )
+    ctx.current_usable_vram_gb = _candidate_usable_vram_gb(chosen)
     ctx.current_attempt = prepared.attempt
     return _CandidatePlan(allocation, candidates, chosen, on_last_gpu, effective_spec, run_spec)
 
 
-def _retry_delay(ctx: _SubmitContext, local_attempt: int) -> float:
+def _retry_delay(ctx: _SubmitContext, infra_retry_ordinal: int | None) -> float:
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
-    if local_attempt >= ctx.infra_budget:
+    if infra_retry_ordinal is None:
         return 0
     remaining = _load_run_deadline_at(ctx.spec.run_id) - _lifecycle.time.time()
-    return min(10 * (local_attempt + 1), remaining) if remaining > 0 else 0
+    return min(10 * infra_retry_ordinal, remaining) if remaining > 0 else 0
 
 
 def _submit_provider(
@@ -689,7 +689,6 @@ def _submit_candidate(
     from flash.runner.supervise.errors import _RunCancelled
     from flash.server.platform.locks import _deploy_lock
 
-    retry_delay = 0.0
     candidate_not_started = False
     ctx.submission_lock = _deploy_lock(ctx.spec.run_id)
     ctx.submission_lock.acquire()
@@ -709,16 +708,12 @@ def _submit_candidate(
         if get_status(ctx.spec.run_id).state in TERMINAL_STATES:
             raise ctx.cancel()
         result, candidate_not_started = _submit_provider(ctx, prepared, plan)
-        if candidate_not_started:
-            retry_delay = _retry_delay(ctx, prepared.local_attempt)
     finally:
         lock = ctx.submission_lock
         ctx.submission_lock = None
         if lock is not None:
             lock.release()
-    if retry_delay:
-        _lifecycle.time.sleep(retry_delay)  # let the transient clear
-    return result
+    return result, candidate_not_started
 
 
 def _run_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt) -> _AttemptOutcome:
@@ -729,12 +724,13 @@ def _run_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt) -> _AttemptOut
     plan = _build_candidate_plan(ctx, prepared, allocation)
     if plan is None:
         return _AttemptOutcome(stop=True)
-    result = _submit_candidate(ctx, prepared, plan)
+    result, candidate_not_started = _submit_candidate(ctx, prepared, plan)
     return _AttemptOutcome(
         result=result,
         chosen=plan.chosen,
         candidates=plan.candidates,
         run_spec=plan.run_spec,
+        candidate_not_started=candidate_not_started,
     )
 
 
@@ -765,7 +761,6 @@ def _handle_failure(
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
-    # cancel wins over any retry-shaped failure.
     ctx.raise_if_cancelled()
     completed_metrics = _lifecycle._await_runpod_completed_metrics(
         ctx.last_handle,
@@ -774,89 +769,36 @@ def _handle_failure(
     )
     if completed_metrics is not None:
         return _FailureDecision(ctx.return_completed_runpod_metrics(completed_metrics), False)
+
     result = outcome.result
     ctx.last_detail = f"{result.failure}: {result.detail}"
-    if outcome.chosen is not None and result.failure in ("stalled", "job_preempted", "oom"):
-        # these outcomes happen after the class admitted the run, so an older no-capacity refusal no
-        # longer describes the current market. poll_error stays ambiguous because submit and lookup
-        # failures can happen before any capacity was granted.
-        ctx.capacity_refusals.pop(_lifecycle._shape_key(outcome.chosen), None)
-    oom_shaped = result.failure == "oom"
-    if oom_shaped and outcome.chosen is not None:
-        # same measure the filter compares against, see _candidate_usable_vram_gb
-        ctx.oom_vram_floor = max(
-            ctx.oom_vram_floor,
-            _lifecycle._candidate_usable_vram_gb(outcome.chosen),
-        )
-    run_had_cache = bool(
+    managed_cache_mounted = bool(
         outcome.chosen is not None
+        and outcome.run_spec is not None
         and getattr(get_provider(outcome.chosen.provider), "supports_weight_cache", False)
         and getattr(outcome.run_spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
     )
-    first_cache_drop = (
-        run_had_cache
-        and not ctx.drop_weight_cache
-        and result.failure in ("no_capacity", "poll_error")
-    )
-    oom_mode = ctx.oom_vram_floor > 0
-    will_retry = ctx.retry_budget.can_retry(
+    plan = ctx.retry_state.decide_failure(
         result.failure,
-        cache_drop=first_cache_drop,
+        chosen=outcome.chosen,
+        candidates=outcome.candidates,
+        managed_cache_mounted=managed_cache_mounted,
+        attempt=prepared.attempt,
     )
-    capacity_exhausted = will_retry and _capacity_exhausted(
-        ctx, outcome, first_cache_drop=first_cache_drop
-    )
-    if capacity_exhausted:
-        will_retry = False
-    # after the check, which asks whether this shape had refused BEFORE this attempt.
-    #
-    # in-memory and per-process on purpose: _build_context starts this empty every time, so a run
-    # resumed after a control-plane restart gets a fresh pair of looks at the market rather than
-    # inheriting a verdict from minutes ago. capacity is exactly the thing that changes in between.
-    if result.failure == "no_capacity":
-        refused_key = _capacity_refusal_key(ctx, outcome)
-        if refused_key is not None:
-            ctx.capacity_refusals[refused_key] = ctx.capacity_refusals.get(refused_key, 0) + 1
-    retry_target = _retry_target(
-        ctx,
-        outcome,
-        will_retry=will_retry,
-        first_cache_drop=first_cache_drop,
-    )
-    action = (
-        f"retrying on a larger GPU (> {ctx.oom_vram_floor:g} GB)"
-        if (will_retry and oom_mode)
-        else retry_target
-        if will_retry
-        else _EXHAUSTED_CAPACITY_ACTION
-        if capacity_exhausted
-        else "not retrying"
+    if not persist_retry_state(ctx.spec.run_id, ctx.retry_state):
+        raise RuntimeError("retry state could not be persisted")
+    retry_delay = (
+        _retry_delay(ctx, plan.infra_retry_ordinal)
+        if plan.retry and outcome.candidate_not_started
+        else 0.0
     )
     print(
-        f"seed={ctx.seed} attempt={prepared.attempt} failed ({result.failure}); {action}"
+        f"seed={ctx.seed} attempt={prepared.attempt} failed ({result.failure}); {plan.action}"
         f"\n--- failure detail ---\n{(result.detail or '')[:2000]}\n---",
         file=ctx.log,
         flush=True,
     )
-    if not will_retry:
-        return _FailureDecision(None, False)
-    if first_cache_drop:
-        ctx.drop_weight_cache = True
-        # dropping the cache WIDENS the search: the weight-cache volume pins the run to the region
-        # holding those weights, so every refusal so far answered "any capacity for this class in
-        # that one region?" -- a narrower question than the cacheless retry is about to ask. Keeping
-        # the tally would let one region's shortage plus a single blip in the unrestricted pool
-        # reach two and stop the run, having heard the wider market refuse only once. Clear it so
-        # the widened search gets its own pair of looks.
-        ctx.capacity_refusals.clear()
-        ctx.retry_budget.record_retry(result.failure, cache_drop=True)
-    else:
-        ctx.retry_budget.record_retry(result.failure, cache_drop=False)
-        if outcome.chosen is not None:
-            if not oom_shaped:
-                ctx.failed_providers.add(outcome.chosen.provider)
-            ctx.tried_classes.add(_lifecycle._shape_key(outcome.chosen))
-    return _FailureDecision(None, True)
+    return _FailureDecision(None, plan.retry, retry_delay)
 
 
 def submit_seed_supervised(
@@ -866,6 +808,7 @@ def submit_seed_supervised(
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     attempt_start: int = 0,
+    retry_state: RetryState | None = None,
 ) -> dict:
     """Run one seed with bounded auto-retry on infra-shaped failures."""
     if spec.algorithm == "opd":
@@ -874,9 +817,19 @@ def submit_seed_supervised(
         # policy and plane configuration are spec-level gates and must fail before durable run state
         # or source identity is consulted. the deadline-dependent gate still runs after context load.
         preflight_validate_managed_teacher(spec)
-    ctx = _build_context(spec, seed, log, runtime_secrets, source_snapshot, attempt_start)
+    ctx = _build_context(
+        spec,
+        seed,
+        log,
+        runtime_secrets,
+        source_snapshot,
+        attempt_start,
+        retry_state,
+    )
     _require_opd_configuration(ctx)
-    for local_attempt in range(ctx.retry_budget.max_attempts):
+    if ctx.retry_state.last_decision_retry is False:
+        raise RuntimeError(f"seed {seed} retry policy rejected replacement after restart")
+    for local_attempt in range(ctx.retry_state.max_attempts):
         preparation = _prepare_attempt(ctx, local_attempt)
         if preparation.completed_metrics is not None:
             return ctx.return_completed_runpod_metrics(preparation.completed_metrics)
@@ -891,5 +844,7 @@ def submit_seed_supervised(
             return decision.metrics
         if not decision.retry:
             break
+        if decision.retry_delay:
+            _lifecycle.time.sleep(decision.retry_delay)
     ctx.gc_seen_endpoints()
     raise RuntimeError(f"seed {seed} failed after retries: {ctx.last_detail}")

@@ -36,12 +36,14 @@ _RUN_DEADLINE_AT_KEY = "run_deadline_at"
 _NEXT_ATTEMPT_KEY = "next_attempt"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"
 _OPD_RETRY_CONTRACT_KEY = OPD_RETRY_CONTRACT_STATUS_KEY
+_RETRY_STATE_KEY = "retry_state"
 _PRIVATE_STATUS_KEYS = frozenset(
     {
         _RUN_DEADLINE_AT_KEY,
         _NEXT_ATTEMPT_KEY,
         _CLEANUP_REMOTES_KEY,
         _OPD_RETRY_CONTRACT_KEY,
+        _RETRY_STATE_KEY,
     }
 )
 _PRIVATE_VALUE_UNSET = object()
@@ -315,6 +317,7 @@ def _save_status(
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
+    _retry_state: dict | object | None = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import deadlines
 
@@ -335,12 +338,19 @@ def _save_status(
                 )
             if _next_attempt is _PRIVATE_VALUE_UNSET:
                 _next_attempt = 0
+            if _retry_state is _PRIVATE_VALUE_UNSET:
+                from flash.runner.supervise.retry_decision import RetryState
+
+                _retry_state = RetryState.initial_for_spec(
+                    _internal_spec_from_status(status)
+                ).to_snapshot()
         _save_status_unlocked(
             status,
             _run_deadline_at=_run_deadline_at,
             _next_attempt=_next_attempt,
             _cleanup_remotes=_cleanup_remotes,
             _opd_retry_contract_version=_opd_retry_contract_version,
+            _retry_state=_retry_state,
         )
 
 
@@ -351,6 +361,7 @@ def _save_status_unlocked(
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
+    _retry_state: dict | object | None = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import reporting
     from flash.runner.lifecycle.status import _load_status_json
@@ -372,6 +383,7 @@ def _save_status_unlocked(
         _NEXT_ATTEMPT_KEY: _next_attempt,
         _CLEANUP_REMOTES_KEY: _cleanup_remotes,
         _OPD_RETRY_CONTRACT_KEY: _opd_retry_contract_version,
+        _RETRY_STATE_KEY: _retry_state,
     }
     data = _status_storage_dict(status)
     for key in _PRIVATE_STATUS_KEYS:

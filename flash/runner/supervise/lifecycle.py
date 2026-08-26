@@ -5,15 +5,9 @@ from __future__ import annotations
 import contextlib
 import os
 import time
-from dataclasses import dataclass
 
 from flash.core.spec import JobSpec, gpu_count_of, require_matching_seed
 
-# Floor so a streak of broken/busy GPUs doesn't kill a run that left retries enabled.
-# max_retries==0 (single-shot) is always respected; floor only applies when retries are on.
-INFRA_RETRY_FLOOR = 5
-INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error", "job_preempted"})
-RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 _STAGED_ENVIRONMENT_RETRY_S = 5.0
 
 
@@ -34,41 +28,6 @@ def _run_job_background(spec: JobSpec, runtime_secrets: dict[str, str] | None = 
         logging.getLogger(__name__).warning(
             "background run %s ended in error: %s", spec.run_id, detail
         )
-
-
-@dataclass
-class _RetryBudget:
-    infra_retries: int
-    oom_retries: int
-    cache_fallbacks: int
-    infra_used: int = 0
-    oom_used: int = 0
-    cache_used: int = 0
-
-    @property
-    def max_attempts(self) -> int:
-        return 1 + self.infra_retries + self.oom_retries + self.cache_fallbacks
-
-    def infra_exhausted(self, *, cache_fallback_available: bool) -> bool:
-        return self.infra_used >= self.infra_retries and not cache_fallback_available
-
-    def can_retry(self, failure: str | None, *, cache_drop: bool) -> bool:
-        if failure not in RETRY_FAILURES:
-            return False
-        if cache_drop:
-            return self.cache_used < self.cache_fallbacks
-        if failure == "oom":
-            return self.oom_used < self.oom_retries
-        return self.infra_used < self.infra_retries
-
-    def record_retry(self, failure: str | None, *, cache_drop: bool) -> None:
-        if cache_drop:
-            self.cache_used += 1
-            return
-        if failure == "oom":
-            self.oom_used += 1
-        elif failure in INFRA_RETRY_FAILURES:
-            self.infra_used += 1
 
 
 def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
@@ -147,21 +106,6 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-def _drop_weight_cache(spec: JobSpec) -> JobSpec:
-    """Spec with the SHARED weight-cache volume removed for an unrestricted cross-region retry.
-
-    Only drops the platform-managed shared cache (WEIGHT_CACHE_VOLUME_NAME); a custom per-org
-    network_volume is the user's own choice and is preserved across retries.
-    """
-    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
-
-    if getattr(spec.gpu, "network_volume", None) != WEIGHT_CACHE_VOLUME_NAME:
-        return spec
-    d = spec.to_internal_dict()
-    d["gpu"] = {**d["gpu"], "network_volume": None}
-    return JobSpec.from_dict(d)
-
-
 def _submit_seed_supervised(
     spec: JobSpec,
     seed: int,
@@ -169,6 +113,7 @@ def _submit_seed_supervised(
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     attempt_start: int = 0,
+    retry_state=None,
 ) -> dict:
     """Run one seed with bounded auto-retry on infra-shaped failures.
 
@@ -185,6 +130,7 @@ def _submit_seed_supervised(
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
         attempt_start=attempt_start,
+        retry_state=retry_state,
     )
 
 
@@ -251,6 +197,7 @@ def _run_training(
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     attempt_start: int = 0,
+    retry_state=None,
 ) -> None:
     """Train the run's single adapter under supervision; finalize the run.
 
@@ -301,6 +248,7 @@ def _run_training(
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
         attempt_start=attempt_start,
+        retry_state=retry_state,
     )
     metrics, verified_attempt = validate_terminal_source_metrics(get_status(spec.run_id), metrics)
     # measured wall x $/hr is recorded in metrics.json for analytics, but is not what we charge.
@@ -344,17 +292,12 @@ from flash.runner.supervise.recovery import (  # noqa: E402,F401
     _adopt_completed_attempt,
     _apply_charge_with_state,
     _await_runpod_completed_metrics,
-    _candidate_usable_vram_gb,
     _canonical_provider_handle,
     _charge_completed_run_by_id,
     _completed_attempt_metrics,
     _CompletedAttemptPending,
-    _oom_escalated,
-    _projected_retry_class,
     _register_checkpoints_best_effort,
     _runpod_completed_metrics,
-    _select_candidate,
-    _shape_key,
     _strict_teardown_handle,
     _worker_provably_gone,
 )

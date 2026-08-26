@@ -759,7 +759,10 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
         runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
         _next_attempt=0,
     )
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    candidates = (
+        Candidate("runpod", "RTX 4090", 0.69, 24),
+        Candidate("runpod", "H100", 1.99, 80),
+    )
     monkeypatch.setattr(
         allocator,
         "allocate",
@@ -768,7 +771,7 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
             gpu="RTX 4090",
             hourly_usd=0.69,
             min_vram_gb=24,
-            candidates=(candidate,),
+            candidates=candidates,
         ),
     )
     monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
@@ -838,7 +841,10 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
         runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
         _next_attempt=0,
     )
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    candidates = (
+        Candidate("runpod", "RTX 4090", 0.69, 24),
+        Candidate("runpod", "H100", 1.99, 80),
+    )
     monkeypatch.setattr(
         allocator,
         "allocate",
@@ -847,7 +853,7 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
             gpu="RTX 4090",
             hourly_usd=0.69,
             min_vram_gb=24,
-            candidates=(candidate,),
+            candidates=candidates,
         ),
     )
     monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
@@ -914,7 +920,10 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
     )
     now = {"value": 100.0}
     monkeypatch.setattr(runner_lifecycle.time, "time", lambda: now["value"])
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    candidates = (
+        Candidate("runpod", "RTX 4090", 0.69, 24),
+        Candidate("runpod", "H100", 1.99, 80),
+    )
     allocation_walls = []
 
     def fake_allocate(*_args, **kwargs):
@@ -924,7 +933,7 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
             gpu="RTX 4090",
             hourly_usd=0.69,
             min_vram_gb=24,
-            candidates=(candidate,),
+            candidates=candidates,
         )
 
     monkeypatch.setattr(allocator, "allocate", fake_allocate)
@@ -1011,7 +1020,10 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
         clock["now"] += seconds
 
     monkeypatch.setattr(lifecycle.time, "sleep", sleep)
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    candidates = (
+        Candidate("runpod", "RTX 4090", 0.69, 24),
+        Candidate("runpod", "H100", 1.99, 80),
+    )
     allocations = []
 
     def fake_allocate(*_args, **_kwargs):
@@ -1021,7 +1033,7 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
             gpu="RTX 4090",
             hourly_usd=0.69,
             min_vram_gb=24,
-            candidates=(candidate,),
+            candidates=candidates,
         )
 
     monkeypatch.setattr(allocator, "allocate", fake_allocate)
@@ -1808,6 +1820,9 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
         "endpoint-old",
         "job-old",
         attempt=persisted_attempt,
+        allocated_gpu="RTX 4090",
+        allocated_gpu_count=1,
+        allocated_usable_vram_gb=24.0,
     )
     status = provisioned_status(spec, state="running", created_at=100.0, remote=remote)
     status.source_snapshot = _SOURCE_SNAPSHOT
@@ -1845,6 +1860,506 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
     assert poll_walls == [200]
     assert status.state == "running"
     assert status.remote is None
+
+
+def test_attach_failure_restores_floor_and_skips_equal_cross_provider_candidates(
+    monkeypatch, tmp_path
+):
+    import io
+
+    import flash.providers.core.allocator as allocator
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate, PollResult
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(
+        run_id="attach-floor",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="grpo",
+        gpu=GpuSpec(max_retries=2, max_wall_seconds=200),
+    )
+    remote = _runpod_remote(
+        "endpoint-old",
+        "job-old",
+        attempt=0,
+        allocated_gpu="RTX 4090",
+        allocated_gpu_count=1,
+        allocated_usable_vram_gb=24.0,
+    )
+    status = provisioned_status(spec, state="running", remote=remote)
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status, _next_attempt=1)
+    candidates = (
+        Candidate("lambda", "A10", 1.0, 24),
+        Candidate("vast", "RTX 4090", 1.0, 24),
+        Candidate("vast", "H100", 2.0, 80),
+    )
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *a, **k: Allocation("lambda", "A10", 1.0, 12, candidates),
+    )
+    submitted = []
+
+    class Provider:
+        supports_weight_cache = False
+
+        def poll(self, *_args, **_kwargs):
+            return PollResult(False, failure="stalled", detail="worker stopped")
+
+        def cancel(self, _handle):
+            return None
+
+        def destroy(self, _handle):
+            return None
+
+        def submit_run(self, run_spec, _seed, *, on_handle, attempt, **_kwargs):
+            submitted.append((run_spec.gpu.type, run_spec.gpu.count))
+            on_handle(_vast_remote(instance_id=8, attempt=attempt))
+            return PollResult(True, metrics={"train_tokens": 1})
+
+    provider = Provider()
+    monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+
+    def resume(run_spec, log, **kwargs):
+        runner_lifecycle._submit_seed_supervised(
+            run_spec,
+            run_spec.seed,
+            log,
+            source_snapshot=kwargs["source_snapshot"],
+            attempt_start=kwargs["attempt_start"],
+            retry_state=kwargs["retry_state"],
+        )
+
+    monkeypatch.setattr(runner_lifecycle, "_run_training", resume)
+
+    runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert submitted == [("H100", 1)]
+    raw = runner_status._load_status_json(spec.run_id)
+    retry = raw[runner_state._RETRY_STATE_KEY]
+    assert retry["usable_vram_floor"] == 24.0
+    assert retry["infra_used"] == 1
+
+
+def test_attach_cache_fallback_restores_exact_shape_and_drops_managed_cache(monkeypatch, tmp_path):
+    import io
+
+    import flash.providers.core.allocator as allocator
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate, PollResult
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-cache",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="grpo",
+        gpu=GpuSpec(
+            type="H100",
+            count=2,
+            max_retries=1,
+            max_wall_seconds=200,
+            network_volume=WEIGHT_CACHE_VOLUME_NAME,
+            network_volume_gb=100,
+        ),
+    )
+    remote = _runpod_remote(
+        "endpoint-old",
+        "job-old",
+        attempt=0,
+        allocated_gpu="H100",
+        allocated_gpu_count=2,
+        allocated_usable_vram_gb=130.4,
+    )
+    status = provisioned_status(spec, state="running", remote=remote)
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status, _next_attempt=1)
+    candidates = (
+        Candidate("runpod", "H100", 1.0, 80, 2),
+        Candidate("runpod", "B200", 2.0, 180, 1),
+    )
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *a, **k: Allocation("runpod", "H100", 1.0, 12, candidates, 2),
+    )
+    submitted = []
+
+    class Provider:
+        supports_weight_cache = True
+
+        def poll(self, *_args, **_kwargs):
+            return PollResult(False, failure="no_capacity", detail="cached region unavailable")
+
+        def cancel(self, _handle):
+            return None
+
+        def destroy(self, _handle):
+            return None
+
+        def submit_run(self, run_spec, _seed, *, on_handle, attempt, **_kwargs):
+            submitted.append((run_spec.gpu.type, run_spec.gpu.count, run_spec.gpu.network_volume))
+            on_handle(_runpod_remote("endpoint-new", "job-new", attempt=attempt))
+            return PollResult(True, metrics={"train_tokens": 1})
+
+    provider = Provider()
+    monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+
+    def resume(run_spec, log, **kwargs):
+        assert run_spec.gpu.network_volume is None
+        runner_lifecycle._submit_seed_supervised(
+            run_spec,
+            run_spec.seed,
+            log,
+            source_snapshot=kwargs["source_snapshot"],
+            attempt_start=kwargs["attempt_start"],
+            retry_state=kwargs["retry_state"],
+        )
+
+    monkeypatch.setattr(runner_lifecycle, "_run_training", resume)
+
+    runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert submitted == [("H100", 2, None)]
+    retry = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
+    assert retry["cache_used"] == 1
+    assert retry["drop_weight_cache"] is True
+    assert retry["cache_retry_shape"] == ["runpod", "H100", 2]
+
+
+def test_nonretryable_attached_failure_tears_down_without_resubmitting(monkeypatch, tmp_path):
+    import io
+
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import PollResult
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-terminal-failure",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=2),
+    )
+    remote = _runpod_remote(
+        attempt=0,
+        allocated_gpu="RTX 4090",
+        allocated_gpu_count=1,
+        allocated_usable_vram_gb=24.0,
+    )
+    runner_state._save_status(
+        provisioned_status(spec, state="running", remote=remote),
+        _next_attempt=1,
+    )
+    teardown = []
+
+    class Provider:
+        def poll(self, *_args, **_kwargs):
+            return PollResult(False, failure="job_failed", detail="worker assertion")
+
+        def cancel(self, _handle):
+            teardown.append("cancel")
+
+        def destroy(self, _handle):
+            teardown.append("destroy")
+
+    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_run_training",
+        lambda *_a, **_k: pytest.fail("nonretryable attached failure resubmitted"),
+    )
+
+    status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert teardown == ["cancel", "destroy"]
+    assert status.state == "failed"
+    retry = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
+    assert retry["infra_used"] == 0
+    assert retry["oom_used"] == 0
+
+
+def test_attach_does_not_reset_a_consumed_infrastructure_budget(monkeypatch, tmp_path):
+    import io
+
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import PollResult
+    from flash.runner.supervise.retry_decision import RetryState
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-consumed-budget",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1),
+    )
+    remote = _runpod_remote(
+        attempt=5,
+        allocated_gpu="H100",
+        allocated_gpu_count=1,
+        allocated_usable_vram_gb=80.0,
+    )
+    state = RetryState.initial_for_spec(spec)
+    state.infra_used = state.infra_retries
+    state.usable_vram_floor = 24.0
+    state.last_decision_attempt = 4
+    state.last_decision_failure = "stalled"
+    state.last_decision_retry = True
+    state.last_infra_retry_ordinal = state.infra_retries
+    runner_state._save_status(
+        provisioned_status(spec, state="running", remote=remote),
+        _next_attempt=6,
+        _retry_state=state.to_snapshot(),
+    )
+
+    class Provider:
+        def poll(self, *_args, **_kwargs):
+            return PollResult(False, failure="stalled", detail="worker stopped")
+
+        def cancel(self, _handle):
+            return None
+
+        def destroy(self, _handle):
+            return None
+
+    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_run_training",
+        lambda *_a, **_k: pytest.fail("consumed retry budget was reset"),
+    )
+
+    status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert status.state == "failed"
+    retry = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
+    assert retry["infra_used"] == state.infra_retries
+    assert retry["usable_vram_floor"] == 80.0
+
+
+def test_atomic_attach_decision_is_immutable_for_attempt(monkeypatch, tmp_path):
+    import io
+
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.base import PollResult
+    from flash.runner.supervise.retry_decision import (
+        decide_attached_failure_atomically,
+        retry_candidate_from_remote,
+    )
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-decision-race",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=2),
+    )
+    remote = _runpod_remote(
+        attempt=0,
+        allocated_gpu="RTX 4090",
+        allocated_gpu_count=1,
+        allocated_usable_vram_gb=24.0,
+    )
+    status = provisioned_status(spec, state="running", remote=remote)
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status, _next_attempt=1)
+    initial_snapshot = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
+    stale_context = runner_attach._build_attach_context(spec, remote)
+    chosen = retry_candidate_from_remote(remote)
+
+    winner = decide_attached_failure_atomically(
+        spec.run_id,
+        spec,
+        expected_remote=remote,
+        expected_retry_snapshot=initial_snapshot,
+        failure="stalled",
+        chosen=chosen,
+        managed_cache_mounted=False,
+        attempt=0,
+    )
+    stale = decide_attached_failure_atomically(
+        spec.run_id,
+        spec,
+        expected_remote=remote,
+        expected_retry_snapshot=initial_snapshot,
+        failure="job_failed",
+        chosen=chosen,
+        managed_cache_mounted=False,
+        attempt=0,
+    )
+
+    assert winner is not None
+    winning_state, winning_plan = winner
+    assert winning_plan.retry is True
+    assert stale is None
+    assert sum(decision is not None and decision[1].retry for decision in (winner, stale)) == 1
+
+    winning_snapshot = winning_state.to_snapshot()
+    conflicting = decide_attached_failure_atomically(
+        spec.run_id,
+        spec,
+        expected_remote=remote,
+        expected_retry_snapshot=winning_snapshot,
+        failure="job_failed",
+        chosen=chosen,
+        managed_cache_mounted=False,
+        attempt=0,
+    )
+    assert conflicting is not None
+    conflicting_state, conflicting_plan = conflicting
+    assert conflicting_plan.retry is True
+    assert conflicting_plan.infra_retry_ordinal == winning_plan.infra_retry_ordinal
+    assert conflicting_state.to_snapshot() == winning_snapshot
+    assert conflicting_state.last_decision_failure == "stalled"
+    assert runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY] == (
+        winning_snapshot
+    )
+
+    observer_b = runner_attach._build_attach_context(spec, remote)
+    observer_c = runner_attach._build_attach_context(spec, remote)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_runpod_completed_metrics",
+        lambda *_args, **_kwargs: None,
+    )
+    teardowns = []
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args, **_kwargs: teardowns.append("teardown") or True,
+    )
+    launches = []
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_run_training",
+        lambda *_args, **kwargs: launches.append(kwargs["attempt_start"]),
+    )
+    stale_status = runner_attach._handle_failed_attach_poll(
+        spec.run_id,
+        stale_context,
+        PollResult(False, failure="job_failed", detail="stale conflicting poll"),
+        io.StringIO(),
+    )
+    assert stale_status.remote == remote
+    assert teardowns == []
+    assert launches == []
+
+    recovered = runner_attach._handle_failed_attach_poll(
+        spec.run_id,
+        observer_b,
+        PollResult(False, failure="job_failed", detail="post-win conflicting poll"),
+        io.StringIO(),
+    )
+    assert recovered.state == "running"
+    assert recovered.remote is None
+    assert teardowns == ["teardown"]
+    assert launches == [1]
+
+    repeated = runner_attach._handle_failed_attach_poll(
+        spec.run_id,
+        observer_c,
+        PollResult(False, failure="oom", detail="repeated conflicting poll"),
+        io.StringIO(),
+    )
+    assert repeated.state == "running"
+    assert repeated.remote is None
+    assert teardowns == ["teardown"]
+    assert launches == [1]
+    assert runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY] == (
+        winning_snapshot
+    )
+
+
+def test_post_win_observer_finishes_immutable_terminal_attach_decision(monkeypatch, tmp_path):
+    import io
+
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.base import PollResult
+    from flash.runner.supervise.retry_decision import (
+        decide_attached_failure_atomically,
+        retry_candidate_from_remote,
+    )
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-terminal-decision-race",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=2),
+    )
+    remote = _runpod_remote(
+        attempt=0,
+        allocated_gpu="RTX 4090",
+        allocated_gpu_count=1,
+        allocated_usable_vram_gb=24.0,
+    )
+    runner_state._save_status(
+        provisioned_status(spec, state="running", remote=remote),
+        _next_attempt=1,
+    )
+    initial_snapshot = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
+    winner = decide_attached_failure_atomically(
+        spec.run_id,
+        spec,
+        expected_remote=remote,
+        expected_retry_snapshot=initial_snapshot,
+        failure="job_failed",
+        chosen=retry_candidate_from_remote(remote),
+        managed_cache_mounted=False,
+        attempt=0,
+    )
+    assert winner is not None
+    winning_state, winning_plan = winner
+    assert winning_plan.retry is False
+    winning_snapshot = winning_state.to_snapshot()
+    observer_b = runner_attach._build_attach_context(spec, remote)
+    observer_c = runner_attach._build_attach_context(spec, remote)
+
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_runpod_completed_metrics",
+        lambda *_args, **_kwargs: None,
+    )
+    teardowns = []
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args, **_kwargs: teardowns.append("teardown") or True,
+    )
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_run_training",
+        lambda *_args, **_kwargs: pytest.fail("terminal decision launched replacement"),
+    )
+
+    recovered = runner_attach._handle_failed_attach_poll(
+        spec.run_id,
+        observer_b,
+        PollResult(False, failure="stalled", detail="post-win conflicting poll"),
+        io.StringIO(),
+    )
+    assert recovered.state == "failed"
+    assert teardowns == ["teardown"]
+    repeated = runner_attach._handle_failed_attach_poll(
+        spec.run_id,
+        observer_c,
+        PollResult(False, failure="oom", detail="repeated conflicting poll"),
+        io.StringIO(),
+    )
+    assert repeated.state == "failed"
+    assert teardowns == ["teardown"]
+    assert runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY] == (
+        winning_snapshot
+    )
 
 
 def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tmp_path):
