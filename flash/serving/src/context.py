@@ -14,7 +14,12 @@ from typing import Any
 
 from fastapi import HTTPException, Request, status
 
-from flash.serving.src.http_headers import _bearer_token, assert_internal, is_trusted_internal
+from flash.serving.src.http_headers import (
+    _bearer_token,
+    assert_internal,
+    is_trusted_internal,
+    training_scope_headers,
+)
 from flash.serving.src.lookup import AdapterLookup
 from flash.serving.src.routing import AdapterRouter, EnginePool
 from flash.serving.src.schemas import AdapterRecord
@@ -35,7 +40,7 @@ class ServingContext:
         internal_key: str | None,
         reload_records: Callable[[], list[AdapterRecord]] | None,
         lookup_record: Callable[[str], AdapterRecord | None] | None,
-        chat_authorizer: Callable[[str, str], Awaitable[str | None]] | None,
+        chat_authorizer: Callable[[str, str, dict[str, str]], Awaitable[str | None]] | None,
     ) -> None:
         self.pool = pool
         self.router = router
@@ -79,7 +84,7 @@ class ServingContext:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth is not configured"
             )
-        return await self.chat_authorizer(token, adapter_id)
+        return await self.chat_authorizer(token, adapter_id, training_scope_headers(request))
 
     async def reload_if_configured(self) -> None:
         if self.reload_records is not None:

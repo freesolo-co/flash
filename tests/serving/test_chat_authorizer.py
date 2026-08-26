@@ -93,7 +93,7 @@ def _authorizer(modal_app_module, monkeypatch, response: Any):
         def __init__(self, *_a: Any, **_k: Any) -> None:
             pass
 
-        async def post(self, _url: str, json: Any) -> _FakeResp:
+        async def post(self, _url: str, json: Any, headers: Any = None) -> _FakeResp:
             if isinstance(response, Exception):
                 raise response
             return response
@@ -205,8 +205,9 @@ def _counting_client(monkeypatch, responder, *, delay: float = 0.0):
         def __init__(self, *_a: Any, **_k: Any) -> None:
             pass
 
-        async def post(self, _url: str, json: Any) -> _FakeResp:
+        async def post(self, _url: str, json: Any, headers: Any = None) -> _FakeResp:
             calls["n"] += 1
+            calls.setdefault("headers", []).append(headers)
             n = calls["n"]
             if delay:
                 await asyncio.sleep(delay)
@@ -418,6 +419,92 @@ def test_failed_authorization_is_not_cached(modal_app_module, monkeypatch):
     assert calls["n"] == 2
 
 
+_TRAINING_SCOPE = {
+    "x-freesolo-org-id": "org-A",
+    "x-freesolo-training-job-id": "job-1",
+    "x-freesolo-project-id": "proj-1",
+    "x-freesolo-worker-id": "worker-1",
+    "x-freesolo-training-job-attempt": "1",
+}
+
+
+def test_training_scope_headers_reach_the_backend(modal_app_module, monkeypatch):
+    # a training container authenticates with the platform internal key, so the backend
+    # identifies the calling job from these headers. dropping them here is what made
+    # catalog-base sampling fail closed with missing_training_context.
+    import asyncio
+
+    calls = _counting_client(monkeypatch, lambda _n: _FakeResp(200, {"orgId": "org-A"}))
+    authorize = _new_authorizer(modal_app_module)
+
+    async def run() -> None:
+        assert await authorize("internal-key", "base-1", dict(_TRAINING_SCOPE)) == "org-A"
+
+    asyncio.run(run())
+
+    assert calls["headers"][0] == _TRAINING_SCOPE
+
+
+def test_customer_request_forwards_no_training_headers(modal_app_module, monkeypatch):
+    # a normal chat request carries none of these; forwarding five blanks would make it
+    # look like a malformed training call to the backend.
+    import asyncio
+
+    calls = _counting_client(monkeypatch, lambda _n: _FakeResp(200, {"orgId": "org-1"}))
+    authorize = _new_authorizer(modal_app_module)
+
+    async def run() -> None:
+        assert await authorize("customer-key", "adapter-1") == "org-1"
+
+    asyncio.run(run())
+
+    assert calls["headers"][0] is None
+
+
+def test_two_jobs_sharing_the_internal_key_do_not_share_a_cached_org(modal_app_module, monkeypatch):
+    # THE correctness case for putting the scope in the cache key: every training container
+    # presents the SAME internal key, so keying on (key, adapter) alone would answer job B
+    # with job A's cached billing org -- metering B's usage to A's tenant.
+    import asyncio
+
+    orgs = ["org-A", "org-B"]
+    calls = _counting_client(
+        monkeypatch, lambda n: _FakeResp(200, {"orgId": orgs[min(n, len(orgs)) - 1]})
+    )
+    authorize = _new_authorizer(modal_app_module)
+
+    job_a = dict(_TRAINING_SCOPE)
+    job_b = {**_TRAINING_SCOPE, "x-freesolo-org-id": "org-B", "x-freesolo-training-job-id": "job-2"}
+
+    async def run() -> None:
+        assert await authorize("internal-key", "base-1", job_a) == "org-A"
+        # same key, same adapter, different job -> must NOT be served from job A's cache entry
+        assert await authorize("internal-key", "base-1", job_b) == "org-B"
+
+    asyncio.run(run())
+
+    assert calls["n"] == 2
+
+
+def test_same_job_is_still_cached(modal_app_module, monkeypatch):
+    # the scope in the key must not defeat caching for a job sampling repeatedly.
+    import asyncio
+
+    calls = _counting_client(monkeypatch, lambda _n: _FakeResp(200, {"orgId": "org-A"}))
+    authorize = _new_authorizer(modal_app_module)
+
+    async def run() -> None:
+        assert await authorize("internal-key", "base-1", dict(_TRAINING_SCOPE)) == "org-A"
+        assert await authorize("internal-key", "base-1", dict(_TRAINING_SCOPE)) == "org-A"
+
+    asyncio.run(run())
+
+    assert calls["n"] == 1
+
+
+_EMPTY_SCOPE_DIGEST = hashlib.sha256(b"").hexdigest()
+
+
 def test_expired_key_is_evicted_before_reauthorization(modal_app_module, monkeypatch):
     import asyncio
     import inspect
@@ -431,7 +518,11 @@ def test_expired_key_is_evicted_before_reauthorization(modal_app_module, monkeyp
     authorize = _new_authorizer(modal_app_module)
     cache = inspect.getclosurevars(authorize).nonlocals["_cache"]
     request_key = ("synthetic-expired-key", "adapter-1")
-    cache_key = (hashlib.sha256(request_key[0].encode("utf-8")).hexdigest(), request_key[1])
+    cache_key = (
+        hashlib.sha256(request_key[0].encode("utf-8")).hexdigest(),
+        request_key[1],
+        _EMPTY_SCOPE_DIGEST,
+    )
 
     async def run() -> None:
         await authorize(*request_key)
@@ -460,10 +551,12 @@ def test_prune_removes_expired_keys_below_capacity(modal_app_module, monkeypatch
     expired_key = (
         hashlib.sha256(expired_request[0].encode("utf-8")).hexdigest(),
         expired_request[1],
+        _EMPTY_SCOPE_DIGEST,
     )
     current_key = (
         hashlib.sha256(current_request[0].encode("utf-8")).hexdigest(),
         current_request[1],
+        _EMPTY_SCOPE_DIGEST,
     )
 
     async def run() -> None:

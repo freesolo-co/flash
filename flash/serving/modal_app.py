@@ -563,7 +563,7 @@ _AUTH_CACHE_MAX_ENTRIES = 4096
 def _build_chat_authorizer(settings: Any) -> Any:
     """Build the serving->backend chat authorizer, or None when not configured.
 
-    Returns an async ``authorize(api_key, adapter_id)`` that POSTs to the backend's
+    Returns an async ``authorize(api_key, adapter_id, scope)`` that POSTs to the backend's
     ``/api/serving/authorize`` (authenticated with the shared internal key) and raises an
     ``HTTPException`` (401/402/403/503) when the Freesolo API key's org does not own the adapter or
     the backend can't be reached. Shares one persistent ``httpx.AsyncClient`` to keep the backend
@@ -593,13 +593,25 @@ def _build_chat_authorizer(settings: Any) -> Any:
 
     # (api_key_sha256, adapter_id) -> (expires_at_monotonic, org_id); populated only on a successful
     # authorization. Per-router-container in-memory (each container reduces its own backend load).
-    _cache: dict[tuple[str, str], tuple[float, str | None]] = {}
+    _cache: dict[tuple[str, str, str], tuple[float, str | None]] = {}
     # In-flight single-flight tasks so concurrent identical misses share ONE backend call.
-    _inflight: dict[tuple[str, str], asyncio.Task[str | None]] = {}
+    _inflight: dict[tuple[str, str, str], asyncio.Task[str | None]] = {}
 
-    async def _authorize_backend(api_key: str, adapter_id: str) -> "str | None":
+    async def _authorize_backend(
+        api_key: str, adapter_id: str, scope: "dict[str, str]"
+    ) -> "str | None":
         try:
-            resp = await _client.post(url, json={"apiKey": api_key, "adapterId": adapter_id})
+            resp = await _client.post(
+                url,
+                json={"apiKey": api_key, "adapterId": adapter_id},
+                # A training container authenticates with the platform internal key rather than a
+                # customer key, so the backend cannot resolve it via authenticate_api_key. It
+                # identifies the calling job from these headers and re-checks them against the live
+                # job row. Dropping them here is indistinguishable, to the backend, from a request
+                # that never had them: it refuses with missing_training_context and catalog-base
+                # sampling fails closed.
+                headers=scope or None,
+            )
         except Exception as exc:  # backend unreachable -> fail closed, never serve unauthorized
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unreachable"
@@ -667,10 +679,10 @@ def _build_chat_authorizer(settings: Any) -> Any:
                 _cache.pop(k, None)
 
     async def _authorize_and_cache(
-        ck: tuple[str, str], api_key: str, adapter_id: str
+        ck: tuple[str, str, str], api_key: str, adapter_id: str, scope: "dict[str, str]"
     ) -> "str | None":
         try:
-            org = await _authorize_backend(api_key, adapter_id)
+            org = await _authorize_backend(api_key, adapter_id, scope)
         finally:
             # Drop the single-flight slot regardless of outcome so a failed lookup re-checks next
             # time (failures are never cached) and a success can be re-driven once the cache expires.
@@ -681,9 +693,21 @@ def _build_chat_authorizer(settings: Any) -> Any:
         _prune(now)
         return org
 
-    async def authorize(api_key: str, adapter_id: str) -> "str | None":
+    async def authorize(
+        api_key: str, adapter_id: str, scope: "dict[str, str] | None" = None
+    ) -> "str | None":
         # do not retain raw user credentials as live dict keys beyond the request that supplied them.
-        ck = (hashlib.sha256(api_key.encode("utf-8")).hexdigest(), adapter_id)
+        scope = scope or {}
+        # The scope is part of the key, not just the payload. Every training container presents the
+        # SAME platform internal key, so keying on (key, adapter) alone would let one job's cached
+        # authorization answer another job's request -- and the cached value is the billing org, so
+        # the second job's usage would be metered to the first job's tenant. Digested for the same
+        # reason the api key is: these are identifiers, not secrets, but they should not sit in a
+        # long-lived dict key either.
+        scope_digest = hashlib.sha256(
+            "\x00".join(f"{k}={scope[k]}" for k in sorted(scope)).encode("utf-8")
+        ).hexdigest()
+        ck = (hashlib.sha256(api_key.encode("utf-8")).hexdigest(), adapter_id, scope_digest)
         cached = _cache.get(ck)
         now = time.monotonic()
         if cached is not None:
@@ -692,7 +716,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
             _cache.pop(ck, None)
         task = _inflight.get(ck)
         if task is None:
-            task = asyncio.ensure_future(_authorize_and_cache(ck, api_key, adapter_id))
+            task = asyncio.ensure_future(_authorize_and_cache(ck, api_key, adapter_id, scope))
             # Retrieve the task's outcome even if every awaiter is cancelled (all identical clients
             # disconnect), so an orphaned single-flight failure doesn't warn "exception never retrieved".
             task.add_done_callback(lambda t: t.cancelled() or t.exception())

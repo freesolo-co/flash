@@ -27,7 +27,7 @@ from flash.serving.src.structured_outputs import StructuredOutputsError
 QWEN = "Qwen/Qwen3.5-0.8B"
 
 
-async def _allow(_token: str, _adapter_id: str):
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None):
     return None
 
 

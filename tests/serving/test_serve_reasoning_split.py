@@ -25,7 +25,7 @@ from tests.serving.conftest import attest
 QWEN = "Qwen/Qwen3.5-0.8B"
 
 
-async def _allow(_token: str, _adapter_id: str) -> None:
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> None:
     return None
 
 

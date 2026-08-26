@@ -48,7 +48,7 @@ def build_serving_app(
     lookup_record: Callable[[str], AdapterRecord | None] | None = None,
     reload_interval_seconds: float = 30.0,
     usage_reporter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-    chat_authorizer: Callable[[str, str], Awaitable["str | None"]] | None = None,
+    chat_authorizer: Callable[[str, str, dict[str, str]], Awaitable["str | None"]] | None = None,
 ):
     """Front-door FastAPI app. ``reload_records`` re-reads persisted ready adapters so a router
     that missed a (un)registration on another container still resolves it: reload once on a miss

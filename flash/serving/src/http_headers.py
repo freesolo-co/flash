@@ -38,6 +38,34 @@ def is_trusted_internal(request: Request, trusted_keys: tuple[str, ...]) -> bool
     return any([hmac.compare_digest(presented, k) for k in trusted_keys])  # noqa: C419
 
 
+# The job-scope headers a training container sends with a catalog-base sample. The backend
+# re-checks all five against the live training job row before authorizing, so they have to
+# survive the hop through this service -- it forwards the caller's key but is otherwise the
+# only thing standing between the container and /api/serving/authorize.
+TRAINING_SCOPE_HEADERS = (
+    "x-freesolo-org-id",
+    "x-freesolo-training-job-id",
+    "x-freesolo-project-id",
+    "x-freesolo-worker-id",
+    "x-freesolo-training-job-attempt",
+)
+
+
+def training_scope_headers(request: Request) -> dict[str, str]:
+    """The training job-scope headers present on this request, lowercased.
+
+    Absent headers are omitted rather than sent empty: a normal customer chat request carries
+    none of these, and forwarding five blanks would make every such request look like a
+    malformed training call to the backend.
+    """
+    found = {}
+    for name in TRAINING_SCOPE_HEADERS:
+        value = (request.headers.get(name) or "").strip()
+        if value:
+            found[name] = value
+    return found
+
+
 def _bearer_token(request: Request) -> str | None:
     header = request.headers.get("Authorization") or ""
     scheme, _, value = header.partition(" ")

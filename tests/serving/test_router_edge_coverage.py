@@ -18,7 +18,7 @@ QWEN = "Qwen/Qwen3.5-0.8B"
 SHA = "a" * 40
 
 
-async def _allow(_token: str, _adapter_id: str) -> None:
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> None:
     return None
 
 

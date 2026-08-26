@@ -25,7 +25,7 @@ from flash.serving.src.streaming import _produce_openai_chat_stream, openai_chat
 from tests.serving.conftest import attest
 
 
-async def _allow(_token: str, _adapter_id: str) -> None:
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> None:
     """Permissive chat authorizer for routing tests (auth is always enforced; these
     tests exercise routing/metering, not auth)."""
     return
@@ -1097,7 +1097,7 @@ def test_openai_chat_stream_sets_anti_buffering_headers(app_setup):
 def test_openai_chat_rejects_non_boolean_stream_after_authorization(stream):
     authorizations: list[str] = []
 
-    async def _authorize(_token: str, adapter_id: str) -> None:
+    async def _authorize(_token: str, adapter_id: str, _scope: dict | None = None) -> None:
         authorizations.append(adapter_id)
 
     pool = FakePool()

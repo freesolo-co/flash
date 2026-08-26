@@ -747,7 +747,7 @@ class _Pool:
         return None
 
 
-async def _allow(_token: str, _adapter_id: str) -> None:
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> None:
     return None
 
 
