@@ -33,10 +33,10 @@ point of use; install it with `pip install freesolo`.
 
 Two components stay Freesolo-operated and are **not** in this repository:
 
-| Component                 | Where it lives                                                                                         | Self-hosted equivalent                                                      |
-| ------------------------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
-| Multi-tenant identity     | `api.freesolo.co`; verifies keys and owns projects/orgs                                                | `FLASH_STANDALONE=1` runs single-tenant on your own key                     |
-| Hosted Multi-LoRA serving | `serve.freesolo.co`, deployed from `flash/serving/`; `flash/serve/` owns the client and shared runtime | `flash serve deploy` provisions serving in your own Modal or RunPod account |
+| Component                 | Where it lives                                                                                         | Self-hosted equivalent                                            |
+| ------------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
+| Multi-tenant identity     | `api.freesolo.co`; verifies keys and owns projects/orgs                                                | `FLASH_STANDALONE=1` runs single-tenant on your own key           |
+| Hosted Multi-LoRA serving | `serve.freesolo.co`, deployed from `flash/serving/`; `flash/serve/` owns the client and shared runtime | `flash serve deploy` provisions serving in your own Modal account |
 
 So there are three ways to use Flash: against the **hosted service**, **self-hosted** against
 your own GPU accounts, or as **training and provider code to read and modify**. The training
@@ -48,10 +48,9 @@ The active training catalog is `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
 `Qwen/Qwen3.6-35B-A3B`. Hosted serving is active for 9B and 35B-A3B; hosted Qwen3.8 27B remains
 inactive. The retired dense Qwen3.6 27B identity is never translated into Qwen3.8. Customer-owned
 Modal supports all three active models; 27B and 35B-A3B are bound to the certified serving image
-digest. Persistent RunPod remains qualified only for profiles whose live-qualification flag is
-enabled: currently 9B. The 27B and 35B-A3B RunPod profiles remain blocked
-pending exact H200 qualification because provider allocation never produced a pod handle; their
-provisional storage values are not shipping measurements.
+digest. Customer-owned `flash serve` requires explicit `--provider modal`. Customer-serving RunPod
+commands and deployment identities are unsupported, with no migration or teardown shim. Managed
+RunPod training remains supported and unchanged.
 
 `flash login` is not interactive. Export `FREESOLO_API_KEY` first so the key does not appear in process listings:
 
@@ -227,8 +226,9 @@ External bearer tokens are rejected rather than accepted unverified. A standalon
 **single-tenant** — whoever holds that key can spend your GPU budget, so keep it off
 untrusted networks. See [the security model](SELF_HOSTING.md#the-security-model).
 
-`flash serve deploy` provisions serving in your own Modal or RunPod account. Each deployment owns
-one exact base model and its compatible adapters; another base model requires another deployment.
+`flash serve deploy` provisions serving in your own Modal account and requires explicit
+`--provider modal`. Each deployment owns one exact base model and its compatible adapters; another
+base model requires another deployment. Customer-serving RunPod identities are unsupported.
 It implements the same contract `flash/serve/` speaks; [docs/serving-contract.md](docs/serving-contract.md)
 documents it if you would rather write your own.
 

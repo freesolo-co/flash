@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 
 from flash.core.catalog import MODELS, get_model, supports_image_training
-from flash.serve.control import ModalPlacement, RunPodPlacement
+from flash.serve.control import ModalPlacement
 from flash.serve.deployment.profiles import (
     SERVE_RUNTIME_FAMILY,
     ProfileError,
@@ -235,22 +235,6 @@ def test_invalid_certified_image_digest_fails_the_whole_registry(
         supported_models()
 
 
-def test_invalid_runpod_storage_fails_the_whole_registry(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from flash.serve.deployment import profiles
-
-    profile = get_profile(MODEL)
-    monkeypatch.setitem(
-        profiles._PROFILES,
-        MODEL,
-        replace(profile, runpod_gpu=replace(profile.runpod_gpu, volume_size_gb=0)),
-    )
-
-    with pytest.raises(ProfileError, match="volume_size_gb must be a positive integer"):
-        supported_models()
-
-
 def test_missing_profile_fails_the_whole_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     from flash.serve.deployment import profiles
 
@@ -299,42 +283,6 @@ def test_engine_derives_fingerprints_from_the_carried_kwargs() -> None:
     )
 
 
-def test_model_specific_checkpoint_and_scheduler_choices() -> None:
-    nine = get_profile("Qwen/Qwen3.5-9B")
-    twenty_seven = get_profile("Qwen/Qwen3.8-27B")
-    thirty_five = get_profile("Qwen/Qwen3.6-35B-A3B")
-
-    assert nine.served_model == "Freesolo-Co/Qwen3.5-9B-FP8"
-    assert twenty_seven.served_model == "Qwen/Qwen3.8-27B-FP8"
-    assert twenty_seven.served_model_revision == "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
-    assert twenty_seven.tokenizer_model == "Qwen/Qwen3.8-27B"
-    assert twenty_seven.modal_gpu == "H100"
-    assert twenty_seven.modal_gpu_request == "H100!"
-    assert twenty_seven.runpod_gpu.gpu_type_id == "NVIDIA H200"
-    assert twenty_seven.runpod_gpu.container_disk_gb == 150
-    assert twenty_seven.runpod_gpu.volume_size_gb == 300
-    assert twenty_seven.modal_live_qualified is True
-    assert twenty_seven.runpod_live_qualified is False
-    assert twenty_seven.modal_certified_image_digest == (
-        "sha256:2bf27b51f6e4b7f0b2d805d96202579d94868e2c594b7c496777d350ad6936f6"
-    )
-    assert twenty_seven.runpod_certified_image_digest is None
-    assert thirty_five.served_model == "Qwen/Qwen3.6-35B-A3B"
-    assert thirty_five.modal_gpu_request == "H200"
-    assert thirty_five.quantization is None
-    assert thirty_five.tensor_parallel_size == 1
-    assert thirty_five.max_num_batched_tokens == 4096
-    assert thirty_five.max_num_seqs == 8
-    assert thirty_five.max_loras == 6
-    assert thirty_five.max_lora_rank == 64
-    assert thirty_five.modal_live_qualified is True
-    assert thirty_five.runpod_live_qualified is False
-    assert thirty_five.modal_certified_image_digest == twenty_seven.modal_certified_image_digest
-    assert thirty_five.runpod_certified_image_digest is None
-    assert nine.modal_certified_image_digest is None
-    assert nine.runpod_certified_image_digest is None
-
-
 def test_engine_binds_the_supplied_image_and_revisions() -> None:
     profile = get_profile(MODEL)
     other = "sha256:" + "c" * 64
@@ -374,70 +322,6 @@ def test_modal_placement_uses_the_validated_gpu_and_matches_tensor_parallelism()
     assert placement.gpu_count == profile.tensor_parallel_size
 
 
-def test_runpod_placement_uses_the_runpod_gpu_id_not_the_modal_name() -> None:
-    profile = get_profile(MODEL)
-
-    placement = placement_for(profile, "runpod", account_id="account", data_center_id="US-KS-2")
-
-    assert type(placement) is RunPodPlacement
-    assert placement.gpu_type_id == profile.runpod_gpu.gpu_type_id
-    assert placement.gpu_type_id != profile.modal_gpu
-    assert placement.gpu_count == profile.tensor_parallel_size
-    assert placement.container_disk_gb == profile.runpod_gpu.container_disk_gb
-    assert placement.volume_size_gb == profile.runpod_gpu.volume_size_gb
-
-
-@pytest.mark.parametrize(
-    ("provider", "supplied"),
-    [
-        ("modal", {"workspace_name": "workspace", "region": "us-east"}),
-        ("modal", {"environment": "dev", "region": "us-east"}),
-        ("modal", {"workspace_name": "workspace", "environment": "dev"}),
-        ("runpod", {"account_id": "account"}),
-        ("runpod", {"data_center_id": "US-KS-2"}),
-    ],
-)
-def test_incomplete_placement_inputs_are_rejected(provider: str, supplied: dict) -> None:
-    profile = get_profile(MODEL)
-
-    with pytest.raises(ProfileError) as excinfo:
-        placement_for(profile, provider, **supplied)  # type: ignore[arg-type]
-
-    assert "requires" in str(excinfo.value)
-
-
-@pytest.mark.parametrize(
-    ("provider", "supplied"),
-    [
-        (
-            "modal",
-            {
-                "workspace_name": "w",
-                "environment": "dev",
-                "region": "us-east",
-                "data_center_id": "US-KS-2",
-            },
-        ),
-        ("runpod", {"account_id": "a", "data_center_id": "US-KS-2", "environment": "dev"}),
-        ("runpod", {"account_id": "a", "data_center_id": "US-KS-2", "region": "us-east"}),
-        # a modal web suffix is as foreign to runpod as a modal region: dropping it would let
-        # `--modal-web-suffix --provider runpod` look accepted while changing nothing.
-        ("runpod", {"account_id": "a", "data_center_id": "US-KS-2", "web_suffix": "team"}),
-    ],
-)
-def test_foreign_provider_inputs_are_rejected_rather_than_ignored(
-    provider: str, supplied: dict
-) -> None:
-    # silently dropping a runpod data center on a modal deployment would let the caller keep a
-    # false belief about where this runs.
-    profile = get_profile(MODEL)
-
-    with pytest.raises(ProfileError) as excinfo:
-        placement_for(profile, provider, **supplied)  # type: ignore[arg-type]
-
-    assert "does not accept" in str(excinfo.value)
-
-
 def test_unsupported_provider_is_rejected() -> None:
     profile = get_profile(MODEL)
 
@@ -474,19 +358,46 @@ def test_image_capable_profiles_enable_tower_connector_lora() -> None:
         )
 
 
-def test_runpod_container_disk_holds_the_extracted_serving_image() -> None:
-    # the container disk must hold the image as EXTRACTED, not as downloaded. the serving image is
-    # 13.7 GB compressed and 40.7 GB on disk (`docker system df -v`), so a 40 GB disk sized from the
-    # compressed number cannot hold the image it is pulling at all.
-    #
-    # this floor is deliberately stated as the extracted size plus room for extraction scratch and
-    # the runtime's own writes. it is not a guess at "big enough": anything at or under ~41 GB is
-    # known-broken by direct observation.
-    extracted_image_gb = 41
-    for model_id in supported_models():
-        profile = get_profile(model_id)
-        assert profile.runpod_gpu.container_disk_gb > extracted_image_gb, (
-            f"{model_id} provisions a {profile.runpod_gpu.container_disk_gb} GB runpod container "
-            f"disk, which cannot hold the {extracted_image_gb} GB extracted serving image; the pod "
-            "will hang mid-pull and bill without ever serving"
-        )
+def test_model_specific_checkpoint_and_scheduler_choices() -> None:
+    nine = get_profile("Qwen/Qwen3.5-9B")
+    twenty_seven = get_profile("Qwen/Qwen3.8-27B")
+    thirty_five = get_profile("Qwen/Qwen3.6-35B-A3B")
+
+    assert nine.served_model == "Freesolo-Co/Qwen3.5-9B-FP8"
+    assert twenty_seven.served_model == "Qwen/Qwen3.8-27B-FP8"
+    assert twenty_seven.served_model_revision == "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
+    assert twenty_seven.tokenizer_model == "Qwen/Qwen3.8-27B"
+    assert twenty_seven.modal_gpu == "H100"
+    assert twenty_seven.modal_gpu_request == "H100!"
+    assert twenty_seven.modal_live_qualified is True
+    assert twenty_seven.modal_certified_image_digest == (
+        "sha256:2bf27b51f6e4b7f0b2d805d96202579d94868e2c594b7c496777d350ad6936f6"
+    )
+    assert thirty_five.served_model == "Qwen/Qwen3.6-35B-A3B"
+    assert thirty_five.modal_gpu_request == "H200"
+    assert thirty_five.quantization is None
+    assert thirty_five.tensor_parallel_size == 1
+    assert thirty_five.max_num_batched_tokens == 4096
+    assert thirty_five.max_num_seqs == 8
+    assert thirty_five.max_loras == 6
+    assert thirty_five.max_lora_rank == 64
+    assert thirty_five.modal_live_qualified is True
+    assert thirty_five.modal_certified_image_digest == twenty_seven.modal_certified_image_digest
+    assert nine.modal_certified_image_digest is None
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        {"workspace_name": "workspace", "region": "us-east"},
+        {"environment": "dev", "region": "us-east"},
+        {"workspace_name": "workspace", "environment": "dev"},
+    ],
+)
+def test_incomplete_placement_inputs_are_rejected(supplied: dict) -> None:
+    profile = get_profile(MODEL)
+
+    with pytest.raises(ProfileError) as excinfo:
+        placement_for(profile, "modal", **supplied)  # type: ignore[arg-type]
+
+    assert "requires" in str(excinfo.value)

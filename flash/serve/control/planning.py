@@ -1,4 +1,4 @@
-"""pure deterministic planning for modal and persistent runpod pods."""
+"""pure deterministic planning for customer-owned modal deployments."""
 
 from __future__ import annotations
 

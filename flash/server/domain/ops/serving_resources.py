@@ -1,7 +1,7 @@
 """credential-free serving deployment composition and preview."""
 
 from flash.serve.app import ExecutionInputs, build_serving_manifest
-from flash.serve.control import DeploymentRequest, ModalPlacement, RunPodPlacement, plan_deployment
+from flash.serve.control import DeploymentRequest, plan_deployment
 from flash.serve.provisioning import DeploymentBundle, ServingImage
 
 
@@ -18,11 +18,11 @@ def resolve_deployment_bundle(
 
 
 def dry_run_deployment(bundle: DeploymentBundle) -> dict[str, object]:
-    """return a credential-free identity, runtime, and provider-plan preview."""
+    """return a credential-free identity, runtime, and modal-plan preview."""
 
     engine = bundle.spec.engine
     placement = bundle.spec.placement
-    preview: dict[str, object] = {
+    return {
         "deployment_id": bundle.spec.deployment_id,
         "generation": bundle.spec.generation,
         "provider": bundle.spec.provider,
@@ -35,9 +35,7 @@ def dry_run_deployment(bundle: DeploymentBundle) -> dict[str, object]:
         "tokenizer_model": engine.tokenizer_model,
         "tokenizer_revision": engine.tokenizer_revision,
         "runtime_family": engine.runtime_family,
-        "provider_gpu": placement.gpu
-        if type(placement) is ModalPlacement
-        else placement.gpu_type_id,
+        "provider_gpu": placement.gpu,
         "provider_gpu_count": placement.gpu_count,
         "max_model_len": engine.max_model_len,
         "max_num_seqs": engine.max_num_seqs,
@@ -50,12 +48,3 @@ def dry_run_deployment(bundle: DeploymentBundle) -> dict[str, object]:
         "adapter_count": len(bundle.spec.adapters),
         "adapter_capacity": engine.adapter_capacity,
     }
-    if type(placement) is RunPodPlacement:
-        preview.update(
-            {
-                "runpod_data_center": placement.data_center_id,
-                "runpod_container_disk_gb": placement.container_disk_gb,
-                "runpod_volume_size_gb": placement.volume_size_gb,
-            }
-        )
-    return preview

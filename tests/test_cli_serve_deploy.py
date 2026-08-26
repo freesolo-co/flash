@@ -3,10 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import pathlib
-import re
-import shlex
-import tomllib
 
 import pytest
 
@@ -14,7 +10,7 @@ from flash.cli.commands.serving import deploy as serve_deploy
 from flash.cli.commands.serving.deploy import cmd_serve_deploy
 from flash.cli.commands.serving.identity import encode_deployment_identity
 from flash.cli.parsing.serve_parser import _add_serve_commands
-from flash.serve.deployment.profiles import get_profile, placement_for
+from flash.serve.deployment.profiles import get_profile
 from flash.serve.provisioning import InterruptedProvisioning
 
 DIGEST = "sha256:" + "a" * 64
@@ -82,118 +78,7 @@ def _args(**overrides) -> argparse.Namespace:
     parsed = _parse(base)
     for key, value in overrides.items():
         setattr(parsed, key, value)
-    # the base args are modal's, so overriding provider="runpod" would otherwise leave modal
-    # placement fields set and placement_for would reject them as foreign inputs -- a fixture
-    # artifact, not the behavior under test. each provider keeps only its own fields.
-    if parsed.provider == "runpod":
-        parsed.modal_workspace = ""
-        parsed.modal_environment = ""
-        parsed.modal_region = ""
-        parsed.runpod_account = parsed.runpod_account or "account1"
-        parsed.runpod_data_center = parsed.runpod_data_center or "US-KS-2"
     return parsed
-
-
-def test_provider_is_required_and_restricted_to_supported_providers() -> None:
-    # vast, lambda, kubernetes, and serverless runpod are explicitly out of scope, so an
-    # unsupported provider must be refused by the parser rather than reaching a provider call.
-    with pytest.raises(SystemExit):
-        _parse(
-            [
-                "serve",
-                "deploy",
-                "--provider",
-                "vast",
-                "--model",
-                MODEL,
-                "--run",
-                "run1",
-                "--deployment-id",
-                "deployment1",
-                "--image",
-                IMAGE,
-                "--artifact-repo",
-                "Freesolo-Co/artifacts",
-                "--artifact-subfolder",
-                "adapter",
-                "--lora-rank",
-                "32",
-            ]
-        )
-
-
-def test_deploy_routes_to_the_named_provider(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    calls: list[str] = []
-
-    def _fake_modal(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        calls.append("modal")
-        return _result(bundle)
-
-    def _fake_runpod(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        calls.append("runpod")
-        return _result(bundle)
-
-    _stub_resolution(monkeypatch)
-    _stub_environment(monkeypatch)
-    monkeypatch.setattr(
-        "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment",
-        _fake_modal,
-    )
-    monkeypatch.setattr(
-        "flash.serve.provisioning.runpod.operations.provision_runpod_deployment", _fake_runpod
-    )
-
-    assert cmd_serve_deploy(_args()) == 0
-    assert (
-        cmd_serve_deploy(
-            _args(
-                provider="runpod",
-                modal_workspace="",
-                modal_environment="",
-                runpod_account="account",
-                runpod_data_center="US-KS-2",
-            )
-        )
-        == 0
-    )
-
-    assert calls == ["modal", "runpod"]
-    assert capsys.readouterr().err == ""
-
-
-def test_runpod_storage_precondition_message_reaches_the_user(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    from flash.serve.provisioning.runpod.operations import RunPodDataCenterUnsupported
-
-    def _reject(*_args, **_kwargs):
-        raise RunPodDataCenterUnsupported("US-TX-4", ("EU-NL-1", "US-TX-3"))
-
-    _stub_resolution(monkeypatch)
-    _stub_environment(monkeypatch)
-    monkeypatch.setattr(
-        "flash.serve.provisioning.runpod.operations.provision_runpod_deployment", _reject
-    )
-
-    assert (
-        cmd_serve_deploy(
-            _args(
-                provider="runpod",
-                modal_workspace="",
-                modal_environment="",
-                runpod_account="account",
-                runpod_data_center="US-TX-4",
-            )
-        )
-        == 1
-    )
-    assert capsys.readouterr().err == (
-        "error: runpod data center US-TX-4 does not support network volumes. "
-        "valid data centers: EU-NL-1, US-TX-3\n"
-    )
 
 
 def test_dry_run_contacts_no_provider(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -240,8 +125,8 @@ def test_hub_token_reaches_provisioning_so_the_container_can_hydrate(
     # the container hydrates its adapter from the hub itself, and artifact repos are private by
     # default. the command resolved the adapter with HF_TOKEN and then built the runtime secrets
     # without it, so every real deployment reached the launcher with no way to authenticate and
-    # died in `_prepare_cache` -- after the provider had created and started billing for the app,
-    # volume, secret, and pod. nothing offline noticed because no test read the secrets the
+    # died in `_prepare_cache` after the provider had created and started billing for the app,
+    # volume, and secrets. nothing offline noticed because no test read the secrets the
     # command actually passed.
     seen: list[tuple[str, str | None]] = []
 
@@ -259,67 +144,6 @@ def test_hub_token_reaches_provisioning_so_the_container_can_hydrate(
 
     assert cmd_serve_deploy(_args()) == 0
     assert seen == [("inference-key", "hf-token")]
-
-
-@pytest.mark.parametrize(
-    ("provider", "target"),
-    [
-        (
-            "modal",
-            "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment",
-        ),
-        ("runpod", "flash.serve.provisioning.runpod.operations.provision_runpod_deployment"),
-    ],
-)
-def test_tokenless_adoption_reaches_the_provider(
-    monkeypatch: pytest.MonkeyPatch, provider: str, target: str
-) -> None:
-    seen: list[tuple[str, str | None]] = []
-
-    def _adopt(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        seen.append(secrets._reveal_for_launch())
-        return _result(bundle)
-
-    _stub_resolution(monkeypatch)
-    _stub_environment(monkeypatch)
-    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "   ")
-    monkeypatch.setattr(target, _adopt)
-
-    assert serve_deploy._optional_env(serve_deploy.ARTIFACT_TOKEN_ENV) is None
-    assert cmd_serve_deploy(_args(provider=provider)) == 0
-    assert seen == [("inference-key", None)]
-
-
-@pytest.mark.parametrize(
-    ("provider", "target"),
-    [
-        (
-            "modal",
-            "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment",
-        ),
-        ("runpod", "flash.serve.provisioning.runpod.operations.provision_runpod_deployment"),
-    ],
-)
-def test_tokenless_fresh_create_rejection_is_actionable(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    provider: str,
-    target: str,
-) -> None:
-    def _reject(*_args, **_kwargs):
-        raise serve_deploy.FreshDeploymentArtifactTokenRequired
-
-    _stub_resolution(monkeypatch)
-    _stub_environment(monkeypatch)
-    monkeypatch.delenv(serve_deploy.ARTIFACT_TOKEN_ENV, raising=False)
-    monkeypatch.setattr(target, _reject)
-
-    assert cmd_serve_deploy(_args(provider=provider)) == 1
-    assert capsys.readouterr().err == (
-        f"error: {serve_deploy.ARTIFACT_TOKEN_ENV} is not set. a new deployment hydrates its "
-        "serving cache from the hub before the engine starts, and that hydration requires a token "
-        "even when the repositories are public\n"
-    )
 
 
 def test_the_deploy_proceeds_once_a_token_is_present(
@@ -438,53 +262,6 @@ def test_registry_inconsistency_fails_before_artifact_resolution(
 
 
 @pytest.mark.parametrize(
-    ("model", "provider"),
-    [
-        ("Qwen/Qwen3.5-9B", "modal"),
-        ("Qwen/Qwen3.5-9B", "runpod"),
-        ("Qwen/Qwen3.8-27B", "modal"),
-        ("Qwen/Qwen3.8-27B", "runpod"),
-        ("Qwen/Qwen3.6-35B-A3B", "modal"),
-        ("Qwen/Qwen3.6-35B-A3B", "runpod"),
-    ],
-)
-def test_every_catalog_profile_builds_a_provider_free_dry_run(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    model: str,
-    provider: str,
-) -> None:
-    _stub_resolution(monkeypatch)
-
-    assert cmd_serve_deploy(_args(model=model, provider=provider, dry_run=True)) == 0
-    output = capsys.readouterr().out
-    assert "dry run: no provider was contacted" in output
-    assert "engine_id" in output
-
-
-def test_27b_runpod_dry_run_uses_h200_in_ap_jp_1(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _stub_resolution(monkeypatch)
-
-    args = _args(
-        model="Qwen/Qwen3.8-27B",
-        provider="runpod",
-        runpod_data_center="AP-JP-1",
-        dry_run=True,
-    )
-
-    assert cmd_serve_deploy(args) == 0
-    output = capsys.readouterr().out
-    assert "provider_gpu       NVIDIA H200" in output
-    assert "runpod_data_center AP-JP-1" in output
-    assert "runpod_container_disk_gb 150" in output
-    assert "runpod_volume_size_gb 300" in output
-    assert "dry run: no provider was contacted" in output
-
-
-@pytest.mark.parametrize(
     ("model", "expected_calls", "expected_model_revision", "expected_tokenizer_revision"),
     [
         (
@@ -594,40 +371,6 @@ def test_uncertified_modal_image_fails_before_resolution(
     assert f"requested {DIGEST}" in error
 
 
-@pytest.mark.parametrize("provider", ["modal", "runpod"])
-def test_9b_qualification_remains_image_digest_agnostic(
-    monkeypatch: pytest.MonkeyPatch,
-    provider: str,
-) -> None:
-    _stub_resolution(monkeypatch)
-    _stub_environment(monkeypatch)
-
-    target = (
-        "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment"
-        if provider == "modal"
-        else "flash.serve.provisioning.runpod.operations.provision_runpod_deployment"
-    )
-    monkeypatch.setattr(
-        target,
-        lambda bundle, credentials, secrets, *, deadline_at, **_kwargs: _result(bundle),
-    )
-
-    assert cmd_serve_deploy(_args(model=MODEL, provider=provider, image=IMAGE)) == 0
-
-
-@pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"])
-def test_runpod_profile_fails_before_resolution_on_real_deploy(
-    monkeypatch: pytest.MonkeyPatch,
-    model: str,
-) -> None:
-    def _explode(**_kwargs):
-        raise AssertionError("resolution ran before live qualification")
-
-    monkeypatch.setattr("flash.serve.deployment.resolve.resolve_adapter", _explode)
-
-    assert cmd_serve_deploy(_args(model=model, provider="runpod")) == 1
-
-
 @pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"])
 def test_synthetic_unqualified_modal_profile_still_fails_before_resolution(
     monkeypatch: pytest.MonkeyPatch,
@@ -651,36 +394,6 @@ def test_synthetic_unqualified_modal_profile_still_fails_before_resolution(
     assert cmd_serve_deploy(_args(model=model, provider="modal", image=CERTIFIED_IMAGE)) == 1
 
 
-def test_runpod_provisioning_warns_that_the_pod_may_be_live_and_billing(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    from flash.serve.control import DeploymentResult
-
-    def _provisioning(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        ready = _result(bundle)
-        return DeploymentResult.from_spec(
-            bundle.spec,
-            status="provisioning",
-            handle=ready.handle,
-        )
-
-    _stub_resolution(monkeypatch)
-    _stub_environment(monkeypatch)
-    monkeypatch.setattr(
-        "flash.serve.provisioning.runpod.operations.provision_runpod_deployment", _provisioning
-    )
-
-    assert cmd_serve_deploy(_args(provider="runpod")) == 1
-    captured = capsys.readouterr()
-    assert "status      provisioning" in captured.out
-    assert "pod pod1234567890 did not prove ready before the deadline" in captured.err
-    assert "may be live and billing" in captured.err
-    assert "flash serve status" in captured.err
-    assert "flash serve undeploy" in captured.err
-    assert "artifact cleanup did not settle" not in captured.err
-    assert "provider outcome could not be confirmed" not in captured.err
-
-
 def test_outcome_unknown_is_not_reported_as_a_plain_failure(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -695,7 +408,7 @@ def test_outcome_unknown_is_not_reported_as_a_plain_failure(
             bundle.spec,
             status="outcome_unknown",
             error_code="transport_failed",
-            error_reason="readiness_observation_failed",
+            error_reason="readiness_deadline_unproven",
         )
 
     _stub_resolution(monkeypatch)
@@ -709,7 +422,7 @@ def test_outcome_unknown_is_not_reported_as_a_plain_failure(
     captured = capsys.readouterr()
     assert "outcome_unknown" in captured.out
     assert f"identity    {identities[0]}\n" in captured.out
-    assert "reason      readiness_observation_failed" in captured.err
+    assert "reason      readiness_deadline_unproven" in captured.err
     assert "flash serve status" in captured.err
     assert "flash serve undeploy" in captured.err
 
@@ -721,32 +434,6 @@ def test_outcome_unknown_is_not_reported_as_a_plain_failure(
     )
     assert cmd_serve_deploy(_args()) == 1
     assert "outcome_unknown" in capsys.readouterr().out
-
-
-def test_runpod_unknown_outcome_explains_idless_identity_reclaim(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    def _unknown(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        from flash.serve.control import DeploymentResult
-
-        return DeploymentResult.from_spec(
-            bundle.spec,
-            status="outcome_unknown",
-            error_code="resource_ambiguous",
-            error_reason="mutation_outcome_unknown",
-        )
-
-    _stub_resolution(monkeypatch)
-    _stub_environment(monkeypatch)
-    monkeypatch.setattr(
-        "flash.serve.provisioning.runpod.operations.provision_runpod_deployment", _unknown
-    )
-
-    assert cmd_serve_deploy(_args(provider="runpod")) == 1
-    captured = capsys.readouterr()
-    assert "identity    " in captured.out
-    assert "omit all four id flags" in captured.err
-    assert "flash serve status" not in captured.err
 
 
 def test_identity_reporting_does_not_swallow_keyboard_interrupt(
@@ -761,73 +448,6 @@ def test_identity_reporting_does_not_swallow_keyboard_interrupt(
 
     with pytest.raises(KeyboardInterrupt):
         serve_deploy._report_identity(object())
-
-
-def test_artifact_cleanup_timeout_reports_a_live_billing_service(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    from flash.serve.control import DeploymentResult
-
-    def _timed_out(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        ready = _result(bundle)
-        return DeploymentResult.from_spec(
-            bundle.spec,
-            status="failed",
-            handle=ready.handle,
-            error_code="artifact_cleanup_timeout",
-            error_reason="artifact_cleanup_unproven",
-        )
-
-    _stub_resolution(monkeypatch)
-    _stub_environment(monkeypatch)
-    monkeypatch.setattr(
-        "flash.serve.provisioning.runpod.operations.provision_runpod_deployment", _timed_out
-    )
-
-    assert cmd_serve_deploy(_args(provider="runpod")) == 1
-    captured = capsys.readouterr()
-    assert "service reached readiness" in captured.err
-    assert "artifact cleanup did not settle" in captured.err
-    assert "live and billing" in captured.err
-    assert "flash serve status" in captured.err
-    # the pod proved ready, so it bills until it is torn down. the earlier wording withheld the
-    # teardown command, which left the cost to the user to work out.
-    assert "flash serve undeploy" in captured.err
-    assert "did not prove ready before the deadline" not in captured.err
-
-
-def test_artifact_cleanup_rejection_warns_that_the_pod_is_live_and_billing(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """a definite cleanup rejection must not read like an ordinary failed deploy.
-
-    the pod proved ready before cleanup ran, so it is live and billing. reporting `failed` with a
-    bare error line sent the user away believing nothing was provisioned, while the gpu kept
-    charging. every `artifact_cleanup_` reason is raised after readiness, so all of them warn.
-    """
-
-    from flash.serve.control import DeploymentResult
-
-    def _rejected(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        ready = _result(bundle)
-        return DeploymentResult.from_spec(
-            bundle.spec,
-            status="failed",
-            handle=ready.handle,
-            error_code="provider_rejected",
-            error_reason="artifact_cleanup_patch_rejected",
-        )
-
-    _stub_resolution(monkeypatch)
-    _stub_environment(monkeypatch)
-    monkeypatch.setattr(
-        "flash.serve.provisioning.runpod.operations.provision_runpod_deployment", _rejected
-    )
-
-    assert cmd_serve_deploy(_args(provider="runpod")) == 1
-    captured = capsys.readouterr()
-    assert "live and billing" in captured.err
-    assert "flash serve undeploy" in captured.err
 
 
 @pytest.mark.parametrize(
@@ -925,11 +545,7 @@ def _deploy_help(parser: argparse.ArgumentParser) -> str:
 def _result(bundle):
     """a ready result must carry the provider handle its own validator requires."""
 
-    from flash.serve.control import (
-        DeploymentResult,
-        ModalProviderHandle,
-        RunPodProviderHandle,
-    )
+    from flash.serve.control import DeploymentResult, ModalProviderHandle
 
     spec = bundle.spec
     common = {
@@ -938,44 +554,27 @@ def _result(bundle):
         "engine_id": spec.engine.engine_id,
         "image_digest": spec.engine.image_digest,
     }
-    if spec.provider == "modal":
-        handle = ModalProviderHandle(
-            workspace_name=spec.placement.workspace_name,
-            app_id="ap-" + "1" * 22,
-            app_name="flash-app-test",
-            volume_id="vo-" + "1" * 22,
-            volume_name="flash-volume-test",
-            inference_secret_id="st-" + "1" * 22,
-            inference_secret_name="flash-inference-secret-test",
-            environment=spec.placement.environment,
-            # from the spec, not a literal: the handle is validated against the planned placement,
-            # so a hardcoded region silently becomes a mismatch the moment the plan carries one.
-            region=spec.placement.region,
-            public_url="https://workspace--flash-app-test.modal.run",
-            **common,
-        )
-    else:
-        handle = RunPodProviderHandle(
-            account_id=spec.placement.account_id,
-            pod_id="pod1234567890",
-            pod_name="flash-pod-test",
-            network_volume_id="vol1234567890",
-            network_volume_name="flash-volume-test",
-            template_id="tpl1234567890",
-            template_name="flash-template-test",
-            inference_secret_id="sec1234567890",
-            inference_secret_name="flash-inference-secret-test",
-            data_center_id=spec.placement.data_center_id,
-            public_url="https://pod1234567890-8000.proxy.runpod.net",
-            **common,
-        )
+    handle = ModalProviderHandle(
+        workspace_name=spec.placement.workspace_name,
+        app_id="ap-" + "1" * 22,
+        app_name="flash-app-test",
+        volume_id="vo-" + "1" * 22,
+        volume_name="flash-volume-test",
+        inference_secret_id="st-" + "1" * 22,
+        inference_secret_name="flash-inference-secret-test",
+        environment=spec.placement.environment,
+        # from the spec, not a literal: the handle is validated against the planned placement,
+        # so a hardcoded region silently becomes a mismatch the moment the plan carries one.
+        region=spec.placement.region,
+        public_url="https://workspace--flash-app-test.modal.run",
+        **common,
+    )
     return DeploymentResult.from_spec(spec, status="ready", handle=handle)
 
 
 def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_ID_ENV, "token-id")
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_SECRET_ENV, "token-secret")
-    monkeypatch.setenv(serve_deploy.RUNPOD_API_KEY_ENV, "api-key")
     monkeypatch.setenv(serve_deploy.INFERENCE_KEY_ENV, "inference-key")
     # a deployable environment includes the artifact token: hydration on a fresh volume is
     # token-only, so the command rejects a missing one before contacting any provider. tests
@@ -1066,93 +665,6 @@ def _historical_identity(
         image=current.image,
     )
     return encode_deployment_identity(historical)
-
-
-def test_self_hosting_docs_document_a_command_that_exists() -> None:
-    """The documented serving procedure must be runnable as written.
-
-    SELF_HOSTING.md previously walked operators through `flash serve setup` and a `serve-modal`
-    extra. Both are deleted, so anyone following that section installed a nonexistent extra and then
-    hit "invalid choice" on the first command -- a self-hosting doc that cannot be followed at all.
-    """
-    root = pathlib.Path(__file__).resolve().parents[1]
-    doc = (root / "SELF_HOSTING.md").read_text(encoding="utf-8")
-
-    extras = tomllib.loads((root / "pyproject.toml").read_text())["project"][
-        "optional-dependencies"
-    ]
-    for gone in ("flash serve setup", "serve-modal"):
-        assert gone not in doc, gone
-    assert "serve-modal" not in extras
-
-    # every flag the documented example passes must be one the parser actually accepts, and every
-    # required flag must appear -- otherwise the example fails at parse time.
-    example = doc.split("flash serve deploy \\")[1].split("```")[0]
-    documented = set(re.findall(r"--[a-z-]+", example))
-
-    parser = argparse.ArgumentParser()
-    _add_serve_commands(parser.add_subparsers(dest="cmd", required=True))
-    deploy = (
-        parser._subparsers._group_actions[0]
-        .choices["serve"]
-        ._subparsers._group_actions[0]
-        .choices["deploy"]
-    )
-    accepted = {option for action in deploy._actions for option in action.option_strings}
-    required = {
-        action.option_strings[0]
-        for action in deploy._actions
-        if action.required and action.option_strings
-    }
-
-    assert documented <= accepted, documented - accepted
-    assert required <= documented, required - documented
-
-    # argparse-required is not the same as runnable. The `--modal-*` placement flags are optional
-    # to argparse (RunPod takes its own pair instead), but `placement_for` requires exactly one
-    # provider's full set, so a modal example without them exits with "modal placement requires
-    # environment, region, workspace_name". Drive the real resolver rather than re-listing flags.
-    parsed = deploy.parse_args(shlex.split(example.replace("\\\n", " ")))
-    placement_for(
-        get_profile(parsed.model),
-        parsed.provider,
-        workspace_name=parsed.modal_workspace,
-        environment=parsed.modal_environment,
-        region=parsed.modal_region,
-        web_suffix=(parsed.modal_web_suffix or None),
-        account_id=parsed.runpod_account,
-        data_center_id=parsed.runpod_data_center,
-    )
-
-    # and the documented install must supply what the command imports: the base install has no
-    # dependencies at all, so `pip install freesolo-flash` alone dies in `_hub_api`.
-    assert "pip install 'freesolo-flash[server]'" in doc
-
-
-def test_self_hosting_docs_do_not_route_the_plane_key_to_a_customer_endpoint() -> None:
-    """The documented way to call a `serve deploy` endpoint must be the one it authenticates.
-
-    The packaged app's `_authorize` reads `Authorization: Bearer` and nothing else -- there is no
-    internal-key acceptance anywhere in `flash/serve/app/`. `FREESOLO_SERVING_URL` drives the
-    separate multi-LoRA backend, and every request it sends carries `FREESOLO_INTERNAL_KEY` via
-    `X-Freesolo-Internal-Key`. So documenting the deployment URL under `FREESOLO_SERVING_URL` does
-    not merely fail `401`: it first sends the key that controls the whole plane to a provider
-    endpoint, which `docs/serving-contract.md` forbids ("must never be sent to a customer-owned
-    endpoint"). Asserting on the app's real check rather than on prose keeps the two in step.
-    """
-    root = pathlib.Path(__file__).resolve().parents[1]
-    doc = (root / "SELF_HOSTING.md").read_text(encoding="utf-8")
-
-    app = (root / "flash" / "serve" / "app" / "http.py").read_text(encoding="utf-8")
-    assert "internal-key" not in app.casefold(), "the packaged app must not read the plane key"
-    assert '"bearer"' in app.casefold(), "the packaged app must authenticate with bearer"
-
-    # the deployment section must show the bearer call, and must not hand its url to the command
-    # family that authenticates with the plane key.
-    section = doc.split("## Serving")[1]
-    assert "Authorization: Bearer $FLASH_SERVING_KEY" in section
-    exported = re.findall(r"export FREESOLO_SERVING_URL=(\S+)", section)
-    assert not any("modal.run" in value or "proxy.runpod" in value for value in exported), exported
 
 
 @pytest.mark.parametrize("bad", ["0", "-1", "-0.5", "nan", "inf", "-inf"])
@@ -1311,3 +823,105 @@ def test_a_nonpositive_checkpoint_step_is_rejected_at_parse(bad: str) -> None:
                 bad,
             ]
         )
+
+
+def test_provider_is_required_and_restricted_to_supported_providers() -> None:
+    # vast, lambda, kubernetes, and serverless runpod are explicitly out of scope, so an
+    # unsupported provider must be refused by the parser rather than reaching a provider call.
+    with pytest.raises(SystemExit):
+        _parse(
+            [
+                "serve",
+                "deploy",
+                "--provider",
+                "vast",
+                "--model",
+                MODEL,
+                "--run",
+                "run1",
+                "--deployment-id",
+                "deployment1",
+                "--image",
+                IMAGE,
+                "--artifact-repo",
+                "Freesolo-Co/artifacts",
+                "--artifact-subfolder",
+                "adapter",
+                "--lora-rank",
+                "32",
+            ]
+        )
+
+
+def test_tokenless_adoption_reaches_the_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[tuple[str, str | None]] = []
+
+    def _adopt(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        seen.append(secrets._reveal_for_launch())
+        return _result(bundle)
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "   ")
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment",
+        _adopt,
+    )
+
+    assert serve_deploy._optional_env(serve_deploy.ARTIFACT_TOKEN_ENV) is None
+    assert cmd_serve_deploy(_args()) == 0
+    assert seen == [("inference-key", None)]
+
+
+def test_tokenless_fresh_create_rejection_is_actionable(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def _reject(*_args, **_kwargs):
+        raise serve_deploy.FreshDeploymentArtifactTokenRequired
+
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+    monkeypatch.delenv(serve_deploy.ARTIFACT_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment",
+        _reject,
+    )
+
+    assert cmd_serve_deploy(_args()) == 1
+    assert capsys.readouterr().err == (
+        f"error: {serve_deploy.ARTIFACT_TOKEN_ENV} is not set. a new deployment hydrates its "
+        "serving cache from the hub before the engine starts, and that hydration requires a token "
+        "even when the repositories are public\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"],
+)
+def test_every_catalog_profile_builds_a_provider_free_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    model: str,
+) -> None:
+    _stub_resolution(monkeypatch)
+
+    assert cmd_serve_deploy(_args(model=model, dry_run=True)) == 0
+    output = capsys.readouterr().out
+    assert "dry run: no provider was contacted" in output
+    assert "engine_id" in output
+
+
+def test_9b_qualification_remains_image_digest_agnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_resolution(monkeypatch)
+    _stub_environment(monkeypatch)
+
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment",
+        lambda bundle, credentials, secrets, *, deadline_at, **_kwargs: _result(bundle),
+    )
+
+    assert cmd_serve_deploy(_args(model=MODEL, image=IMAGE)) == 0

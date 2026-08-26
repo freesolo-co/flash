@@ -77,70 +77,6 @@ def test_resolve_reuses_existing_image_binding_validators() -> None:
         resolve_deployment_bundle(request, execution_inputs, _image(OTHER_IMAGE_DIGEST))
 
 
-@pytest.mark.parametrize("model_id", supported_models())
-@pytest.mark.parametrize("provider", ["modal", "runpod"])
-def test_dry_run_preview_has_exact_safe_plan_facts(model_id: str, provider: str) -> None:
-    spec, execution_inputs = _profile_spec_and_inputs(model_id)
-    profile = get_profile(model_id)
-    if provider == "modal":
-        placement = placement_for(
-            profile,
-            provider,
-            workspace_name="workspace",
-            environment="dev",
-            region="us-east",
-        )
-    else:
-        placement = placement_for(
-            profile,
-            provider,
-            account_id="account",
-            data_center_id="US-KS-2",
-        )
-    spec = replace(spec, provider=provider, placement=placement)
-    bundle = resolve_deployment_bundle(_request(spec), execution_inputs, _image())
-
-    preview = dry_run_deployment(bundle)
-
-    assert preview == {
-        "deployment_id": bundle.spec.deployment_id,
-        "generation": bundle.spec.generation,
-        "provider": provider,
-        "spec_id": bundle.spec.spec_id,
-        "manifest_id": bundle.manifest.manifest_id,
-        "engine_id": bundle.spec.engine.engine_id,
-        "image_digest": bundle.image.digest,
-        "served_model": spec.engine.served_model,
-        "model_revision": spec.engine.model_revision,
-        "tokenizer_model": spec.engine.tokenizer_model,
-        "tokenizer_revision": spec.engine.tokenizer_revision,
-        "runtime_family": spec.engine.runtime_family,
-        "provider_gpu": profile.modal_gpu_request
-        if provider == "modal"
-        else profile.runpod_gpu.gpu_type_id,
-        "provider_gpu_count": profile.tensor_parallel_size,
-        "max_model_len": profile.max_model_len,
-        "max_num_seqs": profile.max_num_seqs,
-        "max_num_batched_tokens": profile.max_num_batched_tokens,
-        "max_loras": profile.max_loras,
-        "max_cpu_loras": profile.max_cpu_loras,
-        "max_lora_rank": profile.max_lora_rank,
-        "modality": profile.modality,
-        "image_limit": profile.image_limit,
-        "adapter_count": len(bundle.spec.adapters),
-        "adapter_capacity": spec.engine.adapter_capacity,
-        **(
-            {
-                "runpod_data_center": "US-KS-2",
-                "runpod_container_disk_gb": profile.runpod_gpu.container_disk_gb,
-                "runpod_volume_size_gb": profile.runpod_gpu.volume_size_gb,
-            }
-            if provider == "runpod"
-            else {}
-        ),
-    }
-
-
 def test_json_preview_excludes_nonallowlisted_bundle_data() -> None:
     spec, execution_inputs = _spec_and_inputs()
     placement = ModalPlacement(
@@ -197,16 +133,57 @@ def test_json_preview_excludes_nonallowlisted_bundle_data() -> None:
     }.isdisjoint(preview)
 
 
+@pytest.mark.parametrize("model_id", supported_models())
+def test_dry_run_preview_has_exact_safe_plan_facts(model_id: str) -> None:
+    spec, execution_inputs = _profile_spec_and_inputs(model_id)
+    profile = get_profile(model_id)
+    placement = placement_for(
+        profile,
+        "modal",
+        workspace_name="workspace",
+        environment="dev",
+        region="us-east",
+    )
+    spec = replace(spec, provider="modal", placement=placement)
+    bundle = resolve_deployment_bundle(_request(spec), execution_inputs, _image())
+
+    preview = dry_run_deployment(bundle)
+
+    assert preview == {
+        "deployment_id": bundle.spec.deployment_id,
+        "generation": bundle.spec.generation,
+        "provider": "modal",
+        "spec_id": bundle.spec.spec_id,
+        "manifest_id": bundle.manifest.manifest_id,
+        "engine_id": bundle.spec.engine.engine_id,
+        "image_digest": bundle.image.digest,
+        "served_model": spec.engine.served_model,
+        "model_revision": spec.engine.model_revision,
+        "tokenizer_model": spec.engine.tokenizer_model,
+        "tokenizer_revision": spec.engine.tokenizer_revision,
+        "runtime_family": spec.engine.runtime_family,
+        "provider_gpu": profile.modal_gpu_request,
+        "provider_gpu_count": profile.tensor_parallel_size,
+        "max_model_len": profile.max_model_len,
+        "max_num_seqs": profile.max_num_seqs,
+        "max_num_batched_tokens": profile.max_num_batched_tokens,
+        "max_loras": profile.max_loras,
+        "max_cpu_loras": profile.max_cpu_loras,
+        "max_lora_rank": profile.max_lora_rank,
+        "modality": profile.modality,
+        "image_limit": profile.image_limit,
+        "adapter_count": len(bundle.spec.adapters),
+        "adapter_capacity": spec.engine.adapter_capacity,
+    }
+
+
 def test_domain_module_import_does_not_load_provider_packages_or_lifecycle_modules() -> None:
     probe = r"""
 import builtins
 import sys
 
 provider_roots = ("modal", "runpod", "runpod_flash")
-lifecycle_prefixes = (
-    "flash.serve.provisioning.modal",
-    "flash.serve.provisioning.runpod",
-)
+lifecycle_prefixes = ("flash.serve.provisioning.modal",)
 real_import = builtins.__import__
 intercepted = []
 

@@ -1,7 +1,7 @@
 """build one explicitly named nonshipping serving qualification plan.
 
-this tool resolves the same bundle and builds the same provider plan as `flash serve deploy`, but it
-never calls a provider and never changes a profile's shipping qualification flags. provider
+this tool resolves the same bundle and builds the same modal plan as `flash serve deploy`, but it
+never calls a provider and never changes a profile's shipping qualification flag. provider
 credentials are not accepted as arguments or read from the environment.
 """
 
@@ -24,12 +24,12 @@ def build_qualification_plan(args: argparse.Namespace, qualification_cell: str):
             f"qualification cell {qualification_cell!r} does not match CLI cell {expected!r}"
         )
     bundle = _deployment_bundle(args)
-    return bundle, _build_provider_plan(args.provider, bundle)
+    return bundle, _build_provider_plan(bundle)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="build one provider-free customer-serving qualification plan"
+        description="build one provider-free modal customer-serving qualification plan"
     )
     parser.add_argument(
         "--qualification-cell",

@@ -67,7 +67,6 @@ _FIXED_CHILD_ENVIRONMENT = {
 }
 # engine settings the vllm process needs regardless of which provider started the container.
 #
-# these used to be supplied only by the modal image, which is why modal served and runpod did not:
 # without the spawn method vllm forks its EngineCore after this process has already touched cuda,
 # and the child dies with "Cannot re-initialize CUDA in forked subprocess" before anything binds a
 # port. externally that is another silent boot failure, indistinguishable from a slow image pull.

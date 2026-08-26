@@ -34,14 +34,14 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   `Qwen/Qwen3.6-27B` cannot activate, while historical status, accepted billing retry,
   cancellation, cleanup, hosted revocation, and exact identity-based undeploy remain available.
   Qwen3.6 27B adapters are not compatible with Qwen3.8.
-- Customer-owned Modal serving is now live-qualified for all three active models. The 27B and
-  35B-A3B qualifications are bound to the exact certified serving image digest. Each deployment
-  still serves one exact base model. The 27B engine keeps its `H100!` placement and distinct served
-  checkpoint and tokenizer provenance. The 35B-A3B engine keeps its H200, BF16, FP8 KV, 32K context,
-  eight-sequence, 4096 batched-token, and six rank-64 LoRA-slot contract. Persistent RunPod remains
-  qualified only where the profile flag is enabled, currently 9B. The 27B and 35B-A3B H200 profiles
-  remain blocked because exact-head provider allocation attempts produced no pod handle; their
-  provisional 150 GB container and 300 GB volume values are nonshipping, not qualified storage.
+- Customer-owned serving is now Modal-only and requires explicit `--provider modal`. Modal remains
+  live-qualified for all three active models. The 27B and 35B-A3B qualifications stay bound to the
+  exact certified serving image digest. Each deployment still serves one exact base model. The 27B
+  engine keeps its `H100!` placement and distinct served checkpoint and tokenizer provenance. The
+  35B-A3B engine keeps its H200, BF16, FP8 KV, 32K context, eight-sequence, 4096 batched-token, and
+  six rank-64 LoRA-slot contract. Customer-serving RunPod commands, profiles, identities, and
+  lifecycle code are removed without a compatibility or teardown shim. Managed RunPod training,
+  serverless workers, dependencies, provider routing, artifacts, and caching are unchanged.
 - `[train] init_from_adapter` now works for every source/target algorithm pair. SFT was rejected as
   a warm-start target, so an adapter could be continued only by GRPO or OPD; that restriction
   described the retired trl SFT backend, and the verl backend that replaced it loads a warm-start
