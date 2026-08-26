@@ -78,6 +78,8 @@ def _loaded_reference_paths(
             raise ValueError
         instructions = tuple(dis.get_instructions(current))
         for index, instruction in enumerate(instructions):
+            if instruction.opname in {"IMPORT_NAME", "IMPORT_FROM", "IMPORT_STAR"}:
+                raise ValueError
             name = instruction.argval
             if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}:
                 root_kind = "global"
@@ -526,6 +528,8 @@ def _references_target(
         budget = [0]
     if any(value is target for target in targets):
         return True
+    if any(value is dynamic for dynamic in _DYNAMIC_NAMESPACE_VALUES):
+        raise ValueError
     if any(value is trusted for trusted in trusted_objects):
         return False
     value_type = type(value)

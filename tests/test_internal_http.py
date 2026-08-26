@@ -3215,6 +3215,112 @@ def test_cached_private_opener_global_cannot_enable_redirect_transport(
     assert all(url != sink for url, _authorization in observed)
 
 
+def test_callback_import_cannot_reach_cached_private_opener(
+    monkeypatch,
+) -> None:
+    safe = "https://safe.invalid/data"
+    source = "https://source.invalid/data"
+    sink = "https://sink.invalid/steal"
+    contacted: list[tuple[str, str | None]] = []
+    namespace = types.ModuleType("retained_import_namespace")
+    namespace.private = None
+    monkeypatch.setitem(sys.modules, namespace.__name__, namespace)
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        handler_order = 100
+
+        def https_open(self, request):
+            self.contacted.append((request.full_url, request.get_header("Authorization")))
+            return _response(request.full_url)
+
+    handler = CallbackHandler()
+    handler.contacted = contacted
+    opener = urllib.request.build_opener(handler)
+    urllib.request.install_opener(opener)
+    with _urlopen_no_redirect(urllib.request.Request(safe), timeout=1.0) as response:
+        assert response.read() == b"ok"
+
+    def importing_https_open(self, request):
+        import retained_import_namespace
+
+        self.contacted.append((request.full_url, request.get_header("Authorization")))
+        if request.full_url == self.source:
+            private = retained_import_namespace.private
+            blocker = next(
+                item
+                for item in private.handlers
+                if isinstance(item, http_transport._NoRedirectHandler)
+            )
+            private.handlers.remove(blocker)
+            private.process_response["https"].remove(blocker)
+            for status in http_transport._REDIRECT_STATUSES:
+                private.handle_error["http"][status].remove(blocker)
+            private.add_handler(urllib.request.HTTPRedirectHandler())
+            headers = email.message.Message()
+            headers["Location"] = self.sink
+            response = urllib.response.addinfourl(
+                io.BytesIO(b""), headers, request.full_url, code=302
+            )
+            response.msg = "redirect"
+            return response
+        return _response(request.full_url)
+
+    handler.source = source
+    handler.sink = sink
+    CallbackHandler.https_open.__code__ = importing_https_open.__code__
+    namespace.private = http_transport._INSTALLED_OPENER_CACHE.private
+    contacted.clear()
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(
+            urllib.request.Request(source, headers={"Authorization": "Bearer secret"}),
+            timeout=1.0,
+        )
+
+    assert contacted == []
+    assert all(url != sink for url, _authorization in contacted)
+
+
+def test_nested_dynamic_builtin_partial_fails_before_transport() -> None:
+    source = "custom://source.invalid/data"
+    sink = "custom://sink.invalid/steal"
+    contacted: list[tuple[str, str | None]] = []
+    namespace = types.ModuleType("dynamic_partial_namespace")
+
+    class CallbackHandler(urllib.request.BaseHandler):
+        def custom_open(self, request):
+            authorization = request.get_header("Authorization")
+            contacted.append((request.full_url, authorization))
+            if request.full_url == sink:
+                return _response(request.full_url)
+            redirected = urllib.request.Request(
+                sink,
+                headers={"Authorization": authorization},
+            )
+            return self.config["nested"][0]().open(redirected, timeout=request.timeout)
+
+    handler = CallbackHandler()
+    opener = urllib.request.build_opener(handler)
+    namespace.target = opener
+    handler.config = {
+        "nested": [functools.partial(getattr, namespace, "target")],
+    }
+    urllib.request.install_opener(opener)
+
+    with pytest.raises(
+        urllib.error.URLError, match="installed urllib handler cannot be copied safely"
+    ):
+        _urlopen_no_redirect(
+            urllib.request.Request(source, headers={"Authorization": "Bearer secret"}),
+            timeout=1.0,
+        )
+
+    assert contacted == []
+    assert all(url != sink for url, _authorization in contacted)
+
+
 def test_nested_reader_disqualifies_append_only_private_observer() -> None:
     safe = "https://safe.invalid/data"
     source = "https://source.invalid/data"
