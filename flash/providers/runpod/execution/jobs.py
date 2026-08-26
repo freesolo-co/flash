@@ -32,7 +32,7 @@ __all__ = [
 
 # capacity grace on the LAST candidate class: there is nowhere left to walk, so wait longer before
 # giving up. purely a timing knob -- it says nothing about whether a retry follows, because
-# on_last_gpu (runner/lifecycle.py) is also true when the infra retry budget is exhausted.
+# on_last_gpu (runner/supervise/retry_decision.py) is also true when the infra retry budget is exhausted.
 LAST_GPU_CAPACITY_GRACE_S = 900.0
 
 # multi-card shapes are rarer than single cards, so a grace sized for 1x expires on a 4x wait that

@@ -1732,6 +1732,73 @@ def test_candidate_less_allocation_no_capacity_stops_immediately(orch, monkeypat
     assert calls == 1
 
 
+def test_unsupported_gpu_terminal_failure_consumes_prehandle_claim(orch, monkeypatch, tmp_path):
+    from flash.providers.core import allocator
+    from flash.providers.core.base import UnsupportedGpuError
+    from flash.runner.lifecycle import claim_lock
+
+    spec = _spec(run_id="flash-unsupported-prehandle")
+    status = _seed_status(orch, spec)
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status)
+    monkeypatch.setattr(
+        runner_artifacts, "stage_environment_package", lambda value, **_kwargs: value
+    )
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(UnsupportedGpuError("unsupported")),
+    )
+
+    with pytest.raises(UnsupportedGpuError, match="unsupported"):
+        runner_lifecycle._run_job_inner(spec, str(tmp_path / "unsupported.log"))
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.state == "failed"
+    raw = runner_status._load_status_json(spec.run_id)
+    assert runner_state._ACTIVE_LAUNCH_CLAIM_KEY not in raw
+    fd = claim_lock.try_acquire(spec.run_id)
+    assert fd is not None
+    claim_lock.close(fd)
+
+
+def test_cancel_before_provider_submit_consumes_prehandle_claim(orch, monkeypatch, tmp_path):
+    from flash.providers.core import allocator
+    from flash.runner.lifecycle import claim_lock
+    from flash.runner.supervise import seed_submission as submission
+
+    spec = _spec(run_id="flash-cancel-prehandle")
+    status = _seed_status(orch, spec)
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status)
+    monkeypatch.setattr(
+        runner_artifacts, "stage_environment_package", lambda value, **_kwargs: value
+    )
+    original_prepare = submission._prepare_attempt
+
+    def cancel_after_reservation(ctx):
+        prepared = original_prepare(ctx)
+        assert runner_status._update(spec.run_id, "cancelled")
+        return prepared
+
+    monkeypatch.setattr(submission, "_prepare_attempt", cancel_after_reservation)
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *_args, **_kwargs: pytest.fail("cancelled run reached provider allocation"),
+    )
+
+    runner_lifecycle._run_job_inner(spec, str(tmp_path / "cancelled.log"))
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.state == "cancelled"
+    raw = runner_status._load_status_json(spec.run_id)
+    assert runner_state._ACTIVE_LAUNCH_CLAIM_KEY not in raw
+    fd = claim_lock.try_acquire(spec.run_id)
+    assert fd is not None
+    claim_lock.close(fd)
+
+
 def test_stale_reserved_attempt_cannot_reach_provider_submit(orch, monkeypatch):
     from flash.providers.core import registry as providers
     from flash.runner.lifecycle import attempts as runner_attempts

@@ -1319,6 +1319,32 @@ def test_multiprocess_launch_claim_cannot_be_stolen_until_owner_exits(monkeypatc
     runner_attempts.release_launch_claim(spec.run_id, recovered.claim)
 
 
+def test_terminal_claim_consumption_never_clears_newer_owner(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="claim-consume-fence", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    )
+    stale = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert stale is not None
+    runner_attempts.release_launch_claim(spec.run_id, stale)
+    newer = runner_attempts.reserve_handleless_recovery_launch(
+        spec.run_id,
+        expected_state="provisioning",
+        provider_clear_confirmed=True,
+        expected_stale_claim=stale,
+    ).claim
+    assert newer is not None
+
+    assert not runner_attempts.consume_active_launch_claim(spec.run_id, stale)
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._ACTIVE_LAUNCH_CLAIM_KEY] == newer.to_dict()
+    assert runner_attempts.claim_is_live(spec.run_id, newer)
+    assert runner_attempts.consume_active_launch_claim(spec.run_id, newer)
+
+
 def test_attempt_launch_claim_validates_and_defensively_copies_snapshot():
     from flash.core.spec import JobSpec
     from flash.runner.supervise.retry_decision import RetryState

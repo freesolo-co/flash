@@ -371,8 +371,8 @@ def _prepare_attempt(ctx: _SubmitContext) -> _PreparationOutcome:
             from flash.runner.supervise.errors import _LaunchOwnershipLost
 
             raise _LaunchOwnershipLost("attempt launch reservation lost ownership")
-    retry_state = RetryState.from_snapshot(ctx.spec, claim.retry_snapshot)
     ctx.current_claim = claim
+    retry_state = RetryState.from_snapshot(ctx.spec, claim.retry_snapshot)
     ctx.current_attempt = claim.attempt
     _mark_attempt_boundary(ctx, claim.attempt)
     attempt_runtime_secrets = dict(ctx.runtime_secrets or {})
@@ -835,24 +835,33 @@ def submit_seed_supervised(
         reserved_claim,
     )
     _require_opd_configuration(ctx)
-    while True:
-        preparation = _prepare_attempt(ctx)
-        if preparation.completed_metrics is not None:
-            return ctx.return_completed_runpod_metrics(preparation.completed_metrics)
-        prepared = preparation.prepared
-        outcome = _run_attempt(ctx, prepared)
-        if outcome.result.ok:
-            return _return_success_metrics(ctx, outcome)
-        decision = _handle_failure(ctx, prepared, outcome)
-        if decision.metrics is not None:
-            return decision.metrics
-        if decision.lost_ownership:
-            from flash.runner.supervise.errors import _LaunchOwnershipLost
+    try:
+        while True:
+            preparation = _prepare_attempt(ctx)
+            if preparation.completed_metrics is not None:
+                return ctx.return_completed_runpod_metrics(preparation.completed_metrics)
+            prepared = preparation.prepared
+            outcome = _run_attempt(ctx, prepared)
+            if outcome.result.ok:
+                return _return_success_metrics(ctx, outcome)
+            decision = _handle_failure(ctx, prepared, outcome)
+            if decision.metrics is not None:
+                return decision.metrics
+            if decision.lost_ownership:
+                from flash.runner.supervise.errors import _LaunchOwnershipLost
 
-            raise _LaunchOwnershipLost(f"seed {seed} lost retry decision ownership")
-        if not decision.retry:
-            break
-        if decision.retry_delay:
-            _lifecycle.time.sleep(decision.retry_delay)
-    ctx.gc_seen_endpoints()
-    raise RuntimeError(f"seed {seed} failed after retries: {ctx.last_detail}")
+                raise _LaunchOwnershipLost(f"seed {seed} lost retry decision ownership")
+            if not decision.retry:
+                break
+            if decision.retry_delay:
+                _lifecycle.time.sleep(decision.retry_delay)
+        ctx.gc_seen_endpoints()
+        raise RuntimeError(f"seed {seed} failed after retries: {ctx.last_detail}")
+    finally:
+        claim = ctx.current_claim
+        if claim is not None:
+            from flash.runner.lifecycle.attempts import consume_active_launch_claim
+
+            with contextlib.suppress(Exception):
+                consume_active_launch_claim(ctx.spec.run_id, claim)
+            ctx.current_claim = None

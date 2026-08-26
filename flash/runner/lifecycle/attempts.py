@@ -453,6 +453,22 @@ def attempt_claim_is_current(run_id: str, claim: AttemptLaunchClaim) -> bool:
         return decision is not None and decision.attempt == claim.attempt
 
 
+def consume_active_launch_claim(run_id: str, claim: AttemptLaunchClaim) -> bool:
+    """Clear one exact unconsumed claim, then release its os-shared launch lease."""
+    try:
+        with state._status_guard(run_id):
+            raw = status_ops._load_status_json(run_id)
+            if not _claim_matches_raw(raw, claim):
+                return False
+            state._save_status_unlocked(
+                status_ops._runstatus_from_json(raw),
+                _active_launch_claim=None,
+            )
+        return True
+    finally:
+        release_launch_claim(run_id, claim)
+
+
 def persist_claimed_remote(
     run_id: str,
     claim: AttemptLaunchClaim,
