@@ -98,7 +98,7 @@ def _pod(
     count: int = 2,
     data_center: str | None = "US-KS-2",
     volume_id: str | None = "volume123",
-    image: str = "ghcr.io/freesolo-co/flash-worker:cu128-sm90",
+    image: str | None = "ghcr.io/freesolo-co/flash-worker:cu128-sm90",
     disk: int = 120,
     rate: float | None = 6.58,
     complete: bool = True,
@@ -161,12 +161,12 @@ def _handle(
     )
 
 
-def _api_pod_row(env: object) -> dict:
+def _api_pod_row(env: object, *, image: str | None = "image:tag") -> dict:
     return {
         "id": "pod123456",
         "name": "flash-0123456789ab-s0-a0",
         "desiredStatus": "RUNNING",
-        "imageName": "image:tag",
+        "imageName": image,
         "gpuCount": 2,
         "containerDiskInGb": 120,
         "costPerHr": 5.0,
@@ -229,6 +229,17 @@ def test_api_parses_payload_only_env_identity():
     assert parsed[0].support_public_ip is None
     assert parsed[0].public_ip_assigned is False
     assert reference not in repr(parsed)
+
+
+@pytest.mark.parametrize("omitted", [False, True])
+def test_api_preserves_missing_or_null_pod_image_as_unknown(omitted):
+    row = _api_pod_row(
+        {"FLASH_INSTANCE_PAYLOAD": "{{ RUNPOD_SECRET_FLASH_PAYLOAD_0123456789abcdef }}"},
+        image=None,
+    )
+    if omitted:
+        del row["imageName"]
+    assert pod_api._pod_rows([row])[0].image_name is None
 
 
 @pytest.mark.parametrize(
@@ -593,14 +604,16 @@ def test_allowed_http_error_detail_is_single_line_and_control_neutral(monkeypatc
 
 
 def test_pending_and_exact_handles_round_trip_with_full_owner_identity():
-    pending = _handle()
-    exact = _handle(exact=True)
+    pending = replace(_handle(), image_name="image@sha256:request")
+    exact = replace(_handle(exact=True), image_name="image@sha256:request")
     assert pending.pending
     assert pending.pod_id is None
     assert not exact.pending
     assert exact.pod_id == "pod123456"
     assert pods.RunpodPodHandle.from_dict(pending.to_dict()) == pending
     assert pods.RunpodPodHandle.from_dict(exact.to_dict()) == exact
+    assert exact.to_dict()["image_name"] == "image@sha256:request"
+    assert exact.to_dict()["data_center_id"] == "US-KS-2"
     bad = exact.to_dict()
     bad["key_fingerprint"] = bad["key_fingerprint"][:16]
     with pytest.raises(ValueError, match="fingerprint"):
@@ -746,6 +759,120 @@ def test_live_shaped_pod_with_public_ip_fails_closed(monkeypatch):
         pods.create_or_adopt_pod(pending, payload, deadline_at=time.time() + 60)
     assert deleted == [observed.id]
     assert "203.0.113.10" not in repr(observed)
+
+
+@pytest.mark.parametrize("omitted", [False, True])
+def test_create_reconciles_after_partial_image_observation(monkeypatch, omitted):
+    pending = replace(
+        _handle(count=1, data_center=None, volume_id=None),
+        image_name="image@sha256:request",
+    )
+    base = pod_identity.pod_attempt_label_base("runpod-pod-test", 0, pending.attempt)
+    identity = pods._payload_for_handle(replace(pending, label=base))
+    label = pod_identity.pod_label_from_payload(base, pending.payload_secret_name, identity)
+    pending = replace(pending, instance_id=label, label=label)
+    payload = pods._payload_for_handle(pending)
+    partial_row = _live_api_pod_row(pending, payload)
+    partial_row["imageName"] = None
+    if omitted:
+        del partial_row["imageName"]
+    partial = pod_api._parse_pod(partial_row)
+    complete = replace(partial, image_name=pending.image_name)
+    monkeypatch.setattr(pod_api, "create_pod_for_fingerprint", lambda *args, **kwargs: partial)
+    monkeypatch.setattr(pod_api, "list_pods_for_key", lambda *args, **kwargs: [complete])
+
+    exact = pods.create_or_adopt_pod(pending, payload, deadline_at=time.time() + 60)
+
+    assert exact.image_name == pending.image_name
+    assert exact.pod_id == complete.id
+
+
+@pytest.mark.parametrize("omitted", [False, True])
+def test_reconciliation_treats_missing_image_as_incomplete(monkeypatch, omitted):
+    pending = replace(
+        _handle(count=1, data_center=None, volume_id=None),
+        image_name="image@sha256:request",
+    )
+    payload = pods._payload_for_handle(pending)
+    row = _live_api_pod_row(pending, payload)
+    row["imageName"] = None
+    if omitted:
+        del row["imageName"]
+    partial = pod_api._parse_pod(row)
+    monkeypatch.setattr(pod_api, "list_pods_for_key", lambda *args, **kwargs: [partial])
+
+    with pytest.raises(pods.UnreconciledCreateError, match="incomplete immutable fields"):
+        pods._reconcile_ambiguous_create(pending, payload, deadline_at=time.time() + 60)
+
+    assert pods._pod_identity_is_incomplete(
+        partial,
+        payload,
+        network_volume_id=None,
+        data_center_id=None,
+        allow_preplacement=True,
+    )
+
+
+def test_exact_handle_copies_authoritative_image_and_observed_data_center():
+    pending = replace(
+        _handle(count=1, data_center=None, volume_id=None),
+        image_name="image@sha256:request",
+    )
+    observed = _pod(
+        count=1,
+        data_center="EUR-IS-1",
+        volume_id=None,
+        image="image@sha256:request",
+    )
+    exact = pods._exact_handle(pending, observed)
+    assert exact.image_name == observed.image_name
+    assert exact.data_center_id == "EUR-IS-1"
+
+
+def test_exact_handle_preserves_requested_image_when_observation_is_null():
+    pending = replace(
+        _handle(count=1, data_center=None, volume_id=None),
+        image_name="image@sha256:request",
+    )
+    exact = pods._exact_handle(
+        pending,
+        _pod(count=1, data_center="EUR-IS-1", volume_id=None, image=None),
+    )
+    assert exact.image_name == "image@sha256:request"
+    assert exact.data_center_id == "EUR-IS-1"
+
+
+def test_exact_handle_rejects_non_null_image_format_mismatch():
+    pending = replace(
+        _handle(count=1, data_center=None, volume_id=None),
+        image_name="registry/image@sha256:request",
+    )
+    observed = _pod(
+        count=1,
+        data_center=None,
+        volume_id=None,
+        image="registry/image:tag",
+    )
+    with pytest.raises(pods.UnreconciledCreateError, match="image conflicts"):
+        pods._exact_handle(pending, observed)
+
+
+def test_exact_handle_preserves_requested_volume_and_rejects_conflicting_data_center():
+    pending = replace(
+        _handle(count=1, data_center="US-KS-2", volume_id="volume123"),
+        image_name="image@sha256:request",
+    )
+    observed = _pod(
+        count=1,
+        data_center="US-KS-2",
+        volume_id="volume123",
+        image="image@sha256:request",
+    )
+    exact = pods._exact_handle(pending, observed)
+    assert exact.data_center_id == "US-KS-2"
+    assert exact.network_volume_id == "volume123"
+    with pytest.raises(pods.UnreconciledCreateError, match="data center conflicts"):
+        pods._exact_handle(pending, replace(observed, data_center_id="EUR-IS-1"))
 
 
 def test_exact_volume_identity_proves_placement_when_data_center_is_omitted():
@@ -1160,6 +1287,137 @@ def test_active_expired_preload_orphan_remains_protected(monkeypatch):
     assert pods.sweep_orphan_pods(active_labels={run_id}, known_labels=set()) == []
 
 
+def test_cacheless_poll_enriches_data_center_without_erasing_unobserved_image(monkeypatch):
+    handle = replace(
+        _handle(exact=True, count=1, data_center=None, volume_id=None),
+        image_name="image@sha256:request",
+    )
+    observed = replace(
+        _pod(
+            pod_id=handle.pod_id,
+            count=1,
+            data_center="EUR-IS-1",
+            volume_id=None,
+            image=None,
+        ),
+        desired_status="RUNNING",
+    )
+    persisted = []
+    monkeypatch.setattr(pods, "_make_hf_file_reader", lambda *args, **kwargs: lambda **kw: None)
+    monkeypatch.setattr(pod_api, "get_pod_for_fingerprint", lambda *args, **kwargs: observed)
+
+    def fake_poll(adapter, **kwargs):
+        assert adapter.fetch_instance() == {"desired_status": "RUNNING"}
+        assert adapter.fetch_instance() == {"desired_status": "RUNNING"}
+        return PollResult(False, failure="stalled", detail="test")
+
+    monkeypatch.setattr(pods, "poll_instance_job", fake_poll)
+    result = pods.poll_runpod_pod(
+        handle,
+        _spec(count=1),
+        0,
+        heartbeat_reader=lambda **kwargs: None,
+        on_handle=persisted.append,
+        deadline_at=time.time() + 60,
+    )
+    assert result.failure == "stalled"
+    assert len(persisted) == 1
+    assert persisted[0]["image_name"] == handle.image_name
+    assert persisted[0]["data_center_id"] == "EUR-IS-1"
+
+
+def test_poll_enriches_missing_image_and_data_center(monkeypatch):
+    handle = replace(
+        _handle(exact=True, count=1, data_center=None, volume_id=None),
+        image_name=None,
+    )
+    observed = replace(
+        _pod(
+            pod_id=handle.pod_id,
+            count=1,
+            data_center="EUR-IS-1",
+            volume_id=None,
+            image="registry/image@sha256:observed",
+        ),
+        desired_status="RUNNING",
+    )
+    persisted = []
+    monkeypatch.setattr(pods, "_make_hf_file_reader", lambda *args, **kwargs: lambda **kw: None)
+    monkeypatch.setattr(pod_api, "get_pod_for_fingerprint", lambda *args, **kwargs: observed)
+
+    def fake_poll(adapter, **kwargs):
+        assert adapter.fetch_instance() == {"desired_status": "RUNNING"}
+        return PollResult(False, failure="stalled", detail="test")
+
+    monkeypatch.setattr(pods, "poll_instance_job", fake_poll)
+    pods.poll_runpod_pod(
+        handle,
+        _spec(count=1),
+        0,
+        heartbeat_reader=lambda **kwargs: None,
+        on_handle=persisted.append,
+        deadline_at=time.time() + 60,
+    )
+    assert persisted == [
+        {
+            **handle.to_dict(),
+            "image_name": "registry/image@sha256:observed",
+            "data_center_id": "EUR-IS-1",
+        }
+    ]
+
+
+def test_poll_rejects_non_null_observed_image_mismatch(monkeypatch):
+    handle = replace(
+        _handle(exact=True, count=1, data_center=None, volume_id=None),
+        image_name="registry/image@sha256:request",
+    )
+    observed = replace(
+        _pod(
+            pod_id=handle.pod_id,
+            count=1,
+            data_center=None,
+            volume_id=None,
+            image="registry/image:tag",
+        ),
+        desired_status="RUNNING",
+    )
+    monkeypatch.setattr(pods, "_make_hf_file_reader", lambda *args, **kwargs: lambda **kw: None)
+    monkeypatch.setattr(pod_api, "get_pod_for_fingerprint", lambda *args, **kwargs: observed)
+
+    def fake_poll(adapter, **kwargs):
+        adapter.fetch_instance()
+        pytest.fail("mismatched image observation was accepted")
+
+    monkeypatch.setattr(pods, "poll_instance_job", fake_poll)
+    with pytest.raises(pods.UnreconciledCreateError, match="image conflicts"):
+        pods.poll_runpod_pod(
+            handle,
+            _spec(count=1),
+            0,
+            heartbeat_reader=lambda **kwargs: None,
+            deadline_at=time.time() + 60,
+        )
+
+
+def test_cache_attached_poll_preserves_requested_placement_and_rejects_conflict(monkeypatch):
+    handle = replace(
+        _handle(exact=True, count=1, data_center="US-KS-2", volume_id="volume123"),
+        image_name="image@sha256:request",
+    )
+    observed = _pod(
+        pod_id=handle.pod_id,
+        count=1,
+        data_center="EUR-IS-1",
+        volume_id=handle.network_volume_id,
+        image=handle.image_name,
+    )
+    with pytest.raises(pods.UnreconciledCreateError, match="data center conflicts"):
+        pods._enrich_exact_handle(handle, observed)
+    assert handle.data_center_id == "US-KS-2"
+    assert handle.network_volume_id == "volume123"
+
+
 def test_poll_uses_pod_state_and_shared_instance_kernel(monkeypatch):
     handle = _handle(exact=True)
     captured = {}
@@ -1189,6 +1447,85 @@ def test_poll_uses_pod_state_and_shared_instance_kernel(monkeypatch):
     assert captured["adapter"].early_liveness_alive() is False
 
 
+@pytest.mark.parametrize("child_returncode", [0, 7])
+def test_launcher_invokes_child_once_and_parks_after_exit(child_returncode):
+    path = Path(__file__).parents[1] / "docker" / "runpod_pod_launcher.py"
+    spec = importlib.util.spec_from_file_location("runpod_pod_launcher_once_test", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls = []
+    parked = []
+
+    class Child:
+        def poll(self):
+            return child_returncode
+
+        def send_signal(self, signum):
+            pytest.fail(f"completed child received signal {signum}")
+
+        def wait(self):
+            calls.append("wait")
+            return child_returncode
+
+    def popen(argv):
+        calls.append(argv)
+        return Child()
+
+    def park(stopped):
+        assert not stopped.is_set()
+        parked.append(True)
+
+    assert (
+        module._run_child_once(
+            {}, popen=popen, park=park, install_signal=lambda signum, handler: None
+        )
+        == 0
+    )
+    assert calls == [[module.sys.executable, str(module.CAPSULE_PATH), "bootstrap"], "wait"]
+    assert parked == [True]
+
+
+def test_launcher_signal_stops_park_and_forwards_to_running_child():
+    path = Path(__file__).parents[1] / "docker" / "runpod_pod_launcher.py"
+    spec = importlib.util.spec_from_file_location("runpod_pod_launcher_signal_test", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    handlers = {}
+    forwarded = []
+
+    class Child:
+        def poll(self):
+            return None
+
+        def send_signal(self, signum):
+            forwarded.append(signum)
+
+        def wait(self):
+            handlers[module.signal.SIGTERM](module.signal.SIGTERM, None)
+            return -module.signal.SIGTERM
+
+    def install_signal(signum, handler):
+        handlers[signum] = handler
+
+    def park(stopped):
+        assert stopped.is_set()
+
+    assert (
+        module._run_child_once(
+            {},
+            popen=lambda argv: Child(),
+            park=park,
+            install_signal=install_signal,
+        )
+        == 0
+    )
+    assert forwarded == [module.signal.SIGTERM]
+
+
 def test_launcher_writes_mode_0600_unsets_payload_and_executes_capsule(tmp_path, monkeypatch):
     path = Path(__file__).parents[1] / "docker" / "runpod_pod_launcher.py"
     spec = importlib.util.spec_from_file_location("runpod_pod_launcher_test", path)
@@ -1201,12 +1538,61 @@ def test_launcher_writes_mode_0600_unsets_payload_and_executes_capsule(tmp_path,
     module.CAPSULE_PATH = tmp_path / "capsule.pyz"
     monkeypatch.setenv(module.PAYLOAD_ENV, '{"run_id":"safe"}')
     calls = []
-    monkeypatch.setattr(module.subprocess, "call", lambda argv: calls.append(argv) or 0)
+
+    class Child:
+        def poll(self):
+            return 0
+
+        def send_signal(self, signum):
+            pytest.fail(f"completed child received signal {signum}")
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda argv: calls.append(argv) or Child())
+    monkeypatch.setattr(module.signal, "signal", lambda signum, handler: None)
+    monkeypatch.setattr(module, "_park_until_stopped", lambda stopped: None)
     assert module.main() == 0
     assert stat.S_IMODE(payload_path.stat().st_mode) == 0o600
     assert json.loads(payload_path.read_text()) == {"run_id": "safe"}
     assert module.PAYLOAD_ENV not in os.environ
     assert calls == [[module.sys.executable, str(module.CAPSULE_PATH), "bootstrap"]]
+
+
+def test_launcher_park_prevents_replay_from_overwriting_terminal_evidence():
+    path = Path(__file__).parents[1] / "docker" / "runpod_pod_launcher.py"
+    spec = importlib.util.spec_from_file_location("runpod_pod_launcher_terminal_test", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    terminal = {"ok": True, "checkpoint": "step-2"}
+    invocations = []
+
+    class Child:
+        def poll(self):
+            return 0
+
+        def send_signal(self, signum):
+            pytest.fail(f"completed child received signal {signum}")
+
+        def wait(self):
+            invocations.append("terminal-written")
+            return 0
+
+    def park(stopped):
+        assert terminal == {"ok": True, "checkpoint": "step-2"}
+        raise RuntimeError("pod teardown")
+
+    with pytest.raises(RuntimeError, match="pod teardown"):
+        module._run_child_once(
+            {},
+            popen=lambda argv: Child(),
+            park=park,
+            install_signal=lambda signum, handler: None,
+        )
+    assert invocations == ["terminal-written"]
+    assert terminal == {"ok": True, "checkpoint": "step-2"}
 
 
 def test_instance_payload_preserves_runpod_weight_cache_redirect():
@@ -1394,7 +1780,229 @@ def test_submission_persists_every_create_phase_before_mutation(monkeypatch):
     assert observed_handles[0]["payload_secret_id"] is None
     assert observed_handles[1]["payload_secret_id"] == "secret123"
     assert observed_handles[-1]["instance_id"] == "pod123456"
+    assert all(
+        item["image_name"] == "ghcr.io/freesolo-co/flash-worker:cu128-sm90"
+        for item in observed_handles
+    )
     assert all(item["key_fingerprint"] == fingerprint for item in observed_handles)
+
+
+@pytest.mark.parametrize(
+    ("poll_fails", "teardown_fails"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+def test_reattached_poll_persists_enrichment_before_teardown(
+    monkeypatch,
+    tmp_path,
+    poll_fails,
+    teardown_fails,
+):
+    import flash.runner.lifecycle.reporting as runner_reporting
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    from flash.providers.runpod.execution.provider import PROVIDER
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda status: None)
+    handle = replace(
+        _handle(exact=True, count=1, data_center=None, volume_id=None),
+        image_name=None,
+    )
+    persisted = {
+        **handle.to_dict(),
+        "seed": 42,
+        "allocated_gpu": "H100",
+        "allocated_gpu_count": 1,
+    }
+    spec = _spec(count=1)
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            remote=persisted,
+        )
+    )
+    monkeypatch.setattr(
+        "flash.providers.artifacts.hf.heartbeat_reader_for",
+        lambda *args, **kwargs: None,
+    )
+    enriched = replace(
+        handle,
+        image_name="registry/image@sha256:observed",
+        data_center_id="EUR-IS-1",
+    )
+
+    def poll_job(*args, on_handle, **kwargs):
+        on_handle(enriched.to_dict())
+        if poll_fails:
+            raise api.RunpodApiError("poll failed")
+        return PollResult(True, metrics={"ok": True})
+
+    teardown_handles = []
+
+    def teardown(strict, spec):
+        durable = runner_status.get_status(spec.run_id).remote
+        assert durable["image_name"] == enriched.image_name
+        assert durable["data_center_id"] == enriched.data_center_id
+        teardown_handles.append(strict)
+        if teardown_fails:
+            raise api.RunpodApiError("unconfirmed")
+
+    monkeypatch.setattr(PROVIDER, "_poll_job", poll_job)
+    monkeypatch.setattr(PROVIDER, "_teardown_reattached", teardown)
+
+    if poll_fails:
+        with pytest.raises(api.RunpodApiError, match="poll failed"):
+            PROVIDER.poll(
+                JobHandle.from_dict(handle.to_dict()),
+                spec,
+                42,
+                _deadline_at=time.time() + 60,
+            )
+    else:
+        result = PROVIDER.poll(
+            JobHandle.from_dict(handle.to_dict()),
+            spec,
+            42,
+            _deadline_at=time.time() + 60,
+        )
+        assert result.ok
+    assert teardown_handles == [enriched]
+    durable = runner_status.get_status(spec.run_id).remote
+    assert durable["image_name"] == enriched.image_name
+    assert durable["data_center_id"] == enriched.data_center_id
+    assert durable["allocated_gpu"] == "H100"
+    assert durable["allocated_gpu_count"] == 1
+    cleanup_remotes = runner_status._load_status_json(spec.run_id).get(
+        runner_state._CLEANUP_REMOTES_KEY,
+        [],
+    )
+    assert cleanup_remotes == ([enriched.to_dict()] if teardown_fails else [])
+
+
+def test_reattached_poll_preserves_original_when_cleanup_persistence_raises(monkeypatch):
+    from flash.providers.runpod.execution.provider import PROVIDER
+
+    secret = "runpod-secret-value-0123456789"
+    monkeypatch.setenv("RUNPOD_API_KEY", secret)
+    handle = _handle(exact=True)
+    original = api.RunpodApiError("poll failed")
+    monkeypatch.setattr(
+        "flash.providers.artifacts.hf.heartbeat_reader_for",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        PROVIDER,
+        "_poll_job",
+        lambda *args, **kwargs: (_ for _ in ()).throw(original),
+    )
+    monkeypatch.setattr(
+        PROVIDER,
+        "_teardown_reattached",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            api.RunpodApiError(f"teardown api_key={secret}")
+        ),
+    )
+    monkeypatch.setattr(
+        "flash.runner.accounting.reconciliation._record_cleanup_remote",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError(f"persistence token={secret}")),
+    )
+
+    with pytest.raises(api.RunpodApiError, match="poll failed") as raised:
+        PROVIDER.poll(
+            JobHandle.from_dict(handle.to_dict()),
+            _spec(count=2),
+            42,
+            _deadline_at=time.time() + 60,
+        )
+
+    assert raised.value is original
+    notes = raised.value.__notes__
+    assert len(notes) == 2
+    assert all(len(note) <= 320 for note in notes)
+    assert secret not in "\n".join(notes)
+    assert "<redacted>" in "\n".join(notes)
+
+
+@pytest.mark.parametrize("teardown_fails", [False, True])
+def test_reattached_poll_cas_loss_tracks_fallback_until_confirmed_teardown(
+    monkeypatch,
+    tmp_path,
+    teardown_fails,
+):
+    import flash.runner.lifecycle.reporting as runner_reporting
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+    from flash.providers.runpod.execution.provider import PROVIDER
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda status: None)
+    handle = replace(
+        _handle(exact=True, count=1, data_center=None, volume_id=None),
+        image_name=None,
+    )
+    persisted = {
+        **handle.to_dict(),
+        "seed": 42,
+        "allocated_gpu": "H100",
+        "allocated_gpu_count": 1,
+    }
+    spec = _spec(count=1)
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            remote=persisted,
+        )
+    )
+    monkeypatch.setattr(
+        "flash.providers.artifacts.hf.heartbeat_reader_for",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "flash.runner.accounting.reconciliation._compare_and_enrich_remote",
+        lambda *args, **kwargs: False,
+    )
+    enriched = replace(
+        handle,
+        image_name="registry/image@sha256:observed",
+        data_center_id="EUR-IS-1",
+    )
+
+    def poll_job(*args, on_handle, **kwargs):
+        on_handle(enriched.to_dict())
+        pytest.fail("CAS loss must stop recovered polling")
+
+    def teardown(strict, teardown_spec):
+        assert strict == enriched
+        cleanup_remotes = runner_status._load_status_json(teardown_spec.run_id).get(
+            runner_state._CLEANUP_REMOTES_KEY,
+            [],
+        )
+        assert cleanup_remotes == [enriched.to_dict()]
+        if teardown_fails:
+            raise api.RunpodApiError("unconfirmed")
+
+    monkeypatch.setattr(PROVIDER, "_poll_job", poll_job)
+    monkeypatch.setattr(PROVIDER, "_teardown_reattached", teardown)
+
+    with pytest.raises(RuntimeError, match="ownership changed before persistence"):
+        PROVIDER.poll(
+            JobHandle.from_dict(handle.to_dict()),
+            spec,
+            42,
+            _deadline_at=time.time() + 60,
+        )
+
+    durable = runner_status.get_status(spec.run_id).remote
+    assert durable == persisted
+    cleanup_remotes = runner_status._load_status_json(spec.run_id).get(
+        runner_state._CLEANUP_REMOTES_KEY,
+        [],
+    )
+    assert cleanup_remotes == ([enriched.to_dict()] if teardown_fails else [])
 
 
 def test_reattached_poll_preserves_success_and_records_unconfirmed_cleanup(monkeypatch):

@@ -84,6 +84,7 @@ class RunpodProvider(InstanceProvider):
         log: Any,
         heartbeat_reader: Any,
         deadline_at: float | None,
+        on_handle: Any = None,
     ) -> PollResult:
         from flash.providers.runpod.execution.pods import poll_runpod_pod
 
@@ -93,6 +94,7 @@ class RunpodProvider(InstanceProvider):
             seed,
             log=log,
             heartbeat_reader=heartbeat_reader,
+            on_handle=on_handle,
             deadline_at=deadline_at,
         )
 
@@ -111,9 +113,14 @@ class RunpodProvider(InstanceProvider):
         _deadline_at: float | None = None,
     ) -> PollResult:
         """Poll a recovered Pod and require complete Pod plus secret teardown."""
+        from flash._internal.diagnostics import sanitize_diagnostic
         from flash.core.spec import require_matching_seed
         from flash.providers.artifacts.hf import heartbeat_reader_for
-        from flash.runner.accounting.reconciliation import _record_cleanup_remote
+        from flash.runner.accounting.reconciliation import (
+            _compare_and_enrich_remote,
+            _compare_and_remove_cleanup_remote,
+            _record_cleanup_remote,
+        )
 
         seed = require_matching_seed(spec, seed)
         reader = heartbeat_reader_for(spec, deadline_at=_deadline_at)
@@ -124,6 +131,31 @@ class RunpodProvider(InstanceProvider):
             )
         if log is not None:
             print(f"attaching: runpod instance={strict.instance_id}", file=log, flush=True)
+
+        fallback_cleanup_remote: dict | None = None
+
+        def add_recovery_note(original: BaseException, message: str, error: BaseException) -> None:
+            try:
+                detail = sanitize_diagnostic(error, limit=256)
+            except BaseException:
+                detail = type(error).__name__
+            original.add_note(f"{message}: {detail}")
+
+        def persist_enriched_handle(remote: dict) -> None:
+            nonlocal fallback_cleanup_remote, strict
+            enriched = self._handle_cls.from_dict(remote)
+            expected = strict
+            strict = enriched
+            if not _compare_and_enrich_remote(
+                spec.run_id,
+                expected.to_dict(),
+                enriched.to_dict(),
+            ):
+                if not _record_cleanup_remote(spec.run_id, enriched.to_dict()):
+                    raise RuntimeError("enriched runpod cleanup target could not be persisted")
+                fallback_cleanup_remote = enriched.to_dict()
+                raise RuntimeError("enriched runpod handle ownership changed before persistence")
+
         try:
             result = self._poll_job(
                 strict,
@@ -132,12 +164,44 @@ class RunpodProvider(InstanceProvider):
                 log=log,
                 heartbeat_reader=reader,
                 deadline_at=_deadline_at,
+                on_handle=persist_enriched_handle,
             )
-        except BaseException:
+        except BaseException as original:
             try:
                 self._teardown_reattached(strict, spec)
-            except Exception:
-                _record_cleanup_remote(spec.run_id, strict.to_dict())
+            except BaseException as teardown_error:
+                add_recovery_note(
+                    original,
+                    "runpod recovered teardown also failed",
+                    teardown_error,
+                )
+                try:
+                    cleanup_recorded = _record_cleanup_remote(spec.run_id, strict.to_dict())
+                except BaseException as persistence_error:
+                    add_recovery_note(
+                        original,
+                        "runpod recovered cleanup persistence also failed",
+                        persistence_error,
+                    )
+                else:
+                    if not cleanup_recorded:
+                        original.add_note("runpod recovered cleanup persistence also failed")
+            else:
+                if fallback_cleanup_remote is not None:
+                    try:
+                        cleanup_removed = _compare_and_remove_cleanup_remote(
+                            spec.run_id,
+                            fallback_cleanup_remote,
+                        )
+                    except BaseException as persistence_error:
+                        add_recovery_note(
+                            original,
+                            "runpod recovered cleanup record removal also failed",
+                            persistence_error,
+                        )
+                    else:
+                        if not cleanup_removed:
+                            original.add_note("runpod recovered cleanup record removal also failed")
             raise
         try:
             self._teardown_reattached(strict, spec)

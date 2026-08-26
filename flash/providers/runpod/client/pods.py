@@ -114,7 +114,7 @@ class RunpodPod:
     id: str
     name: str
     desired_status: str
-    image_name: str
+    image_name: str | None
     gpu_type_id: str | None
     gpu_count: int
     data_center_id: str | None
@@ -248,7 +248,7 @@ def _parse_pod(row: object) -> RunpodPod:
         id=_strict_id(row.get("id"), "Pod id"),
         name=_strict_string(row.get("name"), "Pod name"),
         desired_status=_strict_string(desired_status, "Pod status").upper(),
-        image_name=_strict_string(image_name, "Pod image"),
+        image_name=_optional_string(image_name, "Pod image"),
         gpu_type_id=_optional_string(gpu_type, "Pod GPU type"),
         gpu_count=_strict_positive_int(gpu_count, "Pod GPU count"),
         data_center_id=_optional_string(data_center, "Pod data center"),

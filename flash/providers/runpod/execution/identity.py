@@ -359,6 +359,7 @@ def pod_identity_is_incomplete(
 ) -> bool:
     """Return whether missing realized fields prevent a conclusive identity decision."""
     required = (
+        pod.image_name,
         pod.docker_start_cmd,
         pod.payload_env_sha256,
         pod.payload_secret_name,

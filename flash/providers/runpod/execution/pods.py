@@ -29,6 +29,7 @@ from flash.providers._lifecycle.net.deadline import (
     require_create_allowance,
     require_deadline_at,
 )
+from flash.providers._lifecycle.net.worker import worker_image_for_gpu
 from flash.providers.artifacts.hf import (
     error_artifact_name,
     heartbeat_reader_for,
@@ -224,12 +225,55 @@ def _pod_create_intent(
 
 
 def _exact_handle(pending: RunpodPodHandle, pod: runpod_pods.RunpodPod) -> RunpodPodHandle:
+    if (
+        pending.image_name is not None
+        and pod.image_name is not None
+        and pod.image_name != pending.image_name
+    ):
+        raise UnreconciledCreateError("RunPod realized image conflicts with the persisted request")
+    if (
+        pending.data_center_id is not None
+        and pod.data_center_id is not None
+        and pending.data_center_id != pod.data_center_id
+    ):
+        raise UnreconciledCreateError(
+            "RunPod realized data center conflicts with the persisted request"
+        )
     return replace(
         pending,
         instance_id=pod.id,
         phase=EXACT,
         hourly_usd=pod.cost_per_hr if pod.cost_per_hr is not None else pending.hourly_usd,
+        image_name=pending.image_name or pod.image_name,
+        data_center_id=pod.data_center_id or pending.data_center_id,
     )
+
+
+def _enrich_exact_handle(
+    handle: RunpodPodHandle,
+    pod: runpod_pods.RunpodPod | None,
+) -> RunpodPodHandle:
+    if pod is None:
+        return handle
+    if (
+        handle.image_name is not None
+        and pod.image_name is not None
+        and pod.image_name != handle.image_name
+    ):
+        raise UnreconciledCreateError("RunPod observed image conflicts with the persisted request")
+    if (
+        handle.data_center_id is not None
+        and pod.data_center_id is not None
+        and handle.data_center_id != pod.data_center_id
+    ):
+        raise UnreconciledCreateError(
+            "RunPod observed data center conflicts with the persisted request"
+        )
+    image_name = handle.image_name or pod.image_name
+    data_center_id = handle.data_center_id or pod.data_center_id
+    if image_name != handle.image_name or data_center_id != handle.data_center_id:
+        return replace(handle, image_name=image_name, data_center_id=data_center_id)
+    return handle
 
 
 def _delete_duplicate_pods(
@@ -455,6 +499,7 @@ def poll_runpod_pod(
     *,
     log=None,
     heartbeat_reader=None,
+    on_handle=None,
     interval_s: float = 15.0,
     setup_grace_s: float = SETUP_GRACE_S,
     stall_after_s: float = STALL_AFTER_S,
@@ -477,6 +522,20 @@ def poll_runpod_pod(
         )
 
     error_reader = reader(err_name)
+
+    def fetch_instance():
+        nonlocal handle
+        pod = runpod_pods.get_pod_for_fingerprint(
+            handle.pod_id,
+            handle.key_fingerprint,
+            **deadline_kwargs(runpod_pods.get_pod_for_fingerprint, absolute_deadline),
+        )
+        enriched = _enrich_exact_handle(handle, pod)
+        if enriched != handle:
+            handle = enriched
+            if on_handle is not None:
+                on_handle(handle.to_dict())
+        return None if pod is None else {"desired_status": pod.desired_status}
 
     def stamp_cost_and_notes(metrics, *, end_ts, launch_ts) -> None:
         wall = max(0.0, end_ts - launch_ts)
@@ -510,18 +569,7 @@ def poll_runpod_pod(
         done_reader=reader("DONE"),
         marker_reader=reader(f"runpod_attempt{handle.attempt}.json", min_interval_s=60.0),
         metrics_reader=reader("metrics.json"),
-        fetch_instance=lambda: (
-            None
-            if (
-                pod := runpod_pods.get_pod_for_fingerprint(
-                    handle.pod_id,
-                    handle.key_fingerprint,
-                    **deadline_kwargs(runpod_pods.get_pod_for_fingerprint, absolute_deadline),
-                )
-            )
-            is None
-            else {"desired_status": pod.desired_status}
-        ),
+        fetch_instance=fetch_instance,
         poll_error_exceptions=(runpod_api.RunpodApiError,),
         status_field="desired_status",
         running_status="RUNNING",
@@ -623,7 +671,7 @@ def launch_payload_pod(
     )
     current = replace(
         intent,
-        image_name=image_name,
+        image_name=image_name or worker_image_for_gpu(spec.gpu.type),
         gpu_type_id_override=gpu_type_id_override,
         allowed_cuda_versions=allowed_cuda_versions,
         docker_start_cmd=docker_start_cmd,
@@ -742,6 +790,7 @@ def submit_runpod_pod(
                     seed,
                     log=log,
                     heartbeat_reader=reader,
+                    on_handle=on_handle,
                     **deadline_kwargs(poll_runpod_pod, absolute_deadline),
                 )
             finally:

@@ -240,6 +240,73 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
     assert source_context is None
 
 
+def test_failed_source_allows_concrete_checkpoint_but_rejects_bare_ref(monkeypatch):
+    import flash.adapters.lora_rank as rank_mod
+    import flash.runner.results.checkpoints as checkpoints
+    from flash.core.spec import JobSpec
+
+    source = JobSpec.from_dict(
+        {
+            "run_id": "source-run",
+            "model": "Qwen/Qwen3.5-9B",
+            "algorithm": "sft",
+            "train": {"hf_repo": "owner/source-runs"},
+        }
+    )
+    source_status = provisioned_status(source, state="failed")
+    monkeypatch.setattr(runner_status, "get_status", lambda run_id: source_status)
+    monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
+    monkeypatch.setattr(
+        checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: step == 2
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "load_hf_adapter_config",
+        lambda adapter_ref, token, revision: {
+            "peft_type": "LORA",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": "Qwen/Qwen3.5-9B",
+            "r": 8,
+            "lora_alpha": 16,
+            "exclude_modules": None,
+        },
+    )
+    monkeypatch.setattr(
+        rank_mod,
+        "adapter_artifact_identity",
+        lambda *args, **kwargs: rank_mod.AdapterArtifactIdentity(
+            "digest", "config", "adapter_model.safetensors", "weight:1"
+        ),
+    )
+
+    checkpoint_child = JobSpec.from_dict(
+        {
+            "run_id": "checkpoint-child",
+            "model": "Qwen/Qwen3.5-9B",
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": "source-run/step-2"},
+        }
+    )
+    public_spec, worker_spec, _identity, _source_context = (
+        runner_preparation._prepare_init_from_adapter(checkpoint_child, token="token")
+    )
+    assert public_spec.train.init_from_adapter == "source-run/step-2"
+    assert worker_spec.train.init_from_adapter == (
+        "owner/source-runs:sft/source-run/checkpoints/step-2"
+    )
+
+    bare_child = JobSpec.from_dict(
+        {
+            "run_id": "bare-child",
+            "model": "Qwen/Qwen3.5-9B",
+            "algorithm": "grpo",
+            "train": {"init_from_adapter": "source-run"},
+        }
+    )
+    with pytest.raises(runner_preparation.WarmStartPreparationError, match=r"concrete.*checkpoint"):
+        runner_preparation._prepare_init_from_adapter(bare_child, token="token")
+
+
 def test_qwen36_adapter_is_never_reinterpreted_as_qwen38(monkeypatch):
     from flash.core.spec import JobSpec
 

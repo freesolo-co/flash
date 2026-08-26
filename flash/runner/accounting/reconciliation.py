@@ -226,6 +226,59 @@ def _compare_and_replace_remote(
     return True
 
 
+def _compare_and_enrich_remote(
+    run_id: str,
+    expected_remote: dict,
+    enriched_remote: dict,
+) -> bool:
+    """durably add observed fields to one active exact runpod identity."""
+    try:
+        from flash.providers.runpod.execution.identity import RunpodPodHandle
+
+        expected = RunpodPodHandle.from_dict(expected_remote)
+        enriched = RunpodPodHandle.from_dict(enriched_remote)
+    except (TypeError, ValueError):
+        return False
+    if expected.pending or enriched.pending:
+        return False
+    expected_dict = expected.to_dict()
+    enriched_dict = enriched.to_dict()
+    mutable_fields = {"image_name", "data_center_id"}
+    if any(
+        expected_dict[key] != enriched_dict[key] for key in expected_dict.keys() - mutable_fields
+    ):
+        return False
+    for field in mutable_fields:
+        if expected_dict[field] is not None and enriched_dict[field] != expected_dict[field]:
+            return False
+    report_status: RunStatus | None = None
+    with state._status_guard(run_id):
+        status = status_ops.get_status(run_id)
+        if status.state in state.TERMINAL_STATES:
+            return False
+        if not _expected_remote_matches(status.remote, expected_remote):
+            return False
+        current = RunpodPodHandle.from_dict(status.remote)
+        for field in mutable_fields:
+            current_value = getattr(current, field)
+            enriched_value = getattr(enriched, field)
+            if current_value is not None and enriched_value != current_value:
+                return False
+        status.remote = {**status.remote, **enriched_dict}
+        status.updated_at = time.time()
+        state._save_status_unlocked(status)
+        report_status = status
+    confirmed = status_ops.get_status(run_id)
+    confirmed_handle = RunpodPodHandle.from_dict(confirmed.remote)
+    if any(
+        getattr(confirmed_handle, field) != getattr(enriched, field) for field in mutable_fields
+    ):
+        raise RuntimeError("enriched provider handle was not durably confirmed")
+    if report_status is not None:
+        reporting._report_status(report_status)
+    return True
+
+
 def _compare_and_prepare_resubmit(
     run_id: str,
     expected_remote: dict | None,

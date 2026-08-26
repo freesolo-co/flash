@@ -5,15 +5,57 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 PAYLOAD_ENV = "FLASH_INSTANCE_PAYLOAD"
 PAYLOAD_PATH = Path("/root/flash/payload.json")
 CAPSULE_PATH = Path("/opt/flash/instance-bootstrap.pyz")
 BAKE_ENTRY_PATH = Path("/opt/flash/bake_pod_entry.py")
+
+
+def _park_until_stopped(stopped: threading.Event) -> None:
+    stopped.wait()
+
+
+def _run_child_once(
+    parsed: dict,
+    *,
+    popen=None,
+    park=None,
+    install_signal=None,
+) -> int:
+    stopped = threading.Event()
+    child = None
+    stop_signum = None
+
+    def stop(signum, _frame) -> None:
+        nonlocal stop_signum
+        stop_signum = signum
+        stopped.set()
+        if child is not None and child.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                child.send_signal(signum)
+
+    register = install_signal or signal.signal
+    register(signal.SIGTERM, stop)
+    register(signal.SIGINT, stop)
+    command = (
+        [sys.executable, str(BAKE_ENTRY_PATH), str(PAYLOAD_PATH)]
+        if parsed.get("mode") == "kernel_bake"
+        else [sys.executable, str(CAPSULE_PATH), "bootstrap"]
+    )
+    child = (popen or subprocess.Popen)(command)
+    if stop_signum is not None and child.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            child.send_signal(stop_signum)
+    child.wait()
+    (park or _park_until_stopped)(stopped)
+    return 0
 
 
 def main() -> int:
@@ -42,9 +84,7 @@ def main() -> int:
             os.close(descriptor)
         raise
     os.environ.pop(PAYLOAD_ENV, None)
-    if parsed.get("mode") == "kernel_bake":
-        return subprocess.call([sys.executable, str(BAKE_ENTRY_PATH), str(PAYLOAD_PATH)])
-    return subprocess.call([sys.executable, str(CAPSULE_PATH), "bootstrap"])
+    return _run_child_once(parsed)
 
 
 if __name__ == "__main__":
