@@ -206,19 +206,30 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
 def mark_deployment_revocation_failed(run_id: str, error: str) -> RunStatus:
     from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
     from flash.runner.lifecycle.status import get_status
+    from flash.runner.results.verified_revisions import remove_verified_checkpoint
 
     with _status_guard(run_id):
         status = get_status(run_id)
         deployment = status.deployment if isinstance(status.deployment, dict) else {}
-        status.deployment = {
-            **deployment,
-            "state": "revocation_failed",
-            "error": error,
-            "retryable": True,
-            "updated_at": time.time(),
-        }
-        status.updated_at = time.time()
-        _save_status_unlocked(status)
+        checkpoint_id = deployment.get("checkpoint_id")
+        parsed = parse_checkpoint_ref(checkpoint_id) if isinstance(checkpoint_id, str) else None
+
+        def _commit() -> None:
+            now = time.time()
+            status.deployment = {
+                **deployment,
+                "state": "revocation_failed",
+                "error": error,
+                "retryable": True,
+                "updated_at": now,
+            }
+            status.updated_at = now
+            _save_status_unlocked(status)
+
+        if parsed is not None and parsed[0] == run_id:
+            remove_verified_checkpoint(run_id, checkpoint_id, commit=_commit)
+        else:
+            _commit()
         return status
 
 
@@ -238,16 +249,17 @@ def mark_undeployed(run_id: str, checkpoint_id: str | None = None) -> RunStatus:
             raise ValueError("exact undeploy requires checkpoint_id")
 
         def _commit() -> None:
-            if (
+            removes_summary = (
                 isinstance(status.deployment, dict)
                 and status.deployment.get("checkpoint_id") == target
-            ):
+            )
+            if removes_summary:
                 deployment = dict(status.deployment)
                 for field in ("error", "retryable", "updated_at"):
                     deployment.pop(field, None)
                 status.deployment = {**deployment, "state": "undeployed"}
-            if status.state == "deployed":
-                status.state = "done"
+                if status.state == "deployed":
+                    status.state = "done"
             status.updated_at = time.time()
             _save_status_unlocked(status)
 

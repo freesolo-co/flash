@@ -288,6 +288,7 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
         run_id=spec.run_id,
         state="deployed",
         spec=spec.to_dict(),
+        platform_context={"org_id": "org-1"},
         deployment={
             "state": "ready",
             "gpu": "RTX 5090",
@@ -316,7 +317,12 @@ def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-dep-racein"})
     runner_state._save_status(
-        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            platform_context={"org_id": "org-1"},
+        )
     )
 
     undeployed: list[str] = []
@@ -365,6 +371,7 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
         run_id=spec.run_id,
         state="deployed",
         spec=spec.to_dict(),
+        platform_context={"org_id": "org-1"},
         deployment={
             "state": "ready",
             "gpu": "RTX 5090",
@@ -411,6 +418,7 @@ def test_cancel_deployed_run_undeployed_even_when_raced_to_terminal(tmp_path, mo
         run_id=spec.run_id,
         state="deployed",
         spec=spec.to_dict(),
+        platform_context={"org_id": "org-1"},
         deployment={
             "state": "ready",
             "gpu": "RTX 5090",
@@ -457,6 +465,7 @@ def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
         run_id=spec.run_id,
         state="deployed",
         spec=spec.to_dict(),
+        platform_context={"org_id": "org-1"},
         deployment={
             "state": "ready",
             "gpu": "RTX 5090",
@@ -1068,6 +1077,7 @@ def test_cancel_revokes_inflight_checkpoint_deployment(tmp_path, monkeypatch):
             run_id=run_id,
             state="running",
             spec=spec.to_dict(),
+            platform_context={"org_id": "org-1"},
             deployment={
                 "state": "deploying",
                 "checkpoint_id": revision,
@@ -1114,6 +1124,7 @@ def test_cancel_active_removed_model_still_cleans_up_and_revokes(
             run_id=run_id,
             state="running",
             spec=spec.to_dict(),
+            platform_context={"org_id": "org-1"},
             deployment={
                 "state": "deploying",
                 "checkpoint_id": f"{run_id}/final",
@@ -1143,7 +1154,9 @@ def test_cancel_active_removed_model_still_cleans_up_and_revokes(
     gc_calls = []
     monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: gc_calls.append(_spec))
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: backend_calls.append(target))
+    monkeypatch.setattr(
+        deploy, "undeploy_adapter", lambda target, **_: backend_calls.append(target)
+    )
 
     out = runner_deploy.cancel_run(run_id)
 
@@ -1168,12 +1181,15 @@ def test_cancel_backend_success_local_commit_failure_is_not_backend_uncertainty(
             run_id=run_id,
             state="running",
             spec=spec.to_dict(),
+            platform_context={"org_id": "org-1"},
             deployment={"state": "ready", "checkpoint_id": revision},
         )
     )
     backend_calls = []
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: backend_calls.append(target))
+    monkeypatch.setattr(
+        deploy, "undeploy_adapter", lambda target, **_: backend_calls.append(target)
+    )
     monkeypatch.setattr(
         runner_transitions,
         "mark_undeployed",
@@ -1264,6 +1280,7 @@ def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_p
             run_id=run_id,
             state="deployed",
             spec=spec.to_dict(),
+            platform_context={"org_id": "org-1"},
             deployment={
                 "state": "ready",
                 "checkpoint_id": revision,
@@ -1275,7 +1292,7 @@ def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_p
 
     attempts = []
 
-    def fail_undeploy(target):
+    def fail_undeploy(target, **_):
         attempts.append(target)
         raise serving_errors.ServingError("backend unavailable")
 
@@ -1293,7 +1310,9 @@ def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_p
     assert failed.deployment["retryable"] is True
     assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: attempts.append(target) or {})
+    monkeypatch.setattr(
+        deploy, "undeploy_adapter", lambda target, **_: attempts.append(target) or {}
+    )
     retried = runner_deploy.cancel_run(run_id)
 
     assert attempts == [revision, revision]

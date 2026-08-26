@@ -93,9 +93,11 @@ def _deployment_projection(status: Any) -> dict[str, Any] | None:
     checkpoint_id = _checkpoint_id(status)
     if deployment is None or checkpoint_id is None:
         return None
+    projected = {**deployment, "checkpoint_id": checkpoint_id}
+    projected["endpoint"] = deployment.get("endpoint") or deployment.get("endpoint_name")
     return {
         key: value
-        for key, value in {**deployment, "checkpoint_id": checkpoint_id}.items()
+        for key, value in projected.items()
         if key in _DEPLOYMENT_FIELDS and value is not None
     }
 

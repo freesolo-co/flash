@@ -43,7 +43,7 @@ from flash.serve.contract.urls import public_deployment
 from flash.server.asgi import app as _app
 from flash.server.platform import auth, db
 from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key
-from flash.server.platform.internal_client import run_org_id
+from flash.server.platform.internal_client import run_org_id, run_serving_org_id
 
 router = APIRouter()
 
@@ -332,6 +332,7 @@ def deploy(
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
         deploy_org_id = run_org_id(status) or str(key.get("org_id") or "").strip() or None
         _require_deploy_org(run_id, deploy_org_id)
+        deploy_org_id = auth.serving_org_id(deploy_org_id)
         deploy_kwargs = {
             "run_id": run_id,
             "model": effective_spec.model,
@@ -439,7 +440,7 @@ def undeploy(
                     status_code=400,
                     detail="checkpoint_id must be a canonical checkpoint belonging to the route run",
                 )
-            org_id = run_org_id(status)
+            org_id = run_serving_org_id(status)
             if not org_id:
                 raise HTTPException(
                     status_code=409, detail=f"run {run_id} has no organization scope"

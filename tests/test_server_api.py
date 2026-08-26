@@ -2906,7 +2906,7 @@ def test_user_key_undeploy_returns_public_persisted_deployment(api, monkeypatch)
     monkeypatch.setattr(
         app_mod,
         "undeploy_adapter",
-        lambda target: {
+        lambda target, **_: {
             "checkpoint_id": target,
             "disabled_checkpoints": [target],
             "serving_deregistered": True,
@@ -2953,7 +2953,7 @@ def test_hosted_undeploy_preserves_historical_removed_model_cleanup(
     }
     runner_state._save_status(status)
     calls = []
-    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda target: calls.append(target) or {})
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda target, **_: calls.append(target) or {})
 
     response = api.delete(
         f"/v1/runs/{run_id}/deploy?checkpoint_id={run_id}/final", headers=_bearer(key)
@@ -2991,7 +2991,7 @@ def test_internal_org_undeploy_returns_public_persisted_deployment(api, monkeypa
     monkeypatch.setattr(
         app_mod,
         "undeploy_adapter",
-        lambda target: {
+        lambda target, **_: {
             "checkpoint_id": target,
             "disabled_checkpoints": [target],
             "serving_deregistered": True,
@@ -3145,7 +3145,7 @@ def test_internal_owned_run_still_requires_matching_org_for_deployment_managemen
         calls["deploy"] += 1
         return _FakeDeployment(kwargs["adapter_prefix"])
 
-    def fake_undeploy(target):
+    def fake_undeploy(target, **_):
         calls["undeploy"] += 1
         return {"run_id": target}
 
@@ -3315,7 +3315,7 @@ def test_public_run_routes_redact_private_deployment_fields(api, monkeypatch):
     assert persisted["openai_base_url"] == "https://serve.example/v1"
     assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset({revision})
 
-    monkeypatch.setattr(deploy_mod, "undeploy_adapter", lambda target: [target])
+    monkeypatch.setattr(deploy_mod, "undeploy_adapter", lambda target, **_: [target])
     cancelled = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
 
     assert cancelled.status_code == 200, cancelled.text
@@ -5622,7 +5622,7 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
         expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
 
-    def boom(_run_id):
+    def boom(_run_id, **_):
         raise ServingError("serving backend unreachable: could not delete endpoint")
 
     monkeypatch.setattr(app_mod, "undeploy_adapter", boom)
@@ -5635,7 +5635,7 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
     assert detail["code"] == "deployment_revocation_failed"
     assert detail["retryable"] is True
     assert "serving backend unreachable" in detail["message"]
-    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset({revision})
     deployment = runner_status.get_status(run_id).deployment
     assert deployment["state"] == "revocation_failed"
     assert deployment["retryable"] is True
@@ -5658,7 +5658,7 @@ def test_undeploy_without_status_projection_invalidates_orphaned_ledger(api, mon
     monkeypatch.setattr(
         app_mod,
         "undeploy_adapter",
-        lambda target: {"run_id": target, "serving_deregistered": False},
+        lambda target, **_: {"run_id": target, "serving_deregistered": False},
     )
     reports = []
     monkeypatch.setattr(
@@ -7721,7 +7721,7 @@ def test_deploy_checkpoint_preserves_final_deploy_that_wins_cas(api, monkeypatch
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     undeploys = []
-    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: undeploys.append(run_id))
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id, **_: undeploys.append(run_id))
 
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -7782,7 +7782,7 @@ def test_undeploy_checkpoint_of_running_run_keeps_training_state(api, monkeypatc
 
     monkeypatch.setattr(app_mod, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     monkeypatch.setattr(app_mod, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"]))
-    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id: [run_id])
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda run_id, **_: [run_id])
 
     key = _login()
     run_id = _make_run(api, key, "running")

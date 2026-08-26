@@ -213,7 +213,9 @@ def deploy_adapter(
     }
     if so_default is not None:
         body["structured_outputs"] = so_default
-    normalized_org_id = (org_id or "").strip()
+    from flash.server.platform.auth import serving_org_id
+
+    normalized_org_id = serving_org_id(org_id)
     if not normalized_org_id:
         raise ValueError("org_id is required for hosted checkpoint deployment")
     body["org_id"] = normalized_org_id

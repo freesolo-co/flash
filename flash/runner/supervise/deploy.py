@@ -449,9 +449,9 @@ def _revoke_serving(
             ) from exc
     try:
         from flash.serve.deployment.deploy import undeploy_adapter
-        from flash.server.platform.internal_client import run_org_id
+        from flash.server.platform.internal_client import run_serving_org_id
 
-        org_id = run_org_id(status)
+        org_id = run_serving_org_id(status)
         if not org_id:
             raise ValueError(f"run {run_id} has no organization scope")
         undeploy_adapter(checkpoint_id, org_id=org_id)

@@ -22,7 +22,7 @@ from flash.serve.request.openai import (
 from flash.serve.request.transport import RawChatStream, is_event_stream_content_type
 from flash.server.asgi import app as _app
 from flash.server.platform.deps import manageable_run
-from flash.server.platform.internal_client import run_org_id
+from flash.server.platform.internal_client import run_serving_org_id
 from flash.server.routes.serving_revisions import (
     _DEPLOYMENT_BUSY_STATES,
     _authorized_chat_checkpoint,
@@ -117,7 +117,7 @@ def _resolve_chat_request(
         )
     except OpenAIRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    org_id = run_org_id(status)
+    org_id = run_serving_org_id(status)
     if not org_id:
         raise HTTPException(status_code=409, detail=f"run {run_id} has no organization scope")
     return request, messages, effective_spec, authorized_checkpoint, org_id

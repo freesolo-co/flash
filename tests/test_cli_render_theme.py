@@ -321,16 +321,20 @@ def test_undeploy_confirms_disabled_immutable_records(monkeypatch) -> None:
     named = render.undeployed(
         {
             "run_id": "flash-1",
-            "disabled_aliases": ["flash-1"],
-            "disabled_revisions": ["flash-1@final." + "a" * 40],
+            "checkpoint_id": "flash-1/final",
+            "disabled_checkpoints": ["flash-1/final"],
         }
     )
-    assert "torn down flash-1" in named
-    assert "flash-1@final" in named
+    assert "torn down flash-1/final" in named
+    assert "disabled flash-1/final" in named
     idempotent = render.undeployed(
-        {"run_id": "flash-1", "disabled_aliases": [], "disabled_revisions": []}
+        {
+            "run_id": "flash-1",
+            "checkpoint_id": "flash-1/final",
+            "disabled_checkpoints": [],
+        }
     )
-    assert "torn down flash-1" in idempotent
+    assert "torn down flash-1/final" in idempotent
 
 
 def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:

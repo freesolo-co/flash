@@ -2092,24 +2092,24 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert _run(["runs", "cancel", "flash-1"]) == 0
     assert ("cancel", "flash-1") in fake_client.calls
 
-    assert _run(["models", "deploy", "flash-1"]) == 0
-    assert ("deploy", "flash-1", {"dry_run": False}) in fake_client.calls
+    assert _run(["models", "deploy", "flash-1/final"]) == 0
+    assert ("deploy", "flash-1/final", {"dry_run": False}) in fake_client.calls
 
     assert _run(["models", "deploy", "flash-1/step-40"]) == 0
     assert ("deploy", "flash-1/step-40", {"dry_run": False}) in fake_client.calls
     err = capsys.readouterr().err
-    assert "flash models undeploy flash-1`" in err
-    assert "flash models undeploy flash-1/step-40`" not in err
+    assert "flash models undeploy flash-1/final`" in err
+    assert "flash models undeploy flash-1/step-40`" in err
 
     assert _run(["models", "deployments"]) == 0
     deployments_out = capsys.readouterr().out
     assert "flash-1" in deployments_out
-    assert "REVISION" in deployments_out
+    assert "CHECKPOINT ID" in deployments_out
     assert "OPENAI BASE URL" in deployments_out
     assert "https://serve.example/v1" in deployments_out
 
-    assert _run(["models", "undeploy", "flash-1"]) == 0
-    assert ("undeploy", "flash-1") in fake_client.calls
+    assert _run(["models", "undeploy", "flash-1/final"]) == 0
+    assert ("undeploy", "flash-1/final") in fake_client.calls
 
 
 def test_deployments_json_passes_server_rows_through(fake_client, capsys) -> None:
@@ -2147,7 +2147,7 @@ def test_deployments_without_base_url_renders_placeholder(fake_client, monkeypat
 
 
 def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
-    assert _run(["models", "chat", "flash-1", "-m", "What is 6*7?"]) == 0
+    assert _run(["models", "chat", "flash-1/final", "-m", "What is 6*7?"]) == 0
     assert "42" in capsys.readouterr().out
     assert fake_client.calls[-1][0] == "chat_stream"
 
@@ -2160,10 +2160,10 @@ def test_chat_checkpoint_ref_is_forwarded_unchanged(fake_client) -> None:
     assert fake_client.calls[-1][1] == target
 
 
-def test_chat_stream_caches_a_successful_checkpoint_capability_check(monkeypatch) -> None:
-    # env eval opens one stream per case. repeating the health preflight makes a large suite pay
-    # hundreds of extra requests and lets one transient health failure replace a model measurement.
-    from flash.client import ApiClient, ClientError
+def test_chat_stream_uses_permanent_checkpoint_without_legacy_capability_preflight(
+    monkeypatch,
+) -> None:
+    from flash.client import ApiClient
 
     class Response:
         def __init__(self):
@@ -2179,49 +2179,34 @@ def test_chat_stream_caches_a_successful_checkpoint_capability_check(monkeypatch
             return b'{"choices":[{"message":{"content":"ok"}}]}'
 
     client = ApiClient("https://flash.test")
-    successful_health_calls = 0
+    health_calls = 0
 
-    def successful_health():
-        nonlocal successful_health_calls
-        successful_health_calls += 1
-        return {"capabilities": ["chat_step_selector_v1"]}
+    def health():
+        nonlocal health_calls
+        health_calls += 1
+        return {"capabilities": []}
 
-    monkeypatch.setattr(client, "health", successful_health)
+    monkeypatch.setattr(client, "health", health)
     monkeypatch.setattr(
         "flash.client.http.urllib.request.urlopen", lambda *args, **kwargs: Response()
     )
 
-    for _ in range(2):
-        assert list(client.chat_stream("flash-1/step-3", [])) == ["ok"]
-
-    assert successful_health_calls == 1
-
-    failing_client = ApiClient("https://flash.test")
-    failing_health_calls = 0
-
-    def failing_health():
-        nonlocal failing_health_calls
-        failing_health_calls += 1
-        return {"capabilities": []}
-
-    monkeypatch.setattr(failing_client, "health", failing_health)
-    for _ in range(2):
-        with pytest.raises(ClientError, match="chat_step_selector_v1"):
-            list(failing_client.chat_stream("flash-1/step-3", []))
-
-    assert failing_health_calls == 2
+    assert list(client.chat_stream("flash-1/step-3", [])) == ["ok"]
+    assert health_calls == 0
 
 
-def test_chat_accepts_full_immutable_revision(fake_client) -> None:
-    revision = "flash-1@step-40." + "a" * 40
-    assert _run(["models", "chat", revision, "-m", "What is 6*7?"]) == 0
+def test_chat_accepts_permanent_checkpoint(fake_client) -> None:
+    checkpoint_id = "flash-1/step-40"
+    assert _run(["models", "chat", checkpoint_id, "-m", "What is 6*7?"]) == 0
     assert fake_client.calls[-1][0] == "chat_stream"
-    assert fake_client.calls[-1][1] == revision
+    assert fake_client.calls[-1][1] == checkpoint_id
 
 
 def test_chat_system_flag_prepends_system_message(fake_client) -> None:
     """--system gives evals training-prompt parity without calling the HTTP API directly."""
-    assert _run(["models", "chat", "flash-1", "-m", "What is 6*7?", "--system", "be brief"]) == 0
+    assert (
+        _run(["models", "chat", "flash-1/final", "-m", "What is 6*7?", "--system", "be brief"]) == 0
+    )
     _, _, messages = fake_client.calls[-1]
     assert messages == [
         {"role": "system", "content": "be brief"},
@@ -2230,7 +2215,7 @@ def test_chat_system_flag_prepends_system_message(fake_client) -> None:
 
 
 def test_chat_without_system_flag_sends_user_message_only(fake_client) -> None:
-    assert _run(["models", "chat", "flash-1", "-m", "What is 6*7?"]) == 0
+    assert _run(["models", "chat", "flash-1/final", "-m", "What is 6*7?"]) == 0
     _, _, messages = fake_client.calls[-1]
     assert messages == [{"role": "user", "content": "What is 6*7?"}]
 
@@ -2238,7 +2223,7 @@ def test_chat_without_system_flag_sends_user_message_only(fake_client) -> None:
 @pytest.mark.parametrize("flag", ["--enable-thinking", "--disable-thinking"])
 def test_chat_does_not_expose_thinking_override_flags(fake_client, flag) -> None:
     with pytest.raises(SystemExit) as excinfo:
-        _run(["models", "chat", "flash-1", "-m", "What is 6*7?", flag])
+        _run(["models", "chat", "flash-1/final", "-m", "What is 6*7?", flag])
     assert excinfo.value.code == 2
 
 
@@ -2336,7 +2321,9 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert 'project = "11111111-1111-4111-8111-111111111111"' in training_text
     assert "flash runs checkpoint <run-id>" in training_text
     assert "flash models deployments" in training_text
-    assert "flash models export --adapter-id <run-id> --repository <you>/<repo>" in training_text
+    assert (
+        "flash models export --adapter-id <run-id>/final --repository <you>/<repo>" in training_text
+    )
     assert (
         "flash env push --project 11111111-1111-4111-8111-111111111111 --name my-env ."
         in training_text
@@ -3746,8 +3733,8 @@ def test_export_without_huggingface_hub_skips_preflight(fake_client, monkeypatch
 
 
 def test_deploy_enqueues_server_side_verification(fake_client, capsys) -> None:
-    assert _run(["models", "deploy", "flash-1"]) == 0
-    assert ("deploy", "flash-1", {"dry_run": False}) in fake_client.calls
+    assert _run(["models", "deploy", "flash-1/final"]) == 0
+    assert ("deploy", "flash-1/final", {"dry_run": False}) in fake_client.calls
     assert not any(c[0] == "chat" for c in fake_client.calls)
     err = capsys.readouterr().err
     assert "flash models deployments" in err
@@ -3762,7 +3749,7 @@ def test_deploy_checkpoint_enqueues_base_run_deployment(fake_client) -> None:
 
 def test_deploy_no_verify_flag_is_removed(fake_client) -> None:
     with pytest.raises(SystemExit) as excinfo:
-        _run(["models", "deploy", "flash-1", "--no-verify"])
+        _run(["models", "deploy", "flash-1/final", "--no-verify"])
     assert excinfo.value.code == 2
     assert not any(call[0] == "deploy" for call in fake_client.calls)
 
@@ -3774,7 +3761,7 @@ def test_deploy_dry_run_skips_active_deployment_note(fake_client, monkeypatch, c
         lambda run_id, **_: {"run_id": run_id, "state": "dry_run"},
         raising=False,
     )
-    assert _run(["models", "deploy", "flash-1", "--dry-run"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--dry-run"]) == 0
     assert not any(c[0] == "chat" for c in fake_client.calls)
     assert "flash models deployments" not in capsys.readouterr().err
 
@@ -3791,7 +3778,7 @@ def test_deploy_failed_state_exits_nonzero(fake_client, monkeypatch, capsys) -> 
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1"]) == 1
+    assert _run(["models", "deploy", "flash-1/final"]) == 1
     err = capsys.readouterr().err
     assert "deployment failed: smoke generation failed" in err
     assert "once it is ready" not in err
@@ -3812,7 +3799,7 @@ def test_deploy_without_wait_returns_while_still_queued(fake_client, monkeypatch
     """No --wait keeps the old behaviour: return immediately, do not poll."""
     _queued_deploy(monkeypatch, fake_client)
 
-    assert _run(["models", "deploy", "flash-1"]) == 0
+    assert _run(["models", "deploy", "flash-1/final"]) == 0
     assert not any(c[0] == "deployment_for" for c in fake_client.calls)
     assert "deployment state is 'queued'" in capsys.readouterr().err
 
@@ -3830,7 +3817,7 @@ def test_deploy_wait_polls_until_the_revision_is_servable(fake_client, monkeypat
         fake_client, "deployment_for", lambda run_id, timeout=None: next(states), raising=False
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 0
     out, err = capsys.readouterr()
     assert "ready" in out
     assert "queued" not in err
@@ -3846,7 +3833,7 @@ def test_deploy_wait_stops_on_a_failed_revision(fake_client, monkeypatch, capsys
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     assert "deployment failed: smoke generation failed" in capsys.readouterr().err
 
 
@@ -3864,7 +3851,7 @@ def test_deploy_wait_gives_up_at_the_timeout_without_claiming_success(
     # exit 1, not 0: --wait's contract is "the revision is servable when i return", and a timeout
     # is precisely the case where it is not. exiting 0 here is what lets
     # `deploy --wait && evaluate` proceed against a revision that never became servable.
-    assert _run(["models", "deploy", "flash-1", "--wait", "0.01"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "0.01"]) == 1
     err = capsys.readouterr().err
     assert "still 'smoke_testing' after 0.01s" in err
     assert "flash models deployments" in err
@@ -3880,7 +3867,7 @@ def test_deploy_wait_ends_when_the_deployment_stops_being_listed(
     )
 
     # the last record seen was still queued, so the requested revision never became servable.
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     assert "no longer an active deployment" in capsys.readouterr().err
 
 
@@ -3934,14 +3921,11 @@ def test_deploy_wait_reports_a_rollback_to_a_different_checkpoint_step(
 def test_deploy_wait_reports_a_rollback_from_the_final_adapter(
     fake_client, monkeypatch, capsys
 ) -> None:
-    """A bare run id is a revision too, and its failed redeploy rolls back like any other.
+    """A failed final-checkpoint redeploy reports the restored sibling and its error.
 
-    `deploy flash-1` asks for the final adapter, which `parse_checkpoint_ref` reports as step
-    `None`. A run already serving `step-20` whose final-adapter redeploy fails is restored to
-    step-20 by `mark_deployment_failed`, and `deployment_for` rejects the restored record because
-    its non-null step does not match the requested final adapter -- so the bare-run form reads as
-    absent exactly like the `/step-N` form does. Exempting it from the rollback lookup reported the
-    run as vanished and dropped `last_deploy_error`.
+    `deploy flash-1/final` asks for the permanent final checkpoint. A run already serving
+    `step-20` whose final-checkpoint redeploy fails is restored to step-20, and the exact final
+    checkpoint lookup reads as absent. The rollback lookup must retain `last_deploy_error`.
     """
     _queued_deploy(monkeypatch, fake_client)
     monkeypatch.setattr(
@@ -3971,7 +3955,7 @@ def test_deploy_wait_reports_a_rollback_from_the_final_adapter(
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "5"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "5"]) == 1
     err = capsys.readouterr().err
     assert "adapter merge failed" in err, err
     assert "previously deployed revision is still serving" in err, err
@@ -4108,7 +4092,7 @@ def test_deploy_wait_survives_a_transient_control_plane_error(
 
     monkeypatch.setattr(fake_client, "deployment_for", _next, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 0
     assert "ready" in capsys.readouterr().out
 
 
@@ -4129,7 +4113,7 @@ def test_deploy_wait_zero_polls_once_instead_of_being_treated_as_no_wait(
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "0"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "0"]) == 1
     assert "waiting up to 0s" in capsys.readouterr().err
 
 
@@ -4162,7 +4146,7 @@ def test_deploy_wait_rejects_a_restored_previous_revision(fake_client, monkeypat
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     err = capsys.readouterr().err
     assert "did not become servable" in err
     assert "adapter load failed" in err
@@ -4198,7 +4182,7 @@ def test_deploy_wait_accepts_a_ready_revision_carrying_a_stale_error(
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 0
 
 
 def test_deploy_wait_bounds_each_poll_by_the_remaining_time(
@@ -4218,7 +4202,7 @@ def test_deploy_wait_bounds_each_poll_by_the_remaining_time(
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "5"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "5"]) == 0
     assert seen == [pytest.approx(5.0, abs=0.5)]
 
 
@@ -4238,8 +4222,8 @@ def test_deploy_wait_zero_actually_reads_the_current_state(fake_client, monkeypa
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "0"]) == 0
-    assert polls == ["flash-1"], polls
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "0"]) == 0
+    assert polls == ["flash-1/final"], polls
 
 
 def test_deploy_wait_does_not_start_a_read_after_the_deadline_expires(
@@ -4272,7 +4256,7 @@ def test_deploy_wait_does_not_start_a_read_after_the_deadline_expires(
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "0.1"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "0.1"]) == 1
     assert reads, "the wait issued no read at all"
     # a read starting at `start` and bounded by `bound` occupies the plane until start+bound, so
     # that sum is what has to stay within the advertised wait. this is the assertion the 1.0s floor
@@ -4300,7 +4284,7 @@ def test_deploy_wait_fails_closed_on_a_terminal_state_that_is_not_ready(
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     err = capsys.readouterr().err
     assert "not\nservable" in err or "not servable" in err, err
     assert "once it is ready" not in err, err
@@ -4337,7 +4321,7 @@ def test_deploy_wait_rejects_a_superseding_deploy_that_carries_no_error(
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     assert "once it is ready" not in capsys.readouterr().err
 
 
@@ -4363,7 +4347,7 @@ def test_deploy_wait_observes_readiness_inside_a_short_window(fake_client, monke
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "5"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "5"]) == 0
 
 
 def test_deploy_wait_observes_readiness_inside_the_final_window(fake_client, monkeypatch) -> None:
@@ -4387,7 +4371,7 @@ def test_deploy_wait_observes_readiness_inside_the_final_window(fake_client, mon
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "1"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "1"]) == 0
 
 
 def test_deploy_wait_watches_the_final_window_to_its_deadline(fake_client, monkeypatch) -> None:
@@ -4411,7 +4395,7 @@ def test_deploy_wait_watches_the_final_window_to_its_deadline(fake_client, monke
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "1"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "1"]) == 0
 
 
 def test_deploy_wait_final_window_does_not_poll_unboundedly(fake_client, monkeypatch) -> None:
@@ -4437,7 +4421,7 @@ def test_deploy_wait_final_window_does_not_poll_unboundedly(fake_client, monkeyp
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "1"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "1"]) == 1
     # the up-front read plus the one the split funds. a fractional reserve makes this grow without
     # bound; asserting the exact count is what keeps the split from silently becoming that.
     assert len(reads) == 2, reads
@@ -4458,7 +4442,7 @@ def test_deploy_wait_zero_does_not_block_past_its_own_bound(fake_client, monkeyp
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "0"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "0"]) == 0
     assert seen == [pytest.approx(1.0, abs=0.001)], seen
 
 
@@ -4483,7 +4467,7 @@ def test_deploy_wait_rejects_a_synchronous_failure_that_returns_the_restored_rev
         fake_client, "deployment_for", lambda run_id, timeout=None: dict(settled), raising=False
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     err = capsys.readouterr().err
     assert "did not become servable" in err, err
     assert "adapter load failed" in err, err
@@ -4497,7 +4481,7 @@ def test_deploy_wait_accepts_a_synchronous_success(fake_client, monkeypatch) -> 
         fake_client, "deployment_for", lambda run_id, timeout=None: dict(settled), raising=False
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 0
 
 
 def test_deploy_notes_name_this_channels_executable(fake_client, monkeypatch, capsys) -> None:
@@ -4505,7 +4489,7 @@ def test_deploy_notes_name_this_channels_executable(fake_client, monkeypatch, ca
     monkeypatch.setattr(deploy_commands, "CLI_NAME", "flash-dev")
     _queued_deploy(monkeypatch, fake_client)
 
-    assert _run(["models", "deploy", "flash-1"]) == 0
+    assert _run(["models", "deploy", "flash-1/final"]) == 0
     err = capsys.readouterr().err
     assert "flash-dev models deployments" in err, err
     assert "`flash models" not in err, err
@@ -4526,7 +4510,7 @@ def test_deploy_wait_stops_retrying_a_rejected_key(fake_client, monkeypatch, cap
 
     monkeypatch.setattr(fake_client, "deployment_for", _denied, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     assert len(calls) == 1
     assert "cannot check flash-1" in capsys.readouterr().err
 
@@ -4540,7 +4524,7 @@ def test_deploy_wait_rejects_a_timeout_that_would_never_expire(fake_client, valu
     leading-dash value reaches the validator instead of being read as another option.
     """
     with pytest.raises(SystemExit) as excinfo:
-        _run(["models", "deploy", "flash-1", f"--wait={value}"])
+        _run(["models", "deploy", "flash-1/final", f"--wait={value}"])
     assert excinfo.value.code == 2
     assert "--wait" in capsys.readouterr().err
 
@@ -4568,7 +4552,7 @@ def test_deploy_wait_skips_polling_for_a_dry_run(fake_client, monkeypatch, capsy
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--dry-run", "--wait"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--dry-run", "--wait"]) == 0
     assert not any(c[0] == "deployment_for" for c in fake_client.calls)
     assert "ctrl-c stops waiting" not in capsys.readouterr().err
 

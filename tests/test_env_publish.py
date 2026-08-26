@@ -1152,7 +1152,7 @@ def test_record_training_run_posts_to_backend(monkeypatch):
             deployment={
                 "state": "ready",
                 "checkpoint_id": "flash-1/final",
-                "endpoint": "https://serve.example",
+                "endpoint_name": "https://serve.example",
                 "adapter_hf_prefix": "private/path",
             },
             last_heartbeat={

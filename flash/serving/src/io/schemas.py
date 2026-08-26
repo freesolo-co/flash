@@ -329,9 +329,7 @@ class GenerateRequest(BaseModel):
     @field_validator("adapter_id")
     @classmethod
     def strip_adapter_id(cls, value: str) -> str:
-        # Normalize once so every entry point (/generate, /v1/chat/completions, the per-adapter
-        # route) authorizes against and routes to the same adapter — a stray "  qa  " resolves to
-        # "qa" rather than auth'ing one value and looking up another.
-        if parse_checkpoint_ref(value) is None:
-            raise ValueError("adapter_id must be `<run_id>/final` or `<run_id>/step-N`")
-        return value
+        # normalize once so every entry point authorizes and routes the same nonempty selector.
+        # checkpoint-only control and managed-run boundaries enforce permanent checkpoint grammar;
+        # the serving router distinguishes those records from supported base-model records.
+        return _require_non_empty(value)

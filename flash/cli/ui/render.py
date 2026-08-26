@@ -589,16 +589,15 @@ def deployed(dep: dict) -> str:
 
 
 def undeployed(result: dict) -> str:
-    """`flash models undeploy`: report the run-scoped aliases and immutable revisions disabled."""
-    rid = _paint(result.get("run_id", ""), _ACCENT2)
-    aliases = result.get("disabled_aliases") or []
-    revisions = result.get("disabled_revisions") or []
-    affected = [*aliases, *revisions]
-    line = ok(f"torn down {rid}")
-    if affected:
-        line += "\n" + _dim(f"  disabled {', '.join(str(item) for item in affected)}")
+    """`flash models undeploy`: report the exact permanent checkpoints disabled."""
+    checkpoint_id = str(result.get("checkpoint_id") or result.get("run_id") or "")
+    target = _paint(checkpoint_id, _ACCENT2)
+    disabled = result.get("disabled_checkpoints") or []
+    line = ok(f"torn down {target}")
+    if disabled:
+        line += "\n" + _dim(f"  disabled {', '.join(str(item) for item in disabled)}")
     else:
-        line += "\n" + _dim("  serving records were already disabled or absent")
+        line += "\n" + _dim("  serving record was already disabled or absent")
     return _safe(line)
 
 

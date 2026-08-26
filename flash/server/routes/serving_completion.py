@@ -11,17 +11,29 @@ from flash.runner.results.verified_revisions import verified_checkpoint_generati
 from flash.serve.contract.errors import AdapterConfigMissing, ServingError
 from flash.server.asgi import app as _app
 from flash.server.platform import db
-from flash.server.routes import serving as _serving
-from flash.server.routes.serving import (
-    _deployment_failure_persisted,
-    _deployment_state,
-    _public_deployment,
-)
 from flash.server.routes.serving_revisions import (
     _DEPLOYMENT_BUSY_STATES,
     _DEPLOYMENT_READY_STATES,
     _spec_is_unservable,
 )
+
+
+def _serving():
+    from flash.server.routes import serving
+
+    return serving
+
+
+def _deployment_state(deployment: dict, state: str, **fields) -> dict:
+    return _serving()._deployment_state(deployment, state, **fields)
+
+
+def _deployment_failure_persisted(status, failed: dict) -> bool:
+    return _serving()._deployment_failure_persisted(status, failed)
+
+
+def _public_deployment(deployment: dict) -> dict:
+    return _serving()._public_deployment(deployment)
 
 
 def recover_deployments() -> int:
@@ -57,7 +69,7 @@ def recover_deployments() -> int:
                 recovered_at=time.time(),
             )
             marked = runner_transitions.mark_deployment_failed(status.run_id, failed)
-            _serving._report_persisted_transition(
+            _serving()._report_persisted_transition(
                 status,
                 marked,
                 persisted=_deployment_failure_persisted(marked, failed),
@@ -129,7 +141,7 @@ def _commit_ready_deployment(
         )
         persisted = marked.state == "deployed" and marked.deployment == current
     if persisted:
-        _serving._report_persisted_transition(previous, marked, persisted=True)
+        _serving()._report_persisted_transition(previous, marked, persisted=True)
     return persisted
 
 
@@ -167,12 +179,12 @@ def _finish_deployment_unlocked(
             detail="running bounded fixed-prompt smoke",
         )
         previous = _app.get_status(run_id)
-        marked = _serving.mark_deployment_pending(run_id, current, owner_deployment=deployment)
-        _serving._report_persisted_transition(
+        marked = _serving().mark_deployment_pending(run_id, current, owner_deployment=deployment)
+        _serving()._report_persisted_transition(
             previous, marked, persisted=marked.deployment == current
         )
         smoke_result.update(
-            _serving._run_deployment_smoke(
+            _serving()._run_deployment_smoke(
                 run_id,
                 spec,
                 serving_model=checkpoint_id,
@@ -232,6 +244,6 @@ def _record_deployment_failure(
     )
     previous = _app.get_status(run_id)
     marked = runner_transitions.mark_deployment_failed(run_id, failed)
-    _serving._report_persisted_transition(
+    _serving()._report_persisted_transition(
         previous, marked, persisted=_deployment_failure_persisted(marked, failed)
     )

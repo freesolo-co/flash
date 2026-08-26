@@ -548,7 +548,6 @@ def _run_deployment_smoke(
         spec,
         serving_model=serving_model,
         expected_checkpoint=expected_checkpoint,
-        org_id=org_id,
     )
     verify_turns = 1
     attested_checkpoint_id: str | None = None
@@ -577,7 +576,6 @@ def _run_deployment_smoke(
                 spec,
                 serving_model=serving_model,
                 expected_checkpoint=expected_checkpoint,
-                org_id=org_id,
             )
             _smoke_lora_request_adapter(
                 structured_result, serving_model, attestation_advertised=attestation_advertised

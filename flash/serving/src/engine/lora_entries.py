@@ -10,7 +10,7 @@ from flash.serving.src.store.identity import engine_adapter_name, record_key
 
 @dataclass(frozen=True, slots=True)
 class _LoraEntry:
-    source_ident: tuple[str, str, str, str | None]
+    source_ident: tuple[str, str, str, str, str | None]
     lora_request: Any
     state: Literal["reserved", "loaded", "unconfirmed"]
 

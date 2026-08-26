@@ -16,6 +16,7 @@ from flash.serve.request.openai import OpenAIRequestError, parse_chat_request
 from flash.server.asgi import app as _app
 
 _DEPLOYMENT_BUSY_STATES = {"queued", "smoke_testing"}
+_DEPLOYMENT_READY_STATES = {"ready"}
 
 
 def _verified_checkpoints(status) -> set[str]:
