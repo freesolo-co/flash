@@ -54,15 +54,17 @@ def _record_resource(
     adapter: InstancePollAdapter,
     status: str,
     *,
+    confirmed_missing: bool,
     transport: str = "ok",
-    confirmed_missing: bool = True,
 ) -> None:
     """project one provider observation onto the public resource state.
 
-    ``confirmed_missing`` carries the poll loop's own verdict. the loop deliberately requires
-    ``missing_dead_threshold`` consecutive misses before treating an absent instance as gone, so an
-    isolated miss must not surface publicly as ``terminal`` while the same loop still considers the
-    resource live and may observe it running on the next poll.
+    ``confirmed_missing`` carries the poll loop's own verdict and is required rather than defaulted.
+    the loop deliberately requires ``missing_dead_threshold`` consecutive misses before treating an
+    absent instance as gone, so an isolated miss must not surface publicly as ``terminal`` while the
+    same loop still considers the resource live and may observe it running on the next poll. a
+    defaulted verdict silently re-answers that question at whichever call site forgets to pass it,
+    including the transport-failure path that replays the last observed status.
     """
     from flash.runner.accounting.reconciliation import _remote_resource_identity
     from flash.runner.lifecycle.status import get_status, record_resource
@@ -163,7 +165,14 @@ def poll_instance_job(
             instance = adapter.fetch_instance()
             poll_errors.reset()
         except adapter.poll_error_exceptions as exc:
-            _record_resource(adapter, last_status or "unknown", transport="unavailable")
+            # a transport failure observed nothing, so it can neither confirm nor advance the
+            # missing streak; it replays the last status only to keep the observation age moving.
+            _record_resource(
+                adapter,
+                last_status or "unknown",
+                transport="unavailable",
+                confirmed_missing=missing_streak >= adapter.missing_dead_threshold,
+            )
             if poll_errors.record(exc, deadline_at=attempt.work_deadline_at):
                 return PollResult(
                     False, failure="poll_error", detail="provider status transport failed"

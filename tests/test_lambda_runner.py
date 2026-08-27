@@ -2197,11 +2197,21 @@ def test_isolated_instance_miss_is_not_projected_terminal(monkeypatch):
 
     poll_instance._record_resource(adapter, "missing", confirmed_missing=False)
     poll_instance._record_resource(adapter, "missing", confirmed_missing=True)
+    # the transport path replays the last status, so it must state its verdict too.
+    poll_instance._record_resource(
+        adapter, "missing", transport="unavailable", confirmed_missing=False
+    )
 
     assert recorded[0]["provider_state"] == "missing"
     # unconfirmed stays provisioning; only the threshold-confirmed miss is terminal.
     assert recorded[0]["state"] == "provisioning"
     assert recorded[1]["state"] == "terminal"
+    assert recorded[2]["state"] == "provisioning"
+    assert recorded[2]["transport"] == "unavailable"
+    # the verdict is required, never defaulted: a call site that forgets it must not silently
+    # re-answer "is this resource gone?" -- that is how the transport path regressed once already.
+    with pytest.raises(TypeError):
+        poll_instance._record_resource(adapter, "missing")
 
 
 def test_provider_initial_and_reattached_poll_keep_same_deadline(monkeypatch):
