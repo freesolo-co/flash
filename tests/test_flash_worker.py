@@ -1209,10 +1209,15 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
 
     # sft renders its hydra overrides and child shims in train.sft.config, so the trainer's half of
     # this guard spans both modules. keep these in step when sft_train is split further.
+    from flash.engine.worker.train.sft import orchestration as sft_orchestration
     from flash.engine.worker.train.sft.child import plugin as sft_plugin
     from flash.engine.worker.train.sft.setup import config as sft_config
 
-    train_src = inspect.getsource(sft_train) + inspect.getsource(sft_config)
+    train_src = (
+        inspect.getsource(sft_train)
+        + inspect.getsource(sft_orchestration)
+        + inspect.getsource(sft_config)
+    )
     plugin_src = inspect.getsource(sft_plugin)
     # revision-aware vocab resolution: the worker must size the realized batch through the SAME
     # resolver the cost quote priced with, else a revision-pinned run drifts from its quote.

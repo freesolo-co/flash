@@ -34,7 +34,7 @@ def render_tf32_shim() -> str:
     leave training running on the default path rather than abort a paid run.
     """
     return f"""
-# --- flash: enable tf32 in the trainer process (see backend_common.render_tf32_shim) ---
+# --- flash: enable tf32 in the trainer process (see flash.engine.worker.verl.child_io) ---
 try:
     import torch as _flash_tf32_torch
 
@@ -59,7 +59,7 @@ except Exception:
 # (`FLASH_VERL_PYTHON`, `/opt/verl-venv`) that is built without --system-site-packages and where
 # flash is not installed at all -- and Dockerfile.worker installs tilelang into BOTH (the main
 # interpreter at the fla/Hopper layer, the child venv at its own layer), as does the run-time
-# rebuild in `verl.capabilities.resolve_verl_python`. So a parent-side repoint never reached the copy
+# rebuild in `verl.install.resolve_verl_python`. so a parent-side repoint never reached the copy
 # the trainer loads, and the stub survived into the process that builds the vLLM engine.
 #
 # The allocator is only constructed when rollout sleep mode is on, which is why the one catalog

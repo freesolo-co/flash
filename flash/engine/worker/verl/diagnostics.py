@@ -36,19 +36,6 @@ _RETRIABLE_VERL_CHILD_SIGNATURES = (
 )
 
 
-def _backend_common():
-    """The parent module, imported lazily because it imports this one.
-
-    Only used to resolve `open`: the bounded-read test replaces `backend_common.open` rather than
-    the builtin, because a global replacement leaks into every later test through pytest's own file
-    handling. Reading it back through the parent is what keeps that patch reaching this collector,
-    and falling through to the builtin is what keeps a test that patches `builtins.open` working.
-    """
-    from flash.engine.worker.train.entry import backend_common
-
-    return backend_common
-
-
 class ChildOutputTail:
     """bounded ring buffer of a subprocess's most recent output lines.
 
@@ -481,8 +468,7 @@ def collect_ray_failure_logs(
     for name in RAY_FAILURE_LOGS:
         src = os.path.join(logs_dir, name)
         try:
-            opener = getattr(_backend_common(), "open", open)
-            with opener(src, "rb") as handle:
+            with open(src, "rb") as handle:
                 # seek relative to the file's OWN end and cap the read: ray may still be writing
                 # while this runs, and a getsize()-then-read() would consume from the old offset
                 # through the new EOF -- unbounded, on a dying pod with a bounded upload deadline.

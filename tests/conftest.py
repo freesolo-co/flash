@@ -463,9 +463,9 @@ def _child_subreaper_does_not_leak_between_tests():
         yield
     finally:
         libc.prctl(36, previous, 0, 0, 0)
-        import flash.engine.worker.train.entry.backend_common as _vc
+        import flash.engine.worker.verl.process as _process
 
-        _vc._ADOPTS_ORPHANS = bool(previous)
+        _process._ADOPTS_ORPHANS = bool(previous)
 
 
 @pytest.fixture(autouse=True)

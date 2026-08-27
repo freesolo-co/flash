@@ -23,13 +23,10 @@ def test_sft_worker_requests_the_fused_loss_its_sizing_assumes():
     there is no in-process model to patch and nothing left of ours for those to cover.
     """
     from flash.engine.plan.vram import sft_chunked_nll_enabled
-    from flash.engine.worker.train.entry import sft_train
-
-    # the fused-kernel override is rendered in train.sft.config, the liger choice still in
-    # sft_train, so this guard spans both.
+    from flash.engine.worker.train.sft import orchestration
     from flash.engine.worker.train.sft.setup import config as sft_config
 
-    source = inspect.getsource(sft_train) + inspect.getsource(sft_config)
+    source = inspect.getsource(orchestration) + inspect.getsource(sft_config)
     assert '"model.use_fused_kernels=true"' in source
     assert '"use_liger": False' in source
     # the discount is not universal, so the gate must still be a real allowlist, not a constant.

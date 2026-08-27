@@ -33,6 +33,10 @@ from flash.engine.worker.perf.lifecycle import RetriableInfraError
 from flash.engine.worker.train.core.child import runtime as child_runtime
 from flash.engine.worker.train.entry import backend_common as vc
 from flash.engine.worker.train.entry import rl_train
+from flash.engine.worker.verl import capabilities as verl_capabilities
+from flash.engine.worker.verl import diagnostics as verl_diagnostics
+from flash.engine.worker.verl import install as verl_install
+from flash.engine.worker.verl import process as verl_process
 
 # the stamp reads the run's modality off `exclude_modules`: the language-prefix regex for a
 # text-only run, None for a multimodal one. these artifacts are text-only.
@@ -330,7 +334,7 @@ def test_stamp_adapter_dir_provenance_rejects_base_mismatch(tmp_path):
 
 def test_resolve_verl_python_prefers_preset(monkeypatch, tmp_path):
     monkeypatch.setenv("FLASH_VERL_PYTHON", "/opt/verl/bin/python")
-    assert vc.resolve_verl_python(str(tmp_path)) == "/opt/verl/bin/python"
+    assert verl_install.resolve_verl_python(str(tmp_path)) == "/opt/verl/bin/python"
 
 
 @pytest.mark.parametrize("blank", ["", "   "])
@@ -338,9 +342,9 @@ def test_resolve_verl_python_treats_an_empty_preset_as_unset(monkeypatch, tmp_pa
     # a missing or blank image preset takes the isolated pinned-fork provisioning path.
     calls = []
     monkeypatch.setenv("FLASH_VERL_PYTHON", blank)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls))
 
-    python_bin = vc.resolve_verl_python(str(tmp_path))
+    python_bin = verl_install.resolve_verl_python(str(tmp_path))
 
     assert python_bin.endswith("/verl-venv/bin/python")
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in calls[1])
@@ -371,9 +375,9 @@ def _record_run(calls, *, keep_check: bool = False):
 def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_path):
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls))
 
-    python_bin = vc.resolve_verl_python(str(tmp_path))
+    python_bin = verl_install.resolve_verl_python(str(tmp_path))
 
     assert python_bin.endswith("/verl-venv/bin/python")
     # the interpreter is NAMED, not inherited: FLASH_ATTN_SPEC is a cp312-only wheel and flash
@@ -450,10 +454,10 @@ def test_a_transient_wheel_download_failure_is_retried_rather_than_fatal(monkeyp
     fake_run, attempts = _flaky_wheel_install(
         calls, sleeps, failures=vc.FLASH_ATTN_INSTALL_ATTEMPTS - 1
     )
-    monkeypatch.setattr(vc.subprocess, "run", fake_run)
-    monkeypatch.setattr(vc.time, "sleep", sleeps.append)
+    monkeypatch.setattr(verl_install.subprocess, "run", fake_run)
+    monkeypatch.setattr(verl_install.time, "sleep", sleeps.append)
 
-    python_bin = vc.resolve_verl_python(str(tmp_path))
+    python_bin = verl_install.resolve_verl_python(str(tmp_path))
 
     assert python_bin.endswith("/verl-venv/bin/python")
     # the whole budget is usable: the last attempt succeeding must still provision the run.
@@ -476,11 +480,11 @@ def test_an_exhausted_wheel_install_hands_the_arm_back_instead_of_burning_it(mon
     calls, sleeps = [], []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
     fake_run, attempts = _flaky_wheel_install(calls, sleeps, failures=99)
-    monkeypatch.setattr(vc.subprocess, "run", fake_run)
-    monkeypatch.setattr(vc.time, "sleep", sleeps.append)
+    monkeypatch.setattr(verl_install.subprocess, "run", fake_run)
+    monkeypatch.setattr(verl_install.time, "sleep", sleeps.append)
 
     with pytest.raises(RetriableInfraError) as caught:
-        vc.resolve_verl_python(str(tmp_path))
+        verl_install.resolve_verl_python(str(tmp_path))
 
     # bounded: a genuinely broken wheel spec still terminates. the plane's own INFRA_RETRY_FLOOR
     # bounds the reprovisioning, so a false-positive retry costs attempts, not an unbounded loop.
@@ -501,9 +505,9 @@ def test_the_fallback_install_overrides_the_three_ceilings_it_violates(monkeypat
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls))
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     install = calls[1]
     assert "--override" in install
@@ -523,9 +527,9 @@ def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch,
     # path, so an install of VERL_REQUIREMENT alone provisions an interpreter that cannot launch.
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls))
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     install = calls[1]
     # the [vllm] extra, as Dockerfile.worker's VERL_SPEC asks for it, on the same commit.
@@ -546,9 +550,9 @@ def test_provisioned_venv_gets_flash_attn_for_the_remove_padding_path(monkeypatc
     # the child interpreter or the first paid training batch fails.
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls))
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     flat = [arg for command in calls for arg in command]
     assert vc.FLASH_ATTN_INSTALL_SPEC in flat, (
@@ -566,13 +570,13 @@ def test_flash_attn_spec_stays_in_lockstep_with_the_worker_image():
     dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
     text = dockerfile.read_text()
     assert f"ARG FLASH_ATTN_SPEC={vc.FLASH_ATTN_SPEC}" in text, (
-        "Dockerfile.worker's FLASH_ATTN_SPEC default drifted from backend_common.FLASH_ATTN_SPEC"
+        "Dockerfile.worker's FLASH_ATTN_SPEC default drifted from verl.install.FLASH_ATTN_SPEC"
     )
     # and so must the checksum: the wheel comes from an individual's github release repo, where the
     # asset behind a fixed url can be replaced. two fetch sites verifying different digests would
     # mean the no-image path and the image no longer agree on which bytes are the pinned wheel.
     assert f"ARG FLASH_ATTN_SHA256={vc.FLASH_ATTN_SHA256}" in text, (
-        "Dockerfile.worker's FLASH_ATTN_SHA256 default drifted from backend_common.FLASH_ATTN_SHA256"
+        "Dockerfile.worker's FLASH_ATTN_SHA256 default drifted from verl.install.FLASH_ATTN_SHA256"
     )
     # the install must actually ask for the digest: a pinned constant nothing hands to uv leaves
     # the fetch as unverified as it was without one.
@@ -885,7 +889,7 @@ def test_an_unconvincing_child_leaves_every_capability_fail_closed(monkeypatch, 
     # the SAME fail-closed answer each separate subprocess used to produce -- never a partial dict
     # a caller would read as an affirmative.
     monkeypatch.setattr(
-        vc.subprocess,
+        verl_capabilities.subprocess,
         "run",
         lambda *a, **k: SimpleNamespace(returncode=returncode, stdout=stdout, stderr=""),
     )
@@ -913,9 +917,9 @@ def test_a_slow_gdn_smoke_cannot_retract_the_answers_already_flushed(monkeypatch
 
     def _timeout(*a, **k):
         # the gdn question never answered: the child was killed inside the live cuda kernel.
-        raise vc.subprocess.TimeoutExpired(cmd="python", timeout=1, output=early, stderr="")
+        raise subprocess.TimeoutExpired(cmd="python", timeout=1, output=early, stderr="")
 
-    monkeypatch.setattr(vc.subprocess, "run", _timeout)
+    monkeypatch.setattr(verl_capabilities.subprocess, "run", _timeout)
     caps = vc.probe_verl_capabilities("/verl/bin/python", "m.o.d")
 
     assert vc.verl_declares_rollout_field(caps, "mask_truncated_completions") is True
@@ -931,9 +935,9 @@ def test_a_timed_out_child_that_answered_nothing_still_fails_every_capability_cl
     # keeping partial answers must not weaken the total-failure path: a child killed before it
     # flushed anything is indistinguishable from a dead one and must fail closed everywhere.
     def _timeout(*a, **k):
-        raise vc.subprocess.TimeoutExpired(cmd="python", timeout=1, output="", stderr="")
+        raise subprocess.TimeoutExpired(cmd="python", timeout=1, output="", stderr="")
 
-    monkeypatch.setattr(vc.subprocess, "run", _timeout)
+    monkeypatch.setattr(verl_capabilities.subprocess, "run", _timeout)
     assert vc.probe_verl_capabilities("/verl/bin/python", "m.o.d") == vc._CAPABILITIES_UNAVAILABLE
 
 
@@ -960,7 +964,7 @@ def test_a_child_that_omits_a_key_leaves_it_fail_closed(monkeypatch):
     # fail-closed default rather than vanishing from the dict and turning every caller's
     # `caps.get(...)` into an implicit None that reads differently per call site.
     monkeypatch.setattr(
-        vc.subprocess,
+        verl_capabilities.subprocess,
         "run",
         lambda *a, **k: SimpleNamespace(
             returncode=0, stdout='FLASH_VERL_CAPS={"flashinfer": true}\n', stderr=""
@@ -1001,7 +1005,7 @@ def test_child_diagnostics_survive_the_answered_early_return(monkeypatch, capsys
     The fixture must both answer `flashinfer` and emit the line to exercise that exact path.
     """
     monkeypatch.setattr(
-        vc.subprocess,
+        verl_capabilities.subprocess,
         "run",
         lambda *a, **k: SimpleNamespace(
             returncode=0,
@@ -1054,7 +1058,7 @@ def test_fla_stays_in_lockstep_with_the_worker_image():
     text = (pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker").read_text()
     sha = vc.FLA_REQUIREMENT.rsplit("@", 1)[1]
     assert text.count(sha) >= 2, (
-        "Dockerfile.worker must pin the same fla sha as backend_common.FLA_REQUIREMENT in BOTH the "
+        "Dockerfile.worker must pin the same fla sha as verl.install.FLA_REQUIREMENT in both the "
         "main interpreter and the verl venv"
     )
     assert text.count(vc.CAUSAL_CONV1D_REQUIREMENT) >= 2, (
@@ -1069,9 +1073,9 @@ def test_the_verl_venv_gets_the_gdn_kernels(monkeypatch, tmp_path):
     # boundary shim is inert and packed gdn training is contaminated while looking patched.
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls))
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     flat = [arg for command in calls for arg in command]
     assert vc.FLA_REQUIREMENT in flat, (
@@ -1093,9 +1097,9 @@ def test_causal_conv1d_install_is_best_effort_and_leaves_no_env_residue(monkeypa
         return _Completed(0)
 
     monkeypatch.delenv("CAUSAL_CONV1D_FORCE_BUILD", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+    monkeypatch.setattr(verl_install.subprocess, "run", fake_run)
 
-    vc._install_causal_conv1d("/venv/bin/python")
+    verl_install._install_causal_conv1d("/venv/bin/python")
 
     assert vc.CAUSAL_CONV1D_REQUIREMENT in seen["command"]
     assert seen["check"] is False, "a failed conv build must not kill provisioning"
@@ -1120,7 +1124,7 @@ def _record_run_with_conv_exit(calls, conv_exit, *, import_exit=0, cudart_exit=0
     ``cudart_exit`` drives the child libcudart stub repair, which exits nonzero when it leaves the
     stub shadowing libcudart.
     """
-    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+    from flash.engine.worker.verl.install import _CHILD_CUDART_FIX
 
     inner = _record_run(calls)
 
@@ -1146,9 +1150,9 @@ def test_a_missed_conv_build_leaves_the_venv_unstamped_so_the_next_attempt_rebui
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 1))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run_with_conv_exit(calls, 1))
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert not stamp.exists(), "a venv missing the conv kernel was stamped as fully provisioned"
@@ -1160,9 +1164,9 @@ def test_a_successful_conv_build_still_stamps_the_venv(monkeypatch, tmp_path):
     """The guard must key on the build outcome, not stop stamping altogether."""
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run_with_conv_exit(calls, 0))
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert stamp.read_text() == vc.VERL_VENV_STAMP
@@ -1175,13 +1179,15 @@ def test_an_unrepaired_child_cudart_stub_leaves_the_venv_unstamped(monkeypatch, 
     attempt on this pod reuses a venv whose stamp asserts it is provisioned while its child still
     aborts on vLLM import, and the repair is never attempted again.
     """
-    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+    from flash.engine.worker.verl.install import _CHILD_CUDART_FIX
 
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0, cudart_exit=1))
+    monkeypatch.setattr(
+        verl_install.subprocess, "run", _record_run_with_conv_exit(calls, 0, cudart_exit=1)
+    )
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert not stamp.exists(), (
@@ -1196,9 +1202,11 @@ def test_a_repaired_child_cudart_stub_still_stamps_the_venv(monkeypatch, tmp_pat
     """The guard keys on the repair outcome; it must not stop stamping altogether."""
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0, cudart_exit=0))
+    monkeypatch.setattr(
+        verl_install.subprocess, "run", _record_run_with_conv_exit(calls, 0, cudart_exit=0)
+    )
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert stamp.read_text() == vc.VERL_VENV_STAMP
@@ -1214,9 +1222,11 @@ def test_a_conv_build_that_installs_but_cannot_import_leaves_the_venv_unstamped(
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run_with_conv_exit(calls, 0, import_exit=1))
+    monkeypatch.setattr(
+        verl_install.subprocess, "run", _record_run_with_conv_exit(calls, 0, import_exit=1)
+    )
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert not stamp.exists(), (
@@ -1267,9 +1277,9 @@ def test_the_fallback_pins_transformers_like_the_image_does(monkeypatch, tmp_pat
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls))
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     install = calls[1]
     override_file = install[install.index("--override") + 1]
@@ -1287,7 +1297,7 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
     install_quoted = f'"{vc.TRANSFORMERS_INSTALL_REQUIREMENT}"'
     assert text.count(install_quoted) == 3, (
         "Dockerfile.worker's main, override, and venv transformers pins drifted from "
-        "backend_common.TRANSFORMERS_INSTALL_REQUIREMENT"
+        "verl.install.TRANSFORMERS_INSTALL_REQUIREMENT"
     )
     # the exact override prevents transitive declarations from re-widening the deployed version.
     assert f'"{vc.TRANSFORMERS_INSTALL_REQUIREMENT}" > /tmp/verl-overrides.txt' in text
@@ -1299,7 +1309,7 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
     declared = set(re.findall(r'"(transformers>=[^"]+)"', pyproject))
     assert declared == {vc.TRANSFORMERS_REQUIREMENT}, (
         f"pyproject.toml transformers ranges {sorted(declared)} drifted from "
-        f"backend_common.TRANSFORMERS_REQUIREMENT ({vc.TRANSFORMERS_REQUIREMENT!r}); every extra "
+        f"verl.install.TRANSFORMERS_REQUIREMENT ({vc.TRANSFORMERS_REQUIREMENT!r}); every extra "
         "must declare the range the worker image is built and tested against"
     )
     # and every extra that names transformers at all must name it (four today: gpu, server, dev,
@@ -1328,7 +1338,7 @@ def test_verl_spec_stays_in_lockstep_with_the_worker_image():
     dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
     expected = f"ARG VERL_SPEC=verl[vllm]@{vc.VERL_REQUIREMENT_URL}"
     assert expected in dockerfile.read_text(), (
-        "Dockerfile.worker's VERL_SPEC drifted from backend_common.VERL_REQUIREMENT_URL"
+        "Dockerfile.worker's VERL_SPEC drifted from verl.install.VERL_REQUIREMENT_URL"
     )
 
 
@@ -1337,16 +1347,16 @@ def test_the_venv_stamp_records_the_pin_not_the_install_extras(monkeypatch, tmp_
     # every later call would see a mismatch and rebuild the venv from scratch on a paid pod.
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls))
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
     written = (tmp_path / "verl-venv" / "flash-verl-requirement").read_text()
     assert written == vc.VERL_VENV_STAMP
     assert "[vllm]" not in written
     built = len(calls)
 
     (tmp_path / "verl-venv" / "bin" / "python").write_text("")
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
     assert len(calls) == built, "a venv built from the current pin must not be rebuilt"
 
 
@@ -1358,11 +1368,11 @@ def test_the_stamp_identifies_flash_attn_so_a_prefix_venv_is_not_reused(monkeypa
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls))
     # exactly what the pre-fix release wrote: the bare verl pin, nothing about the wheel.
     _fake_verl_venv(tmp_path, stamp=vc.VERL_REQUIREMENT)
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     assert calls, "a venv stamped before flash-attn was installed must be rebuilt"
     assert any(vc.FLASH_ATTN_INSTALL_SPEC in call for call in calls)
@@ -1371,10 +1381,10 @@ def test_the_stamp_identifies_flash_attn_so_a_prefix_venv_is_not_reused(monkeypa
 def test_resolve_verl_python_reuses_a_venv_built_from_the_current_pin(monkeypatch, tmp_path):
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls))
     _fake_verl_venv(tmp_path, stamp=vc.VERL_VENV_STAMP)
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     # reinstalling verl's torch/vllm on every retry would cost many minutes of paid gpu time.
     assert calls == []
@@ -1390,11 +1400,11 @@ def test_resolve_verl_python_rebuilds_a_venv_that_is_not_the_current_pin(
     # must be rebuilt rather than silently training on the wrong verl.
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls))
     venv = _fake_verl_venv(tmp_path, stamp=stale)
     (venv / "marker").write_text("from the previous attempt")
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     # three installs, then the conv import probe and the libcudart stub repair (both run the venv's
     # python, not uv).
@@ -1415,12 +1425,12 @@ def test_resolve_verl_python_clears_a_venv_whose_creation_was_interrupted(monkey
     # every later retry. it must be removed before uv runs.
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls))
     venv = tmp_path / "verl-venv"
     venv.mkdir()
     (venv / "pyvenv.cfg").write_text("half-written")
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     assert not (venv / "pyvenv.cfg").exists()
     assert [c[:2] for c in calls] == [
@@ -1460,9 +1470,9 @@ def test_verl_pin_matches_the_version_opd_requires_exactly():
 def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypatch, tmp_path):
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls, keep_check=True))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls, keep_check=True))
 
-    vc.resolve_verl_python(str(tmp_path), install_wandb=True)
+    verl_install.resolve_verl_python(str(tmp_path), install_wandb=True)
 
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in calls[1][0])
     # wandb is the LAST call: it follows the kernel installs, and unlike the required ones before it
@@ -1496,11 +1506,11 @@ def test_resolve_verl_python_installs_wandb_into_a_venv_it_is_reusing(monkeypatc
     """
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls, keep_check=True))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls, keep_check=True))
     # exactly what an earlier run without WANDB_API_KEY leaves on the pod.
     _fake_verl_venv(tmp_path, stamp=vc.VERL_VENV_STAMP)
 
-    vc.resolve_verl_python(str(tmp_path), install_wandb=True)
+    verl_install.resolve_verl_python(str(tmp_path), install_wandb=True)
 
     assert _wandb_installs(calls, tmp_path), (
         "a reused venv was never offered wandb, so this run logs to console only"
@@ -1515,9 +1525,9 @@ def test_resolve_verl_python_retries_wandb_after_an_install_that_failed(monkeypa
     # wandb. that must not be permanent for the life of the pod -- the next run has to try again.
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls, keep_check=True))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls, keep_check=True))
 
-    vc.resolve_verl_python(str(tmp_path), install_wandb=True)
+    verl_install.resolve_verl_python(str(tmp_path), install_wandb=True)
     assert len(_wandb_installs(calls, tmp_path)) == 1
     # the fake `uv venv` makes bin/ but not the interpreter inside it, and resolve checks for the
     # file. materialize it, or the second call rebuilds and the reuse path is never reached -- the
@@ -1526,7 +1536,7 @@ def test_resolve_verl_python_retries_wandb_after_an_install_that_failed(monkeypa
     assert (tmp_path / "verl-venv/flash-verl-requirement").read_text() == vc.VERL_VENV_STAMP
     reused_from = len(calls)
 
-    vc.resolve_verl_python(str(tmp_path), install_wandb=True)
+    verl_install.resolve_verl_python(str(tmp_path), install_wandb=True)
     assert len(_wandb_installs(calls, tmp_path)) == 2, "a failed install was never retried"
     # and the retry cost exactly the wandb install: the second call reused the venv rather than
     # reprovisioning it, which is what makes an unconditional retry affordable.
@@ -1538,10 +1548,10 @@ def test_resolve_verl_python_does_not_install_wandb_when_it_was_not_asked(monkey
     # WANDB_API_KEY must not pay an install it cannot use.
     calls = []
     monkeypatch.delenv("FLASH_VERL_PYTHON", raising=False)
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls, keep_check=True))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls, keep_check=True))
     _fake_verl_venv(tmp_path, stamp=vc.VERL_VENV_STAMP)
 
-    vc.resolve_verl_python(str(tmp_path))
+    verl_install.resolve_verl_python(str(tmp_path))
 
     assert calls == []
 
@@ -1551,9 +1561,12 @@ def test_resolve_verl_python_never_installs_wandb_into_a_preset_interpreter(monk
     # returned as-is. moving the wandb install later in the function must not reach past that return.
     calls = []
     monkeypatch.setenv("FLASH_VERL_PYTHON", "/opt/verl/bin/python")
-    monkeypatch.setattr(vc.subprocess, "run", _record_run(calls, keep_check=True))
+    monkeypatch.setattr(verl_install.subprocess, "run", _record_run(calls, keep_check=True))
 
-    assert vc.resolve_verl_python(str(tmp_path), install_wandb=True) == "/opt/verl/bin/python"
+    assert (
+        verl_install.resolve_verl_python(str(tmp_path), install_wandb=True)
+        == "/opt/verl/bin/python"
+    )
     assert calls == []
 
 
@@ -1612,9 +1625,9 @@ def test_resolve_verl_python_returns_preset_unmodified(monkeypatch, tmp_path):
     # separately by the batched capability probe.
     calls = []
     monkeypatch.setenv("FLASH_VERL_PYTHON", "/opt/verl/bin/python")
-    monkeypatch.setattr(vc.subprocess, "run", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(verl_install.subprocess, "run", lambda *a, **k: calls.append(a))
 
-    assert vc.resolve_verl_python(str(tmp_path)) == "/opt/verl/bin/python"
+    assert verl_install.resolve_verl_python(str(tmp_path)) == "/opt/verl/bin/python"
     assert calls == []
 
 
@@ -1622,7 +1635,7 @@ def test_run_verl_training_streams_steps_and_returns_code():
     seen: list[int] = []
     lines: list[str] = []
     beats: list[int] = []
-    code = vc.run_verl_training(
+    code = verl_process.run_verl_training(
         ["bash", "-c", "echo 'foo step: 1 bar'; echo 'step: 2'; echo done"],
         env=dict(os.environ),
         on_step=seen.append,
@@ -1638,7 +1651,7 @@ def test_run_verl_training_streams_steps_and_returns_code():
 
 
 def test_run_verl_training_propagates_nonzero_exit():
-    code = vc.run_verl_training(
+    code = verl_process.run_verl_training(
         ["bash", "-c", "echo 'step: 1'; exit 7"],
         env=dict(os.environ),
         on_step=lambda _s: None,
@@ -1651,7 +1664,7 @@ def test_run_verl_training_terminates_child_when_callback_fails():
         raise RuntimeError("checkpoint upload failed")
 
     with pytest.raises(RuntimeError, match="checkpoint upload failed"):
-        vc.run_verl_training(
+        verl_process.run_verl_training(
             ["bash", "-c", "echo ready; sleep 30"],
             env=dict(os.environ),
             on_line=fail,
@@ -1678,7 +1691,7 @@ def test_run_verl_training_kills_the_grandchild_not_just_the_direct_child(tmp_pa
         raise RuntimeError("stream died")
 
     with pytest.raises(RuntimeError, match="stream died"):
-        vc.run_verl_training(["bash", "-c", script], env=dict(os.environ), on_line=fail)
+        verl_process.run_verl_training(["bash", "-c", script], env=dict(os.environ), on_line=fail)
 
     deadline = time.monotonic() + 15.0
     while time.monotonic() < deadline and not marker.exists():
@@ -1723,7 +1736,7 @@ def test_child_output_tail_drops_blank_lines_and_caps_line_width():
 def test_run_verl_training_records_child_output_into_the_tail():
     """the child's words must reach the tail, because the parent's stdout reaches no log stream."""
     tail = vc.ChildOutputTail()
-    code = vc.run_verl_training(
+    code = verl_process.run_verl_training(
         ["bash", "-c", "echo 'ray placement group pending'; echo 'step: 1'; echo 'wedged here'"],
         env=dict(os.environ),
         tail=tail,
@@ -1739,7 +1752,7 @@ def test_run_verl_training_records_child_output_into_the_tail():
 def test_run_verl_training_without_a_tail_is_unchanged():
     """tail is opt-in; omitting it must not alter streaming or the exit code."""
     lines: list[str] = []
-    code = vc.run_verl_training(
+    code = verl_process.run_verl_training(
         ["bash", "-c", "echo 'step: 4'; exit 3"],
         env=dict(os.environ),
         on_line=lines.append,
@@ -1767,7 +1780,7 @@ def test_run_verl_training_retries_nested_cuda_device_unavailable_after_tail_evi
     env = {**os.environ, "TEST_SIGNATURE": signature}
 
     with pytest.raises(RetriableInfraError) as exc_info:
-        vc.run_verl_training(command, env=env, tail=tail)
+        verl_process.run_verl_training(command, env=env, tail=tail)
 
     assert signature in str(exc_info.value)
     assert signature not in tail.tail()
@@ -1783,7 +1796,7 @@ def test_child_output_tail_latches_signature_before_line_truncation():
 
 
 def test_run_verl_training_does_not_reclassify_a_zero_exit():
-    code = vc.run_verl_training(
+    code = verl_process.run_verl_training(
         ["bash", "-c", "echo 'cudaErrorDevicesUnavailable'; exit 0"],
         env=dict(os.environ),
     )
@@ -1792,7 +1805,7 @@ def test_run_verl_training_does_not_reclassify_a_zero_exit():
 
 
 def test_run_verl_training_leaves_an_unclassified_nonzero_exit_terminal():
-    code = vc.run_verl_training(
+    code = verl_process.run_verl_training(
         ["bash", "-c", "printf '%s\\n' 'unrelated child failure' >&2; exit 9"],
         env=dict(os.environ),
     )
@@ -1807,7 +1820,7 @@ def test_run_verl_training_classifies_a_child_cuda_oom_rather_than_returning_it(
     lifecycle escalates GPU size; it is not a `RetriableInfraError`.
     """
     with pytest.raises(RuntimeError) as exc_info:
-        vc.run_verl_training(
+        verl_process.run_verl_training(
             ["bash", "-c", "printf '%s\\n' 'CUDA out of memory' >&2; exit 9"],
             env=dict(os.environ),
         )
@@ -1839,7 +1852,7 @@ def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
     tail = vc.ChildOutputTail(limit=3)
 
     with pytest.raises(RuntimeError) as exc_info:
-        vc.run_verl_training(
+        verl_process.run_verl_training(
             command,
             env={**os.environ, "FIRST": first, "SECOND": second},
             tail=tail,
@@ -2149,9 +2162,9 @@ def quick_teardown_grace(monkeypatch):
     """shorten the escalation grace so a test that deliberately ignores SIGTERM stays fast.
 
     These tests assert SIGKILL and complete reaping, neither of which depends on the production
-    30-second grace.
+    10-second teardown grace.
     """
-    monkeypatch.setattr(vc, "_TEARDOWN_GRACE_S", 0.5)
+    monkeypatch.setattr(verl_process, "_TEARDOWN_GRACE_S", 0.5)
     return 0.5
 
 
@@ -2180,7 +2193,7 @@ def test_kill_process_group_escalates_to_sigkill_when_sigterm_is_ignored(quick_t
         assert child.stdout is not None
         assert child.stdout.readline().strip() == "ready"
         started = time.monotonic()
-        vc.kill_process_group(child)
+        verl_process.kill_process_group(child)
         assert child.poll() is not None, "child ignoring SIGTERM survived kill_process_group"
         # negative-signal returncode identifies which signal actually reaped it.
         assert child.returncode == -signal.SIGKILL
@@ -2221,7 +2234,7 @@ def test_kill_process_group_reaps_a_grandchild_that_outlives_the_leader(quick_te
         assert leader.stdout is not None
         grandchild_pid = int(leader.stdout.readline().strip())
         started = time.monotonic()
-        vc.kill_process_group(leader)
+        verl_process.kill_process_group(leader)
         assert leader.poll() is not None
         # the leader dying is not the property under test -- the grandchild being gone is. poll
         # rather than assert instantly: sigkill delivery and reaping are asynchronous, so a bare
@@ -2355,7 +2368,7 @@ def test_classified_run_verl_exit_drains_group_after_leader_is_reaped(
     grandchild_pid = None
     try:
         with pytest.raises(RetriableInfraError, match="cudaErrorDevicesUnavailable"):
-            vc.run_verl_training(_classified_exit_command(marker), env=dict(os.environ))
+            verl_process.run_verl_training(_classified_exit_command(marker), env=dict(os.environ))
 
         assert marker.exists(), "leader exited before recording its surviving grandchild"
         grandchild_pid = int(marker.read_text())
@@ -2380,7 +2393,9 @@ def test_unclassified_run_verl_exit_drains_the_group_it_leaves_behind(
     marker = tmp_path / "unclassified-grandchild.pid"
     grandchild_pid = None
     try:
-        code = vc.run_verl_training(_unclassified_exit_command(marker), env=dict(os.environ))
+        code = verl_process.run_verl_training(
+            _unclassified_exit_command(marker), env=dict(os.environ)
+        )
 
         # returned, not raised: the status stays terminal and the caller still sees 9.
         assert code == 9
@@ -2404,7 +2419,7 @@ def test_run_verl_training_bounds_its_wait_on_a_child_that_outlives_its_stdout(
     A child can close stdout and keep running; an unbounded wait would hold a paid GPU forever.
     """
     started = time.monotonic()
-    code = vc.run_verl_training(_outlives_its_stdout_command(), env=dict(os.environ))
+    code = verl_process.run_verl_training(_outlives_its_stdout_command(), env=dict(os.environ))
     elapsed = time.monotonic() - started
 
     # the child sleeps 300s. any bound at all beats that; assert on a budget derived from the
@@ -2430,7 +2445,8 @@ def test_run_verl_training_ends_when_a_grandchild_holds_the_pipe_after_the_child
     The direct child exits while an EngineCore grandchild keeps the pipe open. Bound the test and
     require the child-exit watchdog to stop the paid-attempt stall.
     """
-    monkeypatch.setattr(vc, "_ORPHANED_PIPE_GRACE_S", 1.0)
+    monkeypatch.setattr(verl_process, "_ORPHANED_PIPE_GRACE_S", 1.0)
+    assert verl_process._ORPHANED_PIPE_GRACE_S == 1.0
     marker = tmp_path / "pipe-holder.pid"
     grandchild_pid = None
     started = time.monotonic()
@@ -2438,12 +2454,12 @@ def test_run_verl_training_ends_when_a_grandchild_holds_the_pipe_after_the_child
         # exit 0: the trainer "succeeded", so nothing about its own status hints at the survivor.
         # returning 0 here would publish a partial run as a completed one.
         with pytest.raises(RuntimeError, match="held its output pipe open"):
-            vc.run_verl_training(
+            verl_process.run_verl_training(
                 _orphaned_pipe_command(marker, leader_status=0), env=dict(os.environ)
             )
         elapsed = time.monotonic() - started
 
-        assert elapsed < 60, (
+        assert elapsed < 10 * verl_process._ORPHANED_PIPE_GRACE_S, (
             f"blocked {elapsed:.1f}s reading a pipe whose writer had already exited; in production "
             "this runs until the provider's wall-clock limit on a paid gpu"
         )
@@ -2466,7 +2482,8 @@ def test_child_exit_watchdog_does_not_kill_a_reader_still_draining_a_backlog(mon
     turn a successful run into a failure.
     """
     # a grace this short fires between consecutive callbacks, so only progress-awareness saves it.
-    monkeypatch.setattr(vc, "_ORPHANED_PIPE_GRACE_S", 0.2)
+    monkeypatch.setattr(verl_process, "_ORPHANED_PIPE_GRACE_S", 0.2)
+    assert verl_process._ORPHANED_PIPE_GRACE_S == 0.2
     # the child writes its whole backlog and exits immediately, so every line below is read AFTER
     # the direct child is already gone -- exactly the state that arms the watchdog.
     script = "import sys\nfor i in range(8): print(f'step: {i}', flush=True)\nsys.exit(0)"
@@ -2477,7 +2494,7 @@ def test_child_exit_watchdog_does_not_kill_a_reader_still_draining_a_backlog(mon
         seen.append(step)
         time.sleep(0.15)
 
-    code = vc.run_verl_training(
+    code = verl_process.run_verl_training(
         [sys.executable, "-c", script], env=dict(os.environ), on_step=slow_step
     )
 
@@ -2495,7 +2512,8 @@ def test_child_exit_watchdog_does_not_kill_a_reader_inside_one_long_callback(mon
     One checkpoint callback can run for minutes. Counting only entry makes it look stuck and tears
     down a successful upload; completion must advance progress too.
     """
-    monkeypatch.setattr(vc, "_ORPHANED_PIPE_GRACE_S", 0.2)
+    monkeypatch.setattr(verl_process, "_ORPHANED_PIPE_GRACE_S", 0.2)
+    assert verl_process._ORPHANED_PIPE_GRACE_S == 0.2
     # the child exits immediately, so the callback below runs with the watchdog already armed.
     script = "import sys\nprint('step: 1', flush=True)\nsys.exit(0)"
     finished = []
@@ -2505,7 +2523,7 @@ def test_child_exit_watchdog_does_not_kill_a_reader_inside_one_long_callback(mon
         time.sleep(1.2)
         finished.append(step)
 
-    code = vc.run_verl_training(
+    code = verl_process.run_verl_training(
         [sys.executable, "-c", script], env=dict(os.environ), on_step=one_slow_step
     )
 
@@ -2525,7 +2543,7 @@ def test_child_exit_watchdog_leaves_a_healthy_quiet_child_alone(quick_teardown_g
     # a grace of 0 would fire the instant the child exits, so any teardown observed here is
     # attributable to quiet alone.
     script = "import time,sys; time.sleep(2); print('step: 1', flush=True); sys.exit(0)"
-    code = vc.run_verl_training(
+    code = verl_process.run_verl_training(
         [sys.executable, "-c", script],
         env=dict(os.environ),
         heartbeat_interval_s=0.1,
@@ -2548,17 +2566,17 @@ def test_a_group_whose_only_member_is_a_zombie_is_not_read_as_alive():
         while time.monotonic() < deadline and os.getpgid(pid) != pid:
             time.sleep(0.02)
         pgid = os.getpgid(pid)
-        assert vc._process_group_alive(pgid), "a running group must read as alive"
+        assert verl_process._process_group_alive(pgid), "a running group must read as alive"
 
         os.kill(pid, signal.SIGKILL)
         # deliberately unreaped: waitpid here would clear the zombie and destroy the case.
         deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and not vc._process_is_zombie(pid):
+        while time.monotonic() < deadline and not verl_process._process_is_zombie(pid):
             time.sleep(0.02)
-        assert vc._process_is_zombie(pid), "child should be an unreaped zombie"
+        assert verl_process._process_is_zombie(pid), "child should be an unreaped zombie"
         assert os.killpg(pgid, 0) is None, "the zombie group is still addressable"
 
-        assert not vc._process_group_alive(pgid), (
+        assert not verl_process._process_group_alive(pgid), (
             "a zombie-only group must not read as alive, or teardown waits out the full deadline"
         )
     finally:
@@ -2588,15 +2606,15 @@ def test_teardown_returns_promptly_when_the_survivor_is_only_a_zombie():
         os._exit(0)
     try:
         deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and not vc._process_is_zombie(pid):
+        while time.monotonic() < deadline and not verl_process._process_is_zombie(pid):
             time.sleep(0.02)
-        assert vc._process_is_zombie(pid), "child should be an unreaped zombie"
+        assert verl_process._process_is_zombie(pid), "child should be an unreaped zombie"
 
         started = time.monotonic()
-        vc.kill_process_group(_ExitedChild(pid))
+        verl_process.kill_process_group(_ExitedChild(pid))
         elapsed = time.monotonic() - started
 
-        assert elapsed < vc._TEARDOWN_GRACE_S, (
+        assert elapsed < verl_process._TEARDOWN_GRACE_S, (
             f"teardown took {elapsed:.1f}s waiting on a zombie that no signal can clear"
         )
     finally:
@@ -2615,7 +2633,7 @@ def test_an_unreadable_process_status_does_not_read_as_exited(monkeypatch):
     )
     try:
         pgid = os.getpgid(child.pid)
-        assert not vc._process_is_zombie(child.pid), "a running pid is not a zombie"
+        assert not verl_process._process_is_zombie(child.pid), "a running pid is not a zombie"
 
         real_open = builtins.open
 
@@ -2625,8 +2643,10 @@ def test_an_unreadable_process_status_does_not_read_as_exited(monkeypatch):
             return real_open(path, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "open", out_of_descriptors)
-        assert not vc._process_is_zombie(child.pid), "EMFILE is not evidence that the pid exited"
-        assert vc._process_group_alive(pgid), (
+        assert not verl_process._process_is_zombie(child.pid), (
+            "EMFILE is not evidence that the pid exited"
+        )
+        assert verl_process._process_group_alive(pgid), (
             "a group whose members are merely unreadable must still be signalled"
         )
     finally:
@@ -2639,7 +2659,7 @@ def test_a_missing_process_still_reads_as_exited():
     # is still caught, or a group that really has drained would spin out both deadlines.
     child = subprocess.Popen([sys.executable, "-c", "pass"])
     child.wait(timeout=10)  # reaped by Popen, so the pid is fully gone rather than a zombie
-    assert vc._process_is_zombie(child.pid), "a reaped pid must not read as alive"
+    assert verl_process._process_is_zombie(child.pid), "a reaped pid must not read as alive"
 
 
 @_needs_process_teardown
@@ -2653,9 +2673,18 @@ def test_an_empty_group_snapshot_is_rechecked_against_the_kernel(monkeypatch):
     )
     try:
         pgid = os.getpgid(child.pid)
-        monkeypatch.setattr(vc, "_process_group_members", lambda _pgid: [])
-        assert vc._process_group_alive(pgid), (
+        snapshots = []
+
+        def empty_snapshot(requested_pgid):
+            snapshots.append(requested_pgid)
+            return []
+
+        monkeypatch.setattr(verl_process, "_process_group_members", empty_snapshot)
+        assert verl_process._process_group_alive(pgid), (
             "an empty walk of a group the kernel still knows is a missed member, not a drain"
+        )
+        assert snapshots == [pgid, pgid], (
+            "flash.engine.worker.verl.process did not consume both injected snapshots"
         )
     finally:
         child.kill()
@@ -2679,21 +2708,21 @@ def test_a_zombie_only_snapshot_taken_before_a_fork_is_not_a_drain(subreaper):
     try:
         os.setpgid(leader, leader)
         deadline = time.monotonic() + 10
-        while not vc._process_is_zombie(leader):
+        while not verl_process._process_is_zombie(leader):
             assert time.monotonic() < deadline, "the leader never exited"
             time.sleep(0.01)
-        child = next(p for p in vc._process_group_members(leader) or () if p != leader)
+        child = next(p for p in verl_process._process_group_members(leader) or () if p != leader)
 
         # the stale walk: taken before the fork was published, so it sees only the leader.
         scans = [[leader]]
-        real = vc._process_group_members
-        vc._process_group_members = lambda pgid: scans.pop(0) if scans else real(pgid)
+        real = verl_process._process_group_members
+        verl_process._process_group_members = lambda pgid: scans.pop(0) if scans else real(pgid)
         try:
-            assert vc._process_group_alive(leader), (
+            assert verl_process._process_group_alive(leader), (
                 "a zombie-only walk taken mid-fork was read as a drain, so SIGKILL is skipped"
             )
         finally:
-            vc._process_group_members = real
+            verl_process._process_group_members = real
     finally:
         if child is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -2716,11 +2745,11 @@ def test_a_group_that_really_is_zombie_only_still_drains(subreaper):
     try:
         os.setpgid(pid, pid)
         deadline = time.monotonic() + 10
-        while not vc._process_is_zombie(pid):
+        while not verl_process._process_is_zombie(pid):
             assert time.monotonic() < deadline, "the member never exited"
             time.sleep(0.01)
-        assert vc._process_group_addressable(pid), "a zombie must still hold the group id"
-        assert not vc._process_group_alive(pid), (
+        assert verl_process._process_group_addressable(pid), "a zombie must still hold the group id"
+        assert not verl_process._process_group_alive(pid), (
             "a settled zombie-only group is drained; reporting it alive burns both deadlines"
         )
     finally:
@@ -2764,7 +2793,9 @@ def test_a_production_entry_point_does_not_leave_this_process_adopting_orphans()
         libc.prctl(_PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0)
         assert _child_subreaper_setting() == 0
 
-        code = vc.run_verl_training(["bash", "-c", "echo 'step: 1'"], env=dict(os.environ))
+        code = verl_process.run_verl_training(
+            ["bash", "-c", "echo 'step: 1'"], env=dict(os.environ)
+        )
         assert code == 0
         # inside the test the claim is expected: the entry point needs it to reap its own orphans.
         assert _child_subreaper_setting() == 1, "the entry point never claimed adoption at all"
@@ -2787,13 +2818,13 @@ def test_the_conftest_fixture_restores_the_flag_the_entry_point_set():
         "    libc.prctl(37, ctypes.byref(cur), 0, 0, 0)\n"
         "    return cur.value\n"
         "import os\n"
-        "from flash.engine.worker.train.entry import backend_common as vc\n"
+        "from flash.engine.worker.verl import process as verl_process\n"
         "def test_claims_adoption():\n"
-        "    vc.run_verl_training(['bash', '-c', \"echo 'step: 1'\"], env=dict(os.environ))\n"
+        "    verl_process.run_verl_training(['bash', '-c', \"echo 'step: 1'\"], env=dict(os.environ))\n"
         "    assert flag() == 1\n"
         "def test_zz_sees_it_restored():\n"
         "    assert flag() == 0, 'PR_SET_CHILD_SUBREAPER leaked into a later test'\n"
-        "    assert vc._ADOPTS_ORPHANS is False, 'the module still believes a claim it lost'\n"
+        "    assert verl_process._ADOPTS_ORPHANS is False, 'the module still believes a claim it lost'\n"
     )
     tests_dir = os.path.dirname(os.path.abspath(__file__))
     with tempfile.TemporaryDirectory(dir=tests_dir) as scratch:
@@ -2817,8 +2848,8 @@ def test_an_empty_snapshot_of_a_gone_group_is_still_drained():
     child = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
     pgid = os.getpgid(child.pid)
     child.wait(timeout=10)
-    assert vc._process_group_members(pgid) == []
-    assert not vc._process_group_alive(pgid), (
+    assert verl_process._process_group_members(pgid) == []
+    assert not verl_process._process_group_alive(pgid), (
         "a group with no members and no kernel entry is drained"
     )
 
@@ -2852,7 +2883,7 @@ def test_teardown_reaps_an_adopted_grandchild_rather_than_leaving_a_zombie(
     try:
         assert leader.stdout is not None
         grandchild_pid = int(leader.stdout.readline().strip())
-        vc.kill_process_group(leader)
+        verl_process.kill_process_group(leader)
         # the escalation already proves it was killed; what is under test is that nothing is left in
         # the process table afterwards.
         assert not os.path.exists(f"/proc/{grandchild_pid}"), (
@@ -2881,7 +2912,9 @@ def test_a_straggler_that_dies_after_the_deadline_is_reaped_by_the_next_teardown
     # sleep. such a member can outlast the drain deadline and turn into a zombie afterwards -- past
     # the last wait its own teardown performs -- so with no record no future wait is ever scheduled
     # and the entry is permanent on a pid-1 worker.
-    monkeypatch.setattr(vc, "_UNREAPED_STRAGGLERS", set())
+    isolated_stragglers = set()
+    monkeypatch.setattr(verl_process, "_UNREAPED_STRAGGLERS", isolated_stragglers)
+    assert verl_process._UNREAPED_STRAGGLERS is isolated_stragglers
 
     pid = os.fork()
     if pid == 0:  # pragma: no cover - runs only in the forked child
@@ -2892,8 +2925,8 @@ def test_a_straggler_that_dies_after_the_deadline_is_reaped_by_the_next_teardown
         os.setpgid(pid, pid)
         # the state at the drain deadline: the member is ours and STILL RUNNING, so the nonblocking
         # wait cannot take a status. skip a pid that is not in this group so nothing is excluded.
-        vc._reap_group_zombies(pid, skip=-1)
-        assert pid in vc._UNREAPED_STRAGGLERS, (
+        verl_process._reap_group_zombies(pid, skip=-1)
+        assert pid in verl_process._UNREAPED_STRAGGLERS, (
             "a live adopted member was forgotten at the deadline, so no later wait can reap it"
         )
 
@@ -2901,7 +2934,7 @@ def test_a_straggler_that_dies_after_the_deadline_is_reaped_by_the_next_teardown
         # sleep with a pending SIGKILL would.
         os.kill(pid, signal.SIGKILL)
         deadline = time.monotonic() + 10
-        while os.path.exists(f"/proc/{pid}") and not vc._process_is_zombie(pid):
+        while os.path.exists(f"/proc/{pid}") and not verl_process._process_is_zombie(pid):
             assert time.monotonic() < deadline, "the straggler never exited"
             time.sleep(0.01)
 
@@ -2911,12 +2944,12 @@ def test_a_straggler_that_dies_after_the_deadline_is_reaped_by_the_next_teardown
             [sys.executable, "-c", "import sys; sys.exit(0)"], start_new_session=True
         )
         later.wait(timeout=10)
-        vc.kill_process_group(later)
+        verl_process.kill_process_group(later)
 
         assert not os.path.exists(f"/proc/{pid}"), (
             "a straggler that died after its deadline was never reaped, leaking a pid per run"
         )
-        assert pid not in vc._UNREAPED_STRAGGLERS
+        assert pid not in verl_process._UNREAPED_STRAGGLERS
     finally:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.kill(pid, signal.SIGKILL)
@@ -2929,7 +2962,9 @@ def test_a_straggler_that_was_never_ours_is_not_tracked_forever(monkeypatch):
     # the other direction: `waitpid` raising ChildProcessError means the pid was never ours, which
     # is the ordinary case anywhere but pid 1. remembering those would grow the set without bound
     # on every teardown, and no wait here could ever clear them.
-    monkeypatch.setattr(vc, "_UNREAPED_STRAGGLERS", set())
+    isolated_stragglers = set()
+    monkeypatch.setattr(verl_process, "_UNREAPED_STRAGGLERS", isolated_stragglers)
+    assert verl_process._UNREAPED_STRAGGLERS is isolated_stragglers
     child = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True
     )
@@ -2939,9 +2974,9 @@ def test_a_straggler_that_was_never_ours_is_not_tracked_forever(monkeypatch):
         def _not_ours(pid, options):
             raise ChildProcessError
 
-        monkeypatch.setattr(vc.os, "waitpid", _not_ours)
-        vc._reap_group_zombies(os.getpgid(child.pid), skip=-1)
-        assert not vc._UNREAPED_STRAGGLERS, (
+        monkeypatch.setattr(verl_process.os, "waitpid", _not_ours)
+        verl_process._reap_group_zombies(os.getpgid(child.pid), skip=-1)
+        assert not verl_process._UNREAPED_STRAGGLERS, (
             "a process this worker cannot reap was tracked anyway, so the set grows unboundedly"
         )
     finally:
@@ -2956,7 +2991,9 @@ def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(mon
     # `except BaseException` blocks. a worker whose later jobs all SUCCEED therefore never schedules
     # the future wait a straggler needs, holding that zombie for the process's whole life -- as pid
     # 1 there is nothing else to reap it. the drain has to happen at every job boundary.
-    monkeypatch.setattr(vc, "_UNREAPED_STRAGGLERS", set())
+    isolated_stragglers = set()
+    monkeypatch.setattr(verl_process, "_UNREAPED_STRAGGLERS", isolated_stragglers)
+    assert verl_process._UNREAPED_STRAGGLERS is isolated_stragglers
 
     pid = os.fork()
     if pid == 0:  # pragma: no cover - runs only in the forked child
@@ -2965,21 +3002,23 @@ def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(mon
         # the state an earlier teardown leaves behind: exited, owed to this process, and recorded
         # because it was still running when that teardown's deadline passed.
         deadline = time.monotonic() + 10
-        while not vc._process_is_zombie(pid):
+        while not verl_process._process_is_zombie(pid):
             assert time.monotonic() < deadline, "the straggler never exited"
             time.sleep(0.01)
-        vc._UNREAPED_STRAGGLERS.add(pid)
+        verl_process._UNREAPED_STRAGGLERS.add(pid)
 
         # a job that runs to completion and exits 0 -- no callback failure, no nonzero code, nothing
         # that routes through the error teardown. drive the real entry point rather than the sweep,
         # or this passes just as well with the sweep never wired into the success path.
-        code = vc.run_verl_training(["bash", "-c", "echo 'step: 1'"], env=dict(os.environ))
+        code = verl_process.run_verl_training(
+            ["bash", "-c", "echo 'step: 1'"], env=dict(os.environ)
+        )
 
         assert code == 0
         assert not os.path.exists(f"/proc/{pid}"), (
             "a successful job left an earlier run's zombie in the table: one leaked pid per run"
         )
-        assert pid not in vc._UNREAPED_STRAGGLERS
+        assert pid not in verl_process._UNREAPED_STRAGGLERS
     finally:
         with contextlib.suppress(ChildProcessError):
             os.waitpid(pid, 0)
@@ -2994,7 +3033,7 @@ def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(mon
 _SHORT_LIVED_WORKER = r"""
 import os, sys, time
 sys.path.insert(0, {repo!r})
-from flash.engine.worker.train.entry import backend_common as vc
+from flash.engine.worker.verl import process as verl_process
 
 # a straggler as teardown leaves one: exited, owed to this process, recorded because it was still
 # running when the drain deadline passed.
@@ -3002,10 +3041,10 @@ pid = os.fork()
 if pid == 0:
     os._exit(0)
 deadline = time.monotonic() + 10
-while not vc._process_is_zombie(pid):
+while not verl_process._process_is_zombie(pid):
     assert time.monotonic() < deadline, "the straggler never exited"
     time.sleep(0.01)
-vc._UNREAPED_STRAGGLERS.add(pid)
+verl_process._UNREAPED_STRAGGLERS.add(pid)
 sys.stdout.write(str(pid))
 sys.stdout.flush()
 # and now the phase ends. no later teardown, no next job: this process is the only reaper the pid
@@ -3040,7 +3079,7 @@ def test_the_exit_drain_is_registered_wherever_stragglers_are_recorded():
     `run_verl_training` and `kill_process_group` both record stragglers, so hanging the last drain
     off either one leaves the other's pids uncollected when that process exits.
     """
-    source = " ".join(inspect.getsource(vc).split())
+    source = " ".join(inspect.getsource(verl_process).split())
     assert "atexit.register(_drain_stragglers_before_exit)" in source, (
         "no exit drain is registered, so a straggler recorded by a short-lived worker is never "
         "collected by anything"
@@ -3049,19 +3088,19 @@ def test_the_exit_drain_is_registered_wherever_stragglers_are_recorded():
 
 def test_the_exit_drain_gives_up_rather_than_holding_the_interpreter_open():
     """A straggler that never exits must cost a pid, not the worker's shutdown."""
-    original = set(vc._UNREAPED_STRAGGLERS)
+    original = set(verl_process._UNREAPED_STRAGGLERS)
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
     try:
-        vc._UNREAPED_STRAGGLERS.add(child.pid)  # ours, alive, and not going to exit
+        verl_process._UNREAPED_STRAGGLERS.add(child.pid)  # ours, alive, and not going to exit
         started = time.monotonic()
-        with mock.patch.object(vc, "_EXIT_DRAIN_S", 0.3):
-            vc._drain_stragglers_before_exit()
+        with mock.patch.object(verl_process, "_EXIT_DRAIN_S", 0.3):
+            verl_process._drain_stragglers_before_exit()
         assert time.monotonic() - started < 10, (
             "the exit drain blocked on a process that is running"
         )
     finally:
-        vc._UNREAPED_STRAGGLERS.clear()
-        vc._UNREAPED_STRAGGLERS.update(original)
+        verl_process._UNREAPED_STRAGGLERS.clear()
+        verl_process._UNREAPED_STRAGGLERS.update(original)
         child.kill()
         child.wait(timeout=10)
 
@@ -3246,7 +3285,7 @@ def test_the_claim_is_made_before_each_verl_process_is_spawned():
     Claiming after the child exists leaves any grandchild it has already orphaned parented
     elsewhere, so the fix would work only for the second job onward on a reused worker.
     """
-    for fn in (vc._run_streaming_verl_subprocess, rl_train_runner._execute_rl_child):
+    for fn in (verl_process._run_streaming_verl_subprocess, rl_train_runner._execute_rl_child):
         src = " ".join(inspect.getsource(fn).split())
         assert "adopt_orphaned_descendants()" in src, f"{fn.__name__} never claims its orphans"
         assert src.index("adopt_orphaned_descendants()") < src.index("subprocess.Popen("), (
@@ -3266,25 +3305,27 @@ def test_the_claim_survives_a_kernel_that_refuses_it():
             calls.append(args)
             return -1
 
-    original = vc._ADOPTS_ORPHANS
+    original = verl_process._ADOPTS_ORPHANS
     try:
-        vc._ADOPTS_ORPHANS = False
-        with mock.patch.object(vc.ctypes, "CDLL", return_value=_RefusingLibc()):
-            assert vc.adopt_orphaned_descendants() is False
+        verl_process._ADOPTS_ORPHANS = False
+        with mock.patch.object(verl_process.ctypes, "CDLL", return_value=_RefusingLibc()):
+            assert verl_process.adopt_orphaned_descendants() is False
         assert calls, "the prctl was never attempted"
-        assert vc._ADOPTS_ORPHANS is False, "a refused claim must not be remembered as granted"
+        assert verl_process._ADOPTS_ORPHANS is False, (
+            "a refused claim must not be remembered as granted"
+        )
     finally:
-        vc._ADOPTS_ORPHANS = original
+        verl_process._ADOPTS_ORPHANS = original
 
 
 def test_a_missing_libc_does_not_fail_the_run():
-    original = vc._ADOPTS_ORPHANS
+    original = verl_process._ADOPTS_ORPHANS
     try:
-        vc._ADOPTS_ORPHANS = False
-        with mock.patch.object(vc.ctypes, "CDLL", side_effect=OSError("no libc")):
-            assert vc.adopt_orphaned_descendants() is False
+        verl_process._ADOPTS_ORPHANS = False
+        with mock.patch.object(verl_process.ctypes, "CDLL", side_effect=OSError("no libc")):
+            assert verl_process.adopt_orphaned_descendants() is False
     finally:
-        vc._ADOPTS_ORPHANS = original
+        verl_process._ADOPTS_ORPHANS = original
 
 
 def test_the_grpo_success_path_drains_stragglers_too():
@@ -3314,7 +3355,7 @@ def _cc_probe(monkeypatch, cc):
             returncode=0, stdout="FLASH_VERL_CAPS=" + json.dumps(payload) + "\n", stderr=""
         )
 
-    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+    monkeypatch.setattr(verl_capabilities.subprocess, "run", fake_run)
 
 
 def test_the_capability_probe_reads_what_torch_reports(monkeypatch):
@@ -3335,7 +3376,7 @@ def test_the_capability_probe_reports_failure_as_none(monkeypatch):
     def boom(*a, **k):
         raise OSError("no interpreter")
 
-    monkeypatch.setattr(vc.subprocess, "run", boom)
+    monkeypatch.setattr(verl_capabilities.subprocess, "run", boom)
     caps = vc.probe_verl_capabilities("/verl/bin/python", "")
     assert vc.verl_device_capability(caps) is None
 
@@ -3359,7 +3400,7 @@ def test_the_capability_probe_runs_against_the_verl_interpreter(monkeypatch):
             returncode=0, stdout="FLASH_VERL_CAPS=" + json.dumps(payload) + "\n", stderr=""
         )
 
-    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+    monkeypatch.setattr(verl_capabilities.subprocess, "run", fake_run)
     vc.probe_verl_capabilities("/verl/bin/python", "")
     assert calls
     assert all(cmd[0] == "/verl/bin/python" for cmd in calls)
@@ -3386,7 +3427,7 @@ def test_every_capability_question_costs_exactly_one_child(monkeypatch):
             returncode=0, stdout="FLASH_VERL_CAPS=" + json.dumps(payload) + "\n", stderr=""
         )
 
-    monkeypatch.setattr(vc.subprocess, "run", fake_run)
+    monkeypatch.setattr(verl_capabilities.subprocess, "run", fake_run)
     monkeypatch.setenv("WANDB_API_KEY", "k")
     module = "transformers.models.qwen3_5.modeling_qwen3_5"
     caps = vc.probe_verl_capabilities("/verl/bin/python", module)
@@ -3456,7 +3497,9 @@ def test_non_blackwell_leaves_both_backends_to_vllm(monkeypatch, cc):
     # unknown capability is treated the same way: leave the defaults in place. the answer must not
     # depend on what flashinfer did in the child -- off blackwell nothing consumes it.
     monkeypatch.setattr(
-        vc.subprocess, "run", lambda *a, **k: pytest.fail("must not spawn a child here")
+        verl_capabilities.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("must not spawn a child here"),
     )
     for ok in (True, False):
         assert vc.resolve_blackwell_attention_backends(_flashinfer_caps(flashinfer_ok=ok), cc) == (
@@ -3719,7 +3762,7 @@ def test_a_read_is_capped_even_when_ray_is_still_writing(monkeypatch, tmp_path):
     # patch the name the module under test resolves, NOT builtins: a global open() replacement
     # leaks into every later test in the session through pytest's own file handling.
     monkeypatch.setattr(
-        vc,
+        verl_diagnostics,
         "open",
         lambda path, *a, **k: (
             _GrowingFile(path) if str(path) == str(target) else real_open(path, *a, **k)
@@ -4539,15 +4582,21 @@ def test_every_trainer_asks_for_the_backend_rather_than_hardcoding_one():
     import flash.engine.worker.train.entry.opd_train as opd_train
     import flash.engine.worker.train.entry.rl_train as rl_train
     import flash.engine.worker.train.entry.sft_train as sft_train
+    import flash.engine.worker.train.sft.orchestration as sft_orchestration
 
-    for module in (sft_train, rl_train, opd_train):
-        source = pathlib.Path(module.__file__).read_text()
+    trainer_sources = {
+        sft_train.__name__: (sft_train, sft_orchestration),
+        rl_train.__name__: (rl_train,),
+        opd_train.__name__: (opd_train,),
+    }
+    for trainer, modules in trainer_sources.items():
+        source = "\n".join(pathlib.Path(module.__file__).read_text() for module in modules)
         code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
-        assert "impl_backend=torch" not in code, module.__name__
-        assert "fused_ce_backend(caps)" in code, module.__name__
+        assert "impl_backend=torch" not in code, trainer
+        assert "fused_ce_backend(caps)" in code, trainer
         # the caps-taking form is the whole point of the fix; a bare call would be the parent-cuda
         # probe coming back.
-        assert "fused_ce_backend()" not in code, module.__name__
+        assert "fused_ce_backend()" not in code, trainer
 
 
 def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():

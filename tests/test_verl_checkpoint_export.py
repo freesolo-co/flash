@@ -455,8 +455,8 @@ def test_export_moves_adapter_files_and_cleans_merge_tree(monkeypatch, actor_dir
 
 
 def test_merger_uses_the_shared_streaming_supervisor(monkeypatch):
-    from flash.engine.worker.train.entry import backend_common
     from flash.engine.worker.verl import checkpoints
+    from flash.engine.worker.verl import process as verl_process
 
     seen = {}
 
@@ -465,7 +465,7 @@ def test_merger_uses_the_shared_streaming_supervisor(monkeypatch):
         on_line("merged\n")
         return 0
 
-    monkeypatch.setattr(backend_common, "_run_streaming_verl_subprocess", supervise)
+    monkeypatch.setattr(verl_process, "_run_streaming_verl_subprocess", supervise)
     checkpoints._run_merger(["merge", "checkpoint"], {"KEEP": "yes"})
 
     assert seen == {
@@ -478,8 +478,8 @@ def test_merger_uses_the_shared_streaming_supervisor(monkeypatch):
 def test_short_write_marker_survives_the_merger_subprocess_boundary(
     monkeypatch, actor_dir, tmp_path
 ):
-    from flash.engine.worker.train.entry import backend_common
     from flash.engine.worker.verl import checkpoints
+    from flash.engine.worker.verl import process as verl_process
 
     free = {"value": 1 << 40}
 
@@ -488,7 +488,7 @@ def test_short_write_marker_survives_the_merger_subprocess_boundary(
         free["value"] = 0
         return 7
 
-    monkeypatch.setattr(backend_common, "_run_streaming_verl_subprocess", supervise)
+    monkeypatch.setattr(verl_process, "_run_streaming_verl_subprocess", supervise)
     monkeypatch.setattr(checkpoints.shutil, "disk_usage", lambda path: _disk_usage(free["value"]))
 
     with pytest.raises(checkpoints.MergeDiskExhaustedError) as caught:
@@ -506,15 +506,15 @@ def test_short_write_marker_survives_the_merger_subprocess_boundary(
 def test_direct_disk_marker_replaces_an_earlier_short_write_marker(
     monkeypatch, actor_dir, tmp_path
 ):
-    from flash.engine.worker.train.entry import backend_common
     from flash.engine.worker.verl import checkpoints
+    from flash.engine.worker.verl import process as verl_process
 
     def supervise(cmd, *, env, on_line, errors):
         on_line("unexpected pos 221967808 vs 221967696\n")
         on_line("Disk quota exceeded (os error 122)\n")
         return 7
 
-    monkeypatch.setattr(backend_common, "_run_streaming_verl_subprocess", supervise)
+    monkeypatch.setattr(verl_process, "_run_streaming_verl_subprocess", supervise)
     monkeypatch.setattr(checkpoints.shutil, "disk_usage", lambda path: _disk_usage(1 << 40))
 
     with pytest.raises(checkpoints.MergeDiskExhaustedError) as caught:
@@ -530,15 +530,15 @@ def test_direct_disk_marker_replaces_an_earlier_short_write_marker(
 
 
 def test_merger_preserves_cancellation_identity(monkeypatch):
-    from flash.engine.worker.train.entry import backend_common
     from flash.engine.worker.verl import checkpoints
+    from flash.engine.worker.verl import process as verl_process
 
     cancellation = SystemExit("cancelled")
 
     def cancel(*args, **kwargs):
         raise cancellation
 
-    monkeypatch.setattr(backend_common, "_run_streaming_verl_subprocess", cancel)
+    monkeypatch.setattr(verl_process, "_run_streaming_verl_subprocess", cancel)
     with pytest.raises(SystemExit) as caught:
         checkpoints._run_merger(["merge"], {})
     assert caught.value is cancellation
@@ -565,8 +565,8 @@ def test_merger_preserves_invalid_output_first_disk_marker_and_exit_code(capsys)
 @pytest.mark.wallclock
 @_needs_process_teardown
 def test_merger_output_is_live_without_explicit_child_flush(monkeypatch, tmp_path):
-    from flash.engine.worker.train.entry import backend_common
     from flash.engine.worker.verl import checkpoints
+    from flash.engine.worker.verl import process as verl_process
 
     gate = tmp_path / "continue"
     child = (
@@ -579,7 +579,7 @@ def test_merger_output_is_live_without_explicit_child_flush(monkeypatch, tmp_pat
         "raise SystemExit(0 if p.exists() else 9)\n"
     )
     process: subprocess.Popen | None = None
-    real_popen = backend_common.subprocess.Popen
+    real_popen = verl_process.subprocess.Popen
     seen_alive: list[bool] = []
 
     def popen(*args, **kwargs):
@@ -592,7 +592,7 @@ def test_merger_output_is_live_without_explicit_child_flush(monkeypatch, tmp_pat
         seen_alive.append(process.poll() is None)
         gate.write_text("go")
 
-    monkeypatch.setattr(backend_common.subprocess, "Popen", popen)
+    monkeypatch.setattr(verl_process.subprocess, "Popen", popen)
     monkeypatch.setattr(checkpoints, "print", live_print, raising=False)
     checkpoints._run_merger([sys.executable, "-c", child], dict(os.environ))
     assert seen_alive == [True]

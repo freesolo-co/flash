@@ -25,7 +25,7 @@ dependencies = []
 
 [project.optional-dependencies]
 # heavy deps for running the fine-tuning worker locally (the deployed gpu worker installs its exact
-# stack in Dockerfile.worker, with the fallback verl venv mirrored in capabilities.py).
+# stack in Dockerfile.worker, with the fallback verl venv mirrored in verl/install.py).
 gpu = [
     "torch==2.10.0",
     "transformers>=5.8,<5.13",

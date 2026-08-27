@@ -12,7 +12,7 @@
 #
 # Base is torch 2.10 / cu12.8 / cudnn9 (-devel = has nvcc for any source builds); it ships the
 # CUDA 12.8 runtime libs the PyPI wheels link against. The exact install block below is the deployed
-# worker stack source of truth; the fallback verl venv is kept in lockstep in capabilities.py.
+# worker stack source of truth; the fallback verl venv is kept in lockstep in verl/install.py.
 # digest-pinned so worker rebuilds reuse the exact torch and cuda base image bytes.
 FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel@sha256:b574d4ccf6d8856a5d87dcadc667aa4f95dc18d337ef3a28d02b7b01897d7081
 
@@ -85,7 +85,7 @@ RUN pip install --no-cache-dir \
 # tilelang==0.1.9 AND apache-tvm-ffi==0.1.9, so 0.1.11 made this layer unsatisfiable and every image
 # build failed from 2026-08-12 until the downgrade. 0.1.11 was only ever "latest stable at the time"
 # (the pin exists for determinism, not to dodge a 0.1.9 defect), and the version predates flash-qla.
-# Keep all four sites in lockstep -- both installs here, capabilities.py, and perf's TILELANG_PIN --
+# keep all four sites in lockstep -- both installs here, verl/install.py, and perf's TILELANG_PIN --
 # because perf fails CLOSED: a resolved version != TILELANG_PIN deletes fla and drops sm90 to the
 # pure-PyTorch fallback, which is correct but far slower.
 
@@ -101,7 +101,7 @@ RUN pip install --no-cache-dir \
 # tens of GB of RAM, including the hand-build command in this file's header.
 # NOTE: keep this default in sync with .github/workflows/worker-image.yml's FA2_SPEC.
 ARG FLASH_ATTN_SPEC=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl
-# sha256 of the wheel FLASH_ATTN_SPEC defaults to, kept in lockstep with backend_common's
+# sha256 of the wheel FLASH_ATTN_SPEC defaults to, kept in lockstep with verl/install.py's
 # FLASH_ATTN_SHA256. The wheel is a community rebuild published by an individual, not Dao-AILab, and
 # a github release asset can be deleted and re-uploaded at the same url by whoever holds the account,
 # so the url alone pins nothing, and this is the interpreter that trains. Same discipline as the
@@ -310,7 +310,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # choice, not a contract verl states. This image sets FLASH_VERL_PYTHON, so live workers never take
 # the resolve_verl_python path where that hardening lives -- letting the two lists drift means the
 # fallback protects nobody and a vllm respin breaks launch on the default image alone. Keep them in
-# lockstep with verl/capabilities.py's install list.
+# lockstep with verl/install.py's install list.
 #
 # transformers is exact-pinned in both the direct list and override file to the version this image
 # already resolved. verl and vllm both depend on transformers, so without the exact override a
@@ -360,7 +360,7 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
 # This is /opt/verl-venv/bin/python -- FLASH_VERL_PYTHON, the interpreter that actually trains -- and
 # a separate network fetch from the verified main-interpreter download above (that wheel is gone by
 # now, --no-cache-dir). uv honours a `#sha256=` url fragment and refuses to install a mismatching
-# artifact, the same mechanism flash/engine/worker/train/entry/backend_common.py's FLASH_ATTN_INSTALL_SPEC
+# artifact, the same mechanism flash/engine/worker/verl/install.py's FLASH_ATTN_INSTALL_SPEC
 # already relies on, so appending it here closes the gap: a replaced release asset is rejected before
 # it lands in the venv that trains, not just in the main interpreter. Unlike that block this install
 # has no `|| echo` fallback, so a mismatch already fails the build outright.
@@ -382,14 +382,14 @@ RUN set -eu; \
 # causal_conv1d in the VERL VENV, which is where the model actually trains. The main interpreter's
 # copy above does not reach here: /opt/verl-venv is built without --system-site-packages, so the two
 # have disjoint paths. Together with fla's cu_seqlens (installed above) this is what makes the packed
-# GDN boundary resets real rather than decorative: engine.worker.backend_common's boundary shim hands
+# gdn boundary resets real rather than decorative: train/core/child/runtime.py's boundary shim hands
 # the GDN layer cu_seq_lens_q + seq_idx, but transformers' pure-torch fallbacks take **kwargs and
 # silently DISCARD both, so a child missing these kernels trains across example boundaries while
 # looking patched. verl_child_can_reset_gdn_boundaries probes this venv for exactly that reason.
 #
 # REQUIRED, not best-effort. This was best-effort on the premise that a failed build degrades to
 # unpacked training, and that premise no longer holds: every catalog model is a GDN hybrid, and
-# backend_common.require_gdn_boundary_resets now RAISES for grpo/opd when the child cannot reset,
+# verl/capabilities.py's require_gdn_boundary_resets now raises for grpo/opd when the child cannot reset,
 # because the old padded fallback (use_remove_padding=False) is incompatible with the
 # use_fused_kernels=True these recipes hardcode and dies at padding.py:144 on every batch size.
 # So a conv-less image does not train unpacked here -- it fails grpo and opd after paying for the
@@ -416,8 +416,8 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
 # asserts. Part of the same && chain: a stub left shadowing libcudart exits nonzero and fails the
 # BUILD, which is strictly cheaper than failing the run after the gpu is paid for -- the same
 # discipline as the causal_conv1d layer above.
-COPY flash/engine/worker/verl/capabilities.py docker/extract_cudart_fix.py /tmp/cudartfix/
-RUN python /tmp/cudartfix/extract_cudart_fix.py /tmp/cudartfix/capabilities.py /tmp/cudartfix/fix.py \
+COPY flash/engine/worker/verl/install.py docker/extract_cudart_fix.py /tmp/cudartfix/
+RUN python /tmp/cudartfix/extract_cudart_fix.py /tmp/cudartfix/install.py /tmp/cudartfix/fix.py \
     && /opt/verl-venv/bin/python /tmp/cudartfix/fix.py \
     && rm -rf /tmp/cudartfix
 
@@ -436,7 +436,7 @@ RUN python /tmp/cudartfix/extract_cudart_fix.py /tmp/cudartfix/capabilities.py /
 # cpu CAN prove is what this checks: the packages import, and fla is at least the 0.2.2 the probe
 # demands, so a device-bearing worker will get True. The capability itself is asserted where a gpu
 # exists: verl_child_can_reset_gdn_boundaries runs the real probes in the child, and
-# backend_common.require_gdn_boundary_resets RAISES for grpo/opd before a step runs.
+# verl/capabilities.py's require_gdn_boundary_resets raises for grpo/opd before a step runs.
 #
 # The stakes, unchanged: without fla transformers binds chunk_gated_delta_rule to the pure-torch
 # fallback, which accepts cu_seqlens and discards it, and without causal_conv1d the conv falls back

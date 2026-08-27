@@ -1399,8 +1399,16 @@ def test_venv_provisioning_and_the_capability_probe_run_under_one_wrap(modname, 
         if isinstance(node, ast.With)
         and any(
             isinstance(item.context_expr, ast.Call)
-            and isinstance(item.context_expr.func, ast.Name)
-            and item.context_expr.func.id == "liveness_heartbeat"
+            and (
+                (
+                    isinstance(item.context_expr.func, ast.Name)
+                    and item.context_expr.func.id == "liveness_heartbeat"
+                )
+                or (
+                    isinstance(item.context_expr.func, ast.Attribute)
+                    and item.context_expr.func.attr == "liveness_heartbeat"
+                )
+            )
             and item.context_expr.args
             and isinstance(item.context_expr.args[0], ast.Constant)
             and item.context_expr.args[0].value == stage
@@ -1411,9 +1419,9 @@ def test_venv_provisioning_and_the_capability_probe_run_under_one_wrap(modname, 
         f"{outer} must wrap its cold verl setup in liveness_heartbeat({stage!r})"
     )
     called = {
-        node.func.id
+        node.func.id if isinstance(node.func, ast.Name) else node.func.attr
         for node in ast.walk(wraps[0])
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name | ast.Attribute)
     }
     assert "resolve_verl_python" in called, (
         f"{outer}: the venv build is the silent span -- it must be INSIDE the {stage} wrap"
@@ -1481,8 +1489,16 @@ def test_post_download_model_setup_runs_under_a_liveness_wrap():
         if isinstance(node, ast.With)
         and any(
             isinstance(item.context_expr, ast.Call)
-            and isinstance(item.context_expr.func, ast.Name)
-            and item.context_expr.func.id == "liveness_heartbeat"
+            and (
+                (
+                    isinstance(item.context_expr.func, ast.Name)
+                    and item.context_expr.func.id == "liveness_heartbeat"
+                )
+                or (
+                    isinstance(item.context_expr.func, ast.Attribute)
+                    and item.context_expr.func.attr == "liveness_heartbeat"
+                )
+            )
             and item.context_expr.args
             and isinstance(item.context_expr.args[0], ast.Constant)
             and item.context_expr.args[0].value == "sft_model_load"

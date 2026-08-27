@@ -24,7 +24,7 @@ import pathlib
 from dataclasses import fields
 
 import flash.engine.profiling.sft_workload as sft_workload_mod
-import flash.engine.worker.train.entry.sft_train as sft_train_mod
+import flash.engine.worker.train.sft.orchestration as sft_orchestration
 from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.profiling.sft_workload import sft_max_length as _measured_max_length
@@ -79,8 +79,10 @@ def test_trainer_and_quote_read_the_one_measured_window():
     """
     from flash.cost.spec import runconfig_from_spec
 
-    trainer_src = "".join(pathlib.Path(sft_train_mod.__file__).read_text().split())
-    assert "max_length=profile.max_length" in trainer_src
+    profile = type("Profile", (), {"max_length": 3072})()
+    assert sft_orchestration._sft_profile_max_length(profile) == 3072
+    trainer_src = "".join(pathlib.Path(sft_orchestration.__file__).read_text().split())
+    assert "returnprofile.max_length" in trainer_src
     assert 'train_opt("max_context_tokens"' not in trainer_src
 
     from tests._helpers.profile import attach_sft_profile

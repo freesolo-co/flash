@@ -13,23 +13,10 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import shutil
 import subprocess
 from collections.abc import Sequence
 
 from flash.engine.support.verl_policy import FsdpGeneration
-from flash.engine.worker.train.entry.backend_common import (
-    CAUSAL_CONV1D_REQUIREMENT,
-    FLA_REQUIREMENT,
-    FLASH_QLA_REQUIREMENT,
-    TRANSFORMERS_INSTALL_REQUIREMENT,
-    VERL_REQUIREMENT_NAME,
-    VERL_REQUIREMENT_URL,
-    VERL_VENV_PYTHON,
-    VERL_VENV_STAMP,
-    _install_causal_conv1d,
-    _install_flash_attn,
-)
 
 # ---------------------------------------------------------------------------
 # batched child-interpreter capability probe
@@ -399,282 +386,6 @@ def require_gdn_boundary_resets(caps: dict, gdn_module: str) -> str | None:
     return arch
 
 
-def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
-    """return an interpreter that can import verl.
-
-    prefer ``FLASH_VERL_PYTHON`` unchanged; otherwise provision an isolated venv with the pinned verl
-    stack and optional wandb. rebuild owned venvs when their stamp differs. a missing or blank preset
-    takes the provisioning path.
-    """
-    preset = os.environ.get("FLASH_VERL_PYTHON", "").strip()
-    if preset:
-        return preset
-    venv = os.path.join(workdir, "verl-venv")
-    py = os.path.join(venv, "bin", "python")
-    stamp = os.path.join(venv, "flash-verl-requirement")
-    installed = ""
-    if os.path.exists(stamp):
-        with open(stamp) as f:
-            installed = f.read().strip()
-    if installed != VERL_VENV_STAMP or not os.path.exists(py):
-        # a retry reuses the pod workdir, so this venv can be from an earlier attempt, from an earlier
-        # flash release pinning a different verl, or from an install that died partway. remove it and
-        # start clean: reusing it would train on the wrong verl, and `uv venv` refuses to write into a
-        # directory that already holds a pyvenv.cfg, so a half-built venv wedges every later retry.
-        shutil.rmtree(venv, ignore_errors=True)
-        # dev-only fallback (production uses FLASH_VERL_PYTHON on a prebuilt verl image): verl brings
-        # its own torch/vllm, so use a full install rather than --no-deps to include runtime deps.
-        subprocess.run(["uv", "venv", "--python", VERL_VENV_PYTHON, venv], check=True)
-        # the SAME four overrides Dockerfile.worker writes, for the same reason: this pin
-        # set deliberately violates declared ceilings, and a bare pin cannot break
-        # any of them -- a pin is a constraint the resolver must satisfy alongside the
-        # declaration, so the pair is simply unsatisfiable and the install fails outright.
-        # only --override makes uv IGNORE the declaration. all four lines are required;
-        # dropping any one leaves the set unsatisfiable or silently wrong: verl +
-        # transferqueue declare numpy<2.0.0 -> vllm 0.19.1 needs numpy>=2 verl[vllm]
-        # declares vllm>=0.8.5,<=0.12.0 -> flash needs 0.19.1 for the Qwen3.5 archs vllm
-        # declares xgrammar>=0.1.32 -> structured opd gates on EXACTLY 0.1.25 verl and
-        # vllm both depend on transformers with no upper bound -> an unpinned resolve
-        # drifts the interpreter that TRAINS onto a transformers line nothing validated,
-        # and transformers owns the gdn modelling code the boundary-reset shim patches.
-        overrides = os.path.join(workdir, "verl-overrides.txt")
-        with open(overrides, "w") as f:
-            f.write(
-                f"numpy==2.2.6\nxgrammar==0.1.25\nvllm==0.19.1\n"
-                f"{TRANSFORMERS_INSTALL_REQUIREMENT}\n"
-            )
-        subprocess.run(
-            [
-                "uv",
-                "pip",
-                "install",
-                "--python",
-                py,
-                "--override",
-                overrides,
-                # the [vllm] extra, matching Dockerfile.worker's VERL_SPEC. verl's bare
-                # install_requires omits vllm, and every entrypoint flash launches needs it:
-                # main_ppo/main_ppo_sync set rollout.name=vllm.
-                f"{VERL_REQUIREMENT_NAME}[vllm] @ {VERL_REQUIREMENT_URL}",
-                "vllm==0.19.1",
-                "numpy==2.2.6",
-                TRANSFORMERS_INSTALL_REQUIREMENT,
-                # not transitively guaranteed: verl imports these at module level on the launch path
-                # (main_ppo -> ppo.ray_trainer -> rollout.llm_server imports cachetools, and
-                # rollout.utils imports uvicorn + fastapi), yet declares none of them. vllm happens
-                # to pull cachetools and fastapi today, but that is vllm's dependency choice, not a
-                # contract verl states -- exact pins mirror the worker dockerfile's resolved venv.
-                "cachetools==7.1.7",
-                "uvicorn==0.52.4",
-                "fastapi==0.141.1",
-                # opd's entrypoint calls tq.init()/tq.close(); absent from verl's setup.py.
-                "TransferQueue==0.1.7",
-                # older raises AttributeError on PyArrow PyExtensionType.
-                "datasets==5.0.1",
-                "bitsandbytes==0.50.1",
-                "qwen-vl-utils==0.0.14",
-                "torchvision==0.25.0",
-                "xgrammar==0.1.25",
-                "tqdm==4.70.0",
-                "pyarrow==25.0.1",
-                # gated-deltanet kernels, in LOCKSTEP with Dockerfile.worker's
-                # verl-venv layer (same fla sha, same tilelang pins). the model
-                # trains in THIS interpreter, so fla being installed in the
-                # worker's own env says nothing: without it here, transformers
-                # binds chunk_gated_delta_rule to the pure-torch fallback that
-                # takes **kwargs and discards cu_seqlens, and packed gdn runs
-                # train across example boundaries while looking patched.
-                # apache-tvm-ffi is pinned to 0.1.9 because flash-qla requires exactly that, and
-                # 0.1.12 double-registers TVM-FFI and aborts `import tilelang`.
-                FLA_REQUIREMENT,
-                # the flashqla GDN backend fla 0.5.2 dispatches to. same lockstep requirement:
-                # the shim binds it in THIS interpreter, so a wheel present only in the worker's
-                # env would leave the child on the old kernel while the marker still printed.
-                FLASH_QLA_REQUIREMENT,
-                "tilelang==0.1.9",
-                "apache-tvm-ffi==0.1.9",
-            ],
-            check=True,
-        )
-        # a SEPARATE install, exactly as Dockerfile.worker runs it: the wheel is prebuilt against
-        # torch 2.10, so it needs --no-build-isolation, and that flag must not apply to the resolve
-        # above. required, not best-effort -- remove-padding is the default on all three backends and
-        # verl's cuda path imports flash_attn.bert_padding unguarded with no sdpa fallback, so a venv
-        # without it dies at the first training batch on a paid gpu rather than degrading.
-        _install_flash_attn(py)
-        conv_installed = _install_causal_conv1d(py)
-        # after every install that could have written tilelang into this venv, and before the child
-        # ever imports vLLM. only on the rebuild path: a reused venv was repaired when it was built,
-        # and re-running it there would turn venv reuse back into work.
-        cudart_safe = _neutralize_child_tilelang_cudart_stub(py)
-        # written only after ALL installs succeed, so a venv that died between them is
-        # unstamped and the next attempt rebuilds it rather than reusing a
-        # half-provisioned interpreter. the conv kernel is best-effort to INSTALL but not
-        # optional to RECORD. grpo and opd pack, so require_gdn_boundary_resets raises for
-        # a gdn model whose child lacks it; stamping a venv that missed the build would
-        # hand every later attempt on this pod the same broken interpreter, with the stamp
-        # asserting it is fully provisioned. leaving it unstamped costs one rebuild and
-        # gives the next attempt a real chance at the kernel.
-        # the stub repair is withheld from the stamp for the same reason and on the same terms: it
-        # runs only on this rebuild path, so stamping a venv whose stub still shadows libcudart
-        # freezes that in, and every later attempt on this pod reuses an interpreter that asserts
-        # it is provisioned while its child aborts on vLLM import.
-        if conv_installed and cudart_safe:
-            with open(stamp, "w") as f:
-                f.write(VERL_VENV_STAMP)
-        elif not conv_installed:
-            print(
-                f"[verl] {CAUSAL_CONV1D_REQUIREMENT} did not install; leaving the venv unstamped so "
-                "the next attempt rebuilds it rather than reusing an interpreter that cannot honor "
-                "gdn boundary resets",
-                flush=True,
-            )
-        else:
-            print(
-                "[verl] the child tilelang libcudart stub was not neutralized; leaving the venv "
-                "unstamped so the next attempt rebuilds it rather than reusing an interpreter "
-                "whose child aborts on vLLM import",
-                flush=True,
-            )
-    if install_wandb:
-        # keep wandb outside the stamped rebuild branch. wandb is absent from the stamp, so reused venvs
-        # and transient failures must retry it on later runs; installing an already satisfied package
-        # is a cheap no-op.
-        # exact-pinned to the same version baked into Dockerfile.worker's verl venv.
-        subprocess.run(["uv", "pip", "install", "--python", py, "wandb==0.28.2"], check=False)
-    return py
-
-
-# the parent neutralizes tilelang's libcudart stub in its OWN site-packages, but the child trains in
-# a separate venv with its own tilelang, and vLLM imports THERE. run the same repair against the
-# child interpreter, after every install that could have (re)written its tilelang.
-#
-# inlined rather than imported: flash is not installed in the child venv (the parent resolves
-# flash-dependent facts and hands the child literals), so `from flash...` would raise ImportError
-# and the repair would silently never happen -- the exact failure this exists to prevent.
-_CHILD_CUDART_FIX = """
-import ctypes, ctypes.util, glob, importlib.util, os
-
-def find_real():
-    def verify(cand):
-        try:
-            lib = ctypes.CDLL(cand)
-        except OSError:
-            return None
-        if not hasattr(lib, "cudaDeviceReset"):
-            return None
-        if os.path.isabs(cand) and os.path.exists(cand):
-            return os.path.realpath(cand)
-        base = os.path.basename(cand)
-        try:
-            with open("/proc/self/maps") as f:
-                for line in f:
-                    if base in line and "/" in line:
-                        p = line[line.index("/"):].rstrip()
-                        if os.path.basename(p).startswith(base) and os.path.exists(p):
-                            return os.path.realpath(p)
-        except OSError:
-            pass
-        return None
-
-    candidates = []
-    try:
-        import nvidia
-        for base in sorted(map(str, getattr(nvidia, "__path__", []) or [])):
-            candidates += sorted(glob.glob(os.path.join(base, "*", "lib", "libcudart.so.*")))
-    except Exception:
-        pass
-    for pat in (
-        "/usr/local/cuda*/lib64/libcudart.so.*",
-        "/usr/local/cuda*/targets/*/lib/libcudart.so.*",
-        "/usr/lib/x86_64-linux-gnu/libcudart.so.*",
-    ):
-        candidates += sorted(glob.glob(pat))
-    found = ctypes.util.find_library("cudart")
-    if found:
-        candidates.append(found)
-    for cand in candidates:
-        real = verify(cand)
-        if real is not None:
-            return real
-    return None
-
-try:
-    spec = importlib.util.find_spec("tilelang")
-except Exception:
-    spec = None
-locs = list(getattr(spec, "submodule_search_locations", None) or []) if spec else []
-if not locs:
-    print("no tilelang in child venv; nothing to neutralize")
-else:
-    stub = os.path.join(locs[0], "lib", "libcudart_stub.so")
-    if not os.path.lexists(stub):
-        print("no libcudart_stub.so in child tilelang")
-    elif os.path.islink(stub) and os.path.exists(stub):
-        print("child stub already repointed")
-    else:
-        # do NOT ctypes.CDLL the stub to probe it: that dlopens it into /proc/self/maps,
-        # which is the crash being prevented.
-        real = find_real()
-        if real is None:
-            # the one outcome that leaves the stub a plain file: it still shadows libcudart, so
-            # vLLM aborts its import here. exit nonzero so the caller can tell this apart from the
-            # benign no-op cases above, which also print and also exit 0.
-            print("no real libcudart found in child; left as-is")
-            raise SystemExit(1)
-        else:
-            backup = stub + ".orig"
-            if not os.path.exists(backup):
-                os.replace(stub, backup)
-            else:
-                try:
-                    os.remove(stub)
-                except FileNotFoundError:
-                    pass
-            os.symlink(real, stub)
-            print("redirected child tilelang libcudart_stub.so -> " + real)
-"""
-
-
-def _neutralize_child_tilelang_cudart_stub(py: str) -> bool:
-    """Repoint the CHILD venv's tilelang libcudart stub at a real libcudart.
-
-    vLLM aborts its import when it finds tilelang's stub (no ``cudaDeviceReset``) in
-    /proc/self/maps. The parent's fix only ever sees the parent's site-packages, so without this
-    the child dies on vLLM import on a paid GPU, after the pod is already rented.
-
-    Returns whether the child venv is safe to import vLLM in, which is NOT the same as "the repair
-    ran". A child with no tilelang, or whose stub is already a symlink, has nothing shadowing
-    libcudart and is safe untouched -- those exit 0. What is not safe is a stub left as a plain
-    file, which the script reports by exiting nonzero. The caller withholds the venv stamp on
-    False: the repair only runs on the rebuild path, so a stamped failure is frozen in and every
-    later attempt on this pod reuses an interpreter whose child still aborts.
-
-    Still fails open WITHIN a launch: this only decides whether to record the venv as provisioned,
-    and never blocks a child that would have imported fine.
-    """
-    try:
-        result = subprocess.run(
-            [py, "-c", _CHILD_CUDART_FIX],
-            check=False,
-            capture_output=True,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        print(f"[verl] child libcudart stub neutralize did not run: {error}", flush=True)
-        return False
-    for stream in (getattr(result, "stdout", None), getattr(result, "stderr", None)):
-        if not stream:
-            continue
-        if isinstance(stream, bytes):
-            stream = stream.decode("utf-8", "replace")
-        for line in stream.splitlines():
-            if line.strip():
-                print(f"[verl] child cudart: {line}", flush=True)
-    # default 0, matching `_install_causal_conv1d`: a fake subprocess.run in a test returns None,
-    # and only an explicit nonzero means the stub was left shadowing libcudart.
-    return getattr(result, "returncode", 0) == 0
-
-
 def resolve_verl_loggers(caps: dict) -> list[str]:
     """verl's ``trainer.logger`` list, gated on the interpreter that actually logs.
 
@@ -710,6 +421,54 @@ def verl_device_capability(caps: dict) -> tuple[int, int] | None:
         return (int(cc[0]), int(cc[1]))
     except (TypeError, ValueError, IndexError):
         return None
+
+
+# verl ships two fused linear-CE backends and dispatches on `fused_kernel_options.impl_backend`
+# (models/transformers/monkey_patch.py). all three flash trainers used to pin `torch`, which is
+# verl's own default (config/model/hf_model.yaml:67) -- a restated default rather than a choice.
+#
+# MEASURED, 4096x2560 hidden into a 248320 vocab, bf16, fwd+bwd, paired and alternating, 10 reps
+# after warmup, verl's own entry points on both arms:
+#
+#     card               sm    triton vs torch   peak VRAM        triton err vs fp32
+#     A100 SXM4 80GB     80    3.28x SLOWER      2.75x lower      lower on all 4 quantities
+#     A40                86    1.43x SLOWER      2.75x lower      lower on all 4 quantities
+#     H100 80GB HBM3     90    2.25x FASTER      2.72x lower      lower on all 4 quantities
+#
+# so the choice is card-dependent and a blanket flip would slow every sm80/sm86 run. the split is
+# sm90: the triton kernel's TMA path is gated on `get_device_capability()[0] >= 9`
+# (verl/utils/kernel/kernels.py:48), and below that it takes a general mainloop that loses to the
+# torch chunked loop. the H100 win is stable across shapes (1.9x at 1024 tokens, 2.15x at 2048,
+# 2.25x at 4096 and 8192).
+#
+# ACCURACY is not the deciding axis but is worth recording, because "faster" would not be worth a
+# worse gradient: measured against an fp32 log-softmax arbiter, triton is closer on EVERY card and
+# every quantity -- log_probs 3e-6 vs 7e-4, grad_hidden 6.5e-3 vs 1.8e-2, grad_weight 2.8e-3 vs
+# 1.8e-2. the two backends differ from each other by ~1.9e-2 on gradients, and that gap is mostly
+# the torch backend's own error, not triton's.
+_TRITON_FUSED_CE_MIN_CAPABILITY = (9, 0)
+
+
+def fused_ce_backend(caps: dict) -> str:
+    """`triton` where it is measurably faster (sm90+), `torch` everywhere else.
+
+    Takes the capability from the out-of-process probe (`verl_device_capability`) rather than
+    calling `torch.cuda.get_device_capability` here, for two reasons:
+
+    * this runs in the long-lived PARENT, which does not otherwise touch cuda. initializing a
+      context here to answer one question retains it for the process lifetime, on the same devices
+      `torchrun` is about to own -- unbudgeted VRAM against a reserve sized without it, which is
+      exactly the kind of overhead that OOMs a job sized near a card's limit.
+    * the question is about verl's kernels, and verl pins its own torch. the parent's torch is the
+      wrong interpreter to ask.
+
+    An unanswerable probe (no cuda, no torch, hung import) yields None and falls back to `torch`,
+    which is the current behaviour on every card.
+    """
+    cc = verl_device_capability(caps)
+    if cc is None:
+        return "torch"
+    return "triton" if cc >= _TRITON_FUSED_CE_MIN_CAPABILITY else "torch"
 
 
 def resolve_rollout_enforce_eager(cc: tuple[int, int] | None) -> bool:
