@@ -1888,7 +1888,10 @@ def test_group_teardown_deadline_is_later_than_the_cutoff_that_triggers_teardown
         processes.time.time = lambda: worker_cutoff
         term_wait, kill_wait = processes._bounded_graces(10.0, 5.0, teardown_cap)
         assert kill_wait > 0, "the escalation that frees the gpu must be given time to be reaped"
+        # the whole window is handed to the supervision -- none of it is lost to the split.
+        assert term_wait + kill_wait == pytest.approx(teardown_cap - worker_cutoff)
         assert term_wait + kill_wait <= b._CONSOLE_UPLOAD_STOP_TIMEOUT_S
+        # bounded by the cutoff instead, both waits collapse and the kill is never awaited.
         assert processes._bounded_graces(10.0, 5.0, worker_cutoff) == (0.0, 0.0)
     finally:
         processes.time.time = real_time
