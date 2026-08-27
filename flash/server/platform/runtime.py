@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import os
 import threading
@@ -597,10 +596,9 @@ def _drain_cleanup_remotes_bg(run_id: str) -> None:
         _drain_cleanup_remotes(run_id)
 
 
-def _quarantine_corrupt_recovery_record(run_id: str, known: set[str], exc: Exception) -> None:
-    from flash.runner.lifecycle.status import _quarantine_corrupt_status, _update
+def _quarantine_corrupt_recovery_record(run_id: str, exc: Exception) -> None:
+    from flash.runner.lifecycle.status import _quarantine_corrupt_status
 
-    known.discard(run_id)
     _log.warning(
         "marking run %s failed: persisted status could not be decoded",
         run_id,
@@ -610,12 +608,12 @@ def _quarantine_corrupt_recovery_record(run_id: str, known: set[str], exc: Excep
         f"unrecoverable: persisted status cannot be decoded: {exc}; "
         "provider handle unavailable, orphan sweep will attempt label cleanup"
     )
+    quarantined = False
     with contextlib.suppress(Exception):
-        _quarantine_corrupt_status(run_id)
-    with contextlib.suppress(Exception):
-        _update(run_id, "failed", error=detail)
-    with contextlib.suppress(Exception):
-        _append_run_log(run_id, detail)
+        quarantined = _quarantine_corrupt_status(run_id, detail)
+    if quarantined:
+        with contextlib.suppress(Exception):
+            _append_run_log(run_id, detail)
 
 
 def _classify_recoverable_runs(
@@ -629,9 +627,9 @@ def _classify_recoverable_runs(
     """
     from flash.runner.lifecycle.preparation import _mark_warmstart_source
     from flash.runner.lifecycle.status import (
+        _get_recovery_status,
         _update,
         effective_spec_from_status,
-        get_status,
         reallocation_spec_from_status,
     )
     from flash.runner.supervise.attach import attach_run
@@ -641,11 +639,11 @@ def _classify_recoverable_runs(
     for row in db.all_runs():
         known.add(row["run_id"])
         try:
-            status = get_status(row["run_id"])
+            status = _get_recovery_status(row["run_id"])
         except FileNotFoundError:
             continue
-        except (json.JSONDecodeError, ValueError, TypeError, SourceSnapshotError) as exc:
-            _quarantine_corrupt_recovery_record(row["run_id"], known, exc)
+        except (UnicodeDecodeError, ValueError, TypeError, SourceSnapshotError) as exc:
+            _quarantine_corrupt_recovery_record(row["run_id"], exc)
             continue
         # drain cleanup remotes in the background. provider outages can block each teardown through
         # retry/backoff; serial startup cleanup can exceed HEALTHCHECK grace and create a restart loop.

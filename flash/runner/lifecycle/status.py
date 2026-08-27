@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import tempfile
 import time
 
 from flash.core.catalog import validate_model_for_algorithm
@@ -22,6 +23,7 @@ from flash.core.spec import JobSpec
 from flash.core.spec_persistence import validate_persisted_spec_envelope
 from flash.runner.lifecycle import attempts, preparation, reporting, state
 from flash.runner.lifecycle.state import RunStatus
+from flash.snapshot.archive import SourceSnapshotError
 
 # every other collaborator is reached through `runner.` rather than bound here. `RUNS_DIR`,
 # `get_status`, `_update`, `effective_spec_from_status`, `_gpu_rate`, `_internal_spec_from_status`
@@ -56,20 +58,57 @@ def get_status(run_id: str) -> RunStatus:
     return _runstatus_from_json(_load_status_json(run_id))
 
 
-def _quarantine_corrupt_status(run_id: str) -> None:
-    """Preserve an unreadable status record and install a parseable recovery envelope."""
+def _get_recovery_status(run_id: str) -> RunStatus:
+    status = get_status(run_id)
+    if status.run_id != run_id:
+        raise ValueError(f"stored run status id does not match {run_id}")
+    if not isinstance(status.state, str):
+        raise TypeError(f"stored run status state must be a string for {run_id}")
+    return status
+
+
+def _quarantine_corrupt_status(run_id: str, detail: str) -> bool:
+    """Preserve a still-unreadable status record and atomically install a failed envelope."""
     path = state.runs_file_path(run_id, ".json")
     quarantine_path = state.runs_file_path(run_id, f".json.corrupt-{time.time_ns()}")
-    replacement = RunStatus(run_id=run_id, state="provisioning", spec={})
-    with state._status_guard(run_id):
-        os.replace(path, quarantine_path)
-        try:
-            state._save_status_unlocked(replacement)
-        except Exception:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(path)
-            os.replace(quarantine_path, path)
-            raise
+    now = time.time()
+    failed = RunStatus(
+        run_id=run_id,
+        state="failed",
+        spec={},
+        created_at=now,
+        updated_at=now,
+        error=detail,
+        finished_at=now,
+    )
+    os.makedirs(state.RUNS_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=state.RUNS_DIR, prefix=f"{run_id}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as file:
+            json.dump(state._status_storage_dict(failed), file, indent=2, sort_keys=True)
+            file.flush()
+            os.fsync(file.fileno())
+        with state._status_guard(run_id):
+            try:
+                _get_recovery_status(run_id)
+            except FileNotFoundError:
+                return False
+            except (UnicodeDecodeError, ValueError, TypeError, SourceSnapshotError):
+                pass
+            else:
+                return False
+            os.link(path, quarantine_path)
+            dir_fd = os.open(state.RUNS_DIR, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+                os.replace(tmp, path)
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+            return True
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
 
 
 def source_snapshot_from_status(status: RunStatus, *, required: bool = False) -> dict | None:
