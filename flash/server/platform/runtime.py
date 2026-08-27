@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import threading
@@ -596,6 +597,27 @@ def _drain_cleanup_remotes_bg(run_id: str) -> None:
         _drain_cleanup_remotes(run_id)
 
 
+def _quarantine_corrupt_recovery_record(run_id: str, known: set[str], exc: Exception) -> None:
+    from flash.runner.lifecycle.status import _quarantine_corrupt_status, _update
+
+    known.discard(run_id)
+    _log.warning(
+        "marking run %s failed: persisted status could not be decoded",
+        run_id,
+        exc_info=True,
+    )
+    detail = (
+        f"unrecoverable: persisted status cannot be decoded: {exc}; "
+        "provider handle unavailable, orphan sweep will attempt label cleanup"
+    )
+    with contextlib.suppress(Exception):
+        _quarantine_corrupt_status(run_id, detail)
+    with contextlib.suppress(Exception):
+        _update(run_id, "failed", error=detail)
+    with contextlib.suppress(Exception):
+        _append_run_log(run_id, detail)
+
+
 def _classify_recoverable_runs(
     active: set[str], known: set[str], resubmit: list[tuple[JobSpec, str]]
 ) -> None:
@@ -614,12 +636,16 @@ def _classify_recoverable_runs(
     )
     from flash.runner.supervise.attach import attach_run
     from flash.runner.supervise.recovery import _gc_run_endpoints
+    from flash.snapshot.archive import SourceSnapshotError
 
     for row in db.all_runs():
         known.add(row["run_id"])
         try:
             status = get_status(row["run_id"])
         except FileNotFoundError:
+            continue
+        except (json.JSONDecodeError, ValueError, TypeError, SourceSnapshotError) as exc:
+            _quarantine_corrupt_recovery_record(row["run_id"], known, exc)
             continue
         # drain cleanup remotes in the background. provider outages can block each teardown through
         # retry/backoff; serial startup cleanup can exceed HEALTHCHECK grace and create a restart loop.

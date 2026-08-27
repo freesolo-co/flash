@@ -56,6 +56,31 @@ def get_status(run_id: str) -> RunStatus:
     return _runstatus_from_json(_load_status_json(run_id))
 
 
+def _quarantine_corrupt_status(run_id: str, detail: str) -> None:
+    """Preserve an unreadable status record and replace it with a terminal envelope."""
+    path = state.runs_file_path(run_id, ".json")
+    quarantine_path = state.runs_file_path(run_id, f".json.corrupt-{time.time_ns()}")
+    now = time.time()
+    failed = RunStatus(
+        run_id=run_id,
+        state="failed",
+        spec={},
+        created_at=now,
+        updated_at=now,
+        error=detail,
+        finished_at=now,
+    )
+    with state._status_guard(run_id):
+        os.replace(path, quarantine_path)
+        try:
+            state._save_status_unlocked(failed)
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+            os.replace(quarantine_path, path)
+            raise
+
+
 def source_snapshot_from_status(status: RunStatus, *, required: bool = False) -> dict | None:
     """Return the strict persisted descriptor without ever reconstructing source identity."""
     raw = status.source_snapshot

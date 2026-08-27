@@ -6747,6 +6747,111 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    ("failure_mode", "bad_payload"),
+    [
+        pytest.param("invalid_json", "{", id="invalid-json"),
+        pytest.param("non_object", json.dumps([]), id="valid-json-list"),
+        pytest.param("missing_fields", json.dumps({"run_id": "bad-run"}), id="missing-fields"),
+        pytest.param(
+            "source_snapshot",
+            json.dumps(
+                {
+                    "run_id": "bad-run",
+                    "state": "queued",
+                    "spec": {},
+                    "source_snapshot": {"kind": "invalid"},
+                }
+            ),
+            id="malformed-source-snapshot",
+        ),
+    ],
+)
+def test_recover_runs_corrupt_status_is_quarantined_per_record(
+    monkeypatch, tmp_path, failure_mode, bad_payload
+):
+    import threading
+
+    import flash.runner.supervise.attach as runner_attach
+    import flash.server.platform.db as db_mod
+    from flash.providers.core import registry as providers_mod
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
+    import flash.server.asgi.app as app_mod
+
+    importlib.reload(app_mod)
+
+    healthy_spec = {
+        "model": "Qwen/Qwen3.5-9B",
+        "project": "11111111-1111-4111-8111-111111111111",
+        "algorithm": "grpo",
+        "train": {"epochs": 1, "max_examples": 1},
+        "gpu": {},
+        "run_id": "healthy-run",
+    }
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id="healthy-run",
+            state="queued",
+            spec=healthy_spec,
+            remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
+    )
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+    with open(runner_state.runs_file_path("bad-run", ".json"), "w") as file:
+        file.write(bad_payload)
+
+    # bad-run must be first or the unfixed loop can recover healthy-run before aborting.
+    monkeypatch.setattr(
+        app_mod.db,
+        "all_runs",
+        lambda: [{"run_id": "bad-run"}, {"run_id": "healthy-run"}],
+    )
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda spec: None)
+
+    swept = threading.Event()
+    sweep_known = []
+
+    class _FakeProvider:
+        def sweep_orphans(self, active_labels=None, known_labels=None):
+            sweep_known.append(set(known_labels or ()))
+            swept.set()
+            return []
+
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeProvider()])
+
+    attached = []
+    monkeypatch.setattr(runner_attach, "attach_run", lambda run_id: attached.append(run_id))
+    resubmitted = []
+    done = threading.Event()
+
+    def fake_run_job(spec):
+        resubmitted.append(spec.run_id)
+        done.set()
+
+    monkeypatch.setattr(runner_lifecycle, "_run_job", fake_run_job)
+
+    app_mod.recover_runs()
+
+    assert done.wait(timeout=5), f"healthy-run was not resubmitted after {failure_mode}"
+    assert resubmitted == ["healthy-run"]
+    assert attached == []
+    assert swept.is_set()
+    assert sweep_known == [{"healthy-run"}]
+
+    bad_status = runner_status.get_status("bad-run")
+    assert bad_status.state == "failed"
+    assert bad_status.error
+    assert "persisted status cannot be decoded" in bad_status.error
+    assert "unrecoverable" in runner_status.get_logs("bad-run")
+    quarantine_files = list((tmp_path / "runs").glob("bad-run.json.corrupt-*"))
+    assert len(quarantine_files) == 1
+    assert quarantine_files[0].read_text() == bad_payload
+
+
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     """POST /v1/envs publishes an uploaded package to the managed environment hub."""
     monkeypatch.setenv("GITHUB_TOKEN", "token-for-publish-path")
