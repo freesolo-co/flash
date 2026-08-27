@@ -270,7 +270,14 @@ def _shell_tokens(script: str) -> list[str]:
             end = index + 1
             while end < len(script) and script[end] == character:
                 end += 1
-            tokens.append(script[index:end])
+            operator = script[index:end]
+            # `>&`, `<&`, `>|` and `<>` mix two characters, so a run of one character never spells
+            # them. without this the second character reads as a separator and splits the command,
+            # so `2>&1 uv sync` loses `uv` as the executable and the contract never sees it.
+            if end < len(script) and operator + script[end] in REDIRECTION_OPERATORS:
+                operator += script[end]
+                end += 1
+            tokens.append(operator)
             index = end
             continue
         word, index = _read_shell_word(script, index)
@@ -486,21 +493,33 @@ def _download_urls(words: list[str], index: int) -> list[str]:
 
 
 def _shell_interpreter_scripts(words: list[str], index: int) -> list[str]:
-    """the script arguments a `sh -c`-style invocation will execute."""
+    """the script arguments a `sh -c`-style invocation will execute.
+
+    a shell never takes the script attached to the flag: characters after `-c` are more option
+    letters, so `bash -cecho x` is an invalid-option error, not a script. the script is always the
+    first operand left after option parsing, which means a cluster such as `-ce` or `-lc` still
+    runs one, and `-o` inside a cluster swallows the word before it.
+    """
 
     scripts: list[str] = []
     cursor = index + 1
+    command_mode = False
     while cursor < len(words):
         word = words[cursor]
-        if word.startswith("-c") and word != "-c":
-            scripts.append(word[2:])
-            cursor += 1
-            continue
-        if word == "-c" and cursor + 1 < len(words):
-            scripts.append(words[cursor + 1])
-            cursor += 2
-            continue
         cursor += 1
+        # `--` ends the options but not the operands: `sh -c -- 'uv sync'` still runs the script.
+        if word == "--":
+            continue
+        if len(word) < 2 or word[0] not in "-+":
+            if command_mode:
+                scripts.append(word)
+                command_mode = False
+            continue
+        letters = word[1:]
+        command_mode = command_mode or "c" in letters
+        # `-o`/`-O` take the following word as their value, so it is never the script.
+        if letters[-1] in "oO":
+            cursor += 1
     return scripts
 
 
@@ -664,31 +683,65 @@ def _assert_install_script_contract(source: str) -> None:
     assert "download-from-astral-mirror" not in source
 
 
-def _without_heredoc_payloads(script: str) -> str:
+def _feeds_a_shell_interpreter(line: str) -> bool:
+    """whether a heredoc declared on this line becomes a script the shell will run.
+
+    `bash <<'EOF'` executes its payload; `cat > notes <<'EOF'` only writes it. an interpreter given
+    `-c` runs that argument instead, so its heredoc is plain stdin.
+    """
+
+    return any(
+        _basename(command[_unwrap_command(command)]) in SHELL_INTERPRETERS
+        and not _shell_interpreter_scripts(command, _unwrap_command(command))
+        for command in _shell_commands(line)
+        if _unwrap_command(command) < len(command)
+    )
+
+
+def _split_heredoc_payloads(script: str) -> tuple[str, list[str]]:
+    """the script without its heredoc bodies, plus the bodies that get executed as scripts.
+
+    the bodies have to come back out separately: dropping them all hides an installer written as
+    `bash <<'EOF' ... EOF`, and leaving them all in would read a config file's prose as commands.
+    """
+
     kept: list[str] = []
-    pending: list[tuple[str, bool]] = []
+    executed: list[str] = []
+    pending: list[tuple[str, bool, list[str] | None]] = []
     for line in script.splitlines():
         if pending:
-            delimiter, strip_tabs = pending[0]
+            delimiter, strip_tabs, body = pending[0]
             candidate = line.lstrip("\t") if strip_tabs else line
             if candidate == delimiter:
+                if body is not None:
+                    executed.append("\n".join(body))
                 pending.pop(0)
+            elif body is not None:
+                body.append(candidate)
             continue
 
         kept.append(line)
-        pending.extend(_heredoc_declarations(line))
+        runs_payload = _feeds_a_shell_interpreter(line)
+        pending.extend(
+            (delimiter, strip_tabs, [] if runs_payload else None)
+            for delimiter, strip_tabs in _heredoc_declarations(line)
+        )
 
     assert not pending, f"unterminated heredoc delimiter {pending[0][0]!r}"
-    return "\n".join(kept)
+    return "\n".join(kept), executed
 
 
-def _run_lines(step: dict[str, Any]) -> list[str]:
-    script = _without_heredoc_payloads(str(step.get("run", "")))
+def _significant_lines(script: str) -> list[str]:
     return [
         line.strip()
         for line in script.splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
+
+
+def _run_lines(step: dict[str, Any]) -> list[str]:
+    kept, executed = _split_heredoc_payloads(str(step.get("run", "")))
+    return _significant_lines("\n".join([kept, *executed]))
 
 
 def _step_uses_or_installs_uv(step: dict[str, Any]) -> bool:
@@ -1078,9 +1131,24 @@ def test_serving_docker_contract_rejects_hash_bypass_sabotage(sabotage: Any) -> 
         "uvx ruff check .",
         # a script carried in one -c argument is still a script.
         'bash -c "uv pip install foo"',
-        'sh -c"uv sync"',
         'zsh -c "uvx ruff"',
         'env FOO=1 bash -c "uv sync"',
+        # no shell accepts an attached `-cSCRIPT`; the letters after -c are more option letters, so
+        # a cluster such as -ce or -lc still runs the operand that follows it as the script.
+        "bash -ce 'uv sync'",
+        "bash -lc 'uv pip install foo'",
+        # -o inside a cluster eats the next word as its value, so the script is the word after that.
+        "bash -co pipefail 'uv sync'",
+        "bash -o pipefail -c 'uv sync'",
+        # `--` ends the options but not the operands, so the script still follows it.
+        "sh -c -- 'uv sync'",
+        # a redirection whose two characters differ must tokenize as one operator, or the second
+        # character reads as a command separator and the real executable is lost.
+        "2>&1 uv sync",
+        ">|/tmp/log uv pip install foo",
+        # a heredoc fed straight to a shell is a script that shell executes.
+        "bash <<'EOF'\nuv sync\nEOF",
+        "bash -s <<'EOF'\nuvx ruff\nEOF",
         # command substitutions execute as commands in their own right.
         "echo `uv --version`",
         "echo $(echo $(uv --version))",
@@ -1113,6 +1181,13 @@ def test_workflow_contract_detects_uv_bypass_forms(bypass: str) -> None:
         # near-misses that must stay quiet.
         "uvicorn app:main",
         "mkdir -p /opt/uv",
+        # `-cuv sync` is one option cluster, and `u` is not an option any shell defines. every
+        # shell tested rejects it as an invalid option rather than running it as a script.
+        'sh -c"uv sync"',
+        # a heredoc the receiving command only writes to disk is data, not a script.
+        "cat > notes.txt <<'EOF'\nuv sync is how we used to do it\nEOF",
+        # an interpreter given -c runs that argument; its heredoc is plain stdin, not a script.
+        "bash -c 'echo hi' <<'EOF'\nuv sync\nEOF",
     ],
 )
 def test_workflow_contract_does_not_reject_uv_shaped_text_that_never_installs_uv(
