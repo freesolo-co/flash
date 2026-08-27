@@ -14,6 +14,7 @@ import pytest
 
 from flash.serve.app import __main__ as app_main
 from flash.serve.app import bootstrap as bootstrap_module
+from flash.serve.app import chat_stream as task_cleanup_module
 from flash.serve.app import http as http_module
 from flash.serve.app.bootstrap import (
     PublishedAdapter,
@@ -29,6 +30,7 @@ from flash.serve.app.http import (
 )
 from flash.serve.app.manifest import build_serving_manifest
 from flash.serve.app.openai import ReasoningDeltaSplitter, split_reasoning
+from flash.serve.request import validation
 from flash.serve.runtime import (
     GenerationChoice,
     GenerationResult,
@@ -38,6 +40,7 @@ from flash.serve.runtime import (
     StreamFinished,
     StreamReady,
 )
+from flash.serve.runtime.prompt import PreparedPrompt
 from tests.test_serve_app_manifest import _profile_spec_and_inputs, _spec_and_inputs
 
 AUTH_TOKEN = "inference-token-sentinel"
@@ -670,6 +673,329 @@ def test_disconnect_cancels_generation_after_body_is_consumed(stream: bool) -> N
 
     asyncio.run(scenario())
     assert len(runtime.generation_requests) == 1
+
+
+def test_http_disconnect_detaches_cancellation_resistant_generation_with_consumption(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "flash.serve.app.chat_stream._HTTP_CANCELLATION_GRACE_SECONDS",
+        0.01,
+    )
+    owner, runtime = _published_owner()
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+    body = json.dumps(_chat_body()).encode()
+
+    async def scenario() -> list[dict[str, object]]:
+        generation_started = asyncio.Event()
+        release_generation = asyncio.Event()
+        reported: list[dict[str, object]] = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: reported.append(context))
+
+        async def generate(request):
+            runtime.generation_requests.append(request)
+            generation_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                await release_generation.wait()
+                raise RuntimeError("detached generation failure") from exc
+
+        runtime.generate = generate
+        receive_count = 0
+
+        async def receive():
+            nonlocal receive_count
+            receive_count += 1
+            if receive_count == 1:
+                return {"type": "http.request", "body": body, "more_body": False}
+            await generation_started.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(_message):
+            raise AssertionError("a disconnected request must not send a response")
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [
+                (b"authorization", f"Bearer {AUTH_TOKEN}".encode()),
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+            "client": ("127.0.0.1", 12345),
+            "server": ("test", 80),
+        }
+        app_task = asyncio.create_task(app(scope, receive, send))
+        await generation_started.wait()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(app_task, timeout=0.1)
+        release_generation.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return reported
+
+    assert asyncio.run(scenario()) == []
+    assert len(runtime.generation_requests) == 1
+
+
+@pytest.mark.parametrize("failure_timing", ["already_done", "in_grace"])
+def test_generation_failure_during_cancellation_cleanup_preserves_cancellation(
+    failure_timing: str,
+) -> None:
+    async def scenario() -> list[dict[str, object]]:
+        reported: list[dict[str, object]] = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: reported.append(context))
+        started = asyncio.Event()
+
+        async def generation() -> None:
+            started.set()
+            if failure_timing == "already_done":
+                raise RuntimeError("already failed generation")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                raise RuntimeError("in-grace generation failure") from exc
+
+        operation = asyncio.create_task(generation())
+        await started.wait()
+        if failure_timing == "already_done":
+            await asyncio.sleep(0)
+            assert operation.done()
+
+        async def caller() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await task_cleanup_module.cancel_task(operation)
+
+        caller_task = asyncio.create_task(caller())
+        await asyncio.sleep(0)
+        caller_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller_task
+        await asyncio.sleep(0)
+        return reported
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_cancel_task_retains_work_when_cleanup_caller_is_cancelled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        task_cleanup_module,
+        "_HTTP_CANCELLATION_GRACE_SECONDS",
+        1.0,
+    )
+
+    async def scenario() -> list[dict[str, object]]:
+        reported: list[dict[str, object]] = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: reported.append(context))
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+
+        async def generation() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                cancellation_seen.set()
+                await release.wait()
+                raise RuntimeError("late generation failure") from exc
+
+        operation = asyncio.create_task(generation())
+        await started.wait()
+        cleanup = asyncio.create_task(task_cleanup_module.cancel_task(operation))
+        await cancellation_seen.wait()
+        cleanup.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup
+        assert operation in task_cleanup_module._DETACHED_TASKS
+        release.set()
+        await operation_wait_done(operation)
+        await asyncio.sleep(0)
+        assert operation not in task_cleanup_module._DETACHED_TASKS
+        return reported
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_close_iterator_retains_close_when_cleanup_caller_is_cancelled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        task_cleanup_module,
+        "_HTTP_CANCELLATION_GRACE_SECONDS",
+        1.0,
+    )
+
+    async def scenario() -> tuple[bool, list[dict[str, object]]]:
+        reported: list[dict[str, object]] = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: reported.append(context))
+        close_started = asyncio.Event()
+        release = asyncio.Event()
+
+        class Iterator:
+            closed = False
+
+            async def aclose(self) -> None:
+                close_started.set()
+                await release.wait()
+                self.closed = True
+                raise RuntimeError("late iterator close failure")
+
+        iterator = Iterator()
+        cleanup = asyncio.create_task(task_cleanup_module.close_iterator(iterator))
+        await close_started.wait()
+        cleanup.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup
+        assert len(task_cleanup_module._DETACHED_TASKS) == 1
+        release.set()
+        detached = next(iter(task_cleanup_module._DETACHED_TASKS))
+        await operation_wait_done(detached)
+        await asyncio.sleep(0)
+        assert not task_cleanup_module._DETACHED_TASKS
+        return iterator.closed, reported
+
+    assert asyncio.run(scenario()) == (True, [])
+
+
+def test_caller_cancellation_survives_child_cancellation_and_settles_siblings() -> None:
+    async def scenario() -> tuple[asyncio.CancelledError, asyncio.CancelledError]:
+        operation_started = asyncio.Event()
+        disconnect_started = asyncio.Event()
+        operation_tasks: list[asyncio.Task[object]] = []
+        disconnect_tasks: list[asyncio.Task[object]] = []
+        original: list[asyncio.CancelledError] = []
+
+        async def operation() -> None:
+            task = asyncio.current_task()
+            assert task is not None
+            operation_tasks.append(task)
+            operation_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                raise asyncio.CancelledError("operation child cancellation") from exc
+
+        class Request:
+            async def receive(self) -> dict[str, str]:
+                task = asyncio.current_task()
+                assert task is not None
+                disconnect_tasks.append(task)
+                disconnect_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError as exc:
+                    raise asyncio.CancelledError("disconnect child cancellation") from exc
+
+        async def caller() -> None:
+            try:
+                await http_module._await_until_disconnect(Request(), operation())
+            except asyncio.CancelledError as exc:
+                original.append(exc)
+                raise
+
+        caller_task = asyncio.create_task(caller())
+        await operation_started.wait()
+        await disconnect_started.wait()
+        caller_task.cancel("caller cancellation sentinel")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await caller_task
+        assert operation_tasks[0].done()
+        assert disconnect_tasks[0].done()
+        assert not task_cleanup_module._DETACHED_TASKS
+        return original[0], caught.value
+
+    original, propagated = asyncio.run(scenario())
+    assert propagated is original
+    assert propagated.args == ("caller cancellation sentinel",)
+
+
+def test_close_iterator_preserves_active_caller_cancellation() -> None:
+    async def scenario() -> tuple[asyncio.CancelledError, asyncio.CancelledError, int]:
+        original: list[asyncio.CancelledError] = []
+
+        class Iterator:
+            close_calls = 0
+
+            async def aclose(self) -> None:
+                self.close_calls += 1
+                raise asyncio.CancelledError("iterator child cancellation")
+
+        iterator = Iterator()
+
+        async def caller() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                original.append(exc)
+                await task_cleanup_module.close_iterator(iterator)
+                raise
+
+        caller_task = asyncio.create_task(caller())
+        await asyncio.sleep(0)
+        caller_task.cancel("iterator caller cancellation sentinel")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await caller_task
+        return original[0], caught.value, iterator.close_calls
+
+    original, propagated, close_calls = asyncio.run(scenario())
+    assert propagated is original
+    assert propagated.args == ("iterator caller cancellation sentinel",)
+    assert close_calls == 1
+
+
+@pytest.mark.parametrize("iteration", range(25))
+def test_disconnect_wins_synchronized_simultaneous_operation_failure(iteration: int) -> None:
+    async def scenario() -> list[dict[str, object]]:
+        reported: list[dict[str, object]] = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: reported.append(context))
+        release = asyncio.Event()
+        operation_finished = asyncio.Event()
+        disconnect_finished = asyncio.Event()
+
+        async def operation() -> None:
+            await release.wait()
+            operation_finished.set()
+            raise RuntimeError(f"simultaneous operation failure {iteration}")
+
+        class Request:
+            async def receive(self) -> dict[str, str]:
+                await release.wait()
+                disconnect_finished.set()
+                return {"type": "http.disconnect"}
+
+        outcome = asyncio.create_task(http_module._await_until_disconnect(Request(), operation()))
+        await asyncio.sleep(0)
+        release.set()
+        await operation_finished.wait()
+        await disconnect_finished.wait()
+        with pytest.raises(asyncio.CancelledError):
+            await outcome
+        await asyncio.sleep(0)
+        return reported
+
+    assert asyncio.run(scenario()) == []
+
+
+async def operation_wait_done(operation: asyncio.Future[object]) -> None:
+    for _ in range(100):
+        if operation.done():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("operation did not finish")
 
 
 def test_nonstream_reasoning_accounting_provenance_and_structured_precedence() -> None:
@@ -1326,3 +1652,94 @@ def test_valid_message_shapes_still_reach_the_runtime(label: str, messages: list
     assert list(forwarded) == messages, (
         f"{label} was mutated on the way to the runtime: {forwarded}"
     )
+
+
+def test_cancel_task_preserves_the_operation_error_it_interrupted() -> None:
+    """cleanup cancellation must not erase the failure the caller was already reporting.
+
+    these helpers run from `finally`, so an operation error is usually in flight. plain asyncio
+    chains it onto the cancellation as `__context__`; awaiting inside the handler makes
+    `CancelledError` the frame's current exception, so a naive re-raise drops the original and the
+    operator sees a bare cancellation instead of the error that actually broke the request.
+    """
+
+    class OperationFailed(Exception):
+        pass
+
+    async def scenario() -> BaseException | None:
+        async def cancellation_resistant() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.Event().wait()
+
+        async def caller() -> None:
+            operation = asyncio.ensure_future(cancellation_resistant())
+            await asyncio.sleep(0)
+            try:
+                raise OperationFailed("the real failure")
+            finally:
+                await task_cleanup_module.cancel_task(operation)
+
+        caller_task = asyncio.create_task(caller())
+        await asyncio.sleep(0.05)
+        caller_task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await caller_task
+        return caught.value.__context__
+
+    context = asyncio.run(scenario())
+    assert isinstance(context, OperationFailed), (
+        f"the interrupted operation error was discarded; __context__ was {context!r}"
+    )
+    assert context.args == ("the real failure",)
+
+
+def test_close_images_releases_every_image_when_one_close_raises() -> None:
+    """one failing close() must not strand the remaining decoded image buffers.
+
+    pillow raises from close() on a truncated or already-detached file. this runs on the request
+    teardown path, so abandoning the rest of the list leaks a decoded buffer per request.
+    """
+
+    closed: list[int] = []
+
+    class Image:
+        def __init__(self, index: int, explode: bool) -> None:
+            self.index = index
+            self.explode = explode
+
+        def close(self) -> None:
+            if self.explode:
+                raise OSError(f"image {self.index} cannot be closed")
+            closed.append(self.index)
+
+    images = (Image(0, False), Image(1, True), Image(2, False), Image(3, False))
+
+    validation.close_images(images)
+
+    assert closed == [0, 2, 3], (
+        f"a raising close() stranded later images; only {closed} were released"
+    )
+
+
+def test_prepared_prompt_close_releases_every_image_when_one_close_raises() -> None:
+    """PreparedPrompt owns the same decoded buffers, so it must inherit the same guarantee."""
+
+    closed: list[int] = []
+
+    class Image:
+        def __init__(self, index: int, explode: bool) -> None:
+            self.index = index
+            self.explode = explode
+
+        def close(self) -> None:
+            if self.explode:
+                raise OSError(f"image {self.index} cannot be closed")
+            closed.append(self.index)
+
+    prompt = PreparedPrompt(value={}, images=(Image(0, True), Image(1, False), Image(2, False)))
+
+    prompt.close()
+
+    assert closed == [1, 2], f"a raising close() stranded later images; only {closed} were released"

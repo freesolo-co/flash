@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
 import types
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -132,6 +134,9 @@ class _Engine:
         self.added: list[_LoRARequest] = []
         self.pinned: list[int] = []
         self.removed: list[int] = []
+        self.abort_calls: list[tuple[str | Iterable[str], bool]] = []
+        self.abort_outcomes: list[Any] = []
+        self.active: dict[str, Any] = {}
         self.shutdown_called = False
         self.seen_images: list[Any] = []
         type(self).latest = self
@@ -152,6 +157,23 @@ class _Engine:
 
     async def shutdown(self) -> None:
         self.shutdown_called = True
+
+    async def abort(
+        self,
+        request_id: str | Iterable[str],
+        internal: bool = False,
+    ) -> None:
+        self.abort_calls.append((request_id, internal))
+        outcome = self.abort_outcomes.pop(0) if self.abort_outcomes else None
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if inspect.isawaitable(outcome):
+            await outcome
+        active = self.active.get(request_id) if isinstance(request_id, str) else None
+        release = getattr(active, "set", None)
+        if release is not None and outcome is not False:
+            release()
+        return outcome
 
     async def generate(
         self,
@@ -179,6 +201,17 @@ class _Engine:
         scenario = self.responses.pop(0)
         if isinstance(scenario, BaseException):
             raise scenario
+        if hasattr(scenario, "wait"):
+            self.active[request_id] = scenario
+            try:
+                await scenario.wait()
+            finally:
+                self.active.pop(request_id, None)
+            return
+        if hasattr(scenario, "__aiter__"):
+            async for output in scenario:
+                yield output
+            return
         for output in scenario:
             yield output
 
@@ -856,6 +889,195 @@ def test_multimodal_generation_closes_images(monkeypatch) -> None:
     asyncio.run(runtime.close())
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_output_stream_close_failure_still_closes_images_once(monkeypatch, streaming: bool) -> None:
+    images: list[Any] = []
+
+    class _Image:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def prepare(*_args, **_kwargs):
+        image = _Image()
+        images.append(image)
+        return ([{"role": "user", "content": [{"type": "image"}]}], [image])
+
+    class FailingCloseStream:
+        def __init__(self, output: Any) -> None:
+            self.output = output
+            self.sent = False
+            self.close_calls = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return self.output
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("output close failure")
+
+    monkeypatch.setattr(
+        "flash.serve.runtime.prompt.prepare_multimodal_request",
+        prepare,
+    )
+
+    async def scenario() -> tuple[int, int]:
+        runtime = VllmLoraRuntime(EngineConfig(model="model", image_limit=1))
+        await runtime.start()
+        output_stream = FailingCloseStream(_output("ok", [1]))
+        monkeypatch.setattr(runtime, "_generate_stream", lambda *_args: output_stream)
+        request = GenerationRequest(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": "ignored"}],
+                }
+            ],
+        )
+        if streaming:
+            with pytest.raises(RuntimeError, match="output close failure"):
+                _ = [event async for event in runtime.stream(request)]
+        else:
+            with pytest.raises(RuntimeError, match="output close failure"):
+                await runtime.generate(request)
+        assert runtime.health().owned_request_ids == ()
+        await runtime.close()
+        return output_stream.close_calls, images[0].close_calls
+
+    assert asyncio.run(scenario()) == (1, 1)
+
+
+def test_generate_owned_id_rejects_stream_before_image_or_iterator_preparation(
+    monkeypatch,
+) -> None:
+    images: list[Any] = []
+
+    class _Image:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def prepare(*_args, **_kwargs):
+        image = _Image()
+        images.append(image)
+        return ([{"role": "user", "content": [{"type": "image"}]}], [image])
+
+    monkeypatch.setattr(
+        "flash.serve.runtime.prompt.prepare_multimodal_request",
+        prepare,
+    )
+
+    async def scenario() -> tuple[int, int, list[int]]:
+        runtime = VllmLoraRuntime(EngineConfig(model="model", image_limit=1))
+        await runtime.start()
+        engine = _Engine.latest
+        assert engine is not None
+        engine.responses.append(asyncio.Event())
+        request = GenerationRequest(
+            request_id="generate-stream-collision",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": "ignored"}],
+                }
+            ],
+        )
+        active = asyncio.create_task(runtime.generate(request))
+        await _wait_for_generate_call(engine)
+        rejected = runtime.stream(request)
+        with pytest.raises(RuntimeNotReadyError, match="already owned"):
+            await anext(rejected)
+        await rejected.aclose()
+        active.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await active
+        await runtime.close()
+        return len(images), len(engine.generate_calls), [image.close_calls for image in images]
+
+    assert asyncio.run(scenario()) == (1, 1, [1])
+
+
+def test_stream_owned_id_rejects_generate_and_closes_image_and_iterator(monkeypatch) -> None:
+    images: list[Any] = []
+
+    class _Image:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def prepare(*_args, **_kwargs):
+        image = _Image()
+        images.append(image)
+        return ([{"role": "user", "content": [{"type": "image"}]}], [image])
+
+    monkeypatch.setattr(
+        "flash.serve.runtime.prompt.prepare_multimodal_request",
+        prepare,
+    )
+
+    async def scenario() -> tuple[int, int, list[int], bool]:
+        runtime = VllmLoraRuntime(EngineConfig(model="model", image_limit=1))
+        await runtime.start()
+        engine = _Engine.latest
+        assert engine is not None
+        release = asyncio.Event()
+        iterator_waiting = asyncio.Event()
+        iterator_closed = asyncio.Event()
+
+        async def outputs():
+            try:
+                yield _output("partial", [1], finish_reason=None)
+                engine.active["stream-generate-collision"] = release
+                iterator_waiting.set()
+                await release.wait()
+            finally:
+                engine.active.pop("stream-generate-collision", None)
+                iterator_closed.set()
+
+        engine.responses.append(outputs())
+        request = GenerationRequest(
+            request_id="stream-generate-collision",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image": "ignored"}],
+                }
+            ],
+        )
+        stream = runtime.stream(request)
+        assert isinstance(await anext(stream), StreamReady)
+        assert isinstance(await anext(stream), StreamDelta)
+        next_event = asyncio.create_task(anext(stream))
+        await iterator_waiting.wait()
+        with pytest.raises(RuntimeNotReadyError, match="already owned"):
+            await runtime.generate(request)
+        next_event.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await next_event
+        await stream.aclose()
+        await runtime.close()
+        return (
+            len(images),
+            len(engine.generate_calls),
+            [image.close_calls for image in images],
+            iterator_closed.is_set(),
+        )
+
+    assert asyncio.run(scenario()) == (1, 1, [1], True)
+
+
 def test_engine_death_callback_receives_runtime_health_once() -> None:
     reports = []
     runtime = VllmLoraRuntime(
@@ -908,3 +1130,205 @@ def test_engine_death_callback_retries_after_callback_failure() -> None:
     assert len(reports) == 1
     assert reports[0].runtime_id == runtime.runtime_id
     asyncio.run(runtime.close())
+
+
+def _set_short_cancellation_grace(monkeypatch) -> None:
+    monkeypatch.setattr("flash.serve.runtime.cancellation._ABORT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("flash.serve.runtime.cancellation._DRAIN_TIMEOUT_SECONDS", 0.01)
+
+
+async def _wait_for_generate_call(engine: _Engine) -> None:
+    for _ in range(100):
+        if engine.generate_calls:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("generation did not reach the engine")
+
+
+def test_request_owns_exact_engine_id_and_normal_completion_does_not_abort() -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    engine.responses.append([_output("ok", [1])])
+    request = GenerationRequest(prompt="hello", request_id="request-owned-id")
+
+    result = asyncio.run(runtime.generate(request))
+
+    assert result.request_id == request.request_id
+    assert engine.generate_calls[0]["request_id"] == request.request_id
+    assert engine.abort_calls == []
+    assert runtime.health().owned_request_ids == ()
+    asyncio.run(runtime.close())
+
+
+def test_cancel_before_first_token_aborts_exact_request_once() -> None:
+    async def scenario() -> tuple[list[tuple[str | Iterable[str], bool]], tuple[str, ...]]:
+        runtime = VllmLoraRuntime(EngineConfig(model="model"))
+        await runtime.start()
+        engine = _Engine.latest
+        assert engine is not None
+        engine.responses.append(asyncio.Event())
+        request = GenerationRequest(prompt="hello", request_id="request-before-first")
+        task = asyncio.create_task(runtime.generate(request))
+        await _wait_for_generate_call(engine)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        owned = runtime.health().owned_request_ids
+        await runtime.close()
+        return engine.abort_calls, owned
+
+    abort_calls, owned = asyncio.run(scenario())
+    assert abort_calls == [("request-before-first", False)]
+    assert owned == ()
+
+
+def test_midstream_disconnect_aborts_exact_request_once() -> None:
+    async def scenario() -> list[tuple[str | Iterable[str], bool]]:
+        runtime = VllmLoraRuntime(EngineConfig(model="model"))
+        await runtime.start()
+        engine = _Engine.latest
+        assert engine is not None
+        release = asyncio.Event()
+
+        async def outputs():
+            yield _output("partial", [1], finish_reason=None)
+            engine.active["request-midstream"] = release
+            try:
+                await release.wait()
+            finally:
+                engine.active.pop("request-midstream", None)
+
+        engine.responses.append(outputs())
+        stream = runtime.stream(GenerationRequest(prompt="hello", request_id="request-midstream"))
+        assert isinstance(await anext(stream), StreamReady)
+        assert isinstance(await anext(stream), StreamDelta)
+        next_event = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        next_event.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await next_event
+        await stream.aclose()
+        await runtime.close()
+        return engine.abort_calls
+
+    assert asyncio.run(scenario()) == [("request-midstream", False)]
+
+
+@pytest.mark.parametrize("abort_outcome", [False, RuntimeError("abort failed")])
+def test_unconfirmed_abort_marks_runtime_unhealthy_and_rejects_new_work(
+    monkeypatch, abort_outcome: Any
+) -> None:
+    _set_short_cancellation_grace(monkeypatch)
+
+    async def scenario() -> tuple[Any, list[tuple[str | Iterable[str], bool]]]:
+        runtime = VllmLoraRuntime(EngineConfig(model="model"))
+        await runtime.start()
+        engine = _Engine.latest
+        assert engine is not None
+        engine.responses.append(asyncio.Event())
+        engine.abort_outcomes.append(abort_outcome)
+        task = asyncio.create_task(
+            runtime.generate(GenerationRequest(prompt="hello", request_id="request-unconfirmed"))
+        )
+        await _wait_for_generate_call(engine)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        health = runtime.health()
+        with pytest.raises(RuntimeNotReadyError, match="unhealthy"):
+            await runtime.generate(GenerationRequest(prompt="new"))
+        await runtime.close()
+        return health, engine.abort_calls
+
+    health, abort_calls = asyncio.run(scenario())
+    assert health.ok is False
+    assert health.unhealthy_reason is not None
+    assert health.owned_request_ids == ("request-unconfirmed",)
+    assert abort_calls == [("request-unconfirmed", False)]
+
+
+def test_abort_timeout_and_cancellation_resistant_generation_are_bounded(monkeypatch) -> None:
+    _set_short_cancellation_grace(monkeypatch)
+
+    async def scenario() -> tuple[Any, list[tuple[str | Iterable[str], bool]]]:
+        runtime = VllmLoraRuntime(EngineConfig(model="model"))
+        await runtime.start()
+        engine = _Engine.latest
+        assert engine is not None
+        engine.responses.append(asyncio.Event())
+        engine.abort_outcomes.append(asyncio.Event().wait())
+        task = asyncio.create_task(
+            runtime.generate(GenerationRequest(prompt="hello", request_id="request-timeout"))
+        )
+        await _wait_for_generate_call(engine)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.1)
+        health = runtime.health()
+        await runtime.close()
+        return health, engine.abort_calls
+
+    health, abort_calls = asyncio.run(scenario())
+    assert health.ok is False
+    assert health.owned_request_ids == ("request-timeout",)
+    assert abort_calls == [("request-timeout", False)]
+
+
+def test_detached_abort_exception_is_consumed(monkeypatch) -> None:
+    _set_short_cancellation_grace(monkeypatch)
+
+    async def scenario() -> list[dict[str, Any]]:
+        reported: list[dict[str, Any]] = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: reported.append(context))
+        runtime = VllmLoraRuntime(EngineConfig(model="model"))
+        await runtime.start()
+        engine = _Engine.latest
+        assert engine is not None
+        generation_release = asyncio.Event()
+        abort_release = asyncio.Event()
+        engine.responses.append(generation_release)
+
+        async def late_abort_failure() -> None:
+            await abort_release.wait()
+            raise RuntimeError("late abort failure")
+
+        engine.abort_outcomes.append(late_abort_failure())
+        task = asyncio.create_task(
+            runtime.generate(GenerationRequest(prompt="hello", request_id="request-detached"))
+        )
+        await _wait_for_generate_call(engine)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        abort_release.set()
+        generation_release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await runtime.close()
+        return reported
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_generation_owner_deduplicates_concurrent_abort_calls() -> None:
+    from flash.serve.runtime.cancellation import GenerationOwner
+
+    async def scenario() -> list[tuple[str | Iterable[str], bool]]:
+        engine = _Engine()
+        release = asyncio.Event()
+        engine.active["request-deduplicated"] = release
+        owner = GenerationOwner(
+            engine,
+            "request-deduplicated",
+            mark_unhealthy=lambda *_args: None,
+            detach=lambda *_args: None,
+        )
+        first, second = await asyncio.gather(owner.cancel(), owner.cancel())
+        assert first.abort_confirmed is True
+        assert second.abort_confirmed is True
+        return engine.abort_calls
+
+    assert asyncio.run(scenario()) == [("request-deduplicated", False)]

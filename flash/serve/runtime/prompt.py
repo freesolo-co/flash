@@ -9,6 +9,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
+from ..request.validation import close_images
 from .errors import MultimodalRequestError, PromptError, ServingRuntimeError
 from .multimodal import has_image_blocks, normalize_text_messages, prepare_multimodal_request
 from .types import AdapterSpec, EngineConfig, GenerationRequest
@@ -39,10 +40,7 @@ class PreparedPrompt:
     images: tuple[Any, ...] = ()
 
     def close(self) -> None:
-        for image in self.images:
-            close = getattr(image, "close", None)
-            if close is not None:
-                close()
+        close_images(self.images)
 
 
 def safe_chat_template_kwargs(raw: Any) -> dict[str, Any]:

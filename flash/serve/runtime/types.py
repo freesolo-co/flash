@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -367,6 +368,7 @@ class GenerationRequest:
 
     adapter_id: str | None = None
     expected_incarnation: str | None = None
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     prompt: str | None = None
     messages: Sequence[Mapping[str, Any]] | None = None
     max_tokens: int = 1024
@@ -384,6 +386,7 @@ class GenerationRequest:
     stop: Any = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "request_id", _nonempty(self.request_id, "request_id"))
         if self.adapter_id is not None:
             object.__setattr__(self, "adapter_id", _nonempty(self.adapter_id, "adapter_id"))
         if self.expected_incarnation is not None:
@@ -563,3 +566,5 @@ class RuntimeHealth:
     registered_adapters: int
     loaded_adapters: int
     prompt_cache_entries: int
+    unhealthy_reason: str | None
+    owned_request_ids: tuple[str, ...]

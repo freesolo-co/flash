@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sys
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from typing import Any
@@ -22,6 +23,129 @@ from .openai import (
     stream_chunk,
     usage_stream_chunk,
 )
+
+_HTTP_CANCELLATION_GRACE_SECONDS = 3.0
+_DETACHED_TASKS: set[asyncio.Future[Any]] = set()
+
+
+def _consume_terminal(task: asyncio.Future[Any]) -> None:
+    with suppress(asyncio.CancelledError):
+        task.exception()
+
+
+def _cancellation_count() -> int:
+    caller = asyncio.current_task()
+    return 0 if caller is None else caller.cancelling()
+
+
+def _new_caller_cancellation(previous_count: int) -> bool:
+    return _cancellation_count() > previous_count
+
+
+def _raise_caller_cancellation(
+    caught: asyncio.CancelledError,
+    interrupted: BaseException | None,
+) -> None:
+    """re-raise caller cancellation without discarding the exception it interrupted.
+
+    these helpers run from `finally`, so an operation error is often already in flight. plain
+    asyncio preserves it as the cancellation's `__context__`, but that only holds while the
+    original is the frame's current exception: awaiting inside the handler makes `CancelledError`
+    current, so by the time we re-raise, `sys.exc_info()` is the cancellation itself and the
+    original is unreachable. `interrupted` is therefore captured on entry, before the first await.
+    """
+
+    if interrupted is not None and interrupted is not caught:
+        caught.__context__ = interrupted
+    raise caught
+
+
+def detach_task(task: asyncio.Future[Any]) -> None:
+    """retain a detached task until its terminal exception has been consumed."""
+
+    _DETACHED_TASKS.add(task)
+
+    def consume(done: asyncio.Future[Any]) -> None:
+        _DETACHED_TASKS.discard(done)
+        _consume_terminal(done)
+
+    task.add_done_callback(consume)
+
+
+async def cancel_task(task: asyncio.Future[Any]) -> bool:
+    """cancel and await one task within the http cancellation grace."""
+
+    interrupted = sys.exc_info()[1]
+    cancellation_count = _cancellation_count()
+    if task.done():
+        _consume_terminal(task)
+        return True
+    task.cancel()
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=_HTTP_CANCELLATION_GRACE_SECONDS,
+        )
+    except asyncio.CancelledError as exc:
+        if task.done():
+            _consume_terminal(task)
+        if _new_caller_cancellation(cancellation_count):
+            if not task.done():
+                detach_task(task)
+            _raise_caller_cancellation(exc, interrupted)
+        return True
+    except TimeoutError:
+        if task.done():
+            _consume_terminal(task)
+            return True
+        detach_task(task)
+        return False
+    except Exception:
+        _consume_terminal(task)
+        return True
+    return True
+
+
+async def close_iterator(iterator: AsyncIterator[Any]) -> bool:
+    """close one iterator within the same bounded http cancellation grace."""
+
+    interrupted = sys.exc_info()[1]
+    cancellation_count = _cancellation_count()
+    close = getattr(iterator, "aclose", None)
+    if close is None:
+        return True
+    try:
+        result = close()
+    except asyncio.CancelledError:
+        return True
+    except Exception:
+        return True
+    if not inspect.isawaitable(result):
+        return True
+    task = asyncio.ensure_future(result)
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=_HTTP_CANCELLATION_GRACE_SECONDS,
+        )
+    except asyncio.CancelledError as exc:
+        if task.done():
+            _consume_terminal(task)
+        if _new_caller_cancellation(cancellation_count):
+            if not task.done():
+                detach_task(task)
+            _raise_caller_cancellation(exc, interrupted)
+        return True
+    except TimeoutError:
+        if task.done():
+            _consume_terminal(task)
+            return True
+        detach_task(task)
+        return False
+    except Exception:
+        _consume_terminal(task)
+        return True
+    return True
 
 
 async def stream_chat_body(
@@ -131,13 +255,3 @@ async def stream_chat_body(
         await close_iterator(event_stream)
     if succeeded:
         yield sse_data("[DONE]")
-
-
-async def close_iterator(iterator: AsyncIterator[Any]) -> None:
-    close = getattr(iterator, "aclose", None)
-    if close is None:
-        return
-    with suppress(Exception):
-        result = close()
-        if inspect.isawaitable(result):
-            await result
