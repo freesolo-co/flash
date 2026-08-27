@@ -86,7 +86,9 @@ def validate_adapter_path(raw_path: str) -> Path:
     except OSError as exc:
         raise AdapterPathError(f"adapter path cannot be inspected: {path}") from exc
     if not loadable:
-        raise AdapterPathError(f"adapter path has no loadable adapter tensor files: {path}")
+        raise AdapterPathError(
+            f"adapter path has no loadable adapter weight representation: {path}"
+        )
     return path
 
 

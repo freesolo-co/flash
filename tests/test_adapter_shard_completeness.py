@@ -373,7 +373,7 @@ def test_both_serving_runtimes_refuse_an_unloadable_adapter_directory(tmp_path, 
     assert not has_loadable_adapter_weights(filenames), shape
     assert not directory_holds_loadable_adapter_weights(path), shape
     assert not _adapter_cache_ready(path), shape
-    with pytest.raises(AdapterPathError, match="no loadable adapter tensor files"):
+    with pytest.raises(AdapterPathError, match="no loadable adapter weight representation"):
         validate_adapter_path(str(path))
 
 
@@ -422,7 +422,7 @@ def test_an_empty_single_file_is_rejected_beside_a_complete_shard_set(tmp_path):
 
     assert not directory_holds_loadable_adapter_weights(path)
     assert not _adapter_cache_ready(path)
-    with pytest.raises(AdapterPathError, match="no loadable adapter tensor files"):
+    with pytest.raises(AdapterPathError, match="no loadable adapter weight representation"):
         validate_adapter_path(str(path))
 
 
