@@ -147,15 +147,34 @@ def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app
     from flash.serving.src.engine.model_config import base_models, gpu_for
 
     window_for = modal_app_module.scaledown_window_for
-    default = modal_app_module.DEFAULT_SCALEDOWN_WINDOW_SECONDS
 
     assert window_for("L4") < window_for("L40S") < window_for("H100") < window_for("H200")
     # The H200 keeps the full legacy hold (boot is ~17 min; a miss stalls the user that long).
-    assert window_for("H200") == default == 1800
+    assert window_for("H200") == 1800
     # Every catalog tier resolves to a positive window, so no model falls back by accident.
     assert all(window_for(gpu_for(bm)) > 0 for bm in base_models())
-    # An unknown tier falls back to the safe (longest) default rather than releasing early.
-    assert window_for("B200") == default
+    # The Blackwell tiers hold the H200 window until a real cold-boot canary measures them.
+    assert window_for("B200") == window_for("B300") == 1800
+
+
+def test_unknown_gpu_tier_is_rejected_not_silently_defaulted(modal_app_module):
+    # `gpu` in the serving catalog is a plain string. A typo or an unvalidated new card used to fall
+    # through `dict.get` to the default window and DEPLOY, billing that card's real hourly rate on a
+    # tier nobody qualified. Every one of these once returned 1800 silently.
+    from flash.serving.src.engine.model_config import base_models, gpu_for
+
+    window_for = modal_app_module.scaledown_window_for
+
+    for bogus in ("b200", "B2OO", "H2OO", "A100", "TOTALLY_FAKE", ""):
+        with pytest.raises(ValueError, match="Unsupported serving GPU tier"):
+            window_for(bogus)
+
+    # The gate is membership in the shipped table, so the two stay in sync by construction.
+    assert frozenset(modal_app_module.SCALEDOWN_WINDOW_SECONDS_BY_GPU) == (
+        modal_app_module.SUPPORTED_GPUS
+    )
+    # Every tier a cataloged model actually routes to must be supported.
+    assert {gpu_for(bm) for bm in base_models()} <= modal_app_module.SUPPORTED_GPUS
 
 
 def test_modal_concurrency_is_per_engine_key(modal_app_module):
