@@ -28,7 +28,12 @@ DEPLOYMENT_ID = "12345-1"
 
 
 def _Snapshot(pending=0, leased=0, expired_leases=0, oldest_undelivered_age_seconds=None):
-    """A backlog RPC body, shaped exactly as `serving_usage_backlog_snapshot` returns it."""
+    """A backlog RPC body, shaped exactly as `serving_usage_backlog_snapshot` returns it.
+
+    `pending`/`leased` are still sent by the RPC and still shaped here, because the point of the
+    test below is that a deployment-wide backlog does NOT fail a promotion. The gate no longer
+    reads them; this helper keeps them so the body stays the real wire shape.
+    """
     return {
         "states": {"pending": pending, "leased": leased},
         "expired_leases": expired_leases,

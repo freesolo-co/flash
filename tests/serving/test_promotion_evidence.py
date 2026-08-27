@@ -136,12 +136,7 @@ def test_a_real_stream_passes():
 
 
 def _evidence(**overrides) -> AccountingEvidence:
-    counters = {
-        "pending": 0,
-        "leased": 0,
-        "expired_leases": 0,
-        "oldest_undelivered_age_seconds": None,
-    }
+    counters = {"expired_leases": 0, "oldest_undelivered_age_seconds": None}
     counters.update(overrides)
     return AccountingEvidence(**counters)
 
@@ -155,7 +150,7 @@ def test_traffic_in_flight_is_not_a_failed_promotion():
     burst of unrelated traffic draining to zero would pass a release whose own row never settled.
     Only stall signals mean the same thing regardless of whose rows are in the counters.
     """
-    assert verify_accounting(_evidence(pending=7, leased=3)).ok
+    assert verify_accounting(_evidence(oldest_undelivered_age_seconds=3)).ok
 
 
 def test_an_expired_lease_blocks_promotion():
@@ -166,14 +161,16 @@ def test_an_expired_lease_blocks_promotion():
 
 def test_a_row_undelivered_past_the_stall_threshold_blocks_promotion():
     """Age separates "in flight" from "stuck" without needing to know whose row it is."""
-    assert verify_accounting(_evidence(pending=1, oldest_undelivered_age_seconds=119)).ok
-    verdict = verify_accounting(_evidence(pending=1, oldest_undelivered_age_seconds=120))
+    assert verify_accounting(_evidence(oldest_undelivered_age_seconds=119)).ok
+    verdict = verify_accounting(_evidence(oldest_undelivered_age_seconds=120))
     assert verdict.reason == ACCOUNTING_STALLED
 
 
 def _body(**overrides):
     """A `serving_usage_backlog_snapshot` body, shaped exactly as the RPC returns it."""
     body = {
+        # still sent by the RPC and still required by the parser, though no field is read out of
+        # it: an absent `states` is what a schema rename or an empty result looks like.
         "states": {"pending": 0, "leased": 0},
         "expired_leases": 0,
         "oldest_undelivered_age_seconds": None,
@@ -189,7 +186,9 @@ def test_a_body_missing_a_counter_is_unreadable_not_healthy():
     `int(states.get("pending") or 0)`. Correct for a delivery worker deciding whether to wake up,
     fail-open for a gate, which is why the gate parses the RPC body itself.
     """
-    assert parse_accounting({"states": {"pending": 0}}) is None
+    body = _body()
+    del body["expired_leases"]
+    assert parse_accounting(body) is None
     assert parse_accounting(_body(expired_leases=None)) is None
     assert verify_accounting(parse_accounting({})).reason == ACCOUNTING_MALFORMED
 
@@ -202,6 +201,22 @@ def test_an_empty_rpc_result_never_reads_as_a_drained_backlog():
     """
     for payload in (None, {}, [], "ok", 7, {"states": []}, {"states": None}):
         assert verify_accounting(parse_accounting(payload)).reason == ACCOUNTING_MALFORMED
+
+
+def test_a_body_without_states_is_unreadable_even_when_every_read_field_is_present():
+    """`states` is required despite no field being read out of it.
+
+    The gate reads only `expired_leases` and the age, so a body that lost `states` entirely would
+    otherwise parse fine. But a snapshot missing a whole top-level object is not a healthy
+    snapshot -- it is the shape a renamed schema or a permission-shaped result takes, and the
+    counters that DID survive cannot be trusted to mean what they used to. The other guards do not
+    catch this: every field this parser reads is still present and well-formed here.
+    """
+    body = _body()
+    del body["states"]
+    assert parse_accounting(body) is None
+    assert parse_accounting(_body(states=[])) is None
+    assert parse_accounting(_body(states=None)) is None
 
 
 def test_a_body_missing_the_age_field_is_unreadable():
@@ -217,8 +232,8 @@ def test_a_body_missing_the_age_field_is_unreadable():
 
 def test_a_counter_that_is_not_a_number_is_unreadable():
     """`true` is an int in python, so a boolean counter would read as one row."""
-    assert parse_accounting(_body(states={"pending": True, "leased": 0})) is None
-    assert parse_accounting(_body(states={"pending": "0", "leased": 0})) is None
+    assert parse_accounting(_body(expired_leases=True)) is None
+    assert parse_accounting(_body(expired_leases="0")) is None
     assert parse_accounting(_body(oldest_undelivered_age_seconds="7")) is None
 
 
@@ -230,7 +245,7 @@ def test_a_fractional_age_is_the_normal_wire_shape_not_a_malformed_body():
     The threshold still has to hold across the boundary, hence both sides of it here.
     """
     assert verify_accounting(parse_accounting(_body(oldest_undelivered_age_seconds=0.5))).ok
-    assert verify_accounting(parse_accounting(_body(states={"pending": 2.0, "leased": 0.0}))).ok
+    assert verify_accounting(parse_accounting(_body(expired_leases=0.0))).ok
 
     stalled = parse_accounting(_body(oldest_undelivered_age_seconds=119.9))
     assert stalled is not None

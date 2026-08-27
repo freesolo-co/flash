@@ -177,12 +177,16 @@ class AccountingEvidence:
     individually observable from here.
     """
 
-    # `float` rather than `int` for all four, because postgres numerics arrive as JSON floats and
-    # `float` already admits `int`. `oldest_undelivered_age_seconds` in particular is derived with
+    # Only the two STALL signals are held. `pending` and `leased` were carried by the first
+    # revision, which asserted a drained backlog; review narrowed the claim to what a
+    # deployment-wide snapshot can actually support, and those two counters became unread. Keeping
+    # them would be worse than useless: a field that is parsed and required but never consulted
+    # cannot be verified by any test, so it silently exempts itself from the suite.
+    #
+    # `float` rather than `int` because postgres numerics arrive as JSON floats and `float` already
+    # admits `int`. `oldest_undelivered_age_seconds` in particular is derived with
     # `EXTRACT(EPOCH FROM ...)`, so a fractional value is the NORMAL shape, not a malformed one.
-    # Nothing here needs integrality: every reading below is a threshold comparison.
-    pending: float
-    leased: float
+    # Neither reading needs integrality: both are threshold comparisons.
     expired_leases: float
     oldest_undelivered_age_seconds: float | None
 
@@ -215,21 +219,21 @@ def parse_accounting(payload: Any) -> AccountingEvidence | None:
         payload = payload[0] if payload else None
     if not isinstance(payload, dict):
         return None
-    states = payload.get("states")
-    if not isinstance(states, dict):
+    # `states` is still required even though no field is read out of it. Its absence is the exact
+    # shape a renamed schema or a permission-shaped empty result takes, and this parser's whole job
+    # is to make that unreadable rather than healthy.
+    if not isinstance(payload.get("states"), dict):
         return None
-    counters: list[float] = []
-    for source, field in ((states, "pending"), (states, "leased"), (payload, "expired_leases")):
-        value = _number(source.get(field, _MISSING))
-        if value is None:
-            return None
-        counters.append(value)
+    expired_leases = _number(payload.get("expired_leases", _MISSING))
+    if expired_leases is None:
+        return None
     # None is a real reading here ("nothing undelivered"); an ABSENT field is not, because it would
     # silently read as healthy while carrying no stall signal at all.
-    age = payload.get("oldest_undelivered_age_seconds", _MISSING)
-    if age is not None and _number(age) is None:
+    raw_age = payload.get("oldest_undelivered_age_seconds", _MISSING)
+    age = None if raw_age is None else _number(raw_age)
+    if raw_age is not None and age is None:
         return None
-    return AccountingEvidence(*counters, oldest_undelivered_age_seconds=age)
+    return AccountingEvidence(expired_leases=expired_leases, oldest_undelivered_age_seconds=age)
 
 
 def verify_accounting(evidence: AccountingEvidence | None) -> PromotionVerdict:
