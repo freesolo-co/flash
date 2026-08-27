@@ -3366,6 +3366,48 @@ def test_two_handleless_observers_share_one_prelaunch_claim(monkeypatch, tmp_pat
     assert raw[runner_state._ACTIVE_LAUNCH_CLAIM_KEY] == claim.to_dict()
 
 
+def test_failed_thread_startup_releases_the_handleless_reservation(monkeypatch, tmp_path):
+    """A `Thread.start()` failure must consume the claim it reserved.
+
+    Nothing will ever run `_run_job_background`, so its `finally` cannot consume the claim. The
+    deferred recovery loop catches the exception and retries, and each later pass reads the
+    abandoned claim as live, deferring until the wall deadline instead of launching the run.
+    """
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="handleless-thread-start-fails",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1),
+    )
+    status = provisioned_status(spec, state="provisioning")
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status)
+
+    class Thread:
+        def __init__(self, **kwargs):
+            self.args = kwargs.get("args")
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    with pytest.raises(RuntimeError):
+        runtime._start_handleless_resubmit(spec, "provisioning")
+
+    raw = runner_status._load_status_json(spec.run_id)
+    assert runner_state._ACTIVE_LAUNCH_CLAIM_KEY not in raw
+
+    # the next pass must be able to launch rather than deferring behind an abandoned claim.
+    started = _fake_recovery_thread(monkeypatch, runtime)
+    assert runtime._start_handleless_resubmit(spec, "provisioning") is True
+    assert len(started) == 1
+
+
 def test_handleless_stale_claim_is_reclaimed_without_poll_error(monkeypatch, tmp_path):
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec

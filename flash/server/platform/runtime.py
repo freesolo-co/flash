@@ -332,11 +332,20 @@ def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
             spec.run_id,
             "control plane restarted without a durable handle; resubmitting",
         )
-    threading.Thread(
-        target=_run_job_background,
-        args=(spec, None, reservation.claim),
-        daemon=True,
-    ).start()
+    try:
+        threading.Thread(
+            target=_run_job_background,
+            args=(spec, None, reservation.claim),
+            daemon=True,
+        ).start()
+    except Exception:
+        # nothing will ever run `_run_job_background`, so its `finally` cannot consume the claim.
+        # the caller retries, and an unconsumed claim reads as live to each later pass, which then
+        # defers until the wall deadline instead of launching the recovered run.
+        from flash.runner.supervise.lifecycle import _consume_reserved_claim
+
+        _consume_reserved_claim(spec.run_id, reservation.claim)
+        raise
     return True
 
 
