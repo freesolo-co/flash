@@ -621,7 +621,12 @@ def _stub_serving(monkeypatch, message: dict) -> None:
 def test_non_streaming_chat_balances_before_returning(monkeypatch):
     _stub_serving(monkeypatch, {"content": "answer", "reasoning_content": "reasoned"})
 
-    result = deploy.chat("run-1", [{"role": "user", "content": "hi"}], thinking=True)
+    result = deploy.chat(
+        "run-1/final",
+        [{"role": "user", "content": "hi"}],
+        org_id="org-1",
+        thinking=True,
+    )
 
     # the balanced string is what the deployment smoke greps for its thinking-tag telemetry.
     assert result["choices"][0]["message"]["content"] == "<think>reasoned</think>answer"
@@ -633,7 +638,7 @@ def test_non_thinking_chat_returns_serving_content_unchanged(monkeypatch):
     # that also serves the public non-streaming chat route.
     _stub_serving(monkeypatch, {"content": "foo</think>bar"})
 
-    result = deploy.chat("run-1", [{"role": "user", "content": "hi"}])
+    result = deploy.chat("run-1/final", [{"role": "user", "content": "hi"}], org_id="org-1")
 
     assert result["choices"][0]["message"]["content"] == "foo</think>bar"
 

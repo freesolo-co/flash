@@ -164,7 +164,7 @@ def create_app(
             except Exception:
                 return _error(503, "service_unavailable", "generation service is unavailable")
             if (
-                result.adapter_id != resolved.adapter.adapter_revision
+                result.adapter_id != resolved.adapter.checkpoint_id
                 or result.incarnation != resolved.adapter.aggregate_sha256
                 or result.thinking != resolved.adapter.thinking_default
                 or result.finish_reason is None
@@ -192,7 +192,7 @@ def create_app(
             return _error(503, "service_unavailable", "generation service is unavailable")
         if (
             type(first) is not StreamReady
-            or first.adapter_id != resolved.adapter.adapter_revision
+            or first.adapter_id != resolved.adapter.checkpoint_id
             or first.incarnation != resolved.adapter.aggregate_sha256
             or first.thinking != resolved.adapter.thinking_default
         ):

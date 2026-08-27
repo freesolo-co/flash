@@ -394,10 +394,11 @@ def _build_engine(
         @modal.method()
         async def unregister(
             self,
+            org_id: str,
             adapter_id: str,
             expected_generation: str | None = None,
         ) -> dict[str, Any]:
-            return await self._unregister(adapter_id, expected_generation)
+            return await self._unregister(org_id, adapter_id, expected_generation)
 
         @modal.method()
         def health(self) -> dict[str, Any]:
@@ -461,11 +462,9 @@ class _ModalEnginePool:
 
     @staticmethod
     def _record_payload(record: Any) -> dict[str, Any]:
-        payload = record.model_dump(by_alias=True)
-        generation = getattr(record, "deployment_generation", None)
-        if generation is not None:
-            payload["deployment_generation"] = generation
-        return payload
+        from flash.serving.src.io.schemas import internal_adapter_payload
+
+        return internal_adapter_payload(record)
 
     async def generate(
         self,
@@ -522,11 +521,12 @@ class _ModalEnginePool:
     async def unregister(
         self,
         base_model: str,
+        org_id: str,
         adapter_id: str,
         expected_generation: str | None = None,
     ) -> None:
         engine = _engine_cls_for(base_model)(base_model=base_model)
-        await engine.unregister.remote.aio(adapter_id, expected_generation)
+        await engine.unregister.remote.aio(org_id, adapter_id, expected_generation)
 
 
 def _build_usage_outbox(settings: Any) -> Any:
@@ -591,7 +591,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
 
     async def _authorize_backend(api_key: str, adapter_id: str) -> "str | None":
         try:
-            resp = await _client.post(url, json={"apiKey": api_key, "adapterId": adapter_id})
+            resp = await _client.post(url, json={"apiKey": api_key, "modelId": adapter_id})
         except Exception as exc:  # backend unreachable -> fail closed, never serve unauthorized
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unreachable"
@@ -751,7 +751,7 @@ def router():
         deployment_id=settings.deployment_id,
         # Reload on a routing miss so a stale router still resolves a just-registered adapter.
         reload_records=lambda: load_adapters(settings) + _base_model_records(),
-        lookup_record=lambda adapter_id: get_adapter(adapter_id, settings),
+        lookup_record=lambda org_id, adapter_id: get_adapter(org_id, adapter_id, settings),
         reload_interval_seconds=cfg.RELOAD_INTERVAL_SECONDS,
         # durable capture is required in configured serving deployments.
         usage_store=_build_usage_outbox(settings),

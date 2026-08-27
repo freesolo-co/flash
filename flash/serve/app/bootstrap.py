@@ -138,11 +138,11 @@ async def bootstrap_serving(
                 model=manifest.engine.served_model,
                 revision=manifest.engine.model_revision,
             )
-            revisions: dict[str, PublishedAdapter] = {}
+            checkpoints: dict[str, PublishedAdapter] = {}
             for adapter in manifest.adapters:
-                path = paths[adapter.adapter_revision]
+                path = paths[adapter.checkpoint_id]
                 spec = AdapterSpec(
-                    adapter_id=adapter.adapter_revision,
+                    adapter_id=adapter.checkpoint_id,
                     path=str(path),
                     incarnation=adapter.aggregate_sha256,
                     thinking=adapter.thinking_default,
@@ -153,19 +153,12 @@ async def bootstrap_serving(
                     ),
                 )
                 await runtime.register_adapter(spec)
-                revisions[adapter.adapter_revision] = PublishedAdapter(
-                    requested_model=adapter.adapter_revision,
+                checkpoints[adapter.checkpoint_id] = PublishedAdapter(
+                    requested_model=adapter.checkpoint_id,
                     adapter=adapter,
                 )
-            emit_boot_progress("adapters-registered", count=len(revisions))
-        published = dict(revisions)
-        for alias, revision in manifest.aliases.items():
-            target = revisions[revision]
-            published[alias] = PublishedAdapter(
-                requested_model=alias,
-                adapter=target.adapter,
-            )
-        owner._models = MappingProxyType(dict(sorted(published.items())))
+            emit_boot_progress("adapters-registered", count=len(checkpoints))
+        owner._models = MappingProxyType(dict(sorted(checkpoints.items())))
         owner._ready = True
         emit_filesystem_usage("serving-ready", cache_root)
         return owner

@@ -30,6 +30,11 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- Run-backed adapters now use only explicit permanent checkpoint identities, `<run_id>/final` and
+  `<run_id>/step-N`. Bare run aliases, composite source-revision identities, activation, implicit
+  checkpoint fallback, and public artifact provenance have been removed across hosted, managed, and
+  customer-owned serving. Checkpoint bindings are write-once, exact undeploy preserves siblings,
+  and customer-owned manifests use schema v2.
 - Active training now exposes exactly `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
   `Qwen/Qwen3.6-35B-A3B`. Hosted serving remains active for 9B and 35B-A3B; hosted Qwen3.8 27B
   remains inactive. Qwen3.8 uses the immutable BF16 revision

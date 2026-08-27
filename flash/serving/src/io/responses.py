@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 from flash.serve.app.openai import split_reasoning
 from flash.serve.request.openai import NormalizedChatRequest
-from flash.serving.src.io.provenance import _provenance_headers, _revision_provenance
+from flash.serving.src.io.provenance import _checkpoint_provenance, _provenance_headers
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.io.structured_outputs import StructuredOutputsError
 
@@ -26,7 +26,7 @@ _THINK_CLOSE = "</think>"
 def _inference_json_response(result: dict[str, Any], target: AdapterRecord) -> JSONResponse:
     # attach revision provenance while keeping engine-process attribution internal to metering.
     active_checkpoint = result.get("checkpoint")
-    provenance = _revision_provenance(target, active_checkpoint)
+    provenance = _checkpoint_provenance(target, active_checkpoint)
     internal_fields = {
         "cached_tokens_reported",
         "completion_token_ids",

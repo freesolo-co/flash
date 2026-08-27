@@ -147,7 +147,7 @@ def test_runtime_secret_reads_wandb_and_declared_environment_secrets(tmp_path, m
         "SERPAPI_API_KEY=serp-from-user-file\n"
         "RUNPOD_API_KEY=must-not-be-client-supplied\n"
     )
-    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setenv("WANDB_API_KEY", "wb-from-user-file")
     monkeypatch.delenv("SERPAPI_API_KEY", raising=False)
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
 

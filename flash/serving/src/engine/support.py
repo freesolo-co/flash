@@ -6,11 +6,11 @@ state, so they are testable without constructing an engine.
 """
 
 import hashlib
-import re
 import time
 from pathlib import Path
 from typing import Any
 
+from flash.schema import parse_checkpoint_ref
 from flash.serve.request.runtime_support import (
     argument_names,
     is_adapter_tensor_file,
@@ -66,7 +66,7 @@ def _load_adapters_for_base(settings: Any, base_model: str) -> list[Any]:
             for adapter in load_adapters(settings)
             if adapter.base_model == base_model
             and adapter.status == "ready"
-            and adapter.is_revision
+            and adapter.is_checkpoint
         ]
     except Exception as exc:  # forwarded records still allow request-time serving
         print(
@@ -76,18 +76,21 @@ def _load_adapters_for_base(settings: Any, base_model: str) -> list[Any]:
         return []
 
 
-def _adapter_source_ident(record: Any) -> tuple[str, str, str, str | None]:
+def _adapter_source_ident(record: Any) -> tuple[str, str, str, str, str | None]:
     return (
         record.repo_id,
         getattr(record, "repo_type", "model") or "model",
-        record.hf_revision or "",
+        record.artifact_revision or "",
+        record.artifact_digest or "",
         getattr(record, "subfolder", None),
     )
 
 
 def _adapter_source_cache_dir(root: Path, record: Any) -> Path:
-    repo_id, repo_type, hf_revision, subfolder = _adapter_source_ident(record)
-    raw = "\0".join((repo_id, repo_type, hf_revision, subfolder or ""))
+    repo_id, repo_type, artifact_revision, artifact_digest, subfolder = _adapter_source_ident(
+        record
+    )
+    raw = "\0".join((repo_id, repo_type, artifact_revision, artifact_digest, subfolder or ""))
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
     slug = "".join(c if c.isalnum() or c in "-_." else "-" for c in repo_id)[:80].strip("-")
     return root / "sources" / f"{slug or 'adapter'}-{digest}"
@@ -209,21 +212,10 @@ def _engine_is_dead(engine: Any) -> bool:
 
 
 def active_checkpoint_ref(record: Any) -> str:
-    """Which checkpoint an adapter record is actually serving.
+    """return the canonical permanent checkpoint the record explicitly serves."""
 
-    Prefers the record's explicit checkpoint; otherwise recovers `step-N` from a
-    `checkpoints/step-N` subfolder so a step-pinned deploy is identifiable from the path alone.
-    """
-    checkpoint = str(getattr(record, "checkpoint", "") or "").strip()
-    if checkpoint:
-        return checkpoint
-    subfolder = str(getattr(record, "subfolder", "") or "").strip().strip("/")
-    if not subfolder:
-        return ""
-    match = re.search(r"(?:^|/)checkpoints/(step-\d+)(?:/|$)", subfolder)
-    if match:
-        return f"{record.adapter_id}/{match.group(1)}"
-    return str(record.adapter_id)
+    checkpoint_id = str(getattr(record, "adapter_id", "") or "").strip()
+    return checkpoint_id if parse_checkpoint_ref(checkpoint_id) is not None else ""
 
 
 def enforce_expected_checkpoint(record: Any, expected_checkpoint: str | None) -> str:

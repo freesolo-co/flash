@@ -15,7 +15,7 @@ from flash.serving.src.engine.model_config import reasoning_parser_for, tool_par
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.openai_request import OpenAIGenerateRequest
 from flash.serving.src.io.openai_stream import openai_chat_stream
-from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest, internal_adapter_payload
 from flash.serving.src.store.registry import AdapterRegistry
 
 QWEN = "Qwen/Qwen3.5-9B"
@@ -232,6 +232,12 @@ def _engine(
     return engine
 
 
+def _forwarded_base_record(engine: _LoraEngineImpl) -> dict[str, Any]:
+    record = engine.registry.get(None, "adapter")
+    assert record is not None
+    return internal_adapter_payload(record)
+
+
 def test_hosted_base_model_engine_honors_boolean_thinking_override() -> None:
     engine = _engine(_BufferedChoiceEngine(), thinking=True)
     result = asyncio.run(
@@ -242,22 +248,25 @@ def test_hosted_base_model_engine_honors_boolean_thinking_override() -> None:
                 "logprobs": True,
                 "top_logprobs": 1,
                 "chat_template_kwargs": {"enable_thinking": False},
-            }
+            },
+            _forwarded_base_record(engine),
         )
     )
     assert result["thinking"] is False
 
 
 def test_hosted_buffered_generation_parses_qualified_tool_calls() -> None:
+    engine = _engine(_ToolChoiceEngine())
     result = asyncio.run(
-        _engine(_ToolChoiceEngine())._generate(
+        engine._generate(
             {
                 "adapter_id": "adapter",
                 "messages": [{"role": "user", "content": "weather"}],
                 "tools": _tool_payload(),
                 "tool_choice": "auto",
                 "parallel_tool_calls": True,
-            }
+            },
+            _forwarded_base_record(engine),
         )
     )
     choice = result["choices"][0]
@@ -283,7 +292,8 @@ def test_hosted_stream_reports_hidden_tool_usage_before_structured_delta() -> No
                     "tools": _tool_payload(),
                     "tool_choice": "auto",
                     "parallel_tool_calls": True,
-                }
+                },
+                _forwarded_base_record(engine),
             )
         ]
 
@@ -321,12 +331,14 @@ def test_hosted_tools_reject_effective_persisted_structured_default_after_resolu
         "parallel_tool_calls": True,
     }
 
+    record = _forwarded_base_record(engine)
+
     async def exercise() -> None:
         if streaming:
-            async for _event in engine._stream_generate(payload):
+            async for _event in engine._stream_generate(payload, record):
                 pass
         else:
-            await engine._generate(payload)
+            await engine._generate(payload, record)
 
     with pytest.raises(ValueError, match=r"tools cannot be combined.*structured outputs"):
         asyncio.run(exercise())
@@ -347,12 +359,14 @@ def test_hosted_tool_choice_none_allows_effective_structured_default(streaming: 
         "parallel_tool_calls": True,
     }
 
+    record = _forwarded_base_record(engine)
+
     async def exercise() -> None:
         if streaming:
-            async for _event in engine._stream_generate(payload):
+            async for _event in engine._stream_generate(payload, record):
                 pass
         else:
-            await engine._generate(payload)
+            await engine._generate(payload, record)
 
     asyncio.run(exercise())
 
@@ -376,7 +390,8 @@ def _buffered_result(
                 "presence_penalty": 0.75,
                 "logprobs": True,
                 "top_logprobs": top_logprobs,
-            }
+            },
+            _forwarded_base_record(engine),
         )
     )
     return vllm_engine, result
@@ -421,7 +436,8 @@ def test_hosted_tool_stream_keeps_interleaved_choice_parsers_isolated() -> None:
                     "tools": _tool_payload(),
                     "tool_choice": "auto",
                     "parallel_tool_calls": True,
-                }
+                },
+                _forwarded_base_record(engine),
             )
         ]
 
@@ -464,7 +480,8 @@ def test_hosted_engine_streams_interleaved_indexes_and_aggregate_usage() -> None
                     "n": 2,
                     "logprobs": True,
                     "top_logprobs": 2,
-                }
+                },
+                _forwarded_base_record(engine),
             )
         ]
 
@@ -617,12 +634,14 @@ def test_hosted_generation_rejects_active_stop_marker_collision_before_dispatch(
         "stop": "<parameter=city>",
     }
 
+    record = _forwarded_base_record(engine)
+
     async def exercise() -> None:
         if streaming:
-            async for _event in engine._stream_generate(payload):
+            async for _event in engine._stream_generate(payload, record):
                 pass
         else:
-            await engine._generate(payload)
+            await engine._generate(payload, record)
 
     with pytest.raises(ValueError, match=r"grammar markers.*tool_choice='auto'"):
         asyncio.run(exercise())

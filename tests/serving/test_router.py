@@ -7,7 +7,6 @@ per-base-model Modal GPU containers.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import re
 import threading
 import time
@@ -21,6 +20,11 @@ from flash.serving.src.http.context import ServingContext
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
+from tests.serving.checkpoint_fixtures import (
+    checkpoint_payload,
+    checkpoint_record,
+    checkpoint_registration_payload,
+)
 from tests.serving.conftest import attest
 
 
@@ -34,7 +38,10 @@ def _serve(*args, **kwargs):
     authorizer + a default Bearer header. Sends no X-Freesolo-Internal-Key, so the
     /adapters registration-auth tests still see 401-without-key / 200-with-key."""
     kwargs.setdefault("chat_authorizer", _allow)
-    return TestClient(build_serving_app(*args, **kwargs), headers={"Authorization": "Bearer t"})
+    return TestClient(
+        build_serving_app(*args, **kwargs),
+        headers={"Authorization": "Bearer t", "X-Freesolo-Org-Id": "org-1"},
+    )
 
 
 QWEN = "Qwen/Qwen3.5-9B"
@@ -42,70 +49,19 @@ QWEN_35B = "Qwen/Qwen3.6-35B-A3B"
 
 
 def _revision_id(run_id: str) -> str:
-    return f"{run_id}@final.{hashlib.sha1(run_id.encode()).hexdigest()}"
+    return f"{run_id}/final"
 
 
 def _rec(run_id: str, base_model: str, *, status: str = "ready") -> AdapterRecord:
-    sha = hashlib.sha1(run_id.encode()).hexdigest()
-    return AdapterRecord.model_validate(
-        {
-            "adapter_id": _revision_id(run_id),
-            "repo_id": f"org/{run_id}",
-            "org_id": "org-1",
-            "base_model": base_model,
-            "checkpoint": run_id,
-            "status": status,
-            "thinking": True,
-            "created_at": "2026-07-14T00:00:00+00:00",
-            "updated_at": "2026-07-14T00:00:01+00:00",
-            "metadata": {
-                "record_type": "revision",
-                "run_id": run_id,
-                "checkpoint_step": None,
-                "hf_revision": sha,
-            },
-        }
-    )
-
-
-def _alias(revision: AdapterRecord) -> AdapterRecord:
-    run_id = str(revision.metadata["run_id"])
-    return revision.model_copy(
-        update={
-            "adapter_id": run_id,
-            "checkpoint": None,
-            "metadata": {
-                "record_type": "alias",
-                "run_id": run_id,
-                "alias_of": revision.adapter_id,
-            },
-        }
-    )
+    return checkpoint_record(run_id, base_model, status=status, thinking=True)
 
 
 def _router_for(run_id: str, base_model: str, *, status: str = "ready") -> AdapterRouter:
-    revision = _rec(run_id, base_model, status=status)
-    return AdapterRouter([revision, _alias(revision)])
+    return AdapterRouter([_rec(run_id, base_model, status=status)])
 
 
 def _adapter_payload(run_id: str, base_model: str = QWEN, **overrides: object) -> dict[str, object]:
-    sha = hashlib.sha1(run_id.encode()).hexdigest()
-    payload: dict[str, object] = {
-        "adapter_id": _revision_id(run_id),
-        "repo_id": f"org/{run_id}",
-        "base_model": base_model,
-        "org_id": "org-1",
-        "checkpoint": run_id,
-        "thinking": True,
-        "metadata": {
-            "record_type": "revision",
-            "run_id": run_id,
-            "checkpoint_step": None,
-            "hf_revision": sha,
-        },
-    }
-    payload.update(overrides)
-    return payload
+    return checkpoint_payload(run_id, base_model, thinking=True, **overrides)
 
 
 class FakePool:
@@ -209,10 +165,11 @@ class FakePool:
     async def unregister(
         self,
         base_model: str,
+        org_id: str,
         adapter_id: str,
         expected_generation: str | None = None,
     ) -> None:
-        del expected_generation
+        del org_id, expected_generation
         self.unregistered.append((base_model, adapter_id))
 
 
@@ -220,7 +177,7 @@ class FakePool:
 def app_setup():
     # two adapters share the 9b engine, while one adapter uses the separate 35b engine.
     revisions = [_rec("qa", QWEN), _rec("qb", QWEN), _rec("mc", QWEN_35B)]
-    router = AdapterRouter([*revisions, *(_alias(revision) for revision in revisions)])
+    router = AdapterRouter(revisions)
     pool = FakePool()
     client = _serve(pool, router, internal_key="sekret")
     return client, pool, router
@@ -228,19 +185,20 @@ def app_setup():
 
 def test_unregister_safe_records_exact_gpu_cleanup_failure(capsys):
     class _FailingPool:
-        async def unregister(self, base_model, adapter_id, expected_generation):
+        async def unregister(self, base_model, org_id, adapter_id, expected_generation):
             raise RuntimeError(
-                f"exact eviction failed for {base_model} {adapter_id} {expected_generation}"
+                f"exact eviction failed for {base_model} {org_id} {adapter_id} "
+                f"{expected_generation}"
             )
 
     context = object.__new__(ServingContext)
     context.pool = _FailingPool()
 
-    asyncio.run(context.unregister_safe(QWEN, "active@final.sha", "generation-1"))
+    asyncio.run(context.unregister_safe(QWEN, "org-1", "active/final", "generation-1"))
 
     assert (
-        f"hosted adapter gpu cleanup failed for active@final.sha on {QWEN}: "
-        f"RuntimeError('exact eviction failed for {QWEN} active@final.sha generation-1')"
+        f"hosted adapter gpu cleanup failed for active/final on {QWEN}: "
+        f"RuntimeError('exact eviction failed for {QWEN} org-1 active/final generation-1')"
         in capsys.readouterr().out
     )
 
@@ -250,9 +208,7 @@ def test_healthz_reports_one_gpu_per_base_model(app_setup):
     body = client.get("/healthz").json()
     assert body["ok"] is True
     assert body["capabilities"] == [
-        "immutable_adapter_revisions",
-        "alias_compare_and_swap",
-        "revision_provenance",
+        "permanent_checkpoint_identity",
         "thinking_structured_outputs_deferred_v1",
     ]
     assert body["base_models"] == [QWEN, QWEN_35B]  # sorted by model id
@@ -260,7 +216,7 @@ def test_healthz_reports_one_gpu_per_base_model(app_setup):
     assert body["gpu_by_model"] == {QWEN: "L40S", QWEN_35B: "H200"}
     assert body["gpu_tiers"] == ["H200", "L40S"]
     assert "configuredGpu" not in body  # the single-GPU field is gone (per-model now)
-    assert body["adapters"] == 6
+    assert body["adapters"] == 3
 
 
 def test_healthz_reports_configured_deployment_identity() -> None:
@@ -277,22 +233,15 @@ def test_healthz_reports_configured_deployment_identity() -> None:
 
 
 def test_healthz_reports_unsupported_hydrated_base_models_without_routing_them():
-    legacy = AdapterRecord.model_validate(
-        {
-            "adapter_id": "legacy",
-            "repo_id": "org/legacy",
-            "base_model": "openai/gpt-oss-20b",
-            "thinking": True,
-        }
-    )
+    legacy = checkpoint_record("legacy", "unsupported/model", thinking=True)
     router = AdapterRouter([legacy])
     pool = FakePool()
     client = _serve(pool, router, internal_key="sekret")
 
     body = client.get("/healthz").json()
     assert body["ok"] is True
-    assert body["base_models"] == []
-    assert "unsupported_base_models" not in body
+    assert body["base_models"] == ["unsupported/model"]
+    assert body["unsupported_base_models"] == ["unsupported/model"]
     assert body["gpus"] == 0
     assert body["gpu_by_model"] == {}
 
@@ -302,7 +251,7 @@ def test_healthz_reports_unsupported_hydrated_base_models_without_routing_them()
 
     cleanup = client.delete("/adapters/legacy", headers={"X-Freesolo-Internal-Key": "sekret"})
     assert cleanup.status_code == 404
-    assert router.get("legacy") is not None
+    assert router.get("legacy/final", org_id="org-1") is not None
 
 
 def test_chat_rejects_unknown_multimodal_content_block_before_dispatch(app_setup):
@@ -310,7 +259,7 @@ def test_chat_rejects_unknown_multimodal_content_block_before_dispatch(app_setup
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": "qa",
+            "model": _revision_id("qa"),
             "messages": [
                 {
                     "role": "user",
@@ -332,7 +281,7 @@ def test_chat_rejects_unknown_list_content_without_image_before_dispatch(app_set
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": "qa",
+            "model": _revision_id("qa"),
             "messages": [
                 {
                     "role": "user",
@@ -348,8 +297,18 @@ def test_chat_rejects_unknown_list_content_without_image_before_dispatch(app_set
 
 def test_generate_routes_to_the_adapters_base_model(app_setup):
     client, pool, _ = app_setup
-    assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 200
-    assert client.post("/generate", json={"adapter_id": "mc", "prompt": "hi"}).status_code == 200
+    assert (
+        client.post(
+            "/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/generate", json={"adapter_id": _revision_id("mc"), "prompt": "hi"}
+        ).status_code
+        == 200
+    )
     # each adapter dispatches to its own active base-model engine.
     assert pool.generated == [(QWEN, _revision_id("qa")), (QWEN_35B, _revision_id("mc"))]
 
@@ -361,7 +320,7 @@ def test_chat_template_kwargs_forwarded_on_generate(app_setup):
     resp = client.post(
         "/generate",
         json={
-            "adapter_id": "qa",
+            "adapter_id": _revision_id("qa"),
             "messages": [{"role": "user", "content": "hi"}],
             "chat_template_kwargs": {"enable_thinking": False},
         },
@@ -377,7 +336,7 @@ def test_chat_template_kwargs_forwarded_on_openai_chat(app_setup):
     resp = client.post(
         "/v1/chat/completions",
         json={
-            "model": "mc",
+            "model": _revision_id("mc"),
             "messages": [{"role": "user", "content": "hi"}],
             "chat_template_kwargs": {"enable_thinking": False},
         },
@@ -389,7 +348,7 @@ def test_chat_template_kwargs_forwarded_on_openai_chat(app_setup):
 def test_generate_without_chat_template_kwargs_is_none(app_setup):
     """Absent chat_template_kwargs stays None (template runs at its default) — no accidental key."""
     client, pool, _ = app_setup
-    client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"})
+    client.post("/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"})
     assert pool.template_kwargs[-1] is None
 
 
@@ -408,8 +367,8 @@ def test_thinking_logprobs_policy_runs_after_adapter_resolution(app_setup):
     original_resolve = context.lookup.resolve
     resolved = []
 
-    async def tracked_resolve(adapter_id):
-        result = await original_resolve(adapter_id)
+    async def tracked_resolve(adapter_id, **kwargs):
+        result = await original_resolve(adapter_id, **kwargs)
         resolved.append(result[1].adapter_id)
         return result
 
@@ -417,7 +376,7 @@ def test_thinking_logprobs_policy_runs_after_adapter_resolution(app_setup):
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": "qa",
+            "model": _revision_id("qa"),
             "messages": [{"role": "user", "content": "hi"}],
             "logprobs": True,
         },
@@ -432,7 +391,7 @@ def test_thinking_logprobs_policy_runs_after_adapter_resolution(app_setup):
 def test_tool_choice_none_is_inactive_on_unqualified_thinking_route() -> None:
     record = _rec("unqualified", QWEN_35B)
     pool = FakePool()
-    client = _serve(pool, AdapterRouter([record, _alias(record)]))
+    client = _serve(pool, AdapterRouter([record]))
     tools = [
         {
             "type": "function",
@@ -451,7 +410,7 @@ def test_tool_choice_none_is_inactive_on_unqualified_thinking_route() -> None:
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": "unqualified",
+            "model": _revision_id("unqualified"),
             "messages": [{"role": "user", "content": "hi"}],
             "tools": tools,
             "tool_choice": "none",
@@ -495,7 +454,7 @@ def test_immutable_adapter_ignores_false_thinking_override_for_logprobs(app_setu
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": "qa",
+            "model": _revision_id("qa"),
             "messages": [{"role": "user", "content": "hi"}],
             "logprobs": True,
             "chat_template_kwargs": {"enable_thinking": False},
@@ -529,7 +488,7 @@ def test_chat_rejects_unrelated_vllm_extensions(app_setup):
     resp = client.post(
         "/v1/chat/completions",
         json={
-            "model": "mc",
+            "model": _revision_id("mc"),
             "messages": [{"role": "user", "content": "hi"}],
             "structured_outputs": {"choice": ["a", "b"]},
             "guided_regex": r"\d+",
@@ -553,7 +512,7 @@ def test_chat_accepts_openai_response_format(app_setup):
         resp = client.post(
             "/v1/chat/completions",
             json={
-                "model": "mc",
+                "model": _revision_id("mc"),
                 "messages": [{"role": "user", "content": "hi"}],
                 "response_format": rf,
             },
@@ -566,7 +525,7 @@ def test_chat_rejects_both_structured_output_fields(app_setup):
     """each field works alone, but supplying both is an invalid request."""
     client, pool, _ = app_setup
     base = {
-        "model": "mc",
+        "model": _revision_id("mc"),
         "messages": [{"role": "user", "content": "hi"}],
     }
 
@@ -603,7 +562,7 @@ def test_chat_response_format_json_schema_without_schema_is_422(app_setup):
     resp = client.post(
         "/v1/chat/completions",
         json={
-            "model": "mc",
+            "model": _revision_id("mc"),
             "messages": [{"role": "user", "content": "hi"}],
             "response_format": {"type": "json_schema", "json_schema": {"name": "p"}},
         },
@@ -619,7 +578,7 @@ def test_chat_response_format_unknown_type_is_422(app_setup):
     resp = client.post(
         "/v1/chat/completions",
         json={
-            "model": "mc",
+            "model": _revision_id("mc"),
             "messages": [{"role": "user", "content": "hi"}],
             "response_format": {"type": "image_url"},
         },
@@ -635,7 +594,7 @@ def test_guided_fields_are_rejected(app_setup):
     resp = client.post(
         "/v1/chat/completions",
         json={
-            "model": "mc",
+            "model": _revision_id("mc"),
             "messages": [{"role": "user", "content": "hi"}],
             "guided_regex": r"\d+",
         },
@@ -650,7 +609,7 @@ def test_chat_without_structured_outputs_is_unconstrained(app_setup):
     client, pool, _ = app_setup
     resp = client.post(
         "/v1/chat/completions",
-        json={"model": "mc", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": _revision_id("mc"), "messages": [{"role": "user", "content": "hi"}]},
     )
     assert resp.status_code == 200
     assert pool.structured[-1] is None
@@ -661,7 +620,7 @@ def test_invalid_structured_outputs_is_422_with_detail(app_setup):
     two_constraints = client.post(
         "/v1/chat/completions",
         json={
-            "model": "mc",
+            "model": _revision_id("mc"),
             "messages": [{"role": "user", "content": "hi"}],
             "structured_outputs": {"json": _PERSON_SCHEMA, "regex": r"\d+"},
         },
@@ -671,7 +630,7 @@ def test_invalid_structured_outputs_is_422_with_detail(app_setup):
     unsupported = client.post(
         "/v1/chat/completions",
         json={
-            "model": "mc",
+            "model": _revision_id("mc"),
             "messages": [{"role": "user", "content": "hi"}],
             "structured_outputs": {"grammar": 'root ::= "x"'},
         },
@@ -686,7 +645,11 @@ def test_generate_passes_structured_outputs_through(app_setup):
     client, pool, _ = app_setup
     resp = client.post(
         "/generate",
-        json={"adapter_id": "qa", "prompt": "hi", "structured_outputs": {"json": _PERSON_SCHEMA}},
+        json={
+            "adapter_id": _revision_id("qa"),
+            "prompt": "hi",
+            "structured_outputs": {"json": _PERSON_SCHEMA},
+        },
     )
     assert resp.status_code == 200
     assert pool.structured[-1] == {"json": _PERSON_SCHEMA}
@@ -696,7 +659,7 @@ def test_per_adapter_generate_passes_structured_outputs_through(app_setup):
     # The untyped-dict variant builds a GenerateRequest from the body, so the field rides along.
     client, pool, _ = app_setup
     resp = client.post(
-        "/adapters/qb/generate",
+        f"/adapters/{_revision_id('qb')}/generate",
         json={"prompt": "hi", "structured_outputs": {"choice": ["a", "b"]}},
     )
     assert resp.status_code == 200
@@ -706,7 +669,12 @@ def test_per_adapter_generate_passes_structured_outputs_through(app_setup):
 def test_absent_structured_outputs_stays_none(app_setup):
     """No spec anywhere -> None reaches the engine (which may then apply an adapter default)."""
     client, pool, _ = app_setup
-    assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 200
+    assert (
+        client.post(
+            "/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"}
+        ).status_code
+        == 200
+    )
     assert pool.structured[-1] is None
 
 
@@ -716,7 +684,7 @@ def test_streamed_chat_forwards_structured_outputs(app_setup):
         "POST",
         "/v1/chat/completions",
         json={
-            "model": "mc",
+            "model": _revision_id("mc"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
             "structured_outputs": {"json_object": True},
@@ -729,8 +697,8 @@ def test_streamed_chat_forwards_structured_outputs(app_setup):
 
 def test_many_adapters_share_one_base_model_engine(app_setup):
     client, pool, _ = app_setup
-    client.post("/generate", json={"adapter_id": "qa", "prompt": "x"})
-    client.post("/generate", json={"adapter_id": "qb", "prompt": "y"})
+    client.post("/generate", json={"adapter_id": _revision_id("qa"), "prompt": "x"})
+    client.post("/generate", json={"adapter_id": _revision_id("qb"), "prompt": "y"})
     # Both Qwen adapters dispatched to the SAME base-model engine (one GPU, multi-LoRA).
     assert {bm for bm, _ in pool.generated} == {QWEN}
     assert {aid for _, aid in pool.generated} == {
@@ -742,14 +710,14 @@ def test_many_adapters_share_one_base_model_engine(app_setup):
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
-        ("/generate", {"adapter_id": "qa", "prompt": "hi"}),
-        ("/adapters/qa/generate", {"prompt": "hi"}),
+        ("/generate", {"adapter_id": _revision_id("qa"), "prompt": "hi"}),
+        (f"/adapters/{_revision_id('qa')}/generate", {"prompt": "hi"}),
     ],
 )
 def test_raw_generate_responses_exclude_internal_fields(app_setup, path, payload):
     client, _, _ = app_setup
     body = client.post(path, json=payload).json()
-    assert body["adapter_id"] == "qa"
+    assert body["adapter_id"] == _revision_id("qa")
     assert body["finish_reason"] == "stop"
     assert body["token_ids"] == [1, 2, 3]
     assert body["text"] == f"[{QWEN}] reply"
@@ -777,8 +745,8 @@ def test_raw_generate_responses_exclude_internal_fields(app_setup, path, payload
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
-        ("/generate", {"adapter_id": "qa", "prompt": "hi"}),
-        ("/adapters/qa/generate", {"prompt": "hi"}),
+        ("/generate", {"adapter_id": _revision_id("qa"), "prompt": "hi"}),
+        (f"/adapters/{_revision_id('qa')}/generate", {"prompt": "hi"}),
     ],
 )
 def test_raw_generate_routes_reject_openai_only_sampling_fields(
@@ -797,12 +765,12 @@ def test_openai_chat_completions_routes_and_shapes(app_setup):
     client, pool, _ = app_setup
     resp = client.post(
         "/v1/chat/completions",
-        json={"model": "mc", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": _revision_id("mc"), "messages": [{"role": "user", "content": "hi"}]},
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["object"] == "chat.completion"
-    assert body["model"] == "mc"
+    assert body["model"] == _revision_id("mc")
     assert body["choices"][0]["message"]["content"] == f"[{QWEN_35B}] reply"
     assert pool.generated == [(QWEN_35B, _revision_id("mc"))]
 
@@ -815,7 +783,7 @@ def test_external_openai_chat_forwards_system_prompts(app_setup):
     ]
     resp = client.post(
         "/v1/chat/completions",
-        json={"model": "mc", "messages": messages},
+        json={"model": _revision_id("mc"), "messages": messages},
     )
 
     assert resp.status_code == 200, resp.text
@@ -829,7 +797,7 @@ def test_internal_openai_chat_can_send_system_prompts(app_setup):
         "/v1/chat/completions",
         headers={"X-Freesolo-Internal-Key": "sekret"},
         json={
-            "model": "mc",
+            "model": _revision_id("mc"),
             "messages": [
                 {"role": "system", "content": "platform prompt"},
                 {"role": "user", "content": "hi"},
@@ -849,7 +817,7 @@ def test_external_generate_forwards_system_prompts(app_setup):
     ]
     resp = client.post(
         "/generate",
-        json={"adapter_id": "qa", "messages": messages},
+        json={"adapter_id": _revision_id("qa"), "messages": messages},
     )
 
     assert resp.status_code == 200, resp.text
@@ -863,7 +831,7 @@ def test_openai_chat_completions_streams_sse_chunks(app_setup):
         "POST",
         "/v1/chat/completions",
         json={
-            "model": "mc",
+            "model": _revision_id("mc"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         },
@@ -910,7 +878,7 @@ def test_openai_stream_rejects_unattested_revision_and_closes_engine(attestation
                 self.closed = True
 
     pool = UnattestedPool()
-    client = _serve(pool, AdapterRouter([revision, _alias(revision)]))
+    client = _serve(pool, AdapterRouter([revision]))
 
     response = client.post(
         "/v1/chat/completions",
@@ -935,7 +903,7 @@ def test_openai_chat_completions_stream_can_include_usage(app_setup):
         "POST",
         "/v1/chat/completions",
         json={
-            "model": "mc",
+            "model": _revision_id("mc"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
             "stream_options": {"include_usage": True},
@@ -956,7 +924,7 @@ def test_openai_chat_stream_sets_anti_buffering_headers(app_setup):
         "POST",
         "/v1/chat/completions",
         json={
-            "model": "mc",
+            "model": _revision_id("mc"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         },
@@ -980,7 +948,7 @@ def test_openai_chat_rejects_non_boolean_stream_after_authorization(stream):
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": "qa",
+            "model": _revision_id("qa"),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": stream,
         },
@@ -988,7 +956,7 @@ def test_openai_chat_rejects_non_boolean_stream_after_authorization(stream):
 
     assert response.status_code == 400
     assert response.json()["detail"] == "stream must be a boolean"
-    assert authorizations == ["qa"]
+    assert authorizations == [_revision_id("qa")]
     assert pool.generated == []
 
 
@@ -999,12 +967,16 @@ def test_openai_chat_completions_bad_payload_is_422_not_500(app_setup):
     client, pool, _ = app_setup
     bad_top_p = client.post(
         "/v1/chat/completions",
-        json={"model": "mc", "messages": [{"role": "user", "content": "hi"}], "top_p": "nope"},
+        json={
+            "model": _revision_id("mc"),
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_p": "nope",
+        },
     )
     assert bad_top_p.status_code == 422
     bad_messages = client.post(
         "/v1/chat/completions",
-        json={"model": "mc", "messages": "not-a-list"},
+        json={"model": _revision_id("mc"), "messages": "not-a-list"},
     )
     assert bad_messages.status_code == 422
     # Never reached the engine.
@@ -1013,7 +985,7 @@ def test_openai_chat_completions_bad_payload_is_422_not_500(app_setup):
 
 def test_per_adapter_generate_bad_payload_is_422_not_500(app_setup):
     client, pool, _ = app_setup
-    resp = client.post("/adapters/qb/generate", json={"top_p": "nope"})
+    resp = client.post(f"/adapters/{_revision_id('qb')}/generate", json={"top_p": "nope"})
     assert resp.status_code == 422
     assert pool.generated == []
 
@@ -1021,11 +993,15 @@ def test_per_adapter_generate_bad_payload_is_422_not_500(app_setup):
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
-        ("/generate", {"adapter_id": "qb", "prompt": "hi", "max_tokens": 0}),
-        ("/adapters/qb/generate", {"prompt": "hi", "temperature": -0.1}),
+        ("/generate", {"adapter_id": _revision_id("qb"), "prompt": "hi", "max_tokens": 0}),
+        (f"/adapters/{_revision_id('qb')}/generate", {"prompt": "hi", "temperature": -0.1}),
         (
             "/v1/chat/completions",
-            {"model": "qb", "messages": [{"role": "user", "content": "hi"}], "top_p": 0},
+            {
+                "model": _revision_id("qb"),
+                "messages": [{"role": "user", "content": "hi"}],
+                "top_p": 0,
+            },
         ),
     ],
 )
@@ -1042,7 +1018,10 @@ def test_inference_routes_reject_invalid_sampling_before_engine_dispatch(
 
 def test_per_adapter_generate_endpoint_routes(app_setup):
     client, pool, _ = app_setup
-    assert client.post("/adapters/qb/generate", json={"prompt": "hi"}).status_code == 200
+    assert (
+        client.post(f"/adapters/{_revision_id('qb')}/generate", json={"prompt": "hi"}).status_code
+        == 200
+    )
     assert pool.generated == [(QWEN, _revision_id("qb"))]
 
 
@@ -1065,7 +1044,12 @@ def test_engine_valueerror_is_400_when_adapter_still_ready(app_setup):
 
     pool.generate = boom
     client = _serve(pool, router, internal_key="sekret")
-    assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 400
+    assert (
+        client.post(
+            "/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"}
+        ).status_code
+        == 400
+    )
 
 
 def test_raced_undeploy_engine_valueerror_is_404(app_setup):
@@ -1079,7 +1063,12 @@ def test_raced_undeploy_engine_valueerror_is_404(app_setup):
 
     pool.generate = vanish
     client = _serve(pool, router, internal_key="sekret")
-    assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 404
+    assert (
+        client.post(
+            "/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"}
+        ).status_code
+        == 404
+    )
 
 
 def test_list_adapters_requires_internal_key(app_setup):
@@ -1090,9 +1079,6 @@ def test_list_adapters_requires_internal_key(app_setup):
     ok = client.get("/adapters", headers={"X-Freesolo-Internal-Key": "sekret"})
     assert ok.status_code == 200
     assert {a["adapter_id"] for a in ok.json()["adapters"]} == {
-        "qa",
-        "qb",
-        "mc",
         _revision_id("qa"),
         _revision_id("qb"),
         _revision_id("mc"),
@@ -1101,13 +1087,12 @@ def test_list_adapters_requires_internal_key(app_setup):
 
 def test_list_adapters_refreshes_authoritative_persisted_state():
     persisted_revision = _rec("fresh", QWEN)
-    persisted_alias = _alias(persisted_revision)
     reloads = 0
 
     def _reload():
         nonlocal reloads
         reloads += 1
-        return [persisted_revision, persisted_alias]
+        return [persisted_revision]
 
     router = _router_for("stale", QWEN)
     client = _serve(
@@ -1128,9 +1113,8 @@ def test_list_adapters_refreshes_authoritative_persisted_state():
     assert response.status_code == 200
     assert reloads == 1
     records = {record["adapter_id"]: record for record in response.json()["adapters"]}
-    assert set(records) == {"fresh", _revision_id("fresh")}
-    assert records["fresh"]["metadata"]["alias_of"] == _revision_id("fresh")
-    assert not router.has("stale")
+    assert set(records) == {_revision_id("fresh")}
+    assert not router.has("stale/final", org_id="org-1")
 
 
 def test_adapters_fail_closed_when_no_internal_key_configured():
@@ -1138,15 +1122,17 @@ def test_adapters_fail_closed_when_no_internal_key_configured():
     # register/teardown fail closed (503) rather than allowing unauthenticated mutation.
     router = _router_for("qa", QWEN)
     client = _serve(FakePool(), router)  # no internal_key
-    rec = _adapter_payload("qz")
+    rec = checkpoint_registration_payload("qz", QWEN, thinking=True)
     no_key = client.post("/adapters", json=rec)
     assert no_key.status_code == 503
     # Even presenting a key can't open it when none is configured (no key to compare against).
     with_key = client.post("/adapters", json=rec, headers={"X-Freesolo-Internal-Key": "anything"})
     assert with_key.status_code == 503
-    teardown = client.delete("/adapters/qa")
+    teardown = client.delete(f"/adapters/{_revision_id('qa')}")
     assert teardown.status_code == 503
-    assert router.resolve("qa")[1].base_model == QWEN  # nothing was mutated
+    resolved = router.resolve(_revision_id("qa"), org_id="org-1")
+    assert resolved is not None
+    assert resolved[1].base_model == QWEN
 
 
 def test_base_model_delete_is_rejected_rather_than_faked() -> None:
@@ -1176,7 +1162,10 @@ def test_base_model_delete_is_rejected_rather_than_faked() -> None:
             "type": "http",
             "method": "DELETE",
             "path": f"/adapters/{QWEN}",
-            "headers": [(b"x-freesolo-internal-key", b"sekret")],
+            "headers": [
+                (b"x-freesolo-internal-key", b"sekret"),
+                (b"x-freesolo-org-id", b"org-1"),
+            ],
             "query_string": b"",
             "app": app,
         }
@@ -1236,7 +1225,7 @@ def test_openai_chat_completions_includes_usage_when_engine_reports_counts():
 
     resp = client.post(
         "/v1/chat/completions",
-        json={"model": "qa", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": _revision_id("qa"), "messages": [{"role": "user", "content": "hi"}]},
     )
 
     assert resp.status_code == 200
@@ -1251,7 +1240,7 @@ def test_generate_response_strips_internal_cache_attribution():
     router = _router_for("qa", QWEN)
     client = _serve(_MeteringPool(), router)
 
-    body = client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).json()
+    body = client.post("/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"}).json()
 
     assert "cached_tokens_reported" not in body
     assert "engine_replica_id" not in body
@@ -1320,7 +1309,7 @@ def test_openai_usage_exposes_cached_tokens_in_prompt_details():
     client = _serve(_CachedMeteringPool(), router)
     resp = client.post(
         "/v1/chat/completions",
-        json={"model": "qa", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": _revision_id("qa"), "messages": [{"role": "user", "content": "hi"}]},
     )
     assert resp.status_code == 200
     usage = resp.json()["usage"]
@@ -1336,7 +1325,7 @@ def test_openai_usage_omits_prompt_details_when_no_cache_hit():
     client = _serve(_MeteringPool(), router)
     resp = client.post(
         "/v1/chat/completions",
-        json={"model": "qa", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": _revision_id("qa"), "messages": [{"role": "user", "content": "hi"}]},
     )
     assert resp.status_code == 200
     assert "prompt_tokens_details" not in resp.json()["usage"]
@@ -1344,14 +1333,19 @@ def test_openai_usage_omits_prompt_details_when_no_cache_hit():
 
 def test_disabled_adapter_is_not_routable():
     router = _router_for("off", QWEN, status="disabled")
-    assert router.resolve("off") is None
+    assert router.resolve(_revision_id("off"), org_id="org-1") is None
     assert router.base_models() == []  # no ready adapters -> no GPU
 
 
-def test_undeploy_unknown_adapter_is_404(app_setup):
+def test_undeploy_unknown_checkpoint_is_idempotent(app_setup):
     client, pool, _ = app_setup
-    resp = client.delete("/adapters/nope", headers={"X-Freesolo-Internal-Key": "sekret"})
-    assert resp.status_code == 404
+    resp = client.delete(
+        "/adapters/nope/final",
+        headers={"X-Freesolo-Internal-Key": "sekret", "X-Freesolo-Org-Id": "org-1"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["checkpoint_id"] == "nope/final"
+    assert resp.json()["disabled_checkpoints"] == []
     assert pool.unregistered == []
 
 
@@ -1370,12 +1364,18 @@ def test_generate_forwards_record_for_lazy_engine_load(app_setup):
             "finish_reason": "stop",
             "token_ids": [],
             "inference_time_seconds": 0.0,
-            # a revision request is refused unless the engine attests what it served
+            # a checkpoint request is refused unless the engine attests exact identity
             "lora_request_adapter": record.adapter_id,
+            "checkpoint": record.adapter_id,
         }
 
     pool.generate = _capture
-    assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 200
+    assert (
+        client.post(
+            "/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"}
+        ).status_code
+        == 200
+    )
     assert captured == [(QWEN, _revision_id("qa"), "org/qa")]
 
 
@@ -1387,137 +1387,28 @@ def test_generate_miss_reloads_from_shared_storage():
     def _reload():
         reloaded["count"] += 1
         revision = _rec("late", QWEN)
-        return [revision, _alias(revision)]
+        return [revision]
 
     pool = FakePool()
     router = AdapterRouter([])
     client = _serve(pool, router, reload_records=_reload)
     # Unknown locally -> reload finds it -> 200, and it's now cached.
-    assert client.post("/generate", json={"adapter_id": "late", "prompt": "hi"}).status_code == 200
+    assert (
+        client.post(
+            "/generate", json={"adapter_id": _revision_id("late"), "prompt": "hi"}
+        ).status_code
+        == 200
+    )
     assert reloaded["count"] == 1
-    assert client.post("/generate", json={"adapter_id": "late", "prompt": "hi"}).status_code == 200
-    assert reloaded["count"] == 2  # mutable aliases re-read authority on every resolution
+    assert (
+        client.post(
+            "/generate", json={"adapter_id": _revision_id("late"), "prompt": "hi"}
+        ).status_code
+        == 200
+    )
+    assert reloaded["count"] == 1  # permanent checkpoint hits use the hydrated record
     # Still-unknown after reload -> 404.
     assert client.post("/generate", json={"adapter_id": "ghost", "prompt": "hi"}).status_code == 404
-
-
-def test_first_request_after_alias_move_routes_to_new_revision():
-    old_revision = _rec("qa", QWEN)
-    new_sha = "f" * 40
-    new_revision = old_revision.model_copy(
-        deep=True,
-        update={
-            "adapter_id": f"qa@step-1.{new_sha}",
-            "checkpoint": "qa/step-1",
-            "metadata": {
-                "record_type": "revision",
-                "run_id": "qa",
-                "checkpoint_step": 1,
-                "hf_revision": new_sha,
-            },
-        },
-    )
-    shared = {"rows": [old_revision, _alias(old_revision)]}
-    pool = FakePool()
-    client = _serve(
-        pool,
-        AdapterRouter([old_revision, _alias(old_revision)]),
-        reload_records=lambda: list(shared["rows"]),
-        reload_interval_seconds=30.0,
-    )
-    primed = client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"})
-    assert primed.status_code == 200
-    assert pool.generated_records[-1].adapter_id == old_revision.adapter_id
-    shared["rows"] = [new_revision, _alias(new_revision)]
-
-    response = client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"})
-
-    assert response.status_code == 200
-    assert pool.generated_records[-1].adapter_id == new_revision.adapter_id
-
-
-def test_stale_ready_record_refreshes_in_background():
-    # Immutable revisions refresh in the background because their target cannot drift. Mutable
-    # aliases synchronously refresh after the ttl so an alias moved or undeployed by another
-    # container is authoritative on the first post-change request.
-    import asyncio
-
-    from httpx import ASGITransport, AsyncClient
-
-    revision = _rec("qa", QWEN)
-    # a row this router does not start with. its arrival is the only signal that a reload
-    # hydrated, rather than merely having been entered: the reload callback runs in a worker
-    # thread and counts itself on entry, while hydrate happens later, back on the event loop.
-    # waiting on the counter lets the undeploy below land inside that gap and coalesce onto the
-    # in-flight fetch, which already snapshotted non-empty rows -- failing against correct code.
-    canary = _rec("canary", QWEN)
-    shared = {"rows": [revision, _alias(revision), canary, _alias(canary)]}
-    reloads = {"count": 0}
-    # a deep copy, taken before production is handed the records: the router stores the instances
-    # it is given, so an expectation derived from those objects would move with a corruption
-    # instead of catching it. the whole record rather than a list of fields -- naming fields means
-    # the ones left out (subfolder, repo_type, private, url) can be rewritten by a refresh and
-    # still route from the wrong material with every assertion green.
-    material = revision.model_copy(deep=True)
-
-    def _reload():
-        reloads["count"] += 1
-        return list(shared["rows"])
-
-    pool = FakePool()
-    router = _router_for("qa", QWEN)
-    app = build_serving_app(
-        pool, router, reload_records=_reload, reload_interval_seconds=0.0, chat_authorizer=_allow
-    )
-
-    async def _scenario():
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as ac:
-
-            async def _generate(adapter_id: str) -> int:
-                response = await ac.post(
-                    "/generate",
-                    json={"adapter_id": adapter_id, "prompt": "hi"},
-                    headers={"Authorization": "Bearer t"},
-                )
-                return response.status_code
-
-            lookup = app.state.serving_context.lookup
-
-            # serve on both ids while deployed. priming the immutable id matters: a cache keyed on
-            # "immutable revisions never change" is only reachable once the revision has resolved.
-            assert await _generate("qa") == 200
-            assert await _generate(_revision_id("qa")) == 200
-            first_refresh = lookup._last_reload["task"]
-            assert first_refresh is not None, "the first background refresh was not scheduled"
-            await first_refresh
-            assert router.has("canary"), "the first background refresh never hydrated"
-            settled = reloads["count"]
-            # a refresh must re-serve the same adapter, not merely an adapter under the same id.
-            # existence survives a reload that rebuilds records from the wrong material, so status
-            # codes alone would keep passing while every request is served from the wrong weights.
-            refreshed = router.get(_revision_id("qa"))
-            assert refreshed is not None, "the refresh dropped the revision it re-fetched"
-            assert refreshed == material, (
-                f"the refresh replaced the revision's material: {refreshed}"
-            )
-            assert pool.generated_records == [material] * 2, (
-                f"the engine was handed material other than the record storage returned: "
-                f"{pool.generated_records}"
-            )
-            # another container undeploys qa: it drops out of the status=ready reload. unlike the
-            # immutable revision hit above, a mutable alias must synchronously refresh before routing
-            # because its target can drift. the first post-undeploy alias request therefore sees the
-            # new authoritative state instead of serving the cached revision once more.
-            shared["rows"] = []
-            served = len(pool.generated_records)
-            assert await _generate("qa") == 404
-            assert pool.generated_records[served:] == []
-            assert not router.has("qa"), "the synchronous alias refresh did not land"
-            assert reloads["count"] > settled, "the stale alias did not synchronously refresh"
-            # the immutable id was removed by that authoritative refresh as well.
-            assert await _generate(_revision_id("qa")) == 404
-
-    asyncio.run(_scenario())
 
 
 def test_hit_refresh_failure_serves_cached_adapter():
@@ -1529,14 +1420,17 @@ def test_hit_refresh_failure_serves_cached_adapter():
         if state["fail"]:
             raise RuntimeError("supabase 503")
         revision = _rec("qa", QWEN)
-        return [revision, _alias(revision)]
+        return [revision]
 
     pool = FakePool()
     router = _router_for("qa", QWEN)
     client = _serve(pool, router, reload_records=_reload, reload_interval_seconds=0.0)
     # Warm the cache through the mutable alias, then exercise the immutable revision. Immutable
     # records keep the background-refresh fallback because their target cannot drift.
-    assert client.post("/generate", json={"adapter_id": "qa", "prompt": "x"}).status_code == 200
+    assert (
+        client.post("/generate", json={"adapter_id": _revision_id("qa"), "prompt": "x"}).status_code
+        == 200
+    )
     state["fail"] = True
     revision_id = _revision_id("qa")
     assert (
@@ -1571,12 +1465,12 @@ def test_concurrent_misses_hydrate_in_order_without_stampeding():
     from flash.serving.src.store.lookup import AdapterLookup
 
     revision = _rec("late", QWEN)
-    fresh = [revision, _alias(revision)]
+    fresh = [revision]
     # snapshot the expectation BEFORE production can touch these objects. the router stores the
     # instances it is handed, so comparing against the originals would compare a record with
     # itself: code that corrupts them after hydrate moves both sides of the assertion together
     # and passes while the caller receives the corruption.
-    expected = (_alias(revision).model_copy(deep=True), revision.model_copy(deep=True))
+    expected = (revision.model_copy(deep=True), revision.model_copy(deep=True))
     calls = {"count": 0}
     hydrated: list[int] = []
 
@@ -1600,8 +1494,16 @@ def test_concurrent_misses_hydrate_in_order_without_stampeding():
 
     async def _both():
         return await asyncio.gather(
-            lookup.resolve("late", require_supported_base_model=False),
-            lookup.resolve("late", require_supported_base_model=False),
+            lookup.resolve(
+                _revision_id("late"),
+                org_id="org-1",
+                require_supported_base_model=False,
+            ),
+            lookup.resolve(
+                _revision_id("late"),
+                org_id="org-1",
+                require_supported_base_model=False,
+            ),
             return_exceptions=True,
         )
 
@@ -1663,7 +1565,7 @@ def test_a_reload_that_snapshotted_first_cannot_answer_a_later_miss():
     revision = _rec("committed-late", QWEN)
     # snapshotted before production sees the records, for the same reason as above: the router
     # keeps the instances it is handed, so the originals cannot serve as an expectation.
-    expected = (_alias(revision).model_copy(deep=True), revision.model_copy(deep=True))
+    expected = (revision.model_copy(deep=True), revision.model_copy(deep=True))
     storage: list[AdapterRecord] = []
     snapshotted = threading.Event()
     release = threading.Event()
@@ -1684,7 +1586,7 @@ def test_a_reload_that_snapshotted_first_cannot_answer_a_later_miss():
         first = asyncio.create_task(lookup.reload())
         await asyncio.to_thread(snapshotted.wait, 5)
         # committed AFTER the first fetch snapshotted, BEFORE the second miss begins.
-        storage.extend([revision, _alias(revision)])
+        storage.extend([revision])
         second = asyncio.create_task(lookup.reload())
         await asyncio.sleep(0)
         release.set()
@@ -1696,6 +1598,6 @@ def test_a_reload_that_snapshotted_first_cannot_answer_a_later_miss():
     # and the second fetch's records must actually land, as themselves. the fetch count only proves
     # storage was re-read; the point of re-reading it is that the adapter committed in between
     # becomes resolvable as exactly what was committed.
-    assert router.resolve("committed-late") == expected, (
+    assert router.resolve("committed-late/final", org_id="org-1") == expected, (
         "storage was re-read but did not resolve to the exact records it returned"
     )

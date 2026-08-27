@@ -102,7 +102,7 @@ async def stream_chat_body(
         if (
             finished.request_id != ready.request_id
             or finished.runtime_id != ready.runtime_id
-            or finished.adapter_id != resolved.adapter.adapter_revision
+            or finished.adapter_id != resolved.adapter.checkpoint_id
             or finished.incarnation != resolved.adapter.aggregate_sha256
             or finished.thinking != ready.thinking
         ):

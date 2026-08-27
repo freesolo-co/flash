@@ -106,7 +106,9 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
         return None
     if not spec.train.hf_repo:
         return None
-    return status.run_id
+    from flash.schema import format_checkpoint_ref
+
+    return format_checkpoint_ref(status.run_id, None)
 
 
 # Heartbeat stages that mean the worker has entered training (GPU work underway). The per-step
