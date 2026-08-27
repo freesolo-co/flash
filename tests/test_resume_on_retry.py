@@ -1011,6 +1011,11 @@ def orch(monkeypatch, tmp_path):
         lambda _endpoint_id, job_id, **_kw: {"id": job_id, "status": "CANCELLED"},
     )
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *a, **k: True)
+    # each seeded retry rereads the prior attempt's fenced result before disposition, which is a
+    # hub read. these tests own the retry loop, not attempt-artifact transport, so the observation
+    # reads as "no prior result" instead of reaching hugging face once per attempt. the two tests
+    # that assert on a specific observed result override this with their own stub.
+    monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
 
 
 def _seed_status(orch, spec):

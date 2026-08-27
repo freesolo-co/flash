@@ -2990,6 +2990,9 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
+        # the vram walk is the subject here, not attempt-artifact transport; without the stub the
+        # seeded oom retry rereads the prior fenced result from hugging face.
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
         import contextlib
 
         import flash.providers.core.allocator as allocator
