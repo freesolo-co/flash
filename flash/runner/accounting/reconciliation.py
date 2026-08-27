@@ -169,11 +169,20 @@ def _expected_attempt_identity(
     *,
     expected_attempt_id: int | None,
     expected_fence: int | None,
+    expected_no_attempt: bool = False,
 ) -> tuple[int | None, int | None]:
     """return the exact fenced attempt identity required for terminal settlement."""
     if expected_remote is not None:
         expected_attempt_id = expected_remote.get("attempt")
         expected_fence = expected_remote.get("fence")
+    elif expected_no_attempt:
+        # a run that never reserved an attempt owns no fenced worker, so there is no identity to
+        # compare and refusing to settle would strand it as permanently recoverable. the caller
+        # must say so explicitly, and _settled_attempt still refuses under the lock if the
+        # persisted status turns out to carry an attempt after all.
+        if expected_attempt_id is not None or expected_fence is not None:
+            raise ValueError("identity-free settlement cannot also expect an attempt identity")
+        return None, None
     if (
         isinstance(expected_attempt_id, bool)
         or not isinstance(expected_attempt_id, int)
@@ -193,6 +202,19 @@ def _settled_attempt(
     expected_fence: int | None,
 ) -> tuple[bool, dict | None]:
     """return the settled current attempt only when the expected fence still matches."""
+    if expected_remote is None and expected_attempt_id is None and expected_fence is None:
+        # identity-free settlement, reachable only through the explicit expected_no_attempt
+        # opt-in above. it stays legal exactly while the run still holds no readable attempt:
+        # one reserved between the caller's observation and this lock means a fenced worker may
+        # now exist, and settling it here would terminalize live work. an unreadable record
+        # names no fenced worker either, so it settles rather than stranding the run.
+        if status.attempt is None:
+            return True, None
+        try:
+            status_ops._current_attempt(status)
+        except Exception:
+            return True, None
+        return False, None
     if status.attempt is None:
         return expected_remote is not None, None
     attempt = status_ops._current_attempt(status)
@@ -212,12 +234,14 @@ def _compare_and_fail_remote(
     *,
     expected_attempt_id: int | None = None,
     expected_fence: int | None = None,
+    expected_no_attempt: bool = False,
 ) -> bool:
     """CAS a nonterminal expected remote to failed and confirm the durable write."""
     expected_attempt_id, expected_fence = _expected_attempt_identity(
         expected_remote,
         expected_attempt_id=expected_attempt_id,
         expected_fence=expected_fence,
+        expected_no_attempt=expected_no_attempt,
     )
     report_status: RunStatus | None = None
     with state._status_guard(run_id):
@@ -271,12 +295,14 @@ def _compare_and_complete_remote(
     *,
     expected_attempt_id: int | None = None,
     expected_fence: int | None = None,
+    expected_no_attempt: bool = False,
 ) -> bool:
     """Adopt strict completed artifacts only while the captured remote still owns the run."""
     expected_attempt_id, expected_fence = _expected_attempt_identity(
         expected_remote,
         expected_attempt_id=expected_attempt_id,
         expected_fence=expected_fence,
+        expected_no_attempt=expected_no_attempt,
     )
     report_status: RunStatus | None = None
     with state._status_guard(run_id):

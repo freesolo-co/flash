@@ -48,12 +48,22 @@ class ResubmitLaunch:
             self._lock.release()
 
 
-def _attempt_identity_kwargs(attempt: object) -> dict[str, int]:
+def _attempt_identity_kwargs(attempt: object) -> dict[str, int | bool]:
+    """return the settlement identity for one attempt, or the identity-free opt-in without one.
+
+    a run can legitimately hold no attempt (it failed before reserving one) and a malformed
+    record is not an identity either. both must still be able to reach a terminal state, so
+    they settle through the explicit no-attempt opt-in rather than raising and leaving the run
+    permanently recoverable.
+    """
     from flash.runner.lifecycle.protocol import AttemptRecord
 
     if attempt is None:
-        return {}
-    record = attempt if isinstance(attempt, AttemptRecord) else AttemptRecord.from_dict(attempt)
+        return {"expected_no_attempt": True}
+    try:
+        record = attempt if isinstance(attempt, AttemptRecord) else AttemptRecord.from_dict(attempt)
+    except Exception:
+        return {"expected_no_attempt": True}
     return {"expected_attempt_id": record.attempt_id, "expected_fence": record.fence}
 
 

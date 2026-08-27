@@ -170,19 +170,18 @@ def resume_after_confirmed_teardown(
                     _record_cleanup_remote(run_id, current_remote)
             identity_kwargs = {}
             if current_remote is None:
-                from flash.runner.lifecycle.protocol import AttemptRecord
+                from flash.server.platform.handleless_retry import _attempt_identity_kwargs
 
-                attempt = AttemptRecord.from_dict(current.attempt)
-                identity_kwargs = {
-                    "expected_attempt_id": attempt.attempt_id,
-                    "expected_fence": attempt.fence,
-                }
-            _compare_and_fail_remote(
-                run_id,
-                current_remote,
-                str(exc),
-                **identity_kwargs,
-            )
+                identity_kwargs = _attempt_identity_kwargs(current.attempt)
+            # settling is best effort here: the original training exception is the run's real
+            # cause and must reach the caller even if this terminal write cannot be made.
+            with contextlib.suppress(Exception):
+                _compare_and_fail_remote(
+                    run_id,
+                    current_remote,
+                    str(exc),
+                    **identity_kwargs,
+                )
         raise
     return get_status(run_id)
 

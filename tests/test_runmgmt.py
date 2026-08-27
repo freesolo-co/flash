@@ -1661,6 +1661,114 @@ def test_handleless_terminal_settlement_requires_attempt_identity(
     assert persisted.attempt is None
 
 
+def test_attemptless_run_settles_through_the_no_attempt_optin(monkeypatch, tmp_path):
+    """a run that never reserved an attempt must still reach a terminal state.
+
+    it owns no fenced worker, so there is no identity to compare. refusing to settle it would
+    leave it permanently recoverable and the deferred recovery loop would retry it forever.
+    """
+    from flash.core.spec import JobSpec
+    from flash.server.platform.handleless_retry import _attempt_identity_kwargs
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="attemptless-deadline", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    )
+    status = runner_status.get_status(spec.run_id)
+    assert status.attempt is None
+
+    assert runner_reconciliation._compare_and_fail_remote(
+        spec.run_id,
+        None,
+        "run wall deadline exhausted",
+        **_attempt_identity_kwargs(status.attempt),
+    )
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.state == "failed"
+    assert persisted.error == "run wall deadline exhausted"
+
+
+def test_no_attempt_optin_refuses_a_run_that_reserved_an_attempt(monkeypatch, tmp_path):
+    """the opt-in must not terminalize a fenced worker reserved after the caller looked."""
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="attemptless-raced", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote("endpoint-raced", "job-raced", attempt=0)
+    runner_state._save_status(provisioned_status(spec, state="running", remote=remote))
+
+    assert (
+        runner_reconciliation._compare_and_fail_remote(
+            spec.run_id,
+            None,
+            "run wall deadline exhausted",
+            expected_no_attempt=True,
+        )
+        is False
+    )
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.state == "running"
+    assert persisted.error is None
+
+
+@pytest.mark.parametrize("attempt", [None, {"schema_version": 1, "attempt_id": "bogus"}])
+def test_identity_kwargs_fall_back_to_the_no_attempt_optin(attempt):
+    """a missing or unreadable attempt names no fenced worker, so it must still be settleable."""
+    from flash.server.platform.handleless_retry import _attempt_identity_kwargs
+
+    assert _attempt_identity_kwargs(attempt) == {"expected_no_attempt": True}
+
+
+def test_every_settlement_consumer_accepts_the_identity_kwargs():
+    """the identity kwargs are splatted into these callees, so a missing one is a TypeError.
+
+    the failure only surfaces on the recovery path that settles an attemptless run, so a
+    signature drift here would otherwise stay latent until a real run hit it.
+    """
+    import inspect
+
+    from flash.runner.supervise.recovery import _adopt_completed_attempt
+    from flash.server.platform.handleless_retry import _attempt_identity_kwargs
+
+    emitted = {"expected_attempt_id", "expected_fence"}
+    for attempt in (None, {"schema_version": 1, "attempt_id": "bogus"}):
+        emitted |= set(_attempt_identity_kwargs(attempt))
+
+    for consumer in (
+        runner_reconciliation._compare_and_fail_remote,
+        runner_reconciliation._compare_and_complete_remote,
+        _adopt_completed_attempt,
+    ):
+        accepted = set(inspect.signature(consumer).parameters)
+        assert not emitted - accepted, f"{consumer.__name__} rejects {sorted(emitted - accepted)}"
+
+
+def test_unreadable_attempt_record_still_settles(monkeypatch, tmp_path):
+    """an unparseable persisted attempt must not strand the run as permanently recoverable."""
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="attempt-unreadable", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    status = runner_state.RunStatus(
+        run_id=spec.run_id,
+        state="provisioning",
+        spec=spec.to_dict(),
+        attempt={"schema_version": 1, "attempt_id": "not-an-int"},
+    )
+    runner_state._save_status(status)
+
+    assert runner_reconciliation._compare_and_fail_remote(
+        spec.run_id,
+        None,
+        "run wall deadline exhausted",
+        expected_no_attempt=True,
+    )
+    assert runner_status.get_status(spec.run_id).state == "failed"
+
+
 def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, tmp_path):
     from flash.core.spec import JobSpec
 
@@ -3437,6 +3545,14 @@ def test_attached_no_capacity_drops_shared_cache_without_spending_infra(monkeypa
     monkeypatch.setattr(lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(lifecycle, "_strict_teardown_handle", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(runner_status, "get_status", lambda _run_id: current)
+    # this test owns the retry-plan contract, not teardown accounting persistence, and runs
+    # without an isolated RUNS_DIR, so the confirmed-teardown write is stubbed at its boundary.
+    confirmed = []
+    monkeypatch.setattr(
+        runner_reconciliation,
+        "_compare_and_confirm_remote_teardown",
+        lambda run_id, expected: confirmed.append((run_id, expected)) or True,
+    )
     monkeypatch.setattr(
         runner_deadlines, "_spec_with_remaining_wall", lambda value, **_kwargs: value
     )
@@ -3459,6 +3575,7 @@ def test_attached_no_capacity_drops_shared_cache_without_spending_infra(monkeypa
     )
 
     assert observed is current
+    assert confirmed == [(spec.run_id, remote)]
     assert len(resumed) == 1
     retry_budget = resumed[0][1]["retry_budget"]
     assert resumed[0][1]["drop_weight_cache"] is True
@@ -3525,12 +3642,13 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=120),
     )
+    expired_remote = _runpod_remote("endpoint-old", "job-old", attempt=0)
     runner_state._save_status(
         provisioned_status(
             spec,
             state="running",
             created_at=100.0,
-            remote=_runpod_remote("endpoint-old", "job-old", attempt=0),
+            remote=expired_remote,
         ),
         _run_deadline_at=220.0,
         _next_attempt=1,
@@ -3571,7 +3689,10 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
 
     assert polled == []
     assert resumed == []
-    assert result_checks == [((spec.run_id, status.remote), {})]
+    # the result is observed against the still-active remote, before confirmed teardown clears
+    # status.remote, so the recorded argument is the pre-teardown handle rather than the
+    # post-teardown None.
+    assert result_checks == [((spec.run_id, expired_remote), {})]
     assert [action for action, _handle in teardown] == ["cancel", "destroy"]
     assert gc_runs == [spec.run_id]
     assert status.state == "failed"
@@ -4757,15 +4878,14 @@ def test_deferred_handleless_loop_reconciles_after_resubmit_cas_loss(monkeypatch
 
     assert len(attempts) == 2
     assert sleeps == [runtime._DEFERRED_RECOVERY_RETRY_S]
-    assert (
-        attempts[0][1]
-        == attempts[1][1]
-        == {
-            "expected_remote": None,
-            "expected_state": "provisioning",
-            "result_resolved": True,
-        }
-    )
+    assert attempts[0][1] == attempts[1][1]
+    assert {key: value for key, value in attempts[0][1].items() if key != "resolution"} == {
+        "expected_remote": None,
+        "expected_state": "provisioning",
+    }
+    # the disposition is resolved before the resubmit and carried into it, so the retry after a
+    # lost cas reuses that exact resolution instead of re-deriving one.
+    assert attempts[0][1]["resolution"] is not None
 
 
 def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp_path):
