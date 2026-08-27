@@ -96,6 +96,19 @@ def _full_sequence_signal_sequences(group_ids):
     return group_ids.ge(0).flatten(start_dim=1).any(dim=-1)
 
 
+def _packed_full_sequence(tensor, data):
+    """Put a full-sequence teacher tensor into the layout `no_padding_2_padding` documents.
+
+    That helper wants a nested tensor or `(total_nnz, *)`, and reads `.values()` only when
+    nested, so a padded `(bsz, seq_len, *)` teacher measures as `bsz` and trips its
+    `sequence_offsets[-1] == values.shape[0]` assertion. Both layouts arrive because
+    `list_of_dict_to_tensordict` stacks a field whose samples share one shape and nests only
+    when they differ -- so a batch of uniformly truncated completions comes back padded.
+    Dropping the pad positions restores the contract and leaves the slicing to verl.
+    """
+    return tensor if tensor.is_nested else tensor[data["attention_mask"].bool()]
+
+
 def _flash_groupwise_reverse_kl_values(
     student_logprobs,
     teacher_logsums,
@@ -408,8 +421,14 @@ def _register_flash_distillation_loss() -> None:
     def flash_groupwise_reverse_kl(config, distillation_config, model_output, data):
         _set_current_global_batch_info(config, data)
         student_logprobs = no_padding_2_padding(model_output["log_probs"], data)
-        teacher_logsums = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
-        group_ids = no_padding_2_padding(data["teacher_ids"], data).squeeze(-1).long()
+        teacher_logsums = no_padding_2_padding(
+            _packed_full_sequence(data["teacher_logprobs"], data), data
+        ).squeeze(-1)
+        group_ids = (
+            no_padding_2_padding(_packed_full_sequence(data["teacher_ids"], data), data)
+            .squeeze(-1)
+            .long()
+        )
         response_mask = data["response_mask"]
         if response_mask.is_nested:
             response_mask = response_mask.to_padded_tensor(False)

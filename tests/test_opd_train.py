@@ -9720,3 +9720,197 @@ def test_overrides_floor_max_num_seqs_for_a_tiny_opd_rollout_batch():
         for value in build_opd_overrides(_config(train_batch_size=1, group_size=1))
     )
     assert overrides["actor_rollout_ref.rollout.max_num_seqs"] == "16"
+
+
+def _padded_teacher_batch(sample_lengths, *, prompt_width, response_width):
+    """Build the padded, mask-carrying batch the OPD trainer actually hands to the loss.
+
+    verl's list_of_dict_to_tensordict stacks a field when every sample's tensor shares one
+    shape and nests only when they differ, so a batch whose completions were all truncated at
+    max_completion_tokens arrives padded rather than nested. Prompts are left-padded and
+    responses right-padded, exactly as the attention mask records.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.bridging.prompts import encode_shifted_group_metadata
+
+    teacher, prompts, responses, masks = [], [], [], []
+    for prompt_len, response_len in sample_lengths:
+        _ids, logprobs = encode_shifted_group_metadata(
+            prompt_len, response_len, [(list(range(response_len)), -1.5)]
+        )
+        row = torch.tensor(logprobs, dtype=torch.float32)
+        teacher.append(
+            torch.cat(
+                [
+                    torch.zeros(prompt_width - prompt_len),
+                    row,
+                    torch.zeros(response_width - response_len),
+                ]
+            )
+        )
+        prompts.append(
+            torch.cat(
+                [
+                    torch.zeros(prompt_width - prompt_len, dtype=torch.int64),
+                    torch.arange(1, prompt_len + 1, dtype=torch.int64),
+                ]
+            )
+        )
+        responses.append(
+            torch.cat(
+                [
+                    torch.arange(1, response_len + 1, dtype=torch.int64),
+                    torch.zeros(response_width - response_len, dtype=torch.int64),
+                ]
+            )
+        )
+        masks.append(
+            torch.cat(
+                [
+                    torch.zeros(prompt_width - prompt_len, dtype=torch.int64),
+                    torch.ones(prompt_len + response_len, dtype=torch.int64),
+                    torch.zeros(response_width - response_len, dtype=torch.int64),
+                ]
+            )
+        )
+
+    data = TensorDict(
+        {
+            "prompts": torch.stack(prompts),
+            "responses": torch.stack(responses),
+            "attention_mask": torch.stack(masks),
+        },
+        batch_size=[len(sample_lengths)],
+    )
+    return torch.stack(teacher).unsqueeze(-1), data
+
+
+def _nested_teacher_batch(sample_lengths):
+    """The same samples in the nested layout verl's padding helper already supports."""
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.bridging.prompts import encode_shifted_group_metadata
+
+    rows, prompts, responses = [], [], []
+    for prompt_len, response_len in sample_lengths:
+        _ids, logprobs = encode_shifted_group_metadata(
+            prompt_len, response_len, [(list(range(response_len)), -1.5)]
+        )
+        rows.append(torch.tensor(logprobs, dtype=torch.float32).unsqueeze(-1))
+        prompts.append(torch.arange(1, prompt_len + 1, dtype=torch.int64))
+        responses.append(torch.arange(1, response_len + 1, dtype=torch.int64))
+
+    data = TensorDict(
+        {
+            "prompts": torch.nested.as_nested_tensor(prompts, layout=torch.jagged),
+            "responses": torch.nested.as_nested_tensor(responses, layout=torch.jagged),
+        },
+        batch_size=[len(sample_lengths)],
+    )
+    return torch.nested.as_nested_tensor(rows, layout=torch.jagged), data
+
+
+def _reference_no_padding_2_padding(tensor, data):
+    """Stand-in for verl's helper, matching the pinned implementation's contract.
+
+    Reads tensor.values() only when nested, otherwise treats the input as already flattened
+    to total_nnz -- which is why a padded (bsz, seq_len, *) tensor trips its assertion.
+    """
+    torch = pytest.importorskip("torch")
+
+    values = tensor.values() if tensor.is_nested else tensor
+    prompt_ids, response_ids = data["prompts"], data["responses"]
+    if prompt_ids.is_nested:
+        prompt_lens = prompt_ids.offsets().diff()
+        response_lens = response_ids.offsets().diff()
+        max_response_len = int(response_lens.max().item())
+    else:
+        attention_mask = data["attention_mask"]
+        prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
+        response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
+        max_response_len = response_ids.shape[1]
+
+    sequence_offsets = (prompt_lens + response_lens).cumsum(dim=0)
+    assert sequence_offsets[-1].item() == values.shape[0]
+
+    skip_padding = (0, 0) * (values.ndim - 1)
+    sliced = [
+        torch.nn.functional.pad(
+            values[offset - resp_len - 1 : offset - 1],
+            (*skip_padding, 0, max_response_len - resp_len),
+        )
+        for resp_len, offset in zip(response_lens, sequence_offsets, strict=True)
+    ]
+    return torch.stack(sliced, dim=0)
+
+
+def test_padded_teacher_tensor_trips_the_verl_total_nnz_assertion():
+    """The layout that crashed a paid 8xH200 OPD run, reproduced against verl's contract.
+
+    Once every completion is truncated at max_completion_tokens the samples share one shape,
+    so the teacher tensor is stacked rather than nested and its leading dimension is the
+    batch size instead of total_nnz.
+    """
+    pytest.importorskip("torch")
+
+    teacher, data = _padded_teacher_batch([(120, 1024)] * 16, prompt_width=120, response_width=1024)
+    assert not teacher.is_nested
+    assert teacher.shape[0] == 16
+    assert int(data["attention_mask"].sum().item()) == 16 * (120 + 1024)
+    with pytest.raises(AssertionError):
+        _reference_no_padding_2_padding(teacher, data)
+
+
+@pytest.mark.parametrize(
+    "sample_lengths",
+    [
+        pytest.param([(120, 1024)] * 16, id="all-truncated"),
+        pytest.param([(120, 1024), (120, 800), (120, 512)], id="some-stopped-early"),
+    ],
+)
+def test_packed_full_sequence_matches_verls_nested_result(sample_lengths):
+    """The padded path must return exactly what verl produces from the same samples.
+
+    Not crashing is not enough: a wrong slice would silently train against misaligned teacher
+    logprobs, so this pins value equality against the nested layout verl already handles.
+    """
+    torch = pytest.importorskip("torch")
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    padded, padded_data = _padded_teacher_batch(
+        sample_lengths, prompt_width=120, response_width=1024
+    )
+    nested, nested_data = _nested_teacher_batch(sample_lengths)
+
+    packed = _packed_full_sequence(padded, padded_data)
+    actual = _reference_no_padding_2_padding(packed, padded_data)
+    expected = _reference_no_padding_2_padding(nested, nested_data)
+
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)
+
+
+def test_packed_full_sequence_leaves_a_nested_batch_untouched():
+    """A nested batch already satisfies verl's contract and must pass straight through."""
+    pytest.importorskip("torch")
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    nested, data = _nested_teacher_batch([(120, 1024), (120, 800)])
+    assert _packed_full_sequence(nested, data) is nested
+
+
+def test_packed_full_sequence_rejects_a_tensor_that_is_not_full_width():
+    """A teacher narrower than the mask must fail loudly rather than pack misaligned tokens."""
+    torch = pytest.importorskip("torch")
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    _teacher, data = _padded_teacher_batch([(120, 1024)] * 4, prompt_width=120, response_width=1024)
+    response_only = torch.zeros(4, 1024, 1)
+    with pytest.raises(IndexError):
+        _packed_full_sequence(response_only, data)
