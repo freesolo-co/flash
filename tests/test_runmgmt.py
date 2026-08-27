@@ -4275,6 +4275,11 @@ def test_handle_persistence_failure_still_tears_down_the_created_resource(monkey
     assert [record.get("instance_id") for record in recorded] == ["instance-persist"], (
         "a created provider resource vanished after a persistence failure"
     )
+    # ...and recording it must not strand the run. writing `status.remote` here while the launch
+    # claim is still on disk leaves nobody able to own the run: this caller loses the ownership
+    # check, attach cannot own a remote alongside an active claim, and handleless recovery refuses
+    # a set remote, so a live worker keeps billing with no supervisor and no retry.
+    assert raw.get("remote") is None, "a nonterminal run must not hold a remote it cannot own"
 
 
 def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypatch, tmp_path):

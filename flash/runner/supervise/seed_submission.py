@@ -387,7 +387,10 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
     """Bind provider handle persistence to one immutable reservation and candidate."""
     claim = prepared[0]
     _, chosen, on_last_gpu, _, _ = candidate_plan
-    from flash.runner.accounting.reconciliation import _preserve_cleanup_remote
+    from flash.runner.accounting.reconciliation import (
+        _preserve_cleanup_remote,
+        _record_cleanup_remote,
+    )
     from flash.runner.lifecycle.attempts import persist_claimed_remote
     from flash.runner.supervise.errors import _TerminalHandleRace
 
@@ -416,11 +419,17 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
             # yet. `_submit_provider` turns this into a retryable `poll_error`, so unless the handle
             # is torn down or recorded here it is unreachable: the retry provisions a second worker
             # against the same run artifacts while this one keeps running.
+            #
+            # record the identity WITHOUT writing `status.remote`. the run is still nonterminal and
+            # the launch claim is still on disk, so setting a remote here would leave nobody able to
+            # own the run: this caller loses the ownership check, attach cannot own a remote while an
+            # active claim exists, and handleless recovery refuses a set remote.
             deleted = False
             with contextlib.suppress(Exception):
                 deleted = _lifecycle._strict_teardown_handle(remote, ctx.spec.run_id)
             if not deleted:
-                _preserve_cleanup_remote(ctx.spec.run_id, persisted)
+                with contextlib.suppress(Exception):
+                    _record_cleanup_remote(ctx.spec.run_id, persisted)
             raise
         if claimed:
             ctx.last_handle.clear()
