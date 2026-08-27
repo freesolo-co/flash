@@ -103,9 +103,6 @@ from flash.engine.worker.train.sft.orchestration import (
     _SftOutputs as _SftOutputs,
 )
 from flash.engine.worker.train.sft.orchestration import (
-    _verl_image_message_content as _verl_image_message_content,
-)
-from flash.engine.worker.train.sft.orchestration import (
     _warmstart_adapter_path as _warmstart_adapter_path,
 )
 from flash.engine.worker.train.sft.orchestration import (

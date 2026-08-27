@@ -239,26 +239,6 @@ def _warmstart_adapter_path(
     return adapter_dir
 
 
-def _verl_image_message_content(content) -> str:
-    if isinstance(content, str):
-        return content
-    if content is None:
-        return ""
-    if not isinstance(content, list):
-        raise ValueError("multimodal message content must be text or content blocks")
-    parts: list[str] = []
-    for block in content:
-        if not isinstance(block, dict):
-            raise ValueError("multimodal message content blocks must be objects")
-        if block.get("type") == "text":
-            parts.append(str(block.get("text") or ""))
-        elif block.get("type") == "image":
-            parts.append("<image>")
-        else:
-            raise ValueError(f"unsupported multimodal SFT content block {block.get('type')!r}")
-    return "".join(parts)
-
-
 _restore_verl_resume = partial(restore_verl_resume, job_label="SFT")
 
 
