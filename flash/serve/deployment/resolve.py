@@ -12,17 +12,19 @@ takes provider credentials request-scoped and separately.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from dataclasses import dataclass
 
-from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.schema import format_checkpoint_ref
 from flash.serve.app import AdapterExecutionInput, ArtifactFile, ExecutionInputs
 from flash.serve.app.materialize import MaterializationError, validate_adapter_weight_structure
-from flash.serve.contract.protocol import reject_non_finite_json_constant
 from flash.serve.control import ResolvedAdapter
+from flash.serve.deployment.adapter_config import (
+    AdapterConfigError,
+    DeclaredAdapterConfig,
+    parse_declared_adapter_config,
+)
 from flash.serve.deployment.profiles import ServingProfile
 from flash.serve.provisioning import ServingImage
 
@@ -142,110 +144,27 @@ def _artifact_files(repo_id: str, repo_type: str, revision: str, subfolder: str)
     return tuple(files), config_path, weights_path
 
 
-class _DuplicateConfigKey(ValueError):
-    """raised through `json.load`, so it stays a ValueError for any caller that expects one."""
-
-
-def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    """mirror of the materializer's rule, so both boundaries read the same bytes the same way."""
-
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise _DuplicateConfigKey(f"{ADAPTER_CONFIG} contains a duplicate key")
-        result[key] = value
-    return result
-
-
-def _declared_provenance(
-    config_path: str | None,
-) -> tuple[dict[str, object] | None, int | None, str | None, str | None]:
+def _declared_provenance(config_path: str | None) -> DeclaredAdapterConfig | None:
     """read the rank and base-model provenance the adapter stamps into its own config.
 
     the config is already on disk from the digest pass, so this costs nothing extra. reading it is
     what lets a mistyped ``--lora-rank`` or ``--model`` fail during resolution instead of inside the
     paid GPU container, where ``_validate_adapter_config`` catches the same mismatch only after
-    provisioning has started.
+    provisioning has started. hosted admission reads the same bytes through the same rules, so the
+    two paths cannot reach opposite verdicts about one artifact.
     """
 
     if config_path is None:
-        return None, None, None, None
+        return None
     try:
         with open(config_path, "rb") as handle:
             raw = handle.read()
-        # decode as strict utf-8 first, exactly as `_load_strict_config` does on the gpu side.
-        # handing the bytes straight to `json.load` instead lets it auto-detect utf-16 and accept
-        # a bom (rfc 4627), so a config the container refuses outright resolved cleanly here --
-        # and the deployment failed only after the provider resources had been allocated.
-        #
-        # the duplicate-key rule is shared for the same reason: plain `json.load` takes the last
-        # value, so a config declaring `r` twice would resolve against one rank and then be
-        # rejected inside the container this function exists to avoid paying for.
-        config = json.loads(
-            raw.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=reject_non_finite_json_constant,
-        )
-    except _DuplicateConfigKey as exc:
-        raise ResolveError(str(exc)) from exc
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+    except OSError as exc:
         raise ResolveError(f"{ADAPTER_CONFIG} is not readable json") from exc
-    if not isinstance(config, dict):
-        raise ResolveError(f"{ADAPTER_CONFIG} must be a json object")
-
     try:
-        rank = rank_from_adapter_config(config, source=ADAPTER_CONFIG)
-    except Exception as exc:
-        raise ResolveError(f"{ADAPTER_CONFIG} declares no usable lora rank: {exc}") from exc
-
-    def _text(key: str) -> str | None:
-        """read a config string exactly as the container will compare it.
-
-        `_validate_adapter_config` compares these raw bytes for equality, so a value that matches
-        only after stripping resolved clean here and was then rejected inside the paid container --
-        the outcome this function exists to prevent. normalizing the padding away instead would be
-        worse for `revision`, which the resolver *adopts* into the immutable manifest: that would
-        launder a padded string into the record rather than surface it. rejecting keeps the
-        resolve-time and container-time verdicts identical.
-        """
-        value = config.get(key)
-        if not isinstance(value, str):
-            return None
-        if value != value.strip():
-            raise ResolveError(f"{ADAPTER_CONFIG} {key} has surrounding whitespace: {value!r}")
-        return value or None
-
-    # the container compares `base_model_name_or_path` for equality, so an absent, empty, or
-    # non-string one can never match and the deployment is already doomed. returning None here
-    # skipped the check instead, which deferred a certain failure until after the provider had
-    # allocated and started billing -- the exact outcome this function exists to prevent.
-    declared_base = _text("base_model_name_or_path")
-    if declared_base is None:
-        raise ResolveError(f"{ADAPTER_CONFIG} declares no base_model_name_or_path")
-
-    # the same reasoning applied to the rest of what the container checks about these exact bytes.
-    # `_validate_adapter_config` rejects a non-LORA `peft_type`, an unsupported `task_type` and a
-    # nonempty `modules_to_save` deterministically -- the verdict depends only on the config, not on
-    # anything the gpu learns at runtime -- so leaving them out meant a config that could never
-    # serve still resolved, provisioned, and billed before failing for a reason readable here for
-    # free. a non-string `revision` is the same case: the container compares it for equality, so a
-    # non-string can never match, and `_text` would otherwise quietly map it to None.
-    peft_type = config.get("peft_type")
-    if peft_type != "LORA":
-        raise ResolveError(f"{ADAPTER_CONFIG} peft_type must be LORA, not {peft_type!r}")
-    task_type = config.get("task_type")
-    if task_type not in {None, "CAUSAL_LM"}:
-        raise ResolveError(
-            f"{ADAPTER_CONFIG} task_type must be absent or CAUSAL_LM, not {task_type!r}"
-        )
-    modules_to_save = config.get("modules_to_save")
-    if modules_to_save is not None and modules_to_save != []:
-        raise ResolveError(f"{ADAPTER_CONFIG} modules_to_save adapters are not supported")
-    revision = config.get("revision")
-    if revision is not None and not isinstance(revision, str):
-        raise ResolveError(f"{ADAPTER_CONFIG} revision must be a string when present")
-
-    return config, rank, declared_base, _text("revision")
+        return parse_declared_adapter_config(raw, source=ADAPTER_CONFIG)
+    except AdapterConfigError as exc:
+        raise ResolveError(str(exc)) from exc
 
 
 def _checkpoint_step_from_subfolder(
@@ -316,29 +235,30 @@ def resolve_adapter(
     # the adapter's own config is the authority on what it was trained against. checking it here
     # turns a mistyped --lora-rank or --model into a resolution error, instead of a failure inside
     # the paid GPU container after provisioning has already begun.
-    config, declared_rank, declared_base, declared_base_revision = _declared_provenance(config_path)
-    if declared_rank is not None and declared_rank != lora_rank:
-        raise ResolveError(
-            f"--lora-rank {lora_rank} disagrees with {ADAPTER_CONFIG}, which declares "
-            f"{declared_rank}"
-        )
-    if declared_base is not None and declared_base != base_model:
-        raise ResolveError(
-            f"--model {base_model!r} disagrees with {ADAPTER_CONFIG}, which declares this adapter "
-            f"was trained against {declared_base!r}"
-        )
-    # bind to the revision the adapter was TRAINED against, not the repo's current tip: the model
-    # repo is mutable, so resolving it at deploy time can silently pair the adapter with weights it
-    # never saw. the container compares these directly and would reject the mismatch anyway.
-    if declared_base_revision is not None and declared_base_revision != base_model_revision:
-        base_model_revision = declared_base_revision
+    declared = _declared_provenance(config_path)
+    if declared is not None:
+        if declared.lora_rank != lora_rank:
+            raise ResolveError(
+                f"--lora-rank {lora_rank} disagrees with {ADAPTER_CONFIG}, which declares "
+                f"{declared.lora_rank}"
+            )
+        if declared.base_model != base_model:
+            raise ResolveError(
+                f"--model {base_model!r} disagrees with {ADAPTER_CONFIG}, which declares this "
+                f"adapter was trained against {declared.base_model!r}"
+            )
+        # bind to the revision the adapter was TRAINED against, not the repo's current tip: the
+        # model repo is mutable, so resolving it at deploy time can silently pair the adapter with
+        # weights it never saw. the container compares these directly and would reject the mismatch.
+        if declared.base_revision is not None and declared.base_revision != base_model_revision:
+            base_model_revision = declared.base_revision
 
-    if config is None or weights_path is None:
+    if declared is None or weights_path is None:
         raise ResolveError(
             f"{artifact_repo_id}@{artifact_revision} did not resolve both required adapter files"
         )
     try:
-        validate_adapter_weight_structure(weights_path, config, base_model)
+        validate_adapter_weight_structure(weights_path, declared.config, base_model)
     except MaterializationError as exc:
         prefix = artifact_subfolder.strip("/")
         remote = f"{prefix}/{ADAPTER_WEIGHTS}" if prefix else ADAPTER_WEIGHTS

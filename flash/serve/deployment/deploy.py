@@ -198,7 +198,7 @@ def deploy_adapter(
         bound_revision if is_commit_sha(bound_revision) else resolve_artifact_revision(hf_repo)
     )
     artifact_metadata = adapter_check.adapter_artifact_metadata(
-        hf_repo, subfolder, artifact_revision=artifact_revision
+        hf_repo, subfolder, artifact_revision=artifact_revision, expected_base_model=model
     )
     adapter_check.validate_serving_lora_rank(
         model,

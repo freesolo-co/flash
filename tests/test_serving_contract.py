@@ -21,6 +21,7 @@ from flash.serve.contract.protocol import (
 )
 from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serve.contract.urls import serving_base_url
+from flash.serve.deployment.adapter_config import DeclaredAdapterConfig
 from flash.serve.deployment.deploy import Deployment, deploy_adapter, undeploy_adapter
 
 
@@ -97,13 +98,21 @@ def test_deploy_dry_run_uses_explicit_final_checkpoint() -> None:
 def test_adapter_artifact_metadata_reads_the_exported_modality_marker(
     monkeypatch, marker, targets_images
 ) -> None:
-    config = {"r": 32}
+    config = {"r": 32, "peft_type": "LORA", "base_model_name_or_path": "Qwen/Qwen3.5-4B"}
     if marker is not ...:
         config["exclude_modules"] = marker
     monkeypatch.setattr(
         adapter_check,
         "_load_adapter_config",
-        lambda *_args, **_kwargs: (config, "run/adapter/adapter_config.json"),
+        lambda *_args, **_kwargs: (
+            DeclaredAdapterConfig(
+                config=config,
+                lora_rank=32,
+                base_model="Qwen/Qwen3.5-4B",
+                base_revision=None,
+            ),
+            "run/adapter/adapter_config.json",
+        ),
     )
     monkeypatch.setattr(
         adapter_check,
@@ -112,7 +121,10 @@ def test_adapter_artifact_metadata_reads_the_exported_modality_marker(
     )
 
     metadata = adapter_check.adapter_artifact_metadata(
-        "org/repo", "run/adapter", artifact_revision="a" * 40
+        "org/repo",
+        "run/adapter",
+        artifact_revision="a" * 40,
+        expected_base_model="Qwen/Qwen3.5-4B",
     )
 
     assert metadata.lora_rank == 32

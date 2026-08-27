@@ -16,9 +16,13 @@ import os
 from dataclasses import dataclass
 
 from flash.adapters.artifacts import has_loadable_adapter_weights, is_adapter_weight_filename
-from flash.adapters.lora_rank import rank_from_adapter_config
 from flash.adapters.targets import config_targets_images
 from flash.serve.contract.errors import AdapterConfigMissing, AdapterTensorMissing, ServingError
+from flash.serve.deployment.adapter_config import (
+    AdapterConfigError,
+    DeclaredAdapterConfig,
+    parse_declared_adapter_config,
+)
 
 
 @dataclass(frozen=True)
@@ -151,7 +155,7 @@ def _verify_adapter_artifact_tensors(
 
 def _load_adapter_config(
     hf_repo: str, subfolder: str, *, artifact_revision: str
-) -> tuple[dict, str]:
+) -> tuple[DeclaredAdapterConfig, str]:
     filename = f"{subfolder.rstrip('/')}/adapter_config.json"
     try:
         from huggingface_hub import hf_hub_download
@@ -173,39 +177,51 @@ def _load_adapter_config(
             raise AdapterConfigMissing(message) from exc
         raise ServingError(message) from exc
     try:
-        with open(local, encoding="utf-8") as f:
-            config = json.load(f)
-    except Exception as exc:
-        raise ValueError(
-            f"could not verify adapter rank: invalid JSON in {hf_repo}:{filename}"
+        with open(local, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise ServingError(
+            f"could not verify adapter rank: failed to read {hf_repo}:{filename}"
         ) from exc
-    if not isinstance(config, dict):
-        raise ValueError(
-            f"could not verify adapter rank: {hf_repo}:{filename} is not a JSON object"
-        )
-    return config, filename
+    # the same reader the GPU container applies to these exact bytes. reading them permissively here
+    # admitted configs the container then refused, so the registration succeeded and the deployment
+    # failed after provider resources had been allocated.
+    try:
+        return parse_declared_adapter_config(raw, source=f"{hf_repo}:{filename}"), filename
+    except AdapterConfigError as exc:
+        raise ValueError(f"could not verify adapter rank: {exc}") from exc
 
 
 def adapter_artifact_metadata(
-    hf_repo: str, subfolder: str, *, artifact_revision: str
+    hf_repo: str, subfolder: str, *, artifact_revision: str, expected_base_model: str
 ) -> AdapterArtifactMetadata:
     """Read adapter metadata and verify that tensor weights exist."""
-    config, filename = _load_adapter_config(hf_repo, subfolder, artifact_revision=artifact_revision)
+    declared, filename = _load_adapter_config(
+        hf_repo, subfolder, artifact_revision=artifact_revision
+    )
+    # the container compares this field to the manifest's base model for equality and refuses the
+    # load on a mismatch. checking it here costs nothing extra and turns a certain paid failure into
+    # a registration error.
+    if declared.base_model != expected_base_model:
+        raise ValueError(
+            f"could not verify adapter rank: {hf_repo}:{filename} declares this adapter was "
+            f"trained against {declared.base_model!r}, not {expected_base_model!r}"
+        )
     files = _verify_adapter_artifact_tensors(
         hf_repo, subfolder, artifact_revision=artifact_revision
     )
     content = json.dumps(
         {
-            "config": config,
+            "config": declared.config,
             "files": files,
         },
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
     return AdapterArtifactMetadata(
-        lora_rank=rank_from_adapter_config(config, source=f"{hf_repo}:{filename}"),
+        lora_rank=declared.lora_rank,
         # non-fatal by construction: an unmarked or malformed marker reads as text-only, so modality
         # uncertainty weakens the smoke rather than stranding an otherwise usable deployment.
-        targets_images=config_targets_images(config),
+        targets_images=config_targets_images(declared.config),
         artifact_digest=hashlib.sha256(content).hexdigest(),
     )
