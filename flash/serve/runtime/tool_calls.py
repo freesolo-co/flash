@@ -249,6 +249,26 @@ def _parse_parameter_value(state, value_start, schema, values, name, probe):
         return None
 
 
+def _resumes_missing_parameter(text: str, incomplete: int, missing: set[str]) -> bool:
+    """report whether the span after ``incomplete`` reopens a still-missing parameter.
+
+    a nested candidate that closes short normally ends the search, but when the very
+    next value boundary hands off to a parameter this candidate still needs, a second
+    valid assignment remains reachable. abandoning there would hide the competing
+    interpretation and let an ambiguous candidate parse as one structured call.
+    """
+    value_end = _find_parameter_end(text, _PARAMETER_END, incomplete)
+    if value_end < 0:
+        return False
+    following = _skip_whitespace(text, value_end + len(_PARAMETER_END))
+    if not text.startswith(_PARAMETER_START, following):
+        return False
+    name_end = text.find(">", following + len(_PARAMETER_START))
+    if name_end < 0:
+        return False
+    return text[following + len(_PARAMETER_START) : name_end] in missing
+
+
 def _classify_free_string(state, value_start, values, name, probe):
     text, tool, openers = state
     origin, depth, origin_missing = probe
@@ -287,7 +307,7 @@ def _classify_free_string(state, value_start, values, name, probe):
         elif count == 2:
             return 2, None, None, None
         if incomplete is not None and count == 0:
-            if origin != value_start:
+            if origin != value_start and not _resumes_missing_parameter(text, incomplete, missing):
                 return count, witness_cursor, witness_values, incomplete
             search_from = incomplete
         else:

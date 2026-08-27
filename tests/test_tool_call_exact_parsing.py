@@ -1193,6 +1193,12 @@ def _ownership_cases():
         "</function></tool_call> tail</parameter>"
         "<parameter=c>real-c</parameter><parameter=d>real-d</parameter>"
     )
+    required_abc = _string_field_tools("abc", "abc")
+    resumed_missing_text = _candidate_call(
+        "<parameter=a></parameter>"
+        "<parameter=b></parameter></function></tool_call></parameter>"
+        "<parameter=c></parameter><parameter=b></parameter>"
+    )
     return [
         (
             "all-required-fake-cd",
@@ -1231,6 +1237,7 @@ def _ownership_cases():
                 "d": "real-d",
             },
         ),
+        ("required-b-resumes-after-nested-close", required_abc, resumed_missing_text, None),
     ]
 
 
