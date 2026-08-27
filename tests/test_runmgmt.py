@@ -3502,7 +3502,9 @@ def test_reclaimed_opd_attempt_reverifies_its_resume_evidence(monkeypatch, tmp_p
     _save_opd_recovery_status(spec)
 
     # attempt 0 reserves before anything mutated, so its claim pins no resume evidence.
-    monkeypatch.setattr(runner_attempts, "_verified_opd_retry_state", lambda _run_id: (0, None, None))
+    monkeypatch.setattr(
+        runner_attempts, "_verified_opd_retry_state", lambda _run_id: (0, None, None)
+    )
     original = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
     assert original is not None
     assert original.resume_revision is None
@@ -3535,7 +3537,9 @@ def test_handleless_opd_reservation_rejects_evidence_from_an_older_counter(monke
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_recovery_spec("opd-stale-counter")
     _save_opd_recovery_status(spec)
-    monkeypatch.setattr(runner_attempts, "_verified_opd_retry_state", lambda _run_id: (0, None, None))
+    monkeypatch.setattr(
+        runner_attempts, "_verified_opd_retry_state", lambda _run_id: (0, None, None)
+    )
     original = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
     assert original is not None
     runner_attempts.release_launch_claim(spec.run_id, original)
