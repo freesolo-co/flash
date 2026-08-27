@@ -395,19 +395,38 @@ def require_attempt_launch_current(run_id: str, spec: JobSpec, claim: AttemptLau
         return retry_state
 
 
-def attempt_claim_is_current(run_id: str, claim: AttemptLaunchClaim) -> bool:
-    """Return whether the run still has this exact claim or durable handle."""
+def attempt_is_this_callers_to_fail(run_id: str, claim: AttemptLaunchClaim) -> bool:
+    """Return whether this claim's caller still owes the run a terminal outcome.
+
+    Exact ownership is the common case, but it is not the only one. A caller that already settled
+    its attempt -- persisted a terminal retry decision, then confirmed teardown -- holds neither the
+    active claim nor the remote any more, yet the run is still nonterminal and nobody else will fail
+    it. That settled shape must stay this caller's to finish, or an unwound attempt leaves the run
+    in `provisioning` with no owner and a later handleless pass relaunches decided work.
+
+    A newer attempt is the boundary: once the counter has moved past this claim, ownership belongs
+    to whoever reserved it, and this caller must not write a terminal state over them.
+    """
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
         if raw.get("state") in state.TERMINAL_STATES:
             return False
         remote = raw.get("remote")
-        return _owns_attempt(
+        if _owns_attempt(
             raw,
             attempt=claim.attempt,
             token=claim.token,
             expected_remote=remote if isinstance(remote, dict) else None,
-        )
+        ):
+            return True
+        # settled-and-unwound: nothing is owned because this caller released it. only claim the
+        # duty when no newer attempt was reserved and no other owner has since taken the run.
+        if remote is not None or raw.get(state._ACTIVE_LAUNCH_CLAIM_KEY) is not None:
+            return False
+        try:
+            return status_ops.decode_next_attempt(raw) - 1 == claim.attempt
+        except RuntimeError:
+            return False
 
 
 def decide_attempt_failure(

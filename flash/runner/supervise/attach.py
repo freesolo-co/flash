@@ -124,9 +124,9 @@ def _resume_after_confirmed_teardown(
     except _RunCancelled:
         raise
     except Exception as exc:
-        from flash.runner.lifecycle.attempts import attempt_claim_is_current
+        from flash.runner.lifecycle.attempts import attempt_is_this_callers_to_fail
 
-        if attempt_claim_is_current(run_id, claim):
+        if attempt_is_this_callers_to_fail(run_id, claim):
             current_remote = get_status(run_id).remote
             if current_remote is not None:
                 with contextlib.suppress(Exception):

@@ -1540,6 +1540,51 @@ def test_provider_launch_and_handle_persistence_require_exact_claim_token(monkey
     assert not runner_attempts.claim_is_live(spec.run_id, claim)
 
 
+def test_settled_attempt_still_owes_the_run_a_terminal_outcome(monkeypatch, tmp_path):
+    """A caller that settled its attempt must still be the one to fail an unwound run.
+
+    After a terminal retry decision clears the active claim and teardown clears the remote, nothing
+    is owned any more. If that reads as "not mine", attach's except block skips failing the run and
+    leaves it nonterminal with no owner, and handleless recovery relaunches decided work.
+    """
+    from flash.core.spec import JobSpec
+    from flash.runner.supervise.retry_decision import FailureObservation
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="settled-owes-terminal", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    )
+    claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert claim is not None
+    assert runner_attempts.attempt_is_this_callers_to_fail(spec.run_id, claim)
+
+    # settle the attempt: the decision clears the active claim, and no remote was ever persisted,
+    # which is the exact shape attach unwinds into after `_settle_terminal_remote`.
+    plan = runner_attempts.decide_attempt_failure(
+        spec.run_id,
+        claim_token=claim.token,
+        expected_remote=None,
+        observation=FailureObservation("poll_error"),
+        attempt=claim.attempt,
+    )
+    assert plan is not None
+    raw = runner_status._load_status_json(spec.run_id)
+    assert runner_state._ACTIVE_LAUNCH_CLAIM_KEY not in raw
+    assert raw.get("remote") is None
+    assert raw["state"] not in runner_state.TERMINAL_STATES
+
+    # nothing is owned, but no newer attempt exists, so this caller must still fail the run.
+    assert runner_attempts.attempt_is_this_callers_to_fail(spec.run_id, claim)
+
+    # a newer reserved attempt is the boundary: the stale caller must not write over its owner.
+    replacement = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert replacement is not None
+    assert replacement.attempt == claim.attempt + 1
+    assert not runner_attempts.attempt_is_this_callers_to_fail(spec.run_id, claim)
+    assert runner_attempts.attempt_is_this_callers_to_fail(spec.run_id, replacement)
+
+
 def test_replacement_reservation_requires_exact_previous_authorization(monkeypatch, tmp_path):
     from flash.core.spec import JobSpec
     from flash.runner.supervise.retry_decision import FailureObservation
