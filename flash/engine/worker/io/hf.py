@@ -3,19 +3,40 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
+import tempfile
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path, PurePosixPath
 
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.runtime.state as _worker_state
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.adapters.artifacts import attempt_scoped_artifact_name, has_loadable_adapter_weights
+from flash.adapters.artifacts import (
+    ADAPTER_SHARD_PREFIX,
+    ADAPTER_WEIGHT_FILES,
+    ADAPTER_WEIGHT_SUFFIXES,
+    attempt_scoped_artifact_name,
+    has_loadable_adapter_weights,
+    loadable_adapter_weight_files,
+)
 from flash.engine.profiling.tokenizer import (  # noqa: F401
     load_tokenizer,
     model_revision_kwargs,
+)
+from flash.engine.worker.io.local_snapshot import (
+    SnapshotContentMismatchError,
+    SnapshotFileIdentity,
+    UnsafeLocalSnapshotError,
+    local_snapshot_root,
+    open_snapshot_file,
+    revalidate_snapshot,
+    snapshot_file_identity,
+    snapshot_upload_paths,
+    verify_snapshot_content,
 )
 
 # `gpu_diagnostics` has no call site here since prefetch moved to `.prefetch`, but it is kept
@@ -33,6 +54,10 @@ from flash.teacher.retry_contract import (
 
 class RequiredSaveError(RuntimeError):
     """permanent exact-save contract failure."""
+
+
+class _AdapterPublicationError(RuntimeError):
+    """a stable adapter commit failed in a way that a blind retry must not overwrite."""
 
 
 def error_artifact_name(mode: str, attempt: int = 0) -> str:
@@ -148,6 +173,15 @@ def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> bool
             _require_hf_deadline_allowance()
             do_upload()
             return True
+        except RequiredSaveError:
+            raise
+        except _AdapterPublicationError as e:
+            last_err = e
+            detail = sanitize_diagnostic(e, limit=500)
+            if not required:
+                print(f"{label} warn: {detail}")
+                return False
+            break
         except Exception as e:
             last_err = e
             detail = sanitize_diagnostic(e, limit=500)
@@ -202,15 +236,382 @@ def _resume_checkpoint_upload_slot(timeout_s: float | None = None):
             _RESUME_CHECKPOINT_UPLOAD_LOCK.release()
 
 
-def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) -> bool:
-    """Upload a folder to the run's HF prefix. Returns True on success (see ``_hf_upload``)."""
-    return _hf_upload(
-        lambda: hf_api().upload_folder(
-            folder_path=local_dir,
-            path_in_repo=f"{hf_prefix()}/{repo_subpath}",
-            repo_id=_worker_state.HF_REPO,
+_ADAPTER_INDEX_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _adapter_representation_files(filenames: set[str]) -> set[str]:
+    """return the sole complete supported weight representation, or raise."""
+    singles = set(ADAPTER_WEIGHT_FILES) & filenames
+    shards = {
+        name
+        for name in filenames
+        if name.startswith(ADAPTER_SHARD_PREFIX) and name.endswith(ADAPTER_WEIGHT_SUFFIXES)
+    }
+    indexes = {
+        f"adapter_model{suffix}.index.json"
+        for suffix in ADAPTER_WEIGHT_SUFFIXES
+        if f"adapter_model{suffix}.index.json" in filenames
+    }
+    if singles:
+        if len(singles) != 1 or shards or indexes:
+            raise RequiredSaveError("adapter snapshot contains coexisting weight representations")
+        return singles
+    selected = set(loadable_adapter_weight_files(filenames))
+    if not selected or selected != shards or len(indexes) != 1:
+        raise RequiredSaveError("adapter snapshot has no single complete weight representation")
+    return selected | indexes
+
+
+def _read_bounded_file(file, *, label: str) -> bytes:
+    try:
+        file.seek(0)
+        size = os.fstat(file.fileno()).st_size
+        if size > _ADAPTER_INDEX_MAX_BYTES:
+            raise RequiredSaveError(f"{label} exceeds the adapter index size limit")
+        content = file.read(_ADAPTER_INDEX_MAX_BYTES + 1)
+        file.seek(0)
+    except RequiredSaveError:
+        raise
+    except (OSError, ValueError) as error:
+        raise RequiredSaveError(f"{label} could not be read") from error
+    if len(content) > _ADAPTER_INDEX_MAX_BYTES:
+        raise RequiredSaveError(f"{label} exceeds the adapter index size limit")
+    return content
+
+
+def _read_bounded_path(path: Path, *, label: str) -> bytes:
+    try:
+        with path.open("rb") as file:
+            return _read_bounded_file(file, label=label)
+    except RequiredSaveError:
+        raise
+    except OSError as error:
+        raise RequiredSaveError(f"{label} could not be read") from error
+
+
+def _strict_json_object(content: bytes, *, label: str) -> dict:
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate key {key!r}")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError(f"non-json constant {value!r}")
+
+    try:
+        parsed = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, ValueError, TypeError, RecursionError) as error:
+        raise RequiredSaveError(f"{label} is not strict valid json") from error
+    if not isinstance(parsed, dict):
+        raise RequiredSaveError(f"{label} must be a json object")
+    return parsed
+
+
+def _validate_adapter_index(content: bytes, shards: set[str], *, label: str) -> None:
+    parsed = _strict_json_object(content, label=label)
+    weight_map = parsed.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise RequiredSaveError(f"{label} must contain a nonempty object weight_map")
+
+    referenced: set[str] = set()
+    normalized_aliases: dict[str, str] = {}
+    for tensor_name, shard_path in weight_map.items():
+        if not isinstance(tensor_name, str) or not tensor_name:
+            raise RequiredSaveError(f"{label} contains an invalid weight_map key")
+        if not isinstance(shard_path, str) or not shard_path:
+            raise RequiredSaveError(f"{label} contains an invalid shard path")
+        path = PurePosixPath(shard_path)
+        normalized = path.as_posix()
+        if (
+            path.is_absolute()
+            or len(path.parts) != 1
+            or shard_path in {".", ".."}
+            or "\\" in shard_path
+        ):
+            raise RequiredSaveError(f"{label} contains an unsafe shard path")
+        prior = normalized_aliases.setdefault(normalized, shard_path)
+        if prior != shard_path:
+            raise RequiredSaveError(f"{label} contains duplicate shard aliases")
+        if normalized != shard_path:
+            raise RequiredSaveError(f"{label} contains an unsafe shard path")
+        if not (
+            shard_path.startswith(ADAPTER_SHARD_PREFIX)
+            and shard_path.endswith(ADAPTER_WEIGHT_SUFFIXES)
+        ):
+            raise RequiredSaveError(f"{label} references a non-adapter shard")
+        referenced.add(shard_path)
+    if referenced != shards:
+        raise RequiredSaveError(
+            f"{label} shard references do not exactly match the published adapter shards"
+        )
+
+
+def _validate_adapter_snapshot(
+    paths: set[str],
+    *,
+    read_index: Callable[[str], bytes],
+    label: str,
+) -> set[str]:
+    direct_files = {path for path in paths if "/" not in path}
+    if "adapter_config.json" not in direct_files:
+        raise RequiredSaveError(f"{label} is missing adapter_config.json")
+    representation = _adapter_representation_files(direct_files)
+    indexes = {name for name in representation if name.endswith(".index.json")}
+    if indexes:
+        index_name = next(iter(indexes))
+        shards = representation - indexes
+        _validate_adapter_index(
+            read_index(index_name),
+            shards,
+            label=f"{label} {index_name}",
+        )
+    return {"adapter_config.json", *representation}
+
+
+def _immutable_adapter_metadata(
+    api,
+    *,
+    repo_id: str,
+    revision: str,
+    prefix: str,
+    paths: set[str],
+) -> dict[str, object]:
+    remote_paths = [f"{prefix}{path}" for path in sorted(paths)]
+    try:
+        infos = api.get_paths_info(
+            repo_id=repo_id,
+            paths=remote_paths,
             repo_type="dataset",
+            revision=revision,
+        )
+    except Exception as error:
+        raise _AdapterPublicationError(
+            "immutable adapter commit content metadata could not be read"
+        ) from error
+
+    by_path = {}
+    for info in infos:
+        path = getattr(info, "path", None)
+        if path not in remote_paths or path in by_path:
+            raise _AdapterPublicationError(
+                "immutable adapter commit returned ambiguous content metadata"
+            )
+        by_path[path] = info
+    if set(by_path) != set(remote_paths):
+        raise _AdapterPublicationError("immutable adapter commit omitted content metadata")
+    return by_path
+
+
+def _download_immutable_index(
+    api,
+    *,
+    repo_id: str,
+    revision: str,
+    path: str,
+) -> bytes:
+    try:
+        with tempfile.TemporaryDirectory(prefix="flash-adapter-verify-") as directory:
+            local_path = api.hf_hub_download(
+                repo_id=repo_id,
+                filename=path,
+                repo_type="dataset",
+                revision=revision,
+                local_dir=directory,
+                force_download=True,
+            )
+            return _read_bounded_path(Path(local_path), label="immutable adapter index")
+    except RequiredSaveError:
+        raise
+    except Exception as error:
+        raise RequiredSaveError("immutable adapter index could not be downloaded") from error
+
+
+def _verify_adapter_commit(
+    api,
+    *,
+    repo_id: str,
+    revision: str,
+    prefix: str,
+    expected_remote: set[str],
+    adapter_files: set[str],
+    identities: dict[str, SnapshotFileIdentity],
+) -> None:
+    published_files = set(
+        api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision=revision)
+    )
+    published_adapter_files = {path for path in published_files if path.startswith(prefix)}
+    if published_adapter_files != expected_remote:
+        raise _AdapterPublicationError(
+            "immutable adapter commit does not exactly match the local snapshot"
+        )
+    published_relative = {path[len(prefix) :] for path in published_adapter_files}
+    metadata = _immutable_adapter_metadata(
+        api,
+        repo_id=repo_id,
+        revision=revision,
+        prefix=prefix,
+        paths=set(identities),
+    )
+    indexes = {path for path in adapter_files if path.endswith(".index.json")}
+    if indexes:
+        index_name = next(iter(indexes))
+        index_size = getattr(metadata[f"{prefix}{index_name}"], "size", None)
+        if (
+            isinstance(index_size, bool)
+            or not isinstance(index_size, int)
+            or index_size > _ADAPTER_INDEX_MAX_BYTES
+        ):
+            raise RequiredSaveError("immutable adapter index exceeds the adapter index size limit")
+    published_adapter_files = _validate_adapter_snapshot(
+        published_relative,
+        read_index=lambda name: _download_immutable_index(
+            api,
+            repo_id=repo_id,
+            revision=revision,
+            path=f"{prefix}{name}",
         ),
+        label="immutable adapter commit",
+    )
+    if published_adapter_files != adapter_files:
+        raise RequiredSaveError(
+            "immutable adapter commit representation differs from the local snapshot"
+        )
+    try:
+        verify_snapshot_content(metadata, prefix=prefix, identities=identities)
+    except SnapshotContentMismatchError as error:
+        raise _AdapterPublicationError(str(error)) from error
+
+
+def _replace_adapter_folder(
+    local_dir: str,
+    repo_subpath: str,
+    *,
+    ignore_patterns: tuple[str, ...] = (),
+) -> str:
+    """atomically replace one adapter folder and verify its immutable result."""
+    from huggingface_hub import CommitOperation, CommitOperationAdd, CommitOperationDelete
+
+    api = hf_api()
+    repo_id = _worker_state.HF_REPO
+    target = repo_subpath.strip("/")
+    committed = False
+    try:
+        with contextlib.ExitStack() as stack:
+            snapshot = stack.enter_context(local_snapshot_root(local_dir))
+            local_paths = snapshot_upload_paths(snapshot.paths, ignore_patterns)
+            expected = set(local_paths)
+            files = {
+                path: stack.enter_context(open_snapshot_file(snapshot, path))
+                for path in local_paths
+            }
+            identities = {path: snapshot_file_identity(files[path], path) for path in local_paths}
+            adapter_files = _validate_adapter_snapshot(
+                expected,
+                read_index=lambda name: _read_bounded_file(
+                    files[name], label=f"local adapter snapshot {name}"
+                ),
+                label="local adapter snapshot",
+            )
+            revalidate_snapshot(snapshot, files, identities)
+            prefix = f"{target}/" if target else ""
+            expected_remote = {f"{prefix}{path}" for path in expected}
+            additions = [
+                CommitOperationAdd(path_in_repo=f"{prefix}{path}", path_or_fileobj=files[path])
+                for path in local_paths
+            ]
+            api.preupload_lfs_files(
+                repo_id=repo_id,
+                repo_type="dataset",
+                additions=additions,
+                free_memory=False,
+            )
+            revalidate_snapshot(snapshot, files, identities)
+            parent = getattr(api.repo_info(repo_id=repo_id, repo_type="dataset"), "sha", None)
+            if not isinstance(parent, str) or not is_commit_sha(parent):
+                raise RequiredSaveError(
+                    "adapter publication could not resolve an immutable parent commit"
+                )
+            current_files = set(
+                api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision=parent)
+            )
+            current_adapter_files = {path for path in current_files if path.startswith(prefix)}
+            operations: list[CommitOperation] = [
+                CommitOperationDelete(path_in_repo=path, is_folder=False)
+                for path in sorted(current_adapter_files - expected_remote)
+            ]
+            operations.extend(additions)
+            revalidate_snapshot(snapshot, files, identities)
+            try:
+                commit = api.create_commit(
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    operations=operations,
+                    commit_message=f"Replace adapter at {target}",
+                    parent_commit=parent,
+                )
+            except Exception as error:
+                try:
+                    current_parent = getattr(
+                        api.repo_info(repo_id=repo_id, repo_type="dataset"), "sha", None
+                    )
+                except Exception as parent_error:
+                    raise _AdapterPublicationError(
+                        "adapter publication failed and its parent could not be re-read"
+                    ) from parent_error
+                if current_parent != parent:
+                    raise _AdapterPublicationError(
+                        f"adapter publication parent changed from {parent} to {current_parent}"
+                    ) from error
+                raise
+            committed = True
+            revision = getattr(commit, "oid", None)
+            if not isinstance(revision, str) or not is_commit_sha(revision):
+                raise _AdapterPublicationError(
+                    "post-commit adapter publication returned no immutable commit"
+                )
+            revalidate_snapshot(snapshot, files, identities)
+            _verify_adapter_commit(
+                api,
+                repo_id=repo_id,
+                revision=revision,
+                prefix=prefix,
+                expected_remote=expected_remote,
+                adapter_files=adapter_files,
+                identities=identities,
+            )
+            revalidate_snapshot(snapshot, files, identities)
+            return revision
+    except _AdapterPublicationError as error:
+        if committed and not str(error).startswith("post-commit"):
+            raise _AdapterPublicationError(f"post-commit verification failed: {error}") from error
+        raise
+    except RequiredSaveError as error:
+        if committed:
+            raise _AdapterPublicationError(f"post-commit verification failed: {error}") from error
+        raise
+    except UnsafeLocalSnapshotError as error:
+        if committed:
+            raise _AdapterPublicationError(f"post-commit verification failed: {error}") from error
+        raise RequiredSaveError(str(error)) from error
+    except Exception as error:
+        if committed:
+            detail = sanitize_diagnostic(error, limit=300)
+            raise _AdapterPublicationError(f"post-commit verification failed: {detail}") from error
+        raise
+
+
+def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) -> bool:
+    """atomically replace an adapter folder under the run's HF prefix."""
+    target = f"{hf_prefix()}/{repo_subpath}"
+    return _hf_upload(
+        lambda: _replace_adapter_folder(local_dir, target),
         repo_subpath,
         required,
         "hf_upload_folder",
@@ -377,16 +778,18 @@ def publish_deployable_checkpoint(
     for attempt in range(attempts):
         try:
             _require_hf_deadline_allowance()
-            hf_api().upload_folder(
-                folder_path=ckpt_dir,
-                path_in_repo=subfolder,
-                repo_id=_worker_state.HF_REPO,
-                repo_type="dataset",
-                ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
+            _replace_adapter_folder(
+                ckpt_dir,
+                subfolder,
+                ignore_patterns=_CHECKPOINT_TRAINER_STATE,
             )
             if _emit_heartbeat:
                 _worker_heartbeat.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
             return subfolder
+        except _AdapterPublicationError as e:
+            last_error = e
+            print(f"[ckpt] deployable publish warn (step {step}):", e)
+            break
         except Exception as e:
             last_error = e
             print(f"[ckpt] deployable publish warn (step {step}):", e)
@@ -586,4 +989,4 @@ from flash.engine.worker.io.prefetch import (  # noqa: E402,F401
 
 # the sha predicate lives in the client-safe `envs.loading.loader`; re-exported here because the
 # provenance tests patch and assert it as `hf.is_commit_sha`.
-from flash.envs.loading.loader import is_commit_sha  # noqa: E402,F401
+from flash.envs.loading.loader import is_commit_sha  # noqa: E402
