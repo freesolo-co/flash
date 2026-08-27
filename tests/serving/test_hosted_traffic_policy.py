@@ -26,7 +26,9 @@ def test_catalog_policy_preserves_explicit_current_values() -> None:
         assert policy.min_containers == 1
         assert policy.buffer_containers == 1
 
-    assert all(model["traffic"] == {"max_inputs": 8, "target_inputs": 6} for model in SERVING_MODELS)
+    assert all(
+        model["traffic"] == {"max_inputs": 8, "target_inputs": 6} for model in SERVING_MODELS
+    )
     assert _QWEN38_HOSTED_CANDIDATE["traffic"] == {"max_inputs": 8, "target_inputs": 6}
 
 
