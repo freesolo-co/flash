@@ -9863,6 +9863,10 @@ def test_reference_helper_agrees_with_the_real_pinned_verl_function():
     would skip instead of running. That makes the stand-in a drift risk: it could diverge from
     the pinned helper and keep passing. This test closes that gap on any environment that does
     have verl, so a divergence fails somewhere rather than nowhere.
+
+    It proves agreement with the INSTALLED verl, not with the pin by construction. The two are
+    the same function today, but an environment installed off a different verl would move this
+    oracle with it. `test_verl_pin_is_an_immutable_commit_on_the_freesolo_fork` guards the pin.
     """
     torch = pytest.importorskip("torch")
     TensorDict = pytest.importorskip("tensordict").TensorDict
@@ -10072,6 +10076,32 @@ def test_packed_full_sequence_refuses_a_padded_teacher_with_no_mask():
     width = max(prompt_len + response_len for prompt_len, response_len in samples)
     with pytest.raises(AssertionError, match="carries no attention mask"):
         _packed_full_sequence(torch.zeros(len(samples), width, 1), data)
+
+
+def test_packed_full_sequence_refuses_a_strided_batch_with_no_mask():
+    """A strided batch carries neither a mask nor offsets, so nothing locates the real tokens.
+
+    The producer always writes `attention_mask`, so this is unreachable today. It is pinned
+    anyway because the alternative is an `AttributeError` from reading `.offsets()` off a
+    strided tensor, which reads as a coding slip rather than the batch being unusable.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    prompt_width, response_width = 120, 1024
+    data = TensorDict(
+        {
+            "prompts": torch.zeros(2, prompt_width, dtype=torch.int64),
+            "responses": torch.zeros(2, response_width, dtype=torch.int64),
+        },
+        batch_size=[2],
+    )
+    assert "attention_mask" not in data
+
+    with pytest.raises(AssertionError, match="carries no attention mask"):
+        _packed_full_sequence(torch.zeros(2, prompt_width + response_width, 1), data)
 
 
 def test_packed_full_sequence_flattens_a_full_unmasked_stack():

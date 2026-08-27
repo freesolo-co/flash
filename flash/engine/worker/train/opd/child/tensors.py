@@ -38,10 +38,16 @@ def packed_full_sequence(tensor, data):
         return tensor
     if "attention_mask" in data:
         return tensor[data["attention_mask"].bool()]
-    # no mask: a nested-prompt batch need not carry that key. verl stacks this field only when
-    # every sequence shares one length, and a teacher row is padded only by the helper above,
-    # which pads to the strided widths. So an unmasked stack is full and every position is real.
-    lengths = data["prompts"].offsets().diff() + data["responses"].offsets().diff()
+    # no mask: only a nested-prompt batch may omit that key, and only such a batch carries the
+    # lengths needed to check the stack. verl stacks this field only when every sequence shares
+    # one length, and pads a row only to the strided widths, so an unmasked stack is full.
+    prompts = data["prompts"]
+    if not prompts.is_nested:
+        raise AssertionError(
+            "flash OPD strided batch carries no attention mask, so real token positions "
+            "cannot be located"
+        )
+    lengths = prompts.offsets().diff() + data["responses"].offsets().diff()
     if int(lengths.min()) != tensor.shape[1] or int(lengths.max()) != tensor.shape[1]:
         raise AssertionError(
             "flash OPD teacher tensor is padded but the batch carries no attention mask: "
