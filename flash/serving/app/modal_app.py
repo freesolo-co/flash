@@ -144,8 +144,10 @@ MIN_CONTAINERS = 0
 # an idle one. Bound spend with workspace quotas and billing alerts, which do not silently convert
 # demand into queueing on the hot tier.
 MAX_CONTAINERS = None
-# One spare warm container per base-model engine so a burst past `TARGET_INPUTS` does not pay a full
-# cold boot (420s on L40S, 900s on H100, 1010s on H200) before it can be served.
+# One spare warm container for each autoscaling pool -- every base-model engine AND the cpu router --
+# so a burst past `TARGET_INPUTS` does not pay a full cold boot (420s on L40S, 900s on H100, 1010s on
+# H200) before it can be served. Modal only provisions the buffer while a Function is ACTIVE, so this
+# does not defeat `MIN_CONTAINERS = 0`: idle engines still scale to zero and bill nothing.
 BUFFER_CONTAINERS = 1
 # Concurrent requests packed onto one base-model GPU before Modal autoscales a new (costly) one.
 # A real-GPU sweep (scripts/gpu_canary.py::sweep_concurrency on A10G/Qwen2.5-1.5B) showed vLLM
@@ -731,6 +733,7 @@ def _base_model_records() -> list:
 @app.function(
     secrets=runtime_secrets,
     min_containers=1,  # one warm CPU front door (hardcoded; no deploy-time knob)
+    buffer_containers=BUFFER_CONTAINERS,  # scales out with the engines; see BUFFER_CONTAINERS
     timeout=ROUTER_TIMEOUT_SECONDS,  # must cover engine cold start (see ROUTER_TIMEOUT_SECONDS)
 )
 @modal.concurrent(max_inputs=MAX_INPUTS, target_inputs=TARGET_INPUTS)

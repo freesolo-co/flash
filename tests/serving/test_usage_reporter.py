@@ -144,8 +144,11 @@ def test_no_gpu_engine_is_capped_and_each_keeps_one_buffer(modal_app_module):
     assert all(kwargs["min_containers"] == 0 for kwargs in cls_calls)
 
     # The cpu router is likewise uncapped: it is the front door that triggers cold engines, and
-    # capping it would throttle every model at once rather than bounding gpu spend per model.
-    assert "max_containers" not in modal_app_module.app.function.call_args.kwargs
+    # capping it would throttle every model at once rather than bounding gpu spend per model. It
+    # carries the same buffer, so a burst does not queue behind the front door it just cleared.
+    router_kwargs = modal_app_module.app.function.call_args.kwargs
+    assert "max_containers" not in router_kwargs
+    assert router_kwargs["buffer_containers"] == 1
 
 
 def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app_module):
