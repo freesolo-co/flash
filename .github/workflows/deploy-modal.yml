@@ -87,9 +87,14 @@ jobs:
           DEPLOYED_HEALTH_URL: https://serve.freesolo.co/healthz
         run: |
           deploy=false
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            deploy=true
-          elif ! last_deployed_sha="$(python3 - <<'PY'
+          # the sha reported by the LIVE app is read ONCE, before any decision, because it serves
+          # two purposes: it bounds the undeployed diff below, and it is the rollback target for a
+          # failed promotion. `modal deploy` overwrites the app in place, so after that point there
+          # is no way left to ask what the previous release was. reading it on workflow_dispatch
+          # too -- where the deploy decision does not need it -- is what makes a dispatched deploy
+          # rollback-capable rather than one-way.
+          read_ok=true
+          last_deployed_sha="$(python3 - <<'PY'
           import json
           import os
           import re
@@ -107,7 +112,17 @@ jobs:
               raise ValueError("deployed app returned no valid source revision")
           print(revision.lower())
           PY
-          )"; then
+          )" || read_ok=false
+          if [ "$read_ok" != "true" ]; then
+            last_deployed_sha=""
+          fi
+          # an empty previous sha means rollback is IMPOSSIBLE for this run. the rollback step below
+          # says so out loud rather than reporting a restore it never performed.
+          echo "previous_sha=$last_deployed_sha" >> "$GITHUB_OUTPUT"
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            deploy=true
+          elif [ "$read_ok" != "true" ]; then
             # a missing deployment or any health, network, or parsing failure must deploy safely.
             deploy=true
           elif ! git merge-base --is-ancestor "$last_deployed_sha" "$CURRENT_SHA" 2>/dev/null; then
@@ -370,6 +385,116 @@ jobs:
             fi
             sleep "$sleep_seconds"
           done
+
+      - name: Install promotion gate dependencies
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        run: |
+          # the gate imports flash.serving.promotion, which needs httpx for the streaming canary and
+          # pydantic-settings for the accounting client. this job deliberately does not `uv sync`
+          # (see "Install Modal client"), so install exactly what the gate imports and nothing more.
+          # these are the exact versions uv.lock resolves, so the gate runs against the same client
+          # behaviour the serving tests were validated on rather than whatever pypi ships that day.
+          python -m pip install "httpx==0.28.1" "pydantic==2.13.4" "pydantic-settings==2.15.0"
+
+      - name: Prove the promotion with a real streaming canary
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        env:
+          # a healthy /healthz proves a ROUTER answered with the expected identity. it does not prove
+          # a gpu engine started, that a generation ran, that streaming works, or that usage settled
+          # durably. this step is the only thing standing between "the process booted" and "the
+          # release can actually serve", so a failure here must not be promoted.
+          SERVING_BASE_URL: https://serve.freesolo.co
+          FREESOLO_INTERNAL_KEY: ${{ secrets.FREESOLO_INTERNAL_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+        # credentials reach the gate ONLY through the environment above. passing any of them as an
+        # argument would put them in the process table and in the step's own command echo.
+        run: python -m flash.serving.promotion.gate
+
+      - name: Restore the previous release
+        # `failure()` covers every preceding step, not just the canary: a deploy that half-succeeded
+        # and then failed readiness leaves the same broken app live as one that failed the canary.
+        if: failure() && steps.gate.outputs.deploy == 'true'
+        working-directory: .
+        env:
+          PREVIOUS_SHA: ${{ steps.gate.outputs.previous_sha }}
+          CURRENT_SHA: ${{ github.sha }}
+          # a distinct attempt id so /healthz cannot report the FORWARD deploy's identity and be
+          # mistaken for a completed rollback.
+          ROLLBACK_DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}-rollback
+          HEALTH_URL: https://serve.freesolo.co/healthz
+        run: |
+          if [ -z "$PREVIOUS_SHA" ]; then
+            echo "::error::Promotion failed and NO previous release was recorded, so the broken release is still live. Restore production manually."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$PREVIOUS_SHA" "$CURRENT_SHA" 2>/dev/null; then
+            # refusing here is the safe branch: redeploying a sha that is not an ancestor of this
+            # head would deploy an unknown tree rather than the release that was actually live.
+            echo "::error::Recorded previous release ${PREVIOUS_SHA} is not an ancestor of ${CURRENT_SHA}; refusing to redeploy an unverified tree. Restore production manually."
+            exit 1
+          fi
+
+          echo "Promotion failed; restoring ${PREVIOUS_SHA}."
+          git checkout --quiet --force "$PREVIOUS_SHA"
+
+          # the restored app must report the RESTORED sha, deployed from the restored tree.
+          FREESOLO_DEPLOYMENT_SHA="$PREVIOUS_SHA" \
+          FREESOLO_DEPLOYMENT_ID="$ROLLBACK_DEPLOYMENT_ID" \
+            modal deploy flash/serving/app/modal_app.py
+
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          deadline=$((SECONDS + 300))
+          restored=false
+          while (( SECONDS < deadline )); do
+            if curl --silent --show-error --output "$response_file" --fail \
+              --connect-timeout 5 --max-time 10 "$HEALTH_URL"; then
+              if python3 - "$response_file" "$PREVIOUS_SHA" "$ROLLBACK_DEPLOYMENT_ID" <<'PY'
+          import json
+          import sys
+
+
+          def reject_constant(_value: str) -> None:
+              raise ValueError
+
+
+          try:
+              with open(sys.argv[1], encoding="utf-8") as response:
+                  payload = json.load(response, parse_constant=reject_constant)
+          except (OSError, UnicodeDecodeError, ValueError):
+              sys.exit(1)
+
+          restored = (
+              isinstance(payload, dict)
+              and payload.get("ok") is True
+              and payload.get("deployment_sha") == sys.argv[2]
+              and payload.get("deployment_id") == sys.argv[3]
+          )
+          sys.exit(0 if restored else 1)
+          PY
+              then
+                restored=true
+                break
+              fi
+            fi
+            sleep 10
+          done
+
+          if [ "$restored" != "true" ]; then
+            echo "::error::Rollback to ${PREVIOUS_SHA} was deployed but production never reported the restored release. Production may be serving a broken release; intervene manually."
+            exit 1
+          fi
+          # exit nonzero regardless: a restored predecessor means production is serving again, NOT
+          # that this promotion succeeded. reporting green here would mark an unpromotable commit as
+          # deployed and let the next push build on a release that never passed its gate.
+          echo "::error::Promotion failed; production was restored to ${PREVIOUS_SHA}. This commit is NOT deployed."
+          exit 1
 
       - name: Nothing to deploy
         if: steps.gate.outputs.deploy != 'true'

@@ -63,6 +63,36 @@ Required production wiring is `HF_TOKEN`, `FREESOLO_INTERNAL_KEY`,
 `PLATFORM_BACKEND_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, a nonblank
 `FREESOLO_DEPLOYMENT_ID`, and `SERVING_CUSTOM_DOMAIN=serve.freesolo.co`.
 
+#### Promotion gate
+
+`modal deploy` replaces the live app in place, and a `/healthz` poll only reads back the identity
+the deploy step just injected. That proves a router process booted; it does not prove a GPU engine
+started, that a generation ran, that streaming works, or that usage settled. So after readiness the
+workflow runs `python -m flash.serving.promotion.gate`, which must prove all three in order:
+
+1. the live router reports `ok`, this exact `deployment_sha`, this run's attempt id, and at least
+   one engine;
+2. an authenticated `stream=true` request carrying `X-Correlation-ID: fspromo-<run>-<attempt>`
+   returns SSE with at least one non-empty content delta, a terminal finish reason, terminal usage
+   with non-zero completion tokens, and `data: [DONE]`;
+3. the accounting backlog drains to zero `pending`, `leased`, `due_pending` and `expired_leases`,
+   so that generation settled durably rather than only being captured in memory.
+
+Exact-head binding comes from the durable usage row, not the response: engines receive only
+`HF_TOKEN` and cannot report a release sha, and `engine_replica_id` is stripped from public bodies.
+The router stamps `serving_release` and `serving_deployment_id` onto the usage event it writes.
+
+If any step after the deploy fails, the workflow redeploys the sha the live app reported _before_
+this deploy and re-reads `/healthz` to confirm the restored release under a distinct `-rollback`
+attempt id. The job still exits non-zero: a restored predecessor means production is serving, not
+that this commit shipped.
+
+There is **no ingress fence**. Traffic is not gated during the canary window, so a small amount of
+live traffic can reach a release that is about to be rolled back. Closing that window needs a
+runtime admission gate and a race-free drain (a request admitted just before closure creates no
+durable row before GPU dispatch, so a zero-backlog check cannot see it), which is deliberately not
+part of this mechanism.
+
 ### Development
 
 Development uses the dedicated Modal environment `dev`, development Supabase,

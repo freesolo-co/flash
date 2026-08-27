@@ -631,3 +631,95 @@ def test_bake_workflow_can_publish_versioned_candidate_tags():
         if "docker/build-push-action@" in step.get("uses", "")
     )
     assert "inputs.target_tag_prefix" in image["with"]["tags"]
+
+
+def _deploy_steps() -> list[dict[str, Any]]:
+    return _steps(_jobs(_load(WORKFLOW_DIR / "deploy-modal.yml"))["deploy"])
+
+
+def _step_index(name_fragment: str) -> int:
+    steps = _deploy_steps()
+    for index, step in enumerate(steps):
+        if name_fragment in (step.get("name") or ""):
+            return index
+    raise AssertionError(f"no deploy step named like {name_fragment!r}")
+
+
+def test_promotion_is_gated_on_a_real_stream_after_readiness():
+    """A healthy `/healthz` proves a ROUTER booted, not that the release can serve.
+
+    The readiness poll only reads back the identity the deploy step just injected, so a release
+    whose GPU engines never start, whose streaming path is broken, or whose accounting never
+    settles passes it unchanged. The canary has to run AFTER readiness (it needs the new router
+    live) and BEFORE the job can finish, or a broken release is promoted with a green check.
+    """
+    canary = _deploy_steps()[_step_index("real streaming canary")]
+    assert "flash.serving.promotion.gate" in canary["run"]
+    assert _step_index("real streaming canary") > _step_index("serving readiness")
+
+
+def test_the_promotion_canary_receives_its_credentials_only_through_the_environment():
+    """A credential passed as an argument is readable in the process table and the step echo.
+
+    `run:` lines are echoed into the public build log, so a key interpolated into argv leaks on
+    every run, including successful ones. The gate reads them from `env:` instead.
+    """
+    canary = _deploy_steps()[_step_index("real streaming canary")]
+    env = canary.get("env") or {}
+    assert "FREESOLO_INTERNAL_KEY" in env
+    assert "SUPABASE_SERVICE_ROLE_KEY" in env
+    for secret in ("FREESOLO_INTERNAL_KEY", "SUPABASE_SERVICE_ROLE_KEY", "secrets."):
+        assert secret not in canary["run"]
+
+
+def test_the_previous_release_is_captured_before_the_deploy_overwrites_it():
+    """`modal deploy` replaces the app in place, so the predecessor is unrecoverable afterwards.
+
+    The gate step reads the live app's sha for its own diff bound; publishing it as an output is
+    what makes rollback possible at all. Reading it only on the non-dispatch path would leave a
+    manually dispatched deploy one-way.
+    """
+    gate = _deploy_steps()[_step_index("Decide whether to deploy")]
+    assert 'previous_sha=$last_deployed_sha" >> "$GITHUB_OUTPUT' in gate["run"]
+    assert _step_index("Decide whether to deploy") < _step_index("Deploy serving")
+
+
+def test_a_failed_promotion_restores_and_verifies_the_previous_release():
+    """Restoration has to be PROVEN, not assumed from a successful redeploy command.
+
+    `modal deploy` returning zero says the app was replaced, not that it came up serving the
+    restored code. The rollback re-reads `/healthz` and requires the restored sha under its own
+    distinct attempt id, so the forward deploy's identity cannot be mistaken for a completed
+    rollback.
+    """
+    rollback = _deploy_steps()[_step_index("Restore the previous release")]
+    assert rollback["if"].startswith("failure()")
+    script = rollback["run"]
+    assert 'FREESOLO_DEPLOYMENT_SHA="$PREVIOUS_SHA"' in script
+    assert "modal deploy flash/serving/app/modal_app.py" in script
+    assert 'payload.get("deployment_sha") == sys.argv[2]' in script
+    assert "-rollback" in (rollback.get("env") or {}).get("ROLLBACK_DEPLOYMENT_ID", "")
+
+
+def test_a_rollback_still_fails_the_job():
+    """A restored predecessor means production is serving again, NOT that this commit shipped.
+
+    If the rollback step exited zero the run would go green, marking an unpromotable commit as
+    deployed: the next push would diff against a sha that never passed its gate and skip the
+    deploy entirely, so the failure would compound silently.
+    """
+    script = _deploy_steps()[_step_index("Restore the previous release")]["run"]
+    assert script.rstrip().endswith("exit 1")
+    assert "is NOT deployed" in script
+
+
+def test_rollback_refuses_a_previous_release_it_cannot_verify():
+    """An empty or non-ancestor sha must stop, not redeploy an unknown tree.
+
+    Silently skipping the restore would report a rollback that never happened while the broken
+    release keeps serving, which is worse than a loud failure telling an operator to intervene.
+    """
+    script = _deploy_steps()[_step_index("Restore the previous release")]["run"]
+    assert 'if [ -z "$PREVIOUS_SHA" ]; then' in script
+    assert "merge-base --is-ancestor" in script
+    assert "Restore production manually" in script
