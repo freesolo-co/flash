@@ -781,11 +781,18 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
         "key_fingerprint": "rpk-0123456789ab",
         "attempt": 0,
         "started_ts": time.time(),
+        # the launch persist writes the authorizing token and the allocation stamp together; retry
+        # reconstructs its candidate from the stamp, so a fixture without it never reaches staging.
+        "launch_claim_token": "token-staged-0",
+        "allocated_gpu": worker.gpu.type,
+        "allocated_gpu_count": 1,
+        "allocated_usable_vram_gb": 32.0,
     }
     status = _prepared_status(public, worker, state="running")
     status.remote = remote
     deadline_at = status.created_at + worker.gpu.max_wall_seconds
-    runner_state._save_status(status, _run_deadline_at=deadline_at)
+    # attempt 0 already holds a handle, so the reserved counter production would have written is 1.
+    runner_state._save_status(status, _run_deadline_at=deadline_at, _next_attempt=1)
     context = SimpleNamespace(
         worker_spec=worker,
         persisted_remote=remote,
@@ -794,6 +801,7 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
         recovered_attempt=0,
         next_attempt=1,
         source_snapshot=valid_source_snapshot(),
+        launch_claim_token="token-staged-0",
         allocated_gpu=None,
         allocated_gpu_count=None,
     )

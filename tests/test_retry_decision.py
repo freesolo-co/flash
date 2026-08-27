@@ -9,15 +9,14 @@ import pytest
 from flash.core.spec import GpuSpec, JobSpec
 from flash.providers.core.base import Candidate
 from flash.runner.lifecycle import attempts, state, status
+from flash.runner.lifecycle.attempts import decide_attempt_failure
 from flash.runner.supervise.retry_decision import (
     FailureObservation,
-    ObservedDecisionState,
     PersistedRetryDecision,
     RetryPlan,
     RetryState,
     _candidate_usable_vram_gb,
     _strictly_larger_candidates,
-    decide_failure_atomically,
     transition_failure,
 )
 
@@ -36,12 +35,7 @@ def _candidate(provider: str, gpu: str, vram: float, count: int = 1) -> Candidat
 
 
 def _observe(failure: str, chosen=None, candidates=(), *, cache=False) -> FailureObservation:
-    return FailureObservation.create(
-        failure,
-        chosen=chosen,
-        candidates=candidates,
-        managed_cache_mounted=cache,
-    )
+    return FailureObservation(failure, chosen, candidates, cache)
 
 
 @pytest.mark.parametrize(
@@ -206,29 +200,24 @@ def test_atomic_retry_cas_has_one_owner_and_reuses_persisted_plan(monkeypatch, t
     assert claim is not None
     chosen = _candidate("runpod", "RTX 4090", 24)
 
-    winner = decide_failure_atomically(
+    winner = decide_attempt_failure(
         spec.run_id,
-        spec,
         claim_token=claim.token,
         expected_remote=None,
-        expected_retry_snapshot=claim.retry_snapshot,
         observation=_observe("stalled", chosen, (chosen, _candidate("runpod", "H100", 80))),
         attempt=0,
     )
-    stale = decide_failure_atomically(
+    stale = decide_attempt_failure(
         spec.run_id,
-        spec,
         claim_token=claim.token,
         expected_remote=None,
-        expected_retry_snapshot=claim.retry_snapshot,
         observation=_observe("job_failed", chosen, (chosen,)),
         attempt=0,
     )
 
-    assert winner.state is ObservedDecisionState.PERSISTED
-    assert winner.decision is not None
-    assert winner.decision.plan.retry
-    assert stale.state is ObservedDecisionState.OWNERSHIP_LOST
+    assert winner is not None
+    assert winner.retry
+    assert stale is None
     persisted = RetryState.from_snapshot(
         spec,
         status._load_status_json(spec.run_id)[state._RETRY_STATE_KEY],

@@ -283,7 +283,6 @@ def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
         source_snapshot_from_status,
     )
     from flash.runner.supervise.lifecycle import _run_job_background
-    from flash.server.platform.locks import _deploy_lock
 
     try:
         source_snapshot_from_status(get_status(spec.run_id), required=True)
@@ -296,50 +295,49 @@ def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
             return False
         _fail_blocked_recovery(spec, reason, expected_remote=None)
         return False
-    with _deploy_lock(spec.run_id):
-        raw = _load_status_json(spec.run_id)
-        stale_claim = active_launch_claim_from_raw(raw)
-        if stale_claim is not None and claim_is_live(spec.run_id, stale_claim):
-            return None
-        revision = world_size = None
-        if spec.algorithm == "opd" and stale_claim is None:
-            try:
-                verified_attempt, revision, world_size = _verified_opd_retry_state(spec.run_id)
-                if verified_attempt != decode_next_attempt(raw):
-                    raise RuntimeError("opd recovery attempt identity changed")
-            except Exception as exc:
-                _fail_blocked_recovery(spec, str(exc), expected_remote=None)
-                return False
-        reservation = reserve_handleless_recovery_launch(
-            spec.run_id,
-            expected_state=expected_state,
-            provider_clear_confirmed=True,
-            expected_stale_claim=stale_claim,
-            resume_revision=revision,
-            resume_world_size=world_size,
-        )
-        if reservation.active:
-            return None
-        if reservation.claim is None:
-            if reservation.retry_plan is not None and not reservation.retry_plan.retry:
-                _fail_blocked_recovery(
-                    spec,
-                    "retry policy rejected handleless replacement",
-                    expected_remote=None,
-                )
-                return False
-            return None
-        with contextlib.suppress(Exception):
-            _append_run_log(
-                spec.run_id,
-                "control plane restarted without a durable handle; resubmitting",
+    raw = _load_status_json(spec.run_id)
+    stale_claim = active_launch_claim_from_raw(raw)
+    if stale_claim is not None and claim_is_live(spec.run_id, stale_claim):
+        return None
+    revision = world_size = None
+    if spec.algorithm == "opd" and stale_claim is None:
+        try:
+            verified_attempt, revision, world_size = _verified_opd_retry_state(spec.run_id)
+            if verified_attempt != decode_next_attempt(raw):
+                raise RuntimeError("opd recovery attempt identity changed")
+        except Exception as exc:
+            _fail_blocked_recovery(spec, str(exc), expected_remote=None)
+            return False
+    reservation = reserve_handleless_recovery_launch(
+        spec.run_id,
+        expected_state=expected_state,
+        provider_clear_confirmed=True,
+        expected_stale_claim=stale_claim,
+        resume_revision=revision,
+        resume_world_size=world_size,
+    )
+    if reservation.active:
+        return None
+    if reservation.claim is None:
+        if reservation.retry_plan is not None and not reservation.retry_plan.retry:
+            _fail_blocked_recovery(
+                spec,
+                "retry policy rejected handleless replacement",
+                expected_remote=None,
             )
-        threading.Thread(
-            target=_run_job_background,
-            args=(spec, None, reservation.claim),
-            daemon=True,
-        ).start()
-        return True
+            return False
+        return None
+    with contextlib.suppress(Exception):
+        _append_run_log(
+            spec.run_id,
+            "control plane restarted without a durable handle; resubmitting",
+        )
+    threading.Thread(
+        target=_run_job_background,
+        args=(spec, None, reservation.claim),
+        daemon=True,
+    ).start()
+    return True
 
 
 def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | None:

@@ -59,6 +59,10 @@ def _runpod_remote(endpoint_id="endpoint", job_id="job", attempt=0, started_ts=1
     return remote
 
 
+def _cleanup_remote(remote):
+    return {key: value for key, value in remote.items() if key != "launch_claim_token"}
+
+
 def _lambda_remote(instance_id="instance", attempt=0, started_ts=1.0, **extra):
     return {
         "provider": "lambda",
@@ -1319,6 +1323,87 @@ def test_multiprocess_launch_claim_cannot_be_stolen_until_owner_exits(monkeypatc
     runner_attempts.release_launch_claim(spec.run_id, recovered.claim)
 
 
+def test_persisted_terminal_decision_blocks_relaunch_after_restart(monkeypatch, tmp_path):
+    """A persisted stop survives restart: it is reused verbatim and authorizes no new attempt."""
+    from flash.core.spec import JobSpec
+    from flash.runner.supervise.retry_decision import FailureObservation
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="terminal-decision-restart", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    )
+    claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert claim is not None
+
+    # candidate-less no_capacity stops: there is no larger shape left to try.
+    plan = runner_attempts.decide_attempt_failure(
+        spec.run_id,
+        claim_token=claim.token,
+        expected_remote=None,
+        observation=FailureObservation(failure="no_capacity", candidates=()),
+        attempt=claim.attempt,
+    )
+    assert plan is not None
+    assert not plan.retry
+
+    # a stop is not authorization. the normal path has no decision to read and fails closed.
+    with pytest.raises(RuntimeError, match="lacks exact persisted retry authorization"):
+        runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    # handleless recovery reads the same persisted stop and reports it instead of launching.
+    blocked = runner_attempts.reserve_handleless_recovery_launch(
+        spec.run_id,
+        expected_state="provisioning",
+        provider_clear_confirmed=True,
+        expected_stale_claim=None,
+    )
+    assert blocked.claim is None
+    assert blocked.retry_plan is not None
+    assert not blocked.retry_plan.retry
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._NEXT_ATTEMPT_KEY] == claim.attempt + 1
+
+
+def test_duplicate_failure_for_a_live_handle_reuses_the_persisted_decision(monkeypatch, tmp_path):
+    """A retried failure report for one attempt returns the first decision, never a second one."""
+    from flash.core.spec import JobSpec
+    from flash.runner.supervise.retry_decision import FailureObservation
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="duplicate-failure-report", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    )
+    claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert claim is not None
+    # a persisted handle keeps the attempt owned after the decision, so the report can repeat.
+    remote = {"provider": "runpod", "job_id": "job-dup", "attempt": claim.attempt}
+    assert runner_attempts.persist_claimed_remote(spec.run_id, claim, remote)
+    persisted_remote = runner_status._load_status_json(spec.run_id)["remote"]
+
+    observation = FailureObservation(failure="no_capacity", candidates=())
+    first = runner_attempts.decide_attempt_failure(
+        spec.run_id,
+        claim_token=claim.token,
+        expected_remote=persisted_remote,
+        observation=observation,
+        attempt=claim.attempt,
+    )
+    assert first is not None
+    second = runner_attempts.decide_attempt_failure(
+        spec.run_id,
+        claim_token=claim.token,
+        expected_remote=persisted_remote,
+        observation=observation,
+        attempt=claim.attempt,
+    )
+    assert second is not None
+    assert second.retry == first.retry
+    assert second.action == first.action
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._NEXT_ATTEMPT_KEY] == claim.attempt + 1
+
+
 def test_terminal_claim_consumption_never_clears_newer_owner(monkeypatch, tmp_path):
     from flash.core.spec import JobSpec
 
@@ -1345,33 +1430,17 @@ def test_terminal_claim_consumption_never_clears_newer_owner(monkeypatch, tmp_pa
     assert runner_attempts.consume_active_launch_claim(spec.run_id, newer)
 
 
-def test_attempt_launch_claim_validates_and_defensively_copies_snapshot():
-    from flash.core.spec import JobSpec
-    from flash.runner.supervise.retry_decision import RetryState
-
-    spec = JobSpec(run_id="claim-copy", model="Qwen/Qwen3.5-9B", algorithm="sft")
-    snapshot = RetryState.initial_for_spec(spec).to_snapshot()
-    claim = runner_attempts.AttemptLaunchClaim(0, snapshot, "claim-token")
-
-    snapshot["last_decision"] = {"mutated": True}
-    returned = claim.retry_snapshot
-    returned["infra_used"] = 99
-
-    assert claim.retry_snapshot == RetryState.initial_for_spec(spec).to_snapshot()
-
-
 @pytest.mark.parametrize(
     "args",
     [
-        (True, {}, "token", None, None),
-        (-1, {}, "token", None, None),
-        (0, [], "token", None, None),
-        (0, {}, "", None, None),
-        (0, {}, "token", "", 1),
-        (0, {}, "token", "revision", True),
-        (0, {}, "token", "revision", 0),
-        (0, {}, "token", "revision", None),
-        (0, {}, "token", None, 1),
+        (True, "token", None, None),
+        (-1, "token", None, None),
+        (0, "", None, None),
+        (0, "token", "", 1),
+        (0, "token", "revision", True),
+        (0, "token", "revision", 0),
+        (0, "token", "revision", None),
+        (0, "token", None, 1),
     ],
 )
 def test_attempt_launch_claim_rejects_invalid_typed_fields(args):
@@ -1389,11 +1458,7 @@ def test_provider_launch_and_handle_persistence_require_exact_claim_token(monkey
     )
     claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
     assert claim is not None
-    stale = runner_attempts.AttemptLaunchClaim(
-        claim.attempt,
-        claim.retry_snapshot,
-        "stale-token",
-    )
+    stale = runner_attempts.AttemptLaunchClaim(claim.attempt, "stale-token")
 
     runner_attempts.require_attempt_launch_current(spec.run_id, spec, claim)
     with pytest.raises(RuntimeError, match="claim changed"):
@@ -1417,11 +1482,7 @@ def test_provider_launch_and_handle_persistence_require_exact_claim_token(monkey
 
 def test_replacement_reservation_requires_exact_previous_authorization(monkeypatch, tmp_path):
     from flash.core.spec import JobSpec
-    from flash.runner.supervise.retry_decision import (
-        FailureObservation,
-        ObservedDecisionState,
-        decide_failure_atomically,
-    )
+    from flash.runner.supervise.retry_decision import FailureObservation
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="authorized-attempts", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1432,18 +1493,15 @@ def test_replacement_reservation_requires_exact_previous_authorization(monkeypat
     assert first is not None
     assert first.attempt == 0
     assert runner_attempts.reserve_verified_attempt_launch(spec.run_id) is None
-    decision = decide_failure_atomically(
+    decision = runner_attempts.decide_attempt_failure(
         spec.run_id,
-        spec,
         claim_token=first.token,
         expected_remote=None,
-        expected_retry_snapshot=first.retry_snapshot,
-        observation=FailureObservation.create(
-            "poll_error", chosen=None, candidates=None, managed_cache_mounted=False
-        ),
+        observation=FailureObservation("poll_error"),
         attempt=0,
     )
-    assert decision.state is ObservedDecisionState.PERSISTED
+    assert decision is not None
+    assert decision.retry
     second = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
     assert second is not None
     assert second.attempt == 1
@@ -1537,12 +1595,12 @@ def test_cleanup_collection_deduplicates_and_survives_status_writes_and_reload(
 
     raw = runner_status._load_status_json(spec.run_id)
     assert raw["remote"] == public_remote
-    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [cleanup_remote]
+    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [_cleanup_remote(cleanup_remote)]
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", runs_dir)
     reloaded = runner_status._load_status_json(spec.run_id)
     assert reloaded["remote"] == public_remote
-    assert reloaded[runner_state._CLEANUP_REMOTES_KEY] == [cleanup_remote]
+    assert reloaded[runner_state._CLEANUP_REMOTES_KEY] == [_cleanup_remote(cleanup_remote)]
 
 
 def test_record_cleanup_remote_does_not_revive_cleared_remote(monkeypatch, tmp_path):
@@ -1561,7 +1619,7 @@ def test_record_cleanup_remote_does_not_revive_cleared_remote(monkeypatch, tmp_p
     status = runner_status.get_status(spec.run_id)
     assert status.remote is None
     assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
-        remote
+        _cleanup_remote(remote)
     ]
 
 
@@ -1601,7 +1659,7 @@ def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, 
     assert status.state == "cancelled"
     assert status.remote is None
     assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
-        remote
+        _cleanup_remote(remote)
     ]
 
 
@@ -1699,8 +1757,9 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
         ("destroy", "endpoint-unconfirmed"),
     ]
     raw = runner_status._load_status_json(spec.run_id)
-    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [unconfirmed]
-    assert raw["remote"] == confirmed
+    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [_cleanup_remote(unconfirmed)]
+    assert raw["remote"] is None
+    assert raw["cleanup_confirmed_remote"] == confirmed
 
 
 def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
@@ -1844,11 +1903,12 @@ def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypat
     ]
     raw = runner_status._load_status_json(spec.run_id)
     assert raw[runner_state._CLEANUP_REMOTES_KEY] == [
-        different_owner,
-        different_job,
-        different_attempt,
+        _cleanup_remote(different_owner),
+        _cleanup_remote(different_job),
+        _cleanup_remote(different_attempt),
     ]
-    assert raw["remote"] == confirmed
+    assert raw["remote"] is None
+    assert raw["cleanup_confirmed_remote"] == confirmed
 
 
 def _retry_snapshot_authorizing(spec, attempt: int, *, infra_used: int = 1, floor: float = 0.0):
@@ -1971,7 +2031,7 @@ def test_reserved_attempt_survives_handleless_restart_without_reusing_zero(monke
         == 120
     )
     runner_attempts.release_launch_claim(spec.run_id, first)
-    recovered = runner_attempts.reserve_attempt_launch(
+    recovered = runner_attempts._reserve_attempt_launch(
         spec.run_id,
         expected_state="provisioning",
         recover_handleless=True,
@@ -2022,7 +2082,7 @@ def test_stale_attach_failure_cannot_fail_newer_launch_owner(monkeypatch, tmp_pa
     def replace_owner(_spec, _log, **kwargs):
         stale = kwargs["reserved_claim"]
         runner_attempts.release_launch_claim(spec.run_id, stale)
-        replacement = runner_attempts.reserve_attempt_launch(
+        replacement = runner_attempts._reserve_attempt_launch(
             spec.run_id,
             expected_state="provisioning",
             recover_handleless=True,
@@ -2484,9 +2544,11 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     assert status.state == "done"
     assert status.remote == remote
     assert status.error is None
-    assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
-        remote
-    ]
+    cleanup_remote = runner_status._load_status_json(spec.run_id)[
+        runner_state._CLEANUP_REMOTES_KEY
+    ][0]
+    assert "launch_claim_token" not in cleanup_remote
+    assert cleanup_remote["instance_id"] == remote["instance_id"]
     assert "adopted a completed attempt at the wall deadline" in log.getvalue()
 
 
@@ -2586,7 +2648,6 @@ def test_attach_poll_success_carries_the_whole_allocation_stamp(monkeypatch):
         recovered_attempt=0,
         next_attempt=1,
         source_snapshot=None,
-        retry_snapshot={},
         launch_claim_token="claim-0",
     )
     result = SimpleNamespace(ok=True, metrics={"wall_seconds": 3600.0})
@@ -2876,7 +2937,8 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
     assert [action for action, _handle in teardown] == ["cancel", "destroy"]
     assert gc_runs == [spec.run_id]
     assert status.state == "failed"
-    assert status.remote["endpoint_id"] == "endpoint-old"
+    assert status.remote is None
+    assert status.cleanup_confirmed_remote["endpoint_id"] == "endpoint-old"
     assert "deadline exhausted" in status.error
 
 
@@ -3065,8 +3127,9 @@ def test_two_handleless_observers_share_one_prelaunch_claim(monkeypatch, tmp_pat
     assert len(started) == 1
     claim = started[0][2]
     assert claim.attempt == 0
-    assert claim.retry_snapshot["infra_used"] == 0
-    assert claim.retry_snapshot["last_decision"] is None
+    retry_state = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
+    assert retry_state["infra_used"] == 0
+    assert retry_state["last_decision"] is None
     raw = runner_status._load_status_json(spec.run_id)
     assert raw[runner_state._NEXT_ATTEMPT_KEY] == 1
     assert raw[runner_state._ACTIVE_LAUNCH_CLAIM_KEY] == claim.to_dict()
@@ -3091,7 +3154,8 @@ def test_handleless_stale_claim_is_reclaimed_without_poll_error(monkeypatch, tmp
     replacement = started[0][2]
     assert replacement.attempt == original.attempt == 0
     assert replacement.token != original.token
-    assert replacement.retry_snapshot["last_decision"] is None
+    retry_state = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
+    assert retry_state["last_decision"] is None
     assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 1
 
 
@@ -3110,14 +3174,12 @@ def test_attach_clear_and_reserve_is_atomic_against_second_observer(monkeypatch,
         spec.run_id,
         expected_remote=remote,
         expected_next_attempt=1,
-        expected_retry_snapshot=retry_snapshot,
         transition_state="provisioning",
     )
     loser = runner_attempts.reserve_verified_attempt_launch(
         spec.run_id,
         expected_remote=remote,
         expected_next_attempt=1,
-        expected_retry_snapshot=retry_snapshot,
         transition_state="provisioning",
     )
 
@@ -3138,30 +3200,18 @@ def test_recovery_launch_cas_requires_exact_snapshot_and_attempt(monkeypatch, tm
     runner_state._save_status(
         runner_state.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
     )
-    snapshot = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
-
     assert (
-        runner_attempts.reserve_attempt_launch(
-            spec.run_id,
-            expected_state="queued",
-            expected_retry_snapshot={**snapshot, "infra_used": 1},
-        ).claim
-        is None
-    )
-    assert (
-        runner_attempts.reserve_attempt_launch(
+        runner_attempts._reserve_attempt_launch(
             spec.run_id,
             expected_state="queued",
             expected_next_attempt=1,
-            expected_retry_snapshot=snapshot,
         ).claim
         is None
     )
-    claim = runner_attempts.reserve_attempt_launch(
+    claim = runner_attempts._reserve_attempt_launch(
         spec.run_id,
         expected_state="queued",
         expected_next_attempt=0,
-        expected_retry_snapshot=snapshot,
     ).claim
     assert claim is not None
     assert claim.attempt == 0
@@ -3768,12 +3818,7 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
         assert isinstance(status.remote["launch_claim_token"], str)
         raw = runner_status._load_status_json(spec.run_id)
         assert raw[runner_state._CLEANUP_REMOTES_KEY] == [
-            _runpod_remote(
-                "endpoint-race",
-                "job-race",
-                attempt=0,
-                launch_claim_token=status.remote["launch_claim_token"],
-            )
+            _cleanup_remote(_runpod_remote("endpoint-race", "job-race", attempt=0))
         ]
 
 
@@ -3846,11 +3891,7 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
     raw = runner_status._load_status_json(spec.run_id)
     assert raw["remote"] == remote_a
     cleanup_remote = raw[runner_state._CLEANUP_REMOTES_KEY][0]
-    assert isinstance(cleanup_remote["launch_claim_token"], str)
-    assert cleanup_remote == {
-        **remote_b,
-        "launch_claim_token": cleanup_remote["launch_claim_token"],
-    }
+    assert cleanup_remote == _cleanup_remote(remote_b)
 
 
 def test_run_training_bails_when_running_cas_rejects(monkeypatch):

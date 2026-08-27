@@ -3313,7 +3313,8 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         assert st.state == "done"
         assert calls["n"] == 2
         assert source_snapshots == [_SOURCE_SNAPSHOT, _SOURCE_SNAPSHOT]
-        assert st.remote["job_id"] == "j2"  # latest handle persisted
+        assert st.remote is None
+        assert st.cleanup_confirmed_remote["job_id"] == "j2"
 
 
 def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch):
@@ -4161,7 +4162,7 @@ def test_attach_setup_failure_does_not_overwrite_concurrent_cancel(monkeypatch):
         assert status.remote is None
         assert runner_status._load_status_json("cancelled-attach")[
             runner_state._CLEANUP_REMOTES_KEY
-        ] == [remote]
+        ] == [{key: value for key, value in remote.items() if key != "launch_claim_token"}]
 
 
 def test_attach_setup_failure_does_not_steal_precommit_cancel(monkeypatch):
@@ -4637,7 +4638,9 @@ def test_supervisor_marks_on_last_gpu_on_the_largest_survivor(monkeypatch):
         assert runner_status.get_status("lastgpu").state == "done"
         assert last_flags == [False, False]
         # the cached attempt keeps ordinary queue grace because its exact cacheless fallback remains.
-        assert runner_status.get_status("lastgpu").remote.get("on_last_gpu") is False
+        status = runner_status.get_status("lastgpu")
+        assert status.remote is None
+        assert status.cleanup_confirmed_remote.get("on_last_gpu") is False
 
 
 def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
@@ -5419,7 +5422,8 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
         assert status.state == "failed"
         assert status.error == "stalled: host vanished"
         assert training_calls == []
-        assert status.remote["endpoint_id"] == "epA"
+        assert status.remote is None
+        assert status.cleanup_confirmed_remote["endpoint_id"] == "epA"
 
 
 def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
@@ -5523,7 +5527,8 @@ def test_attach_worker_error_fails_without_replacement(monkeypatch):
         status = runner_attach.attach_run("g1", log_stream=sys.stderr)
 
         assert status.state == "failed"
-        assert status.remote == remote
+        assert status.remote is None
+        assert status.cleanup_confirmed_remote == remote
         assert "bad reward fn" in (status.error or "")
 
 
@@ -6008,7 +6013,7 @@ def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
         assert status.state == "failed"
         assert status.remote == remote
         assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
-            remote
+            {key: value for key, value in remote.items() if key != "launch_claim_token"}
         ]
 
 
@@ -6053,7 +6058,7 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
         assert status.remote == remote
         assert status.error is None
         assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
-            remote
+            {key: value for key, value in remote.items() if key != "launch_claim_token"}
         ]
 
 

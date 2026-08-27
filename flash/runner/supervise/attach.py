@@ -100,7 +100,6 @@ def _resume_after_confirmed_teardown(
         run_id,
         expected_remote=persisted_remote,
         expected_next_attempt=next_attempt,
-        expected_retry_snapshot=retry_snapshot,
         transition_state="provisioning",
     )
     if claim is None:
@@ -187,10 +186,6 @@ def _reconcile_completed_remote(
                 return True
         except Exception:
             pass
-        # past the grace window the terminal CAS is the only exit; if it raised or
-        # lost the compare-and-swap, rate-limit the retry at the full reconcile
-        # interval. remaining grace is <= 0 here, so falling through to the shared
-        # sleep below would sleep 0 and busy-spin the reconciler.
         time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
         return False
     remaining_grace = deadline_at + _RECOVERY_MARKER_GRACE_S - time.time()
@@ -497,7 +492,6 @@ class _AttachContext:
     recovered_attempt: int
     next_attempt: int
     source_snapshot: dict | None
-    retry_snapshot: dict
     launch_claim_token: str
 
 
@@ -507,19 +501,12 @@ def _build_attach_context(
 ) -> _AttachContext:
     """Validate the persisted handle and collect the inputs needed to poll it."""
     from flash.providers.core.base import JobHandle
-    from flash.runner.lifecycle import state as lifecycle_state
-    from flash.runner.lifecycle.status import (
-        _load_status_json,
-        get_status,
-        source_snapshot_from_status,
-    )
+    from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
 
     remote = dict(persisted_remote)
     seed = int(remote.pop("seed", worker_spec.seed))
-    remote.pop("code_prefix", None)
     status = get_status(worker_spec.run_id)
     source_snapshot = source_snapshot_from_status(status)
-    retry_snapshot = _load_status_json(worker_spec.run_id)[lifecycle_state._RETRY_STATE_KEY]
     provider_name = remote.get("provider")
     if not isinstance(provider_name, str) or not provider_name:
         raise ValueError("persisted provider identity is missing or invalid")
@@ -543,7 +530,6 @@ def _build_attach_context(
         recovered_attempt=recovered_attempt,
         next_attempt=recovered_attempt + 1,
         source_snapshot=source_snapshot,
-        retry_snapshot=retry_snapshot,
         launch_claim_token=launch_claim_token,
     )
 
@@ -683,6 +669,7 @@ def _handle_failed_attach_poll(
         _compare_and_confirm_remote_teardown,
         _record_cleanup_remote,
     )
+    from flash.runner.lifecycle.attempts import decide_attempt_failure
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.lifecycle import (
@@ -693,10 +680,7 @@ def _handle_failed_attach_poll(
     )
     from flash.runner.supervise.retry_decision import (
         FailureObservation,
-        ObservedDecisionState,
-        RetryState,
         _managed_cache_mounted,
-        decide_failure_atomically,
         retry_candidate_from_remote,
     )
 
@@ -740,29 +724,20 @@ def _handle_failed_attach_poll(
         )
         return get_status(run_id)
     chosen = retry_candidate_from_remote(context.persisted_remote)
-    observed = decide_failure_atomically(
+    plan = decide_attempt_failure(
         run_id,
-        context.worker_spec,
         claim_token=context.launch_claim_token,
         expected_remote=context.persisted_remote,
-        expected_retry_snapshot=context.retry_snapshot,
-        observation=FailureObservation.create(
+        observation=FailureObservation(
             result.failure,
             chosen=chosen,
             candidates=None,
-            managed_cache_mounted=_managed_cache_mounted(
-                context.worker_spec,
-                RetryState.from_snapshot(context.worker_spec, context.retry_snapshot),
-                chosen,
-            ),
+            managed_cache_mounted=_managed_cache_mounted(context.worker_spec, chosen),
         ),
         attempt=context.recovered_attempt,
     )
-    if observed.state is ObservedDecisionState.OWNERSHIP_LOST:
+    if plan is None:
         return get_status(run_id)
-    if observed.decision is None:
-        raise AssertionError("attached retry decision was not persisted")
-    plan = observed.decision.plan
     print(f"attach: {run_id} {plan.action}", file=log)
     try:
         resource_deleted = _strict_teardown_handle(context.handle, run_id)

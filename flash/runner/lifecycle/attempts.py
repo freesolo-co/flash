@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import time
 import uuid
 from dataclasses import dataclass
@@ -11,14 +10,11 @@ from flash.adapters.artifacts import MAX_ATTEMPT_ID
 from flash.adapters.fused_experts import lora_target_parameters
 from flash.core.spec import JobSpec
 from flash.engine.support.verl_policy import _resolve_fsdp_generation
-from flash.providers._lifecycle.instances.poll import _attempt_int
 from flash.runner.lifecycle import claim_lock, state
 from flash.runner.lifecycle import status as status_ops
 from flash.teacher.retry_contract import require_opd_retry_contract_version
 
-_CLAIM_KEYS = frozenset(
-    {"attempt", "retry_snapshot", "token", "resume_revision", "resume_world_size"}
-)
+_CLAIM_KEYS = frozenset({"attempt", "token", "resume_revision", "resume_world_size"})
 
 
 @dataclass(frozen=True)
@@ -28,54 +24,34 @@ class LaunchReservationResult:
     active: bool = False
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class AttemptLaunchClaim:
     attempt: int
-    _retry_snapshot: dict
     token: str
-    resume_revision: str | None
-    resume_world_size: int | None
+    resume_revision: str | None = None
+    resume_world_size: int | None = None
 
-    def __init__(
-        self,
-        attempt: int,
-        retry_snapshot: dict,
-        token: str,
-        resume_revision: str | None = None,
-        resume_world_size: int | None = None,
-    ) -> None:
-        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+    def __post_init__(self) -> None:
+        if isinstance(self.attempt, bool) or not isinstance(self.attempt, int) or self.attempt < 0:
             raise ValueError("launch claim attempt is invalid")
-        if not isinstance(retry_snapshot, dict):
-            raise ValueError("launch claim retry snapshot is invalid")
-        if not isinstance(token, str) or not token.strip():
+        if not isinstance(self.token, str) or not self.token.strip():
             raise ValueError("launch claim token is invalid")
-        if resume_revision is not None and (
-            not isinstance(resume_revision, str) or not resume_revision.strip()
+        if self.resume_revision is not None and (
+            not isinstance(self.resume_revision, str) or not self.resume_revision.strip()
         ):
             raise ValueError("launch claim resume revision is invalid")
-        if resume_world_size is not None and (
-            isinstance(resume_world_size, bool)
-            or not isinstance(resume_world_size, int)
-            or resume_world_size < 1
+        if self.resume_world_size is not None and (
+            isinstance(self.resume_world_size, bool)
+            or not isinstance(self.resume_world_size, int)
+            or self.resume_world_size < 1
         ):
             raise ValueError("launch claim resume world size is invalid")
-        if (resume_revision is None) != (resume_world_size is None):
+        if (self.resume_revision is None) != (self.resume_world_size is None):
             raise ValueError("launch claim resume revision and world size must be paired")
-        object.__setattr__(self, "attempt", attempt)
-        object.__setattr__(self, "_retry_snapshot", copy.deepcopy(retry_snapshot))
-        object.__setattr__(self, "token", token)
-        object.__setattr__(self, "resume_revision", resume_revision)
-        object.__setattr__(self, "resume_world_size", resume_world_size)
-
-    @property
-    def retry_snapshot(self) -> dict:
-        return copy.deepcopy(self._retry_snapshot)
 
     def to_dict(self) -> dict:
         return {
             "attempt": self.attempt,
-            "retry_snapshot": self.retry_snapshot,
             "token": self.token,
             "resume_revision": self.resume_revision,
             "resume_world_size": self.resume_world_size,
@@ -87,7 +63,6 @@ class AttemptLaunchClaim:
             raise ValueError("persisted launch claim has an invalid shape")
         return cls(
             raw["attempt"],
-            raw["retry_snapshot"],
             raw["token"],
             raw["resume_revision"],
             raw["resume_world_size"],
@@ -105,14 +80,9 @@ def claim_is_live(run_id: str, claim: AttemptLaunchClaim) -> bool:
     return False
 
 
-def release_launch_claim_token(run_id: str, token: str) -> None:
-    """Release a locally held os-shared launch lease by its durable token."""
-    claim_lock.release(run_id, token)
-
-
 def release_launch_claim(run_id: str, claim: AttemptLaunchClaim) -> None:
     """Release this process's os-shared launch lease after durable consumption."""
-    release_launch_claim_token(run_id, claim.token)
+    claim_lock.release(run_id, claim.token)
 
 
 def active_launch_claim_from_raw(raw: dict) -> AttemptLaunchClaim | None:
@@ -123,18 +93,6 @@ def active_launch_claim_from_raw(raw: dict) -> AttemptLaunchClaim | None:
         return AttemptLaunchClaim.from_dict(value)
     except ValueError as exc:
         raise RuntimeError("persisted launch claim is invalid") from exc
-
-
-def _heartbeat_attempt_is_current(hb: object, raw: dict) -> bool:
-    """Return whether a heartbeat names the newest reserved attempt."""
-    if not isinstance(hb, dict):
-        return False
-    try:
-        next_attempt = status_ops.decode_next_attempt(raw)
-    except RuntimeError:
-        return False
-    expected = next_attempt - 1 if next_attempt > 0 else 0
-    return _attempt_int(hb.get("attempt")) == expected
 
 
 def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]:
@@ -196,28 +154,45 @@ def _validate_opd_evidence(
         raise RuntimeError("opd resume checkpoint width is missing")
 
 
-def _validate_attempt_reservation_from_raw(spec: JobSpec, raw: dict, attempt: int) -> None:
-    """Validate retry authorization for one lock-held reservation."""
-    from flash.runner.supervise.retry_decision import require_retry_authorization_from_raw
-
-    require_retry_authorization_from_raw(spec, raw, attempt)
-
-
-def _claim_matches_raw(raw: dict, claim: AttemptLaunchClaim) -> bool:
+def _owns_attempt(
+    raw: dict,
+    *,
+    attempt: int,
+    token: str,
+    expected_remote: dict | None,
+) -> bool:
+    """Match exact ownership through either the active claim or durable handle."""
+    if expected_remote is not None:
+        return bool(
+            raw.get("remote") == expected_remote
+            and expected_remote.get("attempt") == attempt
+            and expected_remote.get("launch_claim_token") == token
+            and raw.get(state._ACTIVE_LAUNCH_CLAIM_KEY) is None
+        )
+    if raw.get("remote") is not None:
+        return False
     try:
         persisted = active_launch_claim_from_raw(raw)
     except RuntimeError:
         return False
-    return persisted == claim
+    return bool(persisted and persisted.attempt == attempt and persisted.token == token)
 
 
-def reserve_attempt_launch(
+def _claim_matches_raw(raw: dict, claim: AttemptLaunchClaim) -> bool:
+    return _owns_attempt(
+        raw,
+        attempt=claim.attempt,
+        token=claim.token,
+        expected_remote=None,
+    )
+
+
+def _reserve_attempt_launch(
     run_id: str,
     *,
     expected_remote: dict | None = None,
     expected_state: str | None = None,
     expected_next_attempt: int | None = None,
-    expected_retry_snapshot: dict | None = None,
     transition_state: str | None = None,
     resume_revision: str | None = None,
     resume_world_size: int | None = None,
@@ -237,6 +212,7 @@ def reserve_attempt_launch(
     from flash.runner.supervise.retry_decision import (
         FailureObservation,
         RetryState,
+        require_retry_authorization_from_raw,
         transition_failure,
     )
 
@@ -250,7 +226,13 @@ def reserve_attempt_launch(
                 return LaunchReservationResult(None)
             if expected_state is not None and status.state != expected_state:
                 return LaunchReservationResult(None)
-            if status.remote != expected_remote:
+            remote_matches = status.remote == expected_remote
+            confirmed_matches = (
+                expected_remote is not None
+                and status.remote is None
+                and status.cleanup_confirmed_remote == expected_remote
+            )
+            if not remote_matches and not confirmed_matches:
                 return LaunchReservationResult(None)
             current = status_ops.decode_next_attempt(raw)
             if expected_next_attempt is not None and current != expected_next_attempt:
@@ -258,13 +240,9 @@ def reserve_attempt_launch(
             snapshot = raw.get(state._RETRY_STATE_KEY)
             if not isinstance(snapshot, dict):
                 raise RuntimeError("persisted retry state is missing or invalid")
-            if expected_retry_snapshot is not None and snapshot != expected_retry_snapshot:
-                return LaunchReservationResult(None)
             spec = state._internal_spec_from_status(status)
             existing = active_launch_claim_from_raw(raw)
             if existing is not None:
-                existing_state = RetryState.from_snapshot(spec, existing.retry_snapshot)
-                snapshot = existing_state.to_snapshot()
                 if not recover_handleless or expected_stale_claim != existing:
                     return LaunchReservationResult(None, active=True)
                 claim_fd = claim_lock.try_acquire(run_id)
@@ -272,7 +250,7 @@ def reserve_attempt_launch(
                     return LaunchReservationResult(None, active=True)
                 if current - 1 != existing.attempt:
                     raise RuntimeError("stale launch claim no longer names the newest attempt")
-                _validate_attempt_reservation_from_raw(spec, raw, existing.attempt)
+                require_retry_authorization_from_raw(spec, raw, existing.attempt)
                 _validate_opd_evidence(
                     spec,
                     raw,
@@ -282,7 +260,6 @@ def reserve_attempt_launch(
                 )
                 claim = AttemptLaunchClaim(
                     existing.attempt,
-                    snapshot,
                     uuid.uuid4().hex,
                     existing.resume_revision,
                     existing.resume_world_size,
@@ -297,12 +274,7 @@ def reserve_attempt_launch(
                     if plan is None:
                         retry_state, plan = transition_failure(
                             retry_state,
-                            FailureObservation.create(
-                                "poll_error",
-                                chosen=None,
-                                candidates=None,
-                                managed_cache_mounted=False,
-                            ),
+                            FailureObservation("poll_error"),
                             attempt=current - 1,
                         )
                         snapshot = retry_state.to_snapshot()
@@ -310,7 +282,7 @@ def reserve_attempt_launch(
                         state._save_status_unlocked(status, _retry_state=snapshot)
                         return LaunchReservationResult(None, retry_plan=plan)
                 reservation_raw = {**raw, state._RETRY_STATE_KEY: snapshot}
-                _validate_attempt_reservation_from_raw(spec, reservation_raw, current)
+                require_retry_authorization_from_raw(spec, reservation_raw, current)
                 _validate_opd_evidence(spec, raw, current, resume_revision, resume_world_size)
                 if current >= MAX_ATTEMPT_ID:
                     raise RuntimeError("run attempt identity is exhausted")
@@ -319,7 +291,6 @@ def reserve_attempt_launch(
                     return LaunchReservationResult(None, active=True)
                 claim = AttemptLaunchClaim(
                     current,
-                    snapshot,
                     uuid.uuid4().hex,
                     resume_revision,
                     resume_world_size,
@@ -363,7 +334,7 @@ def reserve_handleless_recovery_launch(
     resume_world_size: int | None = None,
 ) -> LaunchReservationResult:
     """Reserve one provider-clear recovery through the shared ownership primitive."""
-    return reserve_attempt_launch(
+    return _reserve_attempt_launch(
         run_id,
         expected_state=expected_state,
         transition_state="provisioning",
@@ -381,7 +352,6 @@ def reserve_verified_attempt_launch(
     expected_remote: dict | None = None,
     expected_state: str | None = None,
     expected_next_attempt: int | None = None,
-    expected_retry_snapshot: dict | None = None,
     transition_state: str | None = None,
 ) -> AttemptLaunchClaim | None:
     """Reserve one launch after verifying any required opd resume evidence."""
@@ -394,20 +364,19 @@ def reserve_verified_attempt_launch(
         expected_next = verified_next
     else:
         expected_next, revision, world_size = expected_next_attempt, None, None
-    return reserve_attempt_launch(
+    return _reserve_attempt_launch(
         run_id,
         expected_remote=expected_remote,
         expected_state=expected_state,
         expected_next_attempt=expected_next,
-        expected_retry_snapshot=expected_retry_snapshot,
         transition_state=transition_state,
         resume_revision=revision,
         resume_world_size=world_size,
     ).claim
 
 
-def require_attempt_launch_current(run_id: str, spec: JobSpec, claim: AttemptLaunchClaim) -> None:
-    """Fence provider launch to the exact durable ownership token."""
+def require_attempt_launch_current(run_id: str, spec: JobSpec, claim: AttemptLaunchClaim):
+    """Fence provider launch and return its current retry state."""
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
         if raw.get("state") in state.TERMINAL_STATES:
@@ -418,39 +387,78 @@ def require_attempt_launch_current(run_id: str, spec: JobSpec, claim: AttemptLau
             raise RuntimeError("provider launch claim changed before launch")
         if status_ops.decode_next_attempt(raw) - 1 != claim.attempt:
             raise RuntimeError("provider launch claim is no longer the newest attempt")
-        _validate_attempt_reservation_from_raw(spec, raw, claim.attempt)
-        from flash.runner.supervise.retry_decision import RetryState
+        from flash.runner.supervise.retry_decision import require_retry_authorization_from_raw
 
-        retry_state = RetryState.from_snapshot(spec, claim.retry_snapshot)
+        retry_state = require_retry_authorization_from_raw(spec, raw, claim.attempt)
         if retry_state.persisted_plan(claim.attempt) is not None:
             raise RuntimeError("reserved attempt already has an immutable retry decision")
+        return retry_state
 
 
 def attempt_claim_is_current(run_id: str, claim: AttemptLaunchClaim) -> bool:
-    """Return whether the run is still owned by this claim or its persisted handle."""
+    """Return whether the run still has this exact claim or durable handle."""
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
         if raw.get("state") in state.TERMINAL_STATES:
             return False
-        active = raw.get(state._ACTIVE_LAUNCH_CLAIM_KEY)
-        if active is not None:
-            return _claim_matches_raw(raw, claim)
         remote = raw.get("remote")
-        if isinstance(remote, dict):
-            return bool(
-                remote.get("attempt") == claim.attempt
-                and remote.get("launch_claim_token") == claim.token
-            )
-        if status_ops.decode_next_attempt(raw) - 1 != claim.attempt:
-            return False
-        from flash.runner.supervise.retry_decision import RetryState
-
-        retry_state = RetryState.from_snapshot(
-            spec=state._internal_spec_from_status(status_ops._runstatus_from_json(raw)),
-            raw=raw.get(state._RETRY_STATE_KEY),
+        return _owns_attempt(
+            raw,
+            attempt=claim.attempt,
+            token=claim.token,
+            expected_remote=remote if isinstance(remote, dict) else None,
         )
-        decision = retry_state.last_decision
-        return decision is not None and decision.attempt == claim.attempt
+
+
+def decide_attempt_failure(
+    run_id: str,
+    *,
+    claim_token: str,
+    expected_remote: dict | None,
+    observation,
+    attempt: int,
+):
+    """Atomically persist one immutable failure decision for the exact attempt owner."""
+    from flash.runner.supervise.retry_decision import (
+        FailureObservation,
+        require_retry_authorization_from_raw,
+        transition_failure,
+    )
+
+    if not isinstance(observation, FailureObservation):
+        raise TypeError("failure observation is invalid")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+        raise ValueError("retry decision attempt is invalid")
+    persisted = False
+    with state._status_guard(run_id):
+        raw = status_ops._load_status_json(run_id)
+        if (
+            raw.get("state") in state.TERMINAL_STATES
+            or status_ops.decode_next_attempt(raw) - 1 != attempt
+            or not _owns_attempt(
+                raw,
+                attempt=attempt,
+                token=claim_token,
+                expected_remote=expected_remote,
+            )
+        ):
+            return None
+        status = status_ops._runstatus_from_json(raw)
+        spec = state._internal_spec_from_status(status)
+        retry_state = require_retry_authorization_from_raw(spec, raw, attempt)
+        plan = retry_state.persisted_plan(attempt)
+        if plan is not None:
+            return plan
+        retry_state, plan = transition_failure(retry_state, observation, attempt=attempt)
+        state._save_status_unlocked(
+            status,
+            _retry_state=retry_state.to_snapshot(),
+            _active_launch_claim=None,
+        )
+        persisted = True
+    if persisted:
+        claim_lock.release(run_id, claim_token)
+    return plan
 
 
 def consume_active_launch_claim(run_id: str, claim: AttemptLaunchClaim) -> bool:
@@ -491,6 +499,12 @@ def persist_claimed_remote(
             status.state = "running"
             status.remote = remote
             status.updated_at = time.time()
+            # a fresh live handle supersedes the torn-down handle retained only for delayed
+            # reconciliation; leaving it would price this attempt against the previous resource.
+            status.realized_cost_remote = None
+            # first-start evidence is stamped once, so a later attempt never rewrites it.
+            if status.lifecycle_started_attempt is None:
+                status.lifecycle_started_attempt = claim.attempt
             state._save_status_unlocked(status, _active_launch_claim=None)
             report_status = status
         if report_status is not None:

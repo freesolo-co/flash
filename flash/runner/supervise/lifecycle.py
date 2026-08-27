@@ -39,6 +39,16 @@ def _run_job_background(
         )
 
 
+def _consume_reserved_claim(run_id: str, claim: AttemptLaunchClaim | None) -> None:
+    """Release a reserved claim this process will not launch. Idempotent and never raises."""
+    if claim is None:
+        return
+    from flash.runner.lifecycle.attempts import consume_active_launch_claim
+
+    with contextlib.suppress(Exception):
+        consume_active_launch_claim(run_id, claim)
+
+
 def _run_job(
     spec: JobSpec,
     runtime_secrets: dict[str, str] | None = None,
@@ -55,6 +65,9 @@ def _run_job(
 
     # Cancel can land before this thread starts; don't overwrite a terminal state with provisioning.
     if get_status(spec.run_id).state in TERMINAL_STATES:
+        # a claim reserved by handleless recovery is consumed here too: this return never reaches
+        # the submission path's own cleanup, and an unconsumed claim blocks every later launch.
+        _consume_reserved_claim(spec.run_id, reserved_claim)
         return
     _update(spec.run_id, "provisioning")
     log_path = os.path.join(RUNS_DIR, f"{spec.run_id}.log")
@@ -94,6 +107,10 @@ def _run_job(
                     )
                 time.sleep(min(_STAGED_ENVIRONMENT_RETRY_S, remaining))
     finally:
+        # every exit before the supervised submit -- staging deadline exhaustion, a transient staging
+        # failure that turned terminal, or any raise out of _run_job_inner -- leaves the reserved claim
+        # unconsumed. consuming is idempotent, so the submission path's own release stays authoritative.
+        _consume_reserved_claim(spec.run_id, reserved_claim)
         # gc registered endpoints because undeleted endpoints count against the account-wide worker quota.
         # skip when the run is still non-terminal: another live supervisor then owns the durable handle,
         # and reaping here would tear down its still-active provider resources.

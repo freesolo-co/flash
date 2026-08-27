@@ -207,7 +207,6 @@ def _canonical_cleanup_remote(remote: object) -> dict | None:
     if not isinstance(remote, dict) or _remote_resource_identity(remote) is None:
         return None
     provider = remote.get("provider")
-    token = remote.get("launch_claim_token")
     try:
         if provider == "runpod":
             from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
@@ -223,8 +222,6 @@ def _canonical_cleanup_remote(remote: object) -> dict | None:
             record = VastJobHandle.from_dict(remote).to_dict()
         else:
             return None
-        if isinstance(token, str) and token:
-            record["launch_claim_token"] = token
         return record
     except (TypeError, ValueError):
         return None

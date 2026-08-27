@@ -1324,7 +1324,10 @@ def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width(
 
 def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
     """a filtered rental reports the incompatible execution width, not its card count."""
+    from flash.core.spec import JobSpec
     from flash.providers.core.base import Allocation, Candidate
+    from flash.runner.lifecycle.attempts import AttemptLaunchClaim
+    from flash.runner.supervise.retry_decision import RetryState
     from flash.runner.supervise.seed_submission import (
         _build_candidate_plan,
         _pinned_to_resume_width,
@@ -1339,7 +1342,13 @@ def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
         seed=42,
         log=io.StringIO(),
     )
-    prepared = SimpleNamespace(resume_world_size=2)
+    spec = JobSpec(run_id="opd-width-diagnostic", model="Qwen/Qwen3.5-9B", algorithm="opd")
+    prepared = (
+        AttemptLaunchClaim(0, "opd-width", "revision", 2),
+        spec,
+        {},
+        RetryState.initial_for_spec(spec),
+    )
 
     assert filtered.candidates == ()
     assert _build_candidate_plan(ctx, prepared, filtered) is None

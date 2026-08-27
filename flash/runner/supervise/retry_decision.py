@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from enum import Enum
 
 from flash.core.spec import JobSpec
 
@@ -52,25 +51,14 @@ class PersistedRetryDecision:
 @dataclass(frozen=True)
 class FailureObservation:
     failure: str
-    chosen: object | None
-    candidates: tuple | None
-    managed_cache_mounted: bool
+    chosen: object | None = None
+    candidates: tuple | None = None
+    managed_cache_mounted: bool = False
 
-    @classmethod
-    def create(
-        cls,
-        failure: str | None,
-        *,
-        chosen,
-        candidates,
-        managed_cache_mounted: bool,
-    ) -> FailureObservation:
-        return cls(
-            failure or "unknown",
-            chosen,
-            None if candidates is None else tuple(candidates),
-            bool(managed_cache_mounted),
-        )
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "failure", self.failure or "unknown")
+        if self.candidates is not None:
+            object.__setattr__(self, "candidates", tuple(self.candidates))
 
 
 @dataclass(frozen=True)
@@ -165,36 +153,6 @@ class RetryState:
             return True
         floor = _candidate_usable_vram_gb(chosen)
         return not any(_candidate_usable_vram_gb(candidate) > floor for candidate in candidates)
-
-
-@dataclass(frozen=True)
-class AtomicRetryDecision:
-    snapshot: dict
-    plan: RetryPlan
-
-
-class ObservedDecisionState(Enum):
-    PENDING = "pending"
-    PERSISTED = "persisted"
-    OWNERSHIP_LOST = "ownership_lost"
-
-
-@dataclass(frozen=True)
-class ObservedRetryDecision:
-    state: ObservedDecisionState
-    decision: AtomicRetryDecision | None = None
-
-    @classmethod
-    def pending(cls) -> ObservedRetryDecision:
-        return cls(ObservedDecisionState.PENDING)
-
-    @classmethod
-    def persisted(cls, decision: AtomicRetryDecision) -> ObservedRetryDecision:
-        return cls(ObservedDecisionState.PERSISTED, decision)
-
-    @classmethod
-    def ownership_lost(cls) -> ObservedRetryDecision:
-        return cls(ObservedDecisionState.OWNERSHIP_LOST)
 
 
 def _bounded_count(value: object, label: str, maximum: int) -> int:
@@ -306,8 +264,8 @@ def _drop_weight_cache(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(data)
 
 
-def _managed_cache_mounted(spec: JobSpec, state: RetryState, chosen) -> bool:
-    if chosen is None or state.drop_weight_cache:
+def _managed_cache_mounted(spec: JobSpec, chosen) -> bool:
+    if chosen is None:
         return False
     from flash.providers.core.registry import get_provider
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
@@ -336,7 +294,7 @@ def transition_failure(
     *,
     attempt: int,
 ) -> tuple[RetryState, RetryPlan]:
-    """Return the pure retry transition for one typed failure observation."""
+    """Return the pure retry transition for one failure observation."""
     failure = observation.failure
     chosen = observation.chosen
     candidates = observation.candidates
@@ -441,100 +399,3 @@ def require_retry_authorization_from_raw(spec: JobSpec, raw: dict, attempt: int)
             f"attempt {attempt} lacks exact persisted retry authorization for attempt {attempt - 1}"
         )
     return retry_state
-
-
-def require_retry_authorization(run_id: str, spec: JobSpec, attempt: int) -> RetryState:
-    from flash.runner.lifecycle import state
-    from flash.runner.lifecycle.status import _load_status_json
-
-    with state._status_guard(run_id):
-        return require_retry_authorization_from_raw(spec, _load_status_json(run_id), attempt)
-
-
-def _claim_owns_failure(
-    raw: dict,
-    *,
-    claim_token: str,
-    attempt: int,
-    expected_retry_snapshot: dict,
-    expected_remote: dict | None,
-) -> bool:
-    from flash.runner.lifecycle import state
-
-    if expected_remote is not None:
-        return bool(
-            expected_remote.get("launch_claim_token") == claim_token
-            and expected_remote.get("attempt") == attempt
-            and raw.get(state._ACTIVE_LAUNCH_CLAIM_KEY) is None
-        )
-    claim = raw.get(state._ACTIVE_LAUNCH_CLAIM_KEY)
-    return bool(
-        isinstance(claim, dict)
-        and claim.get("token") == claim_token
-        and claim.get("attempt") == attempt
-        and claim.get("retry_snapshot") == expected_retry_snapshot
-    )
-
-
-def decide_failure_atomically(
-    run_id: str,
-    spec: JobSpec,
-    *,
-    claim_token: str,
-    expected_remote: dict | None,
-    expected_retry_snapshot: dict,
-    observation: FailureObservation,
-    attempt: int,
-) -> ObservedRetryDecision:
-    from flash.runner.lifecycle import state
-    from flash.runner.lifecycle.status import (
-        _load_status_json,
-        _runstatus_from_json,
-        decode_next_attempt,
-    )
-
-    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
-        raise ValueError("retry decision attempt is invalid")
-    with state._status_guard(run_id):
-        raw = _load_status_json(run_id)
-        snapshot = raw.get(state._RETRY_STATE_KEY)
-        if (
-            raw.get("state") in state.TERMINAL_STATES
-            or raw.get("remote") != expected_remote
-            or snapshot != expected_retry_snapshot
-            or decode_next_attempt(raw) - 1 != attempt
-            or not _claim_owns_failure(
-                raw,
-                claim_token=claim_token,
-                attempt=attempt,
-                expected_retry_snapshot=expected_retry_snapshot,
-                expected_remote=expected_remote,
-            )
-        ):
-            return ObservedRetryDecision.ownership_lost()
-        retry_state = RetryState.from_snapshot(spec, snapshot)
-        plan = retry_state.persisted_plan(attempt)
-        if plan is not None:
-            return ObservedRetryDecision.persisted(AtomicRetryDecision(dict(snapshot), plan))
-        if attempt == 0:
-            if retry_state.last_decision is not None:
-                raise RuntimeError("initial attempt has inconsistent persisted retry history")
-        else:
-            previous = retry_state.last_decision
-            if (
-                previous is None
-                or previous.attempt != attempt - 1
-                or previous.plan.retry is not True
-            ):
-                raise RuntimeError("failed attempt lacks exact prior retry authorization")
-        retry_state, plan = transition_failure(retry_state, observation, attempt=attempt)
-        snapshot = retry_state.to_snapshot()
-        state._save_status_unlocked(
-            _runstatus_from_json(raw),
-            _retry_state=snapshot,
-            _active_launch_claim=None,
-        )
-        from flash.runner.lifecycle import claim_lock
-
-        claim_lock.release(run_id, claim_token)
-        return ObservedRetryDecision.persisted(AtomicRetryDecision(snapshot, plan))
