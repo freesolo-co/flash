@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import importlib.metadata
 import json
+import re
+import shlex
 import sys
 import threading
+import tomllib
 import types
 from dataclasses import replace
 from pathlib import Path
 from typing import ClassVar
 
 import pytest
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import Version
 
 from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.profiling.dataset_profile import (
@@ -19,6 +26,320 @@ from flash.engine.profiling.dataset_profile import (
 )
 from flash.engine.profiling.image_tokens import ImageGeometry
 from flash.engine.profiling.workload_profile import sft_profile_input_digest
+
+_ROOT = Path(__file__).resolve().parent.parent
+_REQUIREMENT_NAME_PREFIX = re.compile(r"^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)")
+_SHELL_COMMAND_CHARACTERS = frozenset(";&|")
+
+
+def _docker_run_scripts(dockerfile: str) -> list[str]:
+    scripts: list[str] = []
+    instruction: list[str] = []
+    for line in dockerfile.splitlines():
+        stripped = line.lstrip()
+        if not instruction and (not stripped or stripped.startswith("#")):
+            continue
+        continued = line.rstrip().endswith("\\")
+        instruction.append(line.rstrip()[:-1] if continued else line)
+        if continued:
+            continue
+        logical = " ".join(instruction).strip()
+        instruction = []
+        parts = logical.split(maxsplit=1)
+        if len(parts) == 2 and parts[0].upper() == "RUN":
+            scripts.append(parts[1])
+    if instruction:
+        raise AssertionError("managed worker Dockerfile ends with an incomplete instruction")
+    return scripts
+
+
+def _pip_install_argument_starts(tokens: list[str]) -> list[int]:
+    starts: set[int] = set()
+    for index, token in enumerate(tokens):
+        executable = token.rsplit("/", 1)[-1]
+        if re.fullmatch(r"pip(?:3(?:\.\d+)?)?", executable) and tokens[index + 1 : index + 2] == [
+            "install"
+        ]:
+            starts.add(index + 2)
+        elif executable == "uv" and tokens[index + 1 : index + 3] == ["pip", "install"]:
+            starts.add(index + 3)
+        elif re.fullmatch(r"python(?:3(?:\.\d+)?)?", executable) and tokens[
+            index + 1 : index + 4
+        ] == ["-m", "pip", "install"]:
+            starts.add(index + 4)
+    return sorted(starts)
+
+
+def _docker_pip_requirement_tokens(dockerfile: str) -> list[str]:
+    requirements: list[str] = []
+    for script in _docker_run_scripts(dockerfile):
+        lexer = shlex.shlex(script, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        try:
+            tokens = list(lexer)
+        except ValueError as exc:
+            raise AssertionError("managed worker has an invalid RUN shell command") from exc
+        for start in _pip_install_argument_starts(tokens):
+            for token in tokens[start:]:
+                if token and set(token).issubset(_SHELL_COMMAND_CHARACTERS):
+                    break
+                if not token.startswith("-"):
+                    requirements.append(token)
+    return requirements
+
+
+def _managed_worker_freesolo_version(dockerfile: str | None = None) -> Version:
+    if dockerfile is None:
+        dockerfile = (_ROOT / "Dockerfile.worker").read_text(encoding="utf-8")
+    expected_name = canonicalize_name("freesolo")
+    matches: list[tuple[str, Version]] = []
+    for value in _docker_pip_requirement_tokens(dockerfile):
+        name_match = _REQUIREMENT_NAME_PREFIX.match(value)
+        if name_match is None or canonicalize_name(name_match.group(1)) != expected_name:
+            continue
+        try:
+            requirement = Requirement(value)
+        except InvalidRequirement as exc:
+            raise AssertionError(
+                f"managed worker has an invalid freesolo requirement: {value!r}"
+            ) from exc
+        assert canonicalize_name(requirement.name) == expected_name
+        assert requirement.marker is None, (
+            "managed worker freesolo requirement must not use an environment marker, "
+            f"got {requirement!s}"
+        )
+        exact = [
+            Version(item.version)
+            for item in requirement.specifier
+            if item.operator in {"==", "==="}
+        ]
+        assert len(exact) == 1, f"managed worker must exactly pin freesolo, got {requirement!s}"
+        assert len(requirement.specifier) == 1, (
+            f"managed worker must use only one freesolo specifier, got {requirement!s}"
+        )
+        matches.append((value, exact[0]))
+    assert len(matches) == 1, (
+        "expected exactly one managed-worker freesolo requirement, "
+        f"found {[value for value, _version in matches]}"
+    )
+    return matches[0][1]
+
+
+def _locked_freesolo_version(lockfile: str | None = None) -> Version:
+    lockfile = lockfile or (_ROOT / "uv.lock").read_text(encoding="utf-8")
+    packages = tomllib.loads(lockfile).get("package", [])
+    expected_name = canonicalize_name("freesolo")
+    matches = [
+        package
+        for package in packages
+        if isinstance(name := package.get("name"), str) and canonicalize_name(name) == expected_name
+    ]
+    assert len(matches) == 1, f"expected exactly one locked freesolo package, found {len(matches)}"
+    version = matches[0].get("version")
+    assert isinstance(version, str), "locked freesolo package version must be a string"
+    assert version, "locked freesolo package is missing a version"
+    return Version(version)
+
+
+def _assert_decoder_conformance_versions(
+    *,
+    installed_version: str | None = None,
+    dockerfile: str | None = None,
+    lockfile: str | None = None,
+) -> None:
+    expected = _managed_worker_freesolo_version(dockerfile)
+    installed = Version(installed_version or importlib.metadata.version("freesolo"))
+    assert installed == expected, (
+        f"decoder conformance requires managed-worker freesolo {expected}, installed {installed}"
+    )
+    locked = _locked_freesolo_version(lockfile)
+    assert locked == expected, f"uv.lock resolves freesolo {locked}, managed worker pins {expected}"
+
+
+@pytest.fixture(scope="module")
+def _decoder_sdk_lockstep() -> None:
+    _assert_decoder_conformance_versions()
+
+
+def test_decoder_conformance_sdk_matches_the_managed_worker_pin() -> None:
+    _assert_decoder_conformance_versions()
+
+
+@pytest.mark.parametrize(
+    ("marker", "message"),
+    [
+        ("python_version < '3.0'", "must not use an environment marker"),
+        ("python_version == '3.11'", "must not use an environment marker"),
+        ("python_version == '3.12'", "must not use an environment marker"),
+        ("python_version <", "has an invalid freesolo requirement"),
+    ],
+)
+def test_decoder_conformance_worker_guard_rejects_requirement_markers(marker, message) -> None:
+    expected = _managed_worker_freesolo_version()
+    dockerfile = (_ROOT / "Dockerfile.worker").read_text(encoding="utf-8")
+    marked = dockerfile.replace(f'"freesolo=={expected}"', f'"freesolo=={expected}; {marker}"', 1)
+
+    with pytest.raises(AssertionError, match=message):
+        _managed_worker_freesolo_version(marked)
+
+
+@pytest.mark.parametrize(
+    ("extra_install", "message"),
+    [
+        (
+            'RUN pip install --no-cache-dir "freesolo==9.9.9"',
+            "expected exactly one managed-worker freesolo requirement",
+        ),
+        (
+            'RUN uv pip install --python /opt/worker/bin/python "FreeSolo==9.9.9"',
+            "expected exactly one managed-worker freesolo requirement",
+        ),
+        (
+            'RUN /opt/worker/bin/python -m pip install "FREESOLO==9.9.9"',
+            "expected exactly one managed-worker freesolo requirement",
+        ),
+        (
+            "RUN pip3 install \"freesolo==9.9.9; python_version == '3.11'\"",
+            "must not use an environment marker",
+        ),
+        (
+            "RUN python3.12 -m pip install \"freesolo==9.9.9; python_version == '3.12'\"",
+            "must not use an environment marker",
+        ),
+    ],
+)
+def test_decoder_conformance_worker_guard_rejects_later_overrides(extra_install, message) -> None:
+    dockerfile = (_ROOT / "Dockerfile.worker").read_text(encoding="utf-8")
+
+    with pytest.raises(AssertionError, match=message):
+        _managed_worker_freesolo_version(f"{dockerfile}\n{extra_install}\n")
+
+
+@pytest.mark.parametrize(
+    "install",
+    [
+        'RUN pip install "freesolo==0.4.2"',
+        'RUN uv pip install --python /opt/worker/bin/python "FreeSolo==0.4.2"',
+        'RUN /opt/worker/bin/python -m pip install "FREESOLO==0.4.2"',
+    ],
+)
+def test_decoder_conformance_worker_guard_counts_each_install_once(install) -> None:
+    assert _managed_worker_freesolo_version(install) == Version("0.4.2")
+
+
+@pytest.mark.parametrize("distinct_name", ["free_solo", "free.solo", "FREE-SOLO"])
+def test_decoder_conformance_worker_guard_ignores_distinct_separator_names(
+    distinct_name,
+) -> None:
+    dockerfile = (_ROOT / "Dockerfile.worker").read_text(encoding="utf-8")
+
+    assert canonicalize_name(distinct_name) == canonicalize_name("free-solo")
+    assert canonicalize_name(distinct_name) != canonicalize_name("freesolo")
+    assert _managed_worker_freesolo_version(
+        f'{dockerfile}\nRUN pip install "{distinct_name}==9.9.9"\n'
+    ) == Version("0.4.2")
+
+
+def test_decoder_conformance_worker_guard_rejects_second_install_in_the_same_run() -> None:
+    dockerfile = (_ROOT / "Dockerfile.worker").read_text(encoding="utf-8")
+    duplicate = dockerfile.replace(
+        '    "runpod==1.12.0"',
+        '    "runpod==1.12.0" && pip install "FreeSolo==9.9.9"',
+        1,
+    )
+
+    with pytest.raises(
+        AssertionError, match="expected exactly one managed-worker freesolo requirement"
+    ):
+        _managed_worker_freesolo_version(duplicate)
+
+
+def test_decoder_conformance_worker_guard_rejects_same_line_duplicate() -> None:
+    expected = _managed_worker_freesolo_version()
+    dockerfile = (_ROOT / "Dockerfile.worker").read_text(encoding="utf-8")
+    duplicate = dockerfile.replace(
+        f'    "freesolo=={expected}" \\\n',
+        f'    "freesolo=={expected}" "FreeSolo==9.9.9" \\\n',
+        1,
+    )
+
+    with pytest.raises(
+        AssertionError, match="expected exactly one managed-worker freesolo requirement"
+    ):
+        _managed_worker_freesolo_version(duplicate)
+
+
+def test_decoder_conformance_worker_guard_rejects_same_line_malformed_requirement() -> None:
+    expected = _managed_worker_freesolo_version()
+    dockerfile = (_ROOT / "Dockerfile.worker").read_text(encoding="utf-8")
+    malformed = dockerfile.replace(
+        f'    "freesolo=={expected}" \\\n',
+        f'    "freesolo=={expected}" "freesolo==" \\\n',
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="has an invalid freesolo requirement"):
+        _managed_worker_freesolo_version(malformed)
+
+
+def test_decoder_conformance_version_guard_detects_independent_drift() -> None:
+    expected = _managed_worker_freesolo_version()
+    drifted = Version(f"{expected.major}.{expected.minor}.{expected.micro + 1}")
+    dockerfile = (_ROOT / "Dockerfile.worker").read_text(encoding="utf-8")
+    lockfile = (_ROOT / "uv.lock").read_text(encoding="utf-8")
+
+    drifted_worker = dockerfile.replace(f'"freesolo=={expected}"', f'"freesolo=={drifted}"', 1)
+    with pytest.raises(AssertionError, match=rf"installed {expected}"):
+        _assert_decoder_conformance_versions(
+            installed_version=str(expected), dockerfile=drifted_worker
+        )
+
+    drifted_lock = lockfile.replace(
+        f'name = "freesolo"\nversion = "{expected}"',
+        f'name = "freesolo"\nversion = "{drifted}"',
+        1,
+    )
+    with pytest.raises(AssertionError, match=rf"uv\.lock resolves freesolo {drifted}"):
+        _assert_decoder_conformance_versions(installed_version=str(expected), lockfile=drifted_lock)
+
+    package_start = lockfile.index('[[package]]\nname = "freesolo"\n')
+    package_end = lockfile.index("\n[[package]]", package_start)
+    lock_without_freesolo = lockfile[:package_start] + lockfile[package_end + 1 :]
+    with pytest.raises(
+        AssertionError, match="expected exactly one locked freesolo package, found 0"
+    ):
+        _assert_decoder_conformance_versions(
+            installed_version=str(expected), lockfile=lock_without_freesolo
+        )
+
+    with pytest.raises(AssertionError, match=rf"installed {drifted}"):
+        _assert_decoder_conformance_versions(installed_version=str(drifted))
+
+
+@pytest.mark.parametrize("duplicate_name", ["FreeSolo", "FREESOLO"])
+def test_decoder_conformance_lock_guard_rejects_canonical_name_duplicates(
+    duplicate_name,
+) -> None:
+    expected = _managed_worker_freesolo_version()
+    lockfile = (_ROOT / "uv.lock").read_text(encoding="utf-8")
+    duplicate = f'\n[[package]]\nname = "{duplicate_name}"\nversion = "{expected}"\n'
+
+    with pytest.raises(
+        AssertionError, match="expected exactly one locked freesolo package, found 2"
+    ):
+        _locked_freesolo_version(lockfile + duplicate)
+
+
+@pytest.mark.parametrize("distinct_name", ["free_solo", "free.solo", "FREE-SOLO"])
+def test_decoder_conformance_lock_guard_ignores_distinct_separator_variants(
+    distinct_name,
+) -> None:
+    expected = _managed_worker_freesolo_version()
+    lockfile = (_ROOT / "uv.lock").read_text(encoding="utf-8")
+    distinct = f'\n[[package]]\nname = "{distinct_name}"\nversion = "0"\n'
+
+    assert _locked_freesolo_version(lockfile + distinct) == expected
 
 
 class FakeTokenizer:
@@ -297,6 +618,123 @@ def test_profile_honors_split_and_dataset_path(tmp_path) -> None:
 
     assert split_profile.source_examples == 1
     assert path_profile.source_examples == 2
+
+
+@pytest.mark.usefixtures("_decoder_sdk_lockstep")
+@pytest.mark.parametrize(
+    ("suffix", "content", "expected"),
+    [
+        (
+            ".json",
+            '[{"input":"object","output":"yes"},"string row"]',
+            [
+                {"input": "object", "output": "yes"},
+                {"input": "string row"},
+            ],
+        ),
+        (
+            ".json",
+            '{"data":[{"input":"wrapped","output":"yes"},"string row"]}',
+            [
+                {"input": "wrapped", "output": "yes"},
+                {"input": "string row"},
+            ],
+        ),
+        (
+            ".jsonl",
+            '{"input":"object","output":"yes"}\n"string row"\n\n',
+            [
+                {"input": "object", "output": "yes"},
+                {"input": "string row"},
+            ],
+        ),
+        (".json", "[]", []),
+        (".json", '{"data":[]}', []),
+        (".jsonl", "\n", []),
+    ],
+)
+def test_control_plane_decoder_matches_locked_freesolo_rows(
+    tmp_path, suffix, content, expected
+) -> None:
+    from freesolo.datasets.records import load_records
+
+    from flash.engine.profiling.dataset_profile import _read_dataset_rows
+
+    path = tmp_path / f"train{suffix}"
+    path.write_text(content, encoding="utf-8")
+
+    worker_rows = load_records(path)
+    source_examples, control_rows = _read_dataset_rows(path, max_examples=0)
+
+    assert worker_rows == expected
+    assert control_rows == expected
+    assert source_examples == len(expected)
+
+
+@pytest.mark.usefixtures("_decoder_sdk_lockstep")
+@pytest.mark.parametrize(
+    ("suffix", "content"),
+    [
+        (".json", '{"records":[{"input":"worker rejects this wrapper"}]}'),
+        (".json", '"scalar"'),
+        (".json", "1"),
+        (".json", "{}"),
+        (".json", '{"data":"not a list"}'),
+        (".json", "[1]"),
+        (".json", "{"),
+        (".jsonl", "1\n"),
+        (".jsonl", "[1]\n"),
+        (".jsonl", "{\n"),
+    ],
+)
+def test_control_plane_decoder_rejects_every_file_the_locked_worker_rejects(
+    tmp_path, suffix, content
+) -> None:
+    from freesolo.datasets.records import load_records
+
+    from flash.engine.profiling.dataset_profile import _read_dataset_rows
+
+    path = tmp_path / f"train{suffix}"
+    path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Expect"):
+        load_records(path)
+    with pytest.raises((PackagedDatasetUnavailable, ValueError)):
+        _read_dataset_rows(path, max_examples=0)
+
+
+@pytest.mark.usefixtures("_decoder_sdk_lockstep")
+@pytest.mark.parametrize(
+    ("suffix", "content"),
+    [
+        (".json", '[{"output":"missing"}]'),
+        (".json", '[{"input":null}]'),
+        (".json", '{"data":[{"input":null}]}'),
+        (".jsonl", '{"output":"missing"}\n'),
+        (".jsonl", '{"input":null}\n'),
+    ],
+)
+def test_control_plane_and_locked_worker_reject_the_same_missing_inputs(
+    tmp_path, suffix, content
+) -> None:
+    from freesolo.datasets.records import load_records, load_task_examples
+
+    from flash.engine.profiling.dataset_profile import _read_dataset_rows
+
+    path = tmp_path / f"train{suffix}"
+    path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="input"):
+        load_task_examples(load_records(path))
+    with pytest.raises(ValueError, match="input"):
+        _read_dataset_rows(path, max_examples=0)
+
+
+def test_profile_rejects_an_empty_packaged_dataset_at_the_shared_worker_gate(tmp_path) -> None:
+    entrypoint = _package(tmp_path, {"dataset/train.json": "[]"})
+
+    with pytest.raises(ValueError, match="every SFT example has an empty completion"):
+        _profile(entrypoint)
 
 
 def test_profile_uses_explicit_records_instead_of_a_packaged_dataset_file(
