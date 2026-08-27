@@ -23,36 +23,6 @@ class ServingError(RuntimeError):
         self.retry_after = retry_after
 
 
-class ActivationOutcomeUnknown(ServingError):
-    """Alias activation cannot be resolved to the attempted or previous revision."""
-
-    def __init__(self, run_id: str, attempted_revision: str, *, detail: str | None = None):
-        reason = detail or "authoritative alias readback failed"
-        super().__init__(
-            "alias_activation_unknown: serving may have activated "
-            f"{attempted_revision} for {run_id}, but {reason}; retry deployment reconciliation "
-            "before treating either revision as authoritative"
-        )
-        self.run_id = run_id
-        self.attempted_revision = attempted_revision
-
-
-class AliasThinkingSilent(ServingError):
-    """The activated alias serves the adapter but returns no reasoning channel.
-
-    Distinct from a smoke failure because the alias is already live and answering: the deployment
-    is degraded rather than broken, and the record has to say so instead of committing `ready`.
-    """
-
-    def __init__(self, run_id: str, attempted_revision: str, *, detail: str):
-        super().__init__(
-            f"alias_thinking_silent: {run_id} activated {attempted_revision} and serves it, but "
-            f"{detail}"
-        )
-        self.run_id = run_id
-        self.attempted_revision = attempted_revision
-
-
 class RetryableServingUnavailable(ServingError):
     """a recognized serving cold-start envelope that may be retried within a caller deadline."""
 

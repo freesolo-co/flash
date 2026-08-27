@@ -19,6 +19,7 @@ FREESOLO_BASE_URL_ENV = "FREESOLO_BASE_URL"
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
 
 STANDALONE_ENV = "FLASH_STANDALONE"
+STANDALONE_SERVING_ORG_ID = "flash-standalone"
 _VERIFY_TIMEOUT_S = 5.0
 _VERIFY_CACHE_TTL_S = 300.0
 # Short negative TTL: a transient backend 401 shouldn't lock out a valid key for 5 min.
@@ -159,6 +160,15 @@ def standalone() -> bool:
     cannot distinguish organizations. Use it only under the trust model in ``SELF_HOSTING.md``.
     """
     return (os.environ.get(STANDALONE_ENV) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def serving_org_id(org_id: str | None) -> str:
+    """return the explicit tenant or the stable standalone serving scope."""
+
+    normalized = (org_id or "").strip()
+    if normalized:
+        return normalized
+    return STANDALONE_SERVING_ORG_ID if standalone() else ""
 
 
 def _freesolo_verify(token: str) -> bool:

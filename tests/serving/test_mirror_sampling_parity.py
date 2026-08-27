@@ -14,7 +14,7 @@ from flash.serving.src.engine.model_config import reasoning_parser_for
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.openai_request import OpenAIGenerateRequest
 from flash.serving.src.io.openai_stream import openai_chat_stream
-from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest, internal_adapter_payload
 from flash.serving.src.store.registry import AdapterRegistry
 
 QWEN = "Qwen/Qwen3.5-9B"
@@ -120,6 +120,12 @@ def _engine(vllm_engine: Any, *, thinking: bool = False) -> _LoraEngineImpl:
     return engine
 
 
+def _forwarded_base_record(engine: _LoraEngineImpl) -> dict[str, Any]:
+    record = engine.registry.get(None, "adapter")
+    assert record is not None
+    return internal_adapter_payload(record)
+
+
 def test_hosted_base_model_engine_honors_boolean_thinking_override() -> None:
     engine = _engine(_BufferedChoiceEngine(), thinking=True)
     result = asyncio.run(
@@ -130,7 +136,8 @@ def test_hosted_base_model_engine_honors_boolean_thinking_override() -> None:
                 "logprobs": True,
                 "top_logprobs": 1,
                 "chat_template_kwargs": {"enable_thinking": False},
-            }
+            },
+            _forwarded_base_record(engine),
         )
     )
     assert result["thinking"] is False
@@ -153,7 +160,8 @@ def _buffered_result(
                 "presence_penalty": 0.75,
                 "logprobs": True,
                 "top_logprobs": top_logprobs,
-            }
+            },
+            _forwarded_base_record(engine),
         )
     )
     return vllm_engine, result
@@ -205,7 +213,8 @@ def test_hosted_engine_streams_interleaved_indexes_and_aggregate_usage() -> None
                     "n": 2,
                     "logprobs": True,
                     "top_logprobs": 2,
-                }
+                },
+                _forwarded_base_record(engine),
             )
         ]
 

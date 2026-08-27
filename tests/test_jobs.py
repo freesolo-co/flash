@@ -3310,7 +3310,8 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         assert st.state == "done"
         assert calls["n"] == 2
         assert source_snapshots == [_SOURCE_SNAPSHOT, _SOURCE_SNAPSHOT]
-        assert st.remote["job_id"] == "j2"  # latest handle persisted
+        assert st.remote is None
+        assert st.realized_cost_remote["job_id"] == "j2"
 
 
 def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch):
@@ -3429,7 +3430,7 @@ def test_submit_rejects_cross_org_init_ref(monkeypatch):
         spec = JobSpec.from_dict(
             {
                 **base,
-                "train": {**base["train"], "init_from_adapter": "source-run"},
+                "train": {**base["train"], "init_from_adapter": "source-run/final"},
             }
         )
 
@@ -3487,7 +3488,7 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
         spec = JobSpec.from_dict(
             {
                 **base,
-                "train": {**base["train"], "init_from_adapter": "source-run"},
+                "train": {**base["train"], "init_from_adapter": "source-run/final"},
             }
         )
 
@@ -3549,7 +3550,7 @@ def test_submit_dry_run_omits_public_warmstart_rank_and_resolves_alpha(monkeypat
                 **base,
                 "train": {
                     **base["train"],
-                    "init_from_adapter": "source-run",
+                    "init_from_adapter": "source-run/final",
                     "lora_rank": 8,
                     "lora_alpha": 16,
                 },
@@ -3570,7 +3571,7 @@ def test_submit_dry_run_omits_public_warmstart_rank_and_resolves_alpha(monkeypat
         assert status.to_dict()["spec"] == status.spec
 
 
-def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
+def test_submit_rejects_final_checkpoint_from_unfinished_source_run(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         from flash.core.spec import JobSpec
@@ -3596,7 +3597,7 @@ def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
         spec = JobSpec.from_dict(
             {
                 **base,
-                "train": {**base["train"], "init_from_adapter": "source-run"},
+                "train": {**base["train"], "init_from_adapter": "source-run/final"},
             }
         )
 
@@ -3604,7 +3605,7 @@ def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
             runner_submit.submit_job(spec, dry_run=True, background=False)
 
 
-def test_submit_rejects_bare_init_ref_without_final_adapter(monkeypatch):
+def test_submit_rejects_final_checkpoint_without_adapter_artifact(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         import flash.adapters.lora_rank as rank_mod
@@ -3638,7 +3639,7 @@ def test_submit_rejects_bare_init_ref_without_final_adapter(monkeypatch):
         spec = JobSpec.from_dict(
             {
                 **base,
-                "train": {**base["train"], "init_from_adapter": "source-run"},
+                "train": {**base["train"], "init_from_adapter": "source-run/final"},
             }
         )
 
@@ -3674,7 +3675,7 @@ def test_submit_rejects_missing_source_org_without_same_owner_key(monkeypatch):
         spec = JobSpec.from_dict(
             {
                 **base,
-                "train": {**base["train"], "init_from_adapter": "source-run"},
+                "train": {**base["train"], "init_from_adapter": "source-run/final"},
             }
         )
 
@@ -4717,9 +4718,10 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
         # attempt 0: cheaper class, a next-best still exists -> False; attempts 1 & 2: on the last
         # candidate (and clamped onto it) -> True.
         assert last_flags == [False, True, True]
-        # The winning (last) attempt persisted on_last_gpu into the handle so a reattach reproduces
-        # its stall tuning (see test_reattach_poll_reproduces_persisted_on_last_gpu).
-        assert runner_status.get_status("lastgpu").remote.get("on_last_gpu") is True
+        # the winning attempt retains on_last_gpu in its billing identity after confirmed teardown.
+        status = runner_status.get_status("lastgpu")
+        assert status.remote is None
+        assert status.realized_cost_remote.get("on_last_gpu") is True
 
 
 def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
@@ -4915,7 +4917,7 @@ def test_cancel_prices_and_cleans_up_with_effective_warmstart_spec(monkeypatch):
                 **base,
                 "train": {
                     **base["train"],
-                    "init_from_adapter": "source-run",
+                    "init_from_adapter": "source-run/final",
                     "lora_rank": 8,
                 },
             }
@@ -4977,7 +4979,7 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
                 **base,
                 "train": {
                     **base["train"],
-                    "init_from_adapter": "source-run",
+                    "init_from_adapter": "source-run/final",
                     "lora_rank": 8,
                 },
             }
@@ -4997,7 +4999,10 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
                     "attempt": 0,
                     "started_ts": 1.0,
                 },
-                deployment={"state": "ready"},
+                deployment={
+                    "state": "ready",
+                    "checkpoint_id": f"{public_spec.run_id}/final",
+                },
                 effective_preparation=snapshot,
             )
         )
@@ -5017,7 +5022,7 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
         monkeypatch.setattr(
             flash.serve.deployment.deploy,
             "undeploy_adapter",
-            lambda run_id: calls.append("undeploy"),
+            lambda checkpoint_id, *, org_id: calls.append("undeploy"),
         )
         monkeypatch.setattr(
             runner_recovery,
@@ -5477,7 +5482,9 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
         assert status.state == "failed"
         assert status.error == "stalled: host vanished"
         assert training_calls == []
-        assert status.remote["endpoint_id"] == "epA"
+        assert status.remote is None
+        assert status.cleanup_confirmed_remote["endpoint_id"] == "epA"
+        assert status.realized_cost_remote["endpoint_id"] == "epA"
 
 
 def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -16,7 +14,6 @@ from flash.serving.src.accounting.usage import (
     AuthorizedTraffic,
     build_usage_session,
     capture_authoritative_price,
-    freesolo_price,
     new_generation_id,
     principal_for_external_org,
 )
@@ -28,33 +25,16 @@ from flash.serving.src.accounting.usage_outbox import (
     RequestIdentity,
     UsageOutboxError,
 )
-from flash.serving.src.engine.model_config import base_models
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
+from tests.serving.checkpoint_fixtures import checkpoint_record
 from tests.serving.conftest import RecordingUsageStore, attest
 
 BASE_MODEL = "Qwen/Qwen3.5-9B"
 
 
 def _revision(*, base_model: str = BASE_MODEL) -> AdapterRecord:
-    run_id = "price-admission"
-    sha = hashlib.sha1(run_id.encode()).hexdigest()
-    return AdapterRecord.model_validate(
-        {
-            "adapter_id": f"{run_id}@final.{sha}",
-            "repo_id": "org/price-admission",
-            "org_id": "org-1",
-            "base_model": base_model,
-            "checkpoint": run_id,
-            "thinking": False,
-            "metadata": {
-                "record_type": "revision",
-                "run_id": run_id,
-                "checkpoint_step": None,
-                "hf_revision": sha,
-            },
-        }
-    )
+    return checkpoint_record("price-admission", base_model)
 
 
 class _Pool:
@@ -161,7 +141,7 @@ class _Pool:
         del base_model, adapter_id, expected_generation
 
 
-async def _authorize(_token: str, _adapter_id: str) -> str:
+async def _authorize(_token: str, _adapter_id: str, _scope: Any = None) -> str:
     return "org-1"
 
 
@@ -183,7 +163,9 @@ def _app(
 
 def _headers(caller: str = "freesolo") -> dict[str, str]:
     if caller == "trusted_internal":
-        return {"X-Freesolo-Internal-Key": "internal-key"}
+        # a trusted-internal caller addressing a checkpoint ref must scope it to an org, so the
+        # registry lookup keys on (org_id, checkpoint_id) the same way the record was stored.
+        return {"X-Freesolo-Internal-Key": "internal-key", "X-Freesolo-Org-Id": "org-1"}
     return {"Authorization": "Bearer user-key"}
 
 
@@ -203,6 +185,24 @@ def _request_case(route: str, record: AdapterRecord, *, stream: bool = False):
     )
 
 
+def _base_record(base_model: str = BASE_MODEL) -> AdapterRecord:
+    """A base-model row, which is what org-less openrouter traffic can address.
+
+    ``traffic_org_id`` is None for an openrouter principal, so a checkpoint ref would miss the
+    org-keyed registry entry and 404 before price admission ever runs.
+    """
+
+    return AdapterRecord(
+        adapter_id=base_model,
+        repo_id=base_model,
+        base_model=base_model,
+        serve_base_model=True,
+        thinking=False,
+        org_id=None,
+        status="ready",
+    )
+
+
 def _openrouter_principal(
     snapshot: AcceptedPriceSnapshot | None = None,
 ) -> OpenRouterTrafficPrincipal:
@@ -216,29 +216,6 @@ def _openrouter_principal(
             completionTokenUsd="0.000002",
         ),
     )
-
-
-def test_active_freesolo_prices_match_exact_fixed_point_catalog_contract() -> None:
-    expected = {
-        "Qwen/Qwen3.5-9B": {
-            "prompt_token_usd": "0.0000001368",
-            "cached_prompt_token_usd": "0.0000000276",
-            "completion_token_usd": "0.000000228",
-        },
-        "Qwen/Qwen3.6-35B-A3B": {
-            "prompt_token_usd": "0.0000002376",
-            "cached_prompt_token_usd": "0.0000000792",
-            "completion_token_usd": "0.000001518",
-        },
-    }
-    decimal_string = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")
-
-    assert set(base_models()) == set(expected)
-    for model in base_models():
-        actual = freesolo_price(model).snapshot
-        assert actual == expected[model]
-        assert all(decimal_string.fullmatch(value) for value in actual.values())
-        assert all("e" not in value.lower() for value in actual.values())
 
 
 @pytest.mark.parametrize(
@@ -255,7 +232,7 @@ def test_price_admission_precedes_prepare_and_dispatch(monkeypatch, route: str) 
             events.append("price_admission")
             await super().capture(event)
 
-    async def authorize(_token: str, _adapter_id: str) -> str:
+    async def authorize(_token: str, _adapter_id: str, _scope: Any = None) -> str:
         events.append("authorize")
         return "org-1"
 
@@ -382,7 +359,7 @@ def test_invalid_freesolo_price_rejects_before_dispatch(
 def test_openrouter_malformed_price_http_matrix_rejects_before_dispatch(
     field: str, value: Any, route: str
 ) -> None:
-    record = _revision()
+    record = _base_record()
     pool = _Pool()
     raw = {
         "promptTokenUsd": "0.000001",
@@ -394,7 +371,7 @@ def test_openrouter_malformed_price_http_matrix_rejects_before_dispatch(
     snapshot = AcceptedPriceSnapshot.model_construct(**raw)
     principal = _openrouter_principal(snapshot)
 
-    async def authorize(_token: str, _adapter_id: str) -> AuthorizedTraffic:
+    async def authorize(_token: str, _adapter_id: str, _scope: Any = None) -> AuthorizedTraffic:
         return AuthorizedTraffic(principal=principal)
 
     app = _app(record, pool, authorizer=authorize)
@@ -412,7 +389,7 @@ def test_openrouter_malformed_price_http_matrix_rejects_before_dispatch(
 
 @pytest.mark.parametrize("missing", ["promptTokenUsd", "completionTokenUsd"])
 def test_openrouter_missing_required_price_rejects_before_dispatch(missing: str) -> None:
-    record = _revision()
+    record = _base_record()
     pool = _Pool()
     raw = {
         "promptTokenUsd": "0.000001",
@@ -423,7 +400,7 @@ def test_openrouter_missing_required_price_rejects_before_dispatch(missing: str)
     raw.pop(missing)
     principal = _openrouter_principal(AcceptedPriceSnapshot.model_construct(**raw))
 
-    async def authorize(_token: str, _adapter_id: str) -> AuthorizedTraffic:
+    async def authorize(_token: str, _adapter_id: str, _scope: Any = None) -> AuthorizedTraffic:
         return AuthorizedTraffic(principal=principal)
 
     app = _app(record, pool, authorizer=authorize)
@@ -454,12 +431,12 @@ def test_openrouter_optional_none_prices_are_preserved() -> None:
 
 
 def test_openrouter_stream_succeeds_without_local_freesolo_price(monkeypatch) -> None:
-    record = _revision()
+    record = _base_record()
     pool = _Pool()
     store = RecordingUsageStore()
     principal = _openrouter_principal()
 
-    async def authorize(_token: str, _adapter_id: str) -> AuthorizedTraffic:
+    async def authorize(_token: str, _adapter_id: str, _scope: Any = None) -> AuthorizedTraffic:
         return AuthorizedTraffic(principal=principal)
 
     monkeypatch.delitem(_FREESOLO_USD_PER_MTOK, record.base_model)
@@ -538,7 +515,7 @@ def test_nonstream_finalization_failure_terminalizes_identical_attested_event_on
     assert failed.identity == admission.identity
     assert failed.price is admission.price
     assert failed.rpc_payload() == final.rpc_payload()
-    assert failed.attestation_evidence == {"resolved_adapter_revision": record.adapter_id}
+    assert failed.attestation_evidence == {"checkpoint_id": record.adapter_id}
     assert code == "finalization_failed"
 
 

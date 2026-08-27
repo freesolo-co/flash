@@ -37,7 +37,7 @@ _MODAL_PHASES = frozenset({"bootstrap", "finalized"})
 _SUBDOMAIN_RE = re.compile(r"(?![0-9]+$)(?!-)[a-z0-9-]{1,63}(?<!-)")
 _ENVIRONMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,63}")
 _REGION_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
-_GPU_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,31}")
+_GPU_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,31}!?")
 _TAG_RE = re.compile(r"[A-Za-z0-9._-]{1,63}")
 
 

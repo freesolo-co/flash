@@ -1,9 +1,9 @@
 """portable immutable identity for existing customer-owned serving deployments.
 
-The provider plans validate more than deterministic resource names: Modal binds the exact manifest
-and spec into app tags, while RunPod binds image and placement topology into observed resources.
-Re-resolving mutable Hub repositories is therefore neither sufficient nor necessary for status or
-teardown. This codec carries the already-resolved, credential-free bundle without persisting it.
+The Modal plan validates more than deterministic resource names: it binds the exact manifest and
+spec into app tags. Re-resolving mutable Hub repositories is therefore neither sufficient nor
+necessary for status or teardown. This codec carries the already-resolved, credential-free bundle
+without persisting it.
 """
 
 from __future__ import annotations
@@ -17,33 +17,24 @@ from collections.abc import Mapping
 from flash.serve.control._canonical import canonical_json
 
 _IDENTITY_SCHEMA = "flash.cli.serving.deployment-identity"
-_IDENTITY_VERSION = 1
+_IDENTITY_VERSION = 2
 _MAX_IDENTITY_BYTES = 128 * 1024
 _BASE64URL_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def _placement_payload(placement) -> dict[str, object]:
-    from flash.serve.control import ModalPlacement, RunPodPlacement
+    from flash.serve.control import ModalPlacement
 
-    if type(placement) is ModalPlacement:
-        return {
-            "environment": placement.environment,
-            "gpu": placement.gpu,
-            "gpu_count": placement.gpu_count,
-            "region": placement.region,
-            "web_suffix": placement.web_suffix,
-            "workspace_name": placement.workspace_name,
-        }
-    if type(placement) is RunPodPlacement:
-        return {
-            "account_id": placement.account_id,
-            "container_disk_gb": placement.container_disk_gb,
-            "data_center_id": placement.data_center_id,
-            "gpu_count": placement.gpu_count,
-            "gpu_type_id": placement.gpu_type_id,
-            "volume_size_gb": placement.volume_size_gb,
-        }
-    raise TypeError("deployment identity requires an exact provider placement")
+    if type(placement) is not ModalPlacement:
+        raise TypeError("deployment identity requires an exact ModalPlacement")
+    return {
+        "environment": placement.environment,
+        "gpu": placement.gpu,
+        "gpu_count": placement.gpu_count,
+        "region": placement.region,
+        "web_suffix": placement.web_suffix,
+        "workspace_name": placement.workspace_name,
+    }
 
 
 def encode_deployment_identity(bundle) -> str:
@@ -120,35 +111,21 @@ def _exact_keys(value: Mapping[str, object], expected: set[str], name: str) -> N
 
 
 def _placement(provider: object, value: object):
-    from flash.serve.control import ModalPlacement, RunPodPlacement
+    from flash.serve.control import ModalPlacement
 
+    if provider != "modal":
+        raise ValueError("deployment identity provider must be modal")
     payload = _mapping(value, "placement")
-    if provider == "modal":
-        _exact_keys(
-            payload,
-            {"environment", "gpu", "gpu_count", "region", "web_suffix", "workspace_name"},
-            "modal placement",
-        )
-        return ModalPlacement(**payload)
-    if provider == "runpod":
-        _exact_keys(
-            payload,
-            {
-                "account_id",
-                "container_disk_gb",
-                "data_center_id",
-                "gpu_count",
-                "gpu_type_id",
-                "volume_size_gb",
-            },
-            "runpod placement",
-        )
-        return RunPodPlacement(**payload)
-    raise ValueError("deployment identity provider must be modal or runpod")
+    _exact_keys(
+        payload,
+        {"environment", "gpu", "gpu_count", "region", "web_suffix", "workspace_name"},
+        "modal placement",
+    )
+    return ModalPlacement(**payload)
 
 
 def _resolved_adapters(manifest) -> tuple[object, ...]:
-    from flash.serve.control import AdapterAliasIntent, ResolvedAdapter
+    from flash.serve.control import ResolvedAdapter
     from flash.serve.control._serialization import canonical_adapter_sort_key
 
     adapters = []
@@ -161,8 +138,7 @@ def _resolved_adapters(manifest) -> tuple[object, ...]:
         adapters.append(
             ResolvedAdapter(
                 run_id=adapter.run_id,
-                checkpoint=adapter.checkpoint,
-                adapter_revision=adapter.adapter_revision,
+                checkpoint_id=adapter.checkpoint_id,
                 artifact_repo_id=adapter.repo_id,
                 artifact_repo_type=adapter.repo_type,
                 artifact_revision=adapter.source_revision,
@@ -173,10 +149,6 @@ def _resolved_adapters(manifest) -> tuple[object, ...]:
                 lora_rank=adapter.lora_rank,
                 thinking_default=adapter.thinking_default,
                 structured_outputs_default_json=structured,
-                alias_intent=AdapterAliasIntent(
-                    activate=manifest.aliases.get(adapter.run_id) == adapter.adapter_revision,
-                    expected_adapter_revision=None,
-                ),
             )
         )
     return tuple(sorted(adapters, key=canonical_adapter_sort_key))
@@ -193,6 +165,8 @@ def decode_deployment_identity(value: str):
     )
 
     payload = _decode_payload(value)
+    if payload["provider"] != "modal":
+        raise ValueError("deployment identity provider must be modal")
     manifest_value = payload["manifest"]
     image_reference = payload["image_reference"]
     if type(manifest_value) is not str or type(image_reference) is not str:
@@ -216,16 +190,16 @@ def _mismatch(flag: str) -> None:
 
 
 def _validate_authored_identity(args, bundle) -> None:
-    from flash.serve.control import ModalPlacement, RunPodPlacement
+    from flash.serve.control import ModalPlacement
 
     spec = bundle.spec
     if len(spec.adapters) != 1:
         raise ValueError("--deployment-identity must contain exactly one adapter for this command")
     adapter = spec.adapters[0]
-    expected_checkpoint = (
-        "final"
-        if getattr(args, "checkpoint_step", None) is None
-        else f"step-{args.checkpoint_step}"
+    from flash.schema import format_checkpoint_ref
+
+    expected_checkpoint = format_checkpoint_ref(
+        adapter.run_id, getattr(args, "checkpoint_step", None)
     )
     comparisons = (
         ("provider", spec.provider, args.provider),
@@ -238,7 +212,7 @@ def _validate_authored_identity(args, bundle) -> None:
         ("artifact-repo-type", adapter.artifact_repo_type, args.artifact_repo_type),
         ("artifact-subfolder", adapter.artifact_subfolder, args.artifact_subfolder),
         ("lora-rank", adapter.lora_rank, args.lora_rank),
-        ("checkpoint-step", adapter.checkpoint, expected_checkpoint),
+        ("checkpoint-step", adapter.checkpoint_id, expected_checkpoint),
         ("thinking", adapter.thinking_default, bool(args.thinking)),
     )
     for flag, actual, expected in comparisons:
@@ -254,14 +228,6 @@ def _validate_authored_identity(args, bundle) -> None:
             ("modal-region", placement.region, args.modal_region),
         )
         for flag, actual, expected in modal:
-            if actual != expected:
-                _mismatch(flag)
-    elif type(placement) is RunPodPlacement:
-        runpod = (
-            ("runpod-account", placement.account_id, args.runpod_account),
-            ("runpod-data-center", placement.data_center_id, args.runpod_data_center),
-        )
-        for flag, actual, expected in runpod:
             if actual != expected:
                 _mismatch(flag)
     else:  # pragma: no cover - DeploymentSpec validation already excludes this

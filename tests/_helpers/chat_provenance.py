@@ -1,28 +1,16 @@
 """shared managed chat provenance fixtures."""
 
 
-def managed_chat_result(revision: str, content: str = "ok") -> dict:
-    target, source_revision = revision.rsplit(".", 1)
-    run_id, selector = target.rsplit("@", 1)
-    checkpoint = run_id if selector == "final" else f"{run_id}/{selector}"
+def managed_chat_result(checkpoint_id: str, content: str = "ok") -> dict:
     return {
         "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
-        "flash_provenance": {
-            "adapter_revision": revision,
-            "checkpoint": checkpoint,
-            "source_revision": source_revision,
-        },
+        "flash_provenance": {"checkpoint_id": checkpoint_id},
     }
 
 
-def managed_stream_headers(revision: str) -> dict[str, str]:
-    target, source_revision = revision.rsplit(".", 1)
-    run_id, selector = target.rsplit("@", 1)
-    checkpoint = run_id if selector == "final" else f"{run_id}/{selector}"
+def managed_stream_headers(checkpoint_id: str) -> dict[str, str]:
     return {
         "content-type": "text/event-stream",
-        "x-flash-adapter-revision": revision,
-        "x-flash-checkpoint": checkpoint,
-        "x-flash-source-revision": source_revision,
-        "x-freesolo-lora-request-adapter": revision,
+        "x-flash-checkpoint-id": checkpoint_id,
+        "x-freesolo-lora-request-adapter": checkpoint_id,
     }

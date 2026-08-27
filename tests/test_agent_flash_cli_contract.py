@@ -255,8 +255,8 @@ def test_done_status_exposes_adapter_ref(tmp_path, monkeypatch) -> None:
     runner_state._save_status(
         RunStatus(run_id=rid, state="done", spec=spec.to_dict(), effective_preparation=worker_prep)
     )
-    # the public short ref: exactly what train.init_from_adapter accepts
-    assert get_status(rid).to_dict()["adapter_ref"] == rid
+    # the public final checkpoint: exactly what train.init_from_adapter accepts
+    assert get_status(rid).to_dict()["adapter_ref"] == f"{rid}/final"
 
 
 def test_done_status_with_removed_spec_key_serializes_without_adapter_ref(

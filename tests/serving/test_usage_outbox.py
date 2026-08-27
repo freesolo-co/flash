@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -12,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from flash.serving.src.accounting.usage import (
+    _FREESOLO_USD_PER_MTOK,
     build_usage_session,
     capture_authoritative_price,
     freesolo_price,
@@ -33,6 +35,7 @@ from flash.serving.src.accounting.usage_outbox import (
     UsageEvent,
     UsageOutboxError,
 )
+from flash.serving.src.engine.model_config import base_models
 from flash.serving.src.http.inference_routes import _discard_prepared_stream
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
@@ -50,21 +53,22 @@ BASE_MODEL = "Qwen/Qwen3.5-9B"
 
 def _revision() -> AdapterRecord:
     run_id = "accounting"
-    sha = hashlib.sha1(run_id.encode()).hexdigest()
+    artifact_revision = hashlib.sha1(run_id.encode()).hexdigest()
+    checkpoint_id = f"{run_id}/final"
     return AdapterRecord.model_validate(
         {
-            "adapter_id": f"{run_id}@final.{sha}",
+            "adapter_id": checkpoint_id,
             "repo_id": "org/accounting",
             "org_id": "org-1",
             "base_model": BASE_MODEL,
-            "checkpoint": run_id,
+            "checkpoint": checkpoint_id,
             "thinking": False,
-            "metadata": {
-                "record_type": "revision",
-                "run_id": run_id,
-                "checkpoint_step": None,
-                "hf_revision": sha,
-            },
+            "run_id": run_id,
+            "checkpoint_step": None,
+            "artifact_revision": artifact_revision,
+            "artifact_digest": hashlib.sha256(b"accounting-artifact").hexdigest(),
+            "artifact_fingerprint": hashlib.sha256(b"accounting-binding").hexdigest(),
+            "lora_rank": 16,
         }
     )
 
@@ -181,6 +185,38 @@ class _Store(OfflineUsageStore):
         self.captured.append(event)
 
 
+def test_freesolo_prices_match_committed_catalog_fixed_point_contract() -> None:
+    # The charged per-token rate is the launch per-Mtok price divided by 1e6 with NO markup applied,
+    # so each value below is exactly its published rate shifted six places. Retired models are absent:
+    # the table is exactly the active hosted set.
+    expected = {
+        "Qwen/Qwen3.5-9B": {
+            "prompt_token_usd": "0.000000095",
+            "cached_prompt_token_usd": "0.0000000276",
+            "completion_token_usd": "0.0000001425",
+        },
+        "Qwen/Qwen3.8-27B": {
+            "prompt_token_usd": "0.0000003325",
+            "cached_prompt_token_usd": "0.00000003325",
+            "completion_token_usd": "0.0000024225",
+        },
+        "Qwen/Qwen3.6-35B-A3B": {
+            "prompt_token_usd": "0.000000095",
+            "cached_prompt_token_usd": "0.0000000475",
+            "completion_token_usd": "0.0000009025",
+        },
+    }
+    decimal_string = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")
+
+    assert set(_FREESOLO_USD_PER_MTOK) == set(expected)
+    assert set(_FREESOLO_USD_PER_MTOK) == set(base_models())
+    for model, snapshot in expected.items():
+        actual = freesolo_price(model).snapshot
+        assert actual == snapshot
+        assert all(decimal_string.fullmatch(value) for value in actual.values())
+        assert all("e" not in value.lower() for value in actual.values())
+
+
 def test_generation_id_format_and_public_identity_separation() -> None:
     generation_id = new_generation_id()
 
@@ -260,7 +296,7 @@ def test_nonstream_capture_is_awaited_before_successful_response() -> None:
     pool = _Pool()
     store = _Store()
 
-    async def authorize(_token: str, _adapter_id: str) -> str:
+    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
         return "org-1"
 
     app = build_serving_app(
@@ -281,10 +317,10 @@ def test_nonstream_capture_is_awaited_before_successful_response() -> None:
     event = store.finalized[0]
     assert event.identity.request_id == pool.generation_id
     assert event.principal == FreesoloOrgTrafficPrincipal(orgId="org-1")
-    assert event.target.requested_adapter_id == record.adapter_id
-    assert event.target.resolved_adapter_revision == record.adapter_id
-    assert event.target.resolved_checkpoint_id == record.checkpoint
-    assert event.target.resolved_hf_revision == record.hf_revision
+    assert event.target.public_model_id == record.adapter_id
+    assert event.target.checkpoint_id == record.checkpoint
+    assert event.target.artifact_fingerprint == record.artifact_fingerprint
+    assert event.target.artifact_fingerprint != record.artifact_digest
     assert event.facts.prompt_tokens == 2
     assert event.facts.completion_tokens == 1
     assert event.facts.cached_tokens == 1
@@ -295,7 +331,7 @@ def test_stream_captures_in_progress_before_response_and_finalizes_same_id() -> 
     pool = _Pool()
     store = _Store()
 
-    async def authorize(_token: str, _adapter_id: str) -> str:
+    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
         return "org-1"
 
     app = build_serving_app(
@@ -371,15 +407,13 @@ def test_stream_finalization_preserves_first_event_attestation() -> None:
 
     asyncio.run(session.finalize(final))
 
-    assert store.finalized[0].attestation_evidence == {
-        "resolved_adapter_revision": record.adapter_id
-    }
+    assert store.finalized[0].attestation_evidence == {"checkpoint_id": record.adapter_id}
 
 
 def test_stream_capture_failure_before_headers_returns_controlled_503() -> None:
     record = _revision()
 
-    async def authorize(_token: str, _adapter_id: str) -> str:
+    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
         return "org-1"
 
     app = build_serving_app(
@@ -406,7 +440,7 @@ def test_thinking_request_is_rejected_before_engine_dispatch() -> None:
     record = _revision().model_copy(update={"thinking": True})
     pool = _Pool()
 
-    async def authorize(_token: str, _adapter_id: str) -> str:
+    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
         return "org-1"
 
     app = build_serving_app(
@@ -428,7 +462,7 @@ def test_thinking_request_is_rejected_before_engine_dispatch() -> None:
 def test_nonstream_capture_failure_returns_controlled_503() -> None:
     record = _revision()
 
-    async def authorize(_token: str, _adapter_id: str) -> str:
+    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
         return "org-1"
 
     app = build_serving_app(
@@ -490,7 +524,7 @@ def test_openrouter_event_omits_org_and_billable_requested_adapter() -> None:
 
     assert payload["traffic_principal_kind"] == "openrouter"
     assert payload["org_id"] is None
-    assert payload["requested_adapter_id"] is None
+    assert payload["checkpoint_id"] is None
     assert payload["public_model_id"] == "public/model"
     assert payload["provider_catalog_digest"] == "catalog-digest-1"
     assert payload["accepted_price_snapshot"]["completionTokenUsd"] == "0.000002"
