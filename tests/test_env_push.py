@@ -1973,3 +1973,26 @@ def test_push_directory_still_rejects_two_real_candidate_modules(monkeypatch, tm
     monkeypatch.setattr("flash.client.client_from_config", _fake_client({}))
 
     assert cli.cmd_env_push(_args(env_dir)) == 1
+
+
+def test_push_non_utf8_entrypoint_still_ships_the_helpers_it_imports(monkeypatch, tmp_path):
+    # the publish path decodes the entrypoint with `tokenize.detect_encoding`, so a file carrying a
+    # non-utf-8 encoding cookie is publishable. the import walk read the same file as utf-8 and
+    # swallowed the decode error as "no imports", so the sibling it imports never entered the
+    # archive: `env push` exits 0 and prints an id, and the missing helper only surfaces when a
+    # worker imports the module -- after a gpu has been rented.
+    env_file = tmp_path / "environment.py"
+    env_file.write_bytes(
+        b"# -*- coding: latin-1 -*-\n"
+        b"# caf\xe9\n"
+        b"import helper\n"
+        b"def load_environment(**k):\n"
+        b"    return helper.VALUE\n"
+    )
+    (tmp_path / "helper.py").write_text("VALUE = 1\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file)) == 0
+
+    assert "helper.py" in _member_names(cap["package_b64"])
