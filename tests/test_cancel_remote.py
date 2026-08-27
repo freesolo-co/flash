@@ -862,7 +862,7 @@ def test_cancel_run_successful_exact_teardown_leaves_no_cleanup_remote(tmp_path,
 # Recovery TOCTOU: a run flipped terminal mid-recovery must not submit paid work
 # ---------------------------------------------------------------------------
 def _make_poll_provider(monkeypatch, *, on_poll):
-    """Wire flash.providers.get_provider to a stub provider whose poll() runs ``on_poll``.
+    """Wire flash.providers.get_provider to a stub provider whose poll_attempt() runs ``on_poll``.
 
     Also no-ops _gc_run_endpoints so attach_run's teardown doesn't reach the real SDK.
     """
