@@ -138,8 +138,12 @@ def scaledown_window_for(gpu: str) -> int:
 # gpu model engines scale to zero. inference and adapter registration remote calls start the matching
 # parameter-bound engine on demand.
 MIN_CONTAINERS = 0
-# no autoscaling cap per base-model engine; modal adds capacity as concurrency demands.
-MAX_CONTAINERS = None
+# At most 3 GPUs per base model. `base_model` is a modal.parameter(), and Modal gives each distinct
+# parameter value its own container pool with its own autoscaling accounting, so this bound applies
+# PER MODEL rather than across the catalog. Engines are TENSOR_PARALLEL_SIZE 1 on a single-card `gpu=`
+# request, so one container is exactly one GPU and 3 containers is exactly 3 GPUs. Raising this bounds
+# spend per model, not total spend: N models can still reach 3N GPUs.
+MAX_CONTAINERS = 3
 # Concurrent requests packed onto one base-model GPU before Modal autoscales a new (costly) one.
 # A real-GPU sweep (scripts/gpu_canary.py::sweep_concurrency on A10G/Qwen2.5-1.5B) showed vLLM
 # throughput scaling near-linearly with no saturation through 128 concurrent, while TTFT stayed
