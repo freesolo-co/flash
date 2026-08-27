@@ -744,7 +744,7 @@ class _Pool:
         return None
 
 
-async def _allow(_token: str, _adapter_id: str) -> str:
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
     return "org-1"
 
 
