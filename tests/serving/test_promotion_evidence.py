@@ -6,8 +6,6 @@ poll in `deploy-modal.yml` passes all of them, which is why these rules exist.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from flash.serving.promotion.evidence import (
     ACCOUNTING_MALFORMED,
     ACCOUNTING_STALLED,
@@ -23,7 +21,7 @@ from flash.serving.promotion.evidence import (
     STREAM_NO_USAGE,
     AccountingEvidence,
     StreamEvidence,
-    accounting_from_snapshot,
+    parse_accounting,
     parse_health,
     verify_accounting,
     verify_health,
@@ -173,42 +171,62 @@ def test_a_row_undelivered_past_the_stall_threshold_blocks_promotion():
     assert verdict.reason == ACCOUNTING_STALLED
 
 
-def test_a_snapshot_missing_a_counter_is_unreadable_not_healthy():
-    """Defaulting an absent counter to zero would turn an unreadable snapshot into a pass."""
+def _body(**overrides):
+    """A `serving_usage_backlog_snapshot` body, shaped exactly as the RPC returns it."""
+    body = {
+        "states": {"pending": 0, "leased": 0},
+        "expired_leases": 0,
+        "oldest_undelivered_age_seconds": None,
+    }
+    body.update(overrides)
+    return body
 
-    @dataclass
-    class Partial:
-        pending: int = 0
-        leased: int = 0
 
-    assert accounting_from_snapshot(Partial()) is None
-    assert verify_accounting(accounting_from_snapshot(Partial())).reason == ACCOUNTING_MALFORMED
+def test_a_body_missing_a_counter_is_unreadable_not_healthy():
+    """Defaulting an absent counter to zero would turn an unreadable body into a pass.
+
+    This is not hypothetical: `DurableUsageOutbox.snapshot` does exactly that with
+    `int(states.get("pending") or 0)`. Correct for a delivery worker deciding whether to wake up,
+    fail-open for a gate, which is why the gate parses the RPC body itself.
+    """
+    assert parse_accounting({"states": {"pending": 0}}) is None
+    assert parse_accounting(_body(expired_leases=None)) is None
+    assert verify_accounting(parse_accounting({})).reason == ACCOUNTING_MALFORMED
 
 
-def test_a_snapshot_missing_the_age_field_is_unreadable():
-    """A snapshot without the age field cannot answer the stall question at all.
+def test_an_empty_rpc_result_never_reads_as_a_drained_backlog():
+    """A renamed field, a schema drift, or a permission-shaped empty result must not pass.
+
+    Every counter would default to zero -- precisely the value that means "healthy" -- so the gate
+    would promote a release having verified nothing at all.
+    """
+    for payload in (None, {}, [], "ok", 7, {"states": []}, {"states": None}):
+        assert verify_accounting(parse_accounting(payload)).reason == ACCOUNTING_MALFORMED
+
+
+def test_a_body_missing_the_age_field_is_unreadable():
+    """A body without the age field cannot answer the stall question at all.
 
     Reading a missing age as "nothing undelivered" would silently drop the only signal that
     distinguishes a wedged loop from a busy one.
     """
-
-    @dataclass
-    class NoAge:
-        pending: int = 0
-        leased: int = 0
-        expired_leases: int = 0
-
-    assert accounting_from_snapshot(NoAge()) is None
+    body = _body()
+    del body["oldest_undelivered_age_seconds"]
+    assert parse_accounting(body) is None
 
 
-def test_a_healthy_snapshot_passes():
-    @dataclass
-    class Snapshot:
-        pending: int = 0
-        leased: int = 0
-        expired_leases: int = 0
-        oldest_undelivered_age_seconds: int | None = None
-        quarantined: int = 4
+def test_a_counter_that_is_not_an_integer_is_unreadable():
+    """`true` is an int in python, so a boolean counter would read as one row."""
+    assert parse_accounting(_body(states={"pending": True, "leased": 0})) is None
+    assert parse_accounting(_body(states={"pending": "0", "leased": 0})) is None
+    assert parse_accounting(_body(oldest_undelivered_age_seconds="7")) is None
 
+
+def test_postgrest_returns_the_row_wrapped_in_a_list():
+    """`serving_usage_backlog_snapshot` comes back as a single-element list, not a bare object."""
+    assert verify_accounting(parse_accounting([_body()])).ok
+
+
+def test_a_healthy_body_passes():
     # quarantined rows are a pre-existing backlog condition, not something this release caused.
-    assert verify_accounting(accounting_from_snapshot(Snapshot())).ok
+    assert verify_accounting(parse_accounting(_body(quarantined=4))).ok

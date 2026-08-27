@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import pathlib
+from unittest import mock
+
+import pytest
 
 from flash.serving.promotion import gate as gate_module
 from flash.serving.promotion.canary import CANARY_TIMEOUT, CanaryError
@@ -24,12 +27,13 @@ SHA = "94210a323f9beaa713241e305f178b364848446d"
 DEPLOYMENT_ID = "12345-1"
 
 
-@dataclass
-class _Snapshot:
-    pending: int = 0
-    leased: int = 0
-    expired_leases: int = 0
-    oldest_undelivered_age_seconds: int | None = None
+def _Snapshot(pending=0, leased=0, expired_leases=0, oldest_undelivered_age_seconds=None):
+    """A backlog RPC body, shaped exactly as `serving_usage_backlog_snapshot` returns it."""
+    return {
+        "states": {"pending": pending, "leased": leased},
+        "expired_leases": expired_leases,
+        "oldest_undelivered_age_seconds": oldest_undelivered_age_seconds,
+    }
 
 
 def _health(**overrides):
@@ -207,6 +211,66 @@ def test_a_missing_base_url_does_not_deploy_a_gate_against_nothing(monkeypatch, 
     monkeypatch.delenv("SERVING_BASE_URL", raising=False)
     assert gate_module.main([]) == 1
     assert GATE_CONFIG_INCOMPLETE in capsys.readouterr().err
+
+
+def _gate_step_env() -> dict[str, str]:
+    """Exactly the variables the workflow's gate step actually supplies, read from the YAML.
+
+    Deriving this from the workflow rather than restating it keeps the code and the step that runs
+    it from drifting apart silently: a variable dropped from the `env:` block turns into a red test
+    rather than a broken deploy.
+    """
+    import yaml
+
+    workflow = yaml.safe_load(
+        (pathlib.Path(gate_module.__file__).parents[3] / ".github/workflows/deploy-modal.yml")
+        .read_text()
+        .replace("\ton", "\t'on'")
+    )
+    steps = workflow["jobs"]["deploy"]["steps"]
+    gate_step = next(s for s in steps if s.get("run", "").strip().endswith("promotion.gate"))
+    supplied = set(gate_step.get("env", {}))
+    values = {"SUPABASE_SERVICE_ROLE_KEY": "sb_secret_x", "SUPABASE_URL": "https://db.example"}
+    return {n: values.get(n, "x") for n in gate_module._REQUIRED_ENV if n in supplied}
+
+
+def test_the_gate_is_constructible_from_the_environment_the_workflow_supplies():
+    """The gate must actually be able to build itself in CI.
+
+    Every test above injects its loaders, so none of them touches the real construction. That is
+    exactly where the gate crashed: it built a `DurableUsageOutbox`, which takes a REQUIRED
+    keyword-only `worker_id` and additionally refuses to construct without `backend_url` and
+    `deployment_id`, none of which the workflow's gate step puts in the environment. A crash there
+    is worse than a failed gate -- the rollback step keys off `failure()`, so it would fire on every
+    single deploy and roll production back to its predecessor even when the release was fine.
+    """
+    plan = gate_module._resolve("https://serve.freesolo.co", _gate_step_env())
+
+    assert plan.expected_sha == "x"
+    assert plan.expected_deployment_id == "x-x"
+    assert callable(plan.read_backlog)
+
+
+def test_a_malformed_service_role_key_fails_the_gate_instead_of_crashing_it():
+    """A misconfigured secret must decline to promote, NOT roll production back.
+
+    `supabase_headers` raises on a key that is not `sb_secret_`-shaped. Letting that escape would
+    crash the step, and the rollback fires on `failure()` for a crash exactly as it does for a
+    failure -- so a typo in a secret would redeploy the previous release over a healthy one.
+    """
+    env = {**_gate_step_env(), "SUPABASE_SERVICE_ROLE_KEY": "eyJhbGciOiJIUzI1NiJ9.legacy.key"}
+
+    with pytest.raises(gate_module.GateConfigError):
+        gate_module._resolve("https://serve.freesolo.co", env)
+
+
+def test_an_empty_base_model_catalog_fails_the_gate_instead_of_crashing_it():
+    """Same rollback hazard, reached through the other resolvable config fault."""
+    with (
+        mock.patch("flash.serving.src.engine.model_config.base_models", return_value=[]),
+        pytest.raises(gate_module.GateConfigError),
+    ):
+        gate_module._resolve("https://serve.freesolo.co", _gate_step_env())
 
 
 def test_the_entrypoint_is_importable_as_a_module(monkeypatch, capsys):

@@ -28,6 +28,8 @@ import asyncio
 import os
 import sys
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 from flash.serving.promotion.canary import (
@@ -40,16 +42,18 @@ from flash.serving.promotion.evidence import (
     ACCOUNTING_MALFORMED,
     PromotionVerdict,
     StreamEvidence,
-    accounting_from_snapshot,
+    parse_accounting,
     parse_health,
     verify_accounting,
     verify_health,
     verify_stream,
 )
+from flash.serving.src.store.supabase_rest import supabase_headers
 
 HealthLoader = Callable[[], Awaitable[Any]]
 StreamRunner = Callable[[], Awaitable[StreamEvidence]]
 AccountingLoader = Callable[[], Awaitable[Any]]
+BacklogReader = Callable[[Any], Awaitable[Any]]
 
 GATE_CONFIG_INCOMPLETE = "gate_config_incomplete"
 HEALTH_UNREACHABLE = "health_unreachable"
@@ -57,6 +61,7 @@ HEALTH_UNREACHABLE = "health_unreachable"
 _DEFAULT_CANARY_TIMEOUT_SECONDS = 180.0
 _DEFAULT_ACCOUNTING_DEADLINE_SECONDS = 180.0
 _ACCOUNTING_POLL_SECONDS = 5.0
+_BACKLOG_SNAPSHOT_RPC = "serving_usage_backlog_snapshot"
 _MAX_COMPLETION_TOKENS = 32
 _REQUIRED_ENV = (
     "FREESOLO_INTERNAL_KEY",
@@ -132,7 +137,7 @@ async def _await_accounting(
             verdict = PromotionVerdict(ok=False, reason=ACCOUNTING_MALFORMED)
             snapshot = None
         if snapshot is not None:
-            verdict = verify_accounting(accounting_from_snapshot(snapshot))
+            verdict = verify_accounting(parse_accounting(snapshot))
             if verdict.ok:
                 return verdict
         if waited >= deadline_seconds:
@@ -141,48 +146,113 @@ async def _await_accounting(
         waited += poll_seconds
 
 
-def _canary_model() -> str:
+class GateConfigError(Exception):
+    """The gate cannot be built from this environment, so it never gets to run.
+
+    Carries no detail on purpose: every input here is either a secret or derived from one, and the
+    caller turns this into a log line.
+    """
+
+
+@dataclass(frozen=True)
+class GatePlan:
+    """A gate that is already known to be constructible; the type is the proof.
+
+    Holding the resolved request and reader together is what lets `_resolve` own every rejection and
+    leaves `_run` with nothing left to validate.
+    """
+
+    request: CanaryRequest
+    read_backlog: BacklogReader
+    expected_sha: str
+    expected_deployment_id: str
+
+
+def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
+    """Build the plan from the step's environment, or refuse before any request is made.
+
+    Every rejection lives HERE, above `asyncio.run`, because a gate that raises is strictly worse
+    than one that fails: the rollback step keys off `failure()`, which fires on a crashed step
+    exactly as it does on a failed one, so a misconfigured secret would roll production back to its
+    predecessor instead of simply declining to promote it. All three rejections -- an incomplete
+    environment, `supabase_headers` refusing a key that is not `sb_secret_`-shaped, and an empty
+    base-model catalog -- are knowable before the first request, so each is answered with a reason
+    code rather than a traceback.
+
+    Taking credentials as an argument rather than through `get_settings()` also keeps this
+    constructible in a test: `get_settings` is `lru_cache`d over real process env, so it cannot be
+    exercised offline without leaking global state between tests.
+    """
+    # naming the missing variable would be friendlier, but a secret-shaped value must never
+    # influence log output, and "which one" is one bisection away from the value itself.
+    if not base_url or not all(env.get(name) for name in _REQUIRED_ENV):
+        raise GateConfigError
+
     from flash.serving.src.engine.model_config import base_models
 
     models = base_models()
     if not models:
-        raise ValueError("no hosted base models are configured")
-    return models[0]
+        raise GateConfigError
+
+    key = env["SUPABASE_SERVICE_ROLE_KEY"]
+    url = f"{env['SUPABASE_URL'].rstrip('/')}/rest/v1/rpc/{_BACKLOG_SNAPSHOT_RPC}"
+    # one RPC read, deliberately NOT through `DurableUsageOutbox`: that is the delivery WORKER, and
+    # constructing one demands a `worker_id`, a `backend_url`, and a `deployment_id` that a single
+    # read never uses. reuse the canonical header helper so the service-role format check and the
+    # postgrest schema routing stay identical to every other supabase caller in the repo.
+    try:
+        headers = supabase_headers(
+            SimpleNamespace(supabase_url=env["SUPABASE_URL"], supabase_service_role_key=key),
+            "public",
+        )
+    except RuntimeError as exc:
+        raise GateConfigError from exc
+    headers["Authorization"] = f"Bearer {key}"
+
+    async def read_backlog(client: Any) -> Any:
+        response = await client.post(url, headers=headers, json={}, timeout=15)
+        response.raise_for_status()
+        return response.json()
+
+    run_id, attempt = env["GITHUB_RUN_ID"], env["GITHUB_RUN_ATTEMPT"]
+    return GatePlan(
+        request=CanaryRequest(
+            base_url=base_url,
+            model=models[0],
+            api_key=env["FREESOLO_INTERNAL_KEY"],
+            correlation_id=correlation_id_for(run_id, attempt),
+            timeout_seconds=_DEFAULT_CANARY_TIMEOUT_SECONDS,
+            max_completion_tokens=_MAX_COMPLETION_TOKENS,
+        ),
+        read_backlog=read_backlog,
+        expected_sha=env["GITHUB_SHA"],
+        expected_deployment_id=f"{run_id}-{attempt}",
+    )
 
 
-async def _run(base_url: str, env: dict[str, str]) -> PromotionVerdict:
+async def _run(plan: GatePlan) -> PromotionVerdict:
     import httpx
 
-    from flash.serving.src.accounting.usage_outbox import DurableUsageOutbox
-    from flash.serving.src.store.settings import get_settings
-
-    expected_deployment_id = f"{env['GITHUB_RUN_ID']}-{env['GITHUB_RUN_ATTEMPT']}"
-    correlation_id = correlation_id_for(env["GITHUB_RUN_ID"], env["GITHUB_RUN_ATTEMPT"])
-    request = CanaryRequest(
-        base_url=base_url,
-        model=_canary_model(),
-        api_key=env["FREESOLO_INTERNAL_KEY"],
-        correlation_id=correlation_id,
-        timeout_seconds=_DEFAULT_CANARY_TIMEOUT_SECONDS,
-        max_completion_tokens=_MAX_COMPLETION_TOKENS,
-    )
-    outbox = DurableUsageOutbox(get_settings())
+    base_url = plan.request.base_url.rstrip("/")
     async with httpx.AsyncClient() as client:
 
         async def health_loader() -> Any:
-            response = await client.get(f"{base_url.rstrip('/')}/healthz", timeout=15)
+            response = await client.get(f"{base_url}/healthz", timeout=15)
             response.raise_for_status()
             return response.json()
 
         async def stream_runner() -> StreamEvidence:
-            return await run_stream_canary(request, client=client)
+            return await run_stream_canary(plan.request, client=client)
+
+        async def accounting_loader() -> Any:
+            return await plan.read_backlog(client)
 
         return await evaluate_promotion(
             health_loader=health_loader,
             stream_runner=stream_runner,
-            accounting_loader=outbox.snapshot,
-            expected_sha=env["GITHUB_SHA"],
-            expected_deployment_id=expected_deployment_id,
+            accounting_loader=accounting_loader,
+            expected_sha=plan.expected_sha,
+            expected_deployment_id=plan.expected_deployment_id,
         )
 
 
@@ -191,16 +261,13 @@ def main(argv: list[str] | None = None) -> int:
     # only non-secret configuration is accepted as an argument.
     parser.add_argument("--base-url", default=os.environ.get("SERVING_BASE_URL", ""))
     args = parser.parse_args(argv)
-    if not args.base_url:
-        print(f"promotion gate failed: {GATE_CONFIG_INCOMPLETE}", file=sys.stderr)
-        return 1
     env = {name: os.environ.get(name, "") for name in _REQUIRED_ENV}
-    if not all(env.values()):
-        # naming which variable is missing would be friendlier, but the value of a secret-shaped
-        # variable must never influence log output.
+    try:
+        plan = _resolve(args.base_url, env)
+    except GateConfigError:
         print(f"promotion gate failed: {GATE_CONFIG_INCOMPLETE}", file=sys.stderr)
         return 1
-    verdict = asyncio.run(_run(args.base_url, env))
+    verdict = asyncio.run(_run(plan))
     if verdict.ok:
         print("promotion gate passed")
         return 0

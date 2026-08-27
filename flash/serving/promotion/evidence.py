@@ -180,24 +180,35 @@ class AccountingEvidence:
         return age is not None and age >= _STALL_AGE_SECONDS
 
 
-def accounting_from_snapshot(snapshot: Any) -> AccountingEvidence | None:
-    """Read the backlog counters off an `OutboxSnapshot`, or None when it is not one.
+def parse_accounting(payload: Any) -> AccountingEvidence | None:
+    """Read a `serving_usage_backlog_snapshot` body, or None when it is not one.
 
-    Missing counters must NOT default to zero: zero is precisely the value that means "healthy", so
-    a defaulted read would turn an unreadable snapshot into a pass.
+    Parsing the RPC body directly -- rather than an `OutboxSnapshot` built from it -- is deliberate.
+    `DurableUsageOutbox.snapshot` coerces every absent counter with `int(... or 0)`, which is right
+    for a delivery worker deciding whether to wake up and wrong for a gate: zero is precisely the
+    value that means "healthy", so a body that lost its fields to a rename, a schema drift, or a
+    permission-shaped empty result would read as a perfectly drained backlog and PASS. Absence has
+    to survive parsing to be rejected here.
     """
-    values: list[int] = []
-    for field in ("pending", "leased", "expired_leases"):
-        value = getattr(snapshot, field, None)
+    if isinstance(payload, list):
+        payload = payload[0] if payload else None
+    if not isinstance(payload, dict):
+        return None
+    states = payload.get("states")
+    if not isinstance(states, dict):
+        return None
+    counters: list[int] = []
+    for source, field in ((states, "pending"), (states, "leased"), (payload, "expired_leases")):
+        value = source.get(field, _MISSING)
         if isinstance(value, bool) or not isinstance(value, int):
             return None
-        values.append(value)
+        counters.append(value)
     # None is a real reading here ("nothing undelivered"); an ABSENT field is not, because it would
     # silently read as healthy while carrying no stall signal at all.
-    age = getattr(snapshot, "oldest_undelivered_age_seconds", _MISSING)
+    age = payload.get("oldest_undelivered_age_seconds", _MISSING)
     if age is not None and (isinstance(age, bool) or not isinstance(age, int)):
         return None
-    return AccountingEvidence(*values, oldest_undelivered_age_seconds=age)
+    return AccountingEvidence(*counters, oldest_undelivered_age_seconds=age)
 
 
 def verify_accounting(evidence: AccountingEvidence | None) -> PromotionVerdict:
