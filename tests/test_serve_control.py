@@ -13,7 +13,6 @@ from pathlib import Path
 import pytest
 
 from flash.serve.control import (
-    AdapterAliasIntent,
     DeploymentRequest,
     DeploymentResult,
     DeploymentSpec,
@@ -84,8 +83,7 @@ def _adapter(
     artifact_revision = f"{index + 10:040x}"
     values: dict[str, object] = {
         "run_id": run_id,
-        "checkpoint": "final",
-        "adapter_revision": f"{run_id}@final.{artifact_revision}",
+        "checkpoint_id": f"{run_id}/final",
         "artifact_repo_id": "flash-owned/runs",
         "artifact_repo_type": "model",
         "artifact_revision": artifact_revision,
@@ -96,7 +94,6 @@ def _adapter(
         "lora_rank": 16,
         "thinking_default": False,
         "structured_outputs_default_json": '{"json_object":true}',
-        "alias_intent": AdapterAliasIntent(activate=False, expected_adapter_revision=None),
     }
     values.update(overrides)
     adapter = ResolvedAdapter(**values)
@@ -335,14 +332,13 @@ def test_numeric_equivalent_engines_produce_permutation_stable_specs() -> None:
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
-        ({"adapter_revision": "run-1/final"}, "full immutable"),
-        ({"adapter_revision": "run-1@final.main"}, "full immutable"),
-        ({"adapter_revision": f"other@final.{11:040x}"}, "does not belong"),
-        ({"checkpoint": "step-1"}, "checkpoint"),
+        ({"checkpoint_id": "run-1"}, "checkpoint_id"),
+        ({"checkpoint_id": "run-1/step-01"}, "checkpoint_id"),
+        ({"checkpoint_id": "other/final"}, "does not belong"),
         ({"artifact_repo_id": "missing-owner"}, "owner/name"),
         ({"artifact_repo_type": "space"}, "model or dataset"),
         ({"artifact_revision": "A" * 40}, "lowercase"),
-        ({"artifact_revision": "9" * 40}, "does not match"),
+        ({"artifact_revision": "g" * 40}, "lowercase"),
         ({"artifact_digest": "A" * 64}, "lowercase"),
         ({"artifact_digest": "a" * 63}, "lowercase"),
         ({"artifact_subfolder": "/sft/run-1"}, "safe relative"),
@@ -351,7 +347,6 @@ def test_numeric_equivalent_engines_produce_permutation_stable_specs() -> None:
         ({"base_model": ""}, "base_model"),
         ({"base_model_revision": "A" * 40}, "lowercase"),
         ({"lora_rank": 0}, "positive"),
-        ({"alias_intent": None}, "explicit"),
     ],
 )
 def test_resolved_adapter_rejects_invalid_intrinsic_fields(
@@ -388,52 +383,27 @@ def test_engine_identity_rejects_invalid_capacity_on_direct_construction(
         _engine(**changes)
 
 
-def test_duplicate_revisions_and_multiple_alias_activations_are_rejected() -> None:
+def test_duplicate_checkpoint_identities_are_rejected() -> None:
     adapter = _adapter(1)
-    with pytest.raises(PlanningError, match="duplicate adapter revision"):
+    with pytest.raises(PlanningError, match="duplicate checkpoint identity"):
         plan_deployment(_modal_request(adapter, adapter))
 
-    first = replace(
-        adapter,
-        alias_intent=AdapterAliasIntent(activate=True, expected_adapter_revision=None),
-    )
-    artifact_revision = "d" * 40
+
+def test_sibling_checkpoints_remain_independent_in_one_deployment() -> None:
+    first = _adapter(1)
     second = replace(
         first,
-        checkpoint="step-2",
-        adapter_revision=f"run-1@step-2.{artifact_revision}",
-        artifact_revision=artifact_revision,
+        checkpoint_id="run-1/step-2",
+        artifact_revision="d" * 40,
         artifact_digest="e" * 64,
         artifact_subfolder="sft/run-1-step-2",
     )
-    with pytest.raises(PlanningError, match="at most one active alias intent per run"):
-        plan_deployment(_modal_request(first, second))
 
-    planned = plan_deployment(
-        _modal_request(first, replace(second, alias_intent=AdapterAliasIntent(False, None)))
-    )
-    assert len(planned.adapters) == 2
-
-
-def test_alias_compare_and_swap_revision_must_be_immutable_and_same_run() -> None:
-    for expected in ("main", f"other@final.{12:040x}"):
-        with pytest.raises(ValueError, match="same run"):
-            _adapter(
-                1,
-                alias_intent=AdapterAliasIntent(
-                    activate=True,
-                    expected_adapter_revision=expected,
-                ),
-            )
-
-    adapter = _adapter(
-        1,
-        alias_intent=AdapterAliasIntent(
-            activate=True,
-            expected_adapter_revision=f"run-1@step-2.{12:040x}",
-        ),
-    )
-    assert plan_deployment(_modal_request(adapter)).adapters == (adapter,)
+    planned = plan_deployment(_modal_request(first, second))
+    assert [adapter.checkpoint_id for adapter in planned.adapters] == [
+        "run-1/final",
+        "run-1/step-2",
+    ]
 
 
 def _modal_handle(spec: DeploymentSpec) -> ModalProviderHandle:

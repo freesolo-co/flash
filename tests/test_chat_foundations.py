@@ -14,16 +14,17 @@ from flash._internal.openai_sse import (
 )
 from flash.client.http import ClientError
 from flash.serve.contract.provenance import (
-    ImmutableProvenance,
+    CheckpointProvenance,
     decode_flash_body,
     decode_flash_headers,
     decode_freesolo_body,
     decode_freesolo_headers,
+    validate_header_provenance,
 )
 from flash.serve.request.openai import DEFAULT_MAX_TOKENS, OpenAIRequestError, parse_chat_request
 from flash.serve.request.streaming import _complete_sse_frames
 from flash.serve.request.transport import OpenAIStreamResponse
-from flash.server.routes.serving_revisions import _authorized_chat_revision
+from flash.server.routes.serving_revisions import _authorized_chat_checkpoint
 
 
 def test_canonical_request_parser_owns_defaults_and_strict_schema() -> None:
@@ -60,6 +61,19 @@ def test_canonical_request_parser_owns_defaults_and_strict_schema() -> None:
                 require_model=True,
                 allow_managed_selectors=False,
             )
+
+
+def test_request_parser_rejects_retired_step_selector() -> None:
+    with pytest.raises(OpenAIRequestError, match=r"unsupported chat request field.*step"):
+        parse_chat_request(
+            {
+                "model": "run-1/final",
+                "messages": [{"role": "user", "content": "hello"}],
+                "step": 20,
+            },
+            require_model=True,
+            allow_managed_selectors=True,
+        )
 
 
 @pytest.mark.parametrize("field", ["temperature", "top_p"])
@@ -321,51 +335,45 @@ def test_raw_stream_bytes_are_one_shot_and_owned() -> None:
 
 
 def test_provenance_decoders_share_one_typed_value() -> None:
-    revision = "run-1@step-7." + "a" * 40
-    expected = ImmutableProvenance.from_adapter_revision(revision)
-    freesolo = expected.freesolo_body()
-    flash = {
-        "adapter_revision": expected.adapter_revision,
-        "checkpoint": expected.checkpoint,
-        "source_revision": expected.hf_revision,
-        "deployment_id": "kept",
+    checkpoint_id = "run-1/step-7"
+    expected = CheckpointProvenance(checkpoint_id)
+
+    assert decode_freesolo_body(expected.freesolo_body()) == expected
+    assert decode_flash_body({"checkpoint_id": checkpoint_id, "deployment_id": "kept"}) == expected
+    assert decode_freesolo_headers(expected.freesolo_headers()) == expected
+    assert decode_flash_headers({"X-Flash-Checkpoint-Id": checkpoint_id}) == expected
+
+
+def test_header_provenance_validates_every_present_family() -> None:
+    expected = CheckpointProvenance("run-1/step-7")
+    matching = {
+        "X-Freesolo-Checkpoint": expected.checkpoint_id,
+        "X-Flash-Checkpoint-Id": expected.checkpoint_id,
     }
-    freesolo_headers = expected.freesolo_headers()
-    flash_headers = {
-        "X-Flash-Adapter-Revision": expected.adapter_revision,
-        "X-Flash-Checkpoint": expected.checkpoint,
-        "X-Flash-Source-Revision": expected.hf_revision,
-    }
 
-    assert decode_freesolo_body(freesolo) == expected
-    assert decode_flash_body(flash) == expected
-    assert decode_freesolo_headers(freesolo_headers) == expected
-    assert decode_flash_headers(flash_headers) == expected
+    validate_header_provenance(matching, expected)
+
+    with pytest.raises(ValueError, match="mismatched checkpoint provenance"):
+        validate_header_provenance({**matching, "X-Flash-Checkpoint-Id": "run-1/step-8"}, expected)
 
 
-def test_authorized_revision_resolver_prefers_ready_revision_for_ambiguous_step() -> None:
+def test_authorized_checkpoint_requires_one_explicit_verified_target() -> None:
     run_id = "run-1"
-    older = f"{run_id}@step-7." + "a" * 40
-    ready = f"{run_id}@step-7." + "b" * 40
-    deployment = {"state": "ready", "adapter_revision": ready}
+    checkpoint_id = f"{run_id}/step-7"
+    deployment = {
+        "state": "ready",
+        "checkpoint_id": checkpoint_id,
+        "openai_model": checkpoint_id,
+    }
 
     assert (
-        _authorized_chat_revision(
+        _authorized_chat_checkpoint(
             run_id,
             deployment,
-            None,
-            7,
-            {older, ready},
+            checkpoint_id,
+            {checkpoint_id},
         )
-        == ready
+        == checkpoint_id
     )
-    assert (
-        _authorized_chat_revision(
-            run_id,
-            deployment,
-            None,
-            None,
-            {older, ready},
-        )
-        == ready
-    )
+    with pytest.raises(Exception, match="checkpoint_id must"):
+        _authorized_chat_checkpoint(run_id, deployment, None, {checkpoint_id})

@@ -296,7 +296,7 @@ def test_hydrate_forwards_exact_source_patterns_and_closes_token_fd(tmp_path: Pa
         "token": TOKEN,
         "cache_dir": str((tmp_path / "cache").resolve() / ".hf-cache"),
     }
-    destination = paths[manifest.adapters[0].adapter_revision]
+    destination = paths[manifest.adapters[0].checkpoint_id]
     assert destination == adapter_cache_path(tmp_path / "cache", manifest.adapters[0])
     assert {path.name for path in destination.iterdir()} == {
         "adapter_config.json",
@@ -438,7 +438,7 @@ def test_extra_downloaded_code_is_never_copied_or_executed(tmp_path: Path) -> No
     assert validate_manifest_cache(manifest, tmp_path / "cache")
 
 
-def test_adapter_revision_missing_null_and_empty_are_unspecified(tmp_path: Path) -> None:
+def test_adapter_config_revision_missing_null_and_empty_are_unspecified(tmp_path: Path) -> None:
     for index, revision in enumerate(("missing", None, "")):
         case = tmp_path / f"revision-{index}"
         case.mkdir(mode=0o700)
@@ -696,7 +696,7 @@ def test_mode_probe_leaves_no_entry_when_its_removal_does_not_take(
         snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
     )
 
-    destination = paths[manifest.adapters[0].adapter_revision]
+    destination = paths[manifest.adapters[0].checkpoint_id]
     assert {path.name for path in destination.iterdir()} == {
         "adapter_config.json",
         "adapter_model.safetensors",

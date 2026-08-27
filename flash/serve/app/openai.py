@@ -48,7 +48,7 @@ def parse_chat_request(payload: object, resolved: PublishedAdapter) -> OpenAICha
         logprobs=request.logprobs,
     )
     generation = GenerationRequest(
-        adapter_id=resolved.adapter.adapter_revision,
+        adapter_id=resolved.adapter.checkpoint_id,
         expected_incarnation=resolved.adapter.aggregate_sha256,
         messages=request.messages,
         max_tokens=request.max_tokens,
@@ -175,11 +175,7 @@ def provenance_payload(
         "tokenizer_model": manifest.engine.tokenizer_model,
         "tokenizer_revision": manifest.engine.tokenizer_revision,
         "requested_model": resolved.requested_model,
-        "adapter_revision": adapter.adapter_revision,
-        "checkpoint": adapter.checkpoint,
-        "source_revision": adapter.source_revision,
-        "source_subfolder": adapter.source_subfolder,
-        "aggregate_sha256": adapter.aggregate_sha256,
+        "checkpoint_id": adapter.checkpoint_id,
     }
 
 

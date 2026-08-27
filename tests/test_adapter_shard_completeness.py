@@ -312,7 +312,7 @@ def test_serving_validation_refuses_an_orphan_shard(monkeypatch):
     monkeypatch.setattr(huggingface_hub, "HfApi", lambda *a, **k: FakeApi())
 
     with pytest.raises(AdapterTensorMissing, match="no complete index-referenced set"):
-        _verify_adapter_artifact_tensors("org/repo", "sft/run/adapter", hf_revision="sha")
+        _verify_adapter_artifact_tensors("org/repo", "sft/run/adapter", artifact_revision="sha")
 
 
 def test_serving_validation_accepts_a_complete_shard_set(monkeypatch):
@@ -331,7 +331,7 @@ def test_serving_validation_accepts_a_complete_shard_set(monkeypatch):
 
     monkeypatch.setattr(huggingface_hub, "HfApi", lambda *a, **k: FakeApi())
 
-    _verify_adapter_artifact_tensors("org/repo", "sft/run/adapter", hf_revision="sha")
+    _verify_adapter_artifact_tensors("org/repo", "sft/run/adapter", artifact_revision="sha")
 
 
 def test_warmstart_identity_binds_every_shard(monkeypatch):

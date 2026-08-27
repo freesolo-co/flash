@@ -239,7 +239,9 @@ def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
             {"run_id": "r", "state": "deployed", "endpoint_name": "ep", "openai_base_url": "u"}
         ),
         render.undeployed({"run_id": "r", "deleted_endpoints": ["ep"]}),
-        render.exported({"adapter_id": "r", "repository": "acme/x", "url": "u", "private": True}),
+        render.exported(
+            {"checkpoint_id": "r/final", "repository": "acme/x", "url": "u", "private": True}
+        ),
         render.error("config invalid — bad [environment] id"),
         render.warn("FREESOLO_API_KEY is set — it will override the saved login"),
         render.note("exporting adapter — downloading then re-uploading…"),
@@ -266,6 +268,7 @@ def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
     dep = render.deployed(
         {
             "run_id": "flash-1",
+            "checkpoint_id": "flash-1/step-20",
             "state": "deployed",
             "endpoint_name": "ep",
             "openai_base_url": "https://x",
@@ -273,13 +276,20 @@ def test_checkpoints_and_mutations_are_curated_not_raw(monkeypatch) -> None:
     )
     # curated card, not a raw json dump
     assert "deployed" in dep
+    assert "flash-1/step-20" in dep
     assert "endpoint" in dep
     assert "{" not in dep
 
     exp = render.exported(
-        {"adapter_id": "flash-1", "repository": "acme/x", "url": "https://x", "private": True}
+        {
+            "checkpoint_id": "flash-1/final",
+            "repository": "acme/x",
+            "url": "https://x",
+            "private": True,
+        }
     )
     assert "exported" in exp
+    assert "flash-1/final" in exp
     assert "acme/x" in exp
     assert "{" not in exp
 
@@ -321,16 +331,20 @@ def test_undeploy_confirms_disabled_immutable_records(monkeypatch) -> None:
     named = render.undeployed(
         {
             "run_id": "flash-1",
-            "disabled_aliases": ["flash-1"],
-            "disabled_revisions": ["flash-1@final." + "a" * 40],
+            "checkpoint_id": "flash-1/final",
+            "disabled_checkpoints": ["flash-1/final"],
         }
     )
-    assert "torn down flash-1" in named
-    assert "flash-1@final" in named
+    assert "torn down flash-1/final" in named
+    assert "disabled flash-1/final" in named
     idempotent = render.undeployed(
-        {"run_id": "flash-1", "disabled_aliases": [], "disabled_revisions": []}
+        {
+            "run_id": "flash-1",
+            "checkpoint_id": "flash-1/final",
+            "disabled_checkpoints": [],
+        }
     )
-    assert "torn down flash-1" in idempotent
+    assert "torn down flash-1/final" in idempotent
 
 
 def test_export_card_reflects_requested_privacy(monkeypatch, capsys) -> None:
