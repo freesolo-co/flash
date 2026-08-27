@@ -23,28 +23,22 @@ from flash.providers.core.sharding import combined_vram_gb
 logger = get_logger(__name__)
 
 
-def _fitting_sku(
-    gpu_name: str, count: int, catalog: dict, constraints: AllocationConstraints
-) -> str | None:
-    """The Lambda SKU selling ``gpu_name`` at ``count`` cards, or None when it is not real capacity.
+def _sku_holds_run(catalog: dict, sku: str, constraints: AllocationConstraints) -> bool:
+    """Whether one catalog SKU's fixed disk can hold the run.
 
-    None covers both "Lambda does not sell this shape" and "the SKU's fixed disk cannot hold the
-    run": Lambda ships storage WITH the instance type and takes no launch-time disk parameter, so
-    renting an undersized box pays for a machine that dies mid-setup. An unreported disk is left
-    alone -- a caller must not invent a refusal the catalog cannot prove.
+    Lambda ships storage WITH the instance type and takes no launch-time disk parameter, so renting
+    an undersized box pays for a machine that dies mid-setup. An unreported disk is left alone -- a
+    caller must not invent a refusal the catalog cannot prove.
 
     A malformed catalog field raises ``MalformedProviderFieldError`` so the caller can contain it to
     this one SKU instead of losing every sibling shape.
     """
-    from flash.providers.lambda_.client.gpus import instance_type_disk_gb, instance_type_for
+    from flash.providers.lambda_.client.gpus import instance_type_disk_gb
 
-    sku = instance_type_for(gpu_name, count, catalog)
-    if sku not in catalog:
-        return None
     sku_disk_gb = instance_type_disk_gb(catalog, sku)
-    if constraints.disk_gb and sku_disk_gb is not None and sku_disk_gb < constraints.disk_gb:
-        return None
-    return sku
+    return not (
+        constraints.disk_gb and sku_disk_gb is not None and sku_disk_gb < constraints.disk_gb
+    )
 
 
 class LambdaProvider(InstanceProvider):
@@ -168,6 +162,7 @@ class LambdaProvider(InstanceProvider):
         decodes is not a bad field, it is a broken feed, and still fails the lookup.
         """
         from flash.providers.lambda_.client import api as lambda_api
+        from flash.providers.lambda_.client.gpus import instance_type_for
         from flash.providers.lambda_.jobs import usable_instances
 
         out: list[Candidate] = []
@@ -193,7 +188,15 @@ class LambdaProvider(InstanceProvider):
                         continue
                     probed += 1
                     try:
-                        if _fitting_sku(g.name, count, catalog, constraints) is None:
+                        sku = instance_type_for(g.name, count, catalog)
+                        if sku not in catalog:
+                            # Lambda does not sell this shape. No catalog FIELD was read, so this is
+                            # not evidence the feed decodes -- counting it would let a wholly
+                            # malformed catalog clear the broken-feed gate on shapes it never
+                            # carried, and die as a terminal config miss instead of a retryable
+                            # lookup failure.
+                            continue
+                        if not _sku_holds_run(catalog, sku, constraints):
                             decoded += 1
                             continue
                         structurally_fitting = True

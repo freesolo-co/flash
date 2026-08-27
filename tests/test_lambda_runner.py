@@ -1487,6 +1487,33 @@ def test_live_candidates_fail_when_no_probed_sku_decodes(monkeypatch):
         PROVIDER.live_candidates(24, AllocationConstraints(gpu_type="A10"))
 
 
+def test_broken_feed_beats_unsupported_gpu_when_a_fit_floor_is_set(monkeypatch):
+    """A shape the catalog never carried is not evidence the feed decodes.
+
+    ``allocate`` probes several card counts per class, and only the sold counts appear in the
+    catalog at all. Counting an ABSENT sku as a successful decode let a wholly malformed feed clear
+    the broken-feed gate on the unsold shapes, so with a fit floor set the walk fell through to
+    ``UnsupportedGpuError`` -- a TERMINAL config miss the allocator will not degrade past -- instead
+    of the retryable lookup failure that lets the run reach another provider.
+    """
+    from flash.providers.core.base import AllocationConstraints, CapacityLookupError
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.execution.provider import PROVIDER
+
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instance_types",
+        # the single sold sku is malformed; the 2x/4x/8x shapes probed alongside it are simply absent
+        lambda *a, **k: {"gpu_1x_a10": {"instance_type": {"specs": {"storage_gib": "512"}}}},
+    )
+
+    with pytest.raises(CapacityLookupError):
+        PROVIDER.live_candidates(
+            24,
+            AllocationConstraints(gpu_type="A10", required_vram_gb=24, max_gpu_count=8),
+        )
+
+
 def test_launch_never_rents_an_undersized_sku_from_a_mixed_candidate_list(monkeypatch):
     """A capable SKU elsewhere in the list must not license renting an undersized one.
 
