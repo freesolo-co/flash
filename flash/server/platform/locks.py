@@ -9,6 +9,34 @@ import weakref
 from typing import Self
 
 
+def _acquire_teacher_broker_lease() -> int | None:
+    """try to hold exclusive recovery ownership for the configured teacher ledger."""
+    from flash.server.platform.db import db_path
+
+    path = f"{db_path()}.teacher-broker.lock"
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd: int | None = None
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if fd is not None:
+            os.close(fd)
+        return None
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        raise
+    return fd
+
+
+def _release_teacher_broker_lease(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 class _RunLock:
     """Weak-referenceable mutex shared by threads and control-plane processes."""
 

@@ -27,7 +27,12 @@ from flash.serve.deployment.deploy import (
 )
 from flash.serve.deployment.export import export_adapter
 from flash.server.platform import db
-from flash.server.platform.locks import _DEPLOY_LOCKS, _deploy_lock
+from flash.server.platform.locks import (
+    _DEPLOY_LOCKS,
+    _acquire_teacher_broker_lease,
+    _deploy_lock,
+    _release_teacher_broker_lease,
+)
 from flash.server.platform.runtime import (
     _RECOVERABLE,
     _charge_retry_loop,
@@ -328,7 +333,6 @@ def create_app():
         from flash.server.domain.ops.reconcile import reconcile_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
-        db.recover_teacher_request_ledger()
         _open_deployment_jobs()
         _open_status_reporter()
         recover_runs()
@@ -375,34 +379,41 @@ def create_app():
         from flash.server.domain.ops.repo_cleanup import repo_cleanup_enabled
 
         cleanup_task = asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
+        broker_lease_fd = _acquire_teacher_broker_lease()
         try:
+            if broker_lease_fd is not None:
+                db.recover_teacher_request_ledger()
             yield
         finally:
-            startup_report_stop.set()
-            startup_report_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await startup_report_task
-            for task in (
-                startup_charge_task,
-                cost_task,
-                charge_task,
-                reap_task,
-                sweep_task,
-                cleanup_task,
-            ):
-                if task is not None:
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-            shutdown_deadline = time.monotonic() + 15.0
-            with contextlib.suppress(Exception):
-                if not await asyncio.to_thread(_wait_for_deployment_jobs, 10.0):
-                    _log.warning("deployment jobs still running at shutdown deadline")
-            with contextlib.suppress(Exception):
-                from flash.runner.lifecycle.reporting import _shutdown_status_reporter
+            try:
+                startup_report_stop.set()
+                startup_report_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await startup_report_task
+                for task in (
+                    startup_charge_task,
+                    cost_task,
+                    charge_task,
+                    reap_task,
+                    sweep_task,
+                    cleanup_task,
+                ):
+                    if task is not None:
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await task
+                shutdown_deadline = time.monotonic() + 15.0
+                with contextlib.suppress(Exception):
+                    if not await asyncio.to_thread(_wait_for_deployment_jobs, 10.0):
+                        _log.warning("deployment jobs still running at shutdown deadline")
+                with contextlib.suppress(Exception):
+                    from flash.runner.lifecycle.reporting import _shutdown_status_reporter
 
-                remaining = max(0.0, shutdown_deadline - time.monotonic())
-                await asyncio.to_thread(_shutdown_status_reporter, remaining, close=True)
+                    remaining = max(0.0, shutdown_deadline - time.monotonic())
+                    await asyncio.to_thread(_shutdown_status_reporter, remaining, close=True)
+            finally:
+                if broker_lease_fd is not None:
+                    _release_teacher_broker_lease(broker_lease_fd)
 
     app = FastAPI(title="Flash Control Plane", version=__version__, lifespan=lifespan)
     app.include_router(meta.router)
