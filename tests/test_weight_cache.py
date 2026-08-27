@@ -561,7 +561,6 @@ def test_instance_payload_strips_runpod_volume_redirect():
     for arm in ("lambda",):
         env = _instance.build_payload(
             spec,
-            seed=0,
             attempt=0,
             arm=arm,
             source_snapshot=_SOURCE_SNAPSHOT,
@@ -869,7 +868,7 @@ def _supervised_walk(monkeypatch, failures):
 
         seen: list = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             seen.append((spec.gpu.network_volume, spec.gpu.type))
             fail = failures.get(attempt)
             if fail:
@@ -1636,7 +1635,6 @@ def test_instance_build_payload_preload_mode():
     spec = _preload_spec()
     p = _instance.build_payload(
         spec,
-        spec.seed,
         0,
         arm="lambda",
         source_snapshot=_SOURCE_SNAPSHOT,
@@ -1660,7 +1658,6 @@ def test_instance_build_payload_no_mode_by_default():
     spec = _preload_spec()
     p = _instance.build_payload(
         spec,
-        spec.seed,
         0,
         arm="lambda",
         source_snapshot=_SOURCE_SNAPSHOT,
@@ -1819,7 +1816,6 @@ def test_build_payload_carries_mount_marker_for_nfs_cache():
     spec = _preload_spec()
     p = _instance.build_payload(
         spec,
-        spec.seed,
         0,
         arm="lambda",
         source_snapshot=_SOURCE_SNAPSHOT,
@@ -1878,7 +1874,6 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     spec = _preload_spec()
     jobs.launch_and_submit(
         spec,
-        seed=spec.seed,
         instances=[_inst()],
         attempt=0,
         mode="preload",
@@ -2319,7 +2314,7 @@ def test_warm_falls_back_to_a_pricier_class_when_the_cheap_one_is_rejected(monke
     )
     tried = []
 
-    def picky_launch(spec, seed, instances, **k):
+    def picky_launch(spec, instances, **k):
         tried.append(instances[0].gpu)
         if instances[0].gpu == "A10":
             raise RuntimeError("no capacity for A10 in us-east-1")
@@ -2349,7 +2344,7 @@ def test_warm_stops_the_ladder_on_an_ambiguous_create(monkeypatch):
     )
     tried = []
 
-    def ambiguous_launch(spec, seed, instances, **k):
+    def ambiguous_launch(spec, instances, **k):
         tried.append(instances[0].gpu)
         raise UnreconciledCreateError("ambiguous Lambda launch; refusing another create")
 
@@ -2387,7 +2382,7 @@ def test_warm_ensures_the_region_filesystem_once_before_the_class_ladder(monkeyp
         lambda name, region, **k: ensured.append((name, region)) or f"/lambda/nfs/{name}",
     )
 
-    def no_capacity(spec, seed, instances, **k):
+    def no_capacity(spec, instances, **k):
         tried.append(instances[0].gpu)
         raise RuntimeError("all 1 Lambda region(s) rejected the launch (no capacity): full")
 
@@ -2421,7 +2416,7 @@ def test_warm_skips_a_region_whose_created_filesystem_is_not_yet_listed(monkeypa
     monkeypatch.setattr(
         lj,
         "launch_and_submit",
-        lambda spec, seed, instances, **k: tried.append(instances[0].gpu),
+        lambda spec, instances, **k: tried.append(instances[0].gpu),
     )
     res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
 
@@ -2456,7 +2451,7 @@ def test_warm_does_not_launch_while_the_filesystem_is_unconfirmed(monkeypatch):
     monkeypatch.setattr(
         lj,
         "launch_and_submit",
-        lambda spec, seed, instances, **k: tried.append(instances[0].gpu),
+        lambda spec, instances, **k: tried.append(instances[0].gpu),
     )
     res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
 
@@ -2513,7 +2508,7 @@ def test_warm_still_walks_the_ladder_when_lambda_was_never_reached(monkeypatch):
         # the exact text RestClient.missing_key_message builds in flash/providers/_lifecycle/net/http.py
         raise RuntimeError("LAMBDA_API_KEY not configured on the control-plane host")
 
-    def rejected(spec, seed, instances, **k):
+    def rejected(spec, instances, **k):
         tried.append(instances[0].gpu)
         raise RuntimeError("all 1 Lambda region(s) rejected the launch (no capacity): full")
 
@@ -2635,10 +2630,10 @@ def test_warm_incomplete_summary_does_not_contradict_the_warmed_count(monkeypatc
 
     real_launch = lj.launch_and_submit
 
-    def one_region_fails(spec, seed, instances, **k):
+    def one_region_fails(spec, instances, **k):
         if instances[0].region == "us-west-2":
             raise RuntimeError("all 1 Lambda region(s) rejected the launch (no capacity): full")
-        return real_launch(spec, seed, instances, **k)
+        return real_launch(spec, instances, **k)
 
     monkeypatch.setattr(lj, "usable_instances", flaky)
     monkeypatch.setattr(lj, "launch_and_submit", one_region_fails)

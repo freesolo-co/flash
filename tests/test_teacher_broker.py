@@ -2094,7 +2094,6 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
 
     lambda_payload = build_lambda_payload(
         spec,
-        42,
         0,
         runtime_secrets=runtime,
         source_snapshot=_SOURCE_SNAPSHOT,
@@ -2102,7 +2101,6 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
     )
     vast_payload = build_vast_payload(
         spec,
-        42,
         0,
         runtime_secrets=runtime,
         source_snapshot=_SOURCE_SNAPSHOT,
@@ -2127,7 +2125,6 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
     )
     runpod_job_execution.submit_attempt(
         spec,
-        42,
         attempt=0,
         runtime_secrets=runtime,
         source_snapshot=_SOURCE_SNAPSHOT,

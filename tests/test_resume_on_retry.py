@@ -1035,8 +1035,8 @@ def test_infra_failure_relaunches_same_run_and_seed(orch, monkeypatch, failure):
 
     calls = []
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
-        calls.append((run_spec.run_id, seed))
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
+        calls.append((run_spec.run_id, run_spec.seed))
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         if attempt == 0:
             return PollResult(False, failure=failure, detail="infra")
@@ -1126,7 +1126,7 @@ def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orc
         lambda *a, **k: Allocation("lambda", "A10", 1.29, 12, (candidate,)),
     )
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_kwargs):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_kwargs):
         submits.append(attempt)
         on_handle(_lambda_handle(attempt))
         return PollResult(False, failure="stalled", detail="infra")
@@ -1169,7 +1169,7 @@ def test_terminal_runpod_job_allows_retry_and_persists_leaked_endpoint(
 
     submits = []
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         submits.append(attempt)
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         if attempt == 0:
@@ -1305,7 +1305,7 @@ def test_unconfirmed_runpod_teardown_blocks_replacement_and_preserves_handle(
     submits = []
     teardown_events = []
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         submits.append(attempt)
         on_handle(_runpod_handle(f"ep{attempt}", f"j{attempt}", attempt))
         return PollResult(False, failure="stalled", detail="infra")
@@ -1374,7 +1374,7 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
         lambda eid, jid, **_kw: cancels.append(eid) or {"id": jid, "status": "CANCELLED"},
     )
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         if attempt == 0:
             on_handle(_runpod_handle("ep0", "j0"))  # provisioned, then lost infra-shaped
             return PollResult(False, failure="stalled", detail="infra")
@@ -1415,7 +1415,7 @@ def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
 
     calls = []
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         calls.append(attempt)
         on_handle(_runpod_handle())
         return PollResult(False, failure="job_failed", detail="ValueError in reward_fn")
@@ -1442,7 +1442,7 @@ def test_unreconciled_create_fails_fast_without_relaunch(orch, monkeypatch):
 
     calls = []
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         calls.append(attempt)
         raise UnreconciledCreateError("ambiguous vast create; aborting the offer walk")
 
@@ -1468,7 +1468,7 @@ def test_a_retry_marks_where_the_previous_attempt_ends_in_the_log(orch, monkeypa
     from flash.providers.core.base import PollResult
     from flash.providers.runpod.execution import job_execution as rp_jobs
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         if attempt == 0:
             print("Traceback (most recent call last):\ntorch.OutOfMemoryError: CUDA OOM", file=log)
             return PollResult(False, failure="stalled", detail="infra")
@@ -1503,7 +1503,7 @@ def test_the_marker_does_not_claim_one_previous_attempt_after_two_failures(orch,
     from flash.providers.core.base import PollResult
     from flash.providers.runpod.execution import job_execution as rp_jobs
 
-    def fake_submit(run_spec, seed, log=None, on_handle=None, attempt=0, **_):
+    def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_):
         if attempt < 2:
             print(f"attempt {attempt} output", file=log)
             return PollResult(False, failure="stalled", detail="infra")

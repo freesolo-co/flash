@@ -547,7 +547,6 @@ def test_lambda_capacity_refresh_keeps_the_allocated_card_count():
         monkey.setattr(lj, "usable_instances", fake_usable)
         handle = lj.launch_and_submit(
             spec,
-            seed=spec.seed,
             instances=[_inst("us-east-1")],
             source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=9_999_999_999.0,
@@ -599,7 +598,6 @@ def test_vast_capacity_refresh_keeps_the_allocated_card_count():
         monkey.setattr(vj, "usable_offers", fake_usable)
         handle = vj.deploy_and_submit(
             spec,
-            seed=spec.seed,
             offers=[_offer(1)],
             source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=9_999_999_999.0,
@@ -642,7 +640,6 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
             monkey.setattr(lambda_api, "launch_instance", lambda **_kw: "i-1")
             handle = lj.launch_and_submit(
                 spec,
-                seed=spec.seed,
                 instances=[inst],
                 source_snapshot=_SOURCE_SNAPSHOT,
                 deadline_at=9_999_999_999.0,
@@ -673,7 +670,6 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
             monkey.setattr(vast_api, "create_instance", lambda *_a, **_kw: 4242)
             handle = vj.deploy_and_submit(
                 spec,
-                seed=spec.seed,
                 offers=[offer],
                 source_snapshot=_SOURCE_SNAPSHOT,
                 deadline_at=9_999_999_999.0,

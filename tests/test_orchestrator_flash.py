@@ -39,11 +39,11 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
         captured = {}
 
-        def fake_submit(spec, seed, log=None, **kwargs):
+        def fake_submit(spec, log=None, **kwargs):
             from flash.snapshot.archive import TERMINAL_ATTESTATION_KEY, source_attestation
 
             captured["gpu"] = spec.gpu.type
-            captured["seed"] = seed
+            captured["seed"] = spec.seed
             captured["source_snapshot"] = kwargs["source_snapshot"]
             persisted = runner_status.get_status(spec.run_id)
             assert persisted.source_snapshot == SOURCE_SNAPSHOT
@@ -51,7 +51,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
             return {
                 "arm": "runpod",
                 "phase": spec.phase,
-                "seed": seed,
+                "seed": spec.seed,
                 "wall_seconds": 3600.0,
                 "trained_eval_acc": 0.7,
                 "base_eval_acc": 0.3,
