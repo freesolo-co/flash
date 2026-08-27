@@ -23,6 +23,7 @@ from flash.serve.deployment.deploy import chat_stream as serve_chat_stream
 from flash.serve.deployment.deploy import (
     deploy_adapter,
     deployment_record,
+    resolve_artifact_revision,
     undeploy_adapter,
 )
 from flash.serve.deployment.export import export_adapter
@@ -73,6 +74,7 @@ __all__ = [
     "list_checkpoints",
     "prepare_job",
     "recover_runs",
+    "resolve_artifact_revision",
     "run_server",
     "serve_chat",
     "serve_chat_sse",

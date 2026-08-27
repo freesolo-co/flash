@@ -92,10 +92,11 @@ def test_export_import_does_not_initialize_worker_package(tmp_path):
 def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_token(monkeypatch):
     calls: dict = {}
 
-    def fake_snapshot_download(*, repo_id, repo_type, allow_patterns, local_dir, token):
+    def fake_snapshot_download(*, repo_id, repo_type, revision, allow_patterns, local_dir, token):
         calls["download"] = {
             "repo_id": repo_id,
             "repo_type": repo_type,
+            "revision": revision,
             "allow_patterns": allow_patterns,
             "token": token,
         }
@@ -156,6 +157,7 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
     url = export_adapter(
         source_repo="org/test-runs",
         source_subfolder="rl/run-x/seed0/adapter",
+        source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
@@ -166,6 +168,7 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
     # Read the PRIVATE source dataset repo with the operator token, only the adapter subfolder.
     assert calls["download"]["repo_id"] == "org/test-runs"
     assert calls["download"]["repo_type"] == "dataset"
+    assert calls["download"]["revision"] == "a" * 40
     assert calls["download"]["allow_patterns"] == ["rl/run-x/seed0/adapter/*"]
     assert calls["download"]["token"] == "hf_operator"
     # Write the user's MODEL repo with the user's token; create it (private) if missing.
@@ -242,6 +245,7 @@ def test_export_adapter_normalizes_safetensors_keys_for_vanilla_peft(monkeypatch
     export_adapter(
         source_repo="org/test-runs",
         source_subfolder="rl/run-x/seed0/adapter",
+        source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
@@ -315,6 +319,7 @@ def test_export_adapter_key_collision_fails_the_export(monkeypatch):
         export_adapter(
             source_repo="org/test-runs",
             source_subfolder="rl/run-x/seed0/adapter",
+            source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
@@ -424,6 +429,7 @@ def test_export_adapter_with_vision_keys_leaves_safetensors_unchanged(monkeypatc
     export_adapter(
         source_repo="org/test-runs",
         source_subfolder="rl/run-x/seed0/adapter",
+        source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
@@ -525,6 +531,7 @@ def test_export_adapter_normalizes_sharded_safetensors_and_index(monkeypatch):
     export_adapter(
         source_repo="org/test-runs",
         source_subfolder="rl/run-x/seed0/adapter",
+        source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
@@ -684,6 +691,7 @@ def test_export_adapter_rewrites_temp_merged_base_model_metadata(monkeypatch):
     export_adapter(
         source_repo="org/test-runs",
         source_subfolder="rl/run-x/seed0/adapter",
+        source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         dest_repo="me/adapters",
         dest_token="hf_user",
         source_token="hf_operator",
@@ -792,6 +800,7 @@ def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeyp
     export_adapter(
         source_repo="org/test-runs",
         source_subfolder="rl/run-x/seed0/adapter",
+        source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
@@ -841,6 +850,7 @@ def test_export_public_visibility_is_deferred_until_after_upload(monkeypatch):
     export_adapter(
         source_repo="org/test-runs",
         source_subfolder="rl/run-x/seed0/adapter",
+        source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
@@ -886,6 +896,7 @@ def test_export_private_is_enforced_before_upload(monkeypatch):
     export_adapter(
         source_repo="org/test-runs",
         source_subfolder="rl/run-x/seed0/adapter",
+        source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
@@ -900,7 +911,7 @@ def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf_from_env")
     seen: dict = {}
 
-    def fake_snapshot_download(*, repo_id, repo_type, allow_patterns, local_dir, token):
+    def fake_snapshot_download(*, repo_id, repo_type, revision, allow_patterns, local_dir, token):
         seen["token"] = token
         adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
         adapter.mkdir(parents=True, exist_ok=True)
@@ -930,6 +941,7 @@ def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
     export_adapter(
         source_repo="org/test-runs",
         source_subfolder="rl/run-x/seed0/adapter",
+        source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
@@ -953,6 +965,7 @@ def test_export_adapter_raises_value_error_when_source_is_empty(monkeypatch):
         export_adapter(
             source_repo="org/test-runs",
             source_subfolder="rl/run-x/seed0/adapter",
+            source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
@@ -990,6 +1003,7 @@ def test_export_rejects_source_with_config_but_no_adapter_weight(monkeypatch):
         export_adapter(
             source_repo="org/test-runs",
             source_subfolder="rl/run-x/seed0/adapter",
+            source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
@@ -1208,6 +1222,7 @@ def test_export_refuses_rank_mismatch_before_touching_the_destination_repo(monke
         export_adapter(
             source_repo="org/test-runs",
             source_subfolder="sft/run-x/adapter",
+            source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
@@ -1407,6 +1422,7 @@ def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
         export_adapter(
             source_repo="org/test-runs",
             source_subfolder="rl/run-x/seed0/adapter",
+            source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
@@ -1433,6 +1449,7 @@ def test_export_adapter_wraps_hub_download_oserror_in_serving_error(monkeypatch)
         export_adapter(
             source_repo="org/test-runs",
             source_subfolder="rl/run-x/seed0/adapter",
+            source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
@@ -1459,6 +1476,7 @@ def test_export_adapter_propagates_local_download_oserror(monkeypatch):
         export_adapter(
             source_repo="org/test-runs",
             source_subfolder="rl/run-x/seed0/adapter",
+            source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
@@ -1494,6 +1512,7 @@ def test_export_adapter_wraps_hub_create_repo_oserror_in_serving_error(monkeypat
         export_adapter(
             source_repo="org/test-runs",
             source_subfolder="rl/run-x/seed0/adapter",
+            source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
@@ -1570,6 +1589,7 @@ def test_export_missing_operator_token_raises_runtime_error_not_serving_error(mo
         export.export_adapter(
             source_repo="op/ds",
             source_subfolder="runs/r/adapter",
+            source_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             dest_repo="me/out",
             dest_token="hf_dest",
             base_model=BASE_MODEL,
@@ -1577,3 +1597,101 @@ def test_export_missing_operator_token_raises_runtime_error_not_serving_error(mo
         )
     assert not isinstance(ei.value, ServingError)  # NOT the 502 path
     assert "HF_TOKEN" in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    "revision",
+    [
+        "main",
+        "",
+        "a" * 39,
+        "a" * 41,
+        "g" * 40,
+        "refs/pr/1",
+        None,
+        b"a" * 40,
+    ],
+)
+def test_export_rejects_a_source_revision_that_is_not_an_exact_commit(monkeypatch, revision):
+    """A movable ref must never reach the Hub read.
+
+    The source is a mutable dataset branch that the training run keeps writing to. Downloading its
+    tip means the exported bytes are whatever the last checkpoint upload happened to leave there,
+    while the returned URL still claims to be the checkpoint the caller asked for. Rejecting before
+    ``snapshot_download`` is what makes that unrepresentable rather than merely unlikely.
+    """
+    from flash.serve.contract.errors import ServingError
+    from flash.serve.deployment import export
+
+    def refuse(**kwargs):  # pragma: no cover - reaching this IS the failure
+        raise AssertionError(f"snapshot_download must not run for revision {revision!r}")
+
+    _install_fake_hub(monkeypatch, download=refuse, hf_api=object)
+    monkeypatch.setenv("HF_TOKEN", "hf_operator")
+
+    with pytest.raises(RuntimeError) as ei:
+        export.export_adapter(
+            source_repo="org/test-runs",
+            source_subfolder="rl/run-x/seed0/adapter",
+            source_revision=revision,
+            dest_repo="me/adapters",
+            dest_token="hf_user",
+            base_model=BASE_MODEL,
+        )
+    # a caller mistake, not a Hub outage: this must not become the 502 provider-failure path.
+    assert not isinstance(ei.value, ServingError)
+    assert "source_revision" in str(ei.value)
+
+
+def test_export_downloads_the_exact_pinned_commit_case_normalized(monkeypatch):
+    """The resolved commit reaches ``snapshot_download`` verbatim, lowercased.
+
+    Hub commit ids are hex and compare case-insensitively, but the recorded provenance should have
+    one spelling so a later audit can match it against the deployment record by equality.
+    """
+    seen: dict = {}
+
+    def fake_snapshot_download(*, repo_id, repo_type, revision, allow_patterns, local_dir, token):
+        seen["revision"] = revision
+        adapter = Path(local_dir) / "rl/run-x/seed0/adapter"
+        adapter.mkdir(parents=True, exist_ok=True)
+        (adapter / "adapter_config.json").write_text(_PLAIN_CONFIG)
+        (adapter / "adapter_model.safetensors").write_bytes(_PLAIN_WEIGHTS)
+        return str(local_dir)
+
+    class FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kw):
+            pass
+
+        def list_repo_files(self, **kw):
+            return []
+
+        def update_repo_settings(self, **kw):
+            pass
+
+        def repo_info(self, **kw):
+            return types.SimpleNamespace(sha="parent-sha")
+
+        def upload_folder(self, *, commit_message, **kw):
+            seen["commit_message"] = commit_message
+
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+
+    from flash.serve.deployment.export import export_adapter
+
+    export_adapter(
+        source_repo="org/test-runs",
+        source_subfolder="rl/run-x/seed0/adapter",
+        source_revision="A1B2C3D4" + "e" * 32,
+        dest_repo="me/adapters",
+        dest_token="hf_user",
+        base_model=BASE_MODEL,
+        source_token="hf_operator",
+    )
+
+    assert seen["revision"] == "a1b2c3d4" + "e" * 32
+    # the destination commit records which source commit produced it.
+    assert "a1b2c3d4" + "e" * 32 in seen["commit_message"]
