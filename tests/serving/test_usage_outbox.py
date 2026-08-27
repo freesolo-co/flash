@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import re
@@ -1197,6 +1198,172 @@ def test_non_object_settlement_response_is_quarantined_and_releases_lease(
     assert quarantine_url.endswith("/rpc/quarantine_serving_usage")
     assert quarantine["p_reason"] == "invalid_settlement_response"
     assert outbox._active_leases == set()
+
+
+class _PermanentlyFailingRpcClient:
+    """One rpc fails identically on every call, which is what a permanent fault actually looks like.
+
+    A revoked service-role key or a drifted rpc contract does not present as a single bad response.
+    It presents as this: the same failure every round, forever. No single attempt can be told apart
+    from a transient blip, so the number of rounds that have failed in a row is the only evidence
+    the delivery loop has.
+    """
+
+    def __init__(self, failing_rpc: str, *, status_code: int = 401) -> None:
+        self._failing_rpc = failing_rpc
+        self._status_code = status_code
+        self.failures = 0
+
+    async def post(
+        self, url: str, *, headers: dict[str, str] | None = None, json: Any = None
+    ) -> httpx.Response:
+        del headers, json
+        request = httpx.Request("POST", url)
+        if url.endswith(f"/{self._failing_rpc}"):
+            self.failures += 1
+            return httpx.Response(
+                self._status_code, json={"message": "permission denied"}, request=request
+            )
+        return httpx.Response(200, json=[], request=request)
+
+
+class _IntermittentlyFailingRpcClient:
+    """One rpc fails in short bursts and then recovers, which is what a blip actually looks like."""
+
+    def __init__(self, failing_rpc: str, *, run_length: int) -> None:
+        self._failing_rpc = failing_rpc
+        self._run_length = run_length
+        self.rounds = 0
+
+    async def post(
+        self, url: str, *, headers: dict[str, str] | None = None, json: Any = None
+    ) -> httpx.Response:
+        del headers, json
+        request = httpx.Request("POST", url)
+        if not url.endswith(f"/{self._failing_rpc}"):
+            return httpx.Response(200, json=[], request=request)
+        self.rounds += 1
+        # every run of failures is broken by one success before it can reach the bound.
+        if self.rounds % self._run_length == 0:
+            return httpx.Response(200, json=[], request=request)
+        return httpx.Response(503, json={"message": "unavailable"}, request=request)
+
+
+def _delivery_outbox(client: Any) -> DurableUsageOutbox:
+    return DurableUsageOutbox(
+        _outbox_settings(),
+        client=client,
+        worker_id="worker-1",
+        sleep=_no_sleep,
+        poll_seconds=0.001,
+    )
+
+
+async def _cancel_workers(outbox: DurableUsageOutbox) -> None:
+    for name in ("_worker", "_heartbeat_worker"):
+        task = getattr(outbox, name)
+        if task is None:
+            continue
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        setattr(outbox, name, None)
+
+
+def test_permanently_failing_delivery_stops_instead_of_retrying_forever() -> None:
+    """The delivery worker caught every exception and slept, with no bound and no record. A revoked
+    key or a drifted rpc contract therefore spun the loop for the lifetime of the deployment: usage
+    was never delivered, and nothing anywhere said so."""
+    import flash.serving.src.accounting.usage_outbox as usage_outbox_module
+
+    client = _PermanentlyFailingRpcClient("claim_serving_usage_batch")
+    outbox = _delivery_outbox(client)
+
+    async def run() -> None:
+        await outbox.start()
+        await asyncio.wait_for(outbox._worker, timeout=10)
+
+    asyncio.run(run())
+
+    assert client.failures == usage_outbox_module._MAX_CONSECUTIVE_DELIVERY_FAILURES
+    assert outbox._background_error is not None, "a worker that gives up must record why"
+    assert outbox._stopping.is_set(), "a dead delivery worker must stop the outbox, not linger"
+
+
+def test_a_dead_delivery_worker_is_reported_to_the_request_path() -> None:
+    """Recording the failure is not the same as surfacing it. `capture` is the request path's only
+    chance to learn the outbox is broken before it accepts more billable work."""
+    outbox = _delivery_outbox(_PermanentlyFailingRpcClient("claim_serving_usage_batch"))
+
+    async def run() -> None:
+        await outbox.start()
+        await asyncio.wait_for(outbox._worker, timeout=10)
+        with pytest.raises(UsageOutboxError, match="usage_outbox_background_failure"):
+            await outbox.capture(_usage_event())
+
+    asyncio.run(run())
+
+
+def test_a_dead_delivery_worker_fails_shutdown_rather_than_closing_clean() -> None:
+    """A clean `aclose()` asserts that this deployment settled its usage. It must not assert that
+    when the delivery worker died undelivered."""
+    outbox = _delivery_outbox(_PermanentlyFailingRpcClient("claim_serving_usage_batch"))
+
+    async def run() -> None:
+        await outbox.start()
+        await asyncio.wait_for(outbox._worker, timeout=10)
+        with pytest.raises(UsageOutboxError, match="usage_outbox_shutdown_failed"):
+            await outbox.aclose()
+
+    asyncio.run(run())
+
+
+def test_intermittent_delivery_failures_do_not_accumulate_toward_the_bound() -> None:
+    """The bound counts CONSECUTIVE failures for a reason. A deployment that fails one round every
+    few minutes for a week is healthy, and a bound on total failures would eventually kill it. Only
+    an unbroken run of failures is evidence of a permanent fault."""
+    import flash.serving.src.accounting.usage_outbox as usage_outbox_module
+
+    limit = usage_outbox_module._MAX_CONSECUTIVE_DELIVERY_FAILURES
+    client = _IntermittentlyFailingRpcClient("claim_serving_usage_batch", run_length=limit)
+    outbox = _delivery_outbox(client)
+
+    async def run() -> None:
+        await outbox.start()
+        while client.rounds <= limit * 3:
+            assert not outbox._worker.done(), "an interrupted run of failures is not permanent"
+            await asyncio.sleep(0)
+        assert outbox._background_error is None
+        assert not outbox._stopping.is_set()
+        await _cancel_workers(outbox)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+
+
+def test_a_dying_heartbeat_worker_still_wakes_the_delivery_worker() -> None:
+    """Both workers now stop through one path, so that path has to keep doing what each side needs:
+    a failure must wake the delivery loop out of its poll wait, or the outbox stays alive for a full
+    poll interval after it has already failed."""
+    outbox = _delivery_outbox(_QueuedClient([]))
+    outbox._wake.clear()
+    outbox._heartbeat_wake.clear()
+
+    outbox._fail_background(UsageOutboxError("supabase_rpc_401"))
+
+    assert outbox._wake.is_set(), "the delivery worker must not sleep through a failed outbox"
+    assert outbox._heartbeat_wake.is_set()
+    assert outbox._stopping.is_set()
+
+
+def test_the_first_background_failure_is_the_one_reported() -> None:
+    """Later failures are consequences of the first. Reporting the last one would name a symptom."""
+    outbox = _delivery_outbox(_QueuedClient([]))
+    first = UsageOutboxError("supabase_rpc_401")
+
+    outbox._fail_background(first)
+    outbox._fail_background(UsageOutboxError("supabase_transport_failure"))
+
+    assert outbox._background_error is first
 
 
 def test_startup_claim_recovers_expired_lease_and_delivers() -> None:
