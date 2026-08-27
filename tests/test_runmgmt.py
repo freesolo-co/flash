@@ -3466,6 +3466,107 @@ def test_handleless_stale_claim_is_reclaimed_without_poll_error(monkeypatch, tmp
     assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 1
 
 
+def _opd_recovery_spec(run_id: str):
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+
+    return JobSpec(
+        run_id=run_id,
+        model="Qwen/Qwen3.5-9B",
+        algorithm="opd",
+        seed=42,
+        train=TrainSpec(hf_repo="private/runs", max_examples=1, epochs=1),
+        gpu=GpuSpec(type="RTX 4090", max_retries=3),
+    )
+
+
+def _save_opd_recovery_status(spec):
+    from flash.teacher.retry_contract import OPD_RETRY_CONTRACT_VERSION
+
+    status = provisioned_status(spec, state="provisioning")
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status, _opd_retry_contract_version=OPD_RETRY_CONTRACT_VERSION)
+
+
+def test_reclaimed_opd_attempt_reverifies_its_resume_evidence(monkeypatch, tmp_path):
+    """Reclaiming a stale opd claim must re-read the hub, not trust the claim's own copy.
+
+    The claim pinned its resume evidence before its worker launched. That worker can then cross
+    `optimizer.step()` and upload a mutation marker before provider cleanup finds and terminates it,
+    so relaunching on the claim's pre-launch evidence resumes from a checkpoint that predates the
+    lost attempt, or from step zero, despite newer mutation evidence on the hub.
+    """
+    import flash.server.platform.runtime as runtime
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _opd_recovery_spec("opd-reclaim-reverifies")
+    _save_opd_recovery_status(spec)
+
+    # attempt 0 reserves before anything mutated, so its claim pins no resume evidence.
+    monkeypatch.setattr(runner_attempts, "_verified_opd_retry_state", lambda _run_id: (0, None, None))
+    original = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert original is not None
+    assert original.resume_revision is None
+    runner_attempts.release_launch_claim(spec.run_id, original)
+
+    # that worker mutated the checkpoint before it was lost: verification now pins a revision.
+    monkeypatch.setattr(
+        runner_attempts,
+        "_verified_opd_retry_state",
+        lambda _run_id: (1, "rev-after-mutation", 4),
+    )
+    started = _fake_recovery_thread(monkeypatch, runtime)
+
+    assert runtime._start_handleless_resubmit(spec, "provisioning") is True
+
+    replacement = started[0][2]
+    assert replacement.attempt == original.attempt == 0
+    assert replacement.token != original.token
+    assert replacement.resume_revision == "rev-after-mutation"
+    assert replacement.resume_world_size == 4
+
+
+def test_handleless_opd_reservation_rejects_evidence_from_an_older_counter(monkeypatch, tmp_path):
+    """opd verification reaches the hub outside the status lock.
+
+    A concurrent observer can reserve and settle an attempt while that external call runs. The
+    reservation must reject evidence verified against the older counter rather than resuming from a
+    checkpoint that excludes the intervening attempt's mutation marker.
+    """
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _opd_recovery_spec("opd-stale-counter")
+    _save_opd_recovery_status(spec)
+    monkeypatch.setattr(runner_attempts, "_verified_opd_retry_state", lambda _run_id: (0, None, None))
+    original = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert original is not None
+    runner_attempts.release_launch_claim(spec.run_id, original)
+
+    # evidence verified against counter 0 while the durable counter has already moved to 1.
+    stale = runner_attempts.reserve_handleless_recovery_launch(
+        spec.run_id,
+        expected_state="provisioning",
+        provider_clear_confirmed=True,
+        expected_stale_claim=original,
+        expected_next_attempt=0,
+        resume_revision="rev-too-old",
+        resume_world_size=4,
+    )
+    assert stale.claim is None
+
+    # the same call carrying the current counter is authorized.
+    current = runner_attempts.reserve_handleless_recovery_launch(
+        spec.run_id,
+        expected_state="provisioning",
+        provider_clear_confirmed=True,
+        expected_stale_claim=original,
+        expected_next_attempt=1,
+        resume_revision="rev-current",
+        resume_world_size=4,
+    )
+    assert current.claim is not None
+    assert current.claim.resume_revision == "rev-current"
+    runner_attempts.release_launch_claim(spec.run_id, current.claim)
+
+
 def test_successful_supervision_settles_the_terminal_remote(monkeypatch, tmp_path):
     """A successful run must tear the provider handle down and clear the remote.
 
