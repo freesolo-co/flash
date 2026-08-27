@@ -150,47 +150,28 @@ def _append_run_log(run_id: str, message: str) -> None:
 _DEFERRED_RECOVERY_RETRY_S = 120.0
 
 
-def _confirm_run_clear(spec) -> bool:
-    """Force-reap this run's label and confirm no instance remains.
-
-    ``gc`` alone cannot prove Vast teardown. Providers with ``run_instances_remaining`` must return
-    ``[]``; a live instance or enumeration failure blocks resubmit. A provider recorded in
-    ``submitted_instance_providers`` also blocks when it is now unconfigurable, because a lost
-    non-idempotent create such as Vast ``PUT /asks`` may still be billing without a handle.
-    """
+def _confirm_recorded_run_clear(run_id: str, recorded: set[str] | None, *, spec=None) -> bool:
+    """Confirm provider absence using only durable provider names and the authoritative run id."""
     from flash.providers.core.registry import INSTANCE_PROVIDERS, configured_providers, get_provider
 
-    try:
-        recorded_raw = getattr(get_status(spec.run_id), "submitted_instance_providers", None)
-    except Exception:
-        # Can't read the durable record of providers available at submit -> can't rule out a recorded
-        # Vast phantom that this restart can no longer enumerate -> fail CLOSED.
-        return False
-    recorded = {str(name) for name in recorded_raw} if recorded_raw is not None else None
-    configured = {getattr(p, "name", None): p for p in configured_providers()}
+    configured = {getattr(provider, "name", None): provider for provider in configured_providers()}
     clear = True
-    for name, prov in configured.items():
+    for name, provider in configured.items():
         if name not in INSTANCE_PROVIDERS:
             continue
         if recorded is not None and name not in recorded:
             continue
-        with contextlib.suppress(Exception):
-            prov.gc(spec)
-        check = getattr(prov, "run_instances_remaining", None)
+        if spec is not None:
+            with contextlib.suppress(Exception):
+                provider.gc(spec)
+        check = getattr(provider, "run_instances_remaining", None)
         if check is None:
-            continue  # provider exposes no confirmation -> preserve best-effort resubmit
+            continue
         try:
-            if check(spec.run_id):
-                clear = False  # an instance for this run is still present
+            if check(run_id):
+                clear = False
         except Exception:
-            clear = False  # couldn't list -> can't prove clear -> don't race
-    # An instance provider that WAS available at submit (so it could have taken the lost create) but
-    # is NOT configurable now and owns the standing-instance capability can't be enumerated -> can't
-    # prove clear -> fail closed. Already-configured providers were handled above. CRITICAL: do NOT
-    # wrap this in a broad ``suppress(Exception)`` — an error loading the status, resolving a
-    # recorded provider, or reading the capability would otherwise be swallowed and leave ``clear``
-    # True, defeating the fail-closed intent. Every failure inspecting the recorded set must instead
-    # make the guard CONSERVATIVE (block/defer the resubmit).
+            clear = False
     for name in recorded or []:
         if name in configured or name not in INSTANCE_PROVIDERS:
             continue
@@ -199,12 +180,20 @@ def _confirm_run_clear(spec) -> bool:
                 getattr(get_provider(name), "run_instances_remaining", None) is not None
             )
         except Exception:
-            # Can't even resolve a RECORDED instance provider -> assume it could own a phantom -> fail
-            # closed rather than declare clear.
             has_capability = True
         if has_capability:
             clear = False
     return clear
+
+
+def _confirm_run_clear(spec) -> bool:
+    """Force-reap this run's label and confirm no instance remains."""
+    try:
+        recorded_raw = getattr(get_status(spec.run_id), "submitted_instance_providers", None)
+    except Exception:
+        return False
+    recorded = {str(name) for name in recorded_raw} if recorded_raw is not None else None
+    return _confirm_recorded_run_clear(spec.run_id, recorded, spec=spec)
 
 
 def _recovery_block_reason(spec) -> str | None:
@@ -596,6 +585,47 @@ def _drain_cleanup_remotes_bg(run_id: str) -> None:
         _drain_cleanup_remotes(run_id)
 
 
+def _terminalize_unrecoverable_secretful_dispatch(status, claim: dict | None) -> bool:
+    """Fail a dispatched secretful run only after provider cleanup is confirmed."""
+    if (
+        claim is None
+        or claim["phase"] != "bound"
+        or not claim["had_runtime_secrets"]
+        or status.remote
+    ):
+        return False
+
+    from flash.runner.lifecycle.status import _update
+
+    try:
+        spec = JobSpec.from_dict({**status.spec, "run_id": status.run_id})
+        clear = _confirm_run_clear(spec)
+    except Exception:
+        clear = False
+    if clear is not True:
+        _log.warning(
+            "could not confirm provider cleanup for dispatched secretful submission %s; "
+            "recovery remains blocked",
+            status.run_id,
+        )
+        return True
+    try:
+        _update(
+            status.run_id,
+            "failed",
+            error=(
+                "control plane restarted after runtime-secret dispatch without a durable worker "
+                "handle; the run was stopped because its secrets cannot be restored"
+            ),
+        )
+    except Exception:
+        _log.warning(
+            "could not terminalize dispatched secretful submission %s; recovery remains blocked",
+            status.run_id,
+        )
+    return True
+
+
 def _classify_recoverable_runs(
     active: set[str], known: set[str], resubmit: list[tuple[JobSpec, str]]
 ) -> None:
@@ -616,9 +646,20 @@ def _classify_recoverable_runs(
     from flash.runner.supervise.recovery import _gc_run_endpoints
 
     for row in db.all_runs():
-        known.add(row["run_id"])
+        run_id = row["run_id"]
+        claim = db.run_submission_claim_for_run(run_id)
+        if claim is not None and claim["phase"] == "claimed" and claim["had_runtime_secrets"]:
+            try:
+                db.dispose_run_submission(run_id, reason="runtime_secrets_unrecoverable")
+            except Exception:
+                _log.warning(
+                    "could not dispose unrecoverable secretful submission %s; recovery remains blocked",
+                    run_id,
+                )
+            continue
+        known.add(run_id)
         try:
-            status = get_status(row["run_id"])
+            status = get_status(run_id)
         except FileNotFoundError:
             continue
         # drain cleanup remotes in the background. provider outages can block each teardown through
@@ -628,6 +669,11 @@ def _classify_recoverable_runs(
             target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
         ).start()
         if status.state not in _RECOVERABLE:
+            continue
+        # the durable handoff allowed a supervisor to start, but request-only secrets do not survive
+        # restart. never resubmit the run secretless when no durable worker handle was persisted.
+        # this decides the run terminally, so it runs before the reattach shield below.
+        if _terminalize_unrecoverable_secretful_dispatch(status, claim):
             continue
         if status.remote is None and status.cleanup_confirmed_remote is not None:
             active.add(status.run_id)

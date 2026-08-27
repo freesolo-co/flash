@@ -13,12 +13,14 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core import catalog
 from flash.core.spec import TRAINER_BACKEND, JobSpec
 from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
+from flash.engine.plan.prompt_budget import PromptBudget
 from flash.providers._lifecycle.net import worker as provider_worker
 from flash.runner.accounting import artifacts, weight_cache
 from flash.runner.lifecycle import preparation, reporting, state
@@ -41,7 +43,7 @@ class PreparedJob:
     worker_spec: JobSpec
     estimated_cost_usd: float
     adapter_identity: dict | None = None
-    prompt_budget: object | None = None
+    prompt_budget: PromptBudget | None = None
 
 
 def _with_model_disk(spec: JobSpec, info) -> dict:
@@ -268,6 +270,7 @@ def submit_job(
     platform_context: dict | None = None,
     owner_key_id: int | None = None,
     prepared_job: PreparedJob | None = None,
+    status_persisted_fence: Callable[[], None] | None = None,
 ) -> state.RunStatus:
     """Submit a prepared job, allocating resources only outside dry-run mode."""
     if prepared_job is not None:
@@ -333,13 +336,18 @@ def submit_job(
         ),
     }
     state._save_status(status, **save_kwargs)
+    if not dry_run and status_persisted_fence is not None:
+        # the caller's durable handoff must land after the authoritative status but before any
+        # supervisor can allocate provider resources. a failed fence therefore starts no paid work.
+        status_persisted_fence()
     reporting._report_status(status)
     if dry_run:
-        # A dry-run persists a state=dry_run record (retrievable, listable, and stageable for a
-        # deploy dry-run) — same contract as a real submit minus GPU allocation, provisioning, and
-        # billing. Everything above already validated the spec; just flip the state and return.
+        # a dry-run persists a state=dry_run record (retrievable, listable, and stageable for a
+        # deploy dry-run), so bind it only after that authoritative terminal preview is durable.
         status.state = "dry_run"
         state._save_status(status)
+        if status_persisted_fence is not None:
+            status_persisted_fence()
         reporting._report_status(status)
         return status
     if background:
@@ -348,7 +356,9 @@ def submit_job(
             args=(worker_spec, runtime_secrets or {}),
             daemon=True,
         ).start()
-        return status_ops.get_status(public_spec.run_id)
+        # no fallible work belongs after thread start: a raised status read here would make the route
+        # report submission failure while the paid supervisor was already running.
+        return status
     if runtime_secrets:
         supervision._run_job(worker_spec, runtime_secrets=runtime_secrets)
     else:

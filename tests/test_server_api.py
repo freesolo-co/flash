@@ -7,12 +7,16 @@ distinct token resolves to its own run-ownership identity via ``db.ensure_extern
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import itertools
 import json
+import logging
 import os
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -103,6 +107,7 @@ SPEC = {
 # token with this prefix, so each distinct one is a distinct authenticated user.
 _USER_PREFIX = "fslo-user-"
 _counter = itertools.count()
+_idempotency_counter = itertools.count()
 
 
 def _bearer(key: str) -> dict:
@@ -213,6 +218,18 @@ def api(tmp_path, monkeypatch):
         # submit-time environment pinning call the real GitHub API with `ghp-test`; tokenless planes
         # deliberately defer that work to the worker. tests that exercise a token set their own.
         monkeypatch.delenv("GITHUB_TOKEN")
+        real_post = client.post
+
+        def post(url, *args, **kwargs):
+            if url == "/v1/runs":
+                headers = dict(kwargs.get("headers") or {})
+                headers.setdefault(
+                    "Idempotency-Key", f"test-run-key-{next(_idempotency_counter):08d}"
+                )
+                kwargs["headers"] = headers
+            return real_post(url, *args, **kwargs)
+
+        monkeypatch.setattr(client, "post", post)
         yield client
 
 
@@ -240,7 +257,9 @@ def test_project_validation_blocks_before_run_preparation(api, monkeypatch) -> N
     from fastapi import HTTPException
 
     import flash.server.domain.registry.projects as projects_mod
+    import flash.server.platform.auth as auth_mod
     import flash.server.routes.runs as runs_route
+    from flash.server.platform import db
 
     monkeypatch.setattr(
         projects_mod,
@@ -254,13 +273,18 @@ def test_project_validation_blocks_before_run_preparation(api, monkeypatch) -> N
         "prepare_job",
         lambda *_args, **_kwargs: pytest.fail("project validation must run before preparation"),
     )
+    token = _login()
+    idempotency_key = "project-denial-cleanup-key"
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_idempotent_headers(token, idempotency_key),
         json={"spec": SPEC},
     )
     assert response.status_code == 403
     assert response.json()["detail"] == "project denied"
+    owner = auth_mod.authenticate(f"Bearer {token}")
+    assert db.run_submission_claim(owner["id"], idempotency_key) is None
+    assert db.runs_for_key(owner["id"]) == []
 
 
 def test_environment_project_validation_blocks_before_run_preparation(api, monkeypatch) -> None:
@@ -1492,6 +1516,40 @@ def test_create_run_redacts_internal_warmstart_preparation_error(api, monkeypatc
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
+def test_create_run_warmstart_log_omits_secret_exception_traceback(api, monkeypatch, caplog):
+    import flash.server.asgi.app as app_mod
+
+    secret = "request-only-warmstart-secret-42"
+
+    def failing_prepare(*_args, **_kwargs):
+        raise runner_preparation.WarmStartPreparationError(
+            f"private adapter lookup used credential {secret}"
+        )
+
+    monkeypatch.setattr(app_mod, "prepare_job", failing_prepare)
+    spec = {
+        **SPEC,
+        "train": {**SPEC["train"], "init_from_adapter": "source-run/step-20"},
+    }
+
+    with caplog.at_level(logging.WARNING, logger="flash.server.runs"):
+        response = api.post(
+            "/v1/runs",
+            headers=_bearer("fslo-internal-test"),
+            json={"spec": spec, "runtime_secrets": {"WANDB_API_KEY": secret}},
+        )
+
+    assert response.status_code == 400, response.text
+    assert secret not in response.text
+    assert secret not in caplog.text
+    records = [
+        record for record in caplog.records if "warm-start preparation failed" in record.message
+    ]
+    assert len(records) == 1
+    assert "WarmStartPreparationError" in records[0].message
+    assert records[0].exc_info is None
+
+
 def test_sft_missing_dataset_is_a_400_with_packaging_remediation(api, monkeypatch):
     import flash.server.asgi.app as app_mod
 
@@ -1561,12 +1619,14 @@ def test_create_run_keeps_ownership_when_submit_fails_after_persisting_status(ap
 
     submitted = []
 
-    def submit(spec, **_kwargs):
+    def submit(spec, **kwargs):
         submitted.append(spec.run_id)
-        # mirror the real ordering: status lands first, the rest of the launch can still blow up.
+        # mirror the real ordering: status lands, then the durable dispatch fence, and only then can
+        # the rest of the launch blow up.
         runner_state._save_status(
             runner_state.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
         )
+        kwargs["status_persisted_fence"]()
         raise RuntimeError("provisioning died after status was written")
 
     monkeypatch.setattr(app_mod, "submit_job", submit)
@@ -1613,14 +1673,16 @@ def test_create_run_deletes_the_row_when_submit_fails_before_persisting_status(a
     assert api.get("/v1/runs", headers=_bearer(key)).json()["runs"] == []
 
 
-def _persist_queued_then_raise(app_mod, monkeypatch, submitted):
-    """Monkeypatch submit_job to mirror its real failure ordering: status lands, then it dies."""
+def _persist_queued_then_raise(app_mod, monkeypatch, submitted, *, bind: bool = False):
+    """Mirror a crash after status persistence, optionally after the dispatch fence."""
 
-    def submit(spec, **_kwargs):
+    def submit(spec, **kwargs):
         submitted.append(spec.run_id)
         runner_state._save_status(
             runner_state.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
         )
+        if bind:
+            kwargs["status_persisted_fence"]()
         raise RuntimeError("provisioning died after status was written")
 
     monkeypatch.setattr(app_mod, "submit_job", submit)
@@ -1635,6 +1697,28 @@ def _classified_resubmits() -> list[str]:
     resubmit: list = []
     runtime._classify_recoverable_runs(active, known, resubmit)
     return [spec.run_id for spec, _state in resubmit]
+
+
+@contextlib.contextmanager
+def _captured_http_exceptions(api):
+    """Capture the exact HTTPException consumed by the live endpoint middleware."""
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    middleware = api.app.middleware_stack
+    while not hasattr(middleware, "_exception_handlers"):
+        middleware = middleware.app
+    original_handler = middleware._exception_handlers[StarletteHTTPException]
+    captured = []
+
+    async def capture(request, exc):
+        captured.append(exc)
+        return await original_handler(request, exc)
+
+    middleware._exception_handlers[StarletteHTTPException] = capture
+    try:
+        yield captured
+    finally:
+        middleware._exception_handlers[StarletteHTTPException] = original_handler
 
 
 def test_create_run_dry_run_failure_leaves_no_recoverable_run(api, monkeypatch):
@@ -1674,7 +1758,7 @@ def test_create_run_retained_secretful_run_fails_instead_of_recovering(api, monk
     from flash.server.platform import db
 
     submitted: list[str] = []
-    _persist_queued_then_raise(app_mod, monkeypatch, submitted)
+    _persist_queued_then_raise(app_mod, monkeypatch, submitted, bind=True)
 
     key = _login()
     resp = api.post(
@@ -1694,38 +1778,198 @@ def test_create_run_retained_secretful_run_fails_instead_of_recovering(api, monk
     assert run_id not in _classified_resubmits()
 
 
-def test_create_run_secretful_run_dropped_when_terminalization_fails(api, monkeypatch):
-    """If the compensating terminal write RAISES, the ownership row must go.
+@pytest.mark.parametrize(
+    ("failure_type", "expected_status"),
+    [(RuntimeError, 400), (runner_submit.SourceSnapshotPublicationError, 503)],
+)
+def test_create_run_redacts_runtime_secret_from_submission_errors_and_logs(
+    api, monkeypatch, caplog, failure_type, expected_status
+):
+    import flash.server.asgi.app as app_mod
 
-    that `_update` is the only thing keeping startup recovery away from a queued run whose
-    secrets were never dispatched. a full or read-only status store makes it raise, and
-    swallowing that would leave the run both recoverable and secretless. an orphaned 404 is the
-    lesser harm, so the row is dropped instead.
-    """
+    secret = "request-only-provider-secret-42"
+
+    def failing_submit(spec, **kwargs):
+        assert kwargs["runtime_secrets"] == {"WANDB_API_KEY": secret}
+        runner_state._save_status(
+            runner_state.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+        )
+        raise failure_type(f"provider rejected supplied credential {secret}")
+
+    def failing_terminalization(*_args, **_kwargs):
+        raise OSError(f"status store rejected credential {secret}")
+
+    monkeypatch.setattr(app_mod, "submit_job", failing_submit)
+    monkeypatch.setattr(runner_status, "_update", failing_terminalization)
+    with caplog.at_level(logging.WARNING):
+        response = api.post(
+            "/v1/runs",
+            headers=_idempotent_headers(_login(), f"secret-error-{expected_status}-key"),
+            json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": secret}},
+        )
+
+    assert response.status_code == expected_status, response.text
+    assert response.json()["detail"] == "submission failed"
+    assert secret not in response.text
+    assert secret not in caplog.text
+
+
+def test_create_run_sanitizes_downstream_http_exception_without_chaining(api, monkeypatch):
+    from fastapi import HTTPException
+
+    import flash.server.domain.registry.projects as projects_mod
+
+    first_secret = "request-only-header-secret-42"
+    second_secret = "request-only-header-name-43"
+    downstream = HTTPException(
+        status_code=429,
+        detail={
+            "code": "provider_throttled",
+            "message": f"credential {first_secret} was rejected",
+            "retryable": True,
+        },
+        headers={
+            "Retry-After": "17",
+            "X-Provider-Class": "capacity",
+            "X-Secret-Value": f"Bearer {first_secret}",
+            f"X-{second_secret}": "secret-bearing-name",
+        },
+    )
+
+    def reject_project(**_kwargs):
+        raise downstream
+
+    monkeypatch.setattr(projects_mod, "require_project_access", reject_project)
+    with _captured_http_exceptions(api) as captured:
+        response = api.post(
+            "/v1/runs",
+            headers=_idempotent_headers(_login(), "secret-http-error-key"),
+            json={
+                "spec": {
+                    **SPEC,
+                    "environment": {
+                        **SPEC["environment"],
+                        "secrets": ["SERPAPI_API_KEY"],
+                    },
+                },
+                "runtime_secrets": {
+                    "WANDB_API_KEY": first_secret,
+                    "SERPAPI_API_KEY": second_secret,
+                },
+            },
+        )
+
+    assert response.status_code == 429, response.text
+    assert response.json()["detail"] == {
+        "code": "provider_throttled",
+        "message": "submission failed",
+        "retryable": True,
+    }
+    assert response.headers["Retry-After"] == "17"
+    assert response.headers["X-Provider-Class"] == "capacity"
+    assert "X-Secret-Value" not in response.headers
+    assert f"X-{second_secret}" not in response.headers
+    assert first_secret not in response.text
+    assert second_secret not in response.text
+    assert len(captured) == 1
+    client_error = captured[0]
+    assert client_error is not downstream
+    assert client_error.__context__ is None
+    assert client_error.__cause__ is None
+    assert client_error.status_code == 429
+    assert client_error.detail == response.json()["detail"]
+    assert client_error.headers == {
+        "Retry-After": "17",
+        "X-Provider-Class": "capacity",
+    }
+
+
+def test_create_run_sanitizes_claim_failure_without_chaining(api, monkeypatch):
+    from flash.server.platform import db
+
+    secret = "request-only-claim-secret-42"
+    original = RuntimeError(f"database rejected credential {secret}")
+
+    def reject_claim(**_kwargs):
+        raise original
+
+    monkeypatch.setattr(db, "claim_run_submission", reject_claim)
+    with _captured_http_exceptions(api) as captured:
+        response = api.post(
+            "/v1/runs",
+            headers=_idempotent_headers(_login(), "secret-claim-error-key"),
+            json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": secret}},
+        )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "submission failed"
+    assert secret not in response.text
+    assert len(captured) == 1
+    client_error = captured[0]
+    assert client_error.__context__ is None
+    assert client_error.__cause__ is None
+    assert client_error is not original
+
+
+def test_create_run_preserves_nonsecret_submission_failure_detail(api, monkeypatch):
+    import flash.server.asgi.app as app_mod
+
+    def failing_submit(_spec, **_kwargs):
+        raise RuntimeError("provider out of capacity")
+
+    monkeypatch.setattr(app_mod, "submit_job", failing_submit)
+    response = api.post(
+        "/v1/runs",
+        headers=_idempotent_headers(_login(), "nonsecret-error-detail-key"),
+        json={
+            "spec": SPEC,
+            "runtime_secrets": {"WANDB_API_KEY": "unrelated-request-secret"},
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "provider out of capacity"
+
+
+def test_create_run_secretful_cleanup_failure_is_fail_closed_and_chain_free(api, monkeypatch):
+    """A post-fence cleanup failure retains dispatched ownership without retaining its exception."""
     import flash.server.asgi.app as app_mod
     from flash.server.platform import db
 
     submitted: list[str] = []
-    _persist_queued_then_raise(app_mod, monkeypatch, submitted)
+    _persist_queued_then_raise(app_mod, monkeypatch, submitted, bind=True)
+
+    secret = "cleanup-secret-that-must-not-chain"
+    cleanup_failure = OSError(f"status store exposed {secret}")
 
     def boom(*_args, **_kwargs):
-        raise OSError("[Errno 28] No space left on device")
+        raise cleanup_failure
 
     monkeypatch.setattr(runner_status, "_update", boom)
 
     key = _login()
-    resp = api.post(
-        "/v1/runs",
-        headers=_bearer(key),
-        json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": "user-wandb-key"}},
-    )
+    with _captured_http_exceptions(api) as captured:
+        resp = api.post(
+            "/v1/runs",
+            headers=_bearer(key),
+            json={"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": secret}},
+        )
 
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 500, resp.text
     run_id = submitted[0]
-    # the queued status record survives on disk, so only the dropped row keeps recovery off it.
+    assert resp.json()["detail"] == {
+        "code": "submission_cleanup_failed",
+        "retryable": False,
+        "run_id": run_id,
+    }
+    assert secret not in resp.text
+    assert captured[0].__context__ is None
+    assert captured[0].__cause__ is None
+    assert captured[0] is not cleanup_failure
+    # the bound owner remains visible while recovery stays blocked from secretless resubmission.
     assert runner_status.get_status(run_id).state == "queued"
-    assert db.run_owner(run_id) is None
-    assert run_id not in _classified_resubmits()
+    assert db.run_owner(run_id) is not None
+    assert db.run_submission_claim_for_run(run_id)["phase"] == "bound"
 
 
 def test_create_run_secretful_run_kept_when_status_read_fails(api, monkeypatch):
@@ -1740,7 +1984,7 @@ def test_create_run_secretful_run_kept_when_status_read_fails(api, monkeypatch):
     from flash.server.platform import db
 
     submitted: list[str] = []
-    _persist_queued_then_raise(app_mod, monkeypatch, submitted)
+    _persist_queued_then_raise(app_mod, monkeypatch, submitted, bind=True)
 
     # break status reads only once the terminal write itself has landed (`_update` reads the record
     # to apply it), so this is exactly "the write succeeded, the read after it did not".
@@ -1805,6 +2049,691 @@ def test_create_run_retained_run_records_managed_environment_use(api, monkeypatc
     assert calls
     assert calls[0]["slug"] == "acme/checkout-bot/my-env"
     assert calls[0]["run_id"] == run_id
+
+
+def _idempotent_headers(token: str, idempotency_key: str, *, org_id: str | None = None) -> dict:
+    headers = _bearer(token)
+    headers["Idempotency-Key"] = idempotency_key
+    if org_id is not None:
+        headers["X-Freesolo-Org-Id"] = org_id
+    return headers
+
+
+def test_create_run_requires_valid_idempotency_key(api) -> None:
+    token = _login()
+    for value in (None, "short", "invalid key value", "x" * 129):
+        headers = _bearer(token)
+        if value is not None:
+            headers["Idempotency-Key"] = value
+        response = api.request("POST", "/v1/runs", headers=headers, json={"spec": SPEC})
+        assert response.status_code == 400, response.text
+        assert "Idempotency-Key" in response.json()["detail"]
+
+
+def test_matching_replay_skips_every_submission_side_effect(api, monkeypatch) -> None:
+    import flash.server.domain.registry.projects as projects_mod
+    import flash.server.routes.runs as runs_route
+
+    headers = _idempotent_headers(_login(), "side-effect-sabotage-key")
+    body = {
+        "spec": SPEC,
+        "dry_run": True,
+        "runtime_secrets": {"WANDB_API_KEY": "identical-replay-secret"},
+    }
+    created = api.post("/v1/runs", headers=headers, json=body)
+    assert created.status_code == 200, created.text
+
+    def sabotage(*_args, **_kwargs):
+        raise AssertionError("replay reached a submission side effect")
+
+    monkeypatch.setattr(projects_mod, "require_project_access", sabotage)
+    monkeypatch.setattr(runs_route, "_resolve_managed_environment", sabotage)
+    monkeypatch.setattr(runs_route, "_prepare_submission", sabotage)
+    monkeypatch.setattr(runs_route, "_precheck_budget_or_block", sabotage)
+    monkeypatch.setattr(runs_route._app, "submit_job", sabotage)
+    monkeypatch.setattr(runs_route, "_record_environment_use", sabotage)
+
+    replay = api.post("/v1/runs", headers=headers, json=body)
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["run_id"] == created.json()["run_id"]
+    assert replay.json()["state"] == "dry_run"
+    assert replay.json()["affordability_verified"] is created.json()["affordability_verified"]
+
+
+@pytest.mark.parametrize(
+    ("first_body", "second_body"),
+    [
+        (
+            {"spec": SPEC, "dry_run": True},
+            {
+                "spec": {**SPEC, "train": {**SPEC["train"], "epochs": 2}},
+                "dry_run": True,
+            },
+        ),
+        ({"spec": SPEC, "dry_run": True}, {"spec": SPEC}),
+        (
+            {"spec": SPEC, "dry_run": True},
+            {
+                "spec": SPEC,
+                "dry_run": True,
+                "client_train_schema": {
+                    "version": "1.2.118",
+                    "fields": {"epochs": "0.1.0"},
+                    "authored_keys": ["epochs"],
+                },
+            },
+        ),
+        (
+            {
+                "spec": SPEC,
+                "dry_run": True,
+                "runtime_secrets": {"WANDB_API_KEY": "first"},
+            },
+            {"spec": SPEC, "dry_run": True},
+        ),
+    ],
+)
+def test_idempotency_key_reuse_rejects_fingerprint_mismatches(api, first_body, second_body) -> None:
+    headers = _idempotent_headers(_login(), "fingerprint-mismatch-key")
+    created = api.post("/v1/runs", headers=headers, json=first_body)
+    assert created.status_code == 200, created.text
+
+    conflict = api.post("/v1/runs", headers=headers, json=second_body)
+
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == {
+        "code": "idempotency_key_reused",
+        "retryable": False,
+        "run_id": created.json()["run_id"],
+    }
+
+
+def test_schema_authored_key_order_is_canonical_for_replay(api) -> None:
+    headers = _idempotent_headers(_login(), "schema-order-replay-key")
+    schema = {
+        "version": "1.2.118",
+        "fields": {"epochs": "0.1.0", "max_examples": "0.1.0"},
+        "authored_keys": ["epochs", "max_examples"],
+    }
+    first = api.post(
+        "/v1/runs",
+        headers=headers,
+        json={"spec": SPEC, "dry_run": True, "client_train_schema": schema},
+    )
+    assert first.status_code == 200, first.text
+
+    replay = api.post(
+        "/v1/runs",
+        headers=headers,
+        json={
+            "spec": SPEC,
+            "dry_run": True,
+            "client_train_schema": {
+                **schema,
+                "authored_keys": list(reversed(schema["authored_keys"])),
+            },
+        },
+    )
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["run_id"] == first.json()["run_id"]
+
+
+def test_effective_org_participates_in_internal_key_fingerprint(api, monkeypatch) -> None:
+    import flash.server.domain.registry.projects as projects_mod
+
+    monkeypatch.setattr(
+        projects_mod,
+        "require_project_access",
+        lambda *, project_id, **_kwargs: project_id,
+    )
+    headers_a = _idempotent_headers(
+        "fslo-internal-test", "internal-org-fingerprint-key", org_id="org-a"
+    )
+    headers_b = {**headers_a, "X-Freesolo-Org-Id": "org-b"}
+    created = api.post("/v1/runs", headers=headers_a, json={"spec": SPEC, "dry_run": True})
+    assert created.status_code == 200, created.text
+
+    conflict = api.post("/v1/runs", headers=headers_b, json={"spec": SPEC, "dry_run": True})
+
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "idempotency_key_reused"
+
+
+def test_changed_secret_value_rejects_without_persisting_secrets(api, monkeypatch) -> None:
+    import flash.server.platform.db as db_mod
+    import flash.server.routes.runs as runs_route
+
+    def stored_sqlite_bytes() -> bytes:
+        stored = bytearray()
+        for suffix in ("", "-wal", "-shm"):
+            path = f"{db_mod.db_path()}{suffix}"
+            if os.path.exists(path):
+                with open(path, "rb") as database_file:
+                    stored.extend(database_file.read())
+        return bytes(stored)
+
+    headers = _idempotent_headers(_login(), "secret-value-replay-key")
+    first = api.post(
+        "/v1/runs",
+        headers=headers,
+        json={"spec": SPEC, "dry_run": True, "runtime_secrets": {"WANDB_API_KEY": "one-secret"}},
+    )
+    assert first.status_code == 200, first.text
+    owner_id = db_mod.run_owner(first.json()["run_id"])
+    claim_before = db_mod.run_submission_claim(owner_id, "secret-value-replay-key")
+    stored_after_first = stored_sqlite_bytes()
+    assert b"one-secret" not in stored_after_first
+
+    def sabotage(*_args, **_kwargs):
+        raise AssertionError("fingerprint rejection reached preparation or submission")
+
+    monkeypatch.setattr(runs_route, "_prepare_submission", sabotage)
+    monkeypatch.setattr(runs_route._app, "submit_job", sabotage)
+    conflict = api.post(
+        "/v1/runs",
+        headers=headers,
+        json={"spec": SPEC, "dry_run": True, "runtime_secrets": {"WANDB_API_KEY": "two-secret"}},
+    )
+    claim_after = db_mod.run_submission_claim(owner_id, "secret-value-replay-key")
+
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json()["detail"] == {
+        "code": "idempotency_key_reused",
+        "retryable": False,
+        "run_id": first.json()["run_id"],
+    }
+    assert claim_after["request_fingerprint"] == claim_before["request_fingerprint"]
+    stored_after_conflict = stored_sqlite_bytes()
+    assert b"one-secret" not in stored_after_conflict
+    assert b"two-secret" not in stored_after_conflict
+
+
+def test_standalone_adoption_preserves_bound_replay(api, monkeypatch) -> None:
+    import flash.server.platform.auth as auth_mod
+    import flash.server.routes.runs as runs_route
+    from flash.server.platform import db
+
+    token = _login()
+    headers = _idempotent_headers(token, "standalone-adopted-replay-key")
+    body = {"spec": SPEC, "dry_run": True}
+    created = api.post("/v1/runs", headers=headers, json=body)
+    assert created.status_code == 200, created.text
+
+    monkeypatch.setenv(auth_mod.STANDALONE_ENV, "1")
+    monkeypatch.setenv(auth_mod.INTERNAL_KEY_ENV, "standalone-operator-key")
+    standalone = auth_mod.authenticate("Bearer standalone-operator-key")
+    assert standalone is not None
+    claim = db.run_submission_claim(standalone["id"], "standalone-adopted-replay-key")
+    assert claim is not None
+    assert claim["run_id"] == created.json()["run_id"]
+
+    replay = runs_route._replay_submission(claim, claim["request_fingerprint"], schema=None)
+
+    assert replay is not None
+    assert replay["run_id"] == created.json()["run_id"]
+
+
+def test_same_idempotency_key_is_scoped_to_owner(api) -> None:
+    key = "owner-scoped-replay-key"
+    created_a = api.post(
+        "/v1/runs",
+        headers=_idempotent_headers(_login(), key),
+        json={"spec": SPEC, "dry_run": True},
+    )
+    created_b = api.post(
+        "/v1/runs",
+        headers=_idempotent_headers(_login(), key),
+        json={"spec": SPEC, "dry_run": True},
+    )
+
+    assert created_a.status_code == 200, created_a.text
+    assert created_b.status_code == 200, created_b.text
+    assert created_a.json()["run_id"] != created_b.json()["run_id"]
+
+
+def test_simultaneous_same_key_loser_gets_retryable_conflict(api, monkeypatch) -> None:
+    import flash.server.routes.runs as runs_route
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_prepare = runs_route._prepare_submission
+
+    def blocked_prepare(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=10)
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(runs_route, "_prepare_submission", blocked_prepare)
+    headers = _idempotent_headers(_login(), "simultaneous-race-key")
+    body = {"spec": SPEC, "dry_run": True}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(api.post, "/v1/runs", headers=headers, json=body)
+        assert entered.wait(timeout=10)
+        loser = api.post("/v1/runs", headers=headers, json=body)
+        release.set()
+        winner = first_future.result(timeout=30)
+
+    assert winner.status_code == 200, winner.text
+    assert loser.status_code == 409
+    assert loser.json()["detail"] == {
+        "code": "submission_in_progress",
+        "retryable": True,
+    }
+
+
+def _seed_secret_submission_claim(*, phase: str, status_exists: bool):
+    import flash.server.platform.auth as auth_mod
+    import flash.server.routes.runs as runs_route
+    from flash.server.platform import db
+
+    token = _login()
+    key = auth_mod.authenticate(f"Bearer {token}")
+    assert key is not None
+    run_id = f"flash-secret-{phase}-{'queued' if status_exists else 'missing'}"
+    idempotency_key = f"secret-{phase}-{'queued' if status_exists else 'missing'}-key"
+    payload = {
+        "spec": SPEC,
+        "runtime_secrets": {"WANDB_API_KEY": "unchanged-request-secret"},
+    }
+    spec = runs_route._parse_submission_spec(payload, run_id=run_id, schema=None)
+    runtime_secrets = runs_route._runtime_secrets(payload, spec)
+    fingerprint = runs_route._request_fingerprint(
+        spec=spec,
+        dry_run=False,
+        schema=None,
+        effective_org_id=runs_route._effective_org_id(key, None),
+        runtime_secrets=runtime_secrets,
+    )
+    db.claim_run_submission(
+        run_id=run_id,
+        key_id=key["id"],
+        idempotency_key=idempotency_key,
+        request_fingerprint=fingerprint,
+        dry_run=False,
+        had_runtime_secrets=True,
+    )
+    if status_exists:
+        runner_state._save_status(
+            runner_state.RunStatus(run_id=run_id, state="queued", spec=spec.to_dict())
+        )
+    if phase == "bound":
+        db.bind_run_submission(run_id)
+    return token, key, idempotency_key, payload, run_id
+
+
+@pytest.mark.parametrize(
+    ("phase", "status_exists", "expected_success"),
+    [
+        ("claimed", True, False),
+        ("claimed", False, False),
+        ("bound", True, True),
+        ("bound", False, False),
+    ],
+)
+def test_unchanged_secret_claim_replay_fails_closed_unless_bound_status_exists(
+    api, monkeypatch, phase, status_exists, expected_success
+) -> None:
+    import flash.server.routes.runs as runs_route
+    from flash.server.platform import db
+
+    token, key, idempotency_key, payload, run_id = _seed_secret_submission_claim(
+        phase=phase, status_exists=status_exists
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("secretful replay reached preparation or provider submission")
+
+    monkeypatch.setattr(runs_route, "_prepare_submission", forbidden)
+    monkeypatch.setattr(runs_route._app, "submit_job", forbidden)
+    if phase == "claimed":
+        monkeypatch.setattr(runs_route._app, "get_status", forbidden)
+    replay = api.post(
+        "/v1/runs",
+        headers=_idempotent_headers(token, idempotency_key),
+        json=payload,
+    )
+
+    claim = db.run_submission_claim(key["id"], idempotency_key)
+    if expected_success:
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["run_id"] == run_id
+        assert replay.json()["state"] == "queued"
+        assert claim["phase"] == "bound"
+        assert db.run_owner(run_id) == key["id"]
+        return
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["detail"] == {
+        "code": "submission_disposed",
+        "retryable": False,
+        "run_id": run_id,
+        "reason": "runtime_secrets_unrecoverable",
+    }
+    assert claim["phase"] == "disposed"
+    assert claim["disposed_reason"] == "runtime_secrets_unrecoverable"
+    assert db.run_owner(run_id) is None
+    assert run_id not in _classified_resubmits()
+
+
+def test_concurrent_secretful_claim_replay_disposes_once_without_submission(
+    api, monkeypatch
+) -> None:
+    import flash.server.routes.runs as runs_route
+    from flash.server.platform import db
+
+    token, key, idempotency_key, payload, run_id = _seed_secret_submission_claim(
+        phase="claimed", status_exists=True
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError(
+            "concurrent secretful replay reached preparation or provider submission"
+        )
+
+    monkeypatch.setattr(runs_route, "_prepare_submission", forbidden)
+    monkeypatch.setattr(runs_route._app, "submit_job", forbidden)
+    monkeypatch.setattr(runs_route._app, "get_status", forbidden)
+    headers = _idempotent_headers(token, idempotency_key)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(api.post, "/v1/runs", headers=headers, json=payload) for _ in range(2)
+        ]
+        responses = [future.result(timeout=30) for future in futures]
+
+    assert all(response.status_code == 409 for response in responses)
+    codes = {response.json()["detail"]["code"] for response in responses}
+    assert "submission_disposed" in codes
+    assert codes <= {"submission_disposed", "submission_in_progress"}
+    claim = db.run_submission_claim(key["id"], idempotency_key)
+    assert claim["phase"] == "disposed"
+    assert claim["disposed_reason"] == "runtime_secrets_unrecoverable"
+    assert db.run_owner(run_id) is None
+    assert run_id not in _classified_resubmits()
+
+    durable_replay = api.post("/v1/runs", headers=headers, json=payload)
+    assert durable_replay.status_code == 409
+    assert durable_replay.json()["detail"]["code"] == "submission_disposed"
+    assert durable_replay.json()["detail"]["reason"] == "runtime_secrets_unrecoverable"
+
+
+def test_secret_claim_disposal_failure_is_chain_free(api, monkeypatch) -> None:
+    from flash.server.platform import db
+
+    token, _, idempotency_key, payload, run_id = _seed_secret_submission_claim(
+        phase="claimed", status_exists=True
+    )
+    secret = "disposal-cleanup-secret"
+    disposal_failure = RuntimeError(f"sqlite cleanup exposed {secret}")
+    monkeypatch.setattr(
+        db,
+        "dispose_run_submission",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(disposal_failure),
+    )
+
+    with _captured_http_exceptions(api) as captured:
+        response = api.post(
+            "/v1/runs",
+            headers=_idempotent_headers(token, idempotency_key),
+            json=payload,
+        )
+
+    assert response.status_code == 500, response.text
+    assert response.json()["detail"] == {
+        "code": "submission_cleanup_failed",
+        "retryable": False,
+        "run_id": run_id,
+    }
+    assert secret not in response.text
+    assert captured[0].__context__ is None
+    assert captured[0].__cause__ is None
+    assert captured[0] is not disposal_failure
+
+
+def test_startup_recovery_disposes_secretful_claim_before_provider_work(api, monkeypatch) -> None:
+    import flash.server.platform.runtime as runtime
+    from flash.server.platform import db
+
+    _, key, idempotency_key, _, run_id = _seed_secret_submission_claim(
+        phase="claimed", status_exists=True
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("secretful claimed run reached status or provider recovery")
+
+    monkeypatch.setattr(runner_status, "get_status", forbidden)
+    active: set[str] = set()
+    known: set[str] = set()
+    resubmit = []
+
+    runtime._classify_recoverable_runs(active, known, resubmit)
+
+    claim = db.run_submission_claim(key["id"], idempotency_key)
+    assert claim["phase"] == "disposed"
+    assert claim["disposed_reason"] == "runtime_secrets_unrecoverable"
+    assert db.run_owner(run_id) is None
+    assert run_id not in active
+    assert run_id not in known
+    assert resubmit == []
+
+
+def test_startup_recovery_terminalizes_dispatched_secretful_work_without_resubmit(
+    api, monkeypatch
+) -> None:
+    import flash.server.platform.runtime as runtime
+    from flash.server.platform import db
+
+    _, key, idempotency_key, _, run_id = _seed_secret_submission_claim(
+        phase="bound", status_exists=True
+    )
+    started = []
+
+    class Thread:
+        def __init__(self, *, target, args, daemon):
+            started.append((target, args, daemon))
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    # unlike the `claimed` sibling above, a `bound` claim already dispatched, so its provider state
+    # is unknown and must be confirmed clear before the run can be failed. record the call rather
+    # than forbidding it: skipping confirmation is what would strand a paid instance.
+    confirmed = []
+
+    def confirm_clear(spec):
+        confirmed.append(spec.run_id)
+        return True
+
+    monkeypatch.setattr(runtime, "_confirm_run_clear", confirm_clear)
+    active: set[str] = set()
+    known: set[str] = set()
+    resubmit = []
+
+    runtime._classify_recoverable_runs(active, known, resubmit)
+
+    claim = db.run_submission_claim(key["id"], idempotency_key)
+    assert claim["phase"] == "bound"
+    assert db.run_owner(run_id) == key["id"]
+    assert confirmed == [run_id]
+    status = runner_status.get_status(run_id)
+    assert status.state == "failed"
+    assert "secrets cannot be restored" in status.error
+    assert resubmit == []
+    assert run_id not in active
+    assert run_id in known
+    assert len(started) == 1
+
+
+def test_abandoned_claim_without_status_resumes_same_run_id(api) -> None:
+    import flash.server.platform.auth as auth_mod
+    import flash.server.routes.runs as runs_route
+    from flash.server.platform import db
+
+    token = _login()
+    key = auth_mod.authenticate(f"Bearer {token}")
+    assert key is not None
+    idempotency_key = "abandoned-claim-key"
+    payload = {"spec": SPEC}
+    payload["dry_run"] = True
+    spec = runs_route._parse_submission_spec(payload, run_id="flash-abandoned", schema=None)
+    secrets = runs_route._runtime_secrets(payload, spec)
+    fingerprint = runs_route._request_fingerprint(
+        spec=spec,
+        dry_run=True,
+        schema=None,
+        effective_org_id=runs_route._effective_org_id(key, None),
+        runtime_secrets=secrets,
+    )
+    db.claim_run_submission(
+        run_id=spec.run_id,
+        key_id=key["id"],
+        idempotency_key=idempotency_key,
+        request_fingerprint=fingerprint,
+        dry_run=True,
+        had_runtime_secrets=False,
+    )
+
+    resumed = api.post(
+        "/v1/runs",
+        headers=_idempotent_headers(token, idempotency_key),
+        json=payload,
+    )
+
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["run_id"] == "flash-abandoned"
+    assert db.run_submission_claim(key["id"], idempotency_key)["phase"] == "bound"
+
+
+def test_claimed_status_resumes_same_run_before_dispatch_fence(api, monkeypatch) -> None:
+    import flash.server.routes.runs as runs_route
+    from flash.server.platform import db
+
+    headers = _idempotent_headers(_login(), "claimed-status-replay-key")
+    body = {"spec": SPEC, "dry_run": True}
+    created = api.post("/v1/runs", headers=headers, json=body)
+    assert created.status_code == 200, created.text
+    with db._connect() as conn:
+        conn.execute(
+            "UPDATE run_submission_idempotency SET phase = 'claimed' WHERE run_id = ?",
+            (created.json()["run_id"],),
+        )
+    submitted = []
+
+    def resume(spec, **kwargs):
+        submitted.append(spec.run_id)
+        status = runner_state.RunStatus(run_id=spec.run_id, state="dry_run", spec=spec.to_dict())
+        runner_state._save_status(status)
+        kwargs["status_persisted_fence"]()
+        return status
+
+    monkeypatch.setattr(runs_route._app, "submit_job", resume)
+
+    replay = api.post("/v1/runs", headers=headers, json=body)
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["run_id"] == created.json()["run_id"]
+    assert submitted == [created.json()["run_id"]]
+    assert db.run_submission_claim_for_run(created.json()["run_id"])["phase"] == "bound"
+
+
+def test_bound_claim_without_status_fails_closed(api) -> None:
+    headers = _idempotent_headers(_login(), "bound-missing-status-key")
+    body = {"spec": SPEC, "dry_run": True}
+    created = api.post("/v1/runs", headers=headers, json=body)
+    assert created.status_code == 200, created.text
+    os.remove(runner_state.runs_file_path(created.json()["run_id"], ".json"))
+
+    replay = api.post("/v1/runs", headers=headers, json=body)
+
+    assert replay.status_code == 409
+    assert replay.json()["detail"] == {
+        "code": "submission_state_unavailable",
+        "retryable": False,
+        "run_id": created.json()["run_id"],
+    }
+
+
+def test_post_status_failure_binds_and_replays_authoritative_status(api, monkeypatch) -> None:
+    import flash.server.asgi.app as app_mod
+    from flash.server.platform import db
+
+    submitted = []
+    _persist_queued_then_raise(app_mod, monkeypatch, submitted, bind=True)
+    token = _login()
+    headers = _idempotent_headers(token, "post-status-failure-key")
+    failed = api.post("/v1/runs", headers=headers, json={"spec": SPEC})
+    assert failed.status_code == 400, failed.text
+    owner = db.run_owner(submitted[0])
+    assert db.run_submission_claim(owner, "post-status-failure-key")["phase"] == "bound"
+
+    replay = api.post("/v1/runs", headers=headers, json={"spec": SPEC})
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["run_id"] == submitted[0]
+    assert replay.json()["state"] == "queued"
+
+
+def test_failed_dry_run_replays_tombstone_not_queued_status(api, monkeypatch) -> None:
+    import flash.server.asgi.app as app_mod
+    from flash.server.platform import db
+
+    submitted = []
+    _persist_queued_then_raise(app_mod, monkeypatch, submitted)
+    token = _login()
+    headers = _idempotent_headers(token, "dry-run-disposal-key")
+    body = {"spec": SPEC, "dry_run": True}
+    failed = api.post("/v1/runs", headers=headers, json=body)
+    assert failed.status_code == 400, failed.text
+    key = __import__("flash.server.platform.auth", fromlist=["authenticate"]).authenticate(
+        f"Bearer {token}"
+    )
+    claim = db.run_submission_claim(key["id"], "dry-run-disposal-key")
+    assert claim["phase"] == "disposed"
+    assert db.run_owner(submitted[0]) is None
+
+    replay = api.post("/v1/runs", headers=headers, json=body)
+
+    assert replay.status_code == 409
+    assert replay.json()["detail"] == {
+        "code": "submission_disposed",
+        "retryable": False,
+        "run_id": submitted[0],
+        "reason": "dry_run_status_incomplete",
+    }
+
+
+def test_pre_dispatch_secret_failure_replays_unrecoverable_tombstone(api, monkeypatch) -> None:
+    import flash.server.asgi.app as app_mod
+    import flash.server.platform.auth as auth_mod
+    from flash.server.platform import db
+
+    submitted = []
+    _persist_queued_then_raise(app_mod, monkeypatch, submitted)
+    monkeypatch.setattr(
+        runner_status,
+        "_update",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("status store unavailable")),
+    )
+    token = _login()
+    headers = _idempotent_headers(token, "secret-disposal-key")
+    body = {"spec": SPEC, "runtime_secrets": {"WANDB_API_KEY": "request-only-secret"}}
+    failed = api.post("/v1/runs", headers=headers, json=body)
+    assert failed.status_code == 400, failed.text
+    key = auth_mod.authenticate(f"Bearer {token}")
+    claim = db.run_submission_claim(key["id"], "secret-disposal-key")
+    assert claim["phase"] == "disposed"
+    assert db.run_owner(submitted[0]) is None
+
+    replay = api.post("/v1/runs", headers=headers, json=body)
+
+    assert replay.status_code == 409
+    assert replay.json()["detail"] == {
+        "code": "submission_disposed",
+        "retryable": False,
+        "run_id": submitted[0],
+        "reason": "runtime_secrets_unrecoverable",
+    }
 
 
 def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):

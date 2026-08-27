@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import os
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated
 
@@ -21,6 +24,7 @@ from flash.runner.supervise.deploy import (
     cancel_run,
 )
 from flash.schema import train_schema_metadata
+from flash.serve.control._canonical import canonical_mapping_fingerprint
 from flash.serve.deployment.preflight import ServingPreflightError
 from flash.server.asgi import app as _app
 from flash.server.domain.teacher.broker import TeacherBrokerConfigurationError
@@ -40,6 +44,7 @@ router = APIRouter()
 
 _MAX_SCHEMA_FIELDS = 256
 _MAX_SCHEMA_TEXT = 128
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._~-]{16,128}$")
 
 
 def _client_train_schema(payload: dict) -> dict | None:
@@ -88,6 +93,136 @@ def _client_train_schema(payload: dict) -> dict | None:
             ],
         },
     }
+
+
+def _require_idempotency_key(value: str | None) -> str:
+    if not isinstance(value, str) or _IDEMPOTENCY_KEY_RE.fullmatch(value) is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Idempotency-Key must be 16 to 128 characters using only "
+                "A-Z, a-z, 0-9, period, underscore, tilde, or hyphen"
+            ),
+        )
+    return value
+
+
+def _effective_org_id(key: dict, org_id_header: str | None) -> str:
+    return str(key.get("org_id") or org_id_header or "").strip()
+
+
+def _request_fingerprint(
+    *,
+    spec,
+    dry_run: bool,
+    schema: dict | None,
+    effective_org_id: str,
+    runtime_secrets: dict[str, str],
+) -> str:
+    accepted_schema = None
+    if schema is not None:
+        accepted_schema = {
+            "version": schema["version"],
+            "fields": schema["fields"],
+            "authored_keys": sorted(schema["authored_keys"]),
+        }
+    return canonical_mapping_fingerprint(
+        {
+            "spec": spec.to_dict(),
+            "dry_run": dry_run,
+            "client_train_schema": accepted_schema,
+            "effective_org_id": effective_org_id,
+            "runtime_secrets": runtime_secrets,
+        }
+    )
+
+
+def _submission_lock_name(key_id: int, idempotency_key: str) -> str:
+    payload = f"flash-run-submission-v1\0{key_id}\0{idempotency_key}".encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _submitted_instance_providers() -> tuple[str, ...]:
+    from flash.providers.core.registry import INSTANCE_PROVIDERS, available_providers
+
+    return tuple(sorted(name for name in available_providers() if name in INSTANCE_PROVIDERS))
+
+
+def _idempotency_error(
+    code: str, *, retryable: bool, run_id: str | None = None, reason: str | None = None
+):
+    detail = {"code": code, "retryable": retryable}
+    if run_id is not None:
+        detail["run_id"] = run_id
+    if reason is not None:
+        detail["reason"] = reason
+    return HTTPException(status_code=409, detail=detail)
+
+
+def _cleanup_failure_http_error(run_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=500,
+        detail={
+            "code": "submission_cleanup_failed",
+            "retryable": False,
+            "run_id": run_id,
+        },
+    )
+
+
+def _dispose_unrecoverable_secret_claim(run_id: str) -> None:
+    disposal_failed = False
+    try:
+        db.dispose_run_submission(run_id, reason="runtime_secrets_unrecoverable")
+    except Exception:
+        disposal_failed = True
+    if disposal_failed:
+        raise _cleanup_failure_http_error(run_id) from None
+    raise _idempotency_error(
+        "submission_disposed",
+        run_id=run_id,
+        retryable=False,
+        reason="runtime_secrets_unrecoverable",
+    )
+
+
+def _replay_submission(
+    claim: dict, request_fingerprint: str, *, schema: dict | None
+) -> dict | None:
+    run_id = claim["run_id"]
+    if claim["request_fingerprint"] != request_fingerprint:
+        raise _idempotency_error("idempotency_key_reused", run_id=run_id, retryable=False)
+    if claim["phase"] == "disposed":
+        raise _idempotency_error(
+            "submission_disposed",
+            run_id=run_id,
+            retryable=False,
+            reason=claim.get("disposed_reason") or "submission_disposed",
+        )
+    if claim["phase"] == "claimed":
+        if claim["had_runtime_secrets"]:
+            _dispose_unrecoverable_secret_claim(run_id)
+        # no durable dispatch fence exists. even if the authoritative queued status landed, no
+        # supervisor was allowed to start, so resume the same run id instead of replaying inert work.
+        return None
+    try:
+        status = _app.get_status(run_id)
+    except FileNotFoundError:
+        if claim["phase"] == "bound":
+            if claim["had_runtime_secrets"]:
+                _dispose_unrecoverable_secret_claim(run_id)
+            raise _idempotency_error(
+                "submission_state_unavailable", run_id=run_id, retryable=False
+            ) from None
+        return None
+    response = status.to_dict()
+    if claim["dry_run"]:
+        verified = claim.get("affordability_verified")
+        if verified is not None:
+            response["affordability_verified"] = bool(verified)
+        if schema is not None:
+            response["train_schema_compatibility"] = schema["compatibility"]
+    return response
 
 
 def _schema_disagreement_detail(
@@ -241,85 +376,235 @@ def _record_environment_use(
         )
 
 
-def _submit_failure_http_error(exc: Exception) -> HTTPException:
-    """Classify a failed submission as the submitter's fault or the plane's.
+def _redact_runtime_secret_text(value: str, secret_values: tuple[str, ...]) -> str:
+    """Drop a contaminated diagnostic while preserving text that contains no request secret."""
+    if not any(secret and secret in value for secret in secret_values):
+        return value
+    fallback = "submission failed"
+    return "" if any(secret and secret in fallback for secret in secret_values) else fallback
+
+
+def _redact_runtime_secret_detail(value, secret_values: tuple[str, ...]):
+    """Redact strings recursively while preserving structured HTTP error details."""
+    if isinstance(value, str):
+        return _redact_runtime_secret_text(value, secret_values)
+    if isinstance(value, dict):
+        return {
+            _redact_runtime_secret_detail(key, secret_values): _redact_runtime_secret_detail(
+                item, secret_values
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return type(value)(_redact_runtime_secret_detail(item, secret_values) for item in value)
+    return value
+
+
+def _redact_runtime_secret_headers(
+    headers: Mapping[str, str] | None, secret_values: tuple[str, ...]
+) -> dict[str, str] | None:
+    """Preserve safe downstream headers and omit each contaminated header completely."""
+    if headers is None:
+        return None
+    return {
+        name: value
+        for name, value in headers.items()
+        if not any(secret and (secret in name or secret in value) for secret in secret_values)
+    }
+
+
+def _submit_failure_http_error(
+    exc: Exception, *, runtime_secret_values: tuple[str, ...] = ()
+) -> HTTPException:
+    """Classify a failed submission without exposing request-only credentials.
 
     Everything reaching here is a bad request by default. Submit-time errors may opt into 503 with
     a truthy ``plane_fault`` attribute when the submitter cannot fix the failure by changing the spec.
     """
+    if isinstance(exc, HTTPException):
+        return HTTPException(
+            status_code=exc.status_code,
+            detail=_redact_runtime_secret_detail(exc.detail, runtime_secret_values),
+            headers=_redact_runtime_secret_headers(exc.headers, runtime_secret_values),
+        )
+    detail = _redact_runtime_secret_text(str(exc), runtime_secret_values)
     if isinstance(exc, SourceSnapshotPublicationError):
-        return HTTPException(status_code=503, detail=str(exc))
+        return HTTPException(status_code=503, detail=detail)
     if (
         isinstance(exc, (ImageGeometryUnavailable, TeacherBrokerConfigurationError))
         and exc.plane_fault
     ):
-        return HTTPException(status_code=503, detail=str(exc))
-    return HTTPException(status_code=400, detail=str(exc))
+        return HTTPException(status_code=503, detail=detail)
+    return HTTPException(status_code=400, detail=detail)
 
 
 def _dispose_failed_submission(
     run_id: str,
     *,
     dry_run: bool,
-    had_runtime_secrets: bool,
+    runtime_secret_values: tuple[str, ...],
     environment_slug: str | None,
     project_id: str,
     reporting_key: dict,
 ) -> None:
-    """Settle whatever a failed create_run left behind; never raises past the failure.
-
-    drop the ownership row only when the launch left no run behind. once submit_job has persisted
-    status the run exists to the sweeps and to recovery, so deleting the row would orphan it: 404
-    on status, logs and cancel for its owner while the provider footprint lives on. keep it
-    visible instead and let the normal failure and reconcile machinery drive it to a terminal
-    state.
-    """
+    """Settle a failed submission while preserving replay and recovery invariants."""
     if not os.path.exists(runs_file_path(run_id, ".json")):
-        db.delete_run(run_id)
+        db.remove_run_submission_claim(run_id)
     elif dry_run:
-        # a dry run must never be retained: submit_job persists it as `queued` before flipping
-        # the state to `dry_run`, and startup recovery resubmits every owned queued run as a
-        # real job, so a retained half-flipped dry run could provision a gpu the user never
-        # asked to rent. recovery walks the ownership rows, so dropping the row keeps the
-        # record out of it exactly as before the retain guard existed.
-        db.delete_run(run_id)
-    elif had_runtime_secrets:
-        # this run's secrets live only in the request: recovery resubmits from the persisted
-        # spec, which deliberately excludes them, so a retained secretful run would silently
-        # train without its credentials. fail it loudly instead; the owner keeps the row and
-        # the error, and recovery ignores terminal runs. the update is terminal-sticky, so a
-        # record that already reached a terminal state is left untouched.
-        terminalized = False
+        # a half-persisted dry run must remain invisible to recovery, but its idempotency key stays
+        # consumed as a tombstone so replay can never turn the same request into paid work.
+        db.dispose_run_submission(run_id, reason="dry_run_status_incomplete")
+    elif runtime_secret_values:
+        claim = db.run_submission_claim_for_run(run_id)
+        if claim is None or claim["phase"] != "bound":
+            # the durable dispatch fence never landed, so no supervisor was allowed to start. the
+            # request-only secrets cannot be resumed and this remains a pre-dispatch tombstone.
+            db.dispose_run_submission(run_id, reason="runtime_secrets_unrecoverable")
+            return
+        # the dispatch fence landed before the submitter failed. keep the owner and bound claim so
+        # replay and startup recovery reconcile or terminate it rather than disposing dispatched work
+        # as an abandoned pre-submission claim.
         try:
             runner_status._update(
                 run_id,
                 "failed",
                 error=(
-                    "submission failed before its runtime secrets could be dispatched; "
-                    "the run was not started because recovery cannot restore them - resubmit"
+                    "submission failed after its runtime secrets were dispatched; "
+                    "the run was stopped because recovery cannot restore them - resubmit"
                 ),
             )
-            # returning without raising IS the proof of terminality: True applied the write, and a
-            # sticky False means the record was already terminal. no re-read - a transient status
-            # read error says nothing about the state and must never be read as failure.
-            terminalized = True
         except Exception:
-            _LOG.warning(
-                "could not terminalize secretless-recoverable run %s", run_id, exc_info=True
-            )
-        if not terminalized:
-            # the update RAISED, and it is the ONLY write keeping recovery away from this run; a
-            # full or read-only status store can fail it. owner visibility is worth less than the
-            # guarantee: drop the ownership row so recovery, which walks those rows, can never
-            # resubmit the run without the secrets it needs.
-            with contextlib.suppress(Exception):
-                db.delete_run(run_id)
+            raise RuntimeError("could not terminalize dispatched secretful submission") from None
     else:
-        # a retained run stays live and can recover into real training, so it must carry the
-        # same managed-environment association a successful submission records.
+        # a retained non-secret run can recover safely. its phase already records whether the durable
+        # dispatch fence landed, so cleanup must not promote a pre-fence claim to bound.
         _record_environment_use(
             environment_slug, project_id=project_id, run_id=run_id, reporting_key=reporting_key
         )
+
+
+def _parse_submission_spec(payload: dict, *, run_id: str, schema: dict | None):
+    submitted = payload.get("spec")
+    submitted_train = submitted.get("train") if isinstance(submitted, dict) else None
+    try:
+        return _parse_spec(payload, run_id=run_id)
+    except HTTPException as exc:
+        detail = _schema_disagreement_detail(exc, schema, submitted_train)
+        if detail is None:
+            raise
+        raise HTTPException(status_code=400, detail=detail) from exc
+
+
+def _prepare_submission(spec, *, ctx: _SubmissionContext, key: dict):
+    try:
+        return _app.prepare_job(
+            spec,
+            billing_context=ctx.billing_context,
+            platform_context=ctx.platform_context or None,
+            owner_key_id=key["id"],
+        )
+    except ServingPreflightError:
+        raise
+    # resolve the class off the module because runner reloads rebind the exception class.
+    except WarmStartPreparationError as exc:
+        source_ref = spec.train.init_from_adapter
+        _LOG.warning("warm-start preparation failed for %s (%s)", spec.run_id, type(exc).__name__)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"train.init_from_adapter source {source_ref!r} could not be prepared; "
+                "verify that the source adapter is complete, compatible, and unchanged"
+            ),
+        ) from exc
+
+
+def _submit_claimed_run(
+    *,
+    spec,
+    runtime_secrets: dict[str, str],
+    dry_run: bool,
+    schema: dict | None,
+    key: dict,
+    authorization: str | None,
+    org_id_header: str | None,
+) -> dict:
+    from flash.server.domain.registry.projects import require_project_access
+
+    project_id = ""
+    reporting_key = {**key, "org_id": key.get("org_id") or org_id_header}
+    environment_slug = None
+    affordability_verified = False
+    submission_error = None
+    runtime_secret_values: tuple[str, ...] = ()
+    try:
+        project_id = require_project_access(
+            project_id=spec.project,
+            key=key,
+            authorization=authorization,
+            org_id=org_id_header,
+        )
+        environment_slug = _resolve_managed_environment(
+            spec, project_id=project_id, reporting_key=reporting_key
+        )
+        ctx = _submission_context(
+            key=key, dry_run=dry_run, project_id=project_id, org_id_header=org_id_header
+        )
+        prepared = _prepare_submission(spec, ctx=ctx, key=key)
+        if ctx.bill_on_completion or (dry_run and ctx.billable_key):
+            affordability_verified = _precheck_budget_or_block(
+                run_id=spec.run_id,
+                estimate_usd=prepared.estimated_cost_usd,
+                org_id=ctx.affordability_org_id,
+            )
+        submit_kwargs = {
+            "dry_run": dry_run,
+            "background": True,
+            "owner_key_id": key["id"],
+            "prepared_job": prepared,
+            "status_persisted_fence": lambda: db.bind_run_submission(
+                spec.run_id,
+                affordability_verified=affordability_verified if dry_run else None,
+            ),
+        }
+        if runtime_secrets:
+            submit_kwargs["runtime_secrets"] = runtime_secrets
+        if ctx.billing_context:
+            submit_kwargs["billing_context"] = ctx.billing_context
+        if ctx.platform_context:
+            submit_kwargs["platform_context"] = ctx.platform_context
+        status = _app.submit_job(prepared.public_spec, **submit_kwargs)
+    except Exception as exc:
+        runtime_secret_values = tuple(runtime_secrets.values())
+        submission_error = _submit_failure_http_error(
+            exc, runtime_secret_values=runtime_secret_values
+        )
+    if submission_error is not None:
+        cleanup_error = None
+        try:
+            _dispose_failed_submission(
+                spec.run_id,
+                dry_run=dry_run,
+                runtime_secret_values=runtime_secret_values,
+                environment_slug=environment_slug,
+                project_id=project_id,
+                reporting_key=reporting_key,
+            )
+        except Exception as exc:
+            cleanup_error = _submit_failure_http_error(
+                exc, runtime_secret_values=runtime_secret_values
+            )
+        if cleanup_error is not None:
+            raise _cleanup_failure_http_error(spec.run_id) from None
+        raise submission_error from None
+    _record_environment_use(
+        environment_slug, project_id=project_id, run_id=spec.run_id, reporting_key=reporting_key
+    )
+    response = status.to_dict()
+    if dry_run and schema is not None:
+        response["train_schema_compatibility"] = schema["compatibility"]
+    if dry_run:
+        response["affordability_verified"] = affordability_verified
+    return response
 
 
 @router.post("/v1/runs")
@@ -328,119 +613,61 @@ def create_run(
     key: Annotated[dict, Depends(require_key)],
     authorization: Annotated[str | None, Header()] = None,
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ):
+    idempotency_key = _require_idempotency_key(idempotency_key)
     dry_run = _require_bool(payload, "dry_run", False)
     schema = _client_train_schema(payload)
-    submitted = payload.get("spec")
-    submitted_train = submitted.get("train") if isinstance(submitted, dict) else None
-    try:
-        spec = _parse_spec(payload, run_id=new_run_id())
-    except HTTPException as exc:
-        detail = _schema_disagreement_detail(exc, schema, submitted_train)
-        if detail is None:
-            raise
-        raise HTTPException(status_code=400, detail=detail) from exc
-    from flash.server.domain.registry.projects import require_project_access
-
-    project_id = require_project_access(
-        project_id=spec.project,
-        key=key,
-        authorization=authorization,
-        org_id=x_freesolo_org_id,
-    )
-    reporting_key = {**key, "org_id": key.get("org_id") or x_freesolo_org_id}
-    environment_slug = _resolve_managed_environment(
-        spec, project_id=project_id, reporting_key=reporting_key
-    )
+    spec = _parse_submission_spec(payload, run_id=new_run_id(), schema=schema)
     runtime_secrets = _runtime_secrets(payload, spec)
-    ctx = _submission_context(
-        key=key, dry_run=dry_run, project_id=project_id, org_id_header=x_freesolo_org_id
+    fingerprint = _request_fingerprint(
+        spec=spec,
+        dry_run=dry_run,
+        schema=schema,
+        effective_org_id=_effective_org_id(key, x_freesolo_org_id),
+        runtime_secrets=runtime_secrets,
     )
-    affordability_org_id = ctx.affordability_org_id
-    billable_key = ctx.billable_key
-    bill_on_completion = ctx.bill_on_completion
-    billing_context = ctx.billing_context
-    platform_context = ctx.platform_context
-    run_id = spec.run_id
-    affordability_verified = False
+    from flash.server.platform.locks import submission_lock
+
+    lock = submission_lock(_submission_lock_name(key["id"], idempotency_key))
+    if not lock.acquire(blocking=False):
+        raise _idempotency_error("submission_in_progress", retryable=True)
     try:
-        try:
-            prepared = _app.prepare_job(
-                spec,
-                billing_context=billing_context,
-                platform_context=platform_context or None,
-                owner_key_id=key["id"],
-            )
-        except ServingPreflightError:
-            raise
-        # resolve the class off the module rather than binding it at import: flash.runner is
-        # reloaded (tests, and any reimport), which rebinds the class to a new object, and a
-        # bound name would silently stop matching the error the runner actually raises.
-        except WarmStartPreparationError as exc:
-            # only failures raised while resolving the warm-start source reach here, so the adapter
-            # really is the cause. the reason itself stays out of the response on purpose: it can
-            # name internal storage paths and source-run internals. it is logged instead.
-            source_ref = spec.train.init_from_adapter
-            _LOG.warning(
-                "warm-start preparation failed for %s from %s", run_id, source_ref, exc_info=True
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"train.init_from_adapter source {source_ref!r} could not be prepared; "
-                    "verify that the source adapter is complete, compatible, and unchanged"
-                ),
-            ) from exc
-        run_id = prepared.public_spec.run_id
-        # prepare_job has completed every read-only gate before affordability and retained any
-        # resolved environment sha on the worker spec passed to submit_job below.
-        # run the affordability check for dry runs too. it is verify-only (moves no money), so a
-        # `--dry-run` that passes now also proves the org can cover the estimate, instead of the run
-        # being validated here and rejected 402 only on real submission.
-        if bill_on_completion or (dry_run and billable_key):
-            affordability_verified = _precheck_budget_or_block(
-                run_id=run_id,
-                estimate_usd=prepared.estimated_cost_usd,
-                org_id=affordability_org_id,
-            )
-        db.record_run(run_id, key["id"])
-        submit_kwargs = {
-            "dry_run": dry_run,
-            "background": True,
-            "owner_key_id": key["id"],
-            "prepared_job": prepared,
-        }
-        if runtime_secrets:
-            submit_kwargs["runtime_secrets"] = runtime_secrets
-        if billing_context:
-            submit_kwargs["billing_context"] = billing_context
-        if platform_context:
-            submit_kwargs["platform_context"] = platform_context
-        status = _app.submit_job(prepared.public_spec, **submit_kwargs)
-    except Exception as exc:
-        _dispose_failed_submission(
-            run_id,
+        claim = db.run_submission_claim(key["id"], idempotency_key)
+        if claim is not None:
+            replay = _replay_submission(claim, fingerprint, schema=schema)
+            if replay is not None:
+                return replay
+            spec = _parse_submission_spec(payload, run_id=claim["run_id"], schema=schema)
+        else:
+            claim_error = None
+            try:
+                db.claim_run_submission(
+                    run_id=spec.run_id,
+                    key_id=key["id"],
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=fingerprint,
+                    dry_run=dry_run,
+                    had_runtime_secrets=bool(runtime_secrets),
+                    submitted_instance_providers=_submitted_instance_providers(),
+                )
+            except Exception as exc:
+                claim_error = _submit_failure_http_error(
+                    exc, runtime_secret_values=tuple(runtime_secrets.values())
+                )
+            if claim_error is not None:
+                raise claim_error
+        return _submit_claimed_run(
+            spec=spec,
+            runtime_secrets=runtime_secrets,
             dry_run=dry_run,
-            had_runtime_secrets=bool(runtime_secrets),
-            environment_slug=environment_slug,
-            project_id=project_id,
-            reporting_key=reporting_key,
+            schema=schema,
+            key=key,
+            authorization=authorization,
+            org_id_header=x_freesolo_org_id,
         )
-        if isinstance(exc, HTTPException):
-            raise
-        raise _submit_failure_http_error(exc) from exc
-    _record_environment_use(
-        environment_slug, project_id=project_id, run_id=run_id, reporting_key=reporting_key
-    )
-    response = status.to_dict()
-    if dry_run and schema is not None:
-        response["train_schema_compatibility"] = schema["compatibility"]
-    if dry_run:
-        # say whether the affordability check actually RAN. it fails open on a billing-infra
-        # problem, so a silent 200 would claim the dry run validated cost when it did not -- and
-        # the identical spec can still be rejected 402 once the backend recovers.
-        response["affordability_verified"] = affordability_verified
-    return response
+    finally:
+        lock.release()
 
 
 @router.get("/v1/runs")

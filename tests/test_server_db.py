@@ -394,6 +394,186 @@ def test_record_run_rejects_unknown_key_id(isolated_db) -> None:
     assert isolated_db.all_runs() == []
 
 
+def test_run_submission_claim_is_atomic_and_owner_scoped(isolated_db) -> None:
+    owner_a = isolated_db.ensure_external_key("fslo_claim_a")
+    owner_b = isolated_db.ensure_external_key("fslo_claim_b")
+    assert owner_a is not None
+    assert owner_b is not None
+
+    isolated_db.claim_run_submission(
+        run_id="run-a",
+        key_id=owner_a["id"],
+        idempotency_key="shared-key-123456",
+        request_fingerprint="a" * 64,
+        dry_run=False,
+        had_runtime_secrets=False,
+    )
+    isolated_db.claim_run_submission(
+        run_id="run-b",
+        key_id=owner_b["id"],
+        idempotency_key="shared-key-123456",
+        request_fingerprint="b" * 64,
+        dry_run=True,
+        had_runtime_secrets=True,
+    )
+
+    assert isolated_db.run_owner("run-a") == owner_a["id"]
+    assert isolated_db.run_owner("run-b") == owner_b["id"]
+    assert isolated_db.run_submission_claim(owner_a["id"], "shared-key-123456")["run_id"] == "run-a"
+    assert isolated_db.run_submission_claim(owner_b["id"], "shared-key-123456")["run_id"] == "run-b"
+    with pytest.raises(sqlite3.IntegrityError):
+        isolated_db.claim_run_submission(
+            run_id="run-c",
+            key_id=owner_a["id"],
+            idempotency_key="shared-key-123456",
+            request_fingerprint="c" * 64,
+            dry_run=False,
+            had_runtime_secrets=False,
+        )
+    assert isolated_db.run_owner("run-c") is None
+    with pytest.raises(sqlite3.IntegrityError):
+        isolated_db.claim_run_submission(
+            run_id="run-a",
+            key_id=owner_b["id"],
+            idempotency_key="different-key-1234",
+            request_fingerprint="e" * 64,
+            dry_run=False,
+            had_runtime_secrets=False,
+        )
+    assert isolated_db.run_submission_claim(owner_b["id"], "different-key-1234") is None
+
+
+def test_standalone_adoption_migrates_run_and_idempotency_owner_atomically(isolated_db) -> None:
+    prior_owner = isolated_db.ensure_external_key("fslo_prior_owner")
+    assert prior_owner is not None
+    isolated_db.claim_run_submission(
+        run_id="run-adopted-replay",
+        key_id=prior_owner["id"],
+        idempotency_key="adopted-replay-key",
+        request_fingerprint="a" * 64,
+        dry_run=False,
+        had_runtime_secrets=False,
+    )
+    isolated_db.bind_run_submission("run-adopted-replay")
+
+    standalone = isolated_db.ensure_standalone_owner()
+
+    assert isolated_db.run_owner("run-adopted-replay") == standalone["id"]
+    claim = isolated_db.run_submission_claim(standalone["id"], "adopted-replay-key")
+    assert claim is not None
+    assert claim["run_id"] == "run-adopted-replay"
+    assert claim["phase"] == "bound"
+    assert isolated_db.run_submission_claim(prior_owner["id"], "adopted-replay-key") is None
+
+
+def test_standalone_adoption_collision_fails_closed_without_partial_migration(isolated_db) -> None:
+    owner_a = isolated_db.ensure_external_key("fslo_collision_a")
+    owner_b = isolated_db.ensure_external_key("fslo_collision_b")
+    assert owner_a is not None
+    assert owner_b is not None
+    for run_id, owner, fingerprint in (
+        ("run-collision-a", owner_a, "a" * 64),
+        ("run-collision-b", owner_b, "b" * 64),
+    ):
+        isolated_db.claim_run_submission(
+            run_id=run_id,
+            key_id=owner["id"],
+            idempotency_key="standalone-collision-key",
+            request_fingerprint=fingerprint,
+            dry_run=False,
+            had_runtime_secrets=False,
+        )
+
+    with pytest.raises(
+        isolated_db.StandaloneOwnerAdoptionCollision,
+        match="standalone ownership adoption collision for idempotency key 'standalone-collision-key'",
+    ):
+        isolated_db.ensure_standalone_owner()
+
+    assert isolated_db.run_owner("run-collision-a") == owner_a["id"]
+    assert isolated_db.run_owner("run-collision-b") == owner_b["id"]
+    assert (
+        isolated_db.run_submission_claim(owner_a["id"], "standalone-collision-key")["run_id"]
+        == "run-collision-a"
+    )
+    assert (
+        isolated_db.run_submission_claim(owner_b["id"], "standalone-collision-key")["run_id"]
+        == "run-collision-b"
+    )
+
+
+def test_run_submission_disposal_keeps_tombstone_without_run_owner(isolated_db) -> None:
+    owner = isolated_db.ensure_external_key("fslo_dispose")
+    assert owner is not None
+    isolated_db.claim_run_submission(
+        run_id="run-disposed",
+        key_id=owner["id"],
+        idempotency_key="disposed-key-1234",
+        request_fingerprint="d" * 64,
+        dry_run=True,
+        had_runtime_secrets=False,
+    )
+
+    isolated_db.dispose_run_submission("run-disposed", reason="dry_run_status_incomplete")
+
+    assert isolated_db.run_owner("run-disposed") is None
+    claim = isolated_db.run_submission_claim(owner["id"], "disposed-key-1234")
+    assert claim["phase"] == "disposed"
+    assert claim["disposed_reason"] == "dry_run_status_incomplete"
+
+
+def test_old_database_adds_idempotency_table_without_backfill(tmp_path, monkeypatch) -> None:
+    path = str(tmp_path / "old" / "server.db")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE api_keys (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              key_hash TEXT NOT NULL UNIQUE,
+              key_prefix TEXT NOT NULL,
+              email TEXT,
+              created_at REAL NOT NULL,
+              last_used_at REAL,
+              disabled INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE runs (
+              run_id TEXT PRIMARY KEY,
+              key_id INTEGER NOT NULL REFERENCES api_keys(id),
+              kind TEXT NOT NULL DEFAULT 'train',
+              created_at REAL NOT NULL
+            );
+            INSERT INTO api_keys (key_hash, key_prefix, created_at)
+            VALUES ('old-owner', 'old', 1.0);
+            INSERT INTO runs (run_id, key_id, created_at) VALUES ('old-run', 1, 1.0);
+            """
+        )
+    monkeypatch.setattr(db, "DB_PATH", path)
+
+    assert db.run_owner("old-run") == 1
+    with sqlite3.connect(path) as conn:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(run_submission_idempotency)").fetchall()
+        }
+        rows = conn.execute("SELECT * FROM run_submission_idempotency").fetchall()
+    assert {
+        "key_id",
+        "idempotency_key",
+        "run_id",
+        "request_fingerprint",
+        "phase",
+        "dry_run",
+        "had_runtime_secrets",
+        "submitted_instance_providers",
+        "affordability_verified",
+        "disposed_reason",
+        "created_at",
+        "updated_at",
+    } == columns
+    assert rows == []
+
+
 def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -> None:
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient

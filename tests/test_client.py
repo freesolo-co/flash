@@ -68,6 +68,7 @@ def stub():
 
         def do_POST(self):
             seen["auth"] = self.headers.get("Authorization")
+            seen["idempotency_key"] = self.headers.get("Idempotency-Key")
             seen["path"] = self.path
             n = int(self.headers.get("Content-Length") or 0)
             seen["body"] = json.loads(self.rfile.read(n) or b"{}")
@@ -133,7 +134,159 @@ def test_bearer_header_and_payload(stub):
     out = client.create_run({"model": "m", "project": f" {_PROJECT_ID.upper()} "})
     assert out["run_id"] == "r1"
     assert seen["auth"] == "Bearer fslo-user-test"
+    assert seen["idempotency_key"].startswith("flash-")
     assert seen["body"] == {"spec": {"model": "m", "project": _PROJECT_ID}}
+
+
+def test_create_run_uses_explicit_idempotency_key(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    client.create_run(
+        {"model": "m", "project": _PROJECT_ID},
+        idempotency_key="explicit-run-key-1234",
+    )
+
+    assert seen["idempotency_key"] == "explicit-run-key-1234"
+
+
+@pytest.mark.parametrize("key", ["", "short", "x" * 129, "invalid key value"])
+def test_create_run_rejects_invalid_idempotency_key_before_request(stub, key) -> None:
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+
+    with pytest.raises(ClientError, match="idempotency key"):
+        client.create_run({"model": "m", "project": _PROJECT_ID}, idempotency_key=key)
+
+    assert "body" not in seen
+
+
+def test_create_run_reuses_one_generated_key_for_one_ambiguous_retry(monkeypatch) -> None:
+    client = ApiClient("https://flash.test", "fslo-user-test")
+    keys = []
+
+    def request(*_args, **kwargs):
+        keys.append(kwargs["extra_headers"]["Idempotency-Key"])
+        if len(keys) == 1:
+            from flash.client.http import AmbiguousTransportError
+
+            raise AmbiguousTransportError("connection reset")
+        return {"run_id": "flash-1"}
+
+    monkeypatch.setattr(client, "_request", request)
+
+    assert client.create_run({"model": "m", "project": _PROJECT_ID}) == {"run_id": "flash-1"}
+    assert len(keys) == 2
+    assert keys[0] == keys[1]
+
+
+def test_create_run_exposes_key_after_bounded_ambiguous_retries(monkeypatch) -> None:
+    from flash.client.http import AmbiguousTransportError
+
+    client = ApiClient("https://flash.test", "fslo-user-test")
+    keys = []
+
+    def request(*_args, **kwargs):
+        keys.append(kwargs["extra_headers"]["Idempotency-Key"])
+        raise AmbiguousTransportError("connection reset")
+
+    monkeypatch.setattr(client, "_request", request)
+
+    with pytest.raises(AmbiguousTransportError) as excinfo:
+        client.create_run({"model": "m", "project": _PROJECT_ID})
+
+    assert len(keys) == 2
+    assert keys[0] == keys[1] == excinfo.value.idempotency_key
+
+
+def test_create_run_does_not_retry_definite_connect_failure(monkeypatch) -> None:
+    from flash.client import ServiceUnreachableError
+
+    client = ApiClient("https://flash.test", "fslo-user-test")
+    calls = []
+
+    def request(*_args, **_kwargs):
+        calls.append(True)
+        raise ServiceUnreachableError("connection refused")
+
+    monkeypatch.setattr(client, "_request", request)
+
+    with pytest.raises(ServiceUnreachableError, match="connection refused") as excinfo:
+        client.create_run({"model": "m", "project": _PROJECT_ID})
+
+    assert calls == [True]
+    assert excinfo.value.idempotency_key is None
+
+
+def test_create_run_does_not_retry_raw_connection_refusal(monkeypatch) -> None:
+    client = ApiClient("https://flash.test", "fslo-user-test")
+    calls = []
+
+    def request(*_args, **_kwargs):
+        calls.append(True)
+        raise ConnectionRefusedError("connection refused")
+
+    monkeypatch.setattr(client, "_request", request)
+
+    with pytest.raises(ConnectionRefusedError, match="connection refused") as excinfo:
+        client.create_run({"model": "m", "project": _PROJECT_ID})
+
+    assert calls == [True]
+    assert not hasattr(excinfo.value, "idempotency_key")
+
+
+def test_create_run_retries_raw_connection_reset_once(monkeypatch) -> None:
+    client = ApiClient("https://flash.test", "fslo-user-test")
+    keys = []
+
+    def request(*_args, **kwargs):
+        keys.append(kwargs["extra_headers"]["Idempotency-Key"])
+        raise ConnectionResetError("connection reset")
+
+    monkeypatch.setattr(client, "_request", request)
+
+    with pytest.raises(ConnectionResetError, match="connection reset") as excinfo:
+        client.create_run({"model": "m", "project": _PROJECT_ID})
+
+    assert len(keys) == 2
+    assert keys[0] == keys[1] == excinfo.value.idempotency_key
+
+
+def test_create_run_exposes_key_when_retry_gets_http_error(monkeypatch) -> None:
+    from flash.client.http import AmbiguousTransportError
+
+    client = ApiClient("https://flash.test", "fslo-user-test")
+    calls = []
+
+    def request(*_args, **kwargs):
+        calls.append(kwargs["extra_headers"]["Idempotency-Key"])
+        if len(calls) == 1:
+            raise AmbiguousTransportError("response lost")
+        raise ApiError(409, "submission in progress", detail={"code": "submission_in_progress"})
+
+    monkeypatch.setattr(client, "_request", request)
+
+    with pytest.raises(ApiError) as excinfo:
+        client.create_run({"model": "m", "project": _PROJECT_ID})
+
+    assert calls == [calls[0], calls[0]]
+    assert excinfo.value.idempotency_key == calls[0]
+
+
+def test_create_run_never_retries_http_errors(monkeypatch) -> None:
+    client = ApiClient("https://flash.test", "fslo-user-test")
+    calls = []
+
+    def request(*_args, **_kwargs):
+        calls.append(True)
+        raise ApiError(400, "bad request")
+
+    monkeypatch.setattr(client, "_request", request)
+
+    with pytest.raises(ApiError, match="bad request"):
+        client.create_run({"model": "m", "project": _PROJECT_ID})
+
+    assert calls == [True]
 
 
 def test_create_run_sends_runtime_secrets_outside_spec(stub):

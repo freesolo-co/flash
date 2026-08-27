@@ -1,4 +1,4 @@
-"""per-run deploy, undeploy, and export mutexes for the control plane."""
+"""interprocess operation mutexes for the control plane."""
 
 from __future__ import annotations
 
@@ -12,10 +12,11 @@ from typing import Self
 class _RunLock:
     """Weak-referenceable mutex shared by threads and control-plane processes."""
 
-    __slots__ = ("__weakref__", "_fd", "_lock", "_run_id")
+    __slots__ = ("__weakref__", "_fd", "_lock", "_run_id", "_suffix")
 
-    def __init__(self, run_id: str) -> None:
+    def __init__(self, run_id: str, *, suffix: str = ".deploy.lock") -> None:
         self._run_id = run_id
+        self._suffix = suffix
         self._lock = threading.Lock()
         self._fd: int | None = None
 
@@ -35,9 +36,7 @@ class _RunLock:
             from flash.runner.lifecycle.state import RUNS_DIR, runs_file_path
 
             os.makedirs(RUNS_DIR, exist_ok=True)
-            fd = os.open(
-                runs_file_path(self._run_id, ".deploy.lock"), os.O_CREAT | os.O_RDWR, 0o600
-            )
+            fd = os.open(runs_file_path(self._run_id, self._suffix), os.O_CREAT | os.O_RDWR, 0o600)
             operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
             fcntl.flock(fd, operation)
         except BlockingIOError:
@@ -68,6 +67,8 @@ class _RunLock:
 # Serializes deploy, undeploy, and export per run id.
 _DEPLOY_LOCKS: weakref.WeakValueDictionary[str, _RunLock] = weakref.WeakValueDictionary()
 _DEPLOY_LOCKS_GUARD = threading.Lock()
+_SUBMISSION_LOCKS: weakref.WeakValueDictionary[str, _RunLock] = weakref.WeakValueDictionary()
+_SUBMISSION_LOCKS_GUARD = threading.Lock()
 
 
 def _deploy_lock(run_id: str) -> _RunLock:
@@ -76,4 +77,13 @@ def _deploy_lock(run_id: str) -> _RunLock:
         if lk is None:
             lk = _RunLock(run_id)
             _DEPLOY_LOCKS[run_id] = lk
+        return lk
+
+
+def submission_lock(lock_name: str) -> _RunLock:
+    with _SUBMISSION_LOCKS_GUARD:
+        lk = _SUBMISSION_LOCKS.get(lock_name)
+        if lk is None:
+            lk = _RunLock(lock_name, suffix=".submission.lock")
+            _SUBMISSION_LOCKS[lock_name] = lk
         return lk
