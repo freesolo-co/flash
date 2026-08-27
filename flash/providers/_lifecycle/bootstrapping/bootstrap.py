@@ -529,8 +529,13 @@ def build_worker_env(payload: dict) -> dict:
     if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
         raise RuntimeError("bootstrap fence identity is invalid")
     env["FENCE"] = str(fence)
-    if payload.get("source_snapshot") is not None:
-        env["FLASH_SOURCE_SNAPSHOT_JSON"] = json.dumps(payload["source_snapshot"], sort_keys=True)
+    # every terminal result attests its exact source, so a worker launched without the snapshot
+    # could run to completion and then be unable to publish any manifest at all. fetch_code
+    # already refuses a payload with no descriptor, so this only closes the window in which a
+    # future caller reaches the env build first.
+    if payload.get("source_snapshot") is None:
+        raise RuntimeError("bootstrap payload is missing source_snapshot")
+    env["FLASH_SOURCE_SNAPSHOT_JSON"] = json.dumps(payload["source_snapshot"], sort_keys=True)
     # Override runpod-stamped FLASH_ARM to the real backend from the payload.
     env["FLASH_ARM"] = _arm(payload)
     code_dir = _code_dir(payload)

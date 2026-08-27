@@ -298,11 +298,68 @@ def test_cancelled_result_uses_latest_current_fence_progress(monkeypatch) -> Non
             "training_entered": True,
             "completed_steps": 4,
             "metrics": {"loss": 0.25},
-            "checkpoint": {"step": 4},
+            # progress records a save flat as {"step": N}; the manifest carries one shape, so the
+            # save moves under "saved" and "failure" stays explicit rather than absent.
+            "checkpoint": {"failure": None, "saved": {"step": 4}},
             "artifacts": {"console": "console_rl.txt"},
             "diagnostics": {"error": "worker attempt cancelled"},
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("observed", "expected"),
+    [
+        (None, {"failure": None}),
+        ({}, {"failure": None}),
+        ("not-a-dict", {"failure": None}),
+        ({"step": 7}, {"failure": None, "saved": {"step": 7}}),
+        (
+            {"step": 7, "subfolder": "step-7"},
+            {"failure": None, "saved": {"step": 7, "subfolder": "step-7"}},
+        ),
+        (
+            {"error": "upload failed", "step": None},
+            {"failure": None, "saved": {"error": "upload failed", "step": None}},
+        ),
+        ({"error": "upload failed"}, {"failure": {"error": "upload failed"}}),
+    ],
+)
+def test_supervisor_checkpoint_carries_one_manifest_shape(observed, expected) -> None:
+    """a latched checkpoint failure must stay distinguishable from a successful save.
+
+    workers publish ``{"failure": ...}`` while progress writes flat shapes, so passing progress
+    straight through would put two schemas under one key and make an upload failure read as a
+    save to any reader that later consumes it.
+    """
+    assert result_io._manifest_checkpoint(observed) == expected
+
+
+def test_bootstrap_env_requires_the_source_snapshot(monkeypatch, tmp_path) -> None:
+    """a worker launched without the snapshot can finish training and then publish nothing.
+
+    every terminal manifest attests its exact source, so the env build must refuse the payload
+    rather than let the attempt run to completion and fail at its only terminal authority.
+    """
+    from flash.providers._lifecycle.bootstrapping import bootstrap
+
+    payload = {
+        "phase": "sft",
+        "seed": 1,
+        "attempt": 0,
+        "fence": 1,
+        "run_id": "run-1",
+        "env": {},
+        "job_spec_json": json.dumps({"run_id": "run-1"}),
+        "flash_arm": "sft",
+        "source_snapshot": None,
+    }
+    with pytest.raises(RuntimeError, match="missing source_snapshot"):
+        bootstrap.build_worker_env(payload)
+
+    payload["source_snapshot"] = ATTESTATION
+    env = bootstrap.build_worker_env(payload)
+    assert json.loads(env["FLASH_SOURCE_SNAPSHOT_JSON"]) == ATTESTATION
 
 
 def test_worker_surfaces_required_result_publication_failure(monkeypatch) -> None:

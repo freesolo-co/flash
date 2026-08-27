@@ -276,6 +276,21 @@ def _latest_local_progress() -> dict:
     return max(candidates, key=lambda value: int(value.get("sequence") or 0))
 
 
+def _manifest_checkpoint(observed: object) -> dict:
+    """carry a progress checkpoint into the manifest's one checkpoint shape.
+
+    workers publish ``{"failure": <failure or None>}``, but progress records the flat shapes
+    ``{"step": N}``, ``{"step": N, "subfolder": ...}``, and a bare failure object. reading the
+    latter straight through would put two schemas under one key, so a latched upload failure
+    would be indistinguishable from a successful save to any future reader.
+    """
+    if not isinstance(observed, dict) or not observed:
+        return {"failure": None}
+    if "step" in observed:
+        return {"failure": None, "saved": dict(observed)}
+    return {"failure": dict(observed)}
+
+
 def _publish_supervisor_result(
     *,
     outcome: str,
@@ -292,9 +307,7 @@ def _publish_supervisor_result(
         training_entered=progress.get("training_entered") is True,
         completed_steps=int(progress.get("completed_steps") or 0),
         metrics=progress.get("metrics") if isinstance(progress.get("metrics"), dict) else {},
-        checkpoint=(
-            progress.get("checkpoint") if isinstance(progress.get("checkpoint"), dict) else {}
-        ),
+        checkpoint=_manifest_checkpoint(progress.get("checkpoint")),
         artifacts={"console": f"console_{state.PHASE}.txt"},
         diagnostics={"error": error},
     )
