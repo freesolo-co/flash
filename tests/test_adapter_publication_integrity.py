@@ -30,6 +30,7 @@ class _RecordingHfApi:
         self.events: list[str] = []
         self._head = "a" * 40
         self._snapshots = {self._head: dict.fromkeys(files or [], b"existing")}
+        self._authors = {self._head: dict.fromkeys(files or [], self._head)}
         self.omit_after_commit: str | None = None
         self.omit_metadata: str | None = None
         self.stale_after_commit: dict[str, bytes] = {}
@@ -41,6 +42,23 @@ class _RecordingHfApi:
     @property
     def files(self) -> set[str]:
         return set(self._snapshots[self._head])
+
+    def land_foreign_commit(
+        self, revision: str, snapshot: dict[str, bytes], written: set[str]
+    ) -> None:
+        """Advance the head to another writer's commit that wrote exactly ``written``.
+
+        The hub attributes a path to the commit that last wrote it, whatever bytes that commit
+        happened to land. A path this commit left untouched keeps its earlier author even though
+        the head moved, and a path it rewrote with identical bytes still becomes its own.
+        """
+        authors = dict(self._authors[self._head])
+        for path in snapshot:
+            if path in written or path not in authors:
+                authors[path] = revision
+        self._snapshots[revision] = snapshot
+        self._authors[revision] = {path: authors[path] for path in snapshot}
+        self._head = revision
 
     def upload_folder(self, **kwargs):
         self.uploads.append(kwargs)
@@ -70,9 +88,11 @@ class _RecordingHfApi:
     def create_commit(self, *, repo_id, repo_type, operations, commit_message, parent_commit):
         self.events.append("commit")
         if self.race_before_commit:
-            raced = "b" * 40
-            self._snapshots[raced] = {**self._snapshots[self._head], "other-writer.txt": b"x"}
-            self._head = raced
+            self.land_foreign_commit(
+                "b" * 40,
+                {**self._snapshots[self._head], "other-writer.txt": b"x"},
+                {"other-writer.txt"},
+            )
             raise RuntimeError("parent commit changed")
         if parent_commit != self._head:
             raise RuntimeError("parent commit changed")
@@ -89,7 +109,13 @@ class _RecordingHfApi:
             result.pop(self.omit_after_commit, None)
         result.update(self.stale_after_commit)
         revision = f"{len(self._snapshots) + 1:040x}"
+        written = {operation.path_in_repo for operation in operation_list}
+        authors = dict(self._authors[self._head])
+        for path in result:
+            if path in written or path not in authors:
+                authors[path] = revision
         self._snapshots[revision] = result
+        self._authors[revision] = {path: authors[path] for path in result}
         self._head = revision
         self.commits.append(
             {
@@ -101,8 +127,9 @@ class _RecordingHfApi:
         )
         return SimpleNamespace(oid=revision)
 
-    def get_paths_info(self, *, repo_id, paths, repo_type, revision):
+    def get_paths_info(self, *, repo_id, paths, repo_type, revision, expand=False):
         snapshot = self._snapshots[revision]
+        authors = self._authors[revision]
         infos = []
         for path in paths:
             if path not in snapshot or path == self.omit_metadata:
@@ -117,7 +144,18 @@ class _RecordingHfApi:
                 blob.update(f"blob {len(content)}\0".encode())
                 blob.update(content)
                 blob_id = blob.hexdigest()
-            infos.append(SimpleNamespace(path=path, size=len(content), blob_id=blob_id, lfs=lfs))
+            last_commit = (
+                SimpleNamespace(oid=authors[path], title="c", date=None) if expand else None
+            )
+            infos.append(
+                SimpleNamespace(
+                    path=path,
+                    size=len(content),
+                    blob_id=blob_id,
+                    lfs=lfs,
+                    last_commit=last_commit,
+                )
+            )
         return infos
 
     def hf_hub_download(
@@ -388,9 +426,8 @@ def _retract_after_racing_writer(tmp_path, monkeypatch, rec, mutate):
         finally:
             # another writer lands a commit between our failed verify and the retraction.
             raced = dict(rec._snapshots[rec._head])
-            mutate(raced, target)
-            rec._snapshots["c" * 40] = raced
-            rec._head = "c" * 40
+            written = mutate(raced, target)
+            rec.land_foreign_commit("c" * 40, raced, written)
 
     monkeypatch.setattr(publication, "_verify_adapter_commit", _verify_then_race)
 
@@ -410,10 +447,29 @@ def test_retraction_defers_to_a_writer_that_republished_this_adapter(tmp_path, m
     def _republish_the_adapter(snapshot, target):
         snapshot[f"{target}/adapter_config.json"] = b'{"r": 8}'
         snapshot[f"{target}/adapter_model.safetensors"] = b"republished"
+        return {f"{target}/adapter_config.json", f"{target}/adapter_model.safetensors"}
 
     _retract_after_racing_writer(tmp_path, monkeypatch, rec, _republish_the_adapter)
 
     assert rec.deleted == [], "a newer writer's commit must survive our retraction"
+
+
+def test_retraction_defers_to_a_republication_of_the_identical_snapshot(tmp_path, monkeypatch):
+    """A writer that lands these exact bytes owns the path just as much as one that changed them.
+
+    Both wrappers around this publication retry a failed required save with the same local
+    snapshot, so a same-bytes republication is not a corner case -- it is the ordinary retry. Its
+    subtree is byte-identical to ours by construction, so nothing about the content can tell the
+    two apart, and deleting on content equality destroys the retry's verified adapter.
+    """
+    rec = _RecordingHfApi()
+
+    def _republish_the_identical_snapshot(snapshot, target):
+        return {f"{target}/adapter_config.json"}
+
+    _retract_after_racing_writer(tmp_path, monkeypatch, rec, _republish_the_identical_snapshot)
+
+    assert rec.deleted == [], "a same-bytes republication must survive our retraction"
 
 
 def test_an_unrelated_writer_moving_the_head_does_not_strand_the_unverified_folder(
@@ -429,6 +485,7 @@ def test_an_unrelated_writer_moving_the_head_does_not_strand_the_unverified_fold
 
     def _heartbeat(snapshot, _target):
         snapshot["rl/flash-ckpt-1/heartbeat.json"] = b"{}"
+        return {"rl/flash-ckpt-1/heartbeat.json"}
 
     target = _retract_after_racing_writer(tmp_path, monkeypatch, rec, _heartbeat)
 
@@ -451,11 +508,11 @@ def test_retraction_is_pinned_to_the_head_it_inspected(tmp_path, monkeypatch):
     def _republish_after_the_check():
         if not rec.commits:
             return
-        rec._snapshots["d" * 40] = {
-            **rec._snapshots[rec._head],
-            f"{target}/adapter_config.json": b'{"r": 8}',
-        }
-        rec._head = "d" * 40
+        rec.land_foreign_commit(
+            "d" * 40,
+            {**rec._snapshots[rec._head], f"{target}/adapter_config.json": b'{"r": 8}'},
+            {f"{target}/adapter_config.json"},
+        )
 
     def _delete_after_racing_republish(**kwargs):
         _republish_after_the_check()

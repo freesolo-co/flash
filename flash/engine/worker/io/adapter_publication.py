@@ -297,59 +297,47 @@ def _verify_adapter_commit(
         raise AdapterPublicationError(str(error)) from error
 
 
-def _subtree_content_identity(api, *, repo_id: str, revision: str, prefix: str) -> dict[str, tuple]:
-    """Content identity of every file under ``prefix`` at one immutable revision.
-
-    Raises when the hub cannot describe a listed file, so an unreadable subtree can never compare
-    equal to another unreadable one.
-    """
-    paths = sorted(
-        path
-        for path in api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision=revision)
-        if path.startswith(prefix)
-    )
-    if not paths:
-        return {}
-    identity: dict[str, tuple] = {}
-    for info in api.get_paths_info(
-        repo_id=repo_id, paths=paths, repo_type="dataset", revision=revision
-    ):
-        path = getattr(info, "path", None)
-        size = getattr(info, "size", None)
-        lfs = getattr(info, "lfs", None)
-        digest = getattr(lfs, "sha256", None) if lfs is not None else getattr(info, "blob_id", None)
-        if (
-            path not in paths
-            or path in identity
-            or isinstance(size, bool)
-            or not isinstance(size, int)
-            or not isinstance(digest, str)
-        ):
-            raise AdapterPublicationError("adapter subtree content identity could not be resolved")
-        identity[path] = (size, digest.lower())
-    if set(identity) != set(paths):
-        raise AdapterPublicationError("adapter subtree content identity is incomplete")
-    return identity
-
-
 def _tip_still_carries_our_adapter(
     api, *, repo_id: str, revision: str, head: str, prefix: str
 ) -> bool:
-    """True when the branch tip's adapter subtree is still exactly the one we published.
+    """True when every file under ``prefix`` at the tip was last written by our own commit.
 
-    Ownership of a path is a content question, not a head question. Sibling writers share this
-    repository -- the heartbeat daemon, the streamed resume checkpoint, and every other step's
-    adapter all commit to it -- so the head moves past ours constantly without anyone touching this
-    path. Comparing content instead of commits means an unrelated commit no longer strands an
-    unverified folder on the tip, while a genuine republication of this exact path is still left
-    alone.
+    Ownership of a path is a question about who wrote it, not about what it contains and not about
+    where the branch head is. Sibling writers share this repository -- the heartbeat daemon, the
+    streamed resume checkpoint, and every other step's adapter all commit to it -- so the head moves
+    past ours constantly without anyone touching this path. But content equality cannot separate our
+    own unverified publish from a later writer that landed these same bytes: the two are byte-
+    identical by construction when a retry republishes the same snapshot. The hub records which
+    commit last wrote each path, so ask that instead. A republication moves those paths onto the new
+    writer's commit, and this returns False rather than deleting a publication that was never ours.
+
+    Raises when the hub cannot attribute a listed file, so an unattributable subtree is never
+    mistaken for one we own.
     """
     if head == revision:
         return True
-    ours = _subtree_content_identity(api, repo_id=repo_id, revision=revision, prefix=prefix)
-    return bool(ours) and (
-        _subtree_content_identity(api, repo_id=repo_id, revision=head, prefix=prefix) == ours
+    paths = sorted(
+        path
+        for path in api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision=head)
+        if path.startswith(prefix)
     )
+    if not paths:
+        return False
+    seen: set[str] = set()
+    for info in api.get_paths_info(
+        repo_id=repo_id, paths=paths, repo_type="dataset", revision=head, expand=True
+    ):
+        path = getattr(info, "path", None)
+        commit = getattr(info, "last_commit", None)
+        oid = getattr(commit, "oid", None) if commit is not None else None
+        if path not in paths or path in seen or not isinstance(oid, str):
+            raise AdapterPublicationError("adapter subtree authorship could not be resolved")
+        if oid != revision:
+            return False
+        seen.add(path)
+    if seen != set(paths):
+        raise AdapterPublicationError("adapter subtree authorship is incomplete")
+    return True
 
 
 def _retract_unverified_adapter(api, *, repo_id: str, revision: str | None, target: str) -> None:
@@ -362,8 +350,9 @@ def _retract_unverified_adapter(api, *, repo_id: str, revision: str | None, targ
     existing for the inference drawn from it to stay true.
 
     Another writer may already own this path, and deleting then would destroy a publication that was
-    never in doubt. So retraction runs only while the tip still carries our own unverified content,
-    is pinned to the exact commit that check read, and only ever names a real subfolder.
+    never in doubt. So retraction runs only while every file at the tip is still attributed to our
+    own unverified commit, is pinned to the exact head that check read, and only ever names a real
+    subfolder.
     """
     if not target or not isinstance(revision, str) or not is_commit_sha(revision):
         return
