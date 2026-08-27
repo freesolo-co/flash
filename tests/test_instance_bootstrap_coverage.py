@@ -1856,36 +1856,99 @@ def test_group_teardown_is_bounded_by_the_deadline_it_is_given():
     assert processes._bounded_graces(10.0, 5.0, None) == (10.0, 5.0)
 
 
-def test_teardown_deadline_leaves_the_kill_time_to_land():
-    """Teardown cannot end at the instant it begins, or SIGKILL is sent and never waited on.
+def test_group_teardown_deadline_is_later_than_the_cutoff_that_triggers_teardown():
+    """Teardown cannot be bounded by the instant it starts, or the kill gets no time to land.
 
-    Teardown runs because the worker overran ``_worker_execution_deadline``, so handing that same
-    instant back as its cap leaves zero for both waits. Every capped run would then report a
-    surviving process group -- a false alarm about a stranded gpu -- however promptly the group
-    actually died.
+    ``terminate_process_group`` runs when the worker deadline fires. Handing it that same instant
+    leaves zero remaining, so ``_bounded_graces`` yields (0, 0): SIGKILL is sent but never waited
+    on, ``_group_exists`` still sees the not-yet-reaped group, and an ordinary wall-clock timeout
+    is reported as a survivor holding the gpu. The teardown cap must therefore sit strictly after
+    the worker cutoff, while still leaving the final console tail -- which carries the survivor
+    line -- its own slice.
     """
-    from flash.providers._lifecycle.bootstrapping import processes
+    import flash.providers._lifecycle.bootstrapping.processes as processes
 
-    upload_deadline_at = 1_000.0
-    worker_deadline_at = b._worker_execution_deadline(upload_deadline_at)
-    teardown_deadline_at = b._teardown_deadline(upload_deadline_at)
+    upload_deadline = 1_000.0
+    worker_cutoff = b._worker_execution_deadline(upload_deadline)
+    teardown_cap = b._group_teardown_deadline(upload_deadline)
 
-    teardown_window = teardown_deadline_at - worker_deadline_at
-    assert teardown_window > 0.0
+    assert teardown_cap > worker_cutoff, (
+        "teardown is bounded by the moment it begins, so the kill is never waited on and every "
+        "capped run reports a surviving process group"
+    )
+    # the slack is real time to reap a killed group, not a rounding artefact.
+    assert teardown_cap - worker_cutoff == pytest.approx(b._CONSOLE_UPLOAD_STOP_TIMEOUT_S)
+    # and it stops short of the tail that reports the survivor.
+    assert teardown_cap <= upload_deadline - b._CONSOLE_UPLOAD_FINAL_TIMEOUT_S
 
-    # at the moment teardown starts, the kill still has room to land. the clock is pinned to the
-    # worker deadline because that is when the wall-clock cap hands teardown its budget.
+    # standing at the cutoff -- where teardown actually begins -- that slack is what the
+    # supervision gets to spend. bounded by the cutoff instead, both waits would be zero.
     real_time = processes.time.time
-    processes.time.time = lambda: worker_deadline_at
     try:
-        term_wait, kill_wait = processes._bounded_graces(10.0, 5.0, teardown_deadline_at)
+        processes.time.time = lambda: worker_cutoff
+        term_wait, kill_wait = processes._bounded_graces(10.0, 5.0, teardown_cap)
+        assert kill_wait > 0, "the escalation that frees the gpu must be given time to be reaped"
+        assert term_wait + kill_wait <= b._CONSOLE_UPLOAD_STOP_TIMEOUT_S
+        assert processes._bounded_graces(10.0, 5.0, worker_cutoff) == (0.0, 0.0)
     finally:
         processes.time.time = real_time
-    assert kill_wait > 0.0
-    assert term_wait + kill_wait == pytest.approx(teardown_window)
 
-    # and it still ends before the final console upload it must not displace.
-    assert teardown_deadline_at <= upload_deadline_at - b._CONSOLE_UPLOAD_FINAL_TIMEOUT_S
+
+def test_run_mode_hands_teardown_a_deadline_it_can_actually_use(monkeypatch):
+    """The cap ``run_mode`` passes to teardown must outlast the cutoff that triggered it."""
+    _disable_periodic_console_upload(monkeypatch)
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
+    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+
+    handed = {}
+
+    def terminate(process, *, process_group_id, deadline_at=None):
+        handed["deadline_at"] = deadline_at
+        handed["at"] = b.time.time()
+
+    monkeypatch.setattr(b._bootstrap_processes, "terminate_process_group", terminate)
+
+    class _NeverExits:
+        def __init__(self):
+            self.args = ["worker"]
+            self.stdout = iter(())
+            self.returncode = None
+            self.pid = 909
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(self.args, timeout)
+
+    monkeypatch.setattr(
+        b._bootstrap_processes,
+        "start_process_group",
+        lambda *a, **k: (_NeverExits(), 909),
+    )
+
+    deadline = b.time.time() + 100
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+    }
+    # the worker never exits, so the cap fires and the run ends as an ordinary timeout. that is
+    # the path under test: teardown runs, and what it was handed is what decides whether the kill
+    # is waited on or the run is misreported as a stranded gpu.
+    with pytest.raises(TimeoutError):
+        b.run_mode(payload, {}, "sft", deadline_ts=deadline)
+
+    upload_deadline, _reaping = b._upload_cleanup_deadlines(deadline)
+    assert handed["deadline_at"] == pytest.approx(b._group_teardown_deadline(upload_deadline))
+    # the cap must outlast the worker cutoff that triggered teardown. handing over the cutoff
+    # itself leaves zero remaining, so SIGKILL is sent but never waited on and an ordinary timeout
+    # is reported as a stranded gpu.
+    assert handed["deadline_at"] > b._worker_execution_deadline(upload_deadline)
+    assert handed["deadline_at"] > handed["at"], "teardown was handed an already-expired deadline"
 
 
 def test_run_mode_starts_no_subprocess_at_deadline(monkeypatch):

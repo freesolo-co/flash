@@ -299,22 +299,22 @@ def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
 
 
 def _worker_execution_deadline(upload_deadline_at: float) -> float:
-    """When the worker must be done, leaving the console upload window intact behind it.
-
-    The run wall budget may narrow the worker's own deadline below this instant; this is the floor
-    the console upload window sits behind.
-    """
+    """When the worker must be done, leaving the console upload window intact behind it."""
     return upload_deadline_at - _CONSOLE_UPLOAD_STOP_TIMEOUT_S - _CONSOLE_UPLOAD_FINAL_TIMEOUT_S
 
 
-def _teardown_deadline(upload_deadline_at: float) -> float:
-    """How long group teardown may run once the worker has overrun its own deadline.
+def _group_teardown_deadline(upload_deadline_at: float) -> float:
+    """How long killing the worker's process group may take once the wall-clock cap has fired.
 
-    Teardown starts at the worker deadline, so it cannot also end there: that leaves SIGKILL sent
-    but never waited on, and any group needing even a moment to die is reported as having survived
-    term and kill on every capped run. It gets the stop half of the upload reserve, which keeps the
-    final console tail -- the tail carrying the line that says the box is still occupied -- funded
-    by the timeout that was already sized for it.
+    Teardown begins at the worker deadline, so it cannot be bounded by that same instant: a group
+    supervised against its own start time gets a zero wait, SIGKILL is never given time to be
+    reaped, and an ordinary capped run is reported as a surviving group holding the gpu.
+
+    What it must not eat into is the final console tail, since that tail carries the survivor line
+    to the user -- hence stopping one full ``_CONSOLE_UPLOAD_FINAL_TIMEOUT_S`` short of the upload
+    deadline. The uploader stop that runs in between is capped by its own constant against the same
+    absolute deadline, so it is not squeezed by a teardown that runs long. And running long is only
+    ever the stuck case: a group that dies on SIGKILL is reaped in milliseconds.
     """
     return upload_deadline_at - _CONSOLE_UPLOAD_FINAL_TIMEOUT_S
 
@@ -623,7 +623,7 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     console = f"/tmp/console_{mode}.txt"
     upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
     worker_deadline_at = _worker_execution_deadline(upload_deadline_at)
-    teardown_deadline_at = _teardown_deadline(upload_deadline_at)
+    teardown_deadline_at = _group_teardown_deadline(upload_deadline_at)
     # cap work from its actual start: the absolute deadline includes boot grace, whose unused
     # portion must not extend the declared wall-time budget.
     budget = payload.get("run_max_wall_seconds")
@@ -706,8 +706,6 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                 # every later run on this box. a survivor is recorded rather than raised here, so
                 # the console tail below still uploads and explains why the run was killed.
                 try:
-                    # bounded by the upload window: a group that ignores SIGTERM must not spend the
-                    # time reserved for the console tail that reports it survived.
                     _bootstrap_processes.terminate_process_group(
                         proc,
                         process_group_id=worker_process_group_id,
