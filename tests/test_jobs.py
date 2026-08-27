@@ -6192,6 +6192,44 @@ def _poll_in_queue_forever(monkeypatch, **poll_kwargs):
     )
 
 
+def test_queued_health_probe_is_bounded_by_the_grant_deadline(monkeypatch):
+    """the queued health probe may not outlive the deadline whose verdict it feeds.
+
+    the ``no_capacity`` decision above this call is gated on ``grant_deadline_at``. an unbounded
+    probe runs the REST client's full retry ladder of five 30-second attempts plus backoff, so a
+    slow or unavailable health API near the deadline delays the capacity verdict, the retry, and
+    endpoint cleanup by minutes past an immutable deadline.
+    """
+    import itertools
+
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs
+
+    seen = []
+    polling = _wire_runpod_poll(
+        monkeypatch,
+        attempt=_attempt_record(
+            grant_deadline_at=900.0,
+            work_deadline_at=1_000.0,
+            result_deadline_at=1_100.0,
+        ),
+    )
+    monkeypatch.setattr(runpod_api, "job_status", lambda eid, jid, **_kw: {"status": "IN_QUEUE"})
+
+    def health(_eid, _fingerprint, **kwargs):
+        seen.append(kwargs.get("deadline_at"))
+        raise RuntimeError("no workers yet")
+
+    monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
+    clock = itertools.count(start=0, step=25.0)
+    monkeypatch.setattr(polling.time, "time", lambda: next(clock))
+
+    polling.poll_job(_runpod_handle(jobs), _poll_spec(), interval_s=0, queue_grace_s=900.0)
+
+    assert seen, "the queued path never probed endpoint health"
+    assert all(value == 900.0 for value in seen), seen
+
+
 def test_capacity_detail_does_not_promise_a_next_best_gpu_on_the_last_class(monkeypatch):
     """LS-008/AT-013: do not promise a next-best GPU on the last class.
 

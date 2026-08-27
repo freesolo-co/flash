@@ -50,17 +50,27 @@ def _current_attempt(adapter: InstancePollAdapter) -> AttemptRecord:
     return attempt
 
 
-def _record_resource(adapter: InstancePollAdapter, status: str, *, transport: str = "ok") -> None:
+def _record_resource(
+    adapter: InstancePollAdapter,
+    status: str,
+    *,
+    transport: str = "ok",
+    confirmed_missing: bool = True,
+) -> None:
+    """project one provider observation onto the public resource state.
+
+    ``confirmed_missing`` carries the poll loop's own verdict. the loop deliberately requires
+    ``missing_dead_threshold`` consecutive misses before treating an absent instance as gone, so an
+    isolated miss must not surface publicly as ``terminal`` while the same loop still considers the
+    resource live and may observe it running on the next poll.
+    """
     from flash.runner.accounting.reconciliation import _remote_resource_identity
     from flash.runner.lifecycle.status import get_status, record_resource
 
     current = get_status(adapter.run_id)
+    dead = status in adapter.dead_states or (status == "missing" and confirmed_missing)
     normalized = (
-        "running"
-        if status == adapter.running_status
-        else "terminal"
-        if status in adapter.dead_states or status == "missing"
-        else "provisioning"
+        "running" if status == adapter.running_status else "terminal" if dead else "provisioning"
     )
     remote = current.remote if isinstance(current.remote, dict) else {}
     record_resource(
@@ -168,7 +178,11 @@ def poll_instance_job(
             (instance or {}).get(adapter.status_field)
             or ("missing" if instance is None else "unknown")
         )
-        _record_resource(adapter, status)
+        _record_resource(
+            adapter,
+            status,
+            confirmed_missing=missing_streak >= adapter.missing_dead_threshold,
+        )
         if status != last_status:
             say(f"instance {adapter.instance_id}: {status}")
             last_status = status

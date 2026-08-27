@@ -2169,6 +2169,41 @@ def test_lambda_poll_adapter_carries_attempt_fence_and_cost_stamp(monkeypatch):
     assert metrics["notes"]["provider"] == "lambda"
 
 
+def test_isolated_instance_miss_is_not_projected_terminal(monkeypatch):
+    """an unconfirmed miss must not surface publicly as a dead resource.
+
+    the poll loop deliberately requires ``missing_dead_threshold`` consecutive misses before it
+    treats an instance as gone, so a single transient ``get_instance`` miss leaves the loop still
+    treating the run as live. projecting ``terminal`` on that first miss makes ``flash runs status``
+    and log-follow report a dead resource for a run the same loop may observe running next poll.
+    """
+    from flash.providers._lifecycle.instances import poll_instance
+    from flash.runner.lifecycle import status as status_ops
+
+    recorded = []
+    monkeypatch.setattr(status_ops, "get_status", lambda _run_id: SimpleNamespace(remote={}))
+    monkeypatch.setattr(
+        status_ops, "record_resource", lambda _run_id, payload, **_k: recorded.append(payload)
+    )
+    adapter = SimpleNamespace(
+        run_id="run-1",
+        current_attempt=0,
+        fence=1,
+        provider="lambda",
+        instance_id="i-1",
+        running_status="active",
+        dead_states=frozenset({"terminated"}),
+    )
+
+    poll_instance._record_resource(adapter, "missing", confirmed_missing=False)
+    poll_instance._record_resource(adapter, "missing", confirmed_missing=True)
+
+    assert recorded[0]["provider_state"] == "missing"
+    # unconfirmed stays provisioning; only the threshold-confirmed miss is terminal.
+    assert recorded[0]["state"] == "provisioning"
+    assert recorded[1]["state"] == "terminal"
+
+
 def test_provider_initial_and_reattached_poll_keep_same_deadline(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.core.base import JobHandle, PollResult

@@ -155,6 +155,10 @@ def _queue_failure(
         health = runpod_api.endpoint_health_for_fingerprint(
             context.handle.endpoint_id,
             context.handle.key_fingerprint,
+            # bound the probe by the same immutable deadline that decides no_capacity above. an
+            # unbounded probe can burn its full retry ladder past the grant deadline, delaying the
+            # capacity verdict, the retry, and endpoint cleanup by minutes.
+            deadline_at=context.attempt.grant_deadline_at,
         )
     except Exception:
         return _queued_too_long(context, state, now)
