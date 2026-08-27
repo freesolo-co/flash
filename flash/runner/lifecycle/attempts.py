@@ -21,33 +21,6 @@ def _infer_next_attempt(raw: dict) -> int:
     return stored
 
 
-def _heartbeat_attempt_is_current(hb: object, raw: dict) -> bool:
-    """True when a heartbeat carries the attempt identity this run most recently reserved.
-
-    This is the plane-side counterpart of ``_heartbeat_matches_attempt``, which runs provider-side
-    where the launch timestamp is in hand; here the equivalent identity
-    is the reserved attempt, which the worker stamps on every heartbeat and ``_save_status`` already
-    persists as ``next_attempt`` (the NEXT id to hand out, so the live attempt is one below it --
-    same arithmetic as ``_latest_reserved_attempt``, computed from the caller's already-loaded
-    record because this runs inside the status guard and must not re-read it).
-    """
-    if not isinstance(hb, dict):
-        return False
-    try:
-        next_attempt = _attempt_int(_infer_next_attempt(raw))
-    except RuntimeError:
-        return False
-    if next_attempt is None:
-        return False
-    # `_reserve_attempt` runs before the provider launch (lifecycle.py), so a live worker's
-    # heartbeat always sits one below the stored counter. zero means nothing has been reserved yet;
-    # accept attempt 0 there rather than rejecting, because the launch path writes the counter and
-    # the worker's first heartbeat can be read back in either order, and refusing to arm would hand
-    # the run a budget measured from a moment before it started working.
-    expected = next_attempt - 1 if next_attempt > 0 else 0
-    return _attempt_int(hb.get("attempt")) == expected
-
-
 def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]:
     """Verify one locked opd retry snapshot: its attempt, resume revision, and checkpoint width.
 
