@@ -49,7 +49,6 @@ from flash.schema.fields import (
     _train_teacher,
     _wandb_spec,
 )
-from flash.serve.contract.protocol import ADAPTER_REVISION_PATTERN
 
 # the smallest rank the parser accepts, and so the smallest a source adapter can turn out to have.
 # unresolved warm starts use it instead of the serialization default for permissive client-side
@@ -59,10 +58,9 @@ MIN_LORA_RANK = 1
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
-# canonical short checkpoint references name a run alias or a saved checkpoint. immutable adapter
-# revisions additionally lock that checkpoint identity to the exact hugging face commit.
-_CHECKPOINT_REF_RE = re.compile(rf"^(?P<run_id>{_RUN_ID_RE})(?:/step-(?P<step>\d{{1,18}}))?$")
-_ADAPTER_REVISION_RE = re.compile(ADAPTER_REVISION_PATTERN)
+_CHECKPOINT_REF_RE = re.compile(
+    rf"^(?P<run_id>{_RUN_ID_RE})/(?:(?P<final>final)|step-(?P<step>0|[1-9]\d{{0,17}}))$"
+)
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(
@@ -72,39 +70,29 @@ _ADAPTER_STORAGE_REF_RE = re.compile(
 
 
 def parse_checkpoint_ref(text: str) -> tuple[str, int | None] | None:
-    """Parse the canonical short reference: `<run_id>` or `<run_id>/step-N` -> (run_id, step|None)."""
-    match = _CHECKPOINT_REF_RE.fullmatch(str(text or "").strip())
+    """parse `<run_id>/final` or `<run_id>/step-N` into its canonical components."""
+    if not isinstance(text, str):
+        return None
+    match = _CHECKPOINT_REF_RE.fullmatch(text)
     if match is None:
         return None
     step = match.group("step")
     return match.group("run_id"), int(step) if step is not None else None
 
 
-def parse_adapter_revision(text: str) -> tuple[str, int | None, str] | None:
-    """Parse a locked immutable adapter revision into ``(run_id, step|None, hf_revision)``."""
-    match = _ADAPTER_REVISION_RE.fullmatch(str(text or "").strip())
-    if match is None:
-        return None
-    step = match.group("step")
-    return (
-        match.group("run_id"),
-        int(step) if step is not None else None,
-        match.group("hf_revision"),
-    )
-
-
 def format_checkpoint_ref(run_id: str, step: int | None = None) -> str:
-    """Format the canonical short reference: `<run_id>` or `<run_id>/step-N`."""
-    return f"{run_id}/step-{int(step)}" if step is not None else str(run_id)
-
-
-def format_adapter_revision(run_id: str, step: int | None, hf_revision: str) -> str:
-    """Format and validate a canonical immutable adapter revision."""
-    suffix = f"step-{int(step)}" if step is not None else "final"
-    revision = f"{run_id}@{suffix}.{hf_revision}"
-    if parse_adapter_revision(revision) is None:
-        raise ValueError("invalid immutable adapter revision components")
-    return revision
+    """format and validate one canonical permanent checkpoint identity."""
+    if not isinstance(run_id, str) or re.fullmatch(_RUN_ID_RE, run_id) is None:
+        raise ValueError("invalid run_id for checkpoint identity")
+    if step is None:
+        checkpoint_id = f"{run_id}/final"
+    else:
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("checkpoint step must be a non-negative integer")
+        checkpoint_id = f"{run_id}/step-{step}"
+    if parse_checkpoint_ref(checkpoint_id) is None:
+        raise ValueError("invalid checkpoint identity components")
+    return checkpoint_id
 
 
 def checkpoint_storage_ref(hf_repo: str, phase: str, run_id: str, step: int | None = None) -> str:
@@ -227,8 +215,8 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
     if parse_checkpoint_ref(ref) is not None:
         return ref
     raise ConfigError(
-        "train.init_from_adapter must be `<run_id>` (continue that run's trained adapter) or "
-        f"`<run_id>/step-N` (warm-start from a checkpoint listed by `{CLI_NAME} runs checkpoint`)"
+        "train.init_from_adapter must be `<run_id>/final` or `<run_id>/step-N` "
+        f"from `{CLI_NAME} runs checkpoint`"
     )
 
 

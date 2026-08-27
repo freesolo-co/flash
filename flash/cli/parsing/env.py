@@ -149,7 +149,7 @@ def _add_env_eval_command(env_sub: argparse._SubParsersAction) -> None:
     env_eval.add_argument(
         "target",
         metavar="TARGET",
-        help="a bare RUN_ID, RUN_ID/step-N, or full immutable adapter revision",
+        help="permanent deployed checkpoint id: RUN_ID/final or RUN_ID/step-N",
     )
     # the same two knobs `env test` exposes, and for the same reason: an env whose
     # `load_environment()` requires a difficulty or reads a non-default split cannot be evaluated at

@@ -11,7 +11,7 @@ from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import Any, Literal
 
-from flash.serve.contract.protocol import ADAPTER_REVISION_PATTERN
+from flash.schema import parse_checkpoint_ref
 from flash.serve.control import DeploymentSpec, EngineIdentity
 from flash.serve.control._canonical import (
     canonical_json,
@@ -22,12 +22,11 @@ from flash.serve.control._serialization import serialize_engine
 from flash.serve.control.types import validate_deployment_spec
 
 MANIFEST_SCHEMA = "flash.serving.manifest"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 _REQUIRED_ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _HEX_40_RE = re.compile(r"[0-9a-f]{40}")
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}")
 _IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
-_ADAPTER_REVISION_RE = re.compile(ADAPTER_REVISION_PATTERN)
 _REPO_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
 _SAFE_PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _ALLOWED_ENGINE_ARGS = frozenset({"enforce_eager"})
@@ -121,13 +120,11 @@ class ArtifactFile:
 class AdapterExecutionInput:
     """execution-only file declarations for one control-authorized adapter."""
 
-    adapter_revision: str
+    checkpoint_id: str
     files: tuple[ArtifactFile, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "adapter_revision", _string(self.adapter_revision, "adapter_revision")
-        )
+        object.__setattr__(self, "checkpoint_id", _string(self.checkpoint_id, "checkpoint_id"))
         object.__setattr__(self, "files", tuple(self.files))
         _validate_file_table(self.files)
 
@@ -161,9 +158,9 @@ class ExecutionInputs:
             _frozen_json_mapping(self.processor_kwargs, "processor_kwargs"),
         )
         object.__setattr__(self, "adapters", tuple(self.adapters))
-        revisions = [entry.adapter_revision for entry in self.adapters]
+        revisions = [entry.checkpoint_id for entry in self.adapters]
         if len(revisions) != len(set(revisions)):
-            raise ManifestError("execution inputs contain duplicate adapter revisions")
+            raise ManifestError("execution inputs contain duplicate checkpoint identities")
         _validate_runtime_options(
             self.engine_args,
             self.tokenizer_kwargs,
@@ -176,8 +173,7 @@ class ManifestAdapter:
     """one immutable adapter declaration in a validated serving manifest."""
 
     run_id: str
-    checkpoint: str
-    adapter_revision: str
+    checkpoint_id: str
     repo_id: str
     repo_type: Literal["model", "dataset"]
     source_revision: str
@@ -193,19 +189,16 @@ class ManifestAdapter:
     def __post_init__(self) -> None:
         for name in (
             "run_id",
-            "checkpoint",
-            "adapter_revision",
+            "checkpoint_id",
             "repo_id",
             "source_revision",
             "base_model",
             "base_model_revision",
         ):
             object.__setattr__(self, name, _string(getattr(self, name), name))
-        revision_match = _ADAPTER_REVISION_RE.fullmatch(self.adapter_revision)
-        if revision_match is None or revision_match.group("run_id") != self.run_id:
-            raise ManifestError("adapter_revision must be immutable and belong to run_id")
-        if revision_match.group("hf_revision") != self.source_revision:
-            raise ManifestError("source_revision must match adapter_revision")
+        parsed_checkpoint = parse_checkpoint_ref(self.checkpoint_id)
+        if parsed_checkpoint is None or parsed_checkpoint[0] != self.run_id:
+            raise ManifestError("checkpoint_id must be permanent and belong to run_id")
         if _REPO_ID_RE.fullmatch(self.repo_id) is None:
             raise ManifestError("repo_id must be an exact owner/name repository id")
         if _HEX_40_RE.fullmatch(self.source_revision) is None:
@@ -241,8 +234,7 @@ class ManifestAdapter:
     def payload(self) -> dict[str, object]:
         return {
             "run_id": self.run_id,
-            "checkpoint": self.checkpoint,
-            "adapter_revision": self.adapter_revision,
+            "checkpoint_id": self.checkpoint_id,
             "source": {
                 "repo_id": self.repo_id,
                 "repo_type": self.repo_type,
@@ -279,7 +271,6 @@ class ServingManifest:
     tokenizer_kwargs: Mapping[str, Any]
     processor_kwargs: Mapping[str, Any]
     adapters: tuple[ManifestAdapter, ...]
-    aliases: Mapping[str, str]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "manifest_id", _digest(self.manifest_id, "manifest_id"))
@@ -328,9 +319,13 @@ class ServingManifest:
         object.__setattr__(self, "adapters", tuple(self.adapters))
         if not self.adapters:
             raise ManifestError("manifest requires at least one adapter")
-        revisions = [adapter.adapter_revision for adapter in self.adapters]
-        if revisions != sorted(revisions) or len(revisions) != len(set(revisions)):
-            raise ManifestError("manifest adapters must be unique and sorted by revision")
+        checkpoint_ids = [adapter.checkpoint_id for adapter in self.adapters]
+        if checkpoint_ids != sorted(checkpoint_ids) or len(checkpoint_ids) != len(
+            set(checkpoint_ids)
+        ):
+            raise ManifestError(
+                "manifest adapters must be unique and sorted by checkpoint identity"
+            )
         if len(self.adapters) > self.engine.max_cpu_loras:
             raise ManifestError("manifest adapter count exceeds engine capacity")
         if any(adapter.lora_rank > self.engine.max_lora_rank for adapter in self.adapters):
@@ -341,14 +336,6 @@ class ServingManifest:
             for adapter in self.adapters
         ):
             raise ManifestError("manifest adapter logical base does not match logical_base")
-        aliases = dict(self.aliases)
-        if any(type(key) is not str or type(value) is not str for key, value in aliases.items()):
-            raise ManifestError("aliases must map strings to strings")
-        if list(aliases) != sorted(aliases):
-            raise ManifestError("aliases must use canonical key ordering")
-        if not set(aliases.values()) <= set(revisions):
-            raise ManifestError("aliases must target declared immutable adapter revisions")
-        object.__setattr__(self, "aliases", MappingProxyType(aliases))
         payload_id = hashlib.sha256(canonical_json(self.payload(False)).encode()).hexdigest()
         if payload_id != self.manifest_id:
             raise ManifestError("manifest_id does not match the canonical manifest payload")
@@ -376,7 +363,6 @@ class ServingManifest:
             },
             "engine": engine,
             "adapters": [adapter.payload() for adapter in self.adapters],
-            "aliases": dict(self.aliases),
         }
         if include_manifest_id:
             return {"manifest_id": self.manifest_id, **payload}
@@ -463,15 +449,14 @@ def build_serving_manifest(
         execution_inputs.tokenizer_kwargs,
         execution_inputs.processor_kwargs,
     )
-    input_by_revision = {entry.adapter_revision: entry for entry in execution_inputs.adapters}
-    expected_revisions = {adapter.adapter_revision for adapter in spec.adapters}
-    if set(input_by_revision) != expected_revisions:
+    input_by_checkpoint = {entry.checkpoint_id: entry for entry in execution_inputs.adapters}
+    expected_checkpoints = {adapter.checkpoint_id for adapter in spec.adapters}
+    if set(input_by_checkpoint) != expected_checkpoints:
         raise ManifestError("execution adapter inputs do not exactly match the control spec")
 
     manifest_adapters: list[ManifestAdapter] = []
-    aliases: dict[str, str] = {}
     for adapter in spec.adapters:
-        entry = input_by_revision[adapter.adapter_revision]
+        entry = input_by_checkpoint[adapter.checkpoint_id]
         aggregate = aggregate_file_digest(entry.files)
         if aggregate != adapter.artifact_digest:
             raise ManifestError("adapter file aggregate does not match the control artifact digest")
@@ -483,8 +468,7 @@ def build_serving_manifest(
         manifest_adapters.append(
             ManifestAdapter(
                 run_id=adapter.run_id,
-                checkpoint=adapter.checkpoint,
-                adapter_revision=adapter.adapter_revision,
+                checkpoint_id=adapter.checkpoint_id,
                 repo_id=adapter.artifact_repo_id,
                 repo_type=adapter.artifact_repo_type,
                 source_revision=adapter.artifact_revision,
@@ -498,10 +482,7 @@ def build_serving_manifest(
                 aggregate_sha256=aggregate,
             )
         )
-        if adapter.alias_intent.activate:
-            aliases[adapter.run_id] = adapter.adapter_revision
-    manifest_adapters.sort(key=lambda value: value.adapter_revision)
-    aliases = dict(sorted(aliases.items()))
+    manifest_adapters.sort(key=lambda value: value.checkpoint_id)
     logical = spec.adapters[0]
     values = {
         "manifest_id": "0" * 64,
@@ -516,7 +497,6 @@ def build_serving_manifest(
         "tokenizer_kwargs": execution_inputs.tokenizer_kwargs,
         "processor_kwargs": execution_inputs.processor_kwargs,
         "adapters": tuple(manifest_adapters),
-        "aliases": aliases,
     }
     provisional = object.__new__(ServingManifest)
     for field in fields(ServingManifest):
@@ -552,7 +532,6 @@ def load_serving_manifest(raw: str | bytes | Mapping[str, Any]) -> ServingManife
             "logical_base",
             "engine",
             "adapters",
-            "aliases",
         },
         "manifest",
     )
@@ -574,7 +553,6 @@ def load_serving_manifest(raw: str | bytes | Mapping[str, Any]) -> ServingManife
         _parse_adapter(entry, index)
         for index, entry in enumerate(_sequence(root["adapters"], "adapters"))
     )
-    aliases = _mapping(root["aliases"], "aliases")
     return ServingManifest(
         manifest_id=root["manifest_id"],
         spec_id=root["spec_id"],
@@ -588,7 +566,6 @@ def load_serving_manifest(raw: str | bytes | Mapping[str, Any]) -> ServingManife
         tokenizer_kwargs=_mapping(engine_payload["tokenizer_kwargs"], "engine.tokenizer_kwargs"),
         processor_kwargs=_mapping(engine_payload["processor_kwargs"], "engine.processor_kwargs"),
         adapters=adapters,
-        aliases=aliases,
     )
 
 
@@ -599,8 +576,7 @@ def _parse_adapter(value: object, index: int) -> ManifestAdapter:
         payload,
         {
             "run_id",
-            "checkpoint",
-            "adapter_revision",
+            "checkpoint_id",
             "source",
             "base_model",
             "base_model_revision",
@@ -623,8 +599,7 @@ def _parse_adapter(value: object, index: int) -> ManifestAdapter:
         structured = _mapping(structured, f"{path}.structured_outputs_default")
     return ManifestAdapter(
         run_id=payload["run_id"],
-        checkpoint=payload["checkpoint"],
-        adapter_revision=payload["adapter_revision"],
+        checkpoint_id=payload["checkpoint_id"],
         repo_id=source["repo_id"],
         repo_type=source["repo_type"],
         source_revision=source["revision"],

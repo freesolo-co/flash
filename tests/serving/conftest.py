@@ -257,6 +257,6 @@ def attest(record: Any, result: dict[str, Any]) -> dict[str, Any]:
     confirm. A fake pool that skips this is not modelling the engine contract, so every fake in
     the suite routes through here rather than hand-rolling the field.
     """
-    if getattr(record, "is_revision", False):
+    if getattr(record, "is_checkpoint", False):
         result["lora_request_adapter"] = record.adapter_id
     return result

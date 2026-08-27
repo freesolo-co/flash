@@ -12,7 +12,12 @@ from contextlib import suppress
 from logging import Logger
 from typing import Any
 
-from flash.server.platform.auth import INTERNAL_KEY_ENV, freesolo_base_url, standalone
+from flash.server.platform.auth import (
+    INTERNAL_KEY_ENV,
+    freesolo_base_url,
+    serving_org_id,
+    standalone,
+)
 
 DEFAULT_TIMEOUT_S = 10.0
 
@@ -53,6 +58,12 @@ def run_org_id(status: Any) -> str:
             if org:
                 return org
     return ""
+
+
+def run_serving_org_id(status: Any) -> str:
+    """return the managed run org or the stable standalone serving scope."""
+
+    return serving_org_id(run_org_id(status))
 
 
 def build_internal_request(

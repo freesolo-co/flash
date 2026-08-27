@@ -169,14 +169,14 @@ def test_deployments_empty_and_styled_paths(monkeypatch, capsys) -> None:
 
 
 def test_deployments_plain_path_handles_final_and_detailed_rows(monkeypatch, capsys) -> None:
-    """Plain deployment output must expose immutable revision, final step, model, and failure detail."""
+    """Plain deployment output must expose checkpoint identity, final step, and failure detail."""
     rows = [
         {
             "run_id": "fallback-run",
             "deployment": {
                 "run_id": "flash-1",
                 "checkpoint_step": None,
-                "adapter_revision": "a" * 40,
+                "checkpoint_id": "flash-1/final",
                 "state": "failed",
                 "verified_at": 123,
                 "openai_model": "model-1",
@@ -221,7 +221,7 @@ def test_chat_prints_styled_label_before_streaming(monkeypatch, capsys) -> None:
 
     class ChatClient:
         def chat_stream(self, run_id, messages, **kwargs):
-            assert run_id == "flash-1"
+            assert run_id == "flash-1/final"
             assert messages == [{"role": "user", "content": "hello"}]
             yield "hi"
 
@@ -232,7 +232,7 @@ def test_chat_prints_styled_label_before_streaming(monkeypatch, capsys) -> None:
 
     result = deploy_commands.cmd_chat(
         SimpleNamespace(
-            run_id="flash-1",
+            run_id="flash-1/final",
             message="hello",
             system=None,
             temperature=0.0,
@@ -262,7 +262,7 @@ def test_chat_fails_when_the_stream_carries_no_text(monkeypatch, capsys) -> None
 
     result = deploy_commands.cmd_chat(
         SimpleNamespace(
-            run_id="flash-1",
+            run_id="flash-1/final",
             message="hello",
             system=None,
             temperature=0.0,
@@ -273,7 +273,7 @@ def test_chat_fails_when_the_stream_carries_no_text(monkeypatch, capsys) -> None
     captured = capsys.readouterr()
     assert result == 1
     assert captured.out == ""
-    assert "no response text from flash-1" in captured.err
+    assert "no response text from flash-1/final" in captured.err
 
     # `models list` enumerates supported base models and carries no deployment state, so it cannot
     # investigate either condition this message names. `models deployments` is the one that can.
@@ -303,7 +303,7 @@ def test_chat_treats_a_whitespace_only_stream_as_no_response(monkeypatch, capsys
 
     result = deploy_commands.cmd_chat(
         SimpleNamespace(
-            run_id="flash-1",
+            run_id="flash-1/final",
             message="hello",
             system=None,
             temperature=0.0,
@@ -314,7 +314,7 @@ def test_chat_treats_a_whitespace_only_stream_as_no_response(monkeypatch, capsys
     captured = capsys.readouterr()
     assert result == 1
     assert captured.out == ""
-    assert "no response text from flash-1" in captured.err
+    assert "no response text from flash-1/final" in captured.err
 
 
 def test_chat_preserves_leading_whitespace_once_the_stream_has_text(monkeypatch, capsys) -> None:
@@ -335,7 +335,7 @@ def test_chat_preserves_leading_whitespace_once_the_stream_has_text(monkeypatch,
 
     result = deploy_commands.cmd_chat(
         SimpleNamespace(
-            run_id="flash-1",
+            run_id="flash-1/final",
             message="hello",
             system=None,
             temperature=0.0,
@@ -368,7 +368,7 @@ def test_chat_keeps_stdout_empty_when_a_styled_stream_carries_no_text(monkeypatc
 
     result = deploy_commands.cmd_chat(
         SimpleNamespace(
-            run_id="flash-1",
+            run_id="flash-1/final",
             message="hello",
             system=None,
             temperature=0.0,
@@ -379,7 +379,7 @@ def test_chat_keeps_stdout_empty_when_a_styled_stream_carries_no_text(monkeypatc
     captured = capsys.readouterr()
     assert result == 1
     assert captured.out == ""
-    assert "no response text from flash-1" in captured.err
+    assert "no response text from flash-1/final" in captured.err
 
 
 def test_superseded_attempt_heartbeats_are_tagged_in_the_log_stream(capsys) -> None:
