@@ -968,7 +968,10 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
 
     assert metrics["wall_seconds"] == 1.0
     assert provider.attempts == [0, 1]
-    assert runner_status.get_status(spec.run_id).remote["attempt"] == 1
+    status = runner_status.get_status(spec.run_id)
+    assert status.remote is None
+    assert status.cleanup_confirmed_remote["attempt"] == 1
+    assert status.realized_cost_remote["attempt"] == 1
 
 
 def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monkeypatch, tmp_path):
@@ -1698,6 +1701,42 @@ def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, 
     ]
 
 
+def test_recovered_completion_adopts_after_confirmed_teardown(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(run_id="completion-confirmed", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote("endpoint-completed", "job-completed", attempt=0)
+    status = provisioned_status(spec, state="running", remote=remote)
+    status.remote = None
+    status.cleanup_confirmed_remote = remote
+    status.realized_cost_remote = remote
+    runner_state._save_status(status)
+    monkeypatch.setattr(
+        runner_status,
+        "validate_terminal_source_metrics",
+        lambda _status, metrics, expected_attempt=None, expected_fence=None: (
+            metrics,
+            expected_attempt,
+        ),
+    )
+    monkeypatch.setattr(runner_status, "_persist_metrics", lambda *_args, **_kwargs: 0.5)
+
+    assert runner_reconciliation._compare_and_complete_remote(
+        spec.run_id,
+        remote,
+        spec,
+        {"optimizer_steps_completed": 1},
+    )
+
+    completed = runner_status.get_status(spec.run_id)
+    assert completed.state == "done"
+    assert completed.remote is None
+    assert completed.cleanup_confirmed_remote == remote
+    assert completed.realized_cost_remote == remote
+
+
 @pytest.mark.parametrize("terminal_state", ["done", "failed"])
 def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
     monkeypatch, tmp_path, terminal_state
@@ -1734,6 +1773,15 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
     assert runner_status._current_attempt(status).state == "settled"
     assert reconcile._due(status, status.finished_at + reconcile._SETTLE_SECONDS + 1.0)
 
+    if terminal_state == "failed":
+        assert runner_reconciliation._record_cleanup_remote(spec.run_id, remote) is True
+    assert runner_reconciliation._compare_and_remove_cleanup_remote(spec.run_id, remote) is True
+
+    status = runner_status.get_status(spec.run_id)
+    assert status.remote is None
+    assert status.realized_cost_remote == remote
+    assert reconcile._due(status, status.finished_at + reconcile._SETTLE_SECONDS + 1.0)
+
 
 def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tmp_path):
     from flash.core.spec import JobSpec
@@ -1760,6 +1808,8 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     for remote in (confirmed, endpoint_only, unconfirmed):
         assert runner_reconciliation._preserve_cleanup_remote(spec.run_id, remote) is True
 
+    reports = []
+    monkeypatch.setattr(runner_reporting, "_report_status", reports.append)
     events = []
 
     class Provider:
@@ -1793,7 +1843,9 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     ]
     raw = runner_status._load_status_json(spec.run_id)
     assert raw[runner_state._CLEANUP_REMOTES_KEY] == [unconfirmed]
-    assert raw["remote"] == confirmed
+    assert raw["remote"] is None
+    assert raw["realized_cost_remote"] == confirmed
+    assert [report.remote for report in reports] == [None, None]
 
 
 def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
@@ -1863,6 +1915,31 @@ def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
         assert not _json.load(f).get(runner_state._CLEANUP_REMOTES_KEY), (
             "the confirmed-deleted record survived, so every later sweep retries a deleted endpoint"
         )
+
+
+def test_confirmed_deferred_cleanup_retains_pending_charge_attribution(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="cleanup-pending-charge", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote("endpoint-charge", "job-charge", attempt=0)
+    status = runner_state.RunStatus(
+        run_id=spec.run_id,
+        state="done",
+        spec=spec.to_dict(),
+        remote=remote,
+        billing_context={"org_id": "org-1"},
+        billing_state="failed",
+        reconciled_at=100.0,
+    )
+    runner_state._save_status(status, _cleanup_remotes=[remote])
+
+    assert runner_reconciliation._compare_and_remove_cleanup_remote(spec.run_id, remote)
+
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.remote is None
+    assert persisted.cleanup_confirmed_remote == remote
+    assert persisted.realized_cost_remote == remote
 
 
 def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypatch, tmp_path):
@@ -1941,7 +2018,8 @@ def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypat
         different_job,
         different_attempt,
     ]
-    assert raw["remote"] == confirmed
+    assert raw["remote"] is None
+    assert raw["realized_cost_remote"] == confirmed
 
 
 def test_next_attempt_requires_persisted_integer_identity():
@@ -2094,6 +2172,389 @@ def test_reserved_attempt_survives_handleless_restart_without_reusing_zero(monke
     raw = runner_status._load_status_json(spec.run_id)
     assert raw[runner_state._NEXT_ATTEMPT_KEY] == 2
     assert raw[runner_state._RUN_DEADLINE_AT_KEY] == 300.0
+
+
+def test_confirmed_recovery_keeps_accounting_identity_until_replacement_handle(
+    monkeypatch, tmp_path
+):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="replacement-accounting", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote("endpoint-old", "job-old", attempt=0)
+    status = runner_state.RunStatus(
+        run_id=spec.run_id,
+        state="running",
+        spec=spec.to_dict(),
+        remote=None,
+        cleanup_confirmed_remote=remote,
+        realized_cost_remote=remote,
+    )
+    runner_state._save_status(status)
+
+    assert runner_reconciliation._compare_and_clear_remote(spec.run_id, remote)
+    cleared = runner_status.get_status(spec.run_id)
+    assert cleared.cleanup_confirmed_remote is None
+    assert cleared.realized_cost_remote == remote
+
+
+def test_attach_resumes_after_cleanup_drain_clears_classified_remote(monkeypatch, tmp_path):
+    import io
+
+    from flash.core.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(
+        run_id="attach-cleanup-race",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1, max_wall_seconds=200),
+    )
+    remote = _runpod_remote("endpoint-old", "job-old", attempt=0)
+    status = provisioned_status(spec, state="running", created_at=100.0, remote=remote)
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    status.cleanup_confirmed_remote = remote
+    status.realized_cost_remote = remote
+    status.remote = None
+    runner_state._save_status(
+        status,
+        _run_deadline_at=300.0,
+        _next_attempt=1,
+    )
+    monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 100.0)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(
+            False, failure="job_preempted", detail="provider confirmed worker loss"
+        ),
+    )
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+    resumed = []
+
+    def fake_run_training(_spec, _log, **kwargs):
+        resumed.append(kwargs["attempt_start"])
+
+    monkeypatch.setattr(runner_lifecycle, "_run_training", fake_run_training)
+
+    attached = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert resumed == [1]
+    assert attached.state == "running"
+    assert attached.remote is None
+    assert attached.cleanup_confirmed_remote is None
+    assert attached.realized_cost_remote == remote
+
+
+def test_attach_reconciler_continues_after_confirmed_runpod_teardown(monkeypatch, tmp_path):
+    import io
+
+    import flash.runner.supervise.attach as attach_mod
+    from flash.core.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-confirmed-cleanup",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1, max_wall_seconds=200),
+    )
+    remote = _runpod_remote("endpoint-confirmed", "job-confirmed", attempt=0)
+    runner_state._save_status(provisioned_status(spec, state="running", remote=remote))
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(
+            False, failure="job_preempted", detail="provider confirmed worker loss"
+        ),
+    )
+    monkeypatch.setattr(attach_mod, "_wait_for_replacement_window", lambda *_args: False)
+    monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", lambda *_args: True)
+    monkeypatch.setattr(
+        runner_reconciliation, "_record_cleanup_remote", lambda *_args, **_kwargs: False
+    )
+    resumed = []
+    monkeypatch.setattr(
+        attach_mod,
+        "_resume_after_confirmed_teardown",
+        lambda *_args, **_kwargs: resumed.append(True),
+    )
+
+    attach_mod._reconcile_attached_remote(
+        spec.run_id,
+        remote,
+        spec,
+        1,
+        _SOURCE_SNAPSHOT,
+        io.StringIO(),
+        "stalled: host vanished",
+    )
+
+    assert resumed == [True]
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.remote is None
+    assert persisted.cleanup_confirmed_remote == remote
+
+
+def test_attach_reconciler_persists_unconfirmed_runpod_teardown(monkeypatch, tmp_path):
+    import io
+
+    import flash.runner.supervise.attach as attach_mod
+    from flash.core.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-unconfirmed-cleanup",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1, max_wall_seconds=200),
+    )
+    remote = _runpod_remote("endpoint-unconfirmed", "job-unconfirmed", attempt=0)
+    status = provisioned_status(spec, state="running", remote=remote)
+    runner_state._save_status(status)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(
+            False, failure="job_preempted", detail="provider confirmed worker loss"
+        ),
+    )
+    monkeypatch.setattr(attach_mod, "_wait_for_replacement_window", lambda *_args: False)
+    monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", lambda *_args: False)
+    resumed = []
+    monkeypatch.setattr(
+        attach_mod,
+        "_resume_after_confirmed_teardown",
+        lambda *_args, **_kwargs: resumed.append(True),
+    )
+
+    attach_mod._reconcile_attached_remote(
+        spec.run_id,
+        remote,
+        spec,
+        1,
+        _SOURCE_SNAPSHOT,
+        io.StringIO(),
+        "stalled: host vanished",
+    )
+
+    assert resumed == [True]
+    assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
+        remote
+    ]
+
+
+def test_confirmed_cleanup_retries_transient_staging_without_restart(monkeypatch, tmp_path):
+    import io
+
+    import flash.runner.supervise.attach as attach_mod
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.envs.loading.staged import StagedEnvironmentTransientError
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-confirmed-staging-retry",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1, max_wall_seconds=200),
+    )
+    remote = _runpod_remote("endpoint-confirmed", "job-confirmed", attempt=0)
+    status = provisioned_status(spec, state="running", remote=remote)
+    status.remote = None
+    status.cleanup_confirmed_remote = remote
+    runner_state._save_status(status, _next_attempt=1)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(
+            False, failure="job_preempted", detail="provider confirmed worker loss"
+        ),
+    )
+    monkeypatch.setattr(attach_mod, "_wait_for_replacement_window", lambda *_args: False)
+    monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
+    attempts = []
+
+    def resume(*_args, **_kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise StagedEnvironmentTransientError("artifact store temporarily unavailable")
+        runner_status._update(spec.run_id, "failed", error="stopped after retry proof")
+
+    monkeypatch.setattr(attach_mod, "_resume_after_confirmed_teardown", resume)
+
+    attach_mod._reconcile_attached_remote(
+        spec.run_id,
+        remote,
+        spec,
+        1,
+        _SOURCE_SNAPSHOT,
+        io.StringIO(),
+        "stalled: host vanished",
+    )
+
+    assert attempts == [True, True]
+    assert runner_status.get_status(spec.run_id).state == "failed"
+
+
+def test_confirmed_cleanup_adopts_completed_work_before_resubmitting(monkeypatch, tmp_path):
+    import io
+
+    from flash.core.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    spec = JobSpec(
+        run_id="attach-confirmed-completed",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1, max_wall_seconds=200),
+    )
+    remote = _runpod_remote("endpoint-completed", "job-completed", attempt=0)
+    status = provisioned_status(spec, state="running", remote=remote)
+    status.remote = None
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    status.cleanup_confirmed_remote = remote
+    status.realized_cost_remote = remote
+    runner_state._save_status(status, _next_attempt=1)
+    metrics = {"wall_seconds": 60.0, "optimizer_steps_completed": 1}
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(True, metrics=dict(metrics)),
+    )
+    adopted = []
+
+    def adopt(run_id, worker_spec, expected_remote, completed_metrics, *, log):
+        adopted.append((run_id, expected_remote, completed_metrics))
+        runner_status._update(run_id, "done")
+        return True
+
+    monkeypatch.setattr(runner_lifecycle, "_adopt_completed_attempt", adopt)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_run_training",
+        lambda *_args, **_kwargs: pytest.fail("completed work was retrained"),
+    )
+
+    attached = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert attached.state == "done"
+    assert len(adopted) == 1
+    assert adopted[0][0] == spec.run_id
+    assert adopted[0][1] == remote
+    assert adopted[0][2]["optimizer_steps_completed"] == 1
+    assert adopted[0][2]["allocated_provider"] == "runpod"
+
+
+def test_confirmed_completed_work_defers_when_adoption_is_transient(monkeypatch, tmp_path):
+    import io
+
+    import flash.runner.supervise.attach as attach_mod
+    from flash.core.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-confirmed-adoption-pending",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=1, max_wall_seconds=200),
+    )
+    remote = _runpod_remote("endpoint-completed", "job-completed", attempt=0)
+    status = provisioned_status(spec, state="running", remote=remote)
+    status.remote = None
+    status.cleanup_confirmed_remote = remote
+    runner_state._save_status(status, _next_attempt=1)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args, **_kwargs: PollResult(True, metrics={"optimizer_steps_completed": 1}),
+    )
+    monkeypatch.setattr(
+        runner_lifecycle, "_adopt_completed_attempt", lambda *_args, **_kwargs: False
+    )
+    scheduled = []
+    monkeypatch.setattr(
+        attach_mod,
+        "_schedule_attach_reconciliation",
+        lambda *args, **kwargs: scheduled.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        attach_mod,
+        "_resume_after_confirmed_teardown",
+        lambda *_args, **_kwargs: pytest.fail("completed work was resubmitted"),
+    )
+
+    attached = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert attached.state == "running"
+    assert len(scheduled) == 1
+    assert scheduled[0][0][1] == remote
+
+
+def test_unparseable_attach_fails_after_confirmed_cleanup_without_reteardown(monkeypatch, tmp_path):
+    import io
+
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-confirmed-unparseable",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+    )
+    remote = _runpod_remote("endpoint-confirmed", "job-confirmed", attempt=0)
+    status = provisioned_status(spec, state="running", remote=remote)
+    status.remote = None
+    status.cleanup_confirmed_remote = remote
+    status.realized_cost_remote = remote
+    runner_state._save_status(status)
+    path = runner_state.runs_file_path(spec.run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"]["algorithm"] = "retired-algorithm"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args, **_kwargs: pytest.fail("confirmed resource was torn down again"),
+    )
+
+    attached = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert attached.state == "failed"
+    assert "spec is malformed" in (attached.error or "")
+    assert attached.remote is None
+    assert attached.cleanup_confirmed_remote == remote
+    assert attached.realized_cost_remote == remote
+
+
+def test_confirmed_cleanup_can_fail_a_nonretryable_run(monkeypatch, tmp_path):
+    from flash.core.spec import GpuSpec, JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-cleanup-no-retry",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="sft",
+        gpu=GpuSpec(max_retries=0, max_wall_seconds=200),
+    )
+    remote = _runpod_remote("endpoint-old", "job-old", attempt=0)
+    status = provisioned_status(spec, state="running", remote=remote)
+    status.remote = None
+    status.cleanup_confirmed_remote = remote
+    runner_state._save_status(status)
+
+    assert runner_reconciliation._compare_and_fail_remote(
+        spec.run_id,
+        remote,
+        "persisted cleanup confirmed the worker was torn down",
+    )
+    persisted = runner_status.get_status(spec.run_id)
+    assert persisted.state == "failed"
+    assert persisted.remote is None
+    assert persisted.cleanup_confirmed_remote == remote
 
 
 def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tmp_path):
@@ -3114,7 +3575,9 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
     assert [action for action, _handle in teardown] == ["cancel", "destroy"]
     assert gc_runs == [spec.run_id]
     assert status.state == "failed"
-    assert status.remote["endpoint_id"] == "endpoint-old"
+    assert status.remote is None
+    assert status.cleanup_confirmed_remote["endpoint_id"] == "endpoint-old"
+    assert status.realized_cost_remote["endpoint_id"] == "endpoint-old"
     assert "deadline exhausted" in status.error
 
 
@@ -4052,6 +4515,56 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
     status = runner_status.get_status(spec.run_id)
     assert status.state == "failed"
     assert "unsupported model" in (status.error or "")
+
+
+def test_recover_runs_reattaches_confirmed_teardown_marker(monkeypatch, tmp_path):
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="recover-confirmed", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote("endpoint-confirmed", "job-confirmed", attempt=0)
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            remote=None,
+            cleanup_confirmed_remote=remote,
+            realized_cost_remote=remote,
+        )
+    )
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
+    monkeypatch.setattr(providers, "configured_providers", list)
+    monkeypatch.setattr(runner_reconciliation, "_drain_cleanup_remotes", lambda _run_id: None)
+    swept = []
+    monkeypatch.setattr(
+        runtime,
+        "_sweep_provider_orphans",
+        lambda active, known: swept.append((set(active), set(known))),
+    )
+    attached = []
+    monkeypatch.setattr(runner_attach, "attach_run", lambda run_id: attached.append(run_id))
+    monkeypatch.setattr(
+        runtime,
+        "_start_resubmit",
+        lambda *_args, **_kwargs: pytest.fail("confirmed teardown was resubmitted handleless"),
+    )
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target, self._args = target, args
+
+        def start(self):
+            self._target(*self._args)
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+
+    assert attached == [spec.run_id]
+    assert swept == [({spec.run_id}, {spec.run_id})]
 
 
 def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, tmp_path):

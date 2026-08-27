@@ -340,7 +340,10 @@ def record_attempt_handle(
             resource=resource,
         ).to_dict()
         status.remote = resource
+        status.realized_cost_remote = None
         status.state = "running"
+        if status.lifecycle_started_attempt is None:
+            status.lifecycle_started_attempt = attempt_id
         status.updated_at = time.time()
         state._save_status_unlocked(status)
     reporting._report_status(status)
@@ -400,6 +403,15 @@ def record_progress(run_id: str, value: dict, *, attempt_id: int, fence: int) ->
             elif incoming.get("completed_steps", 0) < current.get("completed_steps", 0):
                 return False
         status.progress = incoming
+        completed_steps = incoming.get("completed_steps")
+        if (
+            status.lifecycle_progressed_attempt is None
+            and incoming.get("training_entered") is True
+            and isinstance(completed_steps, int)
+            and not isinstance(completed_steps, bool)
+            and completed_steps >= 1
+        ):
+            status.lifecycle_progressed_attempt = attempt_id
         status.updated_at = time.time()
         state._save_status_unlocked(status)
         report_status = status
@@ -612,6 +624,11 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
         if not was_terminal and new_state in state.TERMINAL_STATES and status.finished_at is None:
             status.finished_at = status.updated_at
         for key, value in updates.items():
+            if (
+                key in {"lifecycle_started_attempt", "lifecycle_progressed_attempt"}
+                and getattr(status, key) is not None
+            ):
+                continue
             setattr(status, key, value)
         state._save_status_unlocked(status)
         report_status = status

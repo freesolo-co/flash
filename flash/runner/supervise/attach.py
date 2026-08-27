@@ -11,25 +11,22 @@ from typing import TYPE_CHECKING
 from flash.core.spec import JobSpec
 from flash.envs.loading.staged import StagedEnvironmentTransientError
 from flash.providers._lifecycle.instances.poll import _attempt_int
+from flash.runner.supervise.attach_replacement import (
+    adopt_attached_poll_result as _adopt_attached_poll_result,
+)
+from flash.runner.supervise.attach_replacement import (
+    carry_allocation_stamp as _carry_allocation_stamp,
+)
+from flash.runner.supervise.attach_replacement import (
+    dispose_authoritative_failure as _dispose_authoritative_failure,
+)
+from flash.runner.supervise.attach_replacement import (
+    recover_confirmed_remote as _recover_confirmed_remote,
+)
 
 _ATTACH_RECONCILE_INTERVAL_S = 120.0
 _ATTACH_RECONCILING: set[str] = set()
 _ATTACH_RECONCILING_LOCK = threading.Lock()
-
-
-def _carry_allocation_stamp(metrics: dict, remote: dict | None) -> None:
-    """carry the persisted allocation stamp onto adopted metrics."""
-    if not isinstance(metrics, dict) or not isinstance(remote, dict):
-        return
-    allocated_gpu = remote.get("allocated_gpu")
-    if allocated_gpu:
-        metrics.setdefault("allocated_gpu", allocated_gpu)
-    allocated_count = remote.get("allocated_gpu_count")
-    if allocated_count:
-        metrics.setdefault("allocated_gpu_count", int(allocated_count))
-    provider = remote.get("provider")
-    if provider:
-        metrics.setdefault("allocated_provider", provider)
 
 
 if TYPE_CHECKING:
@@ -340,7 +337,12 @@ def _reconcile_attached_remote(
             continue
         if status.state in TERMINAL_STATES:
             return
-        if _remote_resource_identity(status.remote) != expected_identity:
+        active_remote_matches = _remote_resource_identity(status.remote) == expected_identity
+        confirmed_teardown = (
+            status.remote is None
+            and _remote_resource_identity(status.cleanup_confirmed_remote) == expected_identity
+        )
+        if not active_remote_matches and not confirmed_teardown:
             return
         try:
             deadline_at = _load_run_deadline_at(run_id)
@@ -376,6 +378,12 @@ def _reconcile_attached_remote(
                 retry_counters=status.retry_counters,
             )
             try:
+                if confirmed_teardown:
+                    recovered = _recover_confirmed_remote(run_id, context, observed_result, log)
+                    if recovered is not None:
+                        return
+                    time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
+                    continue
                 disposed = _dispose_authoritative_failure(run_id, context, observed_result, log)
             except Exception:
                 time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
@@ -527,56 +535,11 @@ def _build_attach_context(
     )
 
 
-def _dispose_authoritative_failure(
-    run_id: str,
-    context: _AttachContext,
-    result: PollResult,
-    log,
-) -> RunStatus | None:
-    """settle or replace one verified failure after strict resource disposition."""
-    from flash.runner.accounting.reconciliation import (
-        _compare_and_fail_remote,
-        _record_cleanup_remote,
-    )
-    from flash.runner.lifecycle.status import get_status
-    from flash.runner.supervise.lifecycle import (
-        _result_failure_detail,
-        _strict_teardown_handle,
-        _worker_provably_gone,
-    )
-
-    plan = _attach_retry_plan(context, result.failure)
-    try:
-        _strict_teardown_handle(context.handle, run_id)
-        worker_gone = True
-    except Exception:
-        worker_gone = _worker_provably_gone(run_id, context.handle)
-    if not _record_cleanup_remote(run_id, context.persisted_remote):
-        raise RuntimeError("authoritative failure cleanup identity could not be persisted")
-    if not worker_gone:
-        return None
-    if plan is None:
-        _compare_and_fail_remote(run_id, context.persisted_remote, _result_failure_detail(result))
-        return get_status(run_id)
-    retry_budget, oom_vram_floor, drop_weight_cache = plan
-    return _resume_after_confirmed_teardown(
-        run_id,
-        context.worker_spec,
-        context.persisted_remote,
-        context.next_attempt,
-        context.source_snapshot,
-        log,
-        failure=_result_failure_detail(result),
-        retry_budget=retry_budget,
-        oom_vram_floor=oom_vram_floor,
-        drop_weight_cache=drop_weight_cache,
-    )
-
-
 def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log) -> RunStatus:
     """Tear down and fail a run whose persisted public spec cannot be parsed."""
     from flash.providers.core.base import JobHandle
     from flash.runner.accounting.reconciliation import (
+        _compare_and_confirm_remote_teardown,
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
@@ -591,19 +554,25 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     # from the raw persisted status, which is the same route recover_runs takes for its own
     # unparseable-spec branch.
     detail = f"unrecoverable: persisted spec is malformed: {exc}"
-    persisted_remote = dict(status.remote)
+    confirmed_teardown = status.remote is None and status.cleanup_confirmed_remote is not None
+    persisted_remote = dict(status.remote or status.cleanup_confirmed_remote)
     try:
-        resource_deleted = _strict_teardown_handle(JobHandle.from_dict(persisted_remote), run_id)
+        resource_deleted = confirmed_teardown or _strict_teardown_handle(
+            JobHandle.from_dict(persisted_remote), run_id
+        )
     except Exception:
         resource_deleted = False
-    # Tear down BEFORE the state write and hand an unconfirmed deletion to the cleanup drainer:
+    # tear down before the state write and hand an unconfirmed deletion to the cleanup drainer:
     # failing the run first would drop the last record of a worker we have not proven gone.
-    if not resource_deleted:
+    if resource_deleted and not confirmed_teardown:
+        _compare_and_confirm_remote_teardown(run_id, persisted_remote)
+    elif not resource_deleted:
         _record_cleanup_remote(run_id, persisted_remote)
     _compare_and_fail_remote(run_id, persisted_remote, detail)
-    from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
+    if not confirmed_teardown:
+        from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
 
-    terminate_persisted_endpoints(status.spec, run_id)
+        terminate_persisted_endpoints(status.spec, run_id)
     print(f"attach: {run_id} {detail}", file=log)
     return get_status(run_id)
 
@@ -622,6 +591,7 @@ def _handle_attach_wall_deadline(
 ) -> RunStatus:
     """Adopt finished work or fail and tear down an attempt whose wall time is exhausted."""
     from flash.runner.accounting.reconciliation import (
+        _compare_and_confirm_remote_teardown,
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
@@ -710,7 +680,9 @@ def _handle_attach_wall_deadline(
         resource_deleted = _strict_teardown_handle(context.handle, run_id)
     except Exception:
         resource_deleted = False
-    if not resource_deleted:
+    if resource_deleted:
+        _compare_and_confirm_remote_teardown(run_id, context.persisted_remote)
+    else:
         _record_cleanup_remote(run_id, context.persisted_remote)
     _compare_and_fail_remote(run_id, context.persisted_remote, str(exc))
     print(f"attach: {run_id} {exc}", file=log)
@@ -724,7 +696,10 @@ def _handle_failed_attach_poll(
     log,
 ) -> RunStatus:
     """Adopt completed work or safely recover from an unsuccessful provider poll."""
-    from flash.runner.accounting.reconciliation import _record_cleanup_remote
+    from flash.runner.accounting.reconciliation import (
+        _compare_and_confirm_remote_teardown,
+        _record_cleanup_remote,
+    )
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.lifecycle import (
         _adopt_completed_attempt,
@@ -821,6 +796,8 @@ def _handle_failed_attach_poll(
         and not _record_cleanup_remote(run_id, context.persisted_remote)
     ):
         raise RuntimeError("cleanup target could not be persisted")
+    if resource_deleted:
+        _compare_and_confirm_remote_teardown(run_id, context.persisted_remote)
     if worker_gone:
         if retry_plan is None:
             from flash.runner.accounting.reconciliation import _compare_and_fail_remote
@@ -857,34 +834,6 @@ def _handle_failed_attach_poll(
     return get_status(run_id)
 
 
-def _adopt_attached_poll_result(
-    run_id: str,
-    context: _AttachContext,
-    result: PollResult,
-    log,
-) -> None:
-    """Restore allocation metadata and adopt one successful provider result."""
-    from flash.runner.supervise.lifecycle import _adopt_completed_attempt
-
-    # the shared carrier, not a local copy of two of its three fields: `_build_attach_context` pops
-    # gpu and count off its handle copy but leaves `persisted_remote` whole, so the provider is
-    # available here too. dropping it left `_gpu_rate` to fall back to whichever configured provider
-    # offers the class -- normally RunPod -- so an attached vast or lambda run was priced at the
-    # wrong substrate's rate and its notes named a provider that never ran it.
-    _carry_allocation_stamp(result.metrics, context.persisted_remote)
-    if not _adopt_completed_attempt(
-        run_id,
-        context.worker_spec,
-        context.persisted_remote,
-        result.metrics,
-        log=log,
-    ):
-        print(
-            f"attach: {run_id} persisted remote changed before completion adoption",
-            file=log,
-        )
-
-
 def attach_run(run_id: str, log_stream=None) -> RunStatus:
     """Re-attach to a run's remote job from any process (after a client crash/restart)."""
     import sys
@@ -910,7 +859,8 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     status = get_status(run_id)
     if status.state in TERMINAL_STATES:
         return status
-    if not status.remote:
+    confirmed_teardown = status.remote is None and status.cleanup_confirmed_remote is not None
+    if not status.remote and not confirmed_teardown:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
 
     # seed from the lossy public view so the except/finally handlers always have a spec, then
@@ -920,7 +870,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     except Exception as exc:
         # this parse is above the try below, so a raise here escapes every handler.
         return _fail_unparseable_attach(run_id, status, exc, log_stream or sys.stderr)
-    persisted_remote = dict(status.remote)
+    persisted_remote = dict(status.remote or status.cleanup_confirmed_remote)
     next_attempt = 0
     source_snapshot = None
     log = log_stream or sys.stderr
@@ -932,6 +882,28 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
         context = _build_attach_context(worker_spec, persisted_remote)
         next_attempt = context.next_attempt
         source_snapshot = context.source_snapshot
+        if confirmed_teardown:
+            from flash.runner.supervise.lifecycle import _attempt_result
+
+            recovered = _recover_confirmed_remote(
+                run_id,
+                context,
+                _attempt_result(run_id, persisted_remote),
+                log,
+            )
+            if recovered is None:
+                _schedule_attach_reconciliation(
+                    run_id,
+                    persisted_remote,
+                    worker_spec,
+                    next_attempt,
+                    source_snapshot,
+                    log,
+                    "completed attempt adoption is pending durable confirmation",
+                )
+                return status_for_return()
+            cleanup_terminal = recovered.state in TERMINAL_STATES
+            return recovered
         try:
             poll_spec = _spec_with_remaining_wall(worker_spec, require_provider_minimum=False)
         except RuntimeError as exc:

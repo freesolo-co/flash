@@ -15,6 +15,7 @@ from flash.runner.supervise.retry_decision import (
     _persist_retry_budget,
     _retry_delay,
     _retry_target,
+    _settle_terminal_remote,
 )
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
@@ -36,7 +37,6 @@ class _SubmitContext:
     current_on_last_gpu: bool = False
     current_attempt: int = 0
     current_fence: int = 0
-    # tracks complete rN-suffixed retry handles that registry-less gc cannot reconstruct by name.
     seen_endpoints: dict[str, dict] = field(default_factory=dict)
     submission_lock: object | None = None
     # grow only when an attempt actually provisioned a class and lost it to infra.
@@ -143,7 +143,7 @@ class _SubmitContext:
 
     def return_completed_runpod_metrics(self, metrics: dict) -> dict:
         self.raise_if_cancelled()
-        self.gc_seen_endpoints()
+        _settle_terminal_remote(self)
         if self.current_gpu.get("name"):
             metrics.setdefault("allocated_gpu", self.current_gpu["name"])
         if self.current_gpu.get("provider"):
@@ -799,7 +799,7 @@ def _run_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt) -> _AttemptOut
 def _return_success_metrics(ctx: _SubmitContext, outcome: _AttemptOutcome) -> dict:
     # a late worker success must not resurrect a cancelled run.
     ctx.raise_if_cancelled()
-    ctx.gc_seen_endpoints()
+    _settle_terminal_remote(ctx)
     metrics = outcome.result.metrics
     if outcome.chosen is not None and isinstance(metrics, dict):
         metrics.setdefault("allocated_gpu", outcome.chosen.gpu)
@@ -995,5 +995,6 @@ def submit_seed_supervised(
                     "aborting replacement to avoid double-provisioning"
                 )
             ctx.last_handle.clear()
+    _settle_terminal_remote(ctx)
     ctx.gc_seen_endpoints()
     raise RuntimeError(f"seed {seed} failed after retries: {ctx.last_detail}")

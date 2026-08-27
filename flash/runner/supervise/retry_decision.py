@@ -7,6 +7,7 @@ bookkeeping, and when they drifted apart the log claimed a retry the run was not
 
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING
 
 from flash.runner.supervise import lifecycle as _lifecycle
@@ -232,3 +233,36 @@ def _retry_target(
         f"{' again' if same else ''}{no_escalation}{no_escape} (resume from last checkpoint; "
         "reallocated against live capacity, so the class may change)"
     )
+
+
+def _settle_terminal_remote(ctx: _SubmitContext) -> None:
+    """track and clear an attempt only after exact teardown is confirmed."""
+    if not ctx.last_handle:
+        return
+    from flash.providers.core.base import JobHandle
+    from flash.runner.accounting.reconciliation import (
+        _compare_and_confirm_remote_teardown,
+        _compare_and_remove_cleanup_remote,
+        _record_cleanup_remote,
+    )
+
+    remote = dict(ctx.last_handle)
+    cleanup_recorded = False
+    with contextlib.suppress(Exception):
+        cleanup_recorded = _record_cleanup_remote(ctx.spec.run_id, remote)
+    try:
+        deleted = _lifecycle._strict_teardown_handle(JobHandle.from_dict(remote), ctx.spec.run_id)
+    except Exception:
+        return
+    if not deleted:
+        return
+    cleanup_cleared = False
+    if cleanup_recorded:
+        with contextlib.suppress(Exception):
+            cleanup_cleared = _compare_and_remove_cleanup_remote(ctx.spec.run_id, remote)
+    if not cleanup_cleared:
+        with contextlib.suppress(Exception):
+            _compare_and_confirm_remote_teardown(ctx.spec.run_id, remote)
+    endpoint_id = remote.get("endpoint_id")
+    if isinstance(endpoint_id, str):
+        ctx.seen_endpoints.pop(endpoint_id, None)

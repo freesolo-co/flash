@@ -463,6 +463,7 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
 def _gc_run_endpoints(spec: JobSpec) -> None:
     """Best-effort teardown of every endpoint a run may have registered."""
     from flash.runner.accounting.reconciliation import (
+        _compare_and_confirm_remote_teardown,
         _drain_cleanup_remotes,
         _remote_resource_identity,
     )
@@ -484,7 +485,9 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
     ):
         try:
             resource_deleted = _lifecycle()._strict_teardown_handle(status.remote, spec.run_id)
-            if status.remote.get("provider") == "runpod" and not resource_deleted:
+            if resource_deleted:
+                _compare_and_confirm_remote_teardown(spec.run_id, status.remote)
+            elif status.remote.get("provider") == "runpod":
                 from flash.runner.accounting.reconciliation import _record_cleanup_remote
 
                 _record_cleanup_remote(spec.run_id, status.remote)
