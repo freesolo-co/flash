@@ -181,7 +181,12 @@ def _adapter_files(recorder, subfolder):
     return {path[len(prefix) :] for path in recorder.files if path.startswith(prefix)}
 
 
-def _deeply_nested_json(depth=2000):
+def _deeply_nested_json(depth=20000):
+    # The depth has to exhaust the C parser's stack on every supported interpreter, not just the
+    # shallowest one: CPython 3.12 raised its own json recursion headroom, so a payload that is
+    # pathological on 3.11 parses cleanly there and reaches the weight_map check instead, and the
+    # test then asserts a message the reader never emits. 20000 recurses on 3.11 and 3.12 alike and
+    # is 220KB, far under the index size cap that would otherwise reject it first.
     return b'{"nested":' * depth + b"0" + b"}" * depth
 
 
