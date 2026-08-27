@@ -430,6 +430,7 @@ def decide_attempt_failure(
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         raise ValueError("retry decision attempt is invalid")
     persisted = False
+    released = False
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
         if (
@@ -442,21 +443,25 @@ def decide_attempt_failure(
                 expected_remote=expected_remote,
             )
         ):
-            return None
-        status = status_ops._runstatus_from_json(raw)
-        spec = state._internal_spec_from_status(status)
-        retry_state = require_retry_authorization_from_raw(spec, raw, attempt)
-        plan = retry_state.persisted_plan(attempt)
-        if plan is not None:
-            return plan
-        retry_state, plan = transition_failure(retry_state, observation, attempt=attempt)
-        state._save_status_unlocked(
-            status,
-            _retry_state=retry_state.to_snapshot(),
-            _active_launch_claim=None,
-        )
-        persisted = True
-    if persisted:
+            # ownership is gone, so this caller can never persist a decision for the attempt and
+            # drops its claim reference regardless. release the lease here or nothing downstream
+            # can: a retained flock keeps claim_is_live true and blocks handleless recovery.
+            released = True
+            plan = None
+        else:
+            status = status_ops._runstatus_from_json(raw)
+            spec = state._internal_spec_from_status(status)
+            retry_state = require_retry_authorization_from_raw(spec, raw, attempt)
+            plan = retry_state.persisted_plan(attempt)
+            if plan is None:
+                retry_state, plan = transition_failure(retry_state, observation, attempt=attempt)
+                state._save_status_unlocked(
+                    status,
+                    _retry_state=retry_state.to_snapshot(),
+                    _active_launch_claim=None,
+                )
+                persisted = True
+    if persisted or released:
         claim_lock.release(run_id, claim_token)
     return plan
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import tempfile
+import types
 
 import pytest
 
@@ -829,7 +830,12 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
 
     assert metrics["wall_seconds"] == 1.0
     assert provider.attempts == [0, 1]
-    assert runner_status.get_status(spec.run_id).remote["attempt"] == 1
+    # the winning attempt settles on success: teardown is confirmed and the active remote is
+    # cleared, so the attempt identity survives on the confirmed-teardown record rather than on
+    # `remote`. a live remote here would let a crash before `done` reattach a dead handle.
+    status = runner_status.get_status(spec.run_id)
+    assert status.remote is None
+    assert status.cleanup_confirmed_remote["attempt"] == 1
 
 
 def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monkeypatch, tmp_path):
@@ -3211,6 +3217,94 @@ def test_handleless_stale_claim_is_reclaimed_without_poll_error(monkeypatch, tmp
     retry_state = runner_status._load_status_json(spec.run_id)[runner_state._RETRY_STATE_KEY]
     assert retry_state["last_decision"] is None
     assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 1
+
+
+def test_successful_supervision_settles_the_terminal_remote(monkeypatch, tmp_path):
+    """A successful run must tear the provider handle down and clear the remote.
+
+    `gc_seen_endpoints` only reaps RunPod `endpoint_id`s and never confirms teardown, so it cannot
+    stand in for settlement: a Lambda or Vast success would leave a live remote on the record, and
+    a crash before the run reaches `done` could then attach that dead handle and relaunch work that
+    already finished.
+    """
+    from flash.core.spec import JobSpec
+    from flash.runner.supervise import seed_submission
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="settle-on-success", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    # a lambda handle: no endpoint_id, so gc_seen_endpoints would reap nothing here.
+    remote = _lambda_remote()
+    status = provisioned_status(spec, state="running", remote=remote)
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status)
+
+    torn_down = []
+    monkeypatch.setattr(
+        seed_submission._lifecycle,
+        "_strict_teardown_handle",
+        lambda handle, run_id: torn_down.append(run_id) or True,
+    )
+
+    ctx = types.SimpleNamespace(
+        spec=spec,
+        last_handle=dict(remote),
+        seen_endpoints={},
+        raise_if_cancelled=lambda: None,
+    )
+    # enter through the success return, not the helper: the regression this guards was the success
+    # path losing its settlement call while the helper itself still worked.
+    metrics = seed_submission._return_success_metrics(
+        ctx, (types.SimpleNamespace(ok=True, metrics={}), None, (), False)
+    )
+
+    assert metrics == {}
+    assert torn_down == [spec.run_id], "a successful attempt must tear its provider handle down"
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw["remote"] is None, "confirmed teardown must clear the remote off the record"
+    assert raw.get("cleanup_confirmed_remote") == remote
+
+
+def test_lost_ownership_failure_releases_the_launch_lease(monkeypatch, tmp_path):
+    """A failure report that loses ownership must not strand this process's launch lease.
+
+    `decide_attempt_failure` returns none when the caller no longer owns the attempt. That exit
+    happens before the decision is persisted, so it must still drop the local flock: the caller
+    clears its claim reference either way, so nothing downstream can consume the lease afterwards.
+    Leaving it held keeps `claim_is_live` true for the process lifetime and blocks handleless
+    recovery of a run that is still nonterminal.
+    """
+    from flash.core.spec import JobSpec
+    from flash.runner.lifecycle import claim_lock
+    from flash.runner.supervise.retry_decision import FailureObservation
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="lost-ownership-lease", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    status = provisioned_status(spec, state="provisioning")
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status)
+
+    claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert claim is not None
+    assert claim_lock.owned_locally(spec.run_id, claim.token) is True
+
+    # a competing owner takes the attempt over, so this caller's report loses the ownership check.
+    runner_state._save_status(
+        runner_status._runstatus_from_json(runner_status._load_status_json(spec.run_id)),
+        _active_launch_claim=None,
+    )
+
+    plan = runner_attempts.decide_attempt_failure(
+        spec.run_id,
+        claim_token=claim.token,
+        expected_remote=None,
+        observation=FailureObservation("poll_error"),
+        attempt=claim.attempt,
+    )
+
+    assert plan is None
+    # the lease must be gone: the caller drops its claim reference on this path, so a retained
+    # flock could never be released by the submission `finally` fallback.
+    assert claim_lock.owned_locally(spec.run_id, claim.token) is False
 
 
 def test_attach_clear_and_reserve_is_atomic_against_second_observer(monkeypatch, tmp_path):

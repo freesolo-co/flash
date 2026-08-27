@@ -69,6 +69,7 @@ class _SubmitContext:
 
     def return_completed_runpod_metrics(self, metrics: dict) -> dict:
         self.raise_if_cancelled()
+        _settle_terminal_remote(self)
         self.gc_seen_endpoints()
         if self.last_handle.get("allocated_gpu"):
             metrics.setdefault("allocated_gpu", self.last_handle["allocated_gpu"])
@@ -545,9 +546,43 @@ def _run_attempt(ctx: _SubmitContext, prepared):
     return result, chosen, candidates, candidate_not_started
 
 
+def _settle_terminal_remote(ctx: _SubmitContext) -> None:
+    """track and clear an attempt only after exact teardown is confirmed."""
+    if not ctx.last_handle:
+        return
+    from flash.providers.core.base import JobHandle
+    from flash.runner.accounting.reconciliation import (
+        _compare_and_confirm_remote_teardown,
+        _compare_and_remove_cleanup_remote,
+        _record_cleanup_remote,
+    )
+
+    remote = dict(ctx.last_handle)
+    cleanup_recorded = False
+    with contextlib.suppress(Exception):
+        cleanup_recorded = _record_cleanup_remote(ctx.spec.run_id, remote)
+    try:
+        deleted = _lifecycle._strict_teardown_handle(JobHandle.from_dict(remote), ctx.spec.run_id)
+    except Exception:
+        return
+    if not deleted:
+        return
+    cleanup_cleared = False
+    if cleanup_recorded:
+        with contextlib.suppress(Exception):
+            cleanup_cleared = _compare_and_remove_cleanup_remote(ctx.spec.run_id, remote)
+    if not cleanup_cleared:
+        with contextlib.suppress(Exception):
+            _compare_and_confirm_remote_teardown(ctx.spec.run_id, remote)
+    endpoint_id = remote.get("endpoint_id")
+    if isinstance(endpoint_id, str):
+        ctx.seen_endpoints.pop(endpoint_id, None)
+
+
 def _return_success_metrics(ctx: _SubmitContext, outcome) -> dict:
     # a late worker success must not resurrect a cancelled run.
     ctx.raise_if_cancelled()
+    _settle_terminal_remote(ctx)
     result, chosen, _, _ = outcome
     metrics = result.metrics
     if chosen is not None and isinstance(metrics, dict):
@@ -656,6 +691,7 @@ def submit_seed_supervised(
                 break
             if retry_delay:
                 _lifecycle.time.sleep(retry_delay)
+        _settle_terminal_remote(ctx)
         ctx.gc_seen_endpoints()
         raise RuntimeError(f"seed {seed} failed after retries: {ctx.last_detail}")
     finally:
