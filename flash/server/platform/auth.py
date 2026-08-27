@@ -20,27 +20,31 @@ DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
 
 STANDALONE_ENV = "FLASH_STANDALONE"
 _VERIFY_TIMEOUT_S = 5.0
-_VERIFY_CACHE_TTL_S = 300.0
-# Short negative TTL: a transient backend 401 shouldn't lock out a valid key for 5 min.
+# short negative ttl: a definitive rejection should not lock out a rotated key for long.
 _VERIFY_CACHE_NEG_TTL_S = 30.0
 _MAX_TOKEN_LEN = 256
 
-# token -> (verified_bool, identity_dict, expires_at); positives and negatives both cached.
-_verify_cache: dict[str, tuple[bool, dict[str, Any], float]] = {}
+# token digest -> monotonic expiry. only definitive negative results are cached.
+_verify_cache: dict[str, float] = {}
 _verify_cache_lock = threading.Lock()
-_verify_inflight: dict[str, Future[bool]] = {}
+_verify_inflight: dict[str, Future[dict[str, Any] | None]] = {}
 _VERIFY_CACHE_MAX = 1024
+
+
+def _verify_key_digest(token: str) -> str:
+    """Return the collision-resistant state key without retaining bearer material."""
+    return db.hash_key(token)
 
 
 def _prune_verify_cache_locked(now: float) -> None:
     """Drop expired entries then cap size. Caller must hold ``_verify_cache_lock``."""
-    for tok in [t for t, entry in _verify_cache.items() if entry[2] <= now]:
-        del _verify_cache[tok]
+    for digest in [digest for digest, expires_at in _verify_cache.items() if expires_at <= now]:
+        del _verify_cache[digest]
     if len(_verify_cache) >= _VERIFY_CACHE_MAX:
-        for tok, _entry in sorted(_verify_cache.items(), key=lambda kv: kv[1][2])[
+        for digest, _expires_at in sorted(_verify_cache.items(), key=lambda item: item[1])[
             : len(_verify_cache) - _VERIFY_CACHE_MAX + 1
         ]:
-            del _verify_cache[tok]
+            del _verify_cache[digest]
 
 
 def _freesolo_key_prefix(token: str) -> str:
@@ -75,9 +79,12 @@ def _identity_from_verify_body(raw: bytes) -> dict[str, Any]:
     if not isinstance(body, dict):
         return {}
 
-    user = body.get("user") if isinstance(body.get("user"), dict) else {}
-    org = body.get("org") if isinstance(body.get("org"), dict) else {}
-    api_key = body.get("api_key") if isinstance(body.get("api_key"), dict) else {}
+    raw_user = body.get("user")
+    raw_org = body.get("org")
+    raw_api_key = body.get("api_key")
+    user = raw_user if isinstance(raw_user, dict) else {}
+    org = raw_org if isinstance(raw_org, dict) else {}
+    api_key = raw_api_key if isinstance(raw_api_key, dict) else {}
 
     fields = {
         "email": _str_field(body.get("email")) or _str_field(user.get("email")),
@@ -111,15 +118,6 @@ def _response_body(resp: Any) -> bytes:
     if isinstance(data, str):
         return data.encode()
     return b""
-
-
-def _cached_identity(token: str) -> dict[str, Any]:
-    now = time.time()
-    with _verify_cache_lock:
-        cached = _verify_cache.get(token)
-        if cached is not None and cached[2] > now:
-            return dict(cached[1])
-    return {}
 
 
 # Identity fields copied verbatim from a verified caller identity into the auth row, and
@@ -161,58 +159,72 @@ def standalone() -> bool:
     return (os.environ.get(STANDALONE_ENV) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _freesolo_verify(token: str) -> bool:
-    """Verify a token against the freesolo backend; network errors return False, never raise."""
+def _freesolo_verify(token: str) -> dict[str, Any] | None:
+    """Verify a token and return its identity; transport failures reject without caching."""
     if not token or len(token) > _MAX_TOKEN_LEN:
-        return False
-    now = time.time()
+        return None
+    digest = _verify_key_digest(token)
+    now = time.monotonic()
     with _verify_cache_lock:
-        cached = _verify_cache.get(token)
-        if cached is not None and cached[2] > now:
-            return cached[0]
-        pending = _verify_inflight.get(token)
+        negative_expiry = _verify_cache.get(digest)
+        if negative_expiry is not None:
+            if negative_expiry > now:
+                return None
+            del _verify_cache[digest]
+        pending = _verify_inflight.get(digest)
         if pending is None:
-            pending = Future[bool]()
-            _verify_inflight[token] = pending
+            pending = Future[dict[str, Any] | None]()
+            _verify_inflight[digest] = pending
             owns_verify = True
         else:
             owns_verify = False
     if not owns_verify:
+        # drop the bearer material from this frame before waiting: pending.result() re-raises the
+        # owner's exception here, and a traceback through this frame would otherwise carry the token.
+        del token
         return pending.result()
 
     try:
         url = f"{freesolo_base_url()}/api/auth/verify"
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-        identity: dict[str, Any] = {}
-        cache_result = True
+        cache_negative = False
         try:
-            with urllib.request.urlopen(req, timeout=_VERIFY_TIMEOUT_S) as resp:
-                verified = resp.status == 200
-                if verified:
-                    identity = _identity_from_verify_body(_response_body(resp))
+            response = urllib.request.urlopen(req, timeout=_VERIFY_TIMEOUT_S)
         except urllib.error.HTTPError as exc:
-            # treat 5xx/429 as transient and do not cache them.
-            if exc.code >= 500 or exc.code == 429:
-                cache_result = False
-            verified = False
+            identity = None
+            cache_negative = exc.code in {401, 403}
         except (OSError, ValueError):
-            verified = False
-            cache_result = False
-        if cache_result:
+            identity = None
+        else:
+            try:
+                with response as resp:
+                    identity = (
+                        _identity_from_verify_body(_response_body(resp))
+                        if resp.status == 200
+                        else None
+                    )
+                    response_status = resp.status
+            except (urllib.error.HTTPError, OSError, ValueError):
+                identity = None
+            else:
+                cache_negative = response_status in {401, 403}
+        if cache_negative:
             with _verify_cache_lock:
+                now = time.monotonic()
                 _prune_verify_cache_locked(now)
-                ttl = _VERIFY_CACHE_TTL_S if verified else _VERIFY_CACHE_NEG_TTL_S
-                _verify_cache[token] = (verified, identity if verified else {}, now + ttl)
+                _verify_cache[digest] = now + _VERIFY_CACHE_NEG_TTL_S
     except BaseException as exc:
-        pending.set_exception(exc)
+        with _verify_cache_lock:
+            if _verify_inflight.get(digest) is pending:
+                del _verify_inflight[digest]
+            pending.set_exception(exc)
         raise
     else:
-        pending.set_result(verified)
-        return verified
-    finally:
         with _verify_cache_lock:
-            if _verify_inflight.get(token) is pending:
-                del _verify_inflight[token]
+            if _verify_inflight.get(digest) is pending:
+                del _verify_inflight[digest]
+            pending.set_result(identity)
+        return identity
 
 
 def authenticate(authorization: str | None) -> dict | None:
@@ -238,17 +250,19 @@ def authenticate(authorization: str | None) -> dict | None:
         # No backend to verify an external key against, and an unverifiable token must never be
         # accepted. The operator key above is the ONLY credential a standalone plane honours.
         return None
-    if _freesolo_verify(token):
-        identity = _cached_identity(token)
-        if not identity.get("org_slug"):
-            return None
-        email = str(identity.get("email") or "").strip()
-        if "@" not in email:
-            email = ""
-        row = db.lookup_key(token) or db.ensure_external_key(
-            token,
-            key_prefix=_external_key_prefix(token, identity),
-            email=email or None,
-        )
-        return _external_row(row, token, identity) if row is not None else None
-    return None
+    external_identity = _freesolo_verify(token)
+    if external_identity is None or not external_identity.get("org_slug"):
+        return None
+    email = str(external_identity.get("email") or "").strip()
+    if "@" not in email:
+        email = ""
+    external_row_data = db.lookup_key(token) or db.ensure_external_key(
+        token,
+        key_prefix=_external_key_prefix(token, external_identity),
+        email=email or None,
+    )
+    return (
+        _external_row(external_row_data, token, external_identity)
+        if external_row_data is not None
+        else None
+    )
