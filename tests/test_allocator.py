@@ -1381,9 +1381,11 @@ def _stub_provider(monkeypatch, allocator, candidates_by_need):
     from dataclasses import replace
 
     from flash.providers.core.base import Candidate, rentable_gpu_counts
+    from flash.providers.core.capabilities import ProviderCapabilities
 
     class _P:
         name = "runpod"
+        capabilities = ProviderCapabilities(True, False, None, None)
 
         def live_candidates(self, need, constraints):
             return [

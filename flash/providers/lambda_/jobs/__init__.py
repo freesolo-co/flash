@@ -45,6 +45,7 @@ from flash.providers.core.base import (
     UnreconciledCreateError,
     UnsupportedGpuError,
 )
+from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 from flash.providers.lambda_.client import api as lambda_api
 from flash.providers.lambda_.jobs.builders import (
     LambdaInstance,
@@ -178,12 +179,14 @@ def _abort_ambiguous_launch(run_id: str, detail: str) -> None:
         instances = lambda_api.list_instances()
         prefix = run_label_prefix(run_id)
         ids = [
-            str(instance["id"])
+            raw_id
             for instance in instances
-            if instance.get("id") and label_matches_run(str(instance.get("name") or ""), prefix)
+            if isinstance((raw_id := instance.get("id")), str)
+            and raw_id.strip()
+            and label_matches_run(str(instance.get("name") or ""), prefix)
         ]
         if ids:
-            for instance_id in ids:
+            for instance_id in dict.fromkeys(ids):
                 lambda_api.terminate_instance_confirmed(instance_id)
             cleanup = f"terminated {len(ids)} matching instance(s)"
         else:
@@ -879,11 +882,13 @@ def terminate_run_instances(run_id: str) -> list[str]:
         return []
     prefix = run_label_prefix(run_id)
     ids = [
-        str(i.get("id"))
-        for i in instances
-        if i.get("id") and label_matches_run(str(i.get("name") or ""), prefix)
+        raw_id
+        for instance in instances
+        if isinstance((raw_id := instance.get("id")), str)
+        and raw_id.strip()
+        and label_matches_run(str(instance.get("name") or ""), prefix)
     ]
-    return lambda_api.terminate_instances(ids) if ids else []
+    return lambda_api.terminate_instances(list(dict.fromkeys(ids))) if ids else []
 
 
 def run_instances_remaining(run_id: str) -> list[str]:
@@ -914,27 +919,21 @@ def run_instances_remaining(run_id: str) -> list[str]:
 def sweep_orphans(
     active_labels: set[str] | Callable[[], set[str]] | None = None,
     known_labels: set[str] | Callable[[], set[str]] | None = None,
-) -> list[str]:
-    """Terminate flash-prefixed instances not owned by a live run; return terminated ids.
-
-    ``known_labels``: multi-plane guard — only reap instances attributable to THIS plane's runs.
-    Without it, two planes sharing one account mutually reap each other's live instances.
-    Callables are resolved after listing so the protection set is current. Never raises.
-    """
+) -> CleanupResult:
+    """Terminate flash-prefixed instances not owned by a live run."""
     try:
         instances = lambda_api.list_instances()
     except Exception as exc:
         logger.warning("lambda orphan sweep skipped: %s", exc)
-        return []
+        return CleanupResult(CleanupOutcome.RETRYABLE)
     try:
         labels = active_labels() if callable(active_labels) else active_labels
         known = known_labels() if callable(known_labels) else known_labels
     except Exception as exc:
         # never fall through to an empty set because that would reap every live run's instance.
         logger.warning("lambda orphan sweep skipped; could not resolve run sets: %s", exc)
-        return []
+        return CleanupResult(CleanupOutcome.RETRYABLE)
     active = {run_label_prefix(a) for a in (labels or set())}
-    # None = unscoped (single-plane); empty set = this plane owns nothing, reaps nothing.
     known_prefixes = (
         None if known_labels is None else {run_label_prefix(a) for a in (known or set())}
     )
@@ -944,30 +943,42 @@ def sweep_orphans(
 
     now = time.time()
     orphans: list[str] = []
+    unresolved: list[str] = []
     for inst in instances:
         name = str(inst.get("name") or "")
         if not name.startswith("flash-"):
             continue
-        # Preload boxes are exempt (driver-owned, not in run DB) UNLESS past their wall deadline + grace.
         if name.startswith("flash-preload-"):
-            if preload_box_reap_due(name, now):
-                iid = inst.get("id")
-                if iid:
-                    orphans.append(str(iid))
-                    logger.warning(
-                        "reaping orphaned lambda preload box %s (outlived its wall deadline + grace; "
-                        "driver lost)",
-                        name,
-                    )
+            if not preload_box_reap_due(name, now):
+                continue
+            logger.warning(
+                "reaping orphaned lambda preload box %s (outlived its wall deadline + grace; "
+                "driver lost)",
+                name,
+            )
+        elif _matches(active) or (known_prefixes is not None and not _matches(known_prefixes)):
             continue
-        if _matches(active):
-            continue
-        if known_prefixes is not None and not _matches(known_prefixes):
-            continue
-        iid = inst.get("id")
-        if iid:
-            orphans.append(str(iid))
-    deleted = lambda_api.terminate_instances(orphans) if orphans else []
+        raw_id = inst.get("id")
+        if isinstance(raw_id, str) and raw_id.strip():
+            orphans.append(raw_id)
+        else:
+            unresolved.append(name)
+    orphans = list(dict.fromkeys(orphans))
+    if not orphans:
+        outcome = CleanupOutcome.UNCONFIRMED if unresolved else CleanupOutcome.ABSENT
+        return CleanupResult(outcome, unresolved_ids=tuple(unresolved) or None)
+    deleted = tuple(lambda_api.terminate_instances(orphans))
     for iid in deleted:
         logger.warning("terminated orphaned lambda instance %s", iid)
-    return deleted
+    unresolved.extend(iid for iid in orphans if iid not in set(deleted))
+    if not unresolved:
+        outcome = CleanupOutcome.DELETED
+    elif deleted:
+        outcome = CleanupOutcome.UNCONFIRMED
+    else:
+        outcome = CleanupOutcome.RETRYABLE
+    return CleanupResult(
+        outcome,
+        confirmed_deleted_ids=deleted,
+        unresolved_ids=tuple(unresolved) or None,
+    )

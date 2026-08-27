@@ -4,6 +4,8 @@ run-aware protected set + idle grace down to the provider sweep. (Server-side; n
 
 from __future__ import annotations
 
+import pytest
+
 import flash.providers.runpod.execution.resources as runpod_resources
 import flash.server.asgi.app as app_mod
 from flash.providers.core.base import canonical_gpu
@@ -112,10 +114,10 @@ def test_reap_once_passes_protected_set_and_grace(monkeypatch):
         captured["protected"] = protected
         captured["grace"] = min_idle_s
         captured["known"] = known
-        return 3
+        return runpod_resources.IdleEndpointSweepResult(deleted_ids=("a", "b", "c"))
 
     monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", fake_sweep)
-    assert app_mod._reap_idle_endpoints_once(900.0) == 3
+    assert app_mod._reap_idle_endpoints_once(900.0).deleted_count == 3
     assert captured == {
         "protected": {"flash-live"},
         "grace": 900.0,
@@ -147,18 +149,24 @@ class _FakeProvider:
     set reflects the post-listing resolution the periodic sweep relies on."""
 
     def __init__(self, name, torn=(), raises=False):
+        from flash.providers.core.capabilities import ProviderCapabilities
+
         self.name = name
         self._torn = list(torn)
         self._raises = raises
         self.seen_active = None
         self.seen_known = None
+        self.capabilities = ProviderCapabilities(False, True, None, self._sweep_orphans)
 
-    def sweep_orphans(self, active_labels=None, known_labels=None):
+    def _sweep_orphans(self, active_labels=None, known_labels=None):
+        from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
         if self._raises:
             raise RuntimeError(f"{self.name} api blip")
         self.seen_active = active_labels() if callable(active_labels) else active_labels
         self.seen_known = known_labels() if callable(known_labels) else known_labels
-        return self._torn
+        outcome = CleanupOutcome.DELETED if self._torn else CleanupOutcome.ABSENT
+        return CleanupResult(outcome, confirmed_deleted_ids=tuple(self._torn))
 
 
 def test_active_run_ids_covers_live_runs_only(monkeypatch):
@@ -199,7 +207,7 @@ def test_sweep_instances_dispatches_active_set_and_sums(monkeypatch):
     monkeypatch.setattr(app_mod, "_active_run_ids", lambda: {"flash-live"})
     monkeypatch.setattr(app_mod, "_known_run_ids", lambda: {"flash-live", "flash-done"})
     lam = _FakeProvider("lambda", torn=["i-1", "i-2"])
-    rp = _FakeProvider("runpod", torn=[])  # no-op for RunPod, still dispatched
+    rp = _FakeProvider("runpod", torn=[])
     monkeypatch.setattr(
         "flash.providers.core.registry.configured_providers", lambda: [rp, lam], raising=False
     )
@@ -355,7 +363,7 @@ def test_sweep_resolves_active_labels_after_listing(monkeypatch):
     out = jobs.sweep_orphans(active_labels=active_fn)
 
     assert events == ["list", "active"]  # protection set resolved AFTER the instance list
-    assert out == ["i-orphan"]  # fresh worker protected, orphan reaped
+    assert out.confirmed_deleted_ids == ("i-orphan",)  # fresh worker protected, orphan reaped
     assert terminated == ["i-orphan"]
 
 
@@ -381,7 +389,9 @@ def test_sweep_skips_when_active_set_resolution_raises(monkeypatch):
 
     out = jobs.sweep_orphans(active_labels=boom)
 
-    assert out == []  # skipped, did NOT raise
+    from flash.providers.core.capabilities import CleanupOutcome
+
+    assert out.outcome is CleanupOutcome.RETRYABLE
     assert terminated == []  # and crucially did NOT reap the live instance
 
 
@@ -393,7 +403,10 @@ def test_sweep_skips_when_active_set_resolution_raises(monkeypatch):
 
 def _idle_health():
     """A warm-idle endpoint with no work — reapable under reap_warm=True."""
-    return {"workers": {"ready": 1, "idle": 1}, "jobs": {"inQueue": 0, "inProgress": 0}}
+    return {
+        "workers": {"running": 0, "initializing": 0, "ready": 1, "idle": 1},
+        "jobs": {"inQueue": 0, "inProgress": 0},
+    }
 
 
 def test_canonical_endpoint_name_strips_sdk_live_prefix():
@@ -409,6 +422,262 @@ def test_canonical_endpoint_name_strips_sdk_live_prefix():
         == "flash-x"
     )
     assert runpod_resources.canonical_endpoint_name("") == ""
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        pytest.param({"name": "live-flash-bad", "id": ""}, id="empty"),
+        pytest.param({"name": "live-flash-bad", "id": "   "}, id="whitespace"),
+        pytest.param({"name": "live-flash-bad", "id": " ep-bad"}, id="leading-space"),
+        pytest.param({"name": "live-flash-bad", "id": "ep-bad "}, id="trailing-space"),
+        pytest.param({"name": "live-flash-bad", "id": True}, id="bool"),
+        pytest.param({"name": "live-flash-bad", "id": 7}, id="integer"),
+        pytest.param({"name": "live-flash-bad", "id": None}, id="none"),
+        pytest.param({"name": "live-flash-bad"}, id="missing"),
+    ],
+)
+def test_sweep_rejects_malformed_selected_endpoint_ids_before_provider_calls(monkeypatch, endpoint):
+    runpod_resources._idle_since.clear()
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"fpA": [endpoint]}, []),
+    )
+    provider_calls = []
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *args, **kwargs: provider_calls.append(("health", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *args, **kwargs: provider_calls.append(("delete", args, kwargs)),
+    )
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(), min_idle_s=0.0, known={"flash-bad"}
+    )
+
+    assert result.deleted_count == 0
+    assert result.unresolved_count == 1
+    assert result.unresolved[0].endpoint_name == "flash-bad"
+    assert result.unresolved[0].reason == "invalid selected endpoint identity"
+    assert provider_calls == []
+    assert runpod_resources._idle_since == {}
+
+
+def test_sweep_rejects_malformed_selected_owner_before_provider_calls(monkeypatch):
+    runpod_resources._idle_since.clear()
+    endpoint = {"name": "live-flash-bad-owner", "id": "ep-valid"}
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({" fpA": [endpoint]}, []),
+    )
+    provider_calls = []
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *args, **kwargs: provider_calls.append(("health", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *args, **kwargs: provider_calls.append(("delete", args, kwargs)),
+    )
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(), min_idle_s=0.0, known={"flash-bad-owner"}
+    )
+
+    assert result.deleted_count == 0
+    assert result.unresolved_count == 1
+    assert result.unresolved[0].observed_endpoint_id == "'ep-valid'"
+    assert provider_calls == []
+    assert runpod_resources._idle_since == {}
+
+
+def test_sweep_rejects_endpoint_id_with_ambiguous_owner_before_provider_calls(monkeypatch):
+    runpod_resources._idle_since.clear()
+    endpoint = {"name": "live-flash-ambiguous", "id": "ep-shared"}
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"fpA": [endpoint], "fpB": [endpoint]}, []),
+    )
+    provider_calls = []
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *args, **kwargs: provider_calls.append(("health", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *args, **kwargs: provider_calls.append(("delete", args, kwargs)),
+    )
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(), min_idle_s=0.0, known={"flash-ambiguous"}
+    )
+
+    assert result.deleted_count == 0
+    assert result.unresolved_count == 1
+    assert result.unresolved[0].reason == "endpoint identity appeared under multiple owners"
+    assert provider_calls == []
+    assert runpod_resources._idle_since == {}
+
+
+def test_sweep_mixed_valid_and_malformed_owners_blocks_provider_calls(monkeypatch):
+    runpod_resources._idle_since.clear()
+    endpoint = {"name": "live-flash-mixed-owner", "id": "ep-mixed"}
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"fp-valid": [endpoint], " fp-malformed": [endpoint]}, []),
+    )
+    provider_calls = []
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *args, **kwargs: provider_calls.append(("health", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *args, **kwargs: provider_calls.append(("delete", args, kwargs)),
+    )
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(), min_idle_s=0.0, known={"flash-mixed-owner"}
+    )
+
+    assert result.deleted_count == 0
+    assert {issue.reason for issue in result.unresolved} == {
+        "endpoint identity appeared under multiple owners",
+        "invalid selected endpoint identity",
+    }
+    assert provider_calls == []
+    assert runpod_resources._idle_since == {}
+
+
+@pytest.mark.parametrize(
+    ("group", "field", "value"),
+    [
+        pytest.param("workers", "running", True, id="worker-bool"),
+        pytest.param("workers", "initializing", -1, id="worker-negative"),
+        pytest.param("workers", "ready", 1.0, id="worker-float"),
+        pytest.param("workers", "idle", "0", id="worker-string"),
+        pytest.param("jobs", "inQueue", False, id="job-bool"),
+        pytest.param("jobs", "inProgress", -1, id="job-negative"),
+    ],
+)
+def test_sweep_rejects_malformed_cleanup_health_counters(monkeypatch, group, field, value):
+    runpod_resources._idle_since.clear()
+    endpoint = {"name": "live-flash-bad-health", "id": "ep-health"}
+    health = _idle_health()
+    health[group][field] = value
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"fpA": [endpoint]}, []),
+    )
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *_args, **_kwargs: health,
+    )
+    deletes = []
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *args, **kwargs: deletes.append((args, kwargs)) or True,
+    )
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(), min_idle_s=0.0, known={"flash-bad-health"}
+    )
+
+    assert result.deleted_count == 0
+    assert result.unresolved_count == 1
+    assert result.unresolved[0].reason == "health evidence unavailable"
+    assert deletes == []
+    assert runpod_resources._idle_since == {}
+
+
+def test_sweep_rejects_incomplete_cleanup_health(monkeypatch):
+    runpod_resources._idle_since.clear()
+    endpoint = {"name": "live-flash-incomplete-health", "id": "ep-health"}
+    health = _idle_health()
+    del health["jobs"]["inProgress"]
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"fpA": [endpoint]}, []),
+    )
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *_args, **_kwargs: health,
+    )
+    deletes = []
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *args, **kwargs: deletes.append((args, kwargs)) or True,
+    )
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(), min_idle_s=0.0, known={"flash-incomplete-health"}
+    )
+
+    assert result.deleted_count == 0
+    assert result.unresolved_count == 1
+    assert result.unresolved[0].reason == "health evidence unavailable"
+    assert deletes == []
+
+
+def test_sweep_deduplicates_inventory_before_health_and_delete(monkeypatch):
+    runpod_resources._idle_since.clear()
+    endpoint = {"name": "live-flash-duplicate", "id": "ep-duplicate"}
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"fpA": [endpoint, dict(endpoint), endpoint]}, []),
+    )
+    health_calls = []
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *args, **kwargs: health_calls.append((args, kwargs)) or _idle_health(),
+    )
+    deletes = []
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *args, **kwargs: deletes.append((args, kwargs)) or True,
+    )
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(), min_idle_s=0.0, known={"flash-duplicate"}
+    )
+
+    assert result.deleted_ids == ("ep-duplicate",)
+    assert len(health_calls) == 1
+    assert len(deletes) == 1
+
+
+def test_idle_sweep_result_rejects_duplicate_evidence() -> None:
+    issue = runpod_resources.IdleEndpointSweepIssue("fpA", "flash-dup", "ep-dup", "failed")
+
+    with pytest.raises(ValueError, match="deleted_ids must be unique"):
+        runpod_resources.IdleEndpointSweepResult(deleted_ids=("ep-dup", "ep-dup"))
+    with pytest.raises(ValueError, match="unresolved must be unique"):
+        runpod_resources.IdleEndpointSweepResult(unresolved=(issue, issue))
+    with pytest.raises(ValueError, match="failed_owner_fingerprints must be unique"):
+        runpod_resources.IdleEndpointSweepResult(failed_owner_fingerprints=("fpA", "fpA"))
 
 
 def test_sweep_reaps_responsive_account_when_one_pool_key_fails(monkeypatch):
@@ -440,7 +709,8 @@ def test_sweep_reaps_responsive_account_when_one_pool_key_fails(monkeypatch):
     # min_idle_s=0 -> a first idle observation is immediately reapable.
     deleted = runpod_resources._sweep_idle_flash_endpoints(protected=set(), min_idle_s=0.0)
 
-    assert deleted == 1
+    assert deleted.deleted_count == 1
+    assert deleted.failed_owner_fingerprints == ("fpA",)
     assert health_calls == [("ep-b1", "fpB")]  # account-scoped: queried with the OWNING fingerprint
     assert deletes == [("ep-b1", "fpB")]  # ...and deleted with it, no failover waterfall
     assert warnings, "a failed pool account must be surfaced at WARNING, not swallowed at DEBUG"
@@ -473,7 +743,7 @@ def test_sweep_skips_endpoints_outside_known_scope(monkeypatch):
         protected=set(), min_idle_s=0.0, known={"flash-mine-idle"}
     )
 
-    assert deleted == 1
+    assert deleted.deleted_count == 1
     assert deletes == ["ep-mine"]  # only ours; the other plane's idle endpoint is untouched
 
 
@@ -501,7 +771,7 @@ def test_sweep_preserves_grace_for_unlisted_account(monkeypatch):
 
     deleted = runpod_resources._sweep_idle_flash_endpoints(protected=set(), min_idle_s=900.0)
 
-    assert deleted == 0
+    assert deleted.deleted_count == 0
     # grace timer (owned by the FAILED account) SURVIVED the partial outage
     assert runpod_resources._idle_since.get("ep-a1") == (1.0, "fpA")
 
@@ -528,7 +798,7 @@ def test_sweep_partial_view_prunes_vanished_timer_for_responsive_account(monkeyp
 
     deleted = runpod_resources._sweep_idle_flash_endpoints(protected=set(), min_idle_s=900.0)
 
-    assert deleted == 0
+    assert deleted.deleted_count == 0
     assert (
         "gone-b" not in runpod_resources._idle_since
     )  # responsive account's vanished timer pruned (the fix)
@@ -550,5 +820,5 @@ def test_sweep_full_view_prunes_vanished_grace_timer(monkeypatch):
 
     deleted = runpod_resources._sweep_idle_flash_endpoints(protected=set(), min_idle_s=900.0)
 
-    assert deleted == 0
+    assert deleted.deleted_count == 0
     assert "ghost" not in runpod_resources._idle_since  # full view -> stale timer pruned

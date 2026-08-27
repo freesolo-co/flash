@@ -15,6 +15,7 @@ from flash.providers.core.base import (
     Provider,
     rentable_gpu_counts,
 )
+from flash.providers.core.capabilities import ProviderCapabilities
 
 
 def terminate_persisted_endpoints(spec: Any, run_id: str) -> None:
@@ -29,10 +30,12 @@ def terminate_persisted_endpoints(spec: Any, run_id: str) -> None:
 
 class RunpodProvider:
     name = "runpod"
-    # Optional capability (read via getattr, kept off the runtime_checkable Protocol like
-    # run_instances_remaining): only RunPod offers the shared weight-cache network volume, so the
-    # runner's one-shot cache-less retry fallback is gated on it. Instance providers omit it -> False.
-    supports_weight_cache = True
+    capabilities = ProviderCapabilities(
+        supports_weight_cache=True,
+        live_capacity=False,
+        confirm_run_absent=None,
+        sweep_orphans=None,
+    )
 
     def is_configured(self) -> bool:
         # require a usable parsed key pool, not merely a set env var. otherwise the allocator ranks
@@ -209,13 +212,6 @@ class RunpodProvider:
         # so naming a class this run never rented is a no-op.
         for gpu_type in spec.gpu.acceptable_types:
             terminate_endpoint(gpu_type, spec.run_id)
-
-    def sweep_orphans(
-        self,
-        active_labels: set[str] | None = None,
-        known_labels: set[str] | None = None,
-    ) -> list[int]:
-        return []
 
 
 PROVIDER: Provider = RunpodProvider()

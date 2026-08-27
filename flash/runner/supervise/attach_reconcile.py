@@ -58,13 +58,16 @@ def teardown_reconciled_remote(
     confirmed_teardown: bool,
 ) -> tuple[bool, bool]:
     """return whether recovery may continue and exact deletion was confirmed."""
+    from flash.providers.core.capabilities import is_cleanup_confirmed
     from flash.runner.accounting.reconciliation import _record_cleanup_remote
     from flash.runner.supervise.lifecycle import _strict_teardown_handle, _worker_provably_gone
 
     if confirmed_teardown:
         return True, True
     try:
-        resource_deleted = _strict_teardown_handle(handle, run_id)
+        # a CleanupResult is always truthy, so the outcome has to be read rather than the object.
+        # taking the object as a boolean would report confirmed deletion for a surviving instance.
+        resource_deleted = is_cleanup_confirmed(_strict_teardown_handle(handle, run_id))
         worker_gone = True
     except Exception:
         resource_deleted = False

@@ -553,8 +553,10 @@ def test_cancel_run_prices_the_rented_basis_after_teardown_clears_the_handle(mon
     torn_down = []
 
     def teardown(handle, _run_id):
+        from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
         torn_down.append(handle.provider)
-        return True
+        return CleanupResult(CleanupOutcome.DELETED)
 
     monkeypatch.setattr(lifecycle, "_strict_teardown_handle", teardown)
     spec = _spec()

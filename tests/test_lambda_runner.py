@@ -2876,7 +2876,11 @@ def test_run_instances_remaining_uses_exact_labels_and_exact_lookup(monkeypatch)
 
     monkeypatch.setattr(lambda_api, "get_instance", lookup)
 
-    assert LambdaProvider().run_instances_remaining(run_id) == ["i-live"]
+    from flash.providers.core.capabilities import CleanupOutcome
+
+    result = LambdaProvider().capabilities.confirm_run_absent(run_id)
+    assert result.outcome is CleanupOutcome.PRESENT
+    assert result.surviving_ids == ("i-live",)
     assert lookups == [("i-live", True), ("i-gone", True)]
 
 
@@ -2892,9 +2896,10 @@ def test_run_instances_remaining_fails_closed_on_enumeration_lookup_or_identity(
     def listing_failure(*, strict):
         raise lambda_api.LambdaApiError("listing unavailable")
 
+    from flash.providers.core.capabilities import CleanupOutcome
+
     monkeypatch.setattr(lambda_api, "list_instances", listing_failure)
-    with pytest.raises(lambda_api.LambdaApiError, match="listing unavailable"):
-        provider.run_instances_remaining("run1")
+    assert provider.capabilities.confirm_run_absent("run1").outcome is CleanupOutcome.RETRYABLE
 
     monkeypatch.setattr(
         lambda_api,
@@ -2906,16 +2911,14 @@ def test_run_instances_remaining_fails_closed_on_enumeration_lookup_or_identity(
         raise lambda_api.LambdaApiError("lookup unavailable")
 
     monkeypatch.setattr(lambda_api, "get_instance", lookup_failure)
-    with pytest.raises(lambda_api.LambdaApiError, match="lookup unavailable"):
-        provider.run_instances_remaining("run1")
+    assert provider.capabilities.confirm_run_absent("run1").outcome is CleanupOutcome.RETRYABLE
 
     monkeypatch.setattr(
         lambda_api,
         "list_instances",
         lambda *, strict: [{"id": None, "name": jobs.instance_label("run1", 0, 0)}],
     )
-    with pytest.raises(lambda_api.LambdaApiError, match="no usable id"):
-        provider.run_instances_remaining("run1")
+    assert provider.capabilities.confirm_run_absent("run1").outcome is CleanupOutcome.RETRYABLE
 
 
 def test_handle_roundtrip():
@@ -2925,6 +2928,23 @@ def test_handle_roundtrip():
     d = h.to_dict()
     assert d["provider"] == "lambda"
     assert LambdaJobHandle.from_dict(d) == h
+
+
+@pytest.mark.parametrize("builder", ["direct", "persisted"])
+def test_lambda_handle_rejects_whitespace_instance_identity(builder):
+    from flash.providers.lambda_.jobs.builders import LambdaJobHandle
+
+    values = _handle().to_dict()
+    values["instance_id"] = "   "
+    values.pop("provider")
+
+    build = (
+        (lambda: LambdaJobHandle(**values))
+        if builder == "direct"
+        else (lambda: LambdaJobHandle.from_dict({"provider": "lambda", **values}))
+    )
+    with pytest.raises(ValueError, match=r"instance identity|instance id"):
+        build()
 
 
 def test_sweep_orphans_label_safety(monkeypatch):
@@ -2943,8 +2963,119 @@ def test_sweep_orphans_label_safety(monkeypatch):
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels={"flash-1700-bbbb"})
-    assert out == ["i-1"]
+    assert out.confirmed_deleted_ids == ("i-1",)
     assert terminated == ["i-1"]
+
+
+def test_sweep_orphans_deduplicates_inventory_before_termination(monkeypatch):
+    import flash.providers.lambda_.jobs as jobs
+    from flash.providers.lambda_.client import api as lambda_api
+
+    duplicate = {"id": "i-duplicate", "name": "flash-orphan-s0-a0"}
+    monkeypatch.setattr(lambda_api, "list_instances", lambda: [duplicate, dict(duplicate)])
+    calls = []
+    monkeypatch.setattr(
+        lambda_api,
+        "terminate_instances",
+        lambda ids: calls.append(tuple(ids)) or list(ids),
+    )
+
+    result = jobs.sweep_orphans(active_labels=set())
+
+    assert calls == [("i-duplicate",)]
+    assert result.confirmed_deleted_ids == ("i-duplicate",)
+
+
+def test_sweep_orphans_preserves_partial_deletion_evidence(monkeypatch):
+    import flash.providers.lambda_.jobs as jobs
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.lambda_.client import api as lambda_api
+
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instances",
+        lambda: [
+            {"id": "i-deleted", "name": "flash-orphan-a-s0-a0"},
+            {"id": "i-unresolved", "name": "flash-orphan-b-s0-a0"},
+        ],
+    )
+    monkeypatch.setattr(
+        lambda_api,
+        "terminate_instances",
+        lambda _ids: ["i-deleted"],
+    )
+
+    result = jobs.sweep_orphans(active_labels=set())
+
+    assert result.outcome is CleanupOutcome.UNCONFIRMED
+    assert result.confirmed_deleted_ids == ("i-deleted",)
+    assert result.unresolved_ids == ("i-unresolved",)
+
+
+@pytest.mark.parametrize(
+    ("instance", "expected_unresolved"),
+    [
+        pytest.param(
+            {"id": 17, "name": "flash-orphan-s0-a0"},
+            "flash-orphan-s0-a0",
+            id="integer-id",
+        ),
+        pytest.param(
+            {"id": True, "name": "flash-orphan-s0-a0"},
+            "flash-orphan-s0-a0",
+            id="boolean-id",
+        ),
+        pytest.param(
+            {"id": "", "name": "flash-orphan-s0-a0"},
+            "flash-orphan-s0-a0",
+            id="empty-id",
+        ),
+        pytest.param(
+            {"id": "   ", "name": "flash-orphan-s0-a0"},
+            "flash-orphan-s0-a0",
+            id="whitespace-id",
+        ),
+        pytest.param(
+            {"name": "flash-orphan-s0-a0"},
+            "flash-orphan-s0-a0",
+            id="missing-id",
+        ),
+    ],
+)
+def test_sweep_orphans_reports_malformed_selected_identity_without_deleting(
+    monkeypatch, instance, expected_unresolved
+):
+    import flash.providers.lambda_.jobs as jobs
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.lambda_.client import api as lambda_api
+
+    delete_calls = []
+    monkeypatch.setattr(lambda_api, "list_instances", lambda: [instance])
+    monkeypatch.setattr(
+        lambda_api,
+        "terminate_instances",
+        lambda ids: delete_calls.append(tuple(ids)) or list(ids),
+    )
+
+    result = jobs.sweep_orphans(active_labels=set())
+
+    assert result.outcome is CleanupOutcome.UNCONFIRMED
+    assert result.confirmed_deleted_ids == ()
+    assert result.unresolved_ids == (expected_unresolved,)
+    assert delete_calls == []
+
+
+def test_sweep_orphans_reports_successful_empty_selection_as_absent(monkeypatch):
+    import flash.providers.lambda_.jobs as jobs
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.lambda_.client import api as lambda_api
+
+    monkeypatch.setattr(lambda_api, "list_instances", list)
+
+    result = jobs.sweep_orphans(active_labels=set())
+
+    assert result.outcome is CleanupOutcome.ABSENT
+    assert result.confirmed_deleted_ids == ()
 
 
 def test_sweep_orphans_prefix_not_shielded_by_longer_run_id(monkeypatch):
@@ -2962,7 +3093,7 @@ def test_sweep_orphans_prefix_not_shielded_by_longer_run_id(monkeypatch):
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels={"flash-100"})
-    assert out == ["i-2"]
+    assert out.confirmed_deleted_ids == ("i-2",)
 
 
 def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
@@ -2979,7 +3110,7 @@ def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels={"fail-fast"})  # RAW run id (what the server tracks)
-    assert out == ["i-2"]
+    assert out.confirmed_deleted_ids == ("i-2",)
 
 
 def test_sweep_orphans_exempts_warm_preload_boxes(monkeypatch):
@@ -3013,7 +3144,7 @@ def test_sweep_orphans_exempts_warm_preload_boxes(monkeypatch):
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels=set())  # none is a tracked active run
-    assert out == ["i-2"]
+    assert out.confirmed_deleted_ids == ("i-2",)
     assert terminated == ["i-2"]
 
 
@@ -3042,13 +3173,38 @@ def test_sweep_orphans_reaps_stale_preload_box(monkeypatch):
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels=set())
-    assert out == ["i-9"]
+    assert out.confirmed_deleted_ids == ("i-9",)
     assert terminated == ["i-9"]
 
 
 # ---------------------------------------------------------------------------
 # provider object dispatch + capacity-aware allocation
 # ---------------------------------------------------------------------------
+def test_provider_cancel_rejects_whitespace_instance_without_termination(monkeypatch):
+    from flash.providers.core.base import JobHandle
+    from flash.providers.core.registry import get_provider
+    from flash.providers.lambda_.client import api as lambda_api
+
+    calls = []
+    monkeypatch.setattr(
+        lambda_api,
+        "terminate_instance_confirmed",
+        lambda instance_id: calls.append(instance_id),
+    )
+    handle = JobHandle(
+        "lambda",
+        {
+            **_handle().to_dict(),
+            "instance_id": "   ",
+        },
+    )
+
+    with pytest.raises(ValueError, match="instance id"):
+        get_provider("lambda").cancel(handle)
+
+    assert calls == []
+
+
 def test_provider_cancel_destroy_require_authoritative_teardown(monkeypatch):
     from flash.providers.core.base import JobHandle
     from flash.providers.core.registry import get_provider

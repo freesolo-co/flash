@@ -774,7 +774,9 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
     monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
 
     class FakeProvider:
-        supports_weight_cache = False
+        from flash.providers.core.capabilities import ProviderCapabilities
+
+        capabilities = ProviderCapabilities(False, False, None, None)
 
         def __init__(self):
             self.attempts = []
@@ -799,8 +801,15 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
         def destroy(self, _handle):
             return None
 
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
     provider = FakeProvider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
+    monkeypatch.setattr(
+        lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args, **_kwargs: CleanupResult(CleanupOutcome.DELETED),
+    )
 
     metrics = lifecycle._submit_seed_supervised(
         spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
@@ -856,7 +865,9 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
     monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
 
     class Provider:
-        supports_weight_cache = False
+        from flash.providers.core.capabilities import ProviderCapabilities
+
+        capabilities = ProviderCapabilities(False, False, None, None)
 
         def __init__(self):
             self.attempts = []
@@ -934,7 +945,9 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
     monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
 
     class FakeProvider:
-        supports_weight_cache = False
+        from flash.providers.core.capabilities import ProviderCapabilities
+
+        capabilities = ProviderCapabilities(False, False, None, None)
 
         def __init__(self):
             self.walls = []
@@ -962,8 +975,15 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
         def destroy(self, _handle):
             return None
 
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
     provider = FakeProvider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
+    monkeypatch.setattr(
+        lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args, **_kwargs: CleanupResult(CleanupOutcome.DELETED),
+    )
 
     lifecycle._submit_seed_supervised(
         spec, spec.seed, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
@@ -1030,7 +1050,9 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
     monkeypatch.setattr(allocator, "allocate", fake_allocate)
 
     class Provider:
-        supports_weight_cache = False
+        from flash.providers.core.capabilities import ProviderCapabilities
+
+        capabilities = ProviderCapabilities(False, False, None, None)
 
         def __init__(self):
             self.attempts = []
@@ -1535,7 +1557,8 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
 
 def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tmp_path):
     from flash.core.spec import JobSpec
-    from flash.providers.core import registry as providers
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+    from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-drain", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1562,20 +1585,14 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     monkeypatch.setattr(runner_reporting, "_report_status", reports.append)
     events = []
 
-    class Provider:
-        def cancel(self, handle):
-            data = handle.to_dict()
-            events.append(("cancel", data["endpoint_id"]))
-            if data["endpoint_id"] == "endpoint-unconfirmed":
-                raise RuntimeError("cancellation unconfirmed")
+    def teardown(handle, _run_id):
+        endpoint_id = handle.to_dict()["endpoint_id"]
+        events.append(endpoint_id)
+        if endpoint_id == "endpoint-unconfirmed":
+            return CleanupResult(CleanupOutcome.UNCONFIRMED, unresolved_ids=(endpoint_id,))
+        return CleanupResult(CleanupOutcome.DELETED, confirmed_deleted_ids=(endpoint_id,))
 
-        def destroy(self, handle):
-            endpoint_id = handle.to_dict()["endpoint_id"]
-            events.append(("destroy", endpoint_id))
-            if endpoint_id == "endpoint-unconfirmed":
-                raise RuntimeError("endpoint deletion unconfirmed")
-
-    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    monkeypatch.setattr(lifecycle, "_strict_teardown_handle", teardown)
 
     attempted = runner_reconciliation._drain_cleanup_remotes(spec.run_id)
 
@@ -1584,13 +1601,7 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
         ("runpod", 2, "endpoint-only", None, _RUNPOD_FINGERPRINT),
         ("runpod", 3, "endpoint-unconfirmed", "job-unconfirmed", _RUNPOD_FINGERPRINT),
     }
-    assert events == [
-        ("cancel", "endpoint-confirmed"),
-        ("destroy", "endpoint-confirmed"),
-        ("destroy", "endpoint-only"),
-        ("cancel", "endpoint-unconfirmed"),
-        ("destroy", "endpoint-unconfirmed"),
-    ]
+    assert events == ["endpoint-confirmed", "endpoint-only", "endpoint-unconfirmed"]
     raw = runner_status._load_status_json(spec.run_id)
     assert raw[runner_state._CLEANUP_REMOTES_KEY] == [unconfirmed]
     assert raw["remote"] is None
@@ -1940,6 +1951,7 @@ def test_attach_reconciler_continues_after_confirmed_runpod_teardown(monkeypatch
 
     import flash.runner.supervise.attach as attach_mod
     from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -1954,7 +1966,11 @@ def test_attach_reconciler_continues_after_confirmed_runpod_teardown(monkeypatch
         runner_lifecycle, "_runpod_completed_metrics", lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(attach_mod, "_wait_for_replacement_window", lambda *_args: False)
-    monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", lambda *_args: True)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args, **_kwargs: CleanupResult(CleanupOutcome.DELETED),
+    )
     monkeypatch.setattr(
         runner_reconciliation, "_record_cleanup_remote", lambda *_args, **_kwargs: False
     )
@@ -1986,6 +2002,7 @@ def test_attach_reconciler_persists_unconfirmed_runpod_teardown(monkeypatch, tmp
 
     import flash.runner.supervise.attach as attach_mod
     from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(
@@ -2001,7 +2018,13 @@ def test_attach_reconciler_persists_unconfirmed_runpod_teardown(monkeypatch, tmp
         runner_lifecycle, "_runpod_completed_metrics", lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(attach_mod, "_wait_for_replacement_window", lambda *_args: False)
-    monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", lambda *_args: False)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args, **_kwargs: CleanupResult(
+            CleanupOutcome.UNCONFIRMED, unresolved_ids=(spec.run_id,)
+        ),
+    )
     resumed = []
     monkeypatch.setattr(
         attach_mod,
@@ -2271,7 +2294,14 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
         def destroy(self, _handle):
             return None
 
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
     monkeypatch.setattr(providers, "get_provider", lambda _name: FailedProvider())
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_strict_teardown_handle",
+        lambda *_args, **_kwargs: CleanupResult(CleanupOutcome.DELETED),
+    )
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     resumed = []
 
@@ -2728,7 +2758,16 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
         def destroy(self, handle):
             teardown.append(("destroy", handle.to_dict()))
 
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    monkeypatch.setattr(
+        lifecycle,
+        "_strict_teardown_handle",
+        lambda handle, _run_id: (
+            teardown.append(("cleanup", handle.to_dict())) or CleanupResult(CleanupOutcome.DELETED)
+        ),
+    )
     monkeypatch.setattr(
         runner_recovery,
         "_gc_run_endpoints",
@@ -2744,7 +2783,7 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
     assert resumed == []
     assert len(completion_checks) == 1
     assert completion_checks[0][1]["attempt"] == 0
-    assert [action for action, _handle in teardown] == ["cancel", "destroy"]
+    assert [action for action, _handle in teardown] == ["cleanup"]
     assert gc_runs == [spec.run_id]
     assert status.state == "failed"
     assert status.remote is None
@@ -3040,8 +3079,10 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_model_was_removed(
     torn: list[tuple[dict, str]] = []
 
     def fake_teardown(handle, run_id):
+        from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
         torn.append((dict(handle), run_id))
-        return True
+        return CleanupResult(CleanupOutcome.DELETED)
 
     monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
     attached: list[str] = []
@@ -3217,10 +3258,15 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
     torn: list[str] = []
 
     def fake_teardown(handle, run_id):
+        from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
         # the direct teardown is handed the raw dict; the drain rebuilds a JobHandle from the
         # persisted record, so the two call sites are distinguishable here.
         torn.append("drain" if hasattr(handle, "provider") else "direct")
-        return False  # unconfirmed, both times: this is the case that records for the drain
+        return CleanupResult(
+            CleanupOutcome.UNCONFIRMED,
+            unresolved_ids=("ep-unconfirmed",),
+        )
 
     monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
     monkeypatch.setattr(runner_attach, "attach_run", lambda rid: None)
@@ -3546,12 +3592,31 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
         ),
     )
 
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
+    teardown_calls = []
+
+    def teardown(handle, run_id):
+        teardown_calls.append((handle, run_id))
+        if cleanup_confirmed:
+            return CleanupResult(
+                CleanupOutcome.DELETED,
+                confirmed_deleted_ids=("endpoint-race",),
+            )
+        return CleanupResult(
+            CleanupOutcome.UNCONFIRMED,
+            unresolved_ids=("endpoint-race",),
+        )
+
+    monkeypatch.setattr(lifecycle, "_strict_teardown_handle", teardown)
+
     class Provider:
-        supports_weight_cache = False
+        from flash.providers.core.capabilities import ProviderCapabilities
+
+        capabilities = ProviderCapabilities(False, False, None, None)
 
         def __init__(self):
             self.submits = []
-            self.teardown = []
 
         def submit_run(self, _spec, _seed, *, attempt, on_handle, **_kwargs):
             self.submits.append(attempt)
@@ -3564,14 +3629,6 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
                 )
             )
             raise AssertionError("terminal handle callback must not return")
-
-        def cancel(self, handle):
-            self.teardown.append(("cancel", handle.to_dict()))
-
-        def destroy(self, handle):
-            self.teardown.append(("destroy", handle.to_dict()))
-            if not cleanup_confirmed:
-                raise RuntimeError("endpoint deletion unconfirmed")
 
     provider = Provider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
@@ -3586,7 +3643,10 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
 
     status = runner_status.get_status(spec.run_id)
     assert provider.submits == [0]
-    assert [event for event, _handle in provider.teardown] == ["cancel", "destroy"]
+    assert len(teardown_calls) == 1
+    teardown_handle, teardown_run_id = teardown_calls[0]
+    assert teardown_handle == _runpod_remote("endpoint-race", "job-race", attempt=0)
+    assert teardown_run_id == spec.run_id
     assert status.state == "cancelled"
     if cleanup_confirmed:
         assert status.remote is None
@@ -3643,7 +3703,9 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
     remote_b = _runpod_remote("endpoint-b", "job-b", attempt=0)
 
     class Provider:
-        supports_weight_cache = False
+        from flash.providers.core.capabilities import ProviderCapabilities
+
+        capabilities = ProviderCapabilities(False, False, None, None)
 
         def submit_run(self, _spec, _seed, *, on_handle, **_kwargs):
             runner_status._update(spec.run_id, "cancelled", remote=remote_a)

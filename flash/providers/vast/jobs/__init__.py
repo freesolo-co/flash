@@ -48,6 +48,7 @@ from flash.providers.core.base import (
     min_cuda_modern,
     vast_gpu_for_offer,
 )
+from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 from flash.providers.vast.client import api as vast_api
 from flash.providers.vast.jobs.builders import (
     VastJobHandle,
@@ -872,12 +873,14 @@ def destroy_run_instances(run_id: str) -> list[int]:
     except Exception:
         return destroyed
     prefix = run_label_prefix(run_id)
+    selected: list[int] = []
     for inst in instances:
         iid = _coerce_instance_id(inst.get("id"))  # skip a non-intable id, don't abort the loop
         label = str(inst.get("label") or "")
         # Match on the label boundary (not a raw prefix) so ``flash-100`` can't also destroy ``flash-1000``.
-        if iid and label_matches_run(label, prefix) and vast_api.destroy_instance(iid):
-            destroyed.append(iid)
+        if iid and label_matches_run(label, prefix):
+            selected.append(iid)
+    destroyed.extend(iid for iid in dict.fromkeys(selected) if vast_api.destroy_instance(iid))
     return destroyed
 
 
@@ -913,24 +916,20 @@ def run_instances_remaining(run_id: str) -> list[int]:
 def sweep_orphans(
     active_labels: set[str] | Callable[[], set[str]] | None = None,
     known_labels: set[str] | Callable[[], set[str]] | None = None,
-) -> list[int]:
-    """Destroy unclaimed Flash-labeled instances and return their ids.
-
-    Resolve callable active labels after listing to close the launch race. ``known_labels`` limits
-    cleanup to this plane; None reaps every inactive ``flash-`` label. Never raises.
-    """
+) -> CleanupResult:
+    """Destroy unclaimed Flash-labeled instances and preserve partial evidence."""
     try:
         instances = vast_api.list_instances()
     except Exception as exc:
         logger.warning("vast orphan sweep skipped: %s", exc)
-        return []
+        return CleanupResult(CleanupOutcome.RETRYABLE)
     try:
         labels = active_labels() if callable(active_labels) else active_labels
         known = known_labels() if callable(known_labels) else known_labels
     except Exception as exc:
         # resolving a protection set failed, so skip rather than treat live instances as orphans.
         logger.warning("vast orphan sweep skipped; could not resolve run sets: %s", exc)
-        return []
+        return CleanupResult(CleanupOutcome.RETRYABLE)
     active = {run_label_prefix(a) for a in (labels or set())}
     known_prefixes = (
         None if known_labels is None else {run_label_prefix(a) for a in (known or set())}
@@ -939,18 +938,44 @@ def sweep_orphans(
     def _matches(prefixes: set[str], label: str) -> bool:
         return any(label_matches_run(label, p) for p in prefixes)
 
-    destroyed: list[int] = []
+    selected: list[int] = []
+    unresolved: list[str] = []
     for inst in instances:
         label = str(inst.get("label") or "")
         if not label.startswith("flash-"):
             continue
         if _matches(active, label):
-            continue  # a live run owns this box — protected
-        # Multi-plane guard: with a known set, only reap boxes attributable to one of THIS plane's runs.
+            continue
         if known_prefixes is not None and not _matches(known_prefixes, label):
             continue
-        iid = _coerce_instance_id(inst.get("id"))  # skip a non-intable id, don't abort the sweep
-        if iid and vast_api.destroy_instance(iid):
-            destroyed.append(iid)
-            logger.warning("destroyed orphaned vast instance %s (label %s)", iid, label)
-    return destroyed
+        iid = _coerce_instance_id(inst.get("id"))
+        if iid is None:
+            unresolved.append(label)
+        else:
+            selected.append(iid)
+    selected = list(dict.fromkeys(selected))
+    if not selected:
+        outcome = CleanupOutcome.UNCONFIRMED if unresolved else CleanupOutcome.ABSENT
+        return CleanupResult(outcome, unresolved_ids=tuple(unresolved) or None)
+    destroyed: list[str] = []
+    for iid in selected:
+        try:
+            deleted = vast_api.destroy_instance(iid)
+        except Exception:
+            deleted = False
+        if deleted:
+            destroyed.append(str(iid))
+            logger.warning("destroyed orphaned vast instance %s", iid)
+        else:
+            unresolved.append(str(iid))
+    if not unresolved:
+        outcome = CleanupOutcome.DELETED
+    elif destroyed:
+        outcome = CleanupOutcome.UNCONFIRMED
+    else:
+        outcome = CleanupOutcome.RETRYABLE
+    return CleanupResult(
+        outcome,
+        confirmed_deleted_ids=tuple(destroyed),
+        unresolved_ids=tuple(unresolved) or None,
+    )

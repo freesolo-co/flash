@@ -2837,7 +2837,7 @@ def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
 
     # sweep_orphans walks the same list (no active/known protection here) and must behave the same.
     destroyed.clear()
-    assert vast.sweep_orphans(active_labels=set()) == [7]
+    assert vast.sweep_orphans(active_labels=set()).confirmed_deleted_ids == ("7",)
     assert destroyed == [7]
     from flash.providers.vast import jobs as vast
     from flash.providers.vast.client import api as vast_api
@@ -2852,9 +2852,64 @@ def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
     out = vast.sweep_orphans(active_labels={"runA"})  # raw active id; prefix forced internally
-    assert sorted(out) == [2, 3]
+    assert sorted(out.confirmed_deleted_ids) == ["2", "3"]
     assert 1 not in destroyed  # the active run's box survived
     assert 4 not in destroyed  # non-flash box untouched
+
+
+def test_sweep_orphans_reports_malformed_selected_identity_as_unconfirmed(monkeypatch):
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    monkeypatch.setattr(
+        vast_api,
+        "list_instances",
+        lambda: [{"id": "invalid", "label": "flash-orphan-s0-a0"}],
+    )
+
+    result = vast.sweep_orphans(active_labels=set())
+
+    assert result.outcome is CleanupOutcome.UNCONFIRMED
+    assert result.unresolved_ids == ("flash-orphan-s0-a0",)
+
+
+def test_sweep_orphans_preserves_partial_deletion_evidence(monkeypatch):
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    instances = [
+        {"id": 1, "label": "flash-one-s0-a0"},
+        {"id": 2, "label": "flash-two-s0-a0"},
+    ]
+    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: iid == 1)
+
+    result = vast.sweep_orphans(active_labels=set())
+
+    assert result.outcome is CleanupOutcome.UNCONFIRMED
+    assert result.confirmed_deleted_ids == ("1",)
+    assert result.unresolved_ids == ("2",)
+
+
+def test_sweep_orphans_deduplicates_inventory_before_destroy(monkeypatch):
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    duplicate = {"id": 7, "label": "flash-orphan-s0-a0"}
+    monkeypatch.setattr(vast_api, "list_instances", lambda: [duplicate, dict(duplicate)])
+    destroyed = []
+    monkeypatch.setattr(
+        vast_api,
+        "destroy_instance",
+        lambda instance_id: destroyed.append(instance_id) or True,
+    )
+
+    result = vast.sweep_orphans(active_labels=set())
+
+    assert destroyed == [7]
+    assert result.confirmed_deleted_ids == ("7",)
 
 
 def test_sweep_orphans_known_labels_multiplane_guard(monkeypatch):
@@ -2871,7 +2926,7 @@ def test_sweep_orphans_known_labels_multiplane_guard(monkeypatch):
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
     out = vast.sweep_orphans(active_labels=set(), known_labels={"mine"})
-    assert out == [1]
+    assert out.confirmed_deleted_ids == ("1",)
     assert 2 not in destroyed
 
 
@@ -2884,10 +2939,10 @@ def test_sweep_orphans_callable_sets_resolved_after_listing(monkeypatch):
     monkeypatch.setattr(vast_api, "list_instances", lambda: [{"id": 1, "label": "flash-x-s0-a0"}])
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)
     # protected by a callable-resolved active set
-    assert vast.sweep_orphans(active_labels=lambda: {"x"}) == []
+    assert vast.sweep_orphans(active_labels=lambda: {"x"}).deleted_count == 0
 
     # a raising callable -> sweep skipped (returns [], reaps nothing)
     def boom():
         raise RuntimeError("db down")
 
-    assert vast.sweep_orphans(active_labels=boom) == []
+    assert vast.sweep_orphans(active_labels=boom).deleted_count == 0

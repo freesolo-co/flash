@@ -268,7 +268,7 @@ def _prepare_quota_retry(
     # from this sweep and backoff.
     context.require_launchable(key_count, active_key)
     quota_deadline = context.create_deadline(key_count)
-    swept = runpod_resources._sweep_idle_flash_endpoints(
+    sweep_result = runpod_resources._sweep_idle_flash_endpoints(
         protected={runpod_resources.canonical_endpoint_name(name)},
         min_idle_s=0.0,
         reap_warm=False,
@@ -278,11 +278,12 @@ def _prepare_quota_retry(
     if context.deadline_at is not None:
         wait_s = min(wait_s, remaining_seconds(quota_deadline))
     logger.warning(
-        "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s); "
-        "retrying in %ds",
+        "RunPod worker quota hit (attempt %d/%d): swept %d idle flash-* endpoint(s), retained "
+        "%d unresolved record(s); retrying in %ds",
         quota_attempt + 1,
         quota_max_retries,
-        swept,
+        sweep_result.deleted_count,
+        sweep_result.unresolved_count,
         wait_s,
     )
     if wait_s > 0:
@@ -450,7 +451,7 @@ def deploy_train_endpoint(
 
     resource, owning_fingerprint = _deploy_with_failover(context, name, _deploy_once, rp_keys)
     endpoint_id = getattr(resource, "id", None)
-    if not endpoint_id:
+    if not isinstance(endpoint_id, str) or not endpoint_id.strip():
         raise RuntimeError(f"deploy_train_endpoint: no endpoint id on resource {resource!r}")
     if owning_fingerprint is None:
         raise RuntimeError("deploy_train_endpoint: owning RunPod key is unavailable")

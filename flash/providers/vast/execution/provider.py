@@ -20,6 +20,7 @@ from flash.providers.core.base import (
     Provider,
     rentable_gpu_counts,
 )
+from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
 
 class VastProvider(InstanceProvider):
@@ -115,15 +116,24 @@ class VastProvider(InstanceProvider):
             # not depend on the teardown succeeding.
             forget_dead_machines(run_id)
 
-    def _sweep_orphans(
-        self,
-        *,
-        active_labels,
-        known_labels,
-    ) -> list[int]:
+    def _sweep_orphans(self, active_labels=None, known_labels=None) -> CleanupResult:
         from flash.providers.vast.jobs import sweep_orphans
 
         return sweep_orphans(active_labels=active_labels, known_labels=known_labels)
+
+    def _confirm_run_absent(self, run_id: str) -> CleanupResult:
+        from flash.providers.vast.jobs import run_instances_remaining
+
+        try:
+            remaining = run_instances_remaining(run_id)
+        except Exception:
+            return CleanupResult(CleanupOutcome.RETRYABLE, unresolved_ids=(run_id,))
+        if remaining:
+            return CleanupResult(
+                CleanupOutcome.PRESENT,
+                surviving_ids=tuple(str(instance_id) for instance_id in remaining),
+            )
+        return CleanupResult(CleanupOutcome.ABSENT)
 
     def live_candidates(
         self, need_vram_gb: int, constraints: AllocationConstraints
@@ -200,15 +210,6 @@ class VastProvider(InstanceProvider):
             raise vast_api.VastApiError(
                 f"vast destroy_instance({iid}) unconfirmed (success:false); instance may still bill"
             )
-
-    def run_instances_remaining(self, run_id: str) -> list[int]:
-        """Instance ids still carrying ``run_id``'s label after ``gc``. Empty == confirmed clear;
-        non-empty == a possibly-live instance survives. RAISES on a listing failure so the caller can't
-        mistake "couldn't list" for "clear" (``gc`` returns an empty list, not an error, on an
-        unconfirmed DELETE)."""
-        from flash.providers.vast.jobs import run_instances_remaining
-
-        return run_instances_remaining(run_id)
 
 
 PROVIDER: Provider = VastProvider()

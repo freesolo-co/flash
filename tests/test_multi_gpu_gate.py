@@ -310,9 +310,10 @@ def test_lambda_sku_miss_is_provider_local_during_auto_allocation(monkeypatch):
     """A missing Lambda count SKU must not discard a valid shape from another provider."""
     import flash.providers.core.allocator as allocator
     from flash.providers.core.base import Candidate, UnsupportedGpuError, gpu_classes_for
+    from flash.providers.core.capabilities import ProviderCapabilities
 
     class _LambdaMiss:
-        live_capacity = True
+        capabilities = ProviderCapabilities(False, True, None, None)
 
         def live_candidates(self, _need, _constraints):
             raise UnsupportedGpuError("lambda does not sell this count-specific SKU")
@@ -321,7 +322,7 @@ def test_lambda_sku_miss_is_provider_local_during_auto_allocation(monkeypatch):
             return gpu_classes_for("lambda_name")
 
     class _RunPodHit:
-        live_capacity = False
+        capabilities = ProviderCapabilities(True, False, None, None)
 
         def live_candidates(self, _need, _constraints):
             return [Candidate("runpod", "H100", 3.29, 80, 2)]
@@ -1337,10 +1338,11 @@ def test_unpinned_sold_out_live_market_stays_retryable():
     """
     import flash.providers.core.allocator as alloc
     from flash.providers.core.base import CapacityLookupError, UnsupportedGpuError
+    from flash.providers.core.capabilities import ProviderCapabilities
 
     class _SoldOutLiveMarket:
         name = "lambda"
-        live_capacity = True
+        capabilities = ProviderCapabilities(False, True, None, None)
 
         def live_candidates(self, need, constraints):
             return []  # structurally offered, nothing free right now

@@ -40,6 +40,22 @@ def test_delete_endpoint_404_reports_success(monkeypatch):
     assert runpod_api.delete_endpoint_for_key("ep-gone", "rk-test") is True
 
 
+def test_delete_endpoint_rejects_whitespace_identity_without_request(monkeypatch):
+    from flash.providers.runpod.client import api as runpod_api
+
+    requests = []
+    monkeypatch.setattr(
+        runpod_api._CLIENT,
+        "request_with_retries_for_key",
+        lambda *args, **kwargs: requests.append((args, kwargs)),
+    )
+
+    with pytest.raises(runpod_api.RunpodApiError, match="teardown identity is invalid"):
+        runpod_api.delete_endpoint_for_key("   ", "rk-test")
+
+    assert requests == []
+
+
 def test_delete_endpoint_empty_success_response_reports_success(monkeypatch):
     from flash.providers.runpod.client import api as runpod_api
 

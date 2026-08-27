@@ -9,6 +9,7 @@ import types
 
 import pytest
 
+import flash.providers.runpod.execution.resources as runpod_resources
 import flash.server.asgi.app as app_mod
 
 
@@ -76,10 +77,15 @@ def test_idle_endpoint_loop_logs_successful_deletion(monkeypatch) -> None:
     messages = []
     logger = types.SimpleNamespace(
         info=lambda message, *args: messages.append(message % args),
+        warning=lambda message, *args: messages.append(message % args),
         debug=lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(app_mod, "_log", logger)
-    monkeypatch.setattr(app_mod, "_reap_idle_endpoints_once", lambda minimum: 2)
+    monkeypatch.setattr(
+        app_mod,
+        "_reap_idle_endpoints_once",
+        lambda minimum: runpod_resources.IdleEndpointSweepResult(deleted_ids=("ep-1", "ep-2")),
+    )
 
     _run_loop_once(
         monkeypatch, app_mod._reap_idle_endpoints_loop, lambda function, *args: function(*args)

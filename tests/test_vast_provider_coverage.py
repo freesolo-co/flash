@@ -32,16 +32,23 @@ def test_vast_provider_delegates_credentials_pricing_gc_and_orphan_sweep(monkeyp
         "destroy_run_instances",
         lambda run_id: calls.append(("gc", run_id)),
     )
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
     monkeypatch.setattr(
         jobs,
         "sweep_orphans",
-        lambda **kwargs: calls.append(("sweep", kwargs)) or [11],
+        lambda **kwargs: (
+            calls.append(("sweep", kwargs))
+            or CleanupResult(CleanupOutcome.DELETED, confirmed_deleted_ids=("11",))
+        ),
     )
 
     assert provider._missing_credentials(False) == ["missing"]
     assert provider._hourly_rate("H100") == 1.25
     assert provider._gc("flash-1") is None
-    assert provider._sweep_orphans(active_labels={"live"}, known_labels={"live", "done"}) == [11]
+    assert provider._sweep_orphans(
+        active_labels={"live"}, known_labels={"live", "done"}
+    ).confirmed_deleted_ids == ("11",)
     assert calls == [
         ("credentials", False),
         ("rate", "H100"),
@@ -105,6 +112,33 @@ def _generic_handle() -> JobHandle:
     )
 
 
+def test_strict_instance_teardown_distinguishes_deleted_present_and_retryable(monkeypatch) -> None:
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.vast import jobs
+    from flash.runner.supervise import lifecycle
+
+    monkeypatch.setattr(VastProvider, "destroy", lambda self, handle: None)
+    monkeypatch.setattr(jobs, "run_instances_remaining", lambda _run_id: [])
+    result = lifecycle._strict_teardown_handle(_generic_handle(), "flash-1")
+    assert result.outcome is CleanupOutcome.DELETED
+    assert result.confirmed_deleted_ids == ("17",)
+
+    monkeypatch.setattr(jobs, "run_instances_remaining", lambda _run_id: [17])
+    result = lifecycle._strict_teardown_handle(_generic_handle(), "flash-1")
+    assert result.outcome is CleanupOutcome.PRESENT
+    assert result.surviving_ids == ("17",)
+
+    monkeypatch.setattr(
+        jobs,
+        "run_instances_remaining",
+        lambda _run_id: (_ for _ in ()).throw(RuntimeError("list failed")),
+    )
+    assert (
+        lifecycle._strict_teardown_handle(_generic_handle(), "flash-1").outcome
+        is CleanupOutcome.RETRYABLE
+    )
+
+
 def test_cancel_converts_to_strict_handle_and_delegates_serialized_payload(monkeypatch) -> None:
     """Cancellation must validate persisted Vast identity before handing jobs a canonical payload."""
     from flash.providers.vast import jobs
@@ -117,8 +151,8 @@ def test_cancel_converts_to_strict_handle_and_delegates_serialized_payload(monke
     assert payloads == [_generic_handle().to_dict()]
 
 
-def test_run_instances_remaining_delegates_the_run_id(monkeypatch) -> None:
-    """Billing confirmation must return the exact instance ids reported by the Vast jobs layer."""
+def test_confirm_run_absent_reports_surviving_ids(monkeypatch) -> None:
+    from flash.providers.core.capabilities import CleanupOutcome
     from flash.providers.vast import jobs
 
     seen = []
@@ -128,5 +162,7 @@ def test_run_instances_remaining_delegates_the_run_id(monkeypatch) -> None:
         lambda run_id: seen.append(run_id) or [7, 8],
     )
 
-    assert VastProvider().run_instances_remaining("flash-1") == [7, 8]
+    result = VastProvider().capabilities.confirm_run_absent("flash-1")
+    assert result.outcome is CleanupOutcome.PRESENT
+    assert result.surviving_ids == ("7", "8")
     assert seen == ["flash-1"]

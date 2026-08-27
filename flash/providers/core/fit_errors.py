@@ -117,7 +117,7 @@ def rents_arbitrary_card_counts(providers: Iterable[str]) -> bool:
     """
     from flash.providers.core.registry import get_provider
 
-    return any(not getattr(get_provider(name), "live_capacity", False) for name in providers)
+    return any(not get_provider(name).capabilities.live_capacity for name in providers)
 
 
 def widenable_gpu_names(

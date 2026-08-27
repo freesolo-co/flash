@@ -183,8 +183,8 @@ def start_deployment_job(target, *args, **kwargs) -> bool:
     return False
 
 
-def _reap_idle_endpoints_once(min_idle_s: float) -> int:
-    """One run-aware sweep of idle, orphaned RunPod training endpoints. Returns count deleted."""
+def _reap_idle_endpoints_once(min_idle_s: float):
+    """Run one idle endpoint sweep and retain deletion and unresolved evidence."""
     from flash.providers.runpod.execution.resources import _sweep_idle_flash_endpoints
 
     return _sweep_idle_flash_endpoints(
@@ -212,9 +212,17 @@ async def _reap_idle_endpoints_loop() -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            deleted = await asyncio.to_thread(_reap_idle_endpoints_once, min_idle_s)
-            if deleted:
-                _log.info("reaped %d idle RunPod endpoint(s) doing nothing", deleted)
+            sweep_result = await asyncio.to_thread(_reap_idle_endpoints_once, min_idle_s)
+            if sweep_result.deleted_count:
+                _log.info(
+                    "reaped %d idle RunPod endpoint(s) doing nothing",
+                    sweep_result.deleted_count,
+                )
+            if sweep_result.unresolved_count:
+                _log.warning(
+                    "idle RunPod endpoint sweep retained %d unresolved ownership or cleanup record(s)",
+                    sweep_result.unresolved_count,
+                )
         except asyncio.CancelledError:
             raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
         except Exception:
@@ -260,12 +268,17 @@ def _sweep_orphan_instances_once() -> int:
     Pass active ids as a callable so providers list first and read protection state afterward;
     instance APIs expose no creation timestamp for a reliable age grace.
     """
+    from flash.providers.core.capabilities import sweep_orphans
     from flash.providers.core.registry import configured_providers
 
     torn = 0
     for prov in configured_providers():
         try:
-            deleted = prov.sweep_orphans(active_labels=_active_run_ids, known_labels=_known_run_ids)
+            result = sweep_orphans(
+                prov.capabilities,
+                active_labels=_active_run_ids,
+                known_labels=_known_run_ids,
+            )
         except Exception:
             # One provider's API blip / outage must not skip the others — and must NOT be silent
             # (the loop docstring promises failures are logged + retried next cycle), so a
@@ -273,11 +286,11 @@ def _sweep_orphan_instances_once() -> int:
             # like a healthy sweep reaping nothing.
             _log.warning(
                 "instance orphan sweep failed for provider %r; retrying next cycle",
-                getattr(prov, "name", prov),
+                prov.name,
                 exc_info=True,
             )
             continue
-        torn += len(deleted)
+        torn += result.deleted_count
     return torn
 
 

@@ -276,6 +276,13 @@ def test_launch_instance_raises_when_no_instance_id(monkeypatch):
     monkeypatch.setattr(lambda_api, "request_with_retries", lambda *a, **k: {"data": []})
     with pytest.raises(lambda_api.LambdaApiError, match="returned an invalid instance identity"):
         lambda_api.launch_instance(**kwargs)
+    monkeypatch.setattr(
+        lambda_api,
+        "request_with_retries",
+        lambda *a, **k: {"data": {"instance_ids": ["   "]}},
+    )
+    with pytest.raises(lambda_api.LambdaApiError, match="returned an invalid instance identity"):
+        lambda_api.launch_instance(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +428,7 @@ def test_get_instance_dict_none_on_404_and_reraises_others(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# terminate_instances: per-id isolation + falsy filtering + stringify
+# terminate_instances: per-id isolation + strict string identity filtering
 # ---------------------------------------------------------------------------
 def test_terminate_instances_isolates_per_id_and_filters(monkeypatch):
     from flash.providers.lambda_.client import api as lambda_api
@@ -435,11 +442,11 @@ def test_terminate_instances_isolates_per_id_and_filters(monkeypatch):
         return {}
 
     monkeypatch.setattr(lambda_api, "request_with_retries", fake)
-    deleted = lambda_api.terminate_instances(["good1", "", None, "bad", 42])
-    # falsy ids dropped, ints stringified, and the bad id's failure never blocks the others
-    assert deleted == ["good1", "42"]
-    # each surviving id was terminated ONE AT A TIME (batch endpoint 400s the whole set on one bad id)
-    assert [b["instance_ids"] for b in bodies] == [["good1"], ["bad"], ["42"]]
+    deleted = lambda_api.terminate_instances(["good1", "", "   ", None, "bad", 42])
+    # malformed identities are dropped, and the bad valid id's failure never blocks the others
+    assert deleted == ["good1"]
+    # each valid id was terminated one at a time (batch endpoint 400s the whole set on one bad id)
+    assert [b["instance_ids"] for b in bodies] == [["good1"], ["bad"]]
 
 
 def test_terminate_instance_confirmed_requires_acceptance_and_disappearance(monkeypatch):
@@ -448,6 +455,8 @@ def test_terminate_instance_confirmed_requires_acceptance_and_disappearance(monk
     monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: list(ids))
     monkeypatch.setattr(lambda_api, "get_instance", lambda iid, *, strict: None)
     lambda_api.terminate_instance_confirmed("i-1")
+    with pytest.raises(lambda_api.LambdaApiError, match="teardown identity is invalid"):
+        lambda_api.terminate_instance_confirmed("   ")
 
     monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: [])
     with pytest.raises(lambda_api.LambdaApiError, match="was not confirmed"):

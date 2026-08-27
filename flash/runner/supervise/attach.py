@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from flash.core.spec import JobSpec
 from flash.envs.loading.staged import StagedEnvironmentTransientError
 from flash.providers._lifecycle.instances.poll import _attempt_int
+from flash.providers.core.capabilities import is_cleanup_confirmed
 from flash.runner.supervise.attach_reconcile import (
     carry_allocation_stamp as _carry_allocation_stamp,
 )
@@ -563,8 +564,8 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     resource_deleted = confirmed_teardown
     if not confirmed_teardown:
         try:
-            resource_deleted = _strict_teardown_handle(
-                JobHandle.from_dict(persisted_remote), run_id
+            resource_deleted = is_cleanup_confirmed(
+                _strict_teardown_handle(JobHandle.from_dict(persisted_remote), run_id)
             )
         except Exception:
             resource_deleted = False
@@ -656,7 +657,7 @@ def _handle_attach_wall_deadline(
         )
         return get_status(run_id)
     try:
-        resource_deleted = _strict_teardown_handle(context.handle, run_id)
+        resource_deleted = is_cleanup_confirmed(_strict_teardown_handle(context.handle, run_id))
     except Exception:
         resource_deleted = False
     if resource_deleted:
@@ -727,12 +728,9 @@ def _handle_failed_attach_poll(
             file=log,
         )
         return get_status(run_id)
-    try:
-        resource_deleted = _strict_teardown_handle(context.handle, run_id)
-        worker_gone = True
-    except Exception:
-        resource_deleted = False
-        worker_gone = _worker_provably_gone(run_id, context.handle)
+    teardown = _strict_teardown_handle(context.handle, run_id)
+    resource_deleted = is_cleanup_confirmed(teardown)
+    worker_gone = resource_deleted or _worker_provably_gone(run_id, context.handle)
     if (
         worker_gone
         and context.handle.provider == "runpod"

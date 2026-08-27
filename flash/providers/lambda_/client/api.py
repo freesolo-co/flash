@@ -156,7 +156,7 @@ def launch_instance(
     )
     ids = out.get("instance_ids") if isinstance(out, dict) else None
     instance_id = ids[0] if isinstance(ids, list) and len(ids) == 1 else None
-    if not isinstance(instance_id, str) or not instance_id:
+    if not isinstance(instance_id, str) or not instance_id.strip():
         raise LambdaApiError(
             f"launch({instance_type_name}@{region_name}) returned an invalid instance identity"
         )
@@ -291,7 +291,7 @@ def terminate_instances(
     """Terminate instances; return ids that succeeded. Per-id isolation: Lambda's batch endpoint
     rejects the whole request if any id is invalid, so one stale id would leak billing for the rest."""
     deleted: list[str] = []
-    for iid in [str(i) for i in instance_ids if i]:
+    for iid in [i for i in instance_ids if isinstance(i, str) and i.strip()]:
         try:
             request_with_retries(
                 "/instance-operations/terminate",
@@ -312,9 +312,9 @@ def terminate_instance_confirmed(instance_id: str) -> None:
     This cleanup intentionally has no run-deadline dependency: a box that outlived its run must still
     be removable. Any unconfirmed step raises so replacement provisioning keeps the persisted handle.
     """
-    iid = str(instance_id).strip()
-    if not iid:
+    if not isinstance(instance_id, str) or not instance_id.strip():
         raise LambdaApiError("lambda instance teardown identity is invalid")
+    iid = instance_id
     deleted = terminate_instances([iid])
     if deleted != [iid]:
         raise LambdaApiError(f"lambda terminate({iid}) was not confirmed")
