@@ -48,8 +48,10 @@ engine behavior.
 
 Both environments keep one warm container and request one buffer container for every advertised
 model and for each CPU router function. Flash omits `max_containers`, so Modal owns queueing and
-replica scaling subject to workspace and platform limits. Each engine replica admits at most eight
-inputs and targets six before scale-out. Each router replica admits at most 36 inputs and targets 27;
+replica scaling subject to workspace and platform limits. Modal `max_inputs` counts logical requests,
+while vLLM `max_num_seqs` counts sequences; OpenAI `n` can fan one request into up to four sequences.
+Each engine replica currently admits at most eight logical requests and targets six before scale-out.
+Each router replica admits at most 36 inputs and targets 27;
 those router values do not change with engine fleet size. Flash does not maintain a process-local
 application queue or use function statistics to authorize or deny a request. The router authors one
 private 120-second absolute pre-header deadline and forwards it unchanged to the engine. Non-streaming

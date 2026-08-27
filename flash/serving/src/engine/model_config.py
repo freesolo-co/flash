@@ -31,6 +31,7 @@ from flash.serving.src.engine.prequant_config import (
 # ``serve_model_for`` from ``src.prequant_config`` and injected into the overrides as ``serve_model_id``.
 # active models resolve through prequant_config unless an exact validated override is present. the
 # pending 27b candidate carries its own immutable checkpoint pin without entering active resolution.
+# `traffic`: modal logical-request concurrency, independent of the engine's sequence capacity.
 # ⚠ serve_model_id is pointed only at checkpoints VERIFIED to exist (a missing repo 404-crash-loops
 # the engine — the reason this mechanism was removed once); the owned repos are VL-preserving FP8
 # checkpoints published to the operator HF org.
@@ -59,36 +60,35 @@ class HostedTrafficPolicy:
     target_inputs: int
 
     @classmethod
-    def from_engine(cls, engine: Mapping[str, Any]) -> Self:
-        max_num_seqs = engine.get("max_num_seqs")
-        if isinstance(max_num_seqs, bool) or not isinstance(max_num_seqs, int):
-            raise ValueError("hosted traffic policy requires an explicit positive max_num_seqs")
-        if max_num_seqs <= 0:
-            raise ValueError("hosted traffic policy requires an explicit positive max_num_seqs")
+    def from_config(
+        cls,
+        engine: Mapping[str, Any],
+        traffic: Mapping[str, Any],
+    ) -> Self:
         return cls(
             min_containers=1,
             buffer_containers=1,
-            max_num_seqs=max_num_seqs,
-            max_inputs=max_num_seqs,
-            target_inputs=max(1, max_num_seqs * 3 // 4),
+            max_num_seqs=engine.get("max_num_seqs"),
+            max_inputs=traffic.get("max_inputs"),
+            target_inputs=traffic.get("target_inputs"),
         )
 
     def __post_init__(self) -> None:
-        values = (
-            self.min_containers,
-            self.buffer_containers,
-            self.max_num_seqs,
-            self.max_inputs,
-            self.target_inputs,
-        )
-        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
-            raise ValueError("hosted traffic policy values must be integers")
-        if self.max_num_seqs <= 0:
-            raise ValueError("hosted traffic max_num_seqs must be positive")
-        if self.max_inputs != self.max_num_seqs:
-            raise ValueError("hosted traffic max_inputs must equal max_num_seqs")
-        if self.target_inputs != max(1, self.max_num_seqs * 3 // 4):
-            raise ValueError("hosted traffic target_inputs must equal 75 percent of max_num_seqs")
+        values = {
+            "min_containers": self.min_containers,
+            "buffer_containers": self.buffer_containers,
+            "max_num_seqs": self.max_num_seqs,
+            "max_inputs": self.max_inputs,
+            "target_inputs": self.target_inputs,
+        }
+        for field, value in values.items():
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"hosted traffic {field} must be an integer")
+        for field in ("max_num_seqs", "max_inputs", "target_inputs"):
+            if values[field] <= 0:
+                raise ValueError(f"hosted traffic {field} must be positive")
+        if self.target_inputs > self.max_inputs:
+            raise ValueError("hosted traffic target_inputs must not exceed max_inputs")
         if self.min_containers != 1:
             raise ValueError("hosted traffic min_containers must be exactly one")
         if self.buffer_containers != 1:
@@ -111,6 +111,10 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_num_seqs": 8,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
+        },
+        "traffic": {
+            "max_inputs": 8,
+            "target_inputs": 6,
         },
     },
     # 35B-A3B MoE: bf16 on an H200 (141 GiB) is the one serving path that gives a flash adapter its
@@ -157,12 +161,19 @@ SERVING_MODELS: list[dict[str, Any]] = [
             # this adds the vision encoder's weights on top of the already weight-bound 6 x 64 LoRA buffer.
             # the complete model and LoRA load is about 108 GiB on the 141 GiB H200.
         },
+        "traffic": {
+            "max_inputs": 8,
+            "target_inputs": 6,
+        },
     },
 ]
 
 _BY_MODEL: dict[str, dict[str, Any]] = {m["base_model"]: m for m in SERVING_MODELS}
 _HOSTED_TRAFFIC_POLICY_BY_MODEL: dict[str, HostedTrafficPolicy] = {
-    model["base_model"]: HostedTrafficPolicy.from_engine(model.get("engine") or {})
+    model["base_model"]: HostedTrafficPolicy.from_config(
+        model.get("engine") or {},
+        model.get("traffic") or {},
+    )
     for model in SERVING_MODELS
 }
 
@@ -185,6 +196,10 @@ _QWEN38_HOSTED_CANDIDATE: dict[str, Any] = {
         "max_num_seqs": 8,
         "enforce_eager": False,
         "reasoning_parser": "qwen3",
+    },
+    "traffic": {
+        "max_inputs": 8,
+        "target_inputs": 6,
     },
 }
 

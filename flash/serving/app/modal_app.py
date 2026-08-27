@@ -320,6 +320,7 @@ def _policy_contract(base_model: str) -> dict[str, Any]:
         "timeout": TIMEOUT_SECONDS,
         "min_containers": policy.min_containers,
         "buffer_containers": policy.buffer_containers,
+        "max_num_seqs": policy.max_num_seqs,
         "max_inputs": policy.max_inputs,
         "target_inputs": policy.target_inputs,
     }
