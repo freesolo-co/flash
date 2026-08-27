@@ -15,13 +15,12 @@ import time
 from contextlib import contextmanager, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from flash.serve.contract.errors import RetryableServingUnavailable, ServingError
-from flash.server.platform import ipc
+from flash.server.platform import children, ipc
 from flash.server.routes import serving_smoke
 
 _CHECKPOINT_ID = "run-1/final"
@@ -524,8 +523,12 @@ def test_unknown_exception_uses_deliberate_serving_error_fallback() -> None:
 
 
 def test_all_production_process_joins_have_finite_timeouts() -> None:
-    source = inspect.getsource(serving_smoke)
-    tree = ast.parse(source)
+    """Every join on a smoke child is bounded, wherever the reap ladder lives.
+
+    The ladder is owned by `flash.server.platform.children` so both smoke children share one
+    implementation; this guard follows it there rather than pinning it to a module.
+    """
+    tree = ast.parse(inspect.getsource(children))
     joins = [
         node
         for node in ast.walk(tree)
@@ -600,46 +603,13 @@ class _NeverExitsContext:
         return self.process
 
 
-def test_deployment_preserves_process_ownership_when_failure_recording_fails(
-    monkeypatch,
-) -> None:
-    from flash.server.routes import serving, serving_completion
+class _ExplodingCloseConnection(_NoResultConnection):
+    """A pipe end whose close raises, as a real closed or broken fd can."""
 
-    process = object()
-    ownership_error = serving_smoke._ProcessOwnershipError(process)
-    monkeypatch.setattr(
-        serving_completion.JobSpec,
-        "from_dict",
-        lambda _value: SimpleNamespace(thinking=False),
-    )
-    monkeypatch.setattr(
-        serving_completion._app,
-        "get_status",
-        lambda _run_id: SimpleNamespace(deployment={"requested_at": 1.0, "state": "queued"}),
-    )
-    monkeypatch.setattr(
-        serving_completion._app,
-        "deploy_adapter",
-        lambda **_kwargs: (_ for _ in ()).throw(ownership_error),
-    )
-    monkeypatch.setattr(
-        serving_completion,
-        "_record_deployment_failure",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("persistence failed")),
-    )
-
-    with pytest.raises(serving_smoke._ProcessOwnershipError) as exc_info:
-        serving._finish_deployment_unlocked(
-            run_id="run-1",
-            spec_dict={},
-            is_checkpoint=False,
-            deploy_kwargs={},
-            deployment={"requested_at": 1.0, "state": "queued"},
-            prev_state="done",
-        )
-
-    assert exc_info.value is ownership_error
-    assert exc_info.value.process is process
+    def close(self) -> None:
+        self.close_calls += 1
+        os.close(self._fd)
+        raise OSError("pipe close exploded")
 
 
 def test_isolated_smoke_retains_live_process_ownership_without_closing(monkeypatch) -> None:
@@ -652,34 +622,62 @@ def test_isolated_smoke_retains_live_process_ownership_without_closing(monkeypat
         lambda *_args, **_kwargs: (_ for _ in ()).throw(serving_smoke._IpcDeadlineExceeded()),
     )
 
-    with pytest.raises(serving_smoke._ProcessOwnershipError) as exc_info:
+    with pytest.raises(ServingError, match="deployment_smoke_timeout"):
         serving_smoke._isolated_smoke_chat(
             _chat_kwargs(), deadline=time.monotonic() + 1.0, budget_s=1.0
         )
 
-    assert exc_info.value.process is process
-    assert process.join_timeouts == [
-        serving_smoke._PROCESS_TERMINATE_TIMEOUT_SECONDS,
-        serving_smoke._PROCESS_KILL_TIMEOUT_SECONDS,
-    ]
     assert process.terminate_calls == 1
     assert process.kill_calls == 1
     assert process.close_calls == 0
     assert context.receive.close_calls == 1
     assert context.send.close_calls == 1
+    assert process in children._LIVE_CHILDREN
+    children._release(process)
+
+
+def test_a_raising_pipe_close_cannot_drop_a_live_smoke_child(monkeypatch) -> None:
+    """Closing the receive pipe must not be able to preempt the reap or the ownership record.
+
+    The close sits in the same ``finally`` as the reap, so a raising close used to skip the reap
+    entirely and leave a live child with no owner. Ownership now begins at ``spawn_owned``, so the
+    child is registered before the pipe is ever touched and the lifespan boundary still finds it.
+    """
+    process = _NeverExitsProcess()
+    context = _NeverExitsContext(process)
+    context.receive = _ExplodingCloseConnection(context.receive.fileno())
+    monkeypatch.setattr(serving_smoke.multiprocessing, "get_context", lambda _method: context)
+    monkeypatch.setattr(
+        serving_smoke,
+        "_receive_framed_ipc",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(serving_smoke._IpcDeadlineExceeded()),
+    )
+
+    with pytest.raises(ServingError, match="deployment_smoke_timeout"):
+        serving_smoke._isolated_smoke_chat(
+            _chat_kwargs(), deadline=time.monotonic() + 1.0, budget_s=1.0
+        )
+
+    assert context.receive.close_calls == 1
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process in children._LIVE_CHILDREN
+    children._release(process)
 
 
 def test_bounded_process_reaper_kills_a_terminate_resistant_child() -> None:
     context = multiprocessing.get_context("spawn")
     ready = context.Event()
     process = context.Process(target=_ignore_terminate, args=(ready,), daemon=True)
-    process.start()
     try:
+        children.spawn_owned(process)
         assert ready.wait(timeout=5.0)
-        serving_smoke._reap_bounded_process(process)
+        assert children.reap_owned(process) is True
         assert process.is_alive() is False
         assert process.exitcode is not None
+        assert process not in children._LIVE_CHILDREN
     finally:
+        children._release(process)
         if process.is_alive():
             process.kill()
             process.join(timeout=2.0)

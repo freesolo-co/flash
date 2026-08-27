@@ -12,7 +12,6 @@ import logging
 import os
 import threading
 import time
-from typing import Any
 
 from flash import __version__
 from flash.runner.lifecycle.status import get_status
@@ -27,7 +26,7 @@ from flash.serve.deployment.deploy import (
     undeploy_adapter,
 )
 from flash.serve.deployment.export import export_adapter
-from flash.server.platform import db
+from flash.server.platform import children, db
 from flash.server.platform.locks import _DEPLOY_LOCKS, _deploy_lock
 from flash.server.platform.runtime import (
     _RECOVERABLE,
@@ -47,13 +46,6 @@ _log = logging.getLogger("flash.server")
 _DEPLOYMENT_JOBS_LOCK = threading.Lock()
 _DEPLOYMENT_JOBS: set[threading.Thread] = set()
 _DEPLOYMENT_JOBS_ACCEPTING = True
-_RETAINED_DEPLOYMENT_PROCESSES_LOCK = threading.Lock()
-_RETAINED_DEPLOYMENT_PROCESS_REAP_LOCK = threading.Lock()
-_RETAINED_DEPLOYMENT_PROCESS_WAKE = threading.Event()
-_RETAINED_DEPLOYMENT_PROCESSES: set[Any] = set()
-_RETAINED_PROCESS_JOIN_SECONDS = 0.1
-_RETAINED_PROCESS_TERMINATE_SECONDS = 0.2
-_RETAINED_PROCESS_KILL_SECONDS = 0.2
 
 
 class DeploymentJobStartError(RuntimeError):
@@ -141,75 +133,21 @@ def _open_deployment_jobs() -> None:
         _DEPLOYMENT_JOBS_ACCEPTING = True
 
 
-def _retain_deployment_process(process) -> None:
-    """transfer a live child into the lifespan-owned reaping boundary."""
-    with _RETAINED_DEPLOYMENT_PROCESSES_LOCK:
-        _RETAINED_DEPLOYMENT_PROCESSES.add(process)
-        _RETAINED_DEPLOYMENT_PROCESS_WAKE.set()
-
-
-def _reap_retained_deployment_processes(timeout: float) -> bool:
-    """retry bounded shutdown for every child retained by a deployment job."""
-    deadline = time.monotonic() + max(0.0, timeout)
-    with _RETAINED_DEPLOYMENT_PROCESS_REAP_LOCK:
-        with _RETAINED_DEPLOYMENT_PROCESSES_LOCK:
-            processes = tuple(_RETAINED_DEPLOYMENT_PROCESSES)
-        for process in processes:
-            try:
-                remaining = max(0.0, deadline - time.monotonic())
-                process.join(timeout=min(_RETAINED_PROCESS_JOIN_SECONDS, remaining))
-                if process.is_alive():
-                    process.terminate()
-                    remaining = max(0.0, deadline - time.monotonic())
-                    process.join(timeout=min(_RETAINED_PROCESS_TERMINATE_SECONDS, remaining))
-                if process.is_alive():
-                    process.kill()
-                    remaining = max(0.0, deadline - time.monotonic())
-                    process.join(timeout=min(_RETAINED_PROCESS_KILL_SECONDS, remaining))
-                if process.is_alive():
-                    continue
-                process.close()
-            except Exception:
-                _log.warning("retained deployment process could not be reaped", exc_info=True)
-                continue
-            with _RETAINED_DEPLOYMENT_PROCESSES_LOCK:
-                _RETAINED_DEPLOYMENT_PROCESSES.discard(process)
-        with _RETAINED_DEPLOYMENT_PROCESSES_LOCK:
-            empty = not _RETAINED_DEPLOYMENT_PROCESSES
-            if empty:
-                _RETAINED_DEPLOYMENT_PROCESS_WAKE.clear()
-        return empty
-
-
-async def _reap_retained_deployment_processes_loop() -> None:
-    """retry retained deployment children during the whole asgi lifespan."""
+async def _reap_live_deployment_children_loop() -> None:
+    """retry live deployment children during the whole asgi lifespan."""
     while True:
         try:
-            await asyncio.to_thread(_RETAINED_DEPLOYMENT_PROCESS_WAKE.wait, 1.0)
-            await asyncio.to_thread(_reap_retained_deployment_processes, 0.5)
+            await asyncio.to_thread(children.LIVE_CHILDREN_WAKE.wait, 1.0)
+            await asyncio.to_thread(children.reap_live_children, 0.5)
         except asyncio.CancelledError:
             raise
         except Exception:
-            _log.warning("retained deployment process reaper failed", exc_info=True)
+            _log.warning("live deployment child reaper failed", exc_info=True)
 
 
 def _run_deployment_job(target, args, kwargs) -> None:
     try:
         target(*args, **kwargs)
-    except Exception as exc:
-        from flash.server.routes.serving_smoke import _ProcessOwnershipError
-
-        if not isinstance(exc, _ProcessOwnershipError):
-            raise
-        try:
-            _retain_deployment_process(exc.process)
-        except Exception:
-            _log.exception("deployment job could not transfer live smoke process ownership")
-            raise
-        _log.error(
-            "deployment job transferred a live smoke process for managed reaping",
-            exc_info=True,
-        )
     finally:
         with _DEPLOYMENT_JOBS_LOCK:
             _DEPLOYMENT_JOBS.discard(threading.current_thread())
@@ -449,7 +387,7 @@ def create_app():
         from flash.server.domain.ops.repo_cleanup import repo_cleanup_enabled
 
         cleanup_task = asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
-        retained_process_task = asyncio.create_task(_reap_retained_deployment_processes_loop())
+        live_child_task = asyncio.create_task(_reap_live_deployment_children_loop())
         try:
             yield
         finally:
@@ -475,11 +413,11 @@ def create_app():
                     _log.warning("deployment jobs still running at shutdown deadline")
             with contextlib.suppress(Exception):
                 remaining = max(0.0, shutdown_deadline - time.monotonic())
-                if not await asyncio.to_thread(_reap_retained_deployment_processes, remaining):
-                    _log.warning("retained deployment processes survived the shutdown deadline")
-            retained_process_task.cancel()
+                if not await asyncio.to_thread(children.reap_live_children, remaining):
+                    _log.warning("live deployment children survived the shutdown deadline")
+            live_child_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await retained_process_task
+                await live_child_task
             with contextlib.suppress(Exception):
                 from flash.runner.lifecycle.reporting import _shutdown_status_reporter
 

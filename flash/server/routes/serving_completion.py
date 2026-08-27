@@ -16,7 +16,6 @@ from flash.server.routes.serving_revisions import (
     _DEPLOYMENT_READY_STATES,
     _spec_is_unservable,
 )
-from flash.server.routes.serving_smoke import _ProcessOwnershipError
 
 
 def _serving():
@@ -146,25 +145,6 @@ def _commit_ready_deployment(
     return persisted
 
 
-def _record_ownership_failure(
-    run_id: str,
-    spec: JobSpec,
-    exc: _ProcessOwnershipError,
-    current: dict,
-    deployment: dict,
-    is_checkpoint: bool,
-) -> None:
-    """persist a retained-process failure without replacing its ownership exception."""
-    try:
-        _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
-    except Exception as persistence_exc:
-        print(
-            f"deploy[{run_id}]: retained-process failure could not be persisted: "
-            f"{persistence_exc!r}",
-            flush=True,
-        )
-
-
 def _finish_deployment_unlocked(
     *,
     run_id: str,
@@ -218,12 +198,6 @@ def _finish_deployment_unlocked(
 
     try:
         dep = _app.deploy_adapter(**deploy_kwargs, before_ready=_before_ready)
-    except _ProcessOwnershipError as exc:
-        # the smoke child outlived every bounded shutdown step, so this thread still owns it.
-        # record the failure but re-raise so the deployment job can hand the live process to
-        # the lifespan reaper instead of dropping it.
-        _record_ownership_failure(run_id, spec, exc, current, deployment, is_checkpoint)
-        raise
     except Exception as exc:
         _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
         return

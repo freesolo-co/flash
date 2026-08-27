@@ -711,7 +711,6 @@ from flash.server.routes.serving_smoke import (  # noqa: E402,F401
     _SMOKE_PROMPT,
     _bounded_regex_fullmatch,
     _json_schema_validation_worker,
-    _reap_schema_validation_process,
     _run_deployment_smoke,
     _sanitized_schema_error,
     _smoke_provenance,

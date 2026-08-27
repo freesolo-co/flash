@@ -4,7 +4,9 @@ A deployment is only marked ready after this passes, so everything here runs aga
 output under a hard wall-clock budget. Two of those bounds are the reason this is its own module:
 a user-supplied structured-output regex is evaluated with a timeout, and a user-supplied JSON
 schema is compiled in a spawned process that is reaped whether or not it answers -- a catastrophic
-pattern or a schema that hangs the validator must not wedge the serving route.
+pattern or a schema that hangs the validator must not wedge the serving route. Both children are
+owned from `spawn_owned` onward, so a child that outlives its reap stays with the lifespan boundary
+in `flash.server.platform.children` rather than being dropped here.
 
 Split out of `flash.server.routes.serving` to keep that module under the file-size limit.
 """
@@ -40,6 +42,7 @@ from flash.serve.deployment.preflight import (
     validate_structured_output_patterns,
 )
 from flash.server.asgi import app as _app
+from flash.server.platform.children import reap_owned, spawn_owned
 from flash.server.platform.ipc import (
     _IpcDeadlineExceeded,
     _receive_framed_ipc,
@@ -132,19 +135,6 @@ _DIRECT_REGEX_TIMEOUT_SECONDS = 0.05
 _JSON_SCHEMA_TIMEOUT_SECONDS = 3.0
 _JSON_SCHEMA_PROCESS_NAME = "flash-json-schema-validation"
 _SMOKE_CHAT_PROCESS_NAME = "flash-deployment-smoke-chat"
-_PROCESS_JOIN_TIMEOUT_SECONDS = 0.1
-_PROCESS_TERMINATE_TIMEOUT_SECONDS = 0.2
-_PROCESS_KILL_TIMEOUT_SECONDS = 0.2
-
-
-class _ProcessOwnershipError(ServingError):
-    """the caller still owns a child that survived every bounded shutdown step."""
-
-    def __init__(self, process) -> None:
-        super().__init__(
-            "deployment smoke process ownership retained after bounded terminate and kill attempts"
-        )
-        self.process = process
 
 
 def _ipc_credential() -> str:
@@ -220,20 +210,6 @@ def _encode_smoke_chat_exception(exc: Exception) -> tuple:
         }.get(type(exc), "RequestError")
         return ("request_error", error_type, str(exc), request.method, str(request.url))
     return ("unknown_error",)
-
-
-def _reap_bounded_process(process, *, terminate_first: bool = False) -> None:
-    """reap an owned worker or raise while retaining the live process on the error."""
-    if not terminate_first:
-        process.join(timeout=_PROCESS_JOIN_TIMEOUT_SECONDS)
-    if process.is_alive():
-        process.terminate()
-        process.join(timeout=_PROCESS_TERMINATE_TIMEOUT_SECONDS)
-    if process.is_alive():
-        process.kill()
-        process.join(timeout=_PROCESS_KILL_TIMEOUT_SECONDS)
-    if process.is_alive():
-        raise _ProcessOwnershipError(process)
 
 
 def _smoke_chat_worker(connection, chat_kwargs: dict, deadline: float) -> None:
@@ -349,7 +325,7 @@ def _isolated_smoke_chat(chat_kwargs: dict, *, deadline: float, budget_s: float)
     timed_out = False
     try:
         try:
-            process.start()
+            spawn_owned(process)
         except Exception as exc:
             if time.monotonic() >= deadline:
                 raise _smoke_timeout_error(budget_s) from exc
@@ -365,11 +341,9 @@ def _isolated_smoke_chat(chat_kwargs: dict, *, deadline: float, budget_s: float)
         except _IpcDeadlineExceeded:
             timed_out = True
     finally:
-        receive_connection.close()
-        if process.pid is not None:
-            _reap_bounded_process(process, terminate_first=timed_out)
-            process.close()
-        else:
+        with contextlib.suppress(Exception):
+            receive_connection.close()
+        if reap_owned(process, terminate_first=timed_out):
             process.close()
 
     if timed_out:
@@ -429,20 +403,6 @@ def _json_schema_validation_worker(connection, instance, schema, deadline: float
         connection.close()
 
 
-def _reap_schema_validation_process(process, *, deadline: float) -> None:
-    remaining = max(0.0, deadline - time.monotonic())
-    process.join(timeout=min(0.1, remaining))
-    if process.is_alive():
-        process.terminate()
-        remaining = max(0.0, deadline - time.monotonic())
-        process.join(timeout=min(0.2, remaining))
-    if process.is_alive():
-        process.kill()
-        process.join(timeout=_PROCESS_KILL_TIMEOUT_SECONDS)
-    if process.is_alive():
-        raise _ProcessOwnershipError(process)
-
-
 def _validate_json_schema(instance, schema: dict, *, deadline: float, budget_s: float) -> None:
     now = time.monotonic()
     if deadline <= now:
@@ -462,7 +422,7 @@ def _validate_json_schema(instance, schema: dict, *, deadline: float, budget_s: 
     timed_out = False
     try:
         try:
-            process.start()
+            spawn_owned(process)
         except Exception as exc:
             if time.monotonic() >= deadline:
                 raise _smoke_timeout_error(budget_s) from exc
@@ -478,9 +438,9 @@ def _validate_json_schema(instance, schema: dict, *, deadline: float, budget_s: 
         except _IpcDeadlineExceeded:
             timed_out = True
     finally:
-        receive_connection.close()
-        if process.pid is not None:
-            _reap_schema_validation_process(process, deadline=deadline)
+        with contextlib.suppress(Exception):
+            receive_connection.close()
+        if reap_owned(process, deadline=deadline):
             process.close()
 
     if outcome is None:

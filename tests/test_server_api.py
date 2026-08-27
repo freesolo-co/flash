@@ -4009,9 +4009,43 @@ def test_deploy_start_failure_persists_terminal_failure(api, monkeypatch):
     assert [item.deployment["state"] for item in reported] == ["queued", "failed"]
 
 
-def test_deploy_propagates_live_smoke_process_after_recording_failure(api, monkeypatch):
+class _UnreapableChild:
+    """A child no rung of the ladder can end, so ownership must outlive the request."""
+
+    def __init__(self) -> None:
+        self.pid = 9876
+        self.close_calls = 0
+
+    def start(self) -> None:
+        return None
+
+    def join(self, *, timeout) -> None:
+        return None
+
+    def is_alive(self) -> bool:
+        return True
+
+    def terminate(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def test_deploy_keeps_a_live_smoke_child_owned_after_the_request_fails(api, monkeypatch):
+    """A smoke child that survives its reap stays owned, and the deployment records a failure.
+
+    Ownership does not travel on the exception any more, so the deployment failure path is the
+    ordinary one. What must hold is that the request cannot end with a live child that nothing
+    is tracking: the lifespan reaper still finds it in the live set.
+    """
     import flash.server.asgi.app as app_mod
     import flash.server.routes.serving_smoke as serving_smoke
+    from flash.serve.contract.errors import ServingError
+    from flash.server.platform import children
 
     key = _login()
     run_id = api.post(
@@ -4022,46 +4056,43 @@ def test_deploy_propagates_live_smoke_process_after_recording_failure(api, monke
     runner_state._save_status(status)
     revision = f"{run_id}/final"
 
-    class OwnedProcess:
-        def __init__(self) -> None:
-            self.close_calls = 0
+    process = _UnreapableChild()
 
-        def close(self) -> None:
-            self.close_calls += 1
-
-    process = OwnedProcess()
-    ownership_error = serving_smoke._ProcessOwnershipError(process)
+    def leak_a_live_child(*_args, **_kwargs):
+        children.spawn_owned(process)
+        assert children.reap_owned(process) is False
+        raise ServingError("smoke failed with a live child")
 
     def fake_deploy(**kwargs):
         kwargs["before_ready"](revision, revision)
-        pytest.fail("a retained smoke process must abort deployment")
+        pytest.fail("a failing smoke must abort deployment")
 
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
-    monkeypatch.setattr(
-        serving_smoke,
-        "_isolated_smoke_chat",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(ownership_error),
-    )
+    monkeypatch.setattr(serving_smoke, "_isolated_smoke_chat", leak_a_live_child)
 
-    with pytest.raises(serving_smoke._ProcessOwnershipError) as exc_info:
+    try:
         api.post(
             f"/v1/runs/{run_id}/deploy",
             json={"checkpoint_id": f"{run_id}/final"},
             headers=_bearer(key),
         )
 
-    assert exc_info.value is ownership_error
-    assert exc_info.value.process is process
-    assert process.close_calls == 0
-    deployment = runner_status.get_status(run_id).deployment
-    assert deployment["state"] == "failed"
-    assert deployment["error"] == str(ownership_error)
+        assert process in children._LIVE_CHILDREN
+        assert process.close_calls == 0
+        deployment = runner_status.get_status(run_id).deployment
+        assert deployment["state"] == "failed"
+        assert "smoke failed with a live child" in deployment["error"]
+    finally:
+        children._release(process)
 
 
-def test_deploy_failure_recording_cannot_replace_process_ownership_error(api, monkeypatch):
+def test_deploy_keeps_child_ownership_when_failure_recording_raises(api, monkeypatch):
+    """A raising persistence path cannot drop a live child, because it never owned it."""
     import flash.server.asgi.app as app_mod
     import flash.server.routes.serving_completion as serving_completion
     import flash.server.routes.serving_smoke as serving_smoke
+    from flash.serve.contract.errors import ServingError
+    from flash.server.platform import children
 
     key = _login()
     run_id = api.post(
@@ -4071,34 +4102,38 @@ def test_deploy_failure_recording_cannot_replace_process_ownership_error(api, mo
     status.state = "done"
     runner_state._save_status(status)
     revision = f"{run_id}/final"
-    process = object()
-    ownership_error = serving_smoke._ProcessOwnershipError(process)
+
+    process = _UnreapableChild()
+
+    def leak_a_live_child(*_args, **_kwargs):
+        children.spawn_owned(process)
+        assert children.reap_owned(process) is False
+        raise ServingError("smoke failed with a live child")
 
     def fake_deploy(**kwargs):
         kwargs["before_ready"](revision, revision)
-        pytest.fail("a retained smoke process must abort deployment")
+        pytest.fail("a failing smoke must abort deployment")
 
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
-    monkeypatch.setattr(
-        serving_smoke,
-        "_isolated_smoke_chat",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(ownership_error),
-    )
+    monkeypatch.setattr(serving_smoke, "_isolated_smoke_chat", leak_a_live_child)
     monkeypatch.setattr(
         serving_completion,
         "_record_deployment_failure",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("storage unavailable")),
     )
 
-    with pytest.raises(serving_smoke._ProcessOwnershipError) as exc_info:
-        api.post(
-            f"/v1/runs/{run_id}/deploy",
-            json={"checkpoint_id": f"{run_id}/final"},
-            headers=_bearer(key),
-        )
+    try:
+        with pytest.raises(RuntimeError, match="storage unavailable"):
+            api.post(
+                f"/v1/runs/{run_id}/deploy",
+                json={"checkpoint_id": f"{run_id}/final"},
+                headers=_bearer(key),
+            )
 
-    assert exc_info.value is ownership_error
-    assert exc_info.value.process is process
+        assert process in children._LIVE_CHILDREN
+        assert process.close_calls == 0
+    finally:
+        children._release(process)
 
 
 def test_sync_deploy_execution_error_keeps_specific_persisted_outcome(api, monkeypatch):
