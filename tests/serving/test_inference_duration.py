@@ -149,26 +149,27 @@ class _GenerationPool:
 
 def _revision() -> AdapterRecord:
     run_id = "duration"
-    sha = hashlib.sha1(run_id.encode()).hexdigest()
+    artifact_revision = hashlib.sha1(run_id.encode()).hexdigest()
+    checkpoint_id = f"{run_id}/final"
     return AdapterRecord.model_validate(
         {
-            "adapter_id": f"{run_id}@final.{sha}",
+            "adapter_id": checkpoint_id,
             "repo_id": "org/duration",
             "org_id": "org-1",
             "base_model": BASE_MODEL,
-            "checkpoint": run_id,
+            "checkpoint": checkpoint_id,
             "thinking": False,
-            "metadata": {
-                "record_type": "revision",
-                "run_id": run_id,
-                "checkpoint_step": None,
-                "hf_revision": sha,
-            },
+            "run_id": run_id,
+            "checkpoint_step": None,
+            "artifact_revision": artifact_revision,
+            "artifact_digest": hashlib.sha256(b"duration-artifact").hexdigest(),
+            "artifact_fingerprint": hashlib.sha256(b"duration-binding").hexdigest(),
+            "lora_rank": 16,
         }
     )
 
 
-async def _authorize(_token: str, _adapter_id: str) -> str:
+async def _authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
     return "org-1"
 
 

@@ -1003,11 +1003,63 @@ def test_wall_clock_jump_does_not_change_heartbeat_cadence(wall_jump: timedelta)
 
     assert clocks.wall == datetime(2026, 8, 25, 12, 0, 20, tzinfo=UTC) + wall_jump
     assert first.identity.request_id in outbox._active_generations
+    # the renewal is dated from the monotonic instant the heartbeat left, so the deadline is
+    # unaffected by the wall jump the server timestamp would have carried into it.
     assert outbox._generation_lease_deadlines[first.identity.request_id] == 1_140.0
-    assert outbox._generation_lease_expiries[first.identity.request_id] == datetime(
-        2026, 8, 25, 12, 2, 20, tzinfo=UTC
-    )
     assert outbox._background_error is None
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    [
+        pytest.param("2026-08-25T12:02:20", id="naive"),
+        pytest.param("not-a-timestamp", id="unparseable"),
+        pytest.param(1_787_000_000, id="epoch-int"),
+        pytest.param({"at": "2026-08-25T12:02:20Z"}, id="object"),
+    ],
+)
+def test_heartbeat_rejects_a_malformed_server_lease_expiry(expires_at: Any) -> None:
+    """A renewal the server could not describe is not a renewal.
+
+    The absolute expiry is no longer stored, since comparing it against a local wall clock is the
+    skew this fix removes. It is still parsed: a heartbeat row carrying an expiry the server cannot
+    express is a broken contract, and accepting it would extend the local deadline on the strength
+    of a field nobody checked.
+    """
+    event = _usage_event()
+    client = _QueuedClient(
+        [
+            (200, [{"state": "in_progress", "lease_seconds": 120, "heartbeat_seconds": 20}]),
+            (
+                200,
+                [
+                    {
+                        "request_id": event.identity.request_id,
+                        "generation_lease_expires_at": expires_at,
+                    }
+                ],
+            ),
+        ]
+    )
+    clocks = _MutableClocks(datetime(2026, 8, 25, 12, 0, tzinfo=UTC), monotonic=1_000.0)
+    outbox = DurableUsageOutbox(
+        _outbox_settings(),
+        client=client,
+        worker_id="worker-1",
+        clock=clocks.wall_time,
+        monotonic=clocks.monotonic_time,
+    )
+
+    async def run() -> None:
+        await outbox.capture(event)
+        assert outbox._generation_lease_deadlines[event.identity.request_id] == 1_120.0
+        with pytest.raises(UsageOutboxError, match="usage_snapshot_timestamp_invalid"):
+            await outbox._heartbeat_active_generations()
+
+    asyncio.run(run())
+
+    # the capture deadline stands: a rejected row must not silently extend the lease.
+    assert outbox._generation_lease_deadlines[event.identity.request_id] == 1_120.0
 
 
 def test_heartbeat_batches_exact_active_generation_authority() -> None:

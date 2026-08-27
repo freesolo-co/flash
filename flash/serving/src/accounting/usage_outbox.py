@@ -420,7 +420,6 @@ class DurableUsageOutbox:
         self._active_generations: set[str] = set()
         self._terminal_generations: set[str] = set()
         self._generation_lease_deadlines: dict[str, float] = {}
-        self._generation_lease_expiries: dict[str, datetime] = {}
         self._active_leases: set[str] = set()
         self._background_error: BaseException | None = None
 
@@ -441,7 +440,6 @@ class DurableUsageOutbox:
         if timing["state"] == "in_progress":
             request_id = event.identity.request_id
             self._active_generations.add(request_id)
-            self._generation_lease_expiries.pop(request_id, None)
             self._generation_lease_deadlines[request_id] = (
                 lease_started_at + timing["lease_seconds"]
             )
@@ -474,7 +472,6 @@ class DurableUsageOutbox:
         self._active_generations.discard(request_id)
         self._terminal_generations.discard(request_id)
         self._generation_lease_deadlines.pop(request_id, None)
-        self._generation_lease_expiries.pop(request_id, None)
         self._heartbeat_wake.set()
 
     async def snapshot(self) -> OutboxSnapshot:
@@ -728,7 +725,12 @@ class DurableUsageOutbox:
                 renewed.add(request_id)
                 expires_at = row.get("generation_lease_expires_at")
                 if request_id in self._active_generations and expires_at is not None:
-                    self._generation_lease_expiries[request_id] = _parse_datetime(expires_at)
+                    # the server's absolute expiry is validated but not stored: comparing it to a
+                    # local wall clock is what the skew this fix removes would corrupt. the lease
+                    # length is fixed for the outbox, so the renewal is dated from the monotonic
+                    # instant the request left here, which is the earliest the server could have
+                    # started counting.
+                    _parse_datetime(expires_at)
                     if self._generation_lease_seconds is not None:
                         self._generation_lease_deadlines[request_id] = (
                             renewal_started_at + self._generation_lease_seconds
@@ -740,7 +742,6 @@ class DurableUsageOutbox:
                 self._active_generations.difference_update(missing)
                 for request_id in missing:
                     self._generation_lease_deadlines.pop(request_id, None)
-                    self._generation_lease_expiries.pop(request_id, None)
                 raise UsageOutboxError("generation_heartbeat_lease_lost")
 
     async def _claim(self) -> list[dict[str, Any]]:
@@ -885,7 +886,6 @@ class DurableUsageOutbox:
             else:
                 self._active_generations.clear()
                 self._generation_lease_deadlines.clear()
-                self._generation_lease_expiries.clear()
 
         for outbox_id in tuple(self._active_leases):
             try:
