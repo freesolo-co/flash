@@ -883,3 +883,52 @@ def test_rollback_refuses_a_previous_release_it_cannot_verify(previous_sha, is_a
     assert code != 0
     assert expected in logged
     assert "Restore production manually" in logged
+
+
+def _rollback_fires(*, deploy_outcome: str, job_failed: bool = True) -> bool:
+    """Evaluate the rollback step's `if:` the way Actions would, for one step-outcome scenario.
+
+    Asserting the condition's text (`startswith("failure()")`) passes whether or not the guard that
+    keeps a pre-deploy failure from restoring is present at all. The expression is the thing under
+    test, so it has to be evaluated, not matched.
+    """
+    expression = _deploy_steps()[_step_index("Restore the previous release")]["if"]
+    python = (
+        expression.replace("&&", "and")
+        .replace("||", "or")
+        .replace("failure()", repr(job_failed))
+        .replace("steps.gate.outputs.deploy", repr("true"))
+        .replace("steps.deploy_serving.outcome", repr(deploy_outcome))
+    )
+    assert "steps." not in python, f"unresolved step reference in {expression!r}"
+    # the expression comes from our own workflow file, with every step reference substituted out.
+    return bool(eval(python))
+
+
+def test_a_failure_before_the_deploy_never_restores_over_an_untouched_production():
+    """The steps that verify secrets and auth run BEFORE any deploy, under the same gate output.
+
+    If those satisfy the rollback condition, a run that never replaced production would `modal
+    deploy` the previous sha over a live healthy app -- using the very secret set whose verification
+    just failed. Restoring is only meaningful when this run actually deployed something.
+    """
+    steps = _deploy_steps()
+    deploy_index = _step_index("Deploy serving")
+    assert steps[deploy_index].get("id") == "deploy_serving", (
+        "the rollback guard keys off the deploy step's id; without it the guard silently "
+        "evaluates an empty outcome"
+    )
+    for step in steps[:deploy_index]:
+        assert step.get("name") != "Restore the previous release"
+
+    # skipped and empty are the two outcomes a step that never ran reports.
+    assert not _rollback_fires(deploy_outcome="skipped")
+    assert not _rollback_fires(deploy_outcome="")
+
+    # a deploy that ran -- whether it succeeded and failed readiness later, or failed partway --
+    # leaves the new release live, so both must still restore.
+    assert _rollback_fires(deploy_outcome="success")
+    assert _rollback_fires(deploy_outcome="failure")
+
+    # and a green run never restores, whatever the deploy did.
+    assert not _rollback_fires(deploy_outcome="success", job_failed=False)

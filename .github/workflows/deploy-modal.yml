@@ -301,6 +301,7 @@ jobs:
           done
 
       - name: Deploy serving
+        id: deploy_serving
         if: steps.gate.outputs.deploy == 'true'
         env:
           FREESOLO_DEPLOYMENT_SHA: ${{ github.sha }}
@@ -421,9 +422,17 @@ jobs:
         run: python -m flash.serving.promotion.gate
 
       - name: Restore the previous release
-        # `failure()` covers every preceding step, not just the canary: a deploy that half-succeeded
-        # and then failed readiness leaves the same broken app live as one that failed the canary.
-        if: failure() && steps.gate.outputs.deploy == 'true'
+        # `failure()` alone is too broad. It also fires for the steps that run BEFORE any deploy --
+        # installing Modal, verifying auth, verifying the runtime secrets, waiting for the adapter
+        # schema. Restoring there would `modal deploy` the previous SHA over a live app this run never
+        # replaced, using the very secret set whose verification just failed: a healthy release
+        # overwritten by a rollback that had nothing to roll back. Gating on the deploy step's own
+        # outcome keeps the case the previous comment was right about -- a deploy that half-succeeded
+        # and then failed readiness is `failure`, not skipped, so it still restores. Any outcome other
+        # than an attempted deploy (empty, `skipped`) means production is untouched and must stay so.
+        if: >-
+          failure() && steps.gate.outputs.deploy == 'true'
+          && (steps.deploy_serving.outcome == 'success' || steps.deploy_serving.outcome == 'failure')
         working-directory: .
         env:
           PREVIOUS_SHA: ${{ steps.gate.outputs.previous_sha }}
