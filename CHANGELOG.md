@@ -93,7 +93,7 @@ translated or read by the new protocol:
    reconciling attempt.
 3. Confirm that no old RunPod job or endpoint and no Lambda or Vast instance remains.
 4. Confirm that cleanup ledgers contain no unconfirmed resources.
-5. Deploy the Flash control plane, worker images, and CLI package together at version `1.2.121`.
+5. Deploy the Flash control plane, worker images, and CLI package together at version `1.2.124`.
 6. Accept that Freesolo live progress is unavailable until its separate consumer update; lifecycle
    mirroring continues without `lastHeartbeat` or `gpuStatus`.
 7. Run the smallest safe SFT, GRPO, and OPD lifecycle smokes before reopening submissions.
