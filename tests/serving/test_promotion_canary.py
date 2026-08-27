@@ -7,11 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.serve.request.openai import parse_chat_request
 from flash.serving.promotion.canary import (
     CANARY_TIMEOUT,
     CANARY_TRANSPORT_FAILURE,
     CanaryError,
     CanaryRequest,
+    _payload,
     correlation_id_for,
     run_stream_canary,
 )
@@ -26,7 +28,7 @@ def _request(**overrides) -> CanaryRequest:
         "api_key": API_KEY,
         "correlation_id": correlation_id_for("12345", "1"),
         "timeout_seconds": 5.0,
-        "max_completion_tokens": 32,
+        "max_tokens": 32,
     }
     fields.update(overrides)
     return CanaryRequest(**fields)
@@ -93,6 +95,38 @@ _USAGE = '{"choices": [], "usage": {"completion_tokens": 7}}'
 
 def _run(client, request=None):
     return asyncio.run(run_stream_canary(request or _request(), client=client))
+
+
+def test_the_canary_payload_survives_the_real_router_parser():
+    """The gate's own request must not be the thing that fails the gate.
+
+    Asserting the payload's keys against a hand-written list is what let `max_completion_tokens`
+    ship: it is the correct OpenAI spelling, it looks right, and no test in this file could tell
+    that the hosted router rejects it. `parse_chat_request` uses a STRICT allowlist and raises on
+    any unknown top-level key, so an unrecognized field 422s before a single token is generated.
+
+    The gate reads that 422 as a non-SSE response and fails -- and the rollback step keys off
+    `if: failure()`, so the predecessor gets redeployed over a perfectly healthy release, on every
+    deploy, deterministically. Running the payload through the real parser is the only assertion
+    that cannot drift from the router's actual contract.
+    """
+    normalized = parse_chat_request(
+        _payload(_request()), require_model=True, allow_managed_selectors=False
+    )
+    assert normalized.max_tokens == 32
+    assert normalized.stream is True
+
+
+def test_the_canary_key_cannot_reach_a_build_log_through_a_repr():
+    """`CanaryRequest` holds `FREESOLO_INTERNAL_KEY`, and build logs are public and permanent.
+
+    A default dataclass repr renders every field verbatim, so any future f-string, debug print, or
+    exception with the request in scope would publish the key. `CanaryError`'s docstring already
+    warns against exactly this; the field is set `repr=False` so the warning cannot be violated by
+    accident.
+    """
+    assert API_KEY not in repr(_request())
+    assert API_KEY not in str(_request())
 
 
 def test_the_canary_identifies_its_own_generation_for_the_accounting_readback():

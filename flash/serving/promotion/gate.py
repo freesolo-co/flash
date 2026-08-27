@@ -73,10 +73,16 @@ HEALTH_UNREACHABLE = "health_unreachable"
 # with headroom rather than the warm-path latency, because a promotion that fails on `canary_timeout`
 # does not merely fail -- it rolls a healthy release back to its predecessor.
 _DEFAULT_CANARY_TIMEOUT_SECONDS = 420.0
+# long enough for a lease that expired to be RECLAIMED, not merely observed. `modal deploy` replaces
+# the router containers, and a container holding a claimed row when it goes away leaves that lease to
+# expire rather than releasing it -- so a deploy itself produces the exact signal `stalled` reads.
+# `DurableUsageOutbox` leases for 60s and the replacement worker reclaims on its next sweep, so a
+# deploy-induced expiry clears well inside this window while a genuinely wedged loop never does. A
+# deadline at or below the lease would turn every deploy into a rollback of a healthy release.
 _DEFAULT_ACCOUNTING_DEADLINE_SECONDS = 180.0
 _ACCOUNTING_POLL_SECONDS = 5.0
 _BACKLOG_SNAPSHOT_RPC = "serving_usage_backlog_snapshot"
-_MAX_COMPLETION_TOKENS = 32
+_MAX_TOKENS = 32
 _REQUIRED_ENV = (
     "FREESOLO_INTERNAL_KEY",
     "SUPABASE_URL",
@@ -142,7 +148,9 @@ async def _await_accounting(
     is why this retries rather than failing on the first bad read.
     """
     waited = 0.0
-    verdict = verify_accounting(None)
+    # the standing verdict before any read succeeds: an accounting stage that never got a readable
+    # snapshot has proven nothing, so it must not fall through as a pass.
+    verdict = PromotionVerdict(ok=False, reason=ACCOUNTING_MALFORMED)
     while True:
         try:
             snapshot = await loader()
@@ -238,11 +246,20 @@ def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
     return GatePlan(
         request=CanaryRequest(
             base_url=base_url,
+            # ONE model, not all of `base_models()`. This is a deliberate limit and it is narrower
+            # than the health check beside it: `/healthz` reports `gpus` as the count of CONFIGURED
+            # tiers (3 as of the 27B activation), so a passing gate must not be read as three
+            # proven engines. A release that breaks only the 27B or 35B path promotes cleanly.
+            #
+            # Looping all three would put three scale-to-zero cold starts inside one 420s budget,
+            # and a canary that times out fails the gate -- which redeploys the predecessor over a
+            # healthy release. Widening coverage by making spurious rollbacks likelier is a bad
+            # trade; per-model gating needs its own budget, not a longer single wait.
             model=models[0],
             api_key=env["FREESOLO_INTERNAL_KEY"],
             correlation_id=correlation_id_for(run_id, attempt),
             timeout_seconds=_DEFAULT_CANARY_TIMEOUT_SECONDS,
-            max_completion_tokens=_MAX_COMPLETION_TOKENS,
+            max_tokens=_MAX_TOKENS,
         ),
         read_backlog=read_backlog,
         expected_sha=env["GITHUB_SHA"],

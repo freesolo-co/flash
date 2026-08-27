@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from flash.serving.promotion.evidence import StreamEvidence
@@ -42,10 +42,20 @@ class CanaryError(Exception):
 class CanaryRequest:
     base_url: str
     model: str
-    api_key: str
+    # `repr=False` because this dataclass holds `FREESOLO_INTERNAL_KEY`. The default repr would
+    # render it verbatim into any f-string, debug print, or exception that has the request in
+    # scope -- and those land in a PUBLIC github actions log, permanently readable. This is the
+    # exact hazard `CanaryError`'s docstring names; the field must not be able to cause it.
+    api_key: str = field(repr=False)
     correlation_id: str
     timeout_seconds: float
-    max_completion_tokens: int
+    # `max_tokens`, not `max_completion_tokens`. The hosted router parses with
+    # `flash.serve.request.openai.parse_chat_request`, whose `_ALLOWED_REQUEST_KEYS` is a strict
+    # allowlist that raises on any unknown top-level key -- and the newer OpenAI spelling is not in
+    # it. Sending it 422s before generation, which reads here as a non-SSE response and fails the
+    # gate, so `if: failure()` would redeploy the PREDECESSOR over a healthy release on every
+    # deploy. The name is pinned to the wire key so the two cannot drift apart silently.
+    max_tokens: int
 
 
 def correlation_id_for(run_id: str, run_attempt: str) -> str:
@@ -60,7 +70,7 @@ def _payload(request: CanaryRequest) -> dict[str, Any]:
         # without this the terminal chunk carries no usage, and "did this generate any tokens?"
         # becomes unanswerable from the stream alone.
         "stream_options": {"include_usage": True},
-        "max_completion_tokens": request.max_completion_tokens,
+        "max_tokens": request.max_tokens,
         "temperature": 0,
     }
 

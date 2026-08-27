@@ -12,6 +12,7 @@ present" check passes while the guard is commented out.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -658,6 +659,46 @@ def test_promotion_is_gated_on_a_real_stream_after_readiness():
     assert _step_index("real streaming canary") > _step_index("serving readiness")
 
 
+def test_the_job_cap_leaves_room_for_a_rollback_after_every_wait_is_exhausted():
+    """The job cap has to be derived from the waits, not chosen and left to rot.
+
+    `timeout-minutes` kills the job wherever it is, and the worst case ends INSIDE the rollback:
+    both readiness polls burn their full deadlines, the gate burns its canary and accounting
+    budgets, and only then does the restore start its own deploy and 300s verification. A cap that
+    fits the forward path but not the restore converts a recoverable failed promotion into a broken
+    release left live, which is the one outcome this whole step exists to prevent.
+
+    Summing the declared budgets rather than restating a number keeps the cap honest: lengthening
+    any poll, or the gate's own deadlines, moves this bound automatically.
+    """
+    job = _load(WORKFLOW_DIR / "deploy-modal.yml")["jobs"]["deploy"]
+    polls = sum(
+        int(seconds)
+        for step in _steps(job)
+        for seconds in re.findall(r"SECONDS \+ (\d+)", step.get("run") or "")
+    )
+    assert polls > 0, "no bounded polls found -- this test is measuring nothing"
+
+    from flash.serving.promotion import gate as gate_module
+
+    gate_budget = (
+        gate_module._DEFAULT_CANARY_TIMEOUT_SECONDS
+        + gate_module._DEFAULT_ACCOUNTING_DEADLINE_SECONDS
+    )
+    # two `modal deploy` invocations (forward and restore), image build included, plus checkout and
+    # dependency installation. deliberately generous: the assertion should fail while there is still
+    # headroom to fix, not at the moment a real run gets killed.
+    deploy_allowance = 15 * 60
+
+    required_minutes = (polls + gate_budget + deploy_allowance) / 60
+    assert job["timeout-minutes"] >= required_minutes, (
+        f"the deploy job caps at {job['timeout-minutes']}m, but its own declared waits "
+        f"({polls}s of polls + {gate_budget:.0f}s of gate budget) plus a "
+        f"{deploy_allowance // 60}m deploy allowance need {required_minutes:.1f}m. A cap below that "
+        "can kill the job mid-rollback and leave a broken release serving."
+    )
+
+
 def test_the_promotion_canary_receives_its_credentials_only_through_the_environment():
     """A credential passed as an argument is readable in the process table and the step echo.
 
@@ -684,42 +725,161 @@ def test_the_previous_release_is_captured_before_the_deploy_overwrites_it():
     assert _step_index("Decide whether to deploy") < _step_index("Deploy serving")
 
 
-def test_a_failed_promotion_restores_and_verifies_the_previous_release():
-    """Restoration has to be PROVEN, not assumed from a successful redeploy command.
+PREVIOUS = "1111111111111111111111111111111111111111"
+CURRENT = "2222222222222222222222222222222222222222"
 
-    `modal deploy` returning zero says the app was replaced, not that it came up serving the
-    restored code. The rollback re-reads `/healthz` and requires the restored sha under its own
-    distinct attempt id, so the forward deploy's identity cannot be mistaken for a completed
-    rollback.
+
+def _run_rollback(*, previous_sha: str, is_ancestor: bool, health: str) -> tuple[int, str, str]:
+    """Execute the rollback script with `modal`, `curl`, `git`, and `sleep` stubbed on PATH.
+
+    RUN it rather than grep it, for the same reason the dispatch and fork guards above are run:
+    a substring is present in a step that never reaches the branch containing it. Every assertion
+    below reads an OBSERVABLE effect -- did `modal deploy` get invoked, with which identity, and
+    did the step exit nonzero -- so a rewritten step that echoed the right strings without
+    redeploying would be red here and green under a grep.
+
+    `modal`'s recorded invocation is returned separately from the step's stdout/stderr; blending
+    them would reintroduce the same weakness one layer out, since the script also echoes the sha
+    it intends to restore.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        calls = root / "modal-calls.txt"
+        (bin_dir / "modal").write_text(
+            '#!/bin/sh\nprintf "%s sha=%s id=%s\\n" "$*" "$FREESOLO_DEPLOYMENT_SHA" '
+            '"$FREESOLO_DEPLOYMENT_ID" >> "$MODAL_CALLS"\nexit 0\n'
+        )
+        # the health body is served from a file; `--output` is where the script wants it.
+        (bin_dir / "curl").write_text(
+            '#!/bin/sh\nfor arg in "$@"; do\n'
+            '  if [ "$prev" = "--output" ]; then out="$arg"; fi\n  prev="$arg"\ndone\n'
+            'printf "%s" "$HEALTH_BODY" > "$out"\nexit 0\n'
+        )
+        # `merge-base --is-ancestor` answers from the fixture; `checkout` is a no-op. A real repo
+        # would make the ancestor case depend on this checkout's history rather than on the branch
+        # under test.
+        (bin_dir / "git").write_text(
+            '#!/bin/sh\nif [ "$1" = "merge-base" ]; then exit "$ANCESTOR_EXIT"; fi\nexit 0\n'
+        )
+        for stub in bin_dir.iterdir():
+            stub.chmod(0o755)
+
+        # `sleep` is shadowed by a shell FUNCTION, not a PATH stub. The verification loop is bounded
+        # by `$SECONDS`, which is wall-clock, so a stub that merely returns fast spins for the full
+        # real 300s -- the deadline advances whether anything sleeps or not. A function runs in the
+        # script's own shell, where `SECONDS` is assignable, so the loop's structure is preserved
+        # (same number of naps, same deadline arithmetic) while virtual time moves in place of real
+        # time.
+        script = (
+            "sleep() { SECONDS=$((SECONDS + 60)); }\n"
+            + (_deploy_steps()[_step_index("Restore the previous release")]["run"])
+        )
+        completed = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            cwd=tmp,
+            env={
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                "MODAL_CALLS": str(calls),
+                "ANCESTOR_EXIT": "0" if is_ancestor else "1",
+                "HEALTH_BODY": health,
+                "PREVIOUS_SHA": previous_sha,
+                "CURRENT_SHA": CURRENT,
+                "ROLLBACK_DEPLOYMENT_ID": "9-1-rollback",
+            },
+        )
+        recorded = calls.read_text() if calls.exists() else ""
+        return completed.returncode, recorded, completed.stdout + completed.stderr
+
+
+def _health(sha: str, deployment_id: str, ok: bool = True) -> str:
+    return json.dumps({"ok": ok, "deployment_sha": sha, "deployment_id": deployment_id})
+
+
+def test_the_rollback_step_fires_on_failure_with_a_distinct_attempt_id():
+    """Wiring the script cannot prove: `if:` and `env:` are read by Actions, not by the shell.
+
+    The attempt id must differ from the forward deploy's, or the readiness identity already
+    published by the failed release would satisfy the restore check without anything being
+    restored.
     """
     rollback = _deploy_steps()[_step_index("Restore the previous release")]
     assert rollback["if"].startswith("failure()")
-    script = rollback["run"]
-    assert 'FREESOLO_DEPLOYMENT_SHA="$PREVIOUS_SHA"' in script
-    assert "modal deploy flash/serving/app/modal_app.py" in script
-    assert 'payload.get("deployment_sha") == sys.argv[2]' in script
-    assert "-rollback" in (rollback.get("env") or {}).get("ROLLBACK_DEPLOYMENT_ID", "")
+    env = rollback.get("env") or {}
+    assert env.get("PREVIOUS_SHA") == "${{ steps.gate.outputs.previous_sha }}"
+    assert env.get("ROLLBACK_DEPLOYMENT_ID", "").endswith("-rollback")
+    assert env["ROLLBACK_DEPLOYMENT_ID"] != "${{ github.run_id }}-${{ github.run_attempt }}"
 
 
-def test_a_rollback_still_fails_the_job():
-    """A restored predecessor means production is serving again, NOT that this commit shipped.
+def test_a_failed_promotion_restores_the_previous_release_and_still_fails_the_job():
+    """The redeploy must carry the PREVIOUS sha, and a restore must never turn the run green.
 
-    If the rollback step exited zero the run would go green, marking an unpromotable commit as
-    deployed: the next push would diff against a sha that never passed its gate and skip the
-    deploy entirely, so the failure would compound silently.
+    A green run would mark an unpromotable commit as deployed: the next push diffs against a sha
+    that never passed its gate and skips the deploy entirely, so the failure compounds silently.
     """
-    script = _deploy_steps()[_step_index("Restore the previous release")]["run"]
-    assert script.rstrip().endswith("exit 1")
-    assert "is NOT deployed" in script
+    code, deployed, logged = _run_rollback(
+        previous_sha=PREVIOUS,
+        is_ancestor=True,
+        health=_health(PREVIOUS, "9-1-rollback"),
+    )
+
+    assert f"sha={PREVIOUS}" in deployed, f"the redeploy did not carry the restored sha: {deployed}"
+    assert "id=9-1-rollback" in deployed
+    assert "flash/serving/app/modal_app.py" in deployed
+    assert code != 0, "a completed rollback exited 0 -- this commit would be recorded as deployed"
+    assert "is NOT deployed" in logged
 
 
-def test_rollback_refuses_a_previous_release_it_cannot_verify():
-    """An empty or non-ancestor sha must stop, not redeploy an unknown tree.
+@pytest.mark.parametrize(
+    ("health", "why"),
+    [
+        (_health(CURRENT, "9-1"), "the broken release is still live"),
+        (_health(CURRENT, "9-1-rollback"), "stale sha under the rollback's own attempt id"),
+        (_health(PREVIOUS, "9-1"), "restored sha under the FORWARD deploy's attempt id"),
+        (_health(PREVIOUS, "9-1-rollback", ok=False), "right identity, but not serving"),
+    ],
+)
+def test_a_rollback_that_never_reports_the_restored_release_is_not_a_rollback(health, why):
+    """`modal deploy` exiting zero says the app was REPLACED, not that it came up serving.
 
-    Silently skipping the restore would report a rollback that never happened while the broken
-    release keeps serving, which is worse than a loud failure telling an operator to intervene.
+    This is the case a substring test cannot see: the identity comparison is present in the script
+    either way, so what matters is that a live app failing it is rejected rather than read as a
+    completed restore.
+
+    Each field is failed ALONE. A single fixture with everything wrong lets any one surviving check
+    mask the others -- disabling the sha comparison outright left such a test green, because the
+    attempt id was stale in the same body and failed first. Three of these four cases exist only to
+    make each comparison independently load-bearing.
     """
-    script = _deploy_steps()[_step_index("Restore the previous release")]["run"]
-    assert 'if [ -z "$PREVIOUS_SHA" ]; then' in script
-    assert "merge-base --is-ancestor" in script
-    assert "Restore production manually" in script
+    code, deployed, logged = _run_rollback(previous_sha=PREVIOUS, is_ancestor=True, health=health)
+
+    assert f"sha={PREVIOUS}" in deployed, "the restore was never attempted"
+    assert code != 0, f"a rollback was accepted with {why}"
+    assert "never reported the restored release" in logged
+    assert "intervene manually" in logged
+
+
+@pytest.mark.parametrize(
+    ("previous_sha", "is_ancestor", "expected"),
+    [
+        ("", True, "NO previous release was recorded"),
+        (PREVIOUS, False, "is not an ancestor"),
+    ],
+)
+def test_rollback_refuses_a_previous_release_it_cannot_verify(previous_sha, is_ancestor, expected):
+    """An empty or non-ancestor sha must stop WITHOUT deploying, not redeploy an unknown tree.
+
+    Asserting the guard's text alone would pass on a script that printed the refusal and redeployed
+    anyway. The load-bearing assertion is that `modal` was never invoked.
+    """
+    code, deployed, logged = _run_rollback(
+        previous_sha=previous_sha, is_ancestor=is_ancestor, health=_health(PREVIOUS, "9-1-rollback")
+    )
+
+    assert deployed == "", f"an unverifiable predecessor was redeployed anyway: {deployed}"
+    assert code != 0
+    assert expected in logged
+    assert "Restore production manually" in logged

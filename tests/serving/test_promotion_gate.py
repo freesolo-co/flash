@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import pathlib
 from unittest import mock
 
@@ -22,6 +23,7 @@ from flash.serving.promotion.gate import (
     HEALTH_UNREACHABLE,
     evaluate_promotion,
 )
+from flash.serving.src.accounting.usage_outbox import DurableUsageOutbox
 
 SHA = "94210a323f9beaa713241e305f178b364848446d"
 DEPLOYMENT_ID = "12345-1"
@@ -171,6 +173,32 @@ def test_a_transient_stall_that_recovers_is_given_time_to_clear():
     assert calls.count("accounting") == 3
 
 
+def test_the_accounting_deadline_outlives_a_lease_a_deploy_itself_expires():
+    """The deadline is not a round number, it is a function of the outbox's lease.
+
+    `modal deploy` replaces the router containers. A container holding a claimed row when it goes
+    away leaves that lease to EXPIRE rather than releasing it, so a deploy manufactures the exact
+    `expired_leases > 0` signal `stalled` reads -- on a perfectly healthy release. The replacement
+    worker reclaims it on its next sweep, which is why the gate polls instead of failing on the
+    first read. But that only saves the promotion if the deadline outlives the lease: at or below
+    it, the gate would stop looking before the recovery it is waiting for could possibly have
+    happened, and every deploy would roll a healthy release back to its predecessor.
+
+    Asserted against the canonical default rather than a restated number, so raising the outbox's
+    lease turns into a red test here instead of a rollback on the next production deploy.
+    """
+    lease_seconds = (
+        inspect.signature(DurableUsageOutbox.__init__).parameters["lease_seconds"].default
+    )
+
+    assert lease_seconds * 2 < gate_module._DEFAULT_ACCOUNTING_DEADLINE_SECONDS, (
+        f"the accounting deadline is {gate_module._DEFAULT_ACCOUNTING_DEADLINE_SECONDS}s but the "
+        f"outbox leases for {lease_seconds}s. A deploy expires leases by replacing the containers "
+        "holding them; the gate must outlast at least one full reclaim cycle or it rolls back "
+        "healthy releases."
+    )
+
+
 def test_concurrent_traffic_does_not_fail_the_promotion():
     """The snapshot is deployment-wide, so unrelated in-flight rows are always present.
 
@@ -213,7 +241,19 @@ def test_incomplete_configuration_fails_closed_without_naming_the_value(monkeypa
 
 
 def test_a_missing_base_url_does_not_deploy_a_gate_against_nothing(monkeypatch, capsys):
+    """The URL specifically, with EVERY other required variable present.
+
+    Deleting `SERVING_BASE_URL` from an already-empty environment proves nothing: the test passed
+    with the base-url check deleted outright, because the other required variables were empty too
+    and one of them failed first. The whole environment is populated here so the URL is the only
+    thing missing, which is exactly the shape of the real hazard -- a workflow that drops the URL
+    from the gate step would otherwise probe `/healthz` at a relative path and read the failure as
+    an unhealthy release rather than as its own misconfiguration.
+    """
+    for name, value in _gate_step_env().items():
+        monkeypatch.setenv(name, value)
     monkeypatch.delenv("SERVING_BASE_URL", raising=False)
+
     assert gate_module.main([]) == 1
     assert GATE_CONFIG_INCOMPLETE in capsys.readouterr().err
 
