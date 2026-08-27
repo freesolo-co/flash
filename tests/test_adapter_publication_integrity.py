@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.engine.worker.io.adapter_publication as publication
 import flash.engine.worker.io.hf as worker_hf
 from flash.adapters.artifacts import loadable_adapter_weight_files
 
@@ -35,6 +36,7 @@ class _RecordingHfApi:
         self.race_before_commit = False
         self.post_commit_listing_failures = 0
         self.after_preupload = None
+        self.after_repo_info = None
 
     @property
     def files(self) -> set[str]:
@@ -54,6 +56,8 @@ class _RecordingHfApi:
             self.after_preupload()
 
     def repo_info(self, repo_id, repo_type):
+        if self.after_repo_info is not None:
+            self.after_repo_info()
         return SimpleNamespace(sha=self._head)
 
     def list_repo_files(self, repo_id, repo_type, revision=None):
@@ -338,6 +342,26 @@ def test_sidecar_mutation_after_preupload_is_rejected_before_commit(tmp_path, mo
     assert rec.commits == []
 
 
+def test_sidecar_mutation_while_resolving_the_parent_is_rejected_before_commit(
+    tmp_path, monkeypatch
+):
+    # the parent lookup and the current-file listing both round-trip to the hub after the
+    # preupload revalidation, so the snapshot must be revalidated again before the commit is
+    # built from those descriptors.
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+    adapter = tmp_path / "adapter"
+    _write_single_adapter(adapter)
+    sidecar = adapter / "base_model_provenance.json"
+    sidecar.write_bytes(b'{"resolved_commit":"aaaaaaaa"}')
+    rec.after_repo_info = lambda: sidecar.write_bytes(b'{"resolved_commit":"bbbbbbbb"}')
+
+    with pytest.raises(worker_hf.RequiredSaveError, match="changed after hashing"):
+        worker.hf_upload_folder(str(adapter), "adapter", required=True)
+
+    assert rec.commits == []
+
+
 def test_nested_directory_rename_and_replacement_fails_before_preupload(tmp_path, monkeypatch):
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec)
@@ -346,7 +370,7 @@ def test_nested_directory_rename_and_replacement_fails_before_preupload(tmp_path
     nested = adapter / "metadata"
     nested.mkdir()
     (nested / "sidecar.json").write_bytes(b"original")
-    original_context = worker.local_snapshot_root
+    original_context = publication.local_snapshot_root
 
     @contextlib.contextmanager
     def swap_after_scan(local_dir):
@@ -356,7 +380,7 @@ def test_nested_directory_rename_and_replacement_fails_before_preupload(tmp_path
             (nested / "sidecar.json").write_bytes(b"replacement")
             yield snapshot
 
-    monkeypatch.setattr(worker, "local_snapshot_root", swap_after_scan)
+    monkeypatch.setattr(publication, "local_snapshot_root", swap_after_scan)
 
     with pytest.raises(
         worker.RequiredSaveError, match="directory changed after scanning: metadata"
@@ -434,7 +458,7 @@ def test_fifo_replacement_is_opened_nonblocking_before_validation(tmp_path, monk
 
 
 def test_commit_operations_keep_the_hub_union_annotation():
-    source = inspect.getsource(worker_hf._replace_adapter_folder)
+    source = inspect.getsource(publication.replace_adapter_folder)
     tree = ast.parse(source)
     annotations = {
         ast.unparse(node.target): ast.unparse(node.annotation)
