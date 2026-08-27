@@ -327,12 +327,12 @@ def _spec_raw(ref: str) -> dict:
 
 
 def test_init_from_adapter_parses_and_roundtrips() -> None:
-    """The canonical short ref (`<run_id>`) is accepted and survives the JSON round-trip."""
-    spec = spec_from_dict(_spec_raw("run-x"), run_id="grpo-x")
-    assert spec.train.init_from_adapter == "run-x"
-    assert JobSpec.from_dict(spec.to_dict()).train.init_from_adapter == "run-x"
+    """The canonical final checkpoint survives the JSON round-trip."""
+    spec = spec_from_dict(_spec_raw("run-x/final"), run_id="grpo-x")
+    assert spec.train.init_from_adapter == "run-x/final"
+    assert JobSpec.from_dict(spec.to_dict()).train.init_from_adapter == "run-x/final"
     # absent -> empty string (train fresh from base)
-    raw = _spec_raw("run-x")
+    raw = _spec_raw("run-x/final")
     raw["train"].pop("init_from_adapter")
     assert spec_from_dict(raw, run_id="grpo-y").train.init_from_adapter == ""
 
@@ -366,16 +366,16 @@ def test_init_from_adapter_rejects_non_short_refs(bad_ref: str) -> None:
 
 
 def test_init_from_adapter_accepts_only_the_two_canonical_shapes() -> None:
-    """Pin the warm-start grammar: `train.init_from_adapter` accepts EXACTLY `<run_id>` and
-    `<run_id>/step-N` — nothing else. This is the one public shape the control plane also
-    speaks; keeping the client's accepted set identical is what prevents a repeat of the
-    0.2.34 CLI-vs-control-plane skew (CLI wanted the long `<owner>/<repo>:<phase>/<run_id>`
-    storage ref, the server wanted the bare run id, and no single string satisfied both)."""
-    for good in ("run-x", "run-x/step-40"):
+    """Pin warm starts to permanent final or saved-step checkpoint IDs."""
+    for good in ("run-x/final", "run-x/step-40"):
         assert spec_from_dict(_spec_raw(good), run_id="grpo-x").train.init_from_adapter == good
-    # Anything with a second path segment other than a single /step-N is rejected — in
-    # particular the doubled `<run_id>/<run_id>/step-N` form and the legacy storage ref.
-    for bad in ("run-x/run-x/step-40", "run-x/step-40/step-1", "Freesolo-Co/repo:sft/run-x"):
+    # Anything with a second path segment other than /final or a single /step-N is rejected.
+    for bad in (
+        "run-x",
+        "run-x/run-x/step-40",
+        "run-x/step-40/step-1",
+        "Freesolo-Co/repo:sft/run-x",
+    ):
         with pytest.raises(ConfigError, match="run_id"):
             spec_from_dict(_spec_raw(bad), run_id="grpo-x")
 

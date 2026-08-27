@@ -30,22 +30,22 @@ QWEN = "Qwen/Qwen3.5-9B"
 
 def _record() -> AdapterRecord:
     run_id = "run-a"
-    revision = hashlib.sha1(run_id.encode()).hexdigest()
+    checkpoint_id = f"{run_id}/final"
     return AdapterRecord.model_validate(
         {
-            "adapter_id": f"{run_id}@final.{revision}",
+            "adapter_id": checkpoint_id,
             "repo_id": "org/run-a",
             "org_id": "org-1",
             "base_model": QWEN,
-            "checkpoint": run_id,
+            "checkpoint": checkpoint_id,
             "status": "ready",
             "thinking": False,
-            "metadata": {
-                "record_type": "revision",
-                "run_id": run_id,
-                "checkpoint_step": None,
-                "hf_revision": revision,
-            },
+            "run_id": run_id,
+            "checkpoint_step": None,
+            "artifact_revision": hashlib.sha1(run_id.encode()).hexdigest(),
+            "artifact_digest": hashlib.sha256(b"run-a-artifact").hexdigest(),
+            "artifact_fingerprint": hashlib.sha256(b"run-a-binding").hexdigest(),
+            "lora_rank": 16,
         }
     )
 
@@ -101,11 +101,13 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
         record = _record()
 
         class Lookup:
-            async def resolve(self, _adapter_id: str):
+            async def resolve(self, _adapter_id: str, *, org_id: str | None = None):
+                del org_id
                 return record, record
 
         class Context:
             lookup = Lookup()
+            traffic_org_id = staticmethod(ServingContext.traffic_org_id)
 
             async def authorize_inference(self, *_args):
                 return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
@@ -176,7 +178,8 @@ def test_non_streaming_disconnect_after_engine_completion_finishes_finalization_
         store.finalize = blocking_finalize  # type: ignore[method-assign]
 
         class Lookup:
-            async def resolve(self, _adapter_id: str):
+            async def resolve(self, _adapter_id: str, *, org_id: str | None = None):
+                del org_id
                 return record, record
 
         class Context(ServingContext):

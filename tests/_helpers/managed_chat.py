@@ -34,16 +34,15 @@ def _deployed_chat_run(api):
     status = runner_status.get_status(run_id)
     status.state = "done"
     runner_state._save_status(status)
-    revision = f"{run_id}@final." + "a" * 40
+    checkpoint_id = f"{run_id}/final"
     runner_transitions.mark_deployed(
         run_id,
         {
             "state": "ready",
             "endpoint_name": "https://serve.example",
-            "adapter_revision": revision,
+            "checkpoint_id": checkpoint_id,
+            "openai_model": checkpoint_id,
         },
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
+        verification_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
     return key, run_id

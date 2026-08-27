@@ -12,6 +12,7 @@ what the code does.
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
@@ -123,6 +124,40 @@ def test_client_modules_import_without_any_third_party_package():
         + ", ".join(f"{f['module']} needs {f['missing']}" for f in failures)
         + ". Move the import inside the function that uses it, or list the module in "
         "SERVER_ONLY_PREFIXES if it is genuinely server-only or worker-only."
+    )
+
+
+def test_serving_contract_imports_only_shared_identity_modules():
+    contract = REPO_ROOT / "flash" / "serve" / "contract"
+    allowed_flash_prefixes = ("flash.schema", "flash.serve.contract")
+    violations: list[str] = []
+
+    for path in sorted(contract.glob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                modules = [node.module]
+            else:
+                continue
+            for module in modules:
+                allowed_flash = any(
+                    module == prefix or module.startswith(prefix + ".")
+                    for prefix in allowed_flash_prefixes
+                )
+                root = module.split(".", 1)[0]
+                if (
+                    module != "__future__"
+                    and root not in sys.stdlib_module_names
+                    and not allowed_flash
+                ):
+                    violations.append(f"{path.name}: {module}")
+
+    assert violations == [], (
+        "flash.serve.contract is shared identity and HTTP protocol; move module-level deployment, "
+        "control, provisioning, app, runtime, or provider-aware imports to their owning package: "
+        + ", ".join(violations)
     )
 
 

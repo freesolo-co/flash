@@ -22,12 +22,12 @@ def _parse(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _args(provider: str = "modal") -> argparse.Namespace:
+def _args() -> argparse.Namespace:
     base = [
         "serve",
         "status",
         "--provider",
-        provider,
+        "modal",
         "--model",
         MODEL,
         "--run",
@@ -43,53 +43,39 @@ def _args(provider: str = "modal") -> argparse.Namespace:
         "--lora-rank",
         "32",
     ]
-    if provider == "modal":
-        base.extend(
-            [
-                "--modal-workspace",
-                "workspace",
-                "--modal-environment",
-                "dev",
-                "--modal-region",
-                "us-east",
-            ]
-        )
-    else:
-        base.extend(
-            [
-                "--runpod-account",
-                "account1",
-                "--runpod-data-center",
-                "US-KS-2",
-            ]
-        )
+    base.extend(
+        [
+            "--modal-workspace",
+            "workspace",
+            "--modal-environment",
+            "dev",
+            "--modal-region",
+            "us-east",
+        ]
+    )
     return _parse(base)
 
 
-def _args_with_identity(
-    monkeypatch: pytest.MonkeyPatch, provider: str = "modal"
-) -> argparse.Namespace:
+def _args_with_identity(monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace:
     from flash.cli.commands.serving.identity import encode_deployment_identity
 
-    args = _args(provider)
+    args = _args()
     _stub_resolution(monkeypatch)
     args.deployment_identity = encode_deployment_identity(serve_deploy._deployment_bundle(args))
     return args
 
 
-def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str, str, str, str]:
+def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str, str, str]:
     values = (
         "modal-token-id-do-not-print",
         "modal-token-secret-do-not-print",
-        "runpod-api-key-do-not-print",
         "inference-key-do-not-print",
         "artifact-token-do-not-print",
     )
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_ID_ENV, values[0])
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_SECRET_ENV, values[1])
-    monkeypatch.setenv(serve_deploy.RUNPOD_API_KEY_ENV, values[2])
-    monkeypatch.setenv(serve_deploy.INFERENCE_KEY_ENV, values[3])
-    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, values[4])
+    monkeypatch.setenv(serve_deploy.INFERENCE_KEY_ENV, values[2])
+    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, values[3])
     return values
 
 
@@ -208,36 +194,6 @@ def test_status_uses_deploy_time_identity_after_the_model_tip_advances(
     assert seen == [deployed_name]
 
 
-def test_status_without_inference_key_reports_provider_observable_states(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    observed: list[tuple[str, object]] = []
-
-    def _modal(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        observed.append(("modal", secrets))
-        return _result(bundle, "absent")
-
-    def _runpod(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        observed.append(("runpod", secrets))
-        return _result(bundle, "provisioning")
-
-    _stub_environment(monkeypatch)
-    monkeypatch.delenv(serve_deploy.INFERENCE_KEY_ENV)
-    modal_args = _args_with_identity(monkeypatch, "modal")
-    runpod_args = _args_with_identity(monkeypatch, "runpod")
-    monkeypatch.setattr(
-        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
-        _modal,
-    )
-    monkeypatch.setattr(
-        "flash.serve.provisioning.runpod.operations.reconcile_runpod_deployment", _runpod
-    )
-
-    assert cmd_serve_status(modal_args) == 0
-    assert cmd_serve_status(runpod_args) == 0
-    assert observed == [("modal", None), ("runpod", None)]
-
-
 @pytest.mark.parametrize(
     "retired_model",
     ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"],
@@ -246,7 +202,7 @@ def test_status_uses_immutable_identity_for_removed_model(
     monkeypatch: pytest.MonkeyPatch, retired_model: str
 ) -> None:
     _stub_environment(monkeypatch)
-    args = _args("modal")
+    args = _args()
     args.deployment_identity = _historical_identity(monkeypatch, args, retired_model)
     args.model = retired_model
     seen = []
@@ -262,33 +218,6 @@ def test_status_uses_immutable_identity_for_removed_model(
 
     assert cmd_serve_status(args) == 0
     assert seen == [retired_model]
-
-
-def test_status_routes_to_the_named_read_only_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[str] = []
-
-    def _modal(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        calls.append("modal")
-        return _result(bundle, "ready")
-
-    def _runpod(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        calls.append("runpod")
-        return _result(bundle, "ready")
-
-    _stub_environment(monkeypatch)
-    modal_args = _args_with_identity(monkeypatch, "modal")
-    runpod_args = _args_with_identity(monkeypatch, "runpod")
-    monkeypatch.setattr(
-        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
-        _modal,
-    )
-    monkeypatch.setattr(
-        "flash.serve.provisioning.runpod.operations.reconcile_runpod_deployment", _runpod
-    )
-
-    assert cmd_serve_status(modal_args) == 0
-    assert cmd_serve_status(runpod_args) == 0
-    assert calls == ["modal", "runpod"]
 
 
 @pytest.mark.parametrize(
@@ -392,3 +321,24 @@ def test_parser_wires_serve_status_without_credential_flags() -> None:
     help_text = parser.format_help() + status.format_help()
     for forbidden in ("--token", "--api-key", "--password", "--credential"):
         assert forbidden not in help_text
+
+
+def test_status_without_inference_key_reports_provider_observable_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[object] = []
+
+    def _modal(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        observed.append(secrets)
+        return _result(bundle, "absent")
+
+    _stub_environment(monkeypatch)
+    monkeypatch.delenv(serve_deploy.INFERENCE_KEY_ENV)
+    args = _args_with_identity(monkeypatch)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
+        _modal,
+    )
+
+    assert cmd_serve_status(args) == 0
+    assert observed == [None]

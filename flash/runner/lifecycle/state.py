@@ -107,7 +107,9 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
         return None
     if not spec.train.hf_repo:
         return None
-    return status.run_id
+    from flash.schema import format_checkpoint_ref
+
+    return format_checkpoint_ref(status.run_id, None)
 
 
 # Heartbeat stages that mean the worker has entered training (GPU work underway). The per-step
@@ -134,6 +136,14 @@ class RunStatus:
     adapter_ref: str | None = None
     deployment: dict | None = None
     remote: dict | None = None
+    # private canonical attempt proofs stamped once when each lifecycle milestone is first observed.
+    lifecycle_started_attempt: int | None = None
+    lifecycle_progressed_attempt: int | None = None
+    # exact provider handle whose teardown was confirmed independently of retained billing identity.
+    cleanup_confirmed_remote: dict | None = None
+    # exact torn-down provider handle retained until both delayed realized-cost reconciliation and any
+    # pending customer charge complete. it is private and is not an active resource.
+    realized_cost_remote: dict | None = None
     # Instance providers (lambda/vast) configured WHEN THIS RUN WAS SUBMITTED — the set that could have
     # owned a pre-handle non-idempotent create. Recovery's phantom guard (_confirm_run_clear) fails
     # closed for any of these that is no longer configurable (so it can't ENUMERATE to prove clear),
@@ -174,6 +184,10 @@ class RunStatus:
         data = _status_storage_dict(self)
         data["spec"] = _public_status_spec(data.get("spec"))
         data.pop("report_sequence", None)
+        data.pop("lifecycle_started_attempt", None)
+        data.pop("lifecycle_progressed_attempt", None)
+        data.pop("cleanup_confirmed_remote", None)
+        data.pop("realized_cost_remote", None)
         # internal warm-start preparation (storage locators, digests) never leaves the server
         data.pop("effective_preparation", None)
         heartbeat = data.get("last_heartbeat")
