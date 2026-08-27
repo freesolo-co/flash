@@ -1249,6 +1249,88 @@ def test_unconfirmed_abort_marks_runtime_unhealthy_and_rejects_new_work(
     assert abort_calls == [("request-unconfirmed", False)]
 
 
+def test_unconfirmed_sibling_abort_does_not_leak_a_healthy_request(monkeypatch) -> None:
+    """a concurrent unconfirmed abort must not skip another request's own cleanup."""
+
+    _set_short_cancellation_grace(monkeypatch)
+    images: list[Any] = []
+
+    class _Image:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    def prepare(*_args, **_kwargs):
+        image = _Image()
+        images.append(image)
+        return ([{"role": "user", "content": [{"type": "image"}]}], [image])
+
+    class _GatedStream:
+        def __init__(self, output: Any) -> None:
+            self.output = output
+            self.gate = asyncio.Event()
+            self.started = asyncio.Event()
+            self.sent = False
+            self.close_calls = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.sent:
+                raise StopAsyncIteration
+            self.started.set()
+            await self.gate.wait()
+            self.sent = True
+            return self.output
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    monkeypatch.setattr("flash.serve.runtime.prompt.prepare_multimodal_request", prepare)
+
+    def _image_request(request_id: str) -> GenerationRequest:
+        return GenerationRequest(
+            messages=[{"role": "user", "content": [{"type": "image", "image": "ignored"}]}],
+            request_id=request_id,
+        )
+
+    async def scenario() -> tuple[int, int, tuple[str, ...]]:
+        runtime = VllmLoraRuntime(EngineConfig(model="model", image_limit=1))
+        await runtime.start()
+        engine = _Engine.latest
+        assert engine is not None
+        engine.abort_outcomes.append(False)
+        cancelled_stream = _GatedStream(_output("cancelled", [1]))
+        healthy_stream = _GatedStream(_output("healthy", [2]))
+        streams = [cancelled_stream, healthy_stream]
+        monkeypatch.setattr(runtime, "_generate_stream", lambda *_args: streams.pop(0))
+
+        cancelled_task = asyncio.create_task(runtime.generate(_image_request("sibling-cancelled")))
+        await cancelled_stream.started.wait()
+        healthy_task = asyncio.create_task(runtime.generate(_image_request("sibling-healthy")))
+        await healthy_stream.started.wait()
+
+        cancelled_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_task
+        assert runtime.health().unhealthy_reason is not None
+
+        healthy_stream.gate.set()
+        result = await healthy_task
+        assert result.text == "healthy"
+        owned = runtime.health().owned_request_ids
+        await runtime.close()
+        return healthy_stream.close_calls, images[1].close_calls, owned
+
+    stream_closes, image_closes, owned = asyncio.run(scenario())
+    assert stream_closes == 1
+    assert image_closes == 1
+    assert "sibling-healthy" not in owned
+
+
 def test_abort_timeout_and_cancellation_resistant_generation_are_bounded(monkeypatch) -> None:
     _set_short_cancellation_grace(monkeypatch)
 

@@ -338,12 +338,12 @@ class VllmLoraRuntime:
                     await self._notify_if_dead()
                     raise
                 finally:
-                    if not cancelled and self._unhealthy_reason is None:
+                    if not cancelled:
                         try:
                             await self._close_generation_resources(output_stream, prompt)
                         finally:
                             released = True
-                    elif cancelled and released:
+                    elif released:
                         await self._close_generation_resources(None, prompt)
             if final_output is None:
                 raise RuntimeNotReadyError("vllm returned no output")
@@ -443,12 +443,12 @@ class VllmLoraRuntime:
                     await self._notify_if_dead()
                     raise
                 finally:
-                    if not cancelled and self._unhealthy_reason is None:
+                    if not cancelled:
                         try:
                             await self._close_generation_resources(output_stream, prompt)
                         finally:
                             released = True
-                    elif cancelled and released:
+                    elif released:
                         await self._close_generation_resources(None, prompt)
         finally:
             if not dispatched and not released:
