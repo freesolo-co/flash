@@ -409,7 +409,20 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
             "allocated_usable_vram_gb": _candidate_usable_vram_gb(chosen),
             "on_last_gpu": on_last_gpu,
         }
-        if persist_claimed_remote(ctx.spec.run_id, claim, persisted):
+        try:
+            claimed = persist_claimed_remote(ctx.spec.run_id, claim, persisted)
+        except Exception:
+            # the resource exists the moment the provider returned it, but nothing durable names it
+            # yet. `_submit_provider` turns this into a retryable `poll_error`, so unless the handle
+            # is torn down or recorded here it is unreachable: the retry provisions a second worker
+            # against the same run artifacts while this one keeps running.
+            deleted = False
+            with contextlib.suppress(Exception):
+                deleted = _lifecycle._strict_teardown_handle(remote, ctx.spec.run_id)
+            if not deleted:
+                _preserve_cleanup_remote(ctx.spec.run_id, persisted)
+            raise
+        if claimed:
             ctx.last_handle.clear()
             ctx.last_handle.update(persisted)
             ctx.current_claim = None

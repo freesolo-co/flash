@@ -1572,6 +1572,103 @@ def _settled_attempt(run_id, tmp_path, monkeypatch, failure):
     return claim, plan
 
 
+def test_replacement_reservation_clears_the_consumed_teardown_marker(monkeypatch, tmp_path):
+    """Consuming `cleanup_confirmed_remote` must clear it in the same atomic reservation.
+
+    Reservation accepts a confirmed-teardown remote as the expected owner. If the marker survives,
+    a crash before the replacement handle persists makes startup classify the run as confirmed-handle
+    recovery: it reattaches the old attempt, its reservation loses to the already-advanced counter,
+    and the run is left in `provisioning` with no handleless pass scheduled.
+    """
+    from flash.core.spec import JobSpec
+    from flash.runner.accounting.reconciliation import _compare_and_confirm_remote_teardown
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="consumed-teardown-marker", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    )
+    claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert claim is not None
+    remote = {
+        "provider": "lambda",
+        "instance_id": "i-teardown",
+        "attempt": claim.attempt,
+        "started_ts": 1.0,
+        "gpu": "B200",
+        "hourly_usd": 1.0,
+        "instance_type": "gpu_1x_b200",
+        "region": "us-west-1",
+        "name": "worker",
+    }
+    assert runner_attempts.persist_claimed_remote(spec.run_id, claim, remote)
+    persisted_remote = runner_status._load_status_json(spec.run_id)["remote"]
+
+    from flash.runner.supervise.retry_decision import FailureObservation
+
+    plan = runner_attempts.decide_attempt_failure(
+        spec.run_id,
+        claim_token=claim.token,
+        expected_remote=persisted_remote,
+        observation=FailureObservation("poll_error"),
+        attempt=claim.attempt,
+    )
+    assert plan is not None
+    assert plan.retry is True
+    # teardown is confirmed against the still-persisted remote, which is what leaves the marker.
+    assert _compare_and_confirm_remote_teardown(spec.run_id, persisted_remote)
+    status = runner_status.get_status(spec.run_id)
+    assert status.remote is None
+    assert status.cleanup_confirmed_remote is not None
+
+    replacement = runner_attempts.reserve_verified_attempt_launch(
+        spec.run_id,
+        expected_remote=status.cleanup_confirmed_remote,
+        expected_next_attempt=claim.attempt + 1,
+        transition_state="provisioning",
+    )
+    assert replacement is not None
+    settled = runner_status.get_status(spec.run_id)
+    assert settled.remote is None
+    # the consumed marker is gone, so startup cannot misread this as confirmed-handle recovery.
+    assert settled.cleanup_confirmed_remote is None
+    # the accounting copy is carried separately and must survive.
+    assert settled.realized_cost_remote is not None
+
+
+def test_setup_failure_releases_the_reserved_launch_claim(monkeypatch, tmp_path):
+    """A raise during `_run_job` setup must still consume a claim handleless recovery reserved.
+
+    The opd preflight, the initial status read, and the `provisioning` update all run before the
+    submission path exists. `_run_job_background` catches whatever they raise but cannot consume the
+    claim itself, so an unconsumed claim holds its flock for the process lifetime and reads as live
+    to every later observer, which then refuses to resume a run nobody is working on.
+    """
+    from flash.core.spec import JobSpec
+    from flash.runner.supervise import lifecycle
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="setup-raise-claim", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+    )
+    claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert claim is not None
+    assert runner_attempts.claim_is_live(spec.run_id, claim)
+
+    def _raise_preflight(_spec):
+        raise RuntimeError("image preflight failed during setup")
+
+    monkeypatch.setattr("flash.content.multimodal.preflight_validate_image_opd", _raise_preflight)
+
+    # this is the real entry point handleless recovery uses, and it swallows the exception.
+    lifecycle._run_job_background(spec, reserved_claim=claim)
+
+    raw = runner_status._load_status_json(spec.run_id)
+    assert runner_state._ACTIVE_LAUNCH_CLAIM_KEY not in raw
+    assert not runner_attempts.claim_is_live(spec.run_id, claim)
+
+
 def test_settled_terminal_attempt_still_owes_the_run_a_terminal_outcome(monkeypatch, tmp_path):
     """A caller that settled a terminal decision must still be the one to fail an unwound run.
 
@@ -4042,6 +4139,100 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
         assert raw[runner_state._CLEANUP_REMOTES_KEY] == [
             _cleanup_remote(_runpod_remote("endpoint-race", "job-race", attempt=0))
         ]
+
+
+def test_handle_persistence_failure_still_tears_down_the_created_resource(monkeypatch, tmp_path):
+    """A persistence raise must not hide a provider resource that already exists.
+
+    The endpoint is live the moment the provider returns it. If `ctx.last_handle` is only populated
+    after a successful status write, an fsync or replace failure leaves it empty, the retry skips
+    `_cleanup_previous_attempt`, and a second endpoint runs against the same run artifacts.
+    """
+    import contextlib
+    import io
+
+    import flash.providers.core.allocator as allocator
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate
+    from flash.runner.supervise import lifecycle, seed_submission
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="persist-raise-teardown",
+            model="Qwen/Qwen3.5-9B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_retries=0),
+        )
+    )
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+        _next_attempt=0,
+    )
+    # lambda, not runpod: a runpod handle carries an `endpoint_id`, so `gc_seen_endpoints` already
+    # reaps it independently and would mask whether the callback rescued the resource at all.
+    candidate = Candidate("lambda", "A100", 1.0, 40)
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *_args, **_kwargs: Allocation(
+            provider="lambda",
+            gpu="A100",
+            hourly_usd=1.0,
+            min_vram_gb=40,
+            candidates=(candidate,),
+        ),
+    )
+
+    def _raise_on_persist(*_args, **_kwargs):
+        raise OSError("status write failed before becoming durable")
+
+    monkeypatch.setattr(seed_submission, "persist_claimed_remote", _raise_on_persist, raising=False)
+    monkeypatch.setattr("flash.runner.lifecycle.attempts.persist_claimed_remote", _raise_on_persist)
+
+    class Provider:
+        supports_weight_cache = False
+
+        def __init__(self):
+            self.submits = []
+            self.teardown = []
+
+        def submit_run(self, _spec, _seed, *, attempt, on_handle, **_kwargs):
+            self.submits.append(attempt)
+            on_handle(_lambda_remote("instance-persist", attempt=attempt))
+            raise AssertionError("handle callback must not return after a persistence failure")
+
+        def cancel(self, handle):
+            self.teardown.append(("cancel", handle.to_dict()))
+
+        def destroy(self, handle):
+            self.teardown.append(("destroy", handle.to_dict()))
+            # teardown cannot be confirmed, so only a durable cleanup record keeps the resource
+            # reachable. this is the shape that distinguishes rescuing the handle from losing it.
+            raise RuntimeError("endpoint deletion unconfirmed")
+
+    provider = Provider()
+    monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
+
+    with contextlib.suppress(Exception):
+        lifecycle._submit_seed_supervised(
+            spec,
+            spec.seed,
+            io.StringIO(),
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
+
+    # the created endpoint must stay reachable: teardown was refused, so it has to be recorded.
+    raw = runner_status._load_status_json(spec.run_id)
+    recorded = raw.get(runner_state._CLEANUP_REMOTES_KEY) or []
+    assert provider.submits == [0]
+    assert [record.get("instance_id") for record in recorded] == ["instance-persist"], (
+        "a created provider resource vanished after a persistence failure"
+    )
 
 
 def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypatch, tmp_path):

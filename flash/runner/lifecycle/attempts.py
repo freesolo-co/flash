@@ -298,6 +298,13 @@ def _reserve_attempt_launch(
                 current += 1
             if expected_remote is not None:
                 status.remote = None
+                # a confirmed-teardown reservation consumes `cleanup_confirmed_remote`, so the
+                # marker has to go with it. leaving it makes a crash before the replacement handle
+                # look like confirmed-handle recovery: attach reattaches the old attempt, its
+                # reservation loses to the advanced counter, and the run sits in `provisioning`
+                # with no handleless pass scheduled. accounting keeps its own `realized_cost_remote`.
+                if confirmed_matches:
+                    status.cleanup_confirmed_remote = None
             if transition_state is not None:
                 status.state = transition_state
             status.updated_at = time.time()

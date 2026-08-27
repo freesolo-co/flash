@@ -55,23 +55,23 @@ def _run_job(
     reserved_claim: AttemptLaunchClaim | None = None,
 ) -> None:
     from flash.content.multimodal import preflight_validate_image_opd
-
-    preflight_validate_image_opd(spec)
-
     from flash.runner.lifecycle.state import RUNS_DIR, TERMINAL_STATES
     from flash.runner.lifecycle.status import _update, get_status
     from flash.runner.supervise.lifecycle import _run_job_inner
     from flash.runner.supervise.recovery import _gc_run_endpoints
 
-    # Cancel can land before this thread starts; don't overwrite a terminal state with provisioning.
-    if get_status(spec.run_id).state in TERMINAL_STATES:
-        # a claim reserved by handleless recovery is consumed here too: this return never reaches
-        # the submission path's own cleanup, and an unconsumed claim blocks every later launch.
-        _consume_reserved_claim(spec.run_id, reserved_claim)
-        return
-    _update(spec.run_id, "provisioning")
-    log_path = os.path.join(RUNS_DIR, f"{spec.run_id}.log")
+    # setup runs inside the cleanup scope: a raise from the opd preflight, the status read, or the
+    # provisioning update is caught by `_run_job_background`, which cannot consume the claim itself.
+    # an unconsumed claim holds its flock for the process lifetime and reads as live to every
+    # observer, so handleless recovery refuses to resume a run nobody is working on.
     try:
+        preflight_validate_image_opd(spec)
+
+        # Cancel can land before this thread starts; don't overwrite a terminal state with provisioning.
+        if get_status(spec.run_id).state in TERMINAL_STATES:
+            return
+        _update(spec.run_id, "provisioning")
+        log_path = os.path.join(RUNS_DIR, f"{spec.run_id}.log")
         while True:
             try:
                 _run_job_inner(
