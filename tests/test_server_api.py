@@ -1,8 +1,8 @@
 """Control-plane API: freesolo bearer auth, multi-tenant isolation (CPU-only).
 
 User auth is freesolo API keys only (no native key system). Tests run offline: the `api` fixture
-monkeypatches ``auth._freesolo_verify`` to accept any token shaped like a freesolo user key, so each
-distinct token resolves to its own run-ownership identity via ``db.ensure_external_key``.
+monkeypatches ``auth._freesolo_verify`` to return an identity for tokens shaped like freesolo user
+keys, so each distinct token resolves to its own run-ownership identity via ``db.ensure_external_key``.
 """
 
 from __future__ import annotations
@@ -180,8 +180,7 @@ def api(tmp_path, monkeypatch):
     # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. This stub
     # replaces the real network verify.
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
-    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", _identity_for_token)
 
     def validate_project(*, project_id, key, authorization, org_id=None):
         assert isinstance(project_id, str)
@@ -1122,18 +1121,11 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
 
     def fake_verify(token):
         calls["n"] += 1
-        return token == "fslo-user-good"
+        if token != "fslo-user-good":
+            return None
+        return {"email": "user-good@example.com", "key_prefix": "fslo_good", "org_slug": "acme"}
 
     monkeypatch.setattr(auth_mod, "_freesolo_verify", fake_verify)
-    monkeypatch.setattr(
-        auth_mod,
-        "_cached_identity",
-        lambda token: (
-            {"email": "user-good@example.com", "key_prefix": "fslo_good", "org_slug": "acme"}
-            if token == "fslo-user-good"
-            else {}
-        ),
-    )
 
     row = auth_mod.authenticate("Bearer fslo-user-good")
     assert row is not None
@@ -1145,16 +1137,53 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
     assert again["id"] == row["id"]
 
 
+def test_revoked_external_key_is_rejected_across_critical_routes(api, monkeypatch):
+    import flash.server.platform.auth as auth_mod
+
+    key = _login()
+    headers = _bearer(key)
+    run_id = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=headers,
+    ).json()["run_id"]
+
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: None)
+
+    requests = (
+        ("post", "/v1/runs", {"spec": SPEC, "runtime_secrets": {"HF_TOKEN": "secret"}}),
+        ("post", f"/v1/runs/{run_id}/cancel", None),
+        ("post", f"/v1/runs/{run_id}/deploy", {}),
+        (
+            "post",
+            f"/v1/runs/{run_id}/export",
+            {"repository": "me/adapter", "hf_token": "hf-secret"},
+        ),
+        ("get", f"/v1/runs/{run_id}/worker", None),
+        (
+            "post",
+            "/v1/envs",
+            {
+                "project_id": SPEC["project"],
+                "name": "revoked",
+                "package_b64": ENV_PACKAGE_B64,
+            },
+        ),
+    )
+    for method, path, payload in requests:
+        response = api.request(method, path, headers=headers, json=payload)
+        assert response.status_code == 401, (method, path, response.text)
+
+
 def test_freesolo_user_key_without_org_slug_is_rejected(api, monkeypatch):
     # A verified external key must include an org slug. Do not fall back to email or
     # token-derived namespaces for env publishing.
     import flash.server.platform.auth as auth_mod
 
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
     monkeypatch.setattr(
         auth_mod,
-        "_cached_identity",
+        "_freesolo_verify",
         lambda token: {"email": "user@example.com", "key_prefix": "fslo_noorg"},
     )
 
@@ -1165,11 +1194,14 @@ def test_freesolo_user_key_without_email_authenticates_with_org_slug(api, monkey
     import flash.server.platform.auth as auth_mod
 
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
     monkeypatch.setattr(
         auth_mod,
-        "_cached_identity",
-        lambda token: {"key_prefix": "fslo_noemail", "org_slug": "acme", "org_id": "org-acme"},
+        "_freesolo_verify",
+        lambda token: {
+            "key_prefix": "fslo_noemail",
+            "org_slug": "acme",
+            "org_id": "org-acme",
+        },
     )
 
     row = auth_mod.authenticate("Bearer fslo-no-email")
@@ -1182,10 +1214,9 @@ def test_invalid_external_email_is_not_persisted(api, monkeypatch):
     import flash.server.platform.auth as auth_mod
 
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
     monkeypatch.setattr(
         auth_mod,
-        "_cached_identity",
+        "_freesolo_verify",
         lambda token: {
             "email": "not-an-email",
             "key_prefix": "fslo_invalidemail",
@@ -1816,10 +1847,9 @@ def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     import flash.server.platform.db as db_mod
 
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
     monkeypatch.setattr(
         auth_mod,
-        "_cached_identity",
+        "_freesolo_verify",
         lambda token: {
             "email": "revoked@example.com",
             "key_prefix": "fslo_revoked",
@@ -1837,183 +1867,9 @@ def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     assert auth_mod.authenticate("Bearer fslo-revoked") is None
 
 
-def test_freesolo_verify_does_not_cache_network_errors(monkeypatch):
-    # A transient network error must NOT be cached as a rejection, or a valid key would be
-    # locked out for the whole TTL. The next call (backend recovered) must succeed.
-    import urllib.error
-
-    import flash.server.platform.auth as auth_mod
-
-    # Use the real _freesolo_verify (not the fixture stub) and let it touch the (patched) net.
-    importlib.reload(auth_mod)
-    auth_mod._verify_cache.clear()
-
-    class _Resp:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    state = {"fail": True}
-
-    def flaky(req, timeout=None):
-        if state["fail"]:
-            raise urllib.error.URLError("connection timed out")
-        return _Resp()
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", flaky)
-    assert auth_mod._freesolo_verify("tok") is False  # transient failure
-    assert "tok" not in auth_mod._verify_cache  # NOT cached
-    state["fail"] = False
-    assert auth_mod._freesolo_verify("tok") is True  # recovers immediately
-
-
-def test_freesolo_verify_5xx_transient_but_4xx_cached(monkeypatch):
-    # A backend 5xx/429 is a transient hiccup (urllib raises HTTPError for these too): it must
-    # NOT be cached, so a valid key recovers immediately. A definitive 4xx (401/403) IS cached.
-    import urllib.error
-
-    import flash.server.platform.auth as auth_mod
-
-    importlib.reload(auth_mod)
-    auth_mod._verify_cache.clear()
-
-    class _Resp:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    state = {"code": 503}
-
-    def responder(req, timeout=None):
-        code = state["code"]
-        if code == 200:
-            return _Resp()
-        raise urllib.error.HTTPError(req.full_url, code, "err", {}, None)
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", responder)
-    # 5xx -> transient, not cached
-    assert auth_mod._freesolo_verify("tok") is False
-    assert "tok" not in auth_mod._verify_cache
-    # 429 -> transient, not cached
-    state["code"] = 429
-    assert auth_mod._freesolo_verify("tok") is False
-    assert "tok" not in auth_mod._verify_cache
-    # backend recovers -> immediately verified (no stale negative cached)
-    state["code"] = 200
-    assert auth_mod._freesolo_verify("tok") is True
-
-    # a definitive 401 IS cached as a rejection (no repeated backend round-trips)
-    auth_mod._verify_cache.clear()
-    state["code"] = 401
-    assert auth_mod._freesolo_verify("bad") is False
-    assert auth_mod._verify_cache.get("bad", (None,))[0] is False
-
-
-def test_freesolo_verify_discards_identity_on_exit_http_error(monkeypatch):
-    import io
-    import urllib.error
-
-    import flash.server.platform.auth as auth_mod
-
-    importlib.reload(auth_mod)
-    auth_mod._verify_cache.clear()
-
-    class _Resp:
-        status = 200
-
-        def read(self):
-            return b'{"email":"user@example.com","org_id":"org-1","org_slug":"acme"}'
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            raise urllib.error.HTTPError(
-                "https://api.freesolo.co/api/auth/verify",
-                401,
-                "unauthorized",
-                {},
-                io.BytesIO(b'{"detail":"unauthorized"}'),
-            )
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
-
-    assert auth_mod._freesolo_verify("tok") is False
-    verified, identity, _expires_at = auth_mod._verify_cache["tok"]
-    assert verified is False
-    assert identity == {}
-
-
-def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
-    # A negative verdict (a 401 may be a TRANSIENT backend auth-lookup outage, not a real
-    # rejection) gets the short negative TTL so a valid key isn't locked out for 5 minutes;
-    # a positive keeps the long TTL.
-    import urllib.error
-
-    import flash.server.platform.auth as auth_mod
-
-    importlib.reload(auth_mod)
-    auth_mod._verify_cache.clear()
-
-    class _Resp:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    state = {"code": 401}
-
-    def responder(req, timeout=None):
-        code = state["code"]
-        if code == 200:
-            return _Resp()
-        raise urllib.error.HTTPError(req.full_url, code, "err", {}, None)
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", responder)
-
-    # Negative (401) -> cached with the SHORT negative TTL.
-    now = time.time()
-    assert auth_mod._freesolo_verify("neg") is False
-    neg_exp = auth_mod._verify_cache["neg"][2]
-    assert neg_exp <= now + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1
-    # ...and definitely shorter than the long TTL.
-    assert neg_exp < now + auth_mod._VERIFY_CACHE_TTL_S
-
-    # Positive -> cached with the LONG TTL.
-    auth_mod._verify_cache.clear()
-    state["code"] = 200
-    now = time.time()
-    assert auth_mod._freesolo_verify("pos") is True
-    pos_exp = auth_mod._verify_cache["pos"][2]
-    assert pos_exp > now + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1
-    assert pos_exp <= now + auth_mod._VERIFY_CACHE_TTL_S + 1
-
-    # The negative entry expires after the short TTL: simulate the clock advancing past
-    # _VERIFY_CACHE_NEG_TTL_S (but not the long TTL) and confirm the negative is treated as
-    # expired while a same-age positive would still be live.
-    auth_mod._verify_cache.clear()
-    base = time.time()
-    auth_mod._verify_cache["neg"] = (False, {}, base + auth_mod._VERIFY_CACHE_NEG_TTL_S)
-    auth_mod._verify_cache["pos"] = (True, {}, base + auth_mod._VERIFY_CACHE_TTL_S)
-    later = base + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1.0  # past neg TTL, well under pos TTL
-    assert auth_mod._verify_cache["neg"][2] <= later  # negative entry has expired
-    assert auth_mod._verify_cache["pos"][2] > later  # positive entry is still live
-
-
 def test_freesolo_verify_rejects_oversized_token(monkeypatch):
-    # An oversized bearer must be rejected before it touches the cache or the network, so it
-    # can't bloat _verify_cache (keyed by the raw token) or send a huge Authorization header.
+    # An oversized bearer must be rejected before it hashes, touches the cache, or reaches the
+    # network, so it cannot consume verifier state or send a huge Authorization header.
     import flash.server.platform.auth as auth_mod
 
     importlib.reload(auth_mod)
@@ -2024,13 +1880,13 @@ def test_freesolo_verify_rejects_oversized_token(monkeypatch):
 
     monkeypatch.setattr(auth_mod.urllib.request, "urlopen", boom)
     huge = "x" * (auth_mod._MAX_TOKEN_LEN + 1)
-    assert auth_mod._freesolo_verify(huge) is False
-    assert huge not in auth_mod._verify_cache
+    assert auth_mod._freesolo_verify(huge) is None
+    assert auth_mod._verify_cache == {}
 
 
 def test_freesolo_user_key_unverified_when_backend_unreachable(api, monkeypatch):
     # When the backend verify can't be reached (the offline test harness makes urlopen fail),
-    # _freesolo_verify returns False and authenticate yields None — an unverifiable key is
+    # _freesolo_verify returns None and authenticate yields None — an unverifiable key is
     # never admitted.
     import urllib.error
 
@@ -2046,81 +1902,6 @@ def test_freesolo_user_key_unverified_when_backend_unreachable(api, monkeypatch)
         lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError("offline")),
     )
     assert auth_mod.authenticate("Bearer unknown-token") is None
-
-
-def test_freesolo_verify_cache_prevents_second_call(monkeypatch):
-    # The in-process cache means a second authenticate for the same token doesn't re-hit the
-    # backend within the TTL (positives and negatives are both cached).
-    import flash.server.platform.auth as auth_mod
-
-    # Use the real _freesolo_verify (not the fixture stub) and let it touch the (patched) net.
-    importlib.reload(auth_mod)
-    auth_mod._verify_cache.clear()
-    calls = {"n": 0}
-
-    def fake_urlopen(req, timeout=None):
-        calls["n"] += 1
-
-        class _Resp:
-            status = 200
-
-            def read(self):
-                return (
-                    b'{"email":"cached@example.com","key_prefix":"fslo_cached","org_slug":"acme"}'
-                )
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        return _Resp()
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", fake_urlopen)
-
-    first = auth_mod.authenticate("Bearer fslo-cached")
-    second = auth_mod.authenticate("Bearer fslo-cached")
-    assert first is not None
-    assert second is not None
-    assert calls["n"] == 1  # second authenticate served from cache, no second backend call
-
-
-def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
-    # The verify cache keys by the raw bearer token, so a stream of distinct tokens could
-    # grow it without bound. Each write prunes expired entries and caps the cache size.
-    import time
-
-    import flash.server.platform.auth as auth_mod
-
-    importlib.reload(auth_mod)
-    auth_mod._verify_cache.clear()
-
-    class _Resp:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
-
-    # An already-expired entry must be removed on the next write (no longer reachable).
-    auth_mod._verify_cache["stale"] = (True, {}, time.time() - 1)
-    auth_mod._freesolo_verify("fresh-token")
-    assert "stale" not in auth_mod._verify_cache
-    assert "fresh-token" in auth_mod._verify_cache
-
-    # Verifying many distinct (live) tokens never grows the cache past the cap.
-    monkeypatch.setattr(auth_mod, "_VERIFY_CACHE_MAX", 8)
-    auth_mod._verify_cache.clear()
-    for i in range(50):
-        auth_mod._freesolo_verify(f"tok-{i}")
-        assert len(auth_mod._verify_cache) <= auth_mod._VERIFY_CACHE_MAX
-    assert len(auth_mod._verify_cache) <= auth_mod._VERIFY_CACHE_MAX
-    auth_mod._verify_cache.clear()
 
 
 def test_keys_are_hashed_at_rest(api):
@@ -5554,7 +5335,7 @@ def test_deploy_without_any_org_context_is_rejected(api, monkeypatch):
     # a verified identity without org_id (but with the org_slug that auth requires)
     monkeypatch.setattr(
         auth_mod,
-        "_cached_identity",
+        "_freesolo_verify",
         lambda token: {k: v for k, v in _identity_for_token(token).items() if k != "org_id"},
     )
     monkeypatch.setattr(

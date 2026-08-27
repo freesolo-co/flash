@@ -55,8 +55,7 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     monkeypatch.setattr(runs, "_post", lambda *a, **k: False, raising=False)
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token == _USER_TOKEN)
-    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", _identity_for_token)
     with TestClient(app_mod.create_app()) as client:
         yield client
 

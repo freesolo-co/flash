@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib
 import io
 import json
-import time
 import urllib.error
 import urllib.request
 
@@ -310,8 +309,7 @@ def api(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(runs, "_post", lambda *a, **k: False, raising=False)
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
-    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", _identity_for_token)
     # The new submit-time budget precheck would urllib-POST the real backend; stub it to a pass so
     # the default submit path stays hermetic. Gate-specific tests below override this per-test.
     import flash.server.billing.charges as billing_mod
@@ -718,15 +716,19 @@ def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch
     import flash.server.platform.auth as auth_mod
 
     token = "fslo-user-spoof"
-    auth_mod._verify_cache[token] = (
-        True,
-        {
-            "key_prefix": "internal",
-            "email": "user@example.com",
-            "org_id": "org-spoof",
-            "org_slug": "org-spoof",
-        },
-        time.time() + auth_mod._VERIFY_CACHE_TTL_S,
+    monkeypatch.setattr(
+        auth_mod,
+        "_freesolo_verify",
+        lambda candidate: (
+            {
+                "key_prefix": "internal",
+                "email": "user@example.com",
+                "org_id": "org-spoof",
+                "org_slug": "org-spoof",
+            }
+            if candidate == token
+            else None
+        ),
     )
 
     me = api.get("/v1/me", headers=_bearer(token))

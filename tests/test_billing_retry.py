@@ -602,8 +602,7 @@ def test_startup_runs_completion_charge_sweep(monkeypatch, tmp_path):
 
     importlib.reload(app_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
-    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", _identity_for_token)
 
     with TestClient(app_mod.create_app()):
         # entering the context runs the lifespan startup, which SCHEDULES the recovery sweep as a
@@ -669,8 +668,7 @@ def test_startup_does_not_block_on_slow_charge_backlog(monkeypatch, tmp_path):
 
     importlib.reload(app_mod)
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
-    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", _identity_for_token)
 
     started = time.time()
     with TestClient(app_mod.create_app()):
