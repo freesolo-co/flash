@@ -332,6 +332,95 @@ def test_post_commit_listing_failure_never_retries_commit(tmp_path, monkeypatch)
     assert rec.events.count("commit") == 1
 
 
+def test_an_unverified_commit_is_retracted_so_resume_cannot_credit_it(tmp_path, monkeypatch):
+    """A published-but-unverified adapter folder must not stay readable.
+
+    Resume credits a required save from `adapter_config.json` alone, on the stated grounds that the
+    folder lands atomically. A commit that published and then failed verification breaks exactly
+    that implication, so the marker has to stop existing rather than certify a folder nothing
+    confirmed.
+    """
+    target = "rl/flash-ckpt-1/adapter"
+    rec = _RecordingHfApi()
+    rec.omit_after_commit = f"{target}/adapter_model.safetensors"
+    worker = _prime_worker(monkeypatch, rec)
+    adapter = tmp_path / "adapter"
+    _write_single_adapter(adapter)
+
+    with pytest.raises(worker_hf.RetriableInfraError):
+        worker.hf_upload_folder(str(adapter), "adapter", required=True)
+
+    assert rec.deleted == [target], "the unverified folder must be withdrawn"
+
+
+def test_a_verified_commit_is_never_retracted(tmp_path, monkeypatch):
+    """The retraction must fire only on a verification failure.
+
+    Without this, a retraction that ran unconditionally would delete every adapter it had just
+    successfully published.
+    """
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+    adapter = tmp_path / "adapter"
+    _write_single_adapter(adapter)
+
+    worker.hf_upload_folder(str(adapter), "adapter", required=True)
+
+    assert rec.deleted == []
+    assert "rl/flash-ckpt-1/adapter/adapter_config.json" in rec.files
+
+
+def test_retraction_defers_to_a_writer_that_already_moved_the_head(tmp_path, monkeypatch):
+    """A newer commit from another writer owns the path, and must not be deleted.
+
+    Our unverified commit is only safe to withdraw while it is still the head. Once someone else has
+    published over it, deleting the folder would destroy a publication that was never in doubt.
+    """
+    rec = _RecordingHfApi()
+    rec.omit_after_commit = "rl/flash-ckpt-1/adapter/adapter_model.safetensors"
+    worker = _prime_worker(monkeypatch, rec)
+    adapter = tmp_path / "adapter"
+    _write_single_adapter(adapter)
+
+    real_verify = publication._verify_adapter_commit
+
+    def _verify_then_race(*args, **kwargs):
+        try:
+            real_verify(*args, **kwargs)
+        finally:
+            # another writer lands a commit between our failed verify and the retraction.
+            rec._snapshots["c" * 40] = dict(rec._snapshots[rec._head])
+            rec._head = "c" * 40
+
+    monkeypatch.setattr(publication, "_verify_adapter_commit", _verify_then_race)
+
+    with pytest.raises(worker_hf.RetriableInfraError):
+        worker.hf_upload_folder(str(adapter), "adapter", required=True)
+
+    assert rec.deleted == [], "a newer writer's commit must survive our retraction"
+
+
+def test_a_failed_retraction_does_not_mask_the_publication_error(tmp_path, monkeypatch):
+    """Retraction is best effort; the loud failure is the publication error itself.
+
+    If a delete that cannot reach the hub raised, it would replace the diagnostic naming the real
+    problem with one naming the cleanup.
+    """
+    rec = _RecordingHfApi()
+    rec.omit_after_commit = "rl/flash-ckpt-1/adapter/adapter_model.safetensors"
+    worker = _prime_worker(monkeypatch, rec)
+    adapter = tmp_path / "adapter"
+    _write_single_adapter(adapter)
+
+    def _unreachable(**_kwargs):
+        raise OSError("hub unreachable")
+
+    monkeypatch.setattr(rec, "delete_folder", _unreachable)
+
+    with pytest.raises(worker_hf.RetriableInfraError, match="post-commit verification failed"):
+        worker.hf_upload_folder(str(adapter), "adapter", required=True)
+
+
 def test_sidecar_mutation_after_preupload_is_rejected_before_commit(tmp_path, monkeypatch):
     rec = _RecordingHfApi()
     worker = _prime_worker(monkeypatch, rec)
@@ -904,6 +993,81 @@ def test_publish_deployable_checkpoint_starts_no_upload_at_deadline(tmp_path, mo
 
     assert worker.publish_deployable_checkpoint(str(ckpt), 5) is None
     assert rec.commits == []
+
+
+def _coexisting_weights_checkpoint(path):
+    """A checkpoint peft cannot load: a single-file weight AND a sharded set in one folder.
+
+    `_validate_adapter_snapshot` rejects this as a local contract violation. Nothing about it is
+    transient, so it is the cleanest way to drive a `RequiredSaveError` out of the publish path.
+    """
+    path.mkdir()
+    (path / "adapter_config.json").write_text("{}")
+    (path / "adapter_model.safetensors").write_bytes(b"single")
+    (path / "adapter_model-00001-of-00002.safetensors").write_bytes(b"shard-1")
+    (path / "adapter_model-00002-of-00002.safetensors").write_bytes(b"shard-2")
+
+
+def test_required_publish_reports_a_local_contract_violation_as_permanent(tmp_path, monkeypatch):
+    """A malformed local adapter must not be reported as retriable infrastructure trouble.
+
+    `RetriableInfraError` hands the run back to a resume, and a resume re-reads the same broken
+    folder and fails identically -- burning the retry budget and ending in an error that names
+    infrastructure rather than the adapter that is actually wrong.
+    """
+    from flash.engine.worker.io.adapter_publication import RequiredSaveError
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+    ckpt = tmp_path / "checkpoint-30"
+    _coexisting_weights_checkpoint(ckpt)
+
+    with pytest.raises(RequiredSaveError) as caught:
+        worker.publish_deployable_checkpoint(str(ckpt), 30, required=True)
+
+    assert not isinstance(caught.value, RetriableInfraError)
+    assert rec.commits == []
+
+
+def test_required_publish_does_not_retry_a_local_contract_violation(tmp_path, monkeypatch):
+    """The permanent failure aborts on the first attempt rather than consuming the retry budget."""
+    from flash.engine.worker.io.adapter_publication import RequiredSaveError
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+    sleeps: list[float] = []
+    monkeypatch.setattr(worker, "_sleep_with_hf_deadline", lambda s: sleeps.append(s) or True)
+    ckpt = tmp_path / "checkpoint-31"
+    _coexisting_weights_checkpoint(ckpt)
+
+    with pytest.raises(RequiredSaveError):
+        worker.publish_deployable_checkpoint(str(ckpt), 31, required=True, retries=3)
+
+    assert sleeps == [], "a broken local folder is identical on every attempt"
+
+
+def test_transient_upload_trouble_stays_retriable(tmp_path, monkeypatch):
+    """The permanent classification must not swallow genuine infrastructure failures.
+
+    Without this, narrowing the error taxonomy could quietly turn every upload outage into a
+    permanent required-save failure.
+    """
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    rec = _RecordingHfApi()
+    worker = _prime_worker(monkeypatch, rec)
+    monkeypatch.setattr(worker, "_sleep_with_hf_deadline", lambda _s: True)
+
+    def _unreachable(*_args, **_kwargs):
+        raise OSError("hub unreachable")
+
+    monkeypatch.setattr(worker, "_replace_adapter_folder", _unreachable)
+    ckpt = tmp_path / "checkpoint-32"
+    _write_single_adapter(ckpt)
+
+    with pytest.raises(RetriableInfraError):
+        worker.publish_deployable_checkpoint(str(ckpt), 32, required=True)
 
 
 def test_prune_stale_resume_checkpoints_deletes_only_older_steps(monkeypatch):

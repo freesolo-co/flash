@@ -297,6 +297,32 @@ def _verify_adapter_commit(
         raise AdapterPublicationError(str(error)) from error
 
 
+def _retract_unverified_adapter(api, *, repo_id: str, revision: str | None, target: str) -> None:
+    """Remove an adapter folder whose commit landed but could not be verified.
+
+    Resume credits a required save from the presence of ``adapter_config.json`` alone, on the
+    stated grounds that the folder lands as one atomic commit. A commit that published and then
+    failed verification breaks exactly that implication: the marker exists, so the step is credited
+    durable, and a checkpoint nothing ever validated becomes loadable. The marker has to stop
+    existing for the inference drawn from it to stay true.
+
+    Another writer may already own this path -- its commit would have moved the head past ours, and
+    deleting then would destroy a publication that was never in doubt. So retraction runs only while
+    our own unverified commit is still the head, and only for a real subfolder, never the repo root.
+    """
+    if not target or not isinstance(revision, str) or not is_commit_sha(revision):
+        return
+    try:
+        head = getattr(api.repo_info(repo_id=repo_id, repo_type="dataset"), "sha", None)
+        if head != revision:
+            return
+        api.delete_folder(path_in_repo=target, repo_id=repo_id, repo_type="dataset")
+    except Exception:
+        # best effort: the publication error below already fails this save loudly. a retraction that
+        # cannot reach the hub leaves the folder exactly as an unverified commit leaves it today.
+        return
+
+
 def replace_adapter_folder(
     api,
     repo_id: str,
@@ -383,15 +409,21 @@ def replace_adapter_folder(
                 raise AdapterPublicationError(
                     "post-commit adapter publication returned no immutable commit"
                 )
-            _verify_adapter_commit(
-                api,
-                repo_id=repo_id,
-                revision=revision,
-                prefix=prefix,
-                expected_remote=expected_remote,
-                adapter_files=adapter_files,
-                identities=identities,
-            )
+            try:
+                _verify_adapter_commit(
+                    api,
+                    repo_id=repo_id,
+                    revision=revision,
+                    prefix=prefix,
+                    expected_remote=expected_remote,
+                    adapter_files=adapter_files,
+                    identities=identities,
+                )
+            except Exception:
+                # the commit is already published. leaving it in place would leave a checkpoint that
+                # resolves and loads while nothing has confirmed its contents match the snapshot.
+                _retract_unverified_adapter(api, repo_id=repo_id, revision=revision, target=target)
+                raise
             return revision
     except AdapterPublicationError as error:
         if committed and not str(error).startswith("post-commit"):

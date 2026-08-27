@@ -410,6 +410,11 @@ def publish_deployable_checkpoint(
             if _emit_heartbeat:
                 _worker_heartbeat.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
             return subfolder
+        except RequiredSaveError:
+            # a local contract violation: coexisting weight files, a malformed index, no complete
+            # weight representation. no amount of retrying changes the folder on disk, and calling
+            # it retriable infra would hand the run back to a resume that fails identically.
+            raise
         except AdapterPublicationError as e:
             last_error = e
             print(f"[ckpt] deployable publish warn (step {step}):", e)
