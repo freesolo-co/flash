@@ -290,6 +290,23 @@ def _reset_status_reporter_before_test():
 
 
 @pytest.fixture(autouse=True)
+def _arm_recovery_generation_before_test():
+    """Give each test its own recovery generation, the way each lifespan gets one in production.
+
+    Restart recovery is owned by the ASGI lifespan: startup arms a generation and shutdown closes
+    it for good, so nothing can allocate paid work on the way out. A test process runs many
+    lifespans in one interpreter, and any test that drives a real shutdown -- a bare
+    ``with TestClient(create_app()):`` is enough -- leaves the module-global generation closed.
+    Every later test then reads "the plane is shutting down" and supervision refuses to resume,
+    which is correct behavior answering a stale generation. Arming here is the harness standing in
+    for the startup half of a lifespan it never ran.
+    """
+    from flash.server.platform import runtime
+
+    runtime._open_recovery_threads()
+
+
+@pytest.fixture(autouse=True)
 def _rebind_worker_submodule_attributes():
     """Repair the ``flash.engine.worker`` package object after a test re-imports it.
 

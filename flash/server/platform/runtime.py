@@ -16,6 +16,7 @@ from flash.core.spec import JobSpec
 from flash.runner.lifecycle.state import adapter_prefix, runs_file_path
 from flash.runner.lifecycle.status import get_status
 from flash.server.platform import db
+from flash.server.platform.threadgroup import OwnedThreadGroup, current_group
 
 _log = logging.getLogger("flash.server")
 
@@ -152,76 +153,84 @@ _DEFERRED_RECOVERY_RETRY_S = 120.0
 # Restart recovery belongs to the ASGI lifespan: it is started by ``recover_runs`` and must stop
 # when the lifespan does. Without an owner, a deferred-resubmit loop can allocate a fresh paid
 # worker minutes after the plane began shutting down, and nothing ever observes the thread again.
-# Same shape as the deployment-job group in ``flash.server.asgi.app``: a stop signal, a registry of
-# the threads the recovery owns, and a bounded join at the shutdown deadline.
-_RECOVERY_LOCK = threading.Lock()
-_RECOVERY_THREADS: set[threading.Thread] = set()
-_RECOVERY_STOP = threading.Event()
+# Each lifespan gets its own group rather than re-arming a shared registry, so a thread that
+# outlived its generation's shutdown deadline keeps observing that generation's stop signal.
+_RECOVERY_GENERATION_LOCK = threading.Lock()
+_RECOVERY = OwnedThreadGroup()
+
+
+def _recovery() -> OwnedThreadGroup:
+    """The recovery generation owned by the current lifespan."""
+    with _RECOVERY_GENERATION_LOCK:
+        return _RECOVERY
 
 
 def _open_recovery_threads() -> None:
     """Arm a fresh recovery generation. Called by ``recover_runs`` at lifespan startup."""
-    with _RECOVERY_LOCK:
-        _RECOVERY_THREADS.clear()
-    _RECOVERY_STOP.clear()
+    global _RECOVERY
+
+    with _RECOVERY_GENERATION_LOCK:
+        _RECOVERY = OwnedThreadGroup()
 
 
 def _stop_recovery_threads() -> None:
     """Signal every recovery thread to unwind. No new paid work is admitted after this."""
-    _RECOVERY_STOP.set()
+    _recovery().close()
 
 
 def _wait_for_recovery_threads(timeout: float) -> bool:
-    """Join the registered recovery threads. False when one is still running at the deadline."""
-    import time
-
-    deadline = time.monotonic() + timeout
-    while True:
-        with _RECOVERY_LOCK:
-            threads = tuple(t for t in _RECOVERY_THREADS if t.is_alive())
-        if not threads:
-            return True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        threads[0].join(remaining)
+    """Join the recovery threads. False when one is still registered at the deadline."""
+    return _recovery().wait(timeout)
 
 
 def _start_recovery_thread(target, *args) -> None:
     """Start a recovery-owned background thread, unless shutdown already began.
 
-    These threads outlive ``recover_runs`` but not the lifespan: each observes ``_RECOVERY_STOP``
-    and exits, so the shutdown join can drain them. Supervision of an already-attached run has the
-    run's lifetime, not the lifespan's, and is dispatched through ``_start_attach`` instead.
+    These threads outlive ``recover_runs`` but not the lifespan: each observes the group's stop
+    signal and exits, so the shutdown join can drain them.
     """
-    if _RECOVERY_STOP.is_set():
-        return
-    thread = threading.Thread(target=target, args=args, daemon=True)
-    with _RECOVERY_LOCK:
-        if _RECOVERY_STOP.is_set():
-            return
-        _RECOVERY_THREADS.add(thread)
-    thread.start()
+    _owner().start(target, *args)
 
 
 def _start_attach(run_id: str) -> None:
-    """Dispatch supervision for a handle-backed run, unless shutdown already began."""
+    """Dispatch supervision for a handle-backed run, unless shutdown already began.
+
+    Supervision has the run's lifetime rather than the lifespan's, so the thread is owned only
+    well enough to be refused after shutdown and joined at the deadline. What keeps it from
+    buying a replacement worker on the way out is the fence inside
+    ``_resume_after_confirmed_teardown``, not this dispatch.
+    """
     from flash.runner.supervise.attach import attach_run
 
-    if _RECOVERY_STOP.is_set():
-        return
-    threading.Thread(target=attach_run, args=(run_id,), daemon=True).start()
+    _start_recovery_thread(attach_run, run_id)
+
+
+def _owner() -> OwnedThreadGroup:
+    """The generation the calling thread answers to.
+
+    A thread started by an earlier lifespan answers for that lifespan, so one that outran its own
+    shutdown deadline reads its own stop signal rather than the next generation's cleared one.
+    Callers on the startup path belong to no generation and answer for the current one.
+    """
+    return current_group() or _recovery()
+
+
+def recovery_is_stopping() -> bool:
+    """Whether the lifespan that owns the calling thread has begun shutting down.
+
+    Read by supervision before it commits a run to a replacement attempt: that path has the
+    run's lifetime, so it can reach a paid allocation long after the plane started to unwind.
+    """
+    return _owner().stopped.is_set()
 
 
 def _recovery_wait(seconds: float) -> None:
     """Sleep between reconciliation attempts, returning early once shutdown begins.
 
-    A drop-in for ``time.sleep`` in a recovery loop whose head tests ``_RECOVERY_STOP``: the retry
-    interval is two minutes, so an uninterruptible sleep would hold the thread well past the
-    lifespan's shutdown deadline no matter how often the loop checks the flag.
+    The retry interval is two minutes, so an uninterruptible sleep would hold the thread well
+    past the lifespan's shutdown deadline no matter how often the loop checks the stop signal.
     """
-    if seconds > 0:
-        _RECOVERY_STOP.wait(seconds)
+    _owner().sleep(seconds)
 
 
 def _confirm_run_clear(spec) -> bool:
@@ -354,12 +363,10 @@ def _start_resubmit(
     from flash.runner.lifecycle.status import source_snapshot_from_status
     from flash.runner.supervise.lifecycle import _run_job_background
 
-    # Fence ahead of every side effect on this path. ``_compare_and_prepare_resubmit`` below CASes
-    # the run to ``provisioning``, so a stop observed after it would leave a durable provisioning
-    # record with no worker behind it; and _fail_blocked_recovery writes a terminal state that a
-    # shutting-down plane has no business deciding. Refusing here leaves the run exactly as the
-    # next startup recovery will find it.
-    if _RECOVERY_STOP.is_set():
+    # Fence ahead of every side effect on this path. The CAS to ``provisioning`` below and
+    # _fail_blocked_recovery's terminal write are both decisions a shutting-down plane has no
+    # business making. Refusing here leaves the run exactly as the next startup recovery finds it.
+    if recovery_is_stopping():
         return False
     try:
         source_snapshot_from_status(get_status(spec.run_id), required=True)
@@ -378,18 +385,25 @@ def _start_resubmit(
         except Exception as exc:
             _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
             return False
-    if not _compare_and_prepare_resubmit(
-        spec.run_id,
-        expected_remote,
-        expected_state=expected_state,
-    ):
-        return False
-    with contextlib.suppress(Exception):
-        _append_run_log(
+    # The claim and the launch are one step. Checking the fence above and CASing here would let
+    # shutdown land in between, leaving the run durably ``provisioning`` with no worker; holding
+    # admission across both means the group cannot finish closing until this run is either
+    # untouched or claimed and registered.
+    with _owner().admit() as slot:
+        if slot is None:
+            return False
+        if not _compare_and_prepare_resubmit(
             spec.run_id,
-            "control plane restarted without a durable handle; resubmitting",
-        )
-    threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
+            expected_remote,
+            expected_state=expected_state,
+        ):
+            return False
+        with contextlib.suppress(Exception):
+            _append_run_log(
+                spec.run_id,
+                "control plane restarted without a durable handle; resubmitting",
+            )
+        slot.start(_run_job_background, spec)
     return True
 
 
@@ -427,7 +441,7 @@ def _deferred_resubmit_loop(spec) -> None:
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.supervise.lifecycle import _adopt_completed_attempt
 
-    while not _RECOVERY_STOP.is_set():
+    while not recovery_is_stopping():
         try:
             status = get_status(spec.run_id)
         except Exception:

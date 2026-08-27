@@ -4212,6 +4212,43 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
     assert shutdown_steps == ["deployment_jobs", ("status_reports", True)]
 
 
+def test_shutdown_signals_recovery_before_waiting_on_it(monkeypatch):
+    # a bounded join placed before the stop signal would spend its whole budget waiting on threads
+    # nobody had told to unwind, and the deferred-resubmit retry interval alone is eight times the
+    # shutdown deadline. the ordering is the invariant, not the size of the deadline.
+    import flash.server.asgi.app as app_mod
+    import flash.server.billing.retry as billing_retry
+    import flash.server.domain.ops.reconcile as reconcile
+    import flash.server.domain.ops.repo_cleanup as repo_cleanup
+    from flash.providers.core import preflight
+    from flash.server.routes import serving
+
+    recovery_steps = []
+
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.setattr(preflight, "check_run_preflight", lambda: None)
+    monkeypatch.setattr(app_mod, "_open_deployment_jobs", lambda: None)
+    monkeypatch.setattr(runner_reporting, "_open_status_reporter", lambda: None)
+    monkeypatch.setattr(app_mod, "recover_runs", lambda: None)
+    monkeypatch.setattr(serving, "recover_deployments", lambda: 0)
+    monkeypatch.setattr(serving, "replay_status_reports", lambda _stop: 0)
+    monkeypatch.setattr(billing_retry, "charge_retry_enabled", lambda: False)
+    monkeypatch.setattr(reconcile, "reconcile_enabled", lambda: False)
+    monkeypatch.setattr(repo_cleanup, "repo_cleanup_enabled", lambda: False)
+    monkeypatch.setattr(app_mod, "_instance_providers_configured", lambda: False)
+    monkeypatch.setattr(app_mod, "_stop_recovery_threads", lambda: recovery_steps.append("stop"))
+    monkeypatch.setattr(
+        app_mod,
+        "_wait_for_recovery_threads",
+        lambda timeout: recovery_steps.append(("wait", timeout > 0)) or True,
+    )
+
+    with TestClient(app_mod.create_app()):
+        pass
+
+    assert recovery_steps == ["stop", ("wait", True)]
+
+
 def test_status_report_sequence_is_persisted_and_private(api):
 
     key = _login()
