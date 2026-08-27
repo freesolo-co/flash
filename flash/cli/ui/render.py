@@ -569,8 +569,9 @@ def deployed(dep: dict) -> str:
     """`flash models deploy`: the endpoint and serving URL as an aligned card (not a JSON dump)."""
     endpoint = str(dep.get("endpoint_name") or "")
     url = str(dep.get("openai_base_url") or "")
+    checkpoint_id = str(dep.get("checkpoint_id") or dep.get("run_id") or "")
     pairs = [
-        ("run", _paint(dep.get("run_id", ""), _ACCENT2)),
+        ("checkpoint", _paint(checkpoint_id, _ACCENT2)),
         ("endpoint", _paint(endpoint, _GREEN) if endpoint else None),
         ("url", _paint(url, _ACCENT2) if url else None),
     ]
@@ -589,23 +590,22 @@ def deployed(dep: dict) -> str:
 
 
 def undeployed(result: dict) -> str:
-    """`flash models undeploy`: report the run-scoped aliases and immutable revisions disabled."""
-    rid = _paint(result.get("run_id", ""), _ACCENT2)
-    aliases = result.get("disabled_aliases") or []
-    revisions = result.get("disabled_revisions") or []
-    affected = [*aliases, *revisions]
-    line = ok(f"torn down {rid}")
-    if affected:
-        line += "\n" + _dim(f"  disabled {', '.join(str(item) for item in affected)}")
+    """`flash models undeploy`: report the exact permanent checkpoints disabled."""
+    checkpoint_id = str(result.get("checkpoint_id") or result.get("run_id") or "")
+    target = _paint(checkpoint_id, _ACCENT2)
+    disabled = result.get("disabled_checkpoints") or []
+    line = ok(f"torn down {target}")
+    if disabled:
+        line += "\n" + _dim(f"  disabled {', '.join(str(item) for item in disabled)}")
     else:
-        line += "\n" + _dim("  serving records were already disabled or absent")
+        line += "\n" + _dim("  serving record was already disabled or absent")
     return _safe(line)
 
 
 def exported(result: dict) -> str:
     """`flash models export`: where the adapter landed on HuggingFace, as an aligned card."""
     pairs = [
-        ("adapter", _paint(result.get("adapter_id", ""), _ACCENT2)),
+        ("checkpoint", _paint(result.get("checkpoint_id", ""), _ACCENT2)),
         ("repo", _paint(result.get("repository", ""), _ACCENT2)),
         ("url", _paint(result["url"], _ACCENT2) if result.get("url") else None),
         ("visibility", "private" if result.get("private") else "public"),

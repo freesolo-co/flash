@@ -50,11 +50,13 @@ def _add_model_commands(sub: argparse._SubParsersAction) -> argparse._SubParsers
 
 def _add_deployment_commands(models_sub: argparse._SubParsersAction) -> None:
     """`models deploy/undeploy/export/deployments/chat`, hung off the `models` subparser."""
-    deploy = models_sub.add_parser("deploy", help="deploy a run's adapter to a serving endpoint")
+    deploy = models_sub.add_parser(
+        "deploy", help="deploy an exact checkpoint to a serving endpoint"
+    )
     deploy.add_argument(
         "run_id",
-        metavar="RUN_ID[/step-N]",
-        help="run id for the final adapter, or RUN_ID/step-N for a saved checkpoint",
+        metavar="CHECKPOINT_ID",
+        help="permanent checkpoint id: RUN_ID/final or RUN_ID/step-N",
     )
     deploy.add_argument("--dry-run", action="store_true")
     deploy.add_argument(
@@ -71,8 +73,12 @@ def _add_deployment_commands(models_sub: argparse._SubParsersAction) -> None:
     )
     deploy.set_defaults(func=cmd_deploy)
 
-    undeploy = models_sub.add_parser("undeploy", help="tear down a run's serving endpoint")
-    undeploy.add_argument("run_id")
+    undeploy = models_sub.add_parser("undeploy", help="tear down an exact checkpoint deployment")
+    undeploy.add_argument(
+        "run_id",
+        metavar="CHECKPOINT_ID",
+        help="permanent checkpoint id: RUN_ID/final or RUN_ID/step-N",
+    )
     undeploy.set_defaults(func=cmd_undeploy)
 
     export = models_sub.add_parser(
@@ -82,8 +88,8 @@ def _add_deployment_commands(models_sub: argparse._SubParsersAction) -> None:
         "--adapter-id",
         dest="adapter_id",
         required=True,
-        metavar="RUN_ID[/step-N]",
-        help="run id for the final adapter, or RUN_ID/step-N for a saved checkpoint",
+        metavar="CHECKPOINT_ID",
+        help="permanent checkpoint id: RUN_ID/final or RUN_ID/step-N",
     )
     export.add_argument(
         "--repository",
@@ -116,8 +122,7 @@ def _add_deployment_commands(models_sub: argparse._SubParsersAction) -> None:
     chat.add_argument(
         "run_id",
         metavar="TARGET",
-        help="a bare RUN_ID (its current deployment), RUN_ID/step-N (a specific deployed "
-        "checkpoint), or a full immutable adapter revision",
+        help="permanent deployed checkpoint id: RUN_ID/final or RUN_ID/step-N",
     )
     chat.add_argument("-m", "--message", required=True)
     chat.add_argument(
