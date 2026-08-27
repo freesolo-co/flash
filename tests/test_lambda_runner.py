@@ -1549,6 +1549,53 @@ def test_absent_shape_in_a_healthy_catalog_does_not_trip_the_broken_feed_gate(mo
         )
 
 
+def test_a_corrupt_multi_card_entry_is_a_broken_feed_not_an_unsold_shape(monkeypatch):
+    """A decode that fails while RESOLVING the sku name is still feed-health evidence.
+
+    Naming a multi-card shape reads the catalog's own ``gpu_count`` and per-card VRAM fields, so a
+    corrupt N-card sibling raises before the sku is ever in hand. That failure used to be tallied
+    nowhere -- neither as a probe nor as a decode -- which made a corrupt 8x entry read EXACTLY like
+    the healthy catalog below that simply does not sell the shape. Lambda's feed being broken then
+    surfaced as a terminal ``UnsupportedGpuError`` the allocator will not degrade past, so the run
+    died on a config miss it does not have instead of reaching another provider.
+    """
+    from flash.providers.core.base import (
+        AllocationConstraints,
+        CapacityLookupError,
+        UnsupportedGpuError,
+    )
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.execution.provider import PROVIDER
+
+    healthy_1x = {
+        "gpu_1x_h100_pcie": {
+            "instance_type": {"gpu_description": "H100 (80 GB)", "specs": {"storage_gib": 1024}},
+            "regions_with_capacity_available": [],
+        }
+    }
+    # 497.6 GB is what eight 80 GB cards combine to, so the floor admits the 8-card shape and the
+    # walk actually reaches the corrupt entry. A floor above that skips every count and measures
+    # nothing.
+    constraints = AllocationConstraints(gpu_type="H100", required_vram_gb=400, max_gpu_count=8)
+
+    # control: the same catalog WITHOUT the corrupt sibling is a complete "not sold" answer.
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: dict(healthy_1x))
+    with pytest.raises(UnsupportedGpuError, match=r"does not offer a rentable"):
+        PROVIDER.live_candidates(80, constraints)
+
+    # `gpu_0x_` cannot be a real card count, and the VRAM string is unparseable: either field
+    # aborts the family match, and each must reach the broken-feed gate.
+    for corrupt in (
+        {"instance_type": {"gpu_description": "H100 (80 GB)"}},
+        {"instance_type": {"gpu_description": "H100 (0 GB)"}},
+    ):
+        catalog = dict(healthy_1x)
+        catalog["gpu_0x_h100_sxm5" if "80 GB" in str(corrupt) else "gpu_8x_h100_sxm5"] = corrupt
+        monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, _c=catalog, **k: _c)
+        with pytest.raises(CapacityLookupError):
+            PROVIDER.live_candidates(80, constraints)
+
+
 def test_an_entryless_catalog_is_a_broken_feed_not_an_empty_product_line(monkeypatch):
     """Absence only means "not sold" once the catalog around it is known to be a catalog.
 

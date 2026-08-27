@@ -171,8 +171,8 @@ class LambdaProvider(InstanceProvider):
         A malformed catalog field is contained to the SKU carrying it, exactly as a malformed Vast
         row is dropped from the offer search: one bad field must not delete every valid sibling
         shape and take the whole provider out of the allocation. A catalog carrying no entry at
-        all, or one where no PRESENT probed SKU decodes, is not a bad field but a broken feed, and
-        still fails the lookup retryably.
+        all, or one where every decode attempt fails and none succeeds, is not a bad field but a
+        broken feed, and still fails the lookup retryably.
 
         A shape simply absent from a well-formed catalog is the opposite: a complete answer that
         Lambda does not sell it, which no retry can change. It is therefore excluded from the
@@ -187,7 +187,7 @@ class LambdaProvider(InstanceProvider):
         try:
             catalog = lambda_api.list_instance_types()
             structurally_fitting = False
-            probed = 0
+            malformed = 0
             decoded = 0
             for g in self.gpu_classes():
                 if constraints.gpu_type and g.name != constraints.gpu_type:
@@ -208,23 +208,30 @@ class LambdaProvider(InstanceProvider):
                         if sku not in catalog:
                             # Lambda does not sell this shape. A missing key is a COMPLETE answer
                             # that needed no decoding, so it is evidence of neither health nor
-                            # breakage and belongs in neither counter.
+                            # breakage and belongs in neither tally.
                             continue
-                        probed += 1
                         if not _sku_holds_run(catalog, sku, constraints):
                             decoded += 1
                             continue
                         structurally_fitting = True
                         live = usable_instances(g.name, gpu_count=count)
                     except MalformedProviderFieldError as exc:
+                        # A decode failure is evidence about FEED HEALTH wherever in the shape it
+                        # happens -- resolving the multi-card name reads the catalog's own
+                        # ``gpu_count`` and VRAM fields, so a corrupt sibling entry aborts here
+                        # before the sku is ever in hand. Tallying it keeps the broken-feed gate
+                        # able to see it; not tallying it let a corrupt N-card entry read exactly
+                        # like a healthy catalog that does not sell the shape, and a retryable
+                        # outage surfaced as a terminal refusal.
                         logger.warning("dropping malformed lambda catalog sku: %s", exc)
+                        malformed += 1
                         continue
                     decoded += 1
                     if live:
                         out.append(
                             Candidate("lambda", g.name, live[0].price_usd_hr, g.vram_gb, count)
                         )
-            if not _carries_any_entry(catalog) or (probed and not decoded):
+            if not _carries_any_entry(catalog) or (malformed and not decoded):
                 raise MalformedProviderFieldError(
                     "lambda", "instance-types", "at least one well-formed sku"
                 )
