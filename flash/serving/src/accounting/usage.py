@@ -24,16 +24,17 @@ from flash.serving.src.accounting.usage_outbox import (
 from flash.serving.src.io.schemas import AdapterRecord
 
 FREESOLO_PRICING_SOURCE = "freesolo_backend_catalog"
-FREESOLO_PRICING_VERSION = "2026-08-24.1"
+FREESOLO_PRICING_VERSION = "2026-08-27.1"
+# (prompt, completion, cached prompt) usd per million tokens, one entry per active hosted model.
+# these are the charged customer rates, set 5% below the lowest healthy comparable openrouter fp8
+# listing for each model and token category. they are NOT cost-plus: no markup is applied, and they
+# currently sit below the recorded cost basis, so do not reintroduce a multiplier here until measured
+# b200 economics establish a lower truthful cost basis.
 _FREESOLO_USD_PER_MTOK: dict[str, tuple[str, str, str]] = {
-    "Qwen/Qwen3.5-0.8B": ("0.01", "0.05", "0.002"),
-    "Qwen/Qwen3.5-2B": ("0.02", "0.10", "0.004"),
-    "Qwen/Qwen3.5-4B": ("0.03", "0.15", "0.006"),
-    "Qwen/Qwen3.5-9B": ("0.114", "0.19", "0.023"),
-    "Qwen/Qwen3.6-27B": ("0.4254", "3.055", "0.14"),
-    "Qwen/Qwen3.6-35B-A3B": ("0.198", "1.265", "0.066"),
+    "Qwen/Qwen3.5-9B": ("0.095", "0.1425", "0.0276"),
+    "Qwen/Qwen3.8-27B": ("0.3325", "2.4225", "0.03325"),
+    "Qwen/Qwen3.6-35B-A3B": ("0.095", "0.9025", "0.0475"),
 }
-_FREESOLO_MARKUP = Decimal("1.2")
 _USD_PER_MTOK_DIVISOR = Decimal("1000000")
 
 
@@ -173,7 +174,7 @@ def freesolo_price(base_model: str) -> CapturedPrice:
         raise ValueError(f"no durable serving price for base model {base_model!r}") from exc
 
     def per_token(rate: str) -> str:
-        return format(Decimal(rate) * _FREESOLO_MARKUP / _USD_PER_MTOK_DIVISOR, "f")
+        return format(Decimal(rate) / _USD_PER_MTOK_DIVISOR, "f")
 
     return CapturedPrice(
         source=FREESOLO_PRICING_SOURCE,
