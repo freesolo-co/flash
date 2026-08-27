@@ -29,7 +29,7 @@ from tests.serving.checkpoint_fixtures import (
 from tests.serving.conftest import attest
 
 
-async def _allow(_token: str, _adapter_id: str) -> str:
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
     """Permissive attributed authorizer for routing tests."""
     return "org-1"
 
@@ -969,7 +969,7 @@ def test_openai_chat_stream_sets_anti_buffering_headers(app_setup):
 def test_openai_chat_rejects_non_boolean_stream_after_authorization(stream):
     authorizations: list[str] = []
 
-    async def _authorize(_token: str, adapter_id: str) -> str:
+    async def _authorize(_token: str, adapter_id: str, _scope: dict | None = None) -> str:
         authorizations.append(adapter_id)
         return "org-1"
 

@@ -245,9 +245,16 @@ def test_deploy_9b_dry_run_is_not_rejected():
     assert dep.to_dict()["state"] == "dry_run"
 
 
-def test_deploy_27b_rejects_before_rank_resolution_or_dry_run_success(monkeypatch):
+def test_deploy_inactive_model_rejects_before_rank_resolution_or_dry_run_success(monkeypatch):
+    # The hosted-activation guard must fire FIRST: before rank validation and before any artifact is
+    # shaped, so an inactive model cannot reach a dry-run success or a paid path. Uses a model absent
+    # from the hosted catalog -- 27B is active, so it is no longer a witness for this rejection.
     import flash.serve.deployment.adapter_check as adapter_check
     import flash.serve.deployment.deploy as deploy
+    from flash.serving.src.engine.model_config import is_supported_base_model
+
+    inactive_model = "Qwen/Qwen3.5-99B"
+    assert not is_supported_base_model(inactive_model)
 
     monkeypatch.setattr(
         adapter_check,
@@ -262,13 +269,42 @@ def test_deploy_27b_rejects_before_rank_resolution_or_dry_run_success(monkeypatc
 
     with pytest.raises(ValueError, match="not active in hosted serving"):
         deploy.deploy_adapter(
-            run_id="q27",
-            model="Qwen/Qwen3.8-27B",
+            run_id="q99",
+            model=inactive_model,
             hf_repo="org/repo",
-            adapter_prefix="sft/q27/seed0",
+            adapter_prefix="sft/q99/seed0",
             dry_run=True,
             lora_rank=64,
         )
+
+
+def test_deploy_27b_is_active_and_reaches_rank_validation(monkeypatch):
+    # The complement of the guard test: 27B is now an ACTIVE hosted tier, so it must pass the
+    # activation gate and proceed into rank validation rather than being rejected up front.
+    import flash.serve.deployment.adapter_check as adapter_check
+    import flash.serve.deployment.deploy as deploy
+    from flash.serving.src.engine.model_config import is_supported_base_model
+
+    assert is_supported_base_model("Qwen/Qwen3.8-27B")
+
+    reached = []
+    monkeypatch.setattr(
+        adapter_check,
+        "validate_serving_lora_rank",
+        lambda *args, **kwargs: reached.append(args[0]),
+    )
+
+    dep = deploy.deploy_adapter(
+        run_id="q27",
+        model="Qwen/Qwen3.8-27B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/q27/seed0",
+        dry_run=True,
+        lora_rank=64,
+    )
+
+    assert reached == ["Qwen/Qwen3.8-27B"]
+    assert dep.to_dict()["state"] == "dry_run"
 
 
 def test_deploy_rejects_lora_rank_above_serving_cap():

@@ -10,7 +10,7 @@ adapters. A different base model requires a separate deployment. Use
 Customer-owned Modal is live-qualified for `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
 `Qwen/Qwen3.6-35B-A3B`. The 27B and 35B-A3B qualifications are bound to the exact certified serving
 image digest; another digest remains available for offline planning but cannot allocate Modal.
-Hosted Qwen3.8 27B remains inactive. Its customer-owned engine runs on `H100!` and serves the pinned
+Hosted Qwen3.8 27B is active on H100. Its customer-owned engine runs on `H100!` and serves the pinned
 `Qwen/Qwen3.8-27B-FP8` checkpoint while preserving `Qwen/Qwen3.8-27B` as the distinct logical base
 and tokenizer provenance. The 35B-A3B engine serves BF16 weights on one H200 with FP8 KV cache, a
 32K context, eight sequences, a 4096 batched-token cap, and six rank-64 LoRA slots.
