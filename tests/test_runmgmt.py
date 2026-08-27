@@ -1364,6 +1364,45 @@ def test_persisted_terminal_decision_blocks_relaunch_after_restart(monkeypatch, 
     assert raw[runner_state._NEXT_ATTEMPT_KEY] == claim.attempt + 1
 
 
+def test_unparseable_spec_persists_without_a_snapshot_and_authorizes_nothing(monkeypatch, tmp_path):
+    """A record whose spec no longer parses still saves, and still cannot authorize a launch.
+
+    Retry policy is derived from the spec, so such a record gets no retry snapshot. Saving must
+    keep working -- the billing sweep charges these -- while every launch path fails closed,
+    because a run whose spec cannot be read cannot be relaunched either.
+    """
+    from flash.core.spec import JobSpec
+    from flash.runner.supervise.retry_decision import require_retry_authorization_from_raw
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    stale_spec = {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "grpo",
+        # a shape the current validator rejects, reachable only from an older writer on disk.
+        "environment": {"path": "./local/environment.py"},
+        "train": {"epochs": 1, "max_examples": 1},
+    }
+    run_id = "unparseable-spec-record"
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=run_id, state="done", spec=stale_spec, created_at=1000.0),
+        _run_deadline_at=2000.0,
+        _next_attempt=0,
+    )
+
+    raw = runner_status._load_status_json(run_id)
+    assert runner_state._RETRY_STATE_KEY not in raw
+
+    # reservation reloads the spec before it reads the snapshot, so the unreadable spec itself
+    # is what stops the launch. either way no attempt is authorized.
+    with pytest.raises(ValueError, match="environment has unknown key"):
+        runner_attempts.reserve_verified_attempt_launch(run_id, expected_state="done")
+
+    # and the snapshot gate refuses the record directly, independent of spec parsing.
+    spec = JobSpec(run_id=run_id, model="Qwen/Qwen3.5-9B", algorithm="sft")
+    with pytest.raises(RuntimeError, match="persisted retry state is missing or invalid"):
+        require_retry_authorization_from_raw(spec, raw, 0)
+
+
 def test_duplicate_failure_for_a_live_handle_reuses_the_persisted_decision(monkeypatch, tmp_path):
     """A retried failure report for one attempt returns the first decision, never a second one."""
     from flash.core.spec import JobSpec

@@ -358,9 +358,17 @@ def _save_status(
             if _retry_state is _PRIVATE_VALUE_UNSET:
                 from flash.runner.supervise.retry_decision import RetryState
 
-                _retry_state = RetryState.initial_for_spec(
-                    _internal_spec_from_status(status)
-                ).to_snapshot()
+                # retry policy is derived from the spec, so a record whose spec no longer parses
+                # (an older writer's shape, reached by the billing sweep) simply gets no snapshot.
+                # every reader requires one and fails closed, which is the right answer here: a run
+                # whose spec cannot be read cannot be relaunched either. persisting it must still
+                # work, so this never blocks the save.
+                try:
+                    _retry_state = RetryState.initial_for_spec(
+                        _internal_spec_from_status(status)
+                    ).to_snapshot()
+                except Exception:
+                    _retry_state = None
         _save_status_unlocked(
             status,
             _run_deadline_at=_run_deadline_at,
