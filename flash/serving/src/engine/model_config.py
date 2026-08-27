@@ -3,9 +3,9 @@
 The serving app runs one vLLM GPU engine per base model, each on the Modal GPU class set by its
 catalog ``gpu`` (see below). Adapters and routing key off the logical ``base_model``; the engine
 loads its configured checkpoint at that checkpoint's own dtype. The active dense 9B uses Freesolo
-compressed-tensors FP8. Qwen3.8-27B retains pinned candidate metadata but is excluded from active
-lookups until its exact canary passes. The active 35B-A3B MoE serves base bf16 weights because its
-fused-MoE LoRA path will not compile on FP8, as detailed below.
+compressed-tensors FP8 and the active dense 27B uses the official Qwen FP8 checkpoint. The active
+35B-A3B MoE serves base bf16 weights because its fused-MoE LoRA path will not compile on FP8, as
+detailed below.
 """
 
 from __future__ import annotations
@@ -107,9 +107,13 @@ SERVING_MODELS: list[dict[str, Any]] = [
             # the complete model and LoRA load is about 108 GiB on the 141 GiB H200.
         },
     },
-    # 27B dense on an H100 (80 GiB): the FP8 checkpoint is about 27 GiB, leaving room for 16 rank-64
-    # LoRA slots and a 32k KV cache. every repository here is pinned to an immutable revision so a
-    # served engine cannot silently follow an upstream retag.
+    # 27B dense on an H100 (80 GiB). the real-GPU canary measured the load at 44.25 GiB -- above the
+    # FP8 weight size alone, because the vision tower and the non-quantized tensors stay bf16 -- which
+    # still leaves 23.07 GiB of KV cache (350,981 tokens, 10.71x concurrency at 32k) after the 16
+    # rank-64 LoRA buffers and a 0.35 GiB graph capture. every repository here is pinned to an
+    # immutable revision so a served engine cannot silently follow an upstream retag; note the model
+    # pin names a commit in the -FP8 repo while the tokenizer/processor pins name one in the base
+    # repo, which are separate sha namespaces.
     {
         "base_model": "Qwen/Qwen3.8-27B",
         "image_input_limit": 4,
