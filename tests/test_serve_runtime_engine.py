@@ -1104,7 +1104,7 @@ def test_multimodal_template_detaches_and_decodes_historical_tool_arguments(monk
                     "type": "function",
                     "function": {
                         "name": "weather",
-                        "arguments": '{"large":9007199254740993.0,"tiny":1e-400}',
+                        "arguments": '{"large":9007199254740993.0,"tiny":1e-40}',
                     },
                 }
             ],
@@ -1131,11 +1131,11 @@ def test_multimodal_template_detaches_and_decodes_historical_tool_arguments(monk
     processor = runtime._processor
     template_messages = processor.template_calls[0][0]
     arguments = template_messages[1]["tool_calls"][0]["function"]["arguments"]
-    assert str(arguments["large"]) == "9007199254740993.0"
-    assert str(arguments["tiny"]) == "1E-400"
+    assert arguments["large"] == 9007199254740993
+    assert arguments["tiny"] == 1e-40
     assert template_messages[2]["content"] == "sunny"
     assert messages[1]["tool_calls"][0]["function"]["arguments"] == (
-        '{"large":9007199254740993.0,"tiny":1e-400}'
+        '{"large":9007199254740993.0,"tiny":1e-40}'
     )
     assert isinstance(messages[2]["content"], list)
     assert closed == [True]

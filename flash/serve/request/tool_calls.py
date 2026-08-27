@@ -366,6 +366,10 @@ def _validate_history_calls(
                 raise error_type(f"{path} {exc}") from exc
             raise error_type(f"{path} function arguments must encode a JSON object") from exc
         _validate_tool_argument_complexity(decoded, path, error_type)
+        try:
+            _native_json_value(decoded)
+        except ValueError as exc:
+            raise error_type(f"{path} {exc}") from exc
         calls.append((call_id, name))
     return calls
 
@@ -481,21 +485,33 @@ def _decode_json_object(value: str) -> dict[str, Any]:
 
 
 def _template_json_object(value: str) -> dict[str, Any]:
-    return {
-        key: (
-            _dump_exact_json(nested)
-            if type(nested) in {dict, list} and _contains_decimal(nested)
-            else nested
-        )
-        for key, nested in _decode_json_object(value).items()
-    }
+    return _native_json_value(_decode_json_object(value))
 
 
-def _contains_decimal(value: Any) -> bool:
+def _native_json_value(value: Any) -> Any:
     if type(value) is Decimal:
-        return True
-    nested = value if type(value) is list else value.values() if type(value) is dict else ()
-    return any(_contains_decimal(item) for item in nested)
+        if _decimal_is_integral(value):
+            digits, exponent = value.as_tuple().digits, value.as_tuple().exponent
+            expanded_digits = 1 if value.is_zero() else len(digits) + exponent
+            if expanded_digits > _MAX_FIXED_DECIMAL_DIGITS:
+                raise ValueError(
+                    f"expanded integer exceeds {_MAX_FIXED_DECIMAL_DIGITS}-digit template limit"
+                )
+            return int(value)
+        try:
+            converted = float(value)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError(
+                "decimal number is not representable as a native template number"
+            ) from exc
+        if not math.isfinite(converted) or (converted == 0.0 and value != 0):
+            raise ValueError("decimal number is not representable as a native template number")
+        return converted
+    if type(value) is list:
+        return [_native_json_value(item) for item in value]
+    if type(value) is dict:
+        return {key: _native_json_value(item) for key, item in value.items()}
+    return value
 
 
 def _contains_unpaired_surrogate(value: Any) -> bool:

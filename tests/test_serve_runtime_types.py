@@ -9,7 +9,6 @@ import subprocess
 import sys
 from collections import UserDict
 from collections.abc import Mapping, Sequence
-from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
@@ -17,6 +16,7 @@ from typing import Any
 import pytest
 from PIL import Image
 
+from flash.serve.request.openai import parse_chat_request
 from flash.serve.request.tool_calls import (
     FunctionTool,
     detached_template_messages,
@@ -1018,14 +1018,22 @@ def test_generation_request_revalidates_tools_and_rejects_tool_images() -> None:
 
 def test_historical_integer_lexeme_limit_detaches_exactly_and_rejects_overflow() -> None:
     literal = "9" * 1024
+    arguments = (
+        '{"direct":' + literal + ',"nested":{"value":' + literal + '},"values":[' + literal + "]}"
+    )
     messages = _runtime_tool_history("call_1")
-    messages[1]["tool_calls"][0]["function"]["arguments"] = '{"value":' + literal + "}"
+    messages[1]["tool_calls"][0]["function"]["arguments"] = arguments
     request = GenerationRequest(messages=messages)
 
     converted = detached_template_messages(request.messages)
+    detached = converted[1]["tool_calls"][0]["function"]["arguments"]
 
-    assert str(converted[1]["tool_calls"][0]["function"]["arguments"]["value"]) == literal
-    assert messages[1]["tool_calls"][0]["function"]["arguments"] == '{"value":' + literal + "}"
+    assert detached == {
+        "direct": int(literal),
+        "nested": {"value": int(literal)},
+        "values": [int(literal)],
+    }
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == arguments
 
     for digits in (1025, 5000):
         rejected = _runtime_tool_history("call_1")
@@ -1034,6 +1042,25 @@ def test_historical_integer_lexeme_limit_detaches_exactly_and_rejects_overflow()
             GenerationRequest(messages=rejected)
         assert "1024-digit limit" in str(raised.value)
         assert "Exceeds the limit (4300 digits)" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"direct":1e1024}',
+        '{"nested":{"value":1e1024}}',
+        '{"values":[1e1024]}',
+    ],
+    ids=["direct", "nested", "list"],
+)
+def test_expanded_historical_integer_over_template_limit_rejects_before_rendering(
+    arguments: str,
+) -> None:
+    messages = _runtime_tool_history("call_1")
+    messages[1]["tool_calls"][0]["function"]["arguments"] = arguments
+
+    with pytest.raises(RuntimeConfigurationError, match="expanded integer exceeds 1024-digit"):
+        GenerationRequest(messages=messages)
 
 
 def test_detached_history_arguments_are_objects_without_caller_mutation() -> None:
@@ -1068,10 +1095,11 @@ def test_detached_tool_result_text_parts_flatten_only_for_templates() -> None:
     assert messages[0]["content"] == content
 
 
-def test_detached_history_arguments_preserve_exact_decimals() -> None:
+def test_detached_history_arguments_are_native_json_values_without_stringified_containers() -> None:
     arguments = (
-        '{"large":9007199254740993.0,"tiny":1e-400,'
-        '"nested":{"value":9007199254740993.0},"values":[1e-400]}'
+        '{"direct":1.25,"integral":9007199254740993.0,'
+        '"nested":{"value":2.5e1},"values":[6.25e-1,1e2],'
+        '"text":"exact","enabled":true,"empty":null}'
     )
     messages = [
         {
@@ -1091,57 +1119,96 @@ def test_detached_history_arguments_preserve_exact_decimals() -> None:
     detached = converted[0]["tool_calls"][0]["function"]["arguments"]
 
     assert detached == {
-        "large": Decimal("9007199254740993.0"),
-        "tiny": Decimal("1e-400"),
-        "nested": '{"value":9007199254740993.0}',
-        "values": "[1e-400]",
+        "direct": 1.25,
+        "integral": 9007199254740993,
+        "nested": {"value": 25},
+        "values": [0.625, 100],
+        "text": "exact",
+        "enabled": True,
+        "empty": None,
     }
+    json.dumps(detached, allow_nan=False)
+    assert type(detached["nested"]) is dict
+    assert type(detached["values"]) is list
     assert messages[0]["tool_calls"][0]["function"]["arguments"] == arguments
 
 
-def test_cached_qwen35_template_renders_boundary_nested_history_without_mutation() -> None:
+def test_parsed_history_uses_cached_qwen35_template_with_native_numeric_shapes() -> None:
+    import asyncio
+
     from transformers import AutoTokenizer
 
     integer = "9" * 1024
+    expanded = "1" + "0" * 1023
     arguments = (
-        '{"exact":9007199254740993.0,"integer":'
+        '{"direct":1.25,"exponent":1e2,"expanded":1e1023,"integer":'
         + integer
-        + ',"nested":{"items":[{"values":[{"leaf":[[0]]}]}]}}'
+        + ',"nested":{"decimal":2.5,"exponent":2.5e1,"expanded":1e1023,"integer":'
+        + integer
+        + '},"values":[0.625,6.25e-1,1e1023,'
+        + integer
+        + "]}"
     )
-    messages = [
-        {"role": "user", "content": "weather"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "weather", "arguments": arguments},
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
-    ]
+    messages = _runtime_tool_history("call_1")
+    messages[1]["tool_calls"][0]["function"]["arguments"] = arguments
     original = json.loads(json.dumps(messages))
-    request = GenerationRequest(messages=messages)
+    normalized = parse_chat_request(
+        {"messages": messages, "tools": [tool.wire() for tool in _runtime_tools()]},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+    request = GenerationRequest(
+        messages=normalized.messages,
+        tools=normalized.tools,
+        tool_choice=normalized.tool_choice,
+        parallel_tool_calls=normalized.parallel_tool_calls,
+    )
     try:
         tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-9B", local_files_only=True)
     except OSError:
         pytest.skip("Qwen3.5 tokenizer is not cached locally")
-
-    rendered = tokenizer.apply_chat_template(
-        detached_template_messages(request.messages),
-        tokenize=False,
-        add_generation_prompt=True,
-        tools=[tool.wire() for tool in _runtime_tools()],
-        enable_thinking=False,
+    preparer = PromptPreparer(
+        EngineConfig(model="Qwen/Qwen3.5-9B", prompt_cache_size=1),
+        tokenizer,
+        None,
     )
 
-    assert "<parameter=exact>\n9007199254740993.0\n</parameter>" in rendered
-    assert f"<parameter=integer>\n{integer}\n</parameter>" in rendered
-    assert '"leaf": [[0]]' in rendered
+    first = asyncio.run(preparer.prepare(request, False))
+    second = asyncio.run(preparer.prepare(request, False))
+    template_messages = detached_template_messages(request.messages)
+    rendered = tokenizer.apply_chat_template(
+        template_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    detached = template_messages[1]["tool_calls"][0]["function"]["arguments"]
+
+    assert first.value == second.value
+    assert preparer.cache_entries == 1
+    assert detached == {
+        "direct": 1.25,
+        "exponent": 100,
+        "expanded": int(expanded),
+        "integer": int(integer),
+        "nested": {
+            "decimal": 2.5,
+            "exponent": 25,
+            "expanded": int(expanded),
+            "integer": int(integer),
+        },
+        "values": [0.625, 0.625, int(expanded), int(integer)],
+    }
+    assert "<parameter=direct>\n1.25\n</parameter>" in rendered
+    assert "<parameter=exponent>\n100\n</parameter>" in rendered
+    assert f"<parameter=expanded>\n{expanded}\n</parameter>" in rendered
+    assert '"decimal": 2.5' in rendered
+    assert f'"expanded": {expanded}' in rendered
+    assert "<parameter=values>\n[0.625, 0.625," in rendered
+    assert expanded in rendered
+    assert integer in rendered
     assert messages == original
+    assert request.messages[1]["tool_calls"][0]["function"]["arguments"] == arguments
 
 
 def test_a_multimodal_template_rejection_is_a_client_error_not_an_unavailable_engine(

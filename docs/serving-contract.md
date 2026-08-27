@@ -176,8 +176,10 @@ descriptions, enums, and array `items`. Numeric enum members must be JSON intege
 exponent numeric enum lexemes are rejected because Flash cannot preserve them exactly across every
 ingress and template boundary. Generated and historical JSON numeric literals support at most 1024
 significand digits; oversized generated candidates remain exact text and oversized history is rejected.
-Exponent magnitude is not part of this bound, so compact scientific notation remains supported. This
-local serving-contract bound does not depend on Python's process-wide integer conversion limit.
+A historical integral value's expanded native template result is also capped at 1024 digits. Historical
+nonintegral exponent values are supported only when they convert to a finite, non-underflowing native
+template number. These local serving-contract bounds do not depend on Python's process-wide integer
+conversion limit.
 Unsupported keywords and `strict: true` are rejected.
 
 `tool_choice` defaults to `auto` and accepts only `auto` or `none`. `parallel_tool_calls` defaults to

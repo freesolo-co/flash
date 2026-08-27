@@ -735,6 +735,87 @@ def test_malformed_numeric_or_duplicate_key_tool_history_is_a_request_error(
         )
 
 
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"direct":6.25e-1}',
+        '{"nested":{"value":2.5e1}}',
+        '{"values":[1e2,1.25e-2]}',
+    ],
+    ids=["direct", "nested", "list"],
+)
+def test_finite_exponent_tool_history_is_accepted(argument: str) -> None:
+    messages = _historical_tool_messages(argument)
+
+    request = parse_chat_request(
+        {"messages": messages},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    assert request.messages == messages
+
+
+@pytest.mark.parametrize(
+    ("argument", "reason"),
+    [
+        ('{"value":1.' + "0" * 309 + "1e309}", "not representable as a native template number"),
+        ('{"value":1e-400}', "not representable as a native template number"),
+        ('{"value":NaN}', "arguments must encode a JSON object"),
+        ('{"value":Infinity}', "arguments must encode a JSON object"),
+        ('{"value":-Infinity}', "arguments must encode a JSON object"),
+    ],
+    ids=["overflow", "nonzero-underflow", "nan", "infinity", "negative-infinity"],
+)
+def test_unrepresentable_or_nonfinite_tool_history_is_a_request_error(
+    argument: str, reason: str
+) -> None:
+    with pytest.raises(OpenAIRequestError, match=reason):
+        parse_chat_request(
+            {"messages": _historical_tool_messages(argument)},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"direct":' + "9" * 1025 + "}",
+        '{"nested":{"value":' + "9" * 1025 + "}}",
+        '{"values":[' + "9" * 1025 + "]}",
+    ],
+    ids=["direct", "nested", "list"],
+)
+def test_oversized_integer_tool_history_is_a_request_error(argument: str) -> None:
+    with pytest.raises(OpenAIRequestError, match="1024-digit limit"):
+        parse_chat_request(
+            {"messages": _historical_tool_messages(argument)},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"direct":1e1024}',
+        '{"nested":{"value":1e1024}}',
+        '{"values":[1e1024]}',
+    ],
+    ids=["direct", "nested", "list"],
+)
+def test_expanded_integer_tool_history_over_template_limit_is_a_request_error(
+    argument: str,
+) -> None:
+    with pytest.raises(OpenAIRequestError, match="expanded integer exceeds 1024-digit"):
+        parse_chat_request(
+            {"messages": _historical_tool_messages(argument)},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
 @pytest.mark.parametrize("argument", ['{"text":"\\ud800"}', '{"text":"\\udc00"}'])
 def test_unpaired_surrogate_in_tool_history_is_a_request_error(argument: str) -> None:
     messages = _historical_tool_messages(argument)
