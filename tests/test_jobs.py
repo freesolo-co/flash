@@ -1691,7 +1691,11 @@ def test_supervisor_preserves_exact_authoritative_failure_after_retry_exhaustion
         assert status.state == "failed"
         assert status.error == "job_failed: worker validation failed"
         assert runner_status._current_attempt(status).state == "settled"
-        assert status.remote["job_id"] == "job-failed"
+        # teardown was confirmed, so the active handle is cleared and the exact identity is
+        # retained for cleanup and cost attribution instead.
+        assert status.remote is None
+        assert status.cleanup_confirmed_remote["job_id"] == "job-failed"
+        assert status.realized_cost_remote["job_id"] == "job-failed"
 
 
 def test_supervisor_retries_on_provider_loss_then_succeeds(monkeypatch):
