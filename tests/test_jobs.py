@@ -1455,6 +1455,62 @@ def test_live_transient_result_read_waits_for_landed_success(monkeypatch):
     assert ctx.last_handle
 
 
+def test_offline_mode_is_not_a_transient_result_transport_failure():
+    """offline mode must fail closed instead of being waited out.
+
+    ``OfflineModeIsEnabled`` subclasses ``ConnectionError`` (and so ``OSError``), which is exactly
+    the shape the transient check treats as a retryable network blip. Reading it that way makes
+    ``_observe_previous_attempt_result`` sleep-and-retry until ``result_deadline_at``, and that
+    deadline is ``run_deadline_at + 120s`` derived from ``max_wall_seconds`` -- 24 hours by
+    default. Offline mode is a local configuration decision, so no wait can ever reach the hub.
+    """
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    offline = OfflineModeIsEnabled("offline mode is enabled")
+    # the inheritance that makes this misread as transient, pinned so the guard cannot be dropped
+    # as redundant if the class hierarchy is what changes.
+    assert isinstance(offline, OSError)
+    assert runner_lifecycle._result_transport_is_transient(offline) is False
+    # a genuine transport blip of the same base type still waits, so this is not a blanket
+    # "OSError is permanent" rule.
+    assert runner_lifecycle._result_transport_is_transient(OSError("artifact outage")) is True
+
+
+def test_offline_result_observation_fails_closed_without_sleeping(monkeypatch):
+    """the end-to-end consequence: no real-time sleep loop when the hub is unreachable."""
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    import flash.providers.runpod.execution.jobs as jobs
+    import flash.runner.lifecycle.status as status_ops
+    from flash.runner.supervise import seed_submission
+
+    ctx = _failure_context()
+    ctx.last_handle = _runpod_handle_dict(jobs)
+    attempt = _attempt_record(work_deadline_at=105.0, result_deadline_at=110.0).to_dict()
+    monkeypatch.setattr(status_ops, "get_status", lambda _run_id: SimpleNamespace(attempt=attempt))
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_attempt_result",
+        lambda *_args: (_ for _ in ()).throw(OfflineModeIsEnabled("offline mode is enabled")),
+    )
+    failed = []
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_fail_permanent_result_artifact",
+        lambda run_id, remote, error: failed.append((run_id, str(error))) or True,
+    )
+    monkeypatch.setattr(
+        runner_lifecycle.time,
+        "sleep",
+        lambda _seconds: pytest.fail("offline mode must not be waited out"),
+    )
+
+    with pytest.raises(RuntimeError, match="verification failed permanently"):
+        seed_submission._cleanup_previous_attempt(ctx, 1)
+
+    assert [run_id for run_id, _error in failed] == [ctx.spec.run_id]
+
+
 def test_live_permanent_result_verification_fails_closed(monkeypatch):
     import flash.providers.runpod.execution.jobs as jobs
     from flash.providers.artifacts.attempts import AttemptArtifactError
@@ -3070,6 +3126,9 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
+        # this test drives the gpu walk, not attempt-artifact transport; without the stub the
+        # seeded retries reach hugging face for a real fenced result observation.
+        monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args: None)
         import flash.providers.core.allocator as allocator
         import flash.providers.runpod.execution.jobs as jobs
         import flash.providers.runpod.serverless.endpoints as flash_train

@@ -146,8 +146,19 @@ def _failure_disposition(
 
 
 def _result_transport_is_transient(error: BaseException) -> bool:
+    """whether one failed result observation is worth waiting out.
+
+    ``OfflineModeIsEnabled`` subclasses ``ConnectionError``, so it reads as a network blip to the
+    checks below and would be retried until ``result_deadline_at`` -- a real sleep of the whole
+    remaining run wall (24h by default). Offline mode is a local configuration decision, not a
+    remote condition: no amount of waiting reaches the hub, so it fails closed immediately.
+    """
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
     from flash.snapshot.archive import is_transient_fetch_error
 
+    if isinstance(error, OfflineModeIsEnabled):
+        return False
     return isinstance(error, OSError) or is_transient_fetch_error(error)
 
 
