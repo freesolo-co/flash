@@ -9,13 +9,19 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Literal, Protocol
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from flash.serving.src.accounting.settlement import (
+    AuthoritativeProviderDay,
+    ProviderSettlementRecord,
+    ReconciliationDayResult,
+    ReconciliationResult,
+)
 from flash.serving.src.store.settings import Settings
 from flash.serving.src.store.supabase_rest import supabase_headers
 
@@ -27,6 +33,10 @@ _RECOVERY_BATCH_SIZE = 500
 _CLEANUP_TIMEOUT_SECONDS = 10.0
 _RESPONSE_LOSS_REPLAY_ATTEMPTS = 2
 _RESPONSE_LOSS_REPLAY_DELAY_SECONDS = 0.05
+# how many delivery rounds may fail back to back before the outbox declares itself broken. high
+# enough to ride out a restart or a brief supabase outage at the default poll interval, low enough
+# that a permanent failure is reported in minutes rather than never.
+_MAX_CONSECUTIVE_DELIVERY_FAILURES = 20
 _RESPONSE_LOSS_SAFE_RPCS = frozenset(
     {
         "capture_serving_usage",
@@ -270,91 +280,6 @@ class OfflineUsageStore:
         return None
 
 
-@dataclass(frozen=True)
-class AuthoritativeProviderDay:
-    provider: str
-    usage_date: date
-    source: str
-    source_version: str
-    attestation_evidence: Mapping[str, Any]
-
-    def rpc_payload(self) -> dict[str, Any]:
-        return {
-            "p_provider": self.provider,
-            "p_usage_date": self.usage_date.isoformat(),
-            "p_source": self.source,
-            "p_source_version": self.source_version,
-            "p_attestation_evidence": dict(self.attestation_evidence),
-        }
-
-
-@dataclass(frozen=True)
-class ReconciliationDayResult:
-    reconciliation_day_id: str
-    reconciliation_state: str
-    status_reason: str | None
-    replay: bool
-
-
-@dataclass(frozen=True)
-class ReconciliationResult:
-    input_ordinal: int
-    outbox_id: str | None
-    reconciliation_status: str
-    dispute_code: str | None
-    replay: bool
-
-
-@dataclass(frozen=True)
-class ProviderSettlementRecord:
-    provider: str
-    usage_date: date
-    source: str
-    source_version: str
-    provider_record_id: str
-    request_id: str | None
-    provider_amount_micro_usd: int | None
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-    reasoning_tokens: int | None = None
-    cached_tokens: int | None = None
-    evidence: Mapping[str, Any] | None = None
-    attestation_evidence: Mapping[str, Any] | None = None
-
-    def rpc_payload(self) -> dict[str, Any]:
-        return {
-            "provider": self.provider,
-            "usage_date": self.usage_date.isoformat(),
-            "source": self.source,
-            "source_version": self.source_version,
-            "provider_record_id": self.provider_record_id,
-            "request_id": self.request_id,
-            "provider_amount_micro_usd": self.provider_amount_micro_usd,
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "reasoning_tokens": self.reasoning_tokens,
-            "cached_tokens": self.cached_tokens,
-            "evidence": dict(self.evidence or {}),
-            "attestation_evidence": dict(self.attestation_evidence or {}),
-        }
-
-
-@dataclass(frozen=True)
-class ProviderSettlementPage:
-    records: tuple[ProviderSettlementRecord, ...]
-    next_cursor: str | None
-
-
-class ProviderSettlementAdapter(Protocol):
-    provider: str
-    authoritative: bool
-    exact_reasoning_tokens: bool
-
-    async def fetch_day(
-        self, usage_date: date, *, cursor: str | None, limit: int
-    ) -> ProviderSettlementPage: ...
-
-
 Jitter = Callable[[str, int, float], float]
 Sleep = Callable[[float], Awaitable[None]]
 Clock = Callable[[], datetime]
@@ -593,6 +518,20 @@ class DurableUsageOutbox:
         ):
             raise UsageOutboxError("generation_heartbeat_timing_changed")
 
+    def _fail_background(self, exc: BaseException) -> None:
+        """Stop the outbox and remember why, so the failure is reportable rather than silent.
+
+        A background worker has nobody to raise to. Recording the cause and setting `_stopping` is
+        what turns its death into something the request path sees on the next `capture`, and
+        something `aclose()` reports, instead of a task that quietly stopped running. The first
+        cause is the one kept: later failures are consequences of this one.
+        """
+        if self._background_error is None:
+            self._background_error = exc
+        self._stopping.set()
+        self._wake.set()
+        self._heartbeat_wake.set()
+
     def _raise_background_error(self) -> None:
         if self._background_error is not None:
             raise UsageOutboxError("usage_outbox_background_failure") from self._background_error
@@ -623,6 +562,7 @@ class DurableUsageOutbox:
             raise UsageOutboxError("supabase_rpc_invalid_json") from exc
 
     async def _run_worker(self) -> None:
+        consecutive_failures = 0
         while not self._stopping.is_set():
             self._wake.clear()
             try:
@@ -636,8 +576,19 @@ class DurableUsageOutbox:
                     self._wake.set()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                # a delivery round fails for two very different reasons, and only elapsed attempts
+                # tell them apart: a transient supabase or backend blip clears on the next poll,
+                # while a revoked service-role key or a drifted rpc contract fails identically
+                # forever. retrying without a bound treats the second as the first, so the loop
+                # spins for the lifetime of the deployment while `/healthz` still answers ok.
+                consecutive_failures += 1
+                if consecutive_failures >= _MAX_CONSECUTIVE_DELIVERY_FAILURES:
+                    self._fail_background(exc)
+                    return
                 await self._sleep(self._poll_seconds)
+            else:
+                consecutive_failures = 0
             if self._wake.is_set():
                 continue
             with contextlib.suppress(TimeoutError):
@@ -672,9 +623,7 @@ class DurableUsageOutbox:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._background_error = exc
-                self._stopping.set()
-                self._wake.set()
+                self._fail_background(exc)
                 return
 
     async def _heartbeat_active_generations_with_retry(self) -> None:
