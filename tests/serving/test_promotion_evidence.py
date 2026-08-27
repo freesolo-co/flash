@@ -215,11 +215,29 @@ def test_a_body_missing_the_age_field_is_unreadable():
     assert parse_accounting(body) is None
 
 
-def test_a_counter_that_is_not_an_integer_is_unreadable():
+def test_a_counter_that_is_not_a_number_is_unreadable():
     """`true` is an int in python, so a boolean counter would read as one row."""
     assert parse_accounting(_body(states={"pending": True, "leased": 0})) is None
     assert parse_accounting(_body(states={"pending": "0", "leased": 0})) is None
     assert parse_accounting(_body(oldest_undelivered_age_seconds="7")) is None
+
+
+def test_a_fractional_age_is_the_normal_wire_shape_not_a_malformed_body():
+    """`EXTRACT(EPOCH FROM ...)` returns a numeric, so the age arrives as a JSON float.
+
+    Rejecting floats would make the ORDINARY live snapshot unparseable, and an unparseable snapshot
+    fails the gate -- so a perfectly healthy release would be rolled back on almost every deploy.
+    The threshold still has to hold across the boundary, hence both sides of it here.
+    """
+    assert verify_accounting(parse_accounting(_body(oldest_undelivered_age_seconds=0.5))).ok
+    assert verify_accounting(parse_accounting(_body(states={"pending": 2.0, "leased": 0.0}))).ok
+
+    stalled = parse_accounting(_body(oldest_undelivered_age_seconds=119.9))
+    assert stalled is not None
+    assert verify_accounting(stalled).ok
+    verdict = verify_accounting(parse_accounting(_body(oldest_undelivered_age_seconds=120.1)))
+    assert verdict.ok is False
+    assert verdict.reason == ACCOUNTING_STALLED
 
 
 def test_postgrest_returns_the_row_wrapped_in_a_list():

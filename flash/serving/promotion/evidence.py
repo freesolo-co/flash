@@ -27,6 +27,23 @@ _STALL_AGE_SECONDS = 120
 
 _MISSING = object()
 
+
+def _number(value: Any) -> float | None:
+    """A JSON number from the snapshot, or None when the field is absent or not a number.
+
+    Accepts floats as well as ints because these fields come from postgres numerics: the canonical
+    reader (`usage_outbox.DurableUsageOutbox.snapshot`) coerces every one of them with `int(...)`
+    for exactly that reason. Rejecting floats here would make the ORDINARY live shape unparseable,
+    and an unparseable snapshot fails the gate -- which rolls a healthy release back.
+
+    `bool` is excluded ahead of `int` because it is a subclass of it, so `True` would otherwise read
+    as the number 1 and let a wrong-typed field pass as a plausible counter.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 HEALTH_MALFORMED = "health_malformed"
 HEALTH_NOT_OK = "health_not_ok"
 HEALTH_SHA_MISMATCH = "health_sha_mismatch"
@@ -160,10 +177,14 @@ class AccountingEvidence:
     individually observable from here.
     """
 
-    pending: int
-    leased: int
-    expired_leases: int
-    oldest_undelivered_age_seconds: int | None
+    # `float` rather than `int` for all four, because postgres numerics arrive as JSON floats and
+    # `float` already admits `int`. `oldest_undelivered_age_seconds` in particular is derived with
+    # `EXTRACT(EPOCH FROM ...)`, so a fractional value is the NORMAL shape, not a malformed one.
+    # Nothing here needs integrality: every reading below is a threshold comparison.
+    pending: float
+    leased: float
+    expired_leases: float
+    oldest_undelivered_age_seconds: float | None
 
     @property
     def stalled(self) -> bool:
@@ -197,16 +218,16 @@ def parse_accounting(payload: Any) -> AccountingEvidence | None:
     states = payload.get("states")
     if not isinstance(states, dict):
         return None
-    counters: list[int] = []
+    counters: list[float] = []
     for source, field in ((states, "pending"), (states, "leased"), (payload, "expired_leases")):
-        value = source.get(field, _MISSING)
-        if isinstance(value, bool) or not isinstance(value, int):
+        value = _number(source.get(field, _MISSING))
+        if value is None:
             return None
         counters.append(value)
     # None is a real reading here ("nothing undelivered"); an ABSENT field is not, because it would
     # silently read as healthy while carrying no stall signal at all.
     age = payload.get("oldest_undelivered_age_seconds", _MISSING)
-    if age is not None and (isinstance(age, bool) or not isinstance(age, int)):
+    if age is not None and _number(age) is None:
         return None
     return AccountingEvidence(*counters, oldest_undelivered_age_seconds=age)
 
