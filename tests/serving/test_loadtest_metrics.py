@@ -131,6 +131,49 @@ def test_observed_capacity_rejection_is_reported_separately_from_other_503_and_4
     assert verdict["http_429"] == 1
 
 
+def test_offered_rate_across_phases_sums_windows_instead_of_taking_the_longest() -> None:
+    """a group spanning several phases must divide by all their windows, not one.
+
+    ``overall``, ``per_target`` and ``per_profile`` each combine every phase. dividing the combined
+    count by a single phase's window inflates offered rps by the factor of the phases it ignored,
+    which would overstate the load the harness claims to have offered.
+    """
+    events = [
+        _event(0, phase_name="sustained", authored_window_seconds=3.0),
+        _event(1, phase_name="sustained", authored_window_seconds=3.0),
+        _event(2, phase_name="mixed", phase_kind="mixed", authored_window_seconds=1.0),
+    ]
+    overall = summarize_events(events, fake=True)["overall"]["rates"]["offered"]
+    assert overall["denominator_basis"] == "authored_windows"
+    assert overall["denominator_seconds"] == 4.0
+    assert overall["requests_per_second"] == 0.75
+    per_phase = summarize_events(events, fake=True)["per_phase"]
+    assert per_phase["sustained"]["rates"]["offered"]["denominator_seconds"] == 3.0
+    assert per_phase["mixed"]["rates"]["offered"]["denominator_seconds"] == 1.0
+
+
+def test_offered_rate_is_undefined_when_only_some_phases_declare_a_window() -> None:
+    """a warm phase has no authored window, so a mixed group has no defensible denominator."""
+    events = [
+        _event(0, phase_name="warm", phase_kind="warm", authored_window_seconds=None),
+        _event(1, phase_name="sustained", authored_window_seconds=3.0),
+    ]
+    offered = summarize_events(events, fake=True)["overall"]["rates"]["offered"]
+    assert offered["denominator_basis"] == "undefined_mixed_phase_windows"
+    assert offered["denominator_seconds"] is None
+    assert offered["requests_per_second"] is None
+
+
+def test_offered_rate_falls_back_to_scheduled_span_when_no_phase_declares_a_window() -> None:
+    events = [
+        _event(0, phase_name="warm", phase_kind="warm", authored_window_seconds=None),
+        _event(1, phase_name="warm", phase_kind="warm", authored_window_seconds=None),
+    ]
+    offered = summarize_events(events, fake=True)["overall"]["rates"]["offered"]
+    assert offered["denominator_basis"] == "scheduled_span"
+    assert offered["denominator_seconds"] == 1.0
+
+
 def test_authored_vs_achieved_mix_and_duration_windows_are_explicit() -> None:
     events = [
         _event(0),

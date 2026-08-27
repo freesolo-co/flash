@@ -212,8 +212,12 @@ def _observe_chunk(value: dict[str, Any], observation: RequestObservation, now_n
         delta = choice.get("delta") or {}
         if not isinstance(delta, dict):
             raise ProtocolError("sse delta must be an object")
-        has_generated_delta = "content" in delta or "reasoning_content" in delta
-        if has_generated_delta and observation.first_generated_ns is None:
+        # both checks test for generated text, not for key presence: an opening chunk carrying
+        # only a role with an empty content string would otherwise stamp ttft at header time and
+        # report a first token the server had not produced.
+        if (delta.get("content") or delta.get("reasoning_content")) and (
+            observation.first_generated_ns is None
+        ):
             observation.first_generated_ns = now_ns
         if delta.get("content") and observation.first_visible_ns is None:
             observation.first_visible_ns = now_ns

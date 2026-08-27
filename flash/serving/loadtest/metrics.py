@@ -99,9 +99,9 @@ def _group_metrics(events: list[dict[str, Any]]) -> dict[str, Any]:
         for event in successes
         if event.get("prompt_tokens") is not None and event.get("completion_tokens") is not None
     ]
-    offered_seconds = _denominator_seconds(events, "scheduled_ns", use_authored=True)
-    dispatch_seconds = _denominator_seconds(dispatched, "dispatch_ns")
-    completion_seconds = _denominator_seconds(completed, "completed_ns")
+    offered_seconds, offered_basis = _offered_seconds(events)
+    dispatch_seconds = _span_seconds(dispatched, "dispatch_ns")
+    completion_seconds = _span_seconds(completed, "completed_ns")
     output_tokens = sum(int(event["completion_tokens"]) for event in usage)
     decode_seconds = sum(_decode_seconds(event) for event in usage)
     statuses = Counter(
@@ -121,7 +121,7 @@ def _group_metrics(events: list[dict[str, Any]]) -> dict[str, Any]:
             "client_admission_missed": errors.get("client_admission_missed", 0),
         },
         "rates": {
-            "offered": _rate(len(events), offered_seconds, "scheduled_span"),
+            "offered": _rate(len(events), offered_seconds, offered_basis),
             "dispatch": _rate(len(dispatched), dispatch_seconds, "dispatch_span"),
             "completion": _rate(len(completed), completion_seconds, "completion_span"),
         },
@@ -177,13 +177,29 @@ def _percentile(values: list[float], percentile: int) -> float | None:
     return values[index]
 
 
-def _denominator_seconds(
-    events: list[dict[str, Any]], key: str, *, use_authored: bool = False
-) -> float | None:
-    authored = [event.get("authored_window_seconds") for event in events]
-    authored = [float(value) for value in authored if value is not None]
-    if use_authored and authored:
-        return max(authored)
+def _offered_seconds(events: list[dict[str, Any]]) -> tuple[float | None, str]:
+    """how long this group of events was offering load, with the basis that produced it.
+
+    a group can span several phases (``overall``, ``per_target``, ``per_profile`` all do), so the
+    authored denominator is the sum of the distinct phase windows rather than the longest one.
+    dividing a combined count by a single phase's window would inflate offered rps by exactly the
+    factor of the phases it ignored.
+
+    a phase without an authored window (warm, an unbounded cold burst) has no authored duration to
+    contribute. a group made only of those falls back to the scheduled span; a group that mixes
+    both has no defensible denominator and reports none rather than a number built from half the
+    traffic.
+    """
+    windows = {event.get("phase_name"): event.get("authored_window_seconds") for event in events}
+    authored = [float(value) for value in windows.values() if value is not None]
+    if len(authored) == len(windows):
+        return sum(authored), "authored_windows"
+    if not authored:
+        return _span_seconds(events, "scheduled_ns"), "scheduled_span"
+    return None, "undefined_mixed_phase_windows"
+
+
+def _span_seconds(events: list[dict[str, Any]], key: str) -> float | None:
     values = [int(event[key]) for event in events if event.get(key) is not None]
     if len(values) < 2:
         return None

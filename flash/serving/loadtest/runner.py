@@ -212,6 +212,10 @@ async def _run_phase(
     credential: str,
     clock: Clock,
 ) -> None:
+    # the opening probe runs first so the phase origin is the moment traffic actually begins.
+    # stamping it before a blocking round trip would charge the probe's latency to the earliest
+    # arrivals' lag budget and manufacture client_admission_missed rows out of instrumentation.
+    await _health_event(result, client, resolved, f"phase:{phase.name}:start", clock)
     phase_start = clock.monotonic_ns()
     result.events.write(
         {
@@ -223,7 +227,6 @@ async def _run_phase(
             "cold_attestation": resolved.phase_cold_attestations.get(phase.name),
         }
     )
-    await _health_event(result, client, resolved, f"phase:{phase.name}:start", clock)
     recorder = PhaseRecorder(result, scheduled, phase, phase_start)
     try:
         if isinstance(phase, WarmPhase):
@@ -329,7 +332,11 @@ async def _run_open_loop_phase(
             await health.before(deadline_ns)
             await clock.sleep_until_ns(deadline_ns)
             now_ns = clock.monotonic_ns()
-            if now_ns - deadline_ns > max_lag_ns or slots.locked():
+            # lag means the client could not keep up; time spent inside a health probe is the
+            # harness's own cost, so it is excluded from the admission decision. the recorded
+            # timestamps still show the real delay, it just is not blamed on client saturation.
+            lag_ns = now_ns - deadline_ns - health.consumed_ns
+            if lag_ns > max_lag_ns or slots.locked():
                 recorder.miss(item, now_ns)
                 continue
             await slots.acquire()
@@ -349,6 +356,9 @@ class _MidpointHealth:
     duration phases are the only ones with a meaningful midpoint, so a phase without a duration
     simply never fires. keeping this here rather than as a parallel task means it cannot race the
     dispatch loop or outlive an interrupted phase.
+
+    ``consumed_ns`` reports how long the probe blocked the dispatch loop, so the caller can keep
+    instrumentation cost out of the client scheduling-lag budget.
     """
 
     def __init__(
@@ -367,6 +377,7 @@ class _MidpointHealth:
         self._done = False
         self._args = (result, client, resolved, f"phase:{phase.name}:during", clock)
         self._clock = clock
+        self.consumed_ns = 0
 
     async def before(self, deadline_ns: int) -> None:
         if self._at_ns is not None and not self._done and deadline_ns >= self._at_ns:
@@ -378,7 +389,9 @@ class _MidpointHealth:
 
     async def _fire(self) -> None:
         await self._clock.sleep_until_ns(self._at_ns)
+        started_ns = self._clock.monotonic_ns()
         await _health_event(*self._args)
+        self.consumed_ns += self._clock.monotonic_ns() - started_ns
         self._done = True
 
 
@@ -503,9 +516,12 @@ def _client(
         write=float(scenario.client.write_timeout_seconds),
         pool=float(scenario.client.pool_timeout_seconds),
     )
+    # one connection above max_in_flight is reserved for health probes. sizing the pool to exactly
+    # max_in_flight means a midpoint probe at saturation waits on the pool and can time out, which
+    # aborts the phase over instrumentation rather than over anything the deployment did.
     limits = httpx.Limits(
-        max_connections=scenario.client.max_in_flight,
-        max_keepalive_connections=scenario.client.max_in_flight,
+        max_connections=scenario.client.max_in_flight + 1,
+        max_keepalive_connections=scenario.client.max_in_flight + 1,
     )
     return client_factory(
         timeout=timeout,

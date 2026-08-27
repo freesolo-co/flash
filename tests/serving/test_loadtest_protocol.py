@@ -246,6 +246,53 @@ def test_strict_sse_tracks_reasoning_and_visible_content_separately() -> None:
     assert len(requests) == 1
 
 
+def test_role_only_opening_chunk_does_not_count_as_the_first_generated_token() -> None:
+    """an empty content string is not a token, so it must not stamp ttft.
+
+    openai-compatible servers open a stream with a role delta carrying ``content: ""``. keying
+    ttft on the presence of the key rather than on generated text would record the first token at
+    header time and report a time-to-first-token the server never achieved.
+    """
+
+    class TickingClock(FakeClock):
+        def monotonic_ns(self) -> int:
+            self.advance_ns(1_000_000)
+            return super().monotonic_ns()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        body = _sse(
+            {"choices": [{"delta": {"role": "assistant", "content": ""}, "finish_reason": None}]},
+            {"choices": [{"delta": {"reasoning_content": ""}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "answer"}, "finish_reason": "stop"}]},
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 4,
+                    "completion_tokens": 2,
+                    "prompt_tokens_details": {"cached_tokens": 1},
+                },
+            },
+        )
+        return httpx.Response(200, headers=_success_headers(), content=body)
+
+    async def run():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await stream_chat(
+                client,
+                "https://example.invalid",
+                "credential-secret",
+                _adapter(),
+                _profile(),
+                TickingClock(),
+            )
+
+    observation = asyncio.run(run())
+    assert observation.outcome == "success"
+    # the empty deltas arrive before the real one, so a key-presence check would stamp earlier
+    assert observation.first_generated_ns == observation.first_visible_ns
+
+
 def test_missing_usage_makes_token_throughput_unavailable_without_estimate() -> None:
     observation = _run_chat(
         lambda _request: httpx.Response(

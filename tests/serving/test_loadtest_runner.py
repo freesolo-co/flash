@@ -148,6 +148,69 @@ def test_open_loop_saturation_records_admission_misses_without_delayed_work(tmp_
     assert all(event["retry_count"] == 0 for event in terminals)
 
 
+def test_opening_health_probe_latency_is_not_charged_to_the_first_arrivals(tmp_path) -> None:
+    """the phase origin is when traffic starts, not when the opening probe was requested.
+
+    arrival deadlines are measured from the phase origin. stamping that origin before a blocking
+    health round trip charges the probe's latency to the earliest arrivals' lag budget, so a slow
+    probe manufactures client_admission_missed rows out of instrumentation and corrupts the exact
+    metric that separates client saturation from server overload.
+    """
+    payload = scenario_payload()
+    payload["discovery"] = {"enabled": False}
+    payload["targets"] = [{"name": "base", "kind": "base_model", "model": "model-a"}]
+    # a lag budget far smaller than the probe latency below: only the ordering keeps these green
+    payload["client"] = {"max_in_flight": 8, "max_scheduling_lag_ms": 50.0}
+    payload["phases"] = [
+        {"name": "sustained", "kind": "sustained", "duration_seconds": 2.0, "rate_rps": 2.0}
+    ]
+    clock = FakeClock()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/healthz":
+            # a slow probe: half a second, ten times the authored lag budget
+            clock.advance_ns(500_000_000)
+            return httpx.Response(200, json=_health())
+        return httpx.Response(200, content=_sse())
+
+    async def exercise() -> None:
+        path = tmp_path / "result"
+        await run_scenario(
+            Scenario.model_validate(payload),
+            "fake-secret",
+            path,
+            clock=clock,
+            client_factory=_factory(httpx.MockTransport(handler)),
+        )
+        terminals = [
+            event
+            for event in load_events(path / "events.jsonl")
+            if event["type"] == "request_terminal"
+        ]
+        outcomes = [event["outcome"] for event in terminals]
+        assert "client_admission_missed" not in outcomes
+        assert outcomes.count("success") == len(terminals)
+
+    asyncio.run(exercise())
+
+
+def test_health_probe_has_a_connection_beyond_the_in_flight_limit(tmp_path) -> None:
+    """the pool reserves a slot for probes so saturation cannot abort a phase on a pool timeout."""
+    seen: dict[str, int] = {}
+
+    def build(**kwargs):
+        seen["max_connections"] = kwargs["limits"].max_connections
+        return httpx.AsyncClient(transport=httpx.MockTransport(lambda _r: None), **kwargs)
+
+    payload = scenario_payload()
+    payload["client"] = {"max_in_flight": 8, "max_scheduling_lag_ms": 50.0}
+    scenario = Scenario.model_validate(payload)
+    from flash.serving.loadtest.runner import _client
+
+    _client(scenario, "fake-secret", build)
+    assert seen["max_connections"] == scenario.client.max_in_flight + 1
+
+
 def test_interruption_preserves_outcomes_already_observed(tmp_path) -> None:
     """an interrupt must not overwrite requests whose outcome the harness already saw.
 
