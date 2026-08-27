@@ -5,6 +5,7 @@ import base64
 import io
 import types
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from typing import Any
 from unittest import mock
 
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 from PIL import Image, ImageOps
 
 from flash.serve.contract.provenance import immutable_binding_fingerprint
+from flash.serving.src.engine import generation
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl
 from flash.serving.src.engine.support import _num_prompt_tokens
 from flash.serving.src.http.router import AdapterRouter
@@ -1111,3 +1113,57 @@ def test_malformed_tool_calls_are_rejected_before_the_chat_template(tool_calls: 
 def test_a_usable_tool_call_history_still_passes() -> None:
     messages = [{"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "f"}}]}]
     assert normalize_chat_messages(messages, supports_images=False, image_limit=4) == messages
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_source_lease_failure_closes_decoded_images(stream: bool) -> None:
+    """The images are decoded before the source lease is acquired, so the lease owns them too.
+
+    ``_prepare_prompt_input`` runs first and hands back live RGB buffers. If acquiring the source
+    lease then raises -- the exact undeploy/reclaim race this path exists to guard -- the cleanup
+    that closes those buffers must still run. Parameterized over both entry points because each
+    has its own acquire-then-try sequence and fixing one does not fix the other.
+    """
+
+    class _TrackedImage:
+        def __init__(self, image: Image.Image) -> None:
+            self._image = image
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+            self._image.close()
+
+    tracked: list[_TrackedImage] = []
+    real_prepare = multimodal.prepare_multimodal_request
+
+    def _tracking_prepare(*args: Any, **kwargs: Any):
+        template_messages, images = real_prepare(*args, **kwargs)
+        wrapped = [_TrackedImage(image) for image in images]
+        tracked.extend(wrapped)
+        return template_messages, wrapped
+
+    @asynccontextmanager
+    async def _exploding_lease(_record: Any, _lora_request: Any):
+        raise RuntimeError("source reclaimed mid-dispatch")
+        yield
+
+    engine = _engine_impl(processor=_Processor())
+    engine._source_generation_lease = _exploding_lease
+    payload_dict = {"adapter_id": QWEN, "messages": _messages()}
+    record_dict = internal_adapter_payload(_base_record())
+
+    async def run() -> None:
+        if stream:
+            await anext(engine._stream_generate(payload_dict, record_dict))
+        else:
+            await generation.generate(engine, payload_dict, record_dict)
+
+    with (
+        mock.patch.object(multimodal, "prepare_multimodal_request", _tracking_prepare),
+        pytest.raises(RuntimeError, match="source reclaimed mid-dispatch"),
+    ):
+        asyncio.run(run())
+
+    assert len(tracked) == 1, f"expected one decoded image, got {len(tracked)}"
+    assert all(image.closed for image in tracked), "decoded images leaked when the lease failed"

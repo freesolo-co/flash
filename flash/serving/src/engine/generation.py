@@ -188,7 +188,14 @@ async def generate(
     # the source lease pins this adapter's materialized directory for the whole generation, so a
     # concurrent cache reclamation cannot delete weights out from under a running request.
     source_lease = _source_lease(owner, record, lora_request)
-    await source_lease.__aenter__()
+    try:
+        await source_lease.__aenter__()
+    except BaseException:
+        # the images are already decoded at this point, so acquiring the lease is inside their
+        # cleanup rather than before it. a lease failure is the undeploy race this path guards, and
+        # leaving it outside would leak the decoded rgb buffers on exactly that race.
+        owner._close_prompt_images(prompt_input)
+        raise
     try:
         try:
             in_flight_lease = _in_flight_lease(owner, record, lora_request)
@@ -271,7 +278,13 @@ async def stream_generate(
     start = time.time()
     prompt_input = await owner._prepare_prompt_input(payload, thinking)
     source_lease = _source_lease(owner, record, lora_request)
-    await source_lease.__aenter__()
+    try:
+        await source_lease.__aenter__()
+    except BaseException:
+        # same ordering as the non-streaming path: the decoded images predate the lease, so a
+        # failure acquiring it must still close them.
+        owner._close_prompt_images(prompt_input)
+        raise
     output_stream = None
     in_flight_lease = None
     completion_ids: list[int] = []
