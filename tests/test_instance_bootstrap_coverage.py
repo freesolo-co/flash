@@ -1856,6 +1856,38 @@ def test_group_teardown_is_bounded_by_the_deadline_it_is_given():
     assert processes._bounded_graces(10.0, 5.0, None) == (10.0, 5.0)
 
 
+def test_teardown_deadline_leaves_the_kill_time_to_land():
+    """Teardown cannot end at the instant it begins, or SIGKILL is sent and never waited on.
+
+    Teardown runs because the worker overran ``_worker_execution_deadline``, so handing that same
+    instant back as its cap leaves zero for both waits. Every capped run would then report a
+    surviving process group -- a false alarm about a stranded gpu -- however promptly the group
+    actually died.
+    """
+    from flash.providers._lifecycle.bootstrapping import processes
+
+    upload_deadline_at = 1_000.0
+    worker_deadline_at = b._worker_execution_deadline(upload_deadline_at)
+    teardown_deadline_at = b._teardown_deadline(upload_deadline_at)
+
+    teardown_window = teardown_deadline_at - worker_deadline_at
+    assert teardown_window > 0.0
+
+    # at the moment teardown starts, the kill still has room to land. the clock is pinned to the
+    # worker deadline because that is when the wall-clock cap hands teardown its budget.
+    real_time = processes.time.time
+    processes.time.time = lambda: worker_deadline_at
+    try:
+        term_wait, kill_wait = processes._bounded_graces(10.0, 5.0, teardown_deadline_at)
+    finally:
+        processes.time.time = real_time
+    assert kill_wait > 0.0
+    assert term_wait + kill_wait == pytest.approx(teardown_window)
+
+    # and it still ends before the final console upload it must not displace.
+    assert teardown_deadline_at <= upload_deadline_at - b._CONSOLE_UPLOAD_FINAL_TIMEOUT_S
+
+
 def test_run_mode_starts_no_subprocess_at_deadline(monkeypatch):
     monkeypatch.setattr(b.time, "time", lambda: 200.0)
     monkeypatch.setattr(

@@ -301,13 +301,22 @@ def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
 def _worker_execution_deadline(upload_deadline_at: float) -> float:
     """When the worker must be done, leaving the console upload window intact behind it.
 
-    This is also the cap on group teardown. Teardown starts here and a group that ignores SIGTERM
-    would otherwise wait out its full term-then-kill grace, spending the window reserved for the
-    final console tail -- the tail that carries the line saying the box is still occupied. The run
-    wall budget may narrow the worker's own deadline below this instant, but teardown stays capped
-    here: the upload window is what it must not overrun.
+    The run wall budget may narrow the worker's own deadline below this instant; this is the floor
+    the console upload window sits behind.
     """
     return upload_deadline_at - _CONSOLE_UPLOAD_STOP_TIMEOUT_S - _CONSOLE_UPLOAD_FINAL_TIMEOUT_S
+
+
+def _teardown_deadline(upload_deadline_at: float) -> float:
+    """How long group teardown may run once the worker has overrun its own deadline.
+
+    Teardown starts at the worker deadline, so it cannot also end there: that leaves SIGKILL sent
+    but never waited on, and any group needing even a moment to die is reported as having survived
+    term and kill on every capped run. It gets the stop half of the upload reserve, which keeps the
+    final console tail -- the tail carrying the line that says the box is still occupied -- funded
+    by the timeout that was already sized for it.
+    """
+    return upload_deadline_at - _CONSOLE_UPLOAD_FINAL_TIMEOUT_S
 
 
 def _join_upload_process_before(process, deadline_at: float, max_wait_s: float) -> None:
@@ -613,7 +622,8 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     """Run one worker subprocess; tee console to a file and upload periodically for live logs."""
     console = f"/tmp/console_{mode}.txt"
     upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
-    worker_deadline_at = teardown_deadline_at = _worker_execution_deadline(upload_deadline_at)
+    worker_deadline_at = _worker_execution_deadline(upload_deadline_at)
+    teardown_deadline_at = _teardown_deadline(upload_deadline_at)
     # cap work from its actual start: the absolute deadline includes boot grace, whose unused
     # portion must not extend the declared wall-time budget.
     budget = payload.get("run_max_wall_seconds")
