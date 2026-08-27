@@ -202,8 +202,11 @@ def _freesolo_verify(token: str) -> bool:
                 if verified:
                     identity = _identity_from_verify_body(_response_body(resp))
         except urllib.error.HTTPError as exc:
-            # treat 5xx/429 as transient and do not cache them.
-            if exc.code >= 500 or exc.code == 429:
+            # treat 5xx/429 as transient and do not cache them. a 3xx is transient for a different
+            # reason: `_urlopen_no_redirect` raises it instead of following the hop, so the backend
+            # never judged this token at all. caching that as a negative would keep a valid key
+            # failing for the whole negative TTL after the redirect condition is gone.
+            if exc.code >= 500 or exc.code == 429 or 300 <= exc.code < 400:
                 cache_result = False
             verified = False
         except (OSError, ValueError):

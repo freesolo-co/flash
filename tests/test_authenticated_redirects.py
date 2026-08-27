@@ -124,6 +124,44 @@ def test_server_verifier_returns_false_and_does_not_reach_redirect_sink(
     assert sink_seen == []
 
 
+def test_a_rejected_redirect_is_not_cached_as_a_failed_verification(
+    monkeypatch, redirect_servers
+) -> None:
+    """a redirect is not a verdict on the token, so it must not populate the negative cache.
+
+    `_urlopen_no_redirect` raises the 3xx instead of following the hop, which means the backend
+    never judged this token. caching that alongside a real 401 would keep a valid key failing for
+    the whole negative TTL after the redirect condition is gone.
+    """
+    source_url, source_seen, sink_seen = redirect_servers
+    monkeypatch.setenv(auth.FREESOLO_BASE_URL_ENV, source_url)
+    auth._verify_cache.clear()
+    auth._verify_inflight.clear()
+
+    assert auth._freesolo_verify("redirected-secret") is False
+    assert sink_seen == []
+    assert "redirected-secret" not in auth._verify_cache
+
+    class _Ok:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    # the redirect condition clears and the backend answers for real. a cached negative from the
+    # redirect would shadow this and keep returning False without a request.
+    monkeypatch.setattr(auth.urllib.request, "urlopen", lambda req, timeout=None: _Ok())
+
+    assert auth._freesolo_verify("redirected-secret") is True
+    assert len(source_seen) == 1
+
+
 def test_internal_client_returns_false_and_does_not_reach_redirect_sink(
     monkeypatch, redirect_servers
 ) -> None:
