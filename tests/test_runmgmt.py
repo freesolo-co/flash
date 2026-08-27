@@ -1392,6 +1392,21 @@ def test_unparseable_spec_persists_without_a_snapshot_and_authorizes_nothing(mon
     raw = runner_status._load_status_json(run_id)
     assert runner_state._RETRY_STATE_KEY not in raw
 
+    # the deadline default is derived from the same spec, so it must not fail the save either.
+    # without an explicit deadline the record persists with no deadline key, and the loader
+    # refuses to provision it -- the same fail-closed posture as the missing snapshot.
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id="unparseable-spec-no-deadline",
+            state="done",
+            spec=stale_spec,
+            created_at=1000.0,
+        )
+    )
+    bare = runner_status._load_status_json("unparseable-spec-no-deadline")
+    assert runner_state._RUN_DEADLINE_AT_KEY not in bare
+    assert runner_state._RETRY_STATE_KEY not in bare
+
     # reservation reloads the spec before it reads the snapshot, so the unreadable spec itself
     # is what stops the launch. either way no attempt is authorized.
     with pytest.raises(ValueError, match="environment has unknown key"):

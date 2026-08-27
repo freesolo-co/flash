@@ -344,31 +344,31 @@ def _save_status(
             if JobSpec.from_dict(status.spec).algorithm != "opd":
                 raise ValueError("opd retry contract cannot be stored for a non-opd run")
         if not os.path.exists(runs_file_path(status.run_id, ".json")):
-            if _run_deadline_at is _PRIVATE_VALUE_UNSET:
+            # both defaults below are derived from the internal spec, so parse it once. a record
+            # whose spec no longer parses (an older writer's shape, reached by the billing sweep)
+            # still has to persist, so an unreadable spec yields no spec-derived default rather
+            # than failing the save.
+            try:
+                spec = _internal_spec_from_status(status)
+            except (ValueError, TypeError):
+                spec = None
+            if _run_deadline_at is _PRIVATE_VALUE_UNSET and spec is not None:
                 # max_wall_seconds is managed and stripped from the public status.spec; source the
                 # run-global wall budget from the internal worker spec so the auto-computed deadline
                 # reloads consistently (see _canonical_run_deadline).
-                spec = _internal_spec_from_status(status)
                 base = deadlines._require_valid_deadline(status.created_at)
                 _run_deadline_at = deadlines._require_valid_deadline(
                     base + deadlines._require_valid_deadline(spec.gpu.max_wall_seconds)
                 )
             if _next_attempt is _PRIVATE_VALUE_UNSET:
                 _next_attempt = 0
-            if _retry_state is _PRIVATE_VALUE_UNSET:
+            if _retry_state is _PRIVATE_VALUE_UNSET and spec is not None:
                 from flash.runner.supervise.retry_decision import RetryState
 
-                # retry policy is derived from the spec, so a record whose spec no longer parses
-                # (an older writer's shape, reached by the billing sweep) simply gets no snapshot.
+                # retry policy is derived from the spec, so a record without one gets no snapshot.
                 # every reader requires one and fails closed, which is the right answer here: a run
-                # whose spec cannot be read cannot be relaunched either. persisting it must still
-                # work, so this never blocks the save.
-                try:
-                    _retry_state = RetryState.initial_for_spec(
-                        _internal_spec_from_status(status)
-                    ).to_snapshot()
-                except Exception:
-                    _retry_state = None
+                # whose spec cannot be read cannot be relaunched either.
+                _retry_state = RetryState.initial_for_spec(spec).to_snapshot()
         _save_status_unlocked(
             status,
             _run_deadline_at=_run_deadline_at,
