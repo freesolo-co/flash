@@ -940,6 +940,9 @@ def sweep_orphans(
 
     selected: list[int] = []
     unresolved: list[str] = []
+    # keep each selected id's label: it is what maps a reaped box back to its run, so the
+    # billing-cleanup audit trail needs it at destroy time, after this selection loop has ended.
+    labels_by_id: dict[int, str] = {}
     for inst in instances:
         label = str(inst.get("label") or "")
         if not label.startswith("flash-"):
@@ -953,6 +956,7 @@ def sweep_orphans(
             unresolved.append(label)
         else:
             selected.append(iid)
+            labels_by_id.setdefault(iid, label)
     selected = list(dict.fromkeys(selected))
     if not selected:
         outcome = CleanupOutcome.UNCONFIRMED if unresolved else CleanupOutcome.ABSENT
@@ -965,7 +969,9 @@ def sweep_orphans(
             deleted = False
         if deleted:
             destroyed.append(str(iid))
-            logger.warning("destroyed orphaned vast instance %s", iid)
+            logger.warning(
+                "destroyed orphaned vast instance %s (label %s)", iid, labels_by_id.get(iid, "?")
+            )
         else:
             unresolved.append(str(iid))
     if not unresolved:

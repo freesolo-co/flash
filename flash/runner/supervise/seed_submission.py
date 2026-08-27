@@ -316,7 +316,7 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     ctx.gc_seen_endpoints()
     print(
         f"retry {attempt}: {ctx.last_handle.get('provider')} {resource_kind} {resource_id} "
-        f"teardown {teardown.outcome.value}; keeping the handle so the "
+        f"teardown unconfirmed ({teardown.outcome.value}); keeping the handle so the "
         "possibly-billing resource stays reachable for cleanup",
         file=ctx.log,
         flush=True,

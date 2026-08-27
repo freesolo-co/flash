@@ -1063,6 +1063,7 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
     from flash.providers.core import allocator
     from flash.providers.core import registry as providers
     from flash.providers.core.base import Allocation, Candidate, PollResult
+    from flash.providers.core.capabilities import ProviderCapabilities
 
     submits = []
     gc_calls = []
@@ -1074,6 +1075,22 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
     )
 
     class _RaisingVast:
+        def __init__(self) -> None:
+            # instance teardown consults `capabilities.confirm_run_absent` to decide whether a
+            # failed destroy is provably gone; a fake without it cannot reach the unconfirmed path
+            # this test pins. raising mirrors the real provider losing contact with the api.
+            self.capabilities = ProviderCapabilities(
+                supports_weight_cache=False,
+                live_capacity=True,
+                confirm_run_absent=self._confirm_run_absent,
+                sweep_orphans=None,
+            )
+
+        def _confirm_run_absent(self, run_id):
+            from flash.providers.vast.client import api as vast_api
+
+            raise vast_api.VastApiError("absence check unconfirmed (success:false)")
+
         def submit_run(self, run_spec, seed, log=None, on_handle=None, attempt=0, **_):
             submits.append(attempt)
             on_handle(_vast_handle(attempt))
