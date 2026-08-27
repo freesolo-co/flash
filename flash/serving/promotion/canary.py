@@ -16,9 +16,12 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from flash.serving.promotion.evidence import StreamEvidence
+
+if TYPE_CHECKING:
+    import httpx
 
 _DATA_PREFIX = "data: "
 _DONE = "[DONE]"
@@ -140,7 +143,7 @@ class _StreamReader:
         )
 
 
-async def run_stream_canary(request: CanaryRequest, *, client: Any) -> StreamEvidence:
+async def run_stream_canary(request: CanaryRequest, *, client: httpx.AsyncClient) -> StreamEvidence:
     """Stream one completion and report what it proved.
 
     The whole read loop is bounded, not just the connect: a stream that opens and then never sends
@@ -159,7 +162,7 @@ async def run_stream_canary(request: CanaryRequest, *, client: Any) -> StreamEvi
         raise CanaryError(CANARY_TRANSPORT_FAILURE) from exc
 
 
-async def _read_stream(request: CanaryRequest, *, client: Any) -> StreamEvidence:
+async def _read_stream(request: CanaryRequest, *, client: httpx.AsyncClient) -> StreamEvidence:
     url = f"{request.base_url.rstrip('/')}/v1/chat/completions"
     reader = _StreamReader()
     async with client.stream(

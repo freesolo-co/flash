@@ -29,8 +29,10 @@ import os
 import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import httpx
 
 from flash.serving.promotion.canary import (
     CanaryError,
@@ -48,12 +50,17 @@ from flash.serving.promotion.evidence import (
     verify_health,
     verify_stream,
 )
+from flash.serving.src.store.settings import Settings
 from flash.serving.src.store.supabase_rest import supabase_headers
 
+# `Any` return types are the honest shape here: these load UNVALIDATED json off the wire, and
+# narrowing them is precisely what `parse_health`/`parse_accounting` exist to do. The httpx client,
+# by contrast, IS statically known -- CI installs the `serving` extra -- so it is typed under
+# TYPE_CHECKING, which keeps the runtime import deferred into `_run` without costing the annotation.
 HealthLoader = Callable[[], Awaitable[Any]]
 StreamRunner = Callable[[], Awaitable[StreamEvidence]]
 AccountingLoader = Callable[[], Awaitable[Any]]
-BacklogReader = Callable[[Any], Awaitable[Any]]
+BacklogReader = Callable[["httpx.AsyncClient"], Awaitable[Any]]
 
 GATE_CONFIG_INCOMPLETE = "gate_config_incomplete"
 HEALTH_UNREACHABLE = "health_unreachable"
@@ -207,16 +214,22 @@ def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
     # constructing one demands a `worker_id`, a `backend_url`, and a `deployment_id` that a single
     # read never uses. reuse the canonical header helper so the service-role format check and the
     # postgrest schema routing stay identical to every other supabase caller in the repo.
+    # a REAL `Settings`, not a look-alike: `model_construct` skips validation and env resolution, so
+    # it neither reads the runner's ambient environment nor loads a `.env`, and the two fields the
+    # helper touches are the two supplied here. a `SimpleNamespace` would satisfy the call at runtime
+    # while lying to the type checker about what `supabase_headers` accepts.
     try:
         headers = supabase_headers(
-            SimpleNamespace(supabase_url=env["SUPABASE_URL"], supabase_service_role_key=key),
+            Settings.model_construct(
+                supabase_url=env["SUPABASE_URL"], supabase_service_role_key=key
+            ),
             "public",
         )
     except RuntimeError as exc:
         raise GateConfigError from exc
     headers["Authorization"] = f"Bearer {key}"
 
-    async def read_backlog(client: Any) -> Any:
+    async def read_backlog(client: httpx.AsyncClient) -> Any:
         response = await client.post(url, headers=headers, json={}, timeout=15)
         response.raise_for_status()
         return response.json()
