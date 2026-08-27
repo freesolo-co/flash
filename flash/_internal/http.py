@@ -201,7 +201,6 @@ def _build_no_redirect_opener(
 
 
 _OPENER_LOCK = threading.Lock()
-_DEFAULT_NO_REDIRECT_OPENER: urllib.request.OpenerDirector | None = None
 _INSTALLED_OPENER_CACHE: _InstalledOpenerCache | None = None
 _STDLIB_INSTALL_OPENER = globals().get("_STDLIB_INSTALL_OPENER", urllib.request.install_opener)
 
@@ -215,11 +214,10 @@ def _release_installed_opener_cache(reference: weakref.ReferenceType[object]) ->
 
 
 def _install_opener_with_cache_reset(opener) -> None:
-    global _DEFAULT_NO_REDIRECT_OPENER, _INSTALLED_OPENER_CACHE
+    global _INSTALLED_OPENER_CACHE
 
     with _OPENER_LOCK:
         _STDLIB_INSTALL_OPENER(opener)
-        _DEFAULT_NO_REDIRECT_OPENER = None
         _INSTALLED_OPENER_CACHE = None
 
 
@@ -824,13 +822,6 @@ def _clone_installed_opener(
     return private
 
 
-def _default_no_redirect_opener() -> urllib.request.OpenerDirector:
-    global _DEFAULT_NO_REDIRECT_OPENER
-
-    _DEFAULT_NO_REDIRECT_OPENER = _build_no_redirect_opener()
-    return _DEFAULT_NO_REDIRECT_OPENER
-
-
 def _active_no_redirect_opener() -> urllib.request.OpenerDirector:
     global _INSTALLED_OPENER_CACHE
 
@@ -838,8 +829,11 @@ def _active_no_redirect_opener() -> urllib.request.OpenerDirector:
         for _attempt in range(3):
             installed = urllib.request._opener
             if installed is None:
+                # built fresh per call on purpose: a shared opener is mutable state, and this
+                # module's whole contract is that one caller's addheaders never reach another's
+                # request. caching one would hand every authenticated call the same object.
                 _INSTALLED_OPENER_CACHE = None
-                return _default_no_redirect_opener()
+                return _build_no_redirect_opener()
             handlers, addheaders, handler_signature, addheader_signature = _installed_config(
                 installed
             )

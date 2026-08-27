@@ -33,17 +33,14 @@ from flash._internal.http import _build_no_redirect_opener, _urlopen_no_redirect
 @pytest.fixture(autouse=True)
 def _restore_http_globals(monkeypatch):
     opener = urllib.request._opener
-    default = http_transport._DEFAULT_NO_REDIRECT_OPENER
     cached = http_transport._INSTALLED_OPENER_CACHE
     for key in ("HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"):
         monkeypatch.delenv(key, raising=False)
-    http_transport._DEFAULT_NO_REDIRECT_OPENER = None
     http_transport._INSTALLED_OPENER_CACHE = None
     try:
         yield
     finally:
         urllib.request._opener = opener
-        http_transport._DEFAULT_NO_REDIRECT_OPENER = default
         http_transport._INSTALLED_OPENER_CACHE = cached
 
 
@@ -5200,22 +5197,34 @@ def test_class_callback_bound_self_descriptor_fails_without_execution() -> None:
     assert contacted == []
 
 
-def test_non_none_install_releases_active_default_private_opener() -> None:
+def test_no_installed_opener_retains_nothing_between_calls() -> None:
+    """With no installed opener the module builds a private opener and keeps no handle to it.
+
+    A module-level opener would be shared mutable state across every authenticated caller, and one
+    caller's ``addheaders`` would ride the next caller's request. The opener must therefore die with
+    the call that built it.
+    """
     urllib.request.install_opener(None)
-    with _urlopen_no_redirect(
-        urllib.request.Request("data:text/plain,default-private"), timeout=1.0
-    ) as response:
-        assert response.read() == b"default-private"
-    default_private = http_transport._DEFAULT_NO_REDIRECT_OPENER
-    default_private_ref = weakref.ref(default_private)
+    built: list[weakref.ReferenceType[object]] = []
+    real_build = http_transport._build_no_redirect_opener
 
-    replacement = urllib.request.build_opener()
-    urllib.request.install_opener(replacement)
-    del default_private
+    def recording_build(*args, **kwargs):
+        opener = real_build(*args, **kwargs)
+        built.append(weakref.ref(opener))
+        return opener
+
+    http_transport._build_no_redirect_opener = recording_build
+    try:
+        with _urlopen_no_redirect(
+            urllib.request.Request("data:text/plain,default-private"), timeout=1.0
+        ) as response:
+            assert response.read() == b"default-private"
+    finally:
+        http_transport._build_no_redirect_opener = real_build
+
+    assert len(built) == 1
     gc.collect()
-
-    assert default_private_ref() is None
-    assert http_transport._DEFAULT_NO_REDIRECT_OPENER is None
+    assert built[0]() is None
     assert http_transport._INSTALLED_OPENER_CACHE is None
 
 
@@ -5227,28 +5236,36 @@ def test_default_opener_reset_rediscovers_environment_and_releases_identity(monk
         return _response(request.full_url)
 
     monkeypatch.setattr(urllib.request.HTTPSHandler, "https_open", fake_https_open)
+    built: list[weakref.ReferenceType[object]] = []
+    real_build = http_transport._build_no_redirect_opener
+
+    def recording_build(*args, **kwargs):
+        opener = real_build(*args, **kwargs)
+        built.append(weakref.ref(opener))
+        return opener
+
+    monkeypatch.setattr(http_transport, "_build_no_redirect_opener", recording_build)
     urllib.request.install_opener(None)
     monkeypatch.setenv("HTTPS_PROXY", "http://first-proxy.invalid:8080")
     monkeypatch.setenv("NO_PROXY", "")
     with _urlopen_no_redirect(urllib.request.Request("https://source.invalid/first"), timeout=1.0):
         pass
-    first = http_transport._DEFAULT_NO_REDIRECT_OPENER
-    first_ref = weakref.ref(first)
 
     urllib.request.install_opener(None)
     monkeypatch.setenv("HTTPS_PROXY", "http://second-proxy.invalid:8080")
-    del first
-    gc.collect()
     with _urlopen_no_redirect(urllib.request.Request("https://source.invalid/second"), timeout=1.0):
         pass
-    second = http_transport._DEFAULT_NO_REDIRECT_OPENER
 
+    # each call re-reads the environment, so the second request follows the proxy that was set
+    # after the first one -- a retained opener would have pinned the first proxy for both.
     assert observed == [
         ("first-proxy.invalid:8080", "source.invalid"),
         ("second-proxy.invalid:8080", "source.invalid"),
     ]
-    assert second is not first_ref()
-    assert first_ref() is None
+    assert len(built) == 2
+    gc.collect()
+    # neither opener outlives the call that built it, so no caller's addheaders can reach another's.
+    assert [ref() for ref in built] == [None, None]
     assert http_transport._INSTALLED_OPENER_CACHE is None
 
 
