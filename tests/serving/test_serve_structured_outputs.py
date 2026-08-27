@@ -24,10 +24,14 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from flash.serve.contract.provenance import engine_adapter_name
+from flash.serve.contract.provenance import engine_adapter_name, record_key
 from flash.serve.request.openai import parse_chat_request
+from flash.serving.src.engine.lora_engine import _LoraEntry
 from flash.serving.src.engine.model_config import reasoning_parser_for
-from flash.serving.src.engine.support import _require_reasoning_api_compatibility
+from flash.serving.src.engine.support import (
+    _adapter_source_ident,
+    _require_reasoning_api_compatibility,
+)
 from flash.serving.src.io.responses import openai_generate_fields
 from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest, internal_adapter_payload
 from flash.serving.src.io.streaming import openai_chat_stream
@@ -470,13 +474,17 @@ def test_stream_generate_attests_the_resolved_checkpoint_before_deltas(modal_app
     revision = checkpoint_record("run-1", QWEN)
     checkpoint_id = revision.adapter_id
 
+    request = types.SimpleNamespace(
+        lora_name=engine_adapter_name(revision.org_id, checkpoint_id), lora_int_id=42
+    )
+
     async def resolved_lora(_adapter_id, _record_dict=None):
-        return (
-            types.SimpleNamespace(lora_name=engine_adapter_name(revision.org_id, checkpoint_id)),
-            revision,
-        )
+        return request, revision
 
     eng._lora_request = resolved_lora
+    eng._lora_entries = {
+        record_key(revision): _LoraEntry(_adapter_source_ident(revision), request, "reserved")
+    }
 
     async def first_event():
         stream = eng._stream_generate(
