@@ -9914,3 +9914,48 @@ def test_packed_full_sequence_rejects_a_tensor_that_is_not_full_width():
     response_only = torch.zeros(4, 1024, 1)
     with pytest.raises(IndexError):
         _packed_full_sequence(response_only, data)
+
+
+def test_packed_full_sequence_handles_nested_prompts_without_a_mask():
+    """A batch can pair nested prompts with a padded teacher and carry no attention_mask.
+
+    `no_padding_2_padding` reads `attention_mask` only when `prompts` is strided, so that key
+    is not guaranteed present. Packing off the mask alone would turn this batch's assertion
+    into a KeyError instead of fixing it, and `list_of_dict_to_tensordict` chooses the layout
+    per field, so prompts and teacher can disagree.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.bridging.prompts import encode_shifted_group_metadata
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    samples = [(100, 1024), (120, 900), (90, 1024)]
+    rows, prompts, responses = [], [], []
+    for prompt_len, response_len in samples:
+        _ids, logprobs = encode_shifted_group_metadata(
+            prompt_len, response_len, [(list(range(response_len)), -1.5)]
+        )
+        rows.append(torch.tensor(logprobs, dtype=torch.float32).unsqueeze(-1))
+        prompts.append(torch.arange(1, prompt_len + 1, dtype=torch.int64))
+        responses.append(torch.arange(1, response_len + 1, dtype=torch.int64))
+
+    width = max(p + r for p, r in samples)
+    padded_teacher = torch.stack(
+        [torch.cat([row, row.new_zeros(width - row.shape[0], 1)]) for row in rows]
+    )
+    data = TensorDict(
+        {
+            "prompts": torch.nested.as_nested_tensor(prompts, layout=torch.jagged),
+            "responses": torch.nested.as_nested_tensor(responses, layout=torch.jagged),
+        },
+        batch_size=[len(samples)],
+    )
+    assert "attention_mask" not in data
+
+    actual = _reference_no_padding_2_padding(_packed_full_sequence(padded_teacher, data), data)
+    expected = _reference_no_padding_2_padding(
+        torch.nested.as_nested_tensor(rows, layout=torch.jagged), data
+    )
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)

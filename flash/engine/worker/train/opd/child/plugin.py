@@ -26,12 +26,30 @@ if PLUGIN_LOADED_EXTERNALLY:
     from flash_multiturn_glue import multi_modal_image_count
     from flash_opd_multiturn import build_flash_multi_turn_agent_loop
     from flash_opd_structured import StructuredOutputReplay, canonical_structured_spec
+    from flash_opd_tensors import (
+        full_sequence_signal_sequences as _full_sequence_signal_sequences,
+    )
+    from flash_opd_tensors import (
+        packed_full_sequence as _packed_full_sequence,
+    )
+    from flash_opd_tensors import (
+        signal_sequences as _signal_sequences,
+    )
 else:
     from flash.engine.worker.train.core.child.glue import multi_modal_image_count
     from flash.engine.worker.train.opd.child.multiturn import build_flash_multi_turn_agent_loop
     from flash.engine.worker.train.opd.child.structured import (
         StructuredOutputReplay,
         canonical_structured_spec,
+    )
+    from flash.engine.worker.train.opd.child.tensors import (
+        full_sequence_signal_sequences as _full_sequence_signal_sequences,
+    )
+    from flash.engine.worker.train.opd.child.tensors import (
+        packed_full_sequence as _packed_full_sequence,
+    )
+    from flash.engine.worker.train.opd.child.tensors import (
+        signal_sequences as _signal_sequences,
     )
 
 _PERMANENT_TEACHER_EXIT = 86
@@ -84,29 +102,6 @@ def deterministic_rollout_seed(
         payload += f":retry:{attempt_ordinal}"
     digest = hashlib.blake2b(payload.encode("ascii"), digest_size=8).digest()
     return int.from_bytes(digest, "big") & ((1 << 63) - 1)
-
-
-def _signal_sequences(group_ids, response_mask):
-    """Return the per-sequence mask for rows carrying at least one aligned student token."""
-    return ((group_ids >= 0) & response_mask.bool()).any(dim=-1)
-
-
-def _full_sequence_signal_sequences(group_ids):
-    """Detect aligned metadata in native full-sequence teacher tensors."""
-    return group_ids.ge(0).flatten(start_dim=1).any(dim=-1)
-
-
-def _packed_full_sequence(tensor, data):
-    """Put a full-sequence teacher tensor into the layout `no_padding_2_padding` documents.
-
-    That helper wants a nested tensor or `(total_nnz, *)`, and reads `.values()` only when
-    nested, so a padded `(bsz, seq_len, *)` teacher measures as `bsz` and trips its
-    `sequence_offsets[-1] == values.shape[0]` assertion. Both layouts arrive because
-    `list_of_dict_to_tensordict` stacks a field whose samples share one shape and nests only
-    when they differ -- so a batch of uniformly truncated completions comes back padded.
-    Dropping the pad positions restores the contract and leaves the slicing to verl.
-    """
-    return tensor if tensor.is_nested else tensor[data["attention_mask"].bool()]
 
 
 def _flash_groupwise_reverse_kl_values(
