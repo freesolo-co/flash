@@ -283,10 +283,17 @@ def _manifest_checkpoint(observed: object) -> dict:
     ``{"step": N}``, ``{"step": N, "subfolder": ...}``, and a bare failure object. reading the
     latter straight through would put two schemas under one key, so a latched upload failure
     would be indistinguishable from a successful save to any future reader.
+
+    the two are separated by the save allowlist, not by ``step``: the only failure producer
+    (``hf.py``'s ``checkpoint_upload_failed``) always carries ``step`` alongside ``operation``
+    and ``error``, so treating any blob with a ``step`` as a save would report every real
+    latched failure as ``failure: None``. the save shapes are closed, so anything outside them
+    is a failure.
     """
+    saved_keys = {"step", "subfolder"}
     if not isinstance(observed, dict) or not observed:
         return {"failure": None}
-    if "step" in observed:
+    if "step" in observed and set(observed) <= saved_keys:
         return {"failure": None, "saved": dict(observed)}
     return {"failure": dict(observed)}
 

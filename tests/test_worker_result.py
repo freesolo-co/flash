@@ -313,14 +313,17 @@ def test_cancelled_result_uses_latest_current_fence_progress(monkeypatch) -> Non
         (None, {"failure": None}),
         ({}, {"failure": None}),
         ("not-a-dict", {"failure": None}),
+        # the exact save shapes, from checkpoint_uploaded and checkpoint_deployable.
         ({"step": 7}, {"failure": None, "saved": {"step": 7}}),
         (
             {"step": 7, "subfolder": "step-7"},
             {"failure": None, "saved": {"step": 7, "subfolder": "step-7"}},
         ),
+        # the exact failure shape hf.py emits. it always carries step, so a discriminator keyed
+        # on step alone reports every real latched failure as failure: None.
         (
-            {"error": "upload failed", "step": None},
-            {"failure": None, "saved": {"error": "upload failed", "step": None}},
+            {"step": 12, "operation": "after", "error": "upload failed: 500"},
+            {"failure": {"step": 12, "operation": "after", "error": "upload failed: 500"}},
         ),
         ({"error": "upload failed"}, {"failure": {"error": "upload failed"}}),
     ],
@@ -331,8 +334,25 @@ def test_supervisor_checkpoint_carries_one_manifest_shape(observed, expected) ->
     workers publish ``{"failure": ...}`` while progress writes flat shapes, so passing progress
     straight through would put two schemas under one key and make an upload failure read as a
     save to any reader that later consumes it.
+
+    every case here is a shape some producer actually emits. an earlier revision of this test
+    invented ``{"error": ..., "step": None}`` and asserted it as a save, which encoded the bug
+    as the contract and let the suite go green over a real misclassification.
     """
     assert result_io._manifest_checkpoint(observed) == expected
+
+
+def test_real_checkpoint_failure_shape_is_never_read_as_a_save() -> None:
+    """pin the discriminator against the producer rather than against a hand-written shape.
+
+    ``hf.py``'s ``checkpoint_upload_failed`` is the only failure emitter and always includes
+    ``step``, so this asserts the exact keys it publishes stay on the failure side.
+    """
+    emitted = {"step": 3, "operation": "before", "error": "boom"}
+    carried = result_io._manifest_checkpoint(emitted)
+
+    assert carried["failure"] == emitted
+    assert "saved" not in carried
 
 
 def test_bootstrap_env_requires_the_source_snapshot(monkeypatch, tmp_path) -> None:
