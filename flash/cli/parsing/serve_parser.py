@@ -1,7 +1,7 @@
 """Parser wiring for customer-owned serving deployment lifecycle commands.
 
-``serve deploy`` provisions one deployment in the user's Modal or RunPod account. ``serve
-undeploy`` tears down that same exact deployment generation. Kept separate from ``models deploy``
+``serve deploy`` provisions one deployment in the user's Modal account. ``serve undeploy`` tears
+down that same exact deployment generation. Kept separate from ``models deploy``
 and ``models undeploy``, which use the hosted serving backend rather than customer-owned resources.
 """
 
@@ -54,8 +54,8 @@ def _add_deployment_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument(
         "--provider",
         required=True,
-        choices=("modal", "runpod"),
-        help="which of your accounts holds the deployment",
+        choices=("modal",),
+        help="required provider for customer-owned serving",
     )
     command.add_argument("--model", required=True, help="base model id to serve")
     command.add_argument("--run", required=True, help="run id whose adapter to serve")
@@ -114,9 +114,6 @@ def _add_deployment_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument(
         "--modal-region", default="", help="modal region, e.g. us-east (broad is cheaper)"
     )
-    # runpod placement
-    command.add_argument("--runpod-account", default="", help="runpod account id")
-    command.add_argument("--runpod-data-center", default="", help="runpod data center id")
     command.add_argument(
         "--timeout",
         type=_positive_finite_seconds,
@@ -126,22 +123,22 @@ def _add_deployment_arguments(command: argparse.ArgumentParser) -> None:
 
 
 def _add_serve_deploy(serve_sub: argparse._SubParsersAction) -> None:
-    """`serve deploy`: provision one exact deployment in your own Modal or RunPod account.
+    """`serve deploy`: provision one exact deployment in your own Modal account.
 
     Runs the packaged serving image, so a deployment is pinned to an image digest and an engine
     identity rather than to generated source that could drift from what was validated.
 
     Credentials are deliberately NOT arguments. They are read from the environment for this one
     request and never persisted, so they cannot leak into shell history, a process list, or a
-    durable record. The command reads ``MODAL_TOKEN_ID``/``MODAL_TOKEN_SECRET`` or
-    ``RUNPOD_API_KEY`` for the provider, ``FLASH_SERVING_KEY`` for the endpoint's own auth, and
+    durable record. The command reads ``MODAL_TOKEN_ID``/``MODAL_TOKEN_SECRET`` for the provider,
+    ``FLASH_SERVING_KEY`` for the endpoint's own auth, and
     ``HF_TOKEN`` so the container can hydrate its adapter -- required for a private artifact repo,
     which is the default.
     """
 
     deploy = serve_sub.add_parser(
         "deploy",
-        help="provision one deployment on your own modal or runpod account",
+        help="provision one deployment on your own modal account",
     )
     _add_deployment_arguments(deploy)
     deploy.add_argument(
@@ -184,8 +181,8 @@ def _add_serve_undeploy(serve_sub: argparse._SubParsersAction) -> None:
 
     Provider credentials remain request-only environment values. Provider-assigned resource ids are
     not secrets; the deploy command prints them so ordinary teardown can bind every deletion to the
-    exact generation. RunPod ids may all be omitted only to reclaim an ambiguous create from the
-    immutable deployment identity printed by deploy.
+    exact generation. Modal ids may all be omitted to reclaim an ambiguous create from the immutable
+    deployment identity printed by deploy.
     """
 
     undeploy = serve_sub.add_parser(
@@ -200,20 +197,6 @@ def _add_serve_undeploy(serve_sub: argparse._SubParsersAction) -> None:
         "--modal-inference-secret-id",
         default="",
         help="modal inference secret id printed by deploy",
-    )
-    undeploy.add_argument("--runpod-pod-id", default="", help="runpod pod id printed by deploy")
-    undeploy.add_argument(
-        "--runpod-network-volume-id",
-        default="",
-        help="runpod network volume id printed by deploy",
-    )
-    undeploy.add_argument(
-        "--runpod-template-id", default="", help="runpod template id printed by deploy"
-    )
-    undeploy.add_argument(
-        "--runpod-inference-secret-id",
-        default="",
-        help="runpod inference secret id printed by deploy",
     )
     from flash.cli.commands.serving.undeploy import cmd_serve_undeploy
 

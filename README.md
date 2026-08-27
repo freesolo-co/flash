@@ -33,10 +33,10 @@ point of use; install it with `pip install freesolo`.
 
 Two components stay Freesolo-operated and are **not** in this repository:
 
-| Component                 | Where it lives                                                                                         | Self-hosted equivalent                                                      |
-| ------------------------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
-| Multi-tenant identity     | `api.freesolo.co`; verifies keys and owns projects/orgs                                                | `FLASH_STANDALONE=1` runs single-tenant on your own key                     |
-| Hosted Multi-LoRA serving | `serve.freesolo.co`, deployed from `flash/serving/`; `flash/serve/` owns the client and shared runtime | `flash serve deploy` provisions serving in your own Modal or RunPod account |
+| Component                 | Where it lives                                                                                         | Self-hosted equivalent                                            |
+| ------------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
+| Multi-tenant identity     | `api.freesolo.co`; verifies keys and owns projects/orgs                                                | `FLASH_STANDALONE=1` runs single-tenant on your own key           |
+| Hosted Multi-LoRA serving | `serve.freesolo.co`, deployed from `flash/serving/`; `flash/serve/` owns the client and shared runtime | `flash serve deploy` provisions serving in your own Modal account |
 
 So there are three ways to use Flash: against the **hosted service**, **self-hosted** against
 your own GPU accounts, or as **training and provider code to read and modify**. The training
@@ -44,9 +44,13 @@ path is self-hostable end to end — see **[SELF_HOSTING.md](SELF_HOSTING.md)**.
 
 ## Using the hosted service
 
-The active training and hosted-serving catalog is `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
-`Qwen/Qwen3.6-35B-A3B`. The retired dense Qwen3.6 27B identity is never translated into Qwen3.8,
-and customer-owned Modal or RunPod serving remains limited to Qwen3.5 9B.
+The active training catalog is `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
+`Qwen/Qwen3.6-35B-A3B`. Hosted serving is active for 9B and 35B-A3B; hosted Qwen3.8 27B remains
+inactive. The retired dense Qwen3.6 27B identity is never translated into Qwen3.8. Customer-owned
+Modal supports all three active models; 27B and 35B-A3B are bound to the certified serving image
+digest. Customer-owned `flash serve` requires explicit `--provider modal`. Customer-serving RunPod
+commands and deployment identities are unsupported, with no migration or teardown shim. Managed
+RunPod training remains supported and unchanged.
 
 `flash login` is not interactive. Export `FREESOLO_API_KEY` first so the key does not appear in process listings:
 
@@ -87,8 +91,8 @@ lora_rank = 32              # lora_alpha defaults to 2 x lora_rank; set it to ov
 ```bash
 flash train run.toml                  # submit, prints a run id
 flash runs status RUN_ID               # follow it
-flash models deploy RUN_ID             # serve the trained adapter
-flash models chat RUN_ID -m "hello"    # talk to it
+flash models deploy RUN_ID/final             # serve the final checkpoint
+flash models chat RUN_ID/final -m "hello"    # talk to it
 ```
 
 Run management lives under `flash runs` (`list`, `status`, `log`, `cancel`, `checkpoint`)
@@ -97,12 +101,12 @@ and serving under `flash models` (`deploy`, `chat`, `deployments`, `undeploy`, `
 lists GPU classes with estimated $/hr.
 
 Intermediate RL checkpoints are deployable: list them with `flash runs checkpoint RUN_ID`,
-then pass `RUN_ID/step-N` as the adapter id. To copy a finished adapter into your own
+then pass `RUN_ID/step-N` as the checkpoint id. To copy a finished adapter into your own
 HuggingFace repo:
 
 ```bash
 export HF_TOKEN=hf_...
-flash models export --adapter-id RUN_ID --repository your-org/your-repo
+flash models export --adapter-id RUN_ID/final --repository your-org/your-repo
 ```
 
 There are no built-in task environments — the environment you push defines the task.
@@ -110,7 +114,7 @@ Single-turn and bounded multi-turn environments are supported.
 
 ### Calling a deployed adapter from your own app
 
-Deploy once with `flash models deploy RUN_ID`, then POST chat requests with your API key:
+Deploy once with `flash models deploy RUN_ID/final`, then POST chat requests with your API key:
 
 ```bash
 export RUN_ID=flash-1782194170-ce1cfcff
@@ -119,12 +123,12 @@ export FREESOLO_API_KEY=fslo_...
 curl -X POST "https://flash.freesolo.co/v1/runs/$RUN_ID/chat" \
   -H "Authorization: Bearer $FREESOLO_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "hello"}], "max_tokens": 256}'
+  -d "{\"checkpoint_id\": \"$RUN_ID/final\", \"messages\": [{\"role\": \"user\", \"content\": \"hello\"}], \"max_tokens\": 256}"
 ```
 
 The response uses the OpenAI chat-completions shape; read `choices[0].message.content`. The
-run id is the adapter id. If the run is not deployed yet, the endpoint returns `409` with a
-hint to deploy first. Prefer this control-plane endpoint over calling the serving backend
+checkpoint id is the permanent serving identity. If that checkpoint is not deployed yet, the
+endpoint returns `409` with a hint to deploy first. Prefer this control-plane endpoint over calling the serving backend
 directly: it enforces run ownership and forwards per-run serving options such as
 thinking-mode parity.
 
@@ -222,8 +226,10 @@ External bearer tokens are rejected rather than accepted unverified. A standalon
 **single-tenant** — whoever holds that key can spend your GPU budget, so keep it off
 untrusted networks. See [the security model](SELF_HOSTING.md#the-security-model).
 
-`flash serve deploy` provisions serving in your own Modal or RunPod account, implementing the
-same contract `flash/serve/` speaks; [docs/serving-contract.md](docs/serving-contract.md)
+`flash serve deploy` provisions serving in your own Modal account and requires explicit
+`--provider modal`. Each deployment owns one exact base model and its compatible adapters; another
+base model requires another deployment. Customer-serving RunPod identities are unsupported.
+It implements the same contract `flash/serve/` speaks; [docs/serving-contract.md](docs/serving-contract.md)
 documents it if you would rather write your own.
 
 The GPU worker image is public and published under an explicit CUDA tag, not `latest`:

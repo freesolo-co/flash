@@ -306,15 +306,16 @@ def test_get_worker_output_preserves_unknown_run_404(stub):
     assert "unknown run_id: missing" in str(excinfo.value)
 
 
-def test_parse_chat_target_supports_bare_step_and_immutable_revision() -> None:
-    revision = "run-abc@step-5." + "a" * 40
+def test_parse_chat_target_requires_permanent_checkpoint_identity() -> None:
+    assert _parse_chat_target("run-abc/final") == ("run-abc", "run-abc/final")
+    assert _parse_chat_target("run-abc/step-5") == ("run-abc", "run-abc/step-5")
 
-    assert _parse_chat_target("run-abc") == ("run-abc", None, None)
-    assert _parse_chat_target("run-abc/step-5") == ("run-abc", None, 5)
-    assert _parse_chat_target(revision) == ("run-abc", revision, None)
+    for target in ("run-abc", "run-abc@step-5." + "a" * 40):
+        with pytest.raises(ClientError, match="invalid checkpoint id"):
+            _parse_chat_target(target)
 
 
-def test_prepare_chat_request_sends_step_without_adapter_revision() -> None:
+def test_prepare_chat_request_sends_exact_checkpoint_id() -> None:
     base_run_id, body = _prepare_chat_request(
         "run-abc/step-5",
         [{"role": "user", "content": "hi"}],
@@ -323,15 +324,17 @@ def test_prepare_chat_request_sends_step_without_adapter_revision() -> None:
     )
 
     assert base_run_id == "run-abc"
-    assert body["step"] == 5
+    assert body["checkpoint_id"] == "run-abc/step-5"
+    assert "step" not in body
     assert "adapter_revision" not in body
 
 
 def test_chat_omits_thinking_template_controls(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    client.chat("json-chat", messages=[{"role": "user", "content": "hi"}])
+    client.chat("json-chat/final", messages=[{"role": "user", "content": "hi"}])
     assert seen["body"] == {
+        "checkpoint_id": "json-chat/final",
         "messages": [{"role": "user", "content": "hi"}],
         "temperature": 0.0,
         "max_tokens": 512,
@@ -343,7 +346,7 @@ def test_chat_sends_user_supplied_system_prompt(stub):
     client = ApiClient(url, "fslo-user-test")
 
     client.chat(
-        "json-chat",
+        "json-chat/final",
         messages=[
             {"role": "system", "content": "stay terse"},
             {"role": "user", "content": "hi"},
@@ -351,6 +354,7 @@ def test_chat_sends_user_supplied_system_prompt(stub):
     )
 
     assert seen["body"] == {
+        "checkpoint_id": "json-chat/final",
         "messages": [
             {"role": "system", "content": "stay terse"},
             {"role": "user", "content": "hi"},
@@ -360,158 +364,54 @@ def test_chat_sends_user_supplied_system_prompt(stub):
     }
 
 
-def test_chat_full_immutable_revision_is_forwarded_unchanged(stub):
-    url, seen = stub
-    client = ApiClient(url, "fslo-user-test")
-    revision = "run-a@step-40." + "a" * 40
-
-    client.chat(revision, [{"role": "user", "content": "hi"}])
-
-    assert seen["path"] == "/v1/runs/run-a/chat"
-    assert seen["body"]["adapter_revision"] == revision
-
-
-def test_chat_checkpoint_shorthand_forwards_step(stub):
+@pytest.mark.parametrize("checkpoint_id", ["run-a/final", "run-a/step-40"])
+def test_chat_forwards_exact_checkpoint_id(stub, checkpoint_id):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
-    client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
+    client.chat(checkpoint_id, [{"role": "user", "content": "hi"}])
 
     assert seen["path"] == "/v1/runs/run-a/chat"
-    assert seen["body"]["step"] == 40
+    assert seen["body"]["checkpoint_id"] == checkpoint_id
+    assert "step" not in seen["body"]
     assert "adapter_revision" not in seen["body"]
 
 
-def test_chat_checkpoint_shorthand_rejects_older_server(stub):
-    url, seen = stub
-    seen["old_chat_server"] = True
-    client = ApiClient(url, "fslo-user-test")
-
-    with pytest.raises(ClientError, match="chat_step_selector_v1"):
-        client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
-
-    assert seen["path"] == "/v1/health"
-    assert "body" not in seen
-
-
-def test_chat_checkpoint_capability_is_probed_once_per_client(stub):
-    # the capability is a property of the control plane, not of the request. `env eval` sends one
-    # chat per case, so re-probing each time doubled the request count and let a single transient
-    # /v1/health blip fail an arbitrary case while the chat endpoint was healthy.
+@pytest.mark.parametrize("target", ["run-a", "run-a/step-00", "run-a@step-1." + "a" * 40])
+def test_chat_rejects_noncanonical_checkpoint_identity(stub, target):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
-    for _ in range(3):
-        client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
-    list(client.chat_stream("run-a/step-40", [{"role": "user", "content": "hi"}]))
-
-    assert seen["health_calls"] == 1
-    # a separate client has its own plane to verify, so the cache is not process-global
-    ApiClient(url, "fslo-user-test").chat("run-a/step-40", [{"role": "user", "content": "hi"}])
-    assert seen["health_calls"] == 2
-
-
-def test_warming_the_capability_serves_later_chats_from_the_cache(stub):
-    # a caller about to fan out settles the check up front, so its workers inherit the cached answer
-    # instead of every one of them missing the cold cache at once and firing its own /v1/health. a
-    # target with no step selector needs nothing and must stay silent.
-    url, seen = stub
-    client = ApiClient(url, "fslo-user-test")
-
-    client.warm_chat_step_selector("run-a@step-40." + "a" * 40)
-    assert seen.get("health_calls") is None
-
-    client.warm_chat_step_selector("run-a/step-40")
-    assert seen["health_calls"] == 1
-
-    for _ in range(3):
-        client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
-    assert seen["health_calls"] == 1
-
-
-def test_warming_the_capability_raises_on_a_plane_that_lacks_it(stub):
-    # the warm-up must not swallow a genuine capability failure into a silently uncached state:
-    # it raises exactly what the per-request check raises, so the caller fails before fanning out.
-    url, seen = stub
-    seen["old_chat_server"] = True
-    client = ApiClient(url, "fslo-user-test")
-
-    with pytest.raises(ClientError, match="chat_step_selector_v1"):
-        client.warm_chat_step_selector("run-a/step-40")
-
-    assert "body" not in seen
-
-
-def test_chat_checkpoint_capability_failure_is_not_cached(stub):
-    # only a positive result is cached: a plane that genuinely lacks the capability must keep
-    # failing, not fall through to an unsupported request on the second call.
-    url, seen = stub
-    seen["old_chat_server"] = True
-    client = ApiClient(url, "fslo-user-test")
-
-    for _ in range(2):
-        with pytest.raises(ClientError, match="chat_step_selector_v1"):
-            client.chat("run-a/step-40", [{"role": "user", "content": "hi"}])
-
-    assert seen["health_calls"] == 2
-    assert "body" not in seen
-
-
-@pytest.mark.parametrize("step", ["00", "01"])
-def test_chat_rejects_zero_padded_immutable_revision(stub, step):
-    url, seen = stub
-    client = ApiClient(url, "fslo-user-test")
-    revision = f"run-a@step-{step}." + "a" * 40
-
-    with pytest.raises(ClientError, match="invalid run id"):
-        client.chat(revision, [{"role": "user", "content": "hi"}])
+    with pytest.raises(ClientError, match="invalid checkpoint id"):
+        client.chat(target, [{"role": "user", "content": "hi"}])
 
     assert seen == {}
 
 
-def test_chat_stream_sends_stream_request_and_yields_text(stub):
+def test_chat_stream_sends_exact_checkpoint_and_yields_text(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    chunks = list(
-        client.chat_stream("r1", [{"role": "user", "content": "hi"}], temperature=0.2, max_tokens=7)
-    )
-    assert "".join(chunks) == "héllo"
-    assert seen["path"] == "/v1/runs/r1/chat"
-    assert seen["auth"] == "Bearer fslo-user-test"
-    assert seen["body"] == {
-        "messages": [{"role": "user", "content": "hi"}],
-        "temperature": 0.2,
-        "max_tokens": 7,
-        "stream": True,
-    }
-
-
-def test_chat_stream_full_immutable_revision_is_forwarded_unchanged(stub):
-    url, seen = stub
-    client = ApiClient(url, "fslo-user-test")
-    revision = "run-a@step-40." + "a" * 40
-
     chunks = list(
         client.chat_stream(
-            revision,
+            "r1/final",
             [{"role": "user", "content": "hi"}],
             temperature=0.2,
             max_tokens=7,
         )
     )
-
     assert "".join(chunks) == "héllo"
-    assert seen["path"] == "/v1/runs/run-a/chat"
+    assert seen["path"] == "/v1/runs/r1/chat"
+    assert seen["auth"] == "Bearer fslo-user-test"
     assert seen["body"] == {
+        "checkpoint_id": "r1/final",
         "messages": [{"role": "user", "content": "hi"}],
         "temperature": 0.2,
         "max_tokens": 7,
         "stream": True,
-        "adapter_revision": revision,
     }
 
 
-def test_chat_stream_checkpoint_shorthand_forwards_step(stub):
+def test_chat_stream_step_checkpoint_is_forwarded_unchanged(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
 
@@ -519,26 +419,15 @@ def test_chat_stream_checkpoint_shorthand_forwards_step(stub):
 
     assert "".join(chunks) == "héllo"
     assert seen["path"] == "/v1/runs/run-a/chat"
-    assert seen["body"]["step"] == 40
+    assert seen["body"]["checkpoint_id"] == "run-a/step-40"
+    assert "step" not in seen["body"]
     assert "adapter_revision" not in seen["body"]
-
-
-def test_chat_stream_checkpoint_shorthand_rejects_older_server(stub):
-    url, seen = stub
-    seen["old_chat_server"] = True
-    client = ApiClient(url, "fslo-user-test")
-
-    with pytest.raises(ClientError, match="chat_step_selector_v1"):
-        list(client.chat_stream("run-a/step-40", [{"role": "user", "content": "hi"}]))
-
-    assert seen["path"] == "/v1/health"
-    assert "body" not in seen
 
 
 def test_chat_stream_accepts_json_fallback(stub):
     url, _ = stub
     client = ApiClient(url, "fslo-user-test")
-    chunks = list(client.chat_stream("json-chat", [{"role": "user", "content": "hi"}]))
+    chunks = list(client.chat_stream("json-chat/final", [{"role": "user", "content": "hi"}]))
     assert chunks == ["json reply"]
 
 
@@ -804,32 +693,37 @@ def test_cancel_timeout_keeps_polling_nonterminal_revocation_failure(monkeypatch
 
 def test_deploy_rejects_malformed_checkpoint_ref():
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    for bad in ("flash-run/step-", "flash-run/checkpoints/step-4", "flash-run/step-4/adapter"):
-        with pytest.raises(ClientError, match="invalid adapter id"):
+    for bad in ("flash-run", "flash-run/step-", "flash-run/checkpoints/step-4"):
+        with pytest.raises(ClientError, match="invalid checkpoint id"):
             client.deploy(bad)
 
 
-def test_deploy_checkpoint_ref_posts_step(stub):
+def test_deploy_posts_exact_checkpoint_id(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
     client.deploy("flash-run/step-40")
     assert seen["path"] == "/v1/runs/flash-run/deploy"
-    assert seen["body"]["step"] == 40
-    assert seen["body"]["dry_run"] is False
+    assert seen["body"] == {
+        "dry_run": False,
+        "checkpoint_id": "flash-run/step-40",
+    }
     # smoke verification is mandatory server-side; the client sends no opt-out knob
     assert "verify" not in seen["body"]
 
 
-def test_deploy_final_ref_omits_step(stub):
+def test_deploy_final_ref_posts_exact_checkpoint_id(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    client.deploy("flash-run")
+    client.deploy("flash-run/final")
     assert seen["path"] == "/v1/runs/flash-run/deploy"
-    assert seen["body"] == {"dry_run": False}
+    assert seen["body"] == {
+        "dry_run": False,
+        "checkpoint_id": "flash-run/final",
+    }
 
 
-def test_export_sends_repository_token_and_checkpoint_ref(stub):
-    """`flash export` posts the destination repo, the user's HF token, and parsed checkpoint step."""
+def test_export_sends_repository_token_and_checkpoint_id(stub):
+    """`flash export` posts the destination repo, token, and exact checkpoint id."""
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
     client.export("r1/step-40", repository="me/adapters", hf_token="hf_secret", private=False)
@@ -839,26 +733,26 @@ def test_export_sends_repository_token_and_checkpoint_ref(stub):
         "repository": "me/adapters",
         "hf_token": "hf_secret",
         "private": False,
-        "step": 40,
+        "checkpoint_id": "r1/step-40",
     }
 
 
-def test_export_omits_step_when_unset_and_defaults_private(stub):
+def test_export_final_checkpoint_defaults_private(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
-    client.export("r1", repository="me/adapters", hf_token="hf_secret")
+    client.export("r1/final", repository="me/adapters", hf_token="hf_secret")
     assert seen["body"] == {
         "repository": "me/adapters",
         "hf_token": "hf_secret",
         "private": True,
+        "checkpoint_id": "r1/final",
     }
-    assert "step" not in seen["body"]
 
 
 def test_export_rejects_malformed_checkpoint_ref():
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    for bad in ("r1/step-", "r1/checkpoints/step-4", "r1/step-4/adapter"):
-        with pytest.raises(ClientError, match="invalid adapter id"):
+    for bad in ("r1", "r1/step-", "r1/checkpoints/step-4"):
+        with pytest.raises(ClientError, match="invalid checkpoint id"):
             client.export(bad, repository="me/a", hf_token="hf")
 
 
@@ -885,69 +779,108 @@ def test_deployment_for_reads_the_run_scoped_route_not_the_listing(monkeypatch):
     """`/v1/deployments` walks every run the key owns before one record is picked out.
 
     That makes each poll cost grow with the account's run history, so a long-lived account can
-    spend its whole `--wait` budget loading unrelated runs and time out against a revision that is
-    already ready. The run-scoped route resolves exactly the run being polled.
+    spend its whole `--wait` budget loading unrelated runs and time out against a checkpoint that
+    is already ready. The run-scoped route resolves exactly the run being polled.
     """
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    calls = _deployment_reader(monkeypatch, client, {"state": "queued"})
+    calls = _deployment_reader(
+        monkeypatch,
+        client,
+        {"state": "queued", "checkpoint_id": "flash-1/final"},
+    )
 
     # the id is carried onto the returned record: `models deploy --wait` prints this in place of
     # the POST body, so dropping it renders an empty run field and omits it from the json.
-    assert client.deployment_for("flash-1") == {"state": "queued", "run_id": "flash-1"}
+    assert client.deployment_for("flash-1/final") == {
+        "state": "queued",
+        "checkpoint_id": "flash-1/final",
+        "run_id": "flash-1",
+    }
     assert calls == [("GET", "/v1/runs/flash-1/deploy", None, None)]
 
 
 def test_deployment_for_keeps_a_run_id_already_on_the_record(monkeypatch):
     """The record's own id wins; the requested id must not overwrite it."""
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    _deployment_reader(monkeypatch, client, {"state": "ready", "run_id": "flash-1"})
+    _deployment_reader(
+        monkeypatch,
+        client,
+        {"state": "ready", "run_id": "flash-1", "checkpoint_id": "flash-1/final"},
+    )
 
-    assert client.deployment_for("flash-1") == {"state": "ready", "run_id": "flash-1"}
+    assert client.deployment_for("flash-1/final") == {
+        "state": "ready",
+        "run_id": "flash-1",
+        "checkpoint_id": "flash-1/final",
+    }
 
 
 def test_deployment_for_asks_about_the_base_run_not_the_checkpoint_ref(monkeypatch):
     """`RUN/step-N` is not a path segment; the route is keyed by the run alone."""
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     calls = _deployment_reader(
-        monkeypatch, client, {"state": "ready", "checkpoint_step": 40, "run_id": "flash-1"}
+        monkeypatch,
+        client,
+        {
+            "state": "ready",
+            "checkpoint_id": "flash-1/step-40",
+            "checkpoint_step": 40,
+            "run_id": "flash-1",
+        },
     )
 
     assert client.deployment_for("flash-1/step-40") == {
         "state": "ready",
+        "checkpoint_id": "flash-1/step-40",
         "checkpoint_step": 40,
         "run_id": "flash-1",
     }
     assert calls == [("GET", "/v1/runs/flash-1/deploy", None, None)]
 
 
-def test_deployment_for_requires_the_requested_checkpoint_step(monkeypatch):
-    """The requested step is part of the identity, not decoration.
+def test_deployment_for_requires_the_requested_checkpoint_id(monkeypatch):
+    """The requested checkpoint id is the identity, not decoration.
 
-    Matching on the run id alone let `deploy RUN/step-40 --wait` settle on whichever revision was
-    deployed -- an older one still marked ready, or a replacement another shell deployed mid-wait
-    -- and report it as the caller's own.
+    Matching on the run id alone let `deploy RUN/step-40 --wait` settle on whichever checkpoint
+    was deployed, including an older one still marked ready or a replacement deployed mid-wait.
     """
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    _deployment_reader(monkeypatch, client, {"state": "ready", "checkpoint_step": 20})
+    _deployment_reader(
+        monkeypatch,
+        client,
+        {
+            "state": "ready",
+            "checkpoint_id": "flash-1/step-20",
+            "checkpoint_step": 20,
+        },
+    )
 
     assert client.deployment_for("flash-1/step-40") is None
     assert client.deployment_for("flash-1/step-20") == {
         "state": "ready",
+        "checkpoint_id": "flash-1/step-20",
         "checkpoint_step": 20,
         "run_id": "flash-1",
     }
-    # the bare run id is the FINAL adapter, which the plane reports as a null step -- a checkpoint
-    # revision must not answer for it either.
-    assert client.deployment_for("flash-1") is None
+    assert client.deployment_for("flash-1/final") is None
 
 
-def test_deployment_for_matches_the_final_adapters_null_step(monkeypatch):
-    """`checkpoint_step` is None for the final adapter; the bare run id must still match it."""
+def test_deployment_for_matches_the_final_checkpoint_id(monkeypatch):
+    """The permanent final checkpoint id must match exactly."""
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    _deployment_reader(monkeypatch, client, {"state": "ready", "checkpoint_step": None})
+    _deployment_reader(
+        monkeypatch,
+        client,
+        {
+            "state": "ready",
+            "checkpoint_id": "flash-1/final",
+            "checkpoint_step": None,
+        },
+    )
 
-    assert client.deployment_for("flash-1") == {
+    assert client.deployment_for("flash-1/final") == {
         "state": "ready",
+        "checkpoint_id": "flash-1/final",
         "checkpoint_step": None,
         "run_id": "flash-1",
     }
@@ -955,31 +888,34 @@ def test_deployment_for_matches_the_final_adapters_null_step(monkeypatch):
 
 
 def test_deployed_checkpoint_reports_whatever_step_is_serving(monkeypatch):
-    """`deployed_checkpoint` answers "what does this run serve now?", not "is MY step live?".
-
-    The step filter is right for `--wait`, which must not settle for another shell's revision, and
-    wrong for a caller asking what its deploy is about to displace: there the deployed checkpoint
-    differing from the requested one is the entire question.
-    """
+    """`deployed_checkpoint` answers what this run serves, not whether one target is live."""
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    calls = _deployment_reader(monkeypatch, client, {"state": "ready", "checkpoint_step": 100})
+    calls = _deployment_reader(
+        monkeypatch,
+        client,
+        {
+            "state": "ready",
+            "checkpoint_id": "flash-1/step-100",
+            "checkpoint_step": 100,
+        },
+    )
 
     assert client.deployed_checkpoint("flash-1/step-50") == {
         "state": "ready",
+        "checkpoint_id": "flash-1/step-100",
         "checkpoint_step": 100,
         "run_id": "flash-1",
     }
-    # the same run-scoped route, so it costs one read and never walks the account's history.
+    # the same run-scoped route costs one read and never walks the account's history.
     assert calls == [("GET", "/v1/runs/flash-1/deploy", None, None)]
-    # `deployment_for` keeps filtering, so no existing caller changes behaviour.
     assert client.deployment_for("flash-1/step-50") is None
 
 
 @pytest.mark.parametrize("state", ["undeployed", "dry_run"])
 def test_deployed_checkpoint_still_hides_a_never_deployed_run(monkeypatch, state):
-    """Dropping the step check does not make an undeployed run into something being displaced."""
+    """Dropping the id check does not make an undeployed run into a deployed checkpoint."""
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
-    _deployment_reader(monkeypatch, client, {"state": state, "checkpoint_step": 100})
+    _deployment_reader(monkeypatch, client, {"state": state})
 
     assert client.deployed_checkpoint("flash-1/step-50") is None
 
@@ -989,7 +925,7 @@ def test_deployed_checkpoint_reports_an_unknown_run_as_absent(monkeypatch):
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     _deployment_reader(monkeypatch, client, None, status=404)
 
-    assert client.deployed_checkpoint("flash-1") is None
+    assert client.deployed_checkpoint("flash-1/final") is None
 
 
 @pytest.mark.parametrize("state", ["undeployed", "dry_run"])
@@ -997,13 +933,12 @@ def test_deployment_for_reports_a_never_deployed_run_as_absent(monkeypatch, stat
     """The route answers for an undeployed run with a synthesized record instead of 404.
 
     The listing this replaced omitted `undeployed` and `dry_run` rows outright, so returning them
-    here would make `--wait` treat "nothing is deployed" as a live revision and, since neither is
-    a busy state, exit 0 against nothing serving.
+    here would make `--wait` treat "nothing is deployed" as a live checkpoint and exit successfully.
     """
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     _deployment_reader(monkeypatch, client, {"state": state, "run_id": "flash-1"})
 
-    assert client.deployment_for("flash-1") is None
+    assert client.deployment_for("flash-1/final") is None
 
 
 def test_deployment_for_reports_an_unknown_run_as_absent(monkeypatch):
@@ -1015,7 +950,7 @@ def test_deployment_for_reports_an_unknown_run_as_absent(monkeypatch):
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     _deployment_reader(monkeypatch, client, None, status=404)
 
-    assert client.deployment_for("flash-1") is None
+    assert client.deployment_for("flash-1/final") is None
 
 
 def test_deployment_for_still_raises_a_rejected_key(monkeypatch):
@@ -1024,7 +959,7 @@ def test_deployment_for_still_raises_a_rejected_key(monkeypatch):
     _deployment_reader(monkeypatch, client, None, status=401)
 
     with pytest.raises(ApiError):
-        client.deployment_for("flash-1")
+        client.deployment_for("flash-1/final")
 
 
 def test_deployment_for_bounds_the_read(monkeypatch):
@@ -1036,7 +971,7 @@ def test_deployment_for_bounds_the_read(monkeypatch):
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     calls = _deployment_reader(monkeypatch, client, {"state": "undeployed"})
 
-    assert client.deployment_for("flash-1", timeout=3.0) is None
+    assert client.deployment_for("flash-1/final", timeout=3.0) is None
     assert calls == [("GET", "/v1/runs/flash-1/deploy", 3.0, None)]
 
 
@@ -1050,7 +985,7 @@ def test_deployed_checkpoint_takes_a_wall_clock_deadline(monkeypatch):
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     calls = _deployment_reader(monkeypatch, client, {"state": "undeployed"})
 
-    assert client.deployed_checkpoint("flash-1", timeout=5.0, body_deadline=5.0) is None
+    assert client.deployed_checkpoint("flash-1/final", timeout=5.0, body_deadline=5.0) is None
     assert calls == [("GET", "/v1/runs/flash-1/deploy", 5.0, 5.0)]
 
 
@@ -1106,7 +1041,7 @@ def test_a_wall_clock_deadline_bounds_a_body_that_arrives_a_byte_at_a_time():
         client = ApiClient(url, "fslo-user-test", timeout=60)
         start = time.monotonic()
         with pytest.raises(ClientError):
-            client.deployed_checkpoint("flash-1", timeout=2.0, body_deadline=0.5)
+            client.deployed_checkpoint("flash-1/final", timeout=2.0, body_deadline=0.5)
         elapsed = time.monotonic() - start
 
     # generous against CI scheduling noise, and still far under the ~12s of the unbounded read.
@@ -1180,7 +1115,7 @@ def test_a_stalled_body_read_cannot_outlast_the_remaining_deadline():
         client = ApiClient(url, "fslo-user-test", timeout=60)
         start = time.monotonic()
         with pytest.raises(ClientError):
-            client.deployed_checkpoint("flash-1", timeout=5.0, body_deadline=budget)
+            client.deployed_checkpoint("flash-1/final", timeout=5.0, body_deadline=budget)
         elapsed = time.monotonic() - start
 
     # without the re-cap this measured 3.51s. generous against CI noise, still well under that.
@@ -1247,7 +1182,7 @@ def test_a_complete_body_still_reads_whole_under_a_deadline():
     body = json.dumps(payload).encode()
     with _fixed_2xx_server("application/json", body) as url:
         client = ApiClient(url, "fslo-user-test", timeout=30)
-        got = client.deployed_checkpoint("flash-1", timeout=30.0, body_deadline=30.0)
+        got = client.deployed_checkpoint("flash-1/final", timeout=30.0, body_deadline=30.0)
 
     assert got["pad"] == payload["pad"]
     assert got["checkpoint_step"] == 100
