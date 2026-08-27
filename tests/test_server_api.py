@@ -162,6 +162,17 @@ def api(tmp_path, monkeypatch):
         "serve_chat",
         lambda **_k: {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]},
     )
+    import flash.server.routes.serving_smoke as serving_smoke
+
+    def inline_smoke_chat(chat_kwargs, *, deadline, budget_s):
+        if time.monotonic() >= deadline:
+            raise serving_smoke._smoke_timeout_error(budget_s)
+        result = serving_smoke._app.serve_chat(**chat_kwargs)
+        if time.monotonic() > deadline:
+            raise serving_smoke._smoke_timeout_error(budget_s)
+        return result
+
+    monkeypatch.setattr(serving_smoke, "_isolated_smoke_chat", inline_smoke_chat)
     # The new preflight requires the Lambda key above, which also makes
     # `configured_providers()` treat it as live -- so the startup lifespan's `recover_runs()`
     # and the orphan-sweep loop would dispatch real `sweep_orphans()` (Lambda list calls) and
@@ -3996,6 +4007,98 @@ def test_deploy_start_failure_persists_terminal_failure(api, monkeypatch):
     assert deployment["retryable"] is True
     assert "shutting down" in deployment["error"]
     assert [item.deployment["state"] for item in reported] == ["queued", "failed"]
+
+
+def test_deploy_propagates_live_smoke_process_after_recording_failure(api, monkeypatch):
+    import flash.server.asgi.app as app_mod
+    import flash.server.routes.serving_smoke as serving_smoke
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner_status.get_status(run_id)
+    status.state = "done"
+    runner_state._save_status(status)
+    revision = f"{run_id}/final"
+
+    class OwnedProcess:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    process = OwnedProcess()
+    ownership_error = serving_smoke._ProcessOwnershipError(process)
+
+    def fake_deploy(**kwargs):
+        kwargs["before_ready"](revision, revision)
+        pytest.fail("a retained smoke process must abort deployment")
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        serving_smoke,
+        "_isolated_smoke_chat",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ownership_error),
+    )
+
+    with pytest.raises(serving_smoke._ProcessOwnershipError) as exc_info:
+        api.post(
+            f"/v1/runs/{run_id}/deploy",
+            json={"checkpoint_id": f"{run_id}/final"},
+            headers=_bearer(key),
+        )
+
+    assert exc_info.value is ownership_error
+    assert exc_info.value.process is process
+    assert process.close_calls == 0
+    deployment = runner_status.get_status(run_id).deployment
+    assert deployment["state"] == "failed"
+    assert deployment["error"] == str(ownership_error)
+
+
+def test_deploy_failure_recording_cannot_replace_process_ownership_error(api, monkeypatch):
+    import flash.server.asgi.app as app_mod
+    import flash.server.routes.serving_completion as serving_completion
+    import flash.server.routes.serving_smoke as serving_smoke
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner_status.get_status(run_id)
+    status.state = "done"
+    runner_state._save_status(status)
+    revision = f"{run_id}/final"
+    process = object()
+    ownership_error = serving_smoke._ProcessOwnershipError(process)
+
+    def fake_deploy(**kwargs):
+        kwargs["before_ready"](revision, revision)
+        pytest.fail("a retained smoke process must abort deployment")
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(
+        serving_smoke,
+        "_isolated_smoke_chat",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ownership_error),
+    )
+    monkeypatch.setattr(
+        serving_completion,
+        "_record_deployment_failure",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("storage unavailable")),
+    )
+
+    with pytest.raises(serving_smoke._ProcessOwnershipError) as exc_info:
+        api.post(
+            f"/v1/runs/{run_id}/deploy",
+            json={"checkpoint_id": f"{run_id}/final"},
+            headers=_bearer(key),
+        )
+
+    assert exc_info.value is ownership_error
+    assert exc_info.value.process is process
 
 
 def test_sync_deploy_execution_error_keeps_specific_persisted_outcome(api, monkeypatch):

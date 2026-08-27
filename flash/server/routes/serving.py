@@ -709,7 +709,6 @@ from flash.server.routes.serving_smoke import (  # noqa: E402,F401
     _JSON_SCHEMA_PROCESS_NAME,
     _SMOKE_BUDGET_SECONDS,
     _SMOKE_PROMPT,
-    _bounded_call,
     _bounded_regex_fullmatch,
     _json_schema_validation_worker,
     _reap_schema_validation_process,

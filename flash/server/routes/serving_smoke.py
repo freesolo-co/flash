@@ -11,9 +11,11 @@ Split out of `flash.server.routes.serving` to keep that module under the file-si
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import multiprocessing
+import os
 import time
 
 import regex as safe_regex
@@ -38,6 +40,11 @@ from flash.serve.deployment.preflight import (
     validate_structured_output_patterns,
 )
 from flash.server.asgi import app as _app
+from flash.server.platform.ipc import (
+    _IpcDeadlineExceeded,
+    _receive_framed_ipc,
+    _send_framed_ipc,
+)
 
 
 def _serving():
@@ -121,34 +128,255 @@ def _smoke_timeout_error(budget_s: float) -> ServingError:
     return ServingError(f"deployment_smoke_timeout: bounded smoke exceeded {budget_s:g}s")
 
 
-def _bounded_call(fn, *, deadline: float, budget_s: float):
-    """run the trusted smoke call within the remaining global deadline."""
-    import threading
-
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise _smoke_timeout_error(budget_s)
-    result: dict = {}
-
-    def _target() -> None:
-        try:
-            result["value"] = fn()
-        except BaseException as exc:  # re-raised on the caller thread below
-            result["error"] = exc
-
-    thread = threading.Thread(target=_target, daemon=True)
-    thread.start()
-    thread.join(timeout=remaining)
-    if thread.is_alive():
-        raise _smoke_timeout_error(budget_s)
-    if "error" in result:
-        raise result["error"]
-    return result.get("value")
-
-
 _DIRECT_REGEX_TIMEOUT_SECONDS = 0.05
 _JSON_SCHEMA_TIMEOUT_SECONDS = 3.0
 _JSON_SCHEMA_PROCESS_NAME = "flash-json-schema-validation"
+_SMOKE_CHAT_PROCESS_NAME = "flash-deployment-smoke-chat"
+_PROCESS_JOIN_TIMEOUT_SECONDS = 0.1
+_PROCESS_TERMINATE_TIMEOUT_SECONDS = 0.2
+_PROCESS_KILL_TIMEOUT_SECONDS = 0.2
+
+
+class _ProcessOwnershipError(ServingError):
+    """the caller still owns a child that survived every bounded shutdown step."""
+
+    def __init__(self, process) -> None:
+        super().__init__(
+            "deployment smoke process ownership retained after bounded terminate and kill attempts"
+        )
+        self.process = process
+
+
+def _ipc_credential() -> str:
+    return (os.environ.get("FREESOLO_INTERNAL_KEY") or "").strip()
+
+
+def _ipc_redaction(credential: str) -> str:
+    character = "y" if credential == "x" * len(credential) else "x"
+    return character * len(credential)
+
+
+def _redact_ipc_text(value: str) -> str:
+    credential = _ipc_credential()
+    return value.replace(credential, _ipc_redaction(credential)) if credential else value
+
+
+def _redact_ipc_bytes(value: bytes) -> bytes:
+    credential = _ipc_credential()
+    return (
+        value.replace(credential.encode(), _ipc_redaction(credential).encode())
+        if credential
+        else value
+    )
+
+
+def _redact_ipc_value(value):
+    """copy one explicit IPC value while replacing the credential in every string and byte field."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _redact_ipc_text(value)
+    if isinstance(value, bytes):
+        return _redact_ipc_bytes(value)
+    if isinstance(value, tuple):
+        return tuple(_redact_ipc_value(item) for item in value)
+    if isinstance(value, list):
+        return [_redact_ipc_value(item) for item in value]
+    if isinstance(value, dict):
+        return {_redact_ipc_value(key): _redact_ipc_value(item) for key, item in value.items()}
+    raise TypeError("unsupported deployment smoke IPC value")
+
+
+def _encode_smoke_chat_exception(exc: Exception) -> tuple:
+    """encode only the safe fields needed to reconstruct the supported exception taxonomy."""
+    import httpx
+
+    if isinstance(exc, RetryableServingUnavailable):
+        return ("retryable", exc.code, exc.retry_after_seconds)
+    if isinstance(exc, ServingError):
+        return ("serving_error", str(exc), exc.status_code, exc.retry_after)
+    if isinstance(exc, json.JSONDecodeError):
+        return ("json_decode_error", exc.msg, exc.doc, exc.pos)
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        request = exc.request
+        return (
+            "http_status_error",
+            str(exc),
+            request.method,
+            str(request.url),
+            response.status_code,
+            tuple(response.headers.multi_items()),
+            response.content,
+        )
+    if isinstance(exc, httpx.RequestError):
+        request = exc.request
+        error_type = {
+            httpx.ConnectError: "ConnectError",
+            httpx.ConnectTimeout: "ConnectTimeout",
+            httpx.PoolTimeout: "PoolTimeout",
+            httpx.ReadTimeout: "ReadTimeout",
+            httpx.WriteTimeout: "WriteTimeout",
+        }.get(type(exc), "RequestError")
+        return ("request_error", error_type, str(exc), request.method, str(request.url))
+    return ("unknown_error",)
+
+
+def _reap_bounded_process(process, *, terminate_first: bool = False) -> None:
+    """reap an owned worker or raise while retaining the live process on the error."""
+    if not terminate_first:
+        process.join(timeout=_PROCESS_JOIN_TIMEOUT_SECONDS)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=_PROCESS_TERMINATE_TIMEOUT_SECONDS)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=_PROCESS_KILL_TIMEOUT_SECONDS)
+    if process.is_alive():
+        raise _ProcessOwnershipError(process)
+
+
+def _smoke_chat_worker(connection, chat_kwargs: dict, deadline: float) -> None:
+    """run one network smoke in a killable child and return a small, explicit outcome."""
+    try:
+        try:
+            result = _app.serve_chat(**chat_kwargs)
+        except Exception as exc:
+            try:
+                outcome = _encode_smoke_chat_exception(exc)
+            except Exception:
+                outcome = ("unknown_error",)
+        else:
+            outcome = ("ok", result)
+        try:
+            safe_outcome = _redact_ipc_value(outcome)
+        except (TypeError, ValueError):
+            safe_outcome = ("unknown_error",)
+        with contextlib.suppress(BrokenPipeError, EOFError, OSError, _IpcDeadlineExceeded):
+            _send_framed_ipc(
+                connection,
+                safe_outcome,
+                deadline=deadline,
+                description="isolated deployment smoke",
+            )
+    finally:
+        connection.close()
+
+
+def _decode_smoke_chat_outcome(outcome: tuple) -> dict:
+    """reconstruct one explicitly allowed child outcome without dynamic class lookup."""
+    import httpx
+
+    if not isinstance(outcome, tuple):
+        raise ServingError("isolated deployment smoke returned an invalid result")
+    if len(outcome) == 2 and outcome[0] == "ok" and isinstance(outcome[1], dict):
+        return outcome[1]
+    if len(outcome) == 3 and outcome[0] == "retryable":
+        code, delay = outcome[1:]
+        if isinstance(code, str) and isinstance(delay, (int, float)):
+            raise RetryableServingUnavailable(code, float(delay))
+    if len(outcome) == 4 and outcome[0] == "serving_error":
+        message, status_code, retry_after = outcome[1:]
+        if (
+            isinstance(message, str)
+            and (status_code is None or isinstance(status_code, int))
+            and (retry_after is None or isinstance(retry_after, str))
+        ):
+            raise ServingError(message, status_code=status_code, retry_after=retry_after)
+    if len(outcome) == 4 and outcome[0] == "json_decode_error":
+        message, document, position = outcome[1:]
+        if isinstance(message, str) and isinstance(document, str) and isinstance(position, int):
+            raise json.JSONDecodeError(message, document, min(max(0, position), len(document)))
+    if len(outcome) == 7 and outcome[0] == "http_status_error":
+        message, method, url, status_code, headers, content = outcome[1:]
+        valid_headers = isinstance(headers, tuple) and all(
+            isinstance(item, tuple)
+            and len(item) == 2
+            and all(isinstance(part, str) for part in item)
+            for item in headers
+        )
+        if (
+            isinstance(message, str)
+            and isinstance(method, str)
+            and isinstance(url, str)
+            and isinstance(status_code, int)
+            and valid_headers
+            and isinstance(content, bytes)
+        ):
+            request = httpx.Request(method, url)
+            response = httpx.Response(
+                status_code, headers=list(headers), content=content, request=request
+            )
+            raise httpx.HTTPStatusError(message, request=request, response=response)
+    if len(outcome) == 5 and outcome[0] == "request_error":
+        error_type, message, method, url = outcome[1:]
+        error_classes = {
+            "ConnectError": httpx.ConnectError,
+            "ConnectTimeout": httpx.ConnectTimeout,
+            "PoolTimeout": httpx.PoolTimeout,
+            "ReadTimeout": httpx.ReadTimeout,
+            "RequestError": httpx.RequestError,
+            "WriteTimeout": httpx.WriteTimeout,
+        }
+        error_class = error_classes.get(error_type) if isinstance(error_type, str) else None
+        if (
+            error_class is not None
+            and isinstance(message, str)
+            and isinstance(method, str)
+            and isinstance(url, str)
+        ):
+            request = httpx.Request(method, url)
+            raise error_class(message, request=request)
+    if outcome == ("unknown_error",):
+        raise ServingError("isolated deployment smoke failed with an unsupported exception")
+    raise ServingError("isolated deployment smoke returned an invalid result")
+
+
+def _isolated_smoke_chat(chat_kwargs: dict, *, deadline: float, budget_s: float) -> dict:
+    """run one smoke request in a spawned process owned through the absolute deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _smoke_timeout_error(budget_s)
+    context = multiprocessing.get_context("spawn")
+    receive_connection, send_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_smoke_chat_worker,
+        args=(send_connection, chat_kwargs, deadline),
+        name=_SMOKE_CHAT_PROCESS_NAME,
+        daemon=True,
+    )
+    outcome: tuple | None = None
+    timed_out = False
+    try:
+        try:
+            process.start()
+        except Exception as exc:
+            if time.monotonic() >= deadline:
+                raise _smoke_timeout_error(budget_s) from exc
+            raise ServingError(f"could not start isolated deployment smoke: {exc}") from exc
+        finally:
+            send_connection.close()
+        try:
+            outcome = _receive_framed_ipc(
+                receive_connection,
+                deadline=deadline,
+                description="isolated deployment smoke",
+            )
+        except _IpcDeadlineExceeded:
+            timed_out = True
+    finally:
+        receive_connection.close()
+        if process.pid is not None:
+            _reap_bounded_process(process, terminate_first=timed_out)
+            process.close()
+        else:
+            process.close()
+
+    if timed_out:
+        raise _smoke_timeout_error(budget_s)
+    if outcome is None:
+        raise ServingError("isolated deployment smoke exited without returning a result")
+    return _decode_smoke_chat_outcome(outcome)
 
 
 def _bounded_regex_fullmatch(pattern: str, value: str, *, deadline: float, budget_s: float):
@@ -172,7 +400,7 @@ def _sanitized_schema_error(exc: Exception) -> str:
     return " ".join(str(message).split())[:500]
 
 
-def _json_schema_validation_worker(connection, instance, schema) -> None:
+def _json_schema_validation_worker(connection, instance, schema, deadline: float) -> None:
     try:
         validator_class = validate_local_json_schema(
             schema, validator_factory=_serving().validator_for
@@ -190,7 +418,13 @@ def _json_schema_validation_worker(connection, instance, schema) -> None:
     else:
         outcome = ("ok", "")
     try:
-        connection.send(outcome)
+        with contextlib.suppress(BrokenPipeError, EOFError, OSError, _IpcDeadlineExceeded):
+            _send_framed_ipc(
+                connection,
+                outcome,
+                deadline=deadline,
+                description="isolated JSON schema validation",
+            )
     finally:
         connection.close()
 
@@ -204,7 +438,9 @@ def _reap_schema_validation_process(process, *, deadline: float) -> None:
         process.join(timeout=min(0.2, remaining))
     if process.is_alive():
         process.kill()
-        process.join()
+        process.join(timeout=_PROCESS_KILL_TIMEOUT_SECONDS)
+    if process.is_alive():
+        raise _ProcessOwnershipError(process)
 
 
 def _validate_json_schema(instance, schema: dict, *, deadline: float, budget_s: float) -> None:
@@ -218,7 +454,7 @@ def _validate_json_schema(instance, schema: dict, *, deadline: float, budget_s: 
     receive_connection, send_connection = context.Pipe(duplex=False)
     process = context.Process(
         target=_json_schema_validation_worker,
-        args=(send_connection, instance, schema),
+        args=(send_connection, instance, schema, validation_deadline),
         name=_JSON_SCHEMA_PROCESS_NAME,
         daemon=True,
     )
@@ -233,13 +469,13 @@ def _validate_json_schema(instance, schema: dict, *, deadline: float, budget_s: 
             raise ServingError(f"could not start isolated JSON schema validation: {exc}") from exc
         finally:
             send_connection.close()
-        remaining = max(0.0, validation_deadline - time.monotonic())
-        if receive_connection.poll(remaining):
-            try:
-                outcome = receive_connection.recv()
-            except EOFError:
-                outcome = None
-        else:
+        try:
+            outcome = _receive_framed_ipc(
+                receive_connection,
+                deadline=validation_deadline,
+                description="isolated JSON schema validation",
+            )
+        except _IpcDeadlineExceeded:
             timed_out = True
     finally:
         receive_connection.close()
@@ -473,29 +709,25 @@ def _bounded_smoke_chat(
         if remaining <= 0:
             raise _smoke_timeout_error(budget_s)
         try:
-
-            def _chat_call(timeout_s: float = remaining):
-                chat_kwargs = {
-                    "run_id": serving_model,
-                    "messages": (
-                        messages
-                        if messages is not None
-                        else [{"role": "user", "content": _SMOKE_PROMPT}]
-                    ),
-                    "temperature": 0.0,
-                    "max_tokens": max_tokens,
-                    "thinking": thinking,
-                    "expected_checkpoint": expected_checkpoint,
-                    "org_id": org_id,
-                    "timeout_s": timeout_s,
-                    "retry_unavailable": True,
-                    "stop": stop_sequences,
-                }
-                if structured_outputs is not None:
-                    chat_kwargs["structured_outputs"] = structured_outputs
-                return _app.serve_chat(**chat_kwargs)
-
-            return _bounded_call(_chat_call, deadline=deadline, budget_s=budget_s)
+            chat_kwargs = {
+                "run_id": serving_model,
+                "messages": (
+                    messages
+                    if messages is not None
+                    else [{"role": "user", "content": _SMOKE_PROMPT}]
+                ),
+                "temperature": 0.0,
+                "max_tokens": max_tokens,
+                "thinking": thinking,
+                "expected_checkpoint": expected_checkpoint,
+                "org_id": org_id,
+                "timeout_s": remaining,
+                "retry_unavailable": True,
+                "stop": stop_sequences,
+            }
+            if structured_outputs is not None:
+                chat_kwargs["structured_outputs"] = structured_outputs
+            return _isolated_smoke_chat(chat_kwargs, deadline=deadline, budget_s=budget_s)
         except RetryableServingUnavailable as exc:
             remaining = deadline - time.monotonic()
             if remaining <= 0:

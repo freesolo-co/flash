@@ -38,6 +38,21 @@ from flash.serve.contract.errors import ServingError
 from flash.serve.request import transport as serving_transport
 
 
+@pytest.fixture(autouse=True)
+def _inline_mocked_smoke_chat(monkeypatch):
+    """keep direct-call unit tests local while process ownership is covered separately."""
+
+    def invoke(chat_kwargs, *, deadline, budget_s):
+        if time.monotonic() >= deadline:
+            raise serving_smoke._smoke_timeout_error(budget_s)
+        result = serving_smoke._app.serve_chat(**chat_kwargs)
+        if time.monotonic() > deadline:
+            raise serving_smoke._smoke_timeout_error(budget_s)
+        return result
+
+    monkeypatch.setattr(serving_smoke, "_isolated_smoke_chat", invoke)
+
+
 def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -1599,16 +1614,18 @@ def test_run_deployment_smoke_retry_stays_inside_wall_clock_budget(monkeypatch):
     assert clock[0] == 102.0
 
 
-def test_run_deployment_smoke_bounds_chat_by_wall_clock_deadline(monkeypatch):
-    def slow_serve_chat(**kwargs):
-        time.sleep(1.0)
+def test_run_deployment_smoke_maps_a_late_chat_result_to_the_global_deadline(monkeypatch):
+    clock = [100.0]
+
+    def late_serve_chat(**kwargs):
+        clock[0] += 0.1
         return _smoke_response("The answer is 4")
 
-    monkeypatch.setattr(serving._app, "serve_chat", slow_serve_chat)
-    started = time.monotonic()
+    monkeypatch.setattr(serving._app, "serve_chat", late_serve_chat)
+    monkeypatch.setattr(serving.time, "monotonic", lambda: clock[0])
+
     with pytest.raises(ServingError, match="deployment_smoke_timeout: bounded smoke exceeded"):
         _run_smoke(_smoke_spec(thinking=False), budget_s=0.05)
-    assert time.monotonic() - started < 0.5
 
 
 def test_run_deployment_smoke_expired_budget_fails_before_generation(monkeypatch):

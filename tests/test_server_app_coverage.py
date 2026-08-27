@@ -10,6 +10,7 @@ import types
 import pytest
 
 import flash.server.asgi.app as app_mod
+from flash.server.routes.serving_smoke import _ProcessOwnershipError
 
 
 def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> None:
@@ -51,6 +52,54 @@ def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> No
     ]
     with app_mod._DEPLOYMENT_JOBS_LOCK:
         assert not app_mod._DEPLOYMENT_JOBS
+
+
+def test_deployment_job_transfers_live_process_to_lifespan_reaper() -> None:
+    class RetainedProcess:
+        def __init__(self) -> None:
+            self.alive = True
+            self.join_timeouts = []
+            self.terminate_calls = 0
+            self.kill_calls = 0
+            self.close_calls = 0
+
+        def join(self, *, timeout):
+            self.join_timeouts.append(timeout)
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+        def kill(self):
+            self.kill_calls += 1
+            self.alive = False
+
+        def close(self):
+            self.close_calls += 1
+
+    process = RetainedProcess()
+    ownership_error = _ProcessOwnershipError(process)
+    with app_mod._RETAINED_DEPLOYMENT_PROCESSES_LOCK:
+        app_mod._RETAINED_DEPLOYMENT_PROCESSES.clear()
+
+    app_mod._run_deployment_job(
+        lambda: (_ for _ in ()).throw(ownership_error),
+        (),
+        {},
+    )
+
+    with app_mod._RETAINED_DEPLOYMENT_PROCESSES_LOCK:
+        assert {process} == app_mod._RETAINED_DEPLOYMENT_PROCESSES
+    assert process.close_calls == 0
+
+    assert app_mod._reap_retained_deployment_processes(1.0) is True
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process.close_calls == 1
+    with app_mod._RETAINED_DEPLOYMENT_PROCESSES_LOCK:
+        assert not app_mod._RETAINED_DEPLOYMENT_PROCESSES
 
 
 def _run_loop_once(monkeypatch, loop, worker):
