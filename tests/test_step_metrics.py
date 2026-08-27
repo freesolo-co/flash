@@ -539,6 +539,59 @@ def test_real_verl_line_reaches_progress_metrics_and_cli_row(monkeypatch):
     assert _log_follow_metric_rows(status, set()) == [expected]
 
 
+def test_error_progress_backlog_reaches_the_cli(monkeypatch):
+    """a failing rl run must still render the steps it completed.
+
+    the worker error path publishes only ``metrics_last`` -- a list, not the per-key scalars the
+    ``rl_step`` path splats -- so the backlog reaches ``_progress_sections`` as an unknown key and
+    lands in ``diagnostics``. ``_log_follow_metric_rows`` reads ``progress.metrics`` alone, so a
+    short failing GRPO/OPD run would render no reward or loss at all, which is exactly the run
+    whose metrics matter most.
+    """
+    from flash.cli.commands.ops.log_follow import _log_follow_metric_rows
+    from flash.engine.worker.io import progress as worker_progress
+
+    monkeypatch.setattr(worker_progress.worker_state, "RUN_ID", "run-rl-error")
+    monkeypatch.setattr(worker_progress.worker_state, "PHASE", "rl")
+    monkeypatch.setattr(worker_progress.worker_state, "ATTEMPT", 1)
+    monkeypatch.setattr(worker_progress.worker_state, "FENCE", 4)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_SEQUENCE", 0)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_PREVIOUS_DIGEST", None)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_TRAINING_ENTERED", True)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_COMPLETED_STEPS", 2)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_PENDING_CHECKPOINT_FAILURE", None)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_FATAL_ERROR", None)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_COALESCED", None)
+    monkeypatch.setattr(worker_progress, "_PROGRESS_COALESCE_STARTED_AT", None)
+    worker_progress._PROGRESS_QUEUE.clear()
+    records = []
+    monkeypatch.setattr(
+        worker_progress,
+        "_upload_record",
+        lambda record, *, required: records.append(record) or True,
+    )
+
+    # exactly what `worker.py` sends on the error path: the bounded backlog and nothing else.
+    worker_progress.publish_progress(
+        "error_rl",
+        error="boom",
+        metrics_last=[
+            {"step": 1, "reward": 0.25, "grad_norm": 2.0},
+            {"step": 2, "reward": 0.5, "grad_norm": 1.25},
+        ],
+    )
+    worker_progress.flush_progress()
+
+    record = records[-1]
+    assert record.metrics == {}, "backlog is not a scalar section; the fix belongs at the reader"
+    assert record.diagnostics.get("metrics_last"), "worker stopped carrying the backlog"
+    status = {"attempt": {"attempt_id": 1, "fence": 4}, "progress": record.to_dict()}
+    # the NEWEST backlog entry, not the first: a resumed row would otherwise render stale values.
+    assert _log_follow_metric_rows(status, set()) == [
+        "progress_seq=1 step=2 reward=0.5 grad_norm=1.25"
+    ]
+
+
 def test_verl_rl_renders_the_same_metric_fields_the_cli_shows():
     # the payload schema belongs to the cli, not verl: a key the renderer does not know is dead
     # weight, so keep the mapping's flash-side names inside the rendered set.

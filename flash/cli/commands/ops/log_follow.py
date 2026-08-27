@@ -168,6 +168,28 @@ _FOLLOW_METRIC_FIELDS = (
 )
 
 
+def _row_metrics(progress: dict) -> dict:
+    """the metric mapping a progress record renders from.
+
+    the ``rl_step`` path splats per-key scalars, so they land in ``metrics``. the worker's error
+    path publishes only the bounded ``metrics_last`` backlog, which is a list and therefore an
+    unknown key to ``_progress_sections`` -- it lands in ``diagnostics``. reading ``metrics``
+    alone would render no reward or loss for a short failing rl run, which is the run whose
+    metrics matter most. fall back to the newest backlog entry, never merge across the two: a
+    populated ``metrics`` is the record's own step and outranks a carried-forward history.
+    """
+    metrics = progress.get("metrics")
+    if isinstance(metrics, dict) and metrics:
+        return metrics
+    diagnostics = progress.get("diagnostics")
+    backlog = diagnostics.get("metrics_last") if isinstance(diagnostics, dict) else None
+    if isinstance(backlog, list):
+        for entry in reversed(backlog):
+            if isinstance(entry, dict) and entry:
+                return entry
+    return {}
+
+
 def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
     """return one unseen immutable progress row keyed by attempt, fence, and sequence."""
     progress = (status or {}).get("progress")
@@ -183,13 +205,12 @@ def _log_follow_metric_rows(status: dict | None, seen_steps: set) -> list[str]:
     steps = progress.get("completed_steps")
     if isinstance(steps, int) and not isinstance(steps, bool):
         parts.append(f"step={steps}")
-    metrics = progress.get("metrics")
-    if isinstance(metrics, dict):
-        for field, label in _FOLLOW_METRIC_FIELDS:
-            value = metrics.get(field)
-            if value is None:
-                continue
-            if isinstance(value, float):
-                value = f"{value:.6g}"
-            parts.append(f"{label}={value}")
+    metrics = _row_metrics(progress)
+    for field, label in _FOLLOW_METRIC_FIELDS:
+        value = metrics.get(field)
+        if value is None:
+            continue
+        if isinstance(value, float):
+            value = f"{value:.6g}"
+        parts.append(f"{label}={value}")
     return [" ".join(parts)]
