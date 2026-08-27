@@ -40,7 +40,7 @@ from flash.serve.contract.errors import (  # noqa: F401
 )
 from flash.serve.contract.urls import public_deployment
 from flash.server.asgi import app as _app
-from flash.server.platform import auth, db
+from flash.server.platform import auth, listing
 from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key
 from flash.server.platform.internal_client import run_org_id, run_serving_org_id
 
@@ -631,16 +631,14 @@ def _in_deployment_listing_scope(status, org: str, project: str) -> bool:
 @router.get("/v1/deployments")
 def deployments(
     key: Annotated[dict, Depends(require_key)],
+    cursor: str | None = None,
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
     x_freesolo_project_id: Annotated[str | None, Header()] = None,
 ):
     scope = _deployment_listing_scope(key, x_freesolo_org_id, x_freesolo_project_id)
+    rows, next_cursor = listing.page_rows(key["id"], cursor)
     out = []
-    for row in db.runs_for_key(key["id"]):
-        try:
-            status = _app.get_status(row["run_id"])
-        except FileNotFoundError:
-            continue
+    for status in listing.statuses(rows, _app.get_status):
         if scope is not None and not _in_deployment_listing_scope(status, *scope):
             continue
         if status.deployment and status.deployment.get("state") not in (
@@ -650,7 +648,10 @@ def deployments(
             data = status.to_dict()
             data["deployment"] = _public_deployment(data["deployment"])
             out.append(data)
-    return {"deployments": out}
+    # the page bounds rows READ, not deployments returned: a page of runs that deploy nothing yields
+    # an empty page with a cursor still set, and the caller keeps following it. reporting no cursor
+    # here because this page happened to filter empty would hide every later deployment.
+    return {"deployments": out, "next_cursor": next_cursor}
 
 
 @router.post("/v1/runs/{run_id}/chat")

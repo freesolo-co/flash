@@ -24,7 +24,7 @@ from flash.schema import train_schema_metadata
 from flash.serve.deployment.preflight import ServingPreflightError
 from flash.server.asgi import app as _app
 from flash.server.domain.teacher.broker import TeacherBrokerConfigurationError
-from flash.server.platform import db
+from flash.server.platform import db, listing
 from flash.server.platform.deps import (
     _parse_spec,
     _require_bool,
@@ -444,14 +444,10 @@ def create_run(
 
 
 @router.get("/v1/runs")
-def list_runs(key: Annotated[dict, Depends(require_key)]):
-    out = []
-    for row in db.runs_for_key(key["id"]):
-        try:
-            out.append(_app.get_status(row["run_id"]).to_dict())
-        except FileNotFoundError:
-            continue
-    return {"runs": out}
+def list_runs(key: Annotated[dict, Depends(require_key)], cursor: str | None = None):
+    rows, next_cursor = listing.page_rows(key["id"], cursor)
+    runs = [status.to_dict() for status in listing.statuses(rows, _app.get_status)]
+    return {"runs": runs, "next_cursor": next_cursor}
 
 
 @router.get("/v1/runs/{run_id}")
