@@ -274,7 +274,7 @@ def _reconcile_attached_remote(
         except Exception:
             terminal_result = None
         if terminal_result is not None:
-            from flash.runner.supervise.attach_retry import reconcile_terminal_result
+            from flash.runner.supervise.attach_reconcile import reconcile_terminal_result
 
             if reconcile_terminal_result(
                 run_id,
