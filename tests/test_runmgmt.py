@@ -2025,6 +2025,10 @@ def test_attach_reconciler_persists_unconfirmed_runpod_teardown(monkeypatch, tmp
             CleanupOutcome.UNCONFIRMED, unresolved_ids=(spec.run_id,)
         ),
     )
+    # the endpoint delete could not be confirmed, but the job itself reached a terminal state, so
+    # the captured worker cannot still be running. that is what permits a replacement attempt here;
+    # an unconfirmed teardown alone would not, since the endpoint may still be live.
+    monkeypatch.setattr(runner_lifecycle, "_worker_provably_gone", lambda *_args, **_kwargs: True)
     resumed = []
     monkeypatch.setattr(
         attach_mod,
