@@ -924,7 +924,12 @@ def _classify_urlopen(transport: object) -> _UrlopenKind:
     except Exception:
         return _UrlopenKind.UNKNOWN_STDLIB
     if not shape_matches:
-        return _UrlopenKind.INJECTED
+        # metadata already claims to be `urllib.request.urlopen`, so a mismatched shape is not an
+        # honestly-labelled third-party transport. `functools.wraps` copies the module, name and
+        # qualname off the stdlib function it wraps, so an apm or tracing wrapper lands here; it
+        # would reach the real stdlib urlopen, follow a 3xx and forward Authorization. it cannot be
+        # verified, so it fails closed like any other unclassifiable stdlib-claiming transport.
+        return _UrlopenKind.UNKNOWN_STDLIB
     if transport is not _STDLIB_URLOPEN:
         return _UrlopenKind.UNKNOWN_STDLIB
     try:

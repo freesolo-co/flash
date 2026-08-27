@@ -1639,6 +1639,57 @@ def test_unknown_stdlib_urlopen_fails_closed_before_transport(monkeypatch) -> No
     assert contacted == []
 
 
+def test_wraps_style_urlopen_wrapper_fails_closed_before_transport(monkeypatch) -> None:
+    # an apm or tracing library installs `@functools.wraps(urlopen) def wrapper(...)`. wraps copies
+    # __module__/__name__/__qualname__ off the stdlib function, so the wrapper claims to be
+    # urllib.request.urlopen while its code shape is a plain (*args, **kwargs) passthrough. calling
+    # it directly would reach the real stdlib urlopen, follow a 3xx and forward Authorization.
+    contacted: list[str] = []
+    wrapped: list[str] = []
+
+    class UnexpectedTransport(urllib.request.BaseHandler):
+        def https_open(self, request):
+            contacted.append(request.full_url)
+            raise AssertionError("transport was contacted")
+
+    original = urllib.request.urlopen
+
+    @functools.wraps(original)
+    def instrumented_urlopen(*args, **kwargs):
+        wrapped.append("called")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(urllib.request, "urlopen", instrumented_urlopen)
+    urllib.request.install_opener(urllib.request.build_opener(UnexpectedTransport()))
+
+    with pytest.raises(urllib.error.URLError) as exc_info:
+        _urlopen_no_redirect(urllib.request.Request("https://source.invalid/data"), timeout=3.0)
+
+    assert exc_info.value.reason == "stdlib urllib transport cannot be classified safely"
+    assert wrapped == []
+    assert contacted == []
+
+
+def test_honestly_labelled_third_party_urlopen_is_still_called_directly(monkeypatch) -> None:
+    # the fail-closed rule above keys on a transport that CLAIMS stdlib identity. a replacement that
+    # does not spoof urlopen's metadata stays supported and is called directly.
+    seen: list[tuple[str, float]] = []
+    response = object()
+
+    def vendor_urlopen(request, timeout):
+        seen.append((request.full_url, timeout))
+        return response
+
+    monkeypatch.setattr(urllib.request, "urlopen", vendor_urlopen)
+
+    actual = _urlopen_no_redirect(
+        urllib.request.Request("https://source.invalid/data"), timeout=3.0
+    )
+
+    assert actual is response
+    assert seen == [("https://source.invalid/data", 3.0)]
+
+
 def test_http_transport_import_does_not_read_urllib_source() -> None:
     script = textwrap.dedent(
         """
