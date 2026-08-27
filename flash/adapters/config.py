@@ -1,13 +1,16 @@
 """one strict reader for the bytes of an ``adapter_config.json``.
 
-Both deployment paths admit an adapter by reading this one file, and both are gated on the same
+Three boundaries admit an adapter by reading this one file, and all three are gated on the same
 question: do these exact bytes describe a LoRA adapter that the engine about to load them can
-actually serve? Answering it twice let the two paths drift -- customer-owned resolution rejected a
+actually serve? Answering it separately let them drift -- customer-owned resolution rejected a
 config that hosted admission accepted, so the same artifact was refused before provisioning on one
 path and refused inside the paid container on the other.
 
 Every rule here is decidable from the config alone. Nothing in this module reads the hub, the
 filesystem, or a provider, so a verdict costs a caller nothing beyond the bytes it already holds.
+That is why it sits beside the rank and target rules rather than under a deployment path: the
+GPU-side materializer revalidates a cache entry it already holds, and it needs the same verdict
+without importing anything that resolves or deploys.
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ def parse_declared_adapter_config(raw: bytes, *, source: str) -> DeclaredAdapter
     config = _strict_object(raw, source=source)
     try:
         rank = rank_from_adapter_config(config, source=source)
-    except Exception as exc:
+    except ValueError as exc:
         raise AdapterConfigError(f"{source} declares no usable lora rank: {exc}") from exc
 
     peft_type = config.get("peft_type")

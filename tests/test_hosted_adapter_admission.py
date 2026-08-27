@@ -2,7 +2,7 @@
 
 `adapter_artifact_metadata` is the last check before a hosted deployment allocates provider
 resources, and it read the config permissively: a plain `json.load` for the rank, and nothing else.
-Every other field the GPU container validates in `_validate_adapter_config` -- `peft_type`,
+Every other field the GPU container validates through the shared reader -- `peft_type`,
 `task_type`, `modules_to_save`, and above all `base_model_name_or_path` -- went unread, so a config
 the container was certain to refuse was admitted at registration and the deployment failed only
 after a provider had started billing.

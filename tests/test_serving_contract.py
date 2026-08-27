@@ -11,6 +11,7 @@ import flash.serve.contract.errors as serving_errors
 import flash.serve.contract.urls as serving_urls
 import flash.serve.deployment.adapter_check as adapter_check
 import flash.serve.request.transport as serving_transport
+from flash.adapters.config import DeclaredAdapterConfig
 from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
 from flash.serve.contract.protocol import (
     PERMANENT_CHECKPOINT_IDENTITY_CAPABILITY,
@@ -21,7 +22,6 @@ from flash.serve.contract.protocol import (
 )
 from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serve.contract.urls import serving_base_url
-from flash.serve.deployment.adapter_config import DeclaredAdapterConfig
 from flash.serve.deployment.deploy import Deployment, deploy_adapter, undeploy_adapter
 
 

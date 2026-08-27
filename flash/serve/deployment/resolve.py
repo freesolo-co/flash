@@ -16,15 +16,15 @@ import os
 import re
 from dataclasses import dataclass
 
-from flash.schema import format_checkpoint_ref
-from flash.serve.app import AdapterExecutionInput, ArtifactFile, ExecutionInputs
-from flash.serve.app.materialize import MaterializationError, validate_adapter_weight_structure
-from flash.serve.control import ResolvedAdapter
-from flash.serve.deployment.adapter_config import (
+from flash.adapters.config import (
     AdapterConfigError,
     DeclaredAdapterConfig,
     parse_declared_adapter_config,
 )
+from flash.schema import format_checkpoint_ref
+from flash.serve.app import AdapterExecutionInput, ArtifactFile, ExecutionInputs
+from flash.serve.app.materialize import MaterializationError, validate_adapter_weight_structure
+from flash.serve.control import ResolvedAdapter
 from flash.serve.deployment.profiles import ServingProfile
 from flash.serve.provisioning import ServingImage
 
@@ -103,6 +103,15 @@ def _digest_of(path: str) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
+@dataclass(frozen=True)
+class _ArtifactDownload:
+    """the exact adapter file table, plus where the two files landed on this machine."""
+
+    files: tuple[ArtifactFile, ...]
+    config_path: str
+    weights_path: str
+
+
 def _artifact_files(repo_id: str, repo_type: str, revision: str, subfolder: str):
     """build the exact two-file adapter table the serving manifest requires.
 
@@ -119,8 +128,7 @@ def _artifact_files(repo_id: str, repo_type: str, revision: str, subfolder: str)
 
     prefix = subfolder.strip("/")
     files: list[ArtifactFile] = []
-    config_path: str | None = None
-    weights_path: str | None = None
+    local_paths: dict[str, str] = {}
     for name in (ADAPTER_CONFIG, ADAPTER_WEIGHTS):
         remote = f"{prefix}/{name}" if prefix else name
         try:
@@ -137,25 +145,25 @@ def _artifact_files(repo_id: str, repo_type: str, revision: str, subfolder: str)
         if size <= 0:
             raise ResolveError(f"{repo_id}@{revision}:{remote} is empty")
         files.append(ArtifactFile(path=name, size=size, sha256=digest))
-        if name == ADAPTER_CONFIG:
-            config_path = str(local)
-        else:
-            weights_path = str(local)
-    return tuple(files), config_path, weights_path
+        local_paths[name] = str(local)
+    # every miss above raises, so reaching here means both files downloaded.
+    return _ArtifactDownload(
+        files=tuple(files),
+        config_path=local_paths[ADAPTER_CONFIG],
+        weights_path=local_paths[ADAPTER_WEIGHTS],
+    )
 
 
-def _declared_provenance(config_path: str | None) -> DeclaredAdapterConfig | None:
+def _declared_provenance(config_path: str) -> DeclaredAdapterConfig:
     """read the rank and base-model provenance the adapter stamps into its own config.
 
     the config is already on disk from the digest pass, so this costs nothing extra. reading it is
     what lets a mistyped ``--lora-rank`` or ``--model`` fail during resolution instead of inside the
-    paid GPU container, where ``_validate_adapter_config`` catches the same mismatch only after
-    provisioning has started. hosted admission reads the same bytes through the same rules, so the
-    two paths cannot reach opposite verdicts about one artifact.
+    paid GPU container, which revalidates the cache entry through this same shared reader only
+    after provisioning has started. hosted admission reads the same bytes through the same rules, so
+    no two paths can reach opposite verdicts about one artifact.
     """
 
-    if config_path is None:
-        return None
     try:
         with open(config_path, "rb") as handle:
             raw = handle.read()
@@ -228,37 +236,32 @@ def resolve_adapter(
     if len(artifact_revision) != 40:
         raise ResolveError(f"{artifact_repo_id} did not resolve to an immutable commit")
 
-    files, config_path, weights_path = _artifact_files(
+    download = _artifact_files(
         artifact_repo_id, artifact_repo_type, artifact_revision, artifact_subfolder
     )
 
     # the adapter's own config is the authority on what it was trained against. checking it here
     # turns a mistyped --lora-rank or --model into a resolution error, instead of a failure inside
     # the paid GPU container after provisioning has already begun.
-    declared = _declared_provenance(config_path)
-    if declared is not None:
-        if declared.lora_rank != lora_rank:
-            raise ResolveError(
-                f"--lora-rank {lora_rank} disagrees with {ADAPTER_CONFIG}, which declares "
-                f"{declared.lora_rank}"
-            )
-        if declared.base_model != base_model:
-            raise ResolveError(
-                f"--model {base_model!r} disagrees with {ADAPTER_CONFIG}, which declares this "
-                f"adapter was trained against {declared.base_model!r}"
-            )
-        # bind to the revision the adapter was TRAINED against, not the repo's current tip: the
-        # model repo is mutable, so resolving it at deploy time can silently pair the adapter with
-        # weights it never saw. the container compares these directly and would reject the mismatch.
-        if declared.base_revision is not None and declared.base_revision != base_model_revision:
-            base_model_revision = declared.base_revision
-
-    if declared is None or weights_path is None:
+    declared = _declared_provenance(download.config_path)
+    if declared.lora_rank != lora_rank:
         raise ResolveError(
-            f"{artifact_repo_id}@{artifact_revision} did not resolve both required adapter files"
+            f"--lora-rank {lora_rank} disagrees with {ADAPTER_CONFIG}, which declares "
+            f"{declared.lora_rank}"
         )
+    if declared.base_model != base_model:
+        raise ResolveError(
+            f"--model {base_model!r} disagrees with {ADAPTER_CONFIG}, which declares this "
+            f"adapter was trained against {declared.base_model!r}"
+        )
+    # bind to the revision the adapter was TRAINED against, not the repo's current tip: the model
+    # repo is mutable, so resolving it at deploy time can silently pair the adapter with weights it
+    # never saw. the container compares these directly and would reject the mismatch.
+    if declared.base_revision is not None and declared.base_revision != base_model_revision:
+        base_model_revision = declared.base_revision
+
     try:
-        validate_adapter_weight_structure(weights_path, declared.config, base_model)
+        validate_adapter_weight_structure(download.weights_path, declared.config, base_model)
     except MaterializationError as exc:
         prefix = artifact_subfolder.strip("/")
         remote = f"{prefix}/{ADAPTER_WEIGHTS}" if prefix else ADAPTER_WEIGHTS
@@ -271,7 +274,7 @@ def resolve_adapter(
     # so a spec and a manifest cannot disagree about what was deployed.
     from flash.serve.app import aggregate_file_digest
 
-    aggregate = aggregate_file_digest(files)
+    aggregate = aggregate_file_digest(download.files)
     checkpoint_id = format_checkpoint_ref(run_id, checkpoint_step)
 
     adapter = ResolvedAdapter(
@@ -290,7 +293,7 @@ def resolve_adapter(
     )
     return ResolvedDeploymentInputs(
         adapter=adapter,
-        execution=AdapterExecutionInput(checkpoint_id=checkpoint_id, files=files),
+        execution=AdapterExecutionInput(checkpoint_id=checkpoint_id, files=download.files),
     )
 
 

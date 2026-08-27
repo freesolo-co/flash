@@ -7,7 +7,6 @@ import ctypes
 import errno
 import fcntl
 import hashlib
-import json
 import os
 import shutil
 import stat
@@ -16,6 +15,11 @@ from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
+from flash.adapters.config import (
+    AdapterConfigError,
+    DeclaredAdapterConfig,
+    parse_declared_adapter_config,
+)
 from flash.adapters.fused_experts import (
     has_complete_fused_expert_tensors,
     lora_target_parameters,
@@ -23,11 +27,9 @@ from flash.adapters.fused_experts import (
 )
 from flash.adapters.lora_rank import (
     lora_tensor_rank_disagrees,
-    rank_from_adapter_config,
     strict_declared_lora_ranks,
 )
 from flash.engine.worker.model.lora import _read_safetensors_tensor_metadata
-from flash.serve.contract.protocol import reject_non_finite_json_constant
 
 from .manifest import ArtifactFile, ManifestAdapter, ServingManifest
 from .progress import emit_boot_progress
@@ -398,13 +400,20 @@ def validate_materialized_adapter(
 
     directory = Path(path)
     before, contents = _read_exact_regular_files(directory, adapter.files)
-    config = _load_strict_config(contents[_CONFIG_NAME])
-    _validate_adapter_config(config, adapter, manifest)
-    validate_adapter_weight_structure(directory / _WEIGHTS_NAME, config, adapter.base_model)
+    # the config-only rules are the shared reader's, so admission and this container reach the same
+    # verdict on the same bytes by construction. only the rules that need the manifest live here.
+    try:
+        declared = parse_declared_adapter_config(contents[_CONFIG_NAME], source=_CONFIG_NAME)
+    except AdapterConfigError as exc:
+        raise MaterializationError(str(exc)) from exc
+    _validate_against_manifest(declared, adapter, manifest)
+    validate_adapter_weight_structure(
+        directory / _WEIGHTS_NAME, declared.config, adapter.base_model
+    )
     after, _ = _read_exact_regular_files(directory, adapter.files)
     if after != before:
         raise MaterializationError("adapter cache entry changed during validation")
-    return config
+    return declared.config
 
 
 def validate_adapter_weight_structure(
@@ -848,29 +857,6 @@ def _stable_file_identity(details: os.stat_result) -> tuple[int, ...]:
     return (*_stable_directory_identity(details), details.st_size)
 
 
-def _load_strict_config(raw: bytes) -> dict[str, Any]:
-    try:
-        config = json.loads(
-            raw.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=reject_non_finite_json_constant,
-        )
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise MaterializationError("adapter_config.json is not strict utf-8 json") from exc
-    if type(config) is not dict:
-        raise MaterializationError("adapter_config.json must contain a json object")
-    return config
-
-
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise MaterializationError("adapter_config.json contains a duplicate key")
-        result[key] = value
-    return result
-
-
 def _validate_lora_pairs(tensors: Mapping[str, tuple[int, ...]]) -> None:
     pairs: dict[tuple[str, str], dict[str, tuple[int, ...]]] = {}
     for key, shape in tensors.items():
@@ -927,30 +913,21 @@ def _validate_lora_pairs(tensors: Mapping[str, tuple[int, ...]]) -> None:
             )
 
 
-def _validate_adapter_config(
-    config: Mapping[str, Any],
+def _validate_against_manifest(
+    declared: DeclaredAdapterConfig,
     adapter: ManifestAdapter,
     manifest: ServingManifest,
 ) -> None:
-    if config.get("peft_type") != "LORA":
-        raise MaterializationError("adapter_config.json peft_type must be LORA")
-    if config.get("task_type") not in {None, "CAUSAL_LM"}:
-        raise MaterializationError("adapter_config.json task_type must be absent or CAUSAL_LM")
-    if config.get("base_model_name_or_path") != adapter.base_model:
+    """check only what the config alone cannot decide: agreement with this exact manifest."""
+
+    if declared.base_model != adapter.base_model:
         raise MaterializationError("adapter logical base model does not match the manifest")
-    revision = config.get("revision")
-    if revision is not None and revision != "" and revision != adapter.base_model_revision:
+    # an absent revision means the adapter never pinned one, which every manifest satisfies.
+    if declared.base_revision is not None and declared.base_revision != adapter.base_model_revision:
         raise MaterializationError("adapter logical base revision does not match the manifest")
-    modules_to_save = config.get("modules_to_save")
-    if modules_to_save is not None and modules_to_save != []:
-        raise MaterializationError("modules_to_save adapters are not supported")
-    try:
-        declared_rank = rank_from_adapter_config(config, source="adapter_config.json")
-    except ValueError as exc:
-        raise MaterializationError("adapter_config.json has invalid LoRA rank metadata") from exc
-    if declared_rank != adapter.lora_rank:
+    if declared.lora_rank != adapter.lora_rank:
         raise MaterializationError("adapter declared rank does not match the manifest")
-    if declared_rank > manifest.engine.max_lora_rank:
+    if declared.lora_rank > manifest.engine.max_lora_rank:
         raise MaterializationError("adapter declared rank exceeds the engine rank ceiling")
 
 

@@ -16,13 +16,13 @@ import os
 from dataclasses import dataclass
 
 from flash.adapters.artifacts import has_loadable_adapter_weights, is_adapter_weight_filename
-from flash.adapters.targets import config_targets_images
-from flash.serve.contract.errors import AdapterConfigMissing, AdapterTensorMissing, ServingError
-from flash.serve.deployment.adapter_config import (
+from flash.adapters.config import (
     AdapterConfigError,
     DeclaredAdapterConfig,
     parse_declared_adapter_config,
 )
+from flash.adapters.targets import config_targets_images
+from flash.serve.contract.errors import AdapterConfigMissing, AdapterTensorMissing, ServingError
 
 
 @dataclass(frozen=True)
