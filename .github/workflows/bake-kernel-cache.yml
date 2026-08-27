@@ -185,24 +185,26 @@ jobs:
             echo "revision=$(echo "$cfg" | jq -r '.config.Labels["org.opencontainers.image.revision"] // ""')" >> "$GITHUB_OUTPUT"
           fi
 
-      # Pin the checkout to the base's source commit so the warmed flash code matches the base exactly
-      # (the cache is content-keyed by the code that compiled it). Falls back to the event sha if the
+      # install from this workflow revision before replacing the checkout with the base image's source
+      # revision. older base revisions need not contain the local action or current checksum data.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.run == 'true'
+
+      - name: Install uv
+        if: steps.gate.outputs.run == 'true'
+        uses: ./.github/actions/setup-uv
+        with:
+          # no dependency cache: this paid bake consumes the environment once, and a post-job cache
+          # save after the image push adds time without accelerating a later step in this run.
+          enable-cache: false
+
+      # pin the checkout to the base's source commit so the warmed flash code matches the base exactly
+      # (the cache is content-keyed by the code that compiled it). falls back to the event sha if the
       # base predates the revision label.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.gate.outputs.run == 'true'
         with:
           ref: ${{ steps.base.outputs.revision || github.sha }}
-
-      - name: Install uv
-        if: steps.gate.outputs.run == 'true'
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          # pin the installed binary as well as the action implementation.
-          version: "0.12.5"
-          # no cache: the post-run cache-prune calls `uv`, but the "Free disk space" step deletes
-          # /opt/hostedtoolcache (where setup-uv put uv), so the post step fails ("uv not found") and
-          # marks the whole job red even though the bake + push already succeeded.
-          enable-cache: false
 
       - name: Sync deps (flash + runpod + hf)
         if: steps.gate.outputs.run == 'true'

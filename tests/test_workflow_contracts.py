@@ -21,9 +21,11 @@ from typing import Any
 
 import pytest
 import yaml
+from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
+ACTION_DIR = REPO_ROOT / ".github" / "actions"
 
 UPSTREAM_REPOSITORY = "freesolo-co/flash"
 
@@ -36,6 +38,13 @@ def _workflow_paths() -> list[Path]:
     paths = sorted(p for ext in ("*.yml", "*.yaml") for p in WORKFLOW_DIR.glob(ext))
     assert paths, f"no workflows found under {WORKFLOW_DIR}"
     return paths
+
+
+def _composite_action_paths() -> list[Path]:
+    paths = sorted(
+        path for filename in ("action.yml", "action.yaml") for path in ACTION_DIR.rglob(filename)
+    )
+    return [path for path in paths if _load(path).get("runs", {}).get("using") == "composite"]
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -75,6 +84,119 @@ def _assert_gated_upstream(condition: str | None, where: str) -> None:
     )
 
 
+def _is_verified_repository_local_action(reference: str) -> bool:
+    prefix = "./.github/actions/"
+    if not reference.startswith(prefix) or "\\" in reference or "@" in reference:
+        return False
+    suffix = reference.removeprefix(prefix)
+    segments = suffix.split("/")
+    if not suffix or any(segment in {"", ".", ".."} for segment in segments):
+        return False
+
+    action_root = REPO_ROOT / ".github" / "actions"
+    action_path = action_root.joinpath(*segments)
+    current = REPO_ROOT
+    for segment in (".github", "actions", *segments):
+        current /= segment
+        if current.is_symlink():
+            return False
+
+    resolved_root = action_root.resolve()
+    resolved_action = action_path.resolve()
+    if resolved_action == resolved_root or resolved_root not in resolved_action.parents:
+        return False
+    return any(
+        (action_path / filename).is_file() and not (action_path / filename).is_symlink()
+        for filename in ("action.yml", "action.yaml", "Dockerfile")
+    )
+
+
+def _action_reference_sites(
+    path: Path,
+    document: dict[str, Any],
+) -> list[tuple[str, str]]:
+    references: list[tuple[str, str]] = []
+    for job_name, job in _jobs(document).items():
+        local_call = job.get("uses")
+        if local_call is not None:
+            assert local_call.startswith("./.github/workflows/"), (
+                f"{path.name}:{job_name} calls a non-local reusable workflow {local_call!r}; "
+                "a remote one needs a full sha pin"
+            )
+            continue
+        references.extend(
+            (f"{job_name} step {index}", reference)
+            for index, step in enumerate(_steps(job))
+            if (reference := step.get("uses")) is not None
+        )
+
+    runs = document.get("runs") or {}
+    if runs.get("using") == "composite":
+        references.extend(
+            (f"composite step {index}", reference)
+            for index, step in enumerate(runs.get("steps") or [])
+            if (reference := step.get("uses")) is not None
+        )
+    return references
+
+
+def _assert_action_references_pinned(
+    path: Path,
+    document: dict[str, Any] | None = None,
+) -> None:
+    document = _load(path) if document is None else document
+    for where, reference in _action_reference_sites(path, document):
+        if _is_verified_repository_local_action(reference):
+            continue
+        _, _, revision = reference.partition("@")
+        unpinned = (
+            f"{path.name}:{where} uses {reference!r}, which is not pinned to a full-length commit "
+            "sha. the org requires sha pinning, so this fails before any step executes."
+        )
+        assert len(revision) == 40, unpinned
+        assert all(c in "0123456789abcdef" for c in revision), unpinned
+
+
+def _uses_nodes(node: MappingNode | SequenceNode | ScalarNode) -> list[ScalarNode]:
+    references: list[ScalarNode] = []
+    if isinstance(node, MappingNode):
+        for key, value in node.value:
+            if (
+                isinstance(key, ScalarNode)
+                and key.value == "uses"
+                and isinstance(value, ScalarNode)
+            ):
+                references.append(value)
+            if isinstance(value, (MappingNode, SequenceNode)):
+                references.extend(_uses_nodes(value))
+    elif isinstance(node, SequenceNode):
+        for value in node.value:
+            if isinstance(value, (MappingNode, SequenceNode)):
+                references.extend(_uses_nodes(value))
+    return references
+
+
+def _assert_remote_action_version_comments(path: Path) -> None:
+    source = path.read_text()
+    root = yaml.compose(source)
+    assert isinstance(root, MappingNode)
+    lines = source.splitlines()
+    for node in _uses_nodes(root):
+        reference = node.value
+        if "@" not in reference or _is_verified_repository_local_action(reference):
+            continue
+        if reference.startswith("./.github/workflows/"):
+            continue
+        line = lines[node.start_mark.line]
+        _, hash_marker, comment = line.partition("#")
+        missing_version = (
+            f"{path.name}: {line.strip()!r} pins a sha with no version comment. dependabot needs the "
+            "comment to know what it is bumping, and a reviewer cannot read a bare sha."
+        )
+        assert hash_marker, missing_version
+        assert re.match(r"\s*v?\d+(\.\d+)*(\s|$)", comment), missing_version
+
+
 @pytest.mark.parametrize("path", _workflow_paths(), ids=lambda p: p.name)
 def test_every_action_reference_is_pinned_to_a_full_sha(path: Path):
     """The org sets `sha_pinning_required`, so a tag reference is rejected at "Set up job".
@@ -90,49 +212,111 @@ def test_every_action_reference_is_pinned_to_a_full_sha(path: Path):
     rather than the parsed document, because a YAML comment is discarded during parsing.
     """
     document = _load(path)
-    for line in path.read_text().splitlines():
-        stripped = line.strip()
-        if not stripped.startswith(("- uses:", "uses:")):
-            continue
-        if "@" not in stripped or "./.github/workflows/" in stripped:
-            continue
-        # A version-SHAPED comment, not merely any comment: `# TODO` would satisfy "has a comment"
-        # while telling a reviewer nothing about which release the sha is. Dependabot writes
-        # `# v6.1.0`; the digits are the part that carries the information.
-        #
-        # Anchored at the START of the comment, not searched anywhere in it. A bare `re.search` for
-        # "# then digits" is satisfied by an issue reference -- `# fixes #194` contains it -- which
-        # recreates the vacuous pass this assertion exists to close. An action reference cannot
-        # itself contain `#`, so the first one begins the comment.
-        _, hash_marker, comment = stripped.partition("#")
-        missing_version = (
-            f"{path.name}: {stripped!r} pins a sha with no version comment. Dependabot needs the "
-            "comment to know what it is bumping, and a reviewer cannot read a bare sha."
-        )
-        assert hash_marker, missing_version
-        assert re.match(r"\s*v?\d+(\.\d+)*(\s|$)", comment), missing_version
+    _assert_remote_action_version_comments(path)
+    _assert_action_references_pinned(path, document)
 
-    for job_name, job in _jobs(document).items():
-        # A reusable-workflow call (`jobs.<id>.uses`) is a local path, not a marketplace action.
-        local_call = job.get("uses")
-        if local_call is not None:
-            assert local_call.startswith("./.github/workflows/"), (
-                f"{path.name}:{job_name} calls a non-local reusable workflow {local_call!r}; "
-                "a remote one would need a sha pin too"
-            )
-            continue
-        for index, step in enumerate(_steps(job)):
-            reference = step.get("uses")
-            if reference is None:
-                continue
-            _, _, revision = reference.partition("@")
-            unpinned = (
-                f"{path.name}:{job_name} step {index} uses {reference!r}, which is not pinned to a "
-                "full-length commit sha. The org requires sha pinning, so this fails the run at "
-                '"Set up job" before any step executes.'
-            )
-            assert len(revision) == 40, unpinned
-            assert all(c in "0123456789abcdef" for c in revision), unpinned
+
+@pytest.mark.parametrize(
+    "path", _composite_action_paths(), ids=lambda p: str(p.relative_to(ACTION_DIR))
+)
+def test_every_composite_action_reference_is_pinned_to_a_full_sha(path: Path) -> None:
+    _assert_remote_action_version_comments(path)
+    _assert_action_references_pinned(path)
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "./github/actions/setup-uv",
+        ".github/actions/setup-uv",
+        "../.github/actions/setup-uv",
+        "owner/.github/actions/setup-uv@v1",
+        "./.github/action/setup-uv",
+        "./.github/actions-lookalike/setup-uv",
+        "./.github/actions//setup-uv",
+        "./.github/actions/./setup-uv",
+        "./.github/actions/setup-uv/.",
+        "./.github/actions/setup-uv/",
+        "./.github/actions/nested/../setup-uv",
+        "./.github/actions/../workflows/setup-uv",
+        "actions/checkout@v4",
+    ],
+)
+def test_full_sha_contract_rejects_local_lookalikes_and_remote_tags(reference: str) -> None:
+    document = {"jobs": {"test": {"steps": [{"uses": reference}]}}}
+    with pytest.raises(AssertionError):
+        _assert_action_references_pinned(WORKFLOW_DIR / "sabotaged.yml", document)
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "actions/checkout@v7",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b",
+    ],
+)
+def test_full_sha_contract_rejects_unpinned_composite_action_references(
+    reference: str,
+) -> None:
+    document = {
+        "runs": {
+            "using": "composite",
+            "steps": [{"uses": reference}],
+        }
+    }
+    with pytest.raises(AssertionError):
+        _assert_action_references_pinned(ACTION_DIR / "sabotaged" / "action.yml", document)
+
+
+def test_full_sha_contract_preserves_canonical_local_composite_action_exemption() -> None:
+    document = {
+        "runs": {
+            "using": "composite",
+            "steps": [{"uses": "./.github/actions/setup-uv"}],
+        }
+    }
+    _assert_action_references_pinned(ACTION_DIR / "sabotaged" / "action.yml", document)
+
+
+def test_full_sha_contract_rejects_symlinked_local_action_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action_root = tmp_path / ".github" / "actions"
+    canonical = action_root / "canonical"
+    canonical.mkdir(parents=True)
+    (canonical / "action.yml").write_text("runs:\n  using: composite\n  steps: []\n")
+    (action_root / "alias").symlink_to(canonical, target_is_directory=True)
+    monkeypatch.setitem(globals(), "REPO_ROOT", tmp_path)
+
+    assert _is_verified_repository_local_action("./.github/actions/canonical")
+    assert not _is_verified_repository_local_action("./.github/actions/alias")
+
+
+@pytest.mark.parametrize(
+    ("comment", "accepted"),
+    [
+        (" # v4.2.1", True),
+        ("", False),
+        (" # TODO", False),
+        (" # fixes #194", False),
+    ],
+)
+def test_composite_remote_sha_requires_human_readable_version_comment(
+    tmp_path: Path,
+    comment: str,
+    accepted: bool,
+) -> None:
+    sha = "3d3c42e5aac5ba805825da76410c181273ba90b0"
+    path = tmp_path / "action.yml"
+    path.write_text(
+        f"runs:\n  using: composite\n  steps:\n    - uses: actions/checkout@{sha}{comment}\n"
+    )
+    if accepted:
+        _assert_remote_action_version_comments(path)
+    else:
+        with pytest.raises(AssertionError):
+            _assert_remote_action_version_comments(path)
 
 
 @pytest.mark.parametrize("path", _workflow_paths(), ids=lambda p: p.name)

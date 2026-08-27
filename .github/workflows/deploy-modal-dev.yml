@@ -98,11 +98,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: ./.github/actions/setup-uv
         if: steps.gate.outputs.deploy == 'true'
-        with:
-          # pin the installed binary as well as the action implementation.
-          version: "0.12.5"
 
       - name: Install Modal client
         if: steps.gate.outputs.deploy == 'true'
