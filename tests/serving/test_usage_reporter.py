@@ -124,21 +124,31 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     assert modal_app_module.app.function.call_args.kwargs["min_containers"] == 1
 
 
-def test_every_gpu_engine_is_capped_at_three_containers(modal_app_module):
-    # At most 3 GPUs per base model. `base_model` is a modal.parameter(), so Modal gives each distinct
-    # value its own container pool with its own autoscaling accounting -- the cap therefore binds PER
-    # MODEL, not across the catalog. Engines are tensor-parallel 1 on a single-card `gpu=` request, so
-    # one container is exactly one GPU. Asserted on the kwargs modal is actually CALLED with, because a
-    # ceiling that never reaches `app.cls` does not bound anything.
-    assert modal_app_module.MAX_CONTAINERS == 3
+def test_no_gpu_engine_is_capped_and_each_keeps_one_buffer(modal_app_module):
+    # `base_model` is a modal.parameter(), so Modal gives each distinct value its own container pool
+    # with its own autoscaling accounting. A fixed cap therefore ceilings a SINGLE model's capacity
+    # rather than bounding total spend -- sustained load on one model cannot borrow headroom from an
+    # idle one, so the cap converts demand into queueing on the hot tier. Spend is bounded by workspace
+    # quotas and billing alerts instead. Asserted on the kwargs modal is actually CALLED with, because
+    # a module constant that never reaches `app.cls` governs nothing.
+    assert modal_app_module.MAX_CONTAINERS is None
+    assert modal_app_module.BUFFER_CONTAINERS == 1
 
     cls_calls = [call.kwargs for call in modal_app_module.app.cls.call_args_list]
     assert len(cls_calls) == len(modal_app_module.ENGINE_BY_KEY)
-    assert all(kwargs["max_containers"] == 3 for kwargs in cls_calls)
+    assert all(kwargs["max_containers"] is None for kwargs in cls_calls)
+    # One spare warm container per engine absorbs a burst past TARGET_INPUTS without a cold boot.
+    # `buffer_containers` only provisions while the Function is ACTIVE, so this preserves scale-to-zero
+    # (MIN_CONTAINERS stays 0) rather than paying for an idle gpu.
+    assert all(kwargs["buffer_containers"] == 1 for kwargs in cls_calls)
+    assert all(kwargs["min_containers"] == 0 for kwargs in cls_calls)
 
-    # The cpu router is deliberately UNCAPPED: it is the front door that triggers cold engines, and
-    # capping it would throttle every model at once rather than bounding gpu spend per model.
-    assert "max_containers" not in modal_app_module.app.function.call_args.kwargs
+    # The cpu router is likewise uncapped: it is the front door that triggers cold engines, and
+    # capping it would throttle every model at once rather than bounding gpu spend per model. It
+    # carries the same buffer, so a burst does not queue behind the front door it just cleared.
+    router_kwargs = modal_app_module.app.function.call_args.kwargs
+    assert "max_containers" not in router_kwargs
+    assert router_kwargs["buffer_containers"] == 1
 
 
 def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app_module):
