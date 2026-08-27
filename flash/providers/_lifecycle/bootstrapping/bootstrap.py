@@ -688,8 +688,14 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                 # every later run on this box. a survivor is recorded rather than raised here, so
                 # the console tail below still uploads and explains why the run was killed.
                 try:
+                    # bounded by the upload window: a group that ignores SIGTERM must not spend the
+                    # time reserved for the console tail that reports it survived.
                     _bootstrap_processes.terminate_process_group(
-                        proc, process_group_id=worker_process_group_id
+                        proc,
+                        process_group_id=worker_process_group_id,
+                        deadline_at=upload_deadline_at
+                        - _CONSOLE_UPLOAD_STOP_TIMEOUT_S
+                        - _CONSOLE_UPLOAD_FINAL_TIMEOUT_S,
                     )
                 except RuntimeError as exc:
                     survived_teardown = str(exc)

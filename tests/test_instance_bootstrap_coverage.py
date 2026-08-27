@@ -1821,6 +1821,41 @@ def test_run_mode_timeout_reports_a_worker_group_that_survived_teardown(monkeypa
     assert "survived term and kill supervision" in uploaded["extra"]
 
 
+def test_group_teardown_is_bounded_by_the_deadline_it_is_given():
+    """A SIGTERM-ignoring group must not spend time the caller reserved for what follows teardown.
+
+    ``terminate_process_group`` runs at the worker's cutoff, and its term-then-kill grace is 15s by
+    default while the bootstrap holds only 12s before ``upload_deadline_at``. Unbounded, teardown
+    overruns that window and the final console tail is skipped -- discarding the survivor line that
+    is the only record the gpu is still held. Bounding it against a deadline (rather than reserving
+    the worst case up front) keeps short wall budgets startable and preserves the escalation.
+    """
+    import flash.providers._lifecycle.bootstrapping.processes as processes
+
+    # a group that ignores every signal, so the waits run to their full allowance.
+    monkey_now = [1_000.0]
+    real_time = processes.time.time
+    try:
+        processes.time.time = lambda: monkey_now[0]
+        # only 0.4s left: the kill wait is funded first, then whatever remains goes to the term.
+        term_wait, kill_wait = processes._bounded_graces(10.0, 5.0, monkey_now[0] + 0.4)
+        assert kill_wait == pytest.approx(0.4), "the escalation that frees the gpu is funded first"
+        assert term_wait == pytest.approx(0.0)
+        assert term_wait + kill_wait <= 0.4, "the supervision must fit the window it was given"
+
+        # a comfortable budget still gets the full default graces, unchanged.
+        term_wait, kill_wait = processes._bounded_graces(10.0, 5.0, monkey_now[0] + 60.0)
+        assert (term_wait, kill_wait) == (10.0, 5.0)
+
+        # already past the deadline: no waiting at all, but the caller still sends the signals.
+        assert processes._bounded_graces(10.0, 5.0, monkey_now[0] - 1.0) == (0.0, 0.0)
+    finally:
+        processes.time.time = real_time
+
+    # and with no deadline the behaviour is the documented default.
+    assert processes._bounded_graces(10.0, 5.0, None) == (10.0, 5.0)
+
+
 def test_run_mode_starts_no_subprocess_at_deadline(monkeypatch):
     monkeypatch.setattr(b.time, "time", lambda: 200.0)
     monkeypatch.setattr(
