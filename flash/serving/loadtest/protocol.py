@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -37,7 +37,13 @@ class ProtocolError(RuntimeError):
 
 @dataclass
 class RequestObservation:
-    request_id: str
+    """what one dispatched request was observed to do.
+
+    deliberately carries no request id: the schedule already owns that identity, and duplicating
+    it here would leave synthesized observations (an interrupt, an admission miss) with no id to
+    supply. the event writer stamps the id from the scheduled request instead.
+    """
+
     outcome: str = "protocol_error"
     http_status: int | None = None
     error_class: str | None = None
@@ -54,9 +60,6 @@ class RequestObservation:
     cached_tokens: int | None = None
     done_count: int = 0
     retry_count: int = 0
-
-    def as_event_fields(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 async def get_health(
@@ -111,10 +114,9 @@ async def stream_chat(
     credential: str,
     target: Target,
     profile: RequestProfile,
-    request_id: str,
     clock: Clock,
 ) -> RequestObservation:
-    observation = RequestObservation(request_id=request_id, dispatch_ns=clock.monotonic_ns())
+    observation = RequestObservation(dispatch_ns=clock.monotonic_ns())
     headers = {"Authorization": f"Bearer {credential}"}
     if isinstance(target, AdapterTarget):
         headers["X-Freesolo-Expected-Checkpoint"] = target.checkpoint

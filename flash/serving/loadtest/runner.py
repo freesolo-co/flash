@@ -28,11 +28,14 @@ from flash.serving.loadtest.schedule import (
 from flash.serving.loadtest.schema import (
     CLAIM_LIMITATIONS,
     NO_CAPACITY_CONTRACT_LIMITATION,
+    AdapterTarget,
     BaseTarget,
     ColdBurstPhase,
     OverloadPhase,
+    Phase,
     ResolvedScenario,
     Scenario,
+    Target,
     WarmPhase,
 )
 
@@ -69,9 +72,7 @@ async def discover_scenario(
     target_names = [target.name for target in targets]
     if len(set(target_names)) != len(target_names):
         raise ValueError("resolved target names must be unique")
-    target_base_models = {
-        target.base_model if hasattr(target, "base_model") else target.model for target in targets
-    }
+    target_base_models = _required_base_models(targets)
     missing_models = sorted(target_base_models - set(health.base_models))
     if missing_models:
         raise ValueError(
@@ -149,11 +150,64 @@ async def run_scenario(
         raise
 
 
+class PhaseRecorder:
+    """settle each scheduled request exactly once, in authored order.
+
+    the runners hand results here as they settle rather than returning a batch at the end. that
+    is what makes an interruption truthful: a request whose outcome was already observed keeps
+    that outcome, and only requests that never settled become ``interrupted``. batching would
+    force the interrupt path to reconstruct rows it cannot know, overwriting real successes.
+    """
+
+    def __init__(
+        self,
+        result: ResultDirectory,
+        scheduled: list[ScheduledRequest],
+        phase: Phase,
+        start_ns: int,
+    ) -> None:
+        self._result = result
+        self._scheduled = scheduled
+        self._window = phase_duration_seconds(phase)
+        self._settled: dict[str, dict[str, Any]] = {}
+        self.start_ns = start_ns
+        self.peak_in_flight = 0
+
+    def settle(
+        self, item: ScheduledRequest, observation: RequestObservation, in_flight: int
+    ) -> None:
+        if item.request_id in self._settled:
+            return
+        self.peak_in_flight = max(self.peak_in_flight, in_flight)
+        self._settled[item.request_id] = _terminal_event(
+            item, observation, self.start_ns, self._window, in_flight
+        )
+
+    def miss(self, item: ScheduledRequest, now_ns: int) -> None:
+        self.settle(item, _admission_missed_observation(now_ns), 0)
+
+    def flush(self, now_ns: int) -> int:
+        """write exactly one row per scheduled request, marking only unsettled ones interrupted.
+
+        called once per phase: either the interrupt path flushes and re-raises, or the phase
+        completes and the tail flushes. the two are mutually exclusive.
+        """
+        for item in self._scheduled:
+            event = self._settled.get(item.request_id)
+            if event is None:
+                event = _terminal_event(
+                    item, _interrupted_observation(now_ns), self.start_ns, self._window, 0
+                )
+            event["phase_peak_client_in_flight"] = self.peak_in_flight
+            self._result.events.write(event)
+        return len(self._scheduled)
+
+
 async def _run_phase(
     result: ResultDirectory,
     client: httpx.AsyncClient,
     resolved: ResolvedScenario,
-    phase: Any,
+    phase: Phase,
     scheduled: list[ScheduledRequest],
     credential: str,
     clock: Clock,
@@ -170,26 +224,17 @@ async def _run_phase(
         }
     )
     await _health_event(result, client, resolved, f"phase:{phase.name}:start", clock)
+    recorder = PhaseRecorder(result, scheduled, phase, phase_start)
     try:
         if isinstance(phase, WarmPhase):
-            terminals = await _run_warm_phase(
-                client, resolved, phase, scheduled, credential, phase_start, clock
-            )
+            await _run_warm_phase(client, resolved, phase, scheduled, credential, recorder, clock)
         else:
-            terminals = await _run_open_loop_phase(
-                result,
-                client,
-                resolved,
-                phase,
-                scheduled,
-                credential,
-                phase_start,
-                clock,
+            await _run_open_loop_phase(
+                result, client, resolved, phase, scheduled, credential, recorder, clock
             )
     except BaseException:
         now_ns = clock.monotonic_ns()
-        for item in scheduled:
-            result.events.write(_interrupted_terminal(item, phase_start, now_ns, phase))
+        recorder.flush(now_ns)
         result.events.write(
             {
                 "type": "phase_interrupted",
@@ -199,8 +244,7 @@ async def _run_phase(
             }
         )
         raise
-    for terminal in terminals:
-        result.events.write(terminal)
+    terminal_count = recorder.flush(clock.monotonic_ns())
     await _health_event(result, client, resolved, f"phase:{phase.name}:end", clock)
     result.events.write(
         {
@@ -208,7 +252,7 @@ async def _run_phase(
             "phase_name": phase.name,
             "phase_kind": phase.kind,
             "monotonic_ns": clock.monotonic_ns(),
-            "terminal_requests": len(terminals),
+            "terminal_requests": terminal_count,
         }
     )
 
@@ -219,156 +263,178 @@ async def _run_warm_phase(
     phase: WarmPhase,
     scheduled: list[ScheduledRequest],
     credential: str,
-    phase_start_ns: int,
+    recorder: PhaseRecorder,
     clock: Clock,
-) -> list[dict[str, Any]]:
+) -> None:
+    """the only closed-loop phase: a bounded-concurrency sweep of the authored request count."""
     semaphore = asyncio.Semaphore(phase.concurrency)
     in_flight = 0
-    peak = 0
     lock = asyncio.Lock()
 
-    async def execute(item: ScheduledRequest) -> dict[str, Any]:
-        nonlocal in_flight, peak
+    async def execute(item: ScheduledRequest) -> None:
+        nonlocal in_flight
         async with semaphore:
             async with lock:
                 in_flight += 1
-                peak = max(peak, in_flight)
                 current = in_flight
-            observation = await stream_chat(
-                client,
-                str(resolved.authored.endpoint).rstrip("/"),
-                credential,
-                item.target,
-                item.profile,
-                item.request_id,
-                clock,
-            )
-            async with lock:
-                in_flight -= 1
-            return _terminal_event(
-                item,
-                observation,
-                phase_start_ns,
-                phase_duration_seconds(phase),
-                current,
-            )
+            try:
+                observation = await _dispatch(client, resolved, credential, item, clock)
+                recorder.settle(item, observation, current)
+            finally:
+                async with lock:
+                    in_flight -= 1
 
-    terminals = await asyncio.gather(*(execute(item) for item in scheduled))
-    for terminal in terminals:
-        terminal["phase_peak_client_in_flight"] = peak
-    return terminals
+    tasks = [asyncio.create_task(execute(item)) for item in scheduled]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        await _drain(tasks)
+        raise
 
 
 async def _run_open_loop_phase(
     result: ResultDirectory,
     client: httpx.AsyncClient,
     resolved: ResolvedScenario,
-    phase: Any,
+    phase: Phase,
     scheduled: list[ScheduledRequest],
     credential: str,
-    phase_start_ns: int,
+    recorder: PhaseRecorder,
     clock: Clock,
-) -> list[dict[str, Any]]:
-    slots = asyncio.Semaphore(resolved.authored.client.max_in_flight)
-    max_lag_ns = round(resolved.authored.client.max_scheduling_lag_ms * 1_000_000)
-    active = 0
-    peak = 0
-    tasks: list[asyncio.Task[dict[str, Any]]] = []
-    terminals: list[dict[str, Any]] = []
-    duration = phase_duration_seconds(phase)
-    midpoint_ns = phase_start_ns + round(duration * 500_000_000) if duration is not None else None
-    during_health_done = False
+) -> None:
+    """dispatch precomputed arrivals without ever waiting on a previous completion.
 
-    async def execute(item: ScheduledRequest, current: int) -> dict[str, Any]:
+    an arrival that cannot be admitted within the client's in-flight and lag budget is settled as
+    a miss rather than deferred, so client saturation never masquerades as server latency.
+    """
+    limits = resolved.authored.client
+    slots = asyncio.Semaphore(limits.max_in_flight)
+    max_lag_ns = round(limits.max_scheduling_lag_ms * 1_000_000)
+    active = 0
+    tasks: list[asyncio.Task[None]] = []
+    health = _MidpointHealth(result, client, resolved, phase, recorder, clock)
+
+    async def execute(item: ScheduledRequest, current: int) -> None:
         nonlocal active
         try:
-            observation = await stream_chat(
-                client,
-                str(resolved.authored.endpoint).rstrip("/"),
-                credential,
-                item.target,
-                item.profile,
-                item.request_id,
-                clock,
-            )
-            return _terminal_event(
-                item,
-                observation,
-                phase_start_ns,
-                phase_duration_seconds(phase),
-                current,
-            )
+            observation = await _dispatch(client, resolved, credential, item, clock)
+            recorder.settle(item, observation, current)
         finally:
             active -= 1
             slots.release()
 
     try:
         for item in scheduled:
-            deadline_ns = phase_start_ns + item.scheduled_offset_ns
-            if midpoint_ns is not None and not during_health_done and deadline_ns >= midpoint_ns:
-                await clock.sleep_until_ns(midpoint_ns)
-                await _health_event(result, client, resolved, f"phase:{phase.name}:during", clock)
-                during_health_done = True
+            deadline_ns = recorder.start_ns + item.scheduled_offset_ns
+            await health.before(deadline_ns)
             await clock.sleep_until_ns(deadline_ns)
             now_ns = clock.monotonic_ns()
             if now_ns - deadline_ns > max_lag_ns or slots.locked():
-                terminals.append(_admission_missed(item, phase_start_ns, now_ns, phase))
+                recorder.miss(item, now_ns)
                 continue
             await slots.acquire()
             active += 1
-            peak = max(peak, active)
             tasks.append(asyncio.create_task(execute(item, active)))
-        if midpoint_ns is not None and not during_health_done:
-            await clock.sleep_until_ns(midpoint_ns)
-            await _health_event(result, client, resolved, f"phase:{phase.name}:during", clock)
+        await health.finish()
         if tasks:
-            terminals.extend(await asyncio.gather(*tasks))
+            await asyncio.gather(*tasks)
     except BaseException:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await _drain(tasks)
         raise
-    terminals.sort(key=lambda event: event["phase_request_index"])
-    for terminal in terminals:
-        terminal["phase_peak_client_in_flight"] = peak
-    return terminals
 
 
-def _interrupted_terminal(
-    item: ScheduledRequest, phase_start_ns: int, now_ns: int, phase: Any
-) -> dict[str, Any]:
-    observation = RequestObservation(
-        request_id=item.request_id,
+class _MidpointHealth:
+    """emit one health observation at the phase midpoint of a duration-bounded phase.
+
+    duration phases are the only ones with a meaningful midpoint, so a phase without a duration
+    simply never fires. keeping this here rather than as a parallel task means it cannot race the
+    dispatch loop or outlive an interrupted phase.
+    """
+
+    def __init__(
+        self,
+        result: ResultDirectory,
+        client: httpx.AsyncClient,
+        resolved: ResolvedScenario,
+        phase: Phase,
+        recorder: PhaseRecorder,
+        clock: Clock,
+    ) -> None:
+        duration = phase_duration_seconds(phase)
+        self._at_ns = (
+            recorder.start_ns + round(duration * 500_000_000) if duration is not None else None
+        )
+        self._done = False
+        self._args = (result, client, resolved, f"phase:{phase.name}:during", clock)
+        self._clock = clock
+
+    async def before(self, deadline_ns: int) -> None:
+        if self._at_ns is not None and not self._done and deadline_ns >= self._at_ns:
+            await self._fire()
+
+    async def finish(self) -> None:
+        if self._at_ns is not None and not self._done:
+            await self._fire()
+
+    async def _fire(self) -> None:
+        await self._clock.sleep_until_ns(self._at_ns)
+        await _health_event(*self._args)
+        self._done = True
+
+
+def _required_base_models(targets: list[Target]) -> set[str]:
+    """the base model each target needs the deployment to serve.
+
+    an adapter rides on its base model's engine, so its requirement is ``base_model``; a base
+    target is its own requirement. this reads the discriminated union directly rather than
+    sniffing for an attribute, so a new target kind fails typing instead of silently resolving
+    to the wrong field.
+    """
+    return {
+        target.base_model if isinstance(target, AdapterTarget) else target.model
+        for target in targets
+    }
+
+
+async def _dispatch(
+    client: httpx.AsyncClient,
+    resolved: ResolvedScenario,
+    credential: str,
+    item: ScheduledRequest,
+    clock: Clock,
+) -> RequestObservation:
+    return await stream_chat(
+        client,
+        str(resolved.authored.endpoint).rstrip("/"),
+        credential,
+        item.target,
+        item.profile,
+        clock,
+    )
+
+
+async def _drain(tasks: list[asyncio.Task[None]]) -> None:
+    """cancel in-flight work and await it, so no request is abandoned mid-settle."""
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _interrupted_observation(now_ns: int) -> RequestObservation:
+    return RequestObservation(
         outcome="interrupted",
         error_class="interrupted",
         error_detail="run interrupted before the phase produced a complete terminal result",
         completed_ns=now_ns,
     )
-    return _terminal_event(
-        item,
-        observation,
-        phase_start_ns,
-        phase_duration_seconds(phase),
-        0,
-    )
 
 
-def _admission_missed(
-    item: ScheduledRequest, phase_start_ns: int, now_ns: int, phase: Any
-) -> dict[str, Any]:
-    observation = RequestObservation(
-        request_id=item.request_id,
+def _admission_missed_observation(now_ns: int) -> RequestObservation:
+    return RequestObservation(
         outcome="client_admission_missed",
         error_class="client_admission_missed",
         error_detail="client max in-flight or scheduling-lag budget was unavailable",
         completed_ns=now_ns,
-    )
-    return _terminal_event(
-        item,
-        observation,
-        phase_start_ns,
-        phase_duration_seconds(phase),
-        0,
     )
 
 
@@ -382,6 +448,7 @@ def _terminal_event(
     return {
         "type": "request_terminal",
         **asdict(observation),
+        "request_id": item.request_id,
         "phase_name": item.phase_name,
         "phase_kind": item.phase_kind,
         "phase_index": item.phase_index,
@@ -409,13 +476,7 @@ async def _health_event(
         resolved.authored.expected_deployment,
         resolved.authored.required_capabilities,
     )
-    missing_models = sorted(
-        {
-            target.base_model if hasattr(target, "base_model") else target.model
-            for target in resolved.targets
-        }
-        - set(health.base_models)
-    )
+    missing_models = sorted(_required_base_models(resolved.targets) - set(health.base_models))
     if missing_models:
         raise RuntimeError(f"healthz lost required base models: {', '.join(missing_models)}")
     result.events.write(

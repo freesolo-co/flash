@@ -148,6 +148,66 @@ def test_open_loop_saturation_records_admission_misses_without_delayed_work(tmp_
     assert all(event["retry_count"] == 0 for event in terminals)
 
 
+def test_interruption_preserves_outcomes_already_observed(tmp_path) -> None:
+    """an interrupt must not overwrite requests whose outcome the harness already saw.
+
+    settling per request rather than returning a batch is what makes this true: only requests
+    that never reached a terminal state become ``interrupted``. reporting completed successes as
+    interrupted would understate throughput and hide real results.
+    """
+    payload = scenario_payload()
+    payload["discovery"] = {"enabled": False}
+    payload["targets"] = [{"name": "base", "kind": "base_model", "model": "model-a"}]
+    payload["client"] = {"max_in_flight": 8, "max_scheduling_lag_ms": 1000.0}
+    payload["phases"] = [
+        {"name": "sustained", "kind": "sustained", "duration_seconds": 3.0, "rate_rps": 2.0}
+    ]
+    served = 0
+    reached = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal served
+        if request.url.path == "/healthz":
+            return httpx.Response(200, json=_health())
+        served += 1
+        if served >= 3:
+            reached.set()
+            await asyncio.sleep(30)
+        return httpx.Response(200, content=_sse())
+
+    async def exercise() -> None:
+        path = tmp_path / "result"
+        task = asyncio.create_task(
+            run_scenario(
+                Scenario.model_validate(payload),
+                "fake-secret",
+                path,
+                clock=FakeClock(),
+                client_factory=_factory(httpx.MockTransport(handler)),
+            )
+        )
+        await reached.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        terminals = [
+            event
+            for event in load_events(path / "events.jsonl")
+            if event["type"] == "request_terminal"
+        ]
+        outcomes = [event["outcome"] for event in terminals]
+        assert outcomes.count("success") == 2
+        assert "interrupted" in outcomes
+        # exactly one identified row per scheduled request: an interrupted phase must not flush
+        # twice, and a row the harness synthesized still has to say which request it stands for
+        request_ids = [event["request_id"] for event in terminals]
+        assert len(terminals) == 6
+        assert sorted(request_ids) == [f"request-{index:08d}" for index in range(6)]
+        assert not (path / "complete.json").exists()
+
+    asyncio.run(exercise())
+
+
 def test_interruption_leaves_inspectable_invalid_result_without_completion(tmp_path) -> None:
     payload = scenario_payload()
     payload["discovery"] = {"enabled": False}

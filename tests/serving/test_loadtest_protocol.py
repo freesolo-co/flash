@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import asdict
 from typing import Any
 
 import httpx
@@ -84,7 +85,6 @@ def _run_chat(handler, target=None):
                 "credential-secret",
                 target or _adapter(),
                 _profile(),
-                "request-1",
                 FakeClock(),
             )
 
@@ -331,7 +331,7 @@ def test_observation_excludes_secrets_prompts_generated_text_and_raw_bodies() ->
         ),
         BaseTarget(name="base", model="model-a"),
     )
-    serialized = json.dumps(observation.as_event_fields())
+    serialized = json.dumps(asdict(observation))
     assert "credential-secret" not in serialized
     assert "never persist me" not in serialized
     assert "answer" not in serialized
