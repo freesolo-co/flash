@@ -114,6 +114,45 @@ def test_isolate_flash_state_resets_runpod_flash_manager_on_scope_change(tmp_pat
     assert FakeRM._resources_initialized is True
 
 
+def test_deploy_and_terminate_isolate_the_same_registry_scope(monkeypatch):
+    """Deploy must write the SDK registry where teardown reads it.
+
+    The endpoint *name* is attempt-scoped (``<digest>-aN``) but ``terminate_endpoint`` is
+    run-scoped: it isolates on the bare run digest and reaps every attempt in one call. If deploy
+    isolates under the attempt instead, it writes a ``resources.pkl`` teardown never opens, so the
+    undeploy leg reads an empty registry and cleanup silently rests on the REST sweep alone.
+    Attempt zero is the tell: it used to share a scope with teardown, and an explicit ``-a0``
+    breaks that unless the scope is derived from the run.
+    """
+    import inspect
+
+    import flash.providers.runpod.execution.job_execution as je
+
+    # read the scope expression straight out of deploy_train_endpoint rather than reimplementing
+    # it: a hand-recomputed scope agrees with itself no matter what the production line says.
+    src = inspect.getsource(je.deploy_train_endpoint)
+    scope_lines = [ln.strip() for ln in src.splitlines() if ln.strip().startswith("registry_scope")]
+    assert len(scope_lines) == 1, f"expected one registry_scope assignment, got {scope_lines}"
+    scope_expr = scope_lines[0].split("=", 1)[1].strip()
+    assert "isolate_flash_state(registry_scope)" in src, (
+        "deploy must isolate on registry_scope; it now passes something else"
+    )
+
+    run_id = "flash-scope-1"
+    terminate_scope = run_suffix(run_id)
+    for attempt in (0, 1, 7):
+        name_suffix = attempt_suffix(run_id, attempt)
+        deploy_scope = eval(
+            scope_expr, {"runpod_naming": je.runpod_naming}, {"name_suffix": name_suffix}
+        )
+        assert deploy_scope == terminate_scope, (
+            f"attempt {attempt}: deploy isolates {deploy_scope!r} but teardown reads "
+            f"{terminate_scope!r}; the undeploy leg would find an empty registry"
+        )
+        # the name itself stays attempt-scoped - the fix must not collapse attempt identity
+        assert endpoint_name("b200", name_suffix).endswith(f"-a{attempt}")
+
+
 def test_select_matches_live_prefixed_endpoint():
     run_id = "flash-123-c220526e"
     target = endpoint_name("RTX 5090", run_suffix(run_id))  # flash-5090-<digest>

@@ -381,6 +381,11 @@ def deploy_train_endpoint(
     runpod_endpoints._patch_runpod_backoff()
     friendly = canonical_gpu(friendly_gpu)
     name = runpod_naming.endpoint_name(friendly, name_suffix)
+    # Scope the SDK registry to the run, not the attempt. The endpoint name identifies one attempt,
+    # but teardown is run-scoped: it isolates on the run digest and reaps every attempt in one call.
+    # Writing resources.pkl under the attempt gives terminate_endpoint a registry it never opens, so
+    # its undeploy leg reads empty and cleanup silently rests on the REST sweep alone.
+    registry_scope = runpod_naming.run_target_of(name_suffix) or name_suffix
     image = runpod_worker.worker_image_for_gpu(friendly)
     context = _DeployContext(deadline_at, spec, cache_volumes, set())
 
@@ -394,7 +399,7 @@ def deploy_train_endpoint(
             # closed.
             context.require_launchable(rp_keys.key_count(), owning_key)
             owning_fingerprint = runpod_api.key_fingerprint(owning_key)
-            runpod_endpoints.isolate_flash_state(name_suffix)
+            runpod_endpoints.isolate_flash_state(registry_scope)
             kwargs = {
                 "name": name,
                 "gpu": flash_gpu(friendly),
