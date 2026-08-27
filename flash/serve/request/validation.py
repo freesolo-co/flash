@@ -11,7 +11,8 @@ import warnings
 from collections.abc import Mapping
 from typing import Any
 
-from flash.serve.contract.protocol import reject_non_finite_json_constant
+from flash.serve.contract.protocol import TEXT_TYPES, reject_non_finite_json_constant
+from flash.serve.request.tool_calls import validate_tool_history
 
 MAX_IMAGES = 4
 MAX_COMPRESSED_BYTES = 8 * 1024 * 1024
@@ -22,7 +23,6 @@ MAX_SOURCE_CHARS = len("data:image/webp;base64,") + 4 * ((MAX_COMPRESSED_BYTES +
 MAX_MESSAGE_NODES = 4096
 MAX_MESSAGE_DEPTH = 256
 IMAGE_TYPES = frozenset({"image_url", "input_image", "image"})
-TEXT_TYPES = frozenset({"text", "input_text"})
 ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
 MIME_TO_FORMAT = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}
 DATA_URI_RE = re.compile(r"\Adata:(image/[^;,]+);base64,(.*)\Z", re.DOTALL)
@@ -221,8 +221,6 @@ def normalize_messages(
                 ),
             }
         )
-    from flash.serve.request.tool_calls import validate_tool_history
-
     validate_tool_history(normalized, error_type=error_type)
     return normalized, sources
 

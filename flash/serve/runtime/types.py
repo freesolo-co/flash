@@ -17,6 +17,12 @@ from flash.serve.request.tool_calls import (
     validate_tool_control_presence,
     validate_tool_stop_sequences,
 )
+from flash.serve.request.validation import (
+    MAX_SOURCE_CHARS,
+    detached_messages,
+    has_image_blocks,
+    normalize_messages,
+)
 
 from .errors import RuntimeConfigurationError
 from .sampling import (
@@ -431,12 +437,6 @@ class GenerationRequest:
         if self.messages is not None:
             if isinstance(self.messages, str) or not isinstance(self.messages, Sequence):
                 raise RuntimeConfigurationError("messages must be a sequence of mappings")
-            from flash.serve.request.validation import (
-                MAX_SOURCE_CHARS,
-                detached_messages,
-                normalize_messages,
-            )
-
             messages = tuple(
                 detached_messages(
                     self.messages,
@@ -518,8 +518,6 @@ class GenerationRequest:
             if tools_active(normalized_tools, self.tool_choice):
                 if self.prompt is not None:
                     raise RuntimeConfigurationError("tools require chat messages")
-                from flash.serve.request.validation import has_image_blocks
-
                 if has_image_blocks(self.messages, sequence_types=tuple):
                     raise RuntimeConfigurationError("tools cannot be combined with image messages")
                 if self.logprobs or self.structured_outputs:

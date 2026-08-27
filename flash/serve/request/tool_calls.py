@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from decimal import Decimal, DecimalException
 from typing import Any
 
+from flash.serve.contract.protocol import TEXT_TYPES
+
 TOOL_PARSER_QWEN3_CODER = "qwen3_coder"
 TOOL_CALL_START, TOOL_CALL_END = "<tool_call>", "</tool_call>"
 _FUNCTION_START, _FUNCTION_END = "<function=", "</function>"
@@ -196,8 +198,6 @@ def validate_tool_history(
 
 
 def detached_template_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    from flash.serve.request.validation import TEXT_TYPES
-
     detached: list[dict[str, Any]] = []
     for message in messages:
         copied = dict(message)

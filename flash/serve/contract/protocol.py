@@ -13,6 +13,9 @@ THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v
 LORA_REQUEST_ATTESTATION_CAPABILITY = "lora_request_attestation"
 # 16 mib of compressed images expands below 22 mib in base64, leaving over 2 mib for json and text.
 MAX_CHAT_REQUEST_BYTES = 24 * 1024 * 1024
+# both spellings of a text content block. request validation and tool-history detachment each
+# classify blocks, so the set lives here rather than in either of them importing the other.
+TEXT_TYPES = frozenset({"text", "input_text"})
 
 REQUIRED_SERVING_CAPABILITIES = frozenset({PERMANENT_CHECKPOINT_IDENTITY_CAPABILITY})
 PREFERRED_SERVING_CAPABILITIES: frozenset[str] = frozenset()
