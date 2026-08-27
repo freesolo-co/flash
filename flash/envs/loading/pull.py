@@ -89,6 +89,26 @@ def _changed() -> RuntimeError:
     return RuntimeError(_TRANSACTION_ERROR)
 
 
+def _addressable_destination(dest: Path) -> Path:
+    """``dest`` as a parent directory plus an entry name the transaction can address.
+
+    the fd-based transaction opens ``dest.parent`` and works on ``dest.name``, so a path whose
+    last component denotes a directory rather than names an entry in one has to be rewritten
+    first: ``Path('.').name`` is the empty string, which stats as ENOENT, and ``Path('..').name``
+    is ``'..'``, which resolves to the grandparent. both forms are what a user gets by pulling
+    into the directory they are standing in.
+    """
+
+    if dest.name not in {"", ".."}:
+        return dest
+    # for these two forms the last component is a directory reference, not a name, so following
+    # symlinks is the resolution posix already performs -- `link/..` is the parent of the target.
+    resolved = Path(os.path.realpath(dest))
+    if not resolved.name:
+        raise RuntimeError(f"refusing to publish an environment over the root directory {resolved}")
+    return resolved
+
+
 def _identity(result: os.stat_result) -> tuple[int, int, int]:
     return result.st_dev, result.st_ino, stat.S_IFMT(result.st_mode)
 
@@ -178,6 +198,30 @@ def _mkdir_unique(parent_fd: int, prefix: str) -> str:
     raise RuntimeError(_TRANSACTION_ERROR)
 
 
+def _discard_probe(
+    parent_fd: int,
+    probe_name: str,
+    probe_identity: tuple[int, int, int],
+    probe_fd: int,
+    owned: dict[str, tuple[int, int, int]],
+) -> None:
+    """Best-effort removal of a failed probe, limited to entries the probe itself created.
+
+    the probe runs before the destination is known to be usable, so a directory left behind turns
+    an empty destination into an occupied one and every later pull without ``overwrite`` fails
+    with ``FileExistsError``. identity is what keeps this from deleting a substituted entry: a
+    name the probe no longer owns fails its check, the probe root is then not empty, and the whole
+    probe is left in place rather than destroyed.
+    """
+
+    for name, identity in owned.items():
+        with contextlib.suppress(OSError, RuntimeError):
+            _remove_owned_entry(probe_fd, name, identity)
+    with contextlib.suppress(OSError, RuntimeError):
+        if not os.listdir(probe_fd):
+            _remove_owned_entry(parent_fd, probe_name, probe_identity)
+
+
 def _probe_no_replace(parent_fd: int) -> None:
     probe_name = _mkdir_unique(parent_fd, "flash-env-rename-probe")
     probe_fd = _open_directory_at(parent_fd, probe_name)
@@ -185,11 +229,15 @@ def _probe_no_replace(parent_fd: int) -> None:
     source = "source"
     occupied = "occupied"
     installed = "installed"
+    owned: dict[str, tuple[int, int, int]] = {}
+    discardable = True
     try:
         os.mkdir(source, mode=0o700, dir_fd=probe_fd)
         source_identity = _entry_identity(probe_fd, source)
+        owned[source] = source_identity
         os.mkdir(occupied, mode=0o700, dir_fd=probe_fd)
         occupied_identity = _entry_identity(probe_fd, occupied)
+        owned[occupied] = occupied_identity
         try:
             _rename_no_replace_at(probe_fd, source, probe_fd, occupied)
         except FileExistsError:
@@ -197,6 +245,8 @@ def _probe_no_replace(parent_fd: int) -> None:
         else:
             raise RuntimeError(_UNSUPPORTED_ERROR)
         _rename_no_replace_at(probe_fd, source, probe_fd, installed)
+        del owned[source]
+        owned[installed] = source_identity
         if _entry_identity(probe_fd, installed) != source_identity:
             raise _changed()
         _remove_owned_entry(
@@ -205,19 +255,30 @@ def _probe_no_replace(parent_fd: int) -> None:
             source_identity,
             sync_stage="probe_entry_cleanup_ready",
         )
+        del owned[installed]
         _remove_owned_entry(
             probe_fd,
             occupied,
             occupied_identity,
             sync_stage="probe_entry_cleanup_ready",
         )
+        del owned[occupied]
         _remove_owned_entry(
             parent_fd,
             probe_name,
             probe_identity,
             sync_stage="probe_root_cleanup_ready",
         )
+        owned.clear()
+    except RuntimeError as exc:
+        # discarding claims through the same no-replace rename this probe just found missing, so
+        # cleaning up without it is exactly the unsafe delete-by-name the module refuses. the
+        # probe directory has to survive instead.
+        discardable = str(exc) != _UNSUPPORTED_ERROR
+        raise
     finally:
+        if owned and discardable:
+            _discard_probe(parent_fd, probe_name, probe_identity, probe_fd, owned)
         os.close(probe_fd)
 
 
@@ -242,9 +303,20 @@ def _snapshot_entry(parent_fd: int, name: str) -> _TreeSnapshot:
     return _TreeSnapshot(identity, children)
 
 
-def _restore_claim(parent_fd: int, claim_name: str, original_name: str) -> None:
+def _restore_claim(
+    source_parent_fd: int,
+    claim_name: str,
+    target_parent_fd: int,
+    original_name: str,
+) -> None:
+    """Best-effort undo of a claim rename, back to the directory it came from.
+
+    a claim can cross directories, so the restore has to as well: putting a rejected backup back
+    under its own parent is what keeps the destination from being left vacant.
+    """
+
     with contextlib.suppress(OSError):
-        _rename_no_replace_at(parent_fd, claim_name, parent_fd, original_name)
+        _rename_no_replace_at(source_parent_fd, claim_name, target_parent_fd, original_name)
 
 
 def _verify_snapshot(parent_fd: int, name: str, snapshot: _TreeSnapshot) -> None:
@@ -268,7 +340,7 @@ def _claim_entry(parent_fd: int, name: str, snapshot: _TreeSnapshot) -> str:
     try:
         _verify_snapshot(parent_fd, claim_name, snapshot)
     except Exception:
-        _restore_claim(parent_fd, claim_name, name)
+        _restore_claim(parent_fd, claim_name, parent_fd, name)
         raise
     return claim_name
 
@@ -280,7 +352,7 @@ def _claim_tree_for_move(parent_fd: int, name: str, snapshot: _TreeSnapshot) -> 
         if _snapshot_entry(parent_fd, claim_name) != snapshot:
             raise _changed()
     except Exception:
-        _restore_claim(parent_fd, claim_name, name)
+        _restore_claim(parent_fd, claim_name, parent_fd, name)
         raise
     return claim_name
 
@@ -296,7 +368,7 @@ def _claim_identity(
         if _entry_identity(parent_fd, claim_name) != expected_identity:
             raise _changed()
     except Exception:
-        _restore_claim(parent_fd, claim_name, name)
+        _restore_claim(parent_fd, claim_name, parent_fd, name)
         raise
     return claim_name
 
@@ -410,7 +482,7 @@ def _rollback_moves(
         try:
             _rename_no_replace_at(target_fd, claimed_name, source_fd, name)
         except OSError as exc:
-            _restore_claim(target_fd, claimed_name, name)
+            _restore_claim(target_fd, claimed_name, target_fd, name)
             raise _changed() from exc
         if _snapshot_entry(source_fd, name) != snapshot:
             raise _changed()
@@ -514,6 +586,7 @@ def _replace_with_tree_at_identity(
     staging = _create_staging(parent_fd)
     payload_fd = -1
     backup_identity: tuple[int, int, int] | None = None
+    staging_removed = False
     try:
         payload_fd = _copy_tree_into_staging(source, staging, "new")
         if expected_identity is None:
@@ -530,11 +603,26 @@ def _replace_with_tree_at_identity(
             if _entry_identity(parent_fd, dest.name) != expected_identity:
                 raise _changed()
             _rename_no_replace_at(parent_fd, dest.name, staging.fd, "old")
-            backup_identity = _entry_identity(staging.fd, "old")
-            if backup_identity != expected_identity:
-                raise _changed()
+            # the backup now lives in staging, so a rejection here has to put it back the way the
+            # claim helpers do. raising while it sits under `old` would leave the destination
+            # vacant even though nothing was published.
+            try:
+                backup_identity = _entry_identity(staging.fd, "old")
+                if backup_identity != expected_identity:
+                    raise _changed()
+            except Exception:
+                backup_identity = None
+                _restore_claim(staging.fd, "old", parent_fd, dest.name)
+                raise
             _sync_transaction("publish_ready")
             try:
+                # publish moves the entry by NAME, so the name has to still be the payload this
+                # transaction copied. without this check a substitute that takes the `new` name
+                # after the sync point is what gets installed, and the identity check afterwards
+                # reports the swap only once the destination already holds it. rejecting inside
+                # this block is what puts the backup back rather than leaving dest vacant.
+                if _entry_identity(staging.fd, "new") != _fd_identity(payload_fd):
+                    raise _changed()
                 _rename_no_replace_at(staging.fd, "new", parent_fd, dest.name)
             except Exception as publish_exc:
                 backup_snapshot = _snapshot_entry(staging.fd, "old")
@@ -547,7 +635,7 @@ def _replace_with_tree_at_identity(
                 try:
                     _rename_no_replace_at(staging.fd, restore_name, parent_fd, dest.name)
                 except OSError as restore_exc:
-                    _restore_claim(staging.fd, restore_name, "old")
+                    _restore_claim(staging.fd, restore_name, staging.fd, "old")
                     raise _changed() from restore_exc
                 if _snapshot_entry(parent_fd, dest.name) != backup_snapshot:
                     raise _changed() from publish_exc
@@ -563,6 +651,7 @@ def _replace_with_tree_at_identity(
                 os.close(payload_fd)
                 payload_fd = -1
                 _remove_empty_staging(staging)
+                staging_removed = True
                 if isinstance(publish_exc, FileExistsError):
                     raise FileExistsError(
                         f"destination {dest} was created while the environment was being pulled"
@@ -590,9 +679,16 @@ def _replace_with_tree_at_identity(
         if os.listdir(staging.fd):
             raise _changed()
         _remove_empty_staging(staging)
+        staging_removed = True
     finally:
         if payload_fd >= 0:
             os.close(payload_fd)
+        # a failure before publication leaves a full copy of the payload next to the destination.
+        # only the payload is ours to delete: while `backup_identity` is set the backup is the sole
+        # copy of the destination, so the staging directory has to survive for recovery.
+        if not staging_removed and backup_identity is None:
+            with contextlib.suppress(OSError, RuntimeError):
+                _remove_owned_entry(staging.parent_fd, staging.name, staging.identity)
         _close_staging(staging)
         os.close(parent_fd)
 
@@ -632,6 +728,7 @@ def ensure_environment_pull_destination_available(
 
 
 def _copy_environment_source(source: Path, dest_path: Path, *, overwrite: bool = False) -> None:
+    dest_path = _addressable_destination(dest_path)
     try:
         initial_identity = _lstat_identity(dest_path)
     except FileNotFoundError:

@@ -33,6 +33,10 @@ def _only_staging(parent: Path) -> Path:
     return staging[0]
 
 
+def _probe_dirs(parent: Path) -> list[Path]:
+    return sorted(parent.glob(".flash-env-rename-probe-*"))
+
+
 def test_cwd_inside_returns_false_when_path_resolution_fails(monkeypatch, tmp_path) -> None:
     """destination probing returns false when filesystem resolution fails."""
     monkeypatch.setattr(Path, "cwd", classmethod(lambda cls: tmp_path))
@@ -707,3 +711,138 @@ def test_copy_environment_source_rejects_existing_destination_without_overwrite(
         pull._copy_environment_source(source, dest, overwrite=False)
 
     assert dest.read_text() == "old"
+
+
+def test_publish_rejects_a_payload_substituted_after_the_final_sync(tmp_path, monkeypatch) -> None:
+    """publication verifies the staged payload by inode, not by the name it was copied under."""
+    source = _source(tmp_path, {"environment.py": "authentic"})
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "old.txt").write_text("old")
+
+    def hook(stage):
+        if stage != "publish_ready":
+            return
+        staging = _only_staging(tmp_path)
+        (staging / "new").rename(staging / "stashed")
+        forged = staging / "new"
+        forged.mkdir()
+        (forged / "environment.py").write_text("forged")
+
+    monkeypatch.setattr(pull, "_transaction_sync_hook", hook)
+
+    with pytest.raises(RuntimeError, match=_GENERIC_ERROR):
+        pull._replace_with_tree(source, dest)
+
+    # the swap is rejected and the backup is restored, so the destination is neither forged nor
+    # vacant. rejecting outside the publish block would leave the destination missing entirely.
+    assert (dest / "old.txt").read_text() == "old"
+    assert not (dest / "environment.py").exists()
+    assert _staging_dirs(tmp_path) == []
+
+
+def test_rejected_backup_move_restores_the_destination(tmp_path, monkeypatch) -> None:
+    """a backup whose identity fails its check is renamed back rather than left in staging."""
+    source = _source(tmp_path, {"environment.py": "new"})
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "old.txt").write_text("old")
+
+    real_entry_identity = pull._entry_identity
+    poisoned = False
+
+    def fake_entry_identity(parent_fd, name):
+        nonlocal poisoned
+        if name == "old" and not poisoned:
+            poisoned = True
+            return (-1, -1, -1)
+        return real_entry_identity(parent_fd, name)
+
+    monkeypatch.setattr(pull, "_entry_identity", fake_entry_identity)
+
+    with pytest.raises(RuntimeError, match=_GENERIC_ERROR):
+        pull._replace_with_tree(source, dest)
+
+    assert (dest / "old.txt").read_text() == "old"
+    assert _staging_dirs(tmp_path) == []
+
+
+def test_failed_copy_removes_its_own_staging_directory(tmp_path, monkeypatch) -> None:
+    """a failure before the backup exists deletes the staged payload it created."""
+    source = _source(tmp_path, {"environment.py": "new"})
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "old.txt").write_text("old")
+
+    real_copy = pull._copy_tree_into_staging
+
+    def failing_copy(source_path, staging, name):
+        os.close(real_copy(source_path, staging, name))
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(pull, "_copy_tree_into_staging", failing_copy)
+
+    with pytest.raises(OSError, match="No space left on device"):
+        pull._replace_with_tree(source, dest)
+
+    assert _staging_dirs(tmp_path) == []
+    assert (dest / "old.txt").read_text() == "old"
+
+
+def test_failed_probe_does_not_occupy_an_empty_destination(tmp_path, monkeypatch) -> None:
+    """a probe that fails mid-way removes itself so a retry still sees an empty destination."""
+    source = _source(tmp_path, {"environment.py": "new"})
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    real_rename = pull._rename_no_replace_at
+
+    def failing_rename(source_fd, source_name, target_fd, target_name):
+        if target_name == "installed":
+            raise OSError(errno.EIO, "Input/output error")
+        return real_rename(source_fd, source_name, target_fd, target_name)
+
+    monkeypatch.setattr(pull, "_rename_no_replace_at", failing_rename)
+
+    with pytest.raises(OSError, match="Input/output error"):
+        pull._copy_environment_source(source, dest)
+
+    # probe residue would make this empty destination occupied, and every later pull without
+    # overwrite would then fail with FileExistsError on evidence the probe created itself.
+    assert _probe_dirs(dest) == []
+    assert list(dest.iterdir()) == []
+
+    monkeypatch.undo()
+    pull._copy_environment_source(source, dest)
+    assert (dest / "environment.py").read_text() == "new"
+
+
+def test_copy_environment_source_accepts_the_current_directory(tmp_path, monkeypatch) -> None:
+    """a '.' destination names a directory, not an entry, so it is resolved before the stat."""
+    source = _source(tmp_path, {"environment.py": "new"})
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+
+    pull._copy_environment_source(source, Path("."))
+
+    assert (workdir / "environment.py").read_text() == "new"
+
+
+def test_addressable_destination_resolves_a_parent_reference(tmp_path) -> None:
+    """'..' is not normalized away by pathlib, so it would stat as the grandparent."""
+    nested = tmp_path / "outer" / "inner"
+    nested.mkdir(parents=True)
+
+    resolved = pull._addressable_destination(nested / "..")
+
+    assert resolved == (tmp_path / "outer").resolve()
+    assert resolved.name == "outer"
+
+
+def test_addressable_destination_refuses_the_root_directory(tmp_path, monkeypatch) -> None:
+    """resolution that lands on the root leaves no entry name to publish over."""
+    monkeypatch.chdir(Path(os.sep))
+
+    with pytest.raises(RuntimeError, match="root directory"):
+        pull._addressable_destination(Path("."))
