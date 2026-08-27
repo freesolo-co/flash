@@ -71,10 +71,9 @@ class RunpodProvider:
             for count in rentable_gpu_counts(constraints.max_gpu_count)
         ]
 
-    def submit_run(
+    def submit_attempt(
         self,
         spec,
-        seed: int,
         *,
         log: Any = None,
         on_handle: Any = None,
@@ -84,32 +83,29 @@ class RunpodProvider:
         source_snapshot: dict | None = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
-        from flash.core.spec import require_matching_seed
-        from flash.providers.runpod.execution.job_execution import submit_run
+        from flash.providers.runpod.execution.job_execution import submit_attempt
 
-        seed = require_matching_seed(spec, seed)
         kwargs = {
             "log": log,
             "on_handle": on_handle,
             "attempt": attempt,
             "on_last_gpu": on_last_gpu,
             "source_snapshot": source_snapshot,
-            **deadline_kwargs(submit_run, _deadline_at),
+            **deadline_kwargs(submit_attempt, _deadline_at),
         }
         if runtime_secrets:
             kwargs["runtime_secrets"] = runtime_secrets
-        return submit_run(spec, seed, **kwargs)
+        return submit_attempt(spec, **kwargs)
 
-    def poll(
+    def poll_attempt(
         self,
         handle: JobHandle,
         spec,
-        seed: int,
         *,
         log: Any = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
-        from flash.core.spec import gpu_count_of, require_matching_seed
+        from flash.core.spec import gpu_count_of
         from flash.providers.artifacts.hf import (
             make_hf_failure_detail_reader,
             make_hf_heartbeat_reader,
@@ -118,7 +114,6 @@ class RunpodProvider:
         from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
         from flash.providers.runpod.execution.jobs import stall_kwargs
 
-        seed = require_matching_seed(spec, seed)
         hf_repo = spec.train.hf_repo
         prefix = f"{spec.phase}/{spec.run_id}"
         hd = handle.to_dict()

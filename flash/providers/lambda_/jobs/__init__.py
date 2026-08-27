@@ -198,7 +198,6 @@ def _abort_ambiguous_launch(run_id: str, detail: str) -> None:
 
 def _build_launch_user_data(
     spec,
-    seed: int,
     attempt: int,
     runtime_secrets: dict | None,
     source_snapshot: dict | None,
@@ -219,7 +218,7 @@ def _build_launch_user_data(
     if cache_host_mount is not None:
         payload_kwargs["cache_host_mount"] = cache_host_mount
     return build_user_data(
-        build_payload(spec, seed, attempt, **payload_kwargs),
+        build_payload(spec, attempt, **payload_kwargs),
         gpu=spec.gpu.type,
     )
 
@@ -318,7 +317,7 @@ def _rent_instance(
 
     - ``arm`` immediately before the request and only then. A deadline miss in the precheck rents
       nothing, and an armed guard there would reap by run label, killing every other concurrent
-      seed of this run.
+      attempt of this run.
     - ``owns`` as the FIRST statement after the create returns. From there the box is rented and
       named, so anything that can raise -- interpolating the message, building the handle -- must
       find the guard already holding the exact id rather than the run label.
@@ -377,7 +376,7 @@ def _retry_launch_without_cache(
             file_system_names=None,
             describe=lambda instance_id: (
                 f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
-                f"{inst.instance_type} in {inst.region} attempt={plan.attempt} seed={plan.seed}"
+                f"{inst.instance_type} in {inst.region} attempt={plan.attempt}"
             ),
         ), None
     except lambda_api.LambdaApiError as error:
@@ -385,7 +384,7 @@ def _retry_launch_without_cache(
         if clean:
             # rented nothing: stand down on the FIRST statement, before the diagnostic and the say
             # below, either of which can raise while armed and would then reap by run label,
-            # killing every other concurrent seed over a request that rented nothing.
+            # killing every other concurrent attempt over a request that rented nothing.
             reap.disarm()
         cold_detail = sanitize_diagnostic(error, limit=1000)
         if not clean:
@@ -430,7 +429,6 @@ class _LaunchPlan:
     """One launch walk's fixed inputs: everything every candidate region reuses unchanged."""
 
     spec: Any
-    seed: int
     attempt: int
     runtime_secrets: dict | None
     source_snapshot: dict | None
@@ -447,7 +445,6 @@ class _LaunchPlan:
 
 def _build_launch_plan(
     spec,
-    seed: int,
     attempt: int,
     runtime_secrets: dict | None,
     source_snapshot: dict | None,
@@ -458,17 +455,16 @@ def _build_launch_plan(
     """Build the label, SSH key, and both user_data variants once, before any region is tried."""
     cache_name = getattr(spec.gpu, "network_volume", None)
     default_cache_mount = f"/lambda/nfs/{cache_name}" if cache_name else ""
-    build_kwargs = (spec, seed, attempt, runtime_secrets, source_snapshot, absolute_deadline)
+    build_kwargs = (spec, attempt, runtime_secrets, source_snapshot, absolute_deadline)
     return _LaunchPlan(
         spec=spec,
-        seed=seed,
         attempt=attempt,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
         absolute_deadline=absolute_deadline,
         mode=mode,
         models=models,
-        name=instance_label(spec.run_id, seed, attempt),
+        name=instance_label(spec.run_id, attempt),
         ssh_keys=resolve_ssh_key_names(
             **deadline_kwargs(resolve_ssh_key_names, absolute_deadline),
         ),
@@ -514,7 +510,6 @@ def _region_launch_inputs(
             if mount_point == plan.default_cache_mount
             else _build_launch_user_data(
                 plan.spec,
-                plan.seed,
                 plan.attempt,
                 plan.runtime_secrets,
                 plan.source_snapshot,
@@ -539,7 +534,6 @@ def _region_launch_inputs(
 
 def launch_and_submit(
     spec,
-    seed: int,
     instances: list[LambdaInstance],
     attempt: int = 0,
     log=None,
@@ -563,7 +557,7 @@ def launch_and_submit(
         )
     instances = _disk_capable_instances(spec, instances, say)
     plan = _build_launch_plan(
-        spec, seed, attempt, runtime_secrets, source_snapshot, absolute_deadline, mode, models
+        spec, attempt, runtime_secrets, source_snapshot, absolute_deadline, mode, models
     )
 
     tried_regions: set[str] = set()
@@ -597,7 +591,7 @@ def launch_and_submit(
                     describe=lambda instance_id, inst=inst: (
                         f"launched lambda instance {instance_id}: {inst.gpu} {inst.instance_type} "
                         f"${inst.price_usd_hr:.2f}/hr in {inst.region} "
-                        f"attempt={attempt} seed={seed}"
+                        f"attempt={attempt}"
                     ),
                 )
             except lambda_api.LambdaApiError as e:
@@ -605,7 +599,7 @@ def launch_and_submit(
                 if clean:
                     # rented nothing: stand down on the first statement, before the diagnostic and
                     # the say below, either of which can raise while armed and would then reap by
-                    # run label -- killing every other concurrent seed over a rejected request.
+                    # run label -- killing every other concurrent attempt over a rejected request.
                     reap.disarm()
                 last_err = e
                 detail = sanitize_diagnostic(e, limit=1000)
@@ -691,7 +685,6 @@ def _failure_detail(
 def poll_lambda_job(
     handle: LambdaJobHandle,
     spec,
-    seed: int,
     log=None,
     interval_s: float = 15.0,
     heartbeat_reader=None,
@@ -815,9 +808,8 @@ def _teardown_polled_instance(handle: LambdaJobHandle, run_id: str) -> None:
             terminate_run_instances(run_id)
 
 
-def submit_run_lambda(
+def submit_attempt_lambda(
     spec,
-    seed: int,
     log=None,
     on_handle=None,
     attempt: int = 0,
@@ -828,7 +820,7 @@ def submit_run_lambda(
     """Launch, poll, and always terminate the instance (finally is the cost-safety primary)."""
     if spec.gpu.type not in GPU_INFO:
         raise lambda_api.LambdaApiError(
-            f"submit_run_lambda needs a concrete gpu class, got {spec.gpu.type!r}"
+            f"submit_attempt_lambda needs a concrete gpu class, got {spec.gpu.type!r}"
         )
     from flash.core.spec import gpu_count_of
 
@@ -842,7 +834,6 @@ def submit_run_lambda(
     )
     handle = launch_and_submit(
         spec,
-        seed,
         instances,
         attempt=attempt,
         log=log,
@@ -860,7 +851,6 @@ def submit_run_lambda(
         return poll_lambda_job(
             handle,
             spec,
-            seed,
             log=log,
             heartbeat_reader=reader,
             **deadline_kwargs(poll_lambda_job, absolute_deadline),

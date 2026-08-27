@@ -379,7 +379,7 @@ def test_weight_cache_env_custom_mount():
 def test_build_worker_env_sets_base_model_cache_with_volume():
     from flash.providers._lifecycle.net.worker import build_worker_env
 
-    env = build_worker_env(_vol_spec(), 0)
+    env = build_worker_env(_vol_spec())
     assert env["FLASH_WEIGHT_CACHE_DIR"] == "/runpod-volume/hf-cache/hub"
     # The leak fix: no process-global HF_HOME redirect, so env/reward downloads use the ephemeral cache.
     assert "HF_HOME" not in env
@@ -388,7 +388,7 @@ def test_build_worker_env_sets_base_model_cache_with_volume():
 def test_build_worker_env_no_cache_without_volume():
     from flash.providers._lifecycle.net.worker import build_worker_env
 
-    env = build_worker_env(JobSpec(model="m", seed=0), 0)
+    env = build_worker_env(JobSpec(model="m", seed=0))
     # Without a volume the base-model cache var must NOT be set (pointing at a missing mount).
     assert "FLASH_WEIGHT_CACHE_DIR" not in env
     assert "HF_HOME" not in env
@@ -555,7 +555,7 @@ def test_instance_payload_strips_runpod_volume_redirect():
     spec = JobSpec.from_dict(
         {**_vol_spec().to_internal_dict(), "run_id": "r", "model": "Qwen/Qwen3.5-9B"}
     )
-    assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"].startswith(
+    assert build_worker_env(spec)["FLASH_WEIGHT_CACHE_DIR"].startswith(
         "/runpod-volume"
     )  # leak source
     for arm in ("lambda",):
@@ -876,7 +876,7 @@ def _supervised_walk(monkeypatch, failures):
                 return jobs.PollResult(False, failure=fail, detail="x")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(
             provider_worker, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT
         )
@@ -1967,11 +1967,7 @@ def _wire_warm(monkeypatch, marker):
         ),
     )
 
-    def fake_launch(spec, seed, instances, attempt=0, mode=None, models=None, **k):
-        # the preload launch must thread the spec's authoritative seed: the real
-        # build_payload/build_worker_env path calls require_matching_seed, so a stale seed=0
-        # against the default spec.seed would crash every real preload launch.
-        assert seed == spec.seed, (seed, spec.seed)
+    def fake_launch(spec, instances, attempt=0, mode=None, models=None, **k):
         launched.append((instances[0].region, mode, tuple(models or [])))
 
     monkeypatch.setattr(lj, "launch_and_submit", fake_launch)
@@ -4449,7 +4445,7 @@ def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
 def test_the_grow_reserve_does_not_reject_a_launchable_deploy(monkeypatch):
     """Regression: the reserve is a spending cap, not an admission test.
 
-    `submit_run` cannot add headroom to its wall deadline. Admission charges only this attempt's
+    `submit_attempt` cannot add headroom to its wall deadline. Admission charges only this attempt's
     grow; the full pool reserve still limits later spending.
     """
     import runpod_flash
@@ -4480,7 +4476,7 @@ def test_the_grow_reserve_does_not_reject_a_launchable_deploy(monkeypatch):
 
     monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
 
-    # exactly what submit_run passes: the managed cache attached, deadline handed over unpadded
+    # exactly what submit_attempt passes: the managed cache attached, deadline handed over unpadded
     with pytest.raises(RuntimeError, match=r"reached the provider"):
         job_execution.deploy_train_endpoint(
             "RTX 4090",

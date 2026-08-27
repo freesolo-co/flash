@@ -767,14 +767,15 @@ def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         # MtzrJ: a handle-less run hit the submit->provisioning window, so a NON-IDEMPOTENT instance
         # create (Vast's PUT /asks) may have been accepted while the response/handle was lost — a
-        # phantom contract that bills and, worse, writes this run/seed's HF artifacts. The batch
+        # phantom contract that bills and, worse, writes this run's HF artifacts. The batch
         # sweep_orphans above reaps it only if it was VISIBLE then; _confirm_run_clear force-reaps this
         # run's label across the instance providers RIGHT BEFORE relaunching and verifies nothing for the
         # run remains, so a phantom that surfaced in the sweep->resubmit gap (Vast's instance list is
-        # eventually consistent) can't get a SECOND worker writing the same seed-scoped artifacts.
-        # A run still `queued` never reached that window: the runner enqueues as `queued` and lifecycle's
-        # `_update(..., "provisioning")` fires BEFORE any `provider.submit_run`, and nothing regresses
-        # `provisioning`->`queued`, so a `queued` run made no create and can't have left a phantom. Skip
+        # eventually consistent) can't get a SECOND worker writing the same run-scoped artifacts.
+        # A run still `queued` never reached that window: the runner enqueues as `queued` and
+        # lifecycle's `_update(..., "provisioning")` fires BEFORE any `provider.submit_attempt`, and
+        # nothing regresses `provisioning`->`queued`, so a `queued` run made no create and can't
+        # have left a phantom. Skip
         # the guard for it — else a purely-queued run whose VAST_API_KEY was dropped after submit would
         # fail closed in _confirm_run_clear (unenumerable recorded Vast) and defer forever. The guard
         # still runs for `provisioning`/`running`, the states that could have attempted a create.

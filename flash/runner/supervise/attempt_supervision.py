@@ -1,4 +1,4 @@
-"""Supervised seed submission and retry phases.
+"""Supervised attempt submission and retry phases.
 
 Split out of ``flash.runner.supervise.lifecycle`` to keep that module under the file-size limit.
 """
@@ -23,7 +23,6 @@ from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 @dataclass
 class _SubmitContext:
     spec: JobSpec
-    seed: int
     log: object
     runtime_secrets: dict[str, str] | None
     source_snapshot: dict
@@ -36,7 +35,7 @@ class _SubmitContext:
     # persisted into the run handle so attach_run recovery polls with the same stall tuning.
     current_on_last_gpu: bool = False
     current_attempt: int = 0
-    # tracks complete rN-suffixed retry handles that registry-less gc cannot reconstruct by name.
+    # tracks complete attempt-suffixed handles that registry-less gc cannot reconstruct by name.
     seen_endpoints: dict[str, dict] = field(default_factory=dict)
     submission_lock: object | None = None
     # grow only when an attempt actually provisioned a class and lost it to infra.
@@ -73,7 +72,6 @@ class _SubmitContext:
                 self.seen_endpoints[canonical_handle["endpoint_id"]] = dict(canonical_handle)
             persisted_handle = {
                 **canonical_handle,
-                "seed": int(self.seed),
                 "allocated_gpu": self.current_gpu.get("name"),
                 # carried beside the gpu name for the same reason and by the same route: the
                 # canonical provider handle drops unknown keys, so a recovering process can only
@@ -121,11 +119,11 @@ class _SubmitContext:
                 rp.destroy(JobHandle.from_dict(remote))
 
     def cancel(self):
-        """Reap this seed's tracked endpoints before unwinding on cancel."""
+        """Reap this run's tracked endpoints before unwinding on cancel."""
         from flash.runner.supervise.errors import _RunCancelled
 
         # a handle whose `running` write loses the terminal-stickiness race never lands in
-        # status.remote, so only seen_endpoints (rN walk endpoints _gc_run_endpoints can't name)
+        # status.remote, so only seen_endpoints (walk endpoints _gc_run_endpoints can't name)
         # can free it.
         self.gc_seen_endpoints()
         return _RunCancelled(f"run {self.spec.run_id} was cancelled")
@@ -200,7 +198,6 @@ class _FailureDecision:
 
 def _build_context(
     spec: JobSpec,
-    seed: int,
     log,
     runtime_secrets: dict[str, str] | None,
     source_snapshot: dict | None,
@@ -226,7 +223,6 @@ def _build_context(
     # environment transport is already pinned and staged by the controller before allocation.
     return _SubmitContext(
         spec=spec,
-        seed=seed,
         log=log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
@@ -290,12 +286,12 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
         and not _record_cleanup_remote(ctx.spec.run_id, ctx.last_handle)
     ):
         raise RuntimeError(
-            f"seed {ctx.seed}: terminal worker's leaked endpoint cleanup target could not be persisted"
+            f"run {ctx.spec.run_id}: terminal worker's leaked endpoint cleanup target could not be persisted"
         )
     if worker_gone:
         if not _compare_and_clear_remote(ctx.spec.run_id, ctx.last_handle):
             raise RuntimeError(
-                f"seed {ctx.seed}: previous attempt's persisted remote changed before clear; "
+                f"run {ctx.spec.run_id}: previous attempt's persisted remote changed before clear; "
                 "aborting replacement to avoid double-provisioning"
             )
         message = (
@@ -322,7 +318,7 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
         flush=True,
     )
     raise RuntimeError(
-        f"seed {ctx.seed}: previous attempt's {ctx.last_handle.get('provider')} {resource_kind} "
+        f"run {ctx.spec.run_id}: previous attempt's {ctx.last_handle.get('provider')} {resource_kind} "
         f"{resource_id} teardown could not be confirmed; failing to avoid "
         "double-provisioning a second worker over a possibly-live resource"
     )
@@ -534,7 +530,7 @@ def _build_candidate_plan(
                 "retry must preserve that executed rank width"
             )
             print(
-                f"seed={ctx.seed} no candidate executes at pinned OPD checkpoint world size "
+                f"run={ctx.spec.run_id} no candidate executes at pinned OPD checkpoint world size "
                 f"{width}; not retrying",
                 file=ctx.log,
                 flush=True,
@@ -542,7 +538,7 @@ def _build_candidate_plan(
             return None
         ctx.last_detail = f"oom: exceeded the largest available GPU ({ctx.oom_vram_floor:g} GB)"
         print(
-            f"seed={ctx.seed} OOM on the largest GPU class ({ctx.oom_vram_floor:g} GB); not retrying",
+            f"run={ctx.spec.run_id} OOM on the largest GPU class ({ctx.oom_vram_floor:g} GB); not retrying",
             file=ctx.log,
             flush=True,
         )
@@ -644,7 +640,7 @@ def _submit_provider(
             }
             if prepared.runtime_secrets:
                 submit_kwargs["runtime_secrets"] = prepared.runtime_secrets
-            return provider.submit_run(plan.run_spec, ctx.seed, **submit_kwargs), False
+            return provider.submit_attempt(plan.run_spec, **submit_kwargs), False
     except _TerminalHandleRace:
         raise
     except Exception as exc:
@@ -872,7 +868,7 @@ def _handle_failure(
         else "not retrying"
     )
     print(
-        f"seed={ctx.seed} attempt={prepared.attempt} failed ({result.failure}); {action}"
+        f"attempt={prepared.attempt} failed ({result.failure}); {action}"
         f"\n--- failure detail ---\n{(result.detail or '')[:2000]}\n---",
         file=ctx.log,
         flush=True,
@@ -898,22 +894,21 @@ def _handle_failure(
     return _FailureDecision(None, True)
 
 
-def submit_seed_supervised(
+def run_attempts_supervised(
     spec: JobSpec,
-    seed: int,
     log,
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     attempt_start: int = 0,
 ) -> dict:
-    """Run one seed with bounded auto-retry on infra-shaped failures."""
+    """Run one run's attempts with bounded auto-retry on infra-shaped failures."""
     if spec.algorithm == "opd":
         from flash.server.domain.teacher.broker import preflight_validate_managed_teacher
 
         # policy and plane configuration are spec-level gates and must fail before durable run state
         # or source identity is consulted. the deadline-dependent gate still runs after context load.
         preflight_validate_managed_teacher(spec)
-    ctx = _build_context(spec, seed, log, runtime_secrets, source_snapshot, attempt_start)
+    ctx = _build_context(spec, log, runtime_secrets, source_snapshot, attempt_start)
     _require_opd_configuration(ctx)
     for local_attempt in range(ctx.retry_budget.max_attempts):
         preparation = _prepare_attempt(ctx, local_attempt)
@@ -932,4 +927,4 @@ def submit_seed_supervised(
             break
     _settle_terminal_remote(ctx)
     ctx.gc_seen_endpoints()
-    raise RuntimeError(f"seed {seed} failed after retries: {ctx.last_detail}")
+    raise RuntimeError(f"run {spec.run_id} failed after retries: {ctx.last_detail}")

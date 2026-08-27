@@ -7978,7 +7978,6 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
     assert spec.phase == "opd"
     alloc = build_worker_env(
         spec,
-        spec.seed,
         runtime_secrets=teacher_runtime,
     )["PYTORCH_CUDA_ALLOC_CONF"]
     assert "expandable_segments" not in alloc
@@ -7999,7 +7998,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
             "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
         }
     )
-    assert build_worker_env(sft, sft.seed)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert build_worker_env(sft)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
 
 
 def test_worker_fails_closed_on_tool_env(monkeypatch):

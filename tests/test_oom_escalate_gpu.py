@@ -330,7 +330,7 @@ def test_non_sft_oom_escalation_still_uses_every_rented_card():
 def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
     from flash.providers.core.allocator import _executed_width, _fitting_candidates
     from flash.providers.core.base import Candidate, PollResult
-    from flash.runner.supervise import seed_submission
+    from flash.runner.supervise import attempt_supervision
     from flash.runner.supervise.lifecycle import _oom_escalated, _RetryBudget
 
     failed = _fitting_candidates(
@@ -353,20 +353,20 @@ def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
         log=io.StringIO(),
     )
     prepared = types.SimpleNamespace(attempt=0)
-    outcome = seed_submission._AttemptOutcome(
+    outcome = attempt_supervision._AttemptOutcome(
         result=PollResult(False, failure="oom", detail="cuda oom"),
         chosen=failed,
         candidates=(failed,),
         run_spec=types.SimpleNamespace(gpu=types.SimpleNamespace(network_volume=None)),
     )
     monkeypatch.setattr(
-        seed_submission._lifecycle, "_await_runpod_completed_metrics", lambda *a, **k: None
+        attempt_supervision._lifecycle, "_await_runpod_completed_metrics", lambda *a, **k: None
     )
     monkeypatch.setattr(
         "flash.runner.lifecycle.deadlines._load_run_deadline_at", lambda _run_id: None
     )
 
-    decision = seed_submission._handle_failure(ctx, prepared, outcome)
+    decision = attempt_supervision._handle_failure(ctx, prepared, outcome)
 
     assert decision.retry is True
     assert ctx.oom_vram_floor == pytest.approx(35.2)

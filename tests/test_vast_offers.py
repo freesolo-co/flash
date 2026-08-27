@@ -268,7 +268,7 @@ def test_rent_search_outlasts_the_boxs_deadline_not_just_the_wall_grant(monkeypa
     now = 1_800_000_000.0
     monkeypatch.setattr(vast.time, "time", lambda: now)
     with pytest.raises(vast.vast_api.VastApiError):
-        vast.submit_run_vast(spec, 42, deadline_at=now + 1800.0)
+        vast.submit_attempt_vast(spec, deadline_at=now + 1800.0)
     assert captured["max_wall_seconds"] == 1800.0, (
         "offer search must require a host that outlasts the deadline the box enforces"
     )
@@ -291,10 +291,10 @@ def test_rent_search_never_shortens_below_the_granted_wall(monkeypatch):
     now = 1_800_000_000.0
     monkeypatch.setattr(vast.time, "time", lambda: now)
     with pytest.raises(vast.vast_api.VastApiError):
-        vast.submit_run_vast(spec, 42, deadline_at=now + 600.0)
+        vast.submit_attempt_vast(spec, deadline_at=now + 600.0)
     assert captured["max_wall_seconds"] == 600.0
     with pytest.raises(vast.vast_api.VastApiError):
-        vast.submit_run_vast(spec, 42, deadline_at=now + 120.0)
+        vast.submit_attempt_vast(spec, deadline_at=now + 120.0)
     assert captured["max_wall_seconds"] == 600.0
 
 

@@ -635,7 +635,7 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
             pass
     from flash.providers.core.registry import available_providers, get_provider
 
-    # Sweep every CONFIGURED provider, including RunPod (whose gc also reaps the rN-suffixed
+    # Sweep every CONFIGURED provider, including RunPod (whose gc also reaps the other attempts'
     # endpoints the persisted handle cannot name). Gating on available_providers() is what makes
     # this work on a self-hosted plane: an unconfigured provider holds nothing of ours, and
     # calling it would only raise against a credential the operator never set.

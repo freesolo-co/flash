@@ -1719,7 +1719,7 @@ def test_reattach_poll_reproduces_the_multi_card_capacity_grace(monkeypatch):
             "attempt": 1,
         }
     )
-    PROVIDER.poll(handle, spec, spec.seed)
+    PROVIDER.poll_attempt(handle, spec)
     assert captured["queue_grace_s"] == 1800.0
     assert captured["throttled_grace_s"] == 1800.0
 
@@ -1754,23 +1754,21 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
         "started_ts": 1.0,
     }
 
-    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True, "attempt": 2}), spec, spec.seed)
+    PROVIDER.poll_attempt(JobHandle.from_dict({**base, "on_last_gpu": True, "attempt": 2}), spec)
     assert captured["queue_grace_s"] == 900.0
     assert captured["throttled_grace_s"] == 900.0
     assert captured["current_attempt"] == 2
 
     captured.clear()
-    PROVIDER.poll(
-        JobHandle.from_dict({**base, "on_last_gpu": False, "attempt": 0}), spec, spec.seed
-    )
+    PROVIDER.poll_attempt(JobHandle.from_dict({**base, "on_last_gpu": False, "attempt": 0}), spec)
     assert captured["queue_grace_s"] == 300.0
     assert captured["current_attempt"] == 0
 
     with pytest.raises(ValueError, match="attempt identity is invalid"):
-        PROVIDER.poll(JobHandle.from_dict(base), spec, spec.seed)
+        PROVIDER.poll_attempt(JobHandle.from_dict(base), spec)
 
 
-def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
+def test_submit_attempt_payload_carries_structured_source_snapshot(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import job_execution, jobs
@@ -1798,9 +1796,8 @@ def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
     monkeypatch.setattr(polling, "poll_job", lambda *a, **k: jobs.PollResult(True, metrics={}))
 
     source_snapshot = valid_source_snapshot()
-    assert job_execution.submit_run(
+    assert job_execution.submit_attempt(
         spec,
-        seed=spec.seed,
         source_snapshot=source_snapshot,
         deadline_at=10_000_000_000.0,
     ).ok
@@ -1809,7 +1806,7 @@ def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
     assert "code_prefix" not in submitted["payload"]
 
 
-def test_submit_run_rejects_malformed_source_before_deploy(monkeypatch):
+def test_submit_attempt_rejects_malformed_source_before_deploy(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.runpod.execution import job_execution
     from flash.snapshot.archive import SourceSnapshotError
@@ -1831,16 +1828,15 @@ def test_submit_run_rejects_malformed_source_before_deploy(monkeypatch):
     malformed["archive_path"] = "source/wrong/flash-source.zip"
 
     with pytest.raises(SourceSnapshotError, match="archive path"):
-        job_execution.submit_run(
+        job_execution.submit_attempt(
             spec,
-            seed=spec.seed,
             source_snapshot=malformed,
             deadline_at=10_000_000_000.0,
         )
     assert deploy_calls == []
 
 
-def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkeypatch):
+def test_submit_attempt_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkeypatch):
     # The submitting process must apply the scaled budget too, not just a recovering one -- this is
     # the path that burned the queue time in the first place. The count is read off the effective
     # spec this attempt is launching, which allocation may have resolved to FEWER cards than the
@@ -1871,9 +1867,8 @@ def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkey
             train=TrainSpec(epochs=1, hf_repo="org/repo"),
             gpu=GpuSpec(type="H200", count=count),
         )
-        assert job_execution.submit_run(
+        assert job_execution.submit_attempt(
             spec,
-            seed=spec.seed,
             on_last_gpu=True,
             source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=10_000_000_000.0,
@@ -1918,9 +1913,8 @@ def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deleti
     )
 
     with pytest.raises(RuntimeError) as caught:
-        job_execution.submit_run(
+        job_execution.submit_attempt(
             spec,
-            spec.seed,
             attempt=4,
             on_handle=handles.append,
             source_snapshot=_SOURCE_SNAPSHOT,
@@ -1967,9 +1961,8 @@ def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
 
     with pytest.raises(UnreconciledCreateError, match="could not be reconciled"):
-        job_execution.submit_run(
+        job_execution.submit_attempt(
             spec,
-            spec.seed,
             attempt=4,
             on_handle=handles.append,
             source_snapshot=_SOURCE_SNAPSHOT,
@@ -2069,9 +2062,8 @@ def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypat
 
     monkeypatch.setattr(polling, "poll_job", fake_poll)
     provider = RunpodProvider()
-    assert provider.submit_run(
+    assert provider.submit_attempt(
         spec,
-        seed=spec.seed,
         source_snapshot=_SOURCE_SNAPSHOT,
         _deadline_at=deadline_at,
     ).ok
@@ -2083,7 +2075,7 @@ def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypat
             job_id="job-1",
         )
     )
-    assert provider.poll(handle, spec, seed=spec.seed, _deadline_at=deadline_at).ok
+    assert provider.poll_attempt(handle, spec, _deadline_at=deadline_at).ok
 
     assert captured == [deadline_at, deadline_at]
 
@@ -2122,9 +2114,7 @@ def test_runpod_endpoint_time_consumption_blocks_queue_job_creation(monkeypatch)
     )
 
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
-        job_execution.submit_run(
-            spec, seed=spec.seed, source_snapshot=_SOURCE_SNAPSHOT, deadline_at=200.0
-        )
+        job_execution.submit_attempt(spec, source_snapshot=_SOURCE_SNAPSHOT, deadline_at=200.0)
 
     assert submitted == []
     assert deleted == ["ep"]
@@ -2327,7 +2317,7 @@ def test_reattach_normalizes_persisted_attempt_once_for_failure_reader_and_poll(
             "started_ts": 12_345.0,
         },
     )
-    RunpodProvider().poll(handle, spec, spec.seed)
+    RunpodProvider().poll_attempt(handle, spec)
     assert captured["current_attempt"] == 2
     assert captured["failure_attempt"] == 2
     assert captured["handle"].attempt == 2
@@ -2344,7 +2334,7 @@ def test_reattach_normalizes_persisted_attempt_once_for_failure_reader_and_poll(
         },
     )
     with pytest.raises(ValueError, match="attempt identity is invalid"):
-        RunpodProvider().poll(handle, spec, spec.seed)
+        RunpodProvider().poll_attempt(handle, spec)
 
 
 @pytest.mark.parametrize("raw_attempt", ["", "x", None, True, -1, 1.5])
@@ -2375,7 +2365,7 @@ def test_reattach_rejects_explicit_malformed_persisted_attempt(monkeypatch, raw_
     )
 
     with pytest.raises(ValueError, match="attempt identity is invalid"):
-        RunpodProvider().poll(handle, spec, spec.seed)
+        RunpodProvider().poll_attempt(handle, spec)
 
 
 def test_reattach_rejects_endpoint_only_handle(monkeypatch):
@@ -2404,7 +2394,7 @@ def test_reattach_rejects_endpoint_only_handle(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="endpoint-only"):
-        RunpodProvider().poll(handle, spec, spec.seed)
+        RunpodProvider().poll_attempt(handle, spec)
 
 
 def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
@@ -3218,7 +3208,7 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_du
         class Provider:
             supports_weight_cache = False
 
-            def submit_run(self, spec, seed, log=None, on_handle=None, attempt=0, **_):
+            def submit_attempt(self, spec, log=None, on_handle=None, attempt=0, **_):
                 calls["n"] += 1
                 if on_handle:
                     on_handle(
@@ -3257,16 +3247,14 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_du
 
         if cancel_during_status:
             with pytest.raises(runner_errors._RunCancelled):
-                lifecycle._submit_seed_supervised(
+                lifecycle._run_attempts_supervised(
                     spec,
-                    spec.seed,
                     io.StringIO(),
                     source_snapshot=_SOURCE_SNAPSHOT,
                 )
         else:
-            metrics = lifecycle._submit_seed_supervised(
+            metrics = lifecycle._run_attempts_supervised(
                 spec,
-                spec.seed,
                 io.StringIO(),
                 source_snapshot=_SOURCE_SNAPSHOT,
             )
@@ -3284,7 +3272,7 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         calls = {"n": 0}
         source_snapshots: list[dict | None] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, source_snapshot=None, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, source_snapshot=None, **_):
             calls["n"] += 1
             source_snapshots.append(source_snapshot)
             if on_handle:
@@ -3303,7 +3291,7 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         runner_submit.submit_job(_spec("retry-ok"), dry_run=False, background=False)
         st = runner_status.get_status("retry-ok")
@@ -3380,7 +3368,7 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
             launched["lora_alpha"] = spec.train.lora_alpha
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: _adapter_config())
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
@@ -3852,7 +3840,7 @@ def test_attach_polls_live_warmstart_handle_without_source_revalidation(monkeypa
         polled = {}
 
         class Provider:
-            def poll(self, handle, spec, seed, **kwargs):
+            def poll_attempt(self, handle, spec, **kwargs):
                 polled.update(
                     init_from_adapter=spec.train.init_from_adapter,
                     revision=spec.train.init_from_adapter_revision,
@@ -4217,7 +4205,7 @@ def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
             lambda eid, _fingerprint, **_kw: deleted.append(eid) or True,
         )
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             runner_status._update(spec.run_id, "cancelled")  # cancel lands during provisioning
             if on_handle:  # endpoint comes up anyway; its "running" write is rejected (terminal)
                 on_handle(
@@ -4233,7 +4221,7 @@ def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
                 )
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         runner_submit.submit_job(_spec("cancel-reap"), dry_run=False, background=False)
@@ -4255,7 +4243,7 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             if on_handle:
                 on_handle(
@@ -4273,7 +4261,7 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
                 return jobs.PollResult(False, failure="job_preempted", detail="[CANCELLED] None")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         runner_submit.submit_job(_spec("cancel-retry"), dry_run=False, background=False)
         assert runner_status.get_status("cancel-retry").state == "done"
@@ -4288,13 +4276,13 @@ def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             return jobs.PollResult(
                 False, failure="job_failed", detail="Remote execution failed: ValueError"
             )
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         with pytest.raises(RuntimeError):
             runner_submit.submit_job(_spec("fail-fast"), dry_run=False, background=False)
@@ -4316,11 +4304,11 @@ def test_supervisor_infra_failure_retries_up_to_floor(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             return jobs.PollResult(False, failure="stalled", detail="GPU never became ready")
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         with pytest.raises(RuntimeError):
             runner_submit.submit_job(
@@ -4342,11 +4330,11 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             return jobs.PollResult(False, failure="stalled", detail="frozen")
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         spec = JobSpec(
             run_id="no-retry",
@@ -4372,11 +4360,11 @@ def test_shared_cache_zero_retry_budget_submits_exactly_once(monkeypatch, failur
 
         submissions = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
             submissions.append((attempt, spec.gpu.network_volume, on_last_gpu))
             return jobs.PollResult(False, failure=failure, detail="cache-constrained failure")
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         spec = JobSpec(
             run_id=f"cache-zero-{failure}",
@@ -4406,7 +4394,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
 
         gpus_seen: list[str] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle(
@@ -4424,7 +4412,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4501,7 +4489,7 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
         )
         gpus_seen: list[str] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle(
@@ -4519,7 +4507,7 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
                 return jobs.PollResult(False, failure="oom", detail="vLLM free-memory preflight")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         import types
@@ -4568,13 +4556,13 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             return jobs.PollResult(
                 False, failure="job_failed", detail="ValueError: bad reward fn (no infra marker)"
             )
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4620,7 +4608,7 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
         monkeypatch.setattr(allocator, "allocate", two_candidate_allocate)
         gpus_seen: list[str] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle(
@@ -4638,7 +4626,7 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4684,7 +4672,7 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
         monkeypatch.setattr(allocator, "allocate", two_candidate_allocate)
         last_flags: list[bool] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
             last_flags.append(on_last_gpu)
             if on_handle:
                 on_handle(
@@ -4702,7 +4690,7 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4751,7 +4739,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
 
         gpus_seen: list[str] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle(
@@ -4767,7 +4755,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
                 )
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4816,11 +4804,11 @@ def test_selected_provider_never_refreshes_the_accepted_cost_quote(monkeypatch):
         monkeypatch.setattr("flash.cost.spec.estimate_for_spec", fixed_estimate)
         submitted = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_kwargs):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_kwargs):
             submitted.append((spec.gpu.type, attempt))
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -5603,7 +5591,7 @@ def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
         ):
             assert source_snapshot == _SOURCE_SNAPSHOT
             # the training submit re-runs the run; a genuinely broken run fails there (matches
-            # _submit_seed_supervised raising after a non-infra failure with no retries left).
+            # _run_attempts_supervised raising after a non-infra failure with no retries left).
             resumed["called"] = True
             resumed["attempt_start"] = attempt_start
             runner_status._update(spec.run_id, "running", remote=replacement_remote)
@@ -5814,7 +5802,7 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch, rema
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         class _RaisingVast:
-            def poll(self, handle, spec, seed, *, log=None, _deadline_at=None):
+            def poll_attempt(self, handle, spec, *, log=None, _deadline_at=None):
                 assert _deadline_at == pytest.approx(
                     runner_status.get_status("v1").created_at + _spec("v1").gpu.max_wall_seconds
                 )
@@ -7310,7 +7298,7 @@ def test_reattach_keeps_the_stall_grace_but_not_the_capacity_wording(monkeypatch
         "attempt": 2,
     }
 
-    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True}), spec, spec.seed)
+    PROVIDER.poll_attempt(JobHandle.from_dict({**base, "on_last_gpu": True}), spec)
     # the capacity wording is left at poll_job's neutral default: escalation may follow, because
     # after recovery it genuinely can.
     assert "on_last_gpu" not in captured, captured
@@ -7319,7 +7307,7 @@ def test_reattach_keeps_the_stall_grace_but_not_the_capacity_wording(monkeypatch
     assert captured["throttled_grace_s"] == 900.0, captured
 
     captured.clear()
-    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": False}), spec, spec.seed)
+    PROVIDER.poll_attempt(JobHandle.from_dict({**base, "on_last_gpu": False}), spec)
     assert "on_last_gpu" not in captured, captured
     assert captured["queue_grace_s"] == 300.0, captured
 

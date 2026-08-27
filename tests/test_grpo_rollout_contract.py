@@ -393,7 +393,7 @@ def test_grpo_worker_env_reasserts_managed_native_thread_policy(monkeypatch):
         train=TrainSpec(prompts_per_step=64, group_size=8),
     )
     hostile = dict.fromkeys(GRPO_NATIVE_THREAD_ENV, "999")
-    env = build_worker_env(spec, spec.seed, runtime_secrets=hostile)
+    env = build_worker_env(spec, runtime_secrets=hostile)
     assert {key: env[key] for key in GRPO_NATIVE_THREAD_ENV} == dict(GRPO_NATIVE_THREAD_ENV)
     secret_names = set(env.get("FLASH_SECRET_ENV_KEYS", "").split(","))
     assert not (secret_names & set(GRPO_NATIVE_THREAD_ENV))
@@ -425,7 +425,7 @@ def test_sft_worker_env_does_not_gain_grpo_native_policy():
         algorithm="sft",
         environment=EnvironmentSpec(id="owner/project/env"),
     )
-    env = build_worker_env(spec, spec.seed)
+    env = build_worker_env(spec)
     assert not (set(env) & set(GRPO_NATIVE_THREAD_ENV))
 
 

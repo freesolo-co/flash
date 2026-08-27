@@ -1,6 +1,6 @@
 """Whether a failed attempt gets another one, and what the log tells the user instead.
 
-Split out of ``flash.runner.supervise.seed_submission`` to keep that module under the file-size
+Split out of ``flash.runner.supervise.attempt_supervision`` to keep that module under the file-size
 limit. The two questions belong together: the decision and the line describing it read the same
 bookkeeping, and when they drifted apart the log claimed a retry the run was not going to make.
 """
@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from flash.runner.supervise import lifecycle as _lifecycle
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only, and importing these would be circular
-    from flash.runner.supervise.seed_submission import _AttemptOutcome, _SubmitContext
+    from flash.runner.supervise.attempt_supervision import _AttemptOutcome, _SubmitContext
 
 
 def _every_shape_tried(

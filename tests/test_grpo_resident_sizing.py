@@ -170,7 +170,7 @@ def _built_env_for(algorithm: str, phase: str) -> dict:
 
     spec = JobSpec.from_dict({"model": "m", "seed": 0, "algorithm": algorithm})
     assert spec.phase == phase, "phase is derived from algorithm; the mapping moved"
-    return build_worker_env(spec, 0, runtime_secrets=_worker_runtime_for(algorithm))
+    return build_worker_env(spec, runtime_secrets=_worker_runtime_for(algorithm))
 
 
 @pytest.mark.parametrize(("algorithm", "phase"), [("grpo", "rl"), ("opd", "opd")])
