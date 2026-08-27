@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     import httpx
 
 from flash.serving.promotion.canary import (
+    CANARY_TRANSPORT_FAILURE,
     CanaryError,
     CanaryRequest,
     correlation_id_for,
@@ -121,6 +122,13 @@ async def evaluate_promotion(
         evidence = await stream_runner()
     except CanaryError as exc:
         return PromotionVerdict(ok=False, reason=str(exc))
+    # `run_stream_canary` already collapses transport faults into `CanaryError`, but that guarantee
+    # lives in another module and `stream_runner` is injected. The consequence of being wrong lands
+    # here, not there: an escaped exception crashes the step, and `failure()` cannot tell a crash
+    # from a failure, so it would roll production back to its predecessor. Same reasoning as the
+    # health load above.
+    except Exception:
+        return PromotionVerdict(ok=False, reason=CANARY_TRANSPORT_FAILURE)
     verdict = verify_stream(evidence)
     if not verdict.ok:
         return verdict

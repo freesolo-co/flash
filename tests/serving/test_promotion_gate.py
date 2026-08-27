@@ -10,7 +10,11 @@ from unittest import mock
 import pytest
 
 from flash.serving.promotion import gate as gate_module
-from flash.serving.promotion.canary import CANARY_TIMEOUT, CanaryError
+from flash.serving.promotion.canary import (
+    CANARY_TIMEOUT,
+    CANARY_TRANSPORT_FAILURE,
+    CanaryError,
+)
 from flash.serving.promotion.evidence import (
     ACCOUNTING_MALFORMED,
     ACCOUNTING_STALLED,
@@ -335,3 +339,23 @@ def test_the_entrypoint_is_importable_as_a_module(monkeypatch, capsys):
     )
     assert result.returncode == 1
     assert GATE_CONFIG_INCOMPLETE in result.stderr
+
+
+def test_an_unexpected_canary_exception_fails_the_gate_instead_of_crashing_it():
+    """A crash is strictly worse than a failure: `failure()` cannot tell the two apart.
+
+    `run_stream_canary` collapses transport faults into `CanaryError`, but that guarantee lives in
+    another module and the runner is injected here. If anything else escapes, the step crashes,
+    Actions fires the rollback, and a healthy release is redeployed over with its predecessor --
+    the exact outcome the gate exists to prevent. The health load above already catches broadly;
+    this is the same hazard twelve lines further down.
+    """
+    verdict, calls = _evaluate(
+        health=_health(),
+        stream=RuntimeError("httpx raised something the canary does not wrap"),
+        accounting=_Snapshot(),
+    )
+
+    assert verdict.ok is False
+    assert verdict.reason == CANARY_TRANSPORT_FAILURE
+    assert "accounting" not in calls, "a failed stream must not be followed by an accounting wait"
