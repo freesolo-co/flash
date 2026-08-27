@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from flash.serving.src.engine.model_config import (
-    _QWEN38_HOSTED_CANDIDATE,
     SERVING_MODELS,
     base_models,
     engine_overrides_for,
@@ -22,6 +21,7 @@ from flash.serving.src.engine.model_config import (
 def test_catalog_has_only_canary_qualified_active_models() -> None:
     assert set(base_models()) == {
         "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.8-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
 
@@ -36,6 +36,7 @@ def test_every_catalog_model_has_an_intentional_image_classification() -> None:
     image_models = {model for model in base_models() if supports_image_input(model)}
     assert image_models == {
         "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.8-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
     assert all(image_limit_for(model) == 4 for model in image_models)
@@ -92,6 +93,7 @@ def test_dense_models_serve_fp8_and_35b_serves_bf16_base() -> None:
     # serve_model_for() resolves it and engine_overrides_for() injects it as serve_model_id.
     expected_fp8 = {
         "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
+        "Qwen/Qwen3.8-27B": "Qwen/Qwen3.8-27B-FP8",
     }
     for base, ckpt in expected_fp8.items():
         assert serve_model_for(base) == ckpt
@@ -127,18 +129,21 @@ def test_9b_has_l40s_rank128_serving_overrides() -> None:
     )  # CUDA graphs on (~10x faster decode on this hybrid GDN model)
 
 
-def test_qwen38_27b_is_a_pinned_pending_hosted_candidate() -> None:
+def test_qwen38_27b_is_active_on_h100_with_pinned_immutable_revisions() -> None:
+    # 27B is a FULLY ACTIVE hosted tier: every active lookup resolves it, and its served checkpoint,
+    # tokenizer and processor stay pinned to immutable revisions so a served engine cannot follow an
+    # upstream retag. The rank-64 x 16 LoRA shape at 32k is what the H100 (80 GiB) was sized for.
     base_model = "Qwen/Qwen3.8-27B"
-    candidate = _QWEN38_HOSTED_CANDIDATE
-    assert candidate["base_model"] == base_model
-    ov = candidate["engine"]
 
-    assert base_model not in base_models()
-    assert is_supported_base_model(base_model) is False
-    for active_lookup in (engine_overrides_for, gpu_for, image_limit_for, serve_model_for):
-        with pytest.raises(ValueError, match="Unsupported base model"):
-            active_lookup(base_model)
+    assert base_model in base_models()
+    assert is_supported_base_model(base_model) is True
+    assert gpu_for(base_model) == "H100"
+    assert image_limit_for(base_model) == 4
+    assert serve_model_for(base_model) == "Qwen/Qwen3.8-27B-FP8"
+
+    ov = engine_overrides_for(base_model)
     assert ov["serve_model_id"] == "Qwen/Qwen3.8-27B-FP8"
+    assert ov["tokenizer_model"] == base_model
     assert ov["max_loras"] == 16
     assert ov["max_lora_rank"] == 64
     assert ov["max_model_len"] == 32768

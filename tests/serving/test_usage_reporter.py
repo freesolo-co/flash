@@ -124,6 +124,23 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     assert modal_app_module.app.function.call_args.kwargs["min_containers"] == 1
 
 
+def test_every_gpu_engine_is_capped_at_three_containers(modal_app_module):
+    # At most 3 GPUs per base model. `base_model` is a modal.parameter(), so Modal gives each distinct
+    # value its own container pool with its own autoscaling accounting -- the cap therefore binds PER
+    # MODEL, not across the catalog. Engines are tensor-parallel 1 on a single-card `gpu=` request, so
+    # one container is exactly one GPU. Asserted on the kwargs modal is actually CALLED with, because a
+    # ceiling that never reaches `app.cls` does not bound anything.
+    assert modal_app_module.MAX_CONTAINERS == 3
+
+    cls_calls = [call.kwargs for call in modal_app_module.app.cls.call_args_list]
+    assert len(cls_calls) == len(modal_app_module.ENGINE_BY_KEY)
+    assert all(kwargs["max_containers"] == 3 for kwargs in cls_calls)
+
+    # The cpu router is deliberately UNCAPPED: it is the front door that triggers cold engines, and
+    # capping it would throttle every model at once rather than bounding gpu spend per model.
+    assert "max_containers" not in modal_app_module.app.function.call_args.kwargs
+
+
 def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app_module):
     # The whole point of the table: an idle container bills at the full gpu rate, so a cheap
     # fast-booting tier must not hold a card as long as the 35B's ~1010s-boot H200 does.
