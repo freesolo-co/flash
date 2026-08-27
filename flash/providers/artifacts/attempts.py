@@ -63,15 +63,38 @@ def _download_bytes(hf_repo: str, path: str, *, revision: str) -> bytes:
         return handle.read()
 
 
-def _repo_snapshot(hf_repo: str) -> tuple[str, list[str]]:
-    from huggingface_hub import HfApi
+def _repo_snapshot(hf_repo: str, prefix: str) -> tuple[str, list[str]]:
+    """list one pinned revision, scoped to the attempt prefix.
+
+    the repository is shared by every run using the same environment, and accumulates environment
+    packages, adapters, checkpoints, logs, and each attempt's records. an unscoped listing therefore
+    re-enumerates that whole history on every poll of every active attempt, growing slower and more
+    rate-limit prone exactly as the environment is used more.
+    """
+    from huggingface_hub import HfApi, RepoFile
+    from huggingface_hub.errors import EntryNotFoundError
 
     api = HfApi(token=os.environ.get("HF_TOKEN"))
     revision = str(api.repo_info(repo_id=hf_repo, repo_type="dataset").sha or "").strip()
     if not revision:
         raise AttemptArtifactError("artifact repository revision is unavailable")
-    paths = api.list_repo_files(repo_id=hf_repo, repo_type="dataset", revision=revision)
-    if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+    try:
+        entries = list(
+            api.list_repo_tree(
+                repo_id=hf_repo,
+                repo_type="dataset",
+                revision=revision,
+                path_in_repo=prefix,
+                recursive=True,
+            )
+        )
+    except EntryNotFoundError:
+        # the attempt has not published anything yet; that is an empty listing, not a failure.
+        # every other transport or authorization error still propagates.
+        return revision, []
+    # the tree yields folders as well as files; only files name an artifact.
+    paths = [entry.path for entry in entries if isinstance(entry, RepoFile)]
+    if any(not isinstance(path, str) or not path for path in paths):
         raise AttemptArtifactError("artifact repository listing is malformed")
     return revision, paths
 
@@ -271,7 +294,7 @@ def read_attempt_artifacts(
     from flash.runner.lifecycle.protocol import attempt_prefix
 
     prefix = attempt_prefix(phase, run_id, attempt_id, fence)
-    revision, paths = _repo_snapshot(hf_repo)
+    revision, paths = _repo_snapshot(hf_repo, prefix)
     observed_at = time.time()
     progress = _decode_progress(
         hf_repo,

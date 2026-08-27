@@ -262,7 +262,8 @@ def poll_job(
                 return PollResult(
                     False, failure="poll_error", detail="RunPod status transport failed"
                 )
-            time.sleep(min(interval_s, max(0.0, attempt.work_deadline_at - time.time())))
+            # record() already slept its escalating backoff; sleeping another interval here would
+            # double the wait before the transport verdict, holding a paid resource that long.
             continue
         if status != state.last_status:
             context.say(f"job {handle.job_id}: {status}")

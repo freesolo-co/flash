@@ -38,6 +38,11 @@ class InstancePollAdapter:
     dead_states: frozenset
     missing_dead_threshold: int
     stamp_cost_and_notes: Callable[..., None]
+    # strict identity of the handle this poller was started for, captured at construction. deriving
+    # it from the live status instead yields None once teardown clears ``remote``, which disables
+    # the compare-and-set in ``record_resource`` and lets an in-flight observation land on a run
+    # whose resource is already gone.
+    resource_identity: tuple | None = None
     record_resource_loss: Callable[[str], None] | None = None
 
 
@@ -66,15 +71,12 @@ def _record_resource(
     defaulted verdict silently re-answers that question at whichever call site forgets to pass it,
     including the transport-failure path that replays the last observed status.
     """
-    from flash.runner.accounting.reconciliation import _remote_resource_identity
-    from flash.runner.lifecycle.status import get_status, record_resource
+    from flash.runner.lifecycle.status import record_resource
 
-    current = get_status(adapter.run_id)
     dead = status in adapter.dead_states or (status == "missing" and confirmed_missing)
     normalized = (
         "running" if status == adapter.running_status else "terminal" if dead else "provisioning"
     )
-    remote = current.remote if isinstance(current.remote, dict) else {}
     record_resource(
         adapter.run_id,
         {
@@ -89,7 +91,7 @@ def _record_resource(
         },
         attempt_id=adapter.current_attempt,
         fence=adapter.fence,
-        resource_identity=_remote_resource_identity(remote),
+        resource_identity=adapter.resource_identity,
     )
 
 
@@ -177,10 +179,8 @@ def poll_instance_job(
                 return PollResult(
                     False, failure="poll_error", detail="provider status transport failed"
                 )
-            wait_deadline = result_deadline if terminal_status else attempt.work_deadline_at
-            delay = min(interval_s, max(0.0, wait_deadline - time.time()))
-            if delay > 0:
-                time.sleep(delay)
+            # record() already slept its escalating backoff; sleeping another interval here would
+            # double the wait before the transport verdict, holding a paid resource that long.
             continue
         missing_streak = missing_streak + 1 if instance is None else 0
         status = str(

@@ -685,6 +685,7 @@ def poll_lambda_job(
     the provider instance type and region.
     """
     absolute_deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
+    from flash.runner.accounting.reconciliation import _remote_resource_identity
     from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
 
     hf_repo = spec.train.hf_repo
@@ -727,6 +728,7 @@ def poll_lambda_job(
         dead_states=_DEAD_STATES,
         missing_dead_threshold=3,
         stamp_cost_and_notes=stamp_cost_and_notes,
+        resource_identity=_remote_resource_identity(handle.to_dict()),
     )
     return poll_instance_job(
         adapter,

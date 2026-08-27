@@ -381,7 +381,11 @@ def publish_result(
         outcome=outcome,
         failure_class=failure_class,
         started_at=started_at,
-        finished_at=time.time(),
+        # a backward wall-clock correction mid-attempt would otherwise make finished precede
+        # started, which the manifest rejects outright -- costing the attempt its only terminal
+        # authority and leaving the poller to call a finished run preempted. the journal clamps
+        # its own occurrence times for the same reason.
+        finished_at=max(time.time(), started_at),
         training_entered=bool(training_entered),
         completed_steps=max(0, int(completed_steps)),
         metrics=dict(metrics or {}),

@@ -2193,6 +2193,7 @@ def test_isolated_instance_miss_is_not_projected_terminal(monkeypatch):
         instance_id="i-1",
         running_status="active",
         dead_states=frozenset({"terminated"}),
+        resource_identity=("lambda", 0, 1, "i-1"),
     )
 
     poll_instance._record_resource(adapter, "missing", confirmed_missing=False)
@@ -2212,6 +2213,77 @@ def test_isolated_instance_miss_is_not_projected_terminal(monkeypatch):
     # re-answer "is this resource gone?" -- that is how the transport path regressed once already.
     with pytest.raises(TypeError):
         poll_instance._record_resource(adapter, "missing")
+
+
+def test_instance_observation_is_fenced_by_the_captured_handle(monkeypatch):
+    """a cleared remote must not disable the resource fence.
+
+    ``record_resource`` skips its compare-and-set when ``resource_identity`` is None. deriving that
+    identity from the live status produced None once confirmed teardown cleared ``status.remote``,
+    so an in-flight poll could publish a later ``running`` projection onto a run whose resource is
+    already gone. the identity must come from the handle the poller was started for, as RunPod does.
+    """
+    from flash.providers._lifecycle.instances import poll_instance
+    from flash.runner.lifecycle import status as status_ops
+
+    passed = []
+    monkeypatch.setattr(
+        status_ops,
+        "record_resource",
+        lambda _run_id, _payload, **kwargs: passed.append(kwargs.get("resource_identity")),
+    )
+    # the run has already been torn down: status.remote is cleared.
+    monkeypatch.setattr(status_ops, "get_status", lambda _run_id: SimpleNamespace(remote=None))
+    captured = ("lambda", 0, 1, "i-1", "gpu_1x_a100", "us-west-1", "flash-run")
+    adapter = SimpleNamespace(
+        run_id="run-1",
+        current_attempt=0,
+        fence=1,
+        provider="lambda",
+        instance_id="i-1",
+        running_status="active",
+        dead_states=frozenset({"terminated"}),
+        resource_identity=captured,
+    )
+
+    poll_instance._record_resource(adapter, "active", confirmed_missing=False)
+
+    assert passed == [captured], "the projection must fence on the captured handle, not the status"
+
+
+def test_transport_failure_sleeps_only_the_tracker_backoff(monkeypatch):
+    """one transport failure must produce one wait, not two.
+
+    ``PollErrorTracker.record`` already sleeps its escalating bounded backoff. a second sleep in
+    the caller doubles the wait before the ``poll_error`` verdict, so a run whose provider status
+    API is failing holds a paid resource roughly seven extra intervals before the poller gives up.
+    """
+    from flash.providers._lifecycle.instances import poll_instance
+
+    jobs, _poll = _wire_lambda_poll(
+        monkeypatch,
+        attempt=_instance_attempt(provider="lambda", work=200.0, result=220.0),
+        results=[None] * 40,
+    )
+
+    from flash.providers.lambda_.client import api as lambda_api
+
+    def boom(*_args, **_kwargs):
+        raise lambda_api.LambdaApiError("provider status unavailable")
+
+    monkeypatch.setattr(lambda_api, "get_instance", boom)
+    # hold the clock well inside every deadline so the error tracker, not a deadline, ends the loop.
+    monkeypatch.setattr(poll_instance.time, "time", lambda: 50.0)
+    # patch after the wiring helper, which stubs sleep on this same shared module object.
+    sleeps = []
+    monkeypatch.setattr(poll_instance.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    result = jobs.poll_lambda_job(_handle(), _spec(), seed=0, interval_s=10)
+
+    assert result.failure == "poll_error"
+    # exactly the tracker's escalating backoff for failures 1..7; the 8th returns without sleeping.
+    # a flat extra interval per failure here would mean the caller slept a second time.
+    assert sleeps == [10, 20, 30, 40, 50, 60, 60], sleeps
 
 
 def test_provider_initial_and_reattached_poll_keep_same_deadline(monkeypatch):

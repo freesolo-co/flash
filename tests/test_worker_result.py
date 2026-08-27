@@ -269,6 +269,37 @@ def test_result_publication_continues_after_optional_progress_flush_failure(
     assert published.completed_steps == 4
 
 
+def test_backward_clock_correction_still_publishes_a_terminal_result(monkeypatch, tmp_path) -> None:
+    """a wall-clock correction must not cost an attempt its only terminal authority.
+
+    ``ResultManifest`` rejects ``finished_at < started_at``. if the host clock steps backward
+    mid-attempt, an unclamped ``time.time()`` makes that rejection fire on an otherwise successful
+    attempt, so no manifest is published at all and the poller eventually reports the finished run
+    as preempted. the progress journal already clamps its occurrence times for this reason.
+    """
+    _set_identity(monkeypatch)
+    monkeypatch.setattr(result_io, "_source_attestation", lambda: ATTESTATION)
+    monkeypatch.setattr(
+        result_io, "_write_immutable", lambda _payload: str(tmp_path / "result.json")
+    )
+    monkeypatch.setattr(result_io, "_publish_exactly_once", lambda manifest, _path: manifest)
+    # the clock stepped back behind the recorded start.
+    monkeypatch.setattr(result_io.time, "time", lambda: 90.0)
+
+    published = result_io.publish_result(
+        outcome="succeeded",
+        failure_class=None,
+        started_at=100.0,
+        training_entered=True,
+        completed_steps=4,
+        metrics={"step": 4},
+        artifacts={"adapter": "published"},
+    )
+
+    assert published.outcome == "succeeded"
+    assert published.finished_at == 100.0, "finished_at must clamp forward to started_at"
+
+
 def test_result_publication_flushes_the_coalesced_step_before_the_manifest(
     monkeypatch, tmp_path
 ) -> None:
