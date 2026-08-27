@@ -31,7 +31,7 @@ from flash.serving.src.accounting.usage_facts import usage_facts
 
 def _payload(**updates):
     return {
-        "model": "run@final." + "a" * 40,
+        "model": "run/final",
         "messages": [{"role": "user", "content": "hello"}],
         **updates,
     }
@@ -162,7 +162,7 @@ def test_buffered_response_preserves_indexed_choices_and_aggregate_usage():
     )
     result = GenerationResult(
         request_id="request",
-        adapter_id="adapter",
+        adapter_id="adapter/final",
         incarnation="incarnation",
         choices=choices,
         prompt_tokens=5,
@@ -172,12 +172,9 @@ def test_buffered_response_preserves_indexed_choices_and_aggregate_usage():
         thinking=False,
     )
     resolved = SimpleNamespace(
-        requested_model="adapter",
+        requested_model="adapter/final",
         adapter=SimpleNamespace(
-            adapter_revision="adapter",
-            checkpoint="run",
-            source_revision="a" * 40,
-            source_subfolder=None,
+            checkpoint_id="adapter/final",
             aggregate_sha256="incarnation",
         ),
     )
@@ -210,13 +207,13 @@ def test_packaged_sse_interleaves_choices_with_independent_reasoning():
     ready = StreamReady(
         request_id="request",
         runtime_id="runtime",
-        adapter_id="adapter",
+        adapter_id="adapter/final",
         incarnation="incarnation",
         thinking=True,
     )
     resolved = SimpleNamespace(
-        requested_model="adapter",
-        adapter=SimpleNamespace(adapter_revision="adapter", aggregate_sha256="incarnation"),
+        requested_model="adapter/final",
+        adapter=SimpleNamespace(checkpoint_id="adapter/final", aggregate_sha256="incarnation"),
     )
 
     async def events():
@@ -228,7 +225,7 @@ def test_packaged_sse_interleaves_choices_with_independent_reasoning():
         yield StreamFinished(
             request_id="request",
             runtime_id="runtime",
-            adapter_id="adapter",
+            adapter_id="adapter/final",
             incarnation="incarnation",
             choices=(),
             prompt_tokens=4,
@@ -273,13 +270,13 @@ def test_packaged_sse_emits_empty_content_with_logprobs():
     ready = StreamReady(
         request_id="request",
         runtime_id="runtime",
-        adapter_id="adapter",
+        adapter_id="adapter/final",
         incarnation="incarnation",
         thinking=False,
     )
     resolved = SimpleNamespace(
-        requested_model="adapter",
-        adapter=SimpleNamespace(adapter_revision="adapter", aggregate_sha256="incarnation"),
+        requested_model="adapter/final",
+        adapter=SimpleNamespace(checkpoint_id="adapter/final", aggregate_sha256="incarnation"),
     )
     token_logprobs = [{"token": "a", "logprob": -0.1, "bytes": [97], "top_logprobs": []}]
 
@@ -289,7 +286,7 @@ def test_packaged_sse_emits_empty_content_with_logprobs():
         yield StreamFinished(
             request_id="request",
             runtime_id="runtime",
-            adapter_id="adapter",
+            adapter_id="adapter/final",
             incarnation="incarnation",
             choices=(),
             prompt_tokens=1,
@@ -339,9 +336,11 @@ def test_text_only_stream_rejects_multi_choice_before_transport(monkeypatch):
         lambda *_args, **_kwargs: pytest.fail("transport must not open"),
     )
     with pytest.raises(ValueError, match="requires n=1"):
-        deploy.chat_stream("run", [{"role": "user", "content": "hi"}], n=2)
+        deploy.chat_stream("run/final", [{"role": "user", "content": "hi"}], org_id="org-1", n=2)
     with pytest.raises(ValueError, match="does not expose logprobs"):
-        deploy.chat_stream("run", [{"role": "user", "content": "hi"}], logprobs=True)
+        deploy.chat_stream(
+            "run/final", [{"role": "user", "content": "hi"}], org_id="org-1", logprobs=True
+        )
 
 
 @pytest.mark.parametrize(
@@ -362,4 +361,6 @@ def test_text_only_stream_rejects_wrong_control_types_before_transport(
         lambda *_args, **_kwargs: pytest.fail("transport must not open"),
     )
     with pytest.raises(ValueError, match=message):
-        deploy.chat_stream("run", [{"role": "user", "content": "hi"}], **kwargs)
+        deploy.chat_stream(
+            "run/final", [{"role": "user", "content": "hi"}], org_id="org-1", **kwargs
+        )
