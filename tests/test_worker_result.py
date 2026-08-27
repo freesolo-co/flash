@@ -269,6 +269,66 @@ def test_result_publication_continues_after_optional_progress_flush_failure(
     assert published.completed_steps == 4
 
 
+def test_result_publication_flushes_the_coalesced_step_before_the_manifest(
+    monkeypatch, tmp_path
+) -> None:
+    """the manifest may not outrun the progress record billing reads.
+
+    step progress coalesces to a 900s cadence, so at any moment a completed step can be pending
+    rather than published. cancellation racing a terminal manifest drops that manifest and bills
+    from progress alone, so if the manifest could be published while a step was still coalesced,
+    billing would undercount by up to one full cadence. ``publish_result`` flushes first, which
+    makes the pinned snapshot's progress carry the same cumulative count the manifest claims.
+    """
+    from flash.engine.worker.io import progress as progress_io
+
+    _set_identity(monkeypatch)
+    uploaded = []
+    monkeypatch.setattr(progress_io.worker_state, "RUN_ID", "run-1")
+    monkeypatch.setattr(progress_io.worker_state, "PHASE", "rl")
+    monkeypatch.setattr(progress_io.worker_state, "ATTEMPT", 2)
+    monkeypatch.setattr(progress_io.worker_state, "FENCE", 9)
+    monkeypatch.setattr(progress_io, "_PROGRESS_SEQUENCE", 0)
+    monkeypatch.setattr(progress_io, "_PROGRESS_PREVIOUS_DIGEST", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_TRAINING_ENTERED", False)
+    monkeypatch.setattr(progress_io, "_PROGRESS_COMPLETED_STEPS", 0)
+    monkeypatch.setattr(progress_io, "_PROGRESS_PENDING_CHECKPOINT_FAILURE", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_FATAL_ERROR", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_COALESCED", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_COALESCE_STARTED_AT", None)
+    monkeypatch.setattr(progress_io, "_PROGRESS_LAST_COMMITTED_OCCURRED_AT", 0.0)
+    monkeypatch.setattr(progress_io, "_persist_supervisor_snapshot", lambda fields, *, stage: None)
+    monkeypatch.setattr(
+        progress_io, "_upload_record", lambda record, *, required: uploaded.append(record) or True
+    )
+    progress_io._PROGRESS_QUEUE.clear()
+    monkeypatch.setattr(result_io.time, "time", lambda: 120.0)
+    monkeypatch.setattr(result_io, "_source_attestation", lambda: ATTESTATION)
+    monkeypatch.setattr(
+        result_io, "_write_immutable", lambda _payload: str(tmp_path / "result.json")
+    )
+    monkeypatch.setattr(result_io, "_publish_exactly_once", lambda manifest, _path: manifest)
+
+    # step 1 opens the coalescing window; steps 2 and 3 coalesce behind the cadence.
+    for step in (1, 2, 3):
+        progress_io.publish_progress("rl_step", step=step, reward=0.1 * step)
+    assert progress_io._PROGRESS_COALESCED is not None, "step 3 must still be pending"
+    assert uploaded == [], "the coalescing window must hold every step back"
+
+    published = result_io.publish_result(
+        outcome="succeeded",
+        failure_class=None,
+        started_at=100.0,
+        training_entered=True,
+        completed_steps=3,
+        metrics={"step": 3},
+        artifacts={"adapter": "published"},
+    )
+
+    assert uploaded, "the manifest was published while a completed step was still coalesced"
+    assert uploaded[-1].completed_steps == published.completed_steps == 3
+
+
 def test_cancelled_result_uses_latest_current_fence_progress(monkeypatch) -> None:
     _set_identity(monkeypatch)
     captured = []
