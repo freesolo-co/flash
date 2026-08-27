@@ -23,6 +23,18 @@ from flash.providers.core.sharding import combined_vram_gb
 logger = get_logger(__name__)
 
 
+def _carries_any_entry(catalog: object) -> bool:
+    """Whether the catalog is shaped like Lambda's own ``/instance-types`` map.
+
+    ``/instance-types`` lists every type Lambda sells regardless of stock -- availability is the
+    per-entry ``regions_with_capacity_available`` field, not omission -- so an empty or entry-less
+    response is a broken feed rather than an empty product line. This is what makes a MISSING key
+    trustworthy evidence that a shape is not sold: absence only means something once the catalog
+    around it is known to be a catalog.
+    """
+    return isinstance(catalog, dict) and any(isinstance(entry, dict) for entry in catalog.values())
+
+
 def _sku_holds_run(catalog: dict, sku: str, constraints: AllocationConstraints) -> bool:
     """Whether one catalog SKU's fixed disk can hold the run.
 
@@ -158,8 +170,13 @@ class LambdaProvider(InstanceProvider):
 
         A malformed catalog field is contained to the SKU carrying it, exactly as a malformed Vast
         row is dropped from the offer search: one bad field must not delete every valid sibling
-        shape and take the whole provider out of the allocation. A catalog where NO probed SKU
-        decodes is not a bad field, it is a broken feed, and still fails the lookup.
+        shape and take the whole provider out of the allocation. A catalog carrying no entry at
+        all, or one where no PRESENT probed SKU decodes, is not a bad field but a broken feed, and
+        still fails the lookup retryably.
+
+        A shape simply absent from a well-formed catalog is the opposite: a complete answer that
+        Lambda does not sell it, which no retry can change. It is therefore excluded from the
+        broken-feed evidence entirely and left to fall through to ``UnsupportedGpuError``.
         """
         from flash.providers.lambda_.client import api as lambda_api
         from flash.providers.lambda_.client.gpus import instance_type_for
@@ -186,16 +203,14 @@ class LambdaProvider(InstanceProvider):
                         and combined_vram_gb(g.vram_gb, count) < constraints.required_vram_gb
                     ):
                         continue
-                    probed += 1
                     try:
                         sku = instance_type_for(g.name, count, catalog)
                         if sku not in catalog:
-                            # Lambda does not sell this shape. No catalog FIELD was read, so this is
-                            # not evidence the feed decodes -- counting it would let a wholly
-                            # malformed catalog clear the broken-feed gate on shapes it never
-                            # carried, and die as a terminal config miss instead of a retryable
-                            # lookup failure.
+                            # Lambda does not sell this shape. A missing key is a COMPLETE answer
+                            # that needed no decoding, so it is evidence of neither health nor
+                            # breakage and belongs in neither counter.
                             continue
+                        probed += 1
                         if not _sku_holds_run(catalog, sku, constraints):
                             decoded += 1
                             continue
@@ -209,7 +224,7 @@ class LambdaProvider(InstanceProvider):
                         out.append(
                             Candidate("lambda", g.name, live[0].price_usd_hr, g.vram_gb, count)
                         )
-            if probed and not decoded:
+            if not _carries_any_entry(catalog) or (probed and not decoded):
                 raise MalformedProviderFieldError(
                     "lambda", "instance-types", "at least one well-formed sku"
                 )

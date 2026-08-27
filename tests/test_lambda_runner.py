@@ -1514,6 +1514,61 @@ def test_broken_feed_beats_unsupported_gpu_when_a_fit_floor_is_set(monkeypatch):
         )
 
 
+def test_absent_shape_in_a_healthy_catalog_does_not_trip_the_broken_feed_gate(monkeypatch):
+    """A shape missing from a well-formed catalog is a complete answer, not missing evidence.
+
+    The broken-feed gate used to be fed by a sample that structurally EXCLUDED absent shapes: an
+    absent sku was probed but never counted as decoded, so a catalog that decodes perfectly and
+    simply does not sell the requested count left ``decoded == 0`` and raised a retryable
+    ``CapacityLookupError``. The allocator then retried forever for a shape Lambda does not sell.
+    """
+    from flash.providers.core.base import AllocationConstraints, UnsupportedGpuError
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.execution.provider import PROVIDER
+
+    # a healthy catalog for a DIFFERENT class: nothing the A10 walk probes is present in it, so
+    # every probed sku is absent and the gate has no decode evidence from the probed sample at all.
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instance_types",
+        lambda *a, **k: {
+            "gpu_1x_h100_pcie": {
+                "instance_type": {
+                    "gpu_description": "H100 (80 GB)",
+                    "specs": {"storage_gib": 1024},
+                },
+                "regions_with_capacity_available": [],
+            }
+        },
+    )
+
+    with pytest.raises(UnsupportedGpuError, match=r"does not offer a rentable"):
+        PROVIDER.live_candidates(
+            24,
+            AllocationConstraints(gpu_type="A10", required_vram_gb=24, max_gpu_count=8),
+        )
+
+
+def test_an_entryless_catalog_is_a_broken_feed_not_an_empty_product_line(monkeypatch):
+    """Absence only means "not sold" once the catalog around it is known to be a catalog.
+
+    ``/instance-types`` lists every type Lambda sells regardless of stock, so a response carrying no
+    decodable entry is a broken feed. Reading a missing key as a complete "Lambda does not sell
+    this" would turn that outage into a TERMINAL ``UnsupportedGpuError`` the allocator will not
+    degrade past -- the run dies on a config miss it does not have instead of reaching another
+    provider.
+    """
+    from flash.providers.core.base import AllocationConstraints, CapacityLookupError
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.execution.provider import PROVIDER
+
+    constraints = AllocationConstraints(gpu_type="A10", required_vram_gb=24, max_gpu_count=8)
+    for catalog in ({}, {"gpu_1x_a10": "not-an-instance-type-object"}):
+        monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, _c=catalog, **k: _c)
+        with pytest.raises(CapacityLookupError):
+            PROVIDER.live_candidates(24, constraints)
+
+
 def test_launch_never_rents_an_undersized_sku_from_a_mixed_candidate_list(monkeypatch):
     """A capable SKU elsewhere in the list must not license renting an undersized one.
 
