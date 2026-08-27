@@ -633,12 +633,19 @@ class _StoppedUploader:
 
 
 class _FakeProc:
-    def __init__(self, lines, rc=0, timeout_once=False):
+    # the worker is launched as its own process-group leader, so a fake needs a pid to be
+    # addressable as a group. a real one is never signalled: the group teardown is stubbed out in
+    # the tests that reach it.
+    def __init__(self, lines, rc=0, timeout_once=False, pid=4242):
         self.stdout = iter(lines)
         self.returncode = rc
+        self.pid = pid
         self._timeout_once = timeout_once
         self._waits = 0
         self.killed = False
+
+    def poll(self):
+        return self.returncode
 
     def wait(self, timeout=None):
         self._waits += 1
@@ -651,11 +658,15 @@ class _FakeProc:
 
 
 class _RaisingWaitProc:
-    def __init__(self, error):
+    def __init__(self, error, pid=4243):
         self.args = ["worker"]
         self.stdout = iter(())
         self.returncode = None
+        self.pid = pid
         self.error = error
+
+    def poll(self):
+        return self.returncode
 
     def wait(self, timeout=None):
         raise self.error
@@ -1439,8 +1450,12 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
             self.args = ["worker"]
             self.stdout = iter(())
             self.returncode = None
+            self.pid = 4244
             self.wait_timeouts = []
             self.killed_at = None
+
+        def poll(self):
+            return self.returncode
 
         def wait(self, timeout=None):
             self.wait_timeouts.append(timeout)
@@ -1514,6 +1529,13 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
     monkeypatch.setattr(b, "fetch_code", lambda _payload: None)
     monkeypatch.setattr(b, "build_worker_env", lambda _payload: {})
     monkeypatch.setattr(b.subprocess, "Popen", lambda *_args, **_kwargs: worker)
+    # route the group teardown at the fake rather than a real killpg on its invented pid: the
+    # timing of the kill is what this measures, not the signalling mechanics.
+    monkeypatch.setattr(
+        b._bootstrap_processes,
+        "terminate_process_group",
+        lambda process, **_kwargs: process.kill(),
+    )
     monkeypatch.setattr(
         b,
         "_start_console_uploader",
@@ -1734,12 +1756,20 @@ def test_unreapable_uploader_with_interrupt_exits_before_marker(
     assert all(event[0] != "marker" for event in events)
 
 
-def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
+def test_run_mode_timeout_tears_down_the_whole_worker_group_and_raises(monkeypatch):
     _disable_periodic_console_upload(monkeypatch)
     monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *_args: True)
     monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
     proc = _FakeProc(["partial\n"], rc=0, timeout_once=True)
     monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
+    # never let a fake pid reach a real killpg; record the call instead.
+    torn_down = {}
+
+    def _terminate(process, *, process_group_id, **_kwargs):
+        torn_down["process"] = process
+        torn_down["group"] = process_group_id
+
+    monkeypatch.setattr(b._bootstrap_processes, "terminate_process_group", _terminate)
 
     payload = {
         "hf_repo": "o/r",
@@ -1751,7 +1781,44 @@ def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
     }
     with pytest.raises(TimeoutError, match="wall-clock cap"):
         b.run_mode(payload, {}, "grpo", deadline_ts=b.time.time() + 100)
-    assert proc.killed is True  # the child was killed on the deadline
+    # the whole group is torn down on the deadline, not just the leader pid: the worker's
+    # torchrun/vllm children hold the gpu and outlive a bare proc.kill().
+    assert torn_down["process"] is proc
+    assert torn_down["group"] == proc.pid
+
+
+def test_run_mode_timeout_reports_a_worker_group_that_survived_teardown(monkeypatch):
+    """A stranded gpu must not be filed as an ordinary capped run."""
+    _disable_periodic_console_upload(monkeypatch)
+    uploaded = {}
+
+    def _upload(_payload, _console, _mode, extra, *_args):
+        uploaded["extra"] = extra
+        return True
+
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", _upload)
+    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
+    proc = _FakeProc(["partial\n"], rc=0, timeout_once=True)
+    monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
+
+    def _terminate(_process, *, process_group_id, **_kwargs):
+        raise RuntimeError(f"process group {process_group_id} survived term and kill supervision")
+
+    monkeypatch.setattr(b._bootstrap_processes, "terminate_process_group", _terminate)
+
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+    }
+    with pytest.raises(TimeoutError, match="survived term and kill supervision"):
+        b.run_mode(payload, {}, "grpo", deadline_ts=b.time.time() + 100)
+    # the console tail still uploads and carries the survivor, rather than being skipped by the
+    # raise: without it there is no record of why the box is still occupied.
+    assert "survived term and kill supervision" in uploaded["extra"]
 
 
 def test_run_mode_starts_no_subprocess_at_deadline(monkeypatch):
