@@ -34,6 +34,7 @@ from flash.serving.src.accounting.usage_outbox import (
     UsageEvent,
     UsageOutboxError,
 )
+from flash.serving.src.engine.model_config import base_models
 from flash.serving.src.http.inference_routes import _discard_prepared_stream
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
@@ -184,41 +185,30 @@ class _Store(OfflineUsageStore):
 
 
 def test_freesolo_prices_match_committed_catalog_fixed_point_contract() -> None:
+    # The charged per-token rate is the launch per-Mtok price divided by 1e6 with NO markup applied,
+    # so each value below is exactly its published rate shifted six places. Retired models are absent:
+    # the table is exactly the active hosted set.
     expected = {
-        "Qwen/Qwen3.5-0.8B": {
-            "prompt_token_usd": "0.000000012",
-            "cached_prompt_token_usd": "0.0000000024",
-            "completion_token_usd": "0.00000006",
-        },
-        "Qwen/Qwen3.5-2B": {
-            "prompt_token_usd": "0.000000024",
-            "cached_prompt_token_usd": "0.0000000048",
-            "completion_token_usd": "0.00000012",
-        },
-        "Qwen/Qwen3.5-4B": {
-            "prompt_token_usd": "0.000000036",
-            "cached_prompt_token_usd": "0.0000000072",
-            "completion_token_usd": "0.00000018",
-        },
         "Qwen/Qwen3.5-9B": {
-            "prompt_token_usd": "0.0000001368",
+            "prompt_token_usd": "0.000000095",
             "cached_prompt_token_usd": "0.0000000276",
-            "completion_token_usd": "0.000000228",
+            "completion_token_usd": "0.0000001425",
         },
-        "Qwen/Qwen3.6-27B": {
-            "prompt_token_usd": "0.00000051048",
-            "cached_prompt_token_usd": "0.000000168",
-            "completion_token_usd": "0.000003666",
+        "Qwen/Qwen3.8-27B": {
+            "prompt_token_usd": "0.0000003325",
+            "cached_prompt_token_usd": "0.00000003325",
+            "completion_token_usd": "0.0000024225",
         },
         "Qwen/Qwen3.6-35B-A3B": {
-            "prompt_token_usd": "0.0000002376",
-            "cached_prompt_token_usd": "0.0000000792",
-            "completion_token_usd": "0.000001518",
+            "prompt_token_usd": "0.000000095",
+            "cached_prompt_token_usd": "0.0000000475",
+            "completion_token_usd": "0.0000009025",
         },
     }
     decimal_string = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")
 
     assert set(_FREESOLO_USD_PER_MTOK) == set(expected)
+    assert set(_FREESOLO_USD_PER_MTOK) == set(base_models())
     for model, snapshot in expected.items():
         actual = freesolo_price(model).snapshot
         assert actual == snapshot
