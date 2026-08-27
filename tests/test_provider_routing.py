@@ -10,6 +10,7 @@ import pytest
 
 import flash.providers._lifecycle.net.worker as provider_worker
 import flash.runner.accounting.artifacts as runner_artifacts
+import flash.runner.lifecycle.attempts as runner_attempts
 import flash.runner.lifecycle.deadlines as runner_deadlines
 import flash.runner.lifecycle.preparation as runner_preparation
 import flash.runner.lifecycle.state as runner_state
@@ -38,6 +39,10 @@ def _source_snapshot_boundary(monkeypatch):
     monkeypatch.setattr(
         provider_worker, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT
     )
+    # this suite drives provider selection and retry bookkeeping, not attempt-artifact transport.
+    # the fenced result observation is a separate boundary with its own coverage, so it reads as
+    # "no prior result" here instead of reaching hugging face for every seeded retry.
+    monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         runner_status,
         "validate_terminal_source_metrics",
@@ -566,13 +571,18 @@ def test_concurrent_supervisors_keep_only_the_current_fenced_provider(orch, monk
     assert isinstance(results["first"], _TerminalHandleRace)
     assert results["second"]["train_tokens"] == 4096
     assert provider_gpus == ["RTX 4090", "RTX 5090"]
-    assert cancelled == [("ep-first", "job-first")]
+    # the loser is cancelled by the fence race; the winner is cancelled by terminal settlement
+    # after its success is recorded, which is the same teardown that already deleted ep-second.
+    assert cancelled == [("ep-first", "job-first"), ("ep-second", "job-second")]
     assert deleted == ["ep-first", "ep-second"]
 
     status = runner_status.get_status(spec.run_id)
     worker_spec = status.effective_preparation["worker_spec"]
     assert worker_spec["gpu"]["type"] == "RTX 5090"
-    assert status.remote["endpoint_id"] == "ep-second"
+    # terminal settlement confirmed the winner's teardown, so the active handle is cleared and
+    # its exact identity is retained for cost attribution instead.
+    assert status.remote is None
+    assert status.realized_cost_remote["endpoint_id"] == "ep-second"
 
 
 @pytest.mark.parametrize(
@@ -1225,8 +1235,6 @@ def test_the_allocated_card_count_reaches_the_metrics_the_cost_is_read_from(orch
 def test_infra_retry_walks_to_next_runpod_class_and_deletes_endpoint(orch, monkeypatch):
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, PollResult
-
-    monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import job_execution as rp_jobs
 
@@ -1368,10 +1376,16 @@ def test_new_provider_handle_replaces_retained_accounting_identity(orch):
     status.realized_cost_remote = prior
     runner_state._save_status(status)
     ctx = _build_context(spec, spec.seed, io.StringIO(), None, _SOURCE_SNAPSHOT, 1)
-    ctx.current_attempt = 1
+    # attempt and fence are reserved together before any provider create, so reserve through the
+    # real path rather than advancing one of them by hand.
+    record = runner_attempts._reserve_attempt_record(spec.run_id, minimum_attempt=1)
+    ctx.current_attempt = record.attempt_id
+    ctx.current_fence = record.fence
     ctx.current_gpu = {"provider": "runpod", "name": "H100", "count": 2}
 
-    ctx.on_handle(_runpod_handle("ep-current", "job-current", attempt=1))
+    ctx.on_handle(
+        _runpod_handle("ep-current", "job-current", attempt=record.attempt_id, fence=record.fence)
+    )
 
     persisted = runner_status.get_status(spec.run_id)
     assert persisted.remote["endpoint_id"] == "ep-current"
@@ -1724,7 +1738,6 @@ def test_runpod_no_capacity_retry_escapes_to_other_provider(orch, monkeypatch):
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import job_execution as rp_jobs
 
-    monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
     candidates = (
         Candidate("runpod", "H100", 0.49, 48),  # cheapest -> attempt 0
         Candidate("runpod", "RTX Pro 6000", 0.50, 96),  # next runpod class, the wrong retry target
@@ -1820,7 +1833,6 @@ def test_cache_fallback_does_not_consume_gpu_walk_retry(orch, monkeypatch):
     from flash.providers.runpod.execution import job_execution as rp_jobs
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
-    monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
     candidates = (
         Candidate(
             "runpod", "H100", 0.49, 48
@@ -1876,7 +1888,6 @@ def test_broken_gpu_preempt_retries_on_other_provider(orch, monkeypatch):
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import job_execution as rp_jobs
 
-    monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
     candidates = (
         Candidate("lambda", "A10", 0.40, 24),  # cheapest -> attempt 0 (lands on broken instance)
         Candidate("lambda", "H100", 0.45, 48),  # next class on the SAME (sick) provider
@@ -1935,7 +1946,6 @@ def test_explicit_provider_loss_escapes_to_other_provider(orch, monkeypatch):
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import job_execution as rp_jobs
 
-    monkeypatch.setattr(runner_lifecycle, "_attempt_result", lambda *_args, **_kwargs: None)
     candidates = (
         Candidate("lambda", "H100", 0.45, 48),  # cheapest -> attempt 0 (sick region)
         Candidate("runpod", "H100", 0.49, 48),  # the cross-provider escape
