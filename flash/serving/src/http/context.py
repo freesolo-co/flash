@@ -20,6 +20,7 @@ from flash.serving.src.http.headers import (
     assert_internal,
     internal_org_id,
     is_trusted_internal,
+    training_scope_headers,
 )
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
 from flash.serving.src.io.schemas import AdapterRecord
@@ -42,7 +43,10 @@ class ServingContext:
         serving_release: str,
         reload_records: Callable[[], list[AdapterRecord]] | None,
         lookup_record: Callable[[str, str], AdapterRecord | None] | None,
-        chat_authorizer: Callable[[str, str], Awaitable[str | AuthorizedTraffic | None]] | None,
+        chat_authorizer: Callable[
+            [str, str, dict[str, str]], Awaitable[str | AuthorizedTraffic | None]
+        ]
+        | None,
     ) -> None:
         self.pool = pool
         self.router = router
@@ -83,7 +87,7 @@ class ServingContext:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth is not configured"
             )
-        authorized = await self.chat_authorizer(token, adapter_id)
+        authorized = await self.chat_authorizer(token, adapter_id, training_scope_headers(request))
         if isinstance(authorized, AuthorizedTraffic):
             if authorized.principal.kind == "trusted_internal":
                 raise HTTPException(
