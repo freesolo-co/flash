@@ -264,7 +264,7 @@ def test_hosted_authorizer_uses_freesolo_model_id_schema(monkeypatch) -> None:
         def __init__(self, *_args, **_kwargs):
             pass
 
-        async def post(self, _url, *, json):
+        async def post(self, _url, *, json, headers=None):
             seen.update(json)
             return _Response()
 

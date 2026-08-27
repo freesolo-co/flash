@@ -556,6 +556,66 @@ _AUTH_CACHE_TTL_SECONDS = 60.0
 _AUTH_CACHE_MAX_ENTRIES = 4096
 
 
+def _authorize_response_org(resp: Any) -> "str | None":
+    """Translate the backend's authorize response into a billing org, or raise.
+
+    Extracted from _build_chat_authorizer only to keep that closure under the repo's
+    function-size limit; it reads nothing but the response, so hoisting it changes no
+    behaviour and makes each status mapping testable on its own.
+    """
+    from fastapi import HTTPException, status
+
+    if resp.status_code == 200:
+        # Return the authorized billing org so the router can meter a base-model serve to the
+        # caller (a base model has no adapter owner). A malformed response cannot authorize an
+        # external request because that would let base-model usage escape billing.
+        try:
+            org_id = resp.json().get("orgId")
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "serving auth backend returned malformed response",
+            ) from exc
+        if not isinstance(org_id, str) or not org_id:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "serving auth backend returned malformed response",
+            )
+        return org_id
+    if resp.status_code == 401:
+        # The backend returns 401 for BOTH an invalid *user* key (our authorize route, body
+        # code "invalid_api_key") AND a rejected serving *machine* bearer (require_internal_token,
+        # decided before the user key is even read). Only the former is the caller's fault; the
+        # latter is a serving misconfiguration we must not report as the user's bad key.
+        code = ""
+        try:
+            detail = resp.json().get("detail")
+            if isinstance(detail, dict):
+                code = detail.get("code") or ""
+        except Exception:  # a non-JSON 401 is an internal-auth failure (below)
+            code = ""
+        if code == "invalid_api_key":
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid Freesolo API key")
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth is misconfigured")
+    # Org has no budget to serve (zero balance and no card+auto-topup). The backend gates this
+    # before generation so a broke org can't serve for free; surface it as a clean 402 rather
+    # than letting it fall through to the retryable 503 below.
+    if resp.status_code == 402:
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            "insufficient balance: top up or enable auto-topup to serve this model",
+        )
+    # Unknown adapter (404) and org mismatch (403) both collapse to 403 so we don't leak
+    # which adapters exist to an unauthorized caller.
+    if resp.status_code in (403, 404):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "API key is not authorized for this adapter")
+    # Any backend 5xx (500/502/503/504) or other unexpected status is a transient auth-lookup
+    # infra failure (Supabase down, backend overloaded). Surface it as a RETRYABLE 503, never a
+    # 502: a client/load-balancer must be free to retry rather than treat it as a permanent
+    # upstream error. The cache+single-flight above is what makes this failure rare under load.
+    raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unavailable")
+
+
 def _build_chat_authorizer(settings: Any) -> Any:
     """Build the serving->backend chat authorizer, or None when not configured.
 
@@ -589,70 +649,30 @@ def _build_chat_authorizer(settings: Any) -> Any:
 
     # (api_key_sha256, adapter_id) -> (expires_at_monotonic, org_id); populated only on a successful
     # authorization. Per-router-container in-memory (each container reduces its own backend load).
-    _cache: dict[tuple[str, str], tuple[float, str | None]] = {}
+    _cache: dict[tuple[str, str, str], tuple[float, str | None]] = {}
     # In-flight single-flight tasks so concurrent identical misses share ONE backend call.
-    _inflight: dict[tuple[str, str], asyncio.Task[str | None]] = {}
+    _inflight: dict[tuple[str, str, str], asyncio.Task[str | None]] = {}
 
-    async def _authorize_backend(api_key: str, adapter_id: str) -> "str | None":
+    async def _authorize_backend(
+        api_key: str, adapter_id: str, scope: "dict[str, str]"
+    ) -> "str | None":
         try:
-            resp = await _client.post(url, json={"apiKey": api_key, "modelId": adapter_id})
+            resp = await _client.post(
+                url,
+                json={"apiKey": api_key, "modelId": adapter_id},
+                # A training container authenticates with the platform internal key rather
+                # than a customer key, so the backend cannot resolve it via
+                # authenticate_api_key. It identifies the calling job from these headers and
+                # re-checks them against the live job row. Dropping them here is
+                # indistinguishable, to the backend, from a request that never had them: it
+                # refuses with missing_training_context and catalog sampling fails closed.
+                headers=scope or None,
+            )
         except Exception as exc:  # backend unreachable -> fail closed, never serve unauthorized
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unreachable"
             ) from exc
-        if resp.status_code == 200:
-            # Return the authorized billing org so the router can meter a base-model serve to the
-            # caller (a base model has no adapter owner). A malformed response cannot authorize an
-            # external request because that would let base-model usage escape billing.
-            try:
-                org_id = resp.json().get("orgId")
-            except Exception as exc:
-                raise HTTPException(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "serving auth backend returned malformed response",
-                ) from exc
-            if not isinstance(org_id, str) or not org_id:
-                raise HTTPException(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "serving auth backend returned malformed response",
-                )
-            return org_id
-        if resp.status_code == 401:
-            # The backend returns 401 for BOTH an invalid *user* key (our authorize route, body
-            # code "invalid_api_key") AND a rejected serving *machine* bearer (require_internal_token,
-            # decided before the user key is even read). Only the former is the caller's fault; the
-            # latter is a serving misconfiguration we must not report as the user's bad key.
-            code = ""
-            try:
-                detail = resp.json().get("detail")
-                if isinstance(detail, dict):
-                    code = detail.get("code") or ""
-            except Exception:  # a non-JSON 401 is an internal-auth failure (below)
-                code = ""
-            if code == "invalid_api_key":
-                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid Freesolo API key")
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth is misconfigured"
-            )
-        # Org has no budget to serve (zero balance and no card+auto-topup). The backend gates this
-        # before generation so a broke org can't serve for free; surface it as a clean 402 rather
-        # than letting it fall through to the retryable 503 below.
-        if resp.status_code == 402:
-            raise HTTPException(
-                status.HTTP_402_PAYMENT_REQUIRED,
-                "insufficient balance: top up or enable auto-topup to serve this model",
-            )
-        # Unknown adapter (404) and org mismatch (403) both collapse to 403 so we don't leak
-        # which adapters exist to an unauthorized caller.
-        if resp.status_code in (403, 404):
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN, "API key is not authorized for this adapter"
-            )
-        # Any backend 5xx (500/502/503/504) or other unexpected status is a transient auth-lookup
-        # infra failure (Supabase down, backend overloaded). Surface it as a RETRYABLE 503, never a
-        # 502: a client/load-balancer must be free to retry rather than treat it as a permanent
-        # upstream error. The cache+single-flight above is what makes this failure rare under load.
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unavailable")
+        return _authorize_response_org(resp)
 
     def _prune(now: float) -> None:
         for expired in [k for k, (exp, _) in _cache.items() if exp <= now]:
@@ -663,10 +683,10 @@ def _build_chat_authorizer(settings: Any) -> Any:
                 _cache.pop(k, None)
 
     async def _authorize_and_cache(
-        ck: tuple[str, str], api_key: str, adapter_id: str
+        ck: tuple[str, str, str], api_key: str, adapter_id: str, scope: "dict[str, str]"
     ) -> "str | None":
         try:
-            org = await _authorize_backend(api_key, adapter_id)
+            org = await _authorize_backend(api_key, adapter_id, scope)
         finally:
             # Drop the single-flight slot regardless of outcome so a failed lookup re-checks next
             # time (failures are never cached) and a success can be re-driven once the cache expires.
@@ -677,9 +697,19 @@ def _build_chat_authorizer(settings: Any) -> Any:
         _prune(now)
         return org
 
-    async def authorize(api_key: str, adapter_id: str) -> "str | None":
+    async def authorize(
+        api_key: str, adapter_id: str, scope: "dict[str, str] | None" = None
+    ) -> "str | None":
         # do not retain raw user credentials as live dict keys beyond the request that supplied them.
-        ck = (hashlib.sha256(api_key.encode("utf-8")).hexdigest(), adapter_id)
+        scope = scope or {}
+        # The scope is part of the key, not just the payload. Every training container presents
+        # the SAME platform internal key, so keying on (key, model) alone would let one job's
+        # cached authorization answer another job's request -- and the cached value is the
+        # billing org, so the second job's usage would be metered to the first job's tenant.
+        scope_digest = hashlib.sha256(
+            "\x00".join(f"{k}={scope[k]}" for k in sorted(scope)).encode("utf-8")
+        ).hexdigest()
+        ck = (hashlib.sha256(api_key.encode("utf-8")).hexdigest(), adapter_id, scope_digest)
         cached = _cache.get(ck)
         now = time.monotonic()
         if cached is not None:
@@ -688,7 +718,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
             _cache.pop(ck, None)
         task = _inflight.get(ck)
         if task is None:
-            task = asyncio.ensure_future(_authorize_and_cache(ck, api_key, adapter_id))
+            task = asyncio.ensure_future(_authorize_and_cache(ck, api_key, adapter_id, scope))
             # Retrieve the task's outcome even if every awaiter is cancelled (all identical clients
             # disconnect), so an orphaned single-flight failure doesn't warn "exception never retrieved".
             task.add_done_callback(lambda t: t.cancelled() or t.exception())

@@ -86,7 +86,7 @@ class FakeAuthorizer:
         self.calls = []
         self._org = org
 
-    async def __call__(self, token, adapter_id):
+    async def __call__(self, token, adapter_id, scope=None):
         self.calls.append((token, adapter_id))
         return self._org
 
