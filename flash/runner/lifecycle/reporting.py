@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from flash.runner.lifecycle.state import RunStatus
@@ -23,6 +23,14 @@ _STATUS_REPORT_ACCEPTING = True
 _STATUS_REPORT_LAST_SENT: dict[str, int] = {}
 _STATUS_REPORT_LAST_ATTEMPTED: dict[str, int] = {}
 _STATUS_REPORT_LAST_QUEUED: dict[str, int] = {}
+# runs whose queue, worker, and active marks have all cleared, newest last. every other per-run
+# structure self-cleans on drain, but the three sequence dicts above have no eviction at all, so a
+# long-lived server accumulates three entries for every run it has ever reported. they cannot simply
+# be dropped on drain: a run that re-reports the same sequence (a replay, or a retry after a failed
+# send) relies on them to suppress the duplicate delivery. so retire drained runs into a bounded
+# ring instead, and only forget the oldest once the ring is full.
+_STATUS_REPORT_RETIRED: OrderedDict[str, None] = OrderedDict()
+_MAX_RETIRED_STATUS_REPORT_RUNS = 512
 
 
 def _send_status_report(status: RunStatus) -> bool:
@@ -67,6 +75,17 @@ def _deliver_status_report(status: RunStatus, sequence: int, attempt_budget: int
     return False
 
 
+def _retire_status_report_run_unlocked(run_id: str) -> None:
+    """Mark a fully drained run retired, forgetting the oldest retirees once the ring is full."""
+    _STATUS_REPORT_RETIRED.pop(run_id, None)
+    _STATUS_REPORT_RETIRED[run_id] = None
+    while len(_STATUS_REPORT_RETIRED) > _MAX_RETIRED_STATUS_REPORT_RUNS:
+        evicted, _ = _STATUS_REPORT_RETIRED.popitem(last=False)
+        _STATUS_REPORT_LAST_SENT.pop(evicted, None)
+        _STATUS_REPORT_LAST_ATTEMPTED.pop(evicted, None)
+        _STATUS_REPORT_LAST_QUEUED.pop(evicted, None)
+
+
 def _finish_status_report(done: threading.Event) -> None:
     global _STATUS_REPORT_PENDING
     with _STATUS_REPORT_CONDITION:
@@ -87,6 +106,7 @@ def _drain_status_report_run(run_id: str) -> None:
                 _STATUS_REPORT_QUEUES.pop(run_id, None)
                 _STATUS_REPORT_ACTIVE.discard(run_id)
                 _STATUS_REPORT_DRAINING.discard(run_id)
+                _retire_status_report_run_unlocked(run_id)
                 _STATUS_REPORT_CONDITION.notify_all()
                 return
             status, sequence, done, attempt_budget = queue.popleft()
@@ -204,6 +224,8 @@ def _queue_status_report(status: RunStatus, *, wait: bool) -> None:
         if sequence <= _STATUS_REPORT_LAST_QUEUED.get(run_id, 0):
             return
         _STATUS_REPORT_LAST_QUEUED[run_id] = sequence
+        # in flight again, so it is no longer a retirement candidate
+        _STATUS_REPORT_RETIRED.pop(run_id, None)
         _STATUS_REPORT_QUEUES.setdefault(run_id, deque()).append(
             (snapshot, sequence, done, attempt_budget)
         )
