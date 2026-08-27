@@ -30,7 +30,7 @@ from flash.serving.src.io.structured_outputs import StructuredOutputsError
 QWEN = "Qwen/Qwen3.5-9B"
 
 
-async def _allow(_token: str, _adapter_id: str) -> str:
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
     return "org-1"
 
 
