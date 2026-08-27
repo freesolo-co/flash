@@ -543,10 +543,18 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
             enforce_state=True,
         )
         subfolder = f"{prefix}/adapter"
+        # the artifact repo is a mutable dataset branch. resolving one commit here and exporting
+        # that exact revision keeps a concurrent checkpoint upload from swapping the weights out
+        # from under this export.
+        try:
+            source_revision = _app.resolve_artifact_revision(effective_spec.train.hf_repo)
+        except ServingError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         try:
             url = _app.export_adapter(
                 source_repo=effective_spec.train.hf_repo,
                 source_subfolder=subfolder,
+                source_revision=source_revision,
                 dest_repo=repository,
                 dest_token=hf_token,
                 private=private,

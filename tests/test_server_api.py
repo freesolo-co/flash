@@ -7992,6 +7992,21 @@ def _finished_run(api, key) -> str:
     return run_id
 
 
+_STUB_ARTIFACT_SHA = "b" * 40
+
+
+def _stub_artifact_revision(monkeypatch, sha: str = _STUB_ARTIFACT_SHA) -> str:
+    """Stand in for the Hub round-trip that pins the artifact repo to one exact commit.
+
+    The export route resolves the mutable dataset branch to a commit before reading it, so without
+    this stub every export test would reach the network and fail as an unresolvable checkpoint.
+    """
+    import flash.server.asgi.app as app_mod
+
+    monkeypatch.setattr(app_mod, "resolve_artifact_revision", lambda _repo: sha)
+    return sha
+
+
 def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     """A finished run's final adapter is read privately and exported with a public source ref."""
     import flash.server.asgi.app as app_mod
@@ -8011,6 +8026,7 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
         seen.update(kwargs)
         return "https://huggingface.co/me/adapters"
 
+    _stub_artifact_revision(monkeypatch)
     monkeypatch.setattr(app_mod, "export_adapter", capture)
 
     resp = api.post(
@@ -8074,6 +8090,7 @@ def test_export_sends_the_runner_assigned_revision_not_the_public_blank(api, mon
     runner_state._save_status(status)
 
     seen: dict = {}
+    _stub_artifact_revision(monkeypatch)
     monkeypatch.setattr(
         app_mod,
         "export_adapter",
@@ -8132,6 +8149,7 @@ def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
 
     monkeypatch.setattr(serving_routes, "_validate_hf_repo_id", checking_validate)
     monkeypatch.setattr(serving_routes, "owned_run", checking_owned_run)
+    _stub_artifact_revision(monkeypatch)
     monkeypatch.setattr(app_mod, "export_adapter", lambda **kw: "https://huggingface.co/me/a")
 
     resp = api.post(
@@ -8150,6 +8168,7 @@ def test_export_public_flag_sets_private_false(api, monkeypatch):
     key = _login()
     run_id = _finished_run(api, key)
     seen: dict = {}
+    _stub_artifact_revision(monkeypatch)
     monkeypatch.setattr(
         app_mod,
         "export_adapter",
@@ -8235,6 +8254,7 @@ def test_export_unfinished_run_is_409(api, monkeypatch):
     def must_not_run(**kw):
         raise AssertionError("export_adapter must not run for an unfinished run")
 
+    _stub_artifact_revision(monkeypatch)
     monkeypatch.setattr(app_mod, "export_adapter", must_not_run)
     resp = api.post(
         f"/v1/runs/{run_id}/export",
@@ -8253,6 +8273,7 @@ def test_export_missing_artifacts_is_404(api, monkeypatch):
     def boom(**kw):
         raise ValueError("no adapter artifacts found at org/test-runs:... (nothing to export)")
 
+    _stub_artifact_revision(monkeypatch)
     monkeypatch.setattr(app_mod, "export_adapter", boom)
     resp = api.post(
         f"/v1/runs/{run_id}/export",
@@ -8275,6 +8296,7 @@ def test_export_hf_failure_is_clean_502(api, monkeypatch):
     def boom(**kw):
         raise ServingError("could not upload adapter to me/a: 403 Forbidden")
 
+    _stub_artifact_revision(monkeypatch)
     monkeypatch.setattr(app_mod, "export_adapter", boom)
     resp = api.post(
         f"/v1/runs/{run_id}/export",
@@ -8283,6 +8305,63 @@ def test_export_hf_failure_is_clean_502(api, monkeypatch):
     )
     assert resp.status_code == 502, resp.text
     assert "could not upload" in resp.json()["detail"]
+
+
+def test_export_pins_the_resolved_artifact_commit(api, monkeypatch):
+    """The route resolves one commit and hands THAT to the export, not a branch name.
+
+    The per-run artifact repo is a mutable dataset branch the training run keeps appending to. If
+    the export read its tip, a checkpoint upload landing mid-export would silently substitute
+    different weights while the response still reported the requested checkpoint.
+    """
+    import flash.server.asgi.app as app_mod
+
+    key = _login()
+    run_id = _finished_run(api, key)
+    sha = _stub_artifact_revision(monkeypatch, "c" * 40)
+
+    seen: dict = {}
+    monkeypatch.setattr(
+        app_mod,
+        "export_adapter",
+        lambda **kw: (seen.update(kw), "https://huggingface.co/me/a")[1],
+    )
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf", "checkpoint_id": f"{run_id}/final"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["source_revision"] == sha
+
+
+def test_export_unresolvable_artifact_commit_is_502(api, monkeypatch):
+    """A Hub round-trip that cannot pin a commit is an upstream failure, not a client error.
+
+    Falling through to an unpinned read would be the exact defect the pin exists to prevent, so the
+    export must not run at all when the commit is unknown.
+    """
+    import flash.server.asgi.app as app_mod
+    from flash.serve.contract.errors import ServingError
+
+    key = _login()
+    run_id = _finished_run(api, key)
+
+    def unresolvable(_repo):
+        raise ServingError("could not resolve full Hub commit SHA for org/test-runs")
+
+    def must_not_run(**kw):  # pragma: no cover - reaching this IS the failure
+        raise AssertionError("export_adapter must not run without a pinned commit")
+
+    monkeypatch.setattr(app_mod, "resolve_artifact_revision", unresolvable)
+    monkeypatch.setattr(app_mod, "export_adapter", must_not_run)
+    resp = api.post(
+        f"/v1/runs/{run_id}/export",
+        json={"repository": "me/a", "hf_token": "hf", "checkpoint_id": f"{run_id}/final"},
+        headers=_bearer(key),
+    )
+    assert resp.status_code == 502, resp.text
+    assert "could not resolve" in resp.json()["detail"]
 
 
 def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
@@ -8305,6 +8384,7 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
         ],
     )
     seen: dict = {}
+    _stub_artifact_revision(monkeypatch)
     monkeypatch.setattr(
         app_mod,
         "export_adapter",
@@ -8342,6 +8422,7 @@ def test_export_reports_product_analytics_event(api, monkeypatch):
 
     key = _login()
     run_id = _finished_run(api, key)
+    _stub_artifact_revision(monkeypatch)
     monkeypatch.setattr(
         app_mod, "export_adapter", lambda **kw: "https://huggingface.co/me/adapters"
     )
@@ -8376,6 +8457,7 @@ def test_export_succeeds_even_when_analytics_report_raises(api, monkeypatch):
 
     key = _login()
     run_id = _finished_run(api, key)
+    _stub_artifact_revision(monkeypatch)
     monkeypatch.setattr(
         app_mod, "export_adapter", lambda **kw: "https://huggingface.co/me/adapters"
     )

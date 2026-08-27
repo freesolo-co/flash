@@ -31,6 +31,7 @@ from flash.adapters.lora_rank import (
     lora_tensor_rank_disagrees,
     strict_declared_lora_ranks,
 )
+from flash.envs.meta.identity import is_commit_sha
 from flash.serve.contract.errors import ServingError
 
 logger = get_logger(__name__)
@@ -509,6 +510,7 @@ def export_adapter(
     *,
     source_repo: str,
     source_subfolder: str,
+    source_revision: str,
     dest_repo: str,
     dest_token: str,
     base_model: str,
@@ -516,10 +518,18 @@ def export_adapter(
     source_token: str | None = None,
     private: bool = True,
 ) -> str:
-    """Copy adapter ``source_repo:{source_subfolder}`` into ``dest_repo`` and return its URL."""
+    """Copy one immutable source adapter into ``dest_repo`` and return its URL."""
     if not isinstance(base_model, str) or not base_model.strip():
         raise RuntimeError("base_model is required to export adapter metadata")
     base_model = base_model.strip()
+    # the source repo is a mutable dataset branch, so reading its tip would export whatever a
+    # later training step happened to push. the caller resolves one exact commit instead.
+    if not isinstance(source_revision, str) or not is_commit_sha(source_revision):
+        raise RuntimeError(
+            "source_revision must be an exact 40-character Hub commit SHA to export an "
+            f"immutable adapter, got {source_revision!r}"
+        )
+    source_revision = source_revision.lower()
     HfApi, snapshot_download = _hf_api()
     read_token = source_token or os.environ.get("HF_TOKEN")
     if not read_token:
@@ -532,6 +542,7 @@ def export_adapter(
             snapshot_download(
                 repo_id=source_repo,
                 repo_type="dataset",
+                revision=source_revision,
                 allow_patterns=[f"{source_subfolder}/*"],
                 local_dir=tmp,
                 token=read_token,
@@ -540,7 +551,8 @@ def export_adapter(
             if isinstance(exc, OSError) and not isinstance(exc, _hub_error_types()):
                 raise
             raise ServingError(
-                f"could not download adapter {source_repo}:{source_subfolder}: {exc}"
+                f"could not download adapter {source_repo}@{source_revision}:"
+                f"{source_subfolder}: {exc}"
             ) from exc
         adapter_dir = Path(tmp) / source_subfolder
         files = (
@@ -568,7 +580,7 @@ def export_adapter(
                 repo_id=dest_repo,
                 repo_type="model",
                 folder_path=str(adapter_dir),
-                commit_message=f"Export Freesolo adapter ({source_subfolder})",
+                commit_message=f"Export Freesolo adapter ({source_subfolder}@{source_revision})",
                 delete_patterns=_STALE_ADAPTER_DELETE_PATTERNS,
                 parent_commit=parent_commit,
             )
@@ -579,8 +591,9 @@ def export_adapter(
                 raise
             raise ServingError(f"could not upload adapter to {dest_repo}: {exc}") from exc
     logger.info(
-        "exported %s:%s -> %s (%d files, %s key namespace)",
+        "exported %s@%s:%s -> %s (%d files, %s key namespace)",
         source_repo,
+        source_revision,
         source_subfolder,
         dest_repo,
         len(files),
