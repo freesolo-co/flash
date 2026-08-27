@@ -236,6 +236,8 @@ def list_endpoints_by_key(
 
 def delete_endpoint_for_key(endpoint_id: str, key: str) -> bool:
     """Delete using a specific pool key (no failover waterfall — avoids masking failures)."""
+    if not isinstance(endpoint_id, str) or not endpoint_id.strip():
+        raise RunpodApiError("runpod endpoint teardown identity is invalid")
     try:
         _CLIENT.request_with_retries_for_key(
             key, f"{REST_BASE}/endpoints/{endpoint_id}", method="DELETE", retries=2
@@ -266,6 +268,8 @@ def delete_endpoint_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:
 
 def endpoint_absent_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:
     """Confirm absence only from an exact owner-authenticated endpoint lookup returning 404."""
+    if not isinstance(endpoint_id, str) or not endpoint_id.strip():
+        raise RunpodApiError("runpod endpoint lookup identity is invalid")
     key = _key_for_fingerprint(fingerprint)
     try:
         _CLIENT.request_with_retries_for_key(
@@ -384,7 +388,7 @@ def submit_job(
         deadline_at=deadline_at,
     )
     job_id = out.get("id") if isinstance(out, dict) else None
-    if not isinstance(job_id, str) or not job_id:
+    if not isinstance(job_id, str) or not job_id.strip():
         raise RunpodApiError("submit_job: response did not contain a valid job id")
     return job_id
 

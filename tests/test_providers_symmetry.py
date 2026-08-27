@@ -35,7 +35,6 @@ PROVIDER_METHODS = (
     "cancel",
     "destroy",
     "gc",
-    "sweep_orphans",
 )
 
 
@@ -184,27 +183,31 @@ def test_gpu_classes_match_runpod_rows():
     assert rp == {g.name for g in GPU_INFO.values() if g.enum_member}
 
 
-def test_sweep_orphans_is_part_of_the_protocol():
+def test_every_provider_declares_immutable_capabilities():
+    from dataclasses import FrozenInstanceError
+
     from flash.providers.core.base import Provider
+    from flash.providers.core.registry import PROVIDER_NAMES, get_provider
+
+    for name in PROVIDER_NAMES:
+        provider = get_provider(name)
+        assert isinstance(provider, Provider)
+        assert provider.capabilities.live_capacity is (name != "runpod")
+        assert provider.capabilities.supports_weight_cache is (name == "runpod")
+        assert (provider.capabilities.confirm_run_absent is None) is (name == "runpod")
+        assert (provider.capabilities.sweep_orphans is None) is (name == "runpod")
+        with pytest.raises(FrozenInstanceError):
+            provider.capabilities.live_capacity = False
+
+
+def test_runpod_cleanup_capabilities_are_explicitly_unsupported():
+    from flash.providers.core.capabilities import CleanupOutcome, confirm_run_absent, sweep_orphans
     from flash.providers.core.registry import get_provider
 
-    assert hasattr(get_provider("runpod"), "sweep_orphans")
-    assert get_provider("runpod").sweep_orphans(active_labels={"flash-x"}) == []
-    assert "sweep_orphans" in dir(Provider)
-
-
-def test_run_instances_remaining_is_optional_not_required_by_protocol():
-    # Copilot: run_instances_remaining is an OPTIONAL capability (Vast enumerates billable instances by
-    # run label; RunPod serverless self-reaps). It must NOT be on the @runtime_checkable Provider
-    # Protocol, or isinstance(runpod_provider, Provider) would go False and break the symmetry checks
-    # above. Vast implements it; RunPod does not; both still satisfy Provider. Detected via getattr.
-    from flash.providers.core.base import Provider
-    from flash.providers.core.registry import get_provider
-
-    assert "run_instances_remaining" not in dir(Provider)  # not a required Protocol member
-    assert hasattr(get_provider("vast"), "run_instances_remaining")  # Vast provides the capability
-    assert not hasattr(get_provider("runpod"), "run_instances_remaining")  # RunPod opts out
-    assert isinstance(get_provider("runpod"), Provider)  # still a Provider despite opting out
+    capabilities = get_provider("runpod").capabilities
+    assert confirm_run_absent(capabilities, "run-1").outcome is CleanupOutcome.UNSUPPORTED
+    assert sweep_orphans(capabilities).outcome is CleanupOutcome.UNSUPPORTED
+    assert not hasattr(get_provider("runpod"), "sweep_orphans")
 
 
 def test_static_pricing():
@@ -384,7 +387,16 @@ def test_runpod_destroy_accepts_exact_owner_404_confirmation(monkeypatch):
     assert lookups == [("ep-unconfirmed", _RUNPOD_FINGERPRINT)]
 
 
-def test_runpod_destroy_rejects_non_authoritative_absence_result(monkeypatch):
+@pytest.mark.parametrize(
+    "absence_result",
+    [
+        pytest.param(False, id="false"),
+        pytest.param(1, id="truthy-integer"),
+        pytest.param("true", id="truthy-string"),
+        pytest.param(object(), id="truthy-object"),
+    ],
+)
+def test_runpod_destroy_rejects_non_authoritative_absence_result(monkeypatch, absence_result):
     from flash.providers.core.base import JobHandle
     from flash.providers.core.registry import get_provider
     from flash.providers.runpod.client import api as rp_api
@@ -397,7 +409,7 @@ def test_runpod_destroy_rejects_non_authoritative_absence_result(monkeypatch):
     monkeypatch.setattr(
         rp_api,
         "endpoint_absent_for_fingerprint",
-        lambda endpoint_id, fingerprint: False,
+        lambda endpoint_id, fingerprint: absence_result,
     )
     handle = JobHandle(
         "runpod",

@@ -833,7 +833,13 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
         ),
     )
     monkeypatch.setattr(supervise_lifecycle, "_runpod_completed_metrics", lambda *_a, **_k: None)
-    monkeypatch.setattr(supervise_lifecycle, "_strict_teardown_handle", lambda *_a, **_k: True)
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
+    monkeypatch.setattr(
+        supervise_lifecycle,
+        "_strict_teardown_handle",
+        lambda *_a, **_k: CleanupResult(CleanupOutcome.DELETED),
+    )
     monkeypatch.setattr(runner_artifacts, "stage_environment_package", transient_stage)
     monkeypatch.setattr(runner_reconciliation, "_compare_and_clear_remote", record_clear)
     monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", record_fail)

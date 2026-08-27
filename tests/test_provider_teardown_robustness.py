@@ -78,8 +78,28 @@ def test_lambda_sweep_reports_only_truly_reaped(monkeypatch):
     monkeypatch.setattr(la_api, "list_instances", lambda: instances)
     # i-b terminate fails -> terminate_instances returns only the ids actually torn down
     monkeypatch.setattr(la_api, "terminate_instances", lambda ids: [i for i in ids if i == "i-a"])
+    from flash.providers.core.capabilities import CleanupOutcome
+
     out = jobs.sweep_orphans(active_labels=set())
-    assert out == ["i-a"]  # i-b still billing -> NOT reported as reaped
+    assert out.outcome is CleanupOutcome.UNCONFIRMED
+    assert out.confirmed_deleted_ids == ("i-a",)
+    assert out.unresolved_ids == ("i-b",)
+
+
+def test_lambda_sweep_distinguishes_empty_and_listing_failure(monkeypatch):
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.lambda_ import jobs
+    from flash.providers.lambda_.client import api as la_api
+
+    monkeypatch.setattr(la_api, "list_instances", list)
+    assert jobs.sweep_orphans().outcome is CleanupOutcome.ABSENT
+
+    monkeypatch.setattr(
+        la_api,
+        "list_instances",
+        lambda: (_ for _ in ()).throw(la_api.LambdaApiError("list failed")),
+    )
+    assert jobs.sweep_orphans().outcome is CleanupOutcome.RETRYABLE
 
 
 # --- review-fix regressions (bounded label, provider rates, fail-fast user_data) ---

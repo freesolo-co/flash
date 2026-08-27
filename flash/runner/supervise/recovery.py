@@ -14,6 +14,7 @@ import contextlib
 import json
 import time
 from collections.abc import Callable
+from typing import cast
 
 from flash.core.spec import JobSpec
 
@@ -34,6 +35,14 @@ def _lifecycle():
 _RECOVERY_MARKER_GRACE_S = 120.0
 _RECOVERY_METRICS_POLL_S = 5.0
 _RUNPOD_STATUS_PROBE_TIMEOUT_S = 10.0
+
+
+def _best_unresolved_identity(raw, fallback: str) -> str:
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return str(raw)
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    return fallback
 
 
 class _CompletedAttemptPending(RuntimeError):
@@ -170,28 +179,50 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
         except Exception:
             return False
     if handle.provider in INSTANCE_PROVIDERS:
-        try:
-            check = getattr(get_provider(handle.provider), "run_instances_remaining", None)
-            return check is not None and check(run_id) == []
-        except Exception:
-            return False
+        from flash.providers.core.capabilities import CleanupOutcome, confirm_run_absent
+
+        result = confirm_run_absent(get_provider(handle.provider).capabilities, run_id)
+        return result.outcome is CleanupOutcome.ABSENT
     return False
 
 
-def _delete_runpod_endpoint(data: dict, canonical=None) -> None:
-    """Delete one exact RunPod endpoint without trusting the persisted handle's own metadata."""
+def _delete_runpod_endpoint(data: dict, canonical=None, *, run_id: str | None = None):
+    """Delete one exact RunPod endpoint without trusting persisted owner metadata."""
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
     from flash.providers.runpod.client import api as runpod_api
 
     endpoint_id = data.get("endpoint_id")
-    if not isinstance(endpoint_id, str) or not endpoint_id:
-        raise ValueError("persisted RunPod endpoint identity is invalid")
+    if not isinstance(endpoint_id, str) or not endpoint_id.strip():
+        unresolved_id = _best_unresolved_identity(endpoint_id, run_id or "unknown-runpod-endpoint")
+        return CleanupResult(CleanupOutcome.UNCONFIRMED, unresolved_ids=(unresolved_id,))
+
+    def delete_for_owner(fingerprint: str) -> CleanupResult:
+        try:
+            if runpod_api.delete_endpoint_for_fingerprint(endpoint_id, fingerprint):
+                return CleanupResult(
+                    CleanupOutcome.DELETED,
+                    confirmed_deleted_ids=(endpoint_id,),
+                )
+            if runpod_api.endpoint_absent_for_fingerprint(endpoint_id, fingerprint) is True:
+                return CleanupResult(CleanupOutcome.ABSENT)
+        except runpod_api.RunpodApiError as exc:
+            if "still exists" in str(exc):
+                return CleanupResult(CleanupOutcome.PRESENT, surviving_ids=(endpoint_id,))
+            return CleanupResult(CleanupOutcome.RETRYABLE, unresolved_ids=(endpoint_id,))
+        return CleanupResult(CleanupOutcome.RETRYABLE, unresolved_ids=(endpoint_id,))
 
     fingerprint = data.get("key_fingerprint")
     if canonical is not None:
         from flash.providers.core.registry import get_provider
 
-        get_provider("runpod").destroy(canonical)
-        return
+        try:
+            get_provider("runpod").destroy(canonical)
+        except Exception:
+            return CleanupResult(CleanupOutcome.RETRYABLE, unresolved_ids=(endpoint_id,))
+        return CleanupResult(
+            CleanupOutcome.DELETED,
+            confirmed_deleted_ids=(endpoint_id,),
+        )
 
     owner_resolved = False
     try:
@@ -208,15 +239,14 @@ def _delete_runpod_endpoint(data: dict, canonical=None) -> None:
         owner_resolved = True
 
     if owner_resolved:
-        if runpod_api.delete_endpoint_for_fingerprint(endpoint_id, fingerprint):
-            return
-        if not runpod_api.endpoint_absent_for_fingerprint(endpoint_id, fingerprint):
-            raise runpod_api.RunpodApiError(f"runpod endpoint {endpoint_id} deletion unconfirmed")
-        return
+        return delete_for_owner(cast("str", fingerprint))
 
-    by_fingerprint, failed = runpod_api.list_endpoints_by_key(
-        deadline_at=time.time() + _RUNPOD_STATUS_PROBE_TIMEOUT_S
-    )
+    try:
+        by_fingerprint, failed = runpod_api.list_endpoints_by_key(
+            deadline_at=time.time() + _RUNPOD_STATUS_PROBE_TIMEOUT_S
+        )
+    except Exception:
+        return CleanupResult(CleanupOutcome.RETRYABLE, unresolved_ids=(endpoint_id,))
     owners = [
         owner_fingerprint
         for owner_fingerprint, endpoints in by_fingerprint.items()
@@ -226,40 +256,26 @@ def _delete_runpod_endpoint(data: dict, canonical=None) -> None:
         )
     ]
     if len(owners) > 1:
-        raise runpod_api.RunpodApiError(
-            f"runpod endpoint {endpoint_id} appears in multiple accounts; cleanup unconfirmed"
-        )
+        return CleanupResult(CleanupOutcome.UNCONFIRMED, unresolved_ids=(endpoint_id,))
     if not owners:
-        # an inventory over the CONFIGURED keys cannot prove absence. this branch is reached only
-        # when the persisted fingerprint did not resolve, so the owning credential may simply no
-        # longer be in RUNPOD_API_KEY -- "none of my accounts list it" and "it was deleted" are
-        # indistinguishable from here. reporting deletion would let the caller drop the cleanup
-        # record while the unreachable endpoint stays live and billing, so refuse instead and let
-        # the record survive for a later drain that may have the owning key configured again.
-        if failed:
-            raise runpod_api.RunpodApiError(
-                f"runpod endpoint {endpoint_id} owner discovery was incomplete; cleanup unconfirmed"
-            )
-        raise runpod_api.RunpodApiError(
-            f"runpod endpoint {endpoint_id} has no reachable owner account; cleanup unconfirmed"
-        )
-
-    if runpod_api.delete_endpoint_for_fingerprint(endpoint_id, owners[0]):
-        return
-    if not runpod_api.endpoint_absent_for_fingerprint(endpoint_id, owners[0]):
-        raise runpod_api.RunpodApiError(f"runpod endpoint {endpoint_id} deletion unconfirmed")
+        outcome = CleanupOutcome.RETRYABLE if failed else CleanupOutcome.UNCONFIRMED
+        return CleanupResult(outcome, unresolved_ids=(endpoint_id,))
+    return delete_for_owner(owners[0])
 
 
-def _strict_teardown_handle(handle, run_id: str) -> bool:
-    """Request exact teardown, then prove the captured attempt's worker is gone.
-
-    Returns true when the billable resource deletion itself was confirmed. Returns false only for a
-    RunPod job proven terminal while its endpoint deletion remains unconfirmed; callers must persist
-    that exact endpoint in cleanup_remotes before clearing the active remote.
-    """
+def _strict_teardown_handle(handle, run_id: str):
+    """Request exact teardown and return the strongest authoritative cleanup result."""
+    from flash.providers.core.capabilities import (
+        CleanupOutcome,
+        CleanupResult,
+        confirm_run_absent,
+    )
     from flash.providers.core.registry import INSTANCE_PROVIDERS, get_provider
 
-    raw = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
+    try:
+        raw = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
+    except Exception:
+        return CleanupResult(CleanupOutcome.UNCONFIRMED, unresolved_ids=(run_id,))
     if raw.get("provider") == "runpod":
         canonical = None
         with contextlib.suppress(Exception):
@@ -267,34 +283,37 @@ def _strict_teardown_handle(handle, run_id: str) -> bool:
         if canonical is not None and canonical.to_dict().get("job_id"):
             with contextlib.suppress(Exception):
                 get_provider("runpod").cancel(canonical)
-        try:
-            _delete_runpod_endpoint(raw, canonical)
-        except Exception as exc:
-            # malformed legacy handles deliberately cannot use the job-status escape hatch: without
-            # a strict owner identity, only confirmed endpoint deletion may settle teardown.
-            if canonical is not None and _worker_provably_gone(run_id, canonical):
-                return False
-            raise RuntimeError(
-                "runpod endpoint deletion could not be confirmed and its worker may still be live"
-            ) from exc
-        return True
+        return _delete_runpod_endpoint(raw, canonical, run_id=run_id)
 
-    handle = _canonical_provider_handle(raw)
+    try:
+        handle = _canonical_provider_handle(raw)
+    except Exception:
+        resource_id = raw.get("instance_id")
+        unresolved_id = _best_unresolved_identity(resource_id, run_id)
+        return CleanupResult(CleanupOutcome.UNCONFIRMED, unresolved_ids=(unresolved_id,))
     provider = get_provider(handle.provider)
     if handle.provider in INSTANCE_PROVIDERS:
-        destroy_error: Exception | None = None
+        destroyed = False
         try:
             provider.destroy(handle)
-        except Exception as exc:
-            destroy_error = exc
-        if _worker_provably_gone(run_id, handle):
-            return True
-        raise RuntimeError(
-            "instance teardown could not be confirmed absent; its worker may still be live"
-        ) from destroy_error
-    provider.cancel(handle)
-    provider.destroy(handle)
-    return True
+            destroyed = True
+        except Exception:
+            pass
+        absence = confirm_run_absent(provider.capabilities, run_id)
+        if absence.outcome is CleanupOutcome.ABSENT and destroyed:
+            resource_id = handle.to_dict().get("instance_id")
+            valid_id = isinstance(resource_id, str) or (
+                isinstance(resource_id, int) and not isinstance(resource_id, bool)
+            )
+            deleted_ids = (str(resource_id),) if valid_id else ()
+            return CleanupResult(CleanupOutcome.DELETED, confirmed_deleted_ids=deleted_ids)
+        return absence
+    try:
+        provider.cancel(handle)
+        provider.destroy(handle)
+    except Exception:
+        return CleanupResult(CleanupOutcome.RETRYABLE)
+    return CleanupResult(CleanupOutcome.DELETED)
 
 
 def _completed_attempt_metrics(
@@ -624,7 +643,11 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
         and _remote_resource_identity(status.remote) not in attempted_cleanup
     ):
         try:
-            resource_deleted = _lifecycle()._strict_teardown_handle(status.remote, spec.run_id)
+            from flash.providers.core.capabilities import is_cleanup_confirmed
+
+            resource_deleted = is_cleanup_confirmed(
+                _lifecycle()._strict_teardown_handle(status.remote, spec.run_id)
+            )
             if resource_deleted:
                 _compare_and_confirm_remote_teardown(spec.run_id, status.remote)
             elif status.remote.get("provider") == "runpod":

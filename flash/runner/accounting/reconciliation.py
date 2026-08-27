@@ -435,6 +435,7 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     if not records:
         return attempted
     from flash.providers.core.base import JobHandle
+    from flash.providers.core.capabilities import is_cleanup_confirmed
     from flash.runner.supervise.lifecycle import _strict_teardown_handle
 
     for record in records:
@@ -446,7 +447,9 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
             continue
         attempted.add(identity)
         try:
-            resource_deleted = _strict_teardown_handle(JobHandle.from_dict(record), run_id)
+            resource_deleted = is_cleanup_confirmed(
+                _strict_teardown_handle(JobHandle.from_dict(record), run_id)
+            )
         except Exception:
             continue
         if resource_deleted:

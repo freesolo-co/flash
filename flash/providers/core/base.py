@@ -6,10 +6,11 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from flash.providers.core.capabilities import ProviderCapabilities
 from flash.providers.core.sharding import MAX_COMBINATION_CARDS, combined_vram_gb
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Iterable
 
     from flash.core.spec import JobSpec
 
@@ -858,6 +859,7 @@ class Provider(Protocol):
     """GPU-substrate interface implemented by each provider."""
 
     name: str
+    capabilities: ProviderCapabilities
 
     def is_configured(self) -> bool:
         """Whether this provider is enabled on this control plane; does not probe network reachability."""
@@ -925,26 +927,4 @@ class Provider(Protocol):
 
     def gc(self, spec: JobSpec) -> None:
         """Best-effort: reap any resource this run may have left registered."""
-        ...
-
-    # NOTE: ``supports_weight_cache: bool`` is an OPTIONAL capability attr (read via
-    # ``getattr(prov, "supports_weight_cache", False)``, off this Protocol for the same isinstance
-    # reason as below): True only for the provider that offers the shared weight-cache network volume
-    # (RunPod). The runner gates its one-shot cache-less retry fallback on it; every other provider
-    # defaults False.
-
-    # ``run_instances_remaining(run_id)`` is optional and must stay off this runtime-checkable
-    # protocol. callers use getattr in server/_runtime.py. ``[]`` confirms clear; non-empty means a
-    # survivor. incomplete enumeration raises so recovery cannot mistake lookup failure for clear.
-
-    def sweep_orphans(
-        self,
-        active_labels: set[str] | Callable[[], set[str]] | None = None,
-        known_labels: set[str] | Callable[[], set[str]] | None = None,
-    ) -> list[int | str]:
-        """Destroy provider resources unclaimed by live runs.
-
-        Resolve callable ``active_labels`` after listing to close the launch race. ``known_labels``
-        limits cleanup to this plane in shared accounts; None keeps single-plane behavior.
-        """
         ...

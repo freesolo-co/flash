@@ -4242,7 +4242,11 @@ def test_the_account_a_failover_lands_on_still_has_grow_budget(monkeypatch):
     monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
     monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
     monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
-    monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(
+        runpod_resources,
+        "_sweep_idle_flash_endpoints",
+        lambda **kw: runpod_resources.IdleEndpointSweepResult(),
+    )
     monkeypatch.setattr(job_execution, "_is_balance_error", lambda exc: True)
 
     events = []
@@ -4302,7 +4306,11 @@ def test_a_slow_failed_create_cannot_spend_the_failover_grow_budget(monkeypatch)
     monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
     monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
     monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
-    monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(
+        runpod_resources,
+        "_sweep_idle_flash_endpoints",
+        lambda **kw: runpod_resources.IdleEndpointSweepResult(),
+    )
     monkeypatch.setattr(job_execution, "_is_balance_error", lambda exc: "balance" in str(exc))
 
     events = []
@@ -4417,7 +4425,11 @@ def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
     monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
     monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
     monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
-    monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(
+        runpod_resources,
+        "_sweep_idle_flash_endpoints",
+        lambda **kw: runpod_resources.IdleEndpointSweepResult(),
+    )
     monkeypatch.setattr(job_execution, "_is_balance_error", lambda exc: False)
     monkeypatch.setattr(job_execution, "_is_workers_quota_error", lambda exc: True)
     monkeypatch.setattr(job_execution.time, "sleep", lambda *_a: None)
@@ -4634,7 +4646,11 @@ def test_admission_is_rejudged_with_the_key_the_attempt_lands_on(monkeypatch):
     monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
     monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
     monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
-    monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(
+        runpod_resources,
+        "_sweep_idle_flash_endpoints",
+        lambda **kw: runpod_resources.IdleEndpointSweepResult(),
+    )
 
     grown = []
 
@@ -4837,7 +4853,11 @@ def test_failover_reconciles_the_account_it_lands_on(monkeypatch):
     monkeypatch.setattr(job_execution.runpod_api, "key_fingerprint", lambda k: f"fp-{k}")
     monkeypatch.setattr(runpod_endpoints, "isolate_flash_state", lambda *a, **k: None)
     monkeypatch.setattr(runpod_endpoints, "_patch_runpod_backoff", lambda: None)
-    monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", lambda **kw: 0)
+    monkeypatch.setattr(
+        runpod_resources,
+        "_sweep_idle_flash_endpoints",
+        lambda **kw: runpod_resources.IdleEndpointSweepResult(),
+    )
     monkeypatch.setattr(job_execution, "_is_balance_error", lambda exc: True)
 
     grown = []

@@ -93,6 +93,14 @@ class JobHandle:
     attempt: int
     started_ts: float
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.endpoint_id, str) or not self.endpoint_id.strip():
+            raise ValueError("persisted RunPod endpoint identity is invalid")
+        if self.job_id is not None and (
+            not isinstance(self.job_id, str) or not self.job_id.strip()
+        ):
+            raise ValueError("persisted RunPod job identity is invalid")
+
     def to_dict(self) -> dict:
         data = {
             "provider": "runpod",
@@ -120,7 +128,7 @@ class JobHandle:
         if not math.isfinite(started_ts) or started_ts <= 0:
             raise ValueError("persisted RunPod launch timestamp is invalid")
         endpoint_id = d.get("endpoint_id")
-        if not isinstance(endpoint_id, str) or not endpoint_id:
+        if not isinstance(endpoint_id, str) or not endpoint_id.strip():
             raise ValueError("persisted RunPod endpoint identity is invalid")
         endpoint_name = d.get("endpoint_name")
         if not isinstance(endpoint_name, str) or not endpoint_name:
@@ -129,7 +137,7 @@ class JobHandle:
         if not runpod_api._is_valid_key_fingerprint(fingerprint):
             raise ValueError("persisted RunPod key fingerprint is invalid")
         job_id = d.get("job_id")
-        if job_id is not None and (not isinstance(job_id, str) or not job_id):
+        if job_id is not None and (not isinstance(job_id, str) or not job_id.strip()):
             raise ValueError("persisted RunPod job identity is invalid")
         return cls(endpoint_id, endpoint_name, fingerprint, job_id, attempt, started_ts)
 

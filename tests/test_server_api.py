@@ -5892,11 +5892,23 @@ def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
     class _FakeVast:
         name = "vast"
 
+        def __init__(self):
+            from flash.providers.core.capabilities import ProviderCapabilities
+
+            self.capabilities = ProviderCapabilities(False, True, self._confirm, self._sweep)
+
         def gc(self, s):
             reaped.append(s.run_id)
 
-        def sweep_orphans(self, **k):
-            return []
+        def _confirm(self, _run_id):
+            from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
+            return CleanupResult(CleanupOutcome.ABSENT)
+
+        def _sweep(self, _active=None, _known=None):
+            from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
+            return CleanupResult(CleanupOutcome.ABSENT)
 
     from flash.providers.core import registry as providers_mod
 
@@ -6015,6 +6027,46 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
     assert "deadline exhausted" in recovered.error
 
 
+def test_confirm_run_clear_keeps_configured_unsupported_provider_best_effort(monkeypatch, tmp_path):
+    from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
+    from flash.providers.core.capabilities import ProviderCapabilities
+    from flash.server.platform import runtime
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-9B",
+            "project": "11111111-1111-4111-8111-111111111111",
+            "algorithm": "grpo",
+            "train": {"epochs": 1, "max_examples": 1},
+            "gpu": {},
+            "run_id": "unsupported-confirmation",
+        }
+    )
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="provisioning",
+            spec=spec.to_dict(),
+            remote=None,
+        )
+    )
+    gc_calls = []
+
+    class Provider:
+        name = "vast"
+        capabilities = ProviderCapabilities(False, True, None, None)
+
+        def gc(self, value):
+            gc_calls.append(value.run_id)
+
+    monkeypatch.setattr(providers, "configured_providers", lambda: [Provider()])
+
+    assert runtime._confirm_run_clear(spec) is True
+    assert gc_calls == [spec.run_id]
+
+
 def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeypatch, tmp_path):
     # an unconfirmed Vast delete may leave a live phantom. recovery must defer while
     # ``run_instances_remaining`` reports it, or a second worker can write the same HF artifacts.
@@ -6048,14 +6100,23 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
     class _FakeVast:
         name = "vast"
 
-        def gc(self, s):  # unconfirmed DELETE -> destroys nothing, returns no error
+        def __init__(self):
+            from flash.providers.core.capabilities import ProviderCapabilities
+
+            self.capabilities = ProviderCapabilities(False, True, self._confirm, self._sweep)
+
+        def gc(self, s):  # unconfirmed delete destroys nothing
             reaped.append(s.run_id)
 
-        def run_instances_remaining(self, run_id):  # the phantom is STILL there after gc
-            return [4242]
+        def _confirm(self, _run_id):
+            from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
-        def sweep_orphans(self, **k):
-            return []
+            return CleanupResult(CleanupOutcome.PRESENT, surviving_ids=("4242",))
+
+        def _sweep(self, _active=None, _known=None):
+            from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
+            return CleanupResult(CleanupOutcome.ABSENT)
 
     import flash.server.platform.runtime as rt
     from flash.providers.core import registry as providers_mod
@@ -6289,14 +6350,21 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
     class _NewVast:
         name = "vast"
 
+        def __init__(self):
+            from flash.providers.core.capabilities import ProviderCapabilities
+
+            self.capabilities = ProviderCapabilities(False, True, self._confirm, self._sweep)
+
         def gc(self, s):
             raise AssertionError("newly configured unrecorded provider must not be reaped")
 
-        def run_instances_remaining(self, run_id):
+        def _confirm(self, _run_id):
             raise AssertionError("newly configured unrecorded provider must not block recovery")
 
-        def sweep_orphans(self, **k):
-            return []
+        def _sweep(self, _active=None, _known=None):
+            from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
+            return CleanupResult(CleanupOutcome.ABSENT)
 
     from flash.providers.core import registry as providers_mod
 
@@ -6354,15 +6422,26 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
     class _FakeVast:
         name = "vast"
 
+        def __init__(self):
+            from flash.providers.core.capabilities import ProviderCapabilities
+
+            self.capabilities = ProviderCapabilities(False, True, self._confirm, self._sweep)
+
         def gc(self, s):
             pass
 
-        def run_instances_remaining(self, run_id):
-            calls["n"] += 1
-            return [4242] if calls["n"] == 1 else []  # present once, then cleared
+        def _confirm(self, _run_id):
+            from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
-        def sweep_orphans(self, **k):
-            return []
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return CleanupResult(CleanupOutcome.PRESENT, surviving_ids=("4242",))
+            return CleanupResult(CleanupOutcome.ABSENT)
+
+        def _sweep(self, _active=None, _known=None):
+            from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
+            return CleanupResult(CleanupOutcome.ABSENT)
 
     from flash.providers.core import registry as providers_mod
 
@@ -6421,14 +6500,23 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
     class _FakeVast:
         name = "vast"
 
+        def __init__(self):
+            from flash.providers.core.capabilities import ProviderCapabilities
+
+            self.capabilities = ProviderCapabilities(False, True, self._confirm, self._sweep)
+
         def gc(self, s):
             pass
 
-        def run_instances_remaining(self, run_id):  # confirmed clear
-            return []
+        def _confirm(self, _run_id):
+            from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
-        def sweep_orphans(self, **k):
-            return []
+            return CleanupResult(CleanupOutcome.ABSENT)
+
+        def _sweep(self, _active=None, _known=None):
+            from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
+            return CleanupResult(CleanupOutcome.ABSENT)
 
     from flash.providers.core import registry as providers_mod
 
@@ -6698,12 +6786,18 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     swept = threading.Event()
 
     class _FakeProvider:
-        # known_labels is part of the real sweep_orphans signature (multi-plane guard); accept it so the
-        # actual call prov.sweep_orphans(active_labels=..., known_labels=...) doesn't TypeError (which
-        # the recovery suppress would swallow, silently skipping the sweep this test asserts fired).
-        def sweep_orphans(self, active_labels=None, known_labels=None):
+        name = "vast"
+
+        def __init__(self):
+            from flash.providers.core.capabilities import ProviderCapabilities
+
+            self.capabilities = ProviderCapabilities(False, True, None, self._sweep)
+
+        def _sweep(self, _active=None, _known=None):
+            from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
             swept.set()
-            return []
+            return CleanupResult(CleanupOutcome.ABSENT)
 
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeProvider()])
 

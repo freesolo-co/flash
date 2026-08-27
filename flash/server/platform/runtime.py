@@ -153,11 +153,13 @@ _DEFERRED_RECOVERY_RETRY_S = 120.0
 def _confirm_run_clear(spec) -> bool:
     """Force-reap this run's label and confirm no instance remains.
 
-    ``gc`` alone cannot prove Vast teardown. Providers with ``run_instances_remaining`` must return
-    ``[]``; a live instance or enumeration failure blocks resubmit. A provider recorded in
-    ``submitted_instance_providers`` also blocks when it is now unconfigurable, because a lost
+    ``gc`` alone cannot prove instance teardown. Configured providers without an absence callback
+    preserve the existing best-effort recovery behavior; a present instance or failed confirmation
+    blocks resubmit. A provider recorded in ``submitted_instance_providers`` also blocks when it is
+    now unconfigurable, because a lost
     non-idempotent create such as Vast ``PUT /asks`` may still be billing without a handle.
     """
+    from flash.providers.core.capabilities import CleanupOutcome, confirm_run_absent
     from flash.providers.core.registry import INSTANCE_PROVIDERS, configured_providers, get_provider
 
     try:
@@ -167,7 +169,7 @@ def _confirm_run_clear(spec) -> bool:
         # Vast phantom that this restart can no longer enumerate -> fail CLOSED.
         return False
     recorded = {str(name) for name in recorded_raw} if recorded_raw is not None else None
-    configured = {getattr(p, "name", None): p for p in configured_providers()}
+    configured = {provider.name: provider for provider in configured_providers()}
     clear = True
     for name, prov in configured.items():
         if name not in INSTANCE_PROVIDERS:
@@ -176,14 +178,9 @@ def _confirm_run_clear(spec) -> bool:
             continue
         with contextlib.suppress(Exception):
             prov.gc(spec)
-        check = getattr(prov, "run_instances_remaining", None)
-        if check is None:
-            continue  # provider exposes no confirmation -> preserve best-effort resubmit
-        try:
-            if check(spec.run_id):
-                clear = False  # an instance for this run is still present
-        except Exception:
-            clear = False  # couldn't list -> can't prove clear -> don't race
+        result = confirm_run_absent(prov.capabilities, spec.run_id)
+        if result.outcome not in {CleanupOutcome.ABSENT, CleanupOutcome.UNSUPPORTED}:
+            clear = False
     # An instance provider that WAS available at submit (so it could have taken the lost create) but
     # is NOT configurable now and owns the standing-instance capability can't be enumerated -> can't
     # prove clear -> fail closed. Already-configured providers were handled above. CRITICAL: do NOT
@@ -195,9 +192,7 @@ def _confirm_run_clear(spec) -> bool:
         if name in configured or name not in INSTANCE_PROVIDERS:
             continue
         try:
-            has_capability = (
-                getattr(get_provider(name), "run_instances_remaining", None) is not None
-            )
+            has_capability = get_provider(name).capabilities.confirm_run_absent is not None
         except Exception:
             # Can't even resolve a RECORDED instance provider -> assume it could own a phantom -> fail
             # closed rather than declare clear.
@@ -558,8 +553,10 @@ def _teardown_unrecoverable_remote(status) -> None:
     remote = dict(status.remote or {})
     if not remote:
         return
+    from flash.providers.core.capabilities import is_cleanup_confirmed
+
     try:
-        deleted = _strict_teardown_handle(remote, status.run_id)
+        deleted = is_cleanup_confirmed(_strict_teardown_handle(remote, status.run_id))
     except Exception:
         # unconfirmed deletion: leave it recorded for the cleanup drain rather than dropping it.
         deleted = False
@@ -732,11 +729,12 @@ def _classify_recoverable_runs(
 
 def _sweep_provider_orphans(active: set[str], known: set[str]) -> None:
     """Reap orphaned per-run provider resources; each provider sweeps its own."""
+    from flash.providers.core.capabilities import sweep_orphans
     from flash.providers.core.registry import configured_providers
 
     for prov in configured_providers():
         with contextlib.suppress(Exception):
-            prov.sweep_orphans(active_labels=active, known_labels=known)
+            sweep_orphans(prov.capabilities, active_labels=active, known_labels=known)
 
 
 def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:

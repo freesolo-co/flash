@@ -58,21 +58,32 @@ def teardown_reconciled_remote(
     confirmed_teardown: bool,
 ) -> tuple[bool, bool]:
     """return whether recovery may continue and exact deletion was confirmed."""
+    from flash.providers.core.capabilities import is_cleanup_confirmed
     from flash.runner.accounting.reconciliation import _record_cleanup_remote
     from flash.runner.supervise.lifecycle import _strict_teardown_handle, _worker_provably_gone
 
     if confirmed_teardown:
         return True, True
     try:
-        resource_deleted = _strict_teardown_handle(handle, run_id)
-        worker_gone = True
+        outcome = _strict_teardown_handle(handle, run_id)
     except Exception:
-        resource_deleted = False
-        worker_gone = _worker_provably_gone(run_id, handle)
+        outcome = None
+    # a CleanupResult is always truthy, so the outcome has to be read rather than the object.
+    # taking the object as a boolean would report confirmed deletion for a surviving instance.
+    resource_deleted = is_cleanup_confirmed(outcome)
+    # returning without raising is not evidence the worker is gone. teardown reports PRESENT,
+    # RETRYABLE, and UNCONFIRMED as values, so treating any non-raising call as proof of absence
+    # would resume a replacement attempt while the captured instance or endpoint is still live.
+    # only confirmed deletion, or an authoritative absence check, may let recovery continue.
+    worker_gone = resource_deleted or _worker_provably_gone(run_id, handle)
     if not worker_gone:
         return False, resource_deleted
     if resource_deleted:
         return True, True
+    # only runpod can reach here still owing a cleanup. its absence proof is a terminal job status,
+    # which says nothing about the endpoint that keeps billing, so the endpoint has to be written
+    # down before the active remote is cleared. for instance providers the absence proof is the
+    # instance itself being gone, so there is no surviving resource left to record.
     if handle.provider != "runpod":
         return True, False
     try:

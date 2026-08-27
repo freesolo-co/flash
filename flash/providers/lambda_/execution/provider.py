@@ -16,6 +16,7 @@ from flash.providers.core.base import (
     UnsupportedGpuError,
     rentable_gpu_counts,
 )
+from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 from flash.providers.core.sharding import combined_vram_gb
 
 
@@ -102,21 +103,21 @@ class LambdaProvider(InstanceProvider):
 
         terminate_run_instances(run_id)
 
-    def _sweep_orphans(
-        self,
-        *,
-        active_labels,
-        known_labels,
-    ) -> list[str]:
+    def _sweep_orphans(self, active_labels=None, known_labels=None) -> CleanupResult:
         from flash.providers.lambda_.jobs import sweep_orphans
 
         return sweep_orphans(active_labels=active_labels, known_labels=known_labels)
 
-    def run_instances_remaining(self, run_id: str) -> list[str]:
-        """Exact run-owned instance ids still observable after cleanup."""
+    def _confirm_run_absent(self, run_id: str) -> CleanupResult:
         from flash.providers.lambda_.jobs import run_instances_remaining
 
-        return run_instances_remaining(run_id)
+        try:
+            remaining = run_instances_remaining(run_id)
+        except Exception:
+            return CleanupResult(CleanupOutcome.RETRYABLE, unresolved_ids=(run_id,))
+        if remaining:
+            return CleanupResult(CleanupOutcome.PRESENT, surviving_ids=tuple(remaining))
+        return CleanupResult(CleanupOutcome.ABSENT)
 
     def live_candidates(
         self, need_vram_gb: int, constraints: AllocationConstraints
@@ -202,7 +203,7 @@ PROVIDER: Provider = LambdaProvider()
 
 def _terminate_handle_instance(handle: JobHandle) -> None:
     from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.jobs.builders import LambdaJobHandle
 
-    d = handle.to_dict()
-    if d.get("instance_id"):
-        lambda_api.terminate_instance_confirmed(str(d["instance_id"]))
+    instance_id = LambdaJobHandle._coerce_instance_id(handle.to_dict().get("instance_id"))
+    lambda_api.terminate_instance_confirmed(instance_id)

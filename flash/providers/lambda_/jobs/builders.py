@@ -62,9 +62,12 @@ class LambdaJobHandle(InstanceJobHandle):
 
     provider: ClassVar[str] = "lambda"
 
+    def __post_init__(self) -> None:
+        self._coerce_instance_id(self.instance_id)
+
     @staticmethod
     def _coerce_instance_id(raw) -> str:
-        if not isinstance(raw, str) or not raw:
+        if not isinstance(raw, str) or not raw.strip():
             raise ValueError("invalid lambda instance id")
         return raw
 

@@ -643,7 +643,9 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
 
     class Provider:
-        supports_weight_cache = False
+        from flash.providers.core.capabilities import ProviderCapabilities
+
+        capabilities = ProviderCapabilities(False, False, None, None)
 
         def __init__(self):
             self.attempts = []
@@ -716,7 +718,9 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
     monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
 
     class Provider:
-        supports_weight_cache = False
+        from flash.providers.core.capabilities import ProviderCapabilities
+
+        capabilities = ProviderCapabilities(False, False, None, None)
 
         def __init__(self):
             self.runtime_secrets = []

@@ -1293,14 +1293,21 @@ def test_success_attempts_teardown_when_cleanup_recording_fails(
     import flash.runner.accounting.reconciliation as reconciliation
     import flash.runner.supervise.seed_submission as seed_submission
     from flash.providers.core.base import PollResult
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
     from flash.providers.runpod.execution import job_execution as rp_jobs
 
     monkeypatch.setattr(reconciliation, "_record_cleanup_remote", lambda *_args: False)
     torn_down = []
 
     def fake_teardown(handle, run_id):
-        torn_down.append((handle.data["endpoint_id"], run_id))
-        return teardown_confirmed
+        endpoint_id = handle.data["endpoint_id"]
+        torn_down.append((endpoint_id, run_id))
+        # the teardown contract is a validated `CleanupResult`, not a bool: `is_cleanup_confirmed`
+        # refuses any other type outright, so a bare bool would silently read as unconfirmed and
+        # make both arms of this parametrization exercise the same path.
+        if teardown_confirmed:
+            return CleanupResult(CleanupOutcome.DELETED, confirmed_deleted_ids=(endpoint_id,))
+        return CleanupResult(CleanupOutcome.UNCONFIRMED, unresolved_ids=(endpoint_id,))
 
     monkeypatch.setattr(seed_submission._lifecycle, "_strict_teardown_handle", fake_teardown)
 

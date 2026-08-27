@@ -297,6 +297,7 @@ def test_fingerprint_helpers_resolve_to_the_owning_key(monkeypatch):
     [
         pytest.param(None, id="missing"),
         pytest.param("", id="empty-string"),
+        pytest.param("   ", id="whitespace-string"),
         pytest.param({"nested": "private"}, id="dict"),
         pytest.param(["private"], id="list"),
         pytest.param(b"job-private-bytes", id="bytes"),

@@ -174,8 +174,10 @@ def test_cancel_run_revocation_failure_defers_until_after_fence_and_teardown(
     monkeypatch.setattr(server_db, "revoke_teacher_capabilities_for_run", revoke)
 
     def teardown(handle, run_id):
+        from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
         teardown_calls.append((handle.provider, run_id, runner_status.get_status(run_id).state))
-        return True
+        return CleanupResult(CleanupOutcome.DELETED)
 
     monkeypatch.setattr(lifecycle, "_strict_teardown_handle", teardown)
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
@@ -689,7 +691,7 @@ def test_cancel_run_noop_when_terminal(tmp_path, monkeypatch):
 
 def test_cancel_run_retries_durable_cleanup_for_cancelled_run(tmp_path, monkeypatch):
     from flash.core.spec import JobSpec
-    from flash.providers.core import registry as providers
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancelled-1"})
@@ -700,19 +702,16 @@ def test_cancel_run_retries_durable_cleanup_for_cancelled_run(tmp_path, monkeypa
     assert runner_reconciliation._preserve_cleanup_remote(spec.run_id, remote) is True
     events = []
 
-    class Provider:
-        def cancel(self, handle):
-            events.append(("cancel", handle.to_dict()["job_id"]))
+    def teardown(handle, _run_id):
+        events.append(handle.to_dict()["endpoint_id"])
+        return CleanupResult(CleanupOutcome.DELETED)
 
-        def destroy(self, handle):
-            events.append(("destroy", handle.to_dict()["endpoint_id"]))
-
-    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", teardown)
 
     out = runner_deploy.cancel_run(spec.run_id)
 
     assert out.state == "cancelled"
-    assert events == [("cancel", "job-cleanup"), ("destroy", "endpoint-cleanup")]
+    assert events == ["endpoint-cleanup"]
     assert runner_state._CLEANUP_REMOTES_KEY not in runner_status._load_status_json(spec.run_id)
 
 
@@ -720,7 +719,7 @@ def test_cancel_run_accepts_confirmed_endpoint_delete_after_cancel_ack_failure(
     tmp_path, monkeypatch
 ):
     from flash.core.spec import JobSpec
-    from flash.providers.core import registry as providers
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-retry"})
@@ -728,17 +727,12 @@ def test_cancel_run_accepts_confirmed_endpoint_delete_after_cancel_ack_failure(
     runner_state._save_status(provisioned_status(spec, state="running", remote=remote))
     events = []
 
-    class Provider:
-        def cancel(self, handle):
-            data = handle.to_dict()
-            events.append(("cancel", data["endpoint_id"], data["job_id"], data["attempt"]))
-            raise RuntimeError("cancellation acknowledgement failed")
+    def teardown(handle, _run_id):
+        data = handle.to_dict()
+        events.append((data["endpoint_id"], data["job_id"], data["attempt"]))
+        return CleanupResult(CleanupOutcome.DELETED)
 
-        def destroy(self, handle):
-            data = handle.to_dict()
-            events.append(("destroy", data["endpoint_id"], data.get("job_id"), data["attempt"]))
-
-    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", teardown)
     gc_calls = []
     monkeypatch.setattr(
         runner_recovery, "_gc_run_endpoints", lambda value: gc_calls.append(value.run_id)
@@ -751,15 +745,110 @@ def test_cancel_run_accepts_confirmed_endpoint_delete_after_cancel_ack_failure(
     assert raw["remote"] is None
     assert runner_state._CLEANUP_REMOTES_KEY not in raw
     assert gc_calls == [spec.run_id]
-    assert events == [
-        ("cancel", "endpoint-exact", "job-exact", 7),
-        ("destroy", "endpoint-exact", "job-exact", 7),
-    ]
+    assert events == [("endpoint-exact", "job-exact", 7)]
 
 
-def test_cancel_run_failed_teardown_does_not_replace_racing_public_remote(tmp_path, monkeypatch):
+def test_teardown_or_preserve_remote_reports_durable_preservation_safe_to_clear(
+    tmp_path, monkeypatch
+):
     from flash.core.spec import JobSpec
-    from flash.providers.core import registry as providers
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-preserved"})
+    remote = _remote("endpoint-preserved", "job-preserved", 2)
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            remote=remote,
+        )
+    )
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_strict_teardown_handle",
+        lambda _handle, _run_id: CleanupResult(
+            CleanupOutcome.UNCONFIRMED,
+            unresolved_ids=("endpoint-preserved",),
+        ),
+    )
+
+    assert runner_deploy._teardown_or_preserve_remote(spec.run_id, remote) is True
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [remote]
+
+
+def test_invalid_confirmed_cleanup_evidence_preserves_caller_ownership(tmp_path, monkeypatch):
+    from flash.core.spec import JobSpec
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-invalid-proof"})
+    remote = _remote("endpoint-invalid-proof", "job-invalid-proof", 2)
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            remote=remote,
+        )
+    )
+
+    def contradictory_teardown(_handle, _run_id):
+        return CleanupResult(
+            CleanupOutcome.DELETED,
+            unresolved_ids=("endpoint-invalid-proof",),
+        )
+
+    monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", contradictory_teardown)
+
+    assert runner_deploy._teardown_or_preserve_remote(spec.run_id, remote) is False
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [remote]
+    assert raw["remote"] == remote
+
+
+def test_unknown_cleanup_object_cannot_clear_status_remote(tmp_path, monkeypatch):
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
+    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-fake-proof"})
+    remote = _remote("endpoint-fake-proof", "job-fake-proof", 2)
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            remote=remote,
+        )
+    )
+
+    class FakeConfirmation:
+        confirmed = True
+
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_strict_teardown_handle",
+        lambda _handle, _run_id: FakeConfirmation(),
+    )
+
+    runner_deploy._teardown_persisted_remotes(
+        spec.run_id,
+        confirmed_cleanup_identities=set(),
+        clear_exact_remote=lambda expected: runner_deploy._clear_remote_if_unchanged(
+            spec.run_id, expected
+        ),
+    )
+
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw["remote"] == remote
+    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [remote]
+
+
+def test_cancel_run_preserves_and_clears_racing_public_remotes(tmp_path, monkeypatch):
+    from flash.core.spec import JobSpec
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-race"})
@@ -774,24 +863,23 @@ def test_cancel_run_failed_teardown_does_not_replace_racing_public_remote(tmp_pa
         )
     )
 
-    class Provider:
-        def cancel(self, _handle):
-            current = runner_status.get_status(spec.run_id)
-            current.remote = replacement_remote
-            runner_state._save_status(current)
-            raise RuntimeError("cancellation acknowledgement failed")
+    def teardown(_handle, _run_id):
+        current = runner_status.get_status(spec.run_id)
+        current.remote = replacement_remote
+        runner_state._save_status(current)
+        return CleanupResult(
+            CleanupOutcome.UNCONFIRMED,
+            unresolved_ids=("endpoint-original",),
+        )
 
-        def destroy(self, _handle):
-            raise RuntimeError("endpoint deletion failed")
-
-    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", teardown)
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
 
     out = runner_deploy.cancel_run(spec.run_id)
     raw = runner_status._load_status_json(spec.run_id)
 
     assert out.state == "cancelled"
-    assert raw["remote"] == replacement_remote
+    assert raw["remote"] is None
     assert raw[runner_state._CLEANUP_REMOTES_KEY] == [original_remote, replacement_remote]
 
 
@@ -822,7 +910,7 @@ def test_cancel_run_marks_billing_failed_when_pricing_falls_back(tmp_path, monke
 
 def test_cancel_run_successful_exact_teardown_leaves_no_cleanup_remote(tmp_path, monkeypatch):
     from flash.core.spec import JobSpec
-    from flash.providers.core import registry as providers
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-cancel-clean"})
@@ -837,20 +925,17 @@ def test_cancel_run_successful_exact_teardown_leaves_no_cleanup_remote(tmp_path,
     )
     events = []
 
-    class Provider:
-        def cancel(self, handle):
-            events.append(("cancel", handle.to_dict()["job_id"]))
+    def teardown(handle, _run_id):
+        events.append(handle.to_dict()["endpoint_id"])
+        return CleanupResult(CleanupOutcome.DELETED)
 
-        def destroy(self, handle):
-            events.append(("destroy", handle.to_dict()["endpoint_id"]))
-
-    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", teardown)
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
 
     out = runner_deploy.cancel_run(spec.run_id)
 
     assert out.state == "cancelled"
-    assert events == [("cancel", "job-clean"), ("destroy", "endpoint-clean")]
+    assert events == ["endpoint-clean"]
     assert runner_state._CLEANUP_REMOTES_KEY not in runner_status._load_status_json(spec.run_id)
 
 
@@ -863,18 +948,18 @@ def _make_poll_provider(monkeypatch, *, on_poll):
     Also no-ops _gc_run_endpoints so attach_run's teardown doesn't reach the real SDK.
     """
     from flash.providers.core import registry as providers
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda *a, **k: None)
+    monkeypatch.setattr(
+        runner_lifecycle,
+        "_strict_teardown_handle",
+        lambda _handle, _run_id: CleanupResult(CleanupOutcome.DELETED),
+    )
 
     class _StubProvider:
         def poll(self, handle, spec, seed, *, log=None, _deadline_at=None):
             return on_poll(handle, spec, seed)
-
-        def cancel(self, _handle):
-            return None
-
-        def destroy(self, _handle):
-            return None
 
     monkeypatch.setattr(providers, "get_provider", lambda name: _StubProvider())
 
@@ -1052,7 +1137,7 @@ def _ready_checkpoint(run_id: str, step: int, *, remote: dict | None = None) -> 
 def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path, monkeypatch):
     import flash.runner.results.verified_revisions as verified_revisions
     import flash.serve.deployment.deploy as deploy
-    from flash.providers.core import registry as providers
+    from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-order"
@@ -1060,12 +1145,9 @@ def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path,
     deployment = _ready_checkpoint(run_id, 40, remote=remote)
     events = []
 
-    class StubProvider:
-        def cancel(self, handle):
-            events.append("provider-cancel")
-
-        def destroy(self, handle):
-            events.append("provider-destroy")
+    def teardown(_handle, _run_id):
+        events.append("training-teardown")
+        return CleanupResult(CleanupOutcome.DELETED)
 
     real_read = verified_revisions.read_verified_checkpoints
 
@@ -1073,7 +1155,7 @@ def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path,
         events.append("serving-decision")
         return real_read(target)
 
-    monkeypatch.setattr(providers, "get_provider", lambda _provider: StubProvider())
+    monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", teardown)
     monkeypatch.setattr(
         runner_recovery, "_gc_run_endpoints", lambda _spec: events.append("endpoint-gc")
     )
@@ -1087,8 +1169,7 @@ def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path,
     out = runner_deploy.cancel_run(run_id)
 
     assert events == [
-        "provider-cancel",
-        "provider-destroy",
+        "training-teardown",
         "endpoint-gc",
         "serving-decision",
         "serving-decision",

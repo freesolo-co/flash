@@ -770,7 +770,7 @@ def _raise_no_candidate_error(
     # where "no candidate" means the shape genuinely is not offered (terminal). this applies to
     # an unpinned search too: sold out is sold out whether or not the user named the class.
     live_only = bool(supported_available) and all(
-        getattr(get_provider(name), "live_capacity", False) for name in supported_available
+        get_provider(name).capabilities.live_capacity for name in supported_available
     )
     if exact:
         if live_only and could_fit:

@@ -18,11 +18,11 @@ resolve their targets at call time for monkeypatch seams such as ``vast.jobs.sub
 from __future__ import annotations
 
 import abc
-from collections.abc import Callable
 from typing import Any
 
 from flash.providers._lifecycle.instances.instance import InstanceJobHandle
 from flash.providers.core.base import GpuClass, JobHandle, PollResult
+from flash.providers.core.capabilities import CleanupResult, ProviderCapabilities, RunLabels
 
 
 class InstanceProvider(abc.ABC):
@@ -32,11 +32,13 @@ class InstanceProvider(abc.ABC):
     forgets one — a mis-wired new provider fails at construction, not at a billing-critical teardown.
     """
 
-    # Optional capability (read via getattr, kept off the runtime_checkable Protocol like
-    # supports_weight_cache): these substrates price and stock from a LIVE market, so "no candidate
-    # right now" is a transient capacity miss the allocator should let a run retry, not proof the
-    # class is unsupported. Static-table providers omit it -> False.
-    live_capacity = True
+    def __init__(self) -> None:
+        self.capabilities = ProviderCapabilities(
+            supports_weight_cache=False,
+            live_capacity=True,
+            confirm_run_absent=self._confirm_run_absent,
+            sweep_orphans=self._sweep_orphans,
+        )
 
     # --- subclass contract: class attrs + abstract hooks each substrate supplies ---
     name: str
@@ -90,12 +92,14 @@ class InstanceProvider(abc.ABC):
     def _gc(self, run_id: str) -> None: ...
 
     @abc.abstractmethod
+    def _confirm_run_absent(self, run_id: str) -> CleanupResult: ...
+
+    @abc.abstractmethod
     def _sweep_orphans(
         self,
-        *,
-        active_labels: set[str] | Callable[[], set[str]] | None,
-        known_labels: set[str] | Callable[[], set[str]] | None,
-    ) -> list: ...
+        active_labels: RunLabels = None,
+        known_labels: RunLabels = None,
+    ) -> CleanupResult: ...
 
     # --- shared ``base.Provider`` surface ---------------------------------
     def is_configured(self) -> bool:
@@ -175,13 +179,3 @@ class InstanceProvider(abc.ABC):
 
     def gc(self, spec) -> None:
         self._gc(spec.run_id)
-
-    def sweep_orphans(
-        self,
-        active_labels: set[str] | Callable[[], set[str]] | None = None,
-        known_labels: set[str] | Callable[[], set[str]] | None = None,
-    ) -> list:
-        """Crash-recovery sweep (called via the provider object at startup).
-
-        ``known_labels`` scopes the sweep to this control plane's own runs (multi-plane safety)."""
-        return self._sweep_orphans(active_labels=active_labels, known_labels=known_labels)

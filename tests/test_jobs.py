@@ -125,6 +125,18 @@ def test_job_handle_roundtrip_and_rejects_legacy_shapes():
             JobHandle.from_dict(legacy)
     with pytest.raises(ValueError, match="attempt identity is invalid"):
         JobHandle.from_dict({**valid, "attempt": "2"})
+    for field in ("endpoint_id", "job_id"):
+        with pytest.raises(ValueError, match="persisted RunPod"):
+            JobHandle.from_dict({**valid, field: "   "})
+    with pytest.raises(ValueError, match="persisted RunPod endpoint identity"):
+        JobHandle(
+            "   ",
+            "flash-5090-abc",
+            _RUNPOD_FINGERPRINT,
+            "job456",
+            2,
+            12_345.0,
+        )
 
 
 def test_strict_teardown_uses_valid_runpod_owner_without_inventory(monkeypatch):
@@ -166,9 +178,230 @@ def test_strict_teardown_uses_valid_runpod_owner_without_inventory(monkeypatch):
         lambda **_kwargs: pytest.fail("valid owner must not inventory other accounts"),
     )
 
-    assert lifecycle._strict_teardown_handle(handle, "run-direct") is True
+    from flash.providers.core.capabilities import CleanupOutcome
+
+    result = lifecycle._strict_teardown_handle(handle, "run-direct")
+    assert result.outcome is CleanupOutcome.DELETED
+    assert result.confirmed_deleted_ids == ("ep-direct",)
     assert cancelled == [("ep-direct", "job-direct")]
     assert deleted == [("ep-direct", "owner-key")]
+
+
+@pytest.mark.parametrize(
+    ("provider", "instance_id"),
+    [
+        pytest.param("lambda", 42, id="lambda"),
+        pytest.param("vast", "not-an-int", id="vast"),
+    ],
+)
+def test_strict_teardown_reports_malformed_instance_handle_unconfirmed(provider, instance_id):
+    from flash.providers.core.base import JobHandle
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.runner.supervise import lifecycle
+
+    handle = JobHandle.from_dict(
+        {
+            "provider": provider,
+            "instance_id": instance_id,
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+    )
+
+    result = lifecycle._strict_teardown_handle(handle, f"run-malformed-{provider}")
+
+    assert result.outcome is CleanupOutcome.UNCONFIRMED
+    assert result.confirmed is False
+    assert result.unresolved_ids == (str(instance_id),)
+
+
+def test_strict_teardown_never_terminates_whitespace_lambda_identity(monkeypatch):
+    from flash.providers.core.base import JobHandle
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.runner.supervise import lifecycle
+
+    calls = []
+    monkeypatch.setattr(
+        lambda_api,
+        "terminate_instance_confirmed",
+        lambda instance_id: calls.append(instance_id),
+    )
+    handle = JobHandle.from_dict(
+        {
+            "provider": "lambda",
+            "instance_id": "   ",
+            "instance_type": "gpu_1x_a10",
+            "region": "us-east-1",
+            "name": "flash-malformed-s0-a0",
+            "gpu": "A10",
+            "hourly_usd": 1.29,
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+    )
+
+    result = lifecycle._strict_teardown_handle(handle, "run-malformed-lambda")
+
+    assert result.outcome is CleanupOutcome.UNCONFIRMED
+    assert result.unresolved_ids == ("run-malformed-lambda",)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("endpoint_fields", "expected_unresolved_id"),
+    [
+        pytest.param({"endpoint_id": 42}, "42", id="non-string"),
+        pytest.param({"endpoint_id": ""}, "run-malformed-runpod", id="empty"),
+        pytest.param({"endpoint_id": "   "}, "run-malformed-runpod", id="whitespace"),
+        pytest.param({}, "run-malformed-runpod", id="missing"),
+    ],
+)
+def test_strict_teardown_reports_malformed_runpod_endpoint_unconfirmed(
+    endpoint_fields, expected_unresolved_id
+):
+    from flash.providers.core.base import JobHandle
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.runner.supervise import lifecycle
+
+    handle = JobHandle.from_dict(
+        {
+            "provider": "runpod",
+            **endpoint_fields,
+            "endpoint_name": "flash-malformed",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+    )
+
+    result = lifecycle._strict_teardown_handle(handle, "run-malformed-runpod")
+
+    assert result.outcome is CleanupOutcome.UNCONFIRMED
+    assert result.confirmed is False
+    assert result.unresolved_ids == (expected_unresolved_id,)
+
+
+def test_strict_teardown_never_deletes_whitespace_runpod_identity(monkeypatch):
+    from flash.providers.core.base import JobHandle
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.runner.supervise import lifecycle
+
+    calls = []
+
+    def unexpected(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("malformed identity reached RunPod deletion")
+
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", unexpected)
+    monkeypatch.setattr(runpod_api, "endpoint_absent_for_fingerprint", unexpected)
+    monkeypatch.setattr(runpod_api, "list_endpoints_by_key", unexpected)
+    handle = JobHandle.from_dict(
+        {
+            "provider": "runpod",
+            "endpoint_id": "   ",
+            "endpoint_name": "flash-malformed",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+    )
+
+    result = lifecycle._strict_teardown_handle(handle, "run-malformed-runpod")
+
+    assert result.outcome is CleanupOutcome.UNCONFIRMED
+    assert result.unresolved_ids == ("run-malformed-runpod",)
+    assert calls == []
+
+
+def test_strict_teardown_delegates_canonical_runpod_destroy(monkeypatch):
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import JobHandle
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.runner.supervise import lifecycle
+
+    handle = JobHandle.from_dict(
+        {
+            "provider": "runpod",
+            "endpoint_id": "ep-provider-boundary",
+            "endpoint_name": "flash-provider-boundary",
+            "key_fingerprint": "rpk-" + "a" * 64,
+            "job_id": "job-provider-boundary",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+    )
+    events = []
+
+    class Provider:
+        def cancel(self, canonical):
+            events.append(("cancel", canonical.to_dict()["endpoint_id"]))
+
+        def destroy(self, canonical):
+            events.append(("destroy", canonical.to_dict()["endpoint_id"]))
+
+    monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+
+    result = lifecycle._strict_teardown_handle(handle, "run-provider-boundary")
+
+    assert result.outcome is CleanupOutcome.DELETED
+    assert result.confirmed_deleted_ids == ("ep-provider-boundary",)
+    assert events == [
+        ("cancel", "ep-provider-boundary"),
+        ("destroy", "ep-provider-boundary"),
+    ]
+
+
+def test_runpod_cleanup_rejects_exact_false_absence_evidence(monkeypatch):
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.runpod.client import api as runpod_api
+
+    fingerprint = "rpk-" + "a" * 64
+    monkeypatch.setattr(runpod_api, "_key_for_fingerprint", lambda _value: "owner-key")
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_args: False)
+    monkeypatch.setattr(runpod_api, "endpoint_absent_for_fingerprint", lambda *_args: False)
+
+    result = runner_recovery._delete_runpod_endpoint(
+        {"endpoint_id": "ep-unconfirmed", "key_fingerprint": fingerprint}
+    )
+
+    assert result.outcome is CleanupOutcome.RETRYABLE
+    assert result.unresolved_ids == ("ep-unconfirmed",)
+
+
+def test_strict_teardown_maps_authenticated_runpod_absence_to_deleted(monkeypatch):
+    from flash.providers.core.base import JobHandle
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.runner.supervise import lifecycle
+
+    fingerprint = "rpk-" + "a" * 64
+    handle = JobHandle.from_dict(
+        {
+            "provider": "runpod",
+            "endpoint_id": "ep-absent",
+            "endpoint_name": "flash-absent",
+            "key_fingerprint": fingerprint,
+            "job_id": "job-absent",
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
+    )
+    monkeypatch.setattr(runpod_api, "_key_for_fingerprint", lambda _value: "owner-key")
+    monkeypatch.setattr(
+        runpod_api,
+        "cancel_job",
+        lambda _endpoint_id, job_id, **_kwargs: {"id": job_id, "status": "CANCELLED"},
+    )
+    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", lambda *_args: False)
+    monkeypatch.setattr(runpod_api, "endpoint_absent_for_fingerprint", lambda *_args: True)
+
+    result = lifecycle._strict_teardown_handle(handle, "run-absent")
+
+    assert result.outcome is CleanupOutcome.DELETED
+    assert result.confirmed is True
+    assert result.confirmed_deleted_ids == ("ep-absent",)
 
 
 @pytest.mark.parametrize(
@@ -220,7 +453,12 @@ def test_strict_teardown_discovers_runpod_owner_for_invalid_fingerprint(monkeypa
 
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
 
-    assert lifecycle._strict_teardown_handle(handle, "run-discovered") is True
+    from flash.providers.core.capabilities import CleanupOutcome
+
+    assert (
+        lifecycle._strict_teardown_handle(handle, "run-discovered").outcome
+        is CleanupOutcome.DELETED
+    )
     assert deleted == [("ep-discovered", "discovered-owner-key")]
 
 
@@ -264,9 +502,11 @@ def test_strict_teardown_keeps_runpod_record_when_no_configured_account_owns_it(
         lambda *_args: pytest.fail("an absent endpoint must not be deleted blindly"),
     )
 
-    with pytest.raises(RuntimeError, match="endpoint deletion could not be confirmed") as exc_info:
-        lifecycle._strict_teardown_handle(handle, "run-gone")
-    assert "no reachable owner account" in str(exc_info.value.__cause__)
+    from flash.providers.core.capabilities import CleanupOutcome
+
+    result = lifecycle._strict_teardown_handle(handle, "run-gone")
+    assert result.outcome is CleanupOutcome.UNCONFIRMED
+    assert result.unresolved_ids == ("ep-gone",)
 
 
 @pytest.mark.parametrize("mode", ["incomplete", "multiple-owners"])
@@ -311,9 +551,12 @@ def test_strict_teardown_rejects_unconfirmed_runpod_owner_discovery(monkeypatch,
         lambda *_args: pytest.fail("ambiguous ownership must not delete"),
     )
 
-    with pytest.raises(RuntimeError, match="endpoint deletion could not be confirmed") as exc_info:
-        lifecycle._strict_teardown_handle(handle, "run-ambiguous")
-    assert "cleanup unconfirmed" in str(exc_info.value.__cause__)
+    from flash.providers.core.capabilities import CleanupOutcome
+
+    result = lifecycle._strict_teardown_handle(handle, "run-ambiguous")
+    expected = CleanupOutcome.RETRYABLE if mode == "incomplete" else CleanupOutcome.UNCONFIRMED
+    assert result.outcome is expected
+    assert result.unresolved_ids == ("ep-ambiguous",)
 
 
 def test_decode_output_success():
@@ -3216,7 +3459,9 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_du
         calls = {"n": 0}
 
         class Provider:
-            supports_weight_cache = False
+            from flash.providers.core.capabilities import ProviderCapabilities
+
+            capabilities = ProviderCapabilities(False, False, None, None)
 
             def submit_run(self, spec, seed, log=None, on_handle=None, attempt=0, **_):
                 calls["n"] += 1
@@ -5008,17 +5253,15 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
         )
         calls = []
 
-        class Provider:
-            def cancel(self, handle):
-                calls.append("cancel")
+        from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
-            def destroy(self, handle):
-                calls.append("destroy")
+        def teardown(_handle, _run_id):
+            calls.append("cleanup")
+            return CleanupResult(CleanupOutcome.DELETED)
 
         import flash.serve.deployment.deploy
-        from flash.providers.core import registry as provider_registry
 
-        monkeypatch.setattr(provider_registry, "get_provider", lambda name: Provider())
+        monkeypatch.setattr(runner_lifecycle, "_strict_teardown_handle", teardown)
         monkeypatch.setattr(
             flash.serve.deployment.deploy,
             "undeploy_adapter",
@@ -5041,8 +5284,7 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
         assert status.cost_usd == 0.0
         assert status.billing_state == "failed"
         assert "private preparation snapshot" in (status.billing_error or "")
-        assert "cancel" in calls
-        assert "destroy" in calls
+        assert "cleanup" in calls
         assert "undeploy" in calls
         assert ("gc", 32) in calls
 
@@ -5814,6 +6056,18 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch, rema
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         class _RaisingVast:
+            def __init__(self):
+                from flash.providers.core.capabilities import ProviderCapabilities
+
+                self.capabilities = ProviderCapabilities(False, True, self._confirm, None)
+
+            def _confirm(self, _run_id):
+                from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
+
+                if remaining_mode == "raises":
+                    return CleanupResult(CleanupOutcome.RETRYABLE)
+                return CleanupResult(CleanupOutcome.PRESENT, surviving_ids=("101",))
+
             def poll(self, handle, spec, seed, *, log=None, _deadline_at=None):
                 assert _deadline_at == pytest.approx(
                     runner_status.get_status("v1").created_at + _spec("v1").gpu.max_wall_seconds
@@ -5825,11 +6079,6 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch, rema
 
             def gc(self, spec):  # best-effort label reap
                 pass
-
-            def run_instances_remaining(self, run_id):
-                if remaining_mode == "raises":
-                    raise vast_api.VastApiError("instance listing unavailable")
-                return [101]
 
             def is_configured(self):  # available_providers() probes this in the terminal-GC finally
                 return False
@@ -6001,11 +6250,22 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
         )
 
         class Provider:
+            def __init__(self):
+                from flash.providers.core.capabilities import (
+                    CleanupOutcome,
+                    CleanupResult,
+                    ProviderCapabilities,
+                )
+
+                self.capabilities = ProviderCapabilities(
+                    False,
+                    True,
+                    lambda _run_id: CleanupResult(CleanupOutcome.ABSENT),
+                    None,
+                )
+
             def destroy(self, _handle):
                 raise RuntimeError("delete acknowledgement unavailable")
-
-            def run_instances_remaining(self, run_id):
-                return []
 
         monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
         monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
@@ -6535,7 +6795,7 @@ def test_deploy_train_endpoint_retries_on_quota_error(monkeypatch):
 
     def fake_sweep(protected, min_idle_s=0.0, reap_warm=True):
         swept["count"] += 1
-        return 5
+        return runpod_resources.IdleEndpointSweepResult(deleted_ids=("a", "b", "c", "d", "e"))
 
     monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", fake_sweep)
 
@@ -6566,7 +6826,9 @@ def test_deploy_train_endpoint_raises_after_max_quota_retries(monkeypatch):
     monkeypatch.setattr(
         runpod_resources,
         "_sweep_idle_flash_endpoints",
-        lambda protected, min_idle_s=0.0, reap_warm=True: 0,
+        lambda protected, min_idle_s=0.0, reap_warm=True: (
+            runpod_resources.IdleEndpointSweepResult()
+        ),
     )
 
     with pytest.raises(RuntimeError, match="workers quota"):
@@ -6601,7 +6863,9 @@ def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
     monkeypatch.setattr(
         runpod_resources,
         "_sweep_idle_flash_endpoints",
-        lambda protected, min_idle_s=0.0, reap_warm=True: 0,
+        lambda protected, min_idle_s=0.0, reap_warm=True: (
+            runpod_resources.IdleEndpointSweepResult()
+        ),
     )
 
     ep_id, _name, _fingerprint = job_execution.deploy_train_endpoint("A100", name_suffix="testrun")
@@ -6637,7 +6901,7 @@ def test_deploy_fails_over_to_next_account_on_balance(monkeypatch):
 
     def fake_sweep(protected, min_idle_s=0.0, reap_warm=True):
         swept["count"] += 1
-        return 0
+        return runpod_resources.IdleEndpointSweepResult()
 
     monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", fake_sweep)
 
@@ -6671,7 +6935,9 @@ def test_deploy_balance_error_single_account_raises_fast(monkeypatch):
     monkeypatch.setattr(
         runpod_resources,
         "_sweep_idle_flash_endpoints",
-        lambda protected, min_idle_s=0.0, reap_warm=True: 0,
+        lambda protected, min_idle_s=0.0, reap_warm=True: (
+            runpod_resources.IdleEndpointSweepResult()
+        ),
     )
 
     with pytest.raises(RuntimeError, match="account balance"):
@@ -6755,7 +7021,9 @@ def test_deploy_raises_when_all_accounts_exhausted_without_looping(monkeypatch):
     monkeypatch.setattr(
         runpod_resources,
         "_sweep_idle_flash_endpoints",
-        lambda protected, min_idle_s=0.0, reap_warm=True: 0,
+        lambda protected, min_idle_s=0.0, reap_warm=True: (
+            runpod_resources.IdleEndpointSweepResult()
+        ),
     )
 
     with pytest.raises(RuntimeError, match="workers quota"):
@@ -6802,7 +7070,9 @@ def test_deploy_failover_from_midpool_tries_every_remaining_account(monkeypatch)
     monkeypatch.setattr(
         runpod_resources,
         "_sweep_idle_flash_endpoints",
-        lambda protected, min_idle_s=0.0, reap_warm=True: 0,
+        lambda protected, min_idle_s=0.0, reap_warm=True: (
+            runpod_resources.IdleEndpointSweepResult()
+        ),
     )
 
     ep_id, _name, _fingerprint = job_execution.deploy_train_endpoint("A100", name_suffix="testrun")
@@ -6878,7 +7148,7 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
 
     # warm idle/ready (ep-warm-idle) is reaped too — the dominant leak the old scaled-to-zero rule
     # never caught; running/initializing stay, current-run endpoints are protected.
-    assert count == 3
+    assert count.deleted_count == 3
     assert sorted(deleted) == sorted(["ep-live-idle", "ep-warm-idle", "ep-bare-idle"])
 
 
@@ -6913,13 +7183,16 @@ def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
 
     # Deploy-path mode: warm endpoint is treated as busy and kept; only scaled-to-zero is reaped.
     runpod_resources._idle_since.clear()
-    assert runpod_resources._sweep_idle_flash_endpoints(protected=set(), reap_warm=False) == 1
+    assert (
+        runpod_resources._sweep_idle_flash_endpoints(protected=set(), reap_warm=False).deleted_count
+        == 1
+    )
     assert deleted == ["ep-zero"]
 
     # Periodic-reaper mode (default): the warm endpoint is reaped too.
     deleted.clear()
     runpod_resources._idle_since.clear()
-    assert runpod_resources._sweep_idle_flash_endpoints(protected=set()) == 2
+    assert runpod_resources._sweep_idle_flash_endpoints(protected=set()).deleted_count == 2
     assert sorted(deleted) == sorted(["ep-warm", "ep-zero"])
 
 
@@ -6952,18 +7225,33 @@ def test_sweep_idle_grace_requires_sustained_idleness(monkeypatch):
     monkeypatch.setattr(runpod_resources.time, "time", lambda: clock["t"])
 
     # First sweep: idle observed, but grace (300s) not elapsed -> not deleted, timer recorded.
-    assert runpod_resources._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert (
+        runpod_resources._sweep_idle_flash_endpoints(
+            protected=set(), min_idle_s=300.0
+        ).deleted_count
+        == 0
+    )
     assert deleted == []
     assert "ep-x" in runpod_resources._idle_since
 
     # Still within grace -> still not deleted.
     clock["t"] = 1200.0
-    assert runpod_resources._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert (
+        runpod_resources._sweep_idle_flash_endpoints(
+            protected=set(), min_idle_s=300.0
+        ).deleted_count
+        == 0
+    )
     assert deleted == []
 
     # Past grace -> reaped.
     clock["t"] = 1400.0
-    assert runpod_resources._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 1
+    assert (
+        runpod_resources._sweep_idle_flash_endpoints(
+            protected=set(), min_idle_s=300.0
+        ).deleted_count
+        == 1
+    )
     assert deleted == ["ep-x"]
 
 
@@ -6995,17 +7283,32 @@ def test_sweep_grace_resets_when_endpoint_becomes_busy(monkeypatch):
     monkeypatch.setattr(runpod_resources.time, "time", lambda: clock["t"])
 
     # idle at t=1000 -> timer set
-    assert runpod_resources._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert (
+        runpod_resources._sweep_idle_flash_endpoints(
+            protected=set(), min_idle_s=300.0
+        ).deleted_count
+        == 0
+    )
     assert "ep-x" in runpod_resources._idle_since
     # busy at t=1200 -> timer cleared
     state["busy"] = True
     clock["t"] = 1200.0
-    assert runpod_resources._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert (
+        runpod_resources._sweep_idle_flash_endpoints(
+            protected=set(), min_idle_s=300.0
+        ).deleted_count
+        == 0
+    )
     assert "ep-x" not in runpod_resources._idle_since
     # idle again at t=1400 -> fresh timer (not deleted: only 0s of new idleness)
     state["busy"] = False
     clock["t"] = 1400.0
-    assert runpod_resources._sweep_idle_flash_endpoints(protected=set(), min_idle_s=300.0) == 0
+    assert (
+        runpod_resources._sweep_idle_flash_endpoints(
+            protected=set(), min_idle_s=300.0
+        ).deleted_count
+        == 0
+    )
     assert deleted == []
 
 

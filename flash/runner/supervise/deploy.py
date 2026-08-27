@@ -227,22 +227,37 @@ def _drain_confirmed_cleanup(run_id: str) -> set[tuple]:
 def _teardown_or_preserve_remote(run_id: str, remote: dict) -> bool:
     """Tear one remote down. Returns whether it is safe to clear from the status.
 
-    An unconfirmed teardown is NOT safe to clear: the target is recorded for the cleanup drain
-    instead, so a leaked box stays addressable. Failing to record either is a hard error, since
+    An unconfirmed teardown is safe to clear only after the exact target is recorded for the cleanup
+    drain, so a leaked box stays addressable. Failing to confirm or preserve it is a hard error because
     that would lose the only handle to a billing resource.
     """
     from flash.providers.core.base import JobHandle
+    from flash.providers.core.capabilities import CleanupContractError, CleanupResult
     from flash.runner.accounting.reconciliation import _record_cleanup_remote
     from flash.runner.supervise.lifecycle import _strict_teardown_handle
 
     try:
-        resource_deleted = _strict_teardown_handle(JobHandle.from_dict(remote), run_id)
+        teardown = _strict_teardown_handle(JobHandle.from_dict(remote), run_id)
+    except CleanupContractError:
+        if not _record_cleanup_remote(run_id, remote):
+            raise RuntimeError(f"run {run_id} returned invalid endpoint cleanup evidence") from None
+        return False
     except Exception:
         if not _record_cleanup_remote(run_id, remote):
             raise RuntimeError(
                 f"run {run_id} teardown was unconfirmed and its exact cleanup target "
                 "could not be preserved"
             ) from None
+        return True
+    if type(teardown) is not CleanupResult:
+        if not _record_cleanup_remote(run_id, remote):
+            raise RuntimeError(f"run {run_id} returned invalid endpoint cleanup evidence")
+        return False
+    try:
+        resource_deleted = teardown.confirmed
+    except Exception:
+        if not _record_cleanup_remote(run_id, remote):
+            raise RuntimeError(f"run {run_id} returned invalid endpoint cleanup evidence") from None
         return False
     if not resource_deleted and not _record_cleanup_remote(run_id, remote):
         raise RuntimeError(f"run {run_id} leaked endpoint cleanup target could not be preserved")

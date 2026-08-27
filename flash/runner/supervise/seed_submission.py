@@ -90,10 +90,12 @@ class _SubmitContext:
                 lifecycle_started_attempt=canonical_handle["attempt"],
             ):
                 return
+            from flash.providers.core.capabilities import is_cleanup_confirmed
+
             resource_deleted = False
             with contextlib.suppress(Exception):
-                resource_deleted = _lifecycle._strict_teardown_handle(
-                    canonical_handle, self.spec.run_id
+                resource_deleted = is_cleanup_confirmed(
+                    _lifecycle._strict_teardown_handle(canonical_handle, self.spec.run_id)
                 )
             if resource_deleted:
                 self.last_handle.clear()
@@ -270,17 +272,15 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     )
     if completed_metrics is not None:
         return completed_metrics
-    resource_deleted = False
-    teardown_error: Exception | None = None
-    try:
-        resource_deleted = _lifecycle._strict_teardown_handle(
-            JobHandle.from_dict(ctx.last_handle), ctx.spec.run_id
-        )
-    except Exception as exc:
-        teardown_error = exc
+    from flash.providers.core.capabilities import is_cleanup_confirmed
+
+    teardown = _lifecycle._strict_teardown_handle(
+        JobHandle.from_dict(ctx.last_handle), ctx.spec.run_id
+    )
+    resource_deleted = is_cleanup_confirmed(teardown)
     resource_kind = "endpoint" if ctx.last_handle.get("endpoint_id") else "instance"
     resource_id = ctx.last_handle.get("endpoint_id") or ctx.last_handle.get("instance_id")
-    worker_gone = teardown_error is None or _lifecycle._worker_provably_gone(
+    worker_gone = resource_deleted or _lifecycle._worker_provably_gone(
         ctx.spec.run_id, ctx.last_handle
     )
     if (
@@ -316,7 +316,7 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     ctx.gc_seen_endpoints()
     print(
         f"retry {attempt}: {ctx.last_handle.get('provider')} {resource_kind} {resource_id} "
-        f"teardown unconfirmed ({type(teardown_error).__name__}); keeping the handle so the "
+        f"teardown unconfirmed ({teardown.outcome.value}); keeping the handle so the "
         "possibly-billing resource stays reachable for cleanup",
         file=ctx.log,
         flush=True,
@@ -554,7 +554,7 @@ def _build_candidate_plan(
         and ctx.started_with_shared_cache
         and not ctx.drop_weight_cache
         and chosen is not None
-        and getattr(get_provider(chosen.provider), "supports_weight_cache", False)
+        and get_provider(chosen.provider).capabilities.supports_weight_cache
     )
     on_last_gpu = len(untried) <= 1 or ctx.retry_budget.infra_exhausted(
         cache_fallback_available=cache_fallback_available
@@ -749,6 +749,7 @@ def _settle_terminal_remote(ctx: _SubmitContext) -> None:
     if not ctx.last_handle:
         return
     from flash.providers.core.base import JobHandle
+    from flash.providers.core.capabilities import is_cleanup_confirmed
     from flash.runner.accounting.reconciliation import (
         _compare_and_confirm_remote_teardown,
         _compare_and_remove_cleanup_remote,
@@ -760,7 +761,9 @@ def _settle_terminal_remote(ctx: _SubmitContext) -> None:
     with contextlib.suppress(Exception):
         cleanup_recorded = _record_cleanup_remote(ctx.spec.run_id, remote)
     try:
-        deleted = _lifecycle._strict_teardown_handle(JobHandle.from_dict(remote), ctx.spec.run_id)
+        deleted = is_cleanup_confirmed(
+            _lifecycle._strict_teardown_handle(JobHandle.from_dict(remote), ctx.spec.run_id)
+        )
     except Exception:
         return
     if not deleted:
@@ -829,7 +832,7 @@ def _handle_failure(
         )
     run_had_cache = bool(
         outcome.chosen is not None
-        and getattr(get_provider(outcome.chosen.provider), "supports_weight_cache", False)
+        and get_provider(outcome.chosen.provider).capabilities.supports_weight_cache
         and getattr(outcome.run_spec.gpu, "network_volume", None) == WEIGHT_CACHE_VOLUME_NAME
     )
     first_cache_drop = (
