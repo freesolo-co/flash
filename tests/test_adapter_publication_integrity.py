@@ -135,7 +135,9 @@ class _RecordingHfApi:
         destination.write_bytes(self._snapshots[revision][filename])
         return str(destination)
 
-    def delete_folder(self, path_in_repo, repo_id, repo_type):
+    def delete_folder(self, path_in_repo, repo_id, repo_type, parent_commit=None):
+        if parent_commit is not None and parent_commit != self._head:
+            raise RuntimeError("parent commit changed")
         self.deleted.append(path_in_repo)
 
 
@@ -370,14 +372,10 @@ def test_a_verified_commit_is_never_retracted(tmp_path, monkeypatch):
     assert "rl/flash-ckpt-1/adapter/adapter_config.json" in rec.files
 
 
-def test_retraction_defers_to_a_writer_that_already_moved_the_head(tmp_path, monkeypatch):
-    """A newer commit from another writer owns the path, and must not be deleted.
-
-    Our unverified commit is only safe to withdraw while it is still the head. Once someone else has
-    published over it, deleting the folder would destroy a publication that was never in doubt.
-    """
-    rec = _RecordingHfApi()
-    rec.omit_after_commit = "rl/flash-ckpt-1/adapter/adapter_model.safetensors"
+def _retract_after_racing_writer(tmp_path, monkeypatch, rec, mutate):
+    """Run a failing required publication while `mutate` lands another writer's commit."""
+    target = "rl/flash-ckpt-1/adapter"
+    rec.omit_after_commit = f"{target}/adapter_model.safetensors"
     worker = _prime_worker(monkeypatch, rec)
     adapter = tmp_path / "adapter"
     _write_single_adapter(adapter)
@@ -389,15 +387,86 @@ def test_retraction_defers_to_a_writer_that_already_moved_the_head(tmp_path, mon
             real_verify(*args, **kwargs)
         finally:
             # another writer lands a commit between our failed verify and the retraction.
-            rec._snapshots["c" * 40] = dict(rec._snapshots[rec._head])
+            raced = dict(rec._snapshots[rec._head])
+            mutate(raced, target)
+            rec._snapshots["c" * 40] = raced
             rec._head = "c" * 40
 
     monkeypatch.setattr(publication, "_verify_adapter_commit", _verify_then_race)
 
     with pytest.raises(worker_hf.RetriableInfraError):
         worker.hf_upload_folder(str(adapter), "adapter", required=True)
+    return target
+
+
+def test_retraction_defers_to_a_writer_that_republished_this_adapter(tmp_path, monkeypatch):
+    """A newer commit that owns this path must not be deleted.
+
+    Our unverified commit is only safe to withdraw while the folder still holds what we published.
+    Once someone else has published over it, deleting would destroy a publication never in doubt.
+    """
+    rec = _RecordingHfApi()
+
+    def _republish_the_adapter(snapshot, target):
+        snapshot[f"{target}/adapter_config.json"] = b'{"r": 8}'
+        snapshot[f"{target}/adapter_model.safetensors"] = b"republished"
+
+    _retract_after_racing_writer(tmp_path, monkeypatch, rec, _republish_the_adapter)
 
     assert rec.deleted == [], "a newer writer's commit must survive our retraction"
+
+
+def test_an_unrelated_writer_moving_the_head_does_not_strand_the_unverified_folder(
+    tmp_path, monkeypatch
+):
+    """Sibling writers share this repository, so head identity cannot decide ownership.
+
+    The heartbeat daemon, the streamed resume checkpoint, and every other step's adapter all commit
+    here. Reading a moved head as "someone else owns this path" would leave the unverified marker on
+    the tip for resume to credit, which is exactly what the retraction exists to prevent.
+    """
+    rec = _RecordingHfApi()
+
+    def _heartbeat(snapshot, _target):
+        snapshot["rl/flash-ckpt-1/heartbeat.json"] = b"{}"
+
+    target = _retract_after_racing_writer(tmp_path, monkeypatch, rec, _heartbeat)
+
+    assert rec.deleted == [target], "an unrelated commit must not cancel the retraction"
+
+
+def test_retraction_is_pinned_to_the_head_it_inspected(tmp_path, monkeypatch):
+    """A writer that republishes between the ownership check and the delete keeps its commit.
+
+    The check and the delete are two calls, so the path can change owner in the gap. Pinning the
+    delete to the inspected head makes that race lose the delete instead of the publication.
+    """
+    rec = _RecordingHfApi()
+    target = "rl/flash-ckpt-1/adapter"
+    rec.omit_after_commit = f"{target}/adapter_model.safetensors"
+    worker = _prime_worker(monkeypatch, rec)
+    adapter = tmp_path / "adapter"
+    _write_single_adapter(adapter)
+
+    def _republish_after_the_check():
+        if not rec.commits:
+            return
+        rec._snapshots["d" * 40] = {
+            **rec._snapshots[rec._head],
+            f"{target}/adapter_config.json": b'{"r": 8}',
+        }
+        rec._head = "d" * 40
+
+    def _delete_after_racing_republish(**kwargs):
+        _republish_after_the_check()
+        return _RecordingHfApi.delete_folder(rec, **kwargs)
+
+    monkeypatch.setattr(rec, "delete_folder", _delete_after_racing_republish)
+
+    with pytest.raises(worker_hf.RetriableInfraError, match="post-commit verification failed"):
+        worker.hf_upload_folder(str(adapter), "adapter", required=True)
+
+    assert rec.deleted == [], "the racing republication must survive an unpinned delete"
 
 
 def test_a_failed_retraction_does_not_mask_the_publication_error(tmp_path, monkeypatch):

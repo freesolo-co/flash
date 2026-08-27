@@ -297,6 +297,61 @@ def _verify_adapter_commit(
         raise AdapterPublicationError(str(error)) from error
 
 
+def _subtree_content_identity(api, *, repo_id: str, revision: str, prefix: str) -> dict[str, tuple]:
+    """Content identity of every file under ``prefix`` at one immutable revision.
+
+    Raises when the hub cannot describe a listed file, so an unreadable subtree can never compare
+    equal to another unreadable one.
+    """
+    paths = sorted(
+        path
+        for path in api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision=revision)
+        if path.startswith(prefix)
+    )
+    if not paths:
+        return {}
+    identity: dict[str, tuple] = {}
+    for info in api.get_paths_info(
+        repo_id=repo_id, paths=paths, repo_type="dataset", revision=revision
+    ):
+        path = getattr(info, "path", None)
+        size = getattr(info, "size", None)
+        lfs = getattr(info, "lfs", None)
+        digest = getattr(lfs, "sha256", None) if lfs is not None else getattr(info, "blob_id", None)
+        if (
+            path not in paths
+            or path in identity
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or not isinstance(digest, str)
+        ):
+            raise AdapterPublicationError("adapter subtree content identity could not be resolved")
+        identity[path] = (size, digest.lower())
+    if set(identity) != set(paths):
+        raise AdapterPublicationError("adapter subtree content identity is incomplete")
+    return identity
+
+
+def _tip_still_carries_our_adapter(
+    api, *, repo_id: str, revision: str, head: str, prefix: str
+) -> bool:
+    """True when the branch tip's adapter subtree is still exactly the one we published.
+
+    Ownership of a path is a content question, not a head question. Sibling writers share this
+    repository -- the heartbeat daemon, the streamed resume checkpoint, and every other step's
+    adapter all commit to it -- so the head moves past ours constantly without anyone touching this
+    path. Comparing content instead of commits means an unrelated commit no longer strands an
+    unverified folder on the tip, while a genuine republication of this exact path is still left
+    alone.
+    """
+    if head == revision:
+        return True
+    ours = _subtree_content_identity(api, repo_id=repo_id, revision=revision, prefix=prefix)
+    return bool(ours) and (
+        _subtree_content_identity(api, repo_id=repo_id, revision=head, prefix=prefix) == ours
+    )
+
+
 def _retract_unverified_adapter(api, *, repo_id: str, revision: str | None, target: str) -> None:
     """Remove an adapter folder whose commit landed but could not be verified.
 
@@ -306,17 +361,25 @@ def _retract_unverified_adapter(api, *, repo_id: str, revision: str | None, targ
     durable, and a checkpoint nothing ever validated becomes loadable. The marker has to stop
     existing for the inference drawn from it to stay true.
 
-    Another writer may already own this path -- its commit would have moved the head past ours, and
-    deleting then would destroy a publication that was never in doubt. So retraction runs only while
-    our own unverified commit is still the head, and only for a real subfolder, never the repo root.
+    Another writer may already own this path, and deleting then would destroy a publication that was
+    never in doubt. So retraction runs only while the tip still carries our own unverified content,
+    is pinned to the exact commit that check read, and only ever names a real subfolder.
     """
     if not target or not isinstance(revision, str) or not is_commit_sha(revision):
         return
     try:
         head = getattr(api.repo_info(repo_id=repo_id, repo_type="dataset"), "sha", None)
-        if head != revision:
+        if not isinstance(head, str) or not is_commit_sha(head):
             return
-        api.delete_folder(path_in_repo=target, repo_id=repo_id, repo_type="dataset")
+        if not _tip_still_carries_our_adapter(
+            api, repo_id=repo_id, revision=revision, head=head, prefix=f"{target}/"
+        ):
+            return
+        # pinned to the head the check above read: a writer that republishes this path in the gap
+        # between the two calls loses the delete instead of losing its publication.
+        api.delete_folder(
+            path_in_repo=target, repo_id=repo_id, repo_type="dataset", parent_commit=head
+        )
     except Exception:
         # best effort: the publication error below already fails this save loudly. a retraction that
         # cannot reach the hub leaves the folder exactly as an unverified commit leaves it today.
