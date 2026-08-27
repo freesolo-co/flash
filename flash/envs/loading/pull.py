@@ -303,6 +303,22 @@ def _snapshot_entry(parent_fd: int, name: str) -> _TreeSnapshot:
     return _TreeSnapshot(identity, children)
 
 
+def _entry_exists(parent_fd: int, name: str) -> bool:
+    """Whether `name` is present, treating an unreadable parent as present.
+
+    this backs the "is the backup still in staging" question, so the safe answer to a directory we
+    cannot read is yes: a delete that cannot be reasoned about is exactly the one not to attempt.
+    """
+
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def _restore_claim(
     source_parent_fd: int,
     claim_name: str,
@@ -586,6 +602,12 @@ def _replace_with_tree_at_identity(
     staging = _create_staging(parent_fd)
     payload_fd = -1
     backup_identity: tuple[int, int, int] | None = None
+    # `backup_identity` answers "what do we delete"; this answers "is the destination's only copy
+    # still in staging". they are not the same question, and conflating them cost the backup: the
+    # identity-failure path below cleared the identity before a restore that is best-effort, so a
+    # restore that never happened still read as "no backup remains" and the recursive staging
+    # delete in `finally` took the sole surviving copy of the destination with it.
+    backup_in_staging = False
     staging_removed = False
     try:
         payload_fd = _copy_tree_into_staging(source, staging, "new")
@@ -603,6 +625,7 @@ def _replace_with_tree_at_identity(
             if _entry_identity(parent_fd, dest.name) != expected_identity:
                 raise _changed()
             _rename_no_replace_at(parent_fd, dest.name, staging.fd, "old")
+            backup_in_staging = True
             # the backup now lives in staging, so a rejection here has to put it back the way the
             # claim helpers do. raising while it sits under `old` would leave the destination
             # vacant even though nothing was published.
@@ -612,7 +635,11 @@ def _replace_with_tree_at_identity(
                     raise _changed()
             except Exception:
                 backup_identity = None
+                # `_restore_claim` swallows every `OSError`, so the restore is a request, not a
+                # result. only the filesystem can say whether the backup left staging, and if it
+                # did not, staging holds the destination's sole copy and must survive.
                 _restore_claim(staging.fd, "old", parent_fd, dest.name)
+                backup_in_staging = _entry_exists(staging.fd, "old")
                 raise
             _sync_transaction("publish_ready")
             try:
@@ -640,6 +667,9 @@ def _replace_with_tree_at_identity(
                 if _snapshot_entry(parent_fd, dest.name) != backup_snapshot:
                     raise _changed() from publish_exc
                 backup_identity = None
+                # the snapshot above is the filesystem confirming the backup is home again, so
+                # staging no longer holds the destination's only copy.
+                backup_in_staging = False
                 if os.listdir(staging.fd) != ["new"]:
                     raise _changed() from publish_exc
                 _remove_owned_entry(
@@ -672,6 +702,9 @@ def _replace_with_tree_at_identity(
                 verify_after_sync=verify_publication,
             )
             backup_identity = None
+            # publication succeeded and the backup was removed, so the destination's live copy is
+            # the payload at `dest` rather than anything left in staging.
+            backup_in_staging = False
 
         if payload_fd >= 0:
             os.close(payload_fd)
@@ -684,9 +717,9 @@ def _replace_with_tree_at_identity(
         if payload_fd >= 0:
             os.close(payload_fd)
         # a failure before publication leaves a full copy of the payload next to the destination.
-        # only the payload is ours to delete: while `backup_identity` is set the backup is the sole
+        # only the payload is ours to delete: while the backup is still in staging it is the sole
         # copy of the destination, so the staging directory has to survive for recovery.
-        if not staging_removed and backup_identity is None:
+        if not staging_removed and not backup_in_staging:
             with contextlib.suppress(OSError, RuntimeError):
                 _remove_owned_entry(staging.parent_fd, staging.name, staging.identity)
         _close_staging(staging)

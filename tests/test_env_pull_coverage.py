@@ -767,6 +767,49 @@ def test_rejected_backup_move_restores_the_destination(tmp_path, monkeypatch) ->
     assert _staging_dirs(tmp_path) == []
 
 
+def test_a_backup_whose_restore_failed_is_never_deleted(tmp_path, monkeypatch) -> None:
+    """staging cleanup must ask the filesystem whether the backup went home, not a flag.
+
+    the restore on the identity-failure path is best-effort and swallows `OSError`. clearing the
+    "a backup remains" flag before calling it meant a restore that did NOT happen still read as
+    "nothing of the destination is in here", and the recursive staging delete then took the only
+    surviving copy of the destination with it -- an unrecoverable loss of the user's environment.
+    """
+    source = _source(tmp_path, {"environment.py": "new"})
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "irreplaceable.txt").write_text("only copy")
+
+    real_entry_identity = pull._entry_identity
+
+    def fake_entry_identity(parent_fd, name):
+        # a realistic substitution: the backup is still a directory, but not the one that was
+        # moved in. only the inode differs, so the identity check rejects and the restore runs
+        # while every later `S_ISDIR` on the value still behaves like a real stat result.
+        if name == "old":
+            dev, ino, mode = real_entry_identity(parent_fd, name)
+            return (dev, ino + 1, mode)
+        return real_entry_identity(parent_fd, name)
+
+    real_rename = pull._rename_no_replace_at
+
+    def failing_restore(source_fd, source_name, target_fd, target_name):
+        if source_name == "old":
+            raise OSError(errno.EEXIST, "File exists")
+        return real_rename(source_fd, source_name, target_fd, target_name)
+
+    monkeypatch.setattr(pull, "_entry_identity", fake_entry_identity)
+    monkeypatch.setattr(pull, "_rename_no_replace_at", failing_restore)
+
+    with pytest.raises(RuntimeError, match=_GENERIC_ERROR):
+        pull._replace_with_tree(source, dest)
+
+    # the destination is not back yet -- that is the failure being reported. what must hold is that
+    # its bytes still exist somewhere for recovery.
+    staging = _only_staging(tmp_path)
+    assert (staging / "old" / "irreplaceable.txt").read_text() == "only copy"
+
+
 def test_failed_copy_removes_its_own_staging_directory(tmp_path, monkeypatch) -> None:
     """a failure before the backup exists deletes the staged payload it created."""
     source = _source(tmp_path, {"environment.py": "new"})
