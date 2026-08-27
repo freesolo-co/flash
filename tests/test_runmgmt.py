@@ -1540,49 +1540,78 @@ def test_provider_launch_and_handle_persistence_require_exact_claim_token(monkey
     assert not runner_attempts.claim_is_live(spec.run_id, claim)
 
 
-def test_settled_attempt_still_owes_the_run_a_terminal_outcome(monkeypatch, tmp_path):
-    """A caller that settled its attempt must still be the one to fail an unwound run.
-
-    After a terminal retry decision clears the active claim and teardown clears the remote, nothing
-    is owned any more. If that reads as "not mine", attach's except block skips failing the run and
-    leaves it nonterminal with no owner, and handleless recovery relaunches decided work.
-    """
+def _settled_attempt(run_id, tmp_path, monkeypatch, failure):
+    """Reserve one attempt and settle it exactly as attach unwinds: no claim, no remote."""
     from flash.core.spec import JobSpec
     from flash.runner.supervise.retry_decision import FailureObservation
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="settled-owes-terminal", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    spec = JobSpec(run_id=run_id, model="Qwen/Qwen3.5-4B", algorithm="sft")
     runner_state._save_status(
-        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+        runner_state.RunStatus(run_id=run_id, state="provisioning", spec=spec.to_dict())
     )
-    claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    claim = runner_attempts.reserve_verified_attempt_launch(run_id)
     assert claim is not None
-    assert runner_attempts.attempt_is_this_callers_to_fail(spec.run_id, claim)
-
-    # settle the attempt: the decision clears the active claim, and no remote was ever persisted,
-    # which is the exact shape attach unwinds into after `_settle_terminal_remote`.
-    plan = runner_attempts.decide_attempt_failure(
-        spec.run_id,
-        claim_token=claim.token,
-        expected_remote=None,
-        observation=FailureObservation("poll_error"),
-        attempt=claim.attempt,
-    )
-    assert plan is not None
-    raw = runner_status._load_status_json(spec.run_id)
+    assert runner_attempts.attempt_is_this_callers_to_fail(run_id, claim)
+    plan = None
+    if failure is not None:
+        plan = runner_attempts.decide_attempt_failure(
+            run_id,
+            claim_token=claim.token,
+            expected_remote=None,
+            observation=FailureObservation(failure),
+            attempt=claim.attempt,
+        )
+        assert plan is not None
+    else:
+        assert runner_attempts.consume_active_launch_claim(run_id, claim)
+    raw = runner_status._load_status_json(run_id)
     assert runner_state._ACTIVE_LAUNCH_CLAIM_KEY not in raw
     assert raw.get("remote") is None
     assert raw["state"] not in runner_state.TERMINAL_STATES
+    return claim, plan
 
-    # nothing is owned, but no newer attempt exists, so this caller must still fail the run.
-    assert runner_attempts.attempt_is_this_callers_to_fail(spec.run_id, claim)
 
-    # a newer reserved attempt is the boundary: the stale caller must not write over its owner.
-    replacement = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+def test_settled_terminal_attempt_still_owes_the_run_a_terminal_outcome(monkeypatch, tmp_path):
+    """A caller that settled a terminal decision must still be the one to fail an unwound run.
+
+    After a `retry=False` decision clears the active claim and teardown clears the remote, nothing
+    is owned any more. If that reads as "not mine", attach's except block skips failing the run and
+    leaves it nonterminal with no owner that will ever write its terminal state.
+    """
+    claim, plan = _settled_attempt("settled-terminal", tmp_path, monkeypatch, "no_capacity")
+    assert plan.retry is False
+    assert runner_attempts.attempt_is_this_callers_to_fail("settled-terminal", claim)
+
+
+def test_settled_retryable_attempt_is_not_this_callers_to_fail(monkeypatch, tmp_path):
+    """An authorized `retry=True` decision is replacement work, not a run to mark failed.
+
+    The settled shape is byte-identical to the terminal one -- no claim, no remote, nonterminal --
+    so only the persisted plan separates them. Failing here destroys a retry the policy granted and
+    that handleless recovery is entitled to relaunch.
+    """
+    claim, plan = _settled_attempt("settled-retryable", tmp_path, monkeypatch, "poll_error")
+    assert plan.retry is True
+    assert not runner_attempts.attempt_is_this_callers_to_fail("settled-retryable", claim)
+
+    # a newer reserved attempt is the further boundary: its owner, not the stale caller, holds it.
+    replacement = runner_attempts.reserve_verified_attempt_launch("settled-retryable")
     assert replacement is not None
     assert replacement.attempt == claim.attempt + 1
-    assert not runner_attempts.attempt_is_this_callers_to_fail(spec.run_id, claim)
-    assert runner_attempts.attempt_is_this_callers_to_fail(spec.run_id, replacement)
+    assert not runner_attempts.attempt_is_this_callers_to_fail("settled-retryable", claim)
+    assert runner_attempts.attempt_is_this_callers_to_fail("settled-retryable", replacement)
+
+
+def test_settled_attempt_without_a_decision_is_not_this_callers_to_fail(monkeypatch, tmp_path):
+    """An attempt that never reached a decision belongs to adoption, not to a terminal write.
+
+    A success that settled its remote unwinds into the same claimless, remoteless shape. Failing it
+    would overwrite completed work with `failed`.
+    """
+    claim, plan = _settled_attempt("settled-undecided", tmp_path, monkeypatch, None)
+    assert plan is None
+    assert not runner_attempts.attempt_is_this_callers_to_fail("settled-undecided", claim)
 
 
 def test_replacement_reservation_requires_exact_previous_authorization(monkeypatch, tmp_path):

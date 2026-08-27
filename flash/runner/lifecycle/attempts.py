@@ -404,9 +404,20 @@ def attempt_is_this_callers_to_fail(run_id: str, claim: AttemptLaunchClaim) -> b
     it. That settled shape must stay this caller's to finish, or an unwound attempt leaves the run
     in `provisioning` with no owner and a later handleless pass relaunches decided work.
 
-    A newer attempt is the boundary: once the counter has moved past this claim, ownership belongs
-    to whoever reserved it, and this caller must not write a terminal state over them.
+    Releasing ownership is not itself the duty. Three settled shapes look identical from the outside
+    -- no remote, no active claim -- and only one of them is this caller's to fail:
+
+    - a persisted `retry=False` decision for this attempt is terminal, and nobody else will write it;
+    - a persisted `retry=True` decision is authorized replacement work, which handleless recovery
+      relaunches. Failing it here destroys a retry the policy already granted;
+    - no decision at all means the attempt never reached one. That is a success that settled its
+      remote, or a pre-decision unwind, and adoption owns it.
+
+    A newer attempt is the further boundary: once the counter has moved past this claim, ownership
+    belongs to whoever reserved it, and this caller must not write a terminal state over them.
     """
+    from flash.runner.supervise.retry_decision import RetryState
+
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
         if raw.get("state") in state.TERMINAL_STATES:
@@ -419,14 +430,19 @@ def attempt_is_this_callers_to_fail(run_id: str, claim: AttemptLaunchClaim) -> b
             expected_remote=remote if isinstance(remote, dict) else None,
         ):
             return True
-        # settled-and-unwound: nothing is owned because this caller released it. only claim the
-        # duty when no newer attempt was reserved and no other owner has since taken the run.
+        # settled-and-unwound: nothing is owned because this caller released it. only a terminal
+        # decision for this exact attempt, with no newer attempt reserved, is still this caller's.
         if remote is not None or raw.get(state._ACTIVE_LAUNCH_CLAIM_KEY) is not None:
             return False
         try:
-            return status_ops.decode_next_attempt(raw) - 1 == claim.attempt
-        except RuntimeError:
+            if status_ops.decode_next_attempt(raw) - 1 != claim.attempt:
+                return False
+            spec = state._internal_spec_from_status(status_ops._runstatus_from_json(raw))
+            retry_state = RetryState.from_snapshot(spec, raw[state._RETRY_STATE_KEY])
+        except (KeyError, ValueError, RuntimeError):
             return False
+        plan = retry_state.persisted_plan(claim.attempt)
+        return plan is not None and plan.retry is False
 
 
 def decide_attempt_failure(
