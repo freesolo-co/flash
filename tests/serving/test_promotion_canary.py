@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -105,11 +106,34 @@ def test_the_canary_identifies_its_own_generation_for_the_accounting_readback():
     )
     _run(client)
     assert client.calls["headers"]["X-Correlation-ID"] == "fspromo-12345-1"
-    assert client.calls["headers"]["Authorization"] == f"Bearer {API_KEY}"
     assert client.calls["url"] == "https://serve.freesolo.co/v1/chat/completions"
     assert client.calls["json"]["stream"] is True
     # without include_usage the terminal chunk carries no token counts at all.
     assert client.calls["json"]["stream_options"] == {"include_usage": True}
+
+
+def test_the_canary_authenticates_as_trusted_infra_against_the_real_authorizer():
+    """The canary's own headers must satisfy the server's actual internal-key check.
+
+    Asserting a header NAME here would prove nothing -- it would pass just as happily on the wrong
+    one. So this feeds the canary's real headers to `is_trusted_internal`, the same function
+    `authorize_inference` calls, and requires it to accept them.
+
+    The canary previously sent `Authorization: Bearer <FREESOLO_INTERNAL_KEY>`. That is not an
+    internal credential: `authorize_inference` recognizes the internal key only via
+    `X-Freesolo-Internal-Key`, and a bearer token instead falls through to `chat_authorizer`, which
+    resolves CUSTOMER api keys. The internal key is not one, so every promotion 401'd at the stream
+    stage -- and the rollback step keys off `failure()`, so a healthy release would be redeployed
+    back to its predecessor on every single deploy.
+    """
+    from flash.serving.promotion.canary import _headers
+    from flash.serving.src.http.headers import is_trusted_internal
+
+    request = SimpleNamespace(headers=_headers(_request()))
+
+    assert is_trusted_internal(request, (API_KEY,)) is True
+    # and a DIFFERENT key must still be rejected, so the assertion above is not vacuous.
+    assert is_trusted_internal(request, ("some-other-key",)) is False
 
 
 def test_a_transport_failure_never_puts_the_key_in_the_error():

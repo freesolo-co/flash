@@ -58,7 +58,14 @@ BacklogReader = Callable[[Any], Awaitable[Any]]
 GATE_CONFIG_INCOMPLETE = "gate_config_incomplete"
 HEALTH_UNREACHABLE = "health_unreachable"
 
-_DEFAULT_CANARY_TIMEOUT_SECONDS = 180.0
+# the canary is the FIRST request to a freshly deployed release, and engines are scale-to-zero
+# (`MIN_CONTAINERS = 0`), so this budget must cover a full GPU cold start before the first token.
+# `/healthz` cannot have pre-warmed anything: `health_body` reports CONFIGURED per-model tiers and
+# says so explicitly ("remains stable when demand-driven containers scale to zero"), so a passing
+# identity check proves a router booted, not that any engine is up. Sized for a cold engine boot
+# with headroom rather than the warm-path latency, because a promotion that fails on `canary_timeout`
+# does not merely fail -- it rolls a healthy release back to its predecessor.
+_DEFAULT_CANARY_TIMEOUT_SECONDS = 420.0
 _DEFAULT_ACCOUNTING_DEADLINE_SECONDS = 180.0
 _ACCOUNTING_POLL_SECONDS = 5.0
 _BACKLOG_SNAPSHOT_RPC = "serving_usage_backlog_snapshot"

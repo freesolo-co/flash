@@ -63,8 +63,16 @@ def _payload(request: CanaryRequest) -> dict[str, Any]:
 
 
 def _headers(request: CanaryRequest) -> dict[str, str]:
+    """The canary authenticates as trusted infra, which is a HEADER, not a bearer token.
+
+    `ServingContext.authorize_inference` recognizes `FREESOLO_INTERNAL_KEY` only through
+    `X-Freesolo-Internal-Key`. The same value sent as `Authorization: Bearer` is not an internal
+    credential at all: it falls through to `chat_authorizer`, which resolves CUSTOMER api keys, and
+    the internal key is not one -- so every promotion would 401 at the stream stage and roll a
+    healthy release back to its predecessor.
+    """
     return {
-        "Authorization": f"Bearer {request.api_key}",
+        "X-Freesolo-Internal-Key": request.api_key,
         "X-Correlation-ID": request.correlation_id,
         "Accept": "text/event-stream",
         "Content-Type": "application/json",

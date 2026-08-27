@@ -39,10 +39,14 @@ jobs:
     # this only constrains manual dispatches; a non-main dispatch skips without running `modal deploy`.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    # the job's own bounded waits are two 300s readiness polls plus the remote image build; 30
-    # minutes clears that with room while keeping a wedged deploy from holding the runner for
-    # GitHub's 6-hour default.
-    timeout-minutes: 30
+    # the job's own bounded waits now sum well past the old 30: two 300s readiness polls, the remote
+    # image build, a 420s canary that pays a GPU cold start, a 180s accounting deadline, and on the
+    # failure path a SECOND `modal deploy` plus a 300s restore poll. 60 minutes clears that worst
+    # case with room while keeping a wedged deploy from holding the runner for GitHub's 6-hour
+    # default. the headroom is specifically for the rollback: a job killed partway through the
+    # restore leaves the broken release live with no second attempt, which is the one outcome this
+    # workflow exists to prevent.
+    timeout-minutes: 60
     # serialize serving deploys across runs because each deploy mutates the live app. github can still
     # replace a pending run, so the gate compares against the sha reported by the deployed app rather
     # than assuming every push predecessor was deployed.
