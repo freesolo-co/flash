@@ -1436,6 +1436,57 @@ def test_live_candidates_drop_skus_that_cannot_hold_the_run_disk(monkeypatch):
     assert PROVIDER.live_candidates(24, AllocationConstraints(disk_gb=800, gpu_type="A10")) == []
 
 
+def test_live_candidates_contain_a_malformed_sku_to_that_sku(monkeypatch):
+    """One bad catalog field must not delete every VALID sibling shape.
+
+    The decoders raise on a present-but-malformed field on purpose (renting a box off a field you
+    could not read is how a run pays for the wrong machine). But ``live_candidates`` wraps the whole
+    class/count walk in one ``try`` whose tail converts any exception into a provider-wide
+    ``CapacityLookupError``, and the allocator answers that by dropping Lambda from the allocation
+    entirely -- so a single malformed A10 storage value used to cost every real H100 too. Vast
+    already drops the bad row and keeps the rest; Lambda gets the same containment.
+    """
+    import flash.providers.lambda_.jobs as jobs
+    from flash.providers.core.base import AllocationConstraints
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.execution.provider import PROVIDER
+
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instance_types",
+        lambda *a, **k: {
+            # storage_gib is present but not a positive number -> the decoder raises for THIS sku
+            "gpu_1x_a10": {"instance_type": {"specs": {"storage_gib": "512"}}},
+            "gpu_1x_h100_pcie": {"instance_type": {"specs": {"storage_gib": 1024}}},
+        },
+    )
+    monkeypatch.setattr(jobs, "usable_instances", lambda *a, **k: [_inst(disk_gb=1024.0)])
+
+    fits = PROVIDER.live_candidates(24, AllocationConstraints(disk_gb=200))
+    assert "H100" in [c.gpu for c in fits]
+    assert "A10" not in [c.gpu for c in fits]
+
+
+def test_live_candidates_fail_when_no_probed_sku_decodes(monkeypatch):
+    """Containment is per-sku, not a blanket mute: a catalog where NOTHING decodes is a broken feed.
+
+    Skipping every sku would report "lambda has no capacity", which the allocator cannot tell from a
+    real sell-out, so a wholly malformed feed must still surface as a lookup failure.
+    """
+    from flash.providers.core.base import AllocationConstraints, CapacityLookupError
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.execution.provider import PROVIDER
+
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instance_types",
+        lambda *a, **k: {"gpu_1x_a10": {"instance_type": {"specs": {"storage_gib": "512"}}}},
+    )
+
+    with pytest.raises(CapacityLookupError):
+        PROVIDER.live_candidates(24, AllocationConstraints(gpu_type="A10"))
+
+
 def test_launch_never_rents_an_undersized_sku_from_a_mixed_candidate_list(monkeypatch):
     """A capable SKU elsewhere in the list must not license renting an undersized one.
 
