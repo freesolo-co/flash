@@ -9818,23 +9818,32 @@ def _reference_no_padding_2_padding(tensor, data):
 
     Reads tensor.values() only when nested, otherwise treats the input as already flattened
     to total_nnz -- which is why a padded (bsz, seq_len, *) tensor trips its assertion.
+
+    verl is not installed in the offline CI environment, so importing the real helper here
+    would skip these tests rather than run them. The test below pins this body against the
+    pinned source instead, so a drift fails loudly wherever verl IS installed.
     """
     torch = pytest.importorskip("torch")
 
     values = tensor.values() if tensor.is_nested else tensor
     prompt_ids, response_ids = data["prompts"], data["responses"]
+    max_response_len = data.get("max_response_len", -1)
     if prompt_ids.is_nested:
         prompt_lens = prompt_ids.offsets().diff()
         response_lens = response_ids.offsets().diff()
-        max_response_len = int(response_lens.max().item())
+        if max_response_len < 0:
+            max_response_len = int(response_lens.max().item())
     else:
         attention_mask = data["attention_mask"]
+        assert not attention_mask.is_nested
         prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
         response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
         max_response_len = response_ids.shape[1]
 
     sequence_offsets = (prompt_lens + response_lens).cumsum(dim=0)
     assert sequence_offsets[-1].item() == values.shape[0]
+    # the pinned helper's own guard: the slice below reads seq_offset - resp_len - 1.
+    assert not prompt_lens.eq(0).any(), f"prompt_len must be > 0, got {prompt_lens}"
 
     skip_padding = (0, 0) * (values.ndim - 1)
     sliced = [
@@ -9845,6 +9854,58 @@ def _reference_no_padding_2_padding(tensor, data):
         for resp_len, offset in zip(response_lens, sequence_offsets, strict=True)
     ]
     return torch.stack(sliced, dim=0)
+
+
+def test_reference_helper_agrees_with_the_real_pinned_verl_function():
+    """Pin the stand-in above against verl itself wherever verl is installed.
+
+    The offline CI image has no verl, so the tests around it must use the stand-in or they
+    would skip instead of running. That makes the stand-in a drift risk: it could diverge from
+    the pinned helper and keep passing. This test closes that gap on any environment that does
+    have verl, so a divergence fails somewhere rather than nowhere.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+    padding = pytest.importorskip("verl.workers.utils.padding")
+
+    samples = [(100, 1024), (120, 900), (90, 1024)]
+    rows, prompts, responses, masks = [], [], [], []
+    prompt_width = max(prompt_len for prompt_len, _ in samples)
+    response_width = max(response_len for _, response_len in samples)
+    for prompt_len, response_len in samples:
+        rows.append(torch.arange(1, prompt_len + response_len + 1, dtype=torch.float32))
+        prompts.append(torch.arange(1, prompt_len + 1))
+        responses.append(torch.arange(1, response_len + 1))
+        masks.append(
+            torch.tensor(
+                [0] * (prompt_width - prompt_len)
+                + [1] * (prompt_len + response_len)
+                + [0] * (response_width - response_len)
+            )
+        )
+
+    nested_data = TensorDict(
+        {
+            "prompts": torch.nested.as_nested_tensor(prompts, layout=torch.jagged),
+            "responses": torch.nested.as_nested_tensor(responses, layout=torch.jagged),
+        },
+        batch_size=[len(samples)],
+    )
+    strided_data = TensorDict(
+        {
+            "prompts": torch.zeros(len(samples), prompt_width, dtype=torch.int64),
+            "responses": torch.zeros(len(samples), response_width, dtype=torch.int64),
+            "attention_mask": torch.stack(masks),
+        },
+        batch_size=[len(samples)],
+    )
+
+    for data in (nested_data, strided_data):
+        packed = torch.cat(rows).unsqueeze(-1)
+        assert torch.equal(
+            _reference_no_padding_2_padding(packed, data),
+            padding.no_padding_2_padding(packed, data),
+        )
 
 
 def test_padded_teacher_tensor_trips_the_verl_total_nnz_assertion():
