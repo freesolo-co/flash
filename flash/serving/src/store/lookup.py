@@ -26,7 +26,7 @@ class AdapterLookup:
         router: AdapterRouter,
         reload_records: Any = None,
         *,
-        lookup_record: Callable[[str], AdapterRecord | None] | None = None,
+        lookup_record: Callable[[str, str], AdapterRecord | None] | None = None,
         reload_interval_seconds: float = 30.0,
     ) -> None:
         self._router = router
@@ -80,39 +80,39 @@ class AdapterLookup:
         return time.monotonic() - self._last_reload["at"] >= self._reload_interval_seconds
 
     async def resolve(
-        self, adapter_id: str, *, require_supported_base_model: bool = True
+        self,
+        adapter_id: str,
+        *,
+        org_id: str | None,
+        require_supported_base_model: bool = True,
     ) -> tuple[AdapterRecord, AdapterRecord]:
-        resolved = self._router.resolve(adapter_id)
+        resolved = self._router.resolve(adapter_id, org_id=org_id)
         stale = resolved is not None and self._is_stale()
-        if resolved is not None and self._reload_records is not None:
-            if resolved[0].is_alias:
-                if await self._reload_safe():
-                    resolved = self._router.resolve(adapter_id)
-            elif stale:
-                self._schedule_reload()
+        if resolved is not None and self._reload_records is not None and stale:
+            self._schedule_reload()
         elif resolved is None and self._reload_records is not None:
             await self.reload()
-            resolved = self._router.resolve(adapter_id)
+            resolved = self._router.resolve(adapter_id, org_id=org_id)
         if resolved is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
         if require_supported_base_model:
             _assert_supported_base_model(resolved[1].base_model)
         return resolved
 
-    async def get_exact(self, adapter_id: str) -> AdapterRecord:
-        record = self._router.get(adapter_id)
+    async def get_exact(self, org_id: str, adapter_id: str) -> AdapterRecord:
+        record = self._router.get(adapter_id, org_id=org_id)
         cached_ready = record is not None and record.status == "ready"
         if cached_ready and self._is_stale() and self._reload_records is not None:
             self._schedule_reload()
         if not cached_ready and self._lookup_record is not None:
             # lifecycle reads need disabled rows, but routing hydration must stay ready-only. fetch
             # this id without mutating the registry so visibility never makes it routable.
-            record = await asyncio.to_thread(self._lookup_record, adapter_id)
+            record = await asyncio.to_thread(self._lookup_record, org_id, adapter_id)
         elif not cached_ready and self._reload_records is not None:
             await self.reload()
-            record = self._router.get(adapter_id)
+            record = self._router.get(adapter_id, org_id=org_id)
         if record is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
-        if not record.serve_base_model and not (record.is_alias or record.is_revision):
+        if not record.serve_base_model and not record.is_checkpoint:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
         return record

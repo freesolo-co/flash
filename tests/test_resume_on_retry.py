@@ -1207,7 +1207,10 @@ def test_terminal_runpod_job_allows_retry_and_persists_leaked_endpoint(
     assert metrics["train_tokens"] == 4096
     assert submits == [0, 1]
     raw = runner_status._load_status_json(spec.run_id)
-    assert [item["endpoint_id"] for item in raw[runner_state._CLEANUP_REMOTES_KEY]] == ["ep0"]
+    assert [item["endpoint_id"] for item in raw[runner_state._CLEANUP_REMOTES_KEY]] == [
+        "ep0",
+        "ep1",
+    ]
     assert runner_status.get_status(spec.run_id).remote["endpoint_id"] == "ep1"
 
 
@@ -1363,8 +1366,7 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import job_execution as rp_jobs
 
-    # cancel_job fires ONLY in the inter-attempt teardown block (never in the success _gc_seen_endpoints
-    # sweep, which only delete_endpoints), so counting it cleanly isolates re-teardown.
+    # cancel_job records inter-attempt teardown and the final successful attempt's confirmed cleanup.
     cancels: list[str] = []
     monkeypatch.setattr(
         runpod_api,
@@ -1393,9 +1395,8 @@ def test_confirmed_teardown_clears_handle_so_next_retry_does_not_retear(orch, mo
     metrics = runner_lifecycle._submit_seed_supervised(spec, 0, log)
 
     assert metrics["train_tokens"] == 4096, "the run must reach the successful final retry"
-    assert cancels == ["ep0"], (
-        "ep0 must be torn down exactly once, never re-torn after confirmed clear"
-    )
+    assert cancels == ["ep0", "ep2"]
+    assert cancels.count("ep0") == 1, "confirmed cleanup must not re-tear the prior endpoint"
 
 
 def test_worker_error_fails_fast_without_relaunch(orch, monkeypatch):
