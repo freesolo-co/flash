@@ -25,7 +25,7 @@ from flash.serve.runtime.sampling import (
 DEFAULT_MAX_TOKENS = 1024
 _ALLOWED_REQUEST_KEYS = frozenset(
     {
-        "adapter_revision",
+        "checkpoint_id",
         "chat_template_kwargs",
         "frequency_penalty",
         "logprobs",
@@ -36,7 +36,6 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "presence_penalty",
         "response_format",
         "seed",
-        "step",
         "stop",
         "stream",
         "stream_options",
@@ -106,7 +105,7 @@ def parse_chat_request(
         raise OpenAIRequestError("request body must be a json object")
     allowed = _ALLOWED_REQUEST_KEYS
     if not allow_managed_selectors:
-        allowed = allowed - {"adapter_revision", "step"}
+        allowed = allowed - {"checkpoint_id"}
     unknown = sorted(set(payload) - allowed)
     if unknown:
         raise OpenAIRequestError(f"unsupported chat request field(s): {', '.join(unknown)}")

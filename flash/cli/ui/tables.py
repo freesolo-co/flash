@@ -112,7 +112,7 @@ def deployments_table(rows: list[dict]) -> str:
             [
                 (run_id, _ACCENT2),
                 ("final" if step is None else str(step), _TEAL),
-                (str(deployment.get("adapter_revision") or "-"), _ACCENT2),
+                (str(deployment.get("checkpoint_id") or "-"), _ACCENT2),
                 (state, color),
                 (
                     "-" if verified_at is None else (_humanize_ts(verified_at) or str(verified_at)),
@@ -127,7 +127,7 @@ def deployments_table(rows: list[dict]) -> str:
         [
             "RUN ID",
             "STEP",
-            "REVISION",
+            "CHECKPOINT ID",
             "STATE",
             "VERIFIED AT",
             "OPENAI MODEL",

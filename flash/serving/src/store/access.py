@@ -8,12 +8,12 @@ from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.store.persistence import PersistenceRecordError
 
 
-async def _list_run_stored(run_id: str) -> list[AdapterRecord]:
+async def _list_run_stored(org_id: str, run_id: str) -> list[AdapterRecord]:
     from flash.serving.src.store.persistence import list_run_adapters
     from flash.serving.src.store.settings import get_settings
 
     try:
-        return await asyncio.to_thread(list_run_adapters, run_id, get_settings())
+        return await asyncio.to_thread(list_run_adapters, org_id, run_id, get_settings())
     except PersistenceRecordError:
         raise
     except Exception as exc:
@@ -22,12 +22,12 @@ async def _list_run_stored(run_id: str) -> list[AdapterRecord]:
         ) from exc
 
 
-async def _get_stored(adapter_id: str) -> AdapterRecord | None:
+async def _get_stored(org_id: str, adapter_id: str) -> AdapterRecord | None:
     from flash.serving.src.store.persistence import PersistenceRecordError, get_adapter
     from flash.serving.src.store.settings import get_settings
 
     try:
-        return await asyncio.to_thread(get_adapter, adapter_id, get_settings())
+        return await asyncio.to_thread(get_adapter, org_id, adapter_id, get_settings())
     except PersistenceRecordError:
         raise
     except Exception as exc:
@@ -66,7 +66,12 @@ async def _insert_or_read(record: AdapterRecord) -> tuple[AdapterRecord, bool]:
     try:
         return await _insert_stored(record), True
     except PersistenceConflict as exc:
-        winner = await _get_stored(record.adapter_id)
+        if record.org_id is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "checkpoint registration requires org_id",
+            ) from exc
+        winner = await _get_stored(record.org_id, record.adapter_id)
         if winner is None:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,

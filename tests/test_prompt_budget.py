@@ -291,7 +291,7 @@ def test_paid_submit_owner_warning_precedes_create_and_names_source(
     monkeypatch.setattr(cli_train, "client_from_config", lambda: Client())
     monkeypatch.setattr(cli_prompt_budget.render, "styled", lambda: False)
     result = cli_train.cmd_train(
-        _train_args(_train_config(tmp_path, init_from_adapter="source-run"))
+        _train_args(_train_config(tmp_path, init_from_adapter="source-run/final"))
     )
     captured = capsys.readouterr()
 
@@ -329,7 +329,7 @@ def test_paid_submit_org_peer_prints_only_supplement_after_create(
     monkeypatch.setattr(cli_train, "client_from_config", lambda: Client())
     monkeypatch.setattr(cli_prompt_budget.render, "styled", lambda: False)
     result = cli_train.cmd_train(
-        _train_args(_train_config(tmp_path, init_from_adapter="org-peer-run"))
+        _train_args(_train_config(tmp_path, init_from_adapter="org-peer-run/final"))
     )
     captured = capsys.readouterr()
 
@@ -352,7 +352,7 @@ def test_source_lookup_failure_is_non_fatal() -> None:
 
     assert (
         warmstart_source_context(
-            Client(), _budget_spec("grpo", {"init_from_adapter": "source-run"})
+            Client(), _budget_spec("grpo", {"init_from_adapter": "source-run/final"})
         )
         is None
     )
