@@ -70,7 +70,7 @@ def redirect_servers():
     [
         lambda client: client.health(),
         lambda client: client._request_bytes("GET", "/bytes"),
-        lambda client: list(client.chat_stream("run-a", [])),
+        lambda client: list(client.chat_stream("run-a/final", [])),
     ],
     ids=["json", "bytes", "chat-stream"],
 )
