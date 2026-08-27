@@ -388,10 +388,12 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
     claim = prepared[0]
     _, chosen, on_last_gpu, _, _ = candidate_plan
     from flash.runner.accounting.reconciliation import (
+        _expected_remote_matches,
         _preserve_cleanup_remote,
         _record_cleanup_remote,
     )
     from flash.runner.lifecycle.attempts import persist_claimed_remote
+    from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.errors import _TerminalHandleRace
 
     def on_handle(handle: dict) -> None:
@@ -415,9 +417,22 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
         try:
             claimed = persist_claimed_remote(ctx.spec.run_id, claim, persisted)
         except Exception:
-            # the resource exists the moment the provider returned it, but nothing durable names it
-            # yet. `_submit_provider` turns this into a retryable `poll_error`, so unless the handle
-            # is torn down or recorded here it is unreachable: the retry provisions a second worker
+            # a raise does not prove nothing landed: `_save_status_unlocked` runs `os.replace`
+            # before its directory `fsync`, so the remote can already be durable and visible. read
+            # what actually landed instead of assuming the write failed.
+            landed = False
+            with contextlib.suppress(Exception):
+                landed = _expected_remote_matches(get_status(ctx.spec.run_id).remote, persisted)
+            if landed:
+                # the write won. adopt it exactly as the success path would, so `_handle_failure`
+                # reports the real expected remote and keeps ownership of the attempt.
+                ctx.last_handle.clear()
+                ctx.last_handle.update(persisted)
+                ctx.current_claim = None
+                raise
+            # nothing durable names the resource, and it exists the moment the provider returned it.
+            # `_submit_provider` turns this into a retryable `poll_error`, so unless the handle is
+            # torn down or recorded here it is unreachable: the retry provisions a second worker
             # against the same run artifacts while this one keeps running.
             #
             # record the identity WITHOUT writing `status.remote`. the run is still nonterminal and

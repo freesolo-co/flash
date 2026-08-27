@@ -1669,6 +1669,40 @@ def test_setup_failure_releases_the_reserved_launch_claim(monkeypatch, tmp_path)
     assert not runner_attempts.claim_is_live(spec.run_id, claim)
 
 
+def test_reservation_write_failure_rolls_back_the_persisted_claim(monkeypatch, tmp_path):
+    """A reservation write that raises after `os.replace` must not leave a stale claim.
+
+    The caller never receives the claim, and attach compares against the old remote, gets a plain
+    `False` rather than an exception, and schedules no reconciler. The run is then handleless behind
+    an unlocked stale claim until another control-plane restart.
+    """
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="reservation-write-raises", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    )
+
+    real_save = runner_state._save_status_unlocked
+
+    def _save_then_raise(status, **kwargs):
+        # the write lands, exactly as it does when the following directory fsync fails.
+        real_save(status, **kwargs)
+        if kwargs.get("_active_launch_claim") is not None:
+            raise OSError("directory fsync failed after os.replace")
+
+    monkeypatch.setattr(runner_state, "_save_status_unlocked", _save_then_raise)
+
+    with pytest.raises(OSError, match="directory fsync failed"):
+        runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+
+    monkeypatch.setattr(runner_state, "_save_status_unlocked", real_save)
+    raw = runner_status._load_status_json(spec.run_id)
+    # no stale claim survives, so nothing later reads an abandoned reservation as a live owner.
+    assert runner_state._ACTIVE_LAUNCH_CLAIM_KEY not in raw
+
+
 def test_settled_terminal_attempt_still_owes_the_run_a_terminal_outcome(monkeypatch, tmp_path):
     """A caller that settled a terminal decision must still be the one to fail an unwound run.
 
@@ -4280,6 +4314,102 @@ def test_handle_persistence_failure_still_tears_down_the_created_resource(monkey
     # check, attach cannot own a remote alongside an active claim, and handleless recovery refuses
     # a set remote, so a live worker keeps billing with no supervisor and no retry.
     assert raw.get("remote") is None, "a nonterminal run must not hold a remote it cannot own"
+
+
+def test_handle_persistence_raise_after_replace_adopts_the_landed_remote(monkeypatch, tmp_path):
+    """A raise does not prove nothing landed: `os.replace` precedes the directory `fsync`.
+
+    If the remote is already durable and visible, tearing the resource down and unwinding leaves a
+    persisted handle to a destroyed worker, and `_handle_failure` then reports `expected_remote=None`,
+    loses ownership, and the run stays nonterminal. The landed write must be adopted instead.
+    """
+    import contextlib
+    import io
+
+    import flash.providers.core.allocator as allocator
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import Allocation, Candidate
+    from flash.runner.lifecycle import attempts as lifecycle_attempts
+    from flash.runner.supervise import lifecycle
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="persist-raise-after-replace",
+            model="Qwen/Qwen3.5-9B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_retries=0),
+        )
+    )
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+        _next_attempt=0,
+    )
+    candidate = Candidate("lambda", "A100", 1.0, 40)
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *_args, **_kwargs: Allocation(
+            provider="lambda",
+            gpu="A100",
+            hourly_usd=1.0,
+            min_vram_gb=40,
+            candidates=(candidate,),
+        ),
+    )
+
+    real_persist = lifecycle_attempts.persist_claimed_remote
+
+    def _persist_then_raise(run_id, claim, remote):
+        # the durable write wins; the raise happens afterwards, as a directory fsync failure would.
+        real_persist(run_id, claim, remote)
+        raise OSError("directory fsync failed after os.replace")
+
+    monkeypatch.setattr(
+        "flash.runner.lifecycle.attempts.persist_claimed_remote", _persist_then_raise
+    )
+
+    class Provider:
+        supports_weight_cache = False
+
+        def __init__(self):
+            self.teardown = []
+
+        def submit_run(self, _spec, _seed, *, attempt, on_handle, **_kwargs):
+            on_handle(_lambda_remote("instance-landed", attempt=attempt))
+            raise AssertionError("handle callback must not return")
+
+        def cancel(self, handle):
+            self.teardown.append(("cancel", handle.to_dict()))
+
+        def destroy(self, handle):
+            self.teardown.append(("destroy", handle.to_dict()))
+
+    provider = Provider()
+    monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
+
+    with contextlib.suppress(Exception):
+        lifecycle._submit_seed_supervised(
+            spec,
+            spec.seed,
+            io.StringIO(),
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
+
+    # the landed remote is adopted, so the attempt keeps an owner and reaches a terminal state
+    # instead of stranding a durable handle to a torn-down worker.
+    # ownership survived: the attempt persisted its own terminal decision. without adoption the
+    # caller reports `expected_remote=None`, `decide_attempt_failure` returns None, and the attempt
+    # ends with no decision at all -- nobody left to fail the run or reclaim the worker.
+    raw = runner_status._load_status_json(spec.run_id)
+    decision = raw[runner_state._RETRY_STATE_KEY]["last_decision"]
+    assert decision is not None, "ownership was lost after a post-replace persistence raise"
+    assert decision["attempt"] == 0
+    assert decision["plan"]["retry"] is False
 
 
 def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypatch, tmp_path):

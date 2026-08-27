@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 import uuid
 from dataclasses import dataclass
@@ -187,6 +188,65 @@ def _claim_matches_raw(raw: dict, claim: AttemptLaunchClaim) -> bool:
     )
 
 
+def _clear_exact_persisted_claim_unlocked(run_id: str, claim: AttemptLaunchClaim) -> None:
+    """Remove one exact claim a failed reservation write may still have persisted.
+
+    The caller already holds `_status_guard`, which is a plain non-reentrant lock, so this must not
+    re-enter it.
+    """
+    raw = status_ops._load_status_json(run_id)
+    if not _claim_matches_raw(raw, claim):
+        return
+    state._save_status_unlocked(
+        status_ops._runstatus_from_json(raw),
+        _active_launch_claim=None,
+    )
+
+
+def _persist_reservation_unlocked(
+    run_id: str,
+    status,
+    *,
+    claim: AttemptLaunchClaim,
+    next_attempt: int,
+    snapshot,
+    clear_remote: bool,
+    clear_teardown_marker: bool,
+    transition_state: str | None,
+) -> None:
+    """Write one reservation, rolling the claim back if the write raises after landing.
+
+    The caller holds `_status_guard`, which is not reentrant, so every write here is unlocked.
+    """
+    if clear_remote:
+        status.remote = None
+        # a confirmed-teardown reservation consumes `cleanup_confirmed_remote`, so the marker has
+        # to go with it. leaving it makes a crash before the replacement handle look like
+        # confirmed-handle recovery: attach reattaches the old attempt, its reservation loses to
+        # the advanced counter, and the run sits in `provisioning` with no handleless pass
+        # scheduled. accounting keeps its own `realized_cost_remote`.
+        if clear_teardown_marker:
+            status.cleanup_confirmed_remote = None
+    if transition_state is not None:
+        status.state = transition_state
+    status.updated_at = time.time()
+    try:
+        state._save_status_unlocked(
+            status,
+            _next_attempt=next_attempt,
+            _retry_state=snapshot,
+            _active_launch_claim=claim.to_dict(),
+        )
+    except Exception:
+        # `os.replace` runs before the directory `fsync`, so a raise here can still leave the claim
+        # persisted while the caller never receives it. attach then sees a plain `False` against the
+        # old remote and schedules no reconciler, so the run is left handleless behind an unlocked
+        # stale claim. clear only this exact claim.
+        with contextlib.suppress(Exception):
+            _clear_exact_persisted_claim_unlocked(run_id, claim)
+        raise
+
+
 def _reserve_attempt_launch(
     run_id: str,
     *,
@@ -296,23 +356,15 @@ def _reserve_attempt_launch(
                     resume_world_size,
                 )
                 current += 1
-            if expected_remote is not None:
-                status.remote = None
-                # a confirmed-teardown reservation consumes `cleanup_confirmed_remote`, so the
-                # marker has to go with it. leaving it makes a crash before the replacement handle
-                # look like confirmed-handle recovery: attach reattaches the old attempt, its
-                # reservation loses to the advanced counter, and the run sits in `provisioning`
-                # with no handleless pass scheduled. accounting keeps its own `realized_cost_remote`.
-                if confirmed_matches:
-                    status.cleanup_confirmed_remote = None
-            if transition_state is not None:
-                status.state = transition_state
-            status.updated_at = time.time()
-            state._save_status_unlocked(
+            _persist_reservation_unlocked(
+                run_id,
                 status,
-                _next_attempt=current,
-                _retry_state=snapshot,
-                _active_launch_claim=claim.to_dict(),
+                claim=claim,
+                next_attempt=current,
+                snapshot=snapshot,
+                clear_remote=expected_remote is not None,
+                clear_teardown_marker=confirmed_matches,
+                transition_state=transition_state,
             )
             report_status = status
         claim_lock.register(run_id, claim.token, claim_fd)
