@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from flash.serving.loadtest.artifacts import ResultDirectory
+from flash.serving.loadtest.artifacts import ResultDirectory, load_events
 from flash.serving.loadtest.metrics import summarize_events
 from flash.serving.loadtest.protocol import (
     RequestObservation,
@@ -31,12 +32,12 @@ from flash.serving.loadtest.schema import (
     AdapterTarget,
     BaseTarget,
     ColdBurstPhase,
-    OverloadPhase,
     Phase,
     ResolvedScenario,
     Scenario,
     Target,
     WarmPhase,
+    capacity_expectations,
 )
 
 ClientFactory = Callable[..., httpx.AsyncClient]
@@ -51,7 +52,7 @@ async def discover_scenario(
     async with _client(scenario, credential, client_factory) as client:
         health = await get_health(
             client,
-            str(scenario.endpoint).rstrip("/"),
+            scenario.origin,
             scenario.expected_deployment,
             scenario.required_capabilities,
         )
@@ -83,11 +84,7 @@ async def discover_scenario(
         for phase in scenario.phases
         if isinstance(phase, ColdBurstPhase)
     }
-    capacity = {
-        phase.name: phase.expects_capacity_contract
-        for phase in scenario.phases
-        if isinstance(phase, OverloadPhase)
-    }
+    capacity = capacity_expectations(scenario)
     limitations = list(CLAIM_LIMITATIONS)
     if capacity and not all(capacity.values()):
         limitations.append(NO_CAPACITY_CONTRACT_LIMITATION)
@@ -137,7 +134,7 @@ async def run_scenario(
                     run_clock,
                 )
             await _health_event(result, client, resolved, "run_end", run_clock)
-        events = _events_for_summary(result.path)
+        events = load_events(result.path / "events.jsonl")
         summary = summarize_events(
             events,
             fake=scenario.fake,
@@ -272,20 +269,17 @@ async def _run_warm_phase(
     """the only closed-loop phase: a bounded-concurrency sweep of the authored request count."""
     semaphore = asyncio.Semaphore(phase.concurrency)
     in_flight = 0
-    lock = asyncio.Lock()
 
     async def execute(item: ScheduledRequest) -> None:
         nonlocal in_flight
         async with semaphore:
-            async with lock:
-                in_flight += 1
-                current = in_flight
+            in_flight += 1
+            current = in_flight
             try:
                 observation = await _dispatch(client, resolved, credential, item, clock)
                 recorder.settle(item, observation, current)
             finally:
-                async with lock:
-                    in_flight -= 1
+                in_flight -= 1
 
     tasks = [asyncio.create_task(execute(item)) for item in scheduled]
     try:
@@ -315,7 +309,7 @@ async def _run_open_loop_phase(
     max_lag_ns = round(limits.max_scheduling_lag_ms * 1_000_000)
     active = 0
     tasks: list[asyncio.Task[None]] = []
-    health = _MidpointHealth(result, client, resolved, phase, recorder, clock)
+    health = _MidpointHealth(result, client, resolved, phase, recorder.start_ns, clock)
 
     async def execute(item: ScheduledRequest, current: int) -> None:
         nonlocal active
@@ -368,15 +362,15 @@ class _MidpointHealth:
         client: httpx.AsyncClient,
         resolved: ResolvedScenario,
         phase: Phase,
-        recorder: PhaseRecorder,
+        start_ns: int,
         clock: Clock,
     ) -> None:
         duration = phase_duration_seconds(phase)
-        self._at_ns = (
-            recorder.start_ns + round(duration * 500_000_000) if duration is not None else None
-        )
+        self._at_ns = start_ns + round(duration * 500_000_000) if duration is not None else None
         self._done = False
-        self._args = (result, client, resolved, f"phase:{phase.name}:during", clock)
+        self._probe = partial(
+            _health_event, result, client, resolved, f"phase:{phase.name}:during", clock
+        )
         self._clock = clock
         self._started_ns: int | None = None
         self._finished_ns: int | None = None
@@ -405,7 +399,7 @@ class _MidpointHealth:
     async def _fire(self) -> None:
         await self._clock.sleep_until_ns(self._at_ns)
         self._started_ns = self._clock.monotonic_ns()
-        await _health_event(*self._args)
+        await self._probe()
         self._finished_ns = self._clock.monotonic_ns()
         self._done = True
 
@@ -433,7 +427,7 @@ async def _dispatch(
 ) -> RequestObservation:
     return await stream_chat(
         client,
-        str(resolved.authored.endpoint).rstrip("/"),
+        resolved.authored.origin,
         credential,
         item.target,
         item.profile,
@@ -500,7 +494,7 @@ async def _health_event(
 ) -> None:
     health = await get_health(
         client,
-        str(resolved.authored.endpoint).rstrip("/"),
+        resolved.authored.origin,
         resolved.authored.expected_deployment,
         resolved.authored.required_capabilities,
     )
@@ -543,9 +537,3 @@ def _client(
         limits=limits,
         headers={"Authorization": f"Bearer {credential}"},
     )
-
-
-def _events_for_summary(path: Path) -> list[dict[str, Any]]:
-    from flash.serving.loadtest.artifacts import load_events
-
-    return load_events(path / "events.jsonl")

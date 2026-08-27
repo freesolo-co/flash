@@ -287,6 +287,15 @@ class Scenario(StrictModel):
     phases: list[Phase]
     fake: StrictBool = False
 
+    @property
+    def origin(self) -> str:
+        """the endpoint as a request prefix, without the trailing slash pydantic appends.
+
+        every caller builds urls as ``f"{origin}/healthz"``, so the trim belongs here once rather
+        than at each call site where one omission would silently produce a double slash.
+        """
+        return str(self.endpoint).rstrip("/")
+
     @field_validator("name")
     @classmethod
     def validate_name(cls, value: str) -> str:
@@ -405,6 +414,20 @@ NO_CAPACITY_CONTRACT_LIMITATION = (
     "this deployment declares no retryable capacity contract, so an absence of capacity "
     "rejections is not evidence of headroom"
 )
+
+
+def capacity_expectations(scenario: Scenario) -> dict[str, bool]:
+    """per-overload-phase capacity contract declarations, keyed by phase name.
+
+    the live run and the offline ``summarize`` must reach the same overload verdict, so both read
+    this one function over the authored phases rather than keeping parallel comprehensions that
+    could drift apart and disagree about the same evidence.
+    """
+    return {
+        phase.name: phase.expects_capacity_contract
+        for phase in scenario.phases
+        if isinstance(phase, OverloadPhase)
+    }
 
 
 def public_scenario_dict(scenario: Scenario) -> dict[str, Any]:

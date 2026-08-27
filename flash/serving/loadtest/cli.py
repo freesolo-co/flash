@@ -19,7 +19,7 @@ from flash.serving.loadtest.artifacts import (
 )
 from flash.serving.loadtest.metrics import summarize_events
 from flash.serving.loadtest.runner import discover_scenario, run_scenario
-from flash.serving.loadtest.schema import OverloadPhase, Scenario, public_scenario_dict
+from flash.serving.loadtest.schema import Scenario, capacity_expectations, public_scenario_dict
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
                 summarize_events(
                     events,
                     fake=authored.fake,
-                    capacity_expectations=_capacity_expectations(authored),
+                    capacity_expectations=capacity_expectations(authored),
                 )
             )
             return 0
@@ -87,20 +87,6 @@ def load_scenario(path: Path) -> Scenario:
     except json.JSONDecodeError as exc:
         raise ValueError(f"scenario is not valid json: {path}") from exc
     return Scenario.model_validate(value)
-
-
-def _capacity_expectations(scenario: Scenario) -> dict[str, bool]:
-    """rebuild overload capacity expectations from the authored scenario.
-
-    summarize is offline and must reproduce the run's verdict exactly, so this reads the
-    authored phases rather than the resolved artifact, which carries no extra information here
-    and would make the summary depend on a second file.
-    """
-    return {
-        phase.name: phase.expects_capacity_contract
-        for phase in scenario.phases
-        if isinstance(phase, OverloadPhase)
-    }
 
 
 def _credential(scenario: Scenario) -> str:
