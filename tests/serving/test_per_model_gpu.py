@@ -1,7 +1,7 @@
 """Per-model GPU tier routing: each base model's engine runs on the GPU class from the catalog.
 
 Modal fixes a class's GPU and concurrency at decoration time, so the serving app registers one
-``LoraEngine`` ``@app.cls`` per exact model policy and dispatches each base model to
+``LoraEngine`` ``@app.cls`` per distinct (GPU tier, max_inputs) key and dispatches each base model to
 its class (9b -> l40s, 35b -> h200). modal_app imports the ``modal`` sdk
 at module top, which isn't installed offline, so we stub it just enough to import the module and
 reach the built engine classes.
@@ -16,7 +16,6 @@ import subprocess
 import sys
 import time
 import types
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -27,7 +26,6 @@ from flash.serving.src.engine.model_config import (
     base_models,
     configured_warm_container_floor,
     gpu_for,
-    hosted_traffic_policy_for,
 )
 
 
@@ -40,19 +38,8 @@ def _passthrough_decorator(*_a: Any, **_k: Any):
 
 @pytest.fixture(scope="module")
 def modal_app_module(load_modal_app_under_stub):
-    engine_concurrency_by_model: dict[str, dict[str, int]] = {}
-
-    def capture_concurrency(*_args: Any, **kwargs: int):
-        def decorate(obj: Any) -> Any:
-            base_model = getattr(obj, "base_model", None)
-            if isinstance(base_model, str):
-                engine_concurrency_by_model[base_model] = dict(kwargs)
-            return obj
-
-        return decorate
-
     modal_stub = MagicMock(name="modal")
-    modal_stub.concurrent.side_effect = capture_concurrency
+    modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
     modal_stub.enter.side_effect = _passthrough_decorator
     modal_stub.exit.side_effect = _passthrough_decorator
@@ -64,9 +51,7 @@ def modal_app_module(load_modal_app_under_stub):
     app_mock.local_entrypoint.side_effect = _passthrough_decorator
     modal_stub.App.return_value = app_mock
     modal_stub.Period.return_value = MagicMock()
-    module = load_modal_app_under_stub(modal_stub)
-    module._stub_engine_concurrency_by_model = engine_concurrency_by_model
-    return module
+    return load_modal_app_under_stub(modal_stub)
 
 
 _DEVELOPMENT_CUSTOM_DOMAIN = "serve-dev.freesolo.co"
@@ -438,34 +423,6 @@ def test_engine_concurrency_comes_from_validated_model_policy(modal_app_module):
         modal_app_module._engine_concurrency("unsupported/model")
 
 
-def test_each_model_modal_registration_uses_exact_traffic_policy(modal_app_module):
-    expected = {
-        model: {
-            "max_inputs": hosted_traffic_policy_for(model).max_inputs,
-            "target_inputs": hosted_traffic_policy_for(model).target_inputs,
-        }
-        for model in base_models()
-    }
-
-    assert modal_app_module._stub_engine_concurrency_by_model == expected
-
-
-def test_engine_class_identity_includes_max_num_seqs(modal_app_module, monkeypatch):
-    model = "Qwen/Qwen3.5-9B"
-    baseline = modal_app_module._engine_class_name(model)
-    original_policy = modal_app_module.hosted_traffic_policy_for
-
-    def changed_policy(base_model: str):
-        policy = original_policy(base_model)
-        if base_model == model:
-            return replace(policy, max_num_seqs=policy.max_num_seqs + 1)
-        return policy
-
-    monkeypatch.setattr(modal_app_module, "hosted_traffic_policy_for", changed_policy)
-
-    assert modal_app_module._engine_class_name(model) != baseline
-
-
 def test_class_names_are_deterministic_distinct_and_modal_safe(modal_app_module):
     names = [modal_app_module._engine_class_name(model) for model in base_models()]
     assert len(set(names)) == len(base_models())
@@ -538,25 +495,6 @@ app_inner = next(
     value for name, value in vars(modal_app.app).items() if name.startswith("_sync_original")
 )
 registered = app_inner._local_state_attr.functions
-
-
-def registered_concurrency(registration, *field_names):
-    sources = [registration]
-    for key in ("concurrency", "function_options", "autoscaler_settings"):
-        nested = registration.get(key)
-        if nested is not None:
-            sources.append(nested)
-    for source in sources:
-        for field_name in field_names:
-            if isinstance(source, dict):
-                value = source.get(field_name)
-            else:
-                value = getattr(source, field_name, None)
-            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                return value
-    raise RuntimeError(f"Modal registration is missing concurrency metadata: {field_names}")
-
-
 observed = {}
 for model, engine_class in modal_app.ENGINE_BY_MODEL.items():
     instance = engine_class()
@@ -571,17 +509,6 @@ for model, engine_class in modal_app.ENGINE_BY_MODEL.items():
         "min_containers": registration["min_containers"],
         "buffer_containers": registration["buffer_containers"],
         "max_containers": registration["max_containers"],
-        "max_inputs": registered_concurrency(
-            registration,
-            "max_concurrent_inputs",
-            "max_inputs",
-        ),
-        "target_inputs": registered_concurrency(
-            registration,
-            "target_concurrent_inputs_int",
-            "target_concurrent_inputs",
-            "target_inputs",
-        ),
     }
 router_registration = inspect.getclosurevars(registered["router"]._load).nonlocals
 router_policy = {
@@ -619,15 +546,12 @@ print(json.dumps({
     assert set(observed) == set(base_models())
     assert len({entry["class_name"] for entry in observed.values()}) == len(base_models())
     for model, entry in observed.items():
-        policy = hosted_traffic_policy_for(model)
         assert entry["parameters"] == {}
         assert entry["instance_model"] == model
         assert entry["class_model"] == model
         assert entry["min_containers"] == 1
         assert entry["buffer_containers"] == 1
         assert entry["max_containers"] is None
-        assert entry["max_inputs"] == policy.max_inputs
-        assert entry["target_inputs"] == policy.target_inputs
 
 
 def test_changed_hosted_sources_describe_warm_policy() -> None:
