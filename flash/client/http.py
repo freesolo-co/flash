@@ -7,10 +7,12 @@ import contextlib
 import http.client
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Iterator, Mapping
 from typing import Any
 
@@ -37,18 +39,24 @@ from flash.serve.contract.urls import is_freesolo_hosted_url
 class ClientError(RuntimeError):
     """Expected client-side errors (no key, unreachable server) — printed cleanly."""
 
+    idempotency_key: str | None = None
+
 
 class RequestTimeoutError(ClientError):
     """A request timed out before the control plane returned a response."""
 
 
 class ServiceUnreachableError(ClientError):
-    """The transport never reached the control plane (DNS, refused connection, reset).
+    """The transport did not establish a usable connection to the control plane.
 
     Distinct from a plain ``ClientError`` because a caller that retries needs to tell "nobody
     answered" apart from "something answered and it was not a Flash plane". The second is a
     permanent misconfiguration -- retrying it only hides the hint that would fix it.
     """
+
+
+class AmbiguousTransportError(ServiceUnreachableError):
+    """The connection ended after the server may have received the request."""
 
 
 class ApiError(ClientError):
@@ -187,6 +195,8 @@ from flash.client.freesolo_api import list_trace_projects as list_trace_projects
 from flash.client.freesolo_api import upload_eval_run as upload_eval_run  # noqa: E402
 from flash.client.freesolo_api import verify_freesolo_key as verify_freesolo_key  # noqa: E402
 
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._~-]{16,128}$")
+
 
 def _validate_chat_messages(messages: list[dict]) -> None:
     if not isinstance(messages, list):
@@ -311,12 +321,20 @@ class ApiClient:
             detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
             raise ApiError(exc.code, str(detail), detail=detail) from exc
         except urllib.error.URLError as exc:
-            if isinstance(getattr(exc, "reason", None), TimeoutError):
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, TimeoutError):
                 raise RequestTimeoutError(
                     f"request to the Flash service at {self.api_url} timed out; "
                     "check your network connection and FLASH_API_URL"
                 ) from exc
-            raise ServiceUnreachableError(
+            error_type = (
+                AmbiguousTransportError
+                if isinstance(
+                    reason, ConnectionResetError | ConnectionAbortedError | BrokenPipeError
+                )
+                else ServiceUnreachableError
+            )
+            raise error_type(
                 f"cannot reach the Flash service at {self.api_url} ({exc.reason}); "
                 "check your network connection and FLASH_API_URL"
             ) from exc
@@ -540,6 +558,7 @@ class ApiClient:
         runtime_secrets: dict[str, str] | None = None,
         dry_run: bool = False,
         client_train_schema: dict | None = None,
+        idempotency_key: str | None = None,
     ) -> dict:
         if not isinstance(spec, dict):
             raise ClientError("spec must be an object")
@@ -547,6 +566,12 @@ class ApiClient:
             project_id = require_project_id(spec.get("project"))
         except (TypeError, ValueError) as exc:
             raise ClientError(str(exc)) from exc
+        key = f"flash-{uuid.uuid4().hex}" if idempotency_key is None else idempotency_key
+        if _IDEMPOTENCY_KEY_RE.fullmatch(key) is None:
+            raise ClientError(
+                "idempotency key must be 16 to 128 characters using only "
+                "A-Z, a-z, 0-9, period, underscore, tilde, or hyphen"
+            )
         body: dict = {"spec": {**spec, "project": project_id}}
         if runtime_secrets:
             body["runtime_secrets"] = runtime_secrets
@@ -557,7 +582,38 @@ class ApiClient:
             body["dry_run"] = True
         if client_train_schema is not None:
             body["client_train_schema"] = client_train_schema
-        return self._request("POST", "/v1/runs", body=body, require={"run_id": str})
+        headers = {"Idempotency-Key": key}
+        for attempt in range(2):
+            try:
+                return self._request(
+                    "POST",
+                    "/v1/runs",
+                    body=body,
+                    extra_headers=headers,
+                    require={"run_id": str},
+                )
+            except ApiError as exc:
+                if attempt > 0:
+                    exc.idempotency_key = key
+                raise
+            except (RequestTimeoutError, AmbiguousTransportError) as exc:
+                if attempt == 0:
+                    continue
+                exc.idempotency_key = key
+                raise
+            except ServiceUnreachableError:
+                raise
+            except (
+                ConnectionResetError,
+                ConnectionAbortedError,
+                BrokenPipeError,
+                http.client.IncompleteRead,
+            ) as exc:
+                if attempt == 0:
+                    continue
+                exc.__dict__["idempotency_key"] = key
+                raise
+        raise AssertionError("unreachable")
 
     def list_runs(self) -> list[dict]:
         return self._request("GET", "/v1/runs", require={"runs": [dict]})["runs"]

@@ -198,6 +198,80 @@ def test_get_status_tolerates_stale_unknown_keys(monkeypatch):
         assert "old" in {r.run_id for r in runner_status.list_runs()}
 
 
+def _prepared_submit_job(run_id: str):
+    from flash.core.spec import JobSpec
+
+    spec = JobSpec(run_id=run_id, model="Qwen/Qwen3.5-9B", algorithm="sft")
+    return runner_submit.PreparedJob(
+        public_spec=spec,
+        worker_spec=spec,
+        estimated_cost_usd=1.0,
+    )
+
+
+def test_submit_job_crosses_persisted_fence_before_background_thread(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(
+        provider_worker, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT
+    )
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    prepared = _prepared_submit_job("fenced-background")
+    events = []
+
+    class Thread:
+        def __init__(self, *, target, args, daemon):
+            assert target is runner_lifecycle._run_job_background
+            assert args[0].run_id == prepared.public_spec.run_id
+            assert daemon is True
+            events.append("thread-created")
+
+        def start(self):
+            events.append("thread-started")
+
+    def fence():
+        assert runner_status.get_status(prepared.public_spec.run_id).state == "queued"
+        events.append("fence")
+
+    monkeypatch.setattr(runner_submit.threading, "Thread", Thread)
+
+    runner_submit.submit_job(
+        prepared.public_spec,
+        background=True,
+        prepared_job=prepared,
+        status_persisted_fence=fence,
+    )
+
+    assert events == ["fence", "thread-created", "thread-started"]
+
+
+def test_submit_job_fence_failure_starts_no_background_work(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(
+        provider_worker, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT
+    )
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    prepared = _prepared_submit_job("fence-failed")
+
+    def fence():
+        assert runner_status.get_status(prepared.public_spec.run_id).state == "queued"
+        raise RuntimeError("durable bind failed")
+
+    def forbidden_thread(*_args, **_kwargs):
+        raise AssertionError("paid background work started before the dispatch fence")
+
+    monkeypatch.setattr(runner_submit.threading, "Thread", forbidden_thread)
+
+    with pytest.raises(RuntimeError, match="durable bind failed"):
+        runner_submit.submit_job(
+            prepared.public_spec,
+            background=True,
+            prepared_job=prepared,
+            status_persisted_fence=fence,
+        )
+
+    assert runner_status.get_status(prepared.public_spec.run_id).state == "queued"
+
+
 def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_path):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.cost.currency import usd_amount

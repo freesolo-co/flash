@@ -11,77 +11,8 @@ import time
 from pathlib import Path
 
 from flash._internal.paths import data_dir
+from flash.server.platform.db_schema import SCHEMA
 from flash.teacher.provider_status import validated_provider_status
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS api_keys (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  key_hash     TEXT NOT NULL UNIQUE,
-  key_prefix   TEXT NOT NULL,
-  email        TEXT,
-  created_at   REAL NOT NULL,
-  last_used_at REAL,
-  disabled     INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS runs (
-  run_id     TEXT PRIMARY KEY,
-  key_id     INTEGER NOT NULL REFERENCES api_keys(id),
-  kind       TEXT NOT NULL DEFAULT 'train',
-  created_at REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS runs_key_idx ON runs(key_id);
-CREATE TABLE IF NOT EXISTS teacher_capabilities (
-  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-  token_hash            TEXT NOT NULL UNIQUE,
-  run_id                TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-  attempt               INTEGER NOT NULL,
-  teacher_alias         TEXT NOT NULL,
-  provider              TEXT NOT NULL,
-  model                 TEXT NOT NULL,
-  scoring_mode          TEXT NOT NULL,
-  expires_at            REAL NOT NULL,
-  revoked_at            REAL,
-  max_requests          INTEGER NOT NULL,
-  max_score_items       INTEGER NOT NULL,
-  max_request_bytes     INTEGER NOT NULL,
-  max_response_bytes    INTEGER NOT NULL,
-  max_concurrency       INTEGER NOT NULL,
-  max_upstream_attempts INTEGER NOT NULL,
-  max_request_tokens    INTEGER NOT NULL,
-  max_total_tokens      INTEGER NOT NULL,
-  request_count         INTEGER NOT NULL DEFAULT 0,
-  score_item_count      INTEGER NOT NULL DEFAULT 0,
-  token_count           INTEGER NOT NULL DEFAULT 0,
-  in_flight             INTEGER NOT NULL DEFAULT 0,
-  created_at            REAL NOT NULL,
-  UNIQUE(run_id, attempt)
-);
-CREATE INDEX IF NOT EXISTS teacher_capabilities_run_idx
-  ON teacher_capabilities(run_id, attempt);
-CREATE TABLE IF NOT EXISTS teacher_score_requests (
-  id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-  capability_id          INTEGER NOT NULL REFERENCES teacher_capabilities(id) ON DELETE CASCADE,
-  request_id             TEXT NOT NULL,
-  request_fingerprint    TEXT NOT NULL,
-  request_bytes          INTEGER NOT NULL,
-  score_items            INTEGER NOT NULL,
-  state                  TEXT NOT NULL,
-  upstream_attempt_count INTEGER NOT NULL DEFAULT 0,
-  provider_status        INTEGER,
-  error_class            TEXT,
-  input_tokens           INTEGER,
-  output_tokens          INTEGER,
-  response_body          BLOB,
-  created_at             REAL NOT NULL,
-  updated_at             REAL NOT NULL,
-  started_at             REAL,
-  completed_at           REAL,
-  UNIQUE(capability_id, request_id)
-);
-CREATE INDEX IF NOT EXISTS teacher_score_requests_state_idx
-  ON teacher_score_requests(state, updated_at);
-"""
-
 
 # Tests override with monkeypatch.setattr(db, "DB_PATH", tmp).
 DB_PATH = str(data_dir() / "server.db")
@@ -146,11 +77,11 @@ def _initialize_database(path: str) -> None:
                 remaining = max(deadline - time.monotonic(), 0.0)
                 conn = sqlite3.connect(path, timeout=remaining)
                 conn.execute("PRAGMA journal_mode=WAL")
-                conn.executescript(_SCHEMA)
+                conn.executescript(SCHEMA)
                 conn.commit()
                 # Record the identity of the file the schema actually ran on while
                 # the connection is still open, so a file replaced at the same path
-                # afterwards can't be cached as initialized without _SCHEMA on it.
+                # afterwards can't be cached as initialized without SCHEMA on it.
                 schema_identity = _database_file_identity(path)
             except sqlite3.OperationalError as exc:
                 error_code = getattr(exc, "sqlite_errorcode", None)
@@ -261,48 +192,65 @@ def ensure_internal_key(api_key: str) -> dict:
 _STANDALONE_OWNER_HASH = "standalone-operator"
 
 
+class StandaloneOwnerAdoptionCollision(RuntimeError):
+    """Two prior owners used one idempotency key that standalone cannot merge safely."""
+
+
+def _standalone_adoption_needed(conn: sqlite3.Connection, owner_id: int) -> bool:
+    foreign_run = conn.execute(
+        "SELECT 1 FROM runs WHERE key_id < ? OR key_id > ? LIMIT 1", (owner_id, owner_id)
+    ).fetchone()
+    if foreign_run is not None:
+        return True
+    foreign_claim = conn.execute(
+        "SELECT 1 FROM run_submission_idempotency WHERE key_id < ? OR key_id > ? LIMIT 1",
+        (owner_id, owner_id),
+    ).fetchone()
+    return foreign_claim is not None
+
+
+def _adopt_standalone_ownership(conn: sqlite3.Connection, owner_id: int) -> None:
+    collision = conn.execute(
+        "SELECT idempotency_key FROM run_submission_idempotency "
+        "GROUP BY idempotency_key HAVING COUNT(DISTINCT key_id) > 1 "
+        "ORDER BY idempotency_key LIMIT 1"
+    ).fetchone()
+    if collision is not None:
+        raise StandaloneOwnerAdoptionCollision(
+            "standalone ownership adoption collision for idempotency key "
+            f"{collision['idempotency_key']!r}"
+        )
+    conn.execute(
+        "UPDATE run_submission_idempotency SET key_id = ? WHERE key_id != ?",
+        (owner_id, owner_id),
+    )
+    conn.execute("UPDATE runs SET key_id = ? WHERE key_id != ?", (owner_id, owner_id))
+
+
 def ensure_standalone_owner() -> dict:
-    """The single owner row for a standalone plane, independent of the operator key's VALUE.
+    """Return the credential-independent owner row for a single-tenant standalone plane.
 
-    Standalone is single-tenant: the operator key is the only credential, so it owns every run.
-    Deriving the owner row from the key's hash meant rotating that key (or regenerating it after
-    a restart) minted a NEW row with a new id, and every existing run -- matched by
-    ``runs.key_id`` -- became invisible: absent from the listing, 404 on status, logs, cancel.
-    An in-flight job would keep burning GPU hours with no supported way for the new credential to
-    stop it, which makes rotating a COMPROMISED key the thing that costs you control of the plane.
+    Existing runs and submission claims are adopted atomically so operator-key rotation and a
+    managed-to-standalone transition preserve visibility, cancellation, and idempotent replay.
+    Adoption fails closed when different prior owners reused one idempotency key because those
+    claims cannot be merged without changing replay semantics.
 
-    Not reachable by presenting a token: nothing hashes to the sentinel, so this row is only ever
-    returned to a caller who already matched the operator key in ``authenticate``.
-
-    Runs already in the store are ADOPTED, not orphaned. A plane that ran managed first -- or ran
-    on an earlier build of this code -- has runs pointing at whichever key row created them, and
-    leaving them there would reproduce the bug this row exists to fix the moment standalone is
-    switched on: empty listing, 404 on status/logs/cancel, an in-flight job still spending. Adopting
-    is sound precisely because standalone is SINGLE-TENANT: there is exactly one principal, so
-    every run in this store is already the operator's, and there is no second identity that
-    reassignment could take a run away from.
-
-    Called on EVERY authenticated request, so in the steady state this function must issue NO
-    write statements at all. SQLite has a single write slot and takes it for any write regardless
-    of how many rows the statement touches, so a no-op write still serializes concurrent
-    status/logs/submit behind whichever request happens to be recording a run -- up to the
-    connection's 30s timeout. Measured under WAL, both of the writes below block a second writer
-    exactly as hard as a real INSERT does when they change nothing, so both are guarded by a read:
-
-    - The `INSERT OR IGNORE` is read-guarded rather than fired blind. It is NOT a cost problem
-      (the unique-index probe is cheaper per call than the SELECT that replaces it) -- it is
-      purely that it takes the write slot. Kept as OR IGNORE in the miss path because two threads
-      can both miss the SELECT and race to insert; OR IGNORE makes the loser a no-op instead of
-      an IntegrityError, and the re-read then returns the winner's row.
-    - The adoption `UPDATE` cannot use `runs_key_idx` (`WHERE key_id != ?` plans as `SCAN runs`),
-      so unguarded it would also full-scan the whole run history every request. The `< or >`
-      split is a MULTI-INDEX OR over the covering index that stops at the first foreign row: at
-      50k runs, 1.22 ms/call becomes 0.003 ms/call. Standalone mints no new foreign rows --
-      `record_run` takes the key_id of the authenticated identity, which is this row -- so the
-      guard cannot miss a run that appears later.
+    The read guards keep the steady-state request path write-free. The miss path uses one immediate
+    transaction so a concurrent claim cannot appear between collision detection and migration.
     """
     now = time.time()
-    with _connect() as conn:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM api_keys WHERE key_hash = ?", (_STANDALONE_OWNER_HASH,)
+        ).fetchone()
+        if row is not None and not _standalone_adoption_needed(conn, row["id"]):
+            return dict(row)
+
+        # the owner provision and both ownership updates are one write transaction. re-read after
+        # taking the write slot so a concurrent claim cannot appear between collision detection and
+        # migration under the standalone key.
+        _immediate(conn)
         row = conn.execute(
             "SELECT * FROM api_keys WHERE key_hash = ?", (_STANDALONE_OWNER_HASH,)
         ).fetchone()
@@ -317,12 +265,13 @@ def ensure_standalone_owner() -> dict:
             ).fetchone()
         if row is None:  # pragma: no cover - the row was just inserted
             raise RuntimeError("failed to provision the standalone owner row")
-        unowned = conn.execute(
-            "SELECT 1 FROM runs WHERE key_id < ? OR key_id > ? LIMIT 1", (row["id"], row["id"])
-        ).fetchone()
-        if unowned is not None:
-            conn.execute("UPDATE runs SET key_id = ? WHERE key_id != ?", (row["id"], row["id"]))
-    return dict(row)
+        if _standalone_adoption_needed(conn, row["id"]):
+            _adopt_standalone_ownership(conn, row["id"])
+        conn.commit()
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def ensure_external_key(
@@ -369,6 +318,124 @@ def record_run(run_id: str, key_id: int, *, kind: str = "train") -> None:
             "INSERT INTO runs (run_id, key_id, kind, created_at) VALUES (?, ?, ?, ?)",
             (run_id, key_id, kind, time.time()),
         )
+
+
+def claim_run_submission(
+    *,
+    run_id: str,
+    key_id: int,
+    idempotency_key: str,
+    request_fingerprint: str,
+    dry_run: bool,
+    had_runtime_secrets: bool,
+    submitted_instance_providers: tuple[str, ...] = (),
+) -> None:
+    now = time.time()
+    conn = _connect()
+    try:
+        _immediate(conn)
+        conn.execute(
+            "INSERT INTO runs (run_id, key_id, kind, created_at) VALUES (?, ?, 'train', ?)",
+            (run_id, key_id, now),
+        )
+        conn.execute(
+            "INSERT INTO run_submission_idempotency ("
+            "key_id, idempotency_key, run_id, request_fingerprint, phase, dry_run, "
+            "had_runtime_secrets, submitted_instance_providers, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?)",
+            (
+                key_id,
+                idempotency_key,
+                run_id,
+                request_fingerprint,
+                int(dry_run),
+                int(had_runtime_secrets),
+                ",".join(sorted(set(submitted_instance_providers))),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _submission_claim(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    claim = dict(row)
+    encoded_providers = claim["submitted_instance_providers"]
+    claim["submitted_instance_providers"] = tuple(
+        name for name in encoded_providers.split(",") if name
+    )
+    return claim
+
+
+def run_submission_claim(key_id: int, idempotency_key: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM run_submission_idempotency WHERE key_id = ? AND idempotency_key = ?",
+            (key_id, idempotency_key),
+        ).fetchone()
+        return _submission_claim(row)
+
+
+def run_submission_claim_for_run(run_id: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM run_submission_idempotency WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return _submission_claim(row)
+
+
+def bind_run_submission(run_id: str, *, affordability_verified: bool | None = None) -> None:
+    now = time.time()
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE run_submission_idempotency SET phase = 'bound', "
+            "affordability_verified = ?, disposed_reason = NULL, updated_at = ? "
+            "WHERE run_id = ? AND phase != 'disposed'",
+            (
+                None if affordability_verified is None else int(affordability_verified),
+                now,
+                run_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(f"run submission claim is not bindable: {run_id}")
+
+
+def remove_run_submission_claim(run_id: str) -> None:
+    conn = _connect()
+    try:
+        _immediate(conn)
+        conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM run_submission_idempotency WHERE run_id = ?", (run_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def dispose_run_submission(run_id: str, *, reason: str) -> None:
+    now = time.time()
+    conn = _connect()
+    try:
+        _immediate(conn)
+        cursor = conn.execute(
+            "UPDATE run_submission_idempotency SET phase = 'disposed', disposed_reason = ?, "
+            "updated_at = ? WHERE run_id = ?",
+            (reason, now, run_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(f"run submission claim is not disposable: {run_id}")
+        conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def delete_run(run_id: str) -> None:

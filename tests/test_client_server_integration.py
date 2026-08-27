@@ -225,6 +225,29 @@ def test_create_status_list_cancel_lifecycle(make_client) -> None:
     assert cancelled["state"] == "cancelled"
 
 
+def test_create_run_response_loss_replays_one_server_run(make_client, monkeypatch) -> None:
+    client = make_client()
+    in_process_urlopen = urllib.request.urlopen
+    attempts = 0
+
+    def lose_first_response(req, timeout=None):
+        nonlocal attempts
+        response = in_process_urlopen(req, timeout=timeout)
+        if req.get_method() == "POST" and urllib.parse.urlsplit(req.full_url).path == "/v1/runs":
+            attempts += 1
+            if attempts == 1:
+                raise urllib.error.URLError(ConnectionResetError("response lost"))
+        return response
+
+    monkeypatch.setattr(urllib.request, "urlopen", lose_first_response)
+
+    created = client.create_run(SPEC, idempotency_key="response-loss-key-1234")
+
+    assert attempts == 2
+    assert created["run_id"]
+    assert [run["run_id"] for run in client.list_runs()] == [created["run_id"]]
+
+
 def test_dry_run_create_previews_on_the_server(make_client) -> None:
     # `create_run(dry_run=True)` runs the real submit-time validation on the server (cost quote +
     # config preflights) but allocates no GPU and charges nothing. It returns a state=dry_run status

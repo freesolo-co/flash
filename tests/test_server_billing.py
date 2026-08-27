@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import io
+import itertools
 import json
 import time
 import urllib.error
@@ -35,6 +36,7 @@ SPEC = {
 
 _USER_PREFIX = "fslo-user-"
 _SOURCE_SNAPSHOT = valid_source_snapshot()
+_idempotency_counter = itertools.count()
 
 
 def _identity_for_token(token: str) -> dict[str, str]:
@@ -321,6 +323,18 @@ def api(tmp_path, monkeypatch):
         # startup preflight needs the fake token above; billing requests do not. keeping `ghp-test`
         # here turns an offline billing test into a real environment-pin request to GitHub.
         monkeypatch.delenv("GITHUB_TOKEN")
+        real_post = client.post
+
+        def post(url, *args, **kwargs):
+            if url == "/v1/runs":
+                headers = dict(kwargs.get("headers") or {})
+                headers.setdefault(
+                    "Idempotency-Key", f"test-run-key-{next(_idempotency_counter):08d}"
+                )
+                kwargs["headers"] = headers
+            return real_post(url, *args, **kwargs)
+
+        monkeypatch.setattr(client, "post", post)
         yield client
 
 
@@ -336,29 +350,29 @@ def test_submit_records_pending_completion_billing(api):
     assert [r["run_id"] for r in listed] == [run_id]
 
 
-def test_budget_precheck_uses_prepared_estimate_before_record_run(api, monkeypatch):
+def test_budget_precheck_uses_prepared_estimate_after_atomic_claim(api, monkeypatch):
     import flash.server.billing.charges as billing_mod
     import flash.server.platform.db as db_mod
 
     events = []
-    original_record_run = db_mod.record_run
+    original_claim_run = db_mod.claim_run_submission
 
     def capture_precheck(**kwargs):
         events.append(("precheck", kwargs["estimate_usd"]))
         return {"ok": True}
 
-    def capture_record_run(*args, **kwargs):
-        events.append(("record", args[0]))
-        return original_record_run(*args, **kwargs)
+    def capture_claim_run(**kwargs):
+        events.append(("claim", kwargs["run_id"]))
+        return original_claim_run(**kwargs)
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", capture_precheck)
-    monkeypatch.setattr(db_mod, "record_run", capture_record_run)
+    monkeypatch.setattr(db_mod, "claim_run_submission", capture_claim_run)
 
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
 
     assert res.status_code == 200, res.text
-    assert events[0] == ("precheck", res.json()["estimated_cost_usd"])
-    assert events[1] == ("record", res.json()["run_id"])
+    assert events[0] == ("claim", res.json()["run_id"])
+    assert events[1] == ("precheck", res.json()["estimated_cost_usd"])
 
 
 def test_external_submit_requires_org_for_completion_billing(api):
@@ -521,18 +535,18 @@ def test_dry_run_verifies_affordability_and_still_persists(api, monkeypatch):
     import flash.server.platform.db as db_mod
 
     events = []
-    original_record_run = db_mod.record_run
+    original_claim_run = db_mod.claim_run_submission
 
     def capture_precheck(**kwargs):
         events.append(("precheck", kwargs["org_id"]))
         return {"ok": True}
 
-    def capture_record_run(*args, **kwargs):
-        events.append(("record", args[0]))
-        return original_record_run(*args, **kwargs)
+    def capture_claim_run(**kwargs):
+        events.append(("claim", kwargs["run_id"]))
+        return original_claim_run(**kwargs)
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", capture_precheck)
-    monkeypatch.setattr(db_mod, "record_run", capture_record_run)
+    monkeypatch.setattr(db_mod, "claim_run_submission", capture_claim_run)
     res = api.post(
         "/v1/runs",
         json={"spec": SPEC, "dry_run": True},
@@ -541,8 +555,8 @@ def test_dry_run_verifies_affordability_and_still_persists(api, monkeypatch):
 
     assert res.status_code == 200, res.text
     assert res.json()["state"] == "dry_run"
-    # verified before the run is recorded, and it stays a dry run: no billing context is attached
-    assert events == [("precheck", "org-1"), ("record", res.json()["run_id"])]
+    # ownership is claimed before side effects, then affordability is verified before submission.
+    assert events == [("claim", res.json()["run_id"]), ("precheck", "org-1")]
     assert res.json()["billing_state"] is None
     assert res.json()["billing_context"] is None
 
@@ -691,18 +705,18 @@ def test_internal_submit_skips_affordability_precheck_before_persistence(api, mo
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-secret")
     events = []
-    original_record_run = db_mod.record_run
+    original_claim_run = db_mod.claim_run_submission
 
     def unexpected_precheck(**kwargs):
         events.append(("precheck", kwargs["org_id"]))
         raise AssertionError("internal submit must not authorize budget")
 
-    def capture_record_run(*args, **kwargs):
-        events.append(("record", args[0]))
-        return original_record_run(*args, **kwargs)
+    def capture_claim_run(**kwargs):
+        events.append(("claim", kwargs["run_id"]))
+        return original_claim_run(**kwargs)
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", unexpected_precheck)
-    monkeypatch.setattr(db_mod, "record_run", capture_record_run)
+    monkeypatch.setattr(db_mod, "claim_run_submission", capture_claim_run)
     res = api.post(
         "/v1/runs",
         json={"spec": SPEC},
@@ -711,7 +725,7 @@ def test_internal_submit_skips_affordability_precheck_before_persistence(api, mo
 
     assert res.status_code == 200, res.text
     assert res.json()["billing_context"] is None
-    assert events == [("record", res.json()["run_id"])]
+    assert events == [("claim", res.json()["run_id"])]
 
 
 def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch):
@@ -756,16 +770,16 @@ def test_submit_failure_records_nothing(api, monkeypatch):
     assert api.get("/v1/runs", headers=_bearer("fslo-user-r")).json()["runs"] == []
 
 
-def test_record_run_failure_does_not_submit(api, monkeypatch):
-    """If ``db.record_run`` fails (e.g. SQLite locked/full), submit_job is not reached."""
+def test_atomic_claim_failure_does_not_submit(api, monkeypatch):
+    """If the ownership and idempotency claim fails, submit_job is not reached."""
     import flash.server.asgi.app as app_mod
     import flash.server.platform.db as db_mod
 
-    def failing_record(run_id, key_id):
+    def failing_claim(**_kwargs):
         raise RuntimeError("database is locked")
 
-    monkeypatch.setattr(db_mod, "record_run", failing_record)
-    # submit_job must NOT be reached if record_run already failed.
+    monkeypatch.setattr(db_mod, "claim_run_submission", failing_claim)
+    # submit_job must not be reached if the atomic claim already failed.
     monkeypatch.setattr(
         app_mod,
         "submit_job",
