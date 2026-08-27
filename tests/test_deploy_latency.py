@@ -76,9 +76,8 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
 
         def json(self):
             return {
-                "run_id": "run-1",
-                "disabled_aliases": ["run-1"],
-                "disabled_revisions": [],
+                "checkpoint_id": "run-1/final",
+                "disabled_checkpoints": ["run-1/final"],
             }
 
     class _StreamResponse:
@@ -130,10 +129,14 @@ def test_streaming_pool_cannot_starve_control_requests(monkeypatch):
     serving_transport._close_http_client()
     monkeypatch.setattr(httpx, "Client", _PoolLimitedClient)
 
-    stream = serving_deploy.chat_stream("run-1", [{"role": "user", "content": "hello"}])
+    stream = serving_deploy.chat_stream(
+        "run-1/final",
+        [{"role": "user", "content": "hello"}],
+        org_id="org-1",
+    )
     assert next(stream) == "held"
     try:
-        result = deploy.undeploy_adapter("run-1")
+        result = deploy.undeploy_adapter("run-1/final", org_id="org-1")
     finally:
         stream.close()
 
@@ -171,9 +174,8 @@ def test_normal_chat_pool_cannot_starve_control_requests(monkeypatch):
     class _UndeployResponse(_Response):
         def json(self):
             return {
-                "run_id": "run-1",
-                "disabled_aliases": ["run-1"],
-                "disabled_revisions": [],
+                "checkpoint_id": "run-1/final",
+                "disabled_checkpoints": ["run-1/final"],
             }
 
     class _PoolLimitedClient:
@@ -205,13 +207,17 @@ def test_normal_chat_pool_cannot_starve_control_requests(monkeypatch):
 
     thread = threading.Thread(
         target=lambda: chat_result.append(
-            deploy.chat("run-1", [{"role": "user", "content": "hello"}])
+            deploy.chat(
+                "run-1/final",
+                [{"role": "user", "content": "hello"}],
+                org_id="org-1",
+            )
         )
     )
     thread.start()
     assert chat_started.wait(timeout=1.0)
     try:
-        result = deploy.undeploy_adapter("run-1")
+        result = deploy.undeploy_adapter("run-1/final", org_id="org-1")
     finally:
         release_chat.set()
         thread.join(timeout=2.0)
@@ -230,7 +236,7 @@ def test_normal_chat_pool_cannot_starve_control_requests(monkeypatch):
 def test_readiness_backoff_honors_retry_after_and_cap(monkeypatch):
     import flash.serve.deployment.deploy as deploy
 
-    revision = "run-1@final." + "a" * 40
+    revision = "run-1/final"
     subfolder = "sft/run-1/seed0/adapter"
     loading = {
         "adapter_id": revision,
@@ -249,7 +255,8 @@ def test_readiness_backoff_honors_retry_after_and_cap(monkeypatch):
     ]
     sleeps = []
 
-    def registered_adapter_response(adapter_id, *, timeout_s=None):
+    def registered_adapter_response(org_id, adapter_id, *, timeout_s=None):
+        assert org_id == "org-1"
         assert adapter_id == revision
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
@@ -265,7 +272,7 @@ def test_readiness_backoff_honors_retry_after_and_cap(monkeypatch):
     )
     monkeypatch.setattr(deploy.time, "sleep", sleeps.append)
 
-    assert deploy._wait_revision_ready(revision, subfolder, budget_s=30.0) == ready
+    assert deploy._wait_checkpoint_ready("org-1", revision, subfolder, budget_s=30.0) == ready
     assert sleeps == [1.25, 2.0]
 
 
@@ -300,7 +307,7 @@ def test_adapter_preflight_validates_config_before_listing_tensors(monkeypatch, 
         adapter_check.adapter_artifact_metadata(
             "org/repo",
             "sft/run-1/seed0/adapter",
-            hf_revision="a" * 40,
+            artifact_revision="a" * 40,
         ).lora_rank
         == 32
     )
@@ -330,7 +337,7 @@ def test_adapter_preflight_config_failure_does_not_start_tensor_listing(monkeypa
         adapter_check.adapter_artifact_metadata(
             "org/repo",
             "sft/run-1/seed0/adapter",
-            hf_revision="a" * 40,
+            artifact_revision="a" * 40,
         )
 
     assert tensor_started is False
@@ -341,39 +348,6 @@ def test_zero_retry_after_uses_positive_readiness_backoff(monkeypatch):
 
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0.5)
     assert deploy._readback_delay(0, "0") == 0.5
-
-
-def test_activation_reconciliation_keeps_reliability_delay(monkeypatch):
-    import flash.serve.deployment.deploy as deploy
-
-    revision = "run-1@final." + "a" * 40
-    previous = "run-1@final." + "b" * 40
-    aliases = [
-        {"metadata": {"alias_of": previous}},
-        {"metadata": {"alias_of": previous}},
-        {"metadata": {"alias_of": revision}, "updated_at": "2026-07-20T00:00:00Z"},
-    ]
-    sleeps = []
-
-    def fail_activation(*_args, **_kwargs):
-        raise serving_errors.ServingError("activation response lost")
-
-    monkeypatch.setattr(serving_transport, "serving_request", fail_activation)
-    monkeypatch.setattr(deploy, "_registered_adapter", lambda _run_id: aliases.pop(0))
-    monkeypatch.setattr(deploy.time, "sleep", sleeps.append)
-
-    result = deploy._activate_revision(
-        "run-1",
-        revision,
-        "run-1/step-10",
-        expected_adapter_revision=previous,
-    )
-
-    assert result["target_adapter_revision"] == revision
-    assert sleeps == [
-        deploy.ACTIVATION_READBACK_DELAY_SECONDS,
-        deploy.ACTIVATION_READBACK_DELAY_SECONDS,
-    ]
 
 
 def test_bounded_smoke_chat_uses_isolated_client(monkeypatch):
@@ -417,8 +391,9 @@ def test_bounded_smoke_chat_uses_isolated_client(monkeypatch):
     )
 
     assert deploy.chat(
-        "run-1@final." + "a" * 40,
+        "run-1/final",
         [{"role": "user", "content": "hello"}],
+        org_id="org-1",
         timeout_s=1.0,
         retry_unavailable=True,
     ) == {"choices": []}

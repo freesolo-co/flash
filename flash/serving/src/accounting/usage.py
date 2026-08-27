@@ -60,7 +60,7 @@ class UsageSession:
     def event(self, result: dict[str, Any]) -> UsageEvent:
         attested_adapter = result.get("lora_request_adapter") or self.attested_adapter
         evidence = (
-            {"resolved_adapter_revision": attested_adapter}
+            {"checkpoint_id": attested_adapter}
             if isinstance(attested_adapter, str) and attested_adapter
             else {}
         )
@@ -130,19 +130,14 @@ def build_usage_session(
     serving_release: str,
     captured_at: datetime,
 ) -> UsageSession:
-    resolved_checkpoint = _optional_text(result.get("checkpoint"))
     public_model_id = (
         principal.publicModelId if principal.kind == "openrouter" else requested.adapter_id
     )
-    requested_adapter_id = None if principal.kind == "openrouter" else requested.adapter_id
-    resolved_revision = target.adapter_id if target.is_revision else None
     immutable_target = ImmutableTarget(
         public_model_id=public_model_id,
         base_model=target.base_model,
-        requested_adapter_id=requested_adapter_id,
-        resolved_adapter_revision=resolved_revision,
-        resolved_checkpoint_id=resolved_checkpoint,
-        resolved_hf_revision=target.hf_revision,
+        checkpoint_id=target.adapter_id if target.is_checkpoint else None,
+        artifact_fingerprint=target.artifact_fingerprint,
     )
     price = (
         CapturedPrice(
@@ -195,8 +190,11 @@ def principal_for_external_org(org_id: str) -> FreesoloOrgTrafficPrincipal:
     return FreesoloOrgTrafficPrincipal(orgId=org_id)
 
 
-def principal_for_trusted_internal() -> TrustedInternalTrafficPrincipal:
-    return TrustedInternalTrafficPrincipal()
+def principal_for_trusted_internal(org_id: str | None = None) -> TrustedInternalTrafficPrincipal:
+    return TrustedInternalTrafficPrincipal(
+        orgId=org_id,
+        billingAttributionExplicit=org_id is not None,
+    )
 
 
 def captured_now() -> datetime:

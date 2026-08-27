@@ -3433,7 +3433,7 @@ def test_submit_rejects_cross_org_init_ref(monkeypatch):
         spec = JobSpec.from_dict(
             {
                 **base,
-                "train": {**base["train"], "init_from_adapter": "source-run"},
+                "train": {**base["train"], "init_from_adapter": "source-run/final"},
             }
         )
 
@@ -3491,7 +3491,7 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
         spec = JobSpec.from_dict(
             {
                 **base,
-                "train": {**base["train"], "init_from_adapter": "source-run"},
+                "train": {**base["train"], "init_from_adapter": "source-run/final"},
             }
         )
 
@@ -3553,7 +3553,7 @@ def test_submit_dry_run_omits_public_warmstart_rank_and_resolves_alpha(monkeypat
                 **base,
                 "train": {
                     **base["train"],
-                    "init_from_adapter": "source-run",
+                    "init_from_adapter": "source-run/final",
                     "lora_rank": 8,
                     "lora_alpha": 16,
                 },
@@ -3574,7 +3574,7 @@ def test_submit_dry_run_omits_public_warmstart_rank_and_resolves_alpha(monkeypat
         assert status.to_dict()["spec"] == status.spec
 
 
-def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
+def test_submit_rejects_final_checkpoint_from_unfinished_source_run(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         from flash.core.spec import JobSpec
@@ -3600,7 +3600,7 @@ def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
         spec = JobSpec.from_dict(
             {
                 **base,
-                "train": {**base["train"], "init_from_adapter": "source-run"},
+                "train": {**base["train"], "init_from_adapter": "source-run/final"},
             }
         )
 
@@ -3608,7 +3608,7 @@ def test_submit_rejects_bare_init_ref_to_unfinished_source_run(monkeypatch):
             runner_submit.submit_job(spec, dry_run=True, background=False)
 
 
-def test_submit_rejects_bare_init_ref_without_final_adapter(monkeypatch):
+def test_submit_rejects_final_checkpoint_without_adapter_artifact(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         import flash.adapters.lora_rank as rank_mod
@@ -3642,7 +3642,7 @@ def test_submit_rejects_bare_init_ref_without_final_adapter(monkeypatch):
         spec = JobSpec.from_dict(
             {
                 **base,
-                "train": {**base["train"], "init_from_adapter": "source-run"},
+                "train": {**base["train"], "init_from_adapter": "source-run/final"},
             }
         )
 
@@ -3678,7 +3678,7 @@ def test_submit_rejects_missing_source_org_without_same_owner_key(monkeypatch):
         spec = JobSpec.from_dict(
             {
                 **base,
-                "train": {**base["train"], "init_from_adapter": "source-run"},
+                "train": {**base["train"], "init_from_adapter": "source-run/final"},
             }
         )
 
@@ -4837,7 +4837,7 @@ def test_cancel_prices_and_cleans_up_with_effective_warmstart_spec(monkeypatch):
                 **base,
                 "train": {
                     **base["train"],
-                    "init_from_adapter": "source-run",
+                    "init_from_adapter": "source-run/final",
                     "lora_rank": 8,
                 },
             }
@@ -4899,7 +4899,7 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
                 **base,
                 "train": {
                     **base["train"],
-                    "init_from_adapter": "source-run",
+                    "init_from_adapter": "source-run/final",
                     "lora_rank": 8,
                 },
             }
@@ -4920,7 +4920,10 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
                     "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                 },
-                deployment={"state": "ready"},
+                deployment={
+                    "state": "ready",
+                    "checkpoint_id": f"{public_spec.run_id}/final",
+                },
                 effective_preparation=snapshot,
             )
         )
@@ -4940,7 +4943,7 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
         monkeypatch.setattr(
             flash.serve.deployment.deploy,
             "undeploy_adapter",
-            lambda run_id: calls.append("undeploy"),
+            lambda checkpoint_id, *, org_id: calls.append("undeploy"),
         )
         monkeypatch.setattr(
             runner_recovery,

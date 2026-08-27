@@ -117,10 +117,8 @@ class RequestIdentity:
 class ImmutableTarget:
     public_model_id: str
     base_model: str
-    requested_adapter_id: str | None
-    resolved_adapter_revision: str | None
-    resolved_checkpoint_id: str | None
-    resolved_hf_revision: str | None
+    checkpoint_id: str | None
+    artifact_fingerprint: str | None
 
 
 @dataclass(frozen=True)
@@ -163,9 +161,6 @@ class UsageEvent:
         explicit = (
             principal.billingAttributionExplicit if principal.kind == "trusted_internal" else False
         )
-        requested_adapter_id = (
-            None if principal.kind == "openrouter" else self.target.requested_adapter_id
-        )
         accepted = openrouter.acceptedPriceSnapshot.model_dump(mode="json") if openrouter else None
         return {
             "request_id": self.identity.request_id,
@@ -182,10 +177,8 @@ class UsageEvent:
                 openrouter.publicModelId if openrouter else self.target.public_model_id
             ),
             "base_model": self.target.base_model,
-            "requested_adapter_id": requested_adapter_id,
-            "resolved_adapter_revision": self.target.resolved_adapter_revision,
-            "resolved_checkpoint_id": self.target.resolved_checkpoint_id,
-            "resolved_hf_revision": self.target.resolved_hf_revision,
+            "checkpoint_id": None if openrouter else self.target.checkpoint_id,
+            "artifact_fingerprint": self.target.artifact_fingerprint,
             "prompt_tokens": self.facts.prompt_tokens,
             "completion_tokens": self.facts.completion_tokens,
             "reasoning_tokens": self.facts.reasoning_tokens,

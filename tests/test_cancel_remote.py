@@ -357,7 +357,12 @@ def test_cancel_deployed_run_marks_deployment_inactive(tmp_path, monkeypatch):
         run_id=spec.run_id,
         state="deployed",
         spec=spec.to_dict(),
-        deployment={"state": "ready", "gpu": "RTX 5090"},
+        platform_context={"org_id": "org-1"},
+        deployment={
+            "state": "ready",
+            "gpu": "RTX 5090",
+            "checkpoint_id": f"{spec.run_id}/final",
+        },
     )
     runner_state._save_status(st)
 
@@ -381,7 +386,12 @@ def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path
 
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-dep-racein"})
     runner_state._save_status(
-        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="running",
+            spec=spec.to_dict(),
+            platform_context={"org_id": "org-1"},
+        )
     )
 
     undeployed: list[str] = []
@@ -395,11 +405,11 @@ def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path
 
     def gc_then_deploy(s):
         real_gc(s)
-        revision = f"{spec.run_id}@final." + "a" * 40
+        revision = f"{spec.run_id}/final"
         runner_transitions.mark_deployed(
             spec.run_id,
-            {"state": "ready", "gpu": "RTX 5090", "adapter_revision": revision},
-            verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
+            {"state": "ready", "gpu": "RTX 5090", "checkpoint_id": revision},
+            verification_generation=runner_verified_revisions.verified_checkpoint_generation(
                 spec.run_id
             ),
         )
@@ -408,15 +418,16 @@ def test_cancel_undeploys_deployment_that_raced_in_after_entry_snapshot(tmp_path
 
     out = runner_deploy.cancel_run(spec.run_id)
     assert out.state == "cancelled"
-    assert undeployed == [spec.run_id], "the raced-in deployment must be torn down, not orphaned"
+    assert undeployed == [f"{spec.run_id}/final"], (
+        "the raced-in deployment must be torn down, not orphaned"
+    )
     assert (out.deployment or {}).get("state") == "undeployed"
 
 
 def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, monkeypatch):
     # Regression: the deployed branch used a bare _save_status OUTSIDE _STATUS_LOCK, which
     # persisted a stale pre-teardown snapshot and bypassed serialization. It must instead
-    # mark the deployment inactive through the lock-guarded mark_deployment_undeployed
-    # helper, and that write must happen while _STATUS_LOCK is held.
+    # mark the exact checkpoint inactive through the lock-guarded mark_undeployed helper.
     import inspect
 
     import flash.serve.deployment.deploy as deploy
@@ -429,7 +440,12 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
         run_id=spec.run_id,
         state="deployed",
         spec=spec.to_dict(),
-        deployment={"state": "ready", "gpu": "RTX 5090"},
+        platform_context={"org_id": "org-1"},
+        deployment={
+            "state": "ready",
+            "gpu": "RTX 5090",
+            "checkpoint_id": f"{spec.run_id}/final",
+        },
     )
     runner_state._save_status(st)
 
@@ -438,21 +454,19 @@ def test_cancel_deployed_run_undeploy_goes_through_lock_guarded_path(tmp_path, m
 
     # The undeploy write must route through the lock-guarded helper (not a bare _save_status
     # outside _STATUS_LOCK, the old racy path); that helper holds _STATUS_LOCK.
-    assert "with _status_guard(run_id)" in inspect.getsource(
-        runner_transitions.mark_deployment_undeployed
-    )
+    assert "with _status_guard(run_id)" in inspect.getsource(runner_transitions.mark_undeployed)
 
     called = []
-    real_helper = runner_transitions.mark_deployment_undeployed
+    real_helper = runner_transitions.mark_undeployed
 
-    def spy(run_id):
-        called.append(run_id)
-        return real_helper(run_id)
+    def spy(run_id, checkpoint_id=None):
+        called.append((run_id, checkpoint_id))
+        return real_helper(run_id, checkpoint_id)
 
-    monkeypatch.setattr(runner_transitions, "mark_deployment_undeployed", spy)
+    monkeypatch.setattr(runner_transitions, "mark_undeployed", spy)
 
     out = runner_deploy.cancel_run(spec.run_id)
-    assert called == [spec.run_id], "undeploy must go through mark_deployment_undeployed"
+    assert called == [(spec.run_id, f"{spec.run_id}/final")]
     assert out.state == "cancelled"
     assert out.deployment["state"] == "undeployed"
 
@@ -473,7 +487,12 @@ def test_cancel_deployed_run_undeployed_even_when_raced_to_terminal(tmp_path, mo
         run_id=spec.run_id,
         state="deployed",
         spec=spec.to_dict(),
-        deployment={"state": "ready", "gpu": "RTX 5090"},
+        platform_context={"org_id": "org-1"},
+        deployment={
+            "state": "ready",
+            "gpu": "RTX 5090",
+            "checkpoint_id": f"{spec.run_id}/final",
+        },
     )
     runner_state._save_status(st)
 
@@ -484,7 +503,7 @@ def test_cancel_deployed_run_undeployed_even_when_raced_to_terminal(tmp_path, mo
     # cancel_run's initial get_status (state="deployed") but BEFORE the deployment is retired.
     def racing_undeploy(*a, **k):
         # mark_undeployed moves a live `deployed` run to terminal `done`.
-        runner_transitions.mark_undeployed(spec.run_id)
+        runner_transitions.mark_undeployed(spec.run_id, f"{spec.run_id}/final")
         return ["flash-serve-5090-x"]
 
     monkeypatch.setattr(deploy, "undeploy_adapter", racing_undeploy)
@@ -515,7 +534,12 @@ def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
         run_id=spec.run_id,
         state="deployed",
         spec=spec.to_dict(),
-        deployment={"state": "ready", "gpu": "RTX 5090"},
+        platform_context={"org_id": "org-1"},
+        deployment={
+            "state": "ready",
+            "gpu": "RTX 5090",
+            "checkpoint_id": f"{spec.run_id}/final",
+        },
     )
     runner_state._save_status(st)
 
@@ -524,7 +548,7 @@ def test_cancel_wins_over_racing_undeploy_done(tmp_path, monkeypatch):
     # The racing undeploy flips the run to terminal `done` mid-cancel (after cancel_run's
     # initial non-terminal read, before its final `cancelled` write).
     def racing_undeploy(*a, **k):
-        runner_transitions.mark_undeployed(spec.run_id)
+        runner_transitions.mark_undeployed(spec.run_id, f"{spec.run_id}/final")
         assert runner_status.get_status(spec.run_id).state == "done"  # the race landed
         return ["flash-serve-5090-x"]
 
@@ -1013,8 +1037,9 @@ def _run_spec(run_id: str):
     return JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": run_id})
 
 
-def _checkpoint_revision(run_id: str, step: int, sha: str = "a") -> str:
-    return f"{run_id}@step-{step}." + sha * 40
+def _checkpoint_id(run_id: str, step: int, sha: str = "a") -> str:
+    del sha
+    return f"{run_id}/step-{step}"
 
 
 def _ready_checkpoint(run_id: str, step: int, *, remote: dict | None = None) -> dict:
@@ -1030,15 +1055,13 @@ def _ready_checkpoint(run_id: str, step: int, *, remote: dict | None = None) -> 
     deployment = {
         "state": "ready",
         "endpoint_name": "https://serve.example",
-        "adapter_revision": _checkpoint_revision(run_id, step),
+        "checkpoint_id": _checkpoint_id(run_id, step),
         "checkpoint_step": step,
     }
     runner_transitions.mark_checkpoint_deployed(
         run_id,
         deployment,
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
+        verification_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
     return deployment
 
@@ -1061,7 +1084,7 @@ def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path,
         def destroy(self, handle):
             events.append("provider-destroy")
 
-    real_read = verified_revisions.read_verified_adapter_revisions
+    real_read = verified_revisions.read_verified_checkpoints
 
     def read_verified(target):
         events.append("serving-decision")
@@ -1071,7 +1094,7 @@ def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path,
     monkeypatch.setattr(
         runner_recovery, "_gc_run_endpoints", lambda _spec: events.append("endpoint-gc")
     )
-    monkeypatch.setattr(verified_revisions, "read_verified_adapter_revisions", read_verified)
+    monkeypatch.setattr(verified_revisions, "read_verified_checkpoints", read_verified)
     monkeypatch.setattr(
         deploy,
         "undeploy_adapter",
@@ -1089,465 +1112,6 @@ def test_cancel_tears_down_training_before_checkpoint_serving_decision(tmp_path,
     ]
     assert out.state == "cancelled"
     assert out.deployment == deployment
-
-
-def test_cancel_preserves_ready_verified_same_step_checkpoint(tmp_path, monkeypatch):
-    import flash.serve.deployment.deploy as deploy
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-checkpoint-preserve"
-    deployment = _ready_checkpoint(run_id, 80)
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        deploy,
-        "adapter_alias_target",
-        lambda _target: pytest.fail("non-contended verified cancellation must not read the alias"),
-    )
-    monkeypatch.setattr(
-        deploy,
-        "undeploy_adapter",
-        lambda _target: pytest.fail("a valid checkpoint deployment must remain serving"),
-    )
-    monkeypatch.setattr(
-        runner_transitions,
-        "mark_deployment_undeployed",
-        lambda _target: pytest.fail("checkpoint authorization must remain intact"),
-    )
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert out.state == "cancelled"
-    assert out.deployment == deployment
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {deployment["adapter_revision"]}
-    )
-
-
-@pytest.mark.parametrize("state", ["queued", "smoke_testing"])
-def test_cancel_preserves_busy_attempt_previous_checkpoint_without_alias_lookup(
-    tmp_path, monkeypatch, state
-):
-    import flash.serve.deployment.deploy as deploy
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = f"flash-checkpoint-{state}"
-    previous = _ready_checkpoint(run_id, 40)
-    status = runner_status.get_status(run_id)
-    status.deployment = {
-        "state": state,
-        "requested_at": 123.0,
-        "previous_deployment": previous,
-    }
-    runner_state._save_status(status)
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        deploy,
-        "adapter_alias_target",
-        lambda _run_id: pytest.fail("ordinary cancellation must not read the serving alias"),
-    )
-    monkeypatch.setattr(
-        deploy,
-        "undeploy_adapter",
-        lambda _run_id: pytest.fail("the verified previous checkpoint must remain serving"),
-    )
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert out.state == "cancelled"
-    assert out.deployment == previous
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {previous["adapter_revision"]}
-    )
-
-
-def test_cancel_contended_deploy_fences_previous_checkpoint_before_wait(tmp_path, monkeypatch):
-    import flash.serve.deployment.deploy as deploy
-    import flash.server.platform.locks as locks
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-checkpoint-contended-fence"
-    previous = _ready_checkpoint(run_id, 40)
-    status = runner_status.get_status(run_id)
-    status.state = "deployed"
-    attempted = {
-        "state": "smoke_testing",
-        "requested_at": 456.0,
-        "adapter_revision": f"{run_id}@final." + "b" * 40,
-        "previous_deployment": previous,
-        "verification_generation": runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
-    }
-    status.deployment = attempted
-    runner_state._save_status(status)
-    stale_commit = {**attempted, "state": "ready"}
-    lock_events = []
-
-    class ContendedLock:
-        held = False
-
-        def acquire(self, blocking: bool = True) -> bool:
-            if not blocking:
-                lock_events.append("contended")
-                return False
-            lock_events.append("waiting")
-            fenced = runner_status.get_status(run_id)
-            assert fenced.deployment == previous
-            assert runner_verified_revisions.verified_adapter_revision_generation(run_id) == (
-                attempted["verification_generation"] + 1
-            )
-            stale_pending = runner_transitions.mark_deployment_pending(
-                run_id,
-                {**attempted, "state": "reconciling"},
-                owner_deployment=attempted,
-            )
-            assert stale_pending.deployment == previous
-            stale = runner_transitions.mark_deployed(
-                run_id,
-                stale_commit,
-                expect_state="deployed",
-                verification_generation=attempted["verification_generation"],
-            )
-            assert stale.deployment == previous
-            self.held = True
-            return True
-
-        def release(self) -> None:
-            assert self.held is True
-            self.held = False
-            lock_events.append("released")
-
-    alias_reads = []
-    monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        deploy,
-        "adapter_alias_target",
-        lambda target: alias_reads.append(target) or previous["adapter_revision"],
-    )
-    monkeypatch.setattr(
-        deploy,
-        "undeploy_adapter",
-        lambda _target: pytest.fail("the verified predecessor must remain serving"),
-    )
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert alias_reads == [run_id]
-    assert lock_events == ["contended", "waiting", "released"]
-    assert out.state == "cancelled"
-    assert out.deployment == previous
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {previous["adapter_revision"]}
-    )
-
-
-def test_cancel_contended_unknown_activation_is_fenced_before_wait(tmp_path, monkeypatch):
-    import flash.serve.deployment.deploy as deploy
-    import flash.server.platform.locks as locks
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-checkpoint-contended-unknown"
-    previous = _ready_checkpoint(run_id, 40)
-    generation = runner_verified_revisions.verified_adapter_revision_generation(run_id)
-    attempted = {
-        "state": "reconciling",
-        "requested_at": 456.0,
-        "adapter_revision": _checkpoint_revision(run_id, 80, "b"),
-        "checkpoint_step": 80,
-        "activation_outcome_unknown": True,
-        "previous_deployment": previous,
-        "verification_generation": generation,
-    }
-    status = runner_status.get_status(run_id)
-    status.deployment = attempted
-    runner_state._save_status(status)
-
-    class ContendedLock:
-        held = False
-
-        def acquire(self, blocking: bool = True) -> bool:
-            if not blocking:
-                return False
-            assert (
-                runner_verified_revisions.verified_adapter_revision_generation(run_id)
-                == generation + 1
-            )
-            assert runner_status.get_status(run_id).deployment == previous
-            self.held = True
-            return True
-
-        def release(self) -> None:
-            assert self.held is True
-            self.held = False
-
-    monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        deploy, "adapter_alias_target", lambda _target: previous["adapter_revision"]
-    )
-    monkeypatch.setattr(
-        deploy,
-        "undeploy_adapter",
-        lambda _target: pytest.fail("the safely recommitted predecessor must remain serving"),
-    )
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert out.state == "cancelled"
-    assert out.deployment == previous
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {previous["adapter_revision"]}
-    )
-
-
-@pytest.mark.parametrize("restore_failure", ["miss", "raise"])
-def test_cancel_contended_predecessor_recommit_failure_stays_fenced_and_revokes(
-    tmp_path, monkeypatch, restore_failure
-):
-    import flash.serve.deployment.deploy as deploy
-    import flash.server.platform.locks as locks
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-checkpoint-contended-restore-miss"
-    previous = _ready_checkpoint(run_id, 40)
-    attempted = {
-        "state": "smoke_testing",
-        "requested_at": 456.0,
-        "adapter_revision": _checkpoint_revision(run_id, 80, "b"),
-        "checkpoint_step": 80,
-        "previous_deployment": previous,
-        "verification_generation": runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
-    }
-    status = runner_status.get_status(run_id)
-    status.deployment = attempted
-    runner_state._save_status(status)
-    real_mark_checkpoint_deployed = runner_transitions.mark_checkpoint_deployed
-
-    def fail_predecessor_restore(*args, **kwargs):
-        owner = kwargs.get("owner_deployment")
-        if isinstance(owner, dict) and owner.get("state") == "revocation_failed":
-            if restore_failure == "raise":
-                real_mark_checkpoint_deployed(*args, **kwargs)
-                raise OSError("checkpoint restoration acknowledgement lost")
-            return runner_status.get_status(run_id)
-        return real_mark_checkpoint_deployed(*args, **kwargs)
-
-    class ContendedLock:
-        held = False
-
-        def acquire(self, blocking: bool = True) -> bool:
-            if not blocking:
-                return False
-            fenced = runner_status.get_status(run_id)
-            assert fenced.deployment["state"] == "revocation_failed"
-            assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
-            self.held = True
-            return True
-
-        def release(self) -> None:
-            assert self.held is True
-            self.held = False
-
-    undeploys = []
-    monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
-    monkeypatch.setattr(runner_transitions, "mark_checkpoint_deployed", fail_predecessor_restore)
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        deploy, "adapter_alias_target", lambda _target: previous["adapter_revision"]
-    )
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert undeploys == [run_id]
-    assert out.state == "cancelled"
-    assert out.deployment["state"] == "undeployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
-
-
-@pytest.mark.parametrize("attempted_step", [None, 80])
-def test_cancel_contended_fence_revokes_when_alias_changes_before_lock_release(
-    tmp_path, monkeypatch, attempted_step
-):
-    import flash.serve.deployment.deploy as deploy
-    import flash.server.platform.locks as locks
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = f"flash-checkpoint-contended-alias-race-{attempted_step}"
-    previous = _ready_checkpoint(run_id, 40)
-    status = runner_status.get_status(run_id)
-    status.state = "deployed"
-    attempted_revision = (
-        f"{run_id}@final." + "b" * 40
-        if attempted_step is None
-        else _checkpoint_revision(run_id, attempted_step, "b")
-    )
-    attempted = {
-        "state": "smoke_testing",
-        "requested_at": 456.0,
-        "adapter_revision": attempted_revision,
-        "previous_deployment": previous,
-        "verification_generation": runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
-    }
-    if attempted_step is not None:
-        attempted["checkpoint_step"] = attempted_step
-    status.deployment = attempted
-    runner_state._save_status(status)
-    stale_commit = {**attempted, "state": "ready"}
-    alias_target = [previous["adapter_revision"]]
-
-    class ContendedLock:
-        held = False
-
-        def acquire(self, blocking: bool = True) -> bool:
-            if not blocking:
-                return False
-            fenced = runner_status.get_status(run_id)
-            assert fenced.deployment == previous
-            assert runner_verified_revisions.verified_adapter_revision_generation(run_id) == (
-                attempted["verification_generation"] + 1
-            )
-            alias_target[0] = attempted["adapter_revision"]
-            if attempted_step is None:
-                stale = runner_transitions.mark_deployed(
-                    run_id,
-                    stale_commit,
-                    expect_state="deployed",
-                    verification_generation=attempted["verification_generation"],
-                )
-            else:
-                stale = runner_transitions.mark_checkpoint_deployed(
-                    run_id,
-                    stale_commit,
-                    verification_generation=attempted["verification_generation"],
-                    owner_deployment=attempted,
-                )
-            assert stale.deployment == previous
-            self.held = True
-            return True
-
-        def release(self) -> None:
-            assert self.held is True
-            self.held = False
-
-    undeploys = []
-    monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(deploy, "adapter_alias_target", lambda _target: alias_target[0])
-
-    def undeploy(target):
-        undeploys.append(target)
-        assert runner_status.get_status(run_id).deployment["state"] == "revocation_failed"
-
-    monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert undeploys == [run_id]
-    assert out.state == "cancelled"
-    assert out.deployment["state"] == "undeployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
-
-
-def test_cancel_unknown_outcome_restores_live_verified_previous_checkpoint(tmp_path, monkeypatch):
-    import flash.serve.deployment.deploy as deploy
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-checkpoint-unknown-previous"
-    previous = _ready_checkpoint(run_id, 40)
-    busy = {
-        "state": "reconciling",
-        "requested_at": 456.0,
-        "adapter_revision": f"{run_id}@final." + "b" * 40,
-        "activation_outcome_unknown": True,
-        "previous_deployment": previous,
-    }
-    status = runner_status.get_status(run_id)
-    status.deployment = busy
-    runner_state._save_status(status)
-    alias_reads = []
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        deploy,
-        "adapter_alias_target",
-        lambda target: alias_reads.append(target) or previous["adapter_revision"],
-    )
-    monkeypatch.setattr(
-        deploy,
-        "undeploy_adapter",
-        lambda _run_id: pytest.fail("the authoritative previous checkpoint must remain serving"),
-    )
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert alias_reads == [run_id]
-    assert out.state == "cancelled"
-    assert out.deployment == previous
-    assert out.deployment != busy
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {previous["adapter_revision"]}
-    )
-
-
-@pytest.mark.parametrize(
-    ("raced_state", "expected_state"),
-    [("done", "cancelled"), ("failed", "failed")],
-)
-def test_cancel_checkpoint_restore_survives_owned_run_state_race(
-    tmp_path, monkeypatch, raced_state, expected_state
-):
-    import flash.serve.deployment.deploy as deploy
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = f"flash-checkpoint-state-race-{raced_state}"
-    previous = _ready_checkpoint(run_id, 40)
-    busy = {
-        "state": "reconciling",
-        "requested_at": 456.0,
-        "adapter_revision": f"{run_id}@final." + "b" * 40,
-        "activation_outcome_unknown": True,
-        "previous_deployment": previous,
-    }
-    status = runner_status.get_status(run_id)
-    status.deployment = busy
-    runner_state._save_status(status)
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        deploy, "adapter_alias_target", lambda _run_id: previous["adapter_revision"]
-    )
-    real_mark_checkpoint_deployed = runner_transitions.mark_checkpoint_deployed
-
-    def race_run_state(*args, **kwargs):
-        if kwargs.get("retain_only_revision"):
-            assert kwargs["owner_deployment"] == previous
-            return real_mark_checkpoint_deployed(*args, **kwargs)
-        assert kwargs["owner_deployment"] == busy
-        assert "expect_state" not in kwargs
-        raced = runner_status.get_status(run_id)
-        assert raced.deployment == busy
-        raced.state = raced_state
-        runner_state._save_status(raced)
-        return real_mark_checkpoint_deployed(*args, **kwargs)
-
-    monkeypatch.setattr(runner_transitions, "mark_checkpoint_deployed", race_run_state)
-    monkeypatch.setattr(
-        deploy,
-        "undeploy_adapter",
-        lambda _run_id: pytest.fail("the still-owned checkpoint must remain serving"),
-    )
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert out.state == expected_state
-    assert out.deployment == previous
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {previous["adapter_revision"]}
-    )
 
 
 def test_checkpoint_restore_owner_fence_rejects_newer_attempt(tmp_path, monkeypatch):
@@ -1574,315 +1138,11 @@ def test_checkpoint_restore_owner_fence_rejects_newer_attempt(tmp_path, monkeypa
         run_id,
         previous,
         owner_deployment=stale_owner,
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
+        verification_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
 
     assert out.deployment == newer_attempt
     assert runner_status.get_status(run_id).deployment == newer_attempt
-
-
-def test_cancel_restore_failure_revokes_instead_of_leaving_reconciling_authority(
-    tmp_path, monkeypatch
-):
-    import flash.serve.deployment.deploy as deploy
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-checkpoint-restore-failure"
-    previous = _ready_checkpoint(run_id, 40)
-    busy = {
-        "state": "reconciling",
-        "requested_at": 456.0,
-        "adapter_revision": f"{run_id}@final." + "b" * 40,
-        "activation_outcome_unknown": True,
-        "previous_deployment": previous,
-    }
-    status = runner_status.get_status(run_id)
-    status.deployment = busy
-    runner_state._save_status(status)
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        deploy, "adapter_alias_target", lambda _run_id: previous["adapter_revision"]
-    )
-
-    def fail_restore(*_args, **kwargs):
-        assert kwargs["owner_deployment"] == busy
-        raise OSError("checkpoint status store unavailable")
-
-    monkeypatch.setattr(runner_transitions, "mark_checkpoint_deployed", fail_restore)
-    undeploys = []
-
-    def undeploy(target):
-        undeploys.append(target)
-        fenced = runner_status.get_status(run_id)
-        assert fenced.deployment["state"] == "revocation_failed"
-        assert fenced.deployment != busy
-        assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
-
-    monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert undeploys == [run_id]
-    assert out.state == "cancelled"
-    assert out.deployment["state"] == "undeployed"
-    assert out.deployment != previous
-    assert out.deployment != busy
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
-
-
-def test_cancel_restore_ack_failure_preserves_persisted_verified_checkpoint(tmp_path, monkeypatch):
-    import flash.serve.deployment.deploy as deploy
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-checkpoint-restore-ack-failure"
-    previous = _ready_checkpoint(run_id, 40)
-    busy = {
-        "state": "reconciling",
-        "requested_at": 789.0,
-        "adapter_revision": f"{run_id}@final." + "c" * 40,
-        "activation_outcome_unknown": True,
-        "previous_deployment": previous,
-    }
-    status = runner_status.get_status(run_id)
-    status.deployment = busy
-    runner_state._save_status(status)
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        deploy, "adapter_alias_target", lambda _run_id: previous["adapter_revision"]
-    )
-    real_mark_checkpoint_deployed = runner_transitions.mark_checkpoint_deployed
-
-    def persist_then_raise(*args, **kwargs):
-        if kwargs.get("retain_only_revision"):
-            assert kwargs["owner_deployment"] == previous
-            return real_mark_checkpoint_deployed(*args, **kwargs)
-        assert kwargs["owner_deployment"] == busy
-        real_mark_checkpoint_deployed(*args, **kwargs)
-        raise OSError("checkpoint status write acknowledgement lost")
-
-    monkeypatch.setattr(runner_transitions, "mark_checkpoint_deployed", persist_then_raise)
-    monkeypatch.setattr(
-        deploy,
-        "undeploy_adapter",
-        lambda _run_id: pytest.fail("the authoritative restored checkpoint must remain serving"),
-    )
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert out.state == "cancelled"
-    assert out.deployment == previous
-    assert out.deployment != busy
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {previous["adapter_revision"]}
-    )
-
-
-@pytest.mark.parametrize("live_verified", [False, True])
-def test_cancel_unknown_outcome_revokes_attempted_live_checkpoint(
-    tmp_path, monkeypatch, live_verified
-):
-    import flash.serve.deployment.deploy as deploy
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = f"flash-checkpoint-live-{live_verified}"
-    stale_previous = _ready_checkpoint(run_id, 10)
-    live_revision = _checkpoint_revision(run_id, 20, "c")
-    if live_verified:
-        runner_verified_revisions.add_verified_adapter_revision(
-            run_id,
-            live_revision,
-            expected_generation=runner_verified_revisions.verified_adapter_revision_generation(
-                run_id
-            ),
-        )
-    status = runner_status.get_status(run_id)
-    status.deployment = {
-        "state": "reconciling",
-        "requested_at": 789.0,
-        "adapter_revision": live_revision,
-        "checkpoint_step": 20,
-        "activation_outcome_unknown": True,
-        "previous_deployment": stale_previous,
-        "verified_at": 123.0,
-        "verify_kind": "fixed_prompt",
-        "verify_turns": 1,
-        "verify_latency_s": 0.1,
-        "verify_finish_reason": "stop",
-        "thinking_tag": False,
-        "verify_sample": "4",
-    }
-    runner_state._save_status(status)
-    undeploys = []
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: live_revision)
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert undeploys == [run_id]
-    assert out.state == "cancelled"
-    assert out.deployment["state"] == "undeployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
-
-
-def test_cancel_unknown_outcome_rejects_unverified_divergent_checkpoint(tmp_path, monkeypatch):
-    import flash.serve.deployment.deploy as deploy
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-checkpoint-live-divergent"
-    previous = _ready_checkpoint(run_id, 10)
-    attempted_revision = _checkpoint_revision(run_id, 20, "b")
-    divergent_revision = _checkpoint_revision(run_id, 30, "c")
-    status = runner_status.get_status(run_id)
-    status.deployment = {
-        "state": "reconciling",
-        "requested_at": 789.0,
-        "adapter_revision": attempted_revision,
-        "checkpoint_step": 20,
-        "activation_outcome_unknown": True,
-        "previous_deployment": previous,
-    }
-    runner_state._save_status(status)
-    undeploys = []
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: divergent_revision)
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert undeploys == [run_id]
-    assert out.state == "cancelled"
-    assert out.deployment["state"] == "undeployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
-
-
-@pytest.mark.parametrize("alias_result", ["missing", "disabled", "error"])
-def test_cancel_unknown_outcome_alias_failure_revokes_fail_closed(
-    tmp_path, monkeypatch, alias_result
-):
-    import flash.serve.deployment.deploy as deploy
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = f"flash-checkpoint-alias-{alias_result}"
-    previous = _ready_checkpoint(run_id, 30)
-    status = runner_status.get_status(run_id)
-    status.deployment = {
-        "state": "reconciling",
-        "activation_outcome_unknown": True,
-        "previous_deployment": previous,
-    }
-    runner_state._save_status(status)
-    alias_reads = []
-
-    def alias_target(target):
-        alias_reads.append(target)
-        if alias_result == "error":
-            raise serving_errors.ServingError("alias read failed")
-
-    undeploys = []
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(deploy, "adapter_alias_target", alias_target)
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert alias_reads == [run_id]
-    assert undeploys == [run_id]
-    assert out.state == "cancelled"
-    assert out.deployment["state"] == "undeployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
-
-
-def test_cancel_unknown_outcome_never_preserves_verified_final_alias(tmp_path, monkeypatch):
-    import flash.serve.deployment.deploy as deploy
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-final-alias-unknown"
-    final_revision = f"{run_id}@final." + "f" * 40
-    runner_state._save_status(
-        runner_state.RunStatus(
-            run_id=run_id,
-            state="done",
-            spec=_run_spec(run_id).to_dict(),
-            deployment={"state": "reconciling", "activation_outcome_unknown": True},
-        )
-    )
-    runner_verified_revisions.add_verified_adapter_revision(
-        run_id,
-        final_revision,
-        expected_generation=runner_verified_revisions.verified_adapter_revision_generation(run_id),
-    )
-    undeploys = []
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: final_revision)
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeploys.append(target))
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert undeploys == [run_id]
-    assert out.deployment["state"] == "undeployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
-
-
-def test_activation_unknown_final_predecessor_is_not_preservable_checkpoint(tmp_path, monkeypatch):
-    from flash.runner.supervise.deploy import _preservable_checkpoint_deployment
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-final-predecessor"
-    revision = f"{run_id}@final." + "f" * 40
-    runner_verified_revisions.add_verified_adapter_revision(
-        run_id,
-        revision,
-        expected_generation=runner_verified_revisions.verified_adapter_revision_generation(run_id),
-    )
-
-    assert (
-        _preservable_checkpoint_deployment(
-            run_id,
-            {
-                "state": "failed",
-                "activation_outcome_unknown": True,
-                "previous_deployment": {
-                    "state": "ready",
-                    "adapter_revision": revision,
-                    "checkpoint_step": None,
-                },
-            },
-            live_alias_target=revision,
-        )
-        is None
-    )
-
-
-def test_cancel_revokes_final_deployment(tmp_path, monkeypatch):
-    import flash.serve.deployment.deploy as deploy
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-final-revoke"
-    spec = _run_spec(run_id)
-    runner_state._save_status(
-        runner_state.RunStatus(run_id=run_id, state="done", spec=spec.to_dict())
-    )
-    revision = f"{run_id}@final." + "f" * 40
-    runner_transitions.mark_deployed(
-        run_id,
-        {"state": "ready", "adapter_revision": revision, "endpoint_name": "final"},
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
-    )
-    undeployed = []
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeployed.append(target))
-
-    out = runner_deploy.cancel_run(run_id)
-
-    assert undeployed == [run_id]
-    assert out.state == "cancelled"
-    assert out.deployment["state"] == "undeployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
 
 
 def test_cancel_revokes_inflight_checkpoint_deployment(tmp_path, monkeypatch):
@@ -1891,33 +1151,39 @@ def test_cancel_revokes_inflight_checkpoint_deployment(tmp_path, monkeypatch):
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-inflight"
     spec = _run_spec(run_id)
-    revision = _checkpoint_revision(run_id, 40)
+    revision = _checkpoint_id(run_id, 40)
     runner_state._save_status(
         runner_state.RunStatus(
             run_id=run_id,
             state="running",
             spec=spec.to_dict(),
+            platform_context={"org_id": "org-1"},
             deployment={
                 "state": "deploying",
-                "adapter_revision": revision,
+                "checkpoint_id": revision,
                 "checkpoint_step": 40,
             },
+            billing_context={"org_id": "org-a"},
         )
     )
-    runner_verified_revisions.add_verified_adapter_revision(
+    runner_verified_revisions.add_verified_checkpoint(
         run_id,
         revision,
-        expected_generation=runner_verified_revisions.verified_adapter_revision_generation(run_id),
+        expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
     undeployed = []
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: undeployed.append(target))
+    monkeypatch.setattr(
+        deploy,
+        "undeploy_adapter",
+        lambda target, *, org_id: undeployed.append((org_id, target)),
+    )
 
     out = runner_deploy.cancel_run(run_id)
 
-    assert undeployed == [run_id]
+    assert undeployed == [("org-a", revision)]
     assert out.deployment["state"] == "undeployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
 
 @pytest.mark.parametrize(
@@ -1938,7 +1204,12 @@ def test_cancel_active_removed_model_still_cleans_up_and_revokes(
             run_id=run_id,
             state="running",
             spec=spec.to_dict(),
-            deployment={"state": "deploying"},
+            platform_context={"org_id": "org-1"},
+            deployment={
+                "state": "deploying",
+                "checkpoint_id": f"{run_id}/final",
+                "checkpoint_step": None,
+            },
         )
     )
     raw = runner_status._load_status_json(run_id)
@@ -1963,12 +1234,14 @@ def test_cancel_active_removed_model_still_cleans_up_and_revokes(
     gc_calls = []
     monkeypatch.setattr(locks, "_deploy_lock", lambda _target: ContendedLock())
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: gc_calls.append(_spec))
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: backend_calls.append(target))
+    monkeypatch.setattr(
+        deploy, "undeploy_adapter", lambda target, **_: backend_calls.append(target)
+    )
 
     out = runner_deploy.cancel_run(run_id)
 
     assert [spec.model for spec in gc_calls] == [retired_model]
-    assert backend_calls == [run_id]
+    assert backend_calls == [f"{run_id}/final"]
     assert out.state == "cancelled"
     assert out.deployment["state"] == "undeployed"
 
@@ -1982,27 +1255,27 @@ def test_cancel_backend_success_local_commit_failure_is_not_backend_uncertainty(
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     run_id = "flash-local-persistence-failure"
     spec = _run_spec(run_id)
-    revision = f"{run_id}@final." + "d" * 40
+    revision = f"{run_id}/final"
     runner_state._save_status(
         runner_state.RunStatus(
             run_id=run_id,
             state="running",
             spec=spec.to_dict(),
-            deployment={"state": "ready", "adapter_revision": revision},
+            platform_context={"org_id": "org-1"},
+            deployment={"state": "ready", "checkpoint_id": revision},
         )
-    )
-    runner_verified_revisions.add_verified_adapter_revision(
-        run_id,
-        revision,
-        expected_generation=runner_verified_revisions.verified_adapter_revision_generation(run_id),
     )
     backend_calls = []
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: backend_calls.append(target))
+    monkeypatch.setattr(
+        deploy, "undeploy_adapter", lambda target, **_: backend_calls.append(target)
+    )
     monkeypatch.setattr(
         runner_transitions,
-        "mark_deployment_undeployed",
-        lambda _target: (_ for _ in ()).throw(OSError("status store unavailable")),
+        "mark_undeployed",
+        lambda _run_id, _checkpoint_id=None: (_ for _ in ()).throw(
+            OSError("status store unavailable")
+        ),
     )
 
     with pytest.raises(DeploymentStatePersistenceError) as excinfo:
@@ -2011,11 +1284,11 @@ def test_cancel_backend_success_local_commit_failure_is_not_backend_uncertainty(
     assert not isinstance(excinfo.value, runner_deploy.DeploymentRevocationError)
     assert excinfo.value.backend_outcome == "confirmed"
     assert "backend disablement was confirmed" in str(excinfo.value)
-    assert backend_calls == [run_id]
+    assert backend_calls == [f"{run_id}/final"]
     failed = runner_status.get_status(run_id)
     assert failed.state == "cancelled"
     assert failed.deployment["state"] == "revocation_failed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
 
 def test_repeated_cancel_preserves_checkpoint_serving(tmp_path, monkeypatch):
@@ -2036,28 +1309,26 @@ def test_repeated_cancel_preserves_checkpoint_serving(tmp_path, monkeypatch):
 
     assert first.state == second.state == "cancelled"
     assert first.deployment == second.deployment == deployment
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {deployment["adapter_revision"]}
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset(
+        {deployment["checkpoint_id"]}
     )
 
 
-def test_cancel_preserved_checkpoint_prunes_other_verified_revisions(tmp_path, monkeypatch):
+def test_cancel_preserved_checkpoint_keeps_verified_ready_siblings(tmp_path, monkeypatch):
     import flash.serve.deployment.deploy as deploy
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     run_id = "flash-checkpoint-prune"
     preserved = _ready_checkpoint(run_id, 40, remote=None)
     older_revisions = {
-        _checkpoint_revision(run_id, 20, "b"),
-        f"{run_id}@final." + "c" * 40,
+        _checkpoint_id(run_id, 20, "b"),
+        f"{run_id}/final",
     }
     for revision in older_revisions:
-        runner_verified_revisions.add_verified_adapter_revision(
+        runner_verified_revisions.add_verified_checkpoint(
             run_id,
             revision,
-            expected_generation=runner_verified_revisions.verified_adapter_revision_generation(
-                run_id
-            ),
+            expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
         )
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
     monkeypatch.setattr(
@@ -2070,58 +1341,8 @@ def test_cancel_preserved_checkpoint_prunes_other_verified_revisions(tmp_path, m
 
     assert out.state == "cancelled"
     assert out.deployment == preserved
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {preserved["adapter_revision"]}
-    )
-
-
-def test_cancel_checkpoint_prune_failure_is_retryable_without_revocation(tmp_path, monkeypatch):
-    import flash.runner.results.verified_revisions as verified_revisions
-    import flash.serve.deployment.deploy as deploy
-    from flash.runner.supervise.deploy import DeploymentStatePersistenceError
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
-    run_id = "flash-checkpoint-prune-retry"
-    preserved = _ready_checkpoint(run_id, 40, remote=None)
-    older_revision = _checkpoint_revision(run_id, 20, "b")
-    runner_verified_revisions.add_verified_adapter_revision(
-        run_id,
-        older_revision,
-        expected_generation=runner_verified_revisions.verified_adapter_revision_generation(run_id),
-    )
-    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-    monkeypatch.setattr(
-        deploy,
-        "undeploy_adapter",
-        lambda _target: pytest.fail("ledger persistence failure must not revoke serving"),
-    )
-    real_write = verified_revisions._write_unlocked
-
-    def fail_prune(runs_dir, path, generation, revisions):
-        if revisions == [preserved["adapter_revision"]]:
-            raise OSError("verified revision ledger unavailable")
-        return real_write(runs_dir, path, generation, revisions)
-
-    monkeypatch.setattr(verified_revisions, "_write_unlocked", fail_prune)
-
-    with pytest.raises(DeploymentStatePersistenceError) as excinfo:
-        runner_deploy.cancel_run(run_id)
-
-    assert excinfo.value.backend_outcome == "not_required"
-    failed = runner_status.get_status(run_id)
-    assert failed.state == "running"
-    assert failed.deployment == preserved
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {older_revision, preserved["adapter_revision"]}
-    )
-
-    monkeypatch.setattr(verified_revisions, "_write_unlocked", real_write)
-    retried = runner_deploy.cancel_run(run_id)
-
-    assert retried.state == "cancelled"
-    assert retried.deployment == preserved
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {preserved["adapter_revision"]}
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset(
+        {*older_revisions, preserved["checkpoint_id"]}
     )
 
 
@@ -2133,24 +1354,25 @@ def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_p
 
     run_id = "flash-dep-revoke"
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": run_id})
+    revision = f"{run_id}/final"
     runner_state._save_status(
-        runner_state.RunStatus(run_id=run_id, state="done", spec=spec.to_dict())
+        runner_state.RunStatus(
+            run_id=run_id,
+            state="deployed",
+            spec=spec.to_dict(),
+            platform_context={"org_id": "org-1"},
+            deployment={
+                "state": "ready",
+                "checkpoint_id": revision,
+                "endpoint_name": "https://serve.example",
+            },
+        )
     )
-    revision = f"{run_id}@final." + "a" * 40
-    generation = runner_verified_revisions.verified_adapter_revision_generation(run_id)
-    ready = runner_transitions.mark_deployed(
-        run_id,
-        {"state": "ready", "adapter_revision": revision, "endpoint_name": "https://serve.example"},
-        verification_generation=generation,
-    )
-    assert ready.state == "deployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {revision}
-    )
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
     attempts = []
 
-    def fail_undeploy(target):
+    def fail_undeploy(target, **_):
         attempts.append(target)
         raise serving_errors.ServingError("backend unavailable")
 
@@ -2161,20 +1383,22 @@ def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_p
         runner_deploy.cancel_run(run_id)
 
     assert excinfo.value.retryable is True
-    assert attempts == [run_id]
+    assert attempts == [revision]
     failed = runner_status.get_status(run_id)
     assert failed.state == "cancelled"
     assert failed.deployment["state"] == "revocation_failed"
     assert failed.deployment["retryable"] is True
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target: attempts.append(target) or {})
+    monkeypatch.setattr(
+        deploy, "undeploy_adapter", lambda target, **_: attempts.append(target) or {}
+    )
     retried = runner_deploy.cancel_run(run_id)
 
-    assert attempts == [run_id, run_id]
+    assert attempts == [revision, revision]
     assert retried.state == "cancelled"
     assert retried.deployment["state"] == "undeployed"
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
 
 
 # ---------------------------------------------------------------------------

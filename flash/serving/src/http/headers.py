@@ -12,6 +12,18 @@ from typing import Any
 from fastapi import HTTPException, Request, status
 
 
+def internal_org_id(request: Request) -> str:
+    """return the mandatory tenant scope for an internal checkpoint operation."""
+
+    org_id = (request.headers.get("X-Freesolo-Org-Id") or "").strip()
+    if not org_id:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "X-Freesolo-Org-Id is required for internal checkpoint operations",
+        )
+    return org_id
+
+
 def assert_internal(request: Request, internal_key: str | None) -> None:
     if not internal_key:
         # No internal key configured -> the control plane can't be authenticated. Fail closed
