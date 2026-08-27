@@ -21,6 +21,12 @@ from typing import Any
 
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
+# an undelivered row older than this is not "in flight", it is wedged. the outbox worker claims and
+# delivers continuously, so a healthy loop never leaves a row sitting this long.
+_STALL_AGE_SECONDS = 120
+
+_MISSING = object()
+
 HEALTH_MALFORMED = "health_malformed"
 HEALTH_NOT_OK = "health_not_ok"
 HEALTH_SHA_MISMATCH = "health_sha_mismatch"
@@ -34,7 +40,7 @@ STREAM_NO_USAGE = "stream_no_terminal_usage"
 STREAM_NO_DONE = "stream_no_done_sentinel"
 
 ACCOUNTING_MALFORMED = "accounting_malformed"
-ACCOUNTING_NOT_SETTLED = "accounting_not_settled"
+ACCOUNTING_STALLED = "accounting_stalled"
 
 
 @dataclass(frozen=True)
@@ -146,44 +152,65 @@ def verify_stream(evidence: StreamEvidence) -> PromotionVerdict:
 
 @dataclass(frozen=True)
 class AccountingEvidence:
+    """The backlog counters this release's outbox reports.
+
+    This is a WHOLE-DEPLOYMENT view, not a per-request one. `serving_usage_backlog_snapshot` is the
+    only durable accounting surface the router exposes, and it aggregates across every generation in
+    flight. There is no RPC that reads back one row by correlation id, so the canary's own row is not
+    individually observable from here.
+    """
+
     pending: int
     leased: int
-    due_pending: int
     expired_leases: int
+    oldest_undelivered_age_seconds: int | None
 
     @property
-    def settled(self) -> bool:
-        return (
-            self.pending == 0
-            and self.leased == 0
-            and self.due_pending == 0
-            and self.expired_leases == 0
-        )
+    def stalled(self) -> bool:
+        """Delivery is not making progress, as opposed to merely having work in flight.
+
+        A nonzero backlog is normal on a live deployment: concurrent traffic is always producing
+        rows. What is never normal is an expired lease (a worker took a row and died holding it) or
+        an undelivered row older than the stall threshold. Those are properties of the DELIVERY
+        LOOP, so they hold regardless of how much unrelated traffic shares the counters.
+        """
+        if self.expired_leases > 0:
+            return True
+        age = self.oldest_undelivered_age_seconds
+        return age is not None and age >= _STALL_AGE_SECONDS
 
 
 def accounting_from_snapshot(snapshot: Any) -> AccountingEvidence | None:
-    """Read the four backlog counters off an `OutboxSnapshot`, or None when it is not one.
+    """Read the backlog counters off an `OutboxSnapshot`, or None when it is not one.
 
-    Missing counters must NOT default to zero. Zero is precisely the value that means "settled", so
+    Missing counters must NOT default to zero: zero is precisely the value that means "healthy", so
     a defaulted read would turn an unreadable snapshot into a pass.
     """
     values: list[int] = []
-    for field in ("pending", "leased", "due_pending", "expired_leases"):
+    for field in ("pending", "leased", "expired_leases"):
         value = getattr(snapshot, field, None)
         if isinstance(value, bool) or not isinstance(value, int):
             return None
         values.append(value)
-    return AccountingEvidence(*values)
+    # None is a real reading here ("nothing undelivered"); an ABSENT field is not, because it would
+    # silently read as healthy while carrying no stall signal at all.
+    age = getattr(snapshot, "oldest_undelivered_age_seconds", _MISSING)
+    if age is not None and (isinstance(age, bool) or not isinstance(age, int)):
+        return None
+    return AccountingEvidence(*values, oldest_undelivered_age_seconds=age)
 
 
 def verify_accounting(evidence: AccountingEvidence | None) -> PromotionVerdict:
-    """The canary's own usage settled durably, rather than only being captured in memory.
+    """This release's durable delivery loop is running, not wedged.
 
-    A captured-but-undelivered event still bills nothing and still loses the request on restart, so
-    an in-memory capture is not evidence that accounting works on this release.
+    Deliberately NOT "the canary's own row settled": the snapshot cannot express that. Asserting a
+    zero backlog would be both fail-open and flaky on a live deployment -- unrelated traffic can
+    drain the counters to zero while the canary's own row is stuck, and can equally hold them
+    nonzero while everything is healthy. Stall signals are the part of this snapshot that means the
+    same thing no matter whose rows are in it.
     """
     if evidence is None:
         return _fail(ACCOUNTING_MALFORMED)
-    if not evidence.settled:
-        return _fail(ACCOUNTING_NOT_SETTLED)
+    if evidence.stalled:
+        return _fail(ACCOUNTING_STALLED)
     return PASS

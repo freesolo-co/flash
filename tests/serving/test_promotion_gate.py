@@ -9,7 +9,7 @@ from flash.serving.promotion import gate as gate_module
 from flash.serving.promotion.canary import CANARY_TIMEOUT, CanaryError
 from flash.serving.promotion.evidence import (
     ACCOUNTING_MALFORMED,
-    ACCOUNTING_NOT_SETTLED,
+    ACCOUNTING_STALLED,
     HEALTH_SHA_MISMATCH,
     STREAM_NO_CONTENT,
     StreamEvidence,
@@ -28,8 +28,8 @@ DEPLOYMENT_ID = "12345-1"
 class _Snapshot:
     pending: int = 0
     leased: int = 0
-    due_pending: int = 0
     expired_leases: int = 0
+    oldest_undelivered_age_seconds: int | None = None
 
 
 def _health(**overrides):
@@ -134,23 +134,23 @@ def test_a_canary_error_becomes_its_reason_code_not_an_exception():
     assert verdict.reason == CANARY_TIMEOUT
 
 
-def test_a_backlog_that_never_drains_fails_within_the_deadline():
+def test_a_delivery_loop_that_stays_wedged_fails_within_the_deadline():
     """Delivery is asynchronous, so the gate retries; it must still stop."""
     verdict, calls = _evaluate(
         health=_health(),
         stream=_good_stream(),
-        accounting=_Snapshot(pending=1),
+        accounting=_Snapshot(expired_leases=1),
         accounting_deadline_seconds=10,
         poll_seconds=5,
     )
-    assert verdict.reason == ACCOUNTING_NOT_SETTLED
+    assert verdict.reason == ACCOUNTING_STALLED
     # bounded: three reads at t=0, 5, 10, then the deadline stops it.
     assert calls.count("accounting") == 3
 
 
-def test_a_backlog_still_draining_on_the_first_read_is_given_time_to_settle():
-    """Usage in flight immediately after a generation is normal, not a failure."""
-    snapshots = iter([_Snapshot(leased=1), _Snapshot(pending=1), _Snapshot()])
+def test_a_transient_stall_that_recovers_is_given_time_to_clear():
+    """An expired lease gets recovered by the worker, so one bad read is not a verdict."""
+    snapshots = iter([_Snapshot(expired_leases=1), _Snapshot(expired_leases=1), _Snapshot()])
     verdict, calls = _evaluate(
         health=_health(),
         stream=_good_stream(),
@@ -160,6 +160,19 @@ def test_a_backlog_still_draining_on_the_first_read_is_given_time_to_settle():
     )
     assert verdict.ok
     assert calls.count("accounting") == 3
+
+
+def test_concurrent_traffic_does_not_fail_the_promotion():
+    """The snapshot is deployment-wide, so unrelated in-flight rows are always present.
+
+    Requiring a drained backlog here would make every promotion a coin flip on production traffic.
+    """
+    verdict, _ = _evaluate(
+        health=_health(),
+        stream=_good_stream(),
+        accounting=_Snapshot(pending=12, leased=4),
+    )
+    assert verdict.ok
 
 
 def test_an_unreadable_snapshot_never_passes_as_settled():

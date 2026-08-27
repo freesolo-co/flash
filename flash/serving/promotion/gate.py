@@ -5,11 +5,17 @@ readiness poll. Order is load-bearing and short-circuits:
 
   health  -> is the live router THIS release, with engines to route to?
   stream  -> did a real authenticated request generate real tokens over a real stream?
-  usage   -> did that generation settle durably in accounting?
+  usage   -> is this release's durable delivery loop running rather than wedged?
 
 Each stage is skipped when an earlier one failed. Streaming against a router that is not this
-release would prove nothing about it, and waiting on an accounting backlog for a generation that
+release would prove nothing about it, and inspecting an accounting backlog for a generation that
 never happened would just burn the deadline before failing anyway.
+
+The exact-head binding comes from stages 1 and 2 together: the router proved its identity, and then
+that same router served a real generation. Stage 3 is deliberately weaker than "the canary's own row
+settled" -- `serving_usage_backlog_snapshot` aggregates every generation in flight and offers no
+per-correlation read, so a zero-backlog assertion would be fail-open under concurrent traffic and
+flaky besides. See `verify_accounting`.
 
 Credentials are read from the environment only, never from argv: `run:` lines are echoed into the
 public build log, so an interpolated key leaks on every run including the green ones.
@@ -109,11 +115,12 @@ async def _await_accounting(
     poll_seconds: float,
     sleep: Callable[[float], Awaitable[None]],
 ) -> PromotionVerdict:
-    """Poll until the backlog drains, bounded.
+    """Poll until delivery looks healthy, bounded.
 
-    Delivery is asynchronous, so the first read after a generation legitimately shows work in
-    flight. Only a backlog that never drains is evidence of a broken release, which is why this
-    retries rather than failing on the first non-zero read.
+    Delivery is asynchronous, so a single stalled-looking read right after a generation is not yet
+    evidence of anything: a lease can expire and be recovered, and an undelivered row ages until the
+    worker claims it. Only a stall that persists across the deadline indicates a wedged loop, which
+    is why this retries rather than failing on the first bad read.
     """
     waited = 0.0
     verdict = verify_accounting(None)

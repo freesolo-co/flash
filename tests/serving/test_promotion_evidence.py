@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from flash.serving.promotion.evidence import (
     ACCOUNTING_MALFORMED,
-    ACCOUNTING_NOT_SETTLED,
+    ACCOUNTING_STALLED,
     HEALTH_DEPLOYMENT_ID_MISMATCH,
     HEALTH_MALFORMED,
     HEALTH_NO_ENGINES,
@@ -137,39 +137,77 @@ def test_a_real_stream_passes():
     assert verify_stream(_stream()).ok
 
 
-def test_each_backlog_counter_independently_blocks_promotion():
-    """Any one non-zero counter means this release's usage did not settle.
+def _evidence(**overrides) -> AccountingEvidence:
+    counters = {
+        "pending": 0,
+        "leased": 0,
+        "expired_leases": 0,
+        "oldest_undelivered_age_seconds": None,
+    }
+    counters.update(overrides)
+    return AccountingEvidence(**counters)
 
-    Checking only `pending` would miss a row stuck in a lease, which is the failure that loses
-    billing on restart.
+
+def test_traffic_in_flight_is_not_a_failed_promotion():
+    """This is the fail-open/flaky trap that a zero-backlog assertion walks into.
+
+    `serving_usage_backlog_snapshot` aggregates EVERY generation in flight, not the canary's own
+    row, and there is no per-correlation read. On live production some unrelated request is almost
+    always mid-delivery, so requiring zero would fail healthy releases at random -- and, worse, a
+    burst of unrelated traffic draining to zero would pass a release whose own row never settled.
+    Only stall signals mean the same thing regardless of whose rows are in the counters.
     """
-    for field in ("pending", "leased", "due_pending", "expired_leases"):
-        counters = {"pending": 0, "leased": 0, "due_pending": 0, "expired_leases": 0}
-        counters[field] = 1
-        verdict = verify_accounting(AccountingEvidence(**counters))
-        assert verdict.reason == ACCOUNTING_NOT_SETTLED, field
+    assert verify_accounting(_evidence(pending=7, leased=3)).ok
 
 
-def test_a_snapshot_missing_a_counter_is_unreadable_not_settled():
+def test_an_expired_lease_blocks_promotion():
+    """A worker took a row and died holding it: the delivery loop is wedged, not merely busy."""
+    verdict = verify_accounting(_evidence(expired_leases=1))
+    assert verdict.reason == ACCOUNTING_STALLED
+
+
+def test_a_row_undelivered_past_the_stall_threshold_blocks_promotion():
+    """Age separates "in flight" from "stuck" without needing to know whose row it is."""
+    assert verify_accounting(_evidence(pending=1, oldest_undelivered_age_seconds=119)).ok
+    verdict = verify_accounting(_evidence(pending=1, oldest_undelivered_age_seconds=120))
+    assert verdict.reason == ACCOUNTING_STALLED
+
+
+def test_a_snapshot_missing_a_counter_is_unreadable_not_healthy():
     """Defaulting an absent counter to zero would turn an unreadable snapshot into a pass."""
 
     @dataclass
     class Partial:
         pending: int = 0
         leased: int = 0
-        due_pending: int = 0
 
     assert accounting_from_snapshot(Partial()) is None
     assert verify_accounting(accounting_from_snapshot(Partial())).reason == ACCOUNTING_MALFORMED
 
 
-def test_a_fully_drained_snapshot_passes():
+def test_a_snapshot_missing_the_age_field_is_unreadable():
+    """A snapshot without the age field cannot answer the stall question at all.
+
+    Reading a missing age as "nothing undelivered" would silently drop the only signal that
+    distinguishes a wedged loop from a busy one.
+    """
+
+    @dataclass
+    class NoAge:
+        pending: int = 0
+        leased: int = 0
+        expired_leases: int = 0
+
+    assert accounting_from_snapshot(NoAge()) is None
+
+
+def test_a_healthy_snapshot_passes():
     @dataclass
     class Snapshot:
         pending: int = 0
         leased: int = 0
-        due_pending: int = 0
         expired_leases: int = 0
+        oldest_undelivered_age_seconds: int | None = None
         quarantined: int = 4
 
     # quarantined rows are a pre-existing backlog condition, not something this release caused.
