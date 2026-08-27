@@ -11,6 +11,7 @@ from fastapi import HTTPException, status
 
 from flash.serving.src.engine.dispatch import (
     CAPACITY_RETRY_AFTER_SECONDS,
+    AdmissionProtocolError,
     PreHeaderDispatchExpired,
 )
 from flash.serving.src.http.routing import AdapterRouter
@@ -62,6 +63,15 @@ def engine_error_http(
     """
     if isinstance(exc, PreHeaderDispatchExpired):
         return ServingCapacityUnavailable(str(exc))
+    if isinstance(exc, AdmissionProtocolError):
+        # an untrustworthy acknowledgement is an upstream protocol fault, so it gets the same 502
+        # the other protocol failures get. matched on the exact type rather than by widening the
+        # RuntimeError case below, because a bare RuntimeError is the router-side defect that must
+        # keep its 500 instead of being disguised as an engine failure.
+        return HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "The serving engine failed to handle this request.",
+        )
     if isinstance(exc, ValueError):
         return value_error_http(router, adapter_id, exc)
 

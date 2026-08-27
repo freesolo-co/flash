@@ -172,8 +172,10 @@ async def _await_modal_call(
             return result.result()
         if acknowledgement in done:
             value = acknowledgement.result()
-            if time.time() >= deadline:
-                raise PreHeaderDispatchExpired("request expired before gpu generation began")
+            # deliberately not re-checked against the deadline here. the acknowledgement proves the
+            # engine already holds this exact request on a gpu, so expiring on a boundary tick would
+            # refuse the caller with a retryable 503 and cancel work that is already being paid for.
+            # an acknowledgement that arrives too late loses the race above and never reaches here.
             validate_admission_acknowledgement(
                 value,
                 generation_id=generation_id,

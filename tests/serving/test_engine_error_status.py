@@ -19,6 +19,7 @@ from flash.client.http import ClientError
 from flash.serve.request.streaming import _openai_stream_content
 from flash.serving.src.engine.dispatch import (
     CAPACITY_RETRY_AFTER_SECONDS,
+    AdmissionProtocolError,
     PreHeaderDispatchExpired,
 )
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
@@ -180,6 +181,21 @@ def test_capacity_refusal_is_mapped_when_raised_while_building_the_stream() -> N
     resp = _chat(_client(exc, pool_cls=_SyncRaisingStreamPool), stream=True)
     assert resp.status_code == 503
     assert resp.headers["Retry-After"] == str(CAPACITY_RETRY_AFTER_SECONDS)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_untrustworthy_admission_is_a_502_not_an_unhandled_500(stream: bool) -> None:
+    """A malformed admission acknowledgement is an upstream protocol fault, like any other.
+
+    ``AdmissionProtocolError`` subclasses ``RuntimeError``, so before this it fell through every
+    branch and surfaced as an unhandled 500, blaming the router for a message the engine side got
+    wrong. It is mapped explicitly rather than by widening the ``RuntimeError`` case, because a
+    bare ``RuntimeError`` is exactly the router-side defect that must keep its 500.
+    """
+    exc = AdmissionProtocolError("mismatched non-streaming admission acknowledgement")
+    resp = _chat(_client(exc), stream=stream)
+    assert resp.status_code == 502
+    assert resp.status_code != 500
 
 
 def test_stream_dispatch_failure_is_mapped_even_when_raised_synchronously() -> None:

@@ -46,6 +46,10 @@ class _Queue:
         self.get = types.SimpleNamespace(aio=lambda: acknowledgement)
 
 
+async def _ack_soon() -> dict[str, Any]:
+    return _ack()
+
+
 def _ack() -> dict[str, Any]:
     return admission_acknowledgement(
         generation_id="generation-1",
@@ -260,3 +264,37 @@ def test_blocked_call_cancellation_does_not_delay_primary_outcome(
     cancel_count, elapsed = asyncio.run(scenario())
     assert cancel_count == 1
     assert elapsed < 0.05
+
+
+def test_admitted_call_is_not_expired_or_cancelled_at_the_deadline_boundary(
+    modal_app_module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid acknowledgement ends the deadline's authority over this request.
+
+    the acknowledgement wins the race while time remains, and the clock crosses the deadline
+    before the admitted branch is resumed. that is the exact boundary tick: the engine already
+    holds this request on a gpu, so expiring here would 503 the caller and cancel work that is
+    already being paid for.
+
+    the crossing is driven by a controlled clock rather than by racing real sleeps, because the
+    window is a single loop tick wide and a wall-clock race would pass or fail on scheduler luck
+    instead of on the behavior. asserted on ``cancel_count`` as well as the returned value, since
+    refusing without cancelling and refusing with cancellation are different failures and only one
+    of them leaves an abandoned billing call behind.
+    """
+    deadline = 1_000.0
+    # the first reading sizes the race and must leave time; every later reading is past the
+    # deadline, which is precisely when an admitted request must still be honoured.
+    readings = iter([deadline - 10.0])
+    monkeypatch.setattr(
+        modal_app_module.time, "time", lambda: next(readings, deadline + 1.0), raising=True
+    )
+
+    async def scenario() -> tuple[dict[str, bool], int]:
+        # still in flight when the acknowledgement lands, so the admitted branch is the one taken.
+        call = _Call(lambda: asyncio.sleep(0.01, result={"ok": True}))
+        value = await _await(modal_app_module, call, _Queue(_ack_soon()), deadline)
+        await _drain_cleanup(modal_app_module)
+        return value, call.cancel_count
+
+    assert asyncio.run(scenario()) == ({"ok": True}, 0)
