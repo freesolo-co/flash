@@ -594,7 +594,7 @@ def _patch_fused_submit_preflight(
     target_spec = _spec(rank=child_rank, model=_FUSED_MODEL)
     target_spec = replace(
         target_spec,
-        train=replace(target_spec.train, init_from_adapter="source-run"),
+        train=replace(target_spec.train, init_from_adapter="source-run/final"),
     )
     source_spec = replace(
         target_spec,

@@ -19,12 +19,9 @@ import flash.serve.deployment.deploy as d
 import flash.serve.deployment.readiness as serving_readiness
 import flash.serve.request.transport as serving_transport
 from flash.serve.contract.errors import ServingError
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 
-_IMMUTABLE_SERVING_CAPABILITIES = {
-    "immutable_adapter_revisions",
-    "alias_compare_and_swap",
-    "revision_provenance",
-}
+_IMMUTABLE_SERVING_CAPABILITIES = {"permanent_checkpoint_identity"}
 
 
 @pytest.fixture(autouse=True)
@@ -105,16 +102,7 @@ def _stub_adapter_config(
             "_require_serving_capabilities",
             lambda **_kwargs: set(_IMMUTABLE_SERVING_CAPABILITIES),
         )
-    monkeypatch.setattr(deploy, "_wait_revision_ready", lambda *a, **k: {})
-    monkeypatch.setattr(
-        deploy,
-        "_activate_revision",
-        lambda run_id, revision, checkpoint, **kwargs: {
-            "adapter_id": run_id,
-            "target_adapter_revision": revision,
-            "checkpoint": checkpoint,
-        },
-    )
+    monkeypatch.setattr(deploy, "_wait_checkpoint_ready", lambda *a, **k: {})
     return seen
 
 
@@ -147,8 +135,12 @@ def _capture_registration_body(
 
     monkeypatch.setattr(httpx, "post", fake_post)
     run_id = deploy_kwargs.get("run_id", "flash-7-abcd")
+    deploy_kwargs.setdefault("org_id", "org-1")
     stub_serving_registry(
-        {"adapter_id": run_id, "subfolder": f"{deploy_kwargs['adapter_prefix']}/adapter"}
+        {
+            "adapter_id": f"{run_id}/final",
+            "subfolder": f"{deploy_kwargs['adapter_prefix']}/adapter",
+        }
     )
     registry_get = httpx.get
 
@@ -171,6 +163,34 @@ def _capture_registration_body(
     return seen["json"]
 
 
+def test_redeploy_reuses_bound_artifact_revision(
+    monkeypatch, tmp_path, stub_serving_registry
+) -> None:
+    bound_revision = "b" * 40
+    monkeypatch.setattr(
+        d,
+        "_registered_adapter",
+        lambda _org_id, _checkpoint_id: {"artifact_revision": bound_revision},
+    )
+    monkeypatch.setattr(
+        d,
+        "resolve_artifact_revision",
+        lambda _repo: pytest.fail("redeploy must not resolve the mutable repository tip"),
+    )
+
+    body = _capture_registration_body(
+        monkeypatch,
+        tmp_path,
+        stub_serving_registry,
+        run_id="flash-7-abcd",
+        model="Qwen/Qwen3.5-9B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-abcd",
+    )
+
+    assert body["artifact_revision"] == bound_revision
+
+
 def test_deploy_dry_run():
     from flash.serve.deployment.deploy import deploy_adapter
 
@@ -184,8 +204,7 @@ def test_deploy_dry_run():
     d = dep.to_dict()
     assert d["state"] == "dry_run"
     assert "gpu" not in d
-    # The adapter is addressed by its run_id on the freesolo serving app.
-    assert d["openai_model"] == "r1"
+    assert d["openai_model"] == "r1/final"
     assert d["adapter_hf_prefix"] == "sft/r1/seed0/adapter"
     assert "mode" not in d
     assert "est_idle_cost_usd_per_day" not in d
@@ -226,9 +245,16 @@ def test_deploy_9b_dry_run_is_not_rejected():
     assert dep.to_dict()["state"] == "dry_run"
 
 
-def test_deploy_27b_rejects_before_rank_resolution_or_dry_run_success(monkeypatch):
+def test_deploy_inactive_model_rejects_before_rank_resolution_or_dry_run_success(monkeypatch):
+    # The hosted-activation guard must fire FIRST: before rank validation and before any artifact is
+    # shaped, so an inactive model cannot reach a dry-run success or a paid path. Uses a model absent
+    # from the hosted catalog -- 27B is active, so it is no longer a witness for this rejection.
     import flash.serve.deployment.adapter_check as adapter_check
     import flash.serve.deployment.deploy as deploy
+    from flash.serving.src.engine.model_config import is_supported_base_model
+
+    inactive_model = "Qwen/Qwen3.5-99B"
+    assert not is_supported_base_model(inactive_model)
 
     monkeypatch.setattr(
         adapter_check,
@@ -243,13 +269,42 @@ def test_deploy_27b_rejects_before_rank_resolution_or_dry_run_success(monkeypatc
 
     with pytest.raises(ValueError, match="not active in hosted serving"):
         deploy.deploy_adapter(
-            run_id="q27",
-            model="Qwen/Qwen3.8-27B",
+            run_id="q99",
+            model=inactive_model,
             hf_repo="org/repo",
-            adapter_prefix="sft/q27/seed0",
+            adapter_prefix="sft/q99/seed0",
             dry_run=True,
             lora_rank=64,
         )
+
+
+def test_deploy_27b_is_active_and_reaches_rank_validation(monkeypatch):
+    # The complement of the guard test: 27B is now an ACTIVE hosted tier, so it must pass the
+    # activation gate and proceed into rank validation rather than being rejected up front.
+    import flash.serve.deployment.adapter_check as adapter_check
+    import flash.serve.deployment.deploy as deploy
+    from flash.serving.src.engine.model_config import is_supported_base_model
+
+    assert is_supported_base_model("Qwen/Qwen3.8-27B")
+
+    reached = []
+    monkeypatch.setattr(
+        adapter_check,
+        "validate_serving_lora_rank",
+        lambda *args, **kwargs: reached.append(args[0]),
+    )
+
+    dep = deploy.deploy_adapter(
+        run_id="q27",
+        model="Qwen/Qwen3.8-27B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/q27/seed0",
+        dry_run=True,
+        lora_rank=64,
+    )
+
+    assert reached == ["Qwen/Qwen3.8-27B"]
+    assert dep.to_dict()["state"] == "dry_run"
 
 
 def test_deploy_rejects_lora_rank_above_serving_cap():
@@ -339,7 +394,7 @@ def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
     monkeypatch.setitem(
         sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
     )
-    monkeypatch.setattr(d, "resolve_hf_revision", lambda repo: "a" * 40)
+    monkeypatch.setattr(d, "resolve_artifact_revision", lambda repo: "a" * 40)
 
     with pytest.raises(
         serving_errors.ServingError, match="failed to read org/repo:sft/r-hf-down/seed0/adapter"
@@ -370,7 +425,7 @@ def test_deploy_adapter_missing_config_is_adapter_config_missing(monkeypatch):
     monkeypatch.setitem(
         sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
     )
-    monkeypatch.setattr(d, "resolve_hf_revision", lambda repo: "a" * 40)
+    monkeypatch.setattr(d, "resolve_artifact_revision", lambda repo: "a" * 40)
 
     with pytest.raises(
         serving_errors.AdapterConfigMissing,
@@ -450,7 +505,7 @@ def test_deploy_rejects_bin_adapter_tensor(monkeypatch, tmp_path):
     seen = _stub_adapter_config(monkeypatch, tmp_path, tensor_files={"adapter_model.bin": None})
 
     with pytest.raises(AdapterTensorMissing, match="has no adapter_model tensor file"):
-        adapter_artifact_metadata("org/repo", "sft/r-bin/seed0/adapter", hf_revision="a" * 40)
+        adapter_artifact_metadata("org/repo", "sft/r-bin/seed0/adapter", artifact_revision="a" * 40)
     assert seen["list_repo_tree"]["path_in_repo"] == "sft/r-bin/seed0/adapter"
 
 
@@ -484,44 +539,38 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
         return _Resp()
 
     monkeypatch.setattr(httpx, "post", fake_post)
-    # deploy reads the registry back before reporting ready
-    stub_serving_registry(
-        {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
-    )
-
+    monkeypatch.setattr(d, "_registered_adapter", lambda *_args, **_kwargs: None)
     dep = d.deploy_adapter(
         run_id="flash-7-abcd",
         model="Qwen/Qwen3.5-9B",
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
+        org_id="org-1",
     )
     assert seen["url"] == "https://serve.example/adapters"
-    revision = "flash-7-abcd@final." + "a" * 40
-    assert seen["json"] == {
-        "adapter_id": revision,
+    expected = {
+        "adapter_id": "flash-7-abcd/final",
         "repo_id": "org/repo",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "sft/flash-7-abcd/seed0/adapter",
-        # flash always uploads adapters to HF *dataset* repos, so serving must be told to
-        # pull from the dataset namespace (else snapshot_download 404s on the model namespace).
         "repo_type": "dataset",
-        "checkpoint": "flash-7-abcd",
-        # no client-sent "status": the serving backend sets it on registration and rejects an
-        # incoming "status" as an extra field (HTTP 422).
-        "metadata": {
-            "record_type": "revision",
-            "run_id": "flash-7-abcd",
-            "checkpoint_step": None,
-            "hf_revision": "a" * 40,
-        },
-        # per-adapter thinking default carried so serving can apply it as enable_thinking when a
-        # raw chat caller omits chat_template_kwargs (deploy_adapter defaults thinking=False).
+        "checkpoint": "flash-7-abcd/final",
+        "run_id": "flash-7-abcd",
+        "checkpoint_step": None,
+        "artifact_revision": "a" * 40,
+        "artifact_digest": seen["json"]["artifact_digest"],
+        "lora_rank": 32,
         "thinking": False,
+        "org_id": "org-1",
+    }
+    assert seen["json"] == {
+        **expected,
+        "artifact_fingerprint": immutable_binding_fingerprint(expected),
     }
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
     # Modal 303-redirects slow requests to an async-result poll URL, so registration follows them.
     assert seen["follow_redirects"] is True
-    assert dep.openai_model == "flash-7-abcd"
+    assert dep.openai_model == "flash-7-abcd/final"
     assert dep.endpoint_name == "https://serve.example"
     assert dep.state == "ready"
 
@@ -599,12 +648,7 @@ def test_deploy_registers_structured_outputs_for_thinking_after_capability_probe
 @pytest.mark.parametrize(
     ("health_case", "match"),
     [
-        ("missing_immutable_revisions", "immutable_adapter_revisions"),
-        ("missing_alias_cas", "alias_compare_and_swap"),
-        # NOTE: `missing_provenance` is intentionally NOT here anymore -- revision_provenance is a
-        # PREFERRED (warn-only) capability, not a deploy blocker. Its "deploy proceeds when only
-        # provenance is missing" behavior is covered by
-        # test_missing_provenance_only_still_deploys below.
+        ("missing_checkpoint_identity", "permanent_checkpoint_identity"),
         ("missing_thinking_structured", "thinking_structured_outputs_deferred_v1"),
         ("malformed", "must return a list field named capabilities"),
         ("invalid_json", "did not return valid JSON"),
@@ -638,15 +682,14 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
                 d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY
             }
             missing = {
-                "missing_immutable_revisions": "immutable_adapter_revisions",
-                "missing_alias_cas": "alias_compare_and_swap",
-                "missing_provenance": "revision_provenance",
+                "missing_checkpoint_identity": "permanent_checkpoint_identity",
                 "missing_thinking_structured": d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY,
             }.get(health_case)
             return {"capabilities": sorted(capabilities - ({missing} if missing else set()))}
 
     def fake_get(url, **_kwargs):
-        assert url == "https://serve.example/healthz"
+        if url != "https://serve.example/healthz":
+            return httpx.Response(404, request=httpx.Request("GET", url))
         if health_case == "unreachable":
             request = httpx.Request("GET", url)
             raise httpx.ConnectError("connection refused", request=request)
@@ -667,119 +710,15 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
             adapter_prefix="sft/flash-7-abcd/seed0",
             thinking=True,
             structured_outputs=json.dumps({"choice": ["4"]}),
+            org_id="org-1",
         )
     assert posts == []
 
 
-def test_missing_provenance_only_still_deploys(monkeypatch, tmp_path):
-    """The production serving backend advertises immutable revisions + alias CAS + the deferred
-    thinking/structured-outputs cap, but NOT revision_provenance. That must NOT block the deploy
-    (regression guard for the org-wide `serving_contract_unsupported: ... revision_provenance`
-    outage): the capability check passes and registration is attempted."""
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
-    posts: list[str] = []
-
-    advertised = sorted(
-        (_IMMUTABLE_SERVING_CAPABILITIES - {"revision_provenance"})
-        | {d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY}
-    )
-
-    class _HealthResp:
-        status_code = 200
-        text = ""
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"capabilities": advertised}
-
-    def fake_get(url, **_kwargs):
-        assert url == "https://serve.example/healthz"
-        return _HealthResp()
-
-    def fake_post(url, **_kwargs):
-        posts.append(url)
-        raise RuntimeError("REACHED_POST")  # stop after proving the capability gate let us through
-
-    monkeypatch.setattr(httpx, "get", fake_get)
-    monkeypatch.setattr(httpx, "post", fake_post)
-
-    with pytest.raises(RuntimeError, match="REACHED_POST"):
-        d.deploy_adapter(
-            run_id="flash-7-abcd",
-            model="Qwen/Qwen3.5-9B",
-            hf_repo="org/repo",
-            adapter_prefix="sft/flash-7-abcd/seed0",
-            thinking=True,
-            structured_outputs=json.dumps({"choice": ["4"]}),
-        )
-    assert posts == ["https://serve.example/adapters"]  # registration WAS attempted
-
-
-def test_deploy_passes_require_provenance_false_when_backend_lacks_it(monkeypatch, tmp_path):
-    monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
-    _stub_adapter_config(monkeypatch, tmp_path, rank=32, stub_capabilities=False)
-    advertised = sorted(
-        (_IMMUTABLE_SERVING_CAPABILITIES - {"revision_provenance"})
-        | {d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY}
-    )
-    captured: dict[str, bool] = {}
-
-    class _Resp:
-        status_code = 200
-        text = ""
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"capabilities": advertised}
-
-    def fake_get(url, **_kwargs):
-        assert url == "https://serve.example/healthz"
-        return _Resp()
-
-    def wait_ready(
-        adapter_revision,
-        subfolder,
-        *,
-        expected_identity=None,
-        require_provenance=True,
-        budget_s=None,
-    ):
-        captured["require_provenance"] = require_provenance
-        captured["budget_s"] = budget_s
-        return {}
-
-    monkeypatch.setattr(httpx, "get", fake_get)
-    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: _Resp())
-    monkeypatch.setattr(d, "_wait_revision_ready", wait_ready)
-
-    d.deploy_adapter(
-        run_id="flash-7-no-provenance",
-        model="Qwen/Qwen3.5-9B",
-        hf_repo="org/repo",
-        adapter_prefix="sft/flash-7-no-provenance/seed0",
-    )
-    assert captured["require_provenance"] is False
-
-    advertised = sorted(_IMMUTABLE_SERVING_CAPABILITIES)
-    captured.clear()
-    d.deploy_adapter(
-        run_id="flash-7-with-provenance",
-        model="Qwen/Qwen3.5-9B",
-        hf_repo="org/repo",
-        adapter_prefix="sft/flash-7-with-provenance/seed0",
-    )
-    assert captured["require_provenance"] is True
-
-
-def test_wait_revision_ready_retries_transient_read_errors(monkeypatch):
+def test_wait_checkpoint_ready_retries_transient_read_errors(monkeypatch):
     import flash.serve.deployment.deploy as d
 
-    revision = "run-1@final." + "a" * 40
+    revision = "run-1/final"
     ready = {
         "adapter_id": revision,
         "subfolder": "sft/run-1/seed0/adapter",
@@ -791,7 +730,8 @@ def test_wait_revision_ready_retries_transient_read_errors(monkeypatch):
         ready,
     ]
 
-    def fake_registered_adapter(adapter_id, *, timeout_s=None):
+    def fake_registered_adapter(org_id, adapter_id, *, timeout_s=None):
+        assert org_id == "org-1"
         assert adapter_id == revision
         assert timeout_s is not None
         assert timeout_s > 0
@@ -804,18 +744,19 @@ def test_wait_revision_ready_retries_transient_read_errors(monkeypatch):
     monkeypatch.setattr(d, "_registered_adapter_response", fake_registered_adapter)
     monkeypatch.setattr(d.time, "sleep", sleeps.append)
 
-    assert d._wait_revision_ready(revision, ready["subfolder"]) == ready
+    assert d._wait_checkpoint_ready("org-1", revision, ready["subfolder"]) == ready
     assert sleeps == [d._readback_delay(0), d._readback_delay(1)]
 
 
-def test_wait_revision_ready_caps_reads_by_remaining_wall_time(monkeypatch):
+def test_wait_checkpoint_ready_caps_reads_by_remaining_wall_time(monkeypatch):
     import flash.serve.deployment.deploy as d
 
-    revision = "run-1@final." + "a" * 40
+    revision = "run-1/final"
     clock = [100.0]
     request_timeouts = []
 
-    def fake_registered_adapter(adapter_id, *, timeout_s=None):
+    def fake_registered_adapter(org_id, adapter_id, *, timeout_s=None):
+        assert org_id == "org-1"
         assert adapter_id == revision
         request_timeouts.append(timeout_s)
         clock[0] += 3.0 if len(request_timeouts) == 1 else float(timeout_s)
@@ -830,7 +771,7 @@ def test_wait_revision_ready_caps_reads_by_remaining_wall_time(monkeypatch):
     monkeypatch.setattr(d, "_registered_adapter_response", fake_registered_adapter)
 
     with pytest.raises(serving_errors.ServingError, match="readiness could not be confirmed"):
-        d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
+        d._wait_checkpoint_ready("org-1", revision, "sft/run-1/seed0/adapter", budget_s=5.0)
 
     assert request_timeouts == [5.0, 1.0]
     assert clock[0] == 105.0
@@ -939,8 +880,8 @@ def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_
     import flash.serve.deployment.deploy as d
 
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
-    monkeypatch.setattr(d, "resolve_hf_revision", lambda _repo: "a" * 40)
-    monkeypatch.setattr(d, "_activate_revision", lambda *a, **k: {"adapter_id": "run-1"})
+    monkeypatch.setattr(d, "resolve_artifact_revision", lambda _repo: "a" * 40)
+    monkeypatch.setattr(d, "_registered_adapter", lambda *_args, **_kwargs: None)
 
     class Response:
         status_code = 200
@@ -950,24 +891,27 @@ def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_
     )
     budgets = []
 
-    def wait_ready(revision, subfolder, **kwargs):
+    def wait_ready(org_id, checkpoint_id, subfolder, **kwargs):
+        assert org_id == "org-1"
+        assert checkpoint_id == "run-1/final"
         budgets.append(kwargs.get("budget_s"))
         return {}
 
-    monkeypatch.setattr(d, "_wait_revision_ready", wait_ready)
+    monkeypatch.setattr(d, "_wait_checkpoint_ready", wait_ready)
 
     d.deploy_adapter(
         run_id="run-1",
         model="Qwen/Qwen3.6-35B-A3B",
         hf_repo="org/repo",
         adapter_prefix="sft/run-1/seed0",
+        org_id="org-1",
     )
 
     assert budgets == [serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.6-35B-A3B")]
     assert budgets[0] > serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS
 
 
-def test_revision_ready_timeout_message_is_self_diagnosing(monkeypatch):
+def test_checkpoint_ready_timeout_message_is_self_diagnosing(monkeypatch):
     """The timeout must say it IS a timeout, and that retrying is the right response.
 
     `remained 'registered'` read as a serving/registration fault and sent readers to the wrong
@@ -976,10 +920,11 @@ def test_revision_ready_timeout_message_is_self_diagnosing(monkeypatch):
     """
     import flash.serve.deployment.deploy as d
 
-    revision = "run-1@final." + "a" * 40
+    revision = "run-1/final"
     clock = [100.0]
 
-    def registered(adapter_id, *, timeout_s=None):
+    def registered(org_id, adapter_id, *, timeout_s=None):
+        assert org_id == "org-1"
         clock[0] += 1.0
         return (
             {"subfolder": "sft/run-1/seed0/adapter", "metadata": {"lifecycle_state": "queued"}},
@@ -991,19 +936,19 @@ def test_revision_ready_timeout_message_is_self_diagnosing(monkeypatch):
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
     with pytest.raises(serving_errors.ServingError) as excinfo:
-        d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=7.0)
+        d._wait_checkpoint_ready("org-1", revision, "sft/run-1/seed0/adapter", budget_s=7.0)
 
     message = str(excinfo.value)
-    assert "revision_ready_timeout" in message
+    assert "checkpoint_ready_timeout" in message
     # names the clock and the last observed state, so the reader need not open serve/deploy.py
     assert "7s" in message
     assert "'queued'" in message
     # says which way to act, and distinguishes itself from the rejection case
     assert "retrying" in message
-    assert "serving failed to load adapter revision" in message
+    assert "serving failed to load checkpoint" in message
 
 
-def test_revision_ready_timeout_reports_the_loader_failure(monkeypatch):
+def test_checkpoint_ready_timeout_reports_the_loader_failure(monkeypatch):
     """A loader complaint that never moved the revision to `failed` must still be reported.
 
     This is the evidence that says which subsystem is at fault; dropping it is what made the
@@ -1011,10 +956,11 @@ def test_revision_ready_timeout_reports_the_loader_failure(monkeypatch):
     """
     import flash.serve.deployment.deploy as d
 
-    revision = "run-1@final." + "a" * 40
+    revision = "run-1/final"
     clock = [100.0]
 
-    def registered(adapter_id, *, timeout_s=None):
+    def registered(org_id, adapter_id, *, timeout_s=None):
+        assert org_id == "org-1"
         clock[0] += 1.0
         return (
             {
@@ -1029,7 +975,7 @@ def test_revision_ready_timeout_reports_the_loader_failure(monkeypatch):
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
     with pytest.raises(serving_errors.ServingError) as excinfo:
-        d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
+        d._wait_checkpoint_ready("org-1", revision, "sft/run-1/seed0/adapter", budget_s=5.0)
 
     message = str(excinfo.value)
     assert "adapter tensors truncated" in message
@@ -1041,14 +987,15 @@ def test_revision_ready_timeout_reports_the_loader_failure(monkeypatch):
     assert "fix what the loader reported before retrying" in message
 
 
-def test_revision_ready_timeout_distinguishes_a_never_visible_record(monkeypatch):
+def test_checkpoint_ready_timeout_distinguishes_a_never_visible_record(monkeypatch):
     """A revision that 404s for the whole budget is a different fault from a slow load."""
     import flash.serve.deployment.deploy as d
 
-    revision = "run-1@final." + "a" * 40
+    revision = "run-1/final"
     clock = [100.0]
 
-    def registered(adapter_id, *, timeout_s=None):
+    def registered(org_id, adapter_id, *, timeout_s=None):
+        assert org_id == "org-1"
         clock[0] += 1.0
         return None, types.SimpleNamespace(headers={})
 
@@ -1057,10 +1004,10 @@ def test_revision_ready_timeout_distinguishes_a_never_visible_record(monkeypatch
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
     with pytest.raises(serving_errors.ServingError) as excinfo:
-        d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
+        d._wait_checkpoint_ready("org-1", revision, "sft/run-1/seed0/adapter", budget_s=5.0)
 
     message = str(excinfo.value)
-    assert "never returned the revision record" in message
+    assert "never returned the checkpoint record" in message
     # the remedy must match the diagnostic. no engine state was ever read, so the cold-engine retry
     # advice would contradict the line above it and point at the wrong subsystem.
     assert "registration-visibility problem" in message
@@ -1075,11 +1022,12 @@ def test_a_cleared_loader_failure_is_not_reported_after_the_timeout(monkeypatch)
     """
     import flash.serve.deployment.deploy as d
 
-    revision = "run-1@final." + "a" * 40
+    revision = "run-1/final"
     clock = [100.0]
     reads = [0]
 
-    def registered(adapter_id, *, timeout_s=None):
+    def registered(org_id, adapter_id, *, timeout_s=None):
+        assert org_id == "org-1"
         clock[0] += 1.0
         reads[0] += 1
         metadata: dict = {"lifecycle_state": "queued"}
@@ -1096,7 +1044,7 @@ def test_a_cleared_loader_failure_is_not_reported_after_the_timeout(monkeypatch)
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
     with pytest.raises(serving_errors.ServingError) as excinfo:
-        d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
+        d._wait_checkpoint_ready("org-1", revision, "sft/run-1/seed0/adapter", budget_s=5.0)
 
     message = str(excinfo.value)
     assert reads[0] > 1, "the test needs more than one read for the failure to be cleared"
@@ -1113,11 +1061,12 @@ def test_a_loader_failure_survives_later_transient_read_errors(monkeypatch):
     """
     import flash.serve.deployment.deploy as d
 
-    revision = "run-1@final." + "a" * 40
+    revision = "run-1/final"
     clock = [100.0]
     reads = [0]
 
-    def registered(adapter_id, *, timeout_s=None):
+    def registered(org_id, adapter_id, *, timeout_s=None):
+        assert org_id == "org-1"
         clock[0] += 1.0
         reads[0] += 1
         # the FIRST read is authoritative and names the loader's complaint; every later poll is a
@@ -1140,7 +1089,7 @@ def test_a_loader_failure_survives_later_transient_read_errors(monkeypatch):
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
     with pytest.raises(serving_errors.ServingError) as excinfo:
-        d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
+        d._wait_checkpoint_ready("org-1", revision, "sft/run-1/seed0/adapter", budget_s=5.0)
 
     message = str(excinfo.value)
     assert reads[0] > 1, "the test needs the transient errors to follow the authoritative record"
@@ -1154,11 +1103,11 @@ def test_rejected_adapter_still_fails_distinctly_from_a_timeout(monkeypatch):
     """The rejection path must keep its own message: retrying it is wrong."""
     import flash.serve.deployment.deploy as d
 
-    revision = "run-1@final." + "a" * 40
+    revision = "run-1/final"
     monkeypatch.setattr(
         d,
         "_registered_adapter_response",
-        lambda adapter_id, **_kwargs: (
+        lambda org_id, adapter_id, **_kwargs: (
             {
                 "subfolder": "sft/run-1/seed0/adapter",
                 "metadata": {"lifecycle_state": "failed", "failure": "rank 64 exceeds engine cap"},
@@ -1168,34 +1117,37 @@ def test_rejected_adapter_still_fails_distinctly_from_a_timeout(monkeypatch):
     )
 
     with pytest.raises(serving_errors.ServingError) as excinfo:
-        d._wait_revision_ready(revision, "sft/run-1/seed0/adapter", budget_s=5.0)
+        d._wait_checkpoint_ready("org-1", revision, "sft/run-1/seed0/adapter", budget_s=5.0)
 
     message = str(excinfo.value)
-    assert "serving failed to load adapter revision" in message
+    assert "serving failed to load checkpoint" in message
     assert "rank 64 exceeds engine cap" in message
-    assert "revision_ready_timeout" not in message
+    assert "checkpoint_ready_timeout" not in message
 
 
-def test_deploy_ready_read_returned_at_deadline_never_activates(monkeypatch, tmp_path):
+def test_deploy_ready_read_returned_at_deadline_never_succeeds(monkeypatch, tmp_path):
     import flash.serve.deployment.deploy as d
 
-    real_wait_revision_ready = d._wait_revision_ready
+    real_wait_checkpoint_ready = d._wait_checkpoint_ready
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
-    monkeypatch.setattr(d, "_wait_revision_ready", real_wait_revision_ready)
-    monkeypatch.setattr(d, "resolve_hf_revision", lambda _repo: "a" * 40)
+    monkeypatch.setattr(d, "_wait_checkpoint_ready", real_wait_checkpoint_ready)
+    monkeypatch.setattr(d, "resolve_artifact_revision", lambda _repo: "a" * 40)
+    monkeypatch.setattr(d, "_registered_adapter", lambda *_args, **_kwargs: None)
     registration_body = {}
 
     class Response:
         status_code = 200
 
-    def request(method, url, *, json=None, ok_statuses=(), timeout_s=None):
+    def request(method, url, *, json=None, ok_statuses=(), timeout_s=None, org_id=None):
+        assert org_id == "org-1"
         assert method == "POST"
         registration_body.update(json)
         return Response()
 
     clock = [100.0]
 
-    def registered(adapter_id, *, timeout_s=None):
+    def registered(org_id, adapter_id, *, timeout_s=None):
+        assert org_id == "org-1"
         assert adapter_id == registration_body["adapter_id"]
         # the deploy funds this read from the model's own scaled budget, not the bare floor.
         assert timeout_s == serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
@@ -1203,30 +1155,23 @@ def test_deploy_ready_read_returned_at_deadline_never_activates(monkeypatch, tmp
         return (
             {
                 **registration_body,
-                "metadata": {**registration_body["metadata"], "lifecycle_state": "ready"},
+                "lifecycle_state": "ready",
             },
             types.SimpleNamespace(headers={}),
         )
 
-    activations = []
     monkeypatch.setattr(serving_transport, "serving_request", request)
     monkeypatch.setattr(d, "_registered_adapter_response", registered)
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(
-        d,
-        "_activate_revision",
-        lambda *args, **kwargs: activations.append((args, kwargs)),
-    )
 
-    with pytest.raises(serving_errors.ServingError, match="revision_ready_timeout"):
+    with pytest.raises(serving_errors.ServingError, match="checkpoint_ready_timeout"):
         d.deploy_adapter(
             run_id="run-expiry",
             model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="sft/run-expiry/seed0",
+            org_id="org-1",
         )
-
-    assert activations == []
 
 
 def test_registered_adapter_caps_request_timeout(monkeypatch):
@@ -1245,40 +1190,12 @@ def test_registered_adapter_caps_request_timeout(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setattr(httpx, "get", fake_get)
 
-    assert d._registered_adapter("run-1", timeout_s=0.75) is None
+    assert d._registered_adapter("org-1", "run-1/final", timeout_s=0.75) is None
     assert seen["timeout"] == 0.75
 
 
-def test_adapter_alias_target_rejects_legacy_record(monkeypatch):
-    import flash.serve.deployment.deploy as d
-
-    revision = "run-1@final." + "a" * 40
-    monkeypatch.setattr(
-        d,
-        "_registered_adapter",
-        lambda run_id: {"adapter_id": run_id, "metadata": {"alias_of": revision}},
-    )
-    assert d.adapter_alias_target("run-1") == revision
-
-    monkeypatch.setattr(
-        d,
-        "_registered_adapter",
-        lambda run_id: {
-            "adapter_id": run_id,
-            "status": "disabled",
-            "metadata": {"alias_of": revision},
-        },
-    )
-    assert d.adapter_alias_target("run-1") is None
-
-    monkeypatch.setattr(d, "_registered_adapter", lambda run_id: {"adapter_id": run_id})
-    with pytest.raises(serving_errors.ServingError, match="legacy aliases are unsupported"):
-        d.adapter_alias_target("run-1")
-
-
-def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_serving_registry):
-    """When the deploying org is known, registration carries `org_id` so serving can persist
-    hosted_lora_adapters.org_id and later authorize external chat by org. Omitted when unknown."""
+def test_deploy_requires_and_forwards_org_id(monkeypatch, tmp_path, stub_serving_registry):
+    """registration carries the required tenant scope to serving."""
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "secret-internal")
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
@@ -1310,14 +1227,13 @@ def test_deploy_includes_org_id_when_provided(monkeypatch, tmp_path, stub_servin
     )
     assert seen["json"]["org_id"] == "org-xyz"
 
-    # No org -> the key is omitted entirely (registration shape unchanged for older callers).
-    d.deploy_adapter(
-        run_id="flash-7-abcd",
-        model="Qwen/Qwen3.5-9B",
-        hf_repo="org/repo",
-        adapter_prefix="sft/flash-7-abcd/seed0",
-    )
-    assert "org_id" not in seen["json"]
+    with pytest.raises(ValueError, match="org_id is required"):
+        d.deploy_adapter(
+            run_id="flash-7-abcd",
+            model="Qwen/Qwen3.5-9B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/flash-7-abcd/seed0",
+        )
 
 
 def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_registry):
@@ -1352,6 +1268,7 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
         thinking=True,
+        org_id="org-1",
     )
     assert seen["json"]["thinking"] is True
 
@@ -1363,6 +1280,7 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd/seed0",
         thinking=False,
+        org_id="org-1",
     )
     assert seen["json"]["thinking"] is False
 
@@ -1387,6 +1305,7 @@ def test_deploy_propagates_serving_error(monkeypatch, tmp_path):
             model="Qwen/Qwen3.5-9B",
             hf_repo="org/repo",
             adapter_prefix="sft/r1/seed0",
+            org_id="org-1",
         )
 
 
@@ -1407,8 +1326,8 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
         def json(self):
             return {
                 "run_id": "flash-7-abcd",
-                "disabled_aliases": ["flash-7-abcd"],
-                "disabled_revisions": ["flash-7-abcd@final." + "a" * 40],
+                "checkpoint_id": "flash-7-abcd/final",
+                "disabled_checkpoints": ["flash-7-abcd/final"],
             }
 
     def fake_delete(url, headers=None, timeout=None, follow_redirects=None):
@@ -1418,24 +1337,23 @@ def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
         return _Resp(200)
 
     monkeypatch.setattr(httpx, "delete", fake_delete)
-    # no registry-readback get: the structured undeploy response (disabled_aliases /
-    # disabled_revisions / serving_deregistered) is authoritative.
+    # no registry readback: the exact undeploy response is authoritative.
     monkeypatch.setattr(
         httpx,
         "get",
         lambda *a, **k: pytest.fail("undeploy must not read the registry back"),
     )
-    out = d.undeploy_adapter("flash-7-abcd")
-    assert out["disabled_aliases"] == ["flash-7-abcd"]
+    out = d.undeploy_adapter("flash-7-abcd/final", org_id="org-1")
+    assert out["disabled_checkpoints"] == ["flash-7-abcd/final"]
     assert out["serving_deregistered"] is True
-    assert seen["url"] == "https://serve.example/adapters/flash-7-abcd"
+    assert seen["url"] == "https://serve.example/adapters/flash-7-abcd%2Ffinal"
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
     # Modal 303-redirects slow requests to an async-result poll URL, so undeploy follows them too.
     assert seen["follow_redirects"] is True
 
     # A 404 (already gone) returns an empty list, not an error.
     monkeypatch.setattr(httpx, "delete", lambda *a, **k: _Resp(404))
-    assert d.undeploy_adapter("flash-7-abcd")["serving_deregistered"] is False
+    assert d.undeploy_adapter("flash-7-abcd/final", org_id="org-1")["serving_deregistered"] is False
 
 
 def test_undeploy_propagates_serving_error(monkeypatch):
@@ -1455,7 +1373,7 @@ def test_undeploy_propagates_serving_error(monkeypatch):
     # Non-404 (500) → ServingError carrying the upstream status, not a raw httpx error.
     monkeypatch.setattr(httpx, "delete", lambda *a, **k: _Resp(500))
     with pytest.raises(serving_errors.ServingError) as ei:
-        d.undeploy_adapter("flash-7-abcd")
+        d.undeploy_adapter("flash-7-abcd/final", org_id="org-1")
     assert ei.value.status_code == 500
 
     # A transport error (never reached the backend) is also translated into a ServingError.
@@ -1465,16 +1383,16 @@ def test_undeploy_propagates_serving_error(monkeypatch):
     def _boom_delete(*a, **k):
         raise httpx.RequestError(
             "no route to host",
-            request=httpx.Request("DELETE", "https://serve.example/adapters/flash-7-abcd"),
+            request=httpx.Request("DELETE", "https://serve.example/adapters/flash-7-abcd%2Ffinal"),
         )
 
     monkeypatch.setattr(httpx, "delete", _boom_delete)
     with pytest.raises(serving_errors.ServingError):
-        d.undeploy_adapter("flash-7-abcd")
+        d.undeploy_adapter("flash-7-abcd/final", org_id="org-1")
 
     # A 404 short-circuits before raise_for_status(), so it stays a no-op success (not a ServingError).
     monkeypatch.setattr(httpx, "delete", lambda *a, **k: _Resp(404))
-    assert d.undeploy_adapter("flash-7-abcd")["serving_deregistered"] is False
+    assert d.undeploy_adapter("flash-7-abcd/final", org_id="org-1")["serving_deregistered"] is False
 
 
 def test_internal_key_is_stripped_on_cross_origin_redirect(monkeypatch):
