@@ -3552,6 +3552,39 @@ def test_cancellation_refresh_without_attempt_still_bills(monkeypatch):
         assert diagnostic is not None
 
 
+def test_cancellation_refresh_rejects_a_malformed_attempt(monkeypatch):
+    """a corrupt attempt record is not the same fact as an unreserved one.
+
+    ``actual_steps_run`` matches ``progress`` and ``result`` against the raw ``attempt`` dict
+    without validating its schema, so a malformed record that silently skipped the refresh would
+    let cancellation billing price the run off a projection no artifact ever verified.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+
+        spec = _spec("cancel-bad-attempt")
+        runner_state._save_status(
+            runner_state.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                billing_context={"org_id": "org-a"},
+                # matches the fence a progress record would carry, but is not a valid record.
+                attempt={"attempt_id": 0, "fence": 1},
+                progress={
+                    "attempt_id": 0,
+                    "fence": 1,
+                    "completed_steps": 9,
+                    "training_entered": True,
+                },
+                source_snapshot=_SOURCE_SNAPSHOT,
+            )
+        )
+
+        with pytest.raises(ValueError, match="invalid attempt record schema"):
+            runner_deploy._refresh_cancellation_result(spec.run_id, spec)
+
+
 def test_cancellation_refresh_rejects_preexisting_failed_result(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
