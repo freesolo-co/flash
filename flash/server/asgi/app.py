@@ -46,6 +46,12 @@ _log = logging.getLogger("flash.server")
 _DEPLOYMENT_JOBS_LOCK = threading.Lock()
 _DEPLOYMENT_JOBS: set[threading.Thread] = set()
 _DEPLOYMENT_JOBS_ACCEPTING = True
+# a deployment job holds a thread for its whole lifecycle, and that lifecycle is minutes long: the
+# readiness budget alone reaches 15 minutes. every accepted deploy for a distinct run got its own
+# thread, and per-run locking only deduplicates one run id, so concurrent deploys across runs grew
+# without any limit. cap the live set instead. the deploy route already turns a start failure into a
+# retryable 503, so a full plane sheds load through the path it already has.
+_MAX_ACTIVE_DEPLOYMENT_JOBS = 64
 
 
 class DeploymentJobStartError(RuntimeError):
@@ -174,6 +180,10 @@ def start_deployment_job(target, *args, **kwargs) -> bool:
     with _DEPLOYMENT_JOBS_LOCK:
         if not _DEPLOYMENT_JOBS_ACCEPTING:
             raise DeploymentJobStartError("deployment jobs are shutting down")
+        if len(_DEPLOYMENT_JOBS) >= _MAX_ACTIVE_DEPLOYMENT_JOBS:
+            raise DeploymentJobStartError(
+                f"deployment job capacity reached ({_MAX_ACTIVE_DEPLOYMENT_JOBS} active)"
+            )
         _DEPLOYMENT_JOBS.add(thread)
         try:
             thread.start()
