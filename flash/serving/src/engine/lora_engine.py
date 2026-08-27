@@ -317,7 +317,7 @@ class _LoraEngineImpl:
                     if not _adapter_cache_ready(path):
                         raise RuntimeError(
                             f"downloaded adapter cache is incomplete: {path} has no "
-                            "non-empty adapter_model tensor file"
+                            "loadable adapter weight representation"
                         )
                     self._source_paths[source_ident] = path
                     self.registry.set_local_path(record, path)

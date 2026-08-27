@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from flash.serve.request.runtime_support import adapter_dir_is_loadable
+from flash.adapters.artifacts import directory_holds_loadable_adapter_weights
 
 from .errors import (
     AdapterConflictError,
@@ -75,14 +75,14 @@ def lora_int_id(adapter_id: str) -> int:
 
 
 def validate_adapter_path(raw_path: str) -> Path:
-    """return a resolved directory containing config and non-empty lora tensors."""
+    """return a resolved directory holding a config and a loadable adapter weight representation."""
     path = Path(raw_path).expanduser().resolve()
     if not path.is_dir():
         raise AdapterPathError(f"adapter path is not a directory: {path}")
     if not (path / "adapter_config.json").is_file():
         raise AdapterPathError(f"adapter path has no adapter_config.json: {path}")
     try:
-        loadable = adapter_dir_is_loadable(path)
+        loadable = directory_holds_loadable_adapter_weights(path)
     except OSError as exc:
         raise AdapterPathError(f"adapter path cannot be inspected: {path}") from exc
     if not loadable:

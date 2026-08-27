@@ -363,7 +363,7 @@ def test_both_serving_runtimes_refuse_an_unloadable_adapter_directory(tmp_path, 
     and a bin-only adapter is one deployment admission rejects before provisioning -- serving it
     would mean loading an artifact no supported path could have produced.
     """
-    from flash.serve.request.runtime_support import adapter_dir_is_loadable
+    from flash.adapters.artifacts import directory_holds_loadable_adapter_weights
     from flash.serve.runtime.adapters import validate_adapter_path
     from flash.serve.runtime.errors import AdapterPathError
     from flash.serving.src.engine.support import _adapter_cache_ready
@@ -371,7 +371,7 @@ def test_both_serving_runtimes_refuse_an_unloadable_adapter_directory(tmp_path, 
     path = _write_dir(tmp_path, "adapter", filenames)
 
     assert not has_loadable_adapter_weights(filenames), shape
-    assert not adapter_dir_is_loadable(path), shape
+    assert not directory_holds_loadable_adapter_weights(path), shape
     assert not _adapter_cache_ready(path), shape
     with pytest.raises(AdapterPathError, match="no loadable adapter tensor files"):
         validate_adapter_path(str(path))
@@ -379,21 +379,21 @@ def test_both_serving_runtimes_refuse_an_unloadable_adapter_directory(tmp_path, 
 
 @pytest.mark.parametrize(("shape", "filenames"), _LOADABLE_SHAPES)
 def test_both_serving_runtimes_accept_a_loadable_adapter_directory(tmp_path, shape, filenames):
-    from flash.serve.request.runtime_support import adapter_dir_is_loadable
+    from flash.adapters.artifacts import directory_holds_loadable_adapter_weights
     from flash.serve.runtime.adapters import validate_adapter_path
     from flash.serving.src.engine.support import _adapter_cache_ready
 
     path = _write_dir(tmp_path, "adapter", filenames)
 
     assert has_loadable_adapter_weights(filenames), shape
-    assert adapter_dir_is_loadable(path), shape
+    assert directory_holds_loadable_adapter_weights(path), shape
     assert _adapter_cache_ready(path), shape
     assert validate_adapter_path(str(path)) == path
 
 
 def test_both_serving_runtimes_ignore_zero_length_adapter_weights(tmp_path):
     """a created-but-unwritten file is the first thing a download leaves on disk."""
-    from flash.serve.request.runtime_support import adapter_dir_is_loadable
+    from flash.adapters.artifacts import directory_holds_loadable_adapter_weights
     from flash.serving.src.engine.support import _adapter_cache_ready
 
     path = tmp_path / "adapter"
@@ -401,7 +401,40 @@ def test_both_serving_runtimes_ignore_zero_length_adapter_weights(tmp_path):
     (path / "adapter_config.json").write_text("{}")
     (path / "adapter_model.safetensors").write_bytes(b"")
 
-    assert not adapter_dir_is_loadable(path)
+    assert not directory_holds_loadable_adapter_weights(path)
+    assert not _adapter_cache_ready(path)
+
+
+def test_an_empty_single_file_is_rejected_beside_a_complete_shard_set(tmp_path):
+    """size is checked after peft precedence selects, never by filtering the listing before it.
+
+    peft binds the single ``adapter_model.safetensors`` when it is present and never looks at the
+    shards. dropping empty files from the listing first would hide that single file, let the complete
+    shard set be selected, and answer "loadable" for a directory peft cannot load at all.
+    """
+    from flash.adapters.artifacts import directory_holds_loadable_adapter_weights
+    from flash.serve.runtime.adapters import validate_adapter_path
+    from flash.serve.runtime.errors import AdapterPathError
+    from flash.serving.src.engine.support import _adapter_cache_ready
+
+    path = _write_dir(tmp_path, "adapter", (*_SHARDS, _INDEX))
+    (path / "adapter_model.safetensors").write_bytes(b"")
+
+    assert not directory_holds_loadable_adapter_weights(path)
+    assert not _adapter_cache_ready(path)
+    with pytest.raises(AdapterPathError, match="no loadable adapter tensor files"):
+        validate_adapter_path(str(path))
+
+
+def test_an_empty_shard_index_makes_its_shard_set_unloadable(tmp_path):
+    """peft reaches a shard only through the index naming it, so an empty index loads nothing."""
+    from flash.adapters.artifacts import directory_holds_loadable_adapter_weights
+    from flash.serving.src.engine.support import _adapter_cache_ready
+
+    path = _write_dir(tmp_path, "adapter", _SHARDS)
+    (path / _INDEX).write_bytes(b"")
+
+    assert not directory_holds_loadable_adapter_weights(path)
     assert not _adapter_cache_ready(path)
 
 

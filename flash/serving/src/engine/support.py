@@ -10,9 +10,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+from flash.adapters.artifacts import directory_holds_loadable_adapter_weights
 from flash.schema import parse_checkpoint_ref
 from flash.serve.request.runtime_support import (
-    adapter_dir_is_loadable,
     argument_names,
     reasoning_compatibility_guard,
 )
@@ -107,7 +107,7 @@ def _adapter_cache_path(root: Path, subfolder: str | None) -> Path:
 
 def _adapter_cache_ready(path: Path) -> bool:
     try:
-        return adapter_dir_is_loadable(path)
+        return directory_holds_loadable_adapter_weights(path)
     except OSError:
         return False
 

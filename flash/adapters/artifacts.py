@@ -5,6 +5,8 @@ by it, and the two never share a call stack to check. Spelling one on each side 
 coincidence, so they are defined once, here.
 """
 
+from pathlib import Path
+
 # the peft adapter weights file a deployable adapter must carry.
 ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors",)
 
@@ -68,6 +70,48 @@ def loadable_adapter_weight_files(filenames) -> list[str]:
 def has_loadable_adapter_weights(filenames) -> bool:
     """True when ``filenames`` holds weights peft can actually load."""
     return bool(loadable_adapter_weight_files(filenames))
+
+
+def directory_holds_loadable_adapter_weights(path: Path) -> bool:
+    """True when ``path`` on disk holds a config and weights the engine about to read it can load.
+
+    Both serving runtimes ask this before handing a directory to vLLM, and both used to answer it by
+    looking for any one file whose NAME looked like adapter weights. A name is not the question: a
+    directory holding a lone ``adapter_model-00001-of-00002.safetensors`` and no index has no
+    loadable representation at all, which is exactly what a half-finished download looks like. Asking
+    :func:`loadable_adapter_weight_files` instead keeps the runtime verdict identical to the one
+    deployment admission and the exporter already reach from a remote listing.
+
+    Size is checked AFTER that selection, never before it. Filtering empty files out of the listing
+    first would describe a directory that does not exist: an empty ``adapter_model.safetensors``
+    beside a complete shard set would disappear, the shards would be selected, and the caller would
+    be told the directory loads -- while peft, reading the real directory, still binds the empty
+    single file by precedence and fails. So the representation is chosen from every name present, and
+    then every file that representation actually reads has to carry bytes.
+    """
+    if not (path / "adapter_config.json").is_file():
+        return False
+    names = [child.name for child in path.iterdir() if child.is_file()]
+    selected = loadable_adapter_weight_files(names)
+    if not selected:
+        return False
+    return all((path / name).stat().st_size > 0 for name in _files_peft_reads(selected))
+
+
+def _files_peft_reads(selected: list[str]) -> list[str]:
+    """``selected`` plus the shard index, when the selected representation is a sharded one.
+
+    :func:`loadable_adapter_weight_files` returns the weights, but peft reaches a shard only through
+    the index naming it, so an empty index makes the same representation unloadable. It returns
+    shards only when that index is present, so it does not have to be looked for again.
+    """
+    shard_suffixes = {
+        suffix
+        for suffix in ADAPTER_WEIGHT_SUFFIXES
+        for name in selected
+        if name.startswith(ADAPTER_SHARD_PREFIX) and name.endswith(suffix)
+    }
+    return selected + [f"adapter_model{suffix}.index.json" for suffix in sorted(shard_suffixes)]
 
 
 def _index_shard_names(names: set[str], suffix: str) -> set[str]:
