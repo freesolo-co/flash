@@ -94,25 +94,15 @@ def _expected_provenance(
         "tokenizer_model": manifest.engine.tokenizer_model,
         "tokenizer_revision": manifest.engine.tokenizer_revision,
         "requested_model": requested_model,
-        "adapter_revision": adapter.adapter_revision,
-        "checkpoint": adapter.checkpoint,
-        "source_revision": adapter.source_revision,
-        "source_subfolder": adapter.source_subfolder,
-        "aggregate_sha256": adapter.aggregate_sha256,
+        "checkpoint_id": adapter.checkpoint_id,
     }
 
 
 def _expected_models(bundle: DeploymentBundle) -> dict[str, dict[str, object]]:
-    by_revision = {adapter.adapter_revision: adapter for adapter in bundle.manifest.adapters}
-    expected = {
-        revision: _expected_provenance(bundle, revision, adapter)
-        for revision, adapter in by_revision.items()
+    return {
+        adapter.checkpoint_id: _expected_provenance(bundle, adapter.checkpoint_id, adapter)
+        for adapter in bundle.manifest.adapters
     }
-    for alias, revision in bundle.manifest.aliases.items():
-        if alias in expected:
-            return {}
-        expected[alias] = _expected_provenance(bundle, alias, by_revision[revision])
-    return expected
 
 
 def _provenance_matches(payload: object, bundle: DeploymentBundle) -> bool:
