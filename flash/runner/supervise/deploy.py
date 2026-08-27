@@ -478,7 +478,13 @@ def _refresh_cancellation_result(run_id: str, effective_spec) -> None:
     from flash.runner.lifecycle.status import get_status, source_snapshot_from_status
 
     status = get_status(run_id)
-    attempt = AttemptRecord.from_dict(status.attempt)
+    try:
+        attempt = AttemptRecord.from_dict(status.attempt)
+    except ValueError:
+        # the provider handle is rented before the attempt is reserved, so a cancel can land in
+        # that window. no attempt means no current-fence result exists to refresh, and raising
+        # here would abort the cancel between teardown and billing.
+        return
     existing = status.result if isinstance(status.result, dict) else {}
     existing_receipt = existing.get("receipt")
     try:

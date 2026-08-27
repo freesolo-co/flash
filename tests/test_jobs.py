@@ -3515,6 +3515,43 @@ def test_cancellation_billing_prefers_newer_verified_current_fence_result(monkey
         assert runner_status._current_attempt(persisted).state == "active"
 
 
+def test_cancellation_refresh_without_attempt_still_bills(monkeypatch):
+    """a run torn down before it reserved an attempt must still settle.
+
+    the provider handle is rented independently of the fenced attempt, so a cancel can arrive
+    while ``attempt`` is still unset. there is no current-fence result to refresh in that window,
+    and treating the missing record as an error would abort ``cancel_run`` between teardown and
+    billing -- the resource is gone but the run never reaches ``cancelled``.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_orchestrator(tmp, monkeypatch)
+
+        spec = _spec("cancel-no-attempt")
+        runner_state._save_status(
+            runner_state.RunStatus(
+                run_id=spec.run_id,
+                state="running",
+                spec=spec.to_dict(),
+                billing_context={"org_id": "org-a"},
+                attempt=None,
+                source_snapshot=_SOURCE_SNAPSHOT,
+            )
+        )
+
+        runner_deploy._refresh_cancellation_result(spec.run_id, spec)
+
+        charge, diagnostic = runner_deploy._cancellation_billing(
+            spec.run_id,
+            spec,
+            bill_cancel=True,
+            rented_remote={"provider": "runpod", "gpu_type": "B200", "gpu_count": 1},
+        )
+        assert charge is None or charge >= 0
+        assert runner_status._update(spec.run_id, "cancelled")
+        assert runner_status.get_status(spec.run_id).state == "cancelled"
+        assert diagnostic is not None
+
+
 def test_cancellation_refresh_rejects_preexisting_failed_result(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
