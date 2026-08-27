@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import builtins
+import inspect
 import sys
 import threading
 import types
@@ -99,14 +101,54 @@ def test_a_child_still_running_when_the_lifespan_ends_is_reaped() -> None:
     children.spawn_owned(process)
     try:
         assert process.start_calls == 1
-        assert children.LIVE_CHILDREN_WAKE.is_set()
+        assert process in children._LIVE_CHILDREN
 
         assert children.reap_live_children(1.0) is True
 
         assert process.terminate_calls == 1
         assert process.kill_calls == 1
         assert process.close_calls == 1
-        assert not children.LIVE_CHILDREN_WAKE.is_set()
+        assert process not in children._LIVE_CHILDREN
+    finally:
+        children._release(process)
+
+
+def test_live_children_are_drained_only_at_shutdown() -> None:
+    """Ownership is a shutdown backstop, never a background reaper.
+
+    ``reap_live_children`` terminates and kills anything still alive, so running it during the
+    lifespan would destroy healthy in-flight smokes seconds after they start: their budget is far
+    longer than the ladder's join. Every call must therefore sit in the lifespan's ``finally``.
+    """
+    tree = ast.parse(inspect.getsource(app_mod))
+    shutdown_calls = {
+        node
+        for handler in ast.walk(tree)
+        if isinstance(handler, ast.Try)
+        for statement in handler.finalbody
+        for node in ast.walk(statement)
+    }
+    # the drain is handed to `asyncio.to_thread`, so it is an attribute reference, not a call.
+    reaps = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "reap_live_children"
+    ]
+    assert reaps, "the shutdown drain disappeared"
+    assert all(node in shutdown_calls for node in reaps)
+
+
+def test_only_one_reaper_may_close_a_child() -> None:
+    """A confirmed exit hands the right to close to exactly one caller.
+
+    The owning thread and the shutdown drain can both reach the same exited child. Ownership is
+    released under the lock, so the loser is told no and the process is never closed twice.
+    """
+    process = _OwnedProcess()
+    children.spawn_owned(process)
+    try:
+        assert children.reap_owned(process) is True
+        assert children.reap_owned(process) is False
     finally:
         children._release(process)
 

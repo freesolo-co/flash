@@ -133,18 +133,6 @@ def _open_deployment_jobs() -> None:
         _DEPLOYMENT_JOBS_ACCEPTING = True
 
 
-async def _reap_live_deployment_children_loop() -> None:
-    """retry live deployment children during the whole asgi lifespan."""
-    while True:
-        try:
-            await asyncio.to_thread(children.LIVE_CHILDREN_WAKE.wait, 1.0)
-            await asyncio.to_thread(children.reap_live_children, 0.5)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            _log.warning("live deployment child reaper failed", exc_info=True)
-
-
 def _run_deployment_job(target, args, kwargs) -> None:
     try:
         target(*args, **kwargs)
@@ -387,7 +375,6 @@ def create_app():
         from flash.server.domain.ops.repo_cleanup import repo_cleanup_enabled
 
         cleanup_task = asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
-        live_child_task = asyncio.create_task(_reap_live_deployment_children_loop())
         try:
             yield
         finally:
@@ -415,9 +402,6 @@ def create_app():
                 remaining = max(0.0, shutdown_deadline - time.monotonic())
                 if not await asyncio.to_thread(children.reap_live_children, remaining):
                     _log.warning("live deployment children survived the shutdown deadline")
-            live_child_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await live_child_task
             with contextlib.suppress(Exception):
                 from flash.runner.lifecycle.reporting import _shutdown_status_reporter
 

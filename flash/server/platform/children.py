@@ -3,8 +3,12 @@
 A child is owned from the moment it starts, not from the moment a reap fails. `spawn_owned`
 publishes the process into the live set under the same lock that starts it, and `reap_owned`
 releases it only after a confirmed exit. Anything still alive stays in the set, so the caller
-cannot drop it by raising, by failing to close a pipe, or by never reaching its own reap at all:
-`reap_live_children` is the single boundary that finishes the job, and the asgi lifespan drains it.
+cannot drop it by raising, by failing to close a pipe, or by never reaching its own reap at all.
+
+The set is a shutdown backstop, not a background reaper: a smoke child is allowed to run for its
+whole budget, and only `reap_live_children` at the end of the asgi lifespan ends what is left.
+Releasing is what confers the right to `close`, so exactly one of the owning thread and the
+shutdown drain can close a given child.
 """
 
 from __future__ import annotations
@@ -18,7 +22,6 @@ _log = logging.getLogger("flash.server")
 
 _LIVE_CHILDREN_LOCK = threading.Lock()
 _LIVE_CHILDREN: set[Any] = set()
-LIVE_CHILDREN_WAKE = threading.Event()
 
 _JOIN_SECONDS = 0.1
 _TERMINATE_SECONDS = 0.2
@@ -30,14 +33,15 @@ def spawn_owned(process) -> None:
     with _LIVE_CHILDREN_LOCK:
         process.start()
         _LIVE_CHILDREN.add(process)
-        LIVE_CHILDREN_WAKE.set()
 
 
-def _release(process) -> None:
+def _release(process) -> bool:
+    """drop ownership, reporting whether this caller is the one that took it away."""
     with _LIVE_CHILDREN_LOCK:
+        if process not in _LIVE_CHILDREN:
+            return False
         _LIVE_CHILDREN.discard(process)
-        if not _LIVE_CHILDREN:
-            LIVE_CHILDREN_WAKE.clear()
+        return True
 
 
 def _bounded(step: float, deadline: float | None) -> float:
@@ -49,9 +53,11 @@ def _bounded(step: float, deadline: float | None) -> float:
 def reap_owned(process, *, terminate_first: bool = False, deadline: float | None = None) -> bool:
     """run the bounded shutdown ladder, releasing ownership only on a confirmed exit.
 
-    returns whether the caller may close the process: true only for a child that ran and has now
-    confirmably exited. a child that never started owns no os resources to release, and one that
-    survives every step stays owned by the live set for `reap_live_children` to retry.
+    returns whether the caller may close the process: true only for the caller that ran a started
+    child to a confirmed exit and took it out of the live set. a child that never started owns no
+    os resources to release, one that survives every step stays owned for the shutdown drain to
+    retry, and a second caller reaching an already released child is told no so it cannot close
+    the same process twice.
     """
     if process.pid is None:
         _release(process)
@@ -66,8 +72,7 @@ def reap_owned(process, *, terminate_first: bool = False, deadline: float | None
         process.join(timeout=_KILL_SECONDS)
     if process.is_alive():
         return False
-    _release(process)
-    return True
+    return _release(process)
 
 
 def reap_live_children(timeout: float) -> bool:
