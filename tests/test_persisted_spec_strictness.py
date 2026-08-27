@@ -97,7 +97,11 @@ def _set(payload: dict, path: str, value: object) -> dict:
         ("train.teacher_model", None),
         ("environment.params", None),
         ("workload_profile", []),
-        ("wandb", None),
+        # `wandb` is deliberately absent: it is cosmetic run-naming metadata that no training,
+        # billing, or lifecycle decision reads, so a malformed persisted payload coerces to the
+        # default rather than killing a worker reattaching to a real run. the AUTHORING path still
+        # rejects it -- `test_invalid_wandb_section_rejected` covers that -- which is where a
+        # user's typo has to surface. every other field in this list IS read for a decision.
         ("environment.pip", "requests"),
         ("environment.secrets", ["TOKEN", 7]),
         ("train.stop_sequences", "END"),
@@ -161,7 +165,10 @@ def test_retained_sequence_and_numeric_alternatives_round_trip() -> None:
         ("grpo", "train.max_context_tokens", 0, "max_context_tokens must be positive"),
         ("grpo", "train.max_completion_tokens", 0, "max_completion_tokens must be positive"),
         ("sft", "train.max_examples", -1, "max_examples must be nonnegative"),
-        ("sft", "train.max_steps", -1, "max_steps must be nonnegative"),
+        # `train.max_steps` is deliberately absent: `parse_max_steps` canonicalizes every
+        # non-positive spelling to the `None` sentinel before this bound is reached, so there is no
+        # negative value left to reject. `test_max_steps_non_positive_canonicalizes_to_the_derived_
+        # horizon_sentinel` above covers that path instead.
         ("grpo", "train.temperature", -0.1, "temperature must be nonnegative"),
         ("grpo", "train.kl_penalty_coef", -0.1, "kl_penalty_coef must be nonnegative"),
         ("grpo", "train.entropy_quantile", 1.1, "entropy_quantile must be between"),
@@ -182,10 +189,17 @@ def test_resolved_semantic_bounds(algorithm, path, value, match) -> None:
         JobSpec.from_dict(_set(_payload(algorithm=algorithm), path, value))
 
 
-def test_max_steps_zero_persists_as_the_derived_horizon_sentinel() -> None:
-    spec = JobSpec.from_dict(_set(_payload(algorithm="sft"), "train.max_steps", 0))
-    assert spec.train.max_steps == 0
-    assert spec.to_internal_dict()["train"]["max_steps"] == 0
+def test_max_steps_non_positive_canonicalizes_to_the_derived_horizon_sentinel() -> None:
+    """`None` is the single sentinel for "use the derived update count", on read as on authoring.
+
+    `parse_max_steps` canonicalizes every non-positive spelling to `None` so one value means one
+    thing across every parser, serializer, resolver, and save-step path. Persisting `0` as a
+    distinct second sentinel would give the same horizon two representations that compare unequal.
+    """
+    for stored in (0, -4):
+        spec = JobSpec.from_dict(_set(_payload(algorithm="sft"), "train.max_steps", stored))
+        assert spec.train.max_steps is None
+        assert spec.to_internal_dict()["train"]["max_steps"] is None
 
 
 @pytest.mark.parametrize(
@@ -207,16 +221,25 @@ def test_resolved_algorithm_applicability(algorithm, path, value) -> None:
 
 
 @pytest.mark.parametrize("group_size", [1, 3, 6, 32])
-def test_persisted_grpo_rejects_unsupported_group_sizes(group_size) -> None:
-    with pytest.raises(ValueError, match="group_size must be one of"):
-        JobSpec.from_dict(_set(_payload(), "train.group_size", group_size))
+def test_persisted_grpo_reads_back_group_sizes_outside_the_admission_window(group_size) -> None:
+    """The supported-group set bounds what may be SUBMITTED, not what may be READ BACK.
+
+    `test_grpo_rollout_contract` states the split this file follows: `flash.schema` applies the
+    admission rule to authored config, while this decoder reconstructs runs an older Flash already
+    recorded. Applying admission on read makes an existing run undecodable, and status, recovery,
+    retry, deploy and teardown all rebuild runs through here -- so the run would strand with its
+    endpoint still billing. Positivity and type are still enforced; only the window is not applied
+    retroactively.
+    """
+    spec = JobSpec.from_dict(_set(_payload(), "train.group_size", group_size))
+    assert spec.train.group_size == group_size
 
 
-def test_persisted_grpo_rejects_excess_completion_product() -> None:
+def test_persisted_grpo_reads_back_a_completion_product_above_the_current_ceiling() -> None:
     payload = _payload()
     payload["train"].update(prompts_per_step=64, group_size=16)
-    with pytest.raises(ValueError, match=r"prompts_per_step \* train.group_size must be <= 512"):
-        JobSpec.from_dict(payload)
+    spec = JobSpec.from_dict(payload)
+    assert (spec.train.prompts_per_step, spec.train.group_size) == (64, 16)
 
 
 def test_warm_start_persisted_topology_remains_resolved() -> None:

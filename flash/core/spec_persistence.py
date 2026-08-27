@@ -38,8 +38,15 @@ def validated_section(
     name: str,
     allowed: set[str],
 ) -> dict[str, Any]:
-    """Read one nested persisted block and reject null, wrong types, and unknown keys."""
-    section = data.get(name, {})
+    """Read one nested persisted block and reject wrong types and unknown keys.
+
+    an ABSENT or null section reads as an empty block: null is how an omitted section has always
+    been serialized, so it is a known shape rather than corruption. every other non-object is
+    rejected -- a list or a bare string is not a section that was ever written by this writer.
+    """
+    section = data.get(name)
+    if section is None:
+        section = {}
     if not isinstance(section, dict):
         raise TypeError(f"{name} must be an object")
     unknown = sorted(set(section) - allowed)
@@ -216,10 +223,13 @@ def validate_resolved_spec_semantics(spec: Any) -> None:
         if getattr(train, name) != getattr(defaults, name):
             raise ValueError(f"train.{name} does not apply to {spec.algorithm}")
 
-    if spec.algorithm == "grpo":
-        from flash.core.grpo import resolve_grpo_rollout_shape
-
-        resolve_grpo_rollout_shape(train.prompts_per_step, train.group_size)
+    # the supported-group set and the completion ceiling are ADMISSION rules: they bound what may be
+    # newly submitted, and `flash.schema` applies them to authored config. they are deliberately not
+    # applied here. this decoder reads back immutable history an older flash already wrote and never
+    # rewrites, and status, recovery, retry, deploy and teardown all reconstruct existing runs
+    # through it -- so rejecting a shape recorded under an older schema would strand a live run with
+    # its endpoint still billing. type and positivity are still enforced above: a value that was
+    # never valid stays rejected, only the current admission window is not applied retroactively.
     if spec.algorithm == "opd" and train.kl_penalty_coef == 0.0:
         raise ValueError("train.kl_penalty_coef must be positive for opd")
 
@@ -393,16 +403,24 @@ def _decode_wandb(data: dict[str, Any]) -> Any:
 
     from flash.core.spec import WandbSpec
 
-    raw = data.get("wandb", {})
+    # wandb is cosmetic run-naming metadata: nothing downstream reads it to make a training,
+    # billing, or lifecycle decision. a malformed persisted payload therefore coerces to the
+    # default instead of raising, so a worker reattaching to a real run cannot be killed by bad
+    # display metadata. the AUTHORING path stays strict -- `flash.schema` rejects the same shapes
+    # with a ConfigError, which is where a user's typo has to surface.
+    raw = data.get("wandb")
     if not isinstance(raw, dict):
-        raise TypeError("wandb must be an object")
+        return WandbSpec()
     unknown = sorted(set(raw) - {item.name for item in fields(WandbSpec)})
     if unknown:
         raise ValueError(f"wandb has unknown key(s): {', '.join(unknown)}")
-    return WandbSpec(
-        project=persisted_str(raw.get("project"), name="wandb.project", optional=True),
-        run_name=persisted_str(raw.get("run_name"), name="wandb.run_name", optional=True),
-    )
+
+    def _label(value: Any) -> str | None:
+        if value is None:
+            return None
+        return str(value).strip() or None
+
+    return WandbSpec(project=_label(raw.get("project")), run_name=_label(raw.get("run_name")))
 
 
 def decode_persisted_job_spec(data: dict[str, Any]) -> Any:

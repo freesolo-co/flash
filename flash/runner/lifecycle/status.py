@@ -121,7 +121,20 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     preparation._validate_effective_spec(public_spec, worker_spec)
     expected = snapshot.get("adapter_identity")
     stored_digest = snapshot.get("preparation_digest")
-    validate_persisted_spec_envelope(snapshot)
+    # the envelope version and the digest are stamped together by
+    # `_effective_preparation_snapshot`, so they are one unit: a snapshot carrying EITHER must carry
+    # both, and one carrying NEITHER is a partial record rather than a tampered one. a partial
+    # record still cannot activate a warm start -- the branch below refuses that without artifact
+    # identity -- but it must stay READABLE, because status, recovery, retry, deploy and teardown
+    # all reconstruct existing runs through here and would otherwise strand a run whose endpoint is
+    # still billing. dropping the digest must never be a way to skip integrity validation, so a
+    # versioned snapshot is held to the digest and a digest-bearing one to the version.
+    if stored_digest is not None or "version" in snapshot:
+        validate_persisted_spec_envelope(snapshot)
+        if not isinstance(stored_digest, str) or stored_digest != preparation._preparation_digest(
+            public_spec, worker_spec, expected, stored_public=status.spec
+        ):
+            raise ValueError("persisted effective preparation failed integrity validation")
     has_workload_profile = bool(
         worker_spec.workload_profile_input_digest or worker_spec.workload_profile
     )
@@ -129,10 +142,6 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
         worker_spec.workload_profile or None
     ):
         raise ValueError("persisted workload profile does not match the worker spec")
-    if not isinstance(stored_digest, str) or stored_digest != preparation._preparation_digest(
-        public_spec, worker_spec, expected, stored_public=status.spec
-    ):
-        raise ValueError("persisted effective preparation failed integrity validation")
     if public_spec.train.init_from_adapter:
         if not isinstance(expected, dict) or not expected.get("digest"):
             raise ValueError(

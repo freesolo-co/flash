@@ -187,14 +187,17 @@ def parse_seed(value: Any = FIXED_SEED) -> int:
 
 
 def parse_max_steps(value: Any) -> int | None:
-    """Parse the optional exact optimizer-update horizon without coercion."""
+    """parse the optional exact optimizer-update horizon without coercion.
+
+    positive values are authoritative; absent or non-positive values canonicalize to none so every
+    parser, serializer, resolver, and save-step path shares one sentinel. this is an authored-input
+    contract, so it stays lenient about the non-positive spelling and strict about the type.
+    """
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError("train.max_steps must be an integer or null")
-    if value < 0:
-        raise ValueError("train.max_steps must be nonnegative")
-    return value
+    return value if value > 0 else None
 
 
 # this plane's own public origin: the address a gpu worker dials back on to reach the teacher

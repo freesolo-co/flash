@@ -1253,11 +1253,11 @@ def test_sft_caps_parse_from_toml() -> None:
     )
     assert spec.train.max_steps == 50
     assert spec.train.max_examples == 200
-    # zero is the persisted sentinel for a derived horizon; negative values are malformed.
-    zero = spec_from_dict(_raw(**{"train.max_steps": 0}), run_id="caps-zero")
-    assert zero.train.max_steps == 0
-    with pytest.raises(ConfigError, match="max_steps must be nonnegative"):
-        spec_from_dict(_raw(**{"train.max_steps": -7}), run_id="caps-negative")
+    # explicit non-positive max_steps (0 or negative) is not rejected: it canonicalizes to none so a
+    # single sentinel means "use the derived horizon" (max_examples still rejects negatives below).
+    for bad in (0, -7):
+        spec_np = spec_from_dict(_raw(**{"train.max_steps": bad}), run_id="caps-np")
+        assert spec_np.train.max_steps is None
     with pytest.raises(ConfigError, match="max_examples must be >= 0"):
         spec_from_dict(_raw(**{"train.max_examples": -5}))
 

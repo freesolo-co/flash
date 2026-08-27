@@ -343,7 +343,16 @@ def _save_status(
                 # max_wall_seconds is managed and stripped from the public status.spec; source the
                 # run-global wall budget from the internal worker spec so the auto-computed deadline
                 # reloads consistently (see _canonical_run_deadline).
-                spec = _internal_spec_from_status(status)
+                #
+                # a malformed worker half falls back to the public spec's managed default rather
+                # than refusing the write. this is a deadline default on the WRITE path, and a run
+                # whose record cannot be saved is a run nothing can later enumerate to tear down,
+                # so its provider instance keeps billing. the strict refusal belongs on the READ
+                # path, where the caller is deciding whether to ACT on the authoritative spec.
+                try:
+                    spec = _internal_spec_from_status(status)
+                except (TypeError, ValueError):
+                    spec = JobSpec.from_dict(status.spec)
                 base = deadlines._require_valid_deadline(status.created_at)
                 _run_deadline_at = deadlines._require_valid_deadline(
                     base + deadlines._require_valid_deadline(spec.gpu.max_wall_seconds)

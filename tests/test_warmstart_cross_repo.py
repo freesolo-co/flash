@@ -753,6 +753,10 @@ def test_persist_effective_warmstart_requires_valid_snapshot(monkeypatch, tmp_pa
             "train": {"init_from_adapter": "source-run/final"},
         }
     )
+    # neither shape is refused at the WRITE. a run whose record cannot be saved is a run whose
+    # rented provider instance nothing can later find to tear down, so `_save_status` falls back to
+    # the public spec's managed deadline default. the REWRITE is where a snapshot that cannot name
+    # an authoritative worker spec is refused.
     runner_state._save_status(
         runner_state.RunStatus(
             run_id=public.run_id,
@@ -955,7 +959,10 @@ def test_effective_snapshot_rejects_tampering(field, value):
         spec=public.to_dict(),
         effective_preparation=snapshot,
     )
-    with pytest.raises(ValueError, match="effective preparation"):
+    # a tampered `algorithm` is caught by the public/worker equality check before the digest is
+    # ever recomputed, so it is rejected with a more specific message than the digest's. both are
+    # a refusal to activate the tampered snapshot, which is what this test is asserting.
+    with pytest.raises(ValueError, match=r"effective preparation|do not match"):
         runner_status.effective_spec_from_status(status)
 
 
@@ -1521,12 +1528,14 @@ def test_digest_matches_the_shape_the_deployed_release_writes(monkeypatch, tmp_p
     )
 
 
-def test_a_snapshot_written_before_the_version_key_still_recovers(monkeypatch, tmp_path):
-    """The `version` stamp landed in 1.2.59; runs prepared by an older build are still in flight.
+def test_a_snapshot_carrying_a_digest_must_carry_its_version(monkeypatch, tmp_path):
+    """The `version` stamp landed in 1.2.59, and `dev` is now 1.2.121 -- 62 patch releases later.
 
-    Rejecting an ABSENT version makes `reallocation_spec_from_status` raise on the retry path,
-    which marks a live run `unrecoverable` instead of retrying it. A malformed value is still
-    rejected -- absence is a known shape, a bad type is not.
+    `gpu.max_wall_seconds` caps a run at 24 hours, so no run prepared before the stamp can still
+    be in flight, and the pre-stamp shape is no longer a shape this decoder has to read. The
+    version and the digest are stamped together by `_effective_preparation_snapshot`, so a
+    snapshot carrying one must carry the other; `effective_spec_from_status` checks the version
+    only on the digest-bearing path, which is what keeps a digest-less partial record readable.
     """
     from flash.core.spec_persistence import (
         PREPARATION_ENVELOPE_VERSION,
@@ -1534,9 +1543,17 @@ def test_a_snapshot_written_before_the_version_key_still_recovers(monkeypatch, t
     )
 
     assert (
-        validate_persisted_spec_envelope({"worker_spec": {}, "preparation_digest": "d"})
+        validate_persisted_spec_envelope(
+            {
+                "version": PREPARATION_ENVELOPE_VERSION,
+                "worker_spec": {},
+                "preparation_digest": "d",
+            }
+        )
         == PREPARATION_ENVELOPE_VERSION
     )
+    with pytest.raises(ValueError, match="version is required"):
+        validate_persisted_spec_envelope({"worker_spec": {}, "preparation_digest": "d"})
     with pytest.raises(ValueError, match="positive integer"):
         validate_persisted_spec_envelope({"version": "1"})
     with pytest.raises(ValueError, match="unsupported persisted preparation envelope version"):
