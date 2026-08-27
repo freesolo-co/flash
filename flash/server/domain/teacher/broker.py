@@ -336,7 +336,8 @@ _reject_duplicate_keys = reject_duplicate_keys(
 
 def _require_current_attempt(capability: dict[str, Any]) -> None:
     from flash.runner.lifecycle.attempts import _latest_reserved_attempt
-    from flash.runner.lifecycle.status import effective_spec_from_status, get_status
+    from flash.runner.lifecycle.state import _internal_spec_from_status
+    from flash.runner.lifecycle.status import get_status
 
     try:
         status = get_status(capability["run_id"])
@@ -346,8 +347,14 @@ def _require_current_attempt(capability: dict[str, Any]) -> None:
         raise TeacherBrokerError("run_not_active", status_code=401)
     if _latest_reserved_attempt(capability["run_id"]) != capability["attempt"]:
         raise TeacherBrokerError("attempt_replaced", status_code=401)
+    # the STRUCTURAL loader: this authorizes a scoring call for a run ALREADY running, so the
+    # current serving catalog is not its business. `effective_spec_from_status` would additionally
+    # apply activation admission, and retiring a model or tightening the serving rank cap mid-run
+    # would turn every remaining scoring call into `run_scope_invalid`. the strictness this path
+    # needs -- a present but malformed worker spec never silently degrading to the public one --
+    # is already in `_internal_spec_from_status`.
     try:
-        spec = effective_spec_from_status(status)
+        spec = _internal_spec_from_status(status)
     except (TypeError, ValueError) as exc:
         raise TeacherBrokerError("run_scope_invalid", status_code=401) from exc
     if spec.algorithm != "opd" or spec.run_id != capability["run_id"]:
