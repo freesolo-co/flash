@@ -735,6 +735,11 @@ def test_attach_boundary_schedules_reconciliation_for_staged_transient(
         source_snapshot=valid_source_snapshot(),
         allocated_gpu=None,
         allocated_gpu_count=None,
+        # the replacement plan reconstructs the retry budget from the run's persisted counters.
+        # none recorded yet, so the budget comes from the spec's max_retries. without the field the
+        # stub raises AttributeError inside attach_run's broad handler, which fails the run instead
+        # of retrying it -- the staged-environment path under test never runs.
+        retry_counters=None,
     )
     scheduled: list[tuple] = []
     monkeypatch.setattr(attach, "_build_attach_context", lambda *_args: context)
@@ -798,6 +803,11 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
         source_snapshot=valid_source_snapshot(),
         allocated_gpu=None,
         allocated_gpu_count=None,
+        # the replacement plan reconstructs the retry budget from the run's persisted counters.
+        # none recorded yet, so the budget comes from the spec's max_retries. without the field the
+        # stub raises AttributeError inside attach_run's broad handler, which fails the run instead
+        # of retrying it -- the staged-environment path under test never runs.
+        retry_counters=None,
     )
     calls = {"stage": 0, "clear": 0, "fail": 0, "train": 0, "allocate": 0}
     scheduled: list[tuple] = []

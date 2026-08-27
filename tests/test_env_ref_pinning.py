@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 
 import flash.runner.accounting.artifacts as runner_artifacts
+import flash.runner.lifecycle.state as runner_state
 from flash.core.spec import JobSpec
 from tests._helpers.source_snapshot import valid_source_snapshot
 
@@ -43,7 +44,9 @@ def test_worker_retry_path_has_no_github_pin_fallback() -> None:
     assert not hasattr(lifecycle, "_spec_with_resolved_env_sha")
 
 
-def test_submit_context_preserves_controller_staged_identity_without_resolving(monkeypatch) -> None:
+def test_submit_context_preserves_controller_staged_identity_without_resolving(
+    monkeypatch, tmp_path
+) -> None:
     from flash.runner.supervise import seed_submission
 
     monkeypatch.setattr(
@@ -52,6 +55,18 @@ def test_submit_context_preserves_controller_staged_identity_without_resolving(m
         lambda _spec: (_ for _ in ()).throw(AssertionError("worker retry must not resolve github")),
     )
     spec = _staged_spec()
+    # the context reconstructs its retry budget from the run's persisted counters, so the run needs
+    # a durable record to be read back. this test is about the staged environment identity, so the
+    # record carries no counters and the budget falls back to the spec's max_retries.
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id,
+            state="queued",
+            spec=spec.to_dict(),
+            source_snapshot=valid_source_snapshot(),
+        )
+    )
     context = seed_submission._build_context(
         spec,
         spec.seed,

@@ -34,6 +34,10 @@ class _HardExit(BaseException):
 
 def _patch_common(monkeypatch, fake_exit):
     monkeypatch.setattr(worker.os, "_exit", fake_exit)
+    # module-level progress state latches to True on the first step of ANY earlier test in the
+    # process and is never cleared, so `training_entered` here would report a neighbour's training
+    # run. reset it the way every other worker-progress suite already does.
+    monkeypatch.setattr(progress_io, "_PROGRESS_TRAINING_ENTERED", False)
     monkeypatch.setattr(worker_state, "HF_REPO", "")  # keep artifact transport out of this test
     monkeypatch.setattr(worker_state, "RUN_MODE", "sft")
     monkeypatch.setattr(progress_io, "publish_progress", lambda *a, **k: None)

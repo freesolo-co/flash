@@ -363,6 +363,11 @@ def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
     monkeypatch.setattr(
         "flash.runner.lifecycle.deadlines._load_run_deadline_at", lambda _run_id: None
     )
+    # a handle-less retry persists its retry counters against the run's durable record. the subject
+    # here is the vram floor arithmetic on a synthetic context, so the persistence boundary is
+    # stubbed rather than backed by a run store; tests/test_resume_on_retry.py owns the real fenced
+    # counter write. patched on seed_submission, which imported the name at module scope.
+    monkeypatch.setattr(seed_submission, "_persist_retry_budget", lambda *a, **k: None)
 
     decision = seed_submission._handle_failure(ctx, prepared, outcome)
 
