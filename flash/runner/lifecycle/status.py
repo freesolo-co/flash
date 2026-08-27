@@ -601,6 +601,23 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     return float(cost)
 
 
+def _settled_attempt_record(status: RunStatus) -> dict | None:
+    """return the current attempt marked settled, or leave an absent or unreadable record alone.
+
+    an unreadable record names no fenced worker that this transition could be settling, so it is
+    preserved verbatim as diagnostics rather than being rewritten or dropped.
+    """
+    if status.attempt is None:
+        return None
+    try:
+        attempt = _current_attempt(status)
+    except Exception:
+        return status.attempt
+    if attempt.state == "settled":
+        return status.attempt
+    return replace(attempt, state="settled").to_dict()
+
+
 def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
     """Atomically transition run state with terminal-stickiness. Returns False if rejected.
 
@@ -623,6 +640,13 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
         status.updated_at = time.time()
         if not was_terminal and new_state in state.TERMINAL_STATES and status.finished_at is None:
             status.finished_at = status.updated_at
+        if new_state in state.TERMINAL_STATES:
+            # the run is over, so its attempt is over with it. every live terminal path arrives
+            # here -- the supervised "done", cancellation, and terminal failure -- while only the
+            # recovery compare-and-set settles the attempt itself. without this the ordinary
+            # completed run keeps an attempt stuck in result_pending forever, which the status
+            # projection then reports as a finished run whose work is still outstanding.
+            status.attempt = _settled_attempt_record(status)
         for key, value in updates.items():
             if (
                 key in {"lifecycle_started_attempt", "lifecycle_progressed_attempt"}

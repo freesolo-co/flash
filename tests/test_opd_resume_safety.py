@@ -439,6 +439,20 @@ class _FakePrivateHf:
         self.calls.append(("list_repo_files", kwargs))
         return list(self.files)
 
+    def list_repo_tree(self, **kwargs):
+        # the attempt-artifact reader lists one prefix rather than the whole repository, so it
+        # yields RepoFile entries under path_in_repo. the opd checkpoint verifier still uses the
+        # flat list_repo_files above; both share this one fake repository.
+        from huggingface_hub import RepoFile
+
+        self.calls.append(("list_repo_tree", kwargs))
+        prefix = kwargs.get("path_in_repo") or ""
+        return [
+            RepoFile(path=path, size=len(self.files[path]), oid="0" * 40, blob_id="0" * 40)
+            for path in self.files
+            if path.startswith(prefix)
+        ]
+
     def download(self, **kwargs):
         self.calls.append(("download", kwargs))
         path = kwargs["filename"]
@@ -705,8 +719,10 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     assert provider.events.index(("cancel", 0)) < retry_submit
     assert provider.events.index(("destroy", 0)) < retry_submit
     assert [name for name, _kwargs in private_hf.calls] == [
+        # the attempt-artifact read lists one attempt prefix (list_repo_tree); the opd replacement
+        # verifier that follows still lists the checkpoint tree flat.
         "repo_info",
-        "list_repo_files",
+        "list_repo_tree",
         "repo_info",
         "get_paths_info",
     ]
@@ -871,8 +887,10 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
     assert status.realized_cost_remote == _remote(attempt=0)
     assert "replacement is blocked" in status.error
     assert [name for name, _kwargs in private_hf.calls] == [
+        # as above: the first listing is the prefix-scoped attempt-artifact read, the last is the
+        # opd verifier's flat checkpoint listing.
         "repo_info",
-        "list_repo_files",
+        "list_repo_tree",
         "repo_info",
         "get_paths_info",
         "download",

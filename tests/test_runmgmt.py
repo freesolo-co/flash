@@ -599,6 +599,58 @@ def test_result_projection_updates_matching_attempt_receipt_atomically(monkeypat
     assert attempt.result_receipt == receipt
 
 
+@pytest.mark.parametrize("terminal_state", ["done", "failed", "cancelled"])
+def test_terminal_transition_settles_the_live_attempt(monkeypatch, tmp_path, terminal_state):
+    """a finished run must not leave its attempt outstanding.
+
+    only the recovery compare-and-set used to settle the attempt, so an ordinary supervised
+    completion published its result, moved the attempt to ``result_pending``, and then finished
+    the run through the generic terminal update -- leaving ``flash runs status`` reporting a
+    terminal run whose work is still pending forever.
+    """
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id=f"settle-{terminal_state}", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote("endpoint-settle", "job-settle", attempt=2, fence=9)
+    status = provisioned_status(spec, remote=remote, created_at=100.0)
+    runner_state._save_status(status)
+    receipt = {"path": "attempt/result.json", "digest": "a" * 64, "revision": "rev"}
+    assert runner_status.record_result(
+        spec.run_id,
+        {"attempt_id": 2, "fence": 9, "outcome": "failed", "receipt": receipt},
+        attempt_id=2,
+        fence=9,
+    )
+    assert runner_status._current_attempt(runner_status.get_status(spec.run_id)).state == (
+        "result_pending"
+    )
+
+    assert runner_status._update(spec.run_id, terminal_state)
+
+    settled = runner_status._current_attempt(runner_status.get_status(spec.run_id))
+    assert settled.state == "settled"
+    # settling is identity-preserving: it closes the attempt, it does not replace it.
+    assert (settled.attempt_id, settled.fence) == (2, 9)
+    assert settled.result_receipt == receipt
+
+
+def test_nonterminal_transition_leaves_the_attempt_live(monkeypatch, tmp_path):
+    """settling is a terminal-only act; a running transition must not close the attempt."""
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="settle-running", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    remote = _runpod_remote("endpoint-running", "job-running", attempt=2, fence=9)
+    runner_state._save_status(provisioned_status(spec, remote=remote, created_at=100.0))
+    before = runner_status._current_attempt(runner_status.get_status(spec.run_id)).state
+
+    assert runner_status._update(spec.run_id, "running")
+
+    assert runner_status._current_attempt(runner_status.get_status(spec.run_id)).state == before
+    assert before != "settled"
+
+
 @pytest.mark.parametrize(("attempt_id", "fence"), [(1, 9), (2, 8)])
 def test_result_projection_rejects_stale_attempt_or_fence(monkeypatch, tmp_path, attempt_id, fence):
     from flash.core.spec import JobSpec

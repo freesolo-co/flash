@@ -3512,7 +3512,11 @@ def test_cancellation_billing_prefers_newer_verified_current_fence_result(monkey
         persisted = runner_status.get_status(spec.run_id)
         assert persisted.state == "cancelled"
         assert persisted.result["completed_steps"] == 7
-        assert runner_status._current_attempt(persisted).state == "active"
+        # cancelling is terminal, so the transition above settles the attempt with the run. what
+        # this test protects is that settling does not cost the cancellation its billing evidence:
+        # record_result's cancelled branch deliberately bypasses the settled guard, so the newer
+        # verified current-fence result still lands and still bills its 7 completed steps.
+        assert runner_status._current_attempt(persisted).state == "settled"
 
 
 def test_cancellation_refresh_without_attempt_still_bills(monkeypatch):

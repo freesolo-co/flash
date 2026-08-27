@@ -227,12 +227,18 @@ def build_payload(
         raise ValueError("instance attempt identity is invalid")
     if isinstance(fence, bool) or not isinstance(fence, int) or fence < 1:
         raise ValueError("instance fence identity is invalid")
-    from flash.runner.lifecycle.protocol import AttemptRecord
-    from flash.runner.lifecycle.status import get_status
+    # a weight-cache preload is not a training attempt: it runs under a synthetic run id that no
+    # persisted status names, so a fenced lookup here raises FileNotFoundError and fails every warm
+    # before it launches. it also never starts a worker, so it has no work or result deadline to
+    # carry -- its own wall cap comes from ``deadline_at`` alone.
+    attempt_record = None
+    if mode != "preload":
+        from flash.runner.lifecycle.protocol import AttemptRecord
+        from flash.runner.lifecycle.status import get_status
 
-    attempt_record = AttemptRecord.from_dict(get_status(spec.run_id).attempt)
-    if attempt_record.attempt_id != attempt_id or attempt_record.fence != fence:
-        raise RuntimeError("instance payload does not match the current fenced attempt")
+        attempt_record = AttemptRecord.from_dict(get_status(spec.run_id).attempt)
+        if attempt_record.attempt_id != attempt_id or attempt_record.fence != fence:
+            raise RuntimeError("instance payload does not match the current fenced attempt")
     max_wall_seconds = float(spec.gpu.max_wall_seconds)
     payload = {
         "hf_repo": spec.train.hf_repo,
@@ -247,13 +253,14 @@ def build_payload(
         "extra_pip": worker_pip_with_extras(spec.environment.id, spec.environment.pip),
         "hf_prefix": f"{spec.phase}/{spec.run_id}",
         "deadline_at": absolute_deadline,
-        "work_deadline_at": attempt_record.work_deadline_at,
-        "result_deadline_at": attempt_record.result_deadline_at,
         "run_created_at": absolute_deadline - max_wall_seconds,
         "run_max_wall_seconds": max_wall_seconds,
         "attempt": attempt_id,
         "fence": fence,
     }
+    if attempt_record is not None:
+        payload["work_deadline_at"] = attempt_record.work_deadline_at
+        payload["result_deadline_at"] = attempt_record.result_deadline_at
     if mode != "preload":
         payload["source_snapshot"] = parse_descriptor(source_snapshot).to_dict()
     if cache_host_mount:

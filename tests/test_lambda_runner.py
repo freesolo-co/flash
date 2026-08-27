@@ -245,6 +245,64 @@ def test_user_data_skips_capacity_for_baked_image_default(monkeypatch):
     assert "torch==2.10.0" not in script
 
 
+def test_preload_payload_needs_no_persisted_attempt_record(monkeypatch):
+    """a weight-cache warm runs under a synthetic run id that no status names.
+
+    looking that id up would raise FileNotFoundError and fail every warm before it launches, so
+    the preload payload skips the fenced lookup entirely. it starts no worker, so it also carries
+    no work or result deadline: its wall cap is ``deadline_at`` alone.
+    """
+    from flash.providers.lambda_.jobs import builders
+
+    def _no_status(_run_id):
+        raise FileNotFoundError("preload run ids are never persisted")
+
+    monkeypatch.setattr("flash.runner.lifecycle.status.get_status", _no_status)
+    deadline_at = time.time() + 600.0
+    payload = builders.build_payload(
+        _spec(),
+        seed=0,
+        attempt=0,
+        fence=1,
+        mode="preload",
+        models=["Qwen/Qwen3.5-4B"],
+        deadline_at=deadline_at,
+    )
+    assert payload["mode"] == "preload"
+    assert payload["deadline_at"] == deadline_at
+    assert "work_deadline_at" not in payload
+    assert "result_deadline_at" not in payload
+    assert "source_snapshot" not in payload
+
+
+def test_training_payload_still_requires_the_current_fenced_attempt(monkeypatch):
+    """the preload exemption must not weaken the fenced lookup for a real training launch."""
+    from flash.providers.lambda_.jobs import builders
+
+    deadline_at = time.time() + 3600.0
+    attempt = _instance_attempt(
+        provider="lambda",
+        grant=deadline_at - 120.0,
+        work=deadline_at - 60.0,
+        result=deadline_at,
+        attempt_id=2,
+        fence=5,
+    )
+    monkeypatch.setattr(
+        "flash.runner.lifecycle.status.get_status",
+        lambda _run_id: SimpleNamespace(attempt=attempt.to_dict()),
+    )
+    with pytest.raises(RuntimeError, match="does not match the current fenced attempt"):
+        builders.build_payload(
+            _spec(),
+            seed=0,
+            attempt=2,
+            fence=4,
+            source_snapshot=SOURCE_SNAPSHOT,
+            deadline_at=deadline_at,
+        )
+
+
 def test_image_per_sm_selects_arch_tag():
     """Per-SM warmed images (PR #213) reach Lambda too: the GPU class always picks the matching -smXX
     tag for baked arches (so the worker's baked kernel cache matches the rented GPU's arch)."""
