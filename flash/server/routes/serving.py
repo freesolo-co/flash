@@ -428,6 +428,7 @@ def undeploy(
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
     x_freesolo_project_id: Annotated[str | None, Header()] = None,
 ):
+    manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
     with _app._deploy_lock(run_id):
         status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
         try:
@@ -499,28 +500,29 @@ def undeploy(
 def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dict | None = None):
     """Copy a run's trained adapter into a user-owned HuggingFace repo."""
     payload = payload or {}
-    with _app._deploy_lock(run_id):
-        repository = str(payload.get("repository") or "").strip()
-        if not repository:
-            raise HTTPException(
-                status_code=400,
-                detail="repository is required: the destination HuggingFace repo 'owner/name'",
-            )
-        if len(parts := repository.strip("/").split("/")) != 2 or not all(parts):
-            raise HTTPException(
-                status_code=400,
-                detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
-            )
-        repository = "/".join(parts)
-        _validate_hf_repo_id(repository)
-        hf_token = str(payload.get("hf_token") or "").strip()
-        if not hf_token:
-            raise HTTPException(
-                status_code=400,
-                detail="hf_token is required: a HuggingFace token with write access to the destination repo",
-            )
-        private = _require_bool(payload, "private", True)
+    owned_run(run_id, key)
+    repository = str(payload.get("repository") or "").strip()
+    if not repository:
+        raise HTTPException(
+            status_code=400,
+            detail="repository is required: the destination HuggingFace repo 'owner/name'",
+        )
+    if len(parts := repository.strip("/").split("/")) != 2 or not all(parts):
+        raise HTTPException(
+            status_code=400,
+            detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
+        )
+    repository = "/".join(parts)
+    _validate_hf_repo_id(repository)
+    hf_token = str(payload.get("hf_token") or "").strip()
+    if not hf_token:
+        raise HTTPException(
+            status_code=400,
+            detail="hf_token is required: a HuggingFace token with write access to the destination repo",
+        )
+    private = _require_bool(payload, "private", True)
 
+    with _app._deploy_lock(run_id):
         status = owned_run(run_id, key)
         try:
             effective_spec = effective_spec_from_status(status)

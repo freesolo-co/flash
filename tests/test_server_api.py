@@ -8094,54 +8094,141 @@ def test_export_sends_the_runner_assigned_revision_not_the_public_blank(api, mon
     assert seen["base_model_revision"] == "a" * 40
 
 
-def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
-    """The /export handler must take the per-run deploy lock FROM THE VERY TOP — before even the
+@pytest.mark.parametrize("operation", ["export", "undeploy"])
+def test_unauthorized_deployment_operation_returns_while_lock_is_held(api, monkeypatch, operation):
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
-    Taking the lock after body validation leaves a window for another deploy, undeploy, or export
-    operation to interleave with the request. Assert the lock is already held during the payload
-    validation (``_validate_hf_repo_id``, which runs first) AND by the time owned_run runs.
-    """
+    import flash.server.asgi.app as app_mod
+
+    owner = _login()
+    other = _login()
+    run_id = _finished_run(api, owner)
+    calls = []
+    monkeypatch.setattr(app_mod, "export_adapter", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda target: calls.append(target))
+
+    deploy_lock = app_mod._deploy_lock(run_id)
+    assert deploy_lock.acquire(blocking=False) is True
+    executor = ThreadPoolExecutor(max_workers=1)
+    if operation == "export":
+        future = executor.submit(
+            api.post,
+            f"/v1/runs/{run_id}/export",
+            json={},
+            headers=_bearer(other),
+        )
+    else:
+        future = executor.submit(
+            api.delete,
+            f"/v1/runs/{run_id}/deploy?checkpoint_id={run_id}/final",
+            headers=_bearer(other),
+        )
+    try:
+        try:
+            response = future.result(timeout=2)
+        except TimeoutError:
+            pytest.fail(f"unauthorized {operation} waited for the deployment lock")
+        assert deploy_lock.acquire(blocking=False) is False
+    finally:
+        deploy_lock.release()
+        executor.shutdown(wait=True)
+
+    assert response.status_code == 404, response.text
+    assert calls == []
+
+
+def test_invalid_export_returns_while_lock_is_held(api, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+    import flash.server.asgi.app as app_mod
+
+    owner = _login()
+    run_id = _finished_run(api, owner)
+    calls = []
+    monkeypatch.setattr(app_mod, "export_adapter", lambda **kwargs: calls.append(kwargs))
+
+    deploy_lock = app_mod._deploy_lock(run_id)
+    assert deploy_lock.acquire(blocking=False) is True
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(
+        api.post,
+        f"/v1/runs/{run_id}/export",
+        json={},
+        headers=_bearer(owner),
+    )
+    try:
+        try:
+            response = future.result(timeout=2)
+        except TimeoutError:
+            pytest.fail("invalid export waited for the deployment lock")
+        assert deploy_lock.acquire(blocking=False) is False
+    finally:
+        deploy_lock.release()
+        executor.shutdown(wait=True)
+
+    assert response.status_code == 400, response.text
+    assert "repository" in response.json()["detail"]
+    assert calls == []
+
+
+@pytest.mark.parametrize("operation", ["export", "undeploy"])
+def test_deployment_operation_rechecks_authorization_after_waiting(api, monkeypatch, operation):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
     import flash.server.asgi.app as app_mod
     from flash.server.routes import serving as serving_routes
 
-    key = _login()
-    run_id = _finished_run(api, key)
+    owner = _login()
+    run_id = _finished_run(api, owner)
+    authorization_checked = threading.Event()
+    authorization_attempts = []
+    authorized_statuses = []
+    calls = []
+    authorization_name = "owned_run" if operation == "export" else "manageable_run"
+    real_authorize = getattr(serving_routes, authorization_name)
 
-    real_owned_run = serving_routes.owned_run
-    real_validate = serving_routes._validate_hf_repo_id
-    seen: dict = {}
+    def observed_authorize(*args, **kwargs):
+        authorization_attempts.append(None)
+        status = real_authorize(*args, **kwargs)
+        authorized_statuses.append(status)
+        authorization_checked.set()
+        return status
 
-    def checking_validate(repository):
-        # The payload validation runs BEFORE owned_run; assert it too is inside the lock.
-        lk = app_mod._deploy_lock(run_id)
-        acquired = lk.acquire(blocking=False)
-        seen["locked_during_validation"] = not acquired
-        if acquired:
-            lk.release()
-        return real_validate(repository)
+    monkeypatch.setattr(serving_routes, authorization_name, observed_authorize)
+    monkeypatch.setattr(app_mod, "export_adapter", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda target: calls.append(target))
 
-    def checking_owned_run(rid, k):
-        # A non-blocking acquire from outside must FAIL (lock already held by the handler) — proving
-        # the handler is INSIDE the `with _deploy_lock(...)` block by the time owned_run runs.
-        lk = app_mod._deploy_lock(rid)
-        acquired = lk.acquire(blocking=False)
-        seen["locked_during_owned_run"] = not acquired
-        if acquired:
-            lk.release()
-        return real_owned_run(rid, k)
+    deploy_lock = app_mod._deploy_lock(run_id)
+    assert deploy_lock.acquire(blocking=False) is True
+    executor = ThreadPoolExecutor(max_workers=1)
+    if operation == "export":
+        future = executor.submit(
+            api.post,
+            f"/v1/runs/{run_id}/export",
+            json={"repository": "me/a", "hf_token": "hf"},
+            headers=_bearer(owner),
+        )
+    else:
+        future = executor.submit(
+            api.delete,
+            f"/v1/runs/{run_id}/deploy?checkpoint_id={run_id}/final",
+            headers=_bearer(owner),
+        )
+    try:
+        assert authorization_checked.wait(timeout=2)
+        assert len(authorization_attempts) == 1
+        assert len(authorized_statuses) == 1
+        _db_mod.delete_run(run_id)
+    finally:
+        deploy_lock.release()
+    response = future.result(timeout=5)
+    executor.shutdown(wait=True)
 
-    monkeypatch.setattr(serving_routes, "_validate_hf_repo_id", checking_validate)
-    monkeypatch.setattr(serving_routes, "owned_run", checking_owned_run)
-    monkeypatch.setattr(app_mod, "export_adapter", lambda **kw: "https://huggingface.co/me/a")
-
-    resp = api.post(
-        f"/v1/runs/{run_id}/export",
-        json={"repository": "me/a", "hf_token": "hf", "checkpoint_id": f"{run_id}/final"},
-        headers=_bearer(key),
-    )
-    assert resp.status_code == 200, resp.text
-    assert seen["locked_during_validation"] is True
-    assert seen["locked_during_owned_run"] is True
+    assert response.status_code == 404, response.text
+    assert len(authorization_attempts) == 2
+    assert len(authorized_statuses) == 1
+    assert calls == []
 
 
 def test_export_public_flag_sets_private_false(api, monkeypatch):
