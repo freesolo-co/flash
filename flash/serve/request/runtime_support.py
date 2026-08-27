@@ -6,6 +6,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from flash.adapters.artifacts import has_loadable_adapter_weights
+
 
 def argument_names(argument_type: Any) -> set[str]:
     try:
@@ -43,8 +45,27 @@ def reasoning_compatibility_guard(
     return require
 
 
-def is_adapter_tensor_file(path: Path) -> bool:
-    name = path.name
-    return name in {"adapter_model.safetensors", "adapter_model.bin"} or (
-        name.startswith("adapter_model-") and name.endswith((".safetensors", ".bin"))
+def adapter_dir_is_loadable(path: Path) -> bool:
+    """True when ``path`` holds a config and weights the engine about to read them can load.
+
+    Both serving runtimes ask this before handing a directory to vLLM, and both used to answer it
+    by looking for any one file whose NAME looked like adapter weights. A name is not the question:
+    peft binds one representation per suffix, and it discovers the sharded form only through
+    ``adapter_model.<ext>.index.json``. A directory holding a lone
+    ``adapter_model-00001-of-00002.safetensors`` and no index therefore has no loadable
+    representation at all, but passed the name check -- which is exactly what a half-finished
+    download looks like, so a cache entry could be declared ready mid-fetch and the engine then
+    fails on weights it was told were there.
+
+    Deferring to :func:`has_loadable_adapter_weights` keeps that verdict identical to the one
+    deployment admission and the exporter already reach from a remote listing. It also drops
+    ``.bin``, which the same authority has never accepted: deployment rejects a bin-only adapter
+    before provisioning, so a runtime that loaded one would be serving something no supported
+    path could have produced.
+    """
+
+    if not (path / "adapter_config.json").is_file():
+        return False
+    return has_loadable_adapter_weights(
+        child.name for child in path.iterdir() if child.is_file() and child.stat().st_size > 0
     )

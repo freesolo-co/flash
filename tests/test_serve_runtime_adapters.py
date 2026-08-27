@@ -186,7 +186,7 @@ def test_same_incarnation_rejects_different_runtime_state(adapter_dir: Path) -> 
     other = adapter_dir.parent / "other"
     other.mkdir()
     (other / "adapter_config.json").write_text("{}")
-    (other / "adapter_model.bin").write_bytes(b"weights")
+    (other / "adapter_model.safetensors").write_bytes(b"weights")
     manager = AdapterManager(_Engine(), EngineConfig(model="model"))
     asyncio.run(manager.register(_spec(adapter_dir)))
 

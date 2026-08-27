@@ -334,6 +334,84 @@ def test_serving_validation_accepts_a_complete_shard_set(monkeypatch):
     _verify_adapter_artifact_tensors("org/repo", "sft/run/adapter", artifact_revision="sha")
 
 
+def _write_dir(tmp_path, name, filenames):
+    """materialize one adapter directory shape as non-empty files beside a config."""
+    path = tmp_path / name
+    path.mkdir()
+    (path / "adapter_config.json").write_text("{}")
+    for filename in filenames:
+        (path / filename).write_bytes(b"\x00")
+    return path
+
+
+_UNLOADABLE_SHAPES = (
+    ("orphan shard, no index", (_SHARDS[0],)),
+    ("partial set beside its index", (_SHARDS[0], _INDEX)),
+    ("bin only", ("adapter_model.bin",)),
+)
+_LOADABLE_SHAPES = (
+    ("complete single file", ("adapter_model.safetensors",)),
+    ("complete indexed shard set", (*_SHARDS, _INDEX)),
+)
+
+
+@pytest.mark.parametrize(("shape", "filenames"), _UNLOADABLE_SHAPES)
+def test_both_serving_runtimes_refuse_an_unloadable_adapter_directory(tmp_path, shape, filenames):
+    """the runtimes answered by filename, so each of these shapes read as ready mid-download.
+
+    an orphan shard and a partial indexed set are literally what an interrupted fetch leaves behind,
+    and a bin-only adapter is one deployment admission rejects before provisioning -- serving it
+    would mean loading an artifact no supported path could have produced.
+    """
+    from flash.serve.request.runtime_support import adapter_dir_is_loadable
+    from flash.serve.runtime.adapters import validate_adapter_path
+    from flash.serve.runtime.errors import AdapterPathError
+    from flash.serving.src.engine.support import _adapter_cache_ready
+
+    path = _write_dir(tmp_path, "adapter", filenames)
+
+    assert not has_loadable_adapter_weights(filenames), shape
+    assert not adapter_dir_is_loadable(path), shape
+    assert not _adapter_cache_ready(path), shape
+    with pytest.raises(AdapterPathError, match="no loadable adapter tensor files"):
+        validate_adapter_path(str(path))
+
+
+@pytest.mark.parametrize(("shape", "filenames"), _LOADABLE_SHAPES)
+def test_both_serving_runtimes_accept_a_loadable_adapter_directory(tmp_path, shape, filenames):
+    from flash.serve.request.runtime_support import adapter_dir_is_loadable
+    from flash.serve.runtime.adapters import validate_adapter_path
+    from flash.serving.src.engine.support import _adapter_cache_ready
+
+    path = _write_dir(tmp_path, "adapter", filenames)
+
+    assert has_loadable_adapter_weights(filenames), shape
+    assert adapter_dir_is_loadable(path), shape
+    assert _adapter_cache_ready(path), shape
+    assert validate_adapter_path(str(path)) == path
+
+
+def test_both_serving_runtimes_ignore_zero_length_adapter_weights(tmp_path):
+    """a created-but-unwritten file is the first thing a download leaves on disk."""
+    from flash.serve.request.runtime_support import adapter_dir_is_loadable
+    from flash.serving.src.engine.support import _adapter_cache_ready
+
+    path = tmp_path / "adapter"
+    path.mkdir()
+    (path / "adapter_config.json").write_text("{}")
+    (path / "adapter_model.safetensors").write_bytes(b"")
+
+    assert not adapter_dir_is_loadable(path)
+    assert not _adapter_cache_ready(path)
+
+
+def test_a_missing_adapter_directory_is_not_ready_rather_than_raising(tmp_path):
+    """the cache probe runs on paths that may not exist yet, so it must answer rather than raise."""
+    from flash.serving.src.engine.support import _adapter_cache_ready
+
+    assert not _adapter_cache_ready(tmp_path / "absent")
+
+
 def test_warmstart_identity_binds_every_shard(monkeypatch):
     """a sharded source could not be seen at all, so warm-start failed at submission.
 
