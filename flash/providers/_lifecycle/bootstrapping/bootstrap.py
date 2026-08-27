@@ -299,6 +299,14 @@ def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
 
 
 def _worker_execution_deadline(upload_deadline_at: float) -> float:
+    """When the worker must be done, leaving the console upload window intact behind it.
+
+    This is also the cap on group teardown. Teardown starts here and a group that ignores SIGTERM
+    would otherwise wait out its full term-then-kill grace, spending the window reserved for the
+    final console tail -- the tail that carries the line saying the box is still occupied. The run
+    wall budget may narrow the worker's own deadline below this instant, but teardown stays capped
+    here: the upload window is what it must not overrun.
+    """
     return upload_deadline_at - _CONSOLE_UPLOAD_STOP_TIMEOUT_S - _CONSOLE_UPLOAD_FINAL_TIMEOUT_S
 
 
@@ -605,7 +613,7 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     """Run one worker subprocess; tee console to a file and upload periodically for live logs."""
     console = f"/tmp/console_{mode}.txt"
     upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
-    worker_deadline_at = _worker_execution_deadline(upload_deadline_at)
+    worker_deadline_at = teardown_deadline_at = _worker_execution_deadline(upload_deadline_at)
     # cap work from its actual start: the absolute deadline includes boot grace, whose unused
     # portion must not extend the declared wall-time budget.
     budget = payload.get("run_max_wall_seconds")
@@ -693,9 +701,7 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                     _bootstrap_processes.terminate_process_group(
                         proc,
                         process_group_id=worker_process_group_id,
-                        deadline_at=upload_deadline_at
-                        - _CONSOLE_UPLOAD_STOP_TIMEOUT_S
-                        - _CONSOLE_UPLOAD_FINAL_TIMEOUT_S,
+                        deadline_at=teardown_deadline_at,
                     )
                 except RuntimeError as exc:
                     survived_teardown = str(exc)
