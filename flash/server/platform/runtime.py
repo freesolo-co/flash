@@ -611,7 +611,7 @@ def _quarantine_corrupt_recovery_record(run_id: str, known: set[str], exc: Excep
         "provider handle unavailable, orphan sweep will attempt label cleanup"
     )
     with contextlib.suppress(Exception):
-        _quarantine_corrupt_status(run_id, detail)
+        _quarantine_corrupt_status(run_id)
     with contextlib.suppress(Exception):
         _update(run_id, "failed", error=detail)
     with contextlib.suppress(Exception):
