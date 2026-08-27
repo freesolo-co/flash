@@ -27,17 +27,24 @@ def packed_full_sequence(tensor, data):
     """Put a full-sequence teacher tensor into the layout `no_padding_2_padding` documents.
 
     That helper wants a nested tensor or `(total_nnz, *)` and reads `.values()` only when
-    nested, so a padded teacher measures as `bsz` and trips its `total_nnz` assertion. Lengths
-    come from whichever field carries them, because `no_padding_2_padding` consults
-    `attention_mask` only for strided prompts: a nested-prompt batch need not hold that key at
-    all, and packing off the mask alone would turn its assertion into a `KeyError`.
-    """
-    import torch
+    nested, so a padded teacher measures as `bsz` and trips its `total_nnz` assertion.
 
+    The mask decides which positions are real, never the row's shape. verl pads a teacher row on
+    both sides (`_pad_teacher_outputs` left-pads by `prompt_width - prompt_length` and right-pads
+    the response), so a length alone cannot say where the real tokens sit and selecting a prefix
+    would silently train against the pad.
+    """
     if tensor.is_nested:
         return tensor
-    prompts = data["prompts"]
-    if not prompts.is_nested:
+    if "attention_mask" in data:
         return tensor[data["attention_mask"].bool()]
-    lengths = prompts.offsets().diff() + data["responses"].offsets().diff()
-    return tensor[torch.arange(tensor.shape[1], device=tensor.device) < lengths.unsqueeze(1)]
+    # no mask: a nested-prompt batch need not carry that key. verl stacks this field only when
+    # every sequence shares one length, and a teacher row is padded only by the helper above,
+    # which pads to the strided widths. So an unmasked stack is full and every position is real.
+    lengths = data["prompts"].offsets().diff() + data["responses"].offsets().diff()
+    if int(lengths.min()) != tensor.shape[1] or int(lengths.max()) != tensor.shape[1]:
+        raise AssertionError(
+            "flash OPD teacher tensor is padded but the batch carries no attention mask: "
+            f"width {tensor.shape[1]} against lengths {int(lengths.min())}..{int(lengths.max())}"
+        )
+    return tensor.flatten(0, 1)

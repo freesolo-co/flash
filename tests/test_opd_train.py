@@ -9916,34 +9916,89 @@ def test_packed_full_sequence_rejects_a_tensor_that_is_not_full_width():
         _packed_full_sequence(response_only, data)
 
 
-def test_packed_full_sequence_handles_nested_prompts_without_a_mask():
-    """A batch can pair nested prompts with a padded teacher and carry no attention_mask.
+@pytest.mark.parametrize("nested_prompts", [False, True])
+def test_packed_full_sequence_selects_by_mask_not_by_prefix(nested_prompts):
+    """verl pads a teacher row on BOTH sides, so a length can never say where the real tokens sit.
 
-    `no_padding_2_padding` reads `attention_mask` only when `prompts` is strided, so that key
-    is not guaranteed present. Packing off the mask alone would turn this batch's assertion
-    into a KeyError instead of fixing it, and `list_of_dict_to_tensordict` chooses the layout
-    per field, so prompts and teacher can disagree.
+    `_pad_teacher_outputs` left-pads by `prompt_width - prompt_length` and right-pads the
+    response. Selecting the first `length` positions therefore takes pad and drops real teacher
+    logprobs, which trains against silently misaligned supervision rather than crashing. The
+    values here are all nonzero so a prefix select cannot coincidentally match.
+
+    Both prompt layouts are covered because the mask, not the prompts field, decides which
+    positions are real. Reading the layout instead of the mask passes the strided case and
+    quietly mis-slices the nested one.
     """
     torch = pytest.importorskip("torch")
     TensorDict = pytest.importorskip("tensordict").TensorDict
 
-    from flash.engine.worker.train.opd.bridging.prompts import encode_shifted_group_metadata
     from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
 
     samples = [(100, 1024), (120, 900), (90, 1024)]
-    rows, prompts, responses = [], [], []
-    for prompt_len, response_len in samples:
-        _ids, logprobs = encode_shifted_group_metadata(
-            prompt_len, response_len, [(list(range(response_len)), -1.5)]
-        )
-        rows.append(torch.tensor(logprobs, dtype=torch.float32).unsqueeze(-1))
-        prompts.append(torch.arange(1, prompt_len + 1, dtype=torch.int64))
-        responses.append(torch.arange(1, response_len + 1, dtype=torch.int64))
+    prompt_width = max(prompt_len for prompt_len, _ in samples)
+    response_width = max(response_len for _, response_len in samples)
 
-    width = max(p + r for p, r in samples)
-    padded_teacher = torch.stack(
-        [torch.cat([row, row.new_zeros(width - row.shape[0], 1)]) for row in rows]
+    rows, expected, masks = [], [], []
+    for prompt_len, response_len in samples:
+        real = torch.arange(1, prompt_len + response_len + 1, dtype=torch.float32).unsqueeze(-1)
+        expected.append(real)
+        # exactly verl's padding: left on the prompt half, right on the response half.
+        rows.append(
+            torch.cat(
+                [
+                    real.new_zeros(prompt_width - prompt_len, 1),
+                    real,
+                    real.new_zeros(response_width - response_len, 1),
+                ]
+            )
+        )
+        masks.append(
+            torch.tensor(
+                [0] * (prompt_width - prompt_len)
+                + [1] * (prompt_len + response_len)
+                + [0] * (response_width - response_len)
+            )
+        )
+
+    if nested_prompts:
+        fields = {
+            "prompts": torch.nested.as_nested_tensor(
+                [torch.arange(1, prompt_len + 1) for prompt_len, _ in samples], layout=torch.jagged
+            ),
+            "responses": torch.nested.as_nested_tensor(
+                [torch.arange(1, response_len + 1) for _, response_len in samples],
+                layout=torch.jagged,
+            ),
+        }
+    else:
+        fields = {
+            "prompts": torch.zeros(len(samples), prompt_width, dtype=torch.int64),
+            "responses": torch.zeros(len(samples), response_width, dtype=torch.int64),
+        }
+    data = TensorDict(
+        {**fields, "attention_mask": torch.stack(masks)},
+        batch_size=[len(samples)],
     )
+
+    packed = _packed_full_sequence(torch.stack(rows), data)
+    assert torch.equal(packed, torch.cat(expected))
+
+
+def test_packed_full_sequence_refuses_a_padded_teacher_with_no_mask():
+    """Without a mask there is no way to locate the real tokens, so fail rather than guess.
+
+    A nested-prompt batch need not carry `attention_mask`. verl stacks the teacher field only
+    when every sequence shares one length, so an unmasked stack should already be full-width.
+    If it is not, the batch violates that expectation and any selection would be a guess.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    samples = [(100, 1024), (120, 900), (90, 1024)]
+    prompts = [torch.arange(1, prompt_len + 1) for prompt_len, _ in samples]
+    responses = [torch.arange(1, response_len + 1) for _, response_len in samples]
     data = TensorDict(
         {
             "prompts": torch.nested.as_nested_tensor(prompts, layout=torch.jagged),
@@ -9953,9 +10008,38 @@ def test_packed_full_sequence_handles_nested_prompts_without_a_mask():
     )
     assert "attention_mask" not in data
 
-    actual = _reference_no_padding_2_padding(_packed_full_sequence(padded_teacher, data), data)
-    expected = _reference_no_padding_2_padding(
-        torch.nested.as_nested_tensor(rows, layout=torch.jagged), data
+    width = max(prompt_len + response_len for prompt_len, response_len in samples)
+    with pytest.raises(AssertionError, match="carries no attention mask"):
+        _packed_full_sequence(torch.zeros(len(samples), width, 1), data)
+
+
+def test_packed_full_sequence_flattens_a_full_unmasked_stack():
+    """The reachable no-mask case: prompt lengths differ but every total is equal.
+
+    Prompts nest because their lengths differ, while the teacher field stacks because the
+    totals agree. Nothing was padded, so every position is real and the whole stack flattens.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    samples = [(100, 1024), (120, 1004)]
+    prompts = [torch.arange(1, prompt_len + 1) for prompt_len, _ in samples]
+    responses = [torch.arange(1, response_len + 1) for _, response_len in samples]
+    data = TensorDict(
+        {
+            "prompts": torch.nested.as_nested_tensor(prompts, layout=torch.jagged),
+            "responses": torch.nested.as_nested_tensor(responses, layout=torch.jagged),
+        },
+        batch_size=[len(samples)],
     )
-    assert actual.shape == expected.shape
-    assert torch.equal(actual, expected)
+
+    width = samples[0][0] + samples[0][1]
+    assert {prompt_len + response_len for prompt_len, response_len in samples} == {width}
+    teacher = torch.arange(1, len(samples) * width + 1, dtype=torch.float32).reshape(
+        len(samples), width, 1
+    )
+
+    packed = _packed_full_sequence(teacher, data)
+    assert torch.equal(packed, teacher.flatten(0, 1))
