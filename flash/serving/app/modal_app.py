@@ -5,8 +5,11 @@ README to deploy.
 """
 
 import asyncio
+import hashlib
+import json
 import os
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -135,21 +138,12 @@ def scaledown_window_for(gpu: str) -> int:
     return SCALEDOWN_WINDOW_SECONDS_BY_GPU.get(gpu, DEFAULT_SCALEDOWN_WINDOW_SECONDS)
 
 
-# gpu model engines scale to zero. inference and adapter registration remote calls start the matching
-# parameter-bound engine on demand.
-MIN_CONTAINERS = 0
-# no autoscaling cap per base-model engine; modal adds capacity as concurrency demands.
-MAX_CONTAINERS = None
-# Concurrent requests packed onto one base-model GPU before Modal autoscales a new (costly) one.
-# A real-GPU sweep (scripts/gpu_canary.py::sweep_concurrency on A10G/Qwen2.5-1.5B) showed vLLM
-# throughput scaling near-linearly with no saturation through 128 concurrent, while TTFT stayed
-# <60 ms — so the old default of 32 left ~2x of each GPU idle. 64 packs ~2.3x the throughput per
-# GPU for ~+14% per-request latency (now blunted by the fp8 KV cache, which is on for every base —
-# see settings.KV_CACHE_DTYPE), roughly halving GPU count for the same load.
-# Per-engine concurrency is sized by _engine_concurrency from each model's max_num_seqs; these are
-# the router/global ceiling. TARGET_INPUTS auto-derives to 48 (= 64*3//4).
-MAX_INPUTS = 64
-TARGET_INPUTS = max(1, MAX_INPUTS * 3 // 4)
+# each advertised model and the cpu router keep one warm container plus one buffer container.
+MIN_CONTAINERS = 1
+BUFFER_CONTAINERS = 1
+# router concurrency is per cpu replica and independent of the number of gpu engine replicas.
+ROUTER_MAX_INPUTS = 36
+ROUTER_TARGET_INPUTS = 27
 
 # engines enable trust_remote_code, so their secret uses an allowlist: future credentials
 # default to staying router-only. engines hydrate adapter state per request from the router-forwarded
@@ -243,11 +237,12 @@ image = (
             "TRANSFORMERS_CACHE": f"{HOSTING_CACHE_MOUNT}/transformers",
             # vLLM's own cache root, on the SAME persistent volume as the weight caches above.
             # It defaults to ~/.cache/vllm (vllm/envs.py), which is ephemeral container storage, so
-            # every scale-from-zero re-compiled the model from scratch: vLLM writes its torch.compile
-            # artifacts to VLLM_CACHE_ROOT/torch_compile_cache/<hash>/ (vllm/compilation/backends.py),
-            # plus modelinfos/ and the GPU p2p cache. With MIN_CONTAINERS = 0 and a 30-minute
-            # scaledown window that cost is paid on every cold start — it is the torch.compile +
-            # graph-capture portion of the ~1010s 35B engine init measured for STARTUP_TIMEOUT_SECONDS.
+            # every replacement container re-compiled the model from scratch: vllm writes its
+            # torch.compile artifacts to VLLM_CACHE_ROOT/torch_compile_cache/<hash>/
+            # (vllm/compilation/backends.py), plus modelinfos/ and the gpu p2p cache. without the
+            # persistent cache that cost is paid on every replacement or recovery cold start. it is
+            # the torch.compile + graph-capture portion of the ~1010s 35B engine init measured for
+            # STARTUP_TIMEOUT_SECONDS.
             # vLLM's own startup benchmark DEFINES a cold start this way (benchmarks/startup.py
             # cold_startup() points VLLM_CACHE_ROOT at a fresh mkdtemp), so leaving it unset on
             # ephemeral storage reproduces that worst case involuntarily.
@@ -294,72 +289,88 @@ hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing
 # import so it registers nothing, and inside the ``flash`` package so the image's
 # ``add_local_python_source("flash")`` ships it to the remote container under the same import path
 # it has here), re-exported so ``_build_engine`` can subclass it.
-from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
-
-# ---- One Modal LoraEngine class per GPU tier -----------------------------------------------------
+# ---- One Modal LoraEngine class per exact advertised model ---------------------------------------
 # model_config is a pure-stdlib module (no heavy deps), so importing it at module scope is safe for
 # `modal deploy` (which imports modal_app.py locally) — unlike the vllm/transformers imports, which
 # stay lazy inside the engine methods.
+from flash.serving.app.modal_dispatch import (  # noqa: E402
+    _admission_queue,
+    _await_modal_call,
+    _required_stream_identity,
+    _spawn_modal_call,
+)
+from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
 from flash.serving.src.engine.model_config import (  # noqa: E402
+    HostedTrafficPolicy,
     base_models,
-    engine_overrides_for,
     gpu_for,
+    hosted_traffic_policy_for,
 )
 
 
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
-    """(max_inputs, target_inputs) sized to the model's REAL vLLM concurrency (``max_num_seqs``).
-
-    Modal's ``max_inputs`` is how many requests it packs onto ONE container before it must add
-    another. If it far exceeds the engine's ``max_num_seqs`` (e.g. the global 64 on the 35B, which
-    decodes only 8 at a time), Modal piles requests 9..64 INSIDE the container instead of autoscaling
-    — high latency and no scale-out until ~target_inputs are packed. So cap ``max_inputs`` near the
-    engine's capacity with a small boot buffer (2x, so a cold-booting replacement doesn't reject
-    bursts), bounded by the global ``MAX_INPUTS``; scale out at 3/4 of that. Models that leave
-    ``max_num_seqs`` at the vLLM default keep the global sizing."""
-    seqs = int(engine_overrides_for(base_model).get("max_num_seqs", MAX_INPUTS))
-    max_inputs = max(8, min(MAX_INPUTS, seqs * 2))
-    target_inputs = max(1, max_inputs * 3 // 4)
-    return max_inputs, target_inputs
+    policy = hosted_traffic_policy_for(base_model)
+    return policy.max_inputs, policy.target_inputs
 
 
-def _engine_class_name(gpu: str, max_inputs: int) -> str:
-    """Deterministic, Modal-safe class name for a (GPU tier, concurrency) engine — e.g.
-    ('A100-80GB', 16) -> 'LoraEngine_A100_80GB_c16'. The concurrency is part of the identity because
-    ``modal.concurrent`` is fixed per class, so tiers sharing a GPU but needing different max_inputs
-    must be distinct classes."""
-    base = "LoraEngine_" + "".join(ch if ch.isalnum() else "_" for ch in gpu)
-    return f"{base}_c{max_inputs}"
+def _policy_contract(base_model: str) -> dict[str, Any]:
+    """Every value that is baked into a modal class at decoration time."""
+    policy = hosted_traffic_policy_for(base_model)
+    return {
+        "base_model": base_model,
+        "gpu": gpu_for(base_model),
+        "scaledown_window": scaledown_window_for(gpu_for(base_model)),
+        "startup_timeout": STARTUP_TIMEOUT_SECONDS,
+        "timeout": TIMEOUT_SECONDS,
+        "min_containers": policy.min_containers,
+        "buffer_containers": policy.buffer_containers,
+        "max_inputs": policy.max_inputs,
+        "target_inputs": policy.target_inputs,
+    }
 
 
-def _build_engine(
-    gpu: str,
-    class_name: str,
-    max_inputs: int,
-    target_inputs: int,
-) -> Any:
-    """Register one Modal ``@app.cls`` LoraEngine pinned to ``gpu``.
+def _engine_class_name(base_model: str) -> str:
+    """Deterministic identity for one exact model and every decorator-affecting policy value.
 
-    Modal fixes a class's GPU at decoration time, so the A100-80GB 35B model and the L4 models need
-    distinct classes. The Modal entrypoints are defined fresh here (so each class owns its own method
-    objects) and forward to the shared ``_``-prefixed impl on ``_LoraEngineImpl``.
+    the digest is part of the name so changing any baked policy value produces a distinct modal
+    class rather than silently redeploying the old registration under the same name.
+    """
+    contract = _policy_contract(base_model)
+    digest = hashlib.sha256(
+        json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:12]
+    model_name = base_model.rsplit("/", 1)[-1]
+    safe_model = "".join(ch if ch.isalnum() else "_" for ch in model_name)[:32]
+    return f"LoraEngine_{safe_model}_{digest}"
 
-    Class identity (name/qualname + module-global binding) is fixed BEFORE the class-level decorators
-    run. With the real Modal SDK ``@modal.concurrent`` returns a wrapper that holds the user class
-    separately, so renaming the bound name AFTER the decorator would rename the wrapper, not the class
-    Modal registers — every tier would then register under ``_Engine`` and the ``<locals>`` qualname
-    would fail Modal's global-scope validation. So we apply ``modal.concurrent``/``app.cls`` in call
-    form on an already-renamed, already-module-global class."""
+
+def _build_engine(base_model: str, class_name: str, policy: HostedTrafficPolicy) -> Any:
+    """Register one Modal class for one exact advertised model and traffic policy.
+
+    Modal fixes a class's gpu and concurrency at decoration time, so each advertised model gets its
+    own class with its identity baked in rather than a runtime ``modal.parameter()``. The Modal
+    entrypoints are defined fresh here (so each class owns its own method objects) and forward to
+    the shared ``_``-prefixed impl on ``_LoraEngineImpl``.
+
+    Class identity (name/qualname + module-global binding) is fixed BEFORE the class-level
+    decorators run. With the real Modal SDK ``modal.concurrent`` returns a wrapper that holds the
+    user class separately, so renaming the bound name AFTER the decorator would rename the wrapper,
+    not the class Modal registers -- every model would then register under ``_Engine`` and the
+    ``<locals>`` qualname would fail Modal's global-scope validation. So we apply
+    ``modal.concurrent``/``app.cls`` in call form on an already-renamed, already-module-global class.
+    """
+    gpu = gpu_for(base_model)
+    exact_base_model = base_model
 
     class _Engine(_LoraEngineImpl):
-        base_model: str = modal.parameter()
+        base_model: str = exact_base_model
 
         @modal.enter()
         async def load(self) -> None:
             await self._load()
 
         @modal.exit()
-        async def exit(self) -> None:
+        async def cleanup(self) -> None:
             # replica-local adapter directories live outside the shared volume, so this replica
             # must delete its own materialization root before the container goes away.
             await self._exit()
@@ -379,23 +390,43 @@ def _build_engine(
             record_dict: dict[str, Any] | None = None,
             expected_checkpoint: str | None = None,
             generation_id: str | None = None,
+            pre_header_dispatch_deadline: float | None = None,
+            admission_queue_id: str | None = None,
+            invocation_nonce: str | None = None,
         ) -> dict[str, Any]:
             return await self._generate(
-                payload_dict, record_dict, expected_checkpoint, generation_id
+                payload_dict,
+                record_dict,
+                expected_checkpoint,
+                generation_id,
+                pre_header_dispatch_deadline,
+                admission_queue_id,
+                invocation_nonce,
             )
 
-        @modal.method(is_generator=True)
-        async def stream_generate(
+        @modal.method()
+        async def stream_generate_call(
             self,
             payload_dict: dict[str, Any],
-            record_dict: dict[str, Any] | None = None,
-            expected_checkpoint: str | None = None,
-            generation_id: str | None = None,
-        ):
-            async for event in self._stream_generate(
-                payload_dict, record_dict, expected_checkpoint, generation_id
-            ):
-                yield event
+            record_dict: dict[str, Any] | None,
+            expected_checkpoint: str | None,
+            generation_id: str,
+            dispatch_deadline_unix: float,
+            queue_id: str,
+            invocation_nonce: str,
+        ) -> dict[str, Any]:
+            from flash.serving.src.stream_channel.engine import stream_generate_call
+
+            return await stream_generate_call(
+                self,
+                payload_dict,
+                record_dict,
+                expected_checkpoint,
+                generation_id,
+                dispatch_deadline_unix,
+                queue_id,
+                invocation_nonce,
+            )
 
         @modal.method()
         async def unregister(
@@ -428,43 +459,34 @@ def _build_engine(
         scaledown_window=scaledown_window_for(gpu),
         startup_timeout=STARTUP_TIMEOUT_SECONDS,
         timeout=TIMEOUT_SECONDS,
-        min_containers=MIN_CONTAINERS,
-        max_containers=MAX_CONTAINERS,
-    )(modal.concurrent(max_inputs=max_inputs, target_inputs=target_inputs)(_Engine))
+        min_containers=policy.min_containers,
+        buffer_containers=policy.buffer_containers,
+    )(
+        modal.concurrent(
+            max_inputs=policy.max_inputs,
+            target_inputs=policy.target_inputs,
+        )(_Engine)
+    )
     # Rebind the module name to the decorated handle, matching the normal ``@app.cls class X`` pattern
     # where the module attribute ends up referring to the decorated class.
     globals()[class_name] = engine
     return engine
 
 
-def _engine_key(base_model: str) -> tuple[str, int]:
-    """(gpu, max_inputs) — the identity of the engine CLASS a base model runs on."""
-    return gpu_for(base_model), _engine_concurrency(base_model)[0]
-
-
-def _distinct_engine_keys() -> list[tuple[str, int]]:
-    """Distinct (gpu, max_inputs) engine classes needed across the catalog, order-stable."""
-    keys: dict[tuple[str, int], None] = {}
-    for bm in base_models():
-        keys.setdefault(_engine_key(bm), None)
-    return list(keys)
-
-
-# One engine class per distinct (GPU tier, concurrency) — see _engine_concurrency for why max_inputs
-# is part of the class identity (Modal fixes concurrency per class).
-ENGINE_BY_KEY: dict[tuple[str, int], Any] = {
-    (gpu, mi): _build_engine(gpu, _engine_class_name(gpu, mi), mi, max(1, mi * 3 // 4))
-    for (gpu, mi) in _distinct_engine_keys()
+ENGINE_BY_MODEL: dict[str, Any] = {
+    model: _build_engine(model, _engine_class_name(model), hosted_traffic_policy_for(model))
+    for model in base_models()
 }
 
 
 def _engine_cls_for(base_model: str) -> Any:
-    """The Modal LoraEngine class to run ``base_model`` on (its (GPU, concurrency) class)."""
-    return ENGINE_BY_KEY[_engine_key(base_model)]
+    """The Modal LoraEngine class for ``base_model``. Rejects an unsupported model first."""
+    hosted_traffic_policy_for(base_model)
+    return ENGINE_BY_MODEL[base_model]
 
 
 class _ModalEnginePool:
-    """Dispatches router calls to each base model's per-gpu-tier ``LoraEngine`` container."""
+    """Dispatch each model directly to its dedicated Modal engine class."""
 
     @staticmethod
     def _record_payload(record: Any) -> dict[str, Any]:
@@ -483,42 +505,58 @@ class _ModalEnginePool:
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
-        engine = _engine_cls_for(base_model)(base_model=base_model)
-        return await engine.generate.remote.aio(
-            payload.model_dump(by_alias=True),
-            self._record_payload(record),
-            expected_checkpoint,
-            generation_id,
-        )
+        deadline = payload._pre_header_dispatch_deadline
+        if deadline is None:
+            raise RuntimeError("pre-header dispatch deadline is required before modal dispatch")
+        engine = _engine_cls_for(base_model)()
+        invocation_nonce = uuid.uuid4().hex
+        async with _admission_queue(deadline) as queue:
+            call = await _spawn_modal_call(
+                engine.generate,
+                deadline,
+                payload.model_dump(by_alias=True),
+                self._record_payload(record),
+                expected_checkpoint,
+                generation_id,
+                deadline,
+                queue.object_id,
+                invocation_nonce,
+            )
+            return await _await_modal_call(
+                call,
+                queue,
+                deadline,
+                generation_id=generation_id,
+                invocation_nonce=invocation_nonce,
+            )
 
-    async def stream_generate(
+    def stream_generate(
         self,
         base_model: str,
         payload: Any,
         record: Any,
         *,
         expected_checkpoint: str | None = None,
-    ):
-        generation_id = payload.generation_id
-        if not generation_id:
-            raise RuntimeError("generation id is required before modal dispatch")
-        engine = _engine_cls_for(base_model)(base_model=base_model)
-        remote_stream = engine.stream_generate.remote_gen.aio(
-            payload.model_dump(by_alias=True),
-            self._record_payload(record),
-            expected_checkpoint,
-            generation_id,
+    ) -> AsyncIterator[dict[str, Any]]:
+        # returns the channel itself rather than wrapping it in a generator, so the caller's
+        # aclose() reaches the channel's own cancellation path instead of being swallowed by a
+        # wrapper that has already been closed.
+        from flash.serving.src.stream_channel.client import CancellableStreamChannel
+
+        generation_id, deadline = _required_stream_identity(payload)
+        engine = _engine_cls_for(base_model)()
+        return CancellableStreamChannel(
+            spawn_method=engine.stream_generate_call,
+            payload_dict=payload.model_dump(by_alias=True),
+            record_dict=self._record_payload(record),
+            expected_checkpoint=expected_checkpoint,
+            generation_id=generation_id,
+            dispatch_deadline_unix=deadline,
+            invocation_nonce=uuid.uuid4().hex,
         )
-        try:
-            async for event in remote_stream:
-                yield event
-        finally:
-            close = getattr(remote_stream, "aclose", None)
-            if close is not None:
-                await close()
 
     async def register(self, base_model: str, record: Any) -> None:
-        engine = _engine_cls_for(base_model)(base_model=base_model)
+        engine = _engine_cls_for(base_model)()
         await engine.register.remote.aio(
             self._record_payload(record),
             getattr(record, "deployment_generation", None),
@@ -531,7 +569,7 @@ class _ModalEnginePool:
         adapter_id: str,
         expected_generation: str | None = None,
     ) -> None:
-        engine = _engine_cls_for(base_model)(base_model=base_model)
+        engine = _engine_cls_for(base_model)()
         await engine.unregister.remote.aio(org_id, adapter_id, expected_generation)
 
 
@@ -728,10 +766,14 @@ def _base_model_records() -> list:
 
 @app.function(
     secrets=runtime_secrets,
-    min_containers=1,  # one warm CPU front door (hardcoded; no deploy-time knob)
+    min_containers=MIN_CONTAINERS,
+    buffer_containers=BUFFER_CONTAINERS,
     timeout=ROUTER_TIMEOUT_SECONDS,  # must cover engine cold start (see ROUTER_TIMEOUT_SECONDS)
 )
-@modal.concurrent(max_inputs=MAX_INPUTS, target_inputs=TARGET_INPUTS)
+@modal.concurrent(
+    max_inputs=ROUTER_MAX_INPUTS,
+    target_inputs=ROUTER_TARGET_INPUTS,
+)
 @modal.asgi_app(
     label=APP_NAME,
     # Claim the branded domain only when one is configured for this workspace; empty => omit it so the
@@ -762,8 +804,9 @@ def router():
         # durable capture is required in configured serving deployments.
         usage_store=_build_usage_outbox(settings),
         # External chat auth is ALWAYS enforced: a request needs a Freesolo API key whose org owns
-        # the adapter (the backend authorizes), or the shared internal key to bypass. The authorizer
-        # must be wired (backend URL + internal key) or non-internal chat fails closed.
+        # the adapter (the backend authorizes). The shared internal key bypasses user-key auth only;
+        # inference still requires target-derived organization attribution. The authorizer must be
+        # wired (backend URL + internal key) or non-internal chat fails closed.
         chat_authorizer=_build_chat_authorizer(settings),
     )
 
@@ -772,21 +815,19 @@ def router():
 def start_all(base_model: str | None = None) -> None:
     """Explicitly boot deployed gpu engines and wait for them to report healthy.
 
-    Normal deploys leave gpu engines at zero until inference or adapter registration reaches the
-    matching base model. This manual diagnostic can boot one model with ``--base-model`` or every
-    catalog model without changing the scale-to-zero deployment.
+    Normal deploys keep one warm container and one buffer container for every advertised model.
+    This manual diagnostic verifies one model with ``--base-model`` or every catalog model without
+    changing that Modal-managed scaling policy.
     """
-    from flash.serving.src.engine.model_config import base_models, gpu_for
+    from flash.serving.src.engine.model_config import base_models
 
     started = {}
     failures: list[str] = []
     models = [base_model] if base_model else list(base_models())
     for bm in models:
-        # Each base model's engine lives on its (GPU tier, concurrency) class.
-        engine = modal.Cls.from_name(
-            APP_NAME, _engine_class_name(gpu_for(bm), _engine_concurrency(bm)[0])
-        )
-        instance = engine(base_model=bm)
+        # Each base model has its own exact engine class.
+        engine = modal.Cls.from_name(APP_NAME, _engine_class_name(bm))
+        instance = engine()
         started[bm] = instance.health.spawn()
     for bm, handle in started.items():
         try:

@@ -26,21 +26,27 @@ from flash.serving.src.accounting.usage_outbox import (
 @pytest.fixture(scope="module")
 def load_modal_app_under_stub() -> Iterator[Callable[[Any], Any]]:
     module_name = "flash.serving.app.modal_app"
+    # modal_dispatch binds ``modal`` at its own module scope, so it must be evicted alongside the app
+    # module. leaving it cached would let the app import a dispatch module still holding the real sdk
+    # (or a previous test's stub), which only shows up once another file has already loaded it.
+    reloaded = (module_name, "flash.serving.app.modal_dispatch")
     missing = object()
     previous_modal = sys.modules.get("modal", missing)
-    previous_app = sys.modules.get(module_name, missing)
+    previous_modules = {name: sys.modules.get(name, missing) for name in reloaded}
 
     def load(modal_stub: Any) -> Any:
         sys.modules["modal"] = modal_stub
-        sys.modules.pop(module_name, None)
+        for name in reloaded:
+            sys.modules.pop(name, None)
         return importlib.import_module(module_name)
 
     try:
         yield load
     finally:
-        sys.modules.pop(module_name, None)
-        if previous_app is not missing:
-            sys.modules[module_name] = previous_app
+        for name, previous in previous_modules.items():
+            sys.modules.pop(name, None)
+            if previous is not missing:
+                sys.modules[name] = previous
         if previous_modal is missing:
             sys.modules.pop("modal", None)
         else:

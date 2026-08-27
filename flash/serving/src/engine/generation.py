@@ -6,7 +6,7 @@ import inspect
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, TypedDict
 
@@ -15,6 +15,7 @@ from flash.serve.runtime.sampling import (
     indexed_outputs,
     normalize_token_logprobs,
 )
+from flash.serving.src.engine.dispatch import require_pre_header_dispatch_time
 from flash.serving.src.engine.support import (
     _cached_tokens_reported,
     _num_cached_tokens,
@@ -165,7 +166,12 @@ async def generate(
     record_dict: dict[str, Any] | None = None,
     expected_checkpoint: str | None = None,
     generation_id: str | None = None,
+    pre_header_dispatch_deadline: float | None = None,
+    *,
+    admit: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
+    require_pre_header_dispatch_time(pre_header_dispatch_deadline)
+
     from vllm.sampling_params import RequestOutputKind
 
     payload, is_openai = _payload(payload_dict)
@@ -190,6 +196,9 @@ async def generate(
     source_lease = _source_lease(owner, record, lora_request)
     await source_lease.__aenter__()
     try:
+        require_pre_header_dispatch_time(pre_header_dispatch_deadline)
+        if admit is not None:
+            await admit()
         try:
             in_flight_lease = _in_flight_lease(owner, record, lora_request)
             await in_flight_lease.__aenter__()
@@ -253,7 +262,13 @@ async def stream_generate(
     record_dict: dict[str, Any] | None = None,
     expected_checkpoint: str | None = None,
     generation_id: str | None = None,
+    pre_header_dispatch_deadline: float | None = None,
+    *,
+    pre_generate_check: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
+    if pre_generate_check is None:
+        require_pre_header_dispatch_time(pre_header_dispatch_deadline)
+
     from vllm.sampling_params import RequestOutputKind
 
     payload, _ = _payload(payload_dict)
@@ -286,6 +301,10 @@ async def stream_generate(
         "thinking": thinking,
     }
     try:
+        if pre_generate_check is not None:
+            await pre_generate_check()
+        else:
+            require_pre_header_dispatch_time(pre_header_dispatch_deadline)
         try:
             in_flight_lease = _in_flight_lease(owner, record, lora_request)
             await in_flight_lease.__aenter__()
