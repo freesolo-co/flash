@@ -208,7 +208,7 @@ class ModelInfo:
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 
 # the checkpoint each public catalog model loads for customer-owned serving. hosted activation is
-# a separate allowlist in flash.serving.src.engine.model_config, where qwen3.8-27b remains inactive.
+# a separate allowlist in flash.serving.src.engine.model_config.
 SERVING_MODEL_REPOS: dict[str, str] = {
     "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
     "Qwen/Qwen3.8-27B": "Qwen/Qwen3.8-27B-FP8",
