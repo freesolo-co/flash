@@ -18,7 +18,6 @@ from flash.serve.app.manifest import (
     load_serving_manifest,
 )
 from flash.serve.control import (
-    AdapterAliasIntent,
     DeploymentRequest,
     EngineIdentity,
     ModalPlacement,
@@ -92,8 +91,7 @@ def _spec_and_inputs(
     aggregate = aggregate_file_digest(files)
     adapter = ResolvedAdapter(
         run_id="run-1",
-        checkpoint="final",
-        adapter_revision=f"run-1@final.{SOURCE_REVISION}",
+        checkpoint_id="run-1/final",
         artifact_repo_id="flash-owned/run-artifacts",
         artifact_repo_type="model",
         artifact_revision=SOURCE_REVISION,
@@ -104,7 +102,6 @@ def _spec_and_inputs(
         lora_rank=16,
         thinking_default=True,
         structured_outputs_default_json='{"json_object":true}',
-        alias_intent=AdapterAliasIntent(True, None),
     )
     spec = plan_deployment(
         DeploymentRequest(
@@ -126,7 +123,7 @@ def _spec_and_inputs(
         engine_args=ENGINE_ARGS,
         tokenizer_kwargs=TOKENIZER_KWARGS,
         processor_kwargs=PROCESSOR_KWARGS,
-        adapters=(AdapterExecutionInput(adapter.adapter_revision, files),),
+        adapters=(AdapterExecutionInput(adapter.checkpoint_id, files),),
     )
     return spec, inputs
 
@@ -186,12 +183,12 @@ def test_manifest_round_trip_is_canonical_and_data_only() -> None:
     assert loaded == manifest
     assert loaded.spec_id == spec.spec_id
     assert loaded.expected_oci_digest == spec.engine.image_digest
-    assert loaded.aliases == {"run-1": spec.adapters[0].adapter_revision}
+    assert loaded.adapters[0].checkpoint_id == "run-1/final"
     assert loaded.adapters[0].repo_id == "flash-owned/run-artifacts"
     assert loaded.adapters[0].files == _files()
     payload = json.loads(manifest.canonical_json())
     assert payload["schema"] == "flash.serving.manifest"
-    assert payload["version"] == 1
+    assert payload["version"] == 2
     assert "manifest_id" not in manifest.payload(False)
     forbidden = {"token", "signed_url", "capability", "local_path", "wheel", "plugin"}
 
@@ -246,7 +243,7 @@ def test_manifest_recomputes_fingerprints_aggregate_and_ids() -> None:
             spec,
             replace(
                 inputs,
-                adapters=(AdapterExecutionInput(spec.adapters[0].adapter_revision, wrong_files),),
+                adapters=(AdapterExecutionInput(spec.adapters[0].checkpoint_id, wrong_files),),
             ),
         )
 
@@ -267,7 +264,7 @@ def test_manifest_rejects_unsupported_runtime_keys_code_artifacts_and_remote_cod
         )
     with pytest.raises(ManifestError, match="exactly config"):
         AdapterExecutionInput(
-            "run-1@final." + SOURCE_REVISION,
+            "run-1/final",
             (
                 ArtifactFile("adapter_config.json", 1, "1" * 64),
                 ArtifactFile("plugin.py", 1, "2" * 64),

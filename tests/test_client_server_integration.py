@@ -327,7 +327,7 @@ def test_deploy_dry_run_and_deployments_roundtrip(make_client) -> None:
     run_id = client.create_run(SPEC)["run_id"]
 
     # A dry-run deploy validates the serving path without provisioning a GPU.
-    deployment = client.deploy(run_id, dry_run=True)
+    deployment = client.deploy(f"{run_id}/final", dry_run=True)
     assert deployment["state"] == "dry_run"
     assert "mode" not in deployment
 
@@ -342,5 +342,5 @@ def test_chat_without_deployment_maps_to_api_error(make_client) -> None:
     # Chatting a run that was never deployed must be refused with a clear 409,
     # which the client surfaces as an ApiError (not a hang or opaque 500).
     with pytest.raises(ApiError) as exc:
-        client.chat(run_id, messages=[{"role": "user", "content": "hi"}])
+        client.chat(f"{run_id}/final", messages=[{"role": "user", "content": "hi"}])
     assert exc.value.status == 409

@@ -881,7 +881,10 @@ def test_route_does_not_blame_the_adapter_for_unrelated_failures(api, monkeypatc
         raise ValueError("no gpu class satisfies the requested memory")
 
     monkeypatch.setattr(app_mod, "prepare_job", _prepare)
-    warm_start_spec = {**SPEC, "train": {**SPEC["train"], "init_from_adapter": "source-run"}}
+    warm_start_spec = {
+        **SPEC,
+        "train": {**SPEC["train"], "init_from_adapter": "source-run/final"},
+    }
     res = api.post("/v1/runs", json={"spec": warm_start_spec}, headers=_bearer("fslo-user-1"))
 
     assert "no gpu class satisfies" in res.text
