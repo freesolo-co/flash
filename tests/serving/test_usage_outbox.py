@@ -14,18 +14,18 @@ from fastapi.testclient import TestClient
 
 from flash.serving.src.accounting.usage import (
     _FREESOLO_USD_PER_MTOK,
+    FREESOLO_PRICING_SOURCE,
     build_usage_session,
     freesolo_price,
     new_generation_id,
+    principal_for_external_org,
 )
 from flash.serving.src.accounting.usage_facts import usage_facts
 from flash.serving.src.accounting.usage_outbox import (
-    AcceptedPriceSnapshot,
     AuthoritativeProviderDay,
     DurableUsageOutbox,
     FreesoloOrgTrafficPrincipal,
     OfflineUsageStore,
-    OpenRouterTrafficPrincipal,
     OutboxSnapshot,
     ProviderSettlementRecord,
     ReconciliationDayResult,
@@ -33,6 +33,7 @@ from flash.serving.src.accounting.usage_outbox import (
     RequestIdentity,
     UsageEvent,
     UsageOutboxError,
+    _settlement_principal,
 )
 from flash.serving.src.http.inference_routes import _discard_prepared_stream
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
@@ -237,16 +238,10 @@ def test_generation_id_format_and_public_identity_separation() -> None:
         request_id=generation_id,
         correlation_id="correlation-1",
         openai_completion_id="chatcmpl-1",
-        openrouter_request_id="or-request-1",
-        openrouter_generation_id="or-generation-1",
-        upstream_id="upstream-1",
     )
     assert identity.request_id not in {
         identity.correlation_id,
         identity.openai_completion_id,
-        identity.openrouter_request_id,
-        identity.openrouter_generation_id,
-        identity.upstream_id,
     }
 
 
@@ -489,22 +484,11 @@ def test_nonstream_capture_failure_returns_controlled_503() -> None:
     assert response.json() == {"detail": "durable serving accounting unavailable"}
 
 
-def test_openrouter_event_omits_org_and_billable_requested_adapter() -> None:
+def test_every_settled_event_carries_an_attributed_org() -> None:
     record = _revision()
-    principal = OpenRouterTrafficPrincipal(
-        publicModelId="public/model",
-        providerCatalogDigest="catalog-digest-1",
-        acceptedPriceSnapshot=AcceptedPriceSnapshot(
-            promptTokenUsd="0.000001",
-            cachedPromptTokenUsd="0.0000005",
-            completionTokenUsd="0.000002",
-        ),
-    )
     identity = RequestIdentity(
         request_id=new_generation_id(),
         correlation_id="correlation-1",
-        openrouter_request_id="or-request-1",
-        openrouter_generation_id="or-generation-1",
     )
     result = attest(
         record,
@@ -520,7 +504,7 @@ def test_openrouter_event_omits_org_and_billable_requested_adapter() -> None:
     session = build_usage_session(
         OfflineUsageStore(),
         identity,
-        principal,
+        principal_for_external_org("org-1"),
         record,
         record,
         result,
@@ -531,12 +515,39 @@ def test_openrouter_event_omits_org_and_billable_requested_adapter() -> None:
 
     payload = session.event(result).rpc_payload()
 
-    assert payload["traffic_principal_kind"] == "openrouter"
-    assert payload["org_id"] is None
-    assert payload["checkpoint_id"] is None
-    assert payload["public_model_id"] == "public/model"
-    assert payload["provider_catalog_digest"] == "catalog-digest-1"
-    assert payload["accepted_price_snapshot"]["completionTokenUsd"] == "0.000002"
+    assert payload["traffic_principal_kind"] == "freesolo_org"
+    assert payload["org_id"] == "org-1"
+    assert payload["checkpoint_id"] == record.adapter_id
+    assert payload["public_model_id"] == record.adapter_id
+    assert payload["pricing_source"] == FREESOLO_PRICING_SOURCE
+    # no marketplace-specific settlement surface survives on the wire.
+    for absent in (
+        "traffic_source",
+        "openrouter_request_id",
+        "openrouter_generation_id",
+        "upstream_id",
+        "provider_catalog_digest",
+        "accepted_price_snapshot",
+        "quoted_provider_amount_micro_usd",
+    ):
+        assert absent not in payload
+
+
+def test_trusted_internal_settlement_requires_explicit_attribution() -> None:
+    row = _claimed_row()
+    row["traffic_principal_kind"] = "trusted_internal"
+    row["billing_attribution_explicit"] = False
+
+    with pytest.raises(UsageOutboxError, match="usage_principal_invalid"):
+        _settlement_principal(row)
+
+
+def test_settlement_rejects_a_row_without_an_org() -> None:
+    row = _claimed_row()
+    row["org_id"] = None
+
+    with pytest.raises(UsageOutboxError, match="usage_principal_invalid"):
+        _settlement_principal(row)
 
 
 def _usage_event() -> UsageEvent:
@@ -1234,6 +1245,10 @@ def test_startup_claim_recovers_expired_lease_and_delivers() -> None:
                 },
             ),
             acknowledge,
+            # the worker wakes itself after delivering a claimed batch, so it polls again before
+            # shutdown. an exhausted queue would surface as a non-transient background failure.
+            (200, []),
+            (200, []),
             (200, []),
         ]
     )

@@ -40,9 +40,16 @@ _USD_PER_MTOK_DIVISOR = Decimal("1000000")
 @dataclass(frozen=True)
 class AuthorizedTraffic:
     principal: ServingTrafficPrincipal
-    openrouter_request_id: str | None = None
-    openrouter_generation_id: str | None = None
-    upstream_id: str | None = None
+
+
+@dataclass(frozen=True)
+class TrustedInternalAuthorization:
+    """A trusted server-to-server caller that has not yet been attributed to an organization."""
+
+    org_id: str | None = None
+
+
+InferenceAuthorization = AuthorizedTraffic | TrustedInternalAuthorization
 
 
 @dataclass(frozen=True)
@@ -103,7 +110,6 @@ def new_request_identity(
     request: Request,
     *,
     openai_completion_id: str | None = None,
-    traffic: AuthorizedTraffic | None = None,
 ) -> RequestIdentity:
     request_id = new_generation_id()
     supplied_correlation = _bounded_header(request, "X-Correlation-ID")
@@ -112,9 +118,6 @@ def new_request_identity(
         request_id=request_id,
         correlation_id=correlation_id,
         openai_completion_id=openai_completion_id,
-        openrouter_request_id=traffic.openrouter_request_id if traffic else None,
-        openrouter_generation_id=traffic.openrouter_generation_id if traffic else None,
-        upstream_id=traffic.upstream_id if traffic else None,
     )
 
 
@@ -130,29 +133,13 @@ def build_usage_session(
     serving_release: str,
     captured_at: datetime,
 ) -> UsageSession:
-    public_model_id = (
-        principal.publicModelId if principal.kind == "openrouter" else requested.adapter_id
-    )
     immutable_target = ImmutableTarget(
-        public_model_id=public_model_id,
+        public_model_id=requested.adapter_id,
         base_model=target.base_model,
         checkpoint_id=target.adapter_id if target.is_checkpoint else None,
         artifact_fingerprint=target.artifact_fingerprint,
     )
-    price = (
-        CapturedPrice(
-            source="openrouter_admission",
-            version=principal.providerCatalogDigest,
-            snapshot=principal.acceptedPriceSnapshot.model_dump(mode="json"),
-        )
-        if principal.kind == "openrouter"
-        else freesolo_price(target.base_model)
-    )
-    if principal.kind == "trusted_internal" and target.org_id is not None:
-        principal = TrustedInternalTrafficPrincipal(
-            orgId=target.org_id,
-            billingAttributionExplicit=True,
-        )
+    price = freesolo_price(target.base_model)
     return UsageSession(
         store=store,
         identity=identity,
@@ -190,11 +177,8 @@ def principal_for_external_org(org_id: str) -> FreesoloOrgTrafficPrincipal:
     return FreesoloOrgTrafficPrincipal(orgId=org_id)
 
 
-def principal_for_trusted_internal(org_id: str | None = None) -> TrustedInternalTrafficPrincipal:
-    return TrustedInternalTrafficPrincipal(
-        orgId=org_id,
-        billingAttributionExplicit=org_id is not None,
-    )
+def principal_for_trusted_internal(org_id: str) -> TrustedInternalTrafficPrincipal:
+    return TrustedInternalTrafficPrincipal(orgId=org_id)
 
 
 def captured_now() -> datetime:

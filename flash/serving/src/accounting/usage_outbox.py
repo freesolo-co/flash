@@ -10,17 +10,16 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
 from typing import Annotated, Any, Literal, Protocol
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from flash.serving.src.accounting.usage_retry import is_transient_rpc_code
 from flash.serving.src.store.settings import Settings
 from flash.serving.src.store.supabase_rest import supabase_headers
 
 StableId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)]
-DecimalString = Annotated[str, StringConstraints(pattern=r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")]
 _GENERATION_ID_RE = re.compile(r"^fsgen-[0-9a-f]{32}$")
 _HEARTBEAT_BATCH_SIZE = 128
 _RECOVERY_BATCH_SIZE = 500
@@ -41,24 +40,6 @@ _RESPONSE_LOSS_SAFE_RPCS = frozenset(
 )
 
 
-class AcceptedPriceSnapshot(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    promptTokenUsd: DecimalString
-    cachedPromptTokenUsd: DecimalString | None = None
-    completionTokenUsd: DecimalString
-    requestUsd: DecimalString | None = None
-
-
-class OpenRouterTrafficPrincipal(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    kind: Literal["openrouter"] = "openrouter"
-    publicModelId: StableId
-    providerCatalogDigest: StableId
-    acceptedPriceSnapshot: AcceptedPriceSnapshot
-
-
 class FreesoloOrgTrafficPrincipal(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -70,18 +51,12 @@ class TrustedInternalTrafficPrincipal(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     kind: Literal["trusted_internal"] = "trusted_internal"
-    orgId: StableId | None = None
-    billingAttributionExplicit: bool = False
-
-    @model_validator(mode="after")
-    def validate_attribution(self) -> TrustedInternalTrafficPrincipal:
-        if self.orgId is not None and not self.billingAttributionExplicit:
-            raise ValueError("trusted_internal org billing requires explicit attribution")
-        return self
+    orgId: StableId
+    billingAttributionExplicit: Literal[True] = True
 
 
 ServingTrafficPrincipal = Annotated[
-    OpenRouterTrafficPrincipal | FreesoloOrgTrafficPrincipal | TrustedInternalTrafficPrincipal,
+    FreesoloOrgTrafficPrincipal | TrustedInternalTrafficPrincipal,
     Field(discriminator="kind"),
 ]
 
@@ -91,9 +66,6 @@ class RequestIdentity:
     request_id: str
     correlation_id: str
     openai_completion_id: str | None = None
-    openrouter_request_id: str | None = None
-    openrouter_generation_id: str | None = None
-    upstream_id: str | None = None
 
     def __post_init__(self) -> None:
         if _GENERATION_ID_RE.fullmatch(self.request_id) is None:
@@ -103,9 +75,6 @@ class RequestIdentity:
             for value in (
                 self.correlation_id,
                 self.openai_completion_id,
-                self.openrouter_request_id,
-                self.openrouter_generation_id,
-                self.upstream_id,
             )
             if value is not None
         }
@@ -126,7 +95,6 @@ class CapturedPrice:
     source: str
     version: str
     snapshot: Mapping[str, Any]
-    quoted_provider_amount_micro_usd: int | None = None
 
 
 @dataclass(frozen=True)
@@ -156,28 +124,16 @@ class UsageEvent:
 
     def rpc_payload(self) -> dict[str, Any]:
         principal = self.principal
-        openrouter = principal if principal.kind == "openrouter" else None
-        org_id = None if principal.kind == "openrouter" else principal.orgId
-        explicit = (
-            principal.billingAttributionExplicit if principal.kind == "trusted_internal" else False
-        )
-        accepted = openrouter.acceptedPriceSnapshot.model_dump(mode="json") if openrouter else None
         return {
             "request_id": self.identity.request_id,
             "correlation_id": self.identity.correlation_id,
             "traffic_principal_kind": principal.kind,
-            "billing_attribution_explicit": explicit,
-            "org_id": org_id,
-            "traffic_source": "openrouter" if openrouter else "freesolo",
-            "openrouter_request_id": self.identity.openrouter_request_id,
-            "openrouter_generation_id": self.identity.openrouter_generation_id,
+            "billing_attribution_explicit": principal.kind == "trusted_internal",
+            "org_id": principal.orgId,
             "openai_completion_id": self.identity.openai_completion_id,
-            "upstream_id": self.identity.upstream_id,
-            "public_model_id": (
-                openrouter.publicModelId if openrouter else self.target.public_model_id
-            ),
+            "public_model_id": self.target.public_model_id,
             "base_model": self.target.base_model,
-            "checkpoint_id": None if openrouter else self.target.checkpoint_id,
+            "checkpoint_id": self.target.checkpoint_id,
             "artifact_fingerprint": self.target.artifact_fingerprint,
             "prompt_tokens": self.facts.prompt_tokens,
             "completion_tokens": self.facts.completion_tokens,
@@ -195,9 +151,6 @@ class UsageEvent:
             "pricing_source": self.price.source,
             "price_version": self.price.version,
             "price_snapshot": dict(self.price.snapshot),
-            "quoted_provider_amount_micro_usd": self.price.quoted_provider_amount_micro_usd,
-            "provider_catalog_digest": (openrouter.providerCatalogDigest if openrouter else None),
-            "accepted_price_snapshot": accepted,
         }
 
 
@@ -230,6 +183,7 @@ class ReconciliationUnavailable(UsageOutboxError):
 class UsageStore(Protocol):
     enabled: bool
 
+    def assert_healthy(self) -> None: ...
     async def start(self) -> None: ...
     async def capture(self, event: UsageEvent) -> None: ...
     async def finalize(self, event: UsageEvent) -> None: ...
@@ -244,6 +198,9 @@ class OfflineUsageStore:
     """Explicit offline-only store used when app tests do not inject persistence."""
 
     enabled = False
+
+    def assert_healthy(self) -> None:
+        return None
 
     async def start(self) -> None:
         return None
@@ -418,6 +375,15 @@ class DurableUsageOutbox:
         self._generation_lease_deadlines: dict[str, datetime] = {}
         self._active_leases: set[str] = set()
         self._background_error: BaseException | None = None
+
+    def assert_healthy(self) -> None:
+        self._raise_background_error()
+        if self._stopping.is_set():
+            raise UsageOutboxError("usage_outbox_not_accepting_requests")
+        if self._worker is not None and self._worker.done():
+            raise UsageOutboxError("usage_outbox_worker_stopped")
+        if self._heartbeat_worker is not None and self._heartbeat_worker.done():
+            raise UsageOutboxError("usage_outbox_heartbeat_stopped")
 
     async def start(self) -> None:
         if self._worker is not None:
@@ -636,7 +602,15 @@ class DurableUsageOutbox:
                     self._wake.set()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                # a non-transient delivery failure is a settlement defect, not a blip. keep it
+                # instead of looping forever so the health gate can refuse new chargeable traffic.
+                if not _is_transient_rpc_error(exc):
+                    self._background_error = exc
+                    self._stopping.set()
+                    self._wake.set()
+                    self._heartbeat_wake.set()
+                    return
                 await self._sleep(self._poll_seconds)
             if self._wake.is_set():
                 continue
@@ -685,7 +659,7 @@ class DurableUsageOutbox:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if not _is_transient_heartbeat_error(exc):
+                if not _is_transient_rpc_error(exc):
                     raise
                 active_deadlines = [
                     deadline
@@ -903,17 +877,8 @@ class DurableUsageOutbox:
             raise UsageOutboxError("usage_outbox_shutdown_failed") from errors[0]
 
 
-def _is_transient_heartbeat_error(exc: BaseException) -> bool:
-    if not isinstance(exc, UsageOutboxError):
-        return False
-    code = str(exc)
-    if code == "supabase_transport_failure":
-        return True
-    match = re.fullmatch(r"supabase_rpc_([0-9]{3})", code)
-    if match is None:
-        return False
-    status_code = int(match.group(1))
-    return status_code in {408, 429} or status_code >= 500
+def _is_transient_rpc_error(exc: BaseException) -> bool:
+    return isinstance(exc, UsageOutboxError) and is_transient_rpc_code(str(exc))
 
 
 def _generation_capture_result(data: Any) -> dict[str, Any]:
@@ -944,15 +909,16 @@ def _generation_capture_result(data: Any) -> dict[str, Any]:
 
 def _settlement_principal(row: Mapping[str, Any]) -> dict[str, Any]:
     kind = row.get("traffic_principal_kind")
-    if kind == "openrouter":
-        return {"kind": "openrouter", "publicModelId": row.get("public_model_id")}
+    org_id = row.get("org_id")
+    if not isinstance(org_id, str) or not org_id.strip():
+        raise UsageOutboxError("usage_principal_invalid")
     if kind == "freesolo_org":
-        return {"kind": "freesolo_org", "orgId": row.get("org_id")}
-    if kind == "trusted_internal":
+        return {"kind": "freesolo_org", "orgId": org_id}
+    if kind == "trusted_internal" and row.get("billing_attribution_explicit") is True:
         return {
             "kind": "trusted_internal",
-            "orgId": row.get("org_id"),
-            "billingAttributionExplicit": bool(row.get("billing_attribution_explicit")),
+            "orgId": org_id,
+            "billingAttributionExplicit": True,
         }
     raise UsageOutboxError("usage_principal_invalid")
 
@@ -967,13 +933,3 @@ def _parse_datetime(value: Any) -> datetime:
     if parsed.tzinfo is None:
         raise UsageOutboxError("usage_snapshot_timestamp_invalid")
     return parsed
-
-
-def accepted_price_micro_usd(snapshot: AcceptedPriceSnapshot, facts: UsageFacts) -> int:
-    uncached = facts.prompt_tokens - facts.cached_tokens
-    cost = Decimal(snapshot.promptTokenUsd) * uncached
-    cost += Decimal(snapshot.cachedPromptTokenUsd or snapshot.promptTokenUsd) * facts.cached_tokens
-    cost += Decimal(snapshot.completionTokenUsd) * facts.completion_tokens
-    if snapshot.requestUsd is not None:
-        cost += Decimal(snapshot.requestUsd)
-    return int((cost * 1_000_000).quantize(Decimal("1")))

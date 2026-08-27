@@ -6,9 +6,10 @@ from typing import Any
 
 from fastapi import HTTPException, Request, status
 
-from flash.schema import parse_checkpoint_ref
 from flash.serving.src.accounting.usage import (
     AuthorizedTraffic,
+    InferenceAuthorization,
+    TrustedInternalAuthorization,
     UsageSession,
     build_usage_session,
     principal_for_external_org,
@@ -20,6 +21,7 @@ from flash.serving.src.http.headers import (
     assert_internal,
     internal_org_id,
     is_trusted_internal,
+    optional_internal_org_id,
 )
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
 from flash.serving.src.io.schemas import AdapterRecord
@@ -27,6 +29,27 @@ from flash.serving.src.io.streaming import generate_once, openai_chat_stream, pr
 from flash.serving.src.store.lookup import AdapterLookup
 
 APP_STATE_ATTR = "serving_context"
+
+
+def require_attributed_traffic(
+    authorization: InferenceAuthorization, target: AdapterRecord
+) -> AuthorizedTraffic:
+    """resolve a trusted-internal caller to the organization its usage is billed to.
+
+    a trusted internal caller is authenticated but not yet billable. it may state its tenant
+    explicitly, otherwise the resolved target's owner supplies it. a request with neither fails
+    closed rather than producing a chargeable event nobody can be billed for.
+    """
+
+    if isinstance(authorization, AuthorizedTraffic):
+        return authorization
+    org_id = authorization.org_id or target.org_id
+    if org_id is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "serving request lacks required organization attribution",
+        )
+    return AuthorizedTraffic(principal=principal_for_trusted_internal(org_id))
 
 
 class ServingContext:
@@ -67,12 +90,11 @@ class ServingContext:
         self.assert_internal(request)
         return internal_org_id(request)
 
-    async def authorize_inference(self, request: Request, adapter_id: str) -> AuthorizedTraffic:
+    async def authorize_inference(
+        self, request: Request, adapter_id: str
+    ) -> InferenceAuthorization:
         if is_trusted_internal(request, self.trusted_internal_keys):
-            if parse_checkpoint_ref(adapter_id) is None:
-                return AuthorizedTraffic(principal=principal_for_trusted_internal())
-            org_id = internal_org_id(request)
-            return AuthorizedTraffic(principal=principal_for_trusted_internal(org_id=org_id))
+            return TrustedInternalAuthorization(org_id=optional_internal_org_id(request))
         token = _bearer_token(request)
         if not token:
             raise HTTPException(
@@ -84,24 +106,21 @@ class ServingContext:
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth is not configured"
             )
         authorized = await self.chat_authorizer(token, adapter_id)
-        if isinstance(authorized, AuthorizedTraffic):
-            if authorized.principal.kind == "trusted_internal":
-                raise HTTPException(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "serving auth did not return an attributable principal",
-                )
-            return authorized
-        if isinstance(authorized, str) and authorized:
+        if isinstance(authorized, str) and authorized.strip():
             return AuthorizedTraffic(principal=principal_for_external_org(authorized))
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "serving auth did not return an attributable principal",
         )
 
-    @staticmethod
-    def traffic_org_id(traffic: AuthorizedTraffic) -> str | None:
-        principal = traffic.principal
-        return None if principal.kind == "openrouter" else principal.orgId
+    def assert_accounting_healthy(self) -> None:
+        try:
+            self.usage.assert_healthy()
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "durable serving accounting unavailable",
+            ) from exc
 
     def reject_unsettleable_thinking(self, payload: Any, target: AdapterRecord) -> None:
         if not self.usage.enabled:
@@ -152,6 +171,7 @@ class ServingContext:
         captured_at: Any,
         expected_checkpoint: str | None = None,
     ) -> dict[str, Any]:
+        self.assert_accounting_healthy()
         result = await generate_once(
             self.pool,
             self.router,
@@ -211,6 +231,7 @@ class ServingContext:
         generation_id: str,
         expected_checkpoint: str | None,
     ) -> tuple[AsyncIterator[dict[str, Any]], dict[str, str], bool, dict[str, Any]]:
+        self.assert_accounting_healthy()
         return await prepare_stream(
             self.pool,
             self.router,

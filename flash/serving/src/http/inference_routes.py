@@ -21,9 +21,14 @@ from flash.serve.request.openai import (
     parse_chat_request,
     reject_thinking_logprobs,
 )
-from flash.serving.src.accounting.usage import captured_now, new_request_identity
+from flash.serving.src.accounting.usage import (
+    AuthorizedTraffic,
+    InferenceAuthorization,
+    captured_now,
+    new_request_identity,
+)
 from flash.serving.src.accounting.usage_outbox import UsageOutboxError
-from flash.serving.src.http.context import ServingContext
+from flash.serving.src.http.context import ServingContext, require_attributed_traffic
 from flash.serving.src.io.multimodal import _prepare_generate_request
 from flash.serving.src.io.provenance import _checkpoint_provenance, _provenance_headers
 from flash.serving.src.io.requests import (
@@ -45,13 +50,14 @@ inference_router = APIRouter()
 @inference_router.post("/generate", tags=["inference"])
 async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
     context = ServingContext.of(request)
-    traffic = await context.authorize_inference(request, payload.adapter_id)
+    authorization = await context.authorize_inference(request, payload.adapter_id)
     requested, target = await context.lookup.resolve(
-        payload.adapter_id, org_id=context.traffic_org_id(traffic)
+        payload.adapter_id, org_id=_authorization_org_id(authorization)
     )
+    traffic = require_attributed_traffic(authorization, target)
     context.reject_unsettleable_thinking(payload, target)
     await _prepare_generate_request(payload, target)
-    identity = new_request_identity(request, traffic=traffic)
+    identity = new_request_identity(request)
     admitted_at = captured_now()
     try:
         result = await _await_until_disconnect(
@@ -79,14 +85,15 @@ async def generate_for_adapter(
 ) -> JSONResponse:
     context = ServingContext.of(request)
     normalized_adapter_id = _path_adapter_id(adapter_id)
-    traffic = await context.authorize_inference(request, normalized_adapter_id)
+    authorization = await context.authorize_inference(request, normalized_adapter_id)
     req = _parse_generate({**payload, "adapter_id": normalized_adapter_id})
     requested, target = await context.lookup.resolve(
-        req.adapter_id, org_id=context.traffic_org_id(traffic)
+        req.adapter_id, org_id=_authorization_org_id(authorization)
     )
+    traffic = require_attributed_traffic(authorization, target)
     context.reject_unsettleable_thinking(req, target)
     await _prepare_generate_request(req, target)
-    identity = new_request_identity(request, traffic=traffic)
+    identity = new_request_identity(request)
     admitted_at = captured_now()
     try:
         result = await _await_until_disconnect(
@@ -106,6 +113,14 @@ async def generate_for_adapter(
             status.HTTP_503_SERVICE_UNAVAILABLE, "durable serving accounting unavailable"
         ) from exc
     return _inference_json_response(result, target)
+
+
+def _authorization_org_id(authorization: InferenceAuthorization) -> str | None:
+    # tenant scope for the lookup itself. an external key is already bound to its org; a trusted
+    # internal caller scopes by the org header when it supplied one.
+    if isinstance(authorization, AuthorizedTraffic):
+        return authorization.principal.orgId
+    return authorization.org_id
 
 
 def _path_adapter_id(adapter_id: str) -> str:
@@ -128,7 +143,7 @@ def _openai_adapter_id(payload: dict[str, Any]) -> str:
 async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     context = ServingContext.of(request)
     adapter_id = _openai_adapter_id(payload)
-    traffic = await context.authorize_inference(request, adapter_id)
+    authorization = await context.authorize_inference(request, adapter_id)
     try:
         normalized = parse_chat_request(
             payload,
@@ -143,8 +158,9 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         )
         raise HTTPException(request_status, str(exc)) from exc
     requested, target = await context.lookup.resolve(
-        adapter_id, org_id=context.traffic_org_id(traffic)
+        adapter_id, org_id=_authorization_org_id(authorization)
     )
+    traffic = require_attributed_traffic(authorization, target)
     effective_thinking = target.thinking
     if target.serve_base_model:
         override = normalized.chat_template_kwargs.get("enable_thinking")
@@ -165,7 +181,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     include_usage = normalized.include_usage
     await _prepare_generate_request(req, target)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-    identity = new_request_identity(request, openai_completion_id=completion_id, traffic=traffic)
+    identity = new_request_identity(request, openai_completion_id=completion_id)
     admitted_at = captured_now()
     created = int(time.time())
     if stream:
