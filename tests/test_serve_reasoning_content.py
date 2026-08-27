@@ -647,6 +647,6 @@ def test_non_thinking_chat_preserves_tool_only_null_content(monkeypatch) -> None
     tool_calls = [{"type": "function", "function": {"name": "weather", "arguments": "{}"}}]
     _stub_serving(monkeypatch, {"content": None, "tool_calls": tool_calls})
 
-    result = deploy.chat("run-1", [{"role": "user", "content": "hi"}])
+    result = deploy.chat("run-1/final", [{"role": "user", "content": "hi"}], org_id="org-1")
 
     assert result["choices"][0]["message"] == {"content": None, "tool_calls": tool_calls}
