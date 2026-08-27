@@ -17,15 +17,14 @@ from flash import __version__
 from flash.runner.lifecycle.status import get_status
 from flash.runner.lifecycle.submit import prepare_job, submit_job
 from flash.runner.results.checkpoints import list_checkpoints
+from flash.serve.deployment.deploy import chat as serve_chat
+from flash.serve.deployment.deploy import chat_sse as serve_chat_sse
+from flash.serve.deployment.deploy import chat_stream as serve_chat_stream
 from flash.serve.deployment.deploy import (
-    adapter_alias_target,
     deploy_adapter,
     deployment_record,
     undeploy_adapter,
 )
-from flash.serve.deployment.deploy import chat as serve_chat
-from flash.serve.deployment.deploy import chat_sse as serve_chat_sse
-from flash.serve.deployment.deploy import chat_stream as serve_chat_stream
 from flash.serve.deployment.export import export_adapter
 from flash.server.platform import db
 from flash.server.platform.locks import _DEPLOY_LOCKS, _deploy_lock
@@ -66,7 +65,6 @@ __all__ = [
     "_reconcile_cost_loop",
     "_repo_cleanup_loop",
     "_worker_artifacts",
-    "adapter_alias_target",
     "create_app",
     "deploy_adapter",
     "deployment_record",

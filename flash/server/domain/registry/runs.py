@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from flash.core.spec import attributed_gpu_type, require_project_id
+from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
 from flash.server.platform.internal_client import org_id_of, post_internal_json
 
 _LOG = logging.getLogger("flash.server.runs")
@@ -61,6 +62,44 @@ def _managed_environment_slug(spec: dict[str, Any]) -> str | None:
         return env_id.strip() if is_managed_environment_slug(env_id.strip()) else None
     except Exception:
         return None
+
+
+_DEPLOYMENT_FIELDS = frozenset(
+    {
+        "state",
+        "checkpoint_id",
+        "endpoint",
+        "openai_base_url",
+        "deployment_generation",
+        "requested_at",
+        "updated_at",
+        "verified_at",
+        "last_deploy_failed_at",
+        "error",
+        "last_deploy_error",
+    }
+)
+
+
+def _checkpoint_id(status: Any) -> str | None:
+    deployment = status.deployment if isinstance(status.deployment, dict) else {}
+    candidate = deployment.get("checkpoint_id")
+    parsed = parse_checkpoint_ref(candidate) if isinstance(candidate, str) else None
+    return candidate if parsed is not None and parsed[0] == status.run_id else None
+
+
+def _deployment_projection(status: Any) -> dict[str, Any] | None:
+    deployment = status.deployment if isinstance(status.deployment, dict) else None
+    checkpoint_id = _checkpoint_id(status)
+    if deployment is None or checkpoint_id is None:
+        return None
+    projected = {**deployment, "checkpoint_id": checkpoint_id}
+    projected["endpoint"] = deployment.get("endpoint") or deployment.get("endpoint_name")
+    return {
+        key: value
+        for key, value in projected.items()
+        if key in _DEPLOYMENT_FIELDS and value is not None
+    }
 
 
 def _matching_persisted_status(status: Any) -> dict[str, Any] | None:
@@ -183,11 +222,11 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "gpuType": attributed_gpu_type(status) or None,
         "costUsd": status.cost_usd,
         "realizedCostUsd": status.realized_cost_usd,
-        "adapterRef": public_status.get("adapter_ref"),
+        "checkpointId": _checkpoint_id(status),
         "artifactsDir": status.artifacts_dir,
         "error": status.error,
         "spec": spec,
-        "deployment": status.deployment,
+        "deployment": _deployment_projection(status),
         "lifecycle": _lifecycle_projection(status, public_status),
         "createdAt": _iso_from_epoch(status.created_at),
         "updatedAt": _iso_from_epoch(status.updated_at),
@@ -243,12 +282,10 @@ def record_training_checkpoint(
 ) -> bool:
     try:
         from flash.engine.result.accounting import sanitize_worker_metrics
-        from flash.runner.lifecycle.state import adapter_ref
         from flash.runner.lifecycle.status import get_status
 
         metrics = sanitize_worker_metrics(metrics)
         status = get_status(spec.run_id)
-        ref = adapter_ref(spec)
     except Exception:
         return False
     context = _context_from_status(status)
@@ -260,13 +297,13 @@ def record_training_checkpoint(
         project_id = require_project_id(persisted_spec.get("project"))
     except (TypeError, ValueError):
         return False
+    checkpoint_id = format_checkpoint_ref(spec.run_id, None)
     body = {
         "orgId": org_id,
         "projectId": project_id,
         "runId": spec.run_id,
-        "checkpointId": "final",
+        "checkpointId": checkpoint_id,
         "phase": getattr(spec, "phase", None),
-        "adapterRef": ref,
         "artifactPath": artifact_path,
         "metrics": metrics,
         "metadata": {"source": "flash.control_plane"},

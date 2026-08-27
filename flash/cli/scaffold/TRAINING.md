@@ -449,12 +449,12 @@ handles explicit provider preemption and resource loss through the fenced retry 
 
 ```bash
 flash runs checkpoint <run-id>       # deployable per-step RL checkpoints
-flash models deploy <run-id>            # serve the trained adapter
+flash models deploy <run-id>/final            # serve the trained adapter
 flash models deploy <run-id>/step-N     # serve an intermediate checkpoint
-flash models chat <run-id> -m "hello"   # chat with the deployed adapter
+flash models chat <run-id>/final -m "hello"   # chat with the deployed adapter
 flash models deployments                # active serving endpoints
-flash models undeploy <run-id>          # tear the endpoint down
-flash models export --adapter-id <run-id> --repository <you>/<repo>  # copy adapter weights to your HF repo
+flash models undeploy <run-id>/final          # tear the endpoint down
+flash models export --adapter-id <run-id>/final --repository <you>/<repo>  # copy adapter weights to your HF repo
 ```
 
 > **`flash models deploy` returns before the revision is servable.** It returns
@@ -676,15 +676,15 @@ spending another GPU run:
   each completion's reward, OPD its distillation loss — with the first sample-bearing update
   forced through, so you can catch skipped reasoning or a parroted prompt placeholder by
   step 1-2. These are bounded diagnostics, not every rollout or a held-out
-  evaluation, so still **deploy the adapter and probe it**: `flash models deploy <run-id>` then
-  `flash models chat <run-id> -m "..."` on at least a few real inputs, including ones it should
+  evaluation, so still **deploy the adapter and probe it**: `flash models deploy <run-id>/final` then
+  `flash models chat <run-id>/final -m "..."` on at least a few real inputs, including ones it should
   get wrong.
 
   ```bash
   flash runs status <run-id>            # state + accrued cost
   flash runs log <run-id>               # metric trend + worker console/error logs (+ traceback)
   flash runs log <run-id> --follow      # stream a live run until completion
-  flash models deploy <run-id>            # serve the adapter, then `flash models chat` it to read real outputs
+  flash models deploy <run-id>/final            # serve the adapter, then `flash models chat` it to read real outputs
   ```
 
 - **Decide with the noise band — and size it for a _difference_.** Record the eval-split
@@ -852,10 +852,10 @@ Pick SFT when you already have good answers and want the model to imitate them.
 algorithm = "grpo"
 
 [train]
-# the source run id (as printed by `flash runs status`); add /step-n to warm-start from a
-# specific checkpoint listed by `flash runs checkpoint <run-id>`. the source may be an sft,
-# grpo, or opd run, and `algorithm` above may be any of the three.
-init_from_adapter = "<source-run-id>"
+# use the source run's permanent final checkpoint, or /step-n for a specific checkpoint
+# listed by `flash runs checkpoint <run-id>`. the source may be an sft, grpo, or opd run,
+# and `algorithm` above may be any of the three.
+init_from_adapter = "<source-run-id>/final"
 # do NOT set lora_rank or lora_alpha for a warm-start: the source adapter's rank and alpha
 # metadata are authoritative, and setting either alongside init_from_adapter is rejected
 ```
@@ -1760,12 +1760,12 @@ flash runs log <run-id> --follow           # stream a live run to completion
 flash runs list                       # list your runs and their state/cost
 flash runs cancel <run-id>                 # stop a live run
 flash runs checkpoint <run-id>            # list deployable RL checkpoints
-flash models deploy <run-id>                 # serve the trained adapter
+flash models deploy <run-id>/final                 # serve the trained adapter
 flash models deploy <run-id>/step-N          # serve a specific RL checkpoint
-flash models chat <run-id> -m "probe"        # stream a reply from the deployed adapter
+flash models chat <run-id>/final -m "probe"        # stream a reply from the deployed adapter
 flash models deployments                     # list active serving deployments
-flash models undeploy <run-id>               # tear down an active deployment
-flash models export --adapter-id <run-id> --repository <you>/<repo>  # export final adapter
+flash models undeploy <run-id>/final               # tear down an active deployment
+flash models export --adapter-id <run-id>/final --repository <you>/<repo>  # export final adapter
 flash models export --adapter-id <run-id>/step-N --repository <you>/<repo>  # export a checkpoint
 ```
 

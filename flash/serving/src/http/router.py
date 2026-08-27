@@ -31,9 +31,7 @@ THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY = "thinking_structured_outputs_d
 _CLEANUP_TIMEOUT_SECONDS = 10.0
 
 _CAPABILITIES = (
-    "immutable_adapter_revisions",
-    "alias_compare_and_swap",
-    "revision_provenance",
+    "permanent_checkpoint_identity",
     THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY,
 )
 
@@ -55,7 +53,7 @@ def build_serving_app(
     deployment_sha: str = "",
     deployment_id: str = "",
     reload_records: Callable[[], list[AdapterRecord]] | None = None,
-    lookup_record: Callable[[str], AdapterRecord | None] | None = None,
+    lookup_record: Callable[[str, str], AdapterRecord | None] | None = None,
     reload_interval_seconds: float = 30.0,
     usage_store: UsageStore,
     chat_authorizer: Callable[[str, str], Awaitable["str | None"]] | None = None,

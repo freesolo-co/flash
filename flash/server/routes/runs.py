@@ -456,8 +456,13 @@ def list_runs(key: Annotated[dict, Depends(require_key)]):
 
 @router.get("/v1/runs/{run_id}")
 def run_status(run_id: str, key: Annotated[dict, Depends(require_key)]):
+    from flash.runner.results.verified_revisions import read_verified_checkpoints
+
     status = owned_run(run_id, key)
-    return status.to_dict()
+    return {
+        **status.to_dict(),
+        "verified_checkpoints": sorted(read_verified_checkpoints(run_id)),
+    }
 
 
 @router.get("/v1/runs/{run_id}/logs")

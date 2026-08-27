@@ -20,6 +20,7 @@ from flash.serving.src.io.structured_outputs import (
     StructuredOutputsError,
     normalize_structured_outputs,
 )
+from tests.serving.checkpoint_fixtures import checkpoint_record
 
 SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
 
@@ -331,15 +332,9 @@ def test_generate_request_invalid_spec_is_a_validation_error():
 
 
 def _record(**extra) -> AdapterRecord:
-    return AdapterRecord.model_validate(
-        {
-            "adapter_id": "a",
-            "repo_id": "org/a",
-            "base_model": "Qwen/Qwen3.5-9B",
-            "thinking": True,
-            **extra,
-        }
-    )
+    base_model = extra.pop("base_model", "Qwen/Qwen3.5-9B")
+    thinking = extra.pop("thinking", True)
+    return checkpoint_record("a", base_model, thinking=thinking, **extra)
 
 
 def test_adapter_record_normalizes_structured_outputs_default():
@@ -377,21 +372,3 @@ def test_parserless_non_thinking_structured_default_is_allowed():
         structured_outputs=SCHEMA,
     )
     assert record.structured_outputs == {"json": SCHEMA}
-
-
-def test_metadata_structured_outputs_is_storage_only():
-    # metadata.structured_outputs is the DB representation; a stray metadata copy must be stripped
-    # (like metadata.thinking) so it can't be persisted verbatim and resurrected as the field on
-    # the next hydration. The first-class field is the only way to set a default.
-    rec = _record(metadata={"structured_outputs": {"json": SCHEMA}, "note": "keep"})
-    assert rec.structured_outputs is None
-    assert rec.metadata == {"note": "keep"}
-
-
-def test_top_level_structured_outputs_wins_over_metadata():
-    rec = _record(
-        structured_outputs={"json_object": True},
-        metadata={"structured_outputs": {"json": SCHEMA}},
-    )
-    assert rec.structured_outputs == {"json_object": True}
-    assert "structured_outputs" not in rec.metadata

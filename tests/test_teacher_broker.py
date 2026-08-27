@@ -17,7 +17,6 @@ import flash.runner.lifecycle.attempts as runner_attempts
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 import flash.runner.supervise.lifecycle as runner_lifecycle
-import flash.runner.supervise.transitions as runner_transitions
 from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 from flash.server.domain.teacher import broker as teacher_broker
 from flash.server.platform import db
@@ -2054,7 +2053,6 @@ def test_cancellation_fences_teacher_capabilities_before_lifecycle_work(monkeypa
         lambda run_id: events.append(("status", run_id)) or status,
     )
     monkeypatch.setattr(runner_status, "effective_spec_from_status", lambda _status: None)
-    monkeypatch.setattr(runner_transitions, "mark_deployment_undeployed", lambda _run_id: None)
 
     def mark_cancelled(_run_id, state, **_updates):
         status.state = state

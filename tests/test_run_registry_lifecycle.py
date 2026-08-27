@@ -146,7 +146,7 @@ def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypat
     status.source_verified_attempt = 0
     runner_state._save_status(status)
     body = _report(monkeypatch, status)
-    assert body["adapterRef"] == spec.run_id
+    assert "adapterRef" not in body
     assert body["lifecycle"] == {
         "started": True,
         "progressed": True,

@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
 from flash.core.spec import JobSpec
-from flash.schema import format_adapter_revision, parse_adapter_revision
+from flash.schema import parse_checkpoint_ref
 
 if TYPE_CHECKING:
     from flash.runner.lifecycle.state import RunStatus
@@ -41,7 +41,6 @@ class DeploymentRevocationError(RuntimeError):
 
 _BackendOutcome = Literal["confirmed", "not_required", "not_attempted"]
 _BACKEND_OUTCOMES = frozenset({"confirmed", "not_required", "not_attempted"})
-_UNKNOWN_ALIAS_UNCHECKED = object()
 
 
 class DeploymentStatePersistenceError(RuntimeError):
@@ -91,61 +90,28 @@ def _is_preservable_checkpoint_deployment(run_id: str, deployment: object) -> bo
     if state not in _RESTORABLE_DEPLOYMENT_STATES:
         return False
     checkpoint_step = deployment.get("checkpoint_step")
-    if (
-        isinstance(checkpoint_step, bool)
-        or not isinstance(checkpoint_step, int)
-        or checkpoint_step < 0
+    if isinstance(checkpoint_step, bool) or (
+        checkpoint_step is not None
+        and (not isinstance(checkpoint_step, int) or checkpoint_step < 0)
     ):
         return False
-    revision = deployment.get("adapter_revision")
-    if not isinstance(revision, str):
+    checkpoint_id = deployment.get("checkpoint_id")
+    parsed = parse_checkpoint_ref(checkpoint_id) if isinstance(checkpoint_id, str) else None
+    if parsed is None or parsed[0] != run_id or parsed[1] != checkpoint_step:
         return False
-    parsed_revision = parse_adapter_revision(revision)
-    if parsed_revision is None:
-        return False
-    revision_run_id, revision_step, hf_revision = parsed_revision
-    if revision_step is None:
-        return False
-    canonical_revision = format_adapter_revision(revision_run_id, revision_step, hf_revision)
-    if (
-        revision != canonical_revision
-        or revision_run_id != run_id
-        or revision_step != checkpoint_step
-    ):
-        return False
-    from flash.runner.results.verified_revisions import read_verified_adapter_revisions
+    from flash.runner.results.verified_revisions import read_verified_checkpoints
 
     try:
-        return revision in read_verified_adapter_revisions(run_id)
+        return checkpoint_id in read_verified_checkpoints(run_id)
     except Exception:
         return False
 
 
-def _preservable_checkpoint_deployment(
-    run_id: str,
-    deployment: object,
-    *,
-    live_alias_target: object = _UNKNOWN_ALIAS_UNCHECKED,
-) -> dict | None:
-    if not isinstance(deployment, dict):
-        return None
-    if deployment.get("activation_outcome_unknown"):
-        if live_alias_target is _UNKNOWN_ALIAS_UNCHECKED:
-            return None
-        predecessor = deployment.get("previous_deployment")
-        if (
-            isinstance(predecessor, dict)
-            and predecessor.get("adapter_revision") == live_alias_target
-            and _is_preservable_checkpoint_deployment(run_id, predecessor)
-        ):
-            return dict(predecessor)
-        return None
+def _preservable_checkpoint_deployment(run_id: str, deployment: object) -> dict | None:
+    """return the current exact verified checkpoint when it can survive cancellation."""
+
     if _is_preservable_checkpoint_deployment(run_id, deployment):
         return dict(deployment)
-    if deployment.get("state") in {"queued", "smoke_testing"}:
-        predecessor = deployment.get("previous_deployment")
-        if _is_preservable_checkpoint_deployment(run_id, predecessor):
-            return dict(predecessor)
     return None
 
 
@@ -328,96 +294,24 @@ class _ContendedFence:
     predecessor_recommitted: bool = False
 
 
-def _restore_contended_predecessor(
-    run_id: str,
-    predecessor: dict,
-    fenced_deployment: dict | None,
-) -> bool:
-    """Try to recommit the verified predecessor over the fenced attempt.
-
-    Returns whether the predecessor is now the authoritative deployment AND the only verified
-    revision. On failure, re-fence so no unverified attempt is left looking serveable.
-    """
-    from flash.runner.lifecycle.status import get_status
-    from flash.runner.results.verified_revisions import (
-        read_verified_adapter_revisions,
-        verified_adapter_revision_generation,
-    )
-    from flash.runner.supervise.transitions import (
-        mark_checkpoint_deployed,
-        mark_deployment_revocation_failed,
-    )
-
-    recommitted = False
-    if fenced_deployment is not None:
-        try:
-            restored_status = mark_checkpoint_deployed(
-                run_id,
-                predecessor,
-                verification_generation=verified_adapter_revision_generation(run_id),
-                owner_deployment=fenced_deployment,
-                retain_only_revision=True,
-            )
-            predecessor_revision = predecessor.get("adapter_revision")
-            recommitted = (
-                restored_status.deployment == predecessor
-                and isinstance(predecessor_revision, str)
-                and _is_preservable_checkpoint_deployment(run_id, restored_status.deployment)
-                and read_verified_adapter_revisions(run_id) == frozenset({predecessor_revision})
-            )
-        except Exception:
-            recommitted = False
-    if recommitted:
-        return True
-    current = get_status(run_id)
-    current_deployment = current.deployment if isinstance(current.deployment, dict) else {}
-    still_fenced = (
-        current_deployment.get("state") == _REVOCATION_RETRY_STATE
-        and read_verified_adapter_revisions(run_id) == frozenset()
-    )
-    if not still_fenced:
-        try:
-            mark_deployment_revocation_failed(
-                run_id,
-                "backend revocation pending: verified predecessor restoration failed",
-            )
-        except Exception as exc:
-            raise DeploymentStatePersistenceError(
-                run_id, str(exc), backend_outcome="not_attempted"
-            ) from exc
-    return False
-
-
 def _fence_contended_deployment(run_id: str) -> _ContendedFence:
-    """Fence a deployment that holds the deploy lock, before blocking on it.
+    """fence an in-progress deployment before blocking on its deploy lock."""
 
-    Runs BEFORE the blocking acquire so an in-progress deployment cannot finish and present itself
-    as serveable after the cancel decided to tear it down. A preservable checkpoint is left alone.
-    """
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.transitions import mark_deployment_revocation_failed
 
-    prelock_status = get_status(run_id)
-    prelock_raw_deployment = prelock_status.deployment
-    prelock_deployment = (
-        dict(prelock_raw_deployment) if isinstance(prelock_raw_deployment, dict) else None
-    )
-    _, prelock_active = _deployment_state_and_requires_revocation(prelock_raw_deployment)
+    status = get_status(run_id)
+    deployment = dict(status.deployment) if isinstance(status.deployment, dict) else None
+    _, active = _deployment_state_and_requires_revocation(status.deployment)
     must_fence = (
-        prelock_status.state != "dry_run"
-        and prelock_active
-        and not _is_preservable_checkpoint_deployment(run_id, prelock_deployment)
+        status.state != "dry_run"
+        and active
+        and not _is_preservable_checkpoint_deployment(run_id, deployment)
     )
     if not must_fence:
         return _ContendedFence()
-
-    predecessor: dict | None = None
-    if prelock_deployment is not None:
-        candidate = prelock_deployment.get("previous_deployment")
-        if _is_preservable_checkpoint_deployment(run_id, candidate):
-            predecessor = dict(candidate)
     try:
-        fenced_status = mark_deployment_revocation_failed(
+        mark_deployment_revocation_failed(
             run_id,
             "backend revocation pending: cancellation fenced an in-progress deployment",
         )
@@ -425,19 +319,7 @@ def _fence_contended_deployment(run_id: str) -> _ContendedFence:
         raise DeploymentStatePersistenceError(
             run_id, str(exc), backend_outcome="not_attempted"
         ) from exc
-    if predecessor is None:
-        return _ContendedFence(active_attempt=True, captured_attempt=prelock_deployment)
-    fenced_deployment = (
-        dict(fenced_status.deployment) if isinstance(fenced_status.deployment, dict) else None
-    )
-    return _ContendedFence(
-        active_attempt=True,
-        captured_attempt=prelock_deployment,
-        predecessor=predecessor,
-        predecessor_recommitted=_restore_contended_predecessor(
-            run_id, predecessor, fenced_deployment
-        ),
-    )
+    return _ContendedFence(active_attempt=True, captured_attempt=deployment)
 
 
 def _checkpoint_to_preserve(
@@ -445,48 +327,17 @@ def _checkpoint_to_preserve(
     status,
     *,
     contended: _ContendedFence,
+    serving_active_at_entry: bool,
 ) -> dict | None:
-    """Decide which deployment, if any, survives this cancellation.
+    """preserve only serving that was active when cancellation began."""
 
-    A dry run preserves nothing. A contended attempt preserves ONLY its predecessor, and only when
-    every check agrees the predecessor is what is actually live: recommitted, still the stored
-    deployment, still verified, and the alias really points at it.
-    """
-    live_alias_target: object = _UNKNOWN_ALIAS_UNCHECKED
-    unknown_activation = isinstance(status.deployment, dict) and status.deployment.get(
-        "activation_outcome_unknown"
-    )
-    if status.state != "dry_run" and (contended.active_attempt or unknown_activation):
-        try:
-            from flash.serve.deployment.deploy import adapter_alias_target
-
-            live_alias_target = adapter_alias_target(run_id)
-        except Exception:
-            live_alias_target = None
-    if status.state == "dry_run":
+    if not serving_active_at_entry or status.state == "dry_run" or contended.active_attempt:
         return None
-    if not contended.active_attempt:
-        return _preservable_checkpoint_deployment(
-            run_id,
-            status.deployment,
-            live_alias_target=live_alias_target,
-        )
-    predecessor = contended.predecessor
-    predecessor_revision = predecessor.get("adapter_revision") if predecessor is not None else None
-    if (
-        contended.predecessor_recommitted
-        and isinstance(contended.captured_attempt, dict)
-        and isinstance(predecessor_revision, str)
-        and live_alias_target == predecessor_revision
-        and status.deployment == predecessor
-        and _is_preservable_checkpoint_deployment(run_id, status.deployment)
-    ):
-        return dict(predecessor)
-    return None
+    return _preservable_checkpoint_deployment(run_id, status.deployment)
 
 
 def _commit_preserved_checkpoint(run_id: str, status, preserved_checkpoint: dict | None):
-    """Make the preserved checkpoint authoritative and the only verified revision.
+    """Make the preserved checkpoint authoritative and the only verified checkpoint.
 
     Returns ``(status, preserved_checkpoint)``; the checkpoint comes back ``None`` when the first
     commit could not be confirmed, which drops the run through to normal revocation. The second
@@ -494,21 +345,21 @@ def _commit_preserved_checkpoint(run_id: str, status, preserved_checkpoint: dict
     """
     from flash.runner.lifecycle.status import get_status
     from flash.runner.results.verified_revisions import (
-        read_verified_adapter_revisions,
-        verified_adapter_revision_generation,
+        read_verified_checkpoints,
+        verified_checkpoint_generation,
     )
     from flash.runner.supervise.transitions import mark_checkpoint_deployed
 
     if preserved_checkpoint is None:
         return status, None
     if status.deployment != preserved_checkpoint:
-        intended_revision = preserved_checkpoint.get("adapter_revision")
+        intended_revision = preserved_checkpoint.get("checkpoint_id")
         owner_deployment = status.deployment if isinstance(status.deployment, dict) else None
         try:
             status = mark_checkpoint_deployed(
                 run_id,
                 preserved_checkpoint,
-                verification_generation=verified_adapter_revision_generation(run_id),
+                verification_generation=verified_checkpoint_generation(run_id),
                 owner_deployment=owner_deployment,
             )
         except Exception:
@@ -518,7 +369,7 @@ def _commit_preserved_checkpoint(run_id: str, status, preserved_checkpoint: dict
                 stored_deployment = status.deployment
                 if (
                     not isinstance(stored_deployment, dict)
-                    or stored_deployment.get("adapter_revision") != intended_revision
+                    or stored_deployment.get("checkpoint_id") != intended_revision
                     or not _is_preservable_checkpoint_deployment(run_id, stored_deployment)
                 ):
                     preserved_checkpoint = None
@@ -534,28 +385,19 @@ def _commit_preserved_checkpoint(run_id: str, status, preserved_checkpoint: dict
         if preserved_checkpoint is None:
             return status, None
 
-    preserved_revision = preserved_checkpoint.get("adapter_revision")
-    owner_deployment = status.deployment if isinstance(status.deployment, dict) else None
-    try:
-        status = mark_checkpoint_deployed(
-            run_id,
-            preserved_checkpoint,
-            verification_generation=verified_adapter_revision_generation(run_id),
-            owner_deployment=owner_deployment,
-            retain_only_revision=True,
-        )
-        if (
-            status.deployment != preserved_checkpoint
-            or not isinstance(preserved_revision, str)
-            or read_verified_adapter_revisions(run_id) != frozenset({preserved_revision})
-        ):
-            raise RuntimeError(
-                "authoritative checkpoint preservation did not prune verified revisions"
-            )
-    except Exception as exc:
+    preserved_revision = preserved_checkpoint.get("checkpoint_id")
+    if (
+        status.deployment != preserved_checkpoint
+        or not isinstance(preserved_revision, str)
+        or preserved_revision not in read_verified_checkpoints(run_id)
+    ):
         raise DeploymentStatePersistenceError(
-            run_id, str(exc), backend_outcome="not_required"
-        ) from exc
+            run_id,
+            "authoritative checkpoint preservation lost its verified checkpoint",
+            backend_outcome="not_required",
+        )
+    # verified siblings are independent serving authorities. cancellation preserves the complete
+    # ledger unless each sibling is exact-undeployed successfully by its own lifecycle operation.
     return status, preserved_checkpoint
 
 
@@ -573,15 +415,23 @@ def _revoke_serving(
     """
     from flash.runner.supervise.transitions import (
         mark_deployment_revocation_failed,
-        mark_deployment_undeployed,
+        mark_undeployed,
     )
 
+    deployment = status.deployment if isinstance(status.deployment, dict) else None
+    checkpoint_id = deployment.get("checkpoint_id") if deployment is not None else None
     if not active_deployment:
+        if deployment is None:
+            return None, None
+        if not isinstance(checkpoint_id, str):
+            return None, (ValueError("exact undeploy requires checkpoint_id"), "not_required")
         try:
-            mark_deployment_undeployed(run_id)
+            mark_undeployed(run_id, checkpoint_id)
         except Exception as exc:
             return None, (exc, "not_required")
         return None, None
+    if not isinstance(checkpoint_id, str):
+        return ValueError("exact undeploy requires checkpoint_id"), None
 
     already_fenced = (
         isinstance(status.deployment, dict)
@@ -600,14 +450,18 @@ def _revoke_serving(
             ) from exc
     try:
         from flash.serve.deployment.deploy import undeploy_adapter
+        from flash.server.platform.internal_client import run_serving_org_id
 
-        undeploy_adapter(run_id)
+        org_id = run_serving_org_id(status)
+        if not org_id:
+            raise ValueError(f"run {run_id} has no organization scope")
+        undeploy_adapter(checkpoint_id, org_id=org_id)
     except Exception as exc:
         with contextlib.suppress(Exception):
             mark_deployment_revocation_failed(run_id, str(exc))
         return exc, None
     try:
-        mark_deployment_undeployed(run_id)
+        mark_undeployed(run_id, checkpoint_id)
     except Exception as exc:
         return None, (exc, "confirmed")
     return None, None
@@ -845,6 +699,7 @@ def cancel_run(run_id: str) -> RunStatus:
                 predecessor=contended_predecessor,
                 predecessor_recommitted=contended_predecessor_recommitted,
             ),
+            serving_active_at_entry=initial_active,
         )
         status, preserved_checkpoint = _commit_preserved_checkpoint(
             run_id, status, preserved_checkpoint

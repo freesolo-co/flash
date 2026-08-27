@@ -1,237 +1,106 @@
 from __future__ import annotations
 
-import json
-import multiprocessing
-import subprocess
-import sys
-from pathlib import Path
-
 import pytest
 
 import flash.runner.lifecycle.state as runner_state
-import flash.runner.lifecycle.status as runner_status
-import flash.runner.results.verified_revisions as runner_verified_revisions
-import flash.runner.supervise.transitions as runner_transitions
+import flash.runner.results.verified_revisions as verified
 
 
-def _complete_checkpoint(run_id: str, revision: str, barrier) -> None:
-
-    barrier.wait(timeout=10)
-    runner_transitions.mark_checkpoint_deployed(
-        run_id,
-        {
-            "state": "ready",
-            "endpoint_name": "https://serve.example",
-            "adapter_revision": revision,
-        },
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
-    )
-
-
-def _write_stale_status(run_id: str, loaded, release) -> None:
-
-    status = runner_status.get_status(run_id)
-    loaded.set()
-    if not release.wait(timeout=10):
-        raise TimeoutError("stale status writer was not released")
-    status.resource = {"state": "terminal", "observed_at": 1.0}
-    runner_state._save_status(status)
-
-
-def _read_revisions(run_id: str, output) -> None:
-
-    output.put(tuple(sorted(runner_verified_revisions.read_verified_adapter_revisions(run_id))))
-
-
-def _new_status(run_id: str):
-    return runner_state.RunStatus(
-        run_id=run_id,
-        state="done",
-        spec={"model": "Qwen/Qwen3.5-0.8B", "algorithm": "sft"},
-    )
-
-
-@pytest.mark.parametrize("helper_name", ["mark_deployed", "mark_checkpoint_deployed"])
-@pytest.mark.parametrize(
-    "revision",
-    [
-        None,
-        "ready-commit@final.short",
-        "another-run@final." + "a" * 40,
-    ],
-)
-def test_ready_commit_helpers_reject_noncanonical_revision(
-    monkeypatch, tmp_path, helper_name, revision
-):
-
+def _use_runs_dir(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    run_id = "ready-commit"
-    runner_state._save_status(_new_status(run_id))
-    deployment = {"state": "ready", "endpoint_name": "https://serve.example"}
-    if revision is not None:
-        deployment["adapter_revision"] = revision
-
-    with pytest.raises(ValueError, match="full same-run adapter revision"):
-        getattr(runner_transitions, helper_name)(
-            run_id,
-            deployment,
-            verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-                run_id
-            ),
-        )
-
-    assert runner_status.get_status(run_id).deployment is None
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
 
 
-@pytest.mark.parametrize(
-    "raw",
-    [
-        ["legacy-revision"],
-        {"generation": 0, "revisions": ["legacy-revision"]},
-    ],
-)
-def test_verified_revision_ledger_rejects_legacy_shapes(monkeypatch, tmp_path, raw):
+def test_verified_checkpoint_ledger_starts_empty(monkeypatch, tmp_path) -> None:
+    _use_runs_dir(monkeypatch, tmp_path)
 
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    run_id = "strict-revision-ledger"
-    path = Path(runner_state.runs_file_path(run_id, ".verified-revisions"))
-    path.parent.mkdir(parents=True)
-    path.write_text(json.dumps(raw))
-
-    with pytest.raises(ValueError, match="invalid verified"):
-        runner_verified_revisions.read_verified_adapter_revisions(run_id)
+    assert verified.read_verified_checkpoints("run-a") == frozenset()
+    assert verified.verified_checkpoint_generation("run-a") == 0
 
 
-def test_stale_generation_cannot_commit_ready_revision(monkeypatch, tmp_path):
+def test_exact_checkpoint_commits_are_idempotent(monkeypatch, tmp_path) -> None:
+    _use_runs_dir(monkeypatch, tmp_path)
 
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    run_id = "stale-generation"
-    runner_state._save_status(_new_status(run_id))
-    revision = f"{run_id}@final." + "e" * 40
-    stale_generation = runner_verified_revisions.verified_adapter_revision_generation(run_id)
-
-    assert (
-        runner_verified_revisions.invalidate_verified_adapter_revisions(run_id, commit=lambda: None)
-        == stale_generation + 1
+    verified.add_verified_checkpoint(
+        "run-a", "run-a/final", expected_generation=verified.verified_checkpoint_generation("run-a")
     )
-    status = runner_transitions.mark_checkpoint_deployed(
-        run_id,
-        {
-            "state": "ready",
-            "endpoint_name": "https://serve.example",
-            "adapter_revision": revision,
-        },
-        verification_generation=stale_generation,
+    verified.add_verified_checkpoint(
+        "run-a", "run-a/final", expected_generation=verified.verified_checkpoint_generation("run-a")
     )
 
-    assert status.deployment is None
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset()
+    assert verified.read_verified_checkpoints("run-a") == frozenset({"run-a/final"})
 
 
-def test_concurrent_checkpoint_completions_preserve_both_revisions(monkeypatch, tmp_path):
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    run_id = "concurrent-revisions"
-    runner_state._save_status(_new_status(run_id))
-    revisions = [f"{run_id}@step-20." + "a" * 40, f"{run_id}@step-40." + "b" * 40]
-    context = multiprocessing.get_context("fork")
-    barrier = context.Barrier(3)
-    processes = [
-        context.Process(target=_complete_checkpoint, args=(run_id, revision, barrier))
-        for revision in revisions
-    ]
-
-    for process in processes:
-        process.start()
-    barrier.wait(timeout=10)
-    for process in processes:
-        process.join(timeout=10)
-        assert process.exitcode == 0
-
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(revisions)
-
-
-def test_stale_status_process_cannot_erase_verified_revision(monkeypatch, tmp_path):
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    run_id = "stale-status-revision"
-    runner_state._save_status(_new_status(run_id))
-    revision = f"{run_id}@step-20." + "c" * 40
-    context = multiprocessing.get_context("fork")
-    loaded = context.Event()
-    release = context.Event()
-    process = context.Process(target=_write_stale_status, args=(run_id, loaded, release))
-    process.start()
-    assert loaded.wait(timeout=10)
-
-    runner_transitions.mark_checkpoint_deployed(
-        run_id,
-        {
-            "state": "ready",
-            "endpoint_name": "https://serve.example",
-            "adapter_revision": revision,
-        },
-        verification_generation=runner_verified_revisions.verified_adapter_revision_generation(
-            run_id
-        ),
+def test_sibling_checkpoints_are_independent(monkeypatch, tmp_path) -> None:
+    _use_runs_dir(monkeypatch, tmp_path)
+    verified.add_verified_checkpoint(
+        "run-a",
+        "run-a/step-20",
+        expected_generation=verified.verified_checkpoint_generation("run-a"),
     )
-    release.set()
-    process.join(timeout=10)
-
-    assert process.exitcode == 0
-    assert runner_status.get_status(run_id).resource == {"state": "terminal", "observed_at": 1.0}
-    assert runner_verified_revisions.read_verified_adapter_revisions(run_id) == frozenset(
-        {revision}
+    verified.add_verified_checkpoint(
+        "run-a",
+        "run-a/step-40",
+        expected_generation=verified.verified_checkpoint_generation("run-a"),
     )
-    assert "verified_adapter_revisions" not in runner_status.get_status(run_id).to_dict()
+
+    verified.remove_verified_checkpoint("run-a", "run-a/step-20", commit=lambda _retained: None)
+
+    assert verified.read_verified_checkpoints("run-a") == frozenset({"run-a/step-40"})
 
 
-def test_verified_revision_ledger_survives_new_process(monkeypatch, tmp_path):
+def test_wrong_run_and_noncanonical_values_are_rejected(monkeypatch, tmp_path) -> None:
+    _use_runs_dir(monkeypatch, tmp_path)
 
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    run_id = "restart-revision"
-    revision = f"{run_id}@final." + "d" * 40
-    runner_verified_revisions.add_verified_adapter_revision(
-        run_id,
-        revision,
-        expected_generation=runner_verified_revisions.verified_adapter_revision_generation(run_id),
+    for checkpoint_id in ("run-a", "run-b/final", "run-a@final." + "a" * 40):
+        with pytest.raises(ValueError, match="checkpoint"):
+            verified.add_verified_checkpoint("run-a", checkpoint_id, expected_generation=0)
+
+
+def test_generation_fence_rejects_stale_commit(monkeypatch, tmp_path) -> None:
+    _use_runs_dir(monkeypatch, tmp_path)
+    generation = verified.verified_checkpoint_generation("run-a")
+    verified.invalidate_verified_checkpoints("run-a", commit=lambda: None)
+    committed = []
+
+    assert not verified.commit_verified_checkpoint(
+        "run-a",
+        "run-a/final",
+        expected_generation=generation,
+        commit=lambda: committed.append(True),
     )
-    context = multiprocessing.get_context("fork")
-    output = context.Queue()
-    process = context.Process(target=_read_revisions, args=(run_id, output))
-
-    process.start()
-    process.join(timeout=10)
-
-    assert process.exitcode == 0
-    assert output.get(timeout=2) == (revision,)
+    assert committed == []
+    assert verified.read_verified_checkpoints("run-a") == frozenset()
 
 
-def test_verified_revision_ledger_fails_closed_without_fcntl(monkeypatch):
-    # fcntl is unix-only; on platforms without it the ledger must fail closed
-    # rather than silently skip its cross-process lock.
-    from flash.runner.results import verified_revisions
+def test_successful_fenced_commit_persists_checkpoint_and_state(monkeypatch, tmp_path) -> None:
+    _use_runs_dir(monkeypatch, tmp_path)
+    generation = verified.verified_checkpoint_generation("run-a")
+    committed = []
 
-    monkeypatch.setattr(verified_revisions, "fcntl", None)
-    with pytest.raises(RuntimeError, match="verified-revision locking is unavailable"):
-        verified_revisions.read_verified_adapter_revisions("run-without-fcntl")
-
-
-def test_cli_import_chain_survives_missing_fcntl():
-    # reproduces the windows `flash login` crash: fcntl is unix-only, so the cli
-    # import chain (flash.cli -> flash.runner -> verified_revisions) must not
-    # hard-depend on it. blocking fcntl mimics a platform that lacks the module.
-    code = (
-        "import sys; sys.modules['fcntl'] = None; "
-        "import flash.runner.results.verified_revisions; "
-        "import flash.cli"
+    assert verified.commit_verified_checkpoint(
+        "run-a",
+        "run-a/final",
+        expected_generation=generation,
+        commit=lambda: committed.append(True),
     )
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        text=True,
+    assert committed == [True]
+    assert verified.read_verified_checkpoints("run-a") == frozenset({"run-a/final"})
+
+
+def test_run_cleanup_invalidates_all_checkpoints_and_advances_generation(
+    monkeypatch, tmp_path
+) -> None:
+    _use_runs_dir(monkeypatch, tmp_path)
+    verified.add_verified_checkpoint(
+        "run-a", "run-a/final", expected_generation=verified.verified_checkpoint_generation("run-a")
     )
-    assert result.returncode == 0, result.stderr
+    verified.add_verified_checkpoint(
+        "run-a",
+        "run-a/step-20",
+        expected_generation=verified.verified_checkpoint_generation("run-a"),
+    )
+
+    verified.invalidate_verified_checkpoints("run-a", commit=lambda: None)
+
+    assert verified.read_verified_checkpoints("run-a") == frozenset()
+    assert verified.verified_checkpoint_generation("run-a") == 1

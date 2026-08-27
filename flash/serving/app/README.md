@@ -284,7 +284,7 @@ open `<think>` block for generation to close.
 
 ```json
 {
-  "adapter_id": "people-search@step-20.8f2c1b0e5d4a39c7b6e2f014a8d35c9b7e10426f",
+  "adapter_id": "people-search/step-20",
   "repo_id": "Freesolo-Co/people-search-lora",
   "repo_type": "model",
   "base_model": "Qwen/Qwen3.5-9B",
@@ -292,12 +292,12 @@ open `<think>` block for generation to close.
   "org_id": "org-id",
   "private": true,
   "thinking": false,
-  "metadata": {
-    "record_type": "revision",
-    "run_id": "people-search",
-    "checkpoint_step": 20,
-    "hf_revision": "8f2c1b0e5d4a39c7b6e2f014a8d35c9b7e10426f"
-  }
+  "run_id": "people-search",
+  "checkpoint_step": 20,
+  "artifact_revision": "8f2c1b0e5d4a39c7b6e2f014a8d35c9b7e10426f",
+  "artifact_digest": "<private-64-hex-content-digest>",
+  "artifact_fingerprint": "<private-64-hex-binding-fingerprint>",
+  "lora_rank": 16
 }
 ```
 
@@ -305,7 +305,7 @@ open `<think>` block for generation to close.
 
 ```json
 {
-  "adapter_id": "people-search-lora",
+  "adapter_id": "people-search/step-20",
   "messages": [
     { "role": "user", "content": "Find senior search engineers in SF" }
   ],

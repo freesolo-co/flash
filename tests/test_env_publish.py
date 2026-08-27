@@ -1153,6 +1153,12 @@ def test_record_training_run_posts_to_backend(monkeypatch):
             progress={"attempt_id": 0, "fence": 1, "phase": "sft_step"},
             resource={"attempt_id": 0, "fence": 1, "state": "running"},
             result={"attempt_id": 0, "fence": 1, "outcome": "done"},
+            deployment={
+                "state": "ready",
+                "checkpoint_id": "flash-1/final",
+                "endpoint_name": "https://serve.example",
+                "adapter_hf_prefix": "private/path",
+            },
         )
     )
 
@@ -1167,6 +1173,16 @@ def test_record_training_run_posts_to_backend(monkeypatch):
     # the exact canonical project uuid is persisted with every managed training run.
     assert body["projectId"] == "11111111-1111-4111-8111-111111111111"
     assert body["model"] == "Qwen/Qwen3.5-9B"
+    assert body["checkpointId"] == "flash-1/final"
+    assert body["deployment"] == {
+        "state": "ready",
+        "checkpoint_id": "flash-1/final",
+        "endpoint": "https://serve.example",
+    }
+    assert "adapterRef" not in body
+    assert "private/path" not in json.dumps(body)
+    # the heartbeat contract is deleted, and the new fenced projections stay flash-internal
+    # until freesolo has a consumer for them.
     assert "lastHeartbeat" not in body
     assert "gpuStatus" not in body
     assert "attempt" not in body
@@ -1282,7 +1298,7 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
 
     ok = runs.record_training_checkpoint(
         spec=spec,
-        metrics={"cost_usd": 0.25},
+        metrics={"cost_usd": 0.25, "step": 3},
         artifact_path="/tmp/artifacts",
     )
 
@@ -1293,11 +1309,10 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
         "orgId": "org-1",
         "projectId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         "runId": "flash-1",
-        "checkpointId": "final",
+        "checkpointId": "flash-1/final",
         "phase": "rl",
-        "adapterRef": "Freesolo-Co/flashrun-flash-1:rl/flash-1",
         "artifactPath": "/tmp/artifacts",
-        "metrics": {"cost_usd": 0.25},
+        "metrics": {"cost_usd": 0.25, "step": 3},
         "metadata": {"source": "flash.control_plane"},
         "updatedAt": "1970-01-01T00:00:00+00:00",
     }
