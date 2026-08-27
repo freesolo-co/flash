@@ -311,18 +311,21 @@ def _reserve_attempt_launch(
                 if current - 1 != existing.attempt:
                     raise RuntimeError("stale launch claim no longer names the newest attempt")
                 require_retry_authorization_from_raw(spec, raw, existing.attempt)
+                # the claim pinned its resume evidence before its worker launched, and that worker
+                # may have mutated the checkpoint before it was lost. take the caller's freshly
+                # verified evidence, which covers every attempt the counter names.
                 _validate_opd_evidence(
                     spec,
                     raw,
                     existing.attempt,
-                    existing.resume_revision,
-                    existing.resume_world_size,
+                    resume_revision,
+                    resume_world_size,
                 )
                 claim = AttemptLaunchClaim(
                     existing.attempt,
                     uuid.uuid4().hex,
-                    existing.resume_revision,
-                    existing.resume_world_size,
+                    resume_revision,
+                    resume_world_size,
                 )
             else:
                 if expected_stale_claim is not None:
@@ -389,13 +392,21 @@ def reserve_handleless_recovery_launch(
     expected_state: str,
     provider_clear_confirmed: bool,
     expected_stale_claim: AttemptLaunchClaim | None,
+    expected_next_attempt: int | None = None,
     resume_revision: str | None = None,
     resume_world_size: int | None = None,
 ) -> LaunchReservationResult:
-    """Reserve one provider-clear recovery through the shared ownership primitive."""
+    """Reserve one provider-clear recovery through the shared ownership primitive.
+
+    `expected_next_attempt` is the counter the caller's resume evidence was verified against. opd
+    verification reaches hugging face outside the status lock, so a concurrent observer can reserve
+    and settle an attempt while it runs. Passing the verified counter rejects evidence that predates
+    the intervening attempt's mutation marker instead of resuming from a checkpoint that excludes it.
+    """
     return _reserve_attempt_launch(
         run_id,
         expected_state=expected_state,
+        expected_next_attempt=expected_next_attempt,
         transition_state="provisioning",
         resume_revision=resume_revision,
         resume_world_size=resume_world_size,

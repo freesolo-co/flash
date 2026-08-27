@@ -300,7 +300,12 @@ def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
     if stale_claim is not None and claim_is_live(spec.run_id, stale_claim):
         return None
     revision = world_size = None
-    if spec.algorithm == "opd" and stale_claim is None:
+    verified_attempt = None
+    if spec.algorithm == "opd":
+        # reclaiming a stale claim is not exempt. the lost worker can cross `optimizer.step()` and
+        # upload its mutation marker before provider cleanup finds and terminates it, so the claim's
+        # pre-launch resume evidence is already stale. reverify every attempt the counter names and
+        # carry that revision instead of the one the claim pinned.
         try:
             verified_attempt, revision, world_size = _verified_opd_retry_state(spec.run_id)
             if verified_attempt != decode_next_attempt(raw):
@@ -313,6 +318,7 @@ def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
         expected_state=expected_state,
         provider_clear_confirmed=True,
         expected_stale_claim=stale_claim,
+        expected_next_attempt=verified_attempt,
         resume_revision=revision,
         resume_world_size=world_size,
     )
