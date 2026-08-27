@@ -412,3 +412,46 @@ def test_hosted_sse_has_independent_reasoning_and_post_settlement_terminals() ->
     assert usage_payload["usage"]["completion_tokens"] == 3
     assert payloads[-3:] == [*finish_payloads, usage_payload]
     assert chunks[-1] == b"data: [DONE]\n\n"
+
+
+def test_disconnected_terminal_does_not_block_on_a_full_output_queue() -> None:
+    """A disconnect must not wedge the producer once one terminal became many.
+
+    The terminal frames are emitted with ``ignore_disconnect``, which drains the queue once and
+    then pushes unconditionally while no consumer is reading. With one terminal chunk that fit the
+    fixed queue; a per-choice terminal plus the usage frame plus ``[DONE]`` does not, so the queue
+    has to admit every frame this stream can produce after its reader is gone.
+    """
+    session = _UsageSession()
+    record = _record()
+    choice_count = 8
+    usage = {"prompt_tokens": 1, "completion_tokens": choice_count, "cached_tokens": 0}
+
+    async def events():
+        yield {"type": "ready", "thinking": False, **usage}
+        for index in range(choice_count):
+            yield {"type": "delta", "index": index, "text": f"answer-{index}", **usage}
+        for index in range(choice_count):
+            yield {"type": "choice_finished", "index": index, "finish_reason": "stop", **usage}
+        yield {"type": "final", **usage}
+
+    async def collect() -> None:
+        stream = openai_chat_stream(
+            AdapterRouter([record]),
+            record=record,
+            events=events(),
+            adapter_id="adapter",
+            completion_id="chatcmpl-test",
+            created=123,
+            include_usage=True,
+            usage_session=session,  # type: ignore[arg-type]
+            thinking=False,
+            choice_count=choice_count,
+        )
+        # take one frame, then abandon the stream: aclose sets the disconnect and waits for the
+        # producer to shut down. a producer parked on a full queue never returns from that wait.
+        await stream.__anext__()
+        await asyncio.wait_for(stream.aclose(), timeout=5)
+
+    asyncio.run(collect())
+    assert session.failed == []
