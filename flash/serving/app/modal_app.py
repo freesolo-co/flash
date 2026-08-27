@@ -138,12 +138,15 @@ def scaledown_window_for(gpu: str) -> int:
 # gpu model engines scale to zero. inference and adapter registration remote calls start the matching
 # parameter-bound engine on demand.
 MIN_CONTAINERS = 0
-# At most 3 GPUs per base model. `base_model` is a modal.parameter(), and Modal gives each distinct
-# parameter value its own container pool with its own autoscaling accounting, so this bound applies
-# PER MODEL rather than across the catalog. Engines are TENSOR_PARALLEL_SIZE 1 on a single-card `gpu=`
-# request, so one container is exactly one GPU and 3 containers is exactly 3 GPUs. Raising this bounds
-# spend per model, not total spend: N models can still reach 3N GPUs.
-MAX_CONTAINERS = 3
+# No autoscaling cap per base-model engine; modal adds capacity as concurrency demands. A fixed cap
+# here is a hard ceiling on a SINGLE model's capacity: `base_model` is a modal.parameter() and Modal
+# gives each value its own container pool, so sustained load on one model cannot borrow headroom from
+# an idle one. Bound spend with workspace quotas and billing alerts, which do not silently convert
+# demand into queueing on the hot tier.
+MAX_CONTAINERS = None
+# One spare warm container per base-model engine so a burst past `TARGET_INPUTS` does not pay a full
+# cold boot (420s on L40S, 900s on H100, 1010s on H200) before it can be served.
+BUFFER_CONTAINERS = 1
 # Concurrent requests packed onto one base-model GPU before Modal autoscales a new (costly) one.
 # A real-GPU sweep (scripts/gpu_canary.py::sweep_concurrency on A10G/Qwen2.5-1.5B) showed vLLM
 # throughput scaling near-linearly with no saturation through 128 concurrent, while TTFT stayed
@@ -428,6 +431,7 @@ def _build_engine(
         timeout=TIMEOUT_SECONDS,
         min_containers=MIN_CONTAINERS,
         max_containers=MAX_CONTAINERS,
+        buffer_containers=BUFFER_CONTAINERS,
     )(modal.concurrent(max_inputs=max_inputs, target_inputs=target_inputs)(_Engine))
     # Rebind the module name to the decorated handle, matching the normal ``@app.cls class X`` pattern
     # where the module attribute ends up referring to the decorated class.

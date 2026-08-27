@@ -41,8 +41,12 @@ engine behavior.
 
 Both environments keep `MIN_CONTAINERS = 0`, so every GPU engine scales to zero and starts on demand.
 The CPU router remains warm. The shared hardcoded settings remain `MAX_CONTAINERS = None`,
-`SCALEDOWN_WINDOW_SECONDS = 1800`, and `MAX_INPUTS = 64` with
-`TARGET_INPUTS = 48`.
+`BUFFER_CONTAINERS = 1`, `SCALEDOWN_WINDOW_SECONDS = 1800`, and `MAX_INPUTS = 64` with
+`TARGET_INPUTS = 48`. `MAX_CONTAINERS` is deliberately uncapped: `base_model` is a
+`modal.parameter()`, so each model has its own container pool and a fixed cap would ceiling one
+model's capacity rather than bounding total spend. Bound spend with workspace quotas and billing
+alerts instead. `BUFFER_CONTAINERS` only provisions while a Function is active, so engines still
+scale to zero when idle.
 
 ### Production
 
