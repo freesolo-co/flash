@@ -9,25 +9,36 @@ import weakref
 from typing import Self
 
 
-def _acquire_teacher_broker_lease() -> int | None:
-    """try to hold exclusive recovery ownership for the configured teacher ledger."""
+def _open_teacher_broker_lease() -> int:
+    """Open the lease guarding the configured teacher ledger.
+
+    Ledger recovery rewrites every live request, so it is safe only while no process is serving.
+    The lease models that directly: exclusive means recovering, shared means serving. The path is
+    resolved so symlinked or relative aliases of one ledger cannot yield independent leases.
+    """
     from flash.server.platform.db import db_path
 
-    path = f"{db_path()}.teacher-broker.lock"
+    path = f"{os.path.realpath(db_path())}.teacher-broker.lock"
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fd: int | None = None
+    return os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+
+
+def _claim_teacher_recovery(fd: int) -> bool:
+    """Whether this process may recover now: true only while no sibling recovers or serves."""
     try:
-        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        if fd is not None:
-            os.close(fd)
-        return None
-    except BaseException:
-        if fd is not None:
-            os.close(fd)
-        raise
-    return fd
+        return False
+    return True
+
+
+def _enter_teacher_serving(fd: int) -> None:
+    """Hold the lease shared for the serving lifetime, waiting out any in-progress recovery.
+
+    A later process therefore cannot claim recovery while this one is live, which is exactly the
+    turnover that would rewrite our in-flight requests.
+    """
+    fcntl.flock(fd, fcntl.LOCK_SH)
 
 
 def _release_teacher_broker_lease(fd: int) -> None:

@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import multiprocessing
+import pathlib
 import sqlite3
 import threading
 import time
@@ -381,6 +382,116 @@ def test_fresh_broker_process_recovers_stale_teacher_request(tmp_path):
     finally:
         release.set()
         _join_broker_process(process, errors)
+
+
+def _observe_ledger_state_during_run_recovery(db_path, request_id, observed_path, errors):
+    """Record the ledger state visible to `recover_runs`, which resubmits OPD work."""
+    try:
+        app_mod, test_client = _configure_broker_lifespan(db_path)
+
+        def observe_during_run_recovery():
+            state, _in_flight = _teacher_request_accounting(db_path, request_id)
+            pathlib.Path(observed_path).write_text(state, encoding="utf-8")
+
+        app_mod.recover_runs = observe_during_run_recovery
+        with test_client(app_mod.create_app()):
+            pass
+    except BaseException as exc:
+        errors.put(repr(exc))
+        raise
+
+
+def test_ledger_recovery_precedes_run_recovery(tmp_path):
+    """`recover_runs` resubmits OPD runs, so the ledger must be settled before it runs."""
+    pytest.importorskip("fastapi")
+    context = multiprocessing.get_context("spawn")
+    broker_path = tmp_path / "server.db"
+    _seed_started_request(broker_path, "request-ordering-stale-1")
+    observed = tmp_path / "observed-state"
+    errors = context.Queue()
+    process = context.Process(
+        target=_observe_ledger_state_during_run_recovery,
+        args=(str(broker_path), "request-ordering-stale-1", str(observed), errors),
+        name="ordering-broker",
+    )
+
+    process.start()
+    _join_broker_process(process, errors)
+    assert observed.read_text(encoding="utf-8") == "outcome_unknown"
+
+
+def test_broker_turnover_does_not_recover_under_a_live_sibling(tmp_path):
+    """A process starting after another is already serving must not recover its live requests."""
+    pytest.importorskip("fastapi")
+    context = multiprocessing.get_context("spawn")
+    broker_path = tmp_path / "server.db"
+    first_entered = context.Event()
+    first_release = context.Event()
+    errors = context.Queue()
+    first = context.Process(
+        target=_hold_broker_lifespan,
+        args=(str(broker_path), first_entered, first_release, errors),
+        name="serving-broker",
+    )
+
+    first.start()
+    try:
+        assert first_entered.wait(timeout=10)
+        # seed the live request only after the first process is serving, so recovery by the
+        # second process would be the turnover defect rather than legitimate startup recovery.
+        _seed_started_request(broker_path, "request-turnover-live-01")
+        second_entered = context.Event()
+        second_release = context.Event()
+        second = context.Process(
+            target=_hold_broker_lifespan,
+            args=(str(broker_path), second_entered, second_release, errors),
+            name="joining-broker",
+        )
+        second.start()
+        try:
+            assert second_entered.wait(timeout=10)
+            assert _teacher_request_accounting(broker_path, "request-turnover-live-01") == (
+                "started",
+                1,
+            )
+        finally:
+            second_release.set()
+            _join_broker_process(second, errors)
+    finally:
+        first_release.set()
+        _join_broker_process(first, errors)
+
+
+def test_broker_recovery_lease_excludes_an_aliased_database_path(tmp_path):
+    """Two names for one ledger must share a lease, not produce independent ones."""
+    from flash.server.platform import db as db_mod
+    from flash.server.platform.locks import (
+        _claim_teacher_recovery,
+        _open_teacher_broker_lease,
+        _release_teacher_broker_lease,
+    )
+
+    real = tmp_path / "server.db"
+    real.write_bytes(b"")
+    alias = tmp_path / "alias.db"
+    alias.symlink_to(real)
+
+    original = db_mod.DB_PATH
+    try:
+        db_mod.DB_PATH = str(real)
+        real_fd = _open_teacher_broker_lease()
+        try:
+            assert _claim_teacher_recovery(real_fd)
+            db_mod.DB_PATH = str(alias)
+            alias_fd = _open_teacher_broker_lease()
+            try:
+                assert not _claim_teacher_recovery(alias_fd)
+            finally:
+                _release_teacher_broker_lease(alias_fd)
+        finally:
+            _release_teacher_broker_lease(real_fd)
+    finally:
+        db_mod.DB_PATH = original
 
 
 def test_capability_persists_only_sha256_and_has_256_bits_of_entropy(broker_db):

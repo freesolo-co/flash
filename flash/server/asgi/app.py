@@ -29,8 +29,10 @@ from flash.serve.deployment.export import export_adapter
 from flash.server.platform import db
 from flash.server.platform.locks import (
     _DEPLOY_LOCKS,
-    _acquire_teacher_broker_lease,
+    _claim_teacher_recovery,
     _deploy_lock,
+    _enter_teacher_serving,
+    _open_teacher_broker_lease,
     _release_teacher_broker_lease,
 )
 from flash.server.platform.runtime import (
@@ -333,6 +335,18 @@ def create_app():
         from flash.server.domain.ops.reconcile import reconcile_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
+        # Ledger recovery rewrites every live teacher request, so it must complete before this
+        # process does anything that can issue one (`recover_runs` resubmits OPD runs) and before
+        # any process serves. The lease enforces both: exclusive to recover, then held shared for
+        # the whole serving lifetime so no later process can recover underneath a live sibling.
+        broker_lease_fd = _open_teacher_broker_lease()
+        try:
+            if _claim_teacher_recovery(broker_lease_fd):
+                db.recover_teacher_request_ledger()
+            _enter_teacher_serving(broker_lease_fd)
+        except BaseException:
+            _release_teacher_broker_lease(broker_lease_fd)
+            raise
         _open_deployment_jobs()
         _open_status_reporter()
         recover_runs()
@@ -379,10 +393,7 @@ def create_app():
         from flash.server.domain.ops.repo_cleanup import repo_cleanup_enabled
 
         cleanup_task = asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
-        broker_lease_fd = _acquire_teacher_broker_lease()
         try:
-            if broker_lease_fd is not None:
-                db.recover_teacher_request_ledger()
             yield
         finally:
             try:
@@ -412,8 +423,7 @@ def create_app():
                     remaining = max(0.0, shutdown_deadline - time.monotonic())
                     await asyncio.to_thread(_shutdown_status_reporter, remaining, close=True)
             finally:
-                if broker_lease_fd is not None:
-                    _release_teacher_broker_lease(broker_lease_fd)
+                _release_teacher_broker_lease(broker_lease_fd)
 
     app = FastAPI(title="Flash Control Plane", version=__version__, lifespan=lifespan)
     app.include_router(meta.router)
