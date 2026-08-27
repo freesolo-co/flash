@@ -34,6 +34,8 @@ from flash.server.platform.runtime import (
     _charge_retry_startup,
     _reconcile_cost_loop,
     _repo_cleanup_loop,
+    _stop_recovery_threads,
+    _wait_for_recovery_threads,
     _worker_artifacts,
     recover_runs,
 )
@@ -378,6 +380,9 @@ def create_app():
         try:
             yield
         finally:
+            # Signal before cancelling the loop tasks: a recovery thread parked on its retry wait
+            # unblocks immediately, so the bounded join below has a chance to actually drain it.
+            _stop_recovery_threads()
             startup_report_stop.set()
             startup_report_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -398,6 +403,10 @@ def create_app():
             with contextlib.suppress(Exception):
                 if not await asyncio.to_thread(_wait_for_deployment_jobs, 10.0):
                     _log.warning("deployment jobs still running at shutdown deadline")
+            with contextlib.suppress(Exception):
+                remaining = max(0.0, shutdown_deadline - time.monotonic())
+                if not await asyncio.to_thread(_wait_for_recovery_threads, remaining):
+                    _log.warning("recovery threads still running at shutdown deadline")
             with contextlib.suppress(Exception):
                 from flash.runner.lifecycle.reporting import _shutdown_status_reporter
 

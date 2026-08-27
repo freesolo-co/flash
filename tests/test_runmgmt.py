@@ -3273,7 +3273,7 @@ def test_deferred_handleless_loop_resubmits_when_clear_before_deadline(monkeypat
     monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: next(checks))
     monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 1000.0)
     monkeypatch.setattr(time_mod, "time", lambda: 100.0)
-    monkeypatch.setattr(time_mod, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(runtime, "_recovery_wait", lambda _seconds: None)
     started = []
     monkeypatch.setattr(
         runtime,
@@ -3327,7 +3327,7 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
         clock["now"] += seconds
 
     monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", record_failure)
-    monkeypatch.setattr(time_mod, "sleep", advance)
+    monkeypatch.setattr(runtime, "_recovery_wait", advance)
 
     runtime._deferred_resubmit_loop(spec)
 
@@ -3351,7 +3351,7 @@ def test_deferred_handleless_loop_reconciles_after_resubmit_cas_loss(monkeypatch
     monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 1000.0)
     monkeypatch.setattr(time_mod, "time", lambda: 100.0)
     sleeps = []
-    monkeypatch.setattr(time_mod, "sleep", sleeps.append)
+    monkeypatch.setattr(runtime, "_recovery_wait", sleeps.append)
     attempts = []
 
     def start_resubmit(*args, **kwargs):
@@ -3394,7 +3394,7 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
     )
     monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 100.0)
     monkeypatch.setattr(time_mod, "time", lambda: 101.0)
-    monkeypatch.setattr(time_mod, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(runtime, "_recovery_wait", lambda _seconds: None)
     monkeypatch.setattr(runtime, "_handleless_completed_metrics", lambda *a, **k: None)
     real_fail = runner_reconciliation._compare_and_fail_remote
     attempts = []
@@ -3490,8 +3490,8 @@ def test_deferred_handleless_legacy_run_without_attempt_metadata_fails_at_deadli
 
     monkeypatch.setattr(time_mod, "time", lambda: 86501.0)
     monkeypatch.setattr(
-        time_mod,
-        "sleep",
+        runtime,
+        "_recovery_wait",
         lambda _seconds: pytest.fail("legacy recovery must converge without retrying"),
     )
 
@@ -3699,3 +3699,99 @@ def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     with pytest.raises(runner_errors._RunCancelled):
         lifecycle._run_training(spec, None, prior_cost=0.0, source_snapshot=_SOURCE_SNAPSHOT)
     assert submitted == []  # never charged a GPU for an already-terminal run
+
+
+def _reset_recovery_ownership(runtime):
+    """Leave the module's recovery generation disarmed after a fence test."""
+    runtime._RECOVERY_STOP.clear()
+    with runtime._RECOVERY_LOCK:
+        runtime._RECOVERY_THREADS.clear()
+
+
+def test_recovery_stop_refuses_new_threads_and_attaches(monkeypatch):
+    # shutdown began before recovery got to dispatch: neither a recovery-owned loop nor a
+    # supervision attach may start, because nothing would ever join them afterwards.
+    import flash.server.platform.runtime as runtime
+
+    class Thread:
+        def __init__(self, **_kwargs):
+            raise AssertionError("a recovery thread started after shutdown began")
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    runtime._open_recovery_threads()  # a prior test's fake threads must not stand in for ours
+    try:
+        runtime._stop_recovery_threads()
+        runtime._start_recovery_thread(lambda _run_id: None, "run-1")
+        runtime._start_attach("run-1")
+        with runtime._RECOVERY_LOCK:
+            assert not runtime._RECOVERY_THREADS
+    finally:
+        _reset_recovery_ownership(runtime)
+
+
+def test_start_resubmit_refuses_before_touching_durable_state(monkeypatch):
+    # the fence sits above _compare_and_prepare_resubmit's CAS to provisioning: a refusal after
+    # that point would strand the run durably marked provisioning with no worker behind it.
+    import flash.server.platform.runtime as runtime
+
+    def unreachable(*_args, **_kwargs):
+        raise AssertionError("recovery read or wrote durable state after shutdown began")
+
+    monkeypatch.setattr(runtime, "get_status", unreachable)
+    monkeypatch.setattr(runtime, "_fail_blocked_recovery", unreachable)
+    monkeypatch.setattr(runtime, "_recovery_block_reason", unreachable)
+    try:
+        runtime._stop_recovery_threads()
+        assert runtime._start_resubmit(object(), expected_remote=None) is False
+    finally:
+        _reset_recovery_ownership(runtime)
+
+
+def test_deferred_resubmit_loop_returns_promptly_once_stopped(monkeypatch):
+    # the retry interval is two minutes, eight times the lifespan's whole shutdown budget, so a
+    # flag checked only at the loop head is not enough: the wait itself must observe the stop.
+    import threading
+    import time
+    import types
+
+    import flash.server.platform.runtime as runtime
+
+    entered = threading.Event()
+
+    def get_status(_run_id):
+        entered.set()
+        raise OSError("status store unavailable")  # drives the loop into its retry wait
+
+    monkeypatch.setattr(runtime, "get_status", get_status)
+    spec = types.SimpleNamespace(run_id="deferred-stop")
+    thread = threading.Thread(target=runtime._deferred_resubmit_loop, args=(spec,), daemon=True)
+    try:
+        thread.start()
+        assert entered.wait(5.0)
+        started_at = time.monotonic()
+        runtime._stop_recovery_threads()
+        thread.join(10.0)
+        assert not thread.is_alive()
+        assert time.monotonic() - started_at < runtime._DEFERRED_RECOVERY_RETRY_S
+    finally:
+        _reset_recovery_ownership(runtime)
+        thread.join(1.0)
+
+
+def test_wait_for_recovery_threads_reports_a_thread_still_running_at_the_deadline():
+    # the lifespan join is bounded: a recovery thread that ignores the stop must be reported, not
+    # waited on forever, so shutdown still completes inside its deadline.
+    import threading
+
+    import flash.server.platform.runtime as runtime
+
+    release = threading.Event()
+    runtime._open_recovery_threads()
+    try:
+        runtime._start_recovery_thread(release.wait)
+        assert runtime._wait_for_recovery_threads(0.2) is False
+        release.set()
+        assert runtime._wait_for_recovery_threads(5.0) is True
+    finally:
+        release.set()
+        _reset_recovery_ownership(runtime)
