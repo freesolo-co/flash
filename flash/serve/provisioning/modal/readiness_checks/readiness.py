@@ -1,8 +1,8 @@
 """readiness proofs for a modal deployment: what phase the provider is in, and whether it serves.
 
-Split out of `modal.py` when that file reached the 1000-line limit. The boundary mirrors
-`_runpod_readiness`: everything here answers "is this deployment in the exact phase I expect, and
-does its endpoint answer", and nothing here mutates provider state. The lifecycle in `modal.py`
+Split out of `modal.py` when that file reached the 1000-line limit. Everything here answers "is
+this deployment in the exact phase I expect, and does its endpoint answer", and nothing here
+mutates provider state. The lifecycle in `modal.py`
 owns the mutations and decides what to do with these answers.
 """
 

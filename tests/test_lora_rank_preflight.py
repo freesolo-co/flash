@@ -93,21 +93,33 @@ def test_preflight_rejects_adapter_rank_above_serving_cap():
         )
 
 
-def test_inactive_hosted_candidate_has_no_serving_rank_cap():
+@pytest.mark.parametrize("adapter_rank", [64, 65])
+def test_qwen38_customer_serving_rank_envelope(adapter_rank: int):
     from flash.core.catalog import serving_lora_rank_cap
 
     model = "Qwen/Qwen3.8-27B"
-    assert serving_lora_rank_cap(model) is None
-    metadata = preflight_init_adapter_lora_rank(
-        _spec(model=model),
-        config_loader=lambda _ref, _token, _revision: _config(
-            r=256,
-            lora_alpha=512,
-            base_model_name_or_path=model,
-        ),
-    )
-    assert metadata is not None
-    assert metadata.rank == 256
+    assert serving_lora_rank_cap(model) == 64
+    if adapter_rank == 64:
+        metadata = preflight_init_adapter_lora_rank(
+            _spec(model=model),
+            config_loader=lambda _ref, _token, _revision: _config(
+                r=adapter_rank,
+                lora_alpha=128,
+                base_model_name_or_path=model,
+            ),
+        )
+        assert metadata is not None
+        assert metadata.rank == adapter_rank
+    else:
+        with pytest.raises(ValueError, match=r"rank 65.*serving max_lora_rank=64"):
+            preflight_init_adapter_lora_rank(
+                _spec(model=model),
+                config_loader=lambda _ref, _token, _revision: _config(
+                    r=adapter_rank,
+                    lora_alpha=130,
+                    base_model_name_or_path=model,
+                ),
+            )
 
 
 @pytest.mark.parametrize("field", ["rank_pattern", "alpha_pattern"])
@@ -582,7 +594,7 @@ def _patch_fused_submit_preflight(
     target_spec = _spec(rank=child_rank, model=_FUSED_MODEL)
     target_spec = replace(
         target_spec,
-        train=replace(target_spec.train, init_from_adapter="source-run"),
+        train=replace(target_spec.train, init_from_adapter="source-run/final"),
     )
     source_spec = replace(
         target_spec,

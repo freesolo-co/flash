@@ -66,7 +66,7 @@ class _FailingPool:
         if self._mid_stream:
             yield {
                 "type": "ready",
-                "checkpoint": "run-a/step-1",
+                "checkpoint": "run-a/final",
                 "thinking": False,
                 "lora_request_adapter": record.adapter_id,
             }
@@ -84,7 +84,7 @@ class _CleanlyTruncatedPool(_FailingPool):
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
         yield {
             "type": "ready",
-            "checkpoint": "run-a/step-1",
+            "checkpoint": "run-a/final",
             "thinking": False,
             "lora_request_adapter": record.adapter_id,
         }
@@ -113,7 +113,7 @@ def _client(exc: Exception, *, mid_stream: bool = False, pool_cls=_FailingPool) 
 
 
 def _chat(client: TestClient, *, stream: bool = False):
-    body = {"model": "run-a", "messages": [{"role": "user", "content": "hi"}]}
+    body = {"model": "run-a/final", "messages": [{"role": "user", "content": "hi"}]}
     if stream:
         body["stream"] = True
     return client.post("/v1/chat/completions", json=body)

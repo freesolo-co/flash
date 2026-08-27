@@ -274,7 +274,7 @@ def _materialize_all(
     root = _prepare_cache_root(cache_root)
     hydrated: dict[str, Path] = {}
     for adapter in manifest.adapters:
-        hydrated[adapter.adapter_revision] = _materialize_adapter(
+        hydrated[adapter.checkpoint_id] = _materialize_adapter(
             adapter,
             manifest,
             root,
@@ -365,18 +365,18 @@ def locked_manifest_cache(
             lock_path = root / ".locks" / f"{adapter.aggregate_sha256}.lock"
             locks.enter_context(_digest_lock(lock_path))
         paths = {
-            adapter.adapter_revision: adapter_cache_path(root, adapter)
+            adapter.checkpoint_id: adapter_cache_path(root, adapter)
             for adapter in manifest.adapters
         }
         for adapter in manifest.adapters:
-            validate_materialized_adapter(adapter, manifest, paths[adapter.adapter_revision])
+            validate_materialized_adapter(adapter, manifest, paths[adapter.checkpoint_id])
         try:
             yield paths
         except BaseException:
             raise
         else:
             for adapter in manifest.adapters:
-                validate_materialized_adapter(adapter, manifest, paths[adapter.adapter_revision])
+                validate_materialized_adapter(adapter, manifest, paths[adapter.checkpoint_id])
 
 
 def validate_manifest_cache(
@@ -566,8 +566,8 @@ def _validate_cache_ancestor_stat(
         raise MaterializationError(f"{name} is not a directory")
     owner = details.st_uid
     writable = bool(details.st_mode & 0o022)
-    # root-owned shared directories include sticky /tmp and runpod's non-sticky 0777 moosefs mount.
-    # only root can replace their entries, while every inner cache object must still be owned by us.
+    # root-owned shared directories may be sticky or expose fixed world-writable modes. only root can
+    # replace their entries, while every inner cache object must still be owned by us.
     # filesystems that cannot store modes rely on the manifest digest and before/after identity
     # checks instead; _permission_bits_are_enforceable distinguishes those mounts below.
     root_shared = owner == 0
@@ -585,7 +585,7 @@ def _validate_cache_ancestor_stat(
 def _permission_bits_are_enforceable(directory_fd: int) -> bool:
     """report whether this filesystem preserves a private mode on a probe directory.
 
-    runpod's moosefs mount reports fixed 0777/0666 modes, so a capability probe avoids an
+    some mounted filesystems report fixed 0777/0666 modes, so a capability probe avoids an
     unsatisfiable assertion without coupling the policy to a provider or filesystem name.
     """
 

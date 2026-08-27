@@ -188,8 +188,6 @@ from flash.client.freesolo_api import list_trace_projects as list_trace_projects
 from flash.client.freesolo_api import upload_eval_run as upload_eval_run  # noqa: E402
 from flash.client.freesolo_api import verify_freesolo_key as verify_freesolo_key  # noqa: E402
 
-_CHAT_STEP_SELECTOR_CAPABILITY = "chat_step_selector_v1"
-
 
 def _validate_chat_messages(messages: list[dict]) -> None:
     if not isinstance(messages, list):
@@ -199,20 +197,13 @@ def _validate_chat_messages(messages: list[dict]) -> None:
             raise ClientError(f"chat messages[{index}] must be an object")
 
 
-def _parse_chat_target(target: str) -> tuple[str, str | None, int | None]:
-    from flash.schema import parse_adapter_revision, parse_checkpoint_ref
+def _parse_chat_target(target: str) -> tuple[str, str]:
+    from flash.schema import parse_checkpoint_ref
 
-    revision = parse_adapter_revision(target)
-    if revision is not None:
-        return revision[0], target.strip(), None
     parsed = parse_checkpoint_ref(target)
     if parsed is None:
-        raise ClientError(
-            "invalid run id: expected a bare RUN_ID, RUN_ID/step-N, or a full immutable adapter "
-            "revision"
-        )
-    run_id, step = parsed
-    return run_id, None, step
+        raise ClientError("invalid checkpoint id: expected RUN_ID/final or RUN_ID/step-N")
+    return parsed[0], target
 
 
 def _prepare_chat_request(
@@ -223,19 +214,16 @@ def _prepare_chat_request(
     *,
     stream: bool = False,
 ) -> tuple[str, dict[str, Any]]:
-    base_run_id, adapter_revision, step = _parse_chat_target(target)
+    base_run_id, checkpoint_id = _parse_chat_target(target)
     _validate_chat_messages(messages)
     body: dict[str, Any] = {
+        "checkpoint_id": checkpoint_id,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
     if stream:
         body["stream"] = True
-    if adapter_revision is not None:
-        body["adapter_revision"] = adapter_revision
-    elif step is not None:
-        body["step"] = step
     return base_run_id, body
 
 
@@ -280,10 +268,7 @@ def _parse_adapter_target(target: str) -> tuple[str, int | None]:
 
     parsed = parse_checkpoint_ref(target)
     if parsed is None:
-        raise ClientError(
-            "invalid adapter id: expected RUN_ID for the final adapter or RUN_ID/step-N "
-            "for a saved checkpoint"
-        )
+        raise ClientError("invalid checkpoint id: expected RUN_ID/final or RUN_ID/step-N")
     return parsed
 
 
@@ -299,7 +284,6 @@ class ApiClient:
         self.api_key = api_key
         self.timeout = timeout
         self.key_source = key_source
-        self._chat_step_selector_available = False
 
     def _auth_headers(self) -> dict[str, str]:
         if self.api_key:
@@ -463,36 +447,6 @@ class ApiClient:
 
     def health(self) -> dict:
         return self._request("GET", "/v1/health", timeout=10.0)
-
-    def _require_chat_step_selector(self) -> None:
-        # cached after it first succeeds: this is a property of the control plane, not of the
-        # request. `env eval` sends one chat per case, so re-checking each time doubled the request
-        # count and let a single transient /v1/health blip fail an arbitrary case while the chat
-        # endpoint was healthy.
-        if self._chat_step_selector_available:
-            return
-        capabilities = self.health().get("capabilities")
-        if not isinstance(capabilities, list) or _CHAT_STEP_SELECTOR_CAPABILITY not in capabilities:
-            raise ClientError(
-                "chat checkpoint selectors require a control plane that advertises "
-                f"{_CHAT_STEP_SELECTOR_CAPABILITY}; use a full immutable adapter revision or "
-                "upgrade the control plane"
-            )
-        # only a successful capability check is cached, so a transient failure remains visible and
-        # retryable. concurrent first calls may make the same benign request twice; a lock would add
-        # coordination to every client solely to optimize that one startup race, so a caller about to
-        # fan out settles it up front instead (see `warm_chat_step_selector`).
-        self._chat_step_selector_available = True
-
-    def warm_chat_step_selector(self, target: str) -> None:
-        """Settle the step-selector capability now, so concurrent callers inherit the cached answer.
-
-        A caller about to run many chats in parallel would otherwise have every worker miss the cold
-        cache at once and fire its own /v1/health. Only a `RUN/step-N` target needs the
-        capability, so anything else is a no-op. Raises exactly what the per-request check raises.
-        """
-        if _parse_chat_target(target)[2] is not None:
-            self._require_chat_step_selector()
 
     def publish_env(
         self,
@@ -679,11 +633,12 @@ class ApiClient:
         run_id: str,
         dry_run: bool = False,
     ) -> dict:
-        base_run_id, step = _parse_adapter_target(run_id)
+        base_run_id, _ = _parse_adapter_target(run_id)
         # smoke verification is mandatory server-side; there is no opt-out to forward.
-        body: dict = {"dry_run": dry_run}
-        if step is not None:
-            body["step"] = step
+        body: dict = {
+            "dry_run": dry_run,
+            "checkpoint_id": run_id,
+        }
         return self._request(
             "POST",
             f"/v1/runs/{base_run_id}/deploy",
@@ -699,14 +654,19 @@ class ApiClient:
         private: bool = True,
     ) -> dict:
         """Copy a run's adapter into a user-owned HuggingFace repo."""
-        base_run_id, step = _parse_adapter_target(run_id)
-        body: dict = {"repository": repository, "hf_token": hf_token, "private": private}
-        if step is not None:
-            body["step"] = step
+        base_run_id, _ = _parse_adapter_target(run_id)
+        body: dict = {
+            "repository": repository,
+            "hf_token": hf_token,
+            "private": private,
+            "checkpoint_id": run_id,
+        }
         return self._request("POST", f"/v1/runs/{base_run_id}/export", body=body, timeout=30 * 60)
 
-    def undeploy(self, run_id: str) -> dict:
-        return self._request("DELETE", f"/v1/runs/{run_id}/deploy")
+    def undeploy(self, checkpoint_id: str) -> dict:
+        run_id, checkpoint_id = _parse_chat_target(checkpoint_id)
+        quoted = urllib.parse.quote(checkpoint_id, safe="")
+        return self._request("DELETE", f"/v1/runs/{run_id}/deploy?checkpoint_id={quoted}")
 
     def deployments(self, timeout: float | None = None) -> list[dict]:
         return self._request(
@@ -772,19 +732,13 @@ class ApiClient:
         that: the default client timeout is 60s, so one stalled read inside a `--wait 5` would
         overshoot the bound the user asked for by an order of magnitude.
         """
-        base_run_id, step = _parse_adapter_target(run_id)
+        base_run_id, _ = _parse_adapter_target(run_id)
         deployment = self._serving_deployment(base_run_id, timeout)
         if deployment is None:
             return None
-        # the requested step is part of the identity, not decoration. matching on the run id
-        # alone lets `deploy RUN/step-40 --wait` settle on whichever revision happens to be
-        # deployed -- an older one still marked ready, or a replacement another shell deployed
-        # mid-wait -- and report that as this caller's own revision.
-        if "checkpoint_step" in deployment:
-            listed = deployment.get("checkpoint_step")
-            # None is the final adapter, an int is RUN/step-N (see the deployments renderer).
-            if (listed if listed is None else int(listed)) != step:
-                return None
+        # the exact checkpoint identity must match the caller's requested target.
+        if deployment.get("checkpoint_id") != run_id:
+            return None
         return deployment
 
     def deployed_checkpoint(
@@ -820,8 +774,6 @@ class ApiClient:
             temperature,
             max_tokens,
         )
-        if "step" in body:
-            self._require_chat_step_selector()
         return self._request(
             "POST",
             f"/v1/runs/{base_run_id}/chat",
@@ -843,8 +795,6 @@ class ApiClient:
             max_tokens,
             stream=True,
         )
-        if "step" in body:
-            self._require_chat_step_selector()
         headers = {"Content-Type": "application/json", **self._auth_headers()}
         req = urllib.request.Request(
             f"{self.api_url}/v1/runs/{base_run_id}/chat",

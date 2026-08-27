@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl, _LoraEntry
 from flash.serving.src.engine.support import (
     _adapter_source_cache_dir,
@@ -20,40 +21,25 @@ RUN_ID = "flash-1234567890-abcdef12"
 
 
 def _revision(sha: str, *, status: str = "ready") -> AdapterRecord:
-    return AdapterRecord.model_validate(
-        {
-            "adapter_id": f"{RUN_ID}@step-20.{sha}",
-            "repo_id": "org/run",
-            "org_id": "org-1",
-            "base_model": BASE_MODEL,
-            "subfolder": "checkpoints/step-20",
-            "repo_type": "model",
-            "checkpoint": f"{RUN_ID}/step-20",
-            "private": True,
-            "thinking": False,
-            "status": status,
-            "metadata": {
-                "record_type": "revision",
-                "run_id": RUN_ID,
-                "checkpoint_step": 20,
-                "hf_revision": sha,
-            },
-        }
-    )
-
-
-def _alias(target: AdapterRecord) -> AdapterRecord:
-    return target.model_copy(
-        update={
-            "adapter_id": RUN_ID,
-            "checkpoint": None,
-            "metadata": {
-                "record_type": "alias",
-                "run_id": RUN_ID,
-                "alias_of": target.adapter_id,
-            },
-        }
-    )
+    values = {
+        "adapter_id": f"{RUN_ID}/step-20",
+        "repo_id": "org/run",
+        "org_id": "org-1",
+        "base_model": BASE_MODEL,
+        "subfolder": "checkpoints/step-20",
+        "repo_type": "model",
+        "checkpoint": f"{RUN_ID}/step-20",
+        "private": True,
+        "thinking": False,
+        "status": status,
+        "run_id": RUN_ID,
+        "checkpoint_step": 20,
+        "artifact_revision": sha,
+        "artifact_digest": "b" * 64,
+        "lora_rank": 16,
+    }
+    values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
+    return AdapterRecord.model_validate(values)
 
 
 def test_distinct_hub_shas_have_distinct_source_and_cache_identity(tmp_path: Path) -> None:
@@ -63,16 +49,16 @@ def test_distinct_hub_shas_have_distinct_source_and_cache_identity(tmp_path: Pat
     assert _adapter_source_cache_dir(tmp_path, first) != _adapter_source_cache_dir(tmp_path, second)
 
 
-def test_engine_hydration_excludes_aliases_legacy_and_disabled(monkeypatch) -> None:
+def test_engine_hydration_excludes_base_models_and_disabled_checkpoints(monkeypatch) -> None:
     ready = _revision("a" * 40)
     records = [
         ready,
-        _alias(ready),
         AdapterRecord.model_validate(
             {
-                "adapter_id": "legacy",
-                "repo_id": "org/legacy",
+                "adapter_id": BASE_MODEL,
+                "repo_id": BASE_MODEL,
                 "base_model": BASE_MODEL,
+                "serve_base_model": True,
                 "thinking": False,
             }
         ),
@@ -92,17 +78,17 @@ def test_unregister_skips_cleanup_for_a_newer_deployment_generation() -> None:
     engine.registry.upsert(record, revive=True)
     engine._adapter_locks = {}
     engine._adapter_locks_guard = asyncio.Lock()
-    evicted: list[str] = []
+    evicted: list[tuple[str, str]] = []
 
-    async def _evict(adapter_id: str) -> None:
-        evicted.append(adapter_id)
+    async def _evict(adapter_key: tuple[str, str]) -> None:
+        evicted.append(adapter_key)
 
     engine._evict_loaded_lora = _evict
 
     async def _exercise() -> tuple[dict, dict, dict]:
-        legacy = await engine._unregister(record.adapter_id)
-        stale = await engine._unregister(record.adapter_id, "generation-old")
-        removed = await engine._unregister(record.adapter_id, "generation-new")
+        legacy = await engine._unregister(record.org_id, record.adapter_id)
+        stale = await engine._unregister(record.org_id, record.adapter_id, "generation-old")
+        removed = await engine._unregister(record.org_id, record.adapter_id, "generation-new")
         return legacy, stale, removed
 
     legacy, stale, removed = asyncio.run(_exercise())
@@ -110,8 +96,8 @@ def test_unregister_skips_cleanup_for_a_newer_deployment_generation() -> None:
     assert legacy["skipped_stale_generation"] is True
     assert stale["skipped_stale_generation"] is True
     assert removed["removed"] == record.adapter_id
-    assert engine.registry.get(record.adapter_id) is None
-    assert evicted == [record.adapter_id]
+    assert engine.registry.get(record.org_id, record.adapter_id) is None
+    assert evicted == [record.storage_key]
 
 
 def test_add_lora_exception_releases_new_entry_for_retry(tmp_path: Path) -> None:
@@ -133,10 +119,10 @@ def test_add_lora_exception_releases_new_entry_for_retry(tmp_path: Path) -> None
     with pytest.raises(RuntimeError, match="worker unavailable"):
         asyncio.run(engine._add_lora_locked(record, tmp_path))
 
-    assert record.adapter_id not in engine._entries()
+    assert record.storage_key not in engine._entries()
     asyncio.run(engine._add_lora_locked(record, tmp_path))
     assert calls == 2
-    assert engine._entries()[record.adapter_id].state == "loaded"
+    assert engine._entries()[record.storage_key].state == "loaded"
 
 
 def test_rejected_new_lora_releases_entry_and_reaches_engine_on_retry(tmp_path: Path) -> None:
@@ -157,10 +143,10 @@ def test_rejected_new_lora_releases_entry_and_reaches_engine_on_retry(tmp_path: 
     with pytest.raises(RuntimeError, match="vLLM rejected a new LoRA registration"):
         asyncio.run(engine._add_lora_locked(record, tmp_path))
 
-    assert record.adapter_id not in engine._entries()
+    assert record.storage_key not in engine._entries()
     asyncio.run(engine._add_lora_locked(record, tmp_path))
     assert calls == 2
-    assert engine._entries()[record.adapter_id].state == "loaded"
+    assert engine._entries()[record.storage_key].state == "loaded"
 
 
 @pytest.mark.parametrize(
@@ -178,7 +164,7 @@ def test_loaded_lora_failed_removal_retains_unconfirmed_entry(
     request = SimpleNamespace(lora_int_id=42)
     engine = _LoraEngineImpl()
     engine._lora_entries = {
-        record.adapter_id: _LoraEntry(_adapter_source_ident(record), request, "loaded")
+        record.storage_key: _LoraEntry(_adapter_source_ident(record), request, "loaded")
     }
 
     if outcome == "missing":
@@ -194,9 +180,9 @@ def test_loaded_lora_failed_removal_retains_unconfirmed_entry(
         engine.engine = _Engine()
 
     with pytest.raises(RuntimeError, match=message):
-        asyncio.run(engine._evict_loaded_lora(record.adapter_id))
+        asyncio.run(engine._evict_loaded_lora(record.storage_key))
 
-    entry = engine._entries()[record.adapter_id]
+    entry = engine._entries()[record.storage_key]
     assert entry.lora_request is request
     assert entry.state == "unconfirmed"
     with pytest.raises(RuntimeError, match="registration is unconfirmed"):
@@ -208,7 +194,7 @@ def test_reserved_lora_evict_releases_without_engine_removal() -> None:
     request = SimpleNamespace(lora_int_id=42)
     engine = _LoraEngineImpl()
     engine._lora_entries = {
-        record.adapter_id: _LoraEntry(_adapter_source_ident(record), request, "reserved")
+        record.storage_key: _LoraEntry(_adapter_source_ident(record), request, "reserved")
     }
     removed: list[int] = []
 
@@ -219,9 +205,9 @@ def test_reserved_lora_evict_releases_without_engine_removal() -> None:
 
     engine.engine = _Engine()
 
-    asyncio.run(engine._evict_loaded_lora(record.adapter_id))
+    asyncio.run(engine._evict_loaded_lora(record.storage_key))
 
-    assert record.adapter_id not in engine._entries()
+    assert record.storage_key not in engine._entries()
     assert removed == []
 
 
@@ -230,16 +216,16 @@ def test_cached_lora_request_enforces_state_and_source_identity(tmp_path: Path) 
     request = SimpleNamespace(lora_int_id=42)
     source_ident = _adapter_source_ident(record)
     engine = _LoraEngineImpl()
-    engine._lora_entries = {record.adapter_id: _LoraEntry(source_ident, request, "loaded")}
+    engine._lora_entries = {record.storage_key: _LoraEntry(source_ident, request, "loaded")}
 
     assert engine._cached_lora_request_locked(record, tmp_path) is request
 
-    engine._lora_entries[record.adapter_id] = _LoraEntry(source_ident, request, "unconfirmed")
+    engine._lora_entries[record.storage_key] = _LoraEntry(source_ident, request, "unconfirmed")
     with pytest.raises(RuntimeError, match="registration is unconfirmed"):
         engine._cached_lora_request_locked(record, tmp_path)
 
-    other_ident = ("other/repo", source_ident[1], source_ident[2], source_ident[3])
-    engine._lora_entries[record.adapter_id] = _LoraEntry(other_ident, request, "loaded")
+    other_ident = ("other/repo", *source_ident[1:])
+    engine._lora_entries[record.storage_key] = _LoraEntry(other_ident, request, "loaded")
     with pytest.raises(RuntimeError, match="previous LoRA removal is unconfirmed"):
         engine._cached_lora_request_locked(record, tmp_path)
 
@@ -256,19 +242,21 @@ def test_unregister_tombstones_missing_record_for_expected_generation() -> None:
     engine.registry = AdapterRegistry()
     engine._adapter_locks = {}
     engine._adapter_locks_guard = asyncio.Lock()
-    evicted: list[str] = []
+    evicted: list[tuple[str, str]] = []
 
-    async def _evict(adapter_id: str) -> None:
-        evicted.append(adapter_id)
+    async def _evict(adapter_key: tuple[str, str]) -> None:
+        evicted.append(adapter_key)
 
     engine._evict_loaded_lora = _evict
 
-    result = asyncio.run(engine._unregister(stale_record.adapter_id, "generation-old"))
+    result = asyncio.run(
+        engine._unregister(stale_record.org_id, stale_record.adapter_id, "generation-old")
+    )
 
     assert result["removed"] == stale_record.adapter_id
-    assert evicted == [stale_record.adapter_id]
+    assert evicted == [stale_record.storage_key]
     engine.registry.upsert(stale_record)
-    assert engine.registry.get(stale_record.adapter_id) is None
+    assert engine.registry.get(stale_record.org_id, stale_record.adapter_id) is None
 
 
 def test_snapshot_download_receives_exact_hub_sha(monkeypatch, tmp_path: Path) -> None:

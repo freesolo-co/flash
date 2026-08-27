@@ -1,7 +1,7 @@
 """Daily realized-cost reconciliation for finished runs.
 
 Reports provider COGS with the operator key, best-effort and off-path. Attribution uses the last
-`RunStatus.remote`, so multi-resource retries may be undercounted.
+active or cleanup-confirmed provider handle, so multi-resource retries may be undercounted.
 """
 
 from __future__ import annotations
@@ -69,6 +69,12 @@ def _terminal_ts(status: RunStatus) -> float:
     return float(status.finished_at)
 
 
+def _realized_cost_remote(status: RunStatus) -> dict:
+    """Return the exact provider identity retained for delayed COGS reconciliation."""
+    remote = status.realized_cost_remote or status.remote
+    return remote if isinstance(remote, dict) else {}
+
+
 def _due(status: RunStatus, now: float) -> bool:
     """Whether a run should be reconciled this pass: a billable run whose training is finished
     (a terminal billable state, or `deployed` -- see _RECONCILABLE_STATES), not yet reconciled,
@@ -82,7 +88,7 @@ def _due(status: RunStatus, now: float) -> bool:
     )  # from teardown, not a later updated_at bump (see _terminal_ts)
     if age < _SETTLE_SECONDS or age > _WINDOW_SECONDS:
         return False
-    return bool(status.remote)
+    return bool(_realized_cost_remote(status))
 
 
 def reconcile_run(status: RunStatus, *, now: float | None = None) -> bool:
@@ -90,7 +96,7 @@ def reconcile_run(status: RunStatus, *, now: float | None = None) -> bool:
     a positive realized cost was reported. A zero/None result leaves the run unreconciled so a
     later cycle (within the window) retries once the provider invoice settles."""
     now = time.time() if now is None else now
-    remote = status.remote or {}
+    remote = _realized_cost_remote(status)
     spec = status.spec or {}
     # runpod's billing query needs a lower bound even though its endpoint invoice is authoritative.
     # instance cost attribution independently requires a valid persisted started_ts and returns none

@@ -184,7 +184,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "train": {
-                "init_from_adapter": "source-run",
+                "init_from_adapter": "source-run/final",
                 "lora_rank": 8,
                 "lora_alpha": 16,
             },
@@ -226,7 +226,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
     )
 
     assert calls == [("owner/source-runs:sft/source-run", "token", _REVISION)]
-    assert public_spec.train.init_from_adapter == "source-run"
+    assert public_spec.train.init_from_adapter == "source-run/final"
     assert worker_spec.train.init_from_adapter == "owner/source-runs:sft/source-run"
     assert worker_spec.train.init_from_adapter_revision == _REVISION
     assert (public_spec.train.lora_rank, public_spec.train.lora_alpha) == (8, 128)
@@ -261,7 +261,7 @@ def test_qwen36_adapter_is_never_reinterpreted_as_qwen38(monkeypatch):
             "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
             "model_revision_auto": True,
             "algorithm": "grpo",
-            "train": {"init_from_adapter": "source-run"},
+            "train": {"init_from_adapter": "source-run/final"},
         }
     )
     monkeypatch.setattr(runner_status, "get_status", lambda run_id: source_status)
@@ -291,7 +291,7 @@ def test_prepare_init_adapter_requires_exact_model_revision_match(monkeypatch):
             "model_revision": "b" * 40,
             "model_revision_auto": True,
             "algorithm": "grpo",
-            "train": {"init_from_adapter": "source-run"},
+            "train": {"init_from_adapter": "source-run/final"},
         }
     )
     monkeypatch.setattr(runner_status, "get_status", lambda run_id: source_status)
@@ -339,7 +339,7 @@ def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
             "run_id": "child-run",
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
-            "train": {"init_from_adapter": "source-run"},
+            "train": {"init_from_adapter": "source-run/final"},
         }
     )
     monkeypatch.setattr(runner_status, "get_status", lambda run_id: source_status)
@@ -402,7 +402,7 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
             "run_id": "child-run",
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
-            "train": {"init_from_adapter": "source-run", "lora_rank": 8, "lora_alpha": 16},
+            "train": {"init_from_adapter": "source-run/final", "lora_rank": 8, "lora_alpha": 16},
         }
     )
     seen_revisions = []
@@ -483,7 +483,7 @@ def _unpinned_child():
             "run_id": "child-run",
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
-            "train": {"init_from_adapter": "source-run"},
+            "train": {"init_from_adapter": "source-run/final"},
         }
     )
 
@@ -674,7 +674,7 @@ def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path)
             "run_id": "child-run",
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
-            "train": {"init_from_adapter": "source-run", "lora_rank": 8},
+            "train": {"init_from_adapter": "source-run/final", "lora_rank": 8},
         }
     )
     public_dict = public.to_dict()
@@ -704,14 +704,6 @@ def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path)
     runner_state._save_status(status)
 
     assert "effective_preparation" not in status.to_dict()
-    legacy_status = runner_state.RunStatus(
-        run_id="legacy-child",
-        state="queued",
-        spec=public.to_internal_dict(),
-    )
-    public_status_spec = legacy_status.to_dict()["spec"]
-    assert "init_from_adapter_revision" not in public_status_spec["train"]
-    assert "lora_rank" not in public_status_spec["train"]
     with open(runner_state.runs_file_path("child-run", ".json")) as f:
         stored = json.load(f)
     assert stored["effective_preparation"]["worker_spec"]["train"]["lora_rank"] == 64
@@ -721,59 +713,15 @@ def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path)
 
 
 @pytest.mark.parametrize(
-    "raw_spec",
-    [
-        None,
-        "legacy-spec",
-        {"train": "legacy-train", "gpu": {}},
-        {"train": {}, "gpu": "legacy-gpu"},
-    ],
-)
-def test_public_status_tolerates_malformed_legacy_spec_shapes(raw_spec):
-
-    status = runner_state.RunStatus(
-        run_id="legacy-run",
-        state="running",
-        spec=raw_spec,
-        effective_preparation={"private": "snapshot"},
-    )
-
-    public = status.to_dict()
-
-    assert public["spec"] == raw_spec
-    assert "effective_preparation" not in public
-
-
-@pytest.mark.parametrize("init_ref", ["source-run", 123, 0, {}])
-def test_public_status_redacts_identifiable_warmstart_fields_from_malformed_spec(init_ref):
-
-    raw_spec = {
-        "train": {
-            "init_from_adapter": init_ref,
-            "init_from_adapter_revision": _REVISION,
-            "lora_rank": 64,
-        },
-        "gpu": "legacy-gpu",
-    }
-    status = runner_state.RunStatus(run_id="legacy-run", state="running", spec=raw_spec)
-
-    public_spec = status.to_dict()["spec"]
-
-    assert public_spec["train"] == {"init_from_adapter": init_ref}
-    assert raw_spec["train"]["init_from_adapter_revision"] == _REVISION
-    assert raw_spec["train"]["lora_rank"] == 64
-
-
-@pytest.mark.parametrize(
     ("stored_ref", "expected_ref"),
     [
-        ("private-owner/private-source:rl/source-run", "source-run"),
+        ("private-owner/private-source:rl/source-run", "source-run/final"),
         ("private-owner/private-source:rl/source-run/checkpoints/step-20", "source-run/step-20"),
     ],
 )
 def test_public_status_redacts_internal_storage_ref_on_valid_spec(stored_ref, expected_ref):
-    # A worker/effective or legacy record can persist the internal storage locator (which embeds the
-    # private HF repo) as a VALID spec that parses cleanly; the public status must rewrite it back to
+    # A worker spec persists the internal storage locator (which embeds the private HF repo) as a
+    # valid spec; the public status must rewrite it back to
     # the user-facing checkpoint ref instead of leaking the repo.
 
     raw_spec = {
@@ -802,7 +750,7 @@ def test_persist_effective_warmstart_requires_valid_snapshot(monkeypatch, tmp_pa
             "run_id": "legacy-child",
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
-            "train": {"init_from_adapter": "source-run"},
+            "train": {"init_from_adapter": "source-run/final"},
         }
     )
     runner_state._save_status(
@@ -829,7 +777,7 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "gpu": {"type": "RTX 4090"},
-            "train": {"init_from_adapter": "source-run", "lora_rank": 8},
+            "train": {"init_from_adapter": "source-run/final", "lora_rank": 8},
         }
     )
     worker_dict = public.to_internal_dict()
@@ -890,7 +838,7 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
             "run_id": "child-run",
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
-            "train": {"init_from_adapter": "source-run", "lora_rank": 8},
+            "train": {"init_from_adapter": "source-run/final", "lora_rank": 8},
         }
     )
     worker_dict = public.to_dict()
@@ -966,7 +914,7 @@ def test_effective_snapshot_rejects_tampering(field, value):
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "environment": {"id": "owner/environment"},
-            "train": {"init_from_adapter": "source-run", "lora_rank": 8, "lora_alpha": 16},
+            "train": {"init_from_adapter": "source-run/final", "lora_rank": 8, "lora_alpha": 16},
         }
     )
     worker_dict = public.to_dict()
@@ -1094,22 +1042,6 @@ def test_persist_metrics_reports_only_sanitized_worker_metrics(monkeypatch, tmp_
     assert "private/child" not in json.dumps(persisted)
 
 
-def test_legacy_warmstart_status_fails_closed_without_private_snapshot():
-    from flash.core.spec import JobSpec
-
-    public = JobSpec.from_dict(
-        {
-            "run_id": "legacy-child",
-            "model": "Qwen/Qwen3.5-9B",
-            "algorithm": "grpo",
-            "train": {"init_from_adapter": "source-run"},
-        }
-    )
-    status = runner_state.RunStatus(run_id="legacy-child", state="running", spec=public.to_dict())
-    with pytest.raises(ValueError, match="original preparation snapshot is unavailable"):
-        runner_status.effective_spec_from_status(status, verify_source=True)
-
-
 @pytest.mark.parametrize("source_algorithm", ["sft", "grpo", "opd"])
 @pytest.mark.parametrize("target_algorithm", ["sft", "grpo", "opd"])
 def test_every_algorithm_pair_prepares_a_warm_start(
@@ -1145,7 +1077,7 @@ def test_every_algorithm_pair_prepares_a_warm_start(
             "run_id": "child-run",
             "model": source.model,
             "algorithm": target_algorithm,
-            "train": {"init_from_adapter": source.run_id},
+            "train": {"init_from_adapter": f"{source.run_id}/final"},
         }
     )
     monkeypatch.setattr(runner_status, "get_status", lambda run_id: source_status)
@@ -1197,7 +1129,7 @@ def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
             "model": source.model,
             "algorithm": "sft",
             "environment": {"id": "freesolo/math-agent/gsm8k"},
-            "train": {"init_from_adapter": "source-run", "epochs": 1, "max_examples": 8},
+            "train": {"init_from_adapter": "source-run/final", "epochs": 1, "max_examples": 8},
         }
     )
     resolver_calls = []
@@ -1300,7 +1232,7 @@ def test_inherited_sft_pin_survives_the_force_pin_when_the_hub_tip_moved(monkeyp
             "algorithm": "sft",
             "model_revision": _REVISION,
             "model_revision_auto": True,
-            "train": {"init_from_adapter": "source-run", "hf_repo": "org/repo"},
+            "train": {"init_from_adapter": "source-run/final", "hf_repo": "org/repo"},
             "environment": {"id": "org/env"},
         }
     )

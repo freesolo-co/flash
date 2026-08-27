@@ -21,7 +21,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serving.src.engine.model_config import base_models, gpu_for
+from flash.serving.src.io.schemas import AdapterRecord, internal_adapter_payload
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
@@ -325,24 +327,27 @@ def test_router_secret_keeps_supabase_credentials(modal_app_module, monkeypatch)
 def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_path) -> None:
     from flash.serving.src.store.registry import AdapterRegistry
 
-    revision = "a" * 40
-    adapter_id = f"run-1@step-1.{revision}"
-    record_dict = {
+    run_id = "flash-1234567890-abcdef12"
+    adapter_id = f"{run_id}/step-1"
+    record_values = {
         "adapter_id": adapter_id,
         "repo_id": "org/private-adapter",
         "base_model": "Qwen/Qwen3.5-9B",
+        "subfolder": "checkpoints/step-1/adapter",
+        "repo_type": "dataset",
         "org_id": "org-1",
-        "checkpoint": "run-1/step-1",
+        "checkpoint": adapter_id,
         "private": True,
         "thinking": False,
         "status": "ready",
-        "metadata": {
-            "record_type": "revision",
-            "run_id": "run-1",
-            "checkpoint_step": 1,
-            "hf_revision": revision,
-        },
+        "run_id": run_id,
+        "checkpoint_step": 1,
+        "artifact_revision": "a" * 40,
+        "artifact_digest": "b" * 64,
+        "lora_rank": 32,
     }
+    record_values["artifact_fingerprint"] = immutable_binding_fingerprint(record_values)
+    record_dict = internal_adapter_payload(AdapterRecord.model_validate(record_values))
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine.base_model = record_dict["base_model"]
     engine.registry = AdapterRegistry()
@@ -368,7 +373,7 @@ def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_pat
 
     assert lora_request is resolved_request
     assert record.adapter_id == adapter_id
-    assert engine.registry.get(adapter_id) == record
+    assert engine.registry.get("org-1", adapter_id) == record
 
 
 def test_lora_engine_import_does_not_require_pillow() -> None:
@@ -642,17 +647,32 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
         {"messages": [{"role": "user", "content": "hello"}]},
         generation_id=generation_id,
     )
-    record = _Dump(
-        {"adapter_id": "run@step-1.sha"},
-        deployment_generation="generation-1",
-    )
+    checkpoint_id = "flash-1234567890-abcdef12/step-1"
+    record_values = {
+        "adapter_id": checkpoint_id,
+        "repo_id": "org/run",
+        "base_model": "Qwen/Qwen3.5-9B",
+        "subfolder": "checkpoints/step-1/adapter",
+        "repo_type": "dataset",
+        "org_id": "org-1",
+        "checkpoint": checkpoint_id,
+        "thinking": False,
+        "deployment_generation": "generation-1",
+        "run_id": "flash-1234567890-abcdef12",
+        "checkpoint_step": 1,
+        "artifact_revision": "a" * 40,
+        "artifact_digest": "b" * 64,
+        "lora_rank": 32,
+    }
+    record_values["artifact_fingerprint"] = immutable_binding_fingerprint(record_values)
+    record = AdapterRecord.model_validate(record_values)
 
     result = asyncio.run(
         pool.generate(
             "Qwen/Qwen3.5-9B",
             payload,
             record,
-            expected_checkpoint="step-1",
+            expected_checkpoint=checkpoint_id,
         )
     )
 
@@ -663,7 +683,7 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
                 "Qwen/Qwen3.5-9B",
                 payload,
                 record,
-                expected_checkpoint="step-1",
+                expected_checkpoint=checkpoint_id,
             )
         ]
 
@@ -677,26 +697,17 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.5-9B",
     ]
+    forwarded_record = internal_adapter_payload(record)
+    assert AdapterRecord.model_validate(forwarded_record) == record
     expected_inference_call = (
         {"messages": [{"role": "user", "content": "hello"}]},
-        {
-            "adapter_id": "run@step-1.sha",
-            "deployment_generation": "generation-1",
-        },
-        "step-1",
+        forwarded_record,
+        checkpoint_id,
         generation_id,
     )
     assert generate_calls == [expected_inference_call]
     assert stream_calls == [expected_inference_call]
-    assert register_calls == [
-        (
-            {
-                "adapter_id": "run@step-1.sha",
-                "deployment_generation": "generation-1",
-            },
-            "generation-1",
-        )
-    ]
+    assert register_calls == [(forwarded_record, "generation-1")]
 
 
 # ---- Functional: actually run _load() and capture the AsyncEngineArgs (vLLM/tokenizer stubbed) ----

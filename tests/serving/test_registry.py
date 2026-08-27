@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.store.registry import AdapterRegistry, lora_int_id
+from tests.serving.checkpoint_fixtures import checkpoint_record
 
 
 def _record(
@@ -15,30 +14,30 @@ def _record(
     repo_id: str | None = None,
     subfolder: str | None = None,
     repo_type: str = "model",
-    metadata: dict[str, object] | None = None,
 ) -> AdapterRecord:
-    return AdapterRecord.model_validate(
-        {
-            "adapter_id": adapter_id,
-            "repo_id": repo_id or f"Freesolo-Co/{adapter_id}",
-            "base_model": "openai/gpt-oss-20b",
-            "updated_at": updated_at,
-            "subfolder": subfolder,
-            "repo_type": repo_type,
-            "thinking": True,
-            "metadata": metadata or {},
-        }
+    return checkpoint_record(
+        adapter_id,
+        "openai/gpt-oss-20b",
+        repo_id=repo_id or f"Freesolo-Co/{adapter_id}",
+        updated_at=updated_at,
+        subfolder=subfolder,
+        repo_type=repo_type,
+        thinking=True,
     )
+
+
+def _id(run_id: str) -> str:
+    return f"{run_id}/final"
 
 
 def test_registry_hydrates_lists_and_upserts_records() -> None:
     registry = AdapterRegistry()
     registry.hydrate([_record("b"), _record("a")])
 
-    assert [record.adapter_id for record in registry.list_ready()] == ["a", "b"]
+    assert [record.adapter_id for record in registry.list_ready()] == [_id("a"), _id("b")]
 
     registry.upsert(_record("c"))
-    assert registry.get("c") is not None
+    assert registry.get("org-1", _id("c")) is not None
 
     record_c = _record("c")
     path = Path("/tmp/adapter-c")
@@ -57,7 +56,7 @@ def test_upsert_does_not_downgrade_to_an_older_record() -> None:
     registry.upsert(new)
     returned = registry.upsert(old)  # stale forward, revive defaults to False
     assert returned.repo_id == "org/new"  # caller gets the newer record back
-    assert registry.get("x").repo_id == "org/new"  # newer record kept
+    assert registry.get("org-1", _id("x")).repo_id == "org/new"  # newer record kept
 
 
 def test_upsert_newer_and_explicit_revive_win() -> None:
@@ -65,12 +64,12 @@ def test_upsert_newer_and_explicit_revive_win() -> None:
     registry.upsert(_record("y", updated_at="2026-06-26T11:00:00Z", repo_id="org/old"))
     # A strictly newer record overwrites.
     registry.upsert(_record("y", updated_at="2026-06-26T12:00:00Z", repo_id="org/newer"))
-    assert registry.get("y").repo_id == "org/newer"
+    assert registry.get("org-1", _id("y")).repo_id == "org/newer"
     # An explicit redeploy (revive=True) wins even with an OLDER timestamp.
     registry.upsert(
         _record("y", updated_at="2026-06-26T10:00:00Z", repo_id="org/redeploy"), revive=True
     )
-    assert registry.get("y").repo_id == "org/redeploy"
+    assert registry.get("org-1", _id("y")).repo_id == "org/redeploy"
 
 
 def test_upsert_overwrites_when_timestamps_unknown_or_equal() -> None:
@@ -78,12 +77,12 @@ def test_upsert_overwrites_when_timestamps_unknown_or_equal() -> None:
     # No timestamps -> can't prove older -> overwrite (preserves legitimate lazy-load forwards).
     registry.upsert(_record("z", repo_id="org/a"))
     registry.upsert(_record("z", repo_id="org/b"))
-    assert registry.get("z").repo_id == "org/b"
+    assert registry.get("org-1", _id("z")).repo_id == "org/b"
     # EQUAL timestamps -> incoming is not STRICTLY older -> overwrite (a same-instant forward of the
     # same-or-newer record must still win; the guard only blocks strictly-older incoming records).
     registry.upsert(_record("e", updated_at="2026-06-26T12:00:00Z", repo_id="org/a"))
     registry.upsert(_record("e", updated_at="2026-06-26T12:00:00Z", repo_id="org/b"))
-    assert registry.get("e").repo_id == "org/b"
+    assert registry.get("org-1", _id("e")).repo_id == "org/b"
 
 
 def test_revive_stamps_timestamp_so_post_deploy_resists_stale_forward() -> None:
@@ -101,7 +100,9 @@ def test_revive_stamps_timestamp_so_post_deploy_resists_stale_forward() -> None:
     stale = _record("a", updated_at="2026-06-18T00:00:00Z", repo_id="org/old", subfolder="v1")
     returned = registry.upsert(stale)  # stale router lazy-forwards the OLD record (revive=False)
     assert returned.repo_id == "org/new"  # guard rejects the older forward
-    assert registry.get("a").repo_id == "org/new"  # fresh source kept, no stale rollback
+    assert (
+        registry.get("org-1", _id("a")).repo_id == "org/new"
+    )  # fresh source kept, no stale rollback
 
 
 def test_lora_int_id_is_stable_positive() -> None:
@@ -125,31 +126,31 @@ def test_remove_tombstones_block_hydrate_and_lazy_upsert() -> None:
     # (default revive=False, e.g. the generate-path forward) may resurrect the adapter.
     registry = AdapterRegistry()
     registry.hydrate([_record("a")])
-    removed = registry.remove("a")
+    removed = registry.remove("org-1", _id("a"))
     assert removed is not None
-    assert registry.get("a") is None
-    assert not registry.has("a")
+    assert registry.get("org-1", _id("a")) is None
+    assert not registry.has("org-1", _id("a"))
 
     registry.hydrate([_record("a")])  # reload still has the not-yet-disabled ready row
-    assert registry.get("a") is None
-    assert not registry.has("a")
+    assert registry.get("org-1", _id("a")) is None
+    assert not registry.has("org-1", _id("a"))
 
     registry.upsert(_record("a"))  # generate-path lazy adopt
-    assert registry.get("a") is None
-    assert not registry.has("a")
+    assert registry.get("org-1", _id("a")) is None
+    assert not registry.has("org-1", _id("a"))
 
 
 def test_explicit_revive_clears_tombstone() -> None:
     # An explicit redeploy (revive=True, the POST /adapters path) must clear the tombstone.
     registry = AdapterRegistry()
     registry.hydrate([_record("a")])
-    registry.remove("a")
+    registry.remove("org-1", _id("a"))
     registry.upsert(_record("a"), revive=True)
-    assert registry.has("a")
-    assert registry.get("a") is not None
+    assert registry.has("org-1", _id("a"))
+    assert registry.get("org-1", _id("a")) is not None
     # And once revived, a later reload keeps it (tombstone is gone).
     registry.hydrate([_record("a")])
-    assert registry.has("a")
+    assert registry.has("org-1", _id("a"))
 
 
 def test_durably_newer_record_expires_tombstone_on_hydrate() -> None:
@@ -158,13 +159,13 @@ def test_durably_newer_record_expires_tombstone_on_hydrate() -> None:
     # timestamp, which must expire the local tombstone so this warm container stops 404-ing.
     registry = AdapterRegistry()
     registry.hydrate([_record("a", updated_at="2026-06-18T00:00:00Z")])
-    registry.remove("a")  # tombstone at the removed row's updated_at
+    registry.remove("org-1", _id("a"))  # tombstone at the removed row's updated_at
     # Stale ready row at the SAME timestamp must stay suppressed (no redeploy yet).
     registry.hydrate([_record("a", updated_at="2026-06-18T00:00:00Z")])
-    assert not registry.has("a")
+    assert not registry.has("org-1", _id("a"))
     # Durably newer row (a redeploy elsewhere) expires the tombstone -> back in the registry.
     registry.hydrate([_record("a", updated_at="2026-06-18T01:00:00Z")])
-    assert registry.has("a")
+    assert registry.has("org-1", _id("a"))
 
 
 def test_post_added_record_undeploy_is_durable_against_timestamped_reload() -> None:
@@ -173,17 +174,17 @@ def test_post_added_record_undeploy_is_durable_against_timestamped_reload() -> N
     # generate-path forward carrying ANY updated_at would resurrect the just-undeployed adapter.
     registry = AdapterRegistry()
     registry.upsert(_record("a", updated_at=None), revive=True)  # POST: no in-memory timestamp
-    registry.remove("a")
-    assert not registry.has("a")
+    registry.remove("org-1", _id("a"))
+    assert not registry.has("org-1", _id("a"))
     # A stale ready row from shared storage (which always has updated_at) must NOT revive it.
     registry.hydrate([_record("a", updated_at="2026-06-18T00:00:00Z")])
-    assert not registry.has("a")
+    assert not registry.has("org-1", _id("a"))
     # Nor a generate-path lazy forward carrying a timestamp.
     registry.upsert(_record("a", updated_at="2026-06-18T00:00:00Z"))
-    assert not registry.has("a")
+    assert not registry.has("org-1", _id("a"))
     # An explicit redeploy still revives it.
     registry.upsert(_record("a"), revive=True)
-    assert registry.has("a")
+    assert registry.has("org-1", _id("a"))
 
 
 def test_tombstone_same_instant_mixed_iso_does_not_resurrect() -> None:
@@ -194,13 +195,15 @@ def test_tombstone_same_instant_mixed_iso_does_not_resurrect() -> None:
     # expire the tombstone and resurrect the just-undeployed adapter. Comparing instants must not.
     registry = AdapterRegistry()
     registry.upsert(_record("a", updated_at=None), revive=True)  # POST: no in-memory timestamp
-    registry.remove("a")  # tombstone backfilled with _utc_now_iso() => "+00:00" rendering
-    tombstone_iso = registry._tombstones["a"]
+    registry.remove(
+        "org-1", _id("a")
+    )  # tombstone backfilled with _utc_now_iso() => "+00:00" rendering
+    tombstone_iso = registry._tombstones[("org-1", _id("a"))]
     assert tombstone_iso is not None
     assert tombstone_iso.endswith("+00:00")
     same_instant_z = tombstone_iso.replace("+00:00", "Z")  # PostgREST rendering, same instant
     registry.hydrate([_record("a", updated_at=same_instant_z)])
-    assert not registry.has("a")
+    assert not registry.has("org-1", _id("a"))
 
 
 def test_tombstone_compares_instants_across_mixed_iso_renderings() -> None:
@@ -209,13 +212,13 @@ def test_tombstone_compares_instants_across_mixed_iso_renderings() -> None:
     # expire the tombstone, but a strictly-NEWER row in either rendering must.
     registry = AdapterRegistry()
     registry.hydrate([_record("a", updated_at="2026-06-18T00:00:00Z")])
-    registry.remove("a")  # tombstone stamped at the removed row's "...Z" timestamp
+    registry.remove("org-1", _id("a"))  # tombstone stamped at the removed row's "...Z" timestamp
     # Same instant rendered as "+00:00" must NOT expire the tombstone.
     registry.hydrate([_record("a", updated_at="2026-06-18T00:00:00+00:00")])
-    assert not registry.has("a")
+    assert not registry.has("org-1", _id("a"))
     # A strictly newer "+00:00" redeploy must expire the "...Z" tombstone even though "+" < "Z".
     registry.upsert(_record("a", updated_at="2026-06-18T01:00:00+00:00"))
-    assert registry.has("a")
+    assert registry.has("org-1", _id("a"))
 
 
 def test_tombstone_unparseable_timestamp_stays_blocked() -> None:
@@ -223,11 +226,11 @@ def test_tombstone_unparseable_timestamp_stays_blocked() -> None:
     # adapter stays suppressed (only an explicit revive=True clears it).
     registry = AdapterRegistry()
     registry.hydrate([_record("a", updated_at="2026-06-18T00:00:00Z")])
-    registry.remove("a")
+    registry.remove("org-1", _id("a"))
     registry.upsert(_record("a", updated_at="not-a-timestamp"))
-    assert not registry.has("a")
+    assert not registry.has("org-1", _id("a"))
     registry.upsert(_record("a"), revive=True)
-    assert registry.has("a")
+    assert registry.has("org-1", _id("a"))
 
 
 def test_redeploy_with_new_source_invalidates_cached_local_path() -> None:
@@ -262,47 +265,25 @@ def test_durably_newer_record_expires_tombstone_on_lazy_upsert() -> None:
     # Same redeploy-elsewhere expiry, but via the generate-path lazy upsert (revive=False).
     registry = AdapterRegistry()
     registry.hydrate([_record("a", updated_at="2026-06-18T00:00:00Z")])
-    registry.remove("a")
+    registry.remove("org-1", _id("a"))
     # Old/equal-timestamp forward stays suppressed.
     registry.upsert(_record("a", updated_at="2026-06-18T00:00:00Z"))
-    assert not registry.has("a")
+    assert not registry.has("org-1", _id("a"))
     # Newer forward (redeploy) revives it without an explicit revive=True.
     registry.upsert(_record("a", updated_at="2026-06-18T02:00:00Z"))
-    assert registry.has("a")
+    assert registry.has("org-1", _id("a"))
 
 
-def test_hub_sha_participates_in_local_source_identity() -> None:
-    sha_a = "a" * 40
-    sha_b = "b" * 40
-    adapter_id = f"run@step-1.{sha_a}"
+def test_artifact_revision_participates_in_local_source_identity() -> None:
     first = _record(
-        adapter_id,
+        "run",
         repo_id="org/run",
         subfolder="checkpoints/step-1",
-        metadata={
-            "record_type": "revision",
-            "run_id": "run",
-            "checkpoint_step": 1,
-            "hf_revision": sha_a,
-        },
-    )
-    second = first.model_copy(update={"metadata": {**first.metadata, "hf_revision": sha_b}})
+    ).model_copy(update={"artifact_revision": "a" * 40})
+    second = first.model_copy(update={"artifact_revision": "b" * 40})
     registry = AdapterRegistry()
     registry.upsert(first)
     registry.set_local_path(first, Path("/tmp/source-a"))
     registry.upsert(second)
     assert registry.local_path_is_stale(second)
     assert registry.local_path(second) is None
-
-
-def test_aliases_never_acquire_local_paths() -> None:
-    alias = _record(
-        "run",
-        metadata={"record_type": "alias", "run_id": "run", "alias_of": "revision"},
-    )
-    registry = AdapterRegistry()
-    registry.upsert(alias)
-    assert registry.local_path(alias) is None
-    with pytest.raises(ValueError, match="alias records") as exc_info:
-        registry.set_local_path(alias, Path("/tmp/alias"))
-    assert "alias records" in str(exc_info.value)
