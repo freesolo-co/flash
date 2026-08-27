@@ -177,6 +177,9 @@ def api(tmp_path, monkeypatch):
     # runs._post() would urllib-POST the real backend (or wait out its 10s timeout). Stub the
     # single network choke-point so these offline tests stay hermetic (same as the billing fixture).
     monkeypatch.setattr(runs, "_post", lambda *a, **k: False, raising=False)
+    import flash.server.billing.charges as billing_mod
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **_kwargs: {"ok": True})
     # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. This stub
     # replaces the real network verify.
     auth_mod._verify_cache.clear()
