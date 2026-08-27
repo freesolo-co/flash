@@ -373,10 +373,22 @@ def _has_usage(event: dict[str, Any]) -> bool:
 async def _fail_usage(
     usage_session: UsageSession, latest_usage: dict[str, Any] | None, code: str
 ) -> None:
-    if latest_usage is None:
-        await usage_session.fail_admission(code)
-        return
-    await usage_session.fail(latest_usage, code)
+    """Record a terminal failure, releasing the generation even when recording it fails.
+
+    A successful terminal rpc relinquishes on the way out, but a raising one leaves the admission
+    capture in ``in_progress`` with its lease deadline and heartbeats still live. Every caller here
+    is already ending the stream, so nothing later would release it, and the generation would go on
+    being heartbeaten until its lease expired. The release has to survive the failure that makes it
+    necessary.
+    """
+    try:
+        if latest_usage is None:
+            await usage_session.fail_admission(code)
+            return
+        await usage_session.fail(latest_usage, code)
+    except BaseException:
+        usage_session.relinquish()
+        raise
 
 
 def _terminal_chunk(

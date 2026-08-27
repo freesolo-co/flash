@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import re
@@ -1627,6 +1628,76 @@ def test_admitted_stream_failure_before_native_usage_terminalizes_zero_once(
     assert failed_event.facts.completion_tokens == 0
     assert failed_event.facts.cached_tokens == 0
     assert failed_event.facts.reasoning_tokens == 0
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["engine_error", "disconnect", "missing_terminal"],
+)
+def test_a_failed_terminal_write_still_releases_the_admitted_generation(failure: str) -> None:
+    """A terminal failure that cannot be recorded must not leave the generation heartbeating.
+
+    The store relinquishes on a successful terminal rpc, so a raising one is the only path that can
+    strand the admission capture in `in_progress` with its lease alive. Every one of these callers
+    is ending the stream, so nothing later would release it.
+    """
+    record = _revision()
+    released: list[str] = []
+
+    class _RaisingFailStore(RecordingUsageStore):
+        async def fail(self, event: UsageEvent, code: str) -> None:
+            raise UsageOutboxError("terminal write lost")
+
+        def relinquish(self, request_id: str) -> None:
+            released.append(request_id)
+
+    store = _RaisingFailStore()
+    identity = RequestIdentity(request_id=new_generation_id(), correlation_id="correlation-1")
+    session = build_usage_session(
+        store,
+        identity,
+        FreesoloOrgTrafficPrincipal(orgId="org-1"),
+        record,
+        record,
+        price=freesolo_price(record.base_model),
+        deployment_id="deployment-1",
+        serving_release="release-1",
+        captured_at=datetime.now(UTC),
+    )
+
+    async def events():
+        if failure == "engine_error":
+            yield {"type": "error", "message": "engine failed", "code": 502}
+            return
+        if failure == "disconnect":
+            disconnected.set()
+            await asyncio.Event().wait()
+            return
+        yield {"type": "ready"}
+
+    async def run() -> None:
+        await session.admit()
+        await _produce_openai_chat_stream(
+            AdapterRouter([record]),
+            asyncio.Queue(),
+            disconnected,
+            record=record,
+            events=events(),
+            adapter_id=record.adapter_id,
+            completion_id="chatcmpl-terminal-write-lost",
+            created=123,
+            include_usage=True,
+            usage_session=session,
+            thinking=False,
+        )
+
+    disconnected = asyncio.Event()
+    # a disconnected client has no one left to receive an SSE error, so the outbox failure
+    # propagates there rather than being rendered. the release still has to have happened.
+    with contextlib.suppress(UsageOutboxError):
+        asyncio.run(run())
+
+    assert released == [identity.request_id], "the admitted generation must be released"
 
 
 def test_stream_finalizes_before_successful_terminal_usage_event() -> None:
