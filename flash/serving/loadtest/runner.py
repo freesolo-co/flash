@@ -335,7 +335,7 @@ async def _run_open_loop_phase(
             # lag means the client could not keep up; time spent inside a health probe is the
             # harness's own cost, so it is excluded from the admission decision. the recorded
             # timestamps still show the real delay, it just is not blamed on client saturation.
-            lag_ns = now_ns - deadline_ns - health.consumed_ns
+            lag_ns = now_ns - deadline_ns - health.credit_ns(deadline_ns)
             if lag_ns > max_lag_ns or slots.locked():
                 recorder.miss(item, now_ns)
                 continue
@@ -357,8 +357,9 @@ class _MidpointHealth:
     simply never fires. keeping this here rather than as a parallel task means it cannot race the
     dispatch loop or outlive an interrupted phase.
 
-    ``consumed_ns`` reports how long the probe blocked the dispatch loop, so the caller can keep
-    instrumentation cost out of the client scheduling-lag budget.
+    ``credit_ns`` reports how much of the probe an arrival actually waited through, so the caller
+    can keep instrumentation cost out of the client scheduling-lag budget without handing later
+    arrivals a discount they did not earn.
     """
 
     def __init__(
@@ -377,7 +378,8 @@ class _MidpointHealth:
         self._done = False
         self._args = (result, client, resolved, f"phase:{phase.name}:during", clock)
         self._clock = clock
-        self.consumed_ns = 0
+        self._started_ns: int | None = None
+        self._finished_ns: int | None = None
 
     async def before(self, deadline_ns: int) -> None:
         if self._at_ns is not None and not self._done and deadline_ns >= self._at_ns:
@@ -387,11 +389,24 @@ class _MidpointHealth:
         if self._at_ns is not None and not self._done:
             await self._fire()
 
+    def credit_ns(self, deadline_ns: int) -> int:
+        """the part of the probe that delayed an arrival due at ``deadline_ns``.
+
+        an arrival due before the probe returned was held by it and is credited only for the
+        overlap; one due after it returned waited on nothing and is credited zero. a standing
+        credit would be subtracted from every later arrival in the phase and would mask genuine
+        client_admission_missed events for the rest of it, which is the same metric the credit
+        exists to protect, failing in the opposite direction.
+        """
+        if self._started_ns is None or self._finished_ns is None:
+            return 0
+        return max(0, self._finished_ns - max(self._started_ns, deadline_ns))
+
     async def _fire(self) -> None:
         await self._clock.sleep_until_ns(self._at_ns)
-        started_ns = self._clock.monotonic_ns()
+        self._started_ns = self._clock.monotonic_ns()
         await _health_event(*self._args)
-        self.consumed_ns += self._clock.monotonic_ns() - started_ns
+        self._finished_ns = self._clock.monotonic_ns()
         self._done = True
 
 

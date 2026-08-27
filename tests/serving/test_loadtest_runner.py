@@ -194,6 +194,68 @@ def test_opening_health_probe_latency_is_not_charged_to_the_first_arrivals(tmp_p
     asyncio.run(exercise())
 
 
+def test_probe_credit_does_not_mask_a_later_genuine_admission_miss(tmp_path) -> None:
+    """the probe credit must expire with the probe, not discount the rest of the phase.
+
+    crediting every later arrival with the full probe duration is the mirror of charging them for
+    it: a real client stall after the probe returns would compute a negative lag and record a
+    success. that hides client_admission_missed, the metric that separates client saturation from
+    server overload, so the credit is bounded to the overlap between the probe and each arrival.
+    """
+    payload = scenario_payload()
+    payload["discovery"] = {"enabled": False}
+    payload["targets"] = [{"name": "base", "kind": "base_model", "model": "model-a"}]
+    payload["client"] = {"max_in_flight": 8, "max_scheduling_lag_ms": 50.0}
+    payload["phases"] = [
+        {"name": "sustained", "kind": "sustained", "duration_seconds": 2.0, "rate_rps": 2.0}
+    ]
+    # arrivals fall at 0.0, 0.5, 1.0 and 1.5s; the midpoint probe fires at 1.0s and runs to 1.5s.
+    # only the 1.5s arrival separates the two credit models: it is due exactly when the probe
+    # returns, so it waited on none of it. the earlier arrivals overlap the probe and are credited
+    # identically either way, which is why a stall aimed at them cannot detect the regression.
+    probe_ns = 500_000_000
+    stall_ns = 400_000_000
+
+    class StallingClock(FakeClock):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stalled = False
+
+        async def sleep_until_ns(self, deadline_ns: int) -> None:
+            await super().sleep_until_ns(deadline_ns)
+            # stall the dispatch loop itself, after the probe has already completed
+            if not self.stalled and deadline_ns >= 1_500_000_000:
+                self.stalled = True
+                self.advance_ns(stall_ns)
+
+    clock = StallingClock()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/healthz":
+            if clock.monotonic_ns() >= 1_000_000_000 and not clock.stalled:
+                clock.advance_ns(probe_ns)
+            return httpx.Response(200, json=_health())
+        return httpx.Response(200, content=_sse())
+
+    async def exercise() -> None:
+        path = tmp_path / "result"
+        await run_scenario(
+            Scenario.model_validate(payload),
+            "fake-secret",
+            path,
+            clock=clock,
+            client_factory=_factory(httpx.MockTransport(handler)),
+        )
+        outcomes = [
+            event["outcome"]
+            for event in load_events(path / "events.jsonl")
+            if event["type"] == "request_terminal"
+        ]
+        assert "client_admission_missed" in outcomes
+
+    asyncio.run(exercise())
+
+
 def test_health_probe_has_a_connection_beyond_the_in_flight_limit(tmp_path) -> None:
     """the pool reserves a slot for probes so saturation cannot abort a phase on a pool timeout."""
     seen: dict[str, int] = {}
