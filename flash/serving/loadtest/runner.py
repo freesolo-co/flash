@@ -27,8 +27,6 @@ from flash.serving.loadtest.schedule import (
     phase_duration_seconds,
 )
 from flash.serving.loadtest.schema import (
-    CLAIM_LIMITATIONS,
-    NO_CAPACITY_CONTRACT_LIMITATION,
     AdapterTarget,
     BaseTarget,
     ColdBurstPhase,
@@ -38,6 +36,7 @@ from flash.serving.loadtest.schema import (
     Target,
     WarmPhase,
     capacity_expectations,
+    claim_limitations,
 )
 
 ClientFactory = Callable[..., httpx.AsyncClient]
@@ -85,16 +84,13 @@ async def discover_scenario(
         if isinstance(phase, ColdBurstPhase)
     }
     capacity = capacity_expectations(scenario)
-    limitations = list(CLAIM_LIMITATIONS)
-    if capacity and not all(capacity.values()):
-        limitations.append(NO_CAPACITY_CONTRACT_LIMITATION)
     return ResolvedScenario(
         authored=scenario,
         health=health,
         targets=targets,
         phase_cold_attestations=cold,
         phase_capacity_expectations=capacity,
-        claim_limitations=limitations,
+        claim_limitations=claim_limitations(capacity, fake=scenario.fake),
     )
 
 

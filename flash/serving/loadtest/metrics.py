@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from collections.abc import Callable
 from typing import Any
 
-from flash.serving.loadtest.schema import CLAIM_LIMITATIONS, NO_CAPACITY_CONTRACT_LIMITATION
+from flash.serving.loadtest.schema import claim_limitations
 
 _LATENCIES = {
     "scheduling_ms": ("scheduled_ns", "dispatch_ns"),
@@ -28,23 +28,18 @@ def summarize_events(
     terminals = [event for event in events if event.get("type") == "request_terminal"]
     if not terminals:
         raise ValueError("events contain no request terminal records")
-    limitations = list(CLAIM_LIMITATIONS)
-    if fake:
-        limitations.append("fake or test runs cannot support production claims")
-    overload = _overload_verdicts(terminals, capacity_expectations or {})
-    if overload and not all(item["expects_capacity_contract"] for item in overload.values()):
-        limitations.append(NO_CAPACITY_CONTRACT_LIMITATION)
+    capacity = capacity_expectations or {}
     return {
         "schema_version": 1,
         "fake": fake,
         "production_claims_allowed": False if fake else "subject_to_claim_limitations",
-        "claim_limitations": limitations,
+        "claim_limitations": claim_limitations(capacity, fake=fake),
         "overall": _group_metrics(terminals),
         "per_phase": _grouped(terminals, lambda event: event["phase_name"]),
         "per_target": _grouped(terminals, lambda event: event["target_name"]),
         "per_profile": _grouped(terminals, lambda event: event["profile_name"]),
         "sustained_mixed_windows": _duration_windows(terminals),
-        "overload": overload,
+        "overload": _overload_verdicts(terminals, capacity),
     }
 
 

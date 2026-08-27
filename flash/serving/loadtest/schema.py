@@ -415,6 +415,8 @@ NO_CAPACITY_CONTRACT_LIMITATION = (
     "rejections is not evidence of headroom"
 )
 
+FAKE_RUN_LIMITATION = "fake or test runs cannot support production claims"
+
 
 def capacity_expectations(scenario: Scenario) -> dict[str, bool]:
     """per-overload-phase capacity contract declarations, keyed by phase name.
@@ -428,6 +430,23 @@ def capacity_expectations(scenario: Scenario) -> dict[str, bool]:
         for phase in scenario.phases
         if isinstance(phase, OverloadPhase)
     }
+
+
+def claim_limitations(capacity: dict[str, bool], *, fake: bool) -> list[str]:
+    """what this run's evidence cannot establish, derived from the authored scenario alone.
+
+    ``scenario.resolved.json`` and ``summary.json`` both publish this list, so it is derived here
+    once from authored declarations rather than separately at each writer. deriving the
+    no-capacity entry from observed rows instead would drop it whenever an overload phase
+    produced none, which is exactly the interrupted run where the caveat matters most: incomplete
+    evidence would advertise itself as less limited than complete evidence.
+    """
+    limitations = list(CLAIM_LIMITATIONS)
+    if fake:
+        limitations.append(FAKE_RUN_LIMITATION)
+    if capacity and not all(capacity.values()):
+        limitations.append(NO_CAPACITY_CONTRACT_LIMITATION)
+    return limitations
 
 
 def public_scenario_dict(scenario: Scenario) -> dict[str, Any]:

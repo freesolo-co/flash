@@ -116,6 +116,19 @@ def test_declared_capacity_contract_that_never_rejects_is_a_failed_expectation()
     assert not any("not evidence of headroom" in value for value in summary["claim_limitations"])
 
 
+def test_authored_capacity_caveat_survives_an_overload_phase_that_produced_no_rows() -> None:
+    """the no-capacity caveat is authored, so evidence that never reached overload keeps it.
+
+    an interrupted run's journal can end before the overload phase contributes a single row.
+    deriving the caveat from observed rows would drop it exactly there, so the less complete
+    evidence would advertise itself as less limited than a full run over the same deployment.
+    """
+    events = [_event(0)]
+    summary = summarize_events(events, fake=False, capacity_expectations={"overload": False})
+    assert summary["overload"] == {}
+    assert any("not evidence of headroom" in value for value in summary["claim_limitations"])
+
+
 def test_observed_capacity_rejection_is_reported_separately_from_other_503_and_429() -> None:
     events = [
         _overload(0, outcome="error", http_status=503, error_class="exact_capacity_503"),
