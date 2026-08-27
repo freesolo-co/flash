@@ -532,7 +532,7 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
         {"run_id": "r-held"},
         {"run_id": "r-missing"},
     ]
-    monkeypatch.setattr(serving.db, "all_runs", lambda: rows)
+    monkeypatch.setattr(serving_completion.db, "all_runs", lambda: rows)
 
     statuses = {
         # busy with no timestamp
@@ -596,7 +596,7 @@ def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
             spec={"run_id": "r-settled", "model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
         ),
     ]
-    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-settled"}])
+    monkeypatch.setattr(serving_completion.db, "all_runs", lambda: [{"run_id": "r-settled"}])
     monkeypatch.setattr(serving._app, "get_status", lambda _run_id: statuses.pop(0))
     monkeypatch.setattr(
         runner_transitions,
@@ -615,7 +615,7 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
     # as active, and only BUSY states were recovered at startup. the record therefore survived
     # every restart as a deployment that looks live and can never respond.
     rows = [{"run_id": "r-retired"}, {"run_id": "r-servable"}]
-    monkeypatch.setattr(serving.db, "all_runs", lambda: rows)
+    monkeypatch.setattr(serving_completion.db, "all_runs", lambda: rows)
 
     project = "11111111-1111-4111-8111-111111111111"
     statuses = {
@@ -674,7 +674,7 @@ def test_recover_deployments_reports_restored_ready_predecessor(monkeypatch):
         state="deployed",
         deployment={"state": "queued", "previous_deployment": previous},
     )
-    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-stale"}])
+    monkeypatch.setattr(serving_completion.db, "all_runs", lambda: [{"run_id": "r-stale"}])
     monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
 
     def mark_failed(run_id, failed):
