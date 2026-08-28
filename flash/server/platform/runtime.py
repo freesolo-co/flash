@@ -552,7 +552,10 @@ def _teardown_unrecoverable_remote(status) -> None:
     runs off the persisted handle alone, so it works for exactly the spec the parse rejected.
     Best-effort and fully suppressed: recovery must finish for every other run regardless.
     """
-    from flash.runner.accounting.reconciliation import _record_cleanup_remote
+    from flash.runner.accounting.reconciliation import (
+        _compare_and_remove_cleanup_remote,
+        _record_cleanup_remote,
+    )
     from flash.runner.supervise.lifecycle import _strict_teardown_handle
 
     remote = dict(status.remote or {})
@@ -563,8 +566,15 @@ def _teardown_unrecoverable_remote(status) -> None:
     except Exception:
         # unconfirmed deletion: leave it recorded for the cleanup drain rather than dropping it.
         deleted = False
-    if not deleted:
-        with contextlib.suppress(Exception):
+    with contextlib.suppress(Exception):
+        if deleted:
+            # quarantine records this same handle durably before dispatching teardown, so that a
+            # crash in between still leaves it for the next boot's drain. Once deletion is
+            # confirmed that window is closed, and leaving the record behind would make the drain
+            # that runs immediately after this call bill a second teardown for a resource already
+            # gone. Same confirmed-deletion bookkeeping `_drain_cleanup_remotes` applies per record.
+            _compare_and_remove_cleanup_remote(status.run_id, remote)
+        else:
             _record_cleanup_remote(status.run_id, remote)
 
 

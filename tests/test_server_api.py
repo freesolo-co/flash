@@ -6782,6 +6782,15 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
             b'{"run_id":"bad-run","state":"queued","spec":{},"recursion_sentinel":true}',
             id="decoder-recursion",
         ),
+        # a read failure is not a decode failure. `_load_status_json` turns only a MISSING file into
+        # `FileNotFoundError`; `PermissionError`, `ESTALE`, and `EIO` propagate from the bare
+        # `open()`/`json.load()` beneath that check, so without `OSError` in the recovery tuple one
+        # unreadable file aborts classification before any later run is reattached or resubmitted.
+        # Bytes cannot express an unreadable file, so the sentinel below makes the read itself raise.
+        pytest.param(
+            b'{"run_id":"bad-run","state":"queued","spec":{},"oserror_sentinel":true}',
+            id="record-read-oserror",
+        ),
     ],
 )
 def test_recover_runs_corrupt_status_is_quarantined_per_record(monkeypatch, tmp_path, bad_payload):
@@ -6819,21 +6828,32 @@ def test_recover_runs_corrupt_status_is_quarantined_per_record(monkeypatch, tmp_
     with open(runner_state.runs_file_path("bad-run", ".json"), "wb") as file:
         file.write(bad_payload)
 
-    if b"recursion_sentinel" in bad_payload:
+    if b"_sentinel" in bad_payload:
 
-        class _RecursingJson:
-            """Raises where cpython would on a record too deeply nested to walk."""
+        class _FailingJson:
+            """Raises at the decode seam for conditions bytes on disk cannot express.
+
+            `RecursionError` because the depth at which cpython gives up moved between 3.11 and
+            3.12, so one nested payload is corrupt on one interpreter and a healthy queued record
+            on the next. `OSError` because an unreadable file is a property of the filesystem, not
+            of any byte sequence. Both are keyed on the record rather than patched blanket, because
+            `_save_status` reads through this same binding to merge -- healthy-run's own seed would
+            fail too.
+            """
 
             def __getattr__(self, name):
                 return getattr(json, name)
 
             def load(self, file):
                 value = json.load(file)
-                if isinstance(value, dict) and value.get("recursion_sentinel"):
-                    raise RecursionError("maximum recursion depth exceeded while decoding")
+                if isinstance(value, dict):
+                    if value.get("recursion_sentinel"):
+                        raise RecursionError("maximum recursion depth exceeded while decoding")
+                    if value.get("oserror_sentinel"):
+                        raise PermissionError(13, "Permission denied")
                 return value
 
-        monkeypatch.setattr(runner_status, "json", _RecursingJson())
+        monkeypatch.setattr(runner_status, "json", _FailingJson())
 
     # bad-run must be first or the unfixed loop can recover healthy-run before aborting.
     monkeypatch.setattr(
@@ -7124,7 +7144,13 @@ def test_recover_runs_corrupt_status_preserves_and_drains_teardown_evidence(monk
     assert torn_down == [("ep-active", run_id), ("ep-cleanup", run_id)]
     failed = runner_status.get_status(run_id)
     assert failed.state == "failed"
-    assert failed.remote == active_remote
+    # the salvaged handle is proven by `torn_down` above; what survives after its deletion is
+    # confirmed is the confirmed-teardown bookkeeping, not a still-active remote. Leaving it in
+    # `remote` would re-present a deleted resource as live and bill the drain for a second
+    # teardown of it. Realized cost keeps its own copy so the attempt stays chargeable.
+    assert failed.remote is None
+    assert failed.cleanup_confirmed_remote == active_remote
+    assert failed.realized_cost_remote == active_remote
     with open(status_path, encoding="utf-8") as handle:
         assert not json.load(handle).get(runner_state._CLEANUP_REMOTES_KEY)
     quarantine_files = list((tmp_path / "runs").glob(f"{run_id}.json.corrupt-*"))
@@ -7287,6 +7313,82 @@ def test_recover_runs_does_not_quarantine_concurrently_repaired_status(
     assert status.error is None
     assert list((tmp_path / "runs").glob("race-run.json.corrupt-*")) == []
     assert "persisted status cannot be decoded" not in runner_status.get_logs("race-run")
+
+
+def test_quarantine_records_teardown_intent_before_the_daemon_runs(monkeypatch, tmp_path):
+    """The salvaged handle has to be durable in the write that installs the terminal envelope.
+
+    Quarantine installs the envelope and only then dispatches teardown onto a background thread. A
+    process exit between those two points would leave the handle in `status.remote` alone, which no
+    startup path deletes: `_classify_recoverable_runs` skips the record because it is already
+    terminal, and RunPod's `sweep_orphans` is a no-op, so the endpoint bills forever. Asserting the
+    endpoint is eventually torn down would pass without the durable write, so this reads the
+    persisted record back while the teardown thread is still merely queued -- exactly the state a
+    crash in that window would leave on disk.
+    """
+    import flash.server.platform.runtime as runtime
+    from flash.providers.core import registry as providers_mod
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    run_id = "corrupt-intent"
+    canonical_handle = {
+        "provider": "runpod",
+        "endpoint_id": "ep-intent",
+        "endpoint_name": "flash-intent",
+        "key_fingerprint": "rpk-" + "c" * 64,
+        "job_id": None,
+        "attempt": 0,
+        "started_ts": 1.0,
+    }
+    # pin the handle as canonical so this turns only on the durable write, never on lenient salvage.
+    assert runner_reconciliation._canonical_cleanup_remote(canonical_handle) is not None
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=run_id,
+            state="running",
+            spec={"run_id": run_id},
+            remote=canonical_handle,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
+    )
+    status_path = runner_state.runs_file_path(run_id, ".json")
+    with open(status_path, encoding="utf-8") as handle:
+        raw = json.load(handle)
+    raw["source_snapshot"] = {"kind": "invalid"}
+    with open(status_path, "w", encoding="utf-8") as handle:
+        json.dump(raw, handle)
+
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": run_id}])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    torn_down = []
+    monkeypatch.setattr(
+        "flash.runner.supervise.lifecycle._strict_teardown_handle",
+        lambda handle, torn_run_id: torn_down.append(handle["endpoint_id"]) or True,
+    )
+    deferred = []
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target = target
+            self._args = args
+
+        def start(self):
+            deferred.append(lambda: self._target(*self._args))
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+
+    # nothing has run yet, so what is on disk is exactly what a crash in this window would leave.
+    assert not torn_down
+    assert len(deferred) == 1
+    with open(status_path, encoding="utf-8") as handle:
+        persisted = json.load(handle)
+    assert persisted["state"] == "failed"
+    recorded = persisted[runner_state._CLEANUP_REMOTES_KEY]
+    assert [record["endpoint_id"] for record in recorded] == ["ep-intent"]
 
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):

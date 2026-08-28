@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import tempfile
 import time
@@ -98,11 +99,17 @@ def _describes_run(run_id: str, raw: dict | None) -> bool:
     relating it to the run id it is passed, so lifting those handles would let one swapped status
     file terminate another live run's worker. The hard-linked sidecar still preserves the record
     for an operator; the envelope just cannot claim any of it.
+
+    An absent id is benign, because the filename is then the only identity the record carries. Any
+    id that is present and not exactly `run_id` is refused, including `null` and numbers:
+    `_validate_recovery_status` already rejects those as mismatched, so treating them as this run's
+    would lift teardown evidence the decoder itself declined to trust.
     """
     if raw is None:
         return False
-    stored = raw.get("run_id")
-    return not (isinstance(stored, str) and stored != run_id)
+    if "run_id" not in raw:
+        return True
+    return raw["run_id"] == run_id
 
 
 # quarantine owns these; every other readable field is lifted verbatim. `source_snapshot` is
@@ -112,6 +119,61 @@ _QUARANTINE_CONTROLLED = frozenset(
     {"run_id", "state", "error", "finished_at", "updated_at", "remote", "source_snapshot"}
 )
 
+# settled top-level outcomes quarantine must not relabel. `deployed` is not in `TERMINAL_STATES`
+# but it is a live top-level `status.state` this build writes, and three independent readers treat
+# it as settled: `_FINAL_DEPLOYMENT_STATES` in `flash/runner/supervise/deploy.py`,
+# `_DEPLOYABLE_STATES` in `flash/server/asgi/app.py`, and `_RECONCILABLE_STATES` in
+# `flash/server/domain/ops/reconcile.py`. Rewriting it to `failed` would strand a still-live
+# serving deployment: undeployable, no downloadable artifact, and no longer reconcilable.
+_QUARANTINE_RETAINED_STATES = state.TERMINAL_STATES | {"deployed"}
+
+
+def _salvaged_finished_at(raw: dict, now: float) -> float:
+    """The record's own terminal timestamp, which billing treats as the teardown boundary.
+
+    `finished_at` is stamped once on the first terminal transition and is documented on `RunStatus`
+    as surviving every later `updated_at` bump, because realized provider cost is billed from the
+    handle's `started_ts` through this value (`_terminal_ts` in
+    `flash/server/domain/ops/reconcile.py`, `_instance_realized_cost` in
+    `flash/providers/core/realized.py`). Restamping a settled record at restart would bill the
+    entire outage as wall time.
+
+    Anything that is not a finite positive real is unusable as that boundary -- `_terminal_ts`
+    raises on `None` and `float()` raises on a string -- so those fall back to `now`, using the
+    same guards `_instance_realized_cost` applies to `started_ts`.
+    """
+    stored = raw.get("finished_at")
+    if isinstance(stored, bool) or not isinstance(stored, (int, float)):
+        return now
+    if not math.isfinite(stored) or stored <= 0:
+        return now
+    return float(stored)
+
+
+def _durable_teardown_intent(remote: dict | None, cleanup_remotes: list | None) -> list | None:
+    """Fold the salvaged active handle into the durable cleanup list before teardown is attempted.
+
+    Quarantine installs the terminal envelope first and dispatches teardown onto a background
+    thread afterwards. A process exit between those two points would leave the salvaged handle only
+    in `status.remote`, which no startup path deletes: `_classify_recoverable_runs` skips the record
+    because it is already terminal, and RunPod's `sweep_orphans` is a no-op. Recording the intent
+    inside the same atomic write means the next boot's ordinary cleanup drain finds it.
+
+    The drain tolerates handles the strict reader rejects at every stage it has -- the snapshot
+    falls back to `_drainable_cleanup_remotes`, teardown selects by `_teardown_removal_key`, and
+    removal preserves unrecognized siblings verbatim -- so the lenient handle
+    `_salvage_teardown_handle` keeps is persisted here rather than dropped.
+    """
+    from flash.runner.accounting.reconciliation import _teardown_removal_key
+
+    key = _teardown_removal_key(remote)
+    if key is None:
+        return cleanup_remotes
+    records = list(cleanup_remotes or [])
+    if all(_teardown_removal_key(existing) != key for existing in records):
+        records.append(dict(remote or {}))
+    return records
+
 
 def _salvage_corrupt_record(
     run_id: str, raw: dict | None, detail: str, now: float
@@ -119,18 +181,20 @@ def _salvage_corrupt_record(
     """Build the quarantine envelope, keeping every field the corrupt record still reads back.
 
     Only the field that actually failed is untrustworthy. `_load_status_json` has already proved
-    the record decodes to a dict, and `_validate_recovery_status` rejects exactly three things: a
-    run id mismatch, a non-string state, or a malformed `source_snapshot`. Rebuilding the rest from
-    defaults would drop `billing_context`, `cost_usd`, artifacts and deployment metadata, which
-    permanently disqualifies a chargeable run from `flash.server.billing.retry._needs_charge`.
+    the record decodes to a dict, and the decode path rejects two things itself -- a run id
+    mismatch and a non-string state, both in `_validate_recovery_status` -- plus a malformed
+    `source_snapshot`, which `parse_descriptor` raises from inside `get_status`. Rebuilding the
+    rest from defaults would drop `billing_context`, `cost_usd`, artifacts and deployment metadata,
+    which permanently disqualifies a chargeable run from `flash.server.billing.retry._needs_charge`.
 
-    The terminal state is kept for the same reason it is checked at all: `_update` refuses to move
-    a run back out of a terminal state, but quarantine writes the envelope directly and bypasses
-    that compare-and-set, so a `done` record would otherwise be republished as `failed` -- which is
-    undeployable (`_UNDEPLOYABLE_STATES`) and no longer settleable.
+    The settled state is kept for the same reason it is checked at all: `_update` refuses to move a
+    run back out of a terminal state, but quarantine writes the envelope directly and bypasses that
+    compare-and-set, so a `done` or `deployed` record would otherwise be republished as `failed` --
+    which is undeployable (`_UNDEPLOYABLE_STATES`) and no longer settleable.
     """
     values: dict = {"spec": {}, "state": "failed", "remote": None}
     cleanup_remotes = None
+    finished_at = now
     if raw is not None and _describes_run(run_id, raw):
         values.update(
             {
@@ -139,24 +203,41 @@ def _salvage_corrupt_record(
                 if key in RunStatus.__dataclass_fields__ and key not in _QUARANTINE_CONTROLLED
             }
         )
+        # the two lifted dicts serialization dereferences. `_status_storage_dict` reads
+        # `effective_preparation["worker_spec"]` through `_adapter_ref_for_status`, where `.get()`
+        # on a truthy non-dict raises `AttributeError` -- and `_quarantine_corrupt_recovery_record`
+        # suppresses that, so the corrupt record would stay unquarantined and its live remote would
+        # never be torn down. `or {}` is not a guard here: it only defends against falsy values.
         if not isinstance(values.get("spec"), dict):
             values["spec"] = {}
+        if not isinstance(values.get("effective_preparation"), dict):
+            values["effective_preparation"] = None
         stored_state = raw.get("state")
-        if isinstance(stored_state, str) and stored_state in state.TERMINAL_STATES:
+        if isinstance(stored_state, str) and stored_state in _QUARANTINE_RETAINED_STATES:
             values["state"] = stored_state
+            finished_at = _salvaged_finished_at(raw, now)
         values["remote"] = _salvage_teardown_handle(raw.get("remote"))
         stored_cleanup = raw.get(state._CLEANUP_REMOTES_KEY)
         if isinstance(stored_cleanup, list):
             cleanup_remotes = list(stored_cleanup)
-    failed = RunStatus(**values, run_id=run_id, error=detail, finished_at=now, updated_at=now)
+    failed = RunStatus(
+        **values, run_id=run_id, error=detail, finished_at=finished_at, updated_at=now
+    )
     return failed, cleanup_remotes
 
 
+# what one unreadable record can raise without implicating any other run. `OSError` is here because
+# `_load_status_json` only converts a missing file into `FileNotFoundError`; every other read
+# failure -- `PermissionError`, `ESTALE`, `EIO` -- propagates from the bare `open()`/`json.load()`
+# beneath it, and escaping this tuple would abort the whole classification pass before later
+# runs are reattached or resubmitted. `FileNotFoundError` is a subclass, so every handler for
+# these must order its `except FileNotFoundError` clause first; both call sites in this module do.
 _RECOVERY_RECORD_ERRORS = (
     UnicodeDecodeError,
     ValueError,
     TypeError,
     RecursionError,
+    OSError,
     SourceSnapshotError,
 )
 
@@ -177,10 +258,11 @@ def _quarantine_corrupt_status(run_id: str, detail: str) -> tuple[RunStatus | No
             return repaired, False
         try:
             raw = _load_status_json(run_id)
-        except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError, OSError):
             raw = None
         failed, cleanup_remotes = _salvage_corrupt_record(run_id, raw, detail, time.time())
         data = state._status_storage_dict(failed)
+        cleanup_remotes = _durable_teardown_intent(failed.remote, cleanup_remotes)
         if cleanup_remotes is not None:
             data[state._CLEANUP_REMOTES_KEY] = cleanup_remotes
         fd, tmp = tempfile.mkstemp(dir=state.RUNS_DIR, prefix=f"{run_id}.", suffix=".tmp")
