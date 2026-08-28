@@ -164,6 +164,51 @@ def test_score_batcher_wrong_length_fails_every_waiter_without_partial_scatter()
     assert all("zip() argument" in outcome for outcome in outcomes)
 
 
+def test_score_batcher_close_claims_undispatched_grpo_work_within_bound():
+    class FlushWaitCondition(threading.Condition):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+
+        def wait(self, timeout=None):
+            if threading.current_thread().name == "test-grpo-final-batch" and timeout is not None:
+                self.entered.set()
+            return super().wait(timeout)
+
+    scored = threading.Event()
+
+    def score_batch(requests):
+        scored.set()
+        return [f"scored:{request}" for request in requests]
+
+    batcher = ScoreBatcher(
+        score_batch,
+        max_batch_size=8,
+        flush_wait_s=30.0,
+        label="test",
+        thread_name="test-grpo-final-batch",
+    )
+    condition = FlushWaitCondition()
+    batcher._condition = condition
+    outcomes = []
+
+    def score():
+        outcomes.append(batcher.submit("request"))
+
+    waiter = threading.Thread(target=score)
+    waiter.start()
+    try:
+        assert condition.entered.wait(timeout=2.0)
+        batcher.close(1.0)
+        waiter.join(timeout=2.0)
+    finally:
+        batcher.close(0.1)
+
+    assert not waiter.is_alive()
+    assert scored.is_set()
+    assert outcomes == ["scored:request"]
+
+
 def test_score_batcher_close_releases_an_inflight_waiter_after_the_join_bound():
     entered = threading.Event()
     release = threading.Event()
