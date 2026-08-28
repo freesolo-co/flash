@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import time
 import urllib.error
+from collections.abc import Callable
 from typing import Any
 
 from flash._internal.logging import get_logger
@@ -234,13 +235,22 @@ def list_endpoints_by_key(
     return by_fingerprint, failed
 
 
-def delete_endpoint_for_key(endpoint_id: str, key: str) -> bool:
+def delete_endpoint_for_key(
+    endpoint_id: str,
+    key: str,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> bool:
     """Delete using a specific pool key (no failover waterfall — avoids masking failures)."""
     if not isinstance(endpoint_id, str) or not endpoint_id.strip():
         raise RunpodApiError("runpod endpoint teardown identity is invalid")
     try:
         _CLIENT.request_with_retries_for_key(
-            key, f"{REST_BASE}/endpoints/{endpoint_id}", method="DELETE", retries=2
+            key,
+            f"{REST_BASE}/endpoints/{endpoint_id}",
+            method="DELETE",
+            retries=2,
+            should_stop=should_stop,
         )
         return True
     except RunpodApiError as e:
@@ -261,9 +271,18 @@ def endpoint_health_for_key(
     )
 
 
-def delete_endpoint_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:
+def delete_endpoint_for_fingerprint(
+    endpoint_id: str,
+    fingerprint: str,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> bool:
     """delete_endpoint_for_key addressed by fingerprint; raw key resolved internally."""
-    return delete_endpoint_for_key(endpoint_id, _key_for_fingerprint(fingerprint))
+    return delete_endpoint_for_key(
+        endpoint_id,
+        _key_for_fingerprint(fingerprint),
+        should_stop=should_stop,
+    )
 
 
 def endpoint_absent_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:

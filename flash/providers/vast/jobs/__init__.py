@@ -54,26 +54,22 @@ from flash.providers.vast.jobs.builders import (
     build_onstart,
     build_payload,
     instance_label,
-    run_label_prefix,
     vast_image,
 )
+
+# redundant aliases mark the names this package only re-exports: the lifecycle below consumes the
+# rest of the imports directly. no `__all__` -- a partial one would both understate what callers
+# already import from this package and split the monkeypatch seam, since rebinding a package
+# re-export does not rebind the global the leaf module actually reads.
+from flash.providers.vast.jobs.builders import run_label_prefix as run_label_prefix
 from flash.providers.vast.jobs.reaping import (
     _best_effort_destroy,
     _coerce_instance_id,
-    cancel,
     destroy_run_instances,
-    run_instances_remaining,
-    sweep_orphans,
 )
-
-# Re-export for callers that reach teardown and labeling through the package rather than the leaf
-# modules. The lifecycle below consumes the rest of the imports above directly.
-__all__ = [
-    "cancel",
-    "run_instances_remaining",
-    "run_label_prefix",
-    "sweep_orphans",
-]
+from flash.providers.vast.jobs.reaping import cancel as cancel
+from flash.providers.vast.jobs.reaping import run_instances_remaining as run_instances_remaining
+from flash.providers.vast.jobs.reaping import sweep_orphans as sweep_orphans
 
 logger = get_logger(__name__)
 

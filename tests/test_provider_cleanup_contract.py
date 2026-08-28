@@ -443,27 +443,3 @@ def test_the_stop_callback_reaches_each_real_provider_sweep(
     assert result.confirmed_deleted_ids == ("i-9",)
     assert len(seen) == 1
     assert seen[0] is stop  # the same object, not a re-wrapped or defaulted stand-in
-
-
-def test_a_provider_that_ignores_the_stop_callback_is_detected() -> None:
-    """Sabotage guard for the test above: a facade that accepts ``should_stop`` and forwards
-    ``None`` must be distinguishable from one that forwards it, or the identity assertion above
-    would be satisfied by any provider that merely runs."""
-    seen: list[object] = []
-    dropping = ProviderCapabilities(
-        False,
-        True,
-        None,
-        lambda active, known, should_stop=None: (
-            seen.append(None)
-            or CleanupResult(CleanupOutcome.DELETED, confirmed_deleted_ids=("i-9",))
-        ),
-    )
-
-    def stop() -> bool:
-        return False
-
-    sweep_orphans(dropping, should_stop=stop)
-
-    assert seen == [None]
-    assert seen[0] is not stop

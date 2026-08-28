@@ -4325,6 +4325,37 @@ def test_recovered_catalog_restores_disk_metadata_after_a_failed_first_fetch(mon
     assert [i.disk_gb for i in instances] == [200.0]  # recovered, not left unmeasured
 
 
+def test_lambda_stop_during_termination_retry_prevents_second_request(monkeypatch):
+    from flash.providers._lifecycle.net import http as lifecycle_http
+    from flash.providers.lambda_.client import api as lambda_api
+
+    monkeypatch.setenv("LAMBDA_API_KEY", "test-key")
+    monkeypatch.setattr(lifecycle_http.time, "sleep", lambda _delay: None)
+    attempts: list[str] = []
+    stopping: list[bool] = []
+
+    def fail_first_termination(_target, *, method, **_kwargs):
+        attempts.append(method)
+        stopping.append(True)
+        raise OSError("transient termination failure")
+
+    monkeypatch.setattr(lambda_api._CLIENT, "request", fail_first_termination)
+    real_request_with_retries = lambda_api.request_with_retries
+
+    def request_with_retries(*args, **kwargs):
+        return real_request_with_retries(*args, **kwargs)
+
+    monkeypatch.setattr(lambda_api, "request_with_retries", request_with_retries)
+
+    deleted = lambda_api.terminate_instances(
+        ["i-1"],
+        should_stop=lambda: bool(stopping),
+    )
+
+    assert attempts == ["POST"], f"expected one destructive request, got {attempts}"
+    assert not deleted
+
+
 def test_sweep_orphans_halts_between_terminations_and_leaves_the_rest_unresolved(monkeypatch):
     """The sweep runs in a worker thread that task.cancel() cannot interrupt, so the lifespan
     signals it with a stop callback instead. Lambda's terminate loop is already per-id (its batch
@@ -4378,7 +4409,11 @@ def test_sweep_orphans_stop_already_set_terminates_nothing(monkeypatch):
 
 
 def test_sweep_orphans_without_stop_signal_completes_normally(monkeypatch):
-    """should_stop defaults to None so the startup recover_runs path is unchanged."""
+    """Unhalted control for the two halt tests above. They assert UNCONFIRMED/RETRYABLE with ids
+    left unresolved, which a sweep that stranded its tail unconditionally would also satisfy. This
+    pins that DELETED is still reachable, so the halt outcome is a consequence of the stop rather
+    than the new default -- and that the per-id terminate loop confirms EVERY id when nothing
+    halts it, not just the first."""
     from flash.providers.core.capabilities import CleanupOutcome
     from flash.providers.lambda_ import jobs
     from flash.providers.lambda_.client import api as lambda_api

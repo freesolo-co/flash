@@ -170,6 +170,7 @@ class IdleEndpointSweepResult:
     unresolved: tuple[IdleEndpointSweepIssue, ...] = ()
     failed_owner_fingerprints: tuple[str, ...] = ()
     inventory_unavailable: bool = False
+    halted: bool = False
 
     def __post_init__(self) -> None:
         for field, evidence in (
@@ -186,10 +187,16 @@ class IdleEndpointSweepResult:
 
     @property
     def unresolved_count(self) -> int:
+        """Every reason this sweep is not a clean one, endpoint-level and sweep-level alike.
+
+        ``halted`` counts because a halt leaves selected inventory unvisited: without it a caller
+        reading only the counts would take an interrupted sweep for a finished one.
+        """
         return (
             len(self.unresolved)
             + len(self.failed_owner_fingerprints)
             + int(self.inventory_unavailable)
+            + int(self.halted)
         )
 
 
@@ -276,6 +283,16 @@ def _cleanup_health_counts(health: object) -> tuple[dict[str, int], dict[str, in
     )
 
 
+@dataclass(frozen=True)
+class _EndpointReapOutcome:
+    """What one endpoint's visit established, so the caller reads names instead of tuple slots."""
+
+    deleted: bool = False
+    observed_idle: bool = False
+    issue: IdleEndpointSweepIssue | None = None
+    halted: bool = False
+
+
 def _reap_selected_endpoint(
     endpoint_id: str,
     owner_fingerprint: str,
@@ -287,7 +304,7 @@ def _reap_selected_endpoint(
     reap_warm: bool,
     deadline_at: float | None,
     should_stop: Callable[[], bool] | None,
-) -> tuple[bool, bool, IdleEndpointSweepIssue | None]:
+) -> _EndpointReapOutcome:
     observed_idle = False
     try:
         health = runpod_api.endpoint_health_for_fingerprint(
@@ -297,15 +314,13 @@ def _reap_selected_endpoint(
         )
         counts = _cleanup_health_counts(health)
         if counts is None:
-            return (
-                False,
-                False,
-                _sweep_issue(
+            return _EndpointReapOutcome(
+                issue=_sweep_issue(
                     owner_fingerprint,
                     endpoint_name,
                     endpoint_id,
                     "health evidence unavailable",
-                ),
+                )
             )
         workers, jobs_info = counts
         busy_workers = workers["running"] + workers["initializing"]
@@ -314,30 +329,26 @@ def _reap_selected_endpoint(
         in_flight = jobs_info["inQueue"] + jobs_info["inProgress"]
         if busy_workers != 0 or in_flight != 0:
             _idle_since.pop(endpoint_id, None)
-            return False, False, None
+            return _EndpointReapOutcome()
         observed_idle = True
         first_idle, _owner = _idle_since.setdefault(endpoint_id, (now, owner_fingerprint))
         if now - first_idle < min_idle_s:
-            return False, True, None
+            return _EndpointReapOutcome(observed_idle=True)
         if should_stop is not None and should_stop():
             # the health lookup above is a blocking round-trip, so shutdown most often lands
             # DURING it. re-check at the destructive boundary itself: the loop-head check alone
             # would let a stop signal raised mid-request still delete the endpoint after it.
-            return (
-                False,
-                True,
-                _sweep_issue(
-                    owner_fingerprint,
-                    endpoint_name,
-                    endpoint_id,
-                    "halted before delete",
-                ),
-            )
-        if not runpod_api.delete_endpoint_for_fingerprint(endpoint_id, owner_fingerprint):
-            return (
-                False,
-                True,
-                _sweep_issue(
+            # this endpoint has no unresolved evidence of its own -- it was simply never visited
+            # to completion -- so it reports the sweep-level halt rather than an endpoint issue.
+            return _EndpointReapOutcome(observed_idle=True, halted=True)
+        if not runpod_api.delete_endpoint_for_fingerprint(
+            endpoint_id,
+            owner_fingerprint,
+            **({} if should_stop is None else {"should_stop": should_stop}),
+        ):
+            return _EndpointReapOutcome(
+                observed_idle=True,
+                issue=_sweep_issue(
                     owner_fingerprint,
                     endpoint_name,
                     endpoint_id,
@@ -346,7 +357,7 @@ def _reap_selected_endpoint(
             )
         _idle_since.pop(endpoint_id, None)
         logger.info("idle-sweep: deleted idle endpoint %s (%s)", displayed_name, endpoint_id)
-        return True, True, None
+        return _EndpointReapOutcome(deleted=True, observed_idle=True)
     except Exception:
         logger.debug(
             "idle-sweep: error processing endpoint %s (%s)",
@@ -354,10 +365,9 @@ def _reap_selected_endpoint(
             endpoint_id,
             exc_info=True,
         )
-        return (
-            False,
-            observed_idle,
-            _sweep_issue(
+        return _EndpointReapOutcome(
+            observed_idle=observed_idle,
+            issue=_sweep_issue(
                 owner_fingerprint,
                 endpoint_name,
                 endpoint_id,
@@ -419,21 +429,6 @@ def _sweep_idle_flash_endpoints(
                     logger.info(
                         "idle-sweep: stop requested; halting after %d deletion(s)", len(deleted)
                     )
-                    # record the halt as unresolved: the rest of the selected inventory was never
-                    # visited, so a caller reading only `deleted_count` would otherwise take a
-                    # halted sweep for a complete one that found nothing left to reap.
-                    unresolved.append(
-                        IdleEndpointSweepIssue(
-                            owner_fingerprint=_observed_identity(fp),
-                            endpoint_name=_observed_identity(
-                                ep.get("name") if isinstance(ep, dict) else None
-                            ),
-                            observed_endpoint_id=_observed_identity(
-                                ep.get("id") if isinstance(ep, dict) else None
-                            ),
-                            reason="sweep halted with inventory unvisited",
-                        )
-                    )
                     halted = True
                     break
                 if not isinstance(ep, dict):
@@ -473,7 +468,7 @@ def _sweep_idle_flash_endpoints(
                 if endpoint_id in processed_endpoints:
                     continue
                 processed_endpoints.add(endpoint_id)
-                was_deleted, observed_idle, issue = _reap_selected_endpoint(
+                outcome = _reap_selected_endpoint(
                     endpoint_id,
                     owner_fingerprint,
                     canon,
@@ -484,12 +479,17 @@ def _sweep_idle_flash_endpoints(
                     deadline_at=deadline_at,
                     should_stop=should_stop,
                 )
-                if observed_idle:
+                if outcome.observed_idle:
                     still_idle.add(endpoint_id)
-                if was_deleted:
+                if outcome.deleted:
                     deleted.append(endpoint_id)
-                if issue is not None:
-                    unresolved.append(issue)
+                if outcome.issue is not None:
+                    unresolved.append(outcome.issue)
+                if outcome.halted:
+                    # the stop landed inside this endpoint's blocking health lookup, so the rest
+                    # of the selected inventory is just as unvisited as a loop-head halt leaves it.
+                    halted = True
+                    break
         # prune stale timers only for accounts that responded this cycle.
         # timers owned by failed accounts are kept so a flake cannot restart their grace.
         # a halted sweep prunes nothing: it never reached the rest of the inventory, so their
@@ -508,4 +508,5 @@ def _sweep_idle_flash_endpoints(
         failed_owner_fingerprints=tuple(
             dict.fromkeys(_selected_identity(fp) or _observed_identity(fp) for fp in failed_fps)
         ),
+        halted=halted,
     )

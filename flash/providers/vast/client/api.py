@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 
 from flash._internal.logging import get_logger
@@ -55,6 +56,8 @@ def request_with_retries(
     retries: int = 4,
     base_delay: float = 2.0,
     deadline_at: float | None = None,
+    *,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Any:
     """REST call hardened against transient network/5xx blips (jittered backoff)."""
     return _CLIENT.request_with_retries(
@@ -64,6 +67,7 @@ def request_with_retries(
         retries=retries,
         base_delay=base_delay,
         deadline_at=deadline_at,
+        **({} if should_stop is None else {"should_stop": should_stop}),
     )
 
 
@@ -450,6 +454,7 @@ def destroy_instance(
     instance_id: int,
     *,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> bool:
     """destroy an instance and return true only when provider-confirmed absent."""
     try:
@@ -458,6 +463,7 @@ def destroy_instance(
             method="DELETE",
             retries=2,
             deadline_at=deadline_at,
+            should_stop=should_stop,
         )
     except Exception as exc:
         if _genuine_http_not_found(exc):

@@ -114,15 +114,23 @@ def test_reap_once_passes_protected_set_and_grace(monkeypatch):
         captured["protected"] = protected
         captured["grace"] = min_idle_s
         captured["known"] = known
+        captured["should_stop"] = should_stop
         return runpod_resources.IdleEndpointSweepResult(deleted_ids=("a", "b", "c"))
 
+    def stop() -> bool:
+        return False
+
     monkeypatch.setattr(runpod_resources, "_sweep_idle_flash_endpoints", fake_sweep)
-    assert app_mod._reap_idle_endpoints_once(900.0).deleted_count == 3
+    assert app_mod._reap_idle_endpoints_once(900.0, stop).deleted_count == 3
     assert captured == {
         "protected": {"flash-live"},
         "grace": 900.0,
         "known": {"flash-live", "flash-done"},
+        # identity, not truthiness: the loop's stop event is what must reach the sweep. a wrapper
+        # that swallowed it and defaulted to None would leave every other assertion here green.
+        "should_stop": stop,
     }
+    assert captured["should_stop"] is stop
 
 
 def test_protected_names_skip_unreadable_run(monkeypatch):
@@ -860,6 +868,45 @@ def test_sweep_halts_between_deletes_on_stop_signal(monkeypatch):
     assert result.deleted_count == 1
 
 
+def test_runpod_stop_during_delete_retry_prevents_second_request(monkeypatch):
+    from flash.providers._lifecycle.net import http as lifecycle_http
+    from flash.providers.runpod.client import api as runpod_api
+
+    runpod_resources._idle_since.clear()
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"fpA": [{"name": "live-flash-ep1", "id": "ep-1"}]}, []),
+    )
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *_args, **_kwargs: _idle_health(),
+    )
+    monkeypatch.setattr(runpod_api, "_key_for_fingerprint", lambda _fingerprint: "test-key")
+    monkeypatch.setattr(lifecycle_http.time, "sleep", lambda _delay: None)
+    attempts: list[str] = []
+    stopping: list[bool] = []
+
+    def fail_first_delete(_target, *, method, **_kwargs):
+        attempts.append(method)
+        stopping.append(True)
+        raise OSError("transient delete failure")
+
+    monkeypatch.setattr(runpod_api._CLIENT, "request", fail_first_delete)
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(),
+        min_idle_s=0.0,
+        known={"flash-ep1"},
+        should_stop=lambda: bool(stopping),
+    )
+
+    assert attempts == ["DELETE"], f"expected one destructive request, got {attempts}"
+    assert result.deleted_count == 0
+    assert result.unresolved_count == 1
+
+
 def test_stop_during_the_health_lookup_prevents_the_delete_that_follows(monkeypatch):
     """The health call is a blocking round-trip, so shutdown most often lands DURING it -- the
     widest window in the sweep. A loop-head check alone would clear before the request and still
@@ -896,11 +943,13 @@ def test_stop_during_the_health_lookup_prevents_the_delete_that_follows(monkeypa
 
     assert not deletes  # the stop landed mid-request; nothing may be destroyed after it
     assert result.deleted_count == 0
-    assert result.unresolved_count == 1  # and the halt is retained, not reported as a clean sweep
+    assert result.halted  # and the halt is retained, not reported as a clean sweep
+    assert not result.unresolved  # the endpoint itself produced no evidence: it was never visited
+    assert result.unresolved_count == 1
 
 
 def test_a_halted_sweep_is_distinguishable_from_a_complete_one(monkeypatch):
-    """A halt leaves selected inventory unvisited. Without unresolved evidence the result is
+    """A halt leaves selected inventory unvisited. Without a sweep-level halt flag the result is
     byte-identical to a complete sweep that simply found one endpoint to reap, so the server's
     warning path could never tell an interrupted cleanup from a finished one."""
     runpod_resources._idle_since.clear()
@@ -931,8 +980,12 @@ def test_a_halted_sweep_is_distinguishable_from_a_complete_one(monkeypatch):
     )
 
     assert result.deleted_count == 1
+    assert result.halted
+    # the halt is a property of the SWEEP, not of any endpoint: no endpoint-shaped record is
+    # fabricated for inventory that was simply never reached.
+    assert not result.unresolved
+    # but it still counts as unresolved, so the server's existing warning path keeps firing.
     assert result.unresolved_count == 1
-    assert result.unresolved[0].reason == "sweep halted with inventory unvisited"
 
 
 def test_halted_sweep_preserves_grace_for_endpoints_it_never_visited(monkeypatch):
@@ -1013,8 +1066,13 @@ def test_sweep_instances_halts_between_providers_on_stop(monkeypatch):
     assert second.seen_should_stop is None  # second was never dispatched
 
 
-def test_sweep_instances_without_stop_signal_is_unchanged(monkeypatch):
-    """should_stop defaults to None so the startup recover_runs path keeps working."""
+def test_sweep_instances_with_no_stop_signal_counts_every_teardown(monkeypatch):
+    """The ``should_stop=None`` default is a live production path, not just a test convenience:
+    ``platform/runtime.py`` sweeps without a stop callback. This pins that the default reaches the
+    provider as ``None`` -- the capabilities dispatcher forwards it POSITIONALLY into a bare
+    ``except Exception``, so a provider that never learned the parameter would be reported as a
+    silent RETRYABLE rather than raising. The teardown count is the unhalted baseline the halt
+    test above reads against."""
     monkeypatch.setattr(app_mod, "_active_run_ids", lambda: set())
     monkeypatch.setattr(app_mod, "_known_run_ids", lambda: set())
     lam = _FakeProvider("lambda", torn=["i-1", "i-2"])

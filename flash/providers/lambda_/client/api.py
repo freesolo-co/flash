@@ -40,6 +40,8 @@ def request_with_retries(
     retries: int = 4,
     base_delay: float = 2.0,
     deadline_at: float | None = None,
+    *,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Any:
     """REST call hardened against transient network/5xx blips (jittered backoff)."""
     return _CLIENT.request_with_retries(
@@ -49,6 +51,7 @@ def request_with_retries(
         retries=retries,
         base_delay=base_delay,
         deadline_at=deadline_at,
+        **({} if should_stop is None else {"should_stop": should_stop}),
     )
 
 
@@ -310,6 +313,7 @@ def terminate_instances(
                 method="POST",
                 body={"instance_ids": [iid]},
                 retries=2,
+                **({} if should_stop is None else {"should_stop": should_stop}),
                 **({} if deadline_at is None else {"deadline_at": deadline_at}),
             )
             deleted.append(iid)

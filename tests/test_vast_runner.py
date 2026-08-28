@@ -2948,6 +2948,39 @@ def test_sweep_orphans_callable_sets_resolved_after_listing(monkeypatch):
     assert vast.sweep_orphans(active_labels=boom).deleted_count == 0
 
 
+def test_vast_stop_during_destroy_retry_prevents_second_request(monkeypatch):
+    from flash.providers._lifecycle.net import http as lifecycle_http
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "test-key")
+    monkeypatch.setattr(
+        vast_api,
+        "list_instances",
+        lambda: [{"id": 7, "label": "flash-orphan-s0-a0"}],
+    )
+    monkeypatch.setattr(lifecycle_http.time, "sleep", lambda _delay: None)
+    attempts: list[str] = []
+    stopping: list[bool] = []
+
+    def fail_first_destroy(_target, *, method, **_kwargs):
+        if method == "DELETE":
+            attempts.append(method)
+            stopping.append(True)
+            raise OSError("transient destroy failure")
+        return {"instances": {"id": 7}}
+
+    monkeypatch.setattr(vast_api._CLIENT, "request", fail_first_destroy)
+
+    result = vast.sweep_orphans(
+        active_labels=set(),
+        should_stop=lambda: bool(stopping),
+    )
+
+    assert attempts == ["DELETE"], f"expected one destructive request, got {attempts}"
+    assert result.unresolved_ids == ("7",)
+
+
 def test_sweep_orphans_halts_between_destroys_and_leaves_the_rest_unresolved(monkeypatch):
     """The sweep runs in a worker thread that task.cancel() cannot interrupt, so the lifespan
     signals it with a stop callback instead. Halting must not read as a completed clean sweep:
@@ -2959,7 +2992,11 @@ def test_sweep_orphans_halts_between_destroys_and_leaves_the_rest_unresolved(mon
     instances = [{"id": n, "label": f"flash-run{n}-s0-a0"} for n in (1, 2, 3)]
     monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
     destroyed: list[int] = []
-    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
+    monkeypatch.setattr(
+        vast_api,
+        "destroy_instance",
+        lambda iid, **_: destroyed.append(iid) or True,
+    )
     # stop after the first destroy, exactly as a shutdown mid-sweep would
     result = vast.sweep_orphans(active_labels=set(), should_stop=lambda: len(destroyed) >= 1)
 
@@ -2988,7 +3025,11 @@ def test_sweep_orphans_stop_already_set_destroys_nothing(monkeypatch):
 
 
 def test_sweep_orphans_without_stop_signal_completes_normally(monkeypatch):
-    """should_stop defaults to None so the startup recover_runs path is unchanged."""
+    """Unhalted control for the two halt tests above. They assert UNCONFIRMED/RETRYABLE with ids
+    left unresolved, which a sweep that stranded its tail unconditionally would also satisfy. This
+    pins that DELETED is still reachable, so the halt outcome is a consequence of the stop rather
+    than the new default. It also pins the no-stop call shape: ``destroy_instance`` takes only the
+    id here, where the halted fakes accept ``**_``."""
     from flash.providers.core.capabilities import CleanupOutcome
     from flash.providers.vast import jobs as vast
     from flash.providers.vast.client import api as vast_api

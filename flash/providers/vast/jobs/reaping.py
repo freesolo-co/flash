@@ -167,7 +167,10 @@ def sweep_orphans(
             unresolved.extend(str(remaining) for remaining in selected[position:])
             break
         try:
-            deleted = vast_api.destroy_instance(iid)
+            deleted = vast_api.destroy_instance(
+                iid,
+                **({} if should_stop is None else {"should_stop": should_stop}),
+            )
         except Exception:
             deleted = False
         if deleted:
