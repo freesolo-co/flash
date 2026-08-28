@@ -31,12 +31,13 @@ class OwnedThreadGroup:
     def close(self) -> None:
         """Refuse further admissions and signal every member to unwind.
 
-        The signal is raised before the lock so a held admission slot delays only the
-        bookkeeping, never the wake-up that lets members observe the shutdown.
+        Closing and admission share one linearization point: work already admitted completes its
+        short launch decision before the stop signal, while later work is refused. Admission bodies
+        must therefore never contain an unbounded wait.
         """
-        self.stopped.set()
         with self._lock:
             self._accepting = False
+            self.stopped.set()
 
     @contextlib.contextmanager
     def admit(self) -> Iterator["Admission | None"]:

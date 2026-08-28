@@ -3802,6 +3802,140 @@ def test_shutdown_between_the_resubmit_fence_and_the_claim_leaves_the_run_untouc
     assert result == [False]
 
 
+def test_resubmit_never_launches_after_its_generation_stop_signal(monkeypatch, recovery_generation):
+    import threading
+    import types
+
+    import flash.runner.accounting.reconciliation as reconciliation
+    import flash.runner.lifecycle.status as lifecycle_status
+    import flash.server.platform.runtime as runtime
+
+    class TrackingLock:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.close_thread = None
+            self.close_waiting = threading.Event()
+
+        def __enter__(self):
+            if threading.current_thread() is self.close_thread:
+                self.close_waiting.set()
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.lock.release()
+
+    tracking_lock = TrackingLock()
+    monkeypatch.setattr(recovery_generation, "_lock", tracking_lock)
+    claim_entered = threading.Event()
+    release_claim = threading.Event()
+    launch_stop_states = []
+    spec = types.SimpleNamespace(run_id="race-launch", algorithm="sft")
+
+    monkeypatch.setattr(runtime, "get_status", lambda _run_id: object())
+    monkeypatch.setattr(lifecycle_status, "source_snapshot_from_status", lambda *_a, **_k: {})
+    monkeypatch.setattr(runtime, "_recovery_block_reason", lambda _spec: None)
+
+    def claim(*_args, **_kwargs):
+        claim_entered.set()
+        assert release_claim.wait(5.0)
+        return True
+
+    monkeypatch.setattr(reconciliation, "_compare_and_prepare_resubmit", claim)
+    monkeypatch.setattr(
+        recovery_generation,
+        "_start_locked",
+        lambda _target, _args: launch_stop_states.append(recovery_generation.stopped.is_set()),
+    )
+
+    result = []
+    caller = threading.Thread(
+        target=lambda: result.append(runtime._start_resubmit(spec, expected_remote=None)),
+        daemon=True,
+    )
+    caller.start()
+    assert claim_entered.wait(5.0)
+
+    shutdown = threading.Thread(target=runtime._stop_recovery_threads, daemon=True)
+    tracking_lock.close_thread = shutdown
+    shutdown.start()
+    assert tracking_lock.close_waiting.wait(5.0)
+    release_claim.set()
+    caller.join(5.0)
+    shutdown.join(5.0)
+    assert not caller.is_alive()
+    assert not shutdown.is_alive()
+
+    assert result == [True]
+    assert launch_stop_states == [False]
+
+
+def test_resubmit_admission_does_not_wait_for_status_delivery(
+    monkeypatch, tmp_path, recovery_generation
+):
+    import threading
+
+    import flash.runner.supervise.lifecycle as supervise_lifecycle
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="report-wait", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    status = provisioned_status(spec, state="provisioning")
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status)
+    monkeypatch.setattr(runtime, "_recovery_block_reason", lambda _spec: None)
+    monkeypatch.setattr(supervise_lifecycle, "_run_job_background", lambda _spec: None)
+
+    synchronous_report_entered = threading.Event()
+    release_synchronous_report = threading.Event()
+    asynchronous_reports = []
+
+    def blocking_report(_status):
+        synchronous_report_entered.set()
+        assert release_synchronous_report.wait(5.0)
+
+    monkeypatch.setattr(runner_reporting, "_report_status", blocking_report)
+    monkeypatch.setattr(
+        runner_reporting,
+        "_report_status_async",
+        lambda report: asynchronous_reports.append(report.run_id),
+    )
+
+    result = []
+    caller = threading.Thread(
+        target=lambda: result.append(
+            runtime._start_resubmit(
+                spec,
+                expected_remote=None,
+                expected_state="provisioning",
+            )
+        ),
+        daemon=True,
+    )
+    caller.start()
+
+    shutdown_done = threading.Event()
+
+    def stop_recovery():
+        runtime._stop_recovery_threads()
+        shutdown_done.set()
+
+    shutdown = threading.Thread(target=stop_recovery, daemon=True)
+    report_blocked = synchronous_report_entered.wait(0.2)
+    shutdown.start()
+    shutdown_blocked = not shutdown_done.wait(1.0)
+    release_synchronous_report.set()
+    caller.join(5.0)
+    shutdown.join(5.0)
+
+    assert not report_blocked
+    assert not shutdown_blocked
+    assert result == [True]
+    assert asynchronous_reports == [spec.run_id]
+    assert recovery_generation.wait(5.0)
+
+
 def test_attach_refuses_to_buy_a_replacement_worker_after_shutdown(monkeypatch):
     # supervision has the run's lifetime, so this thread can reach the replacement decision long
     # after the plane began unwinding. the captured remote stays captured for the next startup.

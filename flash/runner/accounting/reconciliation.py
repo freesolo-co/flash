@@ -120,7 +120,9 @@ def _compare_and_prepare_resubmit(
         state._save_status_unlocked(status)
         report_status = status
     if report_status is not None:
-        reporting._report_status(report_status)
+        # recovery holds its lifespan admission lock across this claim and the owned launch. queue
+        # delivery without waiting on the backend so shutdown is never blocked by that network call.
+        reporting._report_status_async(report_status)
     return True
 
 
