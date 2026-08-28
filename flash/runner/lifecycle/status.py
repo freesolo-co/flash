@@ -58,8 +58,7 @@ def get_status(run_id: str) -> RunStatus:
     return _runstatus_from_json(_load_status_json(run_id))
 
 
-def _get_recovery_status(run_id: str) -> RunStatus:
-    status = get_status(run_id)
+def _validate_recovery_status(run_id: str, status: RunStatus) -> RunStatus:
     if status.run_id != run_id:
         raise ValueError(f"stored run status id does not match {run_id}")
     if not isinstance(status.state, str):
@@ -67,36 +66,86 @@ def _get_recovery_status(run_id: str) -> RunStatus:
     return status
 
 
-def _quarantine_corrupt_status(run_id: str, detail: str) -> bool:
+def _get_recovery_status(run_id: str) -> RunStatus:
+    return _validate_recovery_status(run_id, get_status(run_id))
+
+
+def _salvage_corrupt_teardown_evidence(raw: dict | None) -> tuple[dict | None, list | None]:
+    if raw is None:
+        return None, None
+    from flash.runner.accounting.reconciliation import _canonical_cleanup_remote
+
+    remote = None
+    with contextlib.suppress(Exception):
+        remote = _canonical_cleanup_remote(raw.get("remote"))
+    cleanup_remotes = raw.get(state._CLEANUP_REMOTES_KEY)
+    return remote, list(cleanup_remotes) if isinstance(cleanup_remotes, list) else None
+
+
+def _salvage_corrupt_terminal_state(raw: dict | None) -> str | None:
+    """Recover an already-settled outcome so quarantine cannot relabel it `failed`.
+
+    `_update` refuses to move a run back out of a terminal state, but quarantine writes the
+    envelope directly and bypasses that compare-and-set. A `done` record whose surrounding fields
+    became unreadable would otherwise be republished as `failed`, which is undeployable
+    (`_UNDEPLOYABLE_STATES`) and no longer settleable.
+    """
+    if raw is None:
+        return None
+    stored = raw.get("state")
+    if isinstance(stored, str) and stored in state.TERMINAL_STATES:
+        return stored
+    return None
+
+
+_RECOVERY_RECORD_ERRORS = (
+    UnicodeDecodeError,
+    ValueError,
+    TypeError,
+    RecursionError,
+    SourceSnapshotError,
+)
+
+
+def _quarantine_corrupt_status(run_id: str, detail: str) -> tuple[RunStatus | None, bool]:
     """Preserve a still-unreadable status record and atomically install a failed envelope."""
     path = state.runs_file_path(run_id, ".json")
     quarantine_path = state.runs_file_path(run_id, f".json.corrupt-{time.time_ns()}")
-    now = time.time()
-    failed = RunStatus(
-        run_id=run_id,
-        state="failed",
-        spec={},
-        created_at=now,
-        updated_at=now,
-        error=detail,
-        finished_at=now,
-    )
     os.makedirs(state.RUNS_DIR, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=state.RUNS_DIR, prefix=f"{run_id}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as file:
-            json.dump(state._status_storage_dict(failed), file, indent=2, sort_keys=True)
-            file.flush()
-            os.fsync(file.fileno())
-        with state._status_guard(run_id):
-            try:
-                _get_recovery_status(run_id)
-            except FileNotFoundError:
-                return False
-            except (UnicodeDecodeError, ValueError, TypeError, SourceSnapshotError):
-                pass
-            else:
-                return False
+    with state._status_guard(run_id):
+        try:
+            repaired = _get_recovery_status(run_id)
+        except FileNotFoundError:
+            return None, False
+        except _RECOVERY_RECORD_ERRORS:
+            pass
+        else:
+            return repaired, False
+        try:
+            raw = _load_status_json(run_id)
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
+            raw = None
+        remote, cleanup_remotes = _salvage_corrupt_teardown_evidence(raw)
+        now = time.time()
+        failed = RunStatus(
+            run_id=run_id,
+            state=_salvage_corrupt_terminal_state(raw) or "failed",
+            spec={},
+            created_at=now,
+            updated_at=now,
+            error=detail,
+            finished_at=now,
+            remote=remote,
+        )
+        data = state._status_storage_dict(failed)
+        if cleanup_remotes is not None:
+            data[state._CLEANUP_REMOTES_KEY] = cleanup_remotes
+        fd, tmp = tempfile.mkstemp(dir=state.RUNS_DIR, prefix=f"{run_id}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as file:
+                json.dump(data, file, indent=2, sort_keys=True)
+                file.flush()
+                os.fsync(file.fileno())
             os.link(path, quarantine_path)
             dir_fd = os.open(state.RUNS_DIR, os.O_RDONLY)
             try:
@@ -105,10 +154,10 @@ def _quarantine_corrupt_status(run_id: str, detail: str) -> bool:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
-            return True
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(tmp)
+            return failed, True
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
 
 
 def source_snapshot_from_status(status: RunStatus, *, required: bool = False) -> dict | None:

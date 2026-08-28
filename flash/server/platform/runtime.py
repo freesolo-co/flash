@@ -13,7 +13,7 @@ import threading
 
 from flash.adapters.artifacts import attempt_scoped_artifact_name
 from flash.core.spec import JobSpec
-from flash.runner.lifecycle.state import adapter_prefix, runs_file_path
+from flash.runner.lifecycle.state import RunStatus, adapter_prefix, runs_file_path
 from flash.runner.lifecycle.status import get_status
 from flash.server.platform import db
 
@@ -596,24 +596,34 @@ def _drain_cleanup_remotes_bg(run_id: str) -> None:
         _drain_cleanup_remotes(run_id)
 
 
-def _quarantine_corrupt_recovery_record(run_id: str, exc: Exception) -> None:
+def _teardown_failed_recovery(status: RunStatus) -> None:
+    _teardown_unrecoverable_remote(status)
+    # direct teardown can record an unconfirmed handle after an earlier drain took its snapshot.
+    with contextlib.suppress(Exception):
+        threading.Thread(
+            target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
+        ).start()
+
+
+def _quarantine_corrupt_recovery_record(
+    run_id: str, exc: Exception
+) -> tuple[RunStatus | None, bool]:
     from flash.runner.lifecycle.status import _quarantine_corrupt_status
 
     _log.warning(
-        "marking run %s failed: persisted status could not be decoded",
+        "quarantining run %s: persisted status could not be decoded",
         run_id,
         exc_info=True,
     )
-    detail = (
-        f"unrecoverable: persisted status cannot be decoded: {exc}; "
-        "provider handle unavailable, orphan sweep will attempt label cleanup"
-    )
-    quarantined = False
+    detail = f"unrecoverable: persisted status cannot be decoded: {exc}"
+    status, quarantined = None, False
     with contextlib.suppress(Exception):
-        quarantined = _quarantine_corrupt_status(run_id, detail)
-    if quarantined:
+        status, quarantined = _quarantine_corrupt_status(run_id, detail)
+    if quarantined and status is not None:
         with contextlib.suppress(Exception):
             _append_run_log(run_id, detail)
+        _teardown_failed_recovery(status)
+    return status, quarantined
 
 
 def _classify_recoverable_runs(
@@ -627,6 +637,7 @@ def _classify_recoverable_runs(
     """
     from flash.runner.lifecycle.preparation import _mark_warmstart_source
     from flash.runner.lifecycle.status import (
+        _RECOVERY_RECORD_ERRORS,
         _get_recovery_status,
         _update,
         effective_spec_from_status,
@@ -634,7 +645,6 @@ def _classify_recoverable_runs(
     )
     from flash.runner.supervise.attach import attach_run
     from flash.runner.supervise.recovery import _gc_run_endpoints
-    from flash.snapshot.archive import SourceSnapshotError
 
     for row in db.all_runs():
         known.add(row["run_id"])
@@ -642,9 +652,10 @@ def _classify_recoverable_runs(
             status = _get_recovery_status(row["run_id"])
         except FileNotFoundError:
             continue
-        except (UnicodeDecodeError, ValueError, TypeError, SourceSnapshotError) as exc:
-            _quarantine_corrupt_recovery_record(row["run_id"], exc)
-            continue
+        except _RECOVERY_RECORD_ERRORS as exc:
+            status, quarantined = _quarantine_corrupt_recovery_record(row["run_id"], exc)
+            if quarantined or status is None:
+                continue
         # drain cleanup remotes in the background. provider outages can block each teardown through
         # retry/backoff; serial startup cleanup can exceed HEALTHCHECK grace and create a restart loop.
         # recovery below does not depend on completion.
@@ -680,18 +691,7 @@ def _classify_recoverable_runs(
                     _update(status.run_id, "failed", error=detail)
                 with contextlib.suppress(Exception):
                     _append_run_log(status.run_id, detail)
-                _teardown_unrecoverable_remote(status)
-                # If that teardown could not confirm deletion it records the handle for the cleanup
-                # drain -- but this run's drain was dispatched above and has already taken its
-                # snapshot, of a list that did not yet contain this record.
-                # `_drain_cleanup_remotes` returns early on an empty snapshot, so nothing would
-                # retry it before the next restart. Dispatch a second drain now that the record
-                # exists. A double teardown of one handle is safe: `_strict_teardown_handle` is
-                # idempotent and the record is removed by compare-and-remove only on a confirmed
-                # delete.
-                threading.Thread(
-                    target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
-                ).start()
+                _teardown_failed_recovery(status)
                 continue
             # Only handle-backed runs are kept by the sweep; a handle-less run is being
             # resubmitted, so its stale half-rented instance (if any) must NOT be shielded.

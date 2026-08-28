@@ -6772,6 +6772,14 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
             json.dumps({"run_id": "other-run", "state": "queued", "spec": {}}).encode(),
             id="mismatched-run-id",
         ),
+        pytest.param(
+            b'{"run_id":"bad-run","state":"queued","spec":{},"extra":'
+            + b"[" * 2000
+            + b"0"
+            + b"]" * 2000
+            + b"}",
+            id="decoder-recursion",
+        ),
         pytest.param(b"\xff", id="invalid-utf8"),
     ],
 )
@@ -6855,8 +6863,140 @@ def test_recover_runs_corrupt_status_is_quarantined_per_record(monkeypatch, tmp_
     assert quarantine_files[0].read_bytes() == bad_payload
 
 
-def test_recover_runs_does_not_quarantine_concurrently_repaired_status(monkeypatch, tmp_path):
+@pytest.mark.parametrize("settled_state", ["done", "cancelled", "dry_run"])
+def test_quarantine_preserves_an_already_settled_outcome(monkeypatch, tmp_path, settled_state):
+    """Quarantine must not relabel a settled run `failed`.
+
+    `_update` is a sticky compare-and-set that refuses to leave a terminal state, but quarantine
+    installs its envelope directly and bypasses that guard. Relabelling `done` as `failed` makes
+    the run undeployable (`_UNDEPLOYABLE_STATES`) and no longer settleable
+    (`reconciliation` gates on `state != "done"`), so the readable outcome has to survive.
+    """
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+    # parseable json carrying a readable settled state, but an undecodable source snapshot.
+    payload = json.dumps(
+        {
+            "run_id": "settled-run",
+            "state": settled_state,
+            "spec": {},
+            "source_snapshot": {"kind": "invalid"},
+        }
+    ).encode()
+    with open(runner_state.runs_file_path("settled-run", ".json"), "wb") as file:
+        file.write(payload)
+
+    status, quarantined = runner_status._quarantine_corrupt_status("settled-run", "boom")
+
+    assert quarantined
+    assert status is not None
+    assert status.state == settled_state
+    assert runner_status.get_status("settled-run").state == settled_state
+    assert status.error is not None
+    assert "boom" in status.error
+    # the corrupt bytes are still preserved beside the repaired envelope.
+    assert len(list((tmp_path / "runs").glob("settled-run.json.corrupt-*"))) == 1
+
+
+def test_quarantine_marks_an_unreadable_outcome_failed(monkeypatch, tmp_path):
+    """An outcome that cannot be read at all still has to become `failed`."""
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+    with open(runner_state.runs_file_path("opaque-run", ".json"), "wb") as file:
+        file.write(b"\xff")
+
+    status, quarantined = runner_status._quarantine_corrupt_status("opaque-run", "boom")
+
+    assert quarantined
+    assert status is not None
+    assert status.state == "failed"
+
+
+def test_recover_runs_corrupt_status_preserves_and_drains_teardown_evidence(monkeypatch, tmp_path):
+    import flash.server.platform.runtime as runtime
+    from flash.providers.core import registry as providers_mod
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    run_id = "corrupt-teardown"
+    active_remote = {
+        "provider": "runpod",
+        "endpoint_id": "ep-active",
+        "endpoint_name": "flash-corrupt-active",
+        "key_fingerprint": "rpk-" + "a" * 64,
+        "attempt": 0,
+        "started_ts": 1.0,
+    }
+    cleanup_remote = {
+        "provider": "runpod",
+        "endpoint_id": "ep-cleanup",
+        "endpoint_name": "flash-corrupt-cleanup",
+        # the lenient drain exists to accept this deployed 16-character fingerprint.
+        "key_fingerprint": "rpk-" + "b" * 12,
+        "attempt": 1,
+        "started_ts": 2.0,
+    }
+    assert runner_reconciliation._remote_resource_identity(active_remote) is not None
+    assert runner_reconciliation._canonical_cleanup_remote(cleanup_remote) is None
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=run_id,
+            state="running",
+            spec={"run_id": run_id},
+            remote=active_remote,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        ),
+        _cleanup_remotes=[cleanup_remote],
+    )
+    status_path = runner_state.runs_file_path(run_id, ".json")
+    with open(status_path, encoding="utf-8") as handle:
+        raw = json.load(handle)
+    raw["source_snapshot"] = {"kind": "invalid"}
+    with open(status_path, "w", encoding="utf-8") as handle:
+        json.dump(raw, handle)
+
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": run_id}])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    torn_down = []
+
+    def fake_teardown(handle, torn_run_id):
+        data = handle if isinstance(handle, dict) else handle.to_dict()
+        torn_down.append((data["endpoint_id"], torn_run_id))
+        return True
+
+    monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target = target
+            self._args = args
+
+        def start(self):
+            self._target(*self._args)
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+
+    assert torn_down == [("ep-active", run_id), ("ep-cleanup", run_id)]
+    failed = runner_status.get_status(run_id)
+    assert failed.state == "failed"
+    assert failed.remote == active_remote
+    with open(status_path, encoding="utf-8") as handle:
+        assert not json.load(handle).get(runner_state._CLEANUP_REMOTES_KEY)
+    quarantine_files = list((tmp_path / "runs").glob(f"{run_id}.json.corrupt-*"))
+    assert len(quarantine_files) == 1
+    assert json.loads(quarantine_files[0].read_text()) == raw
+
+
+@pytest.mark.parametrize("repaired_state", ["queued", "running"])
+def test_recover_runs_does_not_quarantine_concurrently_repaired_status(
+    monkeypatch, tmp_path, repaired_state
+):
+    import flash.runner.supervise.attach as runner_attach
     import flash.server.platform.db as db_mod
+    import flash.server.platform.runtime as runtime
     from flash.providers.core import registry as providers_mod
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
@@ -6874,16 +7014,34 @@ def test_recover_runs_does_not_quarantine_concurrently_repaired_status(monkeypat
         "gpu": {},
         "run_id": "race-run",
     }
+    remote = None
+    if repaired_state == "running":
+        remote = {
+            "provider": "runpod",
+            "endpoint_id": "ep-race",
+            "endpoint_name": "flash-race",
+            "key_fingerprint": "rpk-" + "c" * 64,
+            "attempt": 0,
+            "started_ts": 1.0,
+        }
     runner_state._save_status(
         runner_state.RunStatus(
             run_id="race-run",
-            state="queued",
+            state=repaired_state,
             spec=spec,
+            remote=remote,
             source_snapshot=_SOURCE_SNAPSHOT,
         )
     )
-    monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "race-run"}])
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": "race-run"}])
     monkeypatch.setattr(providers_mod, "configured_providers", list)
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner_preparation, "_mark_warmstart_source", lambda _spec, _run_id: None)
+    monkeypatch.setattr(
+        runner_status,
+        "effective_spec_from_status",
+        lambda _status, **_kwargs: runner_spec.JobSpec.from_dict(spec),
+    )
 
     original_get_status = runner_status.get_status
     calls = 0
@@ -6896,15 +7054,26 @@ def test_recover_runs_does_not_quarantine_concurrently_repaired_status(monkeypat
         return original_get_status(run_id)
 
     monkeypatch.setattr(runner_status, "get_status", decode_then_repair)
+    resubmitted = []
+    attached = []
+    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda job: resubmitted.append(job.run_id))
+    monkeypatch.setattr(runner_attach, "attach_run", attached.append)
 
-    app_mod.recover_runs()
+    runtime.recover_runs()
 
-    assert calls == 2
+    deadline = time.time() + 5
+    expected = ["race-run"]
+    observed = resubmitted if repaired_state == "queued" else attached
+    while not observed and time.time() < deadline:
+        time.sleep(0.01)
+    assert calls >= 2
+    assert observed == expected
+    assert (attached if repaired_state == "queued" else resubmitted) == []
     status = original_get_status("race-run")
-    assert status.state == "queued"
+    assert status.state == ("provisioning" if repaired_state == "queued" else "running")
     assert status.error is None
     assert list((tmp_path / "runs").glob("race-run.json.corrupt-*")) == []
-    assert runner_status.get_logs("race-run") == ""
+    assert "persisted status cannot be decoded" not in runner_status.get_logs("race-run")
 
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
