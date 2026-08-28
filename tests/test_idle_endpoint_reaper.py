@@ -860,6 +860,81 @@ def test_sweep_halts_between_deletes_on_stop_signal(monkeypatch):
     assert result.deleted_count == 1
 
 
+def test_stop_during_the_health_lookup_prevents_the_delete_that_follows(monkeypatch):
+    """The health call is a blocking round-trip, so shutdown most often lands DURING it -- the
+    widest window in the sweep. A loop-head check alone would clear before the request and still
+    delete after it returns, so the stop must be re-read at the destructive boundary itself."""
+    runpod_resources._idle_since.clear()
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"fpA": [{"name": "live-flash-ep1", "id": "ep-1"}]}, []),
+    )
+    stopping = []
+
+    def health_then_stop(*_a, **_k):
+        stopping.append(True)  # shutdown arrives while this request is in flight
+        return _idle_health()
+
+    monkeypatch.setattr(
+        runpod_resources.runpod_api, "endpoint_health_for_fingerprint", health_then_stop
+    )
+    deletes: list[object] = []
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *a, **k: deletes.append(a) or True,
+    )
+    monkeypatch.setattr(runpod_resources.logger, "info", lambda *a, **k: None)
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(),
+        min_idle_s=0.0,
+        known={"flash-ep1"},
+        should_stop=lambda: bool(stopping),
+    )
+
+    assert not deletes  # the stop landed mid-request; nothing may be destroyed after it
+    assert result.deleted_count == 0
+    assert result.unresolved_count == 1  # and the halt is retained, not reported as a clean sweep
+
+
+def test_a_halted_sweep_is_distinguishable_from_a_complete_one(monkeypatch):
+    """A halt leaves selected inventory unvisited. Without unresolved evidence the result is
+    byte-identical to a complete sweep that simply found one endpoint to reap, so the server's
+    warning path could never tell an interrupted cleanup from a finished one."""
+    runpod_resources._idle_since.clear()
+    endpoints = [{"name": f"live-flash-ep{n}", "id": f"ep-{n}"} for n in (1, 2, 3)]
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"fpA": endpoints}, []),
+    )
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: _idle_health(),
+    )
+    deletes: list[object] = []
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *a, **k: deletes.append(a) or True,
+    )
+    monkeypatch.setattr(runpod_resources.logger, "info", lambda *a, **k: None)
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(),
+        min_idle_s=0.0,
+        known={"flash-ep1", "flash-ep2", "flash-ep3"},
+        should_stop=lambda: len(deletes) >= 1,
+    )
+
+    assert result.deleted_count == 1
+    assert result.unresolved_count == 1
+    assert result.unresolved[0].reason == "sweep halted with inventory unvisited"
+
+
 def test_halted_sweep_preserves_grace_for_endpoints_it_never_visited(monkeypatch):
     """A halt leaves the rest of the inventory unvisited, so their absence from ``still_idle``
     means "not reached", not "no longer idle". Pruning there would discard accumulated grace and

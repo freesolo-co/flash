@@ -286,6 +286,7 @@ def _reap_selected_endpoint(
     min_idle_s: float,
     reap_warm: bool,
     deadline_at: float | None,
+    should_stop: Callable[[], bool] | None,
 ) -> tuple[bool, bool, IdleEndpointSweepIssue | None]:
     observed_idle = False
     try:
@@ -318,6 +319,20 @@ def _reap_selected_endpoint(
         first_idle, _owner = _idle_since.setdefault(endpoint_id, (now, owner_fingerprint))
         if now - first_idle < min_idle_s:
             return False, True, None
+        if should_stop is not None and should_stop():
+            # the health lookup above is a blocking round-trip, so shutdown most often lands
+            # DURING it. re-check at the destructive boundary itself: the loop-head check alone
+            # would let a stop signal raised mid-request still delete the endpoint after it.
+            return (
+                False,
+                True,
+                _sweep_issue(
+                    owner_fingerprint,
+                    endpoint_name,
+                    endpoint_id,
+                    "halted before delete",
+                ),
+            )
         if not runpod_api.delete_endpoint_for_fingerprint(endpoint_id, owner_fingerprint):
             return (
                 False,
@@ -404,6 +419,21 @@ def _sweep_idle_flash_endpoints(
                     logger.info(
                         "idle-sweep: stop requested; halting after %d deletion(s)", len(deleted)
                     )
+                    # record the halt as unresolved: the rest of the selected inventory was never
+                    # visited, so a caller reading only `deleted_count` would otherwise take a
+                    # halted sweep for a complete one that found nothing left to reap.
+                    unresolved.append(
+                        IdleEndpointSweepIssue(
+                            owner_fingerprint=_observed_identity(fp),
+                            endpoint_name=_observed_identity(
+                                ep.get("name") if isinstance(ep, dict) else None
+                            ),
+                            observed_endpoint_id=_observed_identity(
+                                ep.get("id") if isinstance(ep, dict) else None
+                            ),
+                            reason="sweep halted with inventory unvisited",
+                        )
+                    )
                     halted = True
                     break
                 if not isinstance(ep, dict):
@@ -452,6 +482,7 @@ def _sweep_idle_flash_endpoints(
                     min_idle_s=min_idle_s,
                     reap_warm=reap_warm,
                     deadline_at=deadline_at,
+                    should_stop=should_stop,
                 )
                 if observed_idle:
                     still_idle.add(endpoint_id)

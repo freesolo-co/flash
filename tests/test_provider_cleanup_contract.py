@@ -342,7 +342,12 @@ def test_capability_helpers_contain_raising_callbacks() -> None:
     def raise_confirmation(_run_id: str) -> CleanupResult:
         raise RuntimeError("confirmation failed")
 
-    def raise_sweep(_active, _known) -> CleanupResult:
+    reached: list[bool] = []
+
+    def raise_sweep(_active, _known, _should_stop=None) -> CleanupResult:
+        # the dispatcher's broad handler turns a STALE signature's TypeError into RETRYABLE too,
+        # so record that the body actually ran: otherwise this asserts nothing about containment.
+        reached.append(True)
         raise RuntimeError("sweep failed")
 
     capabilities = ProviderCapabilities(False, True, raise_confirmation, raise_sweep)
@@ -353,6 +358,7 @@ def test_capability_helpers_contain_raising_callbacks() -> None:
     assert confirmation.outcome is CleanupOutcome.RETRYABLE
     assert confirmation.unresolved_ids == ("run-raising",)
     assert sweep.outcome is CleanupOutcome.RETRYABLE
+    assert reached == [True]
 
 
 def test_capability_helpers_revalidate_mutated_callback_results() -> None:
@@ -393,3 +399,71 @@ def test_unsupported_is_emitted_only_when_capability_is_absent() -> None:
     assert confirmation.outcome is CleanupOutcome.UNSUPPORTED
     assert confirmation.unresolved_ids == ("run-unsupported",)
     assert sweep.outcome is CleanupOutcome.UNSUPPORTED
+
+
+@pytest.mark.parametrize(
+    ("provider_factory", "jobs_module"),
+    [
+        (
+            "flash.providers.lambda_.execution.provider:LambdaProvider",
+            "flash.providers.lambda_.jobs",
+        ),
+        ("flash.providers.vast.execution.provider:VastProvider", "flash.providers.vast.jobs"),
+    ],
+)
+def test_the_stop_callback_reaches_each_real_provider_sweep(
+    provider_factory, jobs_module, monkeypatch
+) -> None:
+    """Identity, not truthiness: the exact callback the lifespan owns must arrive at the jobs-level
+    sweep through the real facade. A test that only asserts the sweep ran stays green when a
+    wrapper silently drops ``should_stop=should_stop``, which is precisely how a shutdown signal
+    goes missing and destructive teardowns keep running after the server was told to stop."""
+    import importlib
+
+    module_path, _, attr = provider_factory.partition(":")
+    provider = getattr(importlib.import_module(module_path), attr)()
+    jobs = importlib.import_module(jobs_module)
+    seen: list[object] = []
+    monkeypatch.setattr(
+        jobs,
+        "sweep_orphans",
+        lambda **kwargs: (
+            seen.append(kwargs.get("should_stop"))
+            or CleanupResult(CleanupOutcome.DELETED, confirmed_deleted_ids=("i-9",))
+        ),
+    )
+
+    def stop() -> bool:
+        return False
+
+    result = sweep_orphans(
+        provider.capabilities, active_labels={"live"}, known_labels={"live"}, should_stop=stop
+    )
+
+    assert result.confirmed_deleted_ids == ("i-9",)
+    assert len(seen) == 1
+    assert seen[0] is stop  # the same object, not a re-wrapped or defaulted stand-in
+
+
+def test_a_provider_that_ignores_the_stop_callback_is_detected() -> None:
+    """Sabotage guard for the test above: a facade that accepts ``should_stop`` and forwards
+    ``None`` must be distinguishable from one that forwards it, or the identity assertion above
+    would be satisfied by any provider that merely runs."""
+    seen: list[object] = []
+    dropping = ProviderCapabilities(
+        False,
+        True,
+        None,
+        lambda active, known, should_stop=None: (
+            seen.append(None)
+            or CleanupResult(CleanupOutcome.DELETED, confirmed_deleted_ids=("i-9",))
+        ),
+    )
+
+    def stop() -> bool:
+        return False
+
+    sweep_orphans(dropping, should_stop=stop)
+
+    assert seen == [None]
+    assert seen[0] is not stop
