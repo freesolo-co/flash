@@ -3965,6 +3965,70 @@ def test_attach_refuses_to_buy_a_replacement_worker_after_shutdown(monkeypatch):
     assert resumed == "status-sentinel"
 
 
+def test_attach_rechecks_shutdown_after_staging_before_clearing_the_remote(monkeypatch):
+    # environment staging blocks for minutes, so shutdown can begin after the fence at the top of
+    # the resume and before the clear that commits the run to a replacement worker. clearing the
+    # captured remote is irreversible: the next startup would find nothing to reattach to.
+    import flash.runner.accounting.artifacts as artifacts
+    import flash.runner.accounting.reconciliation as reconciliation
+    import flash.runner.lifecycle.deadlines as deadlines
+    import flash.runner.lifecycle.status as lifecycle_status
+    import flash.runner.lifecycle.submit as submit
+    import flash.runner.supervise.attach as attach
+    import flash.runner.supervise.lifecycle as supervise_lifecycle
+    import flash.server.platform.runtime as runtime
+    import flash.snapshot.archive as archive
+
+    class _Gpu:
+        max_retries = 3
+
+    class _Spec:
+        gpu = _Gpu()
+        algorithm = "sft"
+        run_id = "run-1"
+
+    spec = _Spec()
+    stopping = iter([False, True, True, True])
+
+    monkeypatch.setattr(runtime, "recovery_is_stopping", lambda: next(stopping))
+    monkeypatch.setattr(lifecycle_status, "get_status", lambda _run_id: "status-sentinel")
+
+    class _Descriptor:
+        @staticmethod
+        def to_dict() -> dict:
+            return {}
+
+    monkeypatch.setattr(archive, "parse_descriptor", lambda _d: _Descriptor())
+    monkeypatch.setattr(deadlines, "_spec_with_remaining_wall", lambda *_a, **_k: spec)
+    monkeypatch.setattr(lifecycle_status, "reallocation_spec_from_status", lambda *_a, **_k: spec)
+    monkeypatch.setattr(deadlines, "_load_run_deadline_at", lambda _run_id: 0.0)
+    # staging is where the plane begins to unwind
+    monkeypatch.setattr(artifacts, "stage_environment_package", lambda s, **_k: s)
+    monkeypatch.setattr(submit, "_persist_effective_worker_spec", lambda _s: True)
+    monkeypatch.setattr(
+        reconciliation,
+        "_compare_and_clear_remote",
+        lambda *_a, **_k: pytest.fail("cleared the captured remote after shutdown began"),
+    )
+    monkeypatch.setattr(
+        supervise_lifecycle,
+        "_run_training",
+        lambda *_a, **_k: pytest.fail("allocated a replacement worker after shutdown began"),
+    )
+
+    resumed = attach._resume_after_confirmed_teardown(
+        "run-1",
+        spec,
+        {"provider": "runpod"},
+        2,
+        {"kind": "git"},
+        io.StringIO(),
+        failure="worker vanished",
+    )
+
+    assert resumed == "status-sentinel"
+
+
 def test_wait_for_recovery_threads_reports_a_thread_still_running_at_the_deadline(
     recovery_generation,
 ):

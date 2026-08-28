@@ -114,6 +114,13 @@ def _resume_after_confirmed_teardown(
     worker_spec = stage_environment_package(worker_spec, deadline_at=deadline_at)
     if not _persist_effective_worker_spec(worker_spec):
         raise _RunCancelled(f"run {run_id} went terminal before environment staging")
+    # staging above stages an environment package and re-reads the run's source, which can block
+    # for minutes. shutdown can therefore begin between the fence at the top of this function and
+    # the clear below, so the fence is re-read immediately before the first irreversible step:
+    # clearing the captured remote is what commits this run to a replacement worker.
+    if recovery_is_stopping():
+        print(f"attach: {run_id} not resuming; the control plane is shutting down", file=log)
+        return get_status(run_id)
     if not _compare_and_clear_remote(run_id, persisted_remote):
         print(
             f"attach: {run_id} persisted remote changed before clear; not resuming",
