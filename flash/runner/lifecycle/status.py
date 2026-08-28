@@ -70,32 +70,86 @@ def _get_recovery_status(run_id: str) -> RunStatus:
     return _validate_recovery_status(run_id, get_status(run_id))
 
 
-def _salvage_corrupt_teardown_evidence(raw: dict | None) -> tuple[dict | None, list | None]:
-    if raw is None:
-        return None, None
-    from flash.runner.accounting.reconciliation import _canonical_cleanup_remote
+def _salvage_teardown_handle(remote: object) -> dict | None:
+    """The strict handle when it parses, else the lenient shape the cleanup drain already accepts.
 
-    remote = None
+    Requiring canonical form here would drop the handle for every endpoint a currently deployed
+    release created: those writers persist the 16-character `rpk-` fingerprint, which
+    `_canonical_cleanup_remote` rejects outright. The record would then reach teardown with nothing
+    to delete and a live RunPod endpoint would bill forever. `_drainable_cleanup_remotes` yields
+    these verbatim for exactly this reason, and `_strict_teardown_handle` resolves the short
+    fingerprint itself.
+    """
+    from flash.runner.accounting.reconciliation import (
+        _canonical_cleanup_remote,
+        _uncanonical_teardown_record,
+    )
+
     with contextlib.suppress(Exception):
-        remote = _canonical_cleanup_remote(raw.get("remote"))
-    cleanup_remotes = raw.get(state._CLEANUP_REMOTES_KEY)
-    return remote, list(cleanup_remotes) if isinstance(cleanup_remotes, list) else None
+        return _canonical_cleanup_remote(remote) or _uncanonical_teardown_record(remote)
+    return None
 
 
-def _salvage_corrupt_terminal_state(raw: dict | None) -> str | None:
-    """Recover an already-settled outcome so quarantine cannot relabel it `failed`.
+def _describes_run(run_id: str, raw: dict | None) -> bool:
+    """False when the record names a different run, so none of it is evidence about `run_id`.
 
-    `_update` refuses to move a run back out of a terminal state, but quarantine writes the
-    envelope directly and bypasses that compare-and-set. A `done` record whose surrounding fields
-    became unreadable would otherwise be republished as `failed`, which is undeployable
-    (`_UNDEPLOYABLE_STATES`) and no longer settleable.
+    A stored id that disagrees with the filename is the one corruption where salvage is unsafe
+    rather than merely lossy: `_strict_teardown_handle` deletes by recorded endpoint id without
+    relating it to the run id it is passed, so lifting those handles would let one swapped status
+    file terminate another live run's worker. The hard-linked sidecar still preserves the record
+    for an operator; the envelope just cannot claim any of it.
     """
     if raw is None:
-        return None
-    stored = raw.get("state")
-    if isinstance(stored, str) and stored in state.TERMINAL_STATES:
-        return stored
-    return None
+        return False
+    stored = raw.get("run_id")
+    return not (isinstance(stored, str) and stored != run_id)
+
+
+# quarantine owns these; every other readable field is lifted verbatim. `source_snapshot` is
+# controlled because it is the one field that fails closed -- re-lifting it would rebuild a record
+# just as unreadable as the one being quarantined.
+_QUARANTINE_CONTROLLED = frozenset(
+    {"run_id", "state", "error", "finished_at", "updated_at", "remote", "source_snapshot"}
+)
+
+
+def _salvage_corrupt_record(
+    run_id: str, raw: dict | None, detail: str, now: float
+) -> tuple[RunStatus, list | None]:
+    """Build the quarantine envelope, keeping every field the corrupt record still reads back.
+
+    Only the field that actually failed is untrustworthy. `_load_status_json` has already proved
+    the record decodes to a dict, and `_validate_recovery_status` rejects exactly three things: a
+    run id mismatch, a non-string state, or a malformed `source_snapshot`. Rebuilding the rest from
+    defaults would drop `billing_context`, `cost_usd`, artifacts and deployment metadata, which
+    permanently disqualifies a chargeable run from `flash.server.billing.retry._needs_charge`.
+
+    The terminal state is kept for the same reason it is checked at all: `_update` refuses to move
+    a run back out of a terminal state, but quarantine writes the envelope directly and bypasses
+    that compare-and-set, so a `done` record would otherwise be republished as `failed` -- which is
+    undeployable (`_UNDEPLOYABLE_STATES`) and no longer settleable.
+    """
+    values: dict = {"spec": {}, "state": "failed", "remote": None}
+    cleanup_remotes = None
+    if raw is not None and _describes_run(run_id, raw):
+        values.update(
+            {
+                key: value
+                for key, value in raw.items()
+                if key in RunStatus.__dataclass_fields__ and key not in _QUARANTINE_CONTROLLED
+            }
+        )
+        if not isinstance(values.get("spec"), dict):
+            values["spec"] = {}
+        stored_state = raw.get("state")
+        if isinstance(stored_state, str) and stored_state in state.TERMINAL_STATES:
+            values["state"] = stored_state
+        values["remote"] = _salvage_teardown_handle(raw.get("remote"))
+        stored_cleanup = raw.get(state._CLEANUP_REMOTES_KEY)
+        if isinstance(stored_cleanup, list):
+            cleanup_remotes = list(stored_cleanup)
+    failed = RunStatus(**values, run_id=run_id, error=detail, finished_at=now, updated_at=now)
+    return failed, cleanup_remotes
 
 
 _RECOVERY_RECORD_ERRORS = (
@@ -125,18 +179,7 @@ def _quarantine_corrupt_status(run_id: str, detail: str) -> tuple[RunStatus | No
             raw = _load_status_json(run_id)
         except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
             raw = None
-        remote, cleanup_remotes = _salvage_corrupt_teardown_evidence(raw)
-        now = time.time()
-        failed = RunStatus(
-            run_id=run_id,
-            state=_salvage_corrupt_terminal_state(raw) or "failed",
-            spec={},
-            created_at=now,
-            updated_at=now,
-            error=detail,
-            finished_at=now,
-            remote=remote,
-        )
+        failed, cleanup_remotes = _salvage_corrupt_record(run_id, raw, detail, time.time())
         data = state._status_storage_dict(failed)
         if cleanup_remotes is not None:
             data[state._CLEANUP_REMOTES_KEY] = cleanup_remotes

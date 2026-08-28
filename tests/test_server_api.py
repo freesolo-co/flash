@@ -6898,6 +6898,131 @@ def test_quarantine_preserves_an_already_settled_outcome(monkeypatch, tmp_path, 
     assert len(list((tmp_path / "runs").glob("settled-run.json.corrupt-*"))) == 1
 
 
+def test_quarantine_preserves_the_billable_fields_of_a_settled_run(monkeypatch, tmp_path):
+    """Only the field that failed is untrustworthy; the rest of the record still has to survive.
+
+    `flash.server.billing.retry._needs_charge` gates on `billing_state` and `cost_usd`, so
+    rebuilding the envelope from defaults would permanently disqualify a chargeable run from
+    settlement while the APIs served an empty result.
+    """
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+    payload = json.dumps(
+        {
+            "run_id": "billable-run",
+            "state": "done",
+            "spec": {"run_id": "billable-run"},
+            "cost_usd": 12.5,
+            "estimated_cost_usd": 12.5,
+            "billing_state": "pending",
+            "billing_context": {"org_id": "org-1"},
+            "adapter_ref": "acct/repo",
+            "artifacts_dir": "/tmp/artifacts",
+            "source_snapshot": {"kind": "invalid"},
+        }
+    ).encode()
+    with open(runner_state.runs_file_path("billable-run", ".json"), "wb") as file:
+        file.write(payload)
+
+    status, quarantined = runner_status._quarantine_corrupt_status("billable-run", "boom")
+
+    assert quarantined
+    assert status is not None
+    assert status.cost_usd == 12.5
+    assert status.billing_state == "pending"
+    assert status.billing_context == {"org_id": "org-1"}
+    assert status.adapter_ref == "acct/repo"
+    assert status.spec == {"run_id": "billable-run"}
+    # the envelope still records why the record was quarantined, and the durable copy agrees.
+    assert status.error is not None
+    assert "boom" in status.error
+    reread = runner_status.get_status("billable-run")
+    assert reread.cost_usd == 12.5
+    assert reread.billing_state == "pending"
+
+
+def test_quarantine_does_not_lift_a_record_naming_a_different_run(monkeypatch, tmp_path):
+    """A record whose stored id disagrees with its filename is evidence about some other run.
+
+    `_strict_teardown_handle` deletes the recorded endpoint id without relating it to the run id it
+    is passed, so lifting a foreign handle here would let one swapped status file tear down another
+    live run's worker. Worse, `_worker_provably_gone` would then ask
+    `run_instances_remaining("bad-run")`, get `[]` because that id genuinely owns nothing, and
+    report the wrong teardown as a CONFIRMED deletion.
+    """
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+    payload = json.dumps(
+        {
+            "run_id": "other-run",
+            "state": "running",
+            "spec": {"run_id": "other-run"},
+            "cost_usd": 9.0,
+            "remote": {
+                "provider": "runpod",
+                "endpoint_id": "ep-other",
+                "key_fingerprint": "rpk-0123456789ab",
+            },
+            "cleanup_remotes": [{"provider": "runpod", "endpoint_id": "ep-other-cleanup"}],
+        }
+    ).encode()
+    with open(runner_state.runs_file_path("bad-run", ".json"), "wb") as file:
+        file.write(payload)
+
+    status, quarantined = runner_status._quarantine_corrupt_status("bad-run", "boom")
+
+    assert quarantined
+    assert status is not None
+    assert status.run_id == "bad-run"
+    # nothing from the foreign record may be claimed: not the handle, not the settled fields.
+    assert status.remote is None
+    assert status.state == "failed"
+    assert status.cost_usd == 0.0
+    assert status.spec == {}
+    with open(runner_state.runs_file_path("bad-run", ".json"), encoding="utf-8") as file:
+        stored = json.load(file)
+    assert runner_state._CLEANUP_REMOTES_KEY not in stored
+    # the foreign bytes are still preserved for an operator.
+    assert len(list((tmp_path / "runs").glob("bad-run.json.corrupt-*"))) == 1
+
+
+def test_quarantine_keeps_a_deployed_release_runpod_handle(monkeypatch, tmp_path):
+    """The 16-character `rpk-` fingerprint deployed writers persist must reach teardown.
+
+    `_canonical_cleanup_remote` rejects that shape outright -- it validates `key_fingerprint` at the
+    full 68-character digest -- so requiring canonical form here would drop the handle for every
+    endpoint a currently deployed release created. RunPod's `sweep_orphans()` is a no-op, so there
+    is no later backstop: the endpoint would bill forever with nothing able to tear it down.
+    """
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+    deployed_handle = {
+        "provider": "runpod",
+        "endpoint_id": "ep-deployed",
+        "key_fingerprint": "rpk-0123456789ab",
+    }
+    # the handle a deployed release writes is precisely the one strict canonicalization refuses.
+    assert runner_reconciliation._canonical_cleanup_remote(deployed_handle) is None
+    payload = json.dumps(
+        {
+            "run_id": "deployed-run",
+            "state": "running",
+            "spec": {},
+            "remote": deployed_handle,
+            "source_snapshot": {"kind": "invalid"},
+        }
+    ).encode()
+    with open(runner_state.runs_file_path("deployed-run", ".json"), "wb") as file:
+        file.write(payload)
+
+    status, quarantined = runner_status._quarantine_corrupt_status("deployed-run", "boom")
+
+    assert quarantined
+    assert status is not None
+    assert status.remote is not None
+    assert status.remote["endpoint_id"] == "ep-deployed"
+
+
 def test_quarantine_marks_an_unreadable_outcome_failed(monkeypatch, tmp_path):
     """An outcome that cannot be read at all still has to become `failed`."""
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
@@ -6988,6 +7113,77 @@ def test_recover_runs_corrupt_status_preserves_and_drains_teardown_evidence(monk
     quarantine_files = list((tmp_path / "runs").glob(f"{run_id}.json.corrupt-*"))
     assert len(quarantine_files) == 1
     assert json.loads(quarantine_files[0].read_text()) == raw
+
+
+def test_recover_runs_tears_down_a_corrupt_record_off_the_startup_thread(monkeypatch, tmp_path):
+    """Direct teardown makes live provider calls, so it cannot run on the startup path.
+
+    `recover_runs()` is invoked synchronously before the ASGI lifespan yields, and each teardown
+    blocks through its own provider retry and backoff. Serial startup cleanup can exceed the
+    HEALTHCHECK grace and turn into a restart loop, which is exactly why the cleanup drain beside it
+    is already threaded. Asserting only that the handle is eventually torn down would pass for the
+    synchronous version too, so this asserts on dispatch.
+    """
+    import flash.server.platform.runtime as runtime
+    from flash.providers.core import registry as providers_mod
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    run_id = "corrupt-async"
+    canonical_handle = {
+        "provider": "runpod",
+        "endpoint_id": "ep-async",
+        "endpoint_name": "flash-async",
+        "key_fingerprint": "rpk-" + "a" * 64,
+        "job_id": None,
+        "attempt": 0,
+        "started_ts": 1.0,
+    }
+    # pin the handle as canonical so this test turns only on dispatch, never on lenient salvage.
+    assert runner_reconciliation._canonical_cleanup_remote(canonical_handle) is not None
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=run_id,
+            state="running",
+            spec={"run_id": run_id},
+            remote=canonical_handle,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
+    )
+    status_path = runner_state.runs_file_path(run_id, ".json")
+    with open(status_path, encoding="utf-8") as handle:
+        raw = json.load(handle)
+    raw["source_snapshot"] = {"kind": "invalid"}
+    with open(status_path, "w", encoding="utf-8") as handle:
+        json.dump(raw, handle)
+
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": run_id}])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    torn_down = []
+    monkeypatch.setattr(
+        "flash.runner.supervise.lifecycle._strict_teardown_handle",
+        lambda handle, torn_run_id: torn_down.append(handle["endpoint_id"]) or True,
+    )
+    deferred = []
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target = target
+            self._args = args
+
+        def start(self):
+            deferred.append(lambda: self._target(*self._args))
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+
+    # recovery returned without making a single provider call: the teardown is queued, not run.
+    assert not torn_down
+    assert len(deferred) == 1
+    deferred[0]()
+    assert torn_down == ["ep-async"]
 
 
 @pytest.mark.parametrize("repaired_state", ["queued", "running"])

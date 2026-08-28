@@ -596,13 +596,24 @@ def _drain_cleanup_remotes_bg(run_id: str) -> None:
         _drain_cleanup_remotes(run_id)
 
 
-def _teardown_failed_recovery(status: RunStatus) -> None:
+def _teardown_failed_recovery_bg(status: RunStatus) -> None:
     _teardown_unrecoverable_remote(status)
     # direct teardown can record an unconfirmed handle after an earlier drain took its snapshot.
+    _drain_cleanup_remotes_bg(status.run_id)
+
+
+def _teardown_failed_recovery(status: RunStatus) -> None:
+    """Release a failed run's rented worker without holding up startup.
+
+    Both halves go on the one background thread for the same reason the drain alone already did:
+    a provider outage blocks each teardown through its own retry and backoff, `recover_runs()` runs
+    synchronously before the ASGI lifespan yields, and serial startup cleanup can exceed the
+    HEALTHCHECK grace and turn into a restart loop. The direct teardown is the slower half -- it
+    makes live provider calls per handle -- so leaving it on the startup thread would have kept
+    exactly the stall the threaded drain exists to avoid.
+    """
     with contextlib.suppress(Exception):
-        threading.Thread(
-            target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
-        ).start()
+        threading.Thread(target=_teardown_failed_recovery_bg, args=(status,), daemon=True).start()
 
 
 def _quarantine_corrupt_recovery_record(
