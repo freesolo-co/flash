@@ -351,3 +351,95 @@ def test_sweep_instances_with_no_stop_signal_counts_every_teardown(monkeypatch):
 
     assert app_mod._sweep_orphan_instances_once().deleted_count == 2
     assert lam.seen_should_stop is None
+
+
+def test_vast_sweep_refuses_clean_absence_from_a_halted_listing(monkeypatch):
+    """A stop landing mid-pagination is a FALSE-CLEAN hazard, not just wasted latency.
+
+    Vast's ``list_instances`` walks pages; when a later page's retry loop observes the stop it
+    raises, and the lenient (non-strict) path catches that and RETURNS the pages already collected.
+    The sweep cannot tell that short list from a complete one. If the collected pages happen to
+    hold no orphan, the ``not selected`` early return reports ``ABSENT`` -- a positive claim that
+    teardown is confirmed clean, built on pages that were never fetched. An unread page can hold a
+    live billable box. The sweep must instead report RETRYABLE/halted so the next sweep re-reads."""
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.vast import jobs
+    from flash.providers.vast.client import api as vast_api
+
+    destroyed = []
+
+    def fake_list(should_stop=None, **_):
+        # page 1 succeeded and held no orphan; page 2's retry loop saw the stop, so the real
+        # client returns just the collected prefix rather than raising.
+        assert should_stop is not None, "the sweep must forward a stop callback into the listing"
+        should_stop()
+        return [{"id": 1, "label": jobs.instance_label("flash-live", 0, 0)}]
+
+    monkeypatch.setattr(vast_api, "list_instances", fake_list)
+    monkeypatch.setattr(
+        vast_api, "destroy_instance", lambda iid, **_: destroyed.append(iid) or True
+    )
+
+    out = jobs.sweep_orphans(active_labels={"flash-live"}, should_stop=lambda: True)
+
+    # before the fix this was CleanupOutcome.ABSENT with halted=False: absence claimed from a
+    # partial inventory.
+    assert out.outcome is CleanupOutcome.RETRYABLE
+    assert out.halted
+    assert destroyed == []
+
+
+def test_vast_sweep_keeps_absence_evidence_when_the_listing_completed(monkeypatch):
+    """The converse of the halted-listing guard, and the reason it observes the stop the LISTING
+    saw rather than re-reading the flag afterwards. A listing that ran to completion is
+    authoritative even if a stop is raised immediately after it; discarding its absence evidence
+    would make every sweep racing a shutdown report RETRYABLE and never confirm a clean account."""
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.vast import jobs
+    from flash.providers.vast.client import api as vast_api
+
+    stop_raised = False
+
+    def fake_list(should_stop=None, **_):
+        # every page fetched cleanly: the retry loops polled the stop and saw it unset. the
+        # shutdown then begins the instant the last page lands.
+        nonlocal stop_raised
+        assert should_stop is not None
+        assert should_stop() is False
+        stop_raised = True
+        return [{"id": 1, "label": jobs.instance_label("flash-live", 0, 0)}]
+
+    monkeypatch.setattr(vast_api, "list_instances", fake_list)
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid, **_: True)
+
+    out = jobs.sweep_orphans(active_labels={"flash-live"}, should_stop=lambda: stop_raised)
+
+    # a naive re-read of the flag after the listing would report RETRYABLE/halted here and throw
+    # away a complete inventory's absence evidence, so every sweep racing a shutdown would fail to
+    # confirm a clean account.
+    assert stop_raised  # the stop really is set by the time the sweep inspects its result
+    assert out.outcome is CleanupOutcome.ABSENT
+    assert not out.halted
+
+
+def test_lambda_sweep_reports_a_halted_listing_as_halted(monkeypatch):
+    """Lambda's listing is a SINGLE unpaginated request, so unlike Vast it cannot hand back a
+    partial inventory: a stop during its retries surfaces as a raise. That already returned
+    RETRYABLE, so there is no false-clean here -- but it was reported as an ordinary retryable
+    failure, indistinguishable from an API blip. Stamping ``halted`` lets the caller tell a
+    deliberate shutdown apart from a provider error it should alarm on."""
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.lambda_ import jobs
+    from flash.providers.lambda_.client import api as lambda_api
+
+    def fake_list(should_stop=None, **_):
+        assert should_stop is not None, "the sweep must forward a stop callback into the listing"
+        should_stop()
+        raise lambda_api.LambdaApiError("listing aborted by stop")
+
+    monkeypatch.setattr(lambda_api, "list_instances", fake_list)
+
+    out = jobs.sweep_orphans(should_stop=lambda: True)
+
+    assert out.outcome is CleanupOutcome.RETRYABLE
+    assert out.halted  # before the fix: halted=False, a shutdown misread as a provider blip

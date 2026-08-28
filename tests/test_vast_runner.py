@@ -3054,24 +3054,33 @@ def test_sweep_orphans_without_stop_signal_completes_normally(monkeypatch):
 def test_sweep_orphans_forwards_stop_into_the_inventory_listing(monkeypatch):
     """The paginated inventory read runs BEFORE the first destroy, so a stop that only reaches the
     destroy loop still waits out every page's retry budget on a thread the caller cannot
-    interrupt. Assert the exact callback object reaches ``list_instances``."""
+    interrupt. The sweep wraps the caller's callback to record whether the listing itself observed
+    the stop, so assert the forwarded callable REPORTS the caller's stop rather than asserting it
+    is the same object."""
     from flash.providers.vast import jobs as vast
     from flash.providers.vast.client import api as vast_api
 
     seen: list[object] = []
+    stopping = False
 
     def fake_list(strict=False, *, should_stop=None, **_):
+        nonlocal stopping
         seen.append(should_stop)
+        assert should_stop is not None
+        assert should_stop() is False  # the caller is not stopping yet
+        stopping = True
+        assert should_stop() is True  # a stop raised mid-listing reaches the transport
         return []
 
     monkeypatch.setattr(vast_api, "list_instances", fake_list)
 
     def stop() -> bool:
-        return False
+        return stopping
 
     vast.sweep_orphans(active_labels=set(), should_stop=stop)
 
-    assert seen == [stop]
+    assert len(seen) == 1
+    assert callable(seen[0])
 
 
 def test_list_instances_forwards_stop_into_every_page_retry_loop(monkeypatch):

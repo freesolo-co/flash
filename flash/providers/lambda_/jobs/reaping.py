@@ -80,11 +80,27 @@ def sweep_orphans(
     a shutdown during its retries is not waited out: cancelling the caller cannot interrupt this
     worker thread, so a long sweep would otherwise keep destroying past the lifespan's shutdown.
     """
+    # this listing is a single unpaginated request, so a stop during its retries surfaces as a
+    # raise rather than a short list: unlike vast, it cannot hand back a partial inventory. observe
+    # the stop anyway so a shutdown is reported as halted instead of as an ordinary retryable
+    # failure, and so a stop that lands between a complete listing and the sweep body still stops.
+    listing_halted = False
+
+    def _observe_listing_stop() -> bool:
+        nonlocal listing_halted
+        listing_halted = listing_halted or (should_stop is not None and should_stop())
+        return listing_halted
+
     try:
-        instances = lambda_api.list_instances(should_stop=should_stop)
+        instances = lambda_api.list_instances(
+            **({} if should_stop is None else {"should_stop": _observe_listing_stop}),
+        )
     except Exception as exc:
         logger.warning("lambda orphan sweep skipped: %s", exc)
-        return CleanupResult(CleanupOutcome.RETRYABLE)
+        return CleanupResult(CleanupOutcome.RETRYABLE, halted=listing_halted)
+    if listing_halted:
+        logger.info("lambda orphan sweep: stop requested during inventory; listing is incomplete")
+        return CleanupResult(CleanupOutcome.RETRYABLE, halted=True)
     try:
         labels = active_labels() if callable(active_labels) else active_labels
         known = known_labels() if callable(known_labels) else known_labels

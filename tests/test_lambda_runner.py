@@ -4433,24 +4433,33 @@ def test_sweep_orphans_without_stop_signal_completes_normally(monkeypatch):
 def test_sweep_orphans_forwards_stop_into_the_inventory_listing(monkeypatch):
     """The inventory read runs BEFORE the first termination, so a stop that only reaches the
     destroy loop still waits out the listing's full retry budget on a thread the caller cannot
-    interrupt. Assert the exact callback object reaches ``list_instances``."""
+    interrupt. The sweep wraps the caller's callback to record whether the listing itself observed
+    the stop, so assert the forwarded callable REPORTS the caller's stop rather than asserting it
+    is the same object."""
     from flash.providers.lambda_ import jobs
     from flash.providers.lambda_.client import api as lambda_api
 
     seen: list[object] = []
+    stopping = False
 
     def fake_list(*, should_stop=None, **_):
+        nonlocal stopping
         seen.append(should_stop)
+        assert should_stop is not None
+        assert should_stop() is False  # the caller is not stopping yet
+        stopping = True
+        assert should_stop() is True  # a stop raised mid-listing reaches the transport
         return []
 
     monkeypatch.setattr(lambda_api, "list_instances", fake_list)
 
     def stop() -> bool:
-        return False
+        return stopping
 
     jobs.sweep_orphans(active_labels=set(), should_stop=stop)
 
-    assert seen == [stop]
+    assert len(seen) == 1
+    assert callable(seen[0])
 
 
 def test_list_instances_forwards_stop_into_the_request_retry_loop(monkeypatch):

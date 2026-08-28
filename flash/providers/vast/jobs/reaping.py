@@ -115,11 +115,28 @@ def sweep_orphans(
     shutdown during its retries is not waited out: cancelling the caller cannot interrupt this
     worker thread, so a long sweep would otherwise keep destroying past the lifespan's shutdown.
     """
+    # a stop that lands mid-pagination abandons the remaining pages and returns the ones already
+    # collected, so the inventory is a partial view. an unread page can hold an orphan, and absence
+    # claimed from a partial listing would falsely confirm a clean teardown. observe the stop the
+    # listing itself saw rather than re-reading the flag: a stop raised after a complete listing
+    # leaves that listing authoritative, and its absence evidence must survive.
+    listing_halted = False
+
+    def _observe_listing_stop() -> bool:
+        nonlocal listing_halted
+        listing_halted = listing_halted or (should_stop is not None and should_stop())
+        return listing_halted
+
     try:
-        instances = vast_api.list_instances(should_stop=should_stop)
+        instances = vast_api.list_instances(
+            **({} if should_stop is None else {"should_stop": _observe_listing_stop}),
+        )
     except Exception as exc:
         logger.warning("vast orphan sweep skipped: %s", exc)
-        return CleanupResult(CleanupOutcome.RETRYABLE)
+        return CleanupResult(CleanupOutcome.RETRYABLE, halted=listing_halted)
+    if listing_halted:
+        logger.info("vast orphan sweep: stop requested during inventory; listing is incomplete")
+        return CleanupResult(CleanupOutcome.RETRYABLE, halted=True)
     try:
         labels = active_labels() if callable(active_labels) else active_labels
         known = known_labels() if callable(known_labels) else known_labels
