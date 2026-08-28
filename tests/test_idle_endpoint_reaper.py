@@ -869,6 +869,14 @@ def test_sweep_halts_between_deletes_on_stop_signal(monkeypatch):
 
 
 def test_runpod_stop_during_delete_retry_prevents_second_request(monkeypatch):
+    """A stop raised inside the delete halts the sweep; it is not endpoint-level evidence.
+
+    The delete honours the same stop signal, so it returns false the moment the signal lands
+    mid-retry. Reporting that as a ``delete was not confirmed`` endpoint issue would blame the
+    endpoint for the operator's shutdown -- exactly the sweep-level-condition-as-endpoint-record
+    lie the halt flag replaces. ``unresolved_count`` alone cannot tell the two apart: it counts
+    ``halted`` too, so it reads 1 under either representation. Assert the shape, not the count.
+    """
     from flash.providers._lifecycle.net import http as lifecycle_http
     from flash.providers.runpod.client import api as runpod_api
 
@@ -904,6 +912,8 @@ def test_runpod_stop_during_delete_retry_prevents_second_request(monkeypatch):
 
     assert attempts == ["DELETE"], f"expected one destructive request, got {attempts}"
     assert result.deleted_count == 0
+    assert result.halted, "a stop inside the delete must report the sweep-level halt"
+    assert not result.unresolved, f"halt must not fabricate endpoint evidence: {result.unresolved}"
     assert result.unresolved_count == 1
 
 

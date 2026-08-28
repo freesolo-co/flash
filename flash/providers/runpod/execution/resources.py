@@ -346,6 +346,12 @@ def _reap_selected_endpoint(
             owner_fingerprint,
             **({} if should_stop is None else {"should_stop": should_stop}),
         ):
+            if should_stop is not None and should_stop():
+                # the delete honours the same stop signal, so a false return here is that halt
+                # surfacing rather than evidence about the endpoint. reporting it as an endpoint
+                # issue would fabricate exactly the sweep-level-condition-as-endpoint-record lie
+                # the halt flag exists to replace.
+                return _EndpointReapOutcome(observed_idle=True, halted=True)
             return _EndpointReapOutcome(
                 observed_idle=True,
                 issue=_sweep_issue(
