@@ -332,10 +332,13 @@ def list_instances(
     strict: bool = False,
     *,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[dict]:
     # list via paginated v1 (`next_token` -> `after_token`, limit 25); detail/destroy remain v0.
     # walk every page. with `strict=True`, any fetch, shape, or page-cap failure raises so an
     # incomplete listing cannot prove an instance is gone.
+    # `should_stop` reaches each page's retry loop: a sweep's inventory read runs before its first
+    # destroy, so without it a shutdown waits out the full retry budget on the joined worker thread.
     instances: list[dict] = []
     after_token: str | None = None
     for page_no in range(
@@ -345,7 +348,7 @@ def list_instances(
         if after_token:
             path += f"?after_token={urllib.parse.quote(str(after_token))}"
         try:
-            out = request_with_retries(path, deadline_at=deadline_at)
+            out = request_with_retries(path, deadline_at=deadline_at, should_stop=should_stop)
         except Exception:
             # A later page failed after earlier ones succeeded: return the partial list rather than
             # discard it — lenient consumers only act on instances they see, and the next sweep

@@ -608,6 +608,59 @@ def test_cooperative_stop_halts_before_deleting(monkeypatch):
     assert api.deleted == []
 
 
+def test_enumeration_stop_reports_a_halt_not_an_empty_sweep(monkeypatch):
+    """Enumeration is a fan-out of slow recursive HF listings, so a stop must be honored inside it.
+
+    The halt has to be reported as a halt: folding it into an empty target list would make an
+    interrupted sweep indistinguishable from one that legitimately found nothing to reap, and the
+    caller would record a clean cycle over artifacts it never actually looked at.
+    """
+    _wire(monkeypatch)
+    api = FakeApi({_managed("e1"): [_adapter("sft/flash-1-old/w", OLD)]})
+
+    targets, halted = rc._collect_targets(
+        api,
+        _LIVE_SENTINEL[0],
+        set(),
+        NOW,
+        rc.DELETE_AGE_SECONDS,
+        lambda: True,
+    )
+
+    assert targets == []
+    assert halted
+    assert api.deleted == []
+
+
+def test_stop_between_the_live_reconfirm_and_the_delete_halts_the_sweep(monkeypatch):
+    """The loop-top stop check is separated from ``delete_folder`` by two slow HF round-trips.
+
+    The pre-delete re-stat and the live-set re-confirm can each take seconds, so a stop that arrives
+    during them is already known by the time the delete runs but would not be seen until the NEXT
+    iteration. Drive the stop so it is false at the loop top and true only after the re-confirm: a
+    sweep that only checks at the top deletes this prefix anyway.
+    """
+    confirms = {"n": 0}
+    stopped = {"v": False}
+
+    def _live():
+        confirms["n"] += 1
+        # confirm #1 is the pre-listing fail-closed read, #2 is the per-delete re-confirm. Flip the
+        # stop as that second one returns, i.e. after the loop-top check already ran and passed.
+        if confirms["n"] >= 2:
+            stopped["v"] = True
+        return _LIVE_SENTINEL
+
+    _wire(monkeypatch, deployed=_live)
+    api = FakeApi({_managed("e1"): [_adapter("sft/flash-1-old/w", OLD)]})
+
+    result = rc.run_scheduled_cleanup(dry_run=False, api=api, should_stop=lambda: stopped["v"])
+
+    assert api.deleted == []
+    assert result.deleted_count == 0
+    assert result.halted
+
+
 # ---- the real per-run lock --------------------------------------------------------------------
 
 

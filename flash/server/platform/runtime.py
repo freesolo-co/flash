@@ -50,6 +50,22 @@ async def _run_owned_stoppable_worker(
         return result
 
 
+async def _cancel_and_join_background(tasks: list[asyncio.Task]) -> None:
+    """Cancel every background task before awaiting any of them.
+
+    The destructive loops own their worker threads across cancellation
+    (``_run_owned_stoppable_worker``), so awaiting one blocks until its sweep thread exits. A
+    cancel-then-await per task would leave every later loop's stop event unset for that whole
+    join, letting them keep deleting endpoints, instances, and repos after the server was told
+    to stop. Signalling first bounds shutdown by the slowest single sweep instead of their sum.
+    """
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 async def _reconcile_cost_loop() -> None:
     """Background loop: periodically pull realized provider cost (COGS) for finished runs and
     report it to the freesolo backend for estimator accuracy. The provider billing calls are

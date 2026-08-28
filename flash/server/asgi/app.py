@@ -31,6 +31,7 @@ from flash.server.platform import db
 from flash.server.platform.locks import _DEPLOY_LOCKS, _deploy_lock
 from flash.server.platform.runtime import (
     _RECOVERABLE,
+    _cancel_and_join_background,
     _charge_retry_loop,
     _charge_retry_startup,
     _reconcile_cost_loop,
@@ -440,18 +441,20 @@ def create_app():
             startup_report_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await startup_report_task
-            for task in (
-                startup_charge_task,
-                cost_task,
-                charge_task,
-                reap_task,
-                sweep_task,
-                cleanup_task,
-            ):
-                if task is not None:
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
+            await _cancel_and_join_background(
+                [
+                    task
+                    for task in (
+                        startup_charge_task,
+                        cost_task,
+                        charge_task,
+                        reap_task,
+                        sweep_task,
+                        cleanup_task,
+                    )
+                    if task is not None
+                ]
+            )
             shutdown_deadline = time.monotonic() + 15.0
             with contextlib.suppress(Exception):
                 if not await asyncio.to_thread(_wait_for_deployment_jobs, 10.0):

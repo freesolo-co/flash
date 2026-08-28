@@ -279,8 +279,11 @@ def list_instances(
     *,
     deadline_at: float | None = None,
     strict: bool = False,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[dict]:
-    out = _data(request_with_retries("/instances", deadline_at=deadline_at))
+    out = _data(
+        request_with_retries("/instances", deadline_at=deadline_at, should_stop=should_stop)
+    )
     if isinstance(out, list):
         return out
     if strict:

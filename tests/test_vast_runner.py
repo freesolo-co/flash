@@ -2828,7 +2828,7 @@ def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
         {"id": "not-an-int", "label": "flash-run1-s1-a0"},  # non-intable -> skip, must NOT raise
         {"id": 7, "label": "flash-run1-s2-a0"},  # good -> destroyed
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: instances)
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
 
@@ -2848,7 +2848,7 @@ def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
         {"id": 3, "label": "flash-runA10-s0-a0"},  # NOT runA (boundary) -> orphan, reaped
         {"id": 4, "label": "not-ours"},  # untouched
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: instances)
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
     out = vast.sweep_orphans(active_labels={"runA"})  # raw active id; prefix forced internally
@@ -2865,7 +2865,7 @@ def test_sweep_orphans_reports_malformed_selected_identity_as_unconfirmed(monkey
     monkeypatch.setattr(
         vast_api,
         "list_instances",
-        lambda: [{"id": "invalid", "label": "flash-orphan-s0-a0"}],
+        lambda **_: [{"id": "invalid", "label": "flash-orphan-s0-a0"}],
     )
 
     result = vast.sweep_orphans(active_labels=set())
@@ -2883,7 +2883,7 @@ def test_sweep_orphans_preserves_partial_deletion_evidence(monkeypatch):
         {"id": 1, "label": "flash-one-s0-a0"},
         {"id": 2, "label": "flash-two-s0-a0"},
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: instances)
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: iid == 1)
 
     result = vast.sweep_orphans(active_labels=set())
@@ -2898,7 +2898,7 @@ def test_sweep_orphans_deduplicates_inventory_before_destroy(monkeypatch):
     from flash.providers.vast.client import api as vast_api
 
     duplicate = {"id": 7, "label": "flash-orphan-s0-a0"}
-    monkeypatch.setattr(vast_api, "list_instances", lambda: [duplicate, dict(duplicate)])
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: [duplicate, dict(duplicate)])
     destroyed = []
     monkeypatch.setattr(
         vast_api,
@@ -2922,7 +2922,7 @@ def test_sweep_orphans_known_labels_multiplane_guard(monkeypatch):
         {"id": 1, "label": "flash-mine-s0-a0"},  # known + not active -> reaped
         {"id": 2, "label": "flash-other-s0-a0"},  # unknown to this plane -> left alone
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: instances)
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
     out = vast.sweep_orphans(active_labels=set(), known_labels={"mine"})
@@ -2936,7 +2936,9 @@ def test_sweep_orphans_callable_sets_resolved_after_listing(monkeypatch):
     from flash.providers.vast import jobs as vast
     from flash.providers.vast.client import api as vast_api
 
-    monkeypatch.setattr(vast_api, "list_instances", lambda: [{"id": 1, "label": "flash-x-s0-a0"}])
+    monkeypatch.setattr(
+        vast_api, "list_instances", lambda **_: [{"id": 1, "label": "flash-x-s0-a0"}]
+    )
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)
     # protected by a callable-resolved active set
     assert vast.sweep_orphans(active_labels=lambda: {"x"}).deleted_count == 0
@@ -2957,7 +2959,7 @@ def test_vast_stop_during_destroy_retry_prevents_second_request(monkeypatch):
     monkeypatch.setattr(
         vast_api,
         "list_instances",
-        lambda: [{"id": 7, "label": "flash-orphan-s0-a0"}],
+        lambda **_: [{"id": 7, "label": "flash-orphan-s0-a0"}],
     )
     monkeypatch.setattr(lifecycle_http.time, "sleep", lambda _delay: None)
     attempts: list[str] = []
@@ -2989,7 +2991,7 @@ def test_sweep_orphans_halts_between_destroys_without_fake_unresolved_ids(monkey
     from flash.providers.vast.client import api as vast_api
 
     instances = [{"id": n, "label": f"flash-run{n}-s0-a0"} for n in (1, 2, 3)]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: instances)
     destroyed: list[int] = []
     from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
 
@@ -3015,7 +3017,9 @@ def test_sweep_orphans_stop_already_set_destroys_nothing(monkeypatch):
     from flash.providers.vast import jobs as vast
     from flash.providers.vast.client import api as vast_api
 
-    monkeypatch.setattr(vast_api, "list_instances", lambda: [{"id": 5, "label": "flash-a-s0-a0"}])
+    monkeypatch.setattr(
+        vast_api, "list_instances", lambda **_: [{"id": 5, "label": "flash-a-s0-a0"}]
+    )
     destroyed: list[int] = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
 
@@ -3038,10 +3042,57 @@ def test_sweep_orphans_without_stop_signal_completes_normally(monkeypatch):
     from flash.providers.vast.client import api as vast_api
 
     instances = [{"id": n, "label": f"flash-run{n}-s0-a0"} for n in (1, 2)]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: instances)
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)
 
     result = vast.sweep_orphans(active_labels=set())
 
     assert result.outcome is CleanupOutcome.DELETED
     assert result.confirmed_deleted_ids == ("1", "2")
+
+
+def test_sweep_orphans_forwards_stop_into_the_inventory_listing(monkeypatch):
+    """The paginated inventory read runs BEFORE the first destroy, so a stop that only reaches the
+    destroy loop still waits out every page's retry budget on a thread the caller cannot
+    interrupt. Assert the exact callback object reaches ``list_instances``."""
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    seen: list[object] = []
+
+    def fake_list(strict=False, *, should_stop=None, **_):
+        seen.append(should_stop)
+        return []
+
+    monkeypatch.setattr(vast_api, "list_instances", fake_list)
+
+    def stop() -> bool:
+        return False
+
+    vast.sweep_orphans(active_labels=set(), should_stop=stop)
+
+    assert seen == [stop]
+
+
+def test_list_instances_forwards_stop_into_every_page_retry_loop(monkeypatch):
+    """``should_stop`` must reach the retrying transport on EVERY page, not just the first: a
+    multi-page account would otherwise keep retrying pages after the server was told to stop."""
+    from flash.providers.vast.client import api as vast_api
+
+    seen: list[object] = []
+    pages = [
+        {"instances": [{"id": 1}], "next_token": "t2"},
+        {"instances": [{"id": 2}]},
+    ]
+
+    def fake_request(path, **kwargs):
+        seen.append(kwargs.get("should_stop"))
+        return pages[len(seen) - 1]
+
+    monkeypatch.setattr(vast_api._CLIENT, "request_with_retries", fake_request)
+
+    def stop() -> bool:
+        return False
+
+    assert vast_api.list_instances(should_stop=stop) == [{"id": 1}, {"id": 2}]
+    assert seen == [stop, stop]

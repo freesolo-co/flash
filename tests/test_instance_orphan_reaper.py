@@ -171,7 +171,7 @@ def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
         {"id": "i-foreign", "name": "not-ours"},  # non-flash name -> never touch
     ]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: lam_instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda **_: lam_instances)
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids, **_: terminated.extend(ids) or list(ids)
     )
@@ -207,7 +207,7 @@ def test_sweep_spares_other_control_planes_live_instances(monkeypatch):
         {"id": "i-theirs", "name": lambda_jobs.instance_label("flash-theirs", 0, 0)},
     ]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: lam_instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda **_: lam_instances)
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids, **_: terminated.extend(ids) or list(ids)
     )
@@ -229,7 +229,7 @@ def test_sweep_resolves_active_labels_after_listing(monkeypatch):
     fresh = jobs.instance_label("flash-fresh", 0, 0)
     orphan = jobs.instance_label("flash-old", 0, 0)
 
-    def fake_list():
+    def fake_list(**_):
         events.append("list")
         return [{"id": "i-fresh", "name": fresh}, {"id": "i-orphan", "name": orphan}]
 

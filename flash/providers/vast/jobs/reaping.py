@@ -111,11 +111,12 @@ def sweep_orphans(
 ) -> CleanupResult:
     """Destroy unclaimed Flash-labeled instances and preserve partial evidence.
 
-    ``should_stop`` is checked between destroys: cancelling the caller cannot interrupt this
+    ``should_stop`` is checked between destroys, and is forwarded into the inventory listing so a
+    shutdown during its retries is not waited out: cancelling the caller cannot interrupt this
     worker thread, so a long sweep would otherwise keep destroying past the lifespan's shutdown.
     """
     try:
-        instances = vast_api.list_instances()
+        instances = vast_api.list_instances(should_stop=should_stop)
     except Exception as exc:
         logger.warning("vast orphan sweep skipped: %s", exc)
         return CleanupResult(CleanupOutcome.RETRYABLE)

@@ -351,3 +351,52 @@ def test_cancelled_destructive_loop_joins_owned_worker(
     monkeypatch, loop, sleep_module, worker_module, worker_name
 ) -> None:
     _assert_cancelled_loop_joins_worker(monkeypatch, loop, sleep_module, worker_module, worker_name)
+
+
+def test_shutdown_signals_every_task_before_joining_the_first() -> None:
+    """A slow destructive join must not delay the stop signal reaching the later sweeps.
+
+    Each destructive loop owns its worker thread across cancellation, so awaiting one blocks until
+    that sweep exits. Cancelling and awaiting one task at a time would leave every later loop still
+    deleting for the whole join.
+    """
+    signalled: list[str] = []
+    siblings_signalled_during_join: list[bool] = []
+
+    async def blocking_loop() -> None:
+        try:
+            await _REAL_ASYNCIO_SLEEP(3600)
+        except asyncio.CancelledError:
+            signalled.append("blocker")
+            # stand in for the owned worker thread: this join takes real time, during which the
+            # siblings must already have been told to stop.
+            for _ in range(100):
+                if len(signalled) == 3:
+                    break
+                await _REAL_ASYNCIO_SLEEP(0)
+            siblings_signalled_during_join.append(len(signalled) == 3)
+            raise
+
+    def make_follower(name: str):
+        async def follower() -> None:
+            try:
+                await _REAL_ASYNCIO_SLEEP(3600)
+            except asyncio.CancelledError:
+                signalled.append(name)
+                raise
+
+        return follower
+
+    async def exercise() -> None:
+        tasks = [
+            asyncio.create_task(blocking_loop()),
+            asyncio.create_task(make_follower("sweep")()),
+            asyncio.create_task(make_follower("cleanup")()),
+        ]
+        while not all(task.get_coro().cr_await is not None for task in tasks):
+            await _REAL_ASYNCIO_SLEEP(0)
+        await runtime._cancel_and_join_background(tasks)
+
+    asyncio.run(exercise())
+    assert siblings_signalled_during_join == [True]
+    assert sorted(signalled) == ["blocker", "cleanup", "sweep"]

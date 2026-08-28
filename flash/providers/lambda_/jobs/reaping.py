@@ -76,11 +76,12 @@ def sweep_orphans(
 ) -> CleanupResult:
     """Terminate flash-prefixed instances not owned by a live run.
 
-    ``should_stop`` is checked between terminations: cancelling the caller cannot interrupt this
+    ``should_stop`` is checked between terminations, and is forwarded into the inventory listing so
+    a shutdown during its retries is not waited out: cancelling the caller cannot interrupt this
     worker thread, so a long sweep would otherwise keep destroying past the lifespan's shutdown.
     """
     try:
-        instances = lambda_api.list_instances()
+        instances = lambda_api.list_instances(should_stop=should_stop)
     except Exception as exc:
         logger.warning("lambda orphan sweep skipped: %s", exc)
         return CleanupResult(CleanupOutcome.RETRYABLE)
