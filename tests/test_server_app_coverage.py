@@ -5,12 +5,17 @@ from __future__ import annotations
 import asyncio
 import builtins
 import sys
+import threading
 import types
 
 import pytest
 
 import flash.providers.runpod.execution.resources as runpod_resources
 import flash.server.asgi.app as app_mod
+import flash.server.platform.runtime as runtime
+from flash.server.domain.ops import repo_cleanup
+
+_REAL_ASYNCIO_SLEEP = asyncio.sleep
 
 
 def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> None:
@@ -137,7 +142,11 @@ def test_instance_orphan_loop_logs_successful_sweep(monkeypatch) -> None:
         debug=lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(app_mod, "_log", logger)
-    monkeypatch.setattr(app_mod, "_sweep_orphan_instances_once", lambda should_stop=None: 3)
+    monkeypatch.setattr(
+        app_mod,
+        "_sweep_orphan_instances_once",
+        lambda should_stop=None: app_mod.InstanceOrphanSweepResult(deleted_count=3),
+    )
 
     _run_loop_once(
         monkeypatch,
@@ -275,45 +284,70 @@ def test_run_server_does_not_repeat_the_advisory_preflight_logging(monkeypatch) 
     assert seen == ["require"]
 
 
-def test_idle_endpoint_loop_sets_the_stop_event_when_cancelled(monkeypatch) -> None:
-    """Cancellation must reach the worker thread, not just the awaiting task. ``task.cancel()``
-    cannot interrupt a thread already inside a blocking provider delete, so the loop hands the
-    sweep a stop callback and sets it before re-raising. Without that, a shutdown mid-sweep keeps
-    deleting endpoints after the server was told to stop."""
-    captured = {}
+def _assert_cancelled_loop_joins_worker(
+    monkeypatch, loop, sleep_module, worker_module, worker_name
+) -> None:
+    entered = threading.Event()
+    stop_observed = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
 
-    async def sleep(_seconds):
+    def worker(*args, **kwargs):
+        should_stop = kwargs.get("should_stop") or args[-1]
+        entered.set()
+        while not should_stop():
+            pass
+        stop_observed.set()
+        release.wait(5)
+        exited.set()
+        return 0
+
+    async def exercise() -> None:
+        task = asyncio.create_task(loop())
+        while not entered.is_set():
+            await _REAL_ASYNCIO_SLEEP(0)
+        task.cancel()
+        while not stop_observed.is_set():
+            await _REAL_ASYNCIO_SLEEP(0)
+        assert not task.done()
+        assert not exited.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert exited.is_set()
+
+    async def immediate_sleep(_seconds):
         return None
 
-    async def to_thread(function, *args):
-        captured["should_stop"] = args[-1]
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(app_mod.asyncio, "sleep", sleep)
-    monkeypatch.setattr(app_mod.asyncio, "to_thread", to_thread)
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(app_mod._reap_idle_endpoints_loop())
-
-    assert captured["should_stop"]() is True
+    monkeypatch.setattr(sleep_module.asyncio, "sleep", immediate_sleep)
+    monkeypatch.setattr(worker_module, worker_name, worker)
+    asyncio.run(exercise())
 
 
-def test_instance_orphan_loop_sets_the_stop_event_when_cancelled(monkeypatch) -> None:
-    """Same fence for the instance sweep: a teardown loop already running in a worker thread must
-    observe the shutdown, otherwise it keeps destroying billed instances past cancellation."""
-    captured = {}
-
-    async def sleep(_seconds):
-        return None
-
-    async def to_thread(function, *args):
-        captured["should_stop"] = args[-1]
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(app_mod.asyncio, "sleep", sleep)
-    monkeypatch.setattr(app_mod.asyncio, "to_thread", to_thread)
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(app_mod._sweep_orphan_instances_loop())
-
-    assert captured["should_stop"]() is True
+@pytest.mark.parametrize(
+    ("loop", "sleep_module", "worker_module", "worker_name"),
+    [
+        (
+            app_mod._reap_idle_endpoints_loop,
+            app_mod,
+            app_mod,
+            "_reap_idle_endpoints_once",
+        ),
+        (
+            app_mod._sweep_orphan_instances_loop,
+            app_mod,
+            app_mod,
+            "_sweep_orphan_instances_once",
+        ),
+        (
+            runtime._repo_cleanup_loop,
+            runtime,
+            repo_cleanup,
+            "run_scheduled_cleanup",
+        ),
+    ],
+)
+def test_cancelled_destructive_loop_joins_owned_worker(
+    monkeypatch, loop, sleep_module, worker_module, worker_name
+) -> None:
+    _assert_cancelled_loop_joins_worker(monkeypatch, loop, sleep_module, worker_module, worker_name)

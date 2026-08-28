@@ -21,6 +21,7 @@ from flash.providers._lifecycle.net.deadline import (
     deadline_kwargs,
     remaining_seconds,
 )
+from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
 from flash.providers.runpod.client import api as runpod_api
 
 # Growing an existing cache volume is best-effort reconciliation, so it gets a short fixed ceiling
@@ -341,17 +342,14 @@ def _reap_selected_endpoint(
             # this endpoint has no unresolved evidence of its own -- it was simply never visited
             # to completion -- so it reports the sweep-level halt rather than an endpoint issue.
             return _EndpointReapOutcome(observed_idle=True, halted=True)
-        if not runpod_api.delete_endpoint_for_fingerprint(
+        delete_outcome = runpod_api._delete_endpoint_for_fingerprint_outcome(
             endpoint_id,
             owner_fingerprint,
             **({} if should_stop is None else {"should_stop": should_stop}),
-        ):
-            if should_stop is not None and should_stop():
-                # the delete honours the same stop signal, so a false return here is that halt
-                # surfacing rather than evidence about the endpoint. reporting it as an endpoint
-                # issue would fabricate exactly the sweep-level-condition-as-endpoint-record lie
-                # the halt flag exists to replace.
-                return _EndpointReapOutcome(observed_idle=True, halted=True)
+        )
+        if delete_outcome is DestructiveOperationOutcome.HALTED:
+            return _EndpointReapOutcome(observed_idle=True, halted=True)
+        if delete_outcome is DestructiveOperationOutcome.NOT_CONFIRMED:
             return _EndpointReapOutcome(
                 observed_idle=True,
                 issue=_sweep_issue(

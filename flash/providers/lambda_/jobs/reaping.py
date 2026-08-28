@@ -11,6 +11,7 @@ from collections.abc import Callable
 
 from flash._internal.logging import get_logger
 from flash.providers._lifecycle.instances.poll import preload_box_reap_due
+from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
 from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 from flash.providers.lambda_.client import api as lambda_api
 from flash.providers.lambda_.jobs.builders import label_matches_run, run_label_prefix
@@ -124,13 +125,32 @@ def sweep_orphans(
     if not orphans:
         outcome = CleanupOutcome.UNCONFIRMED if unresolved else CleanupOutcome.ABSENT
         return CleanupResult(outcome, unresolved_ids=tuple(unresolved) or None)
-    deleted = tuple(lambda_api.terminate_instances(orphans, should_stop=should_stop))
+    deleted: list[str] = []
+    halted = False
+    if should_stop is None:
+        deleted.extend(lambda_api.terminate_instances(orphans))
+        unresolved.extend(iid for iid in orphans if iid not in set(deleted))
+    else:
+        for position, iid in enumerate(orphans):
+            if should_stop():
+                logger.info(
+                    "lambda orphan sweep: stop requested; halting after %d termination(s)", position
+                )
+                halted = True
+                break
+            delete_outcome = lambda_api._terminate_instance_outcome(iid, should_stop=should_stop)
+            if delete_outcome is DestructiveOperationOutcome.DELETED:
+                deleted.append(iid)
+            elif delete_outcome is DestructiveOperationOutcome.HALTED:
+                halted = True
+                break
+            else:
+                unresolved.append(iid)
     for iid in deleted:
         logger.warning("terminated orphaned lambda instance %s", iid)
-    # ids a halted (or failed) teardown never confirmed stay unresolved. that is what keeps the
-    # outcome below out of DELETED, so no caller reads a halted sweep as a clean one.
-    unresolved.extend(iid for iid in orphans if iid not in set(deleted))
-    if not unresolved:
+    if halted:
+        outcome = CleanupOutcome.UNCONFIRMED if deleted else CleanupOutcome.RETRYABLE
+    elif not unresolved:
         outcome = CleanupOutcome.DELETED
     elif deleted:
         outcome = CleanupOutcome.UNCONFIRMED
@@ -138,6 +158,7 @@ def sweep_orphans(
         outcome = CleanupOutcome.RETRYABLE
     return CleanupResult(
         outcome,
-        confirmed_deleted_ids=deleted,
+        confirmed_deleted_ids=tuple(deleted),
         unresolved_ids=tuple(unresolved) or None,
+        halted=halted,
     )

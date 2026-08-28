@@ -10,6 +10,8 @@ import contextlib
 import logging
 import os
 import threading
+from collections.abc import Callable
+from typing import Any
 
 from flash.adapters.artifacts import attempt_scoped_artifact_name
 from flash.core.spec import JobSpec
@@ -21,6 +23,31 @@ _log = logging.getLogger("flash.server")
 
 # Run states that are still in flight and must be recovered after a control-plane restart.
 _RECOVERABLE = {"queued", "provisioning", "running"}
+
+
+async def _run_owned_stoppable_worker(
+    function: Callable[..., Any], /, *args: Any, stop: threading.Event, **kwargs: Any
+) -> Any:
+    """Signal and join a destructive worker before propagating cancellation."""
+    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+                stop.set()
+            if worker.done():
+                raise cancellation from None
+            continue
+        except BaseException:
+            if cancellation is not None:
+                raise cancellation from None
+            raise
+        if cancellation is not None:
+            raise cancellation
+        return result
 
 
 async def _reconcile_cost_loop() -> None:
@@ -70,12 +97,17 @@ async def _repo_cleanup_loop() -> None:
         # can't keep deleting after the server was told to stop (see _reconcile_cost_loop).
         stop = threading.Event()
         try:
-            deleted = await asyncio.to_thread(run_scheduled_cleanup, should_stop=stop.is_set)
-            if deleted:
-                _log.info("repo GC: deleted %d aged undeployed run prefix(es)", deleted)
-        except asyncio.CancelledError:
-            stop.set()  # signal the worker thread to stop deleting between targets
-            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
+            result = await _run_owned_stoppable_worker(
+                run_scheduled_cleanup,
+                should_stop=stop.is_set,
+                stop=stop,
+            )
+            if result.deleted_count:
+                _log.info(
+                    "repo GC: deleted %d aged undeployed run prefix(es)", result.deleted_count
+                )
+            if result.halted:
+                _log.info("repo GC: sweep halted during shutdown")
         except CleanupAborted as exc:
             # Live set unconfirmed -> the sweep deleted NOTHING by design. Expected during a serving/
             # registry blip; not an error. Retry next cycle.

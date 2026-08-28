@@ -35,6 +35,18 @@ def test_cleanup_result_confirmation_is_explicit() -> None:
         assert result.confirmed is False
 
 
+def test_cleanup_result_rejects_non_boolean_halted() -> None:
+    with pytest.raises(TypeError, match="halted must be a bool"):
+        CleanupResult(CleanupOutcome.RETRYABLE, halted=1)
+
+
+def test_cleanup_result_rejects_confirmed_halted_outcome() -> None:
+    with pytest.raises(
+        ValueError, match="halted cleanup outcomes must be unconfirmed or retryable"
+    ):
+        CleanupResult(CleanupOutcome.DELETED, halted=True)
+
+
 def test_cleanup_result_defines_no_boolean_protocol() -> None:
     assert "__bool__" not in CleanupResult.__dict__
     assert CleanupResult(CleanupOutcome.DELETED).confirmed is True
@@ -122,6 +134,7 @@ def test_confirmed_revalidates_a_forged_cleanup_result() -> None:
     object.__setattr__(forged, "confirmed_deleted_ids", ())
     object.__setattr__(forged, "surviving_ids", None)
     object.__setattr__(forged, "unresolved_ids", None)
+    object.__setattr__(forged, "halted", False)
 
     with pytest.raises(TypeError, match="actual CleanupOutcome member"):
         _ = forged.confirmed

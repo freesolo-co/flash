@@ -10,6 +10,7 @@ from typing import Any
 
 from flash._internal.logging import get_logger
 from flash.providers._lifecycle.net.deadline import remaining_seconds
+from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
 from flash.providers._lifecycle.net.http import RestClient, is_not_found
 from flash.providers.runpod.client import auth as _keys
 
@@ -235,6 +236,39 @@ def list_endpoints_by_key(
     return by_fingerprint, failed
 
 
+def _delete_endpoint_for_key_outcome(
+    endpoint_id: str,
+    key: str,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> DestructiveOperationOutcome:
+    """Delete using one key and preserve whether failure or a stop ended the attempt."""
+    if not isinstance(endpoint_id, str) or not endpoint_id.strip():
+        raise RunpodApiError("runpod endpoint teardown identity is invalid")
+    halt_observed = False
+
+    def observe_stop() -> bool:
+        nonlocal halt_observed
+        halt_observed = halt_observed or (should_stop is not None and should_stop())
+        return halt_observed
+
+    try:
+        _CLIENT.request_with_retries_for_key(
+            key,
+            f"{REST_BASE}/endpoints/{endpoint_id}",
+            method="DELETE",
+            retries=2,
+            should_stop=None if should_stop is None else observe_stop,
+        )
+        return DestructiveOperationOutcome.DELETED
+    except RunpodApiError as exc:
+        if halt_observed:
+            return DestructiveOperationOutcome.HALTED
+        if is_not_found(exc):
+            return DestructiveOperationOutcome.DELETED
+        return DestructiveOperationOutcome.NOT_CONFIRMED
+
+
 def delete_endpoint_for_key(
     endpoint_id: str,
     key: str,
@@ -242,19 +276,10 @@ def delete_endpoint_for_key(
     should_stop: Callable[[], bool] | None = None,
 ) -> bool:
     """Delete using a specific pool key (no failover waterfall — avoids masking failures)."""
-    if not isinstance(endpoint_id, str) or not endpoint_id.strip():
-        raise RunpodApiError("runpod endpoint teardown identity is invalid")
-    try:
-        _CLIENT.request_with_retries_for_key(
-            key,
-            f"{REST_BASE}/endpoints/{endpoint_id}",
-            method="DELETE",
-            retries=2,
-            should_stop=should_stop,
-        )
-        return True
-    except RunpodApiError as e:
-        return is_not_found(e)
+    return (
+        _delete_endpoint_for_key_outcome(endpoint_id, key, should_stop=should_stop)
+        is DestructiveOperationOutcome.DELETED
+    )
 
 
 def endpoint_health_for_key(
@@ -271,6 +296,19 @@ def endpoint_health_for_key(
     )
 
 
+def _delete_endpoint_for_fingerprint_outcome(
+    endpoint_id: str,
+    fingerprint: str,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> DestructiveOperationOutcome:
+    return _delete_endpoint_for_key_outcome(
+        endpoint_id,
+        _key_for_fingerprint(fingerprint),
+        should_stop=should_stop,
+    )
+
+
 def delete_endpoint_for_fingerprint(
     endpoint_id: str,
     fingerprint: str,
@@ -281,7 +319,7 @@ def delete_endpoint_for_fingerprint(
     return delete_endpoint_for_key(
         endpoint_id,
         _key_for_fingerprint(fingerprint),
-        should_stop=should_stop,
+        **({} if should_stop is None else {"should_stop": should_stop}),
     )
 
 

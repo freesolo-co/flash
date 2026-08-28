@@ -4356,11 +4356,8 @@ def test_lambda_stop_during_termination_retry_prevents_second_request(monkeypatc
     assert not deleted
 
 
-def test_sweep_orphans_halts_between_terminations_and_leaves_the_rest_unresolved(monkeypatch):
-    """The sweep runs in a worker thread that task.cancel() cannot interrupt, so the lifespan
-    signals it with a stop callback instead. Lambda's terminate loop is already per-id (its batch
-    endpoint rejects the whole request on one bad id), so the stop check lives there. Ids the
-    halt never confirmed stay unresolved, which keeps the outcome out of DELETED."""
+def test_sweep_orphans_halts_between_terminations_without_fake_unresolved_ids(monkeypatch):
+    """A halt is sweep-level evidence, not evidence that untouched instances failed teardown."""
     from flash.providers.core.capabilities import CleanupOutcome
     from flash.providers.lambda_ import jobs
     from flash.providers.lambda_.client import api as lambda_api
@@ -4380,9 +4377,10 @@ def test_sweep_orphans_halts_between_terminations_and_leaves_the_rest_unresolved
     result = jobs.sweep_orphans(active_labels=set(), should_stop=lambda: len(terminated) >= 1)
 
     assert terminated == ["i-1"]  # halted; i-2 and i-3 were never touched
-    assert result.outcome is CleanupOutcome.UNCONFIRMED  # NOT DELETED
+    assert result.outcome is CleanupOutcome.UNCONFIRMED
     assert result.confirmed_deleted_ids == ("i-1",)
-    assert result.unresolved_ids == ("i-2", "i-3")
+    assert result.unresolved_ids is None
+    assert result.halted
 
 
 def test_sweep_orphans_stop_already_set_terminates_nothing(monkeypatch):
@@ -4404,8 +4402,9 @@ def test_sweep_orphans_stop_already_set_terminates_nothing(monkeypatch):
     result = jobs.sweep_orphans(active_labels=set(), should_stop=lambda: True)
 
     assert not terminated
-    assert result.outcome is CleanupOutcome.RETRYABLE  # nothing confirmed at all
-    assert result.unresolved_ids == ("i-9",)
+    assert result.outcome is CleanupOutcome.RETRYABLE
+    assert result.unresolved_ids is None
+    assert result.halted
 
 
 def test_sweep_orphans_without_stop_signal_completes_normally(monkeypatch):

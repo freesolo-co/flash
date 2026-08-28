@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from flash._internal.logging import get_logger
+from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
 from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 from flash.providers.vast.client import api as vast_api
 from flash.providers.vast.jobs.builders import label_matches_run, run_label_prefix
@@ -157,30 +158,41 @@ def sweep_orphans(
         outcome = CleanupOutcome.UNCONFIRMED if unresolved else CleanupOutcome.ABSENT
         return CleanupResult(outcome, unresolved_ids=tuple(unresolved) or None)
     destroyed: list[str] = []
+    halted = False
     for position, iid in enumerate(selected):
         if should_stop is not None and should_stop():
-            # halting leaves the rest selected but untouched. reporting them unresolved is what
-            # keeps the outcome out of DELETED, so no caller reads a halted sweep as a clean one.
             logger.info(
                 "vast orphan sweep: stop requested; halting after %d destroy attempt(s)", position
             )
-            unresolved.extend(str(remaining) for remaining in selected[position:])
+            halted = True
             break
         try:
-            deleted = vast_api.destroy_instance(
-                iid,
-                **({} if should_stop is None else {"should_stop": should_stop}),
-            )
+            if should_stop is None:
+                delete_outcome = (
+                    DestructiveOperationOutcome.DELETED
+                    if vast_api.destroy_instance(iid)
+                    else DestructiveOperationOutcome.NOT_CONFIRMED
+                )
+            else:
+                delete_outcome = vast_api._destroy_instance_outcome(
+                    iid,
+                    should_stop=should_stop,
+                )
         except Exception:
-            deleted = False
-        if deleted:
+            delete_outcome = DestructiveOperationOutcome.NOT_CONFIRMED
+        if delete_outcome is DestructiveOperationOutcome.DELETED:
             destroyed.append(str(iid))
             logger.warning(
                 "destroyed orphaned vast instance %s (label %s)", iid, labels_by_id.get(iid, "?")
             )
+        elif delete_outcome is DestructiveOperationOutcome.HALTED:
+            halted = True
+            break
         else:
             unresolved.append(str(iid))
-    if not unresolved:
+    if halted:
+        outcome = CleanupOutcome.UNCONFIRMED if destroyed else CleanupOutcome.RETRYABLE
+    elif not unresolved:
         outcome = CleanupOutcome.DELETED
     elif destroyed:
         outcome = CleanupOutcome.UNCONFIRMED
@@ -190,4 +202,5 @@ def sweep_orphans(
         outcome,
         confirmed_deleted_ids=tuple(destroyed),
         unresolved_ids=tuple(unresolved) or None,
+        halted=halted,
     )

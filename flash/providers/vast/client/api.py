@@ -22,6 +22,7 @@ from flash.providers._lifecycle.net.deadline import (
     require_create_allowance,
     require_deadline_at,
 )
+from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
 from flash.providers._lifecycle.net.http import RestClient, is_not_found
 
 logger = get_logger(__name__)
@@ -450,6 +451,47 @@ def _exact_instance_absent(instance_id: int, *, deadline_at: float | None = None
     return "instances" in out and out["instances"] is None
 
 
+def _destroy_instance_outcome(
+    instance_id: int,
+    *,
+    deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> DestructiveOperationOutcome:
+    halt_observed = False
+
+    def observe_stop() -> bool:
+        nonlocal halt_observed
+        halt_observed = halt_observed or (should_stop is not None and should_stop())
+        return halt_observed
+
+    try:
+        out = request_with_retries(
+            f"/v0/instances/{int(instance_id)}/",
+            method="DELETE",
+            retries=2,
+            deadline_at=deadline_at,
+            should_stop=None if should_stop is None else observe_stop,
+        )
+    except Exception as exc:
+        if halt_observed:
+            return DestructiveOperationOutcome.HALTED
+        if _genuine_http_not_found(exc):
+            return DestructiveOperationOutcome.DELETED
+        cause = getattr(exc, "__cause__", None)
+        if isinstance(cause, urllib.error.HTTPError) and cause.code < 500 and cause.code != 429:
+            return DestructiveOperationOutcome.NOT_CONFIRMED
+        if _exact_instance_absent(instance_id, deadline_at=deadline_at):
+            return DestructiveOperationOutcome.DELETED
+        return DestructiveOperationOutcome.NOT_CONFIRMED
+    if isinstance(out, dict) and out.get("success") is True:
+        return DestructiveOperationOutcome.DELETED
+    if isinstance(out, dict) and (out.get("success") is False or "error" in out or "detail" in out):
+        return DestructiveOperationOutcome.NOT_CONFIRMED
+    if _exact_instance_absent(instance_id, deadline_at=deadline_at):
+        return DestructiveOperationOutcome.DELETED
+    return DestructiveOperationOutcome.NOT_CONFIRMED
+
+
 def destroy_instance(
     instance_id: int,
     *,
@@ -457,23 +499,11 @@ def destroy_instance(
     should_stop: Callable[[], bool] | None = None,
 ) -> bool:
     """destroy an instance and return true only when provider-confirmed absent."""
-    try:
-        out = request_with_retries(
-            f"/v0/instances/{int(instance_id)}/",
-            method="DELETE",
-            retries=2,
+    return (
+        _destroy_instance_outcome(
+            instance_id,
             deadline_at=deadline_at,
             should_stop=should_stop,
         )
-    except Exception as exc:
-        if _genuine_http_not_found(exc):
-            return True
-        cause = getattr(exc, "__cause__", None)
-        if isinstance(cause, urllib.error.HTTPError) and cause.code < 500 and cause.code != 429:
-            return False
-        return _exact_instance_absent(instance_id, deadline_at=deadline_at)
-    if isinstance(out, dict) and out.get("success") is True:
-        return True
-    if isinstance(out, dict) and (out.get("success") is False or "error" in out or "detail" in out):
-        return False
-    return _exact_instance_absent(instance_id, deadline_at=deadline_at)
+        is DestructiveOperationOutcome.DELETED
+    )

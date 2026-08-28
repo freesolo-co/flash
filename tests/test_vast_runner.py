@@ -2978,13 +2978,12 @@ def test_vast_stop_during_destroy_retry_prevents_second_request(monkeypatch):
     )
 
     assert attempts == ["DELETE"], f"expected one destructive request, got {attempts}"
-    assert result.unresolved_ids == ("7",)
+    assert result.unresolved_ids is None
+    assert result.halted
 
 
-def test_sweep_orphans_halts_between_destroys_and_leaves_the_rest_unresolved(monkeypatch):
-    """The sweep runs in a worker thread that task.cancel() cannot interrupt, so the lifespan
-    signals it with a stop callback instead. Halting must not read as a completed clean sweep:
-    the un-attempted ids stay unresolved, which keeps the outcome out of DELETED."""
+def test_sweep_orphans_halts_between_destroys_without_fake_unresolved_ids(monkeypatch):
+    """A halt is sweep-level evidence, not evidence that untouched instances failed teardown."""
     from flash.providers.core.capabilities import CleanupOutcome
     from flash.providers.vast import jobs as vast
     from flash.providers.vast.client import api as vast_api
@@ -2992,18 +2991,21 @@ def test_sweep_orphans_halts_between_destroys_and_leaves_the_rest_unresolved(mon
     instances = [{"id": n, "label": f"flash-run{n}-s0-a0"} for n in (1, 2, 3)]
     monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
     destroyed: list[int] = []
+    from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
+
     monkeypatch.setattr(
         vast_api,
-        "destroy_instance",
-        lambda iid, **_: destroyed.append(iid) or True,
+        "_destroy_instance_outcome",
+        lambda iid, **_: destroyed.append(iid) or DestructiveOperationOutcome.DELETED,
     )
     # stop after the first destroy, exactly as a shutdown mid-sweep would
     result = vast.sweep_orphans(active_labels=set(), should_stop=lambda: len(destroyed) >= 1)
 
     assert destroyed == [1]  # halted; 2 and 3 were never touched
-    assert result.outcome is CleanupOutcome.UNCONFIRMED  # NOT DELETED
+    assert result.outcome is CleanupOutcome.UNCONFIRMED
     assert result.confirmed_deleted_ids == ("1",)
-    assert result.unresolved_ids == ("2", "3")
+    assert result.unresolved_ids is None
+    assert result.halted
 
 
 def test_sweep_orphans_stop_already_set_destroys_nothing(monkeypatch):
@@ -3020,8 +3022,9 @@ def test_sweep_orphans_stop_already_set_destroys_nothing(monkeypatch):
     result = vast.sweep_orphans(active_labels=set(), should_stop=lambda: True)
 
     assert not destroyed
-    assert result.outcome is CleanupOutcome.RETRYABLE  # nothing confirmed at all
-    assert result.unresolved_ids == ("5",)
+    assert result.outcome is CleanupOutcome.RETRYABLE
+    assert result.unresolved_ids is None
+    assert result.halted
 
 
 def test_sweep_orphans_without_stop_signal_completes_normally(monkeypatch):

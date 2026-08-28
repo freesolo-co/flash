@@ -62,6 +62,7 @@ class CleanupResult:
     confirmed_deleted_ids: tuple[ResourceId, ...] = ()
     surviving_ids: tuple[ResourceId, ...] | None = None
     unresolved_ids: tuple[ResourceId, ...] | None = None
+    halted: bool = False
 
     def __post_init__(self) -> None:
         if type(self.outcome) is not CleanupOutcome or not any(
@@ -70,6 +71,8 @@ class CleanupResult:
             raise CleanupContractTypeError(
                 "cleanup outcome must be an actual CleanupOutcome member"
             )
+        if type(self.halted) is not bool:
+            raise CleanupContractTypeError("cleanup halted must be a bool")
 
         deleted = _normalize_evidence("confirmed_deleted_ids", self.confirmed_deleted_ids)
         surviving = _normalize_optional_evidence("surviving_ids", self.surviving_ids)
@@ -96,6 +99,13 @@ class CleanupResult:
         has_deleted = bool(deleted)
         has_surviving = bool(surviving)
         has_unresolved = bool(unresolved)
+        if self.halted and self.outcome not in {
+            CleanupOutcome.UNCONFIRMED,
+            CleanupOutcome.RETRYABLE,
+        }:
+            raise CleanupContractValueError(
+                "halted cleanup outcomes must be unconfirmed or retryable"
+            )
         if self.outcome in {CleanupOutcome.DELETED, CleanupOutcome.ABSENT}:
             if has_surviving or has_unresolved:
                 raise CleanupContractValueError(
@@ -111,9 +121,9 @@ class CleanupResult:
                     "present cleanup outcomes require only surviving resource ids"
                 )
         elif self.outcome is CleanupOutcome.UNCONFIRMED:
-            if not has_unresolved or has_surviving:
+            if (not has_unresolved and not self.halted) or has_surviving:
                 raise CleanupContractValueError(
-                    "unconfirmed cleanup outcomes require unresolved resource ids"
+                    "unconfirmed cleanup outcomes require unresolved resource ids or a halt"
                 )
         elif self.outcome in {CleanupOutcome.RETRYABLE, CleanupOutcome.UNSUPPORTED}:
             if has_deleted or has_surviving:

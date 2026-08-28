@@ -67,6 +67,14 @@ ARTIFACT_PHASES = frozenset({"sft", "rl", "opd", "dpo", "grpo", "recomb"})
 REF_MARKER = "referenced_by"
 
 
+@dataclass(frozen=True)
+class ScheduledCleanupResult:
+    """Outcome of one repository cleanup sweep."""
+
+    deleted_count: int = 0
+    halted: bool = False
+
+
 class CleanupAborted(RuntimeError):
     """The global live set could not be confirmed, so the sweep deleted nothing (fails closed)."""
 
@@ -292,12 +300,10 @@ def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_Ru
     return targets
 
 
-def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) -> int:
-    """One sweep of the fixed policy. Returns the number of run prefixes deleted (0 in dry-run).
-
-    Raise ``CleanupAborted`` before deleting if the serving set is unconfirmed. ``should_stop`` is
-    checked between deletes because cancelling the caller cannot interrupt the worker thread.
-    """
+def run_scheduled_cleanup(
+    *, dry_run: bool = False, api=None, should_stop=None
+) -> ScheduledCleanupResult:
+    """Run one fixed-policy sweep and report deletion count and cooperative halt."""
     global _warned_hf_unavailable
     if api is None:
         if HfApi is None:
@@ -308,7 +314,7 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
                     "repo GC: huggingface_hub not installed (server extra absent); skipping sweeps"
                 )
                 _warned_hf_unavailable = True
-            return 0
+            return ScheduledCleanupResult()
         api = HfApi()
     max_age_s = DELETE_AGE_SECONDS
 
@@ -320,14 +326,16 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
         logger.info(
             "repo GC (dry-run): %d aged undeployed run prefix(es) would be deleted", len(targets)
         )
-        return 0
+        return ScheduledCleanupResult()
 
     deleted = 0
+    halted = False
     for target in targets:
         # Cooperative shutdown: honor the stop signal BETWEEN deletes so a large in-flight sweep can't
         # keep deleting after the lifespan started tearing down.
         if should_stop is not None and should_stop():
             logger.info("repo GC: stop requested; halting sweep after %d delete(s)", deleted)
+            halted = True
             break
         # Acquire-and-HOLD this plane's per-run deploy/export lock across the delete so the destructive
         # mutation is mutually exclusive with a concurrent deploy/undeploy/export of this run. Non-
@@ -382,4 +390,4 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
         finally:
             held.release()
         time.sleep(_DELETE_SLEEP_S)  # HF repo-mutation rate-limit courtesy
-    return deleted
+    return ScheduledCleanupResult(deleted_count=deleted, halted=halted)
