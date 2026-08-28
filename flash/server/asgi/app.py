@@ -12,6 +12,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
 
 from flash import __version__
 from flash.runner.lifecycle.status import get_status
@@ -30,10 +31,12 @@ from flash.server.platform import db
 from flash.server.platform.locks import _DEPLOY_LOCKS, _deploy_lock
 from flash.server.platform.runtime import (
     _RECOVERABLE,
+    _cancel_and_join_background,
     _charge_retry_loop,
     _charge_retry_startup,
     _reconcile_cost_loop,
     _repo_cleanup_loop,
+    _run_owned_stoppable_worker,
     _worker_artifacts,
     recover_runs,
 )
@@ -183,7 +186,7 @@ def start_deployment_job(target, *args, **kwargs) -> bool:
     return False
 
 
-def _reap_idle_endpoints_once(min_idle_s: float):
+def _reap_idle_endpoints_once(min_idle_s: float, should_stop=None):
     """Run one idle endpoint sweep and retain deletion and unresolved evidence."""
     from flash.providers.runpod.execution.resources import _sweep_idle_flash_endpoints
 
@@ -191,6 +194,7 @@ def _reap_idle_endpoints_once(min_idle_s: float):
         _protected_train_endpoint_names(),
         min_idle_s=min_idle_s,
         known=_known_train_endpoint_names(),
+        should_stop=should_stop,
     )
 
 
@@ -211,8 +215,17 @@ async def _reap_idle_endpoints_loop() -> None:
     )
     while True:
         await asyncio.sleep(interval)
+        # The blocking sweep runs in a worker thread that task.cancel() can't interrupt; a stop
+        # Event lets the lifespan signal it to halt BETWEEN deletes at shutdown, so a large
+        # in-flight sweep can't keep deleting endpoints after the server was told to stop.
+        stop = threading.Event()
         try:
-            sweep_result = await asyncio.to_thread(_reap_idle_endpoints_once, min_idle_s)
+            sweep_result = await _run_owned_stoppable_worker(
+                _reap_idle_endpoints_once,
+                min_idle_s,
+                stop.is_set,
+                stop=stop,
+            )
             if sweep_result.deleted_count:
                 _log.info(
                     "reaped %d idle RunPod endpoint(s) doing nothing",
@@ -223,8 +236,6 @@ async def _reap_idle_endpoints_loop() -> None:
                     "idle RunPod endpoint sweep retained %d unresolved ownership or cleanup record(s)",
                     sweep_result.unresolved_count,
                 )
-        except asyncio.CancelledError:
-            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
         except Exception:
             _log.debug("idle-endpoint reaper sweep failed; retrying next cycle", exc_info=True)
 
@@ -262,22 +273,38 @@ def _known_run_ids() -> set[str]:
     return {row["run_id"] for row in db.all_runs()}
 
 
-def _sweep_orphan_instances_once() -> int:
-    """Run one sweep of orphaned instance-provider workers and return the teardown count.
+@dataclass(frozen=True)
+class InstanceOrphanSweepResult:
+    """Aggregate result from all configured instance providers."""
+
+    deleted_count: int = 0
+    halted: bool = False
+
+
+def _sweep_orphan_instances_once(should_stop=None) -> InstanceOrphanSweepResult:
+    """Run one sweep of orphaned instance-provider workers.
 
     Pass active ids as a callable so providers list first and read protection state afterward;
     instance APIs expose no creation timestamp for a reliable age grace.
+
+    ``should_stop`` is checked between providers and, inside each provider, between teardowns.
     """
-    from flash.providers.core.capabilities import sweep_orphans
+    from flash.providers.core.capabilities import CleanupOutcome, sweep_orphans
     from flash.providers.core.registry import configured_providers
 
     torn = 0
+    halted = False
     for prov in configured_providers():
+        if should_stop is not None and should_stop():
+            _log.info("instance orphan sweep: stop requested; halting after %d teardown(s)", torn)
+            halted = True
+            break
         try:
             result = sweep_orphans(
                 prov.capabilities,
                 active_labels=_active_run_ids,
                 known_labels=_known_run_ids,
+                should_stop=should_stop,
             )
         except Exception:
             # One provider's API blip / outage must not skip the others — and must NOT be silent
@@ -291,7 +318,18 @@ def _sweep_orphan_instances_once() -> int:
             )
             continue
         torn += result.deleted_count
-    return torn
+        if result.halted:
+            halted = True
+            break
+        if result.outcome in {
+            CleanupOutcome.UNCONFIRMED,
+            CleanupOutcome.RETRYABLE,
+        }:
+            _log.warning(
+                "instance orphan sweep was inconclusive for provider %r; retrying next cycle",
+                prov.name,
+            )
+    return InstanceOrphanSweepResult(deleted_count=torn, halted=halted)
 
 
 async def _sweep_orphan_instances_loop() -> None:
@@ -305,12 +343,20 @@ async def _sweep_orphan_instances_loop() -> None:
     interval = 600.0  # sweep every 10 min (matches the RunPod idle reaper)
     while True:
         await asyncio.sleep(interval)
+        # The blocking sweep runs in a worker thread that task.cancel() can't interrupt; a stop
+        # Event lets the lifespan signal it to halt BETWEEN teardowns at shutdown, so a large
+        # in-flight sweep can't keep destroying billed instances after the server was told to stop.
+        stop = threading.Event()
         try:
-            torn = await asyncio.to_thread(_sweep_orphan_instances_once)
-            if torn:
-                _log.info("swept %d orphaned instance-provider worker(s)", torn)
-        except asyncio.CancelledError:
-            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
+            result = await _run_owned_stoppable_worker(
+                _sweep_orphan_instances_once,
+                stop.is_set,
+                stop=stop,
+            )
+            if result.deleted_count:
+                _log.info("swept %d orphaned instance-provider worker(s)", result.deleted_count)
+            if result.halted:
+                _log.info("instance orphan sweep halted during shutdown")
         except Exception:
             _log.debug("instance orphan sweep failed; retrying next cycle", exc_info=True)
 
@@ -395,18 +441,20 @@ def create_app():
             startup_report_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await startup_report_task
-            for task in (
-                startup_charge_task,
-                cost_task,
-                charge_task,
-                reap_task,
-                sweep_task,
-                cleanup_task,
-            ):
-                if task is not None:
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
+            await _cancel_and_join_background(
+                [
+                    task
+                    for task in (
+                        startup_charge_task,
+                        cost_task,
+                        charge_task,
+                        reap_task,
+                        sweep_task,
+                        cleanup_task,
+                    )
+                    if task is not None
+                ]
+            )
             shutdown_deadline = time.monotonic() + 15.0
             with contextlib.suppress(Exception):
                 if not await asyncio.to_thread(_wait_for_deployment_jobs, 10.0):

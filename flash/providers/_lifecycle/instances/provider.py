@@ -22,7 +22,12 @@ from typing import Any
 
 from flash.providers._lifecycle.instances.instance import InstanceJobHandle
 from flash.providers.core.base import GpuClass, JobHandle, PollResult
-from flash.providers.core.capabilities import CleanupResult, ProviderCapabilities, RunLabels
+from flash.providers.core.capabilities import (
+    CleanupResult,
+    ProviderCapabilities,
+    RunLabels,
+    ShouldStop,
+)
 
 
 class InstanceProvider(abc.ABC):
@@ -99,6 +104,7 @@ class InstanceProvider(abc.ABC):
         self,
         active_labels: RunLabels = None,
         known_labels: RunLabels = None,
+        should_stop: ShouldStop | None = None,
     ) -> CleanupResult: ...
 
     # --- shared ``base.Provider`` surface ---------------------------------

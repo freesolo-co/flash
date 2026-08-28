@@ -2848,7 +2848,7 @@ def test_terminate_run_instances_matches_forced_prefix(monkeypatch):
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+        lambda_api, "terminate_instances", lambda ids, **_: terminated.extend(ids) or list(ids)
     )
     assert jobs.terminate_run_instances("fail-fast") == ["i-1"]
     assert terminated == ["i-1"]
@@ -2958,9 +2958,9 @@ def test_sweep_orphans_label_safety(monkeypatch):
         {"id": "i-4", "name": ""},  # unnamed -> NEVER touch
     ]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda **_: instances)
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+        lambda_api, "terminate_instances", lambda ids, **_: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels={"flash-1700-bbbb"})
     assert out.confirmed_deleted_ids == ("i-1",)
@@ -2972,12 +2972,12 @@ def test_sweep_orphans_deduplicates_inventory_before_termination(monkeypatch):
     from flash.providers.lambda_.client import api as lambda_api
 
     duplicate = {"id": "i-duplicate", "name": "flash-orphan-s0-a0"}
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: [duplicate, dict(duplicate)])
+    monkeypatch.setattr(lambda_api, "list_instances", lambda **_: [duplicate, dict(duplicate)])
     calls = []
     monkeypatch.setattr(
         lambda_api,
         "terminate_instances",
-        lambda ids: calls.append(tuple(ids)) or list(ids),
+        lambda ids, **_: calls.append(tuple(ids)) or list(ids),
     )
 
     result = jobs.sweep_orphans(active_labels=set())
@@ -2994,7 +2994,7 @@ def test_sweep_orphans_preserves_partial_deletion_evidence(monkeypatch):
     monkeypatch.setattr(
         lambda_api,
         "list_instances",
-        lambda: [
+        lambda **_: [
             {"id": "i-deleted", "name": "flash-orphan-a-s0-a0"},
             {"id": "i-unresolved", "name": "flash-orphan-b-s0-a0"},
         ],
@@ -3002,7 +3002,7 @@ def test_sweep_orphans_preserves_partial_deletion_evidence(monkeypatch):
     monkeypatch.setattr(
         lambda_api,
         "terminate_instances",
-        lambda _ids: ["i-deleted"],
+        lambda _ids, **_: ["i-deleted"],
     )
 
     result = jobs.sweep_orphans(active_labels=set())
@@ -3050,11 +3050,11 @@ def test_sweep_orphans_reports_malformed_selected_identity_without_deleting(
     from flash.providers.lambda_.client import api as lambda_api
 
     delete_calls = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: [instance])
+    monkeypatch.setattr(lambda_api, "list_instances", lambda **_: [instance])
     monkeypatch.setattr(
         lambda_api,
         "terminate_instances",
-        lambda ids: delete_calls.append(tuple(ids)) or list(ids),
+        lambda ids, **_: delete_calls.append(tuple(ids)) or list(ids),
     )
 
     result = jobs.sweep_orphans(active_labels=set())
@@ -3070,7 +3070,7 @@ def test_sweep_orphans_reports_successful_empty_selection_as_absent(monkeypatch)
     from flash.providers.core.capabilities import CleanupOutcome
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(lambda_api, "list_instances", list)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda **_: [])
 
     result = jobs.sweep_orphans(active_labels=set())
 
@@ -3088,9 +3088,9 @@ def test_sweep_orphans_prefix_not_shielded_by_longer_run_id(monkeypatch):
         {"id": "i-2", "name": jobs.instance_label("flash-1000", 0, 0)},  # orphan -> terminate
     ]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda **_: instances)
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+        lambda_api, "terminate_instances", lambda ids, **_: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels={"flash-100"})
     assert out.confirmed_deleted_ids == ("i-2",)
@@ -3105,9 +3105,9 @@ def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
         {"id": "i-2", "name": jobs.instance_label("orphan-run", 0, 0)},  # no live run -> terminate
     ]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda **_: instances)
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+        lambda_api, "terminate_instances", lambda ids, **_: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels={"fail-fast"})  # RAW run id (what the server tracks)
     assert out.confirmed_deleted_ids == ("i-2",)
@@ -3139,9 +3139,9 @@ def test_sweep_orphans_exempts_warm_preload_boxes(monkeypatch):
         {"id": "i-2", "name": "flash-1700-cccc-s0-a0"},  # genuine orphan -> terminate
     ]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda **_: instances)
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+        lambda_api, "terminate_instances", lambda ids, **_: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels=set())  # none is a tracked active run
     assert out.confirmed_deleted_ids == ("i-2",)
@@ -3168,9 +3168,9 @@ def test_sweep_orphans_reaps_stale_preload_box(monkeypatch):
     stale = preload_instance_run_id("lambda", "us-west-1", stale_deadline, "deadbe")
     instances = [{"id": "i-9", "name": instance_label(stale, 0, 0)}]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda **_: instances)
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+        lambda_api, "terminate_instances", lambda ids, **_: terminated.extend(ids) or list(ids)
     )
     out = jobs.sweep_orphans(active_labels=set())
     assert out.confirmed_deleted_ids == ("i-9",)
@@ -4323,3 +4323,160 @@ def test_recovered_catalog_restores_disk_metadata_after_a_failed_first_fetch(mon
     instances = jobs.usable_instances("A10")
 
     assert [i.disk_gb for i in instances] == [200.0]  # recovered, not left unmeasured
+
+
+def test_lambda_stop_during_termination_retry_prevents_second_request(monkeypatch):
+    from flash.providers._lifecycle.net import http as lifecycle_http
+    from flash.providers.lambda_.client import api as lambda_api
+
+    monkeypatch.setenv("LAMBDA_API_KEY", "test-key")
+    monkeypatch.setattr(lifecycle_http.time, "sleep", lambda _delay: None)
+    attempts: list[str] = []
+    stopping: list[bool] = []
+
+    def fail_first_termination(_target, *, method, **_kwargs):
+        attempts.append(method)
+        stopping.append(True)
+        raise OSError("transient termination failure")
+
+    monkeypatch.setattr(lambda_api._CLIENT, "request", fail_first_termination)
+    real_request_with_retries = lambda_api.request_with_retries
+
+    def request_with_retries(*args, **kwargs):
+        return real_request_with_retries(*args, **kwargs)
+
+    monkeypatch.setattr(lambda_api, "request_with_retries", request_with_retries)
+
+    deleted = lambda_api.terminate_instances(
+        ["i-1"],
+        should_stop=lambda: bool(stopping),
+    )
+
+    assert attempts == ["POST"], f"expected one destructive request, got {attempts}"
+    assert not deleted
+
+
+def test_sweep_orphans_halts_between_terminations_without_fake_unresolved_ids(monkeypatch):
+    """A halt is sweep-level evidence, not evidence that untouched instances failed teardown."""
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.lambda_ import jobs
+    from flash.providers.lambda_.client import api as lambda_api
+
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instances",
+        lambda **_: [{"id": f"i-{n}", "name": f"flash-run{n}-s0-a0"} for n in (1, 2, 3)],
+    )
+    terminated: list[str] = []
+
+    def fake_request(path, method=None, body=None, retries=None, **_):
+        terminated.extend(body["instance_ids"])
+
+    monkeypatch.setattr(lambda_api, "request_with_retries", fake_request)
+
+    result = jobs.sweep_orphans(active_labels=set(), should_stop=lambda: len(terminated) >= 1)
+
+    assert terminated == ["i-1"]  # halted; i-2 and i-3 were never touched
+    assert result.outcome is CleanupOutcome.UNCONFIRMED
+    assert result.confirmed_deleted_ids == ("i-1",)
+    assert result.unresolved_ids is None
+    assert result.halted
+
+
+def test_sweep_orphans_stop_already_set_terminates_nothing(monkeypatch):
+    """A stop already set when the sweep reaches its terminate loop must terminate nothing."""
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.lambda_ import jobs
+    from flash.providers.lambda_.client import api as lambda_api
+
+    monkeypatch.setattr(
+        lambda_api, "list_instances", lambda **_: [{"id": "i-9", "name": "flash-a-s0-a0"}]
+    )
+    terminated: list[str] = []
+    monkeypatch.setattr(
+        lambda_api,
+        "request_with_retries",
+        lambda *a, **k: terminated.append(k.get("body")),
+    )
+
+    result = jobs.sweep_orphans(active_labels=set(), should_stop=lambda: True)
+
+    assert not terminated
+    assert result.outcome is CleanupOutcome.RETRYABLE
+    assert result.unresolved_ids is None
+    assert result.halted
+
+
+def test_sweep_orphans_without_stop_signal_completes_normally(monkeypatch):
+    """Unhalted control for the two halt tests above. They assert UNCONFIRMED/RETRYABLE with ids
+    left unresolved, which a sweep that stranded its tail unconditionally would also satisfy. This
+    pins that DELETED is still reachable, so the halt outcome is a consequence of the stop rather
+    than the new default -- and that the per-id terminate loop confirms EVERY id when nothing
+    halts it, not just the first."""
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.lambda_ import jobs
+    from flash.providers.lambda_.client import api as lambda_api
+
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instances",
+        lambda **_: [{"id": f"i-{n}", "name": f"flash-run{n}-s0-a0"} for n in (1, 2)],
+    )
+    monkeypatch.setattr(lambda_api, "request_with_retries", lambda *a, **k: None)
+
+    result = jobs.sweep_orphans(active_labels=set())
+
+    assert result.outcome is CleanupOutcome.DELETED
+    assert result.confirmed_deleted_ids == ("i-1", "i-2")
+
+
+def test_sweep_orphans_forwards_stop_into_the_inventory_listing(monkeypatch):
+    """The inventory read runs BEFORE the first termination, so a stop that only reaches the
+    destroy loop still waits out the listing's full retry budget on a thread the caller cannot
+    interrupt. The sweep wraps the caller's callback to record whether the listing itself observed
+    the stop, so assert the forwarded callable REPORTS the caller's stop rather than asserting it
+    is the same object."""
+    from flash.providers.lambda_ import jobs
+    from flash.providers.lambda_.client import api as lambda_api
+
+    seen: list[object] = []
+    stopping = False
+
+    def fake_list(*, should_stop=None, **_):
+        nonlocal stopping
+        seen.append(should_stop)
+        assert should_stop is not None
+        assert should_stop() is False  # the caller is not stopping yet
+        stopping = True
+        assert should_stop() is True  # a stop raised mid-listing reaches the transport
+        return []
+
+    monkeypatch.setattr(lambda_api, "list_instances", fake_list)
+
+    def stop() -> bool:
+        return stopping
+
+    jobs.sweep_orphans(active_labels=set(), should_stop=stop)
+
+    assert len(seen) == 1
+    assert callable(seen[0])
+
+
+def test_list_instances_forwards_stop_into_the_request_retry_loop(monkeypatch):
+    """``should_stop`` must reach the retrying transport, not stop at the listing wrapper."""
+    from flash.providers.lambda_.client import api as lambda_api
+
+    seen: list[object] = []
+
+    def fake_request(path, **kwargs):
+        seen.append(kwargs.get("should_stop"))
+        return {"data": []}
+
+    monkeypatch.setattr(lambda_api._CLIENT, "request_with_retries", fake_request)
+
+    def stop() -> bool:
+        return False
+
+    lambda_api.list_instances(should_stop=stop)
+
+    assert seen == [stop]

@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import time
 import urllib.error
+from collections.abc import Callable
 from typing import Any
 
 from flash._internal.logging import get_logger
 from flash.providers._lifecycle.net.deadline import remaining_seconds
+from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
 from flash.providers._lifecycle.net.http import RestClient, is_not_found
 from flash.providers.runpod.client import auth as _keys
 
@@ -134,12 +136,14 @@ def _list_endpoints_for_key(
     key: str,
     *,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[dict]:
     out = _CLIENT.request_with_retries_for_key(
         key,
         f"{REST_BASE}/endpoints",
         retries=2,
         deadline_at=deadline_at,
+        should_stop=should_stop,
     )
     if not isinstance(out, list):
         raise RunpodApiError(
@@ -211,12 +215,16 @@ def _confirm_deleted(endpoint_id: str, fingerprint: str) -> None:
 def list_endpoints_by_key(
     *,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, list[dict]], list[str]]:
     """Best-effort per-account endpoint listing for the idle reaper.
 
     Returns ({key_fingerprint: [endpoints]}, [failed_fingerprints]). One flaky account
     can't abort cleanup of healthy accounts (unlike list_endpoints which is all-or-nothing).
     Fingerprints are used instead of raw keys so the return value is safe to log/persist.
+
+    ``should_stop`` ends the per-key waterfall as well as each key's retries. Each key allows
+    three 30s attempts plus backoffs, so without it a shutdown waits out every configured key.
     """
     pool = _keys.keys()
     if not pool:
@@ -226,25 +234,62 @@ def list_endpoints_by_key(
     by_fingerprint: dict[str, list[dict]] = {}
     failed: list[str] = []
     for key in pool:
+        if should_stop is not None and should_stop():
+            break
         fp = key_fingerprint(key)
         try:
-            by_fingerprint[fp] = _list_endpoints_for_key(key, deadline_at=deadline_at)
+            by_fingerprint[fp] = _list_endpoints_for_key(
+                key, deadline_at=deadline_at, should_stop=should_stop
+            )
         except RunpodApiError:
             failed.append(fp)
     return by_fingerprint, failed
 
 
-def delete_endpoint_for_key(endpoint_id: str, key: str) -> bool:
-    """Delete using a specific pool key (no failover waterfall — avoids masking failures)."""
+def _delete_endpoint_for_key_outcome(
+    endpoint_id: str,
+    key: str,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> DestructiveOperationOutcome:
+    """Delete using one key and preserve whether failure or a stop ended the attempt."""
     if not isinstance(endpoint_id, str) or not endpoint_id.strip():
         raise RunpodApiError("runpod endpoint teardown identity is invalid")
+    halt_observed = False
+
+    def observe_stop() -> bool:
+        nonlocal halt_observed
+        halt_observed = halt_observed or (should_stop is not None and should_stop())
+        return halt_observed
+
     try:
         _CLIENT.request_with_retries_for_key(
-            key, f"{REST_BASE}/endpoints/{endpoint_id}", method="DELETE", retries=2
+            key,
+            f"{REST_BASE}/endpoints/{endpoint_id}",
+            method="DELETE",
+            retries=2,
+            should_stop=None if should_stop is None else observe_stop,
         )
-        return True
-    except RunpodApiError as e:
-        return is_not_found(e)
+        return DestructiveOperationOutcome.DELETED
+    except RunpodApiError as exc:
+        if halt_observed:
+            return DestructiveOperationOutcome.HALTED
+        if is_not_found(exc):
+            return DestructiveOperationOutcome.DELETED
+        return DestructiveOperationOutcome.NOT_CONFIRMED
+
+
+def delete_endpoint_for_key(
+    endpoint_id: str,
+    key: str,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> bool:
+    """Delete using a specific pool key (no failover waterfall — avoids masking failures)."""
+    return (
+        _delete_endpoint_for_key_outcome(endpoint_id, key, should_stop=should_stop)
+        is DestructiveOperationOutcome.DELETED
+    )
 
 
 def endpoint_health_for_key(
@@ -252,18 +297,46 @@ def endpoint_health_for_key(
     key: str,
     *,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict:
-    """Endpoint health via a specific pool key (no failover waterfall)."""
+    """Endpoint health via a specific pool key (no failover waterfall).
+
+    ``should_stop`` ends the retries early. This call inherits the client's default of five 30s
+    attempts plus backoffs, so without it a shutdown waits about three minutes per endpoint.
+    """
     return _CLIENT.request_with_retries_for_key(
         key,
         f"{QUEUE_BASE}/{endpoint_id}/health",
         deadline_at=deadline_at,
+        should_stop=should_stop,
     )
 
 
-def delete_endpoint_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:
+def _delete_endpoint_for_fingerprint_outcome(
+    endpoint_id: str,
+    fingerprint: str,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> DestructiveOperationOutcome:
+    return _delete_endpoint_for_key_outcome(
+        endpoint_id,
+        _key_for_fingerprint(fingerprint),
+        should_stop=should_stop,
+    )
+
+
+def delete_endpoint_for_fingerprint(
+    endpoint_id: str,
+    fingerprint: str,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> bool:
     """delete_endpoint_for_key addressed by fingerprint; raw key resolved internally."""
-    return delete_endpoint_for_key(endpoint_id, _key_for_fingerprint(fingerprint))
+    return delete_endpoint_for_key(
+        endpoint_id,
+        _key_for_fingerprint(fingerprint),
+        **({} if should_stop is None else {"should_stop": should_stop}),
+    )
 
 
 def endpoint_absent_for_fingerprint(endpoint_id: str, fingerprint: str) -> bool:
@@ -292,12 +365,14 @@ def endpoint_health_for_fingerprint(
     fingerprint: str,
     *,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict:
     """endpoint_health_for_key addressed by fingerprint; raw key resolved internally."""
     return endpoint_health_for_key(
         endpoint_id,
         _key_for_fingerprint(fingerprint),
         deadline_at=deadline_at,
+        should_stop=should_stop,
     )
 
 

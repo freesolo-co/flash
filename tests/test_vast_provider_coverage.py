@@ -53,7 +53,10 @@ def test_vast_provider_delegates_credentials_pricing_gc_and_orphan_sweep(monkeyp
         ("credentials", False),
         ("rate", "H100"),
         ("gc", "flash-1"),
-        ("sweep", {"active_labels": {"live"}, "known_labels": {"live", "done"}}),
+        (
+            "sweep",
+            {"active_labels": {"live"}, "known_labels": {"live", "done"}, "should_stop": None},
+        ),
     ]
 
 

@@ -103,10 +103,14 @@ class LambdaProvider(InstanceProvider):
 
         terminate_run_instances(run_id)
 
-    def _sweep_orphans(self, active_labels=None, known_labels=None) -> CleanupResult:
+    def _sweep_orphans(
+        self, active_labels=None, known_labels=None, should_stop=None
+    ) -> CleanupResult:
         from flash.providers.lambda_.jobs import sweep_orphans
 
-        return sweep_orphans(active_labels=active_labels, known_labels=known_labels)
+        return sweep_orphans(
+            active_labels=active_labels, known_labels=known_labels, should_stop=should_stop
+        )
 
     def _confirm_run_absent(self, run_id: str) -> CleanupResult:
         from flash.providers.lambda_.jobs import run_instances_remaining

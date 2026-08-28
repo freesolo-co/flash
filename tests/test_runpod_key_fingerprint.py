@@ -277,7 +277,7 @@ def test_fingerprint_helpers_resolve_to_the_owning_key(monkeypatch):
     monkeypatch.setattr(
         api,
         "endpoint_health_for_key",
-        lambda eid, key, *, deadline_at=None: (
+        lambda eid, key, *, deadline_at=None, **_kwargs: (
             seen.update(health=(eid, key, deadline_at)) or {"ok": True}
         ),
     )
@@ -400,3 +400,53 @@ def test_submit_status_cancel_and_delete_keep_owning_key_after_rotation(monkeypa
     assert api.delete_endpoint_for_fingerprint("ep-1", owner) is True
 
     assert [key for key, _url, _method in calls] == ["secretA"] * 4
+
+
+def test_list_endpoints_by_key_forwards_the_stop_into_each_keys_retries(monkeypatch):
+    """Each key's listing allows three 30s attempts plus backoffs. Without the stop reaching the
+    transport, a shutdown waits out the full waterfall: every configured account, in series."""
+    from flash.providers.runpod.client import api
+
+    _reset_pool(monkeypatch, "secretA,secretB,secretC")
+    attempted: list[str] = []
+    forwarded: list[object] = []
+    stopping = False
+
+    def fake_req(key, url, **kw):
+        nonlocal stopping
+        attempted.append(key)
+        forwarded.append(kw.get("should_stop"))
+        stopping = True  # the lifespan asks to stop while this key's request is in flight
+        return []
+
+    monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", fake_req)
+    api.list_endpoints_by_key(should_stop=lambda: stopping)
+
+    # the waterfall ends at the key boundary instead of starting two more 90s cycles
+    assert attempted == ["secretA"]
+    # and the stop reached the transport, so that key's own retries end early too
+    assert forwarded[0] is not None
+    assert forwarded[0]() is True
+
+
+def test_endpoint_health_for_fingerprint_forwards_the_stop_into_its_retries(monkeypatch):
+    """The health lookup inherits the client default of five 30s attempts plus backoffs, about
+    three minutes per endpoint. The reaper visits endpoints in series, so a stop that cannot reach
+    the transport is waited out once per endpoint left in the sweep."""
+    from flash.providers.runpod.client import api
+
+    _reset_pool(monkeypatch, "secretA")
+    forwarded: list[object] = []
+
+    def fake_req(key, url, **kw):
+        forwarded.append(kw.get("should_stop"))
+        return {"ok": True}
+
+    monkeypatch.setattr(api._CLIENT, "request_with_retries_for_key", fake_req)
+    api.endpoint_health_for_fingerprint(
+        "ep-1", api.key_fingerprint("secretA"), should_stop=lambda: True
+    )
+
+    assert len(forwarded) == 1
+    assert forwarded[0] is not None
+    assert forwarded[0]() is True

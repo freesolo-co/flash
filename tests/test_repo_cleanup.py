@@ -159,7 +159,7 @@ def test_sweep_noops_when_huggingface_hub_unavailable(monkeypatch):
     monkeypatch.setattr(
         rc, "_confirm_live_set", lambda: (_ for _ in ()).throw(AssertionError("called"))
     )
-    assert rc.run_scheduled_cleanup(dry_run=False, api=None) == 0
+    assert rc.run_scheduled_cleanup(dry_run=False, api=None).deleted_count == 0
 
 
 # ---- helpers ----------------------------------------------------------------------------------
@@ -216,7 +216,7 @@ def test_private_opd_retry_markers_are_never_cleanup_targets(monkeypatch):
     assert unknown == {"_opd_retry"}
 
     _wire(monkeypatch)
-    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 1
+    assert rc.run_scheduled_cleanup(dry_run=False, api=api).deleted_count == 1
     assert api.deleted == [(repo, "opd/flash-1-a")]
     assert all(marker_path != deleted_path for _repo, deleted_path in api.deleted)
 
@@ -306,7 +306,7 @@ def test_sweep_deletes_only_old_undeployed(monkeypatch):
         }
     )
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert n == 1
+    assert n.deleted_count == 1
     assert api.deleted == [(_managed("e1"), "sft/flash-1-old")]
 
 
@@ -318,7 +318,7 @@ def test_dry_run_deletes_nothing(monkeypatch):
             _managed("e2"): [_adapter("rl/flash-2-old/w", OLD)],
         }
     )
-    assert rc.run_scheduled_cleanup(dry_run=True, api=api) == 0
+    assert rc.run_scheduled_cleanup(dry_run=True, api=api).deleted_count == 0
     assert api.deleted == []
 
 
@@ -334,7 +334,7 @@ def test_sweep_never_deletes_code_or_unknown_dirs(monkeypatch):
         }
     )
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert n == 1
+    assert n.deleted_count == 1
     assert api.deleted == [(_managed("e"), "sft/flash-1-old")]  # code/ + telemetry/ untouched
 
 
@@ -350,7 +350,7 @@ def test_sweep_protects_warmstart_source_with_recent_marker(monkeypatch):
             ]
         }
     )
-    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
+    assert rc.run_scheduled_cleanup(dry_run=False, api=api).deleted_count == 0
     assert api.deleted == []
 
 
@@ -367,7 +367,7 @@ def test_sweep_reaps_source_whose_marker_is_old(monkeypatch):
         }
     )
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert n == 1
+    assert n.deleted_count == 1
     assert api.deleted == [(_managed("src"), "sft/flash-1-src")]
 
 
@@ -380,7 +380,7 @@ def test_sweep_protects_whole_repo_when_live_unmappable(monkeypatch):
         }
     )
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert n == 1
+    assert n.deleted_count == 1
     assert api.deleted == [(_managed("clean"), "sft/flash-2-old")]
 
 
@@ -391,7 +391,7 @@ def test_sweep_skips_undatable_prefix(monkeypatch):
     _wire(monkeypatch)
     old_epoch = int(NOW - OLD * DAY)  # submitted long ago, but the listing carries no commit date
     api = FakeApi({_managed("e1"): [_adapter(f"sft/flash-{old_epoch}-a/w", None)]})
-    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
+    assert rc.run_scheduled_cleanup(dry_run=False, api=api).deleted_count == 0
     assert api.deleted == []
 
 
@@ -411,7 +411,7 @@ def test_sweep_never_touches_non_flashrun_repos(monkeypatch):
         }
     )
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert n == 1
+    assert n.deleted_count == 1
     assert api.deleted == [(_managed("real"), "sft/flash-3-old")]
 
 
@@ -433,7 +433,7 @@ def test_scan_failure_on_one_repo_is_not_fatal(monkeypatch):
         }
     )
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert n == 1
+    assert n.deleted_count == 1
     assert api.deleted == [(_managed("good"), "sft/flash-2-old")]
 
 
@@ -454,7 +454,7 @@ def test_per_delete_recheck_spares_prefix_deployed_midsweep(monkeypatch):
 
     _wire(monkeypatch, deployed=_live)
     api = FakeApi({target[0]: [_adapter(target[1] + "/w", OLD)]})
-    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
+    assert rc.run_scheduled_cleanup(dry_run=False, api=api).deleted_count == 0
     assert api.deleted == []
 
 
@@ -493,7 +493,7 @@ def test_per_delete_recheck_spares_whole_repo_unmappable_midsweep(monkeypatch):
 
     _wire(monkeypatch, deployed=_live)
     api = FakeApi({target[0]: [_adapter(target[1] + "/w", OLD)]})
-    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
+    assert rc.run_scheduled_cleanup(dry_run=False, api=api).deleted_count == 0
     assert api.deleted == []
 
 
@@ -517,7 +517,7 @@ def test_one_delete_failure_does_not_abort_sweep(monkeypatch):
         }
     )
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert n == 1
+    assert n.deleted_count == 1
     assert api.deleted == [(_managed("e2"), "sft/flash-2-old")]
 
 
@@ -530,7 +530,7 @@ def test_restat_spares_prefix_written_since_enumeration(monkeypatch):
         rc, "_prefix_written_within", lambda *a, **k: True
     )  # a fresh write appeared
     api = FakeApi({_managed("e"): [_adapter("sft/flash-1-old/w", OLD)]})
-    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
+    assert rc.run_scheduled_cleanup(dry_run=False, api=api).deleted_count == 0
     assert api.deleted == []
 
 
@@ -542,7 +542,9 @@ def test_restat_skips_target_when_it_errors(monkeypatch):
 
     monkeypatch.setattr(rc, "_prefix_written_within", _boom)
     api = FakeApi({_managed("e"): [_adapter("sft/flash-1-old/w", OLD)]})
-    assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0  # skipped to stay safe
+    assert (
+        rc.run_scheduled_cleanup(dry_run=False, api=api).deleted_count == 0
+    )  # skipped to stay safe
     assert api.deleted == []
 
 
@@ -588,7 +590,7 @@ def test_sweep_skips_run_with_deploy_or_export_in_progress(monkeypatch):
         }
     )
     n = rc.run_scheduled_cleanup(dry_run=False, api=api)
-    assert n == 1
+    assert n.deleted_count == 1
     assert api.deleted == [(_managed("e2"), "sft/flash-2-other")]
 
 
@@ -600,9 +602,63 @@ def test_cooperative_stop_halts_before_deleting(monkeypatch):
             _managed("e2"): [_adapter("sft/flash-2-old/w", OLD)],
         }
     )
-    n = rc.run_scheduled_cleanup(dry_run=False, api=api, should_stop=lambda: True)
-    assert n == 0
+    result = rc.run_scheduled_cleanup(dry_run=False, api=api, should_stop=lambda: True)
+    assert result.deleted_count == 0
+    assert result.halted
     assert api.deleted == []
+
+
+def test_enumeration_stop_reports_a_halt_not_an_empty_sweep(monkeypatch):
+    """Enumeration is a fan-out of slow recursive HF listings, so a stop must be honored inside it.
+
+    The halt has to be reported as a halt: folding it into an empty target list would make an
+    interrupted sweep indistinguishable from one that legitimately found nothing to reap, and the
+    caller would record a clean cycle over artifacts it never actually looked at.
+    """
+    _wire(monkeypatch)
+    api = FakeApi({_managed("e1"): [_adapter("sft/flash-1-old/w", OLD)]})
+
+    targets, halted = rc._collect_targets(
+        api,
+        _LIVE_SENTINEL[0],
+        set(),
+        NOW,
+        rc.DELETE_AGE_SECONDS,
+        lambda: True,
+    )
+
+    assert targets == []
+    assert halted
+    assert api.deleted == []
+
+
+def test_stop_between_the_live_reconfirm_and_the_delete_halts_the_sweep(monkeypatch):
+    """The loop-top stop check is separated from ``delete_folder`` by two slow HF round-trips.
+
+    The pre-delete re-stat and the live-set re-confirm can each take seconds, so a stop that arrives
+    during them is already known by the time the delete runs but would not be seen until the NEXT
+    iteration. Drive the stop so it is false at the loop top and true only after the re-confirm: a
+    sweep that only checks at the top deletes this prefix anyway.
+    """
+    confirms = {"n": 0}
+    stopped = {"v": False}
+
+    def _live():
+        confirms["n"] += 1
+        # confirm #1 is the pre-listing fail-closed read, #2 is the per-delete re-confirm. Flip the
+        # stop as that second one returns, i.e. after the loop-top check already ran and passed.
+        if confirms["n"] >= 2:
+            stopped["v"] = True
+        return _LIVE_SENTINEL
+
+    _wire(monkeypatch, deployed=_live)
+    api = FakeApi({_managed("e1"): [_adapter("sft/flash-1-old/w", OLD)]})
+
+    result = rc.run_scheduled_cleanup(dry_run=False, api=api, should_stop=lambda: stopped["v"])
+
+    assert api.deleted == []
+    assert result.deleted_count == 0
+    assert result.halted
 
 
 # ---- the real per-run lock --------------------------------------------------------------------

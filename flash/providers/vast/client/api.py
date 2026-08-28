@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 
 from flash._internal.logging import get_logger
@@ -21,6 +22,7 @@ from flash.providers._lifecycle.net.deadline import (
     require_create_allowance,
     require_deadline_at,
 )
+from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
 from flash.providers._lifecycle.net.http import RestClient, is_not_found
 
 logger = get_logger(__name__)
@@ -55,6 +57,8 @@ def request_with_retries(
     retries: int = 4,
     base_delay: float = 2.0,
     deadline_at: float | None = None,
+    *,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Any:
     """REST call hardened against transient network/5xx blips (jittered backoff)."""
     return _CLIENT.request_with_retries(
@@ -64,6 +68,7 @@ def request_with_retries(
         retries=retries,
         base_delay=base_delay,
         deadline_at=deadline_at,
+        **({} if should_stop is None else {"should_stop": should_stop}),
     )
 
 
@@ -327,10 +332,15 @@ def list_instances(
     strict: bool = False,
     *,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[dict]:
     # list via paginated v1 (`next_token` -> `after_token`, limit 25); detail/destroy remain v0.
     # walk every page. with `strict=True`, any fetch, shape, or page-cap failure raises so an
     # incomplete listing cannot prove an instance is gone.
+    # `should_stop` reaches each page's retry loop AND the page boundary: a sweep's inventory read
+    # runs before its first destroy, so without it a shutdown waits out the full retry budget --
+    # and, for an account whose pages all succeed first try, every remaining page -- on the joined
+    # worker thread.
     instances: list[dict] = []
     after_token: str | None = None
     for page_no in range(
@@ -340,7 +350,7 @@ def list_instances(
         if after_token:
             path += f"?after_token={urllib.parse.quote(str(after_token))}"
         try:
-            out = request_with_retries(path, deadline_at=deadline_at)
+            out = request_with_retries(path, deadline_at=deadline_at, should_stop=should_stop)
         except Exception:
             # A later page failed after earlier ones succeeded: return the partial list rather than
             # discard it — lenient consumers only act on instances they see, and the next sweep
@@ -372,6 +382,23 @@ def list_instances(
         after_token = out.get("next_token")
         if not after_token:
             break
+        if should_stop is not None and should_stop():
+            # The retry loop only polls the stop BETWEEN attempts, so a page that succeeds on its
+            # first try never observes it. Without a check at the page boundary a shutdown waits
+            # out every remaining page (up to the cap below) on the joined sweep thread. A halted
+            # walk is incomplete for exactly the same reason the page cap is, so it is reported
+            # the same way: strict raises, lenient keeps the prefix it already collected.
+            if strict:
+                raise VastApiError(
+                    "vast instance listing halted by a stop request; listing incomplete"
+                )
+            logger.info(
+                "vast instance listing halted at page %d by a stop request "
+                "(using %d instance(s) collected so far)",
+                page_no,
+                len(instances),
+            )
+            return instances
     if strict and after_token:
         # Fell off the page-cap runaway guard with more pages pending -> the listing is incomplete.
         raise VastApiError("vast instance listing exceeded the page cap; listing incomplete")
@@ -429,13 +456,23 @@ def _genuine_http_not_found(exc: Exception) -> bool:
     )
 
 
-def _exact_instance_absent(instance_id: int, *, deadline_at: float | None = None) -> bool:
-    """confirm absence only from the exact-instance route's documented null or 404 signal."""
+def _exact_instance_absent(
+    instance_id: int,
+    *,
+    deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> bool:
+    """confirm absence only from the exact-instance route's documented null or 404 signal.
+
+    ``should_stop`` ends the two 30s lookup attempts early. A stop cut short is not evidence of
+    absence, so the caller must read the stop rather than this return value.
+    """
     try:
         out = request_with_retries(
             f"/v0/instances/{int(instance_id)}/",
             retries=1,
             deadline_at=deadline_at,
+            should_stop=should_stop,
         )
     except Exception as exc:
         return _genuine_http_not_found(exc)
@@ -446,28 +483,73 @@ def _exact_instance_absent(instance_id: int, *, deadline_at: float | None = None
     return "instances" in out and out["instances"] is None
 
 
-def destroy_instance(
+def _destroy_instance_outcome(
     instance_id: int,
     *,
     deadline_at: float | None = None,
-) -> bool:
-    """destroy an instance and return true only when provider-confirmed absent."""
+    should_stop: Callable[[], bool] | None = None,
+) -> DestructiveOperationOutcome:
+    halt_observed = False
+
+    def observe_stop() -> bool:
+        nonlocal halt_observed
+        halt_observed = halt_observed or (should_stop is not None and should_stop())
+        return halt_observed
+
     try:
         out = request_with_retries(
             f"/v0/instances/{int(instance_id)}/",
             method="DELETE",
             retries=2,
             deadline_at=deadline_at,
+            should_stop=None if should_stop is None else observe_stop,
         )
     except Exception as exc:
+        if halt_observed:
+            return DestructiveOperationOutcome.HALTED
         if _genuine_http_not_found(exc):
-            return True
+            return DestructiveOperationOutcome.DELETED
         cause = getattr(exc, "__cause__", None)
         if isinstance(cause, urllib.error.HTTPError) and cause.code < 500 and cause.code != 429:
-            return False
-        return _exact_instance_absent(instance_id, deadline_at=deadline_at)
+            return DestructiveOperationOutcome.NOT_CONFIRMED
+        # a completed lookup stays authoritative even if a stop lands right after it, so read the
+        # absence evidence first and fall back to the halt only when the lookup produced none.
+        if _exact_instance_absent(
+            instance_id,
+            deadline_at=deadline_at,
+            should_stop=None if should_stop is None else observe_stop,
+        ):
+            return DestructiveOperationOutcome.DELETED
+        if halt_observed:
+            return DestructiveOperationOutcome.HALTED
+        return DestructiveOperationOutcome.NOT_CONFIRMED
     if isinstance(out, dict) and out.get("success") is True:
-        return True
+        return DestructiveOperationOutcome.DELETED
     if isinstance(out, dict) and (out.get("success") is False or "error" in out or "detail" in out):
-        return False
-    return _exact_instance_absent(instance_id, deadline_at=deadline_at)
+        return DestructiveOperationOutcome.NOT_CONFIRMED
+    if _exact_instance_absent(
+        instance_id,
+        deadline_at=deadline_at,
+        should_stop=None if should_stop is None else observe_stop,
+    ):
+        return DestructiveOperationOutcome.DELETED
+    if halt_observed:
+        return DestructiveOperationOutcome.HALTED
+    return DestructiveOperationOutcome.NOT_CONFIRMED
+
+
+def destroy_instance(
+    instance_id: int,
+    *,
+    deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> bool:
+    """destroy an instance and return true only when provider-confirmed absent."""
+    return (
+        _destroy_instance_outcome(
+            instance_id,
+            deadline_at=deadline_at,
+            should_stop=should_stop,
+        )
+        is DestructiveOperationOutcome.DELETED
+    )

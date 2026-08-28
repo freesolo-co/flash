@@ -5,12 +5,17 @@ from __future__ import annotations
 import asyncio
 import builtins
 import sys
+import threading
 import types
 
 import pytest
 
 import flash.providers.runpod.execution.resources as runpod_resources
 import flash.server.asgi.app as app_mod
+import flash.server.platform.runtime as runtime
+from flash.server.domain.ops import repo_cleanup
+
+_REAL_ASYNCIO_SLEEP = asyncio.sleep
 
 
 def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> None:
@@ -84,7 +89,9 @@ def test_idle_endpoint_loop_logs_successful_deletion(monkeypatch) -> None:
     monkeypatch.setattr(
         app_mod,
         "_reap_idle_endpoints_once",
-        lambda minimum: runpod_resources.IdleEndpointSweepResult(deleted_ids=("ep-1", "ep-2")),
+        lambda minimum, should_stop=None: runpod_resources.IdleEndpointSweepResult(
+            deleted_ids=("ep-1", "ep-2")
+        ),
     )
 
     _run_loop_once(
@@ -135,7 +142,11 @@ def test_instance_orphan_loop_logs_successful_sweep(monkeypatch) -> None:
         debug=lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(app_mod, "_log", logger)
-    monkeypatch.setattr(app_mod, "_sweep_orphan_instances_once", lambda: 3)
+    monkeypatch.setattr(
+        app_mod,
+        "_sweep_orphan_instances_once",
+        lambda should_stop=None: app_mod.InstanceOrphanSweepResult(deleted_count=3),
+    )
 
     _run_loop_once(
         monkeypatch,
@@ -271,3 +282,121 @@ def test_run_server_does_not_repeat_the_advisory_preflight_logging(monkeypatch) 
     # the refusing half only: the advisory summary belongs to the lifespan, which this test's
     # stubbed create_app never builds.
     assert seen == ["require"]
+
+
+def _assert_cancelled_loop_joins_worker(
+    monkeypatch, loop, sleep_module, worker_module, worker_name
+) -> None:
+    entered = threading.Event()
+    stop_observed = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+
+    def worker(*args, **kwargs):
+        should_stop = kwargs.get("should_stop") or args[-1]
+        entered.set()
+        while not should_stop():
+            pass
+        stop_observed.set()
+        release.wait(5)
+        exited.set()
+        return 0
+
+    async def exercise() -> None:
+        task = asyncio.create_task(loop())
+        while not entered.is_set():
+            await _REAL_ASYNCIO_SLEEP(0)
+        task.cancel()
+        while not stop_observed.is_set():
+            await _REAL_ASYNCIO_SLEEP(0)
+        assert not task.done()
+        assert not exited.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert exited.is_set()
+
+    async def immediate_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(sleep_module.asyncio, "sleep", immediate_sleep)
+    monkeypatch.setattr(worker_module, worker_name, worker)
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("loop", "sleep_module", "worker_module", "worker_name"),
+    [
+        (
+            app_mod._reap_idle_endpoints_loop,
+            app_mod,
+            app_mod,
+            "_reap_idle_endpoints_once",
+        ),
+        (
+            app_mod._sweep_orphan_instances_loop,
+            app_mod,
+            app_mod,
+            "_sweep_orphan_instances_once",
+        ),
+        (
+            runtime._repo_cleanup_loop,
+            runtime,
+            repo_cleanup,
+            "run_scheduled_cleanup",
+        ),
+    ],
+)
+def test_cancelled_destructive_loop_joins_owned_worker(
+    monkeypatch, loop, sleep_module, worker_module, worker_name
+) -> None:
+    _assert_cancelled_loop_joins_worker(monkeypatch, loop, sleep_module, worker_module, worker_name)
+
+
+def test_shutdown_signals_every_task_before_joining_the_first() -> None:
+    """A slow destructive join must not delay the stop signal reaching the later sweeps.
+
+    Each destructive loop owns its worker thread across cancellation, so awaiting one blocks until
+    that sweep exits. Cancelling and awaiting one task at a time would leave every later loop still
+    deleting for the whole join.
+    """
+    signalled: list[str] = []
+    siblings_signalled_during_join: list[bool] = []
+
+    async def blocking_loop() -> None:
+        try:
+            await _REAL_ASYNCIO_SLEEP(3600)
+        except asyncio.CancelledError:
+            signalled.append("blocker")
+            # stand in for the owned worker thread: this join takes real time, during which the
+            # siblings must already have been told to stop.
+            for _ in range(100):
+                if len(signalled) == 3:
+                    break
+                await _REAL_ASYNCIO_SLEEP(0)
+            siblings_signalled_during_join.append(len(signalled) == 3)
+            raise
+
+    def make_follower(name: str):
+        async def follower() -> None:
+            try:
+                await _REAL_ASYNCIO_SLEEP(3600)
+            except asyncio.CancelledError:
+                signalled.append(name)
+                raise
+
+        return follower
+
+    async def exercise() -> None:
+        tasks = [
+            asyncio.create_task(blocking_loop()),
+            asyncio.create_task(make_follower("sweep")()),
+            asyncio.create_task(make_follower("cleanup")()),
+        ]
+        while not all(task.get_coro().cr_await is not None for task in tasks):
+            await _REAL_ASYNCIO_SLEEP(0)
+        await runtime._cancel_and_join_background(tasks)
+
+    asyncio.run(exercise())
+    assert siblings_signalled_during_join == [True]
+    assert sorted(signalled) == ["blocker", "cleanup", "sweep"]

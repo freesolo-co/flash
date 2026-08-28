@@ -2828,7 +2828,7 @@ def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
         {"id": "not-an-int", "label": "flash-run1-s1-a0"},  # non-intable -> skip, must NOT raise
         {"id": 7, "label": "flash-run1-s2-a0"},  # good -> destroyed
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: instances)
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
 
@@ -2848,7 +2848,7 @@ def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
         {"id": 3, "label": "flash-runA10-s0-a0"},  # NOT runA (boundary) -> orphan, reaped
         {"id": 4, "label": "not-ours"},  # untouched
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: instances)
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
     out = vast.sweep_orphans(active_labels={"runA"})  # raw active id; prefix forced internally
@@ -2865,7 +2865,7 @@ def test_sweep_orphans_reports_malformed_selected_identity_as_unconfirmed(monkey
     monkeypatch.setattr(
         vast_api,
         "list_instances",
-        lambda: [{"id": "invalid", "label": "flash-orphan-s0-a0"}],
+        lambda **_: [{"id": "invalid", "label": "flash-orphan-s0-a0"}],
     )
 
     result = vast.sweep_orphans(active_labels=set())
@@ -2883,7 +2883,7 @@ def test_sweep_orphans_preserves_partial_deletion_evidence(monkeypatch):
         {"id": 1, "label": "flash-one-s0-a0"},
         {"id": 2, "label": "flash-two-s0-a0"},
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: instances)
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: iid == 1)
 
     result = vast.sweep_orphans(active_labels=set())
@@ -2898,7 +2898,7 @@ def test_sweep_orphans_deduplicates_inventory_before_destroy(monkeypatch):
     from flash.providers.vast.client import api as vast_api
 
     duplicate = {"id": 7, "label": "flash-orphan-s0-a0"}
-    monkeypatch.setattr(vast_api, "list_instances", lambda: [duplicate, dict(duplicate)])
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: [duplicate, dict(duplicate)])
     destroyed = []
     monkeypatch.setattr(
         vast_api,
@@ -2922,7 +2922,7 @@ def test_sweep_orphans_known_labels_multiplane_guard(monkeypatch):
         {"id": 1, "label": "flash-mine-s0-a0"},  # known + not active -> reaped
         {"id": 2, "label": "flash-other-s0-a0"},  # unknown to this plane -> left alone
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: instances)
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
     out = vast.sweep_orphans(active_labels=set(), known_labels={"mine"})
@@ -2936,7 +2936,9 @@ def test_sweep_orphans_callable_sets_resolved_after_listing(monkeypatch):
     from flash.providers.vast import jobs as vast
     from flash.providers.vast.client import api as vast_api
 
-    monkeypatch.setattr(vast_api, "list_instances", lambda: [{"id": 1, "label": "flash-x-s0-a0"}])
+    monkeypatch.setattr(
+        vast_api, "list_instances", lambda **_: [{"id": 1, "label": "flash-x-s0-a0"}]
+    )
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)
     # protected by a callable-resolved active set
     assert vast.sweep_orphans(active_labels=lambda: {"x"}).deleted_count == 0
@@ -2946,3 +2948,251 @@ def test_sweep_orphans_callable_sets_resolved_after_listing(monkeypatch):
         raise RuntimeError("db down")
 
     assert vast.sweep_orphans(active_labels=boom).deleted_count == 0
+
+
+def test_vast_stop_during_destroy_retry_prevents_second_request(monkeypatch):
+    from flash.providers._lifecycle.net import http as lifecycle_http
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    monkeypatch.setenv("VAST_API_KEY", "test-key")
+    monkeypatch.setattr(
+        vast_api,
+        "list_instances",
+        lambda **_: [{"id": 7, "label": "flash-orphan-s0-a0"}],
+    )
+    monkeypatch.setattr(lifecycle_http.time, "sleep", lambda _delay: None)
+    attempts: list[str] = []
+    stopping: list[bool] = []
+
+    def fail_first_destroy(_target, *, method, **_kwargs):
+        if method == "DELETE":
+            attempts.append(method)
+            stopping.append(True)
+            raise OSError("transient destroy failure")
+        return {"instances": {"id": 7}}
+
+    monkeypatch.setattr(vast_api._CLIENT, "request", fail_first_destroy)
+
+    result = vast.sweep_orphans(
+        active_labels=set(),
+        should_stop=lambda: bool(stopping),
+    )
+
+    assert attempts == ["DELETE"], f"expected one destructive request, got {attempts}"
+    assert result.unresolved_ids is None
+    assert result.halted
+
+
+def test_sweep_orphans_halts_between_destroys_without_fake_unresolved_ids(monkeypatch):
+    """A halt is sweep-level evidence, not evidence that untouched instances failed teardown."""
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    instances = [{"id": n, "label": f"flash-run{n}-s0-a0"} for n in (1, 2, 3)]
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: instances)
+    destroyed: list[int] = []
+    from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
+
+    monkeypatch.setattr(
+        vast_api,
+        "_destroy_instance_outcome",
+        lambda iid, **_: destroyed.append(iid) or DestructiveOperationOutcome.DELETED,
+    )
+    # stop after the first destroy, exactly as a shutdown mid-sweep would
+    result = vast.sweep_orphans(active_labels=set(), should_stop=lambda: len(destroyed) >= 1)
+
+    assert destroyed == [1]  # halted; 2 and 3 were never touched
+    assert result.outcome is CleanupOutcome.UNCONFIRMED
+    assert result.confirmed_deleted_ids == ("1",)
+    assert result.unresolved_ids is None
+    assert result.halted
+
+
+def test_sweep_orphans_stop_already_set_destroys_nothing(monkeypatch):
+    """A stop that is already set when the sweep reaches its destroy loop must destroy nothing
+    at all -- the shutdown raced ahead of the worker thread."""
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    monkeypatch.setattr(
+        vast_api, "list_instances", lambda **_: [{"id": 5, "label": "flash-a-s0-a0"}]
+    )
+    destroyed: list[int] = []
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
+
+    result = vast.sweep_orphans(active_labels=set(), should_stop=lambda: True)
+
+    assert not destroyed
+    assert result.outcome is CleanupOutcome.RETRYABLE
+    assert result.unresolved_ids is None
+    assert result.halted
+
+
+def test_sweep_orphans_without_stop_signal_completes_normally(monkeypatch):
+    """Unhalted control for the two halt tests above. They assert UNCONFIRMED/RETRYABLE with ids
+    left unresolved, which a sweep that stranded its tail unconditionally would also satisfy. This
+    pins that DELETED is still reachable, so the halt outcome is a consequence of the stop rather
+    than the new default. It also pins the no-stop call shape: ``destroy_instance`` takes only the
+    id here, where the halted fakes accept ``**_``."""
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    instances = [{"id": n, "label": f"flash-run{n}-s0-a0"} for n in (1, 2)]
+    monkeypatch.setattr(vast_api, "list_instances", lambda **_: instances)
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)
+
+    result = vast.sweep_orphans(active_labels=set())
+
+    assert result.outcome is CleanupOutcome.DELETED
+    assert result.confirmed_deleted_ids == ("1", "2")
+
+
+def test_sweep_orphans_forwards_stop_into_the_inventory_listing(monkeypatch):
+    """The paginated inventory read runs BEFORE the first destroy, so a stop that only reaches the
+    destroy loop still waits out every page's retry budget on a thread the caller cannot
+    interrupt. The sweep wraps the caller's callback to record whether the listing itself observed
+    the stop, so assert the forwarded callable REPORTS the caller's stop rather than asserting it
+    is the same object."""
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    seen: list[object] = []
+    stopping = False
+
+    def fake_list(strict=False, *, should_stop=None, **_):
+        nonlocal stopping
+        seen.append(should_stop)
+        assert should_stop is not None
+        assert should_stop() is False  # the caller is not stopping yet
+        stopping = True
+        assert should_stop() is True  # a stop raised mid-listing reaches the transport
+        return []
+
+    monkeypatch.setattr(vast_api, "list_instances", fake_list)
+
+    def stop() -> bool:
+        return stopping
+
+    vast.sweep_orphans(active_labels=set(), should_stop=stop)
+
+    assert len(seen) == 1
+    assert callable(seen[0])
+
+
+def test_list_instances_forwards_stop_into_every_page_retry_loop(monkeypatch):
+    """``should_stop`` must reach the retrying transport on EVERY page, not just the first: a
+    multi-page account would otherwise keep retrying pages after the server was told to stop."""
+    from flash.providers.vast.client import api as vast_api
+
+    seen: list[object] = []
+    pages = [
+        {"instances": [{"id": 1}], "next_token": "t2"},
+        {"instances": [{"id": 2}]},
+    ]
+
+    def fake_request(path, **kwargs):
+        seen.append(kwargs.get("should_stop"))
+        return pages[len(seen) - 1]
+
+    monkeypatch.setattr(vast_api._CLIENT, "request_with_retries", fake_request)
+
+    def stop() -> bool:
+        return False
+
+    assert vast_api.list_instances(should_stop=stop) == [{"id": 1}, {"id": 2}]
+    assert seen == [stop, stop]
+
+
+def _paging_client(monkeypatch, page_count: int, stop_after: int):
+    """Install a fake transport whose pages ALL succeed on the first attempt.
+
+    That is the case the retry loop cannot cover: ``_request_one_key`` polls ``should_stop`` only
+    for attempt > 0 and after a failed attempt's backoff, so a healthy account never reaches either
+    poll. Returns the list the fake appends each fetched page number to.
+    """
+    from flash.providers.vast.client import api as vast_api
+
+    fetched: list[int] = []
+
+    def fake_request(path, **kwargs):
+        fetched.append(len(fetched) + 1)
+        # the stop is raised by the caller's own progress, exactly as a lifespan shutdown landing
+        # partway through a long walk would be; the transport itself never fails, so it never polls.
+        last = len(fetched) >= page_count
+        page = {"instances": [{"id": len(fetched)}]}
+        if not last:
+            page["next_token"] = f"t{len(fetched) + 1}"
+        return page
+
+    monkeypatch.setattr(vast_api._CLIENT, "request_with_retries", fake_request)
+
+    def stop() -> bool:
+        return len(fetched) >= stop_after
+
+    return fetched, stop
+
+
+def test_list_instances_stops_between_pages_when_every_page_succeeds(monkeypatch):
+    """A stop must end the walk at the PAGE boundary, not only inside a page's retries.
+
+    ``_request_one_key`` polls ``should_stop`` only for retry attempts and after a failed attempt's
+    backoff, so an account whose pages all succeed first try never polls it at all. Without a check
+    here a shutdown waits out every remaining page -- up to the 200-page cap -- on the sweep's
+    joined worker thread, and the sweep's stop-observing wrapper is never invoked, so the halt goes
+    unrecorded and a partial inventory reads as a complete one.
+    """
+    from flash.providers.vast.client import api as vast_api
+
+    fetched, stop = _paging_client(monkeypatch, page_count=6, stop_after=2)
+
+    out = vast_api.list_instances(should_stop=stop)
+
+    # before the fix all six pages were fetched and the caller got a "complete" six-row listing.
+    assert fetched == [1, 2]
+    assert [i["id"] for i in out] == [1, 2]
+
+
+def test_list_instances_strict_rejects_a_stop_halted_walk(monkeypatch):
+    """Strict callers confirm a run is CLEAR from an empty listing, so an incomplete walk must
+    raise rather than return its prefix -- the same contract the page cap already enforces."""
+    from flash.providers.vast.client import api as vast_api
+
+    fetched, stop = _paging_client(monkeypatch, page_count=6, stop_after=2)
+
+    with pytest.raises(vast_api.VastApiError, match="listing incomplete"):
+        vast_api.list_instances(strict=True, should_stop=stop)
+
+    assert fetched == [1, 2]
+
+
+def test_list_instances_walks_every_page_when_no_stop_is_raised(monkeypatch):
+    """The converse: the boundary check must not truncate a healthy walk. Its callable is polled
+    once per boundary, so a callback that never returns True has to leave the walk complete."""
+    from flash.providers.vast.client import api as vast_api
+
+    fetched, _ = _paging_client(monkeypatch, page_count=4, stop_after=99)
+
+    assert [i["id"] for i in vast_api.list_instances(should_stop=lambda: False)] == [1, 2, 3, 4]
+    assert fetched == [1, 2, 3, 4]
+
+
+def test_list_instances_completed_on_its_last_page_is_not_halted(monkeypatch):
+    """A stop that lands while the FINAL page is in flight leaves the walk complete.
+
+    The boundary check sits after the ``next_token`` break for exactly this reason. Placed before
+    it, a strict caller would raise "listing incomplete" for a listing that actually enumerated
+    every instance, and ``run_instances_remaining`` could then never confirm a run is clear -- so
+    handle-less recovery would refuse to launch forever on a genuinely empty account.
+    """
+    from flash.providers.vast.client import api as vast_api
+
+    fetched, stop = _paging_client(monkeypatch, page_count=2, stop_after=2)
+
+    # strict is the caller that turns an incomplete listing into a hard error.
+    assert [i["id"] for i in vast_api.list_instances(strict=True, should_stop=stop)] == [1, 2]
+    assert fetched == [1, 2]
+    assert stop(), "the scenario is only meaningful if the stop is raised by the final page"

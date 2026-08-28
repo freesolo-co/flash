@@ -101,11 +101,15 @@ class RestClient:
         retries: int,
         base_delay: float,
         deadline_at: float | None,
+        *,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Any:
         """One key's full backoff loop (the original single-key behavior)."""
         deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
         last: Exception | None = None
         for attempt in range(retries + 1):
+            if attempt > 0 and should_stop is not None and should_stop():
+                break
             timeout = 30.0
             if deadline is not None:
                 remaining = remaining_seconds(deadline)
@@ -146,6 +150,8 @@ class RestClient:
                     delay = min(delay, remaining)
                 if delay > 0:
                     time.sleep(delay)
+                if should_stop is not None and should_stop():
+                    break
         # Chain last so is_not_found and failover_predicate can inspect the HTTPError code.
         error_kind = type(last).__name__ if last is not None else "unknown error"
         raise self.error_cls(
@@ -161,6 +167,8 @@ class RestClient:
         retries: int = 4,
         base_delay: float = 2.0,
         deadline_at: float | None = None,
+        *,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Any:
         """Like request_with_retries but uses the supplied key, bypassing the pool."""
         return self._request_one_key(
@@ -171,6 +179,7 @@ class RestClient:
             retries,
             base_delay,
             deadline_at,
+            should_stop=should_stop,
         )
 
     def request_with_retries(
@@ -181,6 +190,8 @@ class RestClient:
         retries: int = 4,
         base_delay: float = 2.0,
         deadline_at: float | None = None,
+        *,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Any:
         """REST call with jittered backoff; with a key pool, failover-class errors try the next key."""
         ordered = self._ordered_keys()
@@ -194,6 +205,7 @@ class RestClient:
                     retries,
                     base_delay,
                     deadline_at,
+                    should_stop=should_stop,
                 )
             except self.error_cls as e:
                 if (

@@ -35,6 +35,18 @@ def test_cleanup_result_confirmation_is_explicit() -> None:
         assert result.confirmed is False
 
 
+def test_cleanup_result_rejects_non_boolean_halted() -> None:
+    with pytest.raises(TypeError, match="halted must be a bool"):
+        CleanupResult(CleanupOutcome.RETRYABLE, halted=1)
+
+
+def test_cleanup_result_rejects_confirmed_halted_outcome() -> None:
+    with pytest.raises(
+        ValueError, match="halted cleanup outcomes must be unconfirmed or retryable"
+    ):
+        CleanupResult(CleanupOutcome.DELETED, halted=True)
+
+
 def test_cleanup_result_defines_no_boolean_protocol() -> None:
     assert "__bool__" not in CleanupResult.__dict__
     assert CleanupResult(CleanupOutcome.DELETED).confirmed is True
@@ -122,6 +134,7 @@ def test_confirmed_revalidates_a_forged_cleanup_result() -> None:
     object.__setattr__(forged, "confirmed_deleted_ids", ())
     object.__setattr__(forged, "surviving_ids", None)
     object.__setattr__(forged, "unresolved_ids", None)
+    object.__setattr__(forged, "halted", False)
 
     with pytest.raises(TypeError, match="actual CleanupOutcome member"):
         _ = forged.confirmed
@@ -297,7 +310,7 @@ def test_capability_helpers_invoke_callbacks_or_report_unsupported() -> None:
         seen.append(run_id)
         return CleanupResult(CleanupOutcome.ABSENT)
 
-    def sweep(active, known) -> CleanupResult:
+    def sweep(active, known, should_stop=None) -> CleanupResult:
         seen.extend((active, known))
         return CleanupResult(CleanupOutcome.DELETED, confirmed_deleted_ids=("7",))
 
@@ -342,7 +355,12 @@ def test_capability_helpers_contain_raising_callbacks() -> None:
     def raise_confirmation(_run_id: str) -> CleanupResult:
         raise RuntimeError("confirmation failed")
 
-    def raise_sweep(_active, _known) -> CleanupResult:
+    reached: list[bool] = []
+
+    def raise_sweep(_active, _known, _should_stop=None) -> CleanupResult:
+        # the dispatcher's broad handler turns a STALE signature's TypeError into RETRYABLE too,
+        # so record that the body actually ran: otherwise this asserts nothing about containment.
+        reached.append(True)
         raise RuntimeError("sweep failed")
 
     capabilities = ProviderCapabilities(False, True, raise_confirmation, raise_sweep)
@@ -353,6 +371,7 @@ def test_capability_helpers_contain_raising_callbacks() -> None:
     assert confirmation.outcome is CleanupOutcome.RETRYABLE
     assert confirmation.unresolved_ids == ("run-raising",)
     assert sweep.outcome is CleanupOutcome.RETRYABLE
+    assert reached == [True]
 
 
 def test_capability_helpers_revalidate_mutated_callback_results() -> None:
@@ -393,3 +412,47 @@ def test_unsupported_is_emitted_only_when_capability_is_absent() -> None:
     assert confirmation.outcome is CleanupOutcome.UNSUPPORTED
     assert confirmation.unresolved_ids == ("run-unsupported",)
     assert sweep.outcome is CleanupOutcome.UNSUPPORTED
+
+
+@pytest.mark.parametrize(
+    ("provider_factory", "jobs_module"),
+    [
+        (
+            "flash.providers.lambda_.execution.provider:LambdaProvider",
+            "flash.providers.lambda_.jobs",
+        ),
+        ("flash.providers.vast.execution.provider:VastProvider", "flash.providers.vast.jobs"),
+    ],
+)
+def test_the_stop_callback_reaches_each_real_provider_sweep(
+    provider_factory, jobs_module, monkeypatch
+) -> None:
+    """Identity, not truthiness: the exact callback the lifespan owns must arrive at the jobs-level
+    sweep through the real facade. A test that only asserts the sweep ran stays green when a
+    wrapper silently drops ``should_stop=should_stop``, which is precisely how a shutdown signal
+    goes missing and destructive teardowns keep running after the server was told to stop."""
+    import importlib
+
+    module_path, _, attr = provider_factory.partition(":")
+    provider = getattr(importlib.import_module(module_path), attr)()
+    jobs = importlib.import_module(jobs_module)
+    seen: list[object] = []
+    monkeypatch.setattr(
+        jobs,
+        "sweep_orphans",
+        lambda **kwargs: (
+            seen.append(kwargs.get("should_stop"))
+            or CleanupResult(CleanupOutcome.DELETED, confirmed_deleted_ids=("i-9",))
+        ),
+    )
+
+    def stop() -> bool:
+        return False
+
+    result = sweep_orphans(
+        provider.capabilities, active_labels={"live"}, known_labels={"live"}, should_stop=stop
+    )
+
+    assert result.confirmed_deleted_ids == ("i-9",)
+    assert len(seen) == 1
+    assert seen[0] is stop  # the same object, not a re-wrapped or defaulted stand-in

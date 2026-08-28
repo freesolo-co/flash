@@ -67,6 +67,14 @@ ARTIFACT_PHASES = frozenset({"sft", "rl", "opd", "dpo", "grpo", "recomb"})
 REF_MARKER = "referenced_by"
 
 
+@dataclass(frozen=True)
+class ScheduledCleanupResult:
+    """Outcome of one repository cleanup sweep."""
+
+    deleted_count: int = 0
+    halted: bool = False
+
+
 class CleanupAborted(RuntimeError):
     """The global live set could not be confirmed, so the sweep deleted nothing (fails closed)."""
 
@@ -234,10 +242,18 @@ def _prefix_written_within(api, repo_id: str, prefix: str, now: float, max_age_s
     return (now - newest) < max_age_s
 
 
-def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_RunTarget]:
+def _collect_targets(
+    api, live, whole, now: float, max_age_s: float, should_stop=None
+) -> tuple[list[_RunTarget], bool]:
     """Enumerate every ``flashrun-*`` repo and return the aged, undeployed, non-warm-start-source run
-    prefixes to delete. Per-repo scan failures (HF rate-limit / transient) are skipped and logged, not
-    fatal — the sweep reaps what it could read and tries the rest next cycle."""
+    prefixes to delete, plus whether enumeration stopped early. Per-repo scan failures (HF rate-limit
+    / transient) are skipped and logged, not fatal: the sweep reaps what it could read and tries the
+    rest next cycle.
+
+    Enumeration is a fan-out of slow recursive HF listings, so ``should_stop`` is honored between
+    completed scans: without it a shutdown would have to wait out the whole scan before the delete
+    loop's stop check could ever run. The halt is returned rather than folded into an empty target
+    list so the caller reports a cooperative stop, not a clean sweep that found nothing."""
     repos = [
         d.id for d in api.list_datasets(author=artifact_namespace()) if _is_managed_env_repo(d.id)
     ]
@@ -247,6 +263,11 @@ def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_Ru
     with ThreadPoolExecutor(max_workers=_SCAN_WORKERS) as pool:
         futs = {pool.submit(_scan_repo, api, r): r for r in repos}
         for fut in as_completed(futs):
+            if should_stop is not None and should_stop():
+                logger.info("repo GC: stop requested during enumeration; deleting nothing")
+                # drop the queued scans so the pool's exit join is bounded by the in-flight ones.
+                pool.shutdown(wait=False, cancel_futures=True)
+                return [], True
             repo = futs[fut]
             scanned += 1
             if repo in whole:
@@ -289,15 +310,13 @@ def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_Ru
         errored,
         len(targets),
     )
-    return targets
+    return targets, False
 
 
-def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) -> int:
-    """One sweep of the fixed policy. Returns the number of run prefixes deleted (0 in dry-run).
-
-    Raise ``CleanupAborted`` before deleting if the serving set is unconfirmed. ``should_stop`` is
-    checked between deletes because cancelling the caller cannot interrupt the worker thread.
-    """
+def run_scheduled_cleanup(
+    *, dry_run: bool = False, api=None, should_stop=None
+) -> ScheduledCleanupResult:
+    """Run one fixed-policy sweep and report deletion count and cooperative halt."""
     global _warned_hf_unavailable
     if api is None:
         if HfApi is None:
@@ -308,19 +327,19 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
                     "repo GC: huggingface_hub not installed (server extra absent); skipping sweeps"
                 )
                 _warned_hf_unavailable = True
-            return 0
+            return ScheduledCleanupResult()
         api = HfApi()
     max_age_s = DELETE_AGE_SECONDS
 
     live, whole = _confirm_live_set()  # fail closed before we even list
     now = _now()
-    targets = _collect_targets(api, live, whole, now, max_age_s)
+    targets, halted = _collect_targets(api, live, whole, now, max_age_s, should_stop)
 
     if dry_run:
         logger.info(
             "repo GC (dry-run): %d aged undeployed run prefix(es) would be deleted", len(targets)
         )
-        return 0
+        return ScheduledCleanupResult(halted=halted)
 
     deleted = 0
     for target in targets:
@@ -328,6 +347,7 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
         # keep deleting after the lifespan started tearing down.
         if should_stop is not None and should_stop():
             logger.info("repo GC: stop requested; halting sweep after %d delete(s)", deleted)
+            halted = True
             break
         # Acquire-and-HOLD this plane's per-run deploy/export lock across the delete so the destructive
         # mutation is mutually exclusive with a concurrent deploy/undeploy/export of this run. Non-
@@ -368,6 +388,15 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
             if (target.repo_id, target.prefix) in fresh or target.repo_id in fresh_whole:
                 logger.warning("repo GC: %s became deployed mid-sweep; skipping", target.prefix)
                 continue
+            # The two confirmations above are slow HF round-trips, so the loop-top stop check can be
+            # seconds stale by now. Recheck immediately before the irreversible delete.
+            if should_stop is not None and should_stop():
+                logger.info(
+                    "repo GC: stop requested; halting sweep after %d delete(s)",
+                    deleted,
+                )
+                halted = True
+                break
             try:
                 # delete_folder has no missing_ok; a concurrent delete / already-gone prefix raises.
                 api.delete_folder(
@@ -382,4 +411,4 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
         finally:
             held.release()
         time.sleep(_DELETE_SLEEP_S)  # HF repo-mutation rate-limit courtesy
-    return deleted
+    return ScheduledCleanupResult(deleted_count=deleted, halted=halted)

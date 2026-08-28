@@ -62,6 +62,7 @@ class CleanupResult:
     confirmed_deleted_ids: tuple[ResourceId, ...] = ()
     surviving_ids: tuple[ResourceId, ...] | None = None
     unresolved_ids: tuple[ResourceId, ...] | None = None
+    halted: bool = False
 
     def __post_init__(self) -> None:
         if type(self.outcome) is not CleanupOutcome or not any(
@@ -70,6 +71,8 @@ class CleanupResult:
             raise CleanupContractTypeError(
                 "cleanup outcome must be an actual CleanupOutcome member"
             )
+        if type(self.halted) is not bool:
+            raise CleanupContractTypeError("cleanup halted must be a bool")
 
         deleted = _normalize_evidence("confirmed_deleted_ids", self.confirmed_deleted_ids)
         surviving = _normalize_optional_evidence("surviving_ids", self.surviving_ids)
@@ -96,6 +99,13 @@ class CleanupResult:
         has_deleted = bool(deleted)
         has_surviving = bool(surviving)
         has_unresolved = bool(unresolved)
+        if self.halted and self.outcome not in {
+            CleanupOutcome.UNCONFIRMED,
+            CleanupOutcome.RETRYABLE,
+        }:
+            raise CleanupContractValueError(
+                "halted cleanup outcomes must be unconfirmed or retryable"
+            )
         if self.outcome in {CleanupOutcome.DELETED, CleanupOutcome.ABSENT}:
             if has_surviving or has_unresolved:
                 raise CleanupContractValueError(
@@ -111,9 +121,9 @@ class CleanupResult:
                     "present cleanup outcomes require only surviving resource ids"
                 )
         elif self.outcome is CleanupOutcome.UNCONFIRMED:
-            if not has_unresolved or has_surviving:
+            if (not has_unresolved and not self.halted) or has_surviving:
                 raise CleanupContractValueError(
-                    "unconfirmed cleanup outcomes require unresolved resource ids"
+                    "unconfirmed cleanup outcomes require unresolved resource ids or a halt"
                 )
         elif self.outcome in {CleanupOutcome.RETRYABLE, CleanupOutcome.UNSUPPORTED}:
             if has_deleted or has_surviving:
@@ -159,8 +169,9 @@ def is_cleanup_confirmed(result: object) -> bool:
         return False
 
 
+ShouldStop = Callable[[], bool]
 ConfirmRunAbsent = Callable[[str], CleanupResult]
-SweepOrphans = Callable[[RunLabels, RunLabels], CleanupResult]
+SweepOrphans = Callable[[RunLabels, RunLabels, ShouldStop | None], CleanupResult]
 
 
 @dataclass(frozen=True)
@@ -191,15 +202,22 @@ def sweep_orphans(
     capabilities: ProviderCapabilities,
     active_labels: RunLabels = None,
     known_labels: RunLabels = None,
+    should_stop: ShouldStop | None = None,
 ) -> CleanupResult:
-    """Invoke authoritative orphan cleanup when the provider supports it."""
+    """Invoke authoritative orphan cleanup when the provider supports it.
+
+    ``should_stop`` is checked by the provider between teardowns. The sweep runs in a worker
+    thread that ``task.cancel()`` cannot interrupt, so without it a large in-flight sweep keeps
+    destroying provider resources after the lifespan was told to stop. A sweep that halts early
+    reports the teardowns it did confirm as ``UNCONFIRMED``, never as a completed clean sweep.
+    """
     callback = capabilities.sweep_orphans
     if callback is None:
         return CleanupResult(CleanupOutcome.UNSUPPORTED)
     if not callable(callback):
         return CleanupResult(CleanupOutcome.RETRYABLE)
     try:
-        result = callback(active_labels, known_labels)
+        result = callback(active_labels, known_labels, should_stop)
     except Exception:
         return CleanupResult(CleanupOutcome.RETRYABLE)
     return _validated_callback_result(result)

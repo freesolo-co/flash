@@ -7,10 +7,12 @@ NON-IDEMPOTENT so it is never retried (blind retry = double-provision + double-b
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any
 
 from flash._internal.logging import get_logger
 from flash.providers._lifecycle.net.deadline import require_create_allowance, require_deadline_at
+from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
 from flash.providers._lifecycle.net.http import RestClient, is_not_found
 
 logger = get_logger(__name__)
@@ -39,6 +41,8 @@ def request_with_retries(
     retries: int = 4,
     base_delay: float = 2.0,
     deadline_at: float | None = None,
+    *,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Any:
     """REST call hardened against transient network/5xx blips (jittered backoff)."""
     return _CLIENT.request_with_retries(
@@ -48,6 +52,7 @@ def request_with_retries(
         retries=retries,
         base_delay=base_delay,
         deadline_at=deadline_at,
+        **({} if should_stop is None else {"should_stop": should_stop}),
     )
 
 
@@ -274,8 +279,11 @@ def list_instances(
     *,
     deadline_at: float | None = None,
     strict: bool = False,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[dict]:
-    out = _data(request_with_retries("/instances", deadline_at=deadline_at))
+    out = _data(
+        request_with_retries("/instances", deadline_at=deadline_at, should_stop=should_stop)
+    )
     if isinstance(out, list):
         return out
     if strict:
@@ -283,26 +291,64 @@ def list_instances(
     return []
 
 
+def _terminate_instance_outcome(
+    instance_id: str,
+    *,
+    deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> DestructiveOperationOutcome:
+    halt_observed = False
+
+    def observe_stop() -> bool:
+        nonlocal halt_observed
+        halt_observed = halt_observed or (should_stop is not None and should_stop())
+        return halt_observed
+
+    try:
+        request_with_retries(
+            "/instance-operations/terminate",
+            method="POST",
+            body={"instance_ids": [instance_id]},
+            retries=2,
+            **({} if should_stop is None else {"should_stop": observe_stop}),
+            **({} if deadline_at is None else {"deadline_at": deadline_at}),
+        )
+        return DestructiveOperationOutcome.DELETED
+    except Exception as exc:
+        if halt_observed:
+            return DestructiveOperationOutcome.HALTED
+        logger.warning("lambda terminate(%s) failed (%s)", instance_id, type(exc).__name__)
+        return DestructiveOperationOutcome.NOT_CONFIRMED
+
+
 def terminate_instances(
     instance_ids: list[str],
     *,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[str]:
     """Terminate instances; return ids that succeeded. Per-id isolation: Lambda's batch endpoint
-    rejects the whole request if any id is invalid, so one stale id would leak billing for the rest."""
+    rejects the whole request if any id is invalid, so one stale id would leak billing for the rest.
+
+    ``should_stop`` is checked between terminations. Sweeps run in a worker thread that
+    ``task.cancel()`` cannot interrupt, so without it a long teardown keeps destroying instances
+    after the server was told to stop."""
     deleted: list[str] = []
     for iid in [i for i in instance_ids if isinstance(i, str) and i.strip()]:
-        try:
-            request_with_retries(
-                "/instance-operations/terminate",
-                method="POST",
-                body={"instance_ids": [iid]},
-                retries=2,
-                **({} if deadline_at is None else {"deadline_at": deadline_at}),
+        if should_stop is not None and should_stop():
+            logger.info(
+                "lambda terminate: stop requested; halting after %d termination(s)", len(deleted)
             )
+            break
+        outcome = _terminate_instance_outcome(
+            iid,
+            deadline_at=deadline_at,
+            should_stop=should_stop,
+        )
+        if outcome is DestructiveOperationOutcome.DELETED:
             deleted.append(iid)
-        except Exception as exc:
-            logger.warning("lambda terminate(%s) failed (%s)", iid, type(exc).__name__)
+        elif outcome is DestructiveOperationOutcome.HALTED:
+            break
     return deleted
 
 
