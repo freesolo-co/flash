@@ -34,6 +34,8 @@ from flash.server.platform.runtime import (
     _charge_retry_startup,
     _reconcile_cost_loop,
     _repo_cleanup_loop,
+    _stop_recovery_threads,
+    _wait_for_recovery_threads,
     _worker_artifacts,
     recover_runs,
 )
@@ -326,62 +328,66 @@ def create_app():
         from flash.runner.lifecycle.reporting import _open_status_reporter
         from flash.server.billing.retry import charge_retry_enabled
         from flash.server.domain.ops.reconcile import reconcile_enabled
+        from flash.server.domain.ops.repo_cleanup import repo_cleanup_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         db.recover_teacher_request_ledger()
         _open_deployment_jobs()
         _open_status_reporter()
-        recover_runs()
-        serving.recover_deployments()
-        # replay one persisted status at a time in the background. synchronous per-item delivery
-        # prevents a historical backlog from filling the shared reporter ahead of live updates.
         startup_report_stop = threading.Event()
-        startup_report_task = asyncio.create_task(
-            asyncio.to_thread(serving.replay_status_reports, startup_report_stop)
-        )
-        # retry completion charges missed by transient failure or a crash after done.
-        # run in background so billing timeouts cannot delay startup; backend runId makes it
-        # idempotent.
-        startup_charge_task = (
-            asyncio.create_task(_charge_retry_startup()) if charge_retry_enabled() else None
-        )
-        # Periodic realized-cost reconciliation (estimator accuracy), only when the operator
-        # internal key is configured.
-        cost_task = asyncio.create_task(_reconcile_cost_loop()) if reconcile_enabled() else None
-        # Periodic completion-charge retry: re-charge any run left pending/failed by a transient blip
-        # so it can't leak revenue. Same internal-key gate as the charge itself.
-        charge_task = asyncio.create_task(_charge_retry_loop()) if charge_retry_enabled() else None
-        # Periodic idle-endpoint reaper: proactively delete RunPod training endpoints doing
-        # nothing (orphans from finished/crashed runs) so workers don't linger holding quota.
-        # Only when this plane manages RunPod (its API key is configured).
-        reap_task = (
-            asyncio.create_task(_reap_idle_endpoints_loop())
-            if os.environ.get("RUNPOD_API_KEY")
-            else None
-        )
-        # Periodic instance orphan sweep: proactively tear down Lambda instances left billing by
-        # finished/crashed runs (the in-lifetime counterpart of their startup sweep_orphans). Only
-        # when an instance provider is configured — RunPod-only planes have nothing standing to reap.
-        sweep_task = (
-            asyncio.create_task(_sweep_orphan_instances_loop())
-            if _instance_providers_configured()
-            else None
-        )
-        # periodic artifact gc: delete aged (>7d), undeployed run prefixes inside the per-environment
-        # hf repos (<artifact namespace>/flashrun-*) so old runs' checkpoints/adapters don't pile up
-        # against the org's storage quota. only on a plane with an operator `hf_token` (it deletes
-        # operator-owned repos); fails closed on any live-set uncertainty. see
-        # flash.server.domain.ops.repo_cleanup.
-        from flash.server.domain.ops.repo_cleanup import repo_cleanup_enabled
-
-        cleanup_task = asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
+        startup_report_task = None
+        startup_charge_task = None
+        cost_task = None
+        charge_task = None
+        reap_task = None
+        sweep_task = None
+        cleanup_task = None
         try:
+            recover_runs()
+            serving.recover_deployments()
+            # replay one persisted status at a time in the background. synchronous per-item delivery
+            # prevents a historical backlog from filling the shared reporter ahead of live updates.
+            startup_report_task = asyncio.create_task(
+                asyncio.to_thread(serving.replay_status_reports, startup_report_stop)
+            )
+            # retry completion charges missed by transient failure or a crash after done.
+            # run in background so billing timeouts cannot delay startup; backend run id makes it
+            # idempotent.
+            startup_charge_task = (
+                asyncio.create_task(_charge_retry_startup()) if charge_retry_enabled() else None
+            )
+            # periodic realized-cost reconciliation, only when the operator internal key is configured.
+            cost_task = asyncio.create_task(_reconcile_cost_loop()) if reconcile_enabled() else None
+            # periodic completion-charge retry for transient failures.
+            charge_task = (
+                asyncio.create_task(_charge_retry_loop()) if charge_retry_enabled() else None
+            )
+            # periodic idle-endpoint reaping only when this plane manages runpod.
+            reap_task = (
+                asyncio.create_task(_reap_idle_endpoints_loop())
+                if os.environ.get("RUNPOD_API_KEY")
+                else None
+            )
+            # periodic instance orphan sweeping only when an instance provider is configured.
+            sweep_task = (
+                asyncio.create_task(_sweep_orphan_instances_loop())
+                if _instance_providers_configured()
+                else None
+            )
+            # periodic artifact gc only on a plane with an operator hf token.
+            cleanup_task = (
+                asyncio.create_task(_repo_cleanup_loop()) if repo_cleanup_enabled() else None
+            )
             yield
         finally:
+            # signal before cancelling the loop tasks: a recovery thread parked on its retry wait
+            # unblocks immediately, so the bounded join below has a chance to actually drain it.
+            _stop_recovery_threads()
             startup_report_stop.set()
-            startup_report_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await startup_report_task
+            if startup_report_task is not None:
+                startup_report_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await startup_report_task
             for task in (
                 startup_charge_task,
                 cost_task,
@@ -398,6 +404,10 @@ def create_app():
             with contextlib.suppress(Exception):
                 if not await asyncio.to_thread(_wait_for_deployment_jobs, 10.0):
                     _log.warning("deployment jobs still running at shutdown deadline")
+            with contextlib.suppress(Exception):
+                remaining = max(0.0, shutdown_deadline - time.monotonic())
+                if not await asyncio.to_thread(_wait_for_recovery_threads, remaining):
+                    _log.warning("recovery threads still running at shutdown deadline")
             with contextlib.suppress(Exception):
                 from flash.runner.lifecycle.reporting import _shutdown_status_reporter
 

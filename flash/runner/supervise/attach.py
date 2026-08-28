@@ -67,7 +67,16 @@ def _resume_after_confirmed_teardown(
     from flash.runner.lifecycle.submit import _persist_effective_worker_spec
     from flash.runner.supervise.errors import _RunCancelled
     from flash.runner.supervise.lifecycle import _run_training
+    from flash.server.platform.runtime import recovery_is_stopping
 
+    # Supervision has the run's lifetime, not the lifespan's, so this thread can arrive here long
+    # after the plane began shutting down: it polls the provider on a multi-minute interval, and
+    # the wake that decides to replace a dead worker is not itself interruptible. Buying a fresh
+    # worker at that point strands paid capacity nothing will supervise. The captured remote stays
+    # captured, which is exactly the state the next startup recovery expects to find.
+    if recovery_is_stopping():
+        print(f"attach: {run_id} not resuming; the control plane is shutting down", file=log)
+        return get_status(run_id)
     if int(worker_spec.gpu.max_retries) == 0:
         _compare_and_fail_remote(run_id, persisted_remote, failure)
         print(
@@ -105,6 +114,13 @@ def _resume_after_confirmed_teardown(
     worker_spec = stage_environment_package(worker_spec, deadline_at=deadline_at)
     if not _persist_effective_worker_spec(worker_spec):
         raise _RunCancelled(f"run {run_id} went terminal before environment staging")
+    # staging above stages an environment package and re-reads the run's source, which can block
+    # for minutes. shutdown can therefore begin between the fence at the top of this function and
+    # the clear below, so the fence is re-read immediately before the first irreversible step:
+    # clearing the captured remote is what commits this run to a replacement worker.
+    if recovery_is_stopping():
+        print(f"attach: {run_id} not resuming; the control plane is shutting down", file=log)
+        return get_status(run_id)
     if not _compare_and_clear_remote(run_id, persisted_remote):
         print(
             f"attach: {run_id} persisted remote changed before clear; not resuming",
@@ -461,12 +477,20 @@ def _schedule_attach_reconciliation(
     failure: str,
 ) -> bool:
     """Schedule one in-process reconciler for a captured remote identity."""
+    from flash.server.platform.threadgroup import adopt_group, current_group
+
+    # The reconciler inherits its parent's shutdown signal but not its membership: it has the run's
+    # lifetime, so the lifespan's bounded join has no business waiting for it, while the fence in
+    # _resume_after_confirmed_teardown must still see the generation that spawned it stop.
+    owner = current_group()
+
     with _ATTACH_RECONCILING_LOCK:
         if run_id in _ATTACH_RECONCILING:
             return False
         _ATTACH_RECONCILING.add(run_id)
 
     def run() -> None:
+        adopt_group(owner)
         try:
             _reconcile_attached_remote(
                 run_id,

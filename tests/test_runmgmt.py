@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 
@@ -2978,23 +2979,22 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
     monkeypatch.setattr(runtime, "get_status", get_status)
     started = []
 
-    class Thread:
-        def __init__(self, *, target, args, daemon):
-            started.append((target, args, daemon))
-
-        def start(self):
-            return None
-
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    # intercept the dispatch seam rather than threading.Thread: what this test cares about is which
+    # work recovery handed to the background, not how the owner constructs its threads.
+    monkeypatch.setattr(
+        runtime,
+        "_start_recovery_thread",
+        lambda target, *args: started.append((target, args)),
+    )
 
     runtime.recover_runs()
 
     # recover_runs also backgrounds a _drain_cleanup_remotes_bg thread per known run (see
     # recover_runs) so a slow/outage-hit provider teardown can't block the startup path; check
     # for the resubmit-loop thread specifically rather than asserting the full thread list.
-    assert (runtime._deferred_resubmit_loop, (spec,), True) in started
+    assert (runtime._deferred_resubmit_loop, (spec,)) in started
     drain_calls = [
-        args for target, args, _daemon in started if target.__name__ == "_drain_cleanup_remotes_bg"
+        args for target, args in started if target.__name__ == "_drain_cleanup_remotes_bg"
     ]
     assert drain_calls == [(spec.run_id,)]
 
@@ -3048,15 +3048,10 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_model_was_removed(
     # recover_runs imports attach_run from flash.runner inside the function, so patch it there.
     monkeypatch.setattr(runner_attach, "attach_run", lambda rid: attached.append(rid))
 
-    class Thread:
-        def __init__(self, *, target, args=(), daemon=False):
-            self._target, self._args = target, args
-
-        def start(self):
-            # only the cleanup drain is backgrounded here; attach_run must never be dispatched.
-            self._target(*self._args)
-
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    # run the backgrounded work inline: only the cleanup drain is dispatched here, and attach_run
+    # must never be. patch the dispatch seam rather than threading.Thread so the recovery owner's
+    # own bookkeeping is left alone.
+    monkeypatch.setattr(runtime, "_start_recovery_thread", lambda target, *args: target(*args))
 
     runtime.recover_runs()
 
@@ -3107,14 +3102,7 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
         lambda raw_spec, run_id: terminated.append((raw_spec["model"], run_id)),
     )
 
-    class Thread:
-        def __init__(self, *, target, args=(), daemon=False):
-            self._target, self._args = target, args
-
-        def start(self):
-            self._target(*self._args)
-
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    monkeypatch.setattr(runtime, "_start_recovery_thread", lambda target, *args: target(*args))
 
     runtime.recover_runs()
 
@@ -3159,14 +3147,7 @@ def test_recover_runs_reattaches_confirmed_teardown_marker(monkeypatch, tmp_path
         lambda *_args, **_kwargs: pytest.fail("confirmed teardown was resubmitted handleless"),
     )
 
-    class Thread:
-        def __init__(self, *, target, args=(), daemon=False):
-            self._target, self._args = target, args
-
-        def start(self):
-            self._target(*self._args)
-
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    monkeypatch.setattr(runtime, "_start_recovery_thread", lambda target, *args: target(*args))
 
     runtime.recover_runs()
 
@@ -3228,16 +3209,9 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
     # thread is real in production; here the fake below would stand in for it and never run.
     monkeypatch.setattr(runner_reporting, "_report_status", lambda status: None)
 
-    class Thread:
-        def __init__(self, *, target, args=(), daemon=False):
-            self._target, self._args = target, args
-
-        def start(self):
-            self._target(*self._args)
-
-    # patch the ATTRIBUTE recover_runs reads, not threading.Thread globally: the module-wide patch
-    # also replaced the status reporter's own worker thread, so nothing serviced its queue.
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    # patch the dispatch seam, not threading.Thread globally: the module-wide patch also replaced
+    # the status reporter's own worker thread, so nothing serviced its queue.
+    monkeypatch.setattr(runtime, "_start_recovery_thread", lambda target, *args: target(*args))
 
     runtime.recover_runs()
 
@@ -3273,7 +3247,7 @@ def test_deferred_handleless_loop_resubmits_when_clear_before_deadline(monkeypat
     monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: next(checks))
     monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 1000.0)
     monkeypatch.setattr(time_mod, "time", lambda: 100.0)
-    monkeypatch.setattr(time_mod, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(runtime, "_recovery_wait", lambda _seconds: None)
     started = []
     monkeypatch.setattr(
         runtime,
@@ -3327,7 +3301,7 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
         clock["now"] += seconds
 
     monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", record_failure)
-    monkeypatch.setattr(time_mod, "sleep", advance)
+    monkeypatch.setattr(runtime, "_recovery_wait", advance)
 
     runtime._deferred_resubmit_loop(spec)
 
@@ -3351,7 +3325,7 @@ def test_deferred_handleless_loop_reconciles_after_resubmit_cas_loss(monkeypatch
     monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 1000.0)
     monkeypatch.setattr(time_mod, "time", lambda: 100.0)
     sleeps = []
-    monkeypatch.setattr(time_mod, "sleep", sleeps.append)
+    monkeypatch.setattr(runtime, "_recovery_wait", sleeps.append)
     attempts = []
 
     def start_resubmit(*args, **kwargs):
@@ -3394,7 +3368,7 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
     )
     monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: 100.0)
     monkeypatch.setattr(time_mod, "time", lambda: 101.0)
-    monkeypatch.setattr(time_mod, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(runtime, "_recovery_wait", lambda _seconds: None)
     monkeypatch.setattr(runtime, "_handleless_completed_metrics", lambda *a, **k: None)
     real_fail = runner_reconciliation._compare_and_fail_remote
     attempts = []
@@ -3490,8 +3464,8 @@ def test_deferred_handleless_legacy_run_without_attempt_metadata_fails_at_deadli
 
     monkeypatch.setattr(time_mod, "time", lambda: 86501.0)
     monkeypatch.setattr(
-        time_mod,
-        "sleep",
+        runtime,
+        "_recovery_wait",
         lambda _seconds: pytest.fail("legacy recovery must converge without retrying"),
     )
 
@@ -3699,3 +3673,403 @@ def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     with pytest.raises(runner_errors._RunCancelled):
         lifecycle._run_training(spec, None, prior_cost=0.0, source_snapshot=_SOURCE_SNAPSHOT)
     assert submitted == []  # never charged a GPU for an already-terminal run
+
+
+@pytest.fixture
+def recovery_generation():
+    """Arm a fresh recovery generation per test and drain it afterwards.
+
+    A generation is an object, so a test gets a clean one by opening a lifespan rather than by
+    reaching into module globals: leaving a stopped generation behind cannot poison the next test,
+    because the next _open_recovery_threads builds a new one.
+    """
+    import flash.server.platform.runtime as runtime
+
+    runtime._open_recovery_threads()
+    group = runtime._recovery()
+    try:
+        yield group
+    finally:
+        group.close()
+        group.wait(5.0)
+        runtime._open_recovery_threads()
+
+
+def test_recovery_stop_refuses_new_threads_and_attaches(recovery_generation):
+    # shutdown began before recovery got to dispatch: neither a recovery-owned loop nor a
+    # supervision attach may start, because nothing would ever join them afterwards.
+    import flash.server.platform.runtime as runtime
+
+    runtime._stop_recovery_threads()
+    runtime._start_recovery_thread(lambda _run_id: pytest.fail("started after shutdown"), "run-1")
+    runtime._start_attach("run-1")
+
+    assert runtime._wait_for_recovery_threads(0.0) is True  # nothing was ever admitted
+
+
+def test_a_new_lifespan_does_not_revive_a_thread_that_outran_its_own_shutdown(
+    recovery_generation,
+):
+    # the previous generation blew its shutdown deadline and its thread is still running. arming
+    # the next lifespan must not hand that thread a cleared stop signal: it answers to the
+    # generation that started it, forever.
+    import threading
+
+    import flash.server.platform.runtime as runtime
+
+    running = threading.Event()
+    release = threading.Event()
+    observed = []
+
+    def member() -> None:
+        running.set()
+        release.wait(5.0)
+        observed.append(runtime.recovery_is_stopping())
+
+    runtime._start_recovery_thread(member)
+    assert running.wait(5.0)
+    runtime._stop_recovery_threads()
+    assert runtime._wait_for_recovery_threads(0.1) is False  # blew the deadline, still alive
+
+    runtime._open_recovery_threads()  # the next lifespan arms a fresh generation
+    assert runtime.recovery_is_stopping() is False  # ... which is open for its own work
+    release.set()
+    recovery_generation.wait(5.0)
+
+    assert observed == [True]  # the old thread still reads its own generation's stop
+
+
+def test_start_resubmit_refuses_before_touching_durable_state(monkeypatch, recovery_generation):
+    # the fence sits above _compare_and_prepare_resubmit's CAS to provisioning: a refusal after
+    # that point would strand the run durably marked provisioning with no worker behind it.
+    import flash.server.platform.runtime as runtime
+
+    def unreachable(*_args, **_kwargs):
+        raise AssertionError("recovery read or wrote durable state after shutdown began")
+
+    monkeypatch.setattr(runtime, "get_status", unreachable)
+    monkeypatch.setattr(runtime, "_fail_blocked_recovery", unreachable)
+    monkeypatch.setattr(runtime, "_recovery_block_reason", unreachable)
+
+    runtime._stop_recovery_threads()
+    assert runtime._start_resubmit(object(), expected_remote=None) is False
+
+
+def test_shutdown_between_the_resubmit_fence_and_the_claim_leaves_the_run_untouched(
+    monkeypatch, recovery_generation
+):
+    # the interesting race is not "stopped before the call": it is shutdown landing after the
+    # fence passed, while the resubmit is still deciding. the claim and the launch are one
+    # admission, so shutdown either misses both or is refused before the CAS writes provisioning.
+    import threading
+    import types
+
+    import flash.runner.accounting.reconciliation as reconciliation
+    import flash.runner.lifecycle.status as lifecycle_status
+    import flash.server.platform.runtime as runtime
+
+    at_the_gate = threading.Event()
+    shutdown_done = threading.Event()
+    spec = types.SimpleNamespace(run_id="race-claim", algorithm="sft")
+
+    def block_until_shutdown(_status, **_kwargs):
+        at_the_gate.set()
+        assert shutdown_done.wait(5.0)  # shutdown fully lands while the resubmit is mid-flight
+        return {}
+
+    monkeypatch.setattr(runtime, "get_status", lambda _run_id: object())
+    monkeypatch.setattr(lifecycle_status, "source_snapshot_from_status", block_until_shutdown)
+    monkeypatch.setattr(runtime, "_recovery_block_reason", lambda _spec: None)
+    monkeypatch.setattr(
+        reconciliation,
+        "_compare_and_prepare_resubmit",
+        lambda *_a, **_k: pytest.fail("claimed the run after shutdown began"),
+    )
+
+    result = []
+    caller = threading.Thread(
+        target=lambda: result.append(
+            runtime._start_resubmit(spec, expected_remote=None, expected_state="provisioning")
+        ),
+        daemon=True,
+    )
+    caller.start()
+    assert at_the_gate.wait(5.0)
+    runtime._stop_recovery_threads()
+    shutdown_done.set()
+    caller.join(5.0)
+
+    assert result == [False]
+
+
+def test_resubmit_never_launches_after_its_generation_stop_signal(monkeypatch, recovery_generation):
+    import threading
+    import types
+
+    import flash.runner.accounting.reconciliation as reconciliation
+    import flash.runner.lifecycle.status as lifecycle_status
+    import flash.server.platform.runtime as runtime
+
+    class TrackingLock:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.close_thread = None
+            self.close_waiting = threading.Event()
+
+        def __enter__(self):
+            if threading.current_thread() is self.close_thread:
+                self.close_waiting.set()
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.lock.release()
+
+    tracking_lock = TrackingLock()
+    monkeypatch.setattr(recovery_generation, "_lock", tracking_lock)
+    claim_entered = threading.Event()
+    release_claim = threading.Event()
+    launch_stop_states = []
+    spec = types.SimpleNamespace(run_id="race-launch", algorithm="sft")
+
+    monkeypatch.setattr(runtime, "get_status", lambda _run_id: object())
+    monkeypatch.setattr(lifecycle_status, "source_snapshot_from_status", lambda *_a, **_k: {})
+    monkeypatch.setattr(runtime, "_recovery_block_reason", lambda _spec: None)
+
+    def claim(*_args, **_kwargs):
+        claim_entered.set()
+        assert release_claim.wait(5.0)
+        return True
+
+    monkeypatch.setattr(reconciliation, "_compare_and_prepare_resubmit", claim)
+    monkeypatch.setattr(
+        recovery_generation,
+        "_start_locked",
+        lambda _target, _args: launch_stop_states.append(recovery_generation.stopped.is_set()),
+    )
+
+    result = []
+    caller = threading.Thread(
+        target=lambda: result.append(runtime._start_resubmit(spec, expected_remote=None)),
+        daemon=True,
+    )
+    caller.start()
+    assert claim_entered.wait(5.0)
+
+    shutdown = threading.Thread(target=runtime._stop_recovery_threads, daemon=True)
+    tracking_lock.close_thread = shutdown
+    shutdown.start()
+    assert tracking_lock.close_waiting.wait(5.0)
+    release_claim.set()
+    caller.join(5.0)
+    shutdown.join(5.0)
+    assert not caller.is_alive()
+    assert not shutdown.is_alive()
+
+    assert result == [True]
+    assert launch_stop_states == [False]
+
+
+def test_resubmit_admission_does_not_wait_for_status_delivery(
+    monkeypatch, tmp_path, recovery_generation
+):
+    import threading
+
+    import flash.runner.supervise.lifecycle as supervise_lifecycle
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="report-wait", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    status = provisioned_status(spec, state="provisioning")
+    status.source_snapshot = _SOURCE_SNAPSHOT
+    runner_state._save_status(status)
+    monkeypatch.setattr(runtime, "_recovery_block_reason", lambda _spec: None)
+    monkeypatch.setattr(supervise_lifecycle, "_run_job_background", lambda _spec: None)
+
+    synchronous_report_entered = threading.Event()
+    release_synchronous_report = threading.Event()
+    asynchronous_reports = []
+
+    def blocking_report(_status):
+        synchronous_report_entered.set()
+        assert release_synchronous_report.wait(5.0)
+
+    monkeypatch.setattr(runner_reporting, "_report_status", blocking_report)
+    monkeypatch.setattr(
+        runner_reporting,
+        "_report_status_async",
+        lambda report: asynchronous_reports.append(report.run_id),
+    )
+
+    result = []
+    caller = threading.Thread(
+        target=lambda: result.append(
+            runtime._start_resubmit(
+                spec,
+                expected_remote=None,
+                expected_state="provisioning",
+            )
+        ),
+        daemon=True,
+    )
+    caller.start()
+
+    shutdown_done = threading.Event()
+
+    def stop_recovery():
+        runtime._stop_recovery_threads()
+        shutdown_done.set()
+
+    shutdown = threading.Thread(target=stop_recovery, daemon=True)
+    report_blocked = synchronous_report_entered.wait(0.2)
+    shutdown.start()
+    shutdown_blocked = not shutdown_done.wait(1.0)
+    release_synchronous_report.set()
+    caller.join(5.0)
+    shutdown.join(5.0)
+
+    assert not report_blocked
+    assert not shutdown_blocked
+    assert result == [True]
+    assert asynchronous_reports == [spec.run_id]
+    assert recovery_generation.wait(5.0)
+
+
+def test_attach_refuses_to_buy_a_replacement_worker_after_shutdown(monkeypatch):
+    # supervision has the run's lifetime, so this thread can reach the replacement decision long
+    # after the plane began unwinding. the captured remote stays captured for the next startup.
+    import flash.runner.lifecycle.status as lifecycle_status
+    import flash.runner.supervise.attach as attach
+    import flash.runner.supervise.lifecycle as supervise_lifecycle
+    import flash.server.platform.runtime as runtime
+
+    monkeypatch.setattr(runtime, "recovery_is_stopping", lambda: True)
+    monkeypatch.setattr(lifecycle_status, "get_status", lambda _run_id: "status-sentinel")
+    monkeypatch.setattr(
+        supervise_lifecycle,
+        "_run_training",
+        lambda *_a, **_k: pytest.fail("allocated a replacement worker after shutdown began"),
+    )
+
+    resumed = attach._resume_after_confirmed_teardown(
+        "run-1",
+        object(),
+        {"provider": "runpod"},
+        2,
+        None,
+        io.StringIO(),
+        failure="worker vanished",
+    )
+
+    assert resumed == "status-sentinel"
+
+
+def test_attach_rechecks_shutdown_after_staging_before_clearing_the_remote(monkeypatch):
+    # environment staging blocks for minutes, so shutdown can begin after the fence at the top of
+    # the resume and before the clear that commits the run to a replacement worker. clearing the
+    # captured remote is irreversible: the next startup would find nothing to reattach to.
+    import flash.runner.accounting.artifacts as artifacts
+    import flash.runner.accounting.reconciliation as reconciliation
+    import flash.runner.lifecycle.deadlines as deadlines
+    import flash.runner.lifecycle.status as lifecycle_status
+    import flash.runner.lifecycle.submit as submit
+    import flash.runner.supervise.attach as attach
+    import flash.runner.supervise.lifecycle as supervise_lifecycle
+    import flash.server.platform.runtime as runtime
+    import flash.snapshot.archive as archive
+
+    class _Gpu:
+        max_retries = 3
+
+    class _Spec:
+        gpu = _Gpu()
+        algorithm = "sft"
+        run_id = "run-1"
+
+    spec = _Spec()
+    stopping = iter([False, True, True, True])
+
+    monkeypatch.setattr(runtime, "recovery_is_stopping", lambda: next(stopping))
+    monkeypatch.setattr(lifecycle_status, "get_status", lambda _run_id: "status-sentinel")
+
+    class _Descriptor:
+        @staticmethod
+        def to_dict() -> dict:
+            return {}
+
+    monkeypatch.setattr(archive, "parse_descriptor", lambda _d: _Descriptor())
+    monkeypatch.setattr(deadlines, "_spec_with_remaining_wall", lambda *_a, **_k: spec)
+    monkeypatch.setattr(lifecycle_status, "reallocation_spec_from_status", lambda *_a, **_k: spec)
+    monkeypatch.setattr(deadlines, "_load_run_deadline_at", lambda _run_id: 0.0)
+    # staging is where the plane begins to unwind
+    monkeypatch.setattr(artifacts, "stage_environment_package", lambda s, **_k: s)
+    monkeypatch.setattr(submit, "_persist_effective_worker_spec", lambda _s: True)
+    monkeypatch.setattr(
+        reconciliation,
+        "_compare_and_clear_remote",
+        lambda *_a, **_k: pytest.fail("cleared the captured remote after shutdown began"),
+    )
+    monkeypatch.setattr(
+        supervise_lifecycle,
+        "_run_training",
+        lambda *_a, **_k: pytest.fail("allocated a replacement worker after shutdown began"),
+    )
+
+    resumed = attach._resume_after_confirmed_teardown(
+        "run-1",
+        spec,
+        {"provider": "runpod"},
+        2,
+        {"kind": "git"},
+        io.StringIO(),
+        failure="worker vanished",
+    )
+
+    assert resumed == "status-sentinel"
+
+
+def test_wait_for_recovery_threads_reports_a_thread_still_running_at_the_deadline(
+    recovery_generation,
+):
+    # the lifespan join is bounded: a recovery thread that ignores the stop must be reported, not
+    # waited on forever, so shutdown still completes inside its deadline.
+    import threading
+
+    import flash.server.platform.runtime as runtime
+
+    release = threading.Event()
+    try:
+        runtime._start_recovery_thread(release.wait)
+        assert runtime._wait_for_recovery_threads(0.2) is False
+        release.set()
+        assert runtime._wait_for_recovery_threads(5.0) is True
+    finally:
+        release.set()
+
+
+def test_the_join_waits_for_a_members_work_rather_than_for_it_to_look_alive():
+    # the join must observe membership, not liveness. a member discards itself only after its
+    # target returns, so a successful join is proof the work finished -- where an is_alive() filter
+    # would declare the group drained for any thread not currently scheduled.
+    import threading
+
+    from flash.server.platform.threadgroup import OwnedThreadGroup
+
+    group = OwnedThreadGroup()
+    release = threading.Event()
+    finished = []
+
+    def member() -> None:
+        release.wait(5.0)
+        finished.append("done")
+
+    try:
+        assert group.start(member) is True
+        assert group.wait(0.05) is False  # still owned: its work has not returned
+        release.set()
+        assert group.wait(5.0) is True
+    finally:
+        release.set()
+
+    assert finished == ["done"]

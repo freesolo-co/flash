@@ -16,6 +16,7 @@ from flash.core.spec import JobSpec
 from flash.runner.lifecycle.state import adapter_prefix, runs_file_path
 from flash.runner.lifecycle.status import get_status
 from flash.server.platform import db
+from flash.server.platform.threadgroup import OwnedThreadGroup, current_group
 
 _log = logging.getLogger("flash.server")
 
@@ -149,6 +150,88 @@ def _append_run_log(run_id: str, message: str) -> None:
 # by the run wall deadline; after it passes, terminal persistence keeps retrying until durably confirmed.
 _DEFERRED_RECOVERY_RETRY_S = 120.0
 
+# Restart recovery belongs to the ASGI lifespan: it is started by ``recover_runs`` and must stop
+# when the lifespan does. Without an owner, a deferred-resubmit loop can allocate a fresh paid
+# worker minutes after the plane began shutting down, and nothing ever observes the thread again.
+# Each lifespan gets its own group rather than re-arming a shared registry, so a thread that
+# outlived its generation's shutdown deadline keeps observing that generation's stop signal.
+_RECOVERY_GENERATION_LOCK = threading.Lock()
+_RECOVERY = OwnedThreadGroup()
+
+
+def _recovery() -> OwnedThreadGroup:
+    """The recovery generation owned by the current lifespan."""
+    with _RECOVERY_GENERATION_LOCK:
+        return _RECOVERY
+
+
+def _open_recovery_threads() -> None:
+    """Arm a fresh recovery generation. Called by ``recover_runs`` at lifespan startup."""
+    global _RECOVERY
+
+    with _RECOVERY_GENERATION_LOCK:
+        _RECOVERY = OwnedThreadGroup()
+
+
+def _stop_recovery_threads() -> None:
+    """Signal every recovery thread to unwind. No new paid work is admitted after this."""
+    _recovery().close()
+
+
+def _wait_for_recovery_threads(timeout: float) -> bool:
+    """Join the recovery threads. False when one is still registered at the deadline."""
+    return _recovery().wait(timeout)
+
+
+def _start_recovery_thread(target, *args) -> None:
+    """Start a recovery-owned background thread, unless shutdown already began.
+
+    These threads outlive ``recover_runs`` but not the lifespan: each observes the group's stop
+    signal and exits, so the shutdown join can drain them.
+    """
+    _owner().start(target, *args)
+
+
+def _start_attach(run_id: str) -> None:
+    """Dispatch supervision for a handle-backed run, unless shutdown already began.
+
+    Supervision has the run's lifetime rather than the lifespan's, so the thread is owned only
+    well enough to be refused after shutdown and joined at the deadline. What keeps it from
+    buying a replacement worker on the way out is the fence inside
+    ``_resume_after_confirmed_teardown``, not this dispatch.
+    """
+    from flash.runner.supervise.attach import attach_run
+
+    _start_recovery_thread(attach_run, run_id)
+
+
+def _owner() -> OwnedThreadGroup:
+    """The generation the calling thread answers to.
+
+    A thread started by an earlier lifespan answers for that lifespan, so one that outran its own
+    shutdown deadline reads its own stop signal rather than the next generation's cleared one.
+    Callers on the startup path belong to no generation and answer for the current one.
+    """
+    return current_group() or _recovery()
+
+
+def recovery_is_stopping() -> bool:
+    """Whether the lifespan that owns the calling thread has begun shutting down.
+
+    Read by supervision before it commits a run to a replacement attempt: that path has the
+    run's lifetime, so it can reach a paid allocation long after the plane started to unwind.
+    """
+    return _owner().stopped.is_set()
+
+
+def _recovery_wait(seconds: float) -> None:
+    """Sleep between reconciliation attempts, returning early once shutdown begins.
+
+    The retry interval is two minutes, so an uninterruptible sleep would hold the thread well
+    past the lifespan's shutdown deadline no matter how often the loop checks the stop signal.
+    """
+    _owner().sleep(seconds)
+
 
 def _confirm_run_clear(spec) -> bool:
     """Force-reap this run's label and confirm no instance remains.
@@ -280,6 +363,11 @@ def _start_resubmit(
     from flash.runner.lifecycle.status import source_snapshot_from_status
     from flash.runner.supervise.lifecycle import _run_job_background
 
+    # Fence ahead of every side effect on this path. The CAS to ``provisioning`` below and
+    # _fail_blocked_recovery's terminal write are both decisions a shutting-down plane has no
+    # business making. Refusing here leaves the run exactly as the next startup recovery finds it.
+    if recovery_is_stopping():
+        return False
     try:
         source_snapshot_from_status(get_status(spec.run_id), required=True)
     except Exception as exc:
@@ -297,18 +385,25 @@ def _start_resubmit(
         except Exception as exc:
             _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
             return False
-    if not _compare_and_prepare_resubmit(
-        spec.run_id,
-        expected_remote,
-        expected_state=expected_state,
-    ):
-        return False
-    with contextlib.suppress(Exception):
-        _append_run_log(
+    # The claim and the launch are one step. Checking the fence above and CASing here would let
+    # shutdown land in between, leaving the run durably ``provisioning`` with no worker; holding
+    # admission across both means the group cannot finish closing until this run is either
+    # untouched or claimed and registered.
+    with _owner().admit() as slot:
+        if slot is None:
+            return False
+        if not _compare_and_prepare_resubmit(
             spec.run_id,
-            "control plane restarted without a durable handle; resubmitting",
-        )
-    threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
+            expected_remote,
+            expected_state=expected_state,
+        ):
+            return False
+        with contextlib.suppress(Exception):
+            _append_run_log(
+                spec.run_id,
+                "control plane restarted without a durable handle; resubmitting",
+            )
+        slot.start(_run_job_background, spec)
     return True
 
 
@@ -346,11 +441,11 @@ def _deferred_resubmit_loop(spec) -> None:
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.supervise.lifecycle import _adopt_completed_attempt
 
-    while True:
+    while not recovery_is_stopping():
         try:
             status = get_status(spec.run_id)
         except Exception:
-            time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+            _recovery_wait(_DEFERRED_RECOVERY_RETRY_S)
             continue
         if status.state in TERMINAL_STATES or status.remote is not None:
             return
@@ -361,14 +456,14 @@ def _deferred_resubmit_loop(spec) -> None:
                 if _compare_and_fail_remote(spec.run_id, None, str(exc)):
                     return
             except Exception:
-                time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                _recovery_wait(_DEFERRED_RECOVERY_RETRY_S)
                 continue
             return
         if time.time() >= deadline_at:
             try:
                 metrics = _handleless_completed_metrics(spec, status, deadline_at)
             except Exception:
-                time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                _recovery_wait(_DEFERRED_RECOVERY_RETRY_S)
                 continue
             if metrics is not None:
                 try:
@@ -380,7 +475,7 @@ def _deferred_resubmit_loop(spec) -> None:
                         log=None,
                     )
                 except Exception:
-                    time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                    _recovery_wait(_DEFERRED_RECOVERY_RETRY_S)
                     continue
                 return
             reason = "run wall deadline exhausted while provider teardown remained unconfirmed"
@@ -390,7 +485,7 @@ def _deferred_resubmit_loop(spec) -> None:
                         _append_run_log(spec.run_id, reason)
                     return
             except Exception:
-                time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                _recovery_wait(_DEFERRED_RECOVERY_RETRY_S)
                 continue
             return
         try:
@@ -405,7 +500,7 @@ def _deferred_resubmit_loop(spec) -> None:
                     expected_state=status.state,
                 )
             except Exception:
-                time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                _recovery_wait(_DEFERRED_RECOVERY_RETRY_S)
                 continue
             if started:
                 return
@@ -415,12 +510,10 @@ def _deferred_resubmit_loop(spec) -> None:
             except Exception:
                 pass
             delay = min(_DEFERRED_RECOVERY_RETRY_S, max(0.0, deadline_at - time.time()))
-            if delay > 0:
-                time.sleep(delay)
+            _recovery_wait(delay)
             continue
         delay = min(_DEFERRED_RECOVERY_RETRY_S, max(0.0, deadline_at - time.time()))
-        if delay > 0:
-            time.sleep(delay)
+        _recovery_wait(delay)
 
 
 def _latest_worker_artifact_name(repo: str, prefix: str, phase: str, kind: str) -> str:
@@ -584,6 +677,7 @@ def recover_runs() -> None:
     # attempt is reaped without racing the resubmit's fresh allocation.
     resubmit: list[tuple[JobSpec, str]] = []
 
+    _open_recovery_threads()
     _classify_recoverable_runs(active, known, resubmit)
     _sweep_provider_orphans(active, known)
     _resubmit_recovered_runs(resubmit)
@@ -612,7 +706,6 @@ def _classify_recoverable_runs(
         get_status,
         reallocation_spec_from_status,
     )
-    from flash.runner.supervise.attach import attach_run
     from flash.runner.supervise.recovery import _gc_run_endpoints
 
     for row in db.all_runs():
@@ -624,14 +717,12 @@ def _classify_recoverable_runs(
         # drain cleanup remotes in the background. provider outages can block each teardown through
         # retry/backoff; serial startup cleanup can exceed HEALTHCHECK grace and create a restart loop.
         # recovery below does not depend on completion.
-        threading.Thread(
-            target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
-        ).start()
+        _start_recovery_thread(_drain_cleanup_remotes_bg, status.run_id)
         if status.state not in _RECOVERABLE:
             continue
         if status.remote is None and status.cleanup_confirmed_remote is not None:
             active.add(status.run_id)
-            threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
+            _start_attach(row["run_id"])
             continue
         if status.remote:
             # A spec this build can no longer parse cannot be reattached either: attach_run parses
@@ -665,14 +756,12 @@ def _classify_recoverable_runs(
                 # exists. A double teardown of one handle is safe: `_strict_teardown_handle` is
                 # idempotent and the record is removed by compare-and-remove only on a confirmed
                 # delete.
-                threading.Thread(
-                    target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
-                ).start()
+                _start_recovery_thread(_drain_cleanup_remotes_bg, status.run_id)
                 continue
             # Only handle-backed runs are kept by the sweep; a handle-less run is being
             # resubmitted, so its stale half-rented instance (if any) must NOT be shielded.
             active.add(status.run_id)
-            threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
+            _start_attach(row["run_id"])
         else:
             # No durable handle exists, but a worker may still exist if a non-idempotent create was
             # accepted while its response or handle was lost. A spec that won't parse can never be
@@ -758,11 +847,7 @@ def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
                 except Exception:
                     current = None
                 if current is None or (current.state in _RECOVERABLE and current.remote is None):
-                    threading.Thread(
-                        target=_deferred_resubmit_loop,
-                        args=(spec,),
-                        daemon=True,
-                    ).start()
+                    _start_recovery_thread(_deferred_resubmit_loop, spec)
             continue
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         # MtzrJ: a handle-less run hit the submit->provisioning window, so a NON-IDEMPOTENT instance
@@ -786,7 +871,7 @@ def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
             except Exception:
                 current = None
             if current is None or (current.state in _RECOVERABLE and current.remote is None):
-                threading.Thread(target=_deferred_resubmit_loop, args=(spec,), daemon=True).start()
+                _start_recovery_thread(_deferred_resubmit_loop, spec)
             continue
         # Teardown/listing could not be confirmed (a possibly-live box). DON'T race it: defer with
         # observation bounded by the run wall deadline, then durably persist terminal success or failure.
@@ -800,4 +885,4 @@ def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
                 "control plane restart: instance teardown unconfirmed; "
                 "deferring resubmit for reconciliation",
             )
-        threading.Thread(target=_deferred_resubmit_loop, args=(spec,), daemon=True).start()
+        _start_recovery_thread(_deferred_resubmit_loop, spec)
