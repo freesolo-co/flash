@@ -443,3 +443,95 @@ def test_lambda_sweep_reports_a_halted_listing_as_halted(monkeypatch):
 
     assert out.outcome is CleanupOutcome.RETRYABLE
     assert out.halted  # before the fix: halted=False, a shutdown misread as a provider blip
+
+
+def test_vast_destroy_forwards_the_stop_into_its_absence_confirmation(monkeypatch):
+    """When the DELETE itself fails, absence is confirmed by a second lookup that allows two 30s
+    attempts plus a backoff. Without the stop reaching that lookup, every shutdown racing a destroy
+    waits out the extra minute on the joined sweep thread -- once per instance still in the sweep.
+
+    It also pins the ORDER: a lookup that ran to completion and found the instance gone is
+    authoritative even when the stop lands immediately afterwards. Reading the halt first would
+    throw away real deletion evidence and leave a confirmed-gone instance recorded as unconfirmed.
+    """
+    from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
+    from flash.providers.vast.client import api as vast_api
+
+    stopping = False
+    lookup_stops: list[object] = []
+
+    def fake_req(path, method="GET", body=None, retries=4, base_delay=2.0, deadline_at=None, **kw):
+        nonlocal stopping
+        if method == "DELETE":
+            raise vast_api.VastApiError("destroy blipped")
+        # the absence lookup: its retry loop polls the stop, which the lifespan raises mid-call
+        lookup_stops.append(kw.get("should_stop"))
+        stopping = True
+        return {"success": True, "instances": None}
+
+    monkeypatch.setattr(vast_api, "request_with_retries", fake_req)
+
+    out = vast_api._destroy_instance_outcome(7, should_stop=lambda: stopping)
+
+    assert len(lookup_stops) == 1
+    assert lookup_stops[0] is not None  # before the fix: None, so the lookup ran unstoppable
+    assert stopping  # the stop really is set by the time the outcome is decided
+    assert out is DestructiveOperationOutcome.DELETED
+
+
+def test_vast_destroy_reports_a_stop_cut_absence_lookup_as_halted(monkeypatch):
+    """The converse: a lookup the stop cut short produced no absence evidence at all. Calling that
+    NOT_CONFIRMED would file a fabricated provider fault for an instance nothing is actually wrong
+    with, on every shutdown that lands mid-destroy.
+
+    The stop must land in the LOOKUP, not the DELETE. A stop the DELETE itself saw is caught by the
+    earlier halt check, so a fake that stops during both would leave this branch untested.
+    """
+    from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
+    from flash.providers.vast.client import api as vast_api
+
+    stopping = False
+
+    def fake_req(path, method="GET", body=None, retries=4, base_delay=2.0, deadline_at=None, **kw):
+        nonlocal stopping
+        if method == "DELETE":
+            # a plain transport blip: the stop is not raised yet, so the destroy is not a halt
+            raise vast_api.VastApiError("destroy blipped")
+        stop = kw.get("should_stop")
+        assert stop is not None
+        stopping = True
+        stop()  # the transport polls the stop and gives up on this attempt
+        raise vast_api.VastApiError("aborted by stop")
+
+    monkeypatch.setattr(vast_api, "request_with_retries", fake_req)
+
+    out = vast_api._destroy_instance_outcome(7, should_stop=lambda: stopping)
+
+    assert stopping, (
+        "the absence lookup must run; a stop seen by the DELETE proves a different branch"
+    )
+    assert out is DestructiveOperationOutcome.HALTED
+
+
+def test_vast_destroy_stopped_during_the_delete_does_not_open_a_second_lookup(monkeypatch):
+    """The other halt branch. When the DELETE itself observed the stop, the absence lookup is
+    already known to be pointless: it would spend two more 30s attempts to answer a question the
+    caller has stopped caring about, on the joined sweep thread that shutdown is waiting for."""
+    from flash.providers._lifecycle.net.destructive import DestructiveOperationOutcome
+    from flash.providers.vast.client import api as vast_api
+
+    methods: list[str] = []
+
+    def fake_req(path, method="GET", body=None, retries=4, base_delay=2.0, deadline_at=None, **kw):
+        methods.append(method)
+        stop = kw.get("should_stop")
+        assert stop is not None
+        stop()  # the destroy's own retry loop polls the stop and gives up
+        raise vast_api.VastApiError("aborted by stop")
+
+    monkeypatch.setattr(vast_api, "request_with_retries", fake_req)
+
+    out = vast_api._destroy_instance_outcome(7, should_stop=lambda: True)
+
+    assert methods == ["DELETE"]  # before the fix: a second, pointless GET lookup
+    assert out is DestructiveOperationOutcome.HALTED

@@ -195,7 +195,7 @@ def test_sweep_rejects_malformed_selected_endpoint_ids_before_provider_calls(mon
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"fpA": [endpoint]}, []),
+        lambda **_kwargs: ({"fpA": [endpoint]}, []),
     )
     provider_calls = []
     monkeypatch.setattr(
@@ -227,7 +227,7 @@ def test_sweep_rejects_malformed_selected_owner_before_provider_calls(monkeypatc
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({" fpA": [endpoint]}, []),
+        lambda **_kwargs: ({" fpA": [endpoint]}, []),
     )
     provider_calls = []
     monkeypatch.setattr(
@@ -258,7 +258,7 @@ def test_sweep_rejects_endpoint_id_with_ambiguous_owner_before_provider_calls(mo
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"fpA": [endpoint], "fpB": [endpoint]}, []),
+        lambda **_kwargs: ({"fpA": [endpoint], "fpB": [endpoint]}, []),
     )
     provider_calls = []
     monkeypatch.setattr(
@@ -289,7 +289,7 @@ def test_sweep_mixed_valid_and_malformed_owners_blocks_provider_calls(monkeypatc
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"fp-valid": [endpoint], " fp-malformed": [endpoint]}, []),
+        lambda **_kwargs: ({"fp-valid": [endpoint], " fp-malformed": [endpoint]}, []),
     )
     provider_calls = []
     monkeypatch.setattr(
@@ -335,7 +335,7 @@ def test_sweep_rejects_malformed_cleanup_health_counters(monkeypatch, group, fie
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"fpA": [endpoint]}, []),
+        lambda **_kwargs: ({"fpA": [endpoint]}, []),
     )
     monkeypatch.setattr(
         runpod_resources.runpod_api,
@@ -370,7 +370,7 @@ def test_sweep_rejects_incomplete_cleanup_health(monkeypatch):
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"fpA": [endpoint]}, []),
+        lambda **_kwargs: ({"fpA": [endpoint]}, []),
     )
     monkeypatch.setattr(
         runpod_resources.runpod_api,
@@ -402,7 +402,7 @@ def test_sweep_deduplicates_inventory_before_health_and_delete(monkeypatch):
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"fpA": [endpoint, dict(endpoint), endpoint]}, []),
+        lambda **_kwargs: ({"fpA": [endpoint, dict(endpoint), endpoint]}, []),
     )
     health_calls = []
     monkeypatch.setattr(
@@ -447,7 +447,9 @@ def test_sweep_reaps_responsive_account_when_one_pool_key_fails(monkeypatch):
     # fpA failed to list; fpB returned the orphan. (Accounts are identified by non-secret
     # fingerprints, never the raw key.)
     monkeypatch.setattr(
-        runpod_resources.runpod_api, "list_endpoints_by_key", lambda: ({"fpB": [orphan]}, ["fpA"])
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda **_kwargs: ({"fpB": [orphan]}, ["fpA"]),
     )
     health_calls = []
 
@@ -483,7 +485,9 @@ def test_sweep_skips_endpoints_outside_known_scope(monkeypatch):
     mine = {"id": "ep-mine", "name": "live-flash-mine-idle"}
     theirs = {"id": "ep-theirs", "name": "live-flash-theirs-idle"}
     monkeypatch.setattr(
-        runpod_resources.runpod_api, "list_endpoints_by_key", lambda: ({"fpA": [mine, theirs]}, [])
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda **_kwargs: ({"fpA": [mine, theirs]}, []),
     )
     monkeypatch.setattr(
         runpod_resources.runpod_api,
@@ -516,7 +520,9 @@ def test_sweep_preserves_grace_for_unlisted_account(monkeypatch):
     )  # orphan on account A, observed idle long ago
     # This cycle account A fails to list; account B responds with nothing.
     monkeypatch.setattr(
-        runpod_resources.runpod_api, "list_endpoints_by_key", lambda: ({"fpB": []}, ["fpA"])
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda **_kwargs: ({"fpB": []}, ["fpA"]),
     )
     monkeypatch.setattr(
         runpod_resources.runpod_api,
@@ -553,7 +559,9 @@ def test_sweep_partial_view_prunes_vanished_timer_for_responsive_account(monkeyp
     )  # owned by account A, which fails this cycle
     # B responds (no longer lists gone-b); A fails.
     monkeypatch.setattr(
-        runpod_resources.runpod_api, "list_endpoints_by_key", lambda: ({"fpB": []}, ["fpA"])
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda **_kwargs: ({"fpB": []}, ["fpA"]),
     )
     monkeypatch.setattr(runpod_resources.logger, "warning", lambda *a, **k: None)
 
@@ -575,7 +583,7 @@ def test_sweep_full_view_prunes_vanished_grace_timer(monkeypatch):
     runpod_resources._idle_since.clear()
     runpod_resources._idle_since["ghost"] = (1.0, "fpA")  # endpoint that has since vanished
     monkeypatch.setattr(
-        runpod_resources.runpod_api, "list_endpoints_by_key", lambda: ({"fpA": []}, [])
+        runpod_resources.runpod_api, "list_endpoints_by_key", lambda **_kwargs: ({"fpA": []}, [])
     )
     monkeypatch.setattr(runpod_resources.logger, "warning", lambda *a, **k: None)
 
@@ -593,7 +601,7 @@ def test_sweep_halts_between_deletes_on_stop_signal(monkeypatch):
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"fpA": endpoints}, []),
+        lambda **_kwargs: ({"fpA": endpoints}, []),
     )
     monkeypatch.setattr(
         runpod_resources.runpod_api,
@@ -637,7 +645,7 @@ def test_runpod_stop_during_delete_retry_prevents_second_request(monkeypatch):
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"fpA": [{"name": "live-flash-ep1", "id": "ep-1"}]}, []),
+        lambda **_kwargs: ({"fpA": [{"name": "live-flash-ep1", "id": "ep-1"}]}, []),
     )
     monkeypatch.setattr(
         runpod_resources.runpod_api,
@@ -678,7 +686,7 @@ def test_delete_failure_is_not_reclassified_by_a_later_stop_signal(monkeypatch):
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"fpA": [{"name": "live-flash-ep1", "id": "ep-1"}]}, []),
+        lambda **_kwargs: ({"fpA": [{"name": "live-flash-ep1", "id": "ep-1"}]}, []),
     )
     monkeypatch.setattr(
         runpod_resources.runpod_api,
@@ -721,7 +729,7 @@ def test_stop_during_the_health_lookup_prevents_the_delete_that_follows(monkeypa
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"fpA": [{"name": "live-flash-ep1", "id": "ep-1"}]}, []),
+        lambda **_kwargs: ({"fpA": [{"name": "live-flash-ep1", "id": "ep-1"}]}, []),
     )
     stopping = []
 
@@ -763,7 +771,7 @@ def test_a_halted_sweep_is_distinguishable_from_a_complete_one(monkeypatch):
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"fpA": endpoints}, []),
+        lambda **_kwargs: ({"fpA": endpoints}, []),
     )
     monkeypatch.setattr(
         runpod_resources.runpod_api,
@@ -806,7 +814,7 @@ def test_halted_sweep_preserves_grace_for_endpoints_it_never_visited(monkeypatch
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"fpA": endpoints}, []),
+        lambda **_kwargs: ({"fpA": endpoints}, []),
     )
     monkeypatch.setattr(
         runpod_resources.runpod_api,
@@ -831,3 +839,96 @@ def test_halted_sweep_preserves_grace_for_endpoints_it_never_visited(monkeypatch
     # unvisited endpoints keep their accrued grace; a naive prune would have dropped both
     assert runpod_resources._idle_since.get("ep-2") == (1.0, "fpA")
     assert runpod_resources._idle_since.get("ep-3") == (1.0, "fpA")
+
+
+def test_a_stop_raised_inside_the_inventory_listing_is_a_halt_not_a_dead_pool(monkeypatch):
+    """The listing's own retries allow three 30s attempts per pool key. When the stop reaches the
+    transport the call raises, and reading that raise as ``inventory_unavailable`` would blame a
+    perfectly healthy pool for a shutdown the server itself requested -- and would keep the reaper
+    logging a provider warning on every clean stop."""
+    runpod_resources._idle_since.clear()
+
+    def fake_list(**kwargs):
+        stop = kwargs.get("should_stop")
+        assert stop is not None
+        stop()  # the lifespan's stop lands while the listing's retries are in flight
+        raise RuntimeError("listing ended by the stop")
+
+    monkeypatch.setattr(runpod_resources.runpod_api, "list_endpoints_by_key", fake_list)
+    monkeypatch.setattr(runpod_resources.logger, "info", lambda *a, **k: None)
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(), min_idle_s=0.0, known=set(), should_stop=lambda: True
+    )
+
+    assert result.halted
+    assert not result.inventory_unavailable  # the pool was never observed to be unreachable
+    assert result.unresolved_count == 1
+
+
+def test_a_partial_listing_under_a_stop_is_not_a_complete_inventory(monkeypatch):
+    """``list_endpoints_by_key`` breaks its per-key waterfall on the stop, so it can RETURN
+    normally while covering only the keys it reached. Trusting that as the whole pool would report
+    a clean sweep over accounts that were never listed at all."""
+    runpod_resources._idle_since.clear()
+
+    def fake_list(**kwargs):
+        stop = kwargs.get("should_stop")
+        assert stop is not None
+        stop()  # the stop landed after key A, so keys B and C were never listed
+        return ({"fpA": []}, [])
+
+    monkeypatch.setattr(runpod_resources.runpod_api, "list_endpoints_by_key", fake_list)
+    monkeypatch.setattr(runpod_resources.logger, "info", lambda *a, **k: None)
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(), min_idle_s=0.0, known=set(), should_stop=lambda: True
+    )
+
+    assert result.halted
+    assert not result.deleted_ids
+    assert result.unresolved_count == 1
+
+
+def test_a_stop_inside_the_health_lookup_is_a_halt_not_a_provider_fault(monkeypatch):
+    """The health lookup inherits five 30s attempts plus backoffs. When the stop ends it the call
+    raises, and the generic handler would file a per-endpoint ``provider operation failed`` issue:
+    a fabricated fault record naming a healthy endpoint, on every shutdown mid-sweep."""
+    runpod_resources._idle_since.clear()
+    endpoints = [{"name": "live-flash-ep1", "id": "ep-1"}]
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda **_kwargs: ({"fpA": endpoints}, []),
+    )
+
+    # the stop must still be clear at the loop head, or the sweep breaks there and the health
+    # lookup is never reached -- which would leave the handler below completely untested.
+    stopping = False
+
+    def fake_health(*_a, **kwargs):
+        nonlocal stopping
+        stop = kwargs.get("should_stop")
+        assert stop is not None
+        stopping = True
+        stop()  # the stop lands inside the blocking lookup, which then gives up
+        raise RuntimeError("health lookup ended by the stop")
+
+    monkeypatch.setattr(runpod_resources.runpod_api, "endpoint_health_for_fingerprint", fake_health)
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "_delete_endpoint_for_fingerprint_outcome",
+        lambda *a, **k: pytest.fail("a halted health lookup must not authorize a delete"),
+    )
+    monkeypatch.setattr(runpod_resources.logger, "info", lambda *a, **k: None)
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(), min_idle_s=0.0, known={"flash-ep1"}, should_stop=lambda: stopping
+    )
+
+    assert stopping, "the health lookup must actually run; a loop-head break proves nothing here"
+
+    assert result.halted
+    # no endpoint-shaped fault is invented for an endpoint the stop simply cut short
+    assert not result.unresolved
+    assert result.unresolved_count == 1

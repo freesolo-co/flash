@@ -437,13 +437,23 @@ def _genuine_http_not_found(exc: Exception) -> bool:
     )
 
 
-def _exact_instance_absent(instance_id: int, *, deadline_at: float | None = None) -> bool:
-    """confirm absence only from the exact-instance route's documented null or 404 signal."""
+def _exact_instance_absent(
+    instance_id: int,
+    *,
+    deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> bool:
+    """confirm absence only from the exact-instance route's documented null or 404 signal.
+
+    ``should_stop`` ends the two 30s lookup attempts early. A stop cut short is not evidence of
+    absence, so the caller must read the stop rather than this return value.
+    """
     try:
         out = request_with_retries(
             f"/v0/instances/{int(instance_id)}/",
             retries=1,
             deadline_at=deadline_at,
+            should_stop=should_stop,
         )
     except Exception as exc:
         return _genuine_http_not_found(exc)
@@ -483,15 +493,29 @@ def _destroy_instance_outcome(
         cause = getattr(exc, "__cause__", None)
         if isinstance(cause, urllib.error.HTTPError) and cause.code < 500 and cause.code != 429:
             return DestructiveOperationOutcome.NOT_CONFIRMED
-        if _exact_instance_absent(instance_id, deadline_at=deadline_at):
+        # a completed lookup stays authoritative even if a stop lands right after it, so read the
+        # absence evidence first and fall back to the halt only when the lookup produced none.
+        if _exact_instance_absent(
+            instance_id,
+            deadline_at=deadline_at,
+            should_stop=None if should_stop is None else observe_stop,
+        ):
             return DestructiveOperationOutcome.DELETED
+        if halt_observed:
+            return DestructiveOperationOutcome.HALTED
         return DestructiveOperationOutcome.NOT_CONFIRMED
     if isinstance(out, dict) and out.get("success") is True:
         return DestructiveOperationOutcome.DELETED
     if isinstance(out, dict) and (out.get("success") is False or "error" in out or "detail" in out):
         return DestructiveOperationOutcome.NOT_CONFIRMED
-    if _exact_instance_absent(instance_id, deadline_at=deadline_at):
+    if _exact_instance_absent(
+        instance_id,
+        deadline_at=deadline_at,
+        should_stop=None if should_stop is None else observe_stop,
+    ):
         return DestructiveOperationOutcome.DELETED
+    if halt_observed:
+        return DestructiveOperationOutcome.HALTED
     return DestructiveOperationOutcome.NOT_CONFIRMED
 
 

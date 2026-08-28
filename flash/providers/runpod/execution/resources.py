@@ -307,11 +307,22 @@ def _reap_selected_endpoint(
     should_stop: Callable[[], bool] | None,
 ) -> _EndpointReapOutcome:
     observed_idle = False
+    # the health lookup allows five 30s attempts plus backoffs, so a shutdown that lands during it
+    # would otherwise be waited out. observe the stop the call itself saw so a failure it caused is
+    # reported as a halt rather than misclassified as a provider fault by the handler below.
+    health_halted = False
+
+    def observe_health_stop() -> bool:
+        nonlocal health_halted
+        health_halted = health_halted or (should_stop is not None and should_stop())
+        return health_halted
+
     try:
         health = runpod_api.endpoint_health_for_fingerprint(
             endpoint_id,
             owner_fingerprint,
             **deadline_kwargs(runpod_api.endpoint_health_for_fingerprint, deadline_at),
+            **({} if should_stop is None else {"should_stop": observe_health_stop}),
         )
         counts = _cleanup_health_counts(health)
         if counts is None:
@@ -369,6 +380,10 @@ def _reap_selected_endpoint(
             endpoint_id,
             exc_info=True,
         )
+        if health_halted:
+            # the stop ended the lookup; this endpoint was never visited to completion and holds no
+            # unresolved evidence of its own, so it reports the sweep-level halt instead.
+            return _EndpointReapOutcome(observed_idle=observed_idle, halted=True)
         return _EndpointReapOutcome(
             observed_idle=observed_idle,
             issue=_sweep_issue(
@@ -378,6 +393,44 @@ def _reap_selected_endpoint(
                 "provider operation failed",
             ),
         )
+
+
+def _list_selected_inventory(
+    *,
+    deadline_at: float | None,
+    should_stop: Callable[[], bool] | None,
+) -> tuple[dict, list[str]] | IdleEndpointSweepResult:
+    """List every pool account's endpoints, or the sweep result that ends the sweep instead.
+
+    Observes the stop the listing itself saw, so a failure the stop caused is reported as a halt
+    rather than as an unavailable inventory: the pool may be perfectly healthy.
+    """
+    listing_halted = False
+
+    def observe_listing_stop() -> bool:
+        nonlocal listing_halted
+        listing_halted = listing_halted or (should_stop is not None and should_stop())
+        return listing_halted
+
+    try:
+        by_fp, failed_fps = runpod_api.list_endpoints_by_key(
+            **deadline_kwargs(runpod_api.list_endpoints_by_key, deadline_at),
+            **({} if should_stop is None else {"should_stop": observe_listing_stop}),
+        )
+    except Exception:
+        if listing_halted:
+            logger.info("idle-sweep: stop requested during inventory; skipping sweep")
+            return IdleEndpointSweepResult(halted=True)
+        logger.warning(
+            "idle-sweep: could not list any RunPod pool account; skipping sweep", exc_info=True
+        )
+        return IdleEndpointSweepResult(inventory_unavailable=True)
+    if listing_halted:
+        # the listing stops at the key boundary, so a completed return can still cover only part
+        # of the pool. an unvisited account is not an empty one; report the halt, not a clean sweep.
+        logger.info("idle-sweep: stop requested during inventory; listing is incomplete")
+        return IdleEndpointSweepResult(halted=True)
+    return by_fp, failed_fps
 
 
 def _sweep_idle_flash_endpoints(
@@ -393,21 +446,18 @@ def _sweep_idle_flash_endpoints(
     The scope flags protect other planes and live runs; `min_idle_s` requires persistent idleness.
     List accounts independently so one bad key cannot block healthy cleanup.
 
-    ``should_stop`` is checked between endpoint deletions. The sweep runs in a worker thread that
-    ``task.cancel()`` cannot interrupt, so without it a large in-flight sweep keeps deleting after
-    the lifespan was told to stop.
+    ``should_stop`` is checked between endpoint deletions, and is forwarded into the inventory
+    listing so a shutdown during its retries is not waited out: each pool key allows three 30s
+    attempts plus backoffs. The sweep runs in a worker thread that ``task.cancel()`` cannot
+    interrupt, so without it a large in-flight sweep keeps deleting after the lifespan was told to
+    stop.
     """
     deleted: list[str] = []
     unresolved: list[IdleEndpointSweepIssue] = []
-    try:
-        by_fp, failed_fps = runpod_api.list_endpoints_by_key(
-            **deadline_kwargs(runpod_api.list_endpoints_by_key, deadline_at)
-        )
-    except Exception:
-        logger.warning(
-            "idle-sweep: could not list any RunPod pool account; skipping sweep", exc_info=True
-        )
-        return IdleEndpointSweepResult(inventory_unavailable=True)
+    listing = _list_selected_inventory(deadline_at=deadline_at, should_stop=should_stop)
+    if isinstance(listing, IdleEndpointSweepResult):
+        return listing
+    by_fp, failed_fps = listing
     if failed_fps:
         logger.warning(
             "idle-sweep: %d of %d RunPod pool account(s) failed to list this cycle; reaping the %d "

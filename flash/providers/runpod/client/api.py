@@ -136,12 +136,14 @@ def _list_endpoints_for_key(
     key: str,
     *,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[dict]:
     out = _CLIENT.request_with_retries_for_key(
         key,
         f"{REST_BASE}/endpoints",
         retries=2,
         deadline_at=deadline_at,
+        should_stop=should_stop,
     )
     if not isinstance(out, list):
         raise RunpodApiError(
@@ -213,12 +215,16 @@ def _confirm_deleted(endpoint_id: str, fingerprint: str) -> None:
 def list_endpoints_by_key(
     *,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, list[dict]], list[str]]:
     """Best-effort per-account endpoint listing for the idle reaper.
 
     Returns ({key_fingerprint: [endpoints]}, [failed_fingerprints]). One flaky account
     can't abort cleanup of healthy accounts (unlike list_endpoints which is all-or-nothing).
     Fingerprints are used instead of raw keys so the return value is safe to log/persist.
+
+    ``should_stop`` ends the per-key waterfall as well as each key's retries. Each key allows
+    three 30s attempts plus backoffs, so without it a shutdown waits out every configured key.
     """
     pool = _keys.keys()
     if not pool:
@@ -228,9 +234,13 @@ def list_endpoints_by_key(
     by_fingerprint: dict[str, list[dict]] = {}
     failed: list[str] = []
     for key in pool:
+        if should_stop is not None and should_stop():
+            break
         fp = key_fingerprint(key)
         try:
-            by_fingerprint[fp] = _list_endpoints_for_key(key, deadline_at=deadline_at)
+            by_fingerprint[fp] = _list_endpoints_for_key(
+                key, deadline_at=deadline_at, should_stop=should_stop
+            )
         except RunpodApiError:
             failed.append(fp)
     return by_fingerprint, failed
@@ -287,12 +297,18 @@ def endpoint_health_for_key(
     key: str,
     *,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict:
-    """Endpoint health via a specific pool key (no failover waterfall)."""
+    """Endpoint health via a specific pool key (no failover waterfall).
+
+    ``should_stop`` ends the retries early. This call inherits the client's default of five 30s
+    attempts plus backoffs, so without it a shutdown waits about three minutes per endpoint.
+    """
     return _CLIENT.request_with_retries_for_key(
         key,
         f"{QUEUE_BASE}/{endpoint_id}/health",
         deadline_at=deadline_at,
+        should_stop=should_stop,
     )
 
 
@@ -349,12 +365,14 @@ def endpoint_health_for_fingerprint(
     fingerprint: str,
     *,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict:
     """endpoint_health_for_key addressed by fingerprint; raw key resolved internally."""
     return endpoint_health_for_key(
         endpoint_id,
         _key_for_fingerprint(fingerprint),
         deadline_at=deadline_at,
+        should_stop=should_stop,
     )
 
 
