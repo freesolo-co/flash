@@ -129,6 +129,14 @@ class ScoreBatcher:
             self._condition.notify_all()
         return waiter.wait(self._make_error)
 
+    def _abandoned_after_wait(self) -> bool:
+        """Whether a batch assembled during the flush window must be abandoned unscored.
+
+        Callers must hold ``self._condition``: the answer is only meaningful while no one else can
+        change ``_closed``.
+        """
+        return self._recheck_closed_after_wait and self._closed
+
     def _take_batch(self) -> list[_Waiter] | None:
         with self._condition:
             while not self._pending:
@@ -141,7 +149,7 @@ class ScoreBatcher:
                 if remaining <= 0:
                     break
                 self._condition.wait(remaining)
-            if self._recheck_closed_after_wait and self._closed:
+            if self._abandoned_after_wait():
                 return None
             batch = self._pending[: self.max_batch_size]
             del self._pending[: len(batch)]
@@ -154,6 +162,15 @@ class ScoreBatcher:
                 batch = self._take_batch()
                 if batch is None:
                     return
+                with self._condition:
+                    # `_take_batch` released the lock to return, so shutdown can land in the gap
+                    # between assembling this batch and dispatching it. re-observe it on the same
+                    # side of that release as the call it guards -- for the teacher path a dispatch
+                    # here bills real money for a run that is already shutting down. returning hands
+                    # the batch to the stranded-waiter path in `finally`, which already owns
+                    # `_in_flight`; there is no second way to fail a batch.
+                    if self._abandoned_after_wait():
+                        return
                 try:
                     results = self._score_batch([waiter.request for waiter in batch])
                     scattered = list(zip(batch, results, strict=True))

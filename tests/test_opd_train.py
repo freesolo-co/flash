@@ -2047,6 +2047,70 @@ def test_text_teacher_batcher_close_allows_inflight_scatter_within_bound():
         )
 
 
+def test_text_teacher_batcher_does_not_bill_a_batch_taken_just_before_shutdown():
+    """A batch assembled before ``close`` must not reach the teacher once shutdown has landed.
+
+    ``_take_batch`` re-checks ``_closed`` while holding the condition, then releases it to return.
+    ``close`` can land in that gap, so the check inside ``_take_batch`` alone does not cover the
+    dispatch: without the re-check immediately before ``_score_batch`` the batcher fires a real
+    billed teacher call for a run that is already shutting down. The in-flight scatter test above
+    cannot see this -- there the call is already in progress when ``close`` runs, which is the case
+    the join bound deliberately allows.
+    """
+    from flash.engine.worker.teacher.client import TeacherError
+
+    class NeverCalledTeacher:
+        def __init__(self):
+            self.called = threading.Event()
+
+        def score_many(self, items):
+            self.called.set()
+            return [
+                _teacher_score([TeacherToken(text="AB", logprob=-1.0, start=0, end=2)])
+                for _ in items
+            ]
+
+    teacher = NeverCalledTeacher()
+    batcher = _TextTeacherBatcher(teacher, max_batch_size=1, flush_wait_s=0.01)
+    taken = threading.Event()
+    resume = threading.Event()
+    take_batch = batcher._take_batch
+
+    def take_batch_then_hold():
+        batch = take_batch()
+        if batch is not None:
+            # hold the consumer exactly in the window between assembling the batch and
+            # dispatching it, so shutdown lands there rather than racing nondeterministically.
+            taken.set()
+            assert resume.wait(timeout=10.0)
+        return batch
+
+    batcher._take_batch = take_batch_then_hold
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(batcher.score, "prompt", "AB")
+    close_thread = None
+    try:
+        assert taken.wait(timeout=10.0)
+        close_thread = threading.Thread(target=lambda: batcher.close(timeout_s=5.0))
+        close_thread.start()
+        with batcher._condition:
+            assert batcher._condition.wait_for(lambda: batcher._closed, timeout=10.0)
+        resume.set()
+        with pytest.raises(TeacherError) as error:
+            future.result(timeout=10.0)
+        close_thread.join(timeout=10.0)
+        assert not close_thread.is_alive()
+    finally:
+        resume.set()
+        if close_thread is not None:
+            close_thread.join(timeout=10.0)
+        batcher.close(timeout_s=0.1)
+        executor.shutdown(wait=True)
+
+    assert error.value.permanent
+    assert not teacher.called.is_set(), "shutdown still billed a teacher call for the taken batch"
+
+
 def test_text_teacher_batcher_shutdown_cannot_strand_pending_bridge_waiter(monkeypatch):
     monkeypatch.setattr(opd_protocol, "TEXT_TEACHER_FLUSH_WAIT_S", 10.0)
     teacher = _BatchingTeacher(["question"])
