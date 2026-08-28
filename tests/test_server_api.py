@@ -6772,15 +6772,16 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
             json.dumps({"run_id": "other-run", "state": "queued", "spec": {}}).encode(),
             id="mismatched-run-id",
         ),
+        pytest.param(b"\xff", id="invalid-utf8"),
+        # `RecursionError` is not a `ValueError`, so it needs its own coverage or a record the
+        # decoder cannot walk escapes the handler and aborts every unrelated run. Deeply nested
+        # bytes cannot prove it: the depth at which cpython gives up moved between 3.11 and 3.12,
+        # so the same payload is corrupt on one interpreter and a healthy queued record on the
+        # next. The sentinel key below makes the decoder itself raise instead.
         pytest.param(
-            b'{"run_id":"bad-run","state":"queued","spec":{},"extra":'
-            + b"[" * 2000
-            + b"0"
-            + b"]" * 2000
-            + b"}",
+            b'{"run_id":"bad-run","state":"queued","spec":{},"recursion_sentinel":true}',
             id="decoder-recursion",
         ),
-        pytest.param(b"\xff", id="invalid-utf8"),
     ],
 )
 def test_recover_runs_corrupt_status_is_quarantined_per_record(monkeypatch, tmp_path, bad_payload):
@@ -6817,6 +6818,22 @@ def test_recover_runs_corrupt_status_is_quarantined_per_record(monkeypatch, tmp_
     os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
     with open(runner_state.runs_file_path("bad-run", ".json"), "wb") as file:
         file.write(bad_payload)
+
+    if b"recursion_sentinel" in bad_payload:
+
+        class _RecursingJson:
+            """Raises where cpython would on a record too deeply nested to walk."""
+
+            def __getattr__(self, name):
+                return getattr(json, name)
+
+            def load(self, file):
+                value = json.load(file)
+                if isinstance(value, dict) and value.get("recursion_sentinel"):
+                    raise RecursionError("maximum recursion depth exceeded while decoding")
+                return value
+
+        monkeypatch.setattr(runner_status, "json", _RecursingJson())
 
     # bad-run must be first or the unfixed loop can recover healthy-run before aborting.
     monkeypatch.setattr(
