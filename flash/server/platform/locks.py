@@ -2,20 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import os
 import threading
 import weakref
+from collections.abc import Iterator
 from typing import Self
 
 
 def _open_teacher_broker_lease() -> int:
-    """Open the lease guarding the configured teacher ledger.
-
-    Ledger recovery rewrites every live request, so it is safe only while no process is serving.
-    The lease models that directly: exclusive means recovering, shared means serving. The path is
-    resolved so symlinked or relative aliases of one ledger cannot yield independent leases.
-    """
+    """Open the lease guarding the configured teacher ledger."""
     from flash.server.platform.db import db_path
 
     path = f"{os.path.realpath(db_path())}.teacher-broker.lock"
@@ -23,29 +20,32 @@ def _open_teacher_broker_lease() -> int:
     return os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
 
 
-def _claim_teacher_recovery(fd: int) -> bool:
-    """Whether this process may recover now: true only while no sibling recovers or serves."""
+@contextlib.contextmanager
+def _teacher_broker_lease(*, exclusive: bool) -> Iterator[None]:
+    """Exclude recovery from live requests while allowing brokers to serve concurrently."""
+    fd = _open_teacher_broker_lease()
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    locked = False
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return False
-    return True
-
-
-def _enter_teacher_serving(fd: int) -> None:
-    """Hold the lease shared for the serving lifetime, waiting out any in-progress recovery.
-
-    A later process therefore cannot claim recovery while this one is live, which is exactly the
-    turnover that would rewrite our in-flight requests.
-    """
-    fcntl.flock(fd, fcntl.LOCK_SH)
-
-
-def _release_teacher_broker_lease(fd: int) -> None:
-    try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        fcntl.flock(fd, operation)
+        locked = True
+        yield
     finally:
-        os.close(fd)
+        try:
+            if locked:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _teacher_recovery_lease() -> contextlib.AbstractContextManager[None]:
+    """Wait until no teacher request is live, then own ledger recovery exclusively."""
+    return _teacher_broker_lease(exclusive=True)
+
+
+def _teacher_serving_lease() -> contextlib.AbstractContextManager[None]:
+    """Represent one complete teacher request in the recovery locking protocol."""
+    return _teacher_broker_lease(exclusive=False)
 
 
 class _RunLock:

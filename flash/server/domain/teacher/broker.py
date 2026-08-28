@@ -58,6 +58,7 @@ __all__ = [
     "validate_request_id",
 ]
 from flash.server.platform import db
+from flash.server.platform.locks import _teacher_serving_lease
 from flash.teacher.limits import (
     OPD_TEACHER_SCORING_CONCURRENCY,
     configured_opd_turn_limit,
@@ -808,7 +809,7 @@ def _settle_teacher_response(
     return response.body
 
 
-def _complete_teacher_request(
+def _complete_teacher_request_locked(
     *,
     capability_token: str,
     request_id: str,
@@ -870,6 +871,22 @@ def _complete_teacher_request(
         response_body=response_body,
         chat=chat,
     )
+
+
+def _complete_teacher_request(
+    *,
+    capability_token: str,
+    request_id: str,
+    raw_body: bytes | bytearray,
+    chat: bool,
+) -> dict[str, Any]:
+    with _teacher_serving_lease():
+        return _complete_teacher_request_locked(
+            capability_token=capability_token,
+            request_id=request_id,
+            raw_body=raw_body,
+            chat=chat,
+        )
 
 
 def complete_teacher_request(

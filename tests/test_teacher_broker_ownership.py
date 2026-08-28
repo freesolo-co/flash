@@ -8,6 +8,7 @@ cannot express turnover at all. That is why they live apart from ``test_teacher_
 
 from __future__ import annotations
 
+import contextlib
 import multiprocessing
 import os
 import pathlib
@@ -59,9 +60,37 @@ def _hold_broker_lifespan(db_path, entered, release, errors):
         raise
 
 
+def _hold_broker_lifespan_observing_recovery(
+    db_path,
+    recovery_attempted,
+    entered,
+    release,
+    errors,
+):
+    try:
+        app_mod, test_client = _configure_broker_lifespan(db_path)
+        original_lease = app_mod._teacher_recovery_lease
+
+        @contextlib.contextmanager
+        def observed_lease():
+            recovery_attempted.set()
+            with original_lease():
+                yield
+
+        app_mod._teacher_recovery_lease = observed_lease
+        with test_client(app_mod.create_app()):
+            entered.set()
+            if not release.wait(timeout=10):
+                raise TimeoutError("broker lifespan release timed out")
+    except BaseException as exc:
+        errors.put(repr(exc))
+        raise
+
+
 def _run_live_teacher_request(
     db_path,
     capability_token,
+    request_id,
     provider_entered,
     provider_release,
     request_completed,
@@ -79,12 +108,20 @@ def _run_live_teacher_request(
         teacher_broker._require_current_attempt = lambda _capability: None
         teacher_broker._provider_post = dispatch
         os.environ["PARASAIL_API_KEY"] = PLANE_API_KEY
-        with test_client(app_mod.create_app()):
-            teacher_broker.complete_teacher_request(
-                capability_token=capability_token,
-                request_id="request-live-ownership-01",
-                raw_body=_body(),
+        with test_client(app_mod.create_app()) as client:
+            response = client.post(
+                "/v1/teacher/completions",
+                content=_body(),
+                headers={
+                    "authorization": f"Bearer {capability_token}",
+                    "content-type": "application/json",
+                    "x-flash-teacher-request-id": request_id,
+                },
             )
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"teacher request failed: {response.status_code} {response.text}"
+                )
             request_completed.set()
     except BaseException as exc:
         errors.put(repr(exc))
@@ -136,6 +173,7 @@ def test_second_lifespan_does_not_recover_a_live_broker_request(broker_db):
     provider_entered = context.Event()
     provider_release = context.Event()
     request_completed = context.Event()
+    second_recovery_attempted = context.Event()
     second_entered = context.Event()
     second_release = context.Event()
     errors = context.Queue()
@@ -144,6 +182,7 @@ def test_second_lifespan_does_not_recover_a_live_broker_request(broker_db):
         args=(
             str(broker_db),
             token,
+            "request-live-ownership-01",
             provider_entered,
             provider_release,
             request_completed,
@@ -152,8 +191,14 @@ def test_second_lifespan_does_not_recover_a_live_broker_request(broker_db):
         name="live-teacher-broker",
     )
     second = context.Process(
-        target=_hold_broker_lifespan,
-        args=(str(broker_db), second_entered, second_release, errors),
+        target=_hold_broker_lifespan_observing_recovery,
+        args=(
+            str(broker_db),
+            second_recovery_attempted,
+            second_entered,
+            second_release,
+            errors,
+        ),
         name="second-control-plane",
     )
 
@@ -161,13 +206,15 @@ def test_second_lifespan_does_not_recover_a_live_broker_request(broker_db):
     try:
         assert provider_entered.wait(timeout=10)
         second.start()
-        assert second_entered.wait(timeout=10)
+        assert second_recovery_attempted.wait(timeout=10)
+        assert not second_entered.wait(timeout=0.5)
         assert _teacher_request_accounting(broker_db, "request-live-ownership-01") == (
             "started",
             1,
         )
         provider_release.set()
         assert request_completed.wait(timeout=10)
+        assert second_entered.wait(timeout=10)
     finally:
         provider_release.set()
         second_release.set()
@@ -285,75 +332,295 @@ def test_ledger_recovery_precedes_run_recovery(tmp_path):
     assert observed.read_text(encoding="utf-8") == "outcome_unknown"
 
 
-def test_broker_turnover_does_not_recover_under_a_live_sibling(tmp_path):
-    """A process starting after another is already serving must not recover its live requests."""
+def _crash_during_live_teacher_request(db_path, capability_token, provider_entered):
+    app_mod, test_client = _configure_broker_lifespan(db_path)
+
+    def crash(*_args):
+        provider_entered.set()
+        os._exit(17)
+
+    teacher_broker._require_current_attempt = lambda _capability: None
+    teacher_broker._provider_post = crash
+    os.environ["PARASAIL_API_KEY"] = PLANE_API_KEY
+    with test_client(app_mod.create_app()) as client:
+        client.post(
+            "/v1/teacher/completions",
+            content=_body(),
+            headers={
+                "authorization": f"Bearer {capability_token}",
+                "content-type": "application/json",
+                "x-flash-teacher-request-id": "request-crashed-owner-001",
+            },
+        )
+
+
+def test_replacement_recovers_a_crashed_broker_while_a_sibling_survives(broker_db):
+    pytest.importorskip("fastapi")
+    context = multiprocessing.get_context("spawn")
+    token = _issue(limits=_limits(max_concurrency=1))
+    survivor_entered = context.Event()
+    survivor_release = context.Event()
+    provider_entered = context.Event()
+    replacement_entered = context.Event()
+    replacement_release = context.Event()
+    errors = context.Queue()
+    survivor = context.Process(
+        target=_hold_broker_lifespan,
+        args=(str(broker_db), survivor_entered, survivor_release, errors),
+        name="surviving-broker",
+    )
+    crashed = context.Process(
+        target=_crash_during_live_teacher_request,
+        args=(str(broker_db), token, provider_entered),
+        name="crashed-broker",
+    )
+    replacement = context.Process(
+        target=_hold_broker_lifespan,
+        args=(str(broker_db), replacement_entered, replacement_release, errors),
+        name="replacement-broker",
+    )
+
+    survivor.start()
+    try:
+        assert survivor_entered.wait(timeout=10)
+        crashed.start()
+        assert provider_entered.wait(timeout=10)
+        crashed.join(timeout=5)
+        assert crashed.exitcode == 17
+        replacement.start()
+        assert replacement_entered.wait(timeout=10)
+        assert _teacher_request_accounting(broker_db, "request-crashed-owner-001") == (
+            "outcome_unknown",
+            0,
+        )
+    finally:
+        survivor_release.set()
+        replacement_release.set()
+        if crashed.is_alive():
+            crashed.terminate()
+            crashed.join(timeout=5)
+        if survivor.pid is not None:
+            _join_broker_process(survivor, errors)
+        if replacement.pid is not None:
+            _join_broker_process(replacement, errors)
+
+
+def _fail_first_recovery(db_path, recovery_entered, recovery_release, errors):
+    try:
+        app_mod, test_client = _configure_broker_lifespan(db_path)
+
+        def fail_recovery():
+            recovery_entered.set()
+            if not recovery_release.wait(timeout=10):
+                raise TimeoutError("failed recovery release timed out")
+            raise RuntimeError("recovery owner failed")
+
+        db.recover_teacher_request_ledger = fail_recovery
+        with (
+            pytest.raises(RuntimeError, match="recovery owner failed"),
+            test_client(app_mod.create_app()),
+        ):
+            pass
+    except BaseException as exc:
+        errors.put(repr(exc))
+        raise
+
+
+def test_contender_retries_recovery_after_the_first_owner_fails(tmp_path):
     pytest.importorskip("fastapi")
     context = multiprocessing.get_context("spawn")
     broker_path = tmp_path / "server.db"
-    first_entered = context.Event()
-    first_release = context.Event()
+    _seed_started_request(broker_path, "request-failed-owner-01")
+    recovery_entered = context.Event()
+    recovery_release = context.Event()
+    replacement_recovery_attempted = context.Event()
+    replacement_entered = context.Event()
+    replacement_release = context.Event()
     errors = context.Queue()
-    first = context.Process(
-        target=_hold_broker_lifespan,
-        args=(str(broker_path), first_entered, first_release, errors),
-        name="serving-broker",
+    failed_owner = context.Process(
+        target=_fail_first_recovery,
+        args=(str(broker_path), recovery_entered, recovery_release, errors),
+        name="failed-recovery-owner",
+    )
+    replacement = context.Process(
+        target=_hold_broker_lifespan_observing_recovery,
+        args=(
+            str(broker_path),
+            replacement_recovery_attempted,
+            replacement_entered,
+            replacement_release,
+            errors,
+        ),
+        name="recovery-contender",
     )
 
-    first.start()
+    failed_owner.start()
     try:
-        assert first_entered.wait(timeout=10)
-        # seed the live request only after the first process is serving, so recovery by the
-        # second process would be the turnover defect rather than legitimate startup recovery.
-        _seed_started_request(broker_path, "request-turnover-live-01")
-        second_entered = context.Event()
-        second_release = context.Event()
-        second = context.Process(
-            target=_hold_broker_lifespan,
-            args=(str(broker_path), second_entered, second_release, errors),
-            name="joining-broker",
+        assert recovery_entered.wait(timeout=10)
+        replacement.start()
+        assert replacement_recovery_attempted.wait(timeout=10)
+        assert not replacement_entered.wait(timeout=0.5)
+        recovery_release.set()
+        _join_broker_process(failed_owner, errors)
+        assert replacement_entered.wait(timeout=10)
+        assert _teacher_request_accounting(broker_path, "request-failed-owner-01") == (
+            "outcome_unknown",
+            0,
         )
-        second.start()
-        try:
-            assert second_entered.wait(timeout=10)
-            assert _teacher_request_accounting(broker_path, "request-turnover-live-01") == (
-                "started",
-                1,
-            )
-        finally:
-            second_release.set()
-            _join_broker_process(second, errors)
     finally:
-        first_release.set()
-        _join_broker_process(first, errors)
+        recovery_release.set()
+        replacement_release.set()
+        if failed_owner.is_alive():
+            failed_owner.terminate()
+            failed_owner.join(timeout=5)
+        if replacement.pid is not None:
+            _join_broker_process(replacement, errors)
+
+
+def test_lease_failure_precedes_lifespan_resource_creation(monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import flash.server.asgi.app as app_mod
+    from flash.providers.core import preflight
+
+    monkeypatch.setattr(preflight, "check_run_preflight", lambda: None)
+
+    monkeypatch.setattr(
+        app_mod,
+        "_teacher_recovery_lease",
+        lambda: (_ for _ in ()).throw(PermissionError("lease denied")),
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "_open_deployment_jobs",
+        lambda: pytest.fail("deployment jobs opened before the broker lease"),
+    )
+    monkeypatch.setattr(
+        app_mod,
+        "recover_runs",
+        lambda: pytest.fail("run recovery started before the broker lease"),
+    )
+
+    with pytest.raises(PermissionError, match="lease denied"), TestClient(app_mod.create_app()):
+        pass
+
+
+def test_later_startup_failure_releases_lease_and_unwinds_resources(monkeypatch, tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import flash.server.asgi.app as app_mod
+    from flash.providers.core import preflight
+    from flash.runner.lifecycle import reporting
+
+    events = []
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
+    monkeypatch.setattr(preflight, "check_run_preflight", lambda: events.append("preflight"))
+
+    @contextlib.contextmanager
+    def recovery_lease():
+        events.append("enter_recovery_lease")
+        try:
+            yield
+        finally:
+            events.append("release_recovery_lease")
+
+    monkeypatch.setattr(app_mod, "_teacher_recovery_lease", recovery_lease)
+    monkeypatch.setattr(db, "recover_teacher_request_ledger", lambda: events.append("recover"))
+    monkeypatch.setattr(app_mod, "_open_deployment_jobs", lambda: events.append("open_jobs"))
+
+    def fail_reporter():
+        events.append("open_reporter")
+        raise RuntimeError("reporter startup failed")
+
+    monkeypatch.setattr(reporting, "_open_status_reporter", fail_reporter)
+    monkeypatch.setattr(
+        app_mod,
+        "_wait_for_deployment_jobs",
+        lambda _timeout: events.append("close_jobs") or True,
+    )
+    with (
+        pytest.raises(RuntimeError, match="reporter startup failed"),
+        TestClient(app_mod.create_app()),
+    ):
+        pass
+
+    assert events == [
+        "preflight",
+        "enter_recovery_lease",
+        "recover",
+        "release_recovery_lease",
+        "open_jobs",
+        "open_reporter",
+        "close_jobs",
+    ]
+
+
+def _hold_recovery_lease(db_path, entered, release, errors):
+    try:
+        from flash.server.platform import db as db_mod
+        from flash.server.platform.locks import _teacher_recovery_lease
+
+        db_mod.DB_PATH = db_path
+        with _teacher_recovery_lease():
+            entered.set()
+            if not release.wait(timeout=10):
+                raise TimeoutError("recovery lease release timed out")
+    except BaseException as exc:
+        errors.put(repr(exc))
+        raise
+
+
+def _hold_serving_lease(db_path, entered, release, errors):
+    try:
+        from flash.server.platform import db as db_mod
+        from flash.server.platform.locks import _teacher_serving_lease
+
+        db_mod.DB_PATH = db_path
+        with _teacher_serving_lease():
+            entered.set()
+            if not release.wait(timeout=10):
+                raise TimeoutError("serving lease release timed out")
+    except BaseException as exc:
+        errors.put(repr(exc))
+        raise
 
 
 def test_broker_recovery_lease_excludes_an_aliased_database_path(tmp_path):
     """Two names for one ledger must share a lease, not produce independent ones."""
-    from flash.server.platform import db as db_mod
-    from flash.server.platform.locks import (
-        _claim_teacher_recovery,
-        _open_teacher_broker_lease,
-        _release_teacher_broker_lease,
-    )
-
+    context = multiprocessing.get_context("spawn")
     real = tmp_path / "server.db"
     real.write_bytes(b"")
     alias = tmp_path / "alias.db"
     alias.symlink_to(real)
+    recovery_entered = context.Event()
+    recovery_release = context.Event()
+    serving_entered = context.Event()
+    serving_release = context.Event()
+    errors = context.Queue()
+    recovery = context.Process(
+        target=_hold_recovery_lease,
+        args=(str(real), recovery_entered, recovery_release, errors),
+        name="aliased-recovery-owner",
+    )
+    serving = context.Process(
+        target=_hold_serving_lease,
+        args=(str(alias), serving_entered, serving_release, errors),
+        name="aliased-serving-owner",
+    )
 
-    original = db_mod.DB_PATH
+    recovery.start()
     try:
-        db_mod.DB_PATH = str(real)
-        real_fd = _open_teacher_broker_lease()
-        try:
-            assert _claim_teacher_recovery(real_fd)
-            db_mod.DB_PATH = str(alias)
-            alias_fd = _open_teacher_broker_lease()
-            try:
-                assert not _claim_teacher_recovery(alias_fd)
-            finally:
-                _release_teacher_broker_lease(alias_fd)
-        finally:
-            _release_teacher_broker_lease(real_fd)
+        assert recovery_entered.wait(timeout=10)
+        serving.start()
+        assert not serving_entered.wait(timeout=0.5)
+        recovery_release.set()
+        assert serving_entered.wait(timeout=10)
     finally:
-        db_mod.DB_PATH = original
+        recovery_release.set()
+        serving_release.set()
+        if recovery.pid is not None:
+            _join_broker_process(recovery, errors)
+        if serving.pid is not None:
+            _join_broker_process(serving, errors)

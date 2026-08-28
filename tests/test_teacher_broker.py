@@ -392,6 +392,35 @@ def test_stale_started_request_becomes_terminal_after_broker_recovery(broker_db)
     assert db.teacher_capability_binding(token)["token_count"] == 128
 
 
+def test_broker_recovery_reconstructs_live_in_flight_accounting(broker_db):
+    token = _issue(limits=_limits(max_concurrency=4))
+    reservation = db.reserve_teacher_request(
+        token=token,
+        request_id="request-reconstructed-1",
+        request_fingerprint="a" * 64,
+        request_bytes=10,
+        score_items=1,
+        expected_run_id="run-1",
+        expected_attempt=2,
+    )
+    db.mark_teacher_request_started(
+        reservation["capability"]["id"],
+        "request-reconstructed-1",
+    )
+    connection = sqlite3.connect(broker_db)
+    connection.execute(
+        "CREATE TRIGGER preserve_live_request BEFORE UPDATE OF state ON teacher_score_requests "
+        "WHEN OLD.request_id = 'request-reconstructed-1' BEGIN SELECT RAISE(IGNORE); END"
+    )
+    connection.execute("UPDATE teacher_capabilities SET in_flight = 3")
+    connection.commit()
+    connection.close()
+
+    db.recover_teacher_request_ledger()
+
+    assert db.teacher_capability_binding(token)["in_flight"] == 1
+
+
 def test_closed_parasail_contract_rejects_extra_fields_model_changes_and_batches(broker_db):
     token = _issue()
     capability = db.teacher_capability_binding(token)
