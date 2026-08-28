@@ -167,10 +167,9 @@ class ScoreBatcher:
                     wrapped = self._wrap_batch_error(error) if self._wrap_batch_error else error
                     for waiter in batch:
                         waiter.complete(error=wrapped)
-                finally:
-                    with self._condition:
-                        self._in_flight = []
-                        self._condition.notify_all()
+                with self._condition:
+                    self._in_flight = []
+                    self._condition.notify_all()
         finally:
             # the thread is leaving for good, so anything still queued or in flight will never be
             # answered. fail them here rather than leaving their callers blocked forever.

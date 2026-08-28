@@ -12,6 +12,7 @@ import flash.engine.worker.model.decoding as worker_decoding
 import flash.engine.worker.train.rl.rollout.multi_turn as rl_multi_turn
 import flash.engine.worker.train.rl.rollout.reward_module as rl_reward_module
 import flash.engine.worker.train.rl.rollout.single_turn as rl_single_turn
+from flash.engine.worker.train.entry import score_batcher
 from flash.engine.worker.train.entry.score_batcher import ScoreBatcher
 from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 
@@ -63,6 +64,116 @@ def _assert_batcher_empty(batcher):
         assert batcher._thread is None
         assert batcher._pending == []
         assert batcher._in_flight == []
+
+
+@pytest.mark.parametrize("failure_mode", ["score_base_exception", "error_wrapper_exception"])
+def test_score_batcher_abnormal_consumer_exit_settles_claimed_waiter(failure_mode):
+    score_error = SystemExit("scorer exited")
+    wrapper_error = RuntimeError("error wrapper failed")
+
+    def score_batch(_requests):
+        if failure_mode == "score_base_exception":
+            raise score_error
+        raise ValueError("scoring failed")
+
+    def wrap_batch_error(_error):
+        raise wrapper_error
+
+    batcher = ScoreBatcher(
+        score_batch,
+        max_batch_size=1,
+        flush_wait_s=0.01,
+        label="test",
+        thread_name="test-abnormal-exit-score-batcher",
+        wrap_batch_error=wrap_batch_error if failure_mode == "error_wrapper_exception" else None,
+    )
+    waiter = score_batcher._Waiter("request", enqueued_at=0.0, label="test")
+    batcher._pending.append(waiter)
+    escaped = score_error if failure_mode == "score_base_exception" else wrapper_error
+
+    with pytest.raises(type(escaped), match=str(escaped)) as raised:
+        batcher._run()
+
+    assert raised.value is escaped
+    assert waiter.done.is_set(), "consumer exit stranded its claimed waiter"
+    assert waiter.result is None
+    assert isinstance(waiter.error, RuntimeError)
+    assert str(waiter.error) == "test stopped"
+
+
+def test_score_batcher_claim_is_atomic_against_close():
+    consumer_name = "test-atomic-claim-score-batcher"
+    closer_name = "test-atomic-claim-closer"
+    slice_entered = threading.Event()
+    release_slice = threading.Event()
+    dispatched = threading.Event()
+    outcomes = []
+
+    class GatedPending(list):
+        def __getitem__(self, key):
+            if threading.current_thread().name == consumer_name and isinstance(key, slice):
+                slice_entered.set()
+                assert release_slice.wait(timeout=2.0)
+            return super().__getitem__(key)
+
+    def score_batch(requests):
+        dispatched.set()
+        return [f"scored:{request}" for request in requests]
+
+    batcher = ScoreBatcher(
+        score_batch,
+        max_batch_size=1,
+        flush_wait_s=0.01,
+        label="test",
+        thread_name=consumer_name,
+        cancel_undispatched_on_close=True,
+    )
+    condition = _ConditionContentionProbe(closer_name)
+    batcher._condition = condition
+    batcher._pending = GatedPending()
+
+    def submit():
+        try:
+            outcomes.append(("result", batcher.submit("request")))
+        except Exception as error:
+            outcomes.append(("error", str(error)))
+
+    submitter = threading.Thread(target=submit, name="test-atomic-claim-submitter")
+    closer = threading.Thread(target=lambda: batcher.close(1.0), name=closer_name)
+    submitter.start()
+    assert slice_entered.wait(timeout=2.0)
+    closer.start()
+    try:
+        assert condition.contention_observed.wait(timeout=2.0)
+    finally:
+        release_slice.set()
+    submitter.join(timeout=2.0)
+    closer.join(timeout=2.0)
+    batcher.close(0.1)
+
+    assert not submitter.is_alive()
+    assert not closer.is_alive()
+    assert dispatched.is_set()
+    assert outcomes == [("result", "scored:request")]
+
+
+def test_waiter_complete_preserves_first_outcome():
+    shutdown_error = RuntimeError("shut down")
+    result_first = score_batcher._Waiter("request", enqueued_at=0.0, label="test")
+    result_first.complete(result="provider result")
+    result_first.complete(error=shutdown_error)
+
+    assert result_first.done.is_set()
+    assert result_first.result == "provider result"
+    assert result_first.error is None
+
+    error_first = score_batcher._Waiter("request", enqueued_at=0.0, label="test")
+    error_first.complete(error=shutdown_error)
+    error_first.complete(result="late provider result")
+
+    assert error_first.done.is_set()
+    assert error_first.result is None
+    assert error_first.error is shutdown_error
 
 
 def test_concurrent_single_turn_requests_are_batched_and_scattered_in_order(monkeypatch):
