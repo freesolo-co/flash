@@ -337,8 +337,10 @@ def list_instances(
     # list via paginated v1 (`next_token` -> `after_token`, limit 25); detail/destroy remain v0.
     # walk every page. with `strict=True`, any fetch, shape, or page-cap failure raises so an
     # incomplete listing cannot prove an instance is gone.
-    # `should_stop` reaches each page's retry loop: a sweep's inventory read runs before its first
-    # destroy, so without it a shutdown waits out the full retry budget on the joined worker thread.
+    # `should_stop` reaches each page's retry loop AND the page boundary: a sweep's inventory read
+    # runs before its first destroy, so without it a shutdown waits out the full retry budget --
+    # and, for an account whose pages all succeed first try, every remaining page -- on the joined
+    # worker thread.
     instances: list[dict] = []
     after_token: str | None = None
     for page_no in range(
@@ -380,6 +382,23 @@ def list_instances(
         after_token = out.get("next_token")
         if not after_token:
             break
+        if should_stop is not None and should_stop():
+            # The retry loop only polls the stop BETWEEN attempts, so a page that succeeds on its
+            # first try never observes it. Without a check at the page boundary a shutdown waits
+            # out every remaining page (up to the cap below) on the joined sweep thread. A halted
+            # walk is incomplete for exactly the same reason the page cap is, so it is reported
+            # the same way: strict raises, lenient keeps the prefix it already collected.
+            if strict:
+                raise VastApiError(
+                    "vast instance listing halted by a stop request; listing incomplete"
+                )
+            logger.info(
+                "vast instance listing halted at page %d by a stop request "
+                "(using %d instance(s) collected so far)",
+                page_no,
+                len(instances),
+            )
+            return instances
     if strict and after_token:
         # Fell off the page-cap runaway guard with more pages pending -> the listing is incomplete.
         raise VastApiError("vast instance listing exceeded the page cap; listing incomplete")

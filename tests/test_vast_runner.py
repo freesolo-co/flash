@@ -3105,3 +3105,94 @@ def test_list_instances_forwards_stop_into_every_page_retry_loop(monkeypatch):
 
     assert vast_api.list_instances(should_stop=stop) == [{"id": 1}, {"id": 2}]
     assert seen == [stop, stop]
+
+
+def _paging_client(monkeypatch, page_count: int, stop_after: int):
+    """Install a fake transport whose pages ALL succeed on the first attempt.
+
+    That is the case the retry loop cannot cover: ``_request_one_key`` polls ``should_stop`` only
+    for attempt > 0 and after a failed attempt's backoff, so a healthy account never reaches either
+    poll. Returns the list the fake appends each fetched page number to.
+    """
+    from flash.providers.vast.client import api as vast_api
+
+    fetched: list[int] = []
+
+    def fake_request(path, **kwargs):
+        fetched.append(len(fetched) + 1)
+        # the stop is raised by the caller's own progress, exactly as a lifespan shutdown landing
+        # partway through a long walk would be; the transport itself never fails, so it never polls.
+        last = len(fetched) >= page_count
+        page = {"instances": [{"id": len(fetched)}]}
+        if not last:
+            page["next_token"] = f"t{len(fetched) + 1}"
+        return page
+
+    monkeypatch.setattr(vast_api._CLIENT, "request_with_retries", fake_request)
+
+    def stop() -> bool:
+        return len(fetched) >= stop_after
+
+    return fetched, stop
+
+
+def test_list_instances_stops_between_pages_when_every_page_succeeds(monkeypatch):
+    """A stop must end the walk at the PAGE boundary, not only inside a page's retries.
+
+    ``_request_one_key`` polls ``should_stop`` only for retry attempts and after a failed attempt's
+    backoff, so an account whose pages all succeed first try never polls it at all. Without a check
+    here a shutdown waits out every remaining page -- up to the 200-page cap -- on the sweep's
+    joined worker thread, and the sweep's stop-observing wrapper is never invoked, so the halt goes
+    unrecorded and a partial inventory reads as a complete one.
+    """
+    from flash.providers.vast.client import api as vast_api
+
+    fetched, stop = _paging_client(monkeypatch, page_count=6, stop_after=2)
+
+    out = vast_api.list_instances(should_stop=stop)
+
+    # before the fix all six pages were fetched and the caller got a "complete" six-row listing.
+    assert fetched == [1, 2]
+    assert [i["id"] for i in out] == [1, 2]
+
+
+def test_list_instances_strict_rejects_a_stop_halted_walk(monkeypatch):
+    """Strict callers confirm a run is CLEAR from an empty listing, so an incomplete walk must
+    raise rather than return its prefix -- the same contract the page cap already enforces."""
+    from flash.providers.vast.client import api as vast_api
+
+    fetched, stop = _paging_client(monkeypatch, page_count=6, stop_after=2)
+
+    with pytest.raises(vast_api.VastApiError, match="listing incomplete"):
+        vast_api.list_instances(strict=True, should_stop=stop)
+
+    assert fetched == [1, 2]
+
+
+def test_list_instances_walks_every_page_when_no_stop_is_raised(monkeypatch):
+    """The converse: the boundary check must not truncate a healthy walk. Its callable is polled
+    once per boundary, so a callback that never returns True has to leave the walk complete."""
+    from flash.providers.vast.client import api as vast_api
+
+    fetched, _ = _paging_client(monkeypatch, page_count=4, stop_after=99)
+
+    assert [i["id"] for i in vast_api.list_instances(should_stop=lambda: False)] == [1, 2, 3, 4]
+    assert fetched == [1, 2, 3, 4]
+
+
+def test_list_instances_completed_on_its_last_page_is_not_halted(monkeypatch):
+    """A stop that lands while the FINAL page is in flight leaves the walk complete.
+
+    The boundary check sits after the ``next_token`` break for exactly this reason. Placed before
+    it, a strict caller would raise "listing incomplete" for a listing that actually enumerated
+    every instance, and ``run_instances_remaining`` could then never confirm a run is clear -- so
+    handle-less recovery would refuse to launch forever on a genuinely empty account.
+    """
+    from flash.providers.vast.client import api as vast_api
+
+    fetched, stop = _paging_client(monkeypatch, page_count=2, stop_after=2)
+
+    # strict is the caller that turns an incomplete listing into a hard error.
+    assert [i["id"] for i in vast_api.list_instances(strict=True, should_stop=stop)] == [1, 2]
+    assert fetched == [1, 2]
+    assert stop(), "the scenario is only meaningful if the stop is raised by the final page"

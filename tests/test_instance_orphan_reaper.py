@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import flash.server.asgi.app as app_mod
 from flash.runner.lifecycle.state import RunStatus
 
@@ -535,3 +537,43 @@ def test_vast_destroy_stopped_during_the_delete_does_not_open_a_second_lookup(mo
 
     assert methods == ["DELETE"]  # before the fix: a second, pointless GET lookup
     assert out is DestructiveOperationOutcome.HALTED
+
+
+def test_vast_sweep_records_a_halt_from_an_all_successful_paginated_listing(monkeypatch):
+    """The false-clean hazard reaches the sweep even when NOTHING fails.
+
+    The sibling guard above fakes ``list_instances`` outright, so it only proves the sweep reacts
+    to a listing that already observed the stop. A real account whose pages all succeed on the
+    first attempt never polls the stop inside the retry loop, so before the page-boundary check the
+    sweep's ``_observe_listing_stop`` wrapper was never invoked: the walk ran to the end and its
+    partial-then-complete result was indistinguishable from a clean account. Exercise the real
+    ``list_instances`` against a fake transport to prove the halt is recorded end to end.
+    """
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.vast import jobs
+    from flash.providers.vast.client import api as vast_api
+
+    fetched: list[int] = []
+    shutting_down = False
+
+    def fake_request(path, **kwargs):
+        nonlocal shutting_down
+        fetched.append(len(fetched) + 1)
+        shutting_down = True  # the lifespan shutdown begins while page 1 is in flight
+        # page 1 holds only a live run's box, so a walk that stopped here and reported a complete
+        # listing would claim ABSENT -- teardown confirmed clean -- from one unread page.
+        return {
+            "instances": [{"id": 1, "label": jobs.instance_label("flash-live", 0, 0)}],
+            "next_token": "t2",
+        }
+
+    monkeypatch.setattr(vast_api._CLIENT, "request_with_retries", fake_request)
+    monkeypatch.setattr(
+        vast_api, "destroy_instance", lambda iid, **_: pytest.fail(f"destroyed {iid} during a stop")
+    )
+
+    out = jobs.sweep_orphans(active_labels={"flash-live"}, should_stop=lambda: shutting_down)
+
+    assert fetched == [1], "the walk must end at the first page boundary, not run to the cap"
+    assert out.outcome is CleanupOutcome.RETRYABLE
+    assert out.halted
