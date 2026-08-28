@@ -916,8 +916,13 @@ def run_instances_remaining(run_id: str) -> list[int]:
 def sweep_orphans(
     active_labels: set[str] | Callable[[], set[str]] | None = None,
     known_labels: set[str] | Callable[[], set[str]] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> CleanupResult:
-    """Destroy unclaimed Flash-labeled instances and preserve partial evidence."""
+    """Destroy unclaimed Flash-labeled instances and preserve partial evidence.
+
+    ``should_stop`` is checked between destroys: cancelling the caller cannot interrupt this
+    worker thread, so a long sweep would otherwise keep destroying past the lifespan's shutdown.
+    """
     try:
         instances = vast_api.list_instances()
     except Exception as exc:
@@ -962,7 +967,15 @@ def sweep_orphans(
         outcome = CleanupOutcome.UNCONFIRMED if unresolved else CleanupOutcome.ABSENT
         return CleanupResult(outcome, unresolved_ids=tuple(unresolved) or None)
     destroyed: list[str] = []
-    for iid in selected:
+    for position, iid in enumerate(selected):
+        if should_stop is not None and should_stop():
+            # halting leaves the rest selected but untouched. reporting them unresolved is what
+            # keeps the outcome out of DELETED, so no caller reads a halted sweep as a clean one.
+            logger.info(
+                "vast orphan sweep: stop requested; halting after %d destroy attempt(s)", position
+            )
+            unresolved.extend(str(remaining) for remaining in selected[position:])
+            break
         try:
             deleted = vast_api.destroy_instance(iid)
         except Exception:

@@ -452,17 +452,17 @@ def test_terminate_instances_isolates_per_id_and_filters(monkeypatch):
 def test_terminate_instance_confirmed_requires_acceptance_and_disappearance(monkeypatch):
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: list(ids))
+    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids, **_: list(ids))
     monkeypatch.setattr(lambda_api, "get_instance", lambda iid, *, strict: None)
     lambda_api.terminate_instance_confirmed("i-1")
     with pytest.raises(lambda_api.LambdaApiError, match="teardown identity is invalid"):
         lambda_api.terminate_instance_confirmed("   ")
 
-    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: [])
+    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids, **_: [])
     with pytest.raises(lambda_api.LambdaApiError, match="was not confirmed"):
         lambda_api.terminate_instance_confirmed("i-1")
 
-    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: list(ids))
+    monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids, **_: list(ids))
     monkeypatch.setattr(
         lambda_api,
         "get_instance",

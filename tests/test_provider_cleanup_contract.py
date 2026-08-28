@@ -297,7 +297,7 @@ def test_capability_helpers_invoke_callbacks_or_report_unsupported() -> None:
         seen.append(run_id)
         return CleanupResult(CleanupOutcome.ABSENT)
 
-    def sweep(active, known) -> CleanupResult:
+    def sweep(active, known, should_stop=None) -> CleanupResult:
         seen.extend((active, known))
         return CleanupResult(CleanupOutcome.DELETED, confirmed_deleted_ids=("7",))
 

@@ -5905,7 +5905,7 @@ def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
 
             return CleanupResult(CleanupOutcome.ABSENT)
 
-        def _sweep(self, _active=None, _known=None):
+        def _sweep(self, _active=None, _known=None, _should_stop=None):
             from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
             return CleanupResult(CleanupOutcome.ABSENT)
@@ -6113,7 +6113,7 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
 
             return CleanupResult(CleanupOutcome.PRESENT, surviving_ids=("4242",))
 
-        def _sweep(self, _active=None, _known=None):
+        def _sweep(self, _active=None, _known=None, _should_stop=None):
             from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
             return CleanupResult(CleanupOutcome.ABSENT)
@@ -6361,7 +6361,7 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
         def _confirm(self, _run_id):
             raise AssertionError("newly configured unrecorded provider must not block recovery")
 
-        def _sweep(self, _active=None, _known=None):
+        def _sweep(self, _active=None, _known=None, _should_stop=None):
             from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
             return CleanupResult(CleanupOutcome.ABSENT)
@@ -6438,7 +6438,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
                 return CleanupResult(CleanupOutcome.PRESENT, surviving_ids=("4242",))
             return CleanupResult(CleanupOutcome.ABSENT)
 
-        def _sweep(self, _active=None, _known=None):
+        def _sweep(self, _active=None, _known=None, _should_stop=None):
             from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
             return CleanupResult(CleanupOutcome.ABSENT)
@@ -6513,7 +6513,7 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
 
             return CleanupResult(CleanupOutcome.ABSENT)
 
-        def _sweep(self, _active=None, _known=None):
+        def _sweep(self, _active=None, _known=None, _should_stop=None):
             from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
             return CleanupResult(CleanupOutcome.ABSENT)
@@ -6793,7 +6793,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
 
             self.capabilities = ProviderCapabilities(False, True, None, self._sweep)
 
-        def _sweep(self, _active=None, _known=None):
+        def _sweep(self, _active=None, _known=None, _should_stop=None):
             from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
             swept.set()

@@ -84,7 +84,9 @@ def test_idle_endpoint_loop_logs_successful_deletion(monkeypatch) -> None:
     monkeypatch.setattr(
         app_mod,
         "_reap_idle_endpoints_once",
-        lambda minimum: runpod_resources.IdleEndpointSweepResult(deleted_ids=("ep-1", "ep-2")),
+        lambda minimum, should_stop=None: runpod_resources.IdleEndpointSweepResult(
+            deleted_ids=("ep-1", "ep-2")
+        ),
     )
 
     _run_loop_once(
@@ -135,7 +137,7 @@ def test_instance_orphan_loop_logs_successful_sweep(monkeypatch) -> None:
         debug=lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(app_mod, "_log", logger)
-    monkeypatch.setattr(app_mod, "_sweep_orphan_instances_once", lambda: 3)
+    monkeypatch.setattr(app_mod, "_sweep_orphan_instances_once", lambda should_stop=None: 3)
 
     _run_loop_once(
         monkeypatch,
@@ -271,3 +273,47 @@ def test_run_server_does_not_repeat_the_advisory_preflight_logging(monkeypatch) 
     # the refusing half only: the advisory summary belongs to the lifespan, which this test's
     # stubbed create_app never builds.
     assert seen == ["require"]
+
+
+def test_idle_endpoint_loop_sets_the_stop_event_when_cancelled(monkeypatch) -> None:
+    """Cancellation must reach the worker thread, not just the awaiting task. ``task.cancel()``
+    cannot interrupt a thread already inside a blocking provider delete, so the loop hands the
+    sweep a stop callback and sets it before re-raising. Without that, a shutdown mid-sweep keeps
+    deleting endpoints after the server was told to stop."""
+    captured = {}
+
+    async def sleep(_seconds):
+        return None
+
+    async def to_thread(function, *args):
+        captured["should_stop"] = args[-1]
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(app_mod.asyncio, "sleep", sleep)
+    monkeypatch.setattr(app_mod.asyncio, "to_thread", to_thread)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(app_mod._reap_idle_endpoints_loop())
+
+    assert captured["should_stop"]() is True
+
+
+def test_instance_orphan_loop_sets_the_stop_event_when_cancelled(monkeypatch) -> None:
+    """Same fence for the instance sweep: a teardown loop already running in a worker thread must
+    observe the shutdown, otherwise it keeps destroying billed instances past cancellation."""
+    captured = {}
+
+    async def sleep(_seconds):
+        return None
+
+    async def to_thread(function, *args):
+        captured["should_stop"] = args[-1]
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(app_mod.asyncio, "sleep", sleep)
+    monkeypatch.setattr(app_mod.asyncio, "to_thread", to_thread)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(app_mod._sweep_orphan_instances_loop())
+
+    assert captured["should_stop"]() is True

@@ -2946,3 +2946,58 @@ def test_sweep_orphans_callable_sets_resolved_after_listing(monkeypatch):
         raise RuntimeError("db down")
 
     assert vast.sweep_orphans(active_labels=boom).deleted_count == 0
+
+
+def test_sweep_orphans_halts_between_destroys_and_leaves_the_rest_unresolved(monkeypatch):
+    """The sweep runs in a worker thread that task.cancel() cannot interrupt, so the lifespan
+    signals it with a stop callback instead. Halting must not read as a completed clean sweep:
+    the un-attempted ids stay unresolved, which keeps the outcome out of DELETED."""
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    instances = [{"id": n, "label": f"flash-run{n}-s0-a0"} for n in (1, 2, 3)]
+    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    destroyed: list[int] = []
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
+    # stop after the first destroy, exactly as a shutdown mid-sweep would
+    result = vast.sweep_orphans(active_labels=set(), should_stop=lambda: len(destroyed) >= 1)
+
+    assert destroyed == [1]  # halted; 2 and 3 were never touched
+    assert result.outcome is CleanupOutcome.UNCONFIRMED  # NOT DELETED
+    assert result.confirmed_deleted_ids == ("1",)
+    assert result.unresolved_ids == ("2", "3")
+
+
+def test_sweep_orphans_stop_already_set_destroys_nothing(monkeypatch):
+    """A stop that is already set when the sweep reaches its destroy loop must destroy nothing
+    at all -- the shutdown raced ahead of the worker thread."""
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    monkeypatch.setattr(vast_api, "list_instances", lambda: [{"id": 5, "label": "flash-a-s0-a0"}])
+    destroyed: list[int] = []
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
+
+    result = vast.sweep_orphans(active_labels=set(), should_stop=lambda: True)
+
+    assert not destroyed
+    assert result.outcome is CleanupOutcome.RETRYABLE  # nothing confirmed at all
+    assert result.unresolved_ids == ("5",)
+
+
+def test_sweep_orphans_without_stop_signal_completes_normally(monkeypatch):
+    """should_stop defaults to None so the startup recover_runs path is unchanged."""
+    from flash.providers.core.capabilities import CleanupOutcome
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    instances = [{"id": n, "label": f"flash-run{n}-s0-a0"} for n in (1, 2)]
+    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)
+
+    result = vast.sweep_orphans(active_labels=set())
+
+    assert result.outcome is CleanupOutcome.DELETED
+    assert result.confirmed_deleted_ids == ("1", "2")

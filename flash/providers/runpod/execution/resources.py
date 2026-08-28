@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from flash._internal.logging import get_logger
@@ -356,11 +357,16 @@ def _sweep_idle_flash_endpoints(
     reap_warm: bool = True,
     known: set[str] | None = None,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> IdleEndpointSweepResult:
     """Delete idle, orphaned flash training endpoints and report unresolved selections.
 
     The scope flags protect other planes and live runs; `min_idle_s` requires persistent idleness.
     List accounts independently so one bad key cannot block healthy cleanup.
+
+    ``should_stop`` is checked between endpoint deletions. The sweep runs in a worker thread that
+    ``task.cancel()`` cannot interrupt, so without it a large in-flight sweep keeps deleting after
+    the lifespan was told to stop.
     """
     deleted: list[str] = []
     unresolved: list[IdleEndpointSweepIssue] = []
@@ -387,10 +393,19 @@ def _sweep_idle_flash_endpoints(
     owners_by_endpoint = _selected_owner_map(by_fp, protected, known)
     ambiguous_reported: set[str] = set()
     processed_endpoints: set[str] = set()
+    halted = False
     with _idle_since_lock:
         for fp, endpoints in by_fp.items():
+            if halted:
+                break
             owner_fingerprint = _selected_identity(fp)
             for ep in endpoints:
+                if should_stop is not None and should_stop():
+                    logger.info(
+                        "idle-sweep: stop requested; halting after %d deletion(s)", len(deleted)
+                    )
+                    halted = True
+                    break
                 if not isinstance(ep, dict):
                     continue
                 ep_name = _selected_identity(ep.get("name"))
@@ -446,9 +461,14 @@ def _sweep_idle_flash_endpoints(
                     unresolved.append(issue)
         # prune stale timers only for accounts that responded this cycle.
         # timers owned by failed accounts are kept so a flake cannot restart their grace.
-        prunable = {
-            eid for eid, (_ts, owner_fp) in _idle_since.items() if owner_fp in responded_fps
-        }
+        # a halted sweep prunes nothing: it never reached the rest of the inventory, so their
+        # absence from `still_idle` means "not visited", not "no longer idle" -- pruning there
+        # would discard accumulated grace and restart the idle window on the next boot.
+        prunable = (
+            set()
+            if halted
+            else {eid for eid, (_ts, owner_fp) in _idle_since.items() if owner_fp in responded_fps}
+        )
         for stale in prunable - still_idle:
             _idle_since.pop(stale, None)
     return IdleEndpointSweepResult(

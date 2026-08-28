@@ -7,6 +7,7 @@ NON-IDEMPOTENT so it is never retried (blind retry = double-provision + double-b
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any
 
 from flash._internal.logging import get_logger
@@ -287,11 +288,22 @@ def terminate_instances(
     instance_ids: list[str],
     *,
     deadline_at: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[str]:
     """Terminate instances; return ids that succeeded. Per-id isolation: Lambda's batch endpoint
-    rejects the whole request if any id is invalid, so one stale id would leak billing for the rest."""
+    rejects the whole request if any id is invalid, so one stale id would leak billing for the rest.
+
+    ``should_stop`` is checked between terminations. Sweeps run in a worker thread that
+    ``task.cancel()`` cannot interrupt, so without it a long teardown keeps destroying instances
+    after the server was told to stop. Halting simply omits the untouched ids from the return
+    value, which callers already read as unconfirmed rather than as a completed teardown."""
     deleted: list[str] = []
     for iid in [i for i in instance_ids if isinstance(i, str) and i.strip()]:
+        if should_stop is not None and should_stop():
+            logger.info(
+                "lambda terminate: stop requested; halting after %d termination(s)", len(deleted)
+            )
+            break
         try:
             request_with_retries(
                 "/instance-operations/terminate",

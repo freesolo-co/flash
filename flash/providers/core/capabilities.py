@@ -159,8 +159,9 @@ def is_cleanup_confirmed(result: object) -> bool:
         return False
 
 
+ShouldStop = Callable[[], bool]
 ConfirmRunAbsent = Callable[[str], CleanupResult]
-SweepOrphans = Callable[[RunLabels, RunLabels], CleanupResult]
+SweepOrphans = Callable[[RunLabels, RunLabels, ShouldStop | None], CleanupResult]
 
 
 @dataclass(frozen=True)
@@ -191,15 +192,22 @@ def sweep_orphans(
     capabilities: ProviderCapabilities,
     active_labels: RunLabels = None,
     known_labels: RunLabels = None,
+    should_stop: ShouldStop | None = None,
 ) -> CleanupResult:
-    """Invoke authoritative orphan cleanup when the provider supports it."""
+    """Invoke authoritative orphan cleanup when the provider supports it.
+
+    ``should_stop`` is checked by the provider between teardowns. The sweep runs in a worker
+    thread that ``task.cancel()`` cannot interrupt, so without it a large in-flight sweep keeps
+    destroying provider resources after the lifespan was told to stop. A sweep that halts early
+    reports the teardowns it did confirm as ``UNCONFIRMED``, never as a completed clean sweep.
+    """
     callback = capabilities.sweep_orphans
     if callback is None:
         return CleanupResult(CleanupOutcome.UNSUPPORTED)
     if not callable(callback):
         return CleanupResult(CleanupOutcome.RETRYABLE)
     try:
-        result = callback(active_labels, known_labels)
+        result = callback(active_labels, known_labels, should_stop)
     except Exception:
         return CleanupResult(CleanupOutcome.RETRYABLE)
     return _validated_callback_result(result)

@@ -77,7 +77,9 @@ def test_lambda_sweep_reports_only_truly_reaped(monkeypatch):
     ]
     monkeypatch.setattr(la_api, "list_instances", lambda: instances)
     # i-b terminate fails -> terminate_instances returns only the ids actually torn down
-    monkeypatch.setattr(la_api, "terminate_instances", lambda ids: [i for i in ids if i == "i-a"])
+    monkeypatch.setattr(
+        la_api, "terminate_instances", lambda ids, **_: [i for i in ids if i == "i-a"]
+    )
     from flash.providers.core.capabilities import CleanupOutcome
 
     out = jobs.sweep_orphans(active_labels=set())

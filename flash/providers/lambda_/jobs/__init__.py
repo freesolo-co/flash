@@ -919,8 +919,13 @@ def run_instances_remaining(run_id: str) -> list[str]:
 def sweep_orphans(
     active_labels: set[str] | Callable[[], set[str]] | None = None,
     known_labels: set[str] | Callable[[], set[str]] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> CleanupResult:
-    """Terminate flash-prefixed instances not owned by a live run."""
+    """Terminate flash-prefixed instances not owned by a live run.
+
+    ``should_stop`` is checked between terminations: cancelling the caller cannot interrupt this
+    worker thread, so a long sweep would otherwise keep destroying past the lifespan's shutdown.
+    """
     try:
         instances = lambda_api.list_instances()
     except Exception as exc:
@@ -967,9 +972,11 @@ def sweep_orphans(
     if not orphans:
         outcome = CleanupOutcome.UNCONFIRMED if unresolved else CleanupOutcome.ABSENT
         return CleanupResult(outcome, unresolved_ids=tuple(unresolved) or None)
-    deleted = tuple(lambda_api.terminate_instances(orphans))
+    deleted = tuple(lambda_api.terminate_instances(orphans, should_stop=should_stop))
     for iid in deleted:
         logger.warning("terminated orphaned lambda instance %s", iid)
+    # ids a halted (or failed) teardown never confirmed stay unresolved. that is what keeps the
+    # outcome below out of DELETED, so no caller reads a halted sweep as a clean one.
     unresolved.extend(iid for iid in orphans if iid not in set(deleted))
     if not unresolved:
         outcome = CleanupOutcome.DELETED

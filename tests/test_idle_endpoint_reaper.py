@@ -110,7 +110,7 @@ def test_reap_once_passes_protected_set_and_grace(monkeypatch):
     )
     captured: dict = {}
 
-    def fake_sweep(protected, min_idle_s=0.0, known=None):
+    def fake_sweep(protected, min_idle_s=0.0, known=None, should_stop=None):
         captured["protected"] = protected
         captured["grace"] = min_idle_s
         captured["known"] = known
@@ -156,11 +156,13 @@ class _FakeProvider:
         self._raises = raises
         self.seen_active = None
         self.seen_known = None
+        self.seen_should_stop = None
         self.capabilities = ProviderCapabilities(False, True, None, self._sweep_orphans)
 
-    def _sweep_orphans(self, active_labels=None, known_labels=None):
+    def _sweep_orphans(self, active_labels=None, known_labels=None, should_stop=None):
         from flash.providers.core.capabilities import CleanupOutcome, CleanupResult
 
+        self.seen_should_stop = should_stop
         if self._raises:
             raise RuntimeError(f"{self.name} api blip")
         self.seen_active = active_labels() if callable(active_labels) else active_labels
@@ -290,7 +292,7 @@ def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: lam_instances)
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+        lambda_api, "terminate_instances", lambda ids, **_: terminated.extend(ids) or list(ids)
     )
 
     torn = app_mod._sweep_orphan_instances_once()
@@ -326,7 +328,7 @@ def test_sweep_spares_other_control_planes_live_instances(monkeypatch):
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: lam_instances)
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+        lambda_api, "terminate_instances", lambda ids, **_: terminated.extend(ids) or list(ids)
     )
 
     torn = app_mod._sweep_orphan_instances_once()
@@ -357,7 +359,7 @@ def test_sweep_resolves_active_labels_after_listing(monkeypatch):
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", fake_list)
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+        lambda_api, "terminate_instances", lambda ids, **_: terminated.extend(ids) or list(ids)
     )
 
     out = jobs.sweep_orphans(active_labels=active_fn)
@@ -381,7 +383,7 @@ def test_sweep_skips_when_active_set_resolution_raises(monkeypatch):
         lambda: [{"id": "i-live", "name": jobs.instance_label("flash-live", 0, 0)}],
     )
     monkeypatch.setattr(
-        lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
+        lambda_api, "terminate_instances", lambda ids, **_: terminated.extend(ids) or list(ids)
     )
 
     def boom():
@@ -822,3 +824,128 @@ def test_sweep_full_view_prunes_vanished_grace_timer(monkeypatch):
 
     assert deleted.deleted_count == 0
     assert "ghost" not in runpod_resources._idle_since  # full view -> stale timer pruned
+
+
+def test_sweep_halts_between_deletes_on_stop_signal(monkeypatch):
+    """The sweep runs in a worker thread that task.cancel() cannot interrupt, so the lifespan
+    signals it with a stop callback instead. Once set, no further endpoint is deleted."""
+    runpod_resources._idle_since.clear()
+    endpoints = [{"name": f"live-flash-ep{n}", "id": f"ep-{n}"} for n in (1, 2, 3)]
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"fpA": endpoints}, []),
+    )
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: _idle_health(),
+    )
+    deletes: list[str] = []
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *a, **k: deletes.append(a[1] if len(a) > 1 else "?") or True,
+    )
+    monkeypatch.setattr(runpod_resources.logger, "info", lambda *a, **k: None)
+
+    result = runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(),
+        min_idle_s=0.0,
+        known={"flash-ep1", "flash-ep2", "flash-ep3"},
+        should_stop=lambda: len(deletes) >= 1,
+    )
+
+    assert len(deletes) == 1  # halted after the first delete
+    assert result.deleted_count == 1
+
+
+def test_halted_sweep_preserves_grace_for_endpoints_it_never_visited(monkeypatch):
+    """A halt leaves the rest of the inventory unvisited, so their absence from ``still_idle``
+    means "not reached", not "no longer idle". Pruning there would discard accumulated grace and
+    restart the 15-minute idle window on the next boot, silently extending every orphan's life."""
+    runpod_resources._idle_since.clear()
+    endpoints = [{"name": f"live-flash-ep{n}", "id": f"ep-{n}"} for n in (1, 2, 3)]
+    # ep-2 and ep-3 have already accrued grace from earlier cycles.
+    runpod_resources._idle_since["ep-2"] = (1.0, "fpA")
+    runpod_resources._idle_since["ep-3"] = (1.0, "fpA")
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"fpA": endpoints}, []),
+    )
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda *a, **k: _idle_health(),
+    )
+    deletes: list[object] = []
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda *a, **k: deletes.append(a) or True,
+    )
+    monkeypatch.setattr(runpod_resources.logger, "info", lambda *a, **k: None)
+
+    runpod_resources._sweep_idle_flash_endpoints(
+        protected=set(),
+        min_idle_s=0.0,
+        known={"flash-ep1", "flash-ep2", "flash-ep3"},
+        should_stop=lambda: len(deletes) >= 1,
+    )
+
+    # unvisited endpoints keep their accrued grace; a naive prune would have dropped both
+    assert runpod_resources._idle_since.get("ep-2") == (1.0, "fpA")
+    assert runpod_resources._idle_since.get("ep-3") == (1.0, "fpA")
+
+
+def test_sweep_instances_forwards_the_stop_callback_to_every_provider(monkeypatch):
+    """The callback must actually REACH the provider. The capabilities dispatcher wraps the
+    callback in a bare ``except Exception`` that turns a stale two-arg signature into a
+    RETRYABLE result, so "nothing raised" proves nothing on its own."""
+    monkeypatch.setattr(app_mod, "_active_run_ids", lambda: set())
+    monkeypatch.setattr(app_mod, "_known_run_ids", lambda: set())
+    lam = _FakeProvider("lambda", torn=["i-1"])
+    rp = _FakeProvider("runpod", torn=[])
+    monkeypatch.setattr(
+        "flash.providers.core.registry.configured_providers", lambda: [rp, lam], raising=False
+    )
+
+    def never_stop() -> bool:
+        return False
+
+    assert app_mod._sweep_orphan_instances_once(never_stop) == 1
+    assert lam.seen_should_stop is never_stop
+    assert rp.seen_should_stop is never_stop
+
+
+def test_sweep_instances_halts_between_providers_on_stop(monkeypatch):
+    """Without a between-providers check, a stop arriving during provider A's sweep would still
+    let provider B's entire sweep start from scratch."""
+    monkeypatch.setattr(app_mod, "_active_run_ids", lambda: set())
+    monkeypatch.setattr(app_mod, "_known_run_ids", lambda: set())
+    first = _FakeProvider("runpod", torn=["vm-1"])
+    second = _FakeProvider("lambda", torn=["i-9"])
+    monkeypatch.setattr(
+        "flash.providers.core.registry.configured_providers",
+        lambda: [first, second],
+        raising=False,
+    )
+
+    torn = app_mod._sweep_orphan_instances_once(lambda: first.seen_should_stop is not None)
+
+    assert torn == 1  # only the first provider ran
+    assert second.seen_should_stop is None  # second was never dispatched
+
+
+def test_sweep_instances_without_stop_signal_is_unchanged(monkeypatch):
+    """should_stop defaults to None so the startup recover_runs path keeps working."""
+    monkeypatch.setattr(app_mod, "_active_run_ids", lambda: set())
+    monkeypatch.setattr(app_mod, "_known_run_ids", lambda: set())
+    lam = _FakeProvider("lambda", torn=["i-1", "i-2"])
+    monkeypatch.setattr(
+        "flash.providers.core.registry.configured_providers", lambda: [lam], raising=False
+    )
+
+    assert app_mod._sweep_orphan_instances_once() == 2
+    assert lam.seen_should_stop is None
