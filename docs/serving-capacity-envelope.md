@@ -11,6 +11,30 @@ in `flash/serving/bench/`, driven by `scripts/bench_hosted_capacity.py`.
 Scope: freesolo-owned hosted serving (`flash/serving/`). Not customer-owned `flash/serve`, not
 training viability.
 
+## Relationship to `flash/serving/loadtest/`
+
+Two harnesses exist because they measure two different boundaries, and neither substitutes for the
+other.
+
+`flash/serving/loadtest/` drives the **public HTTP front door** with `httpx` against `/healthz` and
+`/v1/chat/completions`. It measures what a client experiences through the router, including dispatch
+and queuing. Its own documentation states that it cannot prove a replica scaled out, cannot prove an
+engine was cold, and cannot separate a dispatch deadline from the underlying resource constraint.
+
+`flash/serving/bench/` boots each model's engine **on that model's own production tier** and drives
+it in-process, so the number it produces is one engine's capacity rather than the front door's
+behaviour. Two consequences follow from that difference:
+
+- It invalidates any request that reports `cached_tokens > 0` as `ERROR_CACHE_CONTAMINATED`, and any
+  request whose cached-token count is unreported as `ERROR_CACHE_UNVERIFIED`. Prefix-cache reuse is
+  not a fast success; it is a measurement that did not happen. The loadtest harness counts cached
+  tokens but does not invalidate on them, which is correct for its purpose and wrong for this one.
+- It derives a capacity curve — throughput ceiling, knee concurrency, saturation concurrency — which
+  requires sweeping concurrency against a fixed engine. The loadtest harness derives no such curve.
+
+Use the loadtest harness to ask whether the deployed service is holding up. Use this one to ask how
+much a single model engine can take.
+
 ## What is measured
 
 Three models, each on its own production tier. No benchmark-chosen card: an envelope measured on a
