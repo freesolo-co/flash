@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import logging
 import threading
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from flash._internal.http import _urlopen_no_redirect
 from flash.client.freesolo_api import _freesolo_request, verify_freesolo_key
 from flash.client.http import ApiClient, ApiError
 from flash.server.billing.charges import BillingError, _post_billing
@@ -195,3 +198,53 @@ def test_billing_keeps_billing_error_classification_and_does_not_reach_redirect_
     assert exc_info.value.status_code == 302
     assert source_seen == [("POST", "Bearer billing-secret")]
     assert sink_seen == []
+
+
+def test_a_replaced_global_transport_is_called_directly(monkeypatch, redirect_servers) -> None:
+    """a test that swaps `urllib.request.urlopen` must reach its fake, not the opener stack.
+
+    the transport is resolved per call rather than bound at import. a replaced transport is not
+    part of the stdlib opener stack, so routing it through a no-redirect opener would silently
+    bypass it and send a real request instead.
+    """
+    source_url, _source_seen, sink_seen = redirect_servers
+    calls: list[str] = []
+
+    class _Ok:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def _fake(request, timeout=None):
+        calls.append(request.full_url)
+        return _Ok()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake)
+
+    req = urllib.request.Request(f"{source_url}/hop", headers={"Authorization": "Bearer t"})
+    with _urlopen_no_redirect(req, timeout=5) as resp:
+        assert resp.status == 200
+
+    assert calls == [f"{source_url}/hop"]
+    assert sink_seen == []
+
+
+def test_a_redirect_does_not_mutate_the_process_global_opener(redirect_servers) -> None:
+    """rejecting a redirect must not install an opener that changes unrelated urllib callers."""
+    source_url, _source_seen, sink_seen = redirect_servers
+    before = urllib.request._opener
+
+    req = urllib.request.Request(f"{source_url}/hop", headers={"Authorization": "Bearer t"})
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        _urlopen_no_redirect(req, timeout=5)
+
+    assert exc_info.value.code == 302
+    assert sink_seen == []
+    assert urllib.request._opener is before

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import urllib.request
 from types import SimpleNamespace
 
 import pytest
@@ -46,7 +47,7 @@ def test_post_checkpoints_handles_valid_empty_and_malformed_json(
         lambda path, body, token: (path, body, token),
     )
     monkeypatch.setattr(
-        checkpoints.urllib.request,
+        urllib.request,
         "urlopen",
         lambda request, timeout: response,
     )

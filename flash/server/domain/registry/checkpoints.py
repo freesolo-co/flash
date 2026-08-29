@@ -18,7 +18,6 @@ quietly (HF stays the source of truth) — only genuine backend failures warn.""
 from __future__ import annotations
 
 import json
-import urllib.request
 
 from flash._internal.http import _urlopen_no_redirect
 from flash.core.spec import require_project_id
@@ -36,9 +35,7 @@ _RECORD_PATH = "/api/runs/internal/checkpoints"
 def _post_checkpoints(*, token: str, body: dict) -> dict:
     """POST the checkpoint batch to the backend; raise on any non-2xx/unreachable."""
     req = build_internal_request(_RECORD_PATH, body, token=token)
-    with _urlopen_no_redirect(
-        req, timeout=DEFAULT_TIMEOUT_S, urlopen=urllib.request.urlopen
-    ) as resp:
+    with _urlopen_no_redirect(req, timeout=DEFAULT_TIMEOUT_S) as resp:
         raw = resp.read()
     try:
         return json.loads(raw or b"{}")
