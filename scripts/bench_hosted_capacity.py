@@ -7,7 +7,7 @@ docs/serving-capacity-envelope.md):
     modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary \
         --ceiling-usd 7
     modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep \
-        --bucket short_interactive --ceiling-usd 16
+        --bucket short_interactive --ceiling-usd 18
 
 Each model is measured on ITS OWN production tier (L40S / H100 / H200), not on one shared card, so
 the envelope describes the capacity a customer actually gets rather than a hypothetical uniform
@@ -64,6 +64,12 @@ STARTUP_TIMEOUT_SECONDS = 2700
 # artifact, so the run paid for the whole grid and published nothing. Derived below from the
 # preregistered bounds rather than typed, so widening a bucket cannot silently reintroduce the gap.
 TIMEOUT_HEADROOM_SECONDS = 900
+# The probe reads NVML, asks vLLM's resolver which GDN prefill backend it chose, and loads the
+# served config. All of that is post-boot and takes seconds -- but the METHOD timeout is the only
+# thing bounding it, and that timeout is sized for a whole concurrency grid. So a probe stalled in
+# `AutoConfig.from_pretrained` would bill hours against a lane that reserved nothing for it. Bounded
+# here, small, and reserved in both estimators, so the bound enforced matches the bound funded.
+PROBE_TIMEOUT_SECONDS = 300
 # Short: the container is torn down as soon as its lane finishes, and an idle benchmark card is pure
 # waste. Production's window is sized to amortize cold boots across real traffic; there is none here.
 SCALEDOWN_WINDOW_SECONDS = 120
@@ -144,13 +150,28 @@ def _worst_case_bucket_seconds() -> float:
         len(concurrency_grid(int(bench_engine_overrides_for(base_model).get("max_num_seqs", 8))))
         for base_model in BENCH_MODELS
     )
-    cells = points * (max(bucket.max_seconds for bucket in BUCKETS) + REQUEST_TIMEOUT_SECONDS)
+    # Priced per bucket and maximized, not by maximizing each term independently: the widest bucket
+    # is the one that has to fit inside this timeout, and mixing one bucket's window with another's
+    # fitting would describe a bucket that does not exist.
+    #
+    # Prompt fitting is inside this bound even though it is outside `max_seconds`. It runs in the
+    # container before each cell's window opens, so the method clock is running through it, and at
+    # near_32k it is the largest single term after the windows themselves. The budget estimator was
+    # taught this last round; omitting it HERE left the same phase unbounded in the place that
+    # actually kills the call -- Modal would terminate `run_bucket` mid-grid and the bucket's
+    # artifact would never be written, losing every cell the run had already paid for.
+    cells = points * max(
+        bucket.max_seconds + REQUEST_TIMEOUT_SECONDS + prompt_fit_seconds_bound(bucket)
+        for bucket in BUCKETS
+    )
     # A bucket landing on a COLD replacement container warms it first -- the path `_ensure_warm`
     # exists to handle -- and those warmups are SEQUENTIAL, each bounded by REQUEST_TIMEOUT_SECONDS.
     # Timing only the cells would kill that legitimate path mid-flight, and because the timeout fires
     # before `run_bucket` returns, the bucket's artifact is never written: the run loses the
     # measurement it already paid for.
-    return cells + REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS
+    #
+    # The bucket's own provenance probe is bounded separately and included for the same reason.
+    return cells + REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS + PROBE_TIMEOUT_SECONDS
 
 
 # Derived, never typed: widening a bucket or the concurrency grid raises this automatically instead
@@ -381,6 +402,14 @@ async def _run_bucket(
     # so a reader can tell a bucket that inherited the canary's warm container from one that had to
     # warm itself, rather than having to assume every bucket ran on the gated container.
     cold_start_warmup = await _ensure_warm(engine)
+    # Gate THIS container before opening its first cell, not the one the canary happened to land on.
+    # `max_containers=1` caps simultaneous replicas without pinning successive calls to one
+    # container, so the canary's probe describes a container this bucket may never have touched --
+    # and the provenance below is read only AFTER the whole grid, far too late to refuse anything.
+    # Probing here means an unresolved kernel path costs one bucket's boot instead of producing a
+    # publishable artifact whose numbers cannot be attributed to a kernel.
+    provenance = probe_all(engine.base_model, engine)
+    _require_resolved_gdn_backend(provenance)
     cells = []
     records = []
     for concurrency in concurrency_points:
@@ -427,7 +456,9 @@ async def _run_bucket(
         "cells": [cell.to_json() for cell in cells],
         "curve": summarize_curve(cells),
         "records": [record.to_json() for record in records],
-        "provenance": probe_all(engine.base_model, engine),
+        # The SAME probe the gate above accepted. Re-probing here would report a container state
+        # nothing refused, which is how an unresolved backend reached a published artifact.
+        "provenance": provenance,
         # Non-None when THIS container was cold and warmed itself, i.e. it is not the container the
         # canary gated. None means it inherited the gated warm container.
         "cold_start_warmup": cold_start_warmup,
@@ -446,6 +477,30 @@ def _write_artifact(payload: dict[str, Any], name: str) -> Path:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print(f"[bench] wrote {path}", flush=True)
     return path
+
+
+def _probe_within_bound(engine: Any) -> dict[str, Any]:
+    """Run the provenance probe under `PROBE_TIMEOUT_SECONDS`, not the class method timeout.
+
+    `probe.remote()` inherits the class's `timeout`, which is sized for a whole concurrency grid --
+    hours. But the probe only reads NVML, asks vLLM's resolver for its GDN choice, and loads the
+    served config, so anything approaching that ceiling is a stall, not work. Left on the class
+    bound, a probe hung in `AutoConfig.from_pretrained` would bill the full method timeout against
+    a lane whose estimate assigned the probe zero seconds.
+
+    Spawned rather than called so the wait is OURS to bound, and cancelled with the container torn
+    down on timeout: returning while a stuck probe keeps billing would defeat the bound.
+    """
+    call = engine.probe.spawn()
+    try:
+        return call.get(timeout=PROBE_TIMEOUT_SECONDS)
+    except TimeoutError:
+        call.cancel(terminate_containers=True)
+        raise RuntimeError(
+            f"provenance probe exceeded {PROBE_TIMEOUT_SECONDS}s; container terminated. The probe "
+            "reads NVML and the served config, so this is a stall rather than slow work, and its "
+            "cost is not reserved by either lane estimate"
+        ) from None
 
 
 def _require_resolved_gdn_backend(probe: dict[str, Any]) -> None:
@@ -477,7 +532,7 @@ def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, An
     """Boot, verify the card and kernel path, and warm up. The cheap gate before any sweep."""
     from flash.serving.bench.probe import gpu_matches
 
-    probe = engine.probe.remote()
+    probe = _probe_within_bound(engine)
     print(json.dumps(probe, indent=2), flush=True)
     if not gpu_matches(probe, expected_gpu):
         raise RuntimeError(f"expected {expected_gpu}, got {(probe.get('gpu') or {}).get('name')!r}")
@@ -523,7 +578,11 @@ def _canary_gpu_seconds_estimate() -> float:
     requests are counted once because a replacement runs the same five, not a second set.
     """
     calls = 2
-    return float(STARTUP_TIMEOUT_SECONDS) * calls + REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS
+    return (
+        float(STARTUP_TIMEOUT_SECONDS) * calls
+        + PROBE_TIMEOUT_SECONDS
+        + REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS
+    )
 
 
 def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
@@ -575,7 +634,20 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     # whole `STARTUP_TIMEOUT_SECONDS` whenever the warmup landed on its own cold replacement. The
     # warmup requests are NOT doubled: a replacement runs the same five, not a second set.
     canary_replacement_boot = boot
-    return boot + canary_replacement_boot + canary + measured + fitting + drains + replacements
+    # The canary's probe, plus one per bucket: `_run_bucket` probes the container it actually
+    # measured on. Each is bounded by `PROBE_TIMEOUT_SECONDS` rather than the class method timeout,
+    # so this is the exposure the bound permits, not a guess at typical probe time.
+    probes = PROBE_TIMEOUT_SECONDS * (len(selected) + 1)
+    return (
+        boot
+        + canary_replacement_boot
+        + canary
+        + probes
+        + measured
+        + fitting
+        + drains
+        + replacements
+    )
 
 
 @app.local_entrypoint()

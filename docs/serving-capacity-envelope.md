@@ -182,22 +182,31 @@ per-invocation ceilings for a 9B L40S lane; a larger model or a wider bucket sel
 correspondingly larger one. They are stated above what each lane reserves AND above its
 submission stop, because a documented ceiling a lane cannot clear is a command that cannot run.
 
-The canary reserves `2 x 2700s boot + 5 x 900s warmups = 9900s` ($5.37 at the recorded L40S rate) —
-two boots because `_run_canary` makes two remote calls, `probe` then `warmup`, and the second can
-land on a replacement. The single-bucket `short_interactive` sweep reserves 25419s ($13.78): both
-canary boots, the canary warmups, `6 x 420` windows, `6 x 900` drains, one replacement
-boot-plus-canary, and 399s of prompt fitting. A full three-bucket sweep reserves 62846s ($34.06)
-and needs a ceiling above $43.
+The canary reserves `2 x 2700s boot + 300s probe + 5 x 900s warmups = 10200s` ($5.53 at the
+recorded L40S rate) — two boots because `_run_canary` makes two remote calls, `probe` then
+`warmup`, and the second can land on a replacement. The single-bucket `short_interactive` sweep
+reserves 26019s ($14.10): both canary boots, the canary warmups, two bounded probes, `6 x 420`
+windows, `6 x 900` drains, one replacement boot-plus-canary, and 399s of prompt fitting. A full
+three-bucket sweep reserves 64046s ($34.71) and needs a ceiling above $44.
+
+The probe is bounded at `PROBE_TIMEOUT_SECONDS` (300s) rather than inheriting the class method
+timeout, and reserved once per canary plus once per bucket. It only reads NVML, asks vLLM's resolver
+which GDN prefill backend it chose, and loads the served config, so anything near that bound is a
+stall — but on the class timeout a stall would have billed hours against a lane whose estimate
+assigned the probe nothing at all. `_probe_within_bound` spawns the call, waits its own bound, and
+tears the container down on timeout, so the bound funded is the bound enforced.
 
 The sweep reserves the canary's SECOND boot for the same reason the canary lane does: `probe` and
 `warmup` are separate remote calls, so a sweep makes `len(buckets) + 2` separately bootable calls.
 Pricing only the initial boot under-reserved every sweep by a whole 2700s startup timeout.
 
-Prompt fitting is in the reservation but deliberately not in any `max_seconds`. It runs before a
-cell's clock starts, so tokenization cannot compete with the measured window for CPU — but it runs
-on the rented GPU container, so it bills. Leaving it out of the reservation while leaving it out of
-the window funded neither, and at 31k input it is the single largest unreserved term: 3870s across
-the `near_32k` grid against 399s for `short_interactive`.
+Prompt fitting is in the reservation AND in the method timeout, but deliberately not in any
+`max_seconds`. It runs before a cell's clock starts, so tokenization cannot compete with the
+measured window for CPU — but it runs on the rented GPU container, so it bills and the method clock
+runs through it. At 31k input it is the single largest term outside the windows themselves: 3870s
+across the `near_32k` grid against 399s for `short_interactive`. Funding it without bounding it left
+`run_bucket` able to exceed its own `timeout` mid-grid, and because that timeout fires before the
+call returns, the bucket's artifact would never be written — losing every cell already paid for.
 
 That trailing `replacement` term is the non-obvious one. `max_containers=1` caps how many replicas
 run at once; it does NOT pin successive `.remote()` calls to the container the previous bucket
@@ -206,10 +215,10 @@ which bills whether or not the reservation admitted it.
 
 A lane also has to clear its submission stop, not merely its ceiling: `reserve()` refuses at 80% of
 the ceiling so settlement lag and teardown stay funded. A lane consequently needs a ceiling around
-`1.25x` its own reservation -- $6.71 for the canary and $17.22 for the single-bucket
+`1.25x` its own reservation -- $6.91 for the canary and $17.63 for the single-bucket
 `short_interactive` sweep -- and the `--ceiling-usd 7` and `--ceiling-usd 18` above clear those
-thresholds. A larger tier needs proportionally more: the same canary is $12.48 on the 35B's H200,
-so it needs a ceiling above $15.60.
+thresholds. A larger tier needs proportionally more: the same canary is $12.86 on the 35B's H200,
+so it needs a ceiling above $16.08.
 
 The boot dominates cost (~960s of ~1000s per cell in a prior campaign), so one boot runs a whole
 bucket's concurrency grid rather than one cell. `budget.py` reserves before allocation and raises

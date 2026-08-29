@@ -1607,13 +1607,23 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     # `_run_canary` is TWO separately bootable remote calls, `probe` then `warmup`, so the sweep
     # reserves the second canary boot exactly as the canary lane does.
     canary_replacement_boot = startup
+    # The canary's probe plus one per bucket: `_run_bucket` gates the container it measured on, and
+    # each probe is bounded by `PROBE_TIMEOUT_SECONDS` rather than the class method timeout.
+    probes = constants["PROBE_TIMEOUT_SECONDS"] * 2
 
     assert estimate >= windows + drains + canary, (
         "the estimate omits the canary or the per-cell drain tails"
     )
     # The boot is reserved at the ceiling Modal lets a stuck boot reach, not a typical observed one.
     assert estimate == pytest.approx(
-        startup + canary_replacement_boot + canary + windows + fitting + drains + replacements
+        startup
+        + canary_replacement_boot
+        + canary
+        + probes
+        + windows
+        + fitting
+        + drains
+        + replacements
     )
 
 
@@ -1693,11 +1703,13 @@ def test_bench_container_timeout_covers_the_whole_grid_it_runs() -> None:
         "TIMEOUT_HEADROOM_SECONDS",
         "TIMEOUT_SECONDS",
         "CANARY_WARMUP_REQUESTS",
+        "PROBE_TIMEOUT_SECONDS",
         BENCH_MODELS=BENCH_MODELS,
         bench_engine_overrides_for=bench_engine_overrides_for,
         concurrency_grid=concurrency_grid,
         BUCKETS=BUCKETS,
         REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
+        prompt_fit_seconds_bound=prompt_fit_seconds_bound,
     )
     timeout = namespace["TIMEOUT_SECONDS"]
 
@@ -1706,13 +1718,29 @@ def test_bench_container_timeout_covers_the_whole_grid_it_runs() -> None:
         len(list(concurrency_grid(int(bench_engine_overrides_for(model).get("max_num_seqs", 8)))))
         for model in BENCH_MODELS
     )
-    widest = max(bucket.max_seconds for bucket in BUCKETS)
+    # Maximized PER BUCKET. Taking the widest window and the widest fitting separately would
+    # describe a bucket that does not exist; the timeout has to fit the worst real one.
+    #
+    # Prompt fitting is inside this bound even though it is outside `max_seconds`: it runs in the
+    # container before each cell's window opens, so the method clock runs through it. The budget
+    # estimator already reserved it; omitting it here left the same phase unbounded in the place
+    # that actually terminates the call.
+    widest = max(
+        bucket.max_seconds + REQUEST_TIMEOUT_SECONDS + prompt_fit_seconds_bound(bucket)
+        for bucket in BUCKETS
+    )
     # A bucket that lands on a cold replacement warms it SEQUENTIALLY before the first cell. Those
     # warmups run inside the method, so a timeout sized to the grid alone kills the call mid-warmup
     # -- and because the timeout fires before `run_bucket` returns, the artifact is never written.
     warmups = REQUEST_TIMEOUT_SECONDS * namespace["CANARY_WARMUP_REQUESTS"]
-    worst = points * (widest + REQUEST_TIMEOUT_SECONDS) + warmups
+    worst = points * widest + warmups + namespace["PROBE_TIMEOUT_SECONDS"]
     assert namespace["_worst_case_bucket_seconds"]() == worst
+    # Guard the direction that costs money: the grid's own fitting must be INSIDE the bound.
+    assert (
+        worst
+        > points * (max(bucket.max_seconds for bucket in BUCKETS) + REQUEST_TIMEOUT_SECONDS)
+        + warmups
+    ), "the timeout ignores prompt fitting, which runs on the method clock"
     assert timeout >= worst, (
         f"container timeout {timeout}s is below the {worst}s its own grid is allowed to take; "
         "the bucket would be killed after paying for every cell and persist no artifact"
@@ -1816,6 +1844,7 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
         "STARTUP_TIMEOUT_SECONDS",
+        "PROBE_TIMEOUT_SECONDS",
         bench_engine_overrides_for=bench_engine_overrides_for,
         concurrency_grid=concurrency_grid,
         prompt_fit_seconds_bound=prompt_fit_seconds_bound,
@@ -1828,7 +1857,11 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
     # TWO boots: `_run_canary` calls `probe.remote()` then `warmup.remote()`, and `max_containers=1`
     # bounds simultaneous replicas without binding successive calls to one container, so the warmup
     # can land on a replacement that boots again.
-    assert canary == startup * 2 + REQUEST_TIMEOUT_SECONDS * warmups
+    # The probe is bounded separately and reserved: on the class method timeout a stalled probe
+    # would bill hours against a lane whose estimate assigned it zero.
+    assert canary == startup * 2 + namespace["PROBE_TIMEOUT_SECONDS"] + (
+        REQUEST_TIMEOUT_SECONDS * warmups
+    )
     assert canary >= startup, "the canary reserves less than a stuck boot alone would bill"
 
     bucket = BUCKETS_BY_NAME["short_interactive"]
@@ -1848,6 +1881,8 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
         # one replacement boot + warmup per bucket call, since `max_containers=1` does not pin
         # successive `.remote()` calls to the container the previous bucket booted
         + (startup + REQUEST_TIMEOUT_SECONDS * warmups) * 1
+        # the canary's probe plus one per bucket: `_run_bucket` gates the container it measures on
+        + namespace["PROBE_TIMEOUT_SECONDS"] * 2
     )
     assert sweep == expected
     assert sweep - canary >= bucket.max_seconds * points, "the sweep does not price its own cells"
@@ -1870,6 +1905,7 @@ def test_documented_ceilings_exceed_what_each_lane_reserves() -> None:
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
         "STARTUP_TIMEOUT_SECONDS",
+        "PROBE_TIMEOUT_SECONDS",
         bench_engine_overrides_for=bench_engine_overrides_for,
         concurrency_grid=concurrency_grid,
         prompt_fit_seconds_bound=prompt_fit_seconds_bound,
@@ -2266,6 +2302,7 @@ def test_sweep_estimate_includes_prompt_fitting():
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
         "STARTUP_TIMEOUT_SECONDS",
+        "PROBE_TIMEOUT_SECONDS",
         REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
         bench_engine_overrides_for=bench_engine_overrides_for,
         concurrency_grid=concurrency_grid,
@@ -2287,6 +2324,7 @@ def test_sweep_estimate_includes_prompt_fitting():
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
         "STARTUP_TIMEOUT_SECONDS",
+        "PROBE_TIMEOUT_SECONDS",
         REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
         bench_engine_overrides_for=bench_engine_overrides_for,
         concurrency_grid=concurrency_grid,
@@ -2394,6 +2432,7 @@ def test_sweep_reserves_both_canary_boots() -> None:
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
         "STARTUP_TIMEOUT_SECONDS",
+        "PROBE_TIMEOUT_SECONDS",
         bench_engine_overrides_for=bench_engine_overrides_for,
         concurrency_grid=concurrency_grid,
         prompt_fit_seconds_bound=prompt_fit_seconds_bound,
@@ -2412,7 +2451,157 @@ def test_sweep_reserves_both_canary_boots() -> None:
         warmups = REQUEST_TIMEOUT_SECONDS * namespace["CANARY_WARMUP_REQUESTS"]
         # Boots reserved: initial + canary replacement + one per bucket call.
         boots = startup * (count + 2)
-        expected = boots + warmups * (count + 1) + windows + fitting + drains
+        # One bounded probe per bucket call plus the canary's own, each capped by its own bound
+        # rather than by the class method timeout.
+        probes = namespace["PROBE_TIMEOUT_SECONDS"] * (count + 1)
+        expected = boots + probes + warmups * (count + 1) + windows + fitting + drains
         assert estimate == pytest.approx(expected), (
             f"{count}-bucket sweep must reserve {count + 2} boots"
+        )
+
+
+def test_each_bucket_gates_the_container_it_actually_measures_on() -> None:
+    """The GDN gate must run on the bucket's OWN container, before its first cell.
+
+    `max_containers=1` caps simultaneous replicas without pinning successive `.remote()` calls to
+    one container, so the canary's probe can describe a container the bucket never touches. The
+    provenance block was read only AFTER the whole grid and serialized ungated, so an unresolved
+    kernel path still produced a publishable artifact -- paid for in full, and attributable to no
+    kernel.
+
+    Asserted on the CALL SITE, not the predicate. A gate nothing invokes is precisely the reported
+    defect, and a test that only exercises `_require_resolved_gdn_backend` in isolation passes
+    against it.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+    }
+    run_bucket = nodes["_run_bucket"]
+    called = {
+        child.func.id
+        for child in ast.walk(run_bucket)
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+    }
+    assert "_require_resolved_gdn_backend" in called, (
+        "a bucket can measure and publish on a container whose kernel path was never established"
+    )
+
+    # The gate must precede the first cell, or it refuses nothing that was not already paid for.
+    body = run_bucket.body
+    gate_line = min(
+        child.lineno
+        for child in ast.walk(run_bucket)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Name)
+        and child.func.id == "_require_resolved_gdn_backend"
+    )
+    loop_line = min(child.lineno for child in body if isinstance(child, ast.For | ast.AsyncFor))
+    assert gate_line < loop_line, "the kernel gate runs after cells the run has already paid for"
+
+    # And the artifact must carry the probe the gate ACCEPTED. Re-probing at serialization time
+    # would report a container state nothing refused.
+    assert "probe_all(engine.base_model, engine)" in source
+    assert source.count("probe_all(engine.base_model, engine)") == 1, (
+        "the bucket probes twice; the published provenance is then not the gated one"
+    )
+
+
+def test_the_probe_call_is_bounded_below_the_class_method_timeout() -> None:
+    """A stalled probe must not bill the whole method timeout.
+
+    `probe.remote()` inherits the class `timeout`, which is sized for an entire concurrency grid.
+    The probe only reads NVML, asks vLLM's resolver for its GDN choice, and loads the served
+    config, so a probe approaching that ceiling is stalled -- but on the class bound it would bill
+    hours against a lane whose estimate reserved it nothing.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+    }
+    called = {
+        child.func.id
+        for child in ast.walk(nodes["_run_canary"])
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+    }
+    assert "_probe_within_bound" in called, "the canary probes on the unbounded class timeout"
+
+    namespace = _bench_namespace(
+        "PROBE_TIMEOUT_SECONDS",
+        "TIMEOUT_SECONDS",
+        "TIMEOUT_HEADROOM_SECONDS",
+        "CANARY_WARMUP_REQUESTS",
+        "_worst_case_bucket_seconds",
+        BENCH_MODELS=BENCH_MODELS,
+        bench_engine_overrides_for=bench_engine_overrides_for,
+        concurrency_grid=concurrency_grid,
+        BUCKETS=BUCKETS,
+        REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
+        prompt_fit_seconds_bound=prompt_fit_seconds_bound,
+    )
+    bound = namespace["PROBE_TIMEOUT_SECONDS"]
+    assert 0 < bound < namespace["TIMEOUT_SECONDS"], (
+        "a probe bound at or above the method timeout bounds nothing"
+    )
+
+    # The wait must be OURS, and a timeout must tear the container down: returning while a stuck
+    # probe keeps billing would defeat the bound.
+    helper = nodes["_probe_within_bound"]
+    src = ast.get_source_segment(source, helper) or ""
+    assert "spawn()" in src, "a blocking .remote() cannot be bounded by the caller"
+    assert "timeout=PROBE_TIMEOUT_SECONDS" in src, (
+        "the wait is not bounded by the probe's own bound"
+    )
+    assert "terminate_containers=True" in src, (
+        "a timed-out probe keeps billing unless its container is terminated"
+    )
+
+
+def test_the_module_runbook_ceilings_clear_their_own_submission_stop() -> None:
+    """The script's own docstring is a runbook too, and it drifted from the doc's.
+
+    `test_documented_ceilings_exceed_what_each_lane_reserves` checks the markdown. The module
+    docstring carries the same two commands, and after the fitting and second-boot reservations
+    landed it still said `--ceiling-usd 16` -- copy-pasteable, and refused before allocation by the
+    lane's own 80% submission stop.
+    """
+    namespace = _bench_namespace(
+        "_canary_gpu_seconds_estimate",
+        "_sweep_gpu_seconds_estimate",
+        "CANARY_WARMUP_REQUESTS",
+        "STARTUP_TIMEOUT_SECONDS",
+        "PROBE_TIMEOUT_SECONDS",
+        bench_engine_overrides_for=bench_engine_overrides_for,
+        concurrency_grid=concurrency_grid,
+        prompt_fit_seconds_bound=prompt_fit_seconds_bound,
+        REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
+    )
+    docstring = ast.get_docstring(ast.parse(BENCH_APP.read_text(encoding="utf-8"))) or ""
+    documented = {
+        match.group(1): float(match.group(2))
+        for match in re.finditer(
+            r"--mode (canary|sweep)[\s\S]*?--ceiling-usd (\d+(?:\.\d+)?)", docstring
+        )
+    }
+    assert set(documented) == {"canary", "sweep"}, "the module runbook lost one of its commands"
+
+    model = "Qwen/Qwen3.5-9B"
+    gpu = bench_gpu_for(model)
+    reserved = {
+        "canary": namespace["_canary_gpu_seconds_estimate"](),
+        "sweep": namespace["_sweep_gpu_seconds_estimate"](
+            model, [BUCKETS_BY_NAME["short_interactive"]]
+        ),
+    }
+    for mode, seconds in reserved.items():
+        required = usd_for_gpu_seconds(seconds, gpu) / SUBMISSION_STOP_FRACTION
+        assert documented[mode] >= required, (
+            f"the module docstring's --ceiling-usd {documented[mode]} for the {mode} lane is "
+            f"below the ${required:.2f} its reservation needs to clear the submission stop"
         )
