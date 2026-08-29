@@ -15,6 +15,7 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from flash._internal.channel import CLI_NAME
+from flash._internal.http import _urlopen_no_redirect
 from flash._internal.openai_sse import (
     DeltaEvent,
     ErrorEvent,
@@ -408,7 +409,7 @@ class ApiClient:
         deadline = time.monotonic() + body_deadline if body_deadline is not None else None
         with (
             self._translate_http_errors(),
-            urllib.request.urlopen(
+            _urlopen_no_redirect(
                 req, timeout=_capped_timeout(timeout or self.timeout, deadline)
             ) as resp,
         ):
@@ -435,7 +436,7 @@ class ApiClient:
         )
         with (
             self._translate_http_errors(),
-            urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp,
+            _urlopen_no_redirect(req, timeout=timeout or self.timeout) as resp,
         ):
             if max_bytes is not None:
                 return _read_capped_response(resp, max_bytes)
@@ -804,7 +805,7 @@ class ApiClient:
         decoder = codecs.getincrementaldecoder("utf-8")()
         with (
             self._translate_http_errors(),
-            urllib.request.urlopen(req, timeout=30 * 60) as resp,
+            _urlopen_no_redirect(req, timeout=30 * 60) as resp,
         ):
             content_type = resp.headers.get("Content-Type", "")
             media_type = content_type.partition(";")[0].strip().lower()
