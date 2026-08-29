@@ -1772,6 +1772,46 @@ def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypat
     assert raw["realized_cost_remote"] == confirmed
 
 
+def test_drain_survives_a_cleanup_record_with_unhashable_json_fields(monkeypatch, tmp_path):
+    """A quarantined record's malformed sibling must not strand a live endpoint.
+
+    Quarantine preserves a corrupt record's cleanup list verbatim, so `attempt` and the resource
+    ids arrive as arbitrary JSON. The drain puts every key in a `set`, so one list-valued field
+    would raise `TypeError` before any sibling was reached -- and a well-formed RunPod endpoint
+    behind it would keep billing with nothing left to tear it down.
+    """
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="cleanup-unhashable", model="Qwen/Qwen3.5-4B", algorithm="sft")
+    billing = _runpod_remote("endpoint-live", "job-live", attempt=1)
+    poisoned = {"provider": "runpod", "endpoint_id": "ep-poisoned", "attempt": []}
+    unhashable_id = {"provider": "runpod", "endpoint_id": ["ep-listed"], "attempt": 1}
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
+    )
+    assert runner_reconciliation._preserve_cleanup_remote(spec.run_id, billing) is True
+    raw = runner_status._load_status_json(spec.run_id)
+    # the poisoned records go in ahead of the well-formed one: a drain that raises on them would
+    # never reach it, which is the exact stranding this guards.
+    raw[runner_state._CLEANUP_REMOTES_KEY] = [
+        poisoned,
+        unhashable_id,
+        *raw[runner_state._CLEANUP_REMOTES_KEY],
+    ]
+    with open(runner_state.runs_file_path(spec.run_id, ".json"), "w") as file:
+        json.dump(raw, file)
+
+    drainable = runner_reconciliation._drainable_cleanup_remotes(spec.run_id)
+
+    assert billing in drainable, "the live endpoint was stranded behind a malformed sibling"
+    # `attempt` is arbitrary JSON to the lenient reader, so the record still names a deletable
+    # endpoint and is yielded. a list-valued resource id names nothing to delete and is dropped --
+    # what matters is that neither shape raises before the well-formed sibling is reached.
+    assert poisoned in drainable
+    assert unhashable_id not in drainable
+
+
 def test_next_attempt_requires_persisted_integer_identity():
 
     assert runner_attempts._infer_next_attempt({"next_attempt": 0}) == 0

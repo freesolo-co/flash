@@ -357,14 +357,27 @@ def _uncanonical_teardown_record(item: object) -> dict | None:
     return dict(item)
 
 
+def _hashable(value: object) -> object:
+    """A stable hashable stand-in for a JSON value of any shape.
+
+    The lenient key is built from a record that failed strict validation, so every field is
+    arbitrary JSON -- `attempt` can be a list, and so can a resource id. The drain puts these keys
+    in a `set`, so one unhashable field would raise `TypeError` there and strand every well-formed
+    sibling still billing. `repr` is deterministic for a given value, which is all the key needs:
+    equal values still produce equal keys on both the drain and the compare-and-remove.
+    """
+    return value if isinstance(value, (str, int, float, bool, type(None))) else repr(value)
+
+
 def _uncanonical_cleanup_remote_key(record: object) -> tuple | None:
     """Dedupe key for a record the strict reader cannot canonicalize."""
     if not isinstance(record, dict):
         return None
-    identity = tuple(record.get(field) for field in _RESOURCE_ID_FIELDS)
-    if not any(identity):
+    raw_identity = tuple(record.get(field) for field in _RESOURCE_ID_FIELDS)
+    if not any(raw_identity):
         return None
-    return (record.get("provider"), record.get("attempt"), identity)
+    identity = tuple(_hashable(field) for field in raw_identity)
+    return (_hashable(record.get("provider")), _hashable(record.get("attempt")), identity)
 
 
 def _teardown_removal_key(record: object) -> tuple | None:
