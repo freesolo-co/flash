@@ -12,7 +12,11 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import re
+import tomllib
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -32,6 +36,7 @@ from flash.serving.bench.catalog import (
 )
 from flash.serving.bench.driver import (
     REQUEST_TIMEOUT_SECONDS,
+    _build_prompt_pool,
     _StreamOutcome,
     _validate,
     base_model_record,
@@ -48,7 +53,7 @@ from flash.serving.bench.metrics import (
     summarize_curve,
     wilson_upper_bound,
 )
-from flash.serving.bench.probe import gpu_matches, probe_gdn_backend
+from flash.serving.bench.probe import gpu_matches, probe_gdn_backend, probe_gpu
 from flash.serving.bench.workload import (
     BUCKETS,
     BUCKETS_BY_NAME,
@@ -325,7 +330,6 @@ def _record(
         started_at=0.0,
     )
     record.first_token_at = ttft
-    record.first_answer_at = ttft + 0.1
     record.finished_at = latency
     record.prompt_tokens = 512
     record.completion_tokens = tokens
@@ -871,3 +875,240 @@ def test_bench_engine_args_match_production_engine_args_exactly() -> None:
         bench = engine_args_for(model, bench_engine_overrides_for(model), cfg)
         production = engine_args_for(model, engine_overrides_for(model), cfg)
         assert bench == production, f"{model} boots a different engine than production"
+
+
+def test_a_drained_request_records_a_timeout_instead_of_raising() -> None:
+    """The drain fallback must CONSTRUCT. `started_at` is required and has no default, so omitting
+    it raised TypeError here, aborting the bucket and discarding every record of an expensive
+    sweep -- the exact loss the drain exists to prevent."""
+    source = inspect.getsource(run_cell)
+    drain = source.split("if in_flight:")[-1]
+    assert "started_at=" in drain, "drain builds RequestRecord without its required started_at"
+
+    required = {
+        name
+        for name, param in inspect.signature(RequestRecord).parameters.items()
+        if param.default is inspect.Parameter.empty
+    }
+    call = drain[drain.index("RequestRecord(") : drain.index(")", drain.index("ERROR_TIMEOUT"))]
+    for name in required:
+        assert f"{name}=" in call, f"drain record omits required field {name!r}"
+
+    # And it actually builds, rather than merely mentioning the right words.
+    record = RequestRecord(
+        uid="drain-1",
+        base_model="Qwen/Qwen3.5-9B",
+        bucket="short_interactive",
+        concurrency=4,
+        block=0,
+        started_at=1.5,
+        error=ERROR_TIMEOUT,
+    )
+    assert record.ok is False
+    assert record.error == ERROR_TIMEOUT
+
+
+def test_prompts_are_fitted_before_the_clock_starts() -> None:
+    """Fitting is repeated synchronous tokenization. On the event loop it blocks other in-flight
+    streams and inflates their TTFT, which at 31k input exceeds the effect being measured."""
+    source = inspect.getsource(run_cell)
+    pool_at = source.index("_build_prompt_pool(")
+    origin_at = source.index("origin = time.monotonic()")
+    assert pool_at < origin_at, "prompt pool must be built before the measured window opens"
+    assert "fit_prompt_to_tokens" not in source[origin_at:], "fitting leaked into the measured loop"
+
+
+def test_the_prompt_pool_covers_the_cells_request_floor() -> None:
+    """A pool shorter than the floor would wrap and re-send a prompt, which the engine's prefix
+    cache turns into a lookup rather than a measurement."""
+    fitted: list[str] = []
+
+    def fake_fit(_tokenizer: object, uid: str, target: int) -> tuple[list[dict[str, str]], int]:
+        fitted.append(uid)
+        return [{"role": "user", "content": uid}], target
+
+    bucket = BUCKETS_BY_NAME["short_interactive"]
+    with mock.patch("flash.serving.bench.driver.fit_prompt_to_tokens", fake_fit):
+        pool = _build_prompt_pool(
+            object(), bucket, concurrency=8, block=0, min_requests=bucket.min_requests
+        )
+    assert len(pool) >= bucket.min_requests
+    uids = [uid for uid, _, _ in pool]
+    # Compare the sorted list to its deduplicated form rather than only counting: a length check
+    # alone reads clean when a uid is MISSING and another is duplicated, which is the exact shape a
+    # broken index would produce.
+    assert sorted(uids) == sorted({*uids}), "pool contains duplicate prompts"
+    assert len(fitted) == len(pool)
+
+
+def test_no_ttfa_is_published_because_the_raw_stream_cannot_measure_it() -> None:
+    """`_stream_generate` emits type/text/usage and never `reasoning_content`, so the old TTFA
+    condition was true for every delta and TTFA collapsed onto TTFT. Publishing TTFT twice under
+    two names is worse than publishing one number."""
+    generation = (REPO_ROOT / "flash" / "serving" / "src" / "engine" / "generation.py").read_text()
+    assert '"reasoning_content"' not in generation
+
+    record = _record("u0")
+    assert not hasattr(record, "first_answer_at")
+    assert not hasattr(record, "ttfa")
+    assert "ttfa" not in record.to_json()
+
+    cell = reduce_cell(
+        [_record("u1")],
+        base_model="Qwen/Qwen3.5-9B",
+        bucket="short_interactive",
+        concurrency=1,
+        block=0,
+        wall_seconds=10.0,
+    )
+    assert "ttfa_seconds" not in cell.to_json()
+
+
+def test_gpu_identity_never_creates_a_cuda_context_in_this_process() -> None:
+    """A parent-process CUDA context stole the headroom EngineCore needs for FlashInfer's first
+    decode workspace and OOM-killed the 35B engine on its first request. The probe runs before every
+    warmup and every sweep, so a torch-based probe would reproduce that outage."""
+    # Parsed, not grepped: the docstring names `torch.cuda` to explain why it is avoided, and a
+    # substring check would match that prose and pass regardless of what the code does.
+    tree = ast.parse(inspect.getsource(probe_gpu).strip())
+    called = {
+        ast.unparse(node.func)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    cuda_calls = sorted(name for name in called if name.startswith("torch.cuda"))
+    assert not cuda_calls, f"probe_gpu initializes CUDA in the parent process via {cuda_calls}"
+    assert any(name.startswith("pynvml.nvml") for name in called), "identity is not read from NVML"
+    assert "pynvml.nvmlDeviceGetHandleByIndex" in called
+
+    post_mortem = (
+        REPO_ROOT / "flash" / "serving" / "src" / "engine" / "lora_engine.py"
+    ).read_text()
+    assert "extra CUDA context" in post_mortem, "the outage this guards is no longer documented"
+
+
+def test_the_workload_checksum_covers_sample_depth() -> None:
+    """min_requests decides whether the error bound resolves at all. Two campaigns differing only
+    in depth are different measurements and must not share a checksum."""
+    baseline = workload_checksum()
+    bucket = BUCKETS_BY_NAME["short_interactive"]
+
+    for field_name, value in (
+        ("min_requests", bucket.min_requests + 1),
+        ("min_seconds", bucket.min_seconds + 1.0),
+        ("max_seconds", bucket.max_seconds + 1.0),
+    ):
+        shifted = replace(bucket, **{field_name: value})
+        others = [b for b in BUCKETS if b.name != bucket.name]
+        with mock.patch("flash.serving.bench.workload.BUCKETS", [shifted, *others]):
+            assert workload_checksum() != baseline, f"{field_name} does not enter the checksum"
+
+
+def test_the_paid_entrypoint_reserves_budget_before_it_allocates_a_gpu() -> None:
+    """Every path in `main` allocates. A ceiling that is advertised but never consulted stops
+    nothing, and a typo in --mode would launch an unbudgeted sweep."""
+    source = BENCH_APP.read_text()
+    body = source[source.index("def main(") :]
+
+    assert "ceiling_usd" in body.split(")")[0], "main takes no ceiling"
+    reserve_at = body.index("ledger.reserve(")
+    for remote_call in ("_engine_for(base_model)(", ".remote("):
+        assert body.index(remote_call) > reserve_at, f"{remote_call} allocates before reserving"
+
+    mode_at = body.index("if mode not in MODES")
+    assert mode_at < reserve_at, "an unknown mode reaches allocation"
+    assert "ceiling_usd <= 0" in body, "a zero/absent ceiling is not rejected"
+
+
+def test_the_canary_refuses_a_sweep_when_warmup_generation_failed() -> None:
+    """`run_request` turns exceptions, timeouts and malformed streams into ok=False records rather
+    than raising, so `warmup.remote` returns normally against a wholly broken path."""
+    source = BENCH_APP.read_text()
+    gate = source[source.index("def _run_canary(") :]
+    gate = gate[: gate.index("\ndef ")]
+
+    assert '"warmups"' in gate, "the gate reads a key the warmup payload does not emit"
+    assert 'get("ok")' in gate
+    assert "raise RuntimeError" in gate
+
+    warmup = source[source.index("async def _run_warmup(") :]
+    emitted = warmup[: warmup.index("\nasync def ")]
+    assert '"warmups"' in emitted, "warmup payload key drifted from the gate that reads it"
+
+
+def test_results_carry_the_engine_shape_that_produced_them() -> None:
+    """Without the resolved catalog row, a capacity number cannot be tied to the checkpoint,
+    context limit or sequence cap behind it, and catalog drift silently reinterprets old results."""
+    source = BENCH_APP.read_text()
+    assert source.count("bench_catalog_summary") >= 2, "provenance helper is still test-only"
+
+    bucket_payload = source[source.index("async def _run_bucket(") :]
+    bucket_payload = bucket_payload[: bucket_payload.index("\ndef _write_artifact")]
+    assert '"engine_catalog"' in bucket_payload, "per-bucket payload omits the engine shape"
+
+    main_body = source[source.index("def main(") :]
+    assert main_body.count('"engine_catalog"') >= 2, "canary and summary must both carry it"
+
+
+def test_pynvml_is_actually_guaranteed_by_the_images_declared_dependencies() -> None:
+    """The probe imports `pynvml` without flash declaring a bound, so prove the chain that supplies it.
+
+    `test_image_extras_cover_every_directly_imported_third_party_package` allowlists `pynvml` as
+    transitive. An allowlist entry is a weakened guard: if a vllm bump ever drops flashinfer-python,
+    or marks its nvidia-ml-py dependency conditional, the import vanishes from the image and
+    `probe_gpu` degrades to `{"available": False}` -- turning the GPU identity gate into a silent
+    no-op on a paid card. This test fails the moment that chain stops holding.
+    """
+    lock = (REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
+    blocks = {}
+    for block in lock.split("[[package]]"):
+        name = re.search(r'^name = "([^"]+)"', block, re.M)
+        version = re.search(r'^version = "([^"]+)"', block, re.M)
+        if name and version:
+            blocks[(name.group(1), version.group(1))] = block
+
+    pinned = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"
+    ]
+    vllm_spec = next(s for s in pinned["serve-runtime"] if s.startswith("vllm"))
+    vllm_version = vllm_spec.split("==")[1].strip()
+
+    vllm = blocks[("vllm", vllm_version)]
+    deps = vllm.split("dependencies = [")[1].split("\n]")[0]
+    flashinfer_dep = next(
+        (ln.strip() for ln in deps.splitlines() if '"flashinfer-python"' in ln), None
+    )
+    assert flashinfer_dep is not None, (
+        f"vllm {vllm_version} no longer depends on flashinfer-python; pynvml is no longer "
+        "guaranteed and probe_gpu would degrade to unavailable"
+    )
+    # A `marker = ...` qualifier would make the dependency conditional; version/source do not.
+    assert "marker" not in flashinfer_dep, (
+        f"vllm's flashinfer-python dependency became conditional: {flashinfer_dep}"
+    )
+
+    flashinfer = [b for (n, _), b in blocks.items() if n == "flashinfer-python"]
+    assert flashinfer, "flashinfer-python absent from uv.lock"
+    for block in flashinfer:
+        line = next(
+            (ln.strip() for ln in block.splitlines() if "nvidia-ml-py" in ln),
+            None,
+        )
+        assert line is not None, "flashinfer-python no longer depends on nvidia-ml-py"
+        # A marker would make the dependency conditional, so the image could resolve without it.
+        assert "marker" not in line, f"nvidia-ml-py became conditional: {line}"
+
+
+def test_the_gpu_identity_gate_refuses_to_pass_when_the_probe_cannot_read_a_device() -> None:
+    """An unreadable device must fail the canary, never be waved through as 'close enough'.
+
+    Guards the pairing between `probe_gpu`'s failure shape and `gpu_matches`: the probe returns
+    `{"available": False, "reason": ...}` with NO `gpu` key on every error path, and the caller
+    raises on a False result. If `gpu_matches` ever defaulted a missing name to a pass, an
+    unidentified card would be billed and its numbers attributed to a tier nobody confirmed.
+    """
+    for probe in ({}, {"available": False, "reason": "pynvml unavailable: No module"}, {"gpu": {}}):
+        assert gpu_matches(probe, "H200") is False, f"unreadable probe passed the gate: {probe}"
+    assert gpu_matches({"gpu": {"name": "NVIDIA H200 141GB HBM3e"}}, "H200") is True
+    # Substring match would make this true; token match must reject it.
+    assert gpu_matches({"gpu": {"name": "NVIDIA L40S"}}, "L4") is False

@@ -51,7 +51,6 @@ class RequestRecord:
     # Monotonic seconds relative to the cell's start.
     started_at: float
     first_token_at: float | None = None
-    first_answer_at: float | None = None
     finished_at: float | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
@@ -77,22 +76,10 @@ class RequestRecord:
             return None
         return self.first_token_at - self.started_at
 
-    @property
-    def ttfa(self) -> float | None:
-        """Time to first ANSWER token, i.e. the first visible content delta.
-
-        Reported separately from TTFT because with thinking enabled a user waits for this one, and
-        the gap between them is the reasoning phase.
-        """
-        if self.first_answer_at is None:
-            return None
-        return self.first_answer_at - self.started_at
-
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)
         data["latency_seconds"] = self.latency
         data["ttft_seconds"] = self.ttft
-        data["ttfa_seconds"] = self.ttfa
         return data
 
 
@@ -162,7 +149,6 @@ class CellResult:
     prompt_tokens_total: int = 0
     completion_tokens_total: int = 0
     ttft_seconds: dict[str, Any] = field(default_factory=dict)
-    ttfa_seconds: dict[str, Any] = field(default_factory=dict)
     latency_seconds: dict[str, Any] = field(default_factory=dict)
     error_rate: float = 0.0
     error_rate_upper_bound: float = 1.0
@@ -220,7 +206,6 @@ def reduce_cell(
     prompt_total = sum(record.prompt_tokens or 0 for record in successes)
 
     ttft_values = [value for record in successes if (value := record.ttft) is not None]
-    ttfa_values = [value for record in successes if (value := record.ttfa) is not None]
     latency_values = [value for record in successes if (value := record.latency) is not None]
 
     error_rate = (len(failures) / attempted) if attempted else 0.0
@@ -250,7 +235,6 @@ def reduce_cell(
         prompt_tokens_total=prompt_total,
         completion_tokens_total=completion_total,
         ttft_seconds=_distribution(ttft_values, sample_floor_p99),
-        ttfa_seconds=_distribution(ttfa_values, sample_floor_p99),
         latency_seconds=_distribution(latency_values, sample_floor_p99),
         error_rate=error_rate,
         error_rate_upper_bound=upper_bound,

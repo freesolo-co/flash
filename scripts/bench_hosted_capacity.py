@@ -264,6 +264,7 @@ async def _run_bucket(
     The boot dominates cost (~960s of ~1000s per cell in the prior campaign), so the grid runs
     against a single engine rather than paying a boot per point.
     """
+    from flash.serving.bench.catalog import bench_catalog_summary
     from flash.serving.bench.driver import run_cell
     from flash.serving.bench.metrics import summarize_curve
     from flash.serving.bench.probe import probe_all
@@ -305,6 +306,11 @@ async def _run_bucket(
         "curve": summarize_curve(cells),
         "records": [record.to_json() for record in records],
         "provenance": probe_all(engine.base_model, engine),
+        # The resolved engine shape, so a cell's numbers stay interpretable after catalog drift.
+        "engine_catalog": next(
+            (row for row in bench_catalog_summary() if row["base_model"] == engine.base_model),
+            None,
+        ),
     }
 
 
@@ -336,7 +342,29 @@ def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, An
         )
     warm = engine.warmup.remote(5)
     print(json.dumps(warm, indent=2), flush=True)
+    # `run_request` converts exceptions, timeouts, malformed streams and cache-verification failures
+    # into records with ok=False rather than raising, so `warmup.remote` returns normally even when
+    # the generation path is entirely broken. Without this check the cheap gate would wave through an
+    # expensive sweep already known to be invalid.
+    records = warm.get("warmups") if isinstance(warm, dict) else None
+    if not isinstance(records, list) or not records:
+        raise RuntimeError(f"canary warmup returned no records: {warm!r}")
+    failed = [record for record in records if not record.get("ok")]
+    if failed:
+        reasons = sorted({str(record.get("error")) for record in failed})
+        raise RuntimeError(
+            f"canary warmup failed {len(failed)}/{len(records)} requests ({', '.join(reasons)}); "
+            "refusing to start a paid sweep against a broken generation path"
+        )
     return {"probe": probe, "warmup": warm}
+
+
+# Conservative per-lane GPU-second estimates, used to reserve against the ceiling BEFORE any
+# allocation. Deliberately generous: a reservation that overestimates stops a lane early, while one
+# that underestimates lets a lane overspend, and only the second failure costs money.
+ESTIMATED_CANARY_GPU_SECONDS = 1200.0
+ESTIMATED_SWEEP_GPU_SECONDS = 3600.0
+MODES = ("canary", "sweep")
 
 
 @app.local_entrypoint()
@@ -345,15 +373,43 @@ def main(
     mode: str = "canary",
     bucket: str = "",
     block: int = 0,
+    ceiling_usd: float = 0.0,
 ) -> None:
     """Drive one model's benchmark lane on its own production tier.
 
     ``canary`` boots the engine, verifies the card, reports the GDN prefill kernel, and runs a
     handful of warmups. It is the cheap gate that must pass before any sweep spends money.
+
+    ``ceiling_usd`` is REQUIRED and has no usable default: every path below allocates a GPU, so the
+    budget is reserved here, before the first remote call, rather than advertised and never
+    consulted.
     """
+    from flash.serving.bench.budget import BudgetLedger
+    from flash.serving.bench.catalog import bench_catalog_summary
     from flash.serving.bench.workload import BUCKETS, concurrency_grid, workload_checksum
 
+    # Checked before anything else: an unknown mode must not reach a remote call, because every one
+    # of them allocates the model's GPU.
+    if mode not in MODES:
+        raise SystemExit(f"unknown --mode {mode!r}; expected one of {', '.join(MODES)}")
+    if ceiling_usd <= 0:
+        raise SystemExit(
+            "--ceiling-usd is required and must be positive: this entrypoint allocates a GPU, so "
+            "it refuses to run against an unauthorized budget"
+        )
+
     expected_gpu = bench_gpu_for(base_model)
+    ledger = BudgetLedger(ceiling_usd=ceiling_usd)
+    estimate = ESTIMATED_CANARY_GPU_SECONDS if mode == "canary" else ESTIMATED_SWEEP_GPU_SECONDS
+    # Raises BudgetExceeded rather than allocating. This is the line that makes the ceiling real.
+    ledger.reserve(f"{mode}:{base_model}", estimate, expected_gpu)
+
+    catalog = {row["base_model"]: row for row in bench_catalog_summary()}
+    # The resolved engine shape travels WITH the numbers. Without it a published capacity figure
+    # cannot be tied to the checkpoint, context limit, sequence cap, or LoRA allocation that
+    # produced it, and catalog drift would silently reinterpret old results.
+    provenance = catalog.get(base_model)
+
     engine = _engine_for(base_model)(base_model=base_model)
     gate = _run_canary(base_model, engine, expected_gpu)
 
@@ -363,9 +419,11 @@ def main(
                 "base_model": base_model,
                 "gpu": expected_gpu,
                 "mode": "canary",
+                "engine_catalog": provenance,
                 "probe": gate["probe"],
                 "warmup": gate["warmup"],
                 "workload_checksum": workload_checksum(),
+                "budget": ledger.to_json(),
             },
             f"canary-{base_model.replace('/', '_')}.json",
         )
@@ -385,8 +443,10 @@ def main(
             "gpu": expected_gpu,
             "mode": mode,
             "grid": grid,
+            "engine_catalog": provenance,
             "workload_checksum": workload_checksum(),
             "buckets": [payload["curve"] for payload in results],
+            "budget": ledger.to_json(),
         },
         f"summary-{base_model.replace('/', '_')}-b{block}.json",
     )

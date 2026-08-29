@@ -253,6 +253,11 @@ def workload_checksum() -> str:
 
     Any later edit to the buckets or decoding contract changes this value, so a report cannot
     silently describe a workload other than the one it measured.
+
+    The depth floors are part of the digest, not decoration: `min_requests` decides whether the
+    error-rate bound can resolve at all, and `min_seconds`/`max_seconds` decide how long a cell runs.
+    Two campaigns that differ only in those numbers are materially different measurements, so they
+    must not share a checksum.
     """
     material = "|".join(
         [
@@ -260,7 +265,11 @@ def workload_checksum() -> str:
             f"top_p={TOP_P}",
             f"n={N_CHOICES}",
             f"thinking={ENABLE_THINKING}",
-            *(f"{b.name}:{b.target_input_tokens}:{b.max_output_tokens}" for b in BUCKETS),
+            *(
+                f"{b.name}:{b.target_input_tokens}:{b.max_output_tokens}"
+                f":{b.min_requests}:{b.min_seconds}:{b.max_seconds}"
+                for b in BUCKETS
+            ),
         ]
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()

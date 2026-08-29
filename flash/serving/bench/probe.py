@@ -21,27 +21,67 @@ not to a measurement tool that would then be measuring its own side effect.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 
 def probe_gpu() -> dict[str, Any]:
-    """Device identity, capability, and memory as CUDA reports them."""
-    import torch
+    """Device identity, capability, and memory, read from the DRIVER via NVML.
 
-    if not torch.cuda.is_available():
-        return {"available": False}
-    index = torch.cuda.current_device()
-    properties = torch.cuda.get_device_properties(index)
-    major, minor = torch.cuda.get_device_capability(index)
-    return {
-        "available": True,
-        "device_count": torch.cuda.device_count(),
-        "name": torch.cuda.get_device_name(index),
-        "compute_capability": f"{major}.{minor}",
-        "total_memory_bytes": properties.total_memory,
-        "torch_version": torch.__version__,
-        "cuda_version": torch.version.cuda,
-    }
+    Deliberately not ``torch.cuda``. Under vLLM V1 the model runs in a separate EngineCore process,
+    and this probe runs in the parent Modal class process. ``torch.cuda.current_device()`` and
+    friends initialize a CUDA context *here*, and a prior campaign's extra parent-process context
+    stole the post-init headroom EngineCore needs for FlashInfer's first-request decode workspace,
+    OOM-killing the 35B engine on its first request (see the post-mortem comment in
+    ``flash/serving/src/engine/lora_engine.py``). Since the canary runs this probe before every
+    warmup and every sweep, a torch-based probe would either reproduce that outage or measure a
+    memory shape production deliberately avoids.
+
+    NVML queries the driver without creating a context, so identity costs nothing measurable.
+    """
+    try:
+        import pynvml
+    except ImportError as exc:  # pragma: no cover - NVML ships with the serving image
+        return {"available": False, "reason": f"pynvml unavailable: {exc}"}
+
+    try:
+        pynvml.nvmlInit()
+    except Exception as exc:
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+    try:
+        count = pynvml.nvmlDeviceGetCount()
+        if count == 0:
+            return {"available": False, "reason": "NVML reports no devices"}
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        name = pynvml.nvmlDeviceGetName(handle)
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", "replace")
+        major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+        memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        result: dict[str, Any] = {
+            "available": True,
+            "device_count": count,
+            "name": str(name),
+            "compute_capability": f"{major}.{minor}",
+            "total_memory_bytes": int(memory.total),
+            "source": "nvml",
+        }
+    except Exception as exc:
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+    finally:
+        with contextlib.suppress(Exception):
+            pynvml.nvmlShutdown()
+
+    # Version strings are module attributes; reading them creates no context.
+    try:
+        import torch
+
+        result["torch_version"] = torch.__version__
+        result["cuda_version"] = torch.version.cuda
+    except Exception:  # pragma: no cover - torch is present in the serving image
+        pass
+    return result
 
 
 def probe_cutlass_integrity() -> dict[str, Any]:

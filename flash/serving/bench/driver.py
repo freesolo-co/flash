@@ -93,7 +93,6 @@ class _StreamOutcome:
         "completion_tokens",
         "delta_tokens",
         "finish_reason",
-        "first_answer_at",
         "first_token_at",
         "prompt_tokens",
         "reasoning_tokens",
@@ -103,7 +102,6 @@ class _StreamOutcome:
 
     def __init__(self) -> None:
         self.first_token_at: float | None = None
-        self.first_answer_at: float | None = None
         self.prompt_tokens: int | None = None
         self.completion_tokens: int | None = None
         self.cached_tokens: int | None = None
@@ -140,10 +138,6 @@ def _absorb_event(event: dict[str, Any], outcome: _StreamOutcome, now: float) ->
             outcome.delta_tokens += 1
             if outcome.first_token_at is None:
                 outcome.first_token_at = now
-            # With a reasoning parser the engine splits reasoning from answer text. The first event
-            # carrying visible content marks TTFA; reasoning-only deltas do not.
-            if event.get("reasoning_content") is None and outcome.first_answer_at is None:
-                outcome.first_answer_at = now
     elif kind == "choice_finished":
         reason = event.get("finish_reason")
         if isinstance(reason, str) and reason:
@@ -238,7 +232,6 @@ async def run_request(
     finally:
         record.finished_at = time.monotonic() - origin
         record.first_token_at = outcome.first_token_at
-        record.first_answer_at = outcome.first_answer_at
         record.prompt_tokens = outcome.prompt_tokens
         record.completion_tokens = outcome.completion_tokens
         record.cached_tokens = outcome.cached_tokens
@@ -250,6 +243,31 @@ async def run_request(
     if record.error is None:
         _validate(outcome, record)
     return record
+
+
+def _build_prompt_pool(
+    tokenizer: Any,
+    bucket: Bucket,
+    *,
+    concurrency: int,
+    block: int,
+    min_requests: int,
+) -> list[tuple[str, list[dict[str, Any]], int]]:
+    """Fit every prompt the cell can need BEFORE the measured window opens.
+
+    Each entry is request-unique from its first token, so no two requests share a prefix and the
+    engine's prefix cache cannot turn a measurement into a lookup. The pool is sized past the
+    request floor because a cell may overrun it while waiting on `min_seconds`; if it does wrap, it
+    reuses a prompt, and that reuse is caught by the cache-contamination check rather than passing
+    silently as a fast success.
+    """
+    size = max(concurrency, min_requests + concurrency)
+    pool: list[tuple[str, list[dict[str, Any]], int]] = []
+    for index in range(size):
+        uid = request_uid(bucket.name, concurrency, block, index)
+        messages, exact = fit_prompt_to_tokens(tokenizer, uid, bucket.target_input_tokens)
+        pool.append((uid, messages, exact))
+    return pool
 
 
 async def run_cell(
@@ -279,24 +297,36 @@ async def run_cell(
     min_requests = bucket.min_requests if min_requests is None else min_requests
     max_seconds = bucket.max_seconds if max_seconds is None else max_seconds
 
-    issued = 0
     records: list[RequestRecord] = []
-    prompt_cache: dict[str, tuple[list[dict[str, Any]], int]] = {}
+
+    # Fitting is repeated synchronous tokenization. Done lazily it would run ON the event loop: the
+    # first `concurrency` fits land inside the measured window as idle wall time, and every
+    # replacement fit blocks consumption of the OTHER in-flight streams, inflating their TTFT and
+    # latency. At 8k and 31k input that distortion is larger than the effect being measured. So the
+    # whole pool is built BEFORE the clock starts, and the measured loop only pops from it.
+    pool = _build_prompt_pool(
+        tokenizer,
+        bucket,
+        concurrency=concurrency,
+        block=block,
+        min_requests=min_requests,
+    )
+    issued = 0
 
     def _next_prompt() -> tuple[str, list[dict[str, Any]], int]:
         nonlocal issued
-        uid = request_uid(bucket.name, concurrency, block, issued)
+        uid, messages, exact = pool[issued % len(pool)]
         issued += 1
-        if uid not in prompt_cache:
-            prompt_cache[uid] = fit_prompt_to_tokens(tokenizer, uid, bucket.target_input_tokens)
-        messages, exact = prompt_cache[uid]
         return uid, messages, exact
 
     origin = time.monotonic()
+    spawned_at: dict[asyncio.Task[RequestRecord], float] = {}
+    spawned_uid: dict[asyncio.Task[RequestRecord], str] = {}
 
     def _spawn() -> asyncio.Task[RequestRecord]:
         uid, messages, _ = _next_prompt()
-        return asyncio.create_task(
+        started_at = time.monotonic() - origin
+        task = asyncio.create_task(
             run_request(
                 engine,
                 base_model,
@@ -309,6 +339,9 @@ async def run_cell(
                 origin=origin,
             )
         )
+        spawned_at[task] = started_at
+        spawned_uid[task] = uid
+        return task
 
     in_flight = {_spawn() for _ in range(concurrency)}
     try:
@@ -344,13 +377,18 @@ async def run_cell(
             for task in still_pending:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
+                # `started_at` is REQUIRED and has no default. Omitting it raised TypeError here,
+                # which aborted the whole bucket and discarded every record accumulated during the
+                # expensive sweep -- the exact loss this drain exists to prevent. The task's own
+                # start offset is carried on the task so a drained record keeps its real origin.
                 records.append(
                     RequestRecord(
-                        uid=f"drain-{id(task):x}",
+                        uid=spawned_uid.get(task, f"drain-{id(task):x}"),
                         base_model=base_model,
                         bucket=bucket.name,
                         concurrency=concurrency,
                         block=block,
+                        started_at=spawned_at.get(task, 0.0),
                         error=ERROR_TIMEOUT,
                         error_detail="request did not finish within the drain bound",
                     )
