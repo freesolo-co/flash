@@ -6,6 +6,7 @@ import logging
 import threading
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -16,6 +17,29 @@ from flash.client.http import ApiClient, ApiError
 from flash.server.billing.charges import BillingError, _post_billing
 from flash.server.platform import auth
 from flash.server.platform import internal_client as ic
+
+
+@contextmanager
+def _ok_server():
+    """serve 200 with an empty JSON body, for asserting a later call is really made."""
+
+    class OkHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), OkHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 @pytest.fixture
@@ -114,19 +138,6 @@ def test_freesolo_client_paths_keep_api_error_classification_and_do_not_reach_re
     assert sink_seen == []
 
 
-def test_server_verifier_returns_false_and_does_not_reach_redirect_sink(
-    monkeypatch, redirect_servers
-) -> None:
-    source_url, source_seen, sink_seen = redirect_servers
-    monkeypatch.setenv(auth.FREESOLO_BASE_URL_ENV, source_url)
-    auth._verify_cache.clear()
-    auth._verify_inflight.clear()
-
-    assert auth._freesolo_verify("server-secret") is False
-    assert source_seen == [("GET", "Bearer server-secret")]
-    assert sink_seen == []
-
-
 def test_a_rejected_redirect_is_not_cached_as_a_failed_verification(
     monkeypatch, redirect_servers
 ) -> None:
@@ -142,26 +153,16 @@ def test_a_rejected_redirect_is_not_cached_as_a_failed_verification(
     auth._verify_inflight.clear()
 
     assert auth._freesolo_verify("redirected-secret") is False
+    assert source_seen == [("GET", "Bearer redirected-secret")]
     assert sink_seen == []
     assert "redirected-secret" not in auth._verify_cache
 
-    class _Ok:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args: object) -> bool:
-            return False
-
-        def read(self) -> bytes:
-            return b"{}"
-
     # the redirect condition clears and the backend answers for real. a cached negative from the
     # redirect would shadow this and keep returning False without a request.
-    monkeypatch.setattr(auth.urllib.request, "urlopen", lambda req, timeout=None: _Ok())
+    with _ok_server() as ok_url:
+        monkeypatch.setenv(auth.FREESOLO_BASE_URL_ENV, ok_url)
+        assert auth._freesolo_verify("redirected-secret") is True
 
-    assert auth._freesolo_verify("redirected-secret") is True
     assert len(source_seen) == 1
 
 
@@ -200,40 +201,29 @@ def test_billing_keeps_billing_error_classification_and_does_not_reach_redirect_
     assert sink_seen == []
 
 
-def test_a_replaced_global_transport_is_called_directly(monkeypatch, redirect_servers) -> None:
-    """a test that swaps `urllib.request.urlopen` must reach its fake, not the opener stack.
+def test_a_redirect_following_injected_transport_still_loses_the_credential(
+    redirect_servers,
+) -> None:
+    """an injected transport that delegates to the stdlib must not become a credential leak.
 
-    the transport is resolved per call rather than bound at import. a replaced transport is not
-    part of the stdlib opener stack, so routing it through a no-redirect opener would silently
-    bypass it and send a real request instead.
+    the seam honours a caller-supplied transport as given and cannot know whether it follows
+    redirects: an identity check could not tell a test fake from an APM or compatibility wrapper
+    that calls the real stdlib underneath. so the protection is structural instead. the hop is
+    followed here, but the credential lives in the header bag `redirect_request` does not copy,
+    and the sink sees none of it.
     """
-    source_url, _source_seen, sink_seen = redirect_servers
-    calls: list[str] = []
+    source_url, source_seen, sink_seen = redirect_servers
+    stdlib_urlopen = urllib.request.urlopen
 
-    class _Ok:
-        status = 200
+    def _delegating_wrapper(request, **kwargs):
+        return stdlib_urlopen(request, **kwargs)
 
-        def __enter__(self):
-            return self
+    req = urllib.request.Request(f"{source_url}/hop", headers={"Authorization": "Bearer wrapped"})
+    with _urlopen_no_redirect(req, timeout=5, urlopen=_delegating_wrapper) as resp:
+        resp.read()
 
-        def __exit__(self, *args: object) -> bool:
-            return False
-
-        def read(self) -> bytes:
-            return b"{}"
-
-    def _fake(request, timeout=None):
-        calls.append(request.full_url)
-        return _Ok()
-
-    monkeypatch.setattr(urllib.request, "urlopen", _fake)
-
-    req = urllib.request.Request(f"{source_url}/hop", headers={"Authorization": "Bearer t"})
-    with _urlopen_no_redirect(req, timeout=5) as resp:
-        assert resp.status == 200
-
-    assert calls == [f"{source_url}/hop"]
-    assert sink_seen == []
+    assert source_seen == [("GET", "Bearer wrapped")]
+    assert sink_seen == [("GET", None)]
 
 
 def test_a_redirect_does_not_mutate_the_process_global_opener(redirect_servers) -> None:

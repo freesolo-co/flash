@@ -132,7 +132,7 @@ def request_internal_json(
     method: str,
     subject: str,
     logger: Logger,
-    urlopen: UrlOpen = urllib.request.urlopen,
+    urlopen: UrlOpen | None = None,
     raise_for: AbstractSet[int] | None = None,
     expected: AbstractSet[int] | None = None,
 ) -> bool:
@@ -172,7 +172,7 @@ def post_internal_json(
     *,
     subject: str,
     logger: Logger,
-    urlopen: UrlOpen = urllib.request.urlopen,
+    urlopen: UrlOpen | None = None,
     raise_for: AbstractSet[int] | None = None,
     expected: AbstractSet[int] | None = None,
 ) -> bool:
@@ -194,7 +194,7 @@ def delete_internal_json(
     *,
     subject: str,
     logger: Logger,
-    urlopen: UrlOpen = urllib.request.urlopen,
+    urlopen: UrlOpen | None = None,
 ) -> bool:
     return request_internal_json(
         path,

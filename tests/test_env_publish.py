@@ -17,6 +17,7 @@ import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 from flash.server.domain.registry import envs
 from tests._helpers.source_snapshot import valid_source_snapshot
+from tests._helpers.wire_headers import sent_headers
 
 
 def _gnu_longname_bomb(name_len: int) -> bytes:
@@ -590,7 +591,7 @@ def test_require_environment_project_posts_strict_validation(monkeypatch):
         seen.update(
             url=req.full_url,
             method=req.method,
-            headers=dict(req.headers),
+            headers=sent_headers(req),
             body=json.loads(req.data),
             timeout=timeout,
         )

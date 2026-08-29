@@ -155,10 +155,6 @@ class RunpodProvider:
             failure_detail_reader=failure_reader,
             current_attempt=rh.attempt,
             **deadline_kwargs(runpod_polling.poll_job, _deadline_at),
-            # the persisted scarcity flag controls stall grace, not capacity wording. recovery
-            # rebuilds the unpinned allocation with a fresh candidate set, so claiming no escalation
-            # remains would be false.
-            #
             # the card count comes from the spec rather than the handle's `allocated_gpu_count`:
             # attach polls the persisted EFFECTIVE worker spec, which submission already stamped
             # with the count allocation resolved, and the attach context pops that handle key off

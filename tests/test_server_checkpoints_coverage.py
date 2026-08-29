@@ -42,11 +42,6 @@ def test_post_checkpoints_handles_valid_empty_and_malformed_json(
     """Backend response decoding must accept valid JSON and safely normalize empty or malformed bodies."""
     response = _Response(raw)
     monkeypatch.setattr(
-        checkpoints,
-        "build_internal_request",
-        lambda path, body, token: (path, body, token),
-    )
-    monkeypatch.setattr(
         urllib.request,
         "urlopen",
         lambda request, timeout: response,

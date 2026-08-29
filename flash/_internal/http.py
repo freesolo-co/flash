@@ -1,14 +1,19 @@
-"""authenticated stdlib HTTP that refuses to follow a redirect.
+"""authenticated stdlib HTTP that cannot leak a credential across a redirect.
 
-`urllib.request.Request` keeps two header bags: `headers`, which survives a redirect, and
-`unredirected_hdrs`, which does not. `HTTPRedirectHandler.redirect_request` builds the follow-up
-request from `headers` alone, stripping only content headers. application code that writes
-`Request(url, headers={"Authorization": ...})` lands the credential in the surviving bag, so the
-stdlib will replay the token against whatever host the `Location` names.
+`urllib.request.Request` keeps two header bags. `headers` survives a redirect:
+`HTTPRedirectHandler.redirect_request` builds the follow-up request by copying it, stripping only
+content headers. `unredirected_hdrs` does not survive, and `AbstractHTTPHandler.do_open` sends both.
+application code that writes `Request(url, headers={"Authorization": ...})` lands the credential in
+the surviving bag, so the stdlib replays the token against whatever host the `Location` names.
 
-no flash or freesolo endpoint answers 3xx, so this raises the redirect as an `HTTPError` rather
-than trying to decide which hops are safe. each caller already classifies `HTTPError`, so the
-rejection surfaces through its existing error path.
+the fix is to move the credential into the bag a redirect cannot copy. that holds whatever transport
+runs, which is what makes it the guarantee rather than the redirect refusal below: an identity check
+on the transport cannot tell a test fake from a tracing or compatibility wrapper that delegates to
+the real stdlib, and the wrapper's inner call follows redirects normally.
+
+on top of that the stdlib path refuses the hop outright. no flash or freesolo endpoint answers 3xx,
+so this rejects rather than deciding which hops are safe, and surfaces as an `HTTPError` that every
+caller already classifies.
 """
 
 from __future__ import annotations
@@ -19,6 +24,9 @@ from typing import Any
 
 _UrlOpen = Callable[..., Any]
 
+# headers that authenticate the request and must never reach a redirect target.
+_CREDENTIAL_HEADERS = ("authorization", "proxy-authorization", "cookie", "x-api-key")
+
 # the stdlib transport as it was before any test replaced it. comparing against the live
 # `urllib.request.urlopen` instead would defeat the check: a replaced attribute is trivially
 # identical to itself, so every fake would be routed through the opener stack and never called.
@@ -26,10 +34,24 @@ _STDLIB_URLOPEN: _UrlOpen = urllib.request.urlopen
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """raise 3xx instead of replaying the credential against the redirect target."""
+    """raise 3xx instead of following it."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def _move_credentials_out_of_the_redirect_bag(request: urllib.request.Request) -> None:
+    """relocate credential headers into the bag `redirect_request` does not copy.
+
+    `do_open` sends `unredirected_hdrs` and `headers` together, so the original request is
+    unchanged on the wire. only the follow-up request a redirect would build loses them.
+    """
+
+    for name in list(request.headers):
+        if name.lower() in _CREDENTIAL_HEADERS:
+            value = request.headers[name]
+            request.remove_header(name)
+            request.add_unredirected_header(name, value)
 
 
 def _urlopen_no_redirect(
@@ -38,13 +60,16 @@ def _urlopen_no_redirect(
     timeout: float,
     urlopen: _UrlOpen | None = None,
 ):
-    """open one authenticated request without allowing a credential-bearing redirect.
+    """open one authenticated request so that no redirect can carry its credential.
 
     the transport is read at call time rather than bound at import, because many tests replace
     `urllib.request.urlopen` with a fake. a replaced transport is called directly: it is not the
-    stdlib opener stack, so routing it through a no-redirect opener would not reach it.
+    stdlib opener stack, so routing it through a no-redirect opener would not reach it. that
+    dispatch is a compatibility concern rather than the security boundary: the relocation above
+    already ran, so a transport this check misjudges still cannot leak the credential.
     """
 
+    _move_credentials_out_of_the_redirect_bag(request)
     transport = urlopen if urlopen is not None else urllib.request.urlopen
     if transport is not _STDLIB_URLOPEN:
         return transport(request, timeout=timeout)

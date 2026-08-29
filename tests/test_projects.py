@@ -13,6 +13,7 @@ from flash.server.domain.registry.projects import (
     require_project_access,
     require_project_access_slug,
 )
+from tests._helpers.wire_headers import sent_headers
 
 
 class _Response:
@@ -36,7 +37,7 @@ def test_project_client_uses_bearer_api_without_caller_org(monkeypatch) -> None:
 
     def urlopen(req, timeout=None):
         body = json.loads(req.data) if req.data else None
-        seen.append((req.method, req.full_url, dict(req.headers), body))
+        seen.append((req.method, req.full_url, sent_headers(req), body))
         if req.method == "POST":
             return _Response({"id": " 33333333-3333-4333-8333-333333333333 "})
         if req.full_url.endswith("/api/projects/11111111-1111-4111-8111-111111111111"):
@@ -91,7 +92,7 @@ def test_server_project_validation_uses_authenticated_bearer_and_org(monkeypatch
         seen.update(
             method=req.get_method(),
             url=req.full_url,
-            headers=dict(req.headers),
+            headers=sent_headers(req),
             body=req.data,
             timeout=timeout,
         )
@@ -134,7 +135,7 @@ def test_internal_project_validation_uses_internal_service_endpoint(monkeypatch)
         seen.update(
             method=req.get_method(),
             url=req.full_url,
-            headers=dict(req.headers),
+            headers=sent_headers(req),
             body=json.loads(req.data),
             timeout=timeout,
         )
