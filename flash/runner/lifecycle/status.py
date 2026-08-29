@@ -146,6 +146,27 @@ _QUARANTINE_MAPPING_FALLBACKS: dict[str, dict | None] = {
 }
 
 
+def _salvaged_deployment(value: dict) -> dict:
+    """The record's own deployment metadata, with a `state` its readers can safely test.
+
+    The mapping fallback above only replaces a `deployment` that is not a dict at all. A dict whose
+    nested `state` is unhashable passes that check and is persisted verbatim -- and
+    `recover_deployments()` opens by testing exactly that value for membership in two `set`
+    literals, which raises `TypeError` on a list or dict. That runs synchronously in the
+    `create_app()` lifespan, so it aborts startup readiness rather than failing one record.
+
+    Dropping the key rather than the whole mapping is deliberate: `_deployment_projection` in
+    `flash/server/domain/registry/runs.py` still needs `checkpoint_id` and `endpoint` to report a
+    live deployment, so discarding them over an unusable sibling would cost a settled run its
+    serving provenance. A missing `state` reads back as `None`, which is in neither state set, so
+    the record is skipped by recovery exactly as an unrecognized state already is.
+    """
+    stored = value.get("state")
+    if isinstance(stored, str) or "state" not in value:
+        return value
+    return {key: item for key, item in value.items() if key != "state"}
+
+
 def _salvaged_finished_at(raw: dict) -> float | None:
     """The record's own terminal timestamp, which billing treats as the teardown boundary.
 
@@ -283,6 +304,8 @@ def _salvage_corrupt_record(
         for key, fallback in _QUARANTINE_MAPPING_FALLBACKS.items():
             if not isinstance(values.get(key), dict):
                 values[key] = dict(fallback) if fallback is not None else None
+        if isinstance(values.get("deployment"), dict):
+            values["deployment"] = _salvaged_deployment(values["deployment"])
         values["source_snapshot"] = _salvaged_source_snapshot(raw)
         stored_state = raw.get("state")
         if isinstance(stored_state, str) and stored_state in _QUARANTINE_RETAINED_STATES:

@@ -7268,6 +7268,47 @@ def test_quarantine_preserves_the_billable_fields_of_a_settled_run(monkeypatch, 
     assert reread.billing_state == "pending"
 
 
+def test_quarantine_drops_a_deployment_state_its_readers_cannot_test(monkeypatch, tmp_path):
+    """A salvaged `deployment.state` must be safe to test for set membership.
+
+    The mapping fallback only replaces a `deployment` that is not a dict at all, so `{"state": []}`
+    passes it and is persisted verbatim. `recover_deployments()` opens by testing exactly that
+    nested value against two `set` literals, which raises `TypeError` on a list -- synchronously in
+    the `create_app()` lifespan, so it aborts startup readiness for every other deployment instead
+    of failing this one record. The sibling keys stay: `_deployment_projection` still reports a live
+    deployment from them, so discarding the whole mapping would cost a settled run its provenance.
+    """
+    from flash.server.routes import serving_revisions
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+    payload = json.dumps(
+        {
+            "run_id": "unhashable-deployment",
+            "state": "done",
+            "spec": {},
+            "deployment": {"state": [], "checkpoint_id": "ckpt-1", "endpoint": "https://ep"},
+            "source_snapshot": {"kind": "invalid"},
+        }
+    ).encode()
+    with open(runner_state.runs_file_path("unhashable-deployment", ".json"), "wb") as file:
+        file.write(payload)
+
+    status, quarantined = runner_status._quarantine_corrupt_status("unhashable-deployment", "boom")
+
+    assert quarantined
+    assert status is not None
+    deployment = status.deployment or {}
+    # the serving provenance a settled run's deployment projection reads is untouched.
+    assert deployment["checkpoint_id"] == "ckpt-1"
+    assert deployment["endpoint"] == "https://ep"
+    # the exact expression `recover_deployments()` runs first, against the durable record. a
+    # surviving list here raises `TypeError` instead, which is the startup abort this guards.
+    state = (runner_status.get_status("unhashable-deployment").deployment or {}).get("state")
+    assert state not in serving_revisions._DEPLOYMENT_BUSY_STATES
+    assert state not in serving_revisions._DEPLOYMENT_READY_STATES
+
+
 def test_quarantine_does_not_lift_a_record_naming_a_different_run(monkeypatch, tmp_path):
     """A record whose stored id disagrees with its filename is evidence about some other run.
 
