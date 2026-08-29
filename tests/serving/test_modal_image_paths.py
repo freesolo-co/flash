@@ -104,6 +104,65 @@ def test_modal_image_applies_and_verifies_the_shared_vllm_repair() -> None:
     assert command.index(apply) < command.index(verify) < command.index(cleanup)
 
 
+def test_image_repairs_the_cutlass_dsl_install_after_resolving() -> None:
+    """The cuTe-DSL repair must run, and must run AFTER the resolve that corrupts it.
+
+    `nvidia-cutlass-dsl-libs-base` and `-libs-cu13` write many of the same paths under the shared
+    `nvidia_cutlass_dsl/` namespace with different content, so whichever extracts last wins and the
+    order is racy. vllm 0.23.0 gates its FlashInfer Blackwell GDN prefill kernel on
+    `_is_libs_cu13_install_intact()`, which re-hashes every file the cu13 wheel claims -- measured
+    2026-08-23 as 23/26/99/99 of 200 files mismatched across four independently built serving venvs
+    on this pin.
+
+    The failure is SILENT: the backend resolver falls through to Triton/FLA after one
+    `warning_once`, so a Blackwell tier boots, serves, and bills the Blackwell rate while running
+    the slower kernel. Ordering is the whole point -- a repair placed before the resolve is
+    overwritten by it and buys nothing.
+    """
+    tree = _module()
+    steps = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+
+    # the image has more than one `run_commands` (the shared vllm MoE-LoRA repair is another), so
+    # select this one by its payload rather than by attribute name alone.
+    repairs = [
+        node
+        for node in steps
+        if node.func.attr == "run_commands"
+        and any("nvidia-cutlass-dsl-libs-cu13" in str(ast.literal_eval(a)) for a in node.args)
+    ]
+    assert len(repairs) == 1, f"expected exactly one cuTe-DSL repair step, got {len(repairs)}"
+    command = " ".join(str(ast.literal_eval(a)) for a in repairs[0].args)
+
+    # --force-reinstall is what actually rewrites the files the sibling wheel clobbered; --no-deps
+    # keeps the repair from re-resolving (and re-racing) the rest of the stack.
+    assert "--force-reinstall" in command, command
+    assert "--no-deps" in command, command
+
+    # the reinstall must pin to the version the resolve already chose. `--no-deps` ignores the
+    # resolved pin, so an unpinned reinstall silently takes the NEWEST release: observed pulling
+    # `-libs-cu13` 4.7.0 into a stack whose `nvidia-cutlass-dsl` and `-libs-base` are 4.5.2. the
+    # intactness check re-hashes `-libs-cu13` against its own RECORD, so that skew still reads as
+    # intact -- the check cannot catch it, which is why the pin has to be asserted here.
+    assert "==" in command, (
+        "the cuTe-DSL repair must pin the reinstall to the resolved version; an unpinned "
+        f"--no-deps reinstall takes the newest release and skews the stack, got: {command}"
+    )
+
+    # the repair is only meaningful downstream of the install that corrupts it. compare source
+    # offsets rather than walk order so the assertion reads in build order.
+    source = MODAL_APP.read_text(encoding="utf-8")
+    resolve_at = source.index(".pip_install_from_pyproject(")
+    repair_at = source.index("nvidia-cutlass-dsl-libs-cu13")
+    assert resolve_at < repair_at, (
+        "the cuTe-DSL repair must be chained after pip_install_from_pyproject, "
+        f"got resolve at {resolve_at} and repair at {repair_at}"
+    )
+
+
 def test_hosted_deploy_docs_and_workflows_point_at_paths_that_exist() -> None:
     """The documented deploy commands and the workflows that run them must match the move.
 

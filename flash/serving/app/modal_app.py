@@ -127,6 +127,12 @@ SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     # ~1010s cold boot (35B bf16, 67 GiB + ~377s torch.compile). Break-even AND a ~17-min
     # user-visible stall on a miss both argue for keeping the full window here.
     "H200": 1800,
+    # B200 now carries ALL three hosted models, so its hold is sized by the slowest of them (the 35B
+    # bf16 boot, ~1010s of engine init) rather than by the fastest. an explicit entry also keeps the
+    # tier off DEFAULT_SCALEDOWN_WINDOW_SECONDS, which coincides with 1800 today but would drift
+    # silently if that default ever moved. the idle tax per cold wake is ~$3.13 at $6.25/h, the
+    # highest of any tier here -- that is the cost side of consolidating onto one card.
+    "B200": 1800,
 }
 
 
@@ -226,6 +232,36 @@ image = (
         str(REPO_DIR / "pyproject.toml"),
         optional_dependencies=["serve-runtime", "serving"],
     )
+    # repair the cute-dsl install AFTER the resolve above. `nvidia-cutlass-dsl-libs-base` and
+    # `-libs-cu13` both ship into the shared `nvidia_cutlass_dsl/` namespace and write many of the
+    # SAME paths with DIFFERENT content; whichever extracts last wins, and with a parallel installer
+    # the order is racy (NVIDIA/cutlass#3170, #3259). vllm 0.23.0 gates its flashinfer blackwell gdn
+    # prefill kernel on `_is_libs_cu13_install_intact()`
+    # (`model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py`), which re-hashes every file the
+    # `-libs-cu13` wheel claims and returns False on ANY mismatch.
+    #
+    # measured 2026-08-23 across four independently-built serving venvs on this vllm pin: 23, 26, 99
+    # and 99 of 200 files mismatched, so the corruption is the norm, not an edge case. verified end
+    # to end against vllm's OWN `_is_libs_cu13_install_intact()` on a copy of the real serving venv:
+    # False before this step, True after.
+    #
+    # the reinstall pins to the version already resolved above rather than naming one. unpinned,
+    # `--no-deps` ignores the resolved pin and takes the newest release (observed: the resolve gives
+    # the whole cute-dsl stack 4.5.2, and a bare reinstall pulled `-libs-cu13` 4.7.0 while
+    # `nvidia-cutlass-dsl` and `-libs-base` stayed at 4.5.2). that still satisfies the intactness
+    # check, because it re-hashes `-libs-cu13` against its OWN RECORD, so a uniformly-newer variant
+    # looks intact. that is exactly why the check cannot catch the skew this would introduce.
+    #
+    # why this matters on blackwell specifically: the flashinfer gdn path needs SM10.x +
+    # `linear_key_head_dim == 128` (true for every served Qwen3.5/3.6) + cuda>=13 (torch 2.11.0+cu130
+    # satisfies it) + this intactness check. only the last one fails, and it fails SILENTLY: the
+    # resolver falls through to triton/FLA after a single `warning_once`, so a blackwell tier boots,
+    # serves, and bills the blackwell rate while running the slower kernel. SM90 (H100/H200) is
+    # unaffected because it takes flashinfer with no further constraints.
+    .run_commands(
+        'pip install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==$('
+        "pip show nvidia-cutlass-dsl-libs-cu13 | awk '/^Version:/{print $2}')\"",
+    )
     # copy the fail-closed repair into the image before running it. this is a build-time source
     # backport, not a runtime hook: it verifies exact vllm 0.23.0 pre/post hashes without importing
     # vllm or torch. a separate pass rejects a successful no-op, then the script is removed.
@@ -317,17 +353,27 @@ from flash.serving.src.engine.model_config import (  # noqa: E402
 
 
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
-    """(max_inputs, target_inputs) sized to the model's REAL vLLM concurrency (``max_num_seqs``).
+    """(max_inputs, target_inputs) sized 1:1 to the model's REAL vLLM concurrency (``max_num_seqs``).
 
-    Modal's ``max_inputs`` is how many requests it packs onto ONE container before it must add
-    another. If it far exceeds the engine's ``max_num_seqs`` (e.g. the global 64 on the 35B, which
-    decodes only 8 at a time), Modal piles requests 9..64 INSIDE the container instead of autoscaling
-    — high latency and no scale-out until ~target_inputs are packed. So cap ``max_inputs`` near the
-    engine's capacity with a small boot buffer (2x, so a cold-booting replacement doesn't reject
-    bursts), bounded by the global ``MAX_INPUTS``; scale out at 3/4 of that. Models that leave
-    ``max_num_seqs`` at the vLLM default keep the global sizing."""
-    seqs = int(engine_overrides_for(base_model).get("max_num_seqs", MAX_INPUTS))
-    max_inputs = max(8, min(MAX_INPUTS, seqs * 2))
+    Modal's ``max_inputs`` counts REQUESTS packed onto one container; vLLM's ``max_num_seqs`` is how
+    many sequences that container can actually decode at once. When admission exceeds decode capacity,
+    Modal piles the surplus INSIDE the container instead of adding one, and scale-out waits for
+    ``target_inputs``. The old 2x buffer admitted 16 onto every 8-sequence engine: the loadtest
+    measured a 1.98-2.13x per-request slowdown with container throughput flat at 1.01x, i.e. pure
+    queueing, and the wait showed up in TTFT rather than in per-request tok/s.
+
+    So admit exactly what the engine decodes and scale out at 3/4 of that. Throughput is raised by
+    lifting the ENGINE cap (``max_num_seqs`` in model_config) rather than by over-admitting against a
+    fixed one. Models that leave ``max_num_seqs`` at the vLLM default keep the global sizing.
+
+    Caveat this deliberately does not cover: OpenAI ``n`` can fan one request out to as many as four
+    sequences, so an all-``n=4`` workload still queues behind the sequence budget. Sizing every
+    container for that rare worst case would leave ordinary ``n=1`` traffic underutilizing the GPU and
+    cold-booting expensive replicas early, so the common case wins here."""
+    configured = engine_overrides_for(base_model).get("max_num_seqs")
+    if configured is None:
+        return MAX_INPUTS, TARGET_INPUTS
+    max_inputs = max(1, min(MAX_INPUTS, int(configured)))
     target_inputs = max(1, max_inputs * 3 // 4)
     return max_inputs, target_inputs
 
@@ -803,6 +849,42 @@ def router():
     )
 
 
+# Blackwell tiers whose GDN prefill kernel is gated on an intact cuTe-DSL install. SM90 (H100/H200)
+# takes FlashInfer with no further constraints, so only these need the assertion.
+_GDN_GATED_GPUS = frozenset({"B200"})
+
+
+def _degraded_gdn_backend(gpu: str, report: object) -> str | None:
+    """Reason a warmed engine must be treated as FAILED, or ``None`` when it is acceptable.
+
+    A silently-downgraded Blackwell engine is the one failure mode that passes every liveness signal
+    we have: vllm's resolver emits a single ``warning_once`` and returns ``"triton"`` rather than
+    raising, so the container boots, serves correct output, reports ``ok: True``, and bills the
+    Blackwell rate while running the slower kernel. Warm-up only ever caught exceptions, which means
+    the health field reporting this was decorative -- nothing asserted it.
+
+    ``resolved: None`` is rejected here, not tolerated. It means the resolver could not be reached
+    (import moved, signature changed), and an unprovable backend must never pass a gate whose whole
+    purpose is proving it. Non-gated tiers are exempt because the term does not apply to them.
+    """
+    if gpu not in _GDN_GATED_GPUS:
+        return None
+    if not isinstance(report, dict):
+        return f"health report is {type(report).__name__}, not a dict, so the gdn backend is unprovable"
+    backend = report.get("gdn_prefill_backend")
+    if not isinstance(backend, dict):
+        return "health report carries no gdn_prefill_backend, so the kernel is unprovable"
+    resolved = backend.get("resolved")
+    if resolved == "flashinfer":
+        return None
+    intact = backend.get("libs_cu13_intact")
+    return (
+        f"gdn prefill backend resolved to {resolved!r}, not 'flashinfer' "
+        f"(libs_cu13_intact={intact!r}) -- this {gpu} would bill the blackwell rate while "
+        "running the slower kernel; the image's cute-dsl repair is the thing to check"
+    )
+
+
 @app.local_entrypoint()
 def start_all(base_model: str | None = None) -> None:
     """Explicitly boot deployed gpu engines and wait for them to report healthy.
@@ -810,6 +892,9 @@ def start_all(base_model: str | None = None) -> None:
     Normal deploys leave gpu engines at zero until inference or adapter registration reaches the
     matching base model. This manual diagnostic can boot one model with ``--base-model`` or every
     catalog model without changing the scale-to-zero deployment.
+
+    Booting is necessary but not sufficient: on a gated tier this also asserts the resolved GDN
+    prefill kernel, because a degraded engine boots green and only shows up on the bill.
     """
     from flash.serving.src.engine.model_config import base_models, gpu_for
 
@@ -825,11 +910,17 @@ def start_all(base_model: str | None = None) -> None:
         started[bm] = instance.health.spawn()
     for bm, handle in started.items():
         try:
-            print(f"started {bm}: {handle.get(timeout=1800)}", flush=True)
+            report = handle.get(timeout=1800)
+            print(f"started {bm}: {report}", flush=True)
         except Exception as exc:  # report per-model startup failures, keep going
             failure = f"{bm}: {type(exc).__name__}: {exc}"
             failures.append(failure)
             print(f"FAILED  {failure}", flush=True)
+            continue
+        degraded = _degraded_gdn_backend(gpu_for(bm), report)
+        if degraded is not None:
+            failures.append(f"{bm}: {degraded}")
+            print(f"FAILED  {bm}: {degraded}", flush=True)
     if failures:
         raise RuntimeError(
             f"serving warm failed for {len(failures)} model(s): {'; '.join(failures)}"

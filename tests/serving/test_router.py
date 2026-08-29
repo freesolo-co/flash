@@ -213,8 +213,11 @@ def test_healthz_reports_one_gpu_per_base_model(app_setup):
     ]
     assert body["base_models"] == [QWEN, QWEN_35B]  # sorted by model id
     assert body["gpus"] == 2  # two configured supported base-model engines
-    assert body["gpu_by_model"] == {QWEN: "L40S", QWEN_35B: "H200"}
-    assert body["gpu_tiers"] == ["H200", "L40S"]
+    # both hosted models serve on B200 now, so `gpus` (a per-MODEL count) stays 2 while `gpu_tiers`
+    # (the distinct set) collapses to one. they are deliberately different measures: a single tier
+    # entry must not be read as a single engine.
+    assert body["gpu_by_model"] == {QWEN: "B200", QWEN_35B: "B200"}
+    assert body["gpu_tiers"] == ["B200"]
     assert "configuredGpu" not in body  # the single-GPU field is gone (per-model now)
     assert body["adapters"] == 3
 

@@ -40,6 +40,7 @@ from flash.serving.src.engine.support import (
     _load_adapters_for_base,
     _safe_chat_template_kwargs,
     enforce_expected_checkpoint,
+    gdn_prefill_backend_report,
 )
 
 
@@ -770,4 +771,12 @@ class _LoraEngineImpl:
             # a per-model override (every tier now pins 32k) must be reflected here, or
             # health/monitoring misreports the limit vLLM actually serves.
             "max_model_len": _ov.get("max_model_len", cfg.MAX_MODEL_LEN),
+            # Which GDN prefill kernel vLLM actually resolved. Every hosted base is a Qwen3
+            # GDN-hybrid, and on Blackwell the FlashInfer path is gated on an intact cuTe-DSL
+            # install that a stock resolve corrupts. That gate fails SILENTLY (one warning_once,
+            # then Triton), so boot success, ok:True and correct output all stay green on a tier
+            # running the slow kernel at the Blackwell rate. Reported so the canary can assert the
+            # resolved backend instead of inferring it. ``resolved: None`` means UNPROVEN, never
+            # "fine": treat it as a failed assertion.
+            "gdn_prefill_backend": gdn_prefill_backend_report(),
         }

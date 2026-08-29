@@ -149,7 +149,7 @@ GPUs, so there's nothing to tune at deploy time:
   `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, so the canary metadata remains testable without
   advertising or routing the model. The 35B-A3B vision-language MoE is the
   **exception**: it serves the **official bf16
-  base weights** on an H200 (`quantization=None`), because vLLM's fused-MoE LoRA path cannot run under
+  base weights** on a B200 (`quantization=None`), because vLLM's fused-MoE LoRA path cannot run under
   FP8 at the shape a full all-expert flash adapter needs (see the GPU tiers † footnote below).
 
   vLLM auto-detects each checkpoint's declared quantization, so the engine passes no online
@@ -159,13 +159,13 @@ GPUs, so there's nothing to tune at deploy time:
   404-crash-loops, which is why the old GPTQ `serve_model_id` was removed); the owned `Freesolo-Co/*-FP8`
   checkpoints are VL-preserving (each VL-unified base's vision tower + MoE router gates stay in
   original precision) and already published to the operator HF org. Native FP8 tensor cores need
-  compute capability ≥ 8.9; every dense FP8 tier runs on an L4, L40S, or H100 (all native). No serving
-  tier runs on A100 now that the 35B is bf16 on H200. The 27B serves the official native FP8
-  checkpoint on an H100.
+  compute capability ≥ 8.9; every hosted tier now runs on B200 (sm100, native). No serving tier runs
+  on A100. The 27B serves the official native FP8 checkpoint on a B200.
 
 - **The real memory lever — LoRA buffers:** vLLM PRE-ALLOCATES the GPU LoRA buffers at `max_loras ×
 max_lora_rank`, regardless of how many adapters load. Both are linear levers. The qualified 9B runs
-  **16 × 128** on L40S and the 27B runs **16 × 64** on H100. The 35B MoE runs **6 × 64** bf16 on H200. Adapters trained above the effective rank are rejected at load; a base regularly serving
+  **16 × 128**, the 27B runs **16 × 64**, and the 35B MoE runs **6 × 64** bf16 — all three on B200.
+  Adapters trained above the effective rank are rejected at load; a base regularly serving
   more distinct adapters than its hot limit pays a swap latency from the CPU pool unless its hot
   limit equals `MAX_CPU_LORAS`.
 
@@ -180,24 +180,43 @@ sizing determine the GPU tier. Tiers live in `src/model_config.py`; only catalog
 and a catalog entry with no explicit GPU uses `DEFAULT_GPU` (L4). Every tier needs a one-time real-GPU
 cold-boot smoke test first.
 
-| Base model                | Checkpoint                                   | GPU       | Hot LoRA shape | Context |
-| ------------------------- | -------------------------------------------- | --------- | -------------- | ------- |
-| Qwen3.5-9B                | owned FP8 (`Freesolo-Co/*-FP8`)              | **L40S**§ | 16 × 128       | 32768   |
-| Qwen3.8-27B               | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | **H100**‡ | 16 × 64        | 32768   |
-| Qwen3.6-35B-A3B (MoE, VL) | official **bf16** (`Qwen/Qwen3.6-35B-A3B`)   | **H200**† | 6 × 64         | 32768   |
+| Base model                | Checkpoint                                   | GPU       | Hot LoRA shape | `max_num_seqs` | Context |
+| ------------------------- | -------------------------------------------- | --------- | -------------- | -------------- | ------- |
+| Qwen3.5-9B                | owned FP8 (`Freesolo-Co/*-FP8`)              | **B200**§ | 16 × 128       | 16             | 32768   |
+| Qwen3.8-27B               | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | **B200**‡ | 16 × 64        | 16             | 32768   |
+| Qwen3.6-35B-A3B (MoE, VL) | official **bf16** (`Qwen/Qwen3.6-35B-A3B`)   | **B200**† | 6 × 64         | **8**          | 32768   |
 
-§ 9B (L40S) runs **16 × 128** at 32k context with `max_num_seqs=8`, CUDA graphs
+**Modal admission is sized 1:1 to `max_num_seqs`** (`_engine_concurrency`), so that column is the
+container's real throughput, not just a scheduler knob. `max_inputs` equals it and `target_inputs` is
+3/4 of it. Admitting above it does not add throughput — it queues the surplus *inside* the container
+and the wait lands in TTFT rather than in per-request tok/s. Raise throughput by raising the engine
+cap here, never by over-admitting against a fixed one.
+
+⚠ **Two engine classes, not one.** `modal.concurrent` is fixed per class, so the 35B (held at 8) gets
+its own class: `LoraEngine_B200_c16` for the 9B/27B and `LoraEngine_B200_c8` for the 35B. A deploy
+that changes either number renames the class and therefore replaces the engine wholesale — expect a
+cold boot on the next request (~17 min for the 35B), so prefer a low-traffic window.
+
+§ 9B (B200, 180 GiB) runs **16 × 128** at 32k context with `max_num_seqs=16`, CUDA graphs
 (`enforce_eager=False`), and `gpu_memory_utilization=0.90`. Its rank-128 × 16 buffer OOMed an L4 and
-2×L4 in the real-GPU sweep, so it runs on the 48 GiB L40S, the cheapest Ada card that fits it at 32k.
+2×L4 in the real-GPU sweep; it previously ran on the 48 GiB L40S, the cheapest Ada card that fits it
+at 32k, and the B200 is a strict superset of that fit, so every other knob is carried over unchanged.
+The seq cap went 8 → 16 because the per-slot cost on this hybrid is the GatedDeltaNet recurrent
+state, allocated per slot and **constant in context length** (~49 MiB/seq across 24 linear layers,
+roughly 50× the logits buffer), so eight extra slots is sub-GiB on 180 GiB. That figure is derived
+from published config shapes, **not** read from vLLM's allocator — confirm it on the tier canary.
 
-‡ 27B (H100, 80 GiB) runs **16 × 64** at 32k with `max_num_seqs=8`, CUDA graphs
-(`enforce_eager=False`), and `gpu_memory_utilization=0.90`, qualified by a real-GPU canary on the exact
-immutable official FP8 checkpoint: weights loaded at 44.25 GiB, leaving 23.07 GiB of KV cache
-(350,981 tokens, 10.71x concurrency at 32k) after a 0.35 GiB graph capture. Cold boot is about 20 min
-(load + 137 s torch.compile + 442 s warmup dominated by the FlashInfer GDN JIT), all cached on the
-serving volume. Qwen3.6-27B measurements do not qualify or predict the Qwen3.8 checkpoint.
+‡ 27B (B200, 180 GiB) runs **16 × 64** at 32k with `max_num_seqs=16`, CUDA graphs
+(`enforce_eager=False`), and `gpu_memory_utilization=0.90`. The numbers below come from its **H100
+(80 GiB)** canary on the exact immutable official FP8 checkpoint: weights loaded at 44.25 GiB, leaving
+23.07 GiB of KV cache (350,981 tokens, 10.71x concurrency at 32k) after a 0.35 GiB graph capture. Cold
+boot was about 20 min (load + 137 s torch.compile + 442 s warmup dominated by the FlashInfer GDN JIT),
+all cached on the serving volume. The B200 more than doubles that card, which is why the seq cap went
+8 → 16 on a dense model with no MoE activation spike at profiling time — but the measurements above
+are **H100 measurements**; re-canary on B200. Qwen3.6-27B measurements do not qualify or predict the
+Qwen3.8 checkpoint.
 
-† 35B-A3B runs **bf16 on an H200** (141 GiB) at **6 × 64**, the one serving path that gives a flash
+† 35B-A3B runs **bf16 on a B200** (180 GiB) at **6 × 64**, the one serving path that gives a flash
 adapter its full all-expert LoRA AND CUDA graphs at speed. It gets rank 64 like the 27B
 tier but at only **6 hot slots** (`6 × 64`, not `16 × 64`): its fused-MoE LoRA buffer scales with
 `max_loras × rank × num_experts`, so `16 × 64` (~140 GiB) is unreachable on a single GPU. Why bf16 and
@@ -207,11 +226,18 @@ not the FP8 checkpoint every other tier uses:
   leaving no room for CUDA-graph capture, so it is forced eager at ~4-10 tok/s.
 - **FP8 on H200/B200** fails outright: the fused-MoE LoRA kernel dies with `Unsupported lhs dtype
 fp8e4nv` (only A100's Marlin kernel runs this MoE's LoRA), so full-expert LoRA will not even load.
-- **bf16 on H200** sidesteps the fp8 kernel: ~107 GiB weights+LoRA + ~17 GiB KV + graph capture all
-  fit the 141 GiB card, every expert gets its LoRA and graphs (~129 tok/s single-stream, canaried
-  2026-07-06). `gpu_memory_utilization=0.90`, `max_model_len=32768` (32k; the real-GPU canary held a
-  ~679,701-token KV cache at 6 × 64, ~20× concurrency, where 8 × 64 overflowed and fit only ~19k),
-  `max_num_batched_tokens=4096`, `max_num_seqs=8`, `enforce_eager=False`.
+- **bf16** sidesteps the fp8 kernel: ~107 GiB weights+LoRA + ~17 GiB KV + graph capture all fit,
+  every expert gets its LoRA and graphs (~129 tok/s single-stream, canaried 2026-07-06 on the H200's
+  141 GiB; the 180 GiB B200 is a strict superset of that fit). `gpu_memory_utilization=0.90`,
+  `max_model_len=32768` (32k; the real-GPU canary held a ~679,701-token KV cache at 6 × 64, ~20×
+  concurrency, where 8 × 64 overflowed and fit only ~19k), `max_num_batched_tokens=4096`,
+  `max_num_seqs=8`, `enforce_eager=False`.
+
+  **This tier stays at `max_num_seqs=8` while the 9B and 27B go to 16.** It is the one tier whose
+  profiling peak is a documented OOM hazard (`boot.py`), and at p99 it is KV-bound rather than
+  state-bound (~85 MiB/seq of KV at an 8,712-token p99, on top of ~61 MiB/seq of recurrent state), so
+  raising it is not the sub-GiB change it is on the 9B. It needs its own real-GPU canary before it
+  moves; do not raise it on the strength of the other two tiers.
 
 The vision encoder is loaded (no `language_model_only`) so flash adapters' vision-tower LoRA keys bind.
 There is no A100 fallback and no expert-exclusion "fast profile" knob: one faithful path.
