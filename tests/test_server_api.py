@@ -6900,7 +6900,7 @@ def test_recover_runs_corrupt_status_is_quarantined_per_record(monkeypatch, tmp_
     assert quarantine_files[0].read_bytes() == bad_payload
 
 
-@pytest.mark.parametrize("settled_state", ["done", "cancelled", "dry_run"])
+@pytest.mark.parametrize("settled_state", ["done", "cancelled", "dry_run", "deployed"])
 def test_quarantine_preserves_an_already_settled_outcome(monkeypatch, tmp_path, settled_state):
     """Quarantine must not relabel a settled run `failed`.
 
@@ -6933,6 +6933,188 @@ def test_quarantine_preserves_an_already_settled_outcome(monkeypatch, tmp_path, 
     assert "boom" in status.error
     # the corrupt bytes are still preserved beside the repaired envelope.
     assert len(list((tmp_path / "runs").glob("settled-run.json.corrupt-*"))) == 1
+
+
+def test_quarantine_keeps_the_stored_terminal_timestamp(monkeypatch, tmp_path):
+    """A settled record keeps its own `finished_at`, because billing bills up to that instant.
+
+    `_terminal_ts` in `flash/server/domain/ops/reconcile.py` uses `finished_at` as the teardown
+    boundary and `_instance_realized_cost` in `flash/providers/core/realized.py` bills an instance
+    provider from `started_ts` through it. Restamping the envelope at restart would charge the
+    whole outage as wall time, so the boundary has to survive quarantine unchanged. `now` is
+    correct only for a record newly transitioned to `failed`, which the second half pins.
+    """
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+
+    def _write(run_id, extra):
+        payload = json.dumps(
+            {
+                "run_id": run_id,
+                "spec": {},
+                "source_snapshot": {"kind": "invalid"},
+                **extra,
+            }
+        ).encode()
+        with open(runner_state.runs_file_path(run_id, ".json"), "wb") as file:
+            file.write(payload)
+
+    _write("settled-ts", {"state": "done", "finished_at": 1000.0})
+    _write("running-ts", {"state": "running"})
+    before = time.time()
+
+    settled, _ = runner_status._quarantine_corrupt_status("settled-ts", "boom")
+    failed, _ = runner_status._quarantine_corrupt_status("running-ts", "boom")
+
+    assert settled is not None
+    assert failed is not None
+    assert settled.finished_at == 1000.0
+    # the newly failed record has no boundary of its own, so quarantine stamps one.
+    assert failed.state == "failed"
+    assert failed.finished_at >= before
+
+
+@pytest.mark.parametrize("stored", [1000, "1000", None, True, float("nan"), -1.0, 0.0])
+def test_quarantine_rejects_an_unusable_terminal_timestamp(monkeypatch, tmp_path, stored):
+    """Only a finite positive real is usable as the billing boundary; the rest fall back to `now`.
+
+    `_terminal_ts` raises on `None` and `float()` raises on a string, so lifting either verbatim
+    would abort reconciliation rather than merely mis-bill. `True` is an `int` to `isinstance`, and
+    a non-positive or non-finite value cannot bound an interval, so each is refused the same way
+    `_instance_realized_cost` guards `started_ts`. An integer boundary is legitimate and is kept.
+    """
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+    payload = json.dumps(
+        {
+            "run_id": "ts-run",
+            "state": "done",
+            "spec": {},
+            "finished_at": stored,
+            "source_snapshot": {"kind": "invalid"},
+        }
+    ).encode()
+    with open(runner_state.runs_file_path("ts-run", ".json"), "wb") as file:
+        file.write(payload)
+    before = time.time()
+
+    status, _ = runner_status._quarantine_corrupt_status("ts-run", "boom")
+
+    assert status is not None
+    if stored == 1000 and not isinstance(stored, bool):
+        assert status.finished_at == 1000.0
+    else:
+        assert status.finished_at >= before
+
+
+def test_quarantine_keeps_the_adapter_reference_of_a_deployed_run(monkeypatch, tmp_path):
+    """A `deployed` record keeps the adapter reference its live deployment is serving.
+
+    `_status_storage_dict` recomputes `adapter_ref` only for `done` and `deployed`, so relabelling
+    a deployed record `failed` would strip the reference as well as the state, leaving a run that
+    is serving traffic with nothing downloadable behind it.
+    """
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+    payload = json.dumps(
+        {
+            "run_id": "deployed-ref",
+            "state": "deployed",
+            "spec": {},
+            "adapter_ref": "acct/repo",
+            "source_snapshot": {"kind": "invalid"},
+        }
+    ).encode()
+    with open(runner_state.runs_file_path("deployed-ref", ".json"), "wb") as file:
+        file.write(payload)
+
+    status, quarantined = runner_status._quarantine_corrupt_status("deployed-ref", "boom")
+
+    assert quarantined
+    assert status is not None
+    assert status.state == "deployed"
+    with open(runner_state.runs_file_path("deployed-ref", ".json"), encoding="utf-8") as file:
+        assert json.load(file)["state"] == "deployed"
+
+
+def test_quarantine_survives_a_salvaged_field_serialization_dereferences(monkeypatch, tmp_path):
+    """A non-dict `effective_preparation` must not make the whole quarantine write fail.
+
+    `_status_storage_dict` reaches into it through `_adapter_ref_for_status`, where `.get()` on a
+    truthy non-dict raises `AttributeError` -- and `_quarantine_corrupt_recovery_record` suppresses
+    that, so the record would stay unquarantined and its live remote would never be torn down.
+    `or {}` does not help: the value is truthy. The handle below proves teardown evidence still
+    survives the sanitize rather than being dropped along with the unusable field.
+    """
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+    payload = json.dumps(
+        {
+            "run_id": "unserializable-run",
+            "state": "done",
+            "spec": {},
+            "effective_preparation": ["worker_spec"],
+            "remote": {
+                "provider": "runpod",
+                "endpoint_id": "ep-unserializable",
+                "key_fingerprint": "rpk-0123456789ab",
+            },
+            "source_snapshot": {"kind": "invalid"},
+        }
+    ).encode()
+    with open(runner_state.runs_file_path("unserializable-run", ".json"), "wb") as file:
+        file.write(payload)
+
+    status, quarantined = runner_status._quarantine_corrupt_status("unserializable-run", "boom")
+
+    assert quarantined
+    assert status is not None
+    assert status.effective_preparation is None
+    assert status.remote is not None
+    assert status.remote["endpoint_id"] == "ep-unserializable"
+    with open(runner_state.runs_file_path("unserializable-run", ".json"), encoding="utf-8") as file:
+        stored = json.load(file)
+    assert stored["state"] == "done"
+    assert runner_state._CLEANUP_REMOTES_KEY in stored
+
+
+@pytest.mark.parametrize("foreign_id", ["other-run", None, 7, True, ["bad-run"]])
+def test_quarantine_refuses_every_shape_of_mismatched_identifier(monkeypatch, tmp_path, foreign_id):
+    """Any stored id that is not exactly the filename's run id makes the record foreign evidence.
+
+    `_validate_recovery_status` already rejects each of these as mismatched, so treating a `null`
+    or numeric id as belonging to this run would lift a handle the decoder itself declined to
+    trust. `_strict_teardown_handle` deletes by recorded endpoint id without relating it to the run
+    id it is passed, so that is enough to tear down another live run's worker.
+    """
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+    payload = json.dumps(
+        {
+            "run_id": foreign_id,
+            "state": "running",
+            "spec": {"run_id": "other-run"},
+            "cost_usd": 9.0,
+            "remote": {
+                "provider": "runpod",
+                "endpoint_id": "ep-foreign",
+                "key_fingerprint": "rpk-0123456789ab",
+            },
+            "cleanup_remotes": [{"provider": "runpod", "endpoint_id": "ep-foreign-cleanup"}],
+        }
+    ).encode()
+    with open(runner_state.runs_file_path("bad-run", ".json"), "wb") as file:
+        file.write(payload)
+
+    status, quarantined = runner_status._quarantine_corrupt_status("bad-run", "boom")
+
+    assert quarantined
+    assert status is not None
+    assert status.remote is None
+    assert status.state == "failed"
+    assert status.cost_usd == 0.0
+    with open(runner_state.runs_file_path("bad-run", ".json"), encoding="utf-8") as file:
+        assert runner_state._CLEANUP_REMOTES_KEY not in json.load(file)
 
 
 def test_quarantine_preserves_the_billable_fields_of_a_settled_run(monkeypatch, tmp_path):
@@ -7389,6 +7571,122 @@ def test_quarantine_records_teardown_intent_before_the_daemon_runs(monkeypatch, 
     assert persisted["state"] == "failed"
     recorded = persisted[runner_state._CLEANUP_REMOTES_KEY]
     assert [record["endpoint_id"] for record in recorded] == ["ep-intent"]
+
+
+def test_quarantine_reclaims_an_endpoint_no_handle_was_ever_written_for(monkeypatch, tmp_path):
+    """A record with no handle still needs its deterministically-named endpoint terminated.
+
+    The crash window a non-idempotent create leaves: RunPod accepted the endpoint, then the
+    response or the handle write was lost. Quarantine terminalizes the run, which drops it from
+    `_RECOVERABLE`, so no later startup reconsiders it; `_teardown_unrecoverable_remote` has no
+    handle to act on and `RunpodProvider.sweep_orphans` returns `[]` unconditionally. Nothing else
+    reclaims it and it bills forever. The endpoint name is derivable without the handle -- run id
+    plus GPU class, both readable from the raw record -- which is why the parse-failure branch
+    already terminates by name; quarantine reaches teardown by a different route and needs it too.
+    """
+    import flash.server.platform.runtime as runtime
+    from flash.providers.core import registry as providers_mod
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    run_id = "handleless-corrupt"
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=run_id,
+            state="provisioning",
+            spec={"run_id": run_id, "gpu": {"type": ["B200"]}},
+            remote=None,
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
+    )
+    status_path = runner_state.runs_file_path(run_id, ".json")
+    with open(status_path, encoding="utf-8") as handle:
+        raw = json.load(handle)
+    raw["source_snapshot"] = {"kind": "invalid"}
+    with open(status_path, "w", encoding="utf-8") as handle:
+        json.dump(raw, handle)
+
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": run_id}])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    terminated: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "flash.providers.runpod.serverless.endpoints.terminate_endpoint",
+        lambda gpu, torn_run_id=None: terminated.append((gpu, torn_run_id)) or [],
+    )
+    deferred = []
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target = target
+            self._args = args
+
+        def start(self):
+            deferred.append(lambda: self._target(*self._args))
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+
+    # reclaim belongs on the background thread with the rest of teardown, not on the startup path.
+    assert not terminated
+    for run in deferred:
+        run()
+    assert terminated == [("B200", run_id)]
+    with open(status_path, encoding="utf-8") as handle:
+        assert json.load(handle)["state"] == "failed"
+
+
+def test_quarantine_does_not_guess_an_endpoint_name_from_a_foreign_record(monkeypatch, tmp_path):
+    """A record that cannot vouch for the run id must not drive a name-based termination.
+
+    `terminate_endpoint` deletes by reconstructed name, so the GPU class has to come from a spec
+    this run actually owns. `_describes_run` refuses a mismatched id, which salvages `spec = {}` and
+    leaves `persisted_gpu_types` empty -- the reclaim is then a no-op rather than a deletion driven
+    by another run's persisted GPU class.
+    """
+    import flash.server.platform.runtime as runtime
+    from flash.providers.core import registry as providers_mod
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+    run_id = "foreign-corrupt"
+    payload = json.dumps(
+        {
+            "run_id": "some-other-run",
+            "state": "provisioning",
+            "spec": {"run_id": "some-other-run", "gpu": {"type": ["B200"]}},
+        }
+    ).encode()
+    with open(runner_state.runs_file_path(run_id, ".json"), "wb") as file:
+        file.write(payload)
+
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": run_id}])
+    monkeypatch.setattr(providers_mod, "configured_providers", list)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    terminated: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "flash.providers.runpod.serverless.endpoints.terminate_endpoint",
+        lambda gpu, torn_run_id=None: terminated.append((gpu, torn_run_id)) or [],
+    )
+    deferred = []
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target = target
+            self._args = args
+
+        def start(self):
+            deferred.append(lambda: self._target(*self._args))
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+    for run in deferred:
+        run()
+
+    assert terminated == []
 
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):

@@ -94,22 +94,22 @@ def _salvage_teardown_handle(remote: object) -> dict | None:
 def _describes_run(run_id: str, raw: dict | None) -> bool:
     """False when the record names a different run, so none of it is evidence about `run_id`.
 
-    A stored id that disagrees with the filename is the one corruption where salvage is unsafe
+    A stored id that does not confirm the filename is the one corruption where salvage is unsafe
     rather than merely lossy: `_strict_teardown_handle` deletes by recorded endpoint id without
     relating it to the run id it is passed, so lifting those handles would let one swapped status
     file terminate another live run's worker. The hard-linked sidecar still preserves the record
     for an operator; the envelope just cannot claim any of it.
 
-    An absent id is benign, because the filename is then the only identity the record carries. Any
-    id that is present and not exactly `run_id` is refused, including `null` and numbers:
-    `_validate_recovery_status` already rejects those as mismatched, so treating them as this run's
-    would lift teardown evidence the decoder itself declined to trust.
+    Only an id present and exactly equal to `run_id` is evidence. Everything else is refused --
+    a different id, `null`, a number, and an absent key alike. `_status_storage_dict` writes
+    `run_id` on every persisted record, so a missing key is itself corruption and not a
+    filename-only record: the bytes may still carry another run's live handle, and the filename
+    cannot vouch for it. `_validate_recovery_status` already declines to trust these, so lifting
+    teardown evidence out of them would destroy exactly what that decoder refused.
     """
     if raw is None:
         return False
-    if "run_id" not in raw:
-        return True
-    return raw["run_id"] == run_id
+    return raw.get("run_id") == run_id
 
 
 # quarantine owns these; every other readable field is lifted verbatim. `source_snapshot` is
@@ -126,6 +126,24 @@ _QUARANTINE_CONTROLLED = frozenset(
 # `flash/server/domain/ops/reconcile.py`. Rewriting it to `failed` would strand a still-live
 # serving deployment: undeployable, no downloadable artifact, and no longer reconcilable.
 _QUARANTINE_RETAINED_STATES = state.TERMINAL_STATES | {"deployed"}
+
+# lifted fields that readers dereference as mappings, and the fallback for a stored value that is
+# not one. `or {}` does not cover this: every one of these breaks on a *truthy* non-dict, which is
+# what `.get()` is called on. Each has a reader that gets no per-record isolation:
+#   `spec`/`effective_preparation` -- `_status_storage_dict` reads them through
+#     `_adapter_ref_for_status` during the quarantine write itself, and
+#     `_quarantine_corrupt_recovery_record` suppresses the `AttributeError`, so the record would
+#     silently stay unquarantined and its live remote would never be torn down.
+#   `deployment` -- `recover_deployments()` runs synchronously right after `recover_runs()` in the
+#     `create_app()` lifespan and opens with `(status.deployment or {}).get("state")`; that raise
+#     is not caught per record, so one bad envelope aborts startup before readiness.
+# the value is unusable either way; the fallback keeps it from taking a reader down with it.
+# `spec` is non-optional on `RunStatus`, so it falls back to an empty mapping rather than `None`.
+_QUARANTINE_MAPPING_FALLBACKS: dict[str, dict | None] = {
+    "spec": {},
+    "effective_preparation": None,
+    "deployment": None,
+}
 
 
 def _salvaged_finished_at(raw: dict, now: float) -> float:
@@ -203,15 +221,9 @@ def _salvage_corrupt_record(
                 if key in RunStatus.__dataclass_fields__ and key not in _QUARANTINE_CONTROLLED
             }
         )
-        # the two lifted dicts serialization dereferences. `_status_storage_dict` reads
-        # `effective_preparation["worker_spec"]` through `_adapter_ref_for_status`, where `.get()`
-        # on a truthy non-dict raises `AttributeError` -- and `_quarantine_corrupt_recovery_record`
-        # suppresses that, so the corrupt record would stay unquarantined and its live remote would
-        # never be torn down. `or {}` is not a guard here: it only defends against falsy values.
-        if not isinstance(values.get("spec"), dict):
-            values["spec"] = {}
-        if not isinstance(values.get("effective_preparation"), dict):
-            values["effective_preparation"] = None
+        for key, fallback in _QUARANTINE_MAPPING_FALLBACKS.items():
+            if not isinstance(values.get(key), dict):
+                values[key] = dict(fallback) if fallback is not None else None
         stored_state = raw.get("state")
         if isinstance(stored_state, str) and stored_state in _QUARANTINE_RETAINED_STATES:
             values["state"] = stored_state

@@ -608,8 +608,34 @@ def _drain_cleanup_remotes_bg(run_id: str) -> None:
 
 def _teardown_failed_recovery_bg(status: RunStatus) -> None:
     _teardown_unrecoverable_remote(status)
+    _terminate_handleless_endpoints(status)
     # direct teardown can record an unconfirmed handle after an earlier drain took its snapshot.
     _drain_cleanup_remotes_bg(status.run_id)
+
+
+def _terminate_handleless_endpoints(status: RunStatus) -> None:
+    """Reclaim a terminalized run's endpoint when no handle was ever persisted to tear down.
+
+    The crash window a non-idempotent create leaves behind: RunPod accepted the endpoint, then the
+    response or the handle write was lost. `_teardown_unrecoverable_remote` has nothing to act on,
+    `RunpodProvider.sweep_orphans` returns `[]` unconditionally, and the run is now terminal and so
+    dropped from `_RECOVERABLE` -- no later startup reconsiders it while it can still bill. The
+    handle-less parse-failure branch in `_classify_recoverable_runs` already terminates by
+    reconstructed name for exactly this reason; a record too corrupt to decode reaches teardown
+    through quarantine instead and needs the same reclaim.
+
+    Gated on `failed` because that is what quarantine writes when it could NOT keep a settled
+    outcome: a retained `done` or `deployed` envelope describes a run whose training endpoint is
+    already released. A foreign or identity-less record salvages `spec = {}`, so
+    `persisted_gpu_types` yields nothing and this is a no-op -- the name is never guessed from a
+    record that cannot vouch for the run id.
+    """
+    if status.remote or status.state != "failed":
+        return
+    from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
+
+    with contextlib.suppress(Exception):
+        terminate_persisted_endpoints(status.spec, status.run_id)
 
 
 def _teardown_failed_recovery(status: RunStatus) -> None:
