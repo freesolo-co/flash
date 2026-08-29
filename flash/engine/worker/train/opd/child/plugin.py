@@ -26,12 +26,30 @@ if PLUGIN_LOADED_EXTERNALLY:
     from flash_multiturn_glue import multi_modal_image_count
     from flash_opd_multiturn import build_flash_multi_turn_agent_loop
     from flash_opd_structured import StructuredOutputReplay, canonical_structured_spec
+    from flash_opd_tensors import (
+        full_sequence_signal_sequences as _full_sequence_signal_sequences,
+    )
+    from flash_opd_tensors import (
+        packed_full_sequence as _packed_full_sequence,
+    )
+    from flash_opd_tensors import (
+        signal_sequences as _signal_sequences,
+    )
 else:
     from flash.engine.worker.train.core.child.glue import multi_modal_image_count
     from flash.engine.worker.train.opd.child.multiturn import build_flash_multi_turn_agent_loop
     from flash.engine.worker.train.opd.child.structured import (
         StructuredOutputReplay,
         canonical_structured_spec,
+    )
+    from flash.engine.worker.train.opd.child.tensors import (
+        full_sequence_signal_sequences as _full_sequence_signal_sequences,
+    )
+    from flash.engine.worker.train.opd.child.tensors import (
+        packed_full_sequence as _packed_full_sequence,
+    )
+    from flash.engine.worker.train.opd.child.tensors import (
+        signal_sequences as _signal_sequences,
     )
 
 _PERMANENT_TEACHER_EXIT = 86
@@ -84,16 +102,6 @@ def deterministic_rollout_seed(
         payload += f":retry:{attempt_ordinal}"
     digest = hashlib.blake2b(payload.encode("ascii"), digest_size=8).digest()
     return int.from_bytes(digest, "big") & ((1 << 63) - 1)
-
-
-def _signal_sequences(group_ids, response_mask):
-    """Return the per-sequence mask for rows carrying at least one aligned student token."""
-    return ((group_ids >= 0) & response_mask.bool()).any(dim=-1)
-
-
-def _full_sequence_signal_sequences(group_ids):
-    """Detect aligned metadata in native full-sequence teacher tensors."""
-    return group_ids.ge(0).flatten(start_dim=1).any(dim=-1)
 
 
 def _flash_groupwise_reverse_kl_values(
@@ -408,8 +416,14 @@ def _register_flash_distillation_loss() -> None:
     def flash_groupwise_reverse_kl(config, distillation_config, model_output, data):
         _set_current_global_batch_info(config, data)
         student_logprobs = no_padding_2_padding(model_output["log_probs"], data)
-        teacher_logsums = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
-        group_ids = no_padding_2_padding(data["teacher_ids"], data).squeeze(-1).long()
+        teacher_logsums = no_padding_2_padding(
+            _packed_full_sequence(data["teacher_logprobs"], data), data
+        ).squeeze(-1)
+        group_ids = (
+            no_padding_2_padding(_packed_full_sequence(data["teacher_ids"], data), data)
+            .squeeze(-1)
+            .long()
+        )
         response_mask = data["response_mask"]
         if response_mask.is_nested:
             response_mask = response_mask.to_padded_tensor(False)
