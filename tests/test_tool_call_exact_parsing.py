@@ -464,14 +464,33 @@ def test_string_enum_accepts_newline_members(enum_value: str) -> None:
         ("foo", "foo"),
         ("\n\nfoo\n", "\nfoo"),
         ("\nfoo\n\n", "foo\n"),
+        ("", ""),
+        ("\n", "\n"),
+        ("\n\n", ""),
+        ("\n\n\n", "\n"),
+        ("\n\n\n\n", "\n\n"),
     ],
-    ids=["wrapped", "leading-only", "trailing-only", "bare", "wrapped-leading", "wrapped-trailing"],
+    ids=[
+        "wrapped",
+        "leading-only",
+        "trailing-only",
+        "bare",
+        "wrapped-leading",
+        "wrapped-trailing",
+        "empty",
+        "lone-newline",
+        "wrapped-empty",
+        "wrapped-lone-newline",
+        "wrapped-two-newlines",
+    ],
 )
 def test_free_string_strips_only_the_complete_newline_wrapper(emitted: str, decoded: str) -> None:
     """a one-sided newline is data, not framing, so it must survive the parse.
 
     stripping each side independently collapses four distinct wire forms onto one value, which
-    silently invokes the tool with different arguments than the model emitted.
+    silently invokes the tool with different arguments than the model emitted. the newline-only
+    cases pin the length guard: a lone ``"\\n"`` must not be read as both halves of a wrapper,
+    and a wrapped ``"\\n\\n"`` must still decode to the empty value.
     """
     text = _exact_call().replace(
         "<parameter=label>ok</parameter>", f"<parameter=label>{emitted}</parameter>"

@@ -33,6 +33,20 @@ _PARAMETER_OPEN_RE = re.compile(r"<parameter=([^>]+)>")
 _AMBIGUOUS, _EXHAUSTED = object(), object()
 
 
+def _strip_grammar_newline_wrapper(raw: str) -> str:
+    """undo the ``\\n`` framing the grammar puts around a parameter value.
+
+    the grammar writes a value as ``<parameter=name>\\n<value>\\n</parameter>``, so only a
+    complete both-sided pair is framing. stripping each side independently would collapse
+    ``"\\nfoo"``, ``"foo\\n"``, and ``"foo"`` onto one value and invoke the tool with data the
+    model never emitted. the length guard keeps a lone ``"\\n"`` as its own single character
+    rather than reading one newline as both halves of a wrapper.
+    """
+    if raw.startswith("\n") and raw.endswith("\n") and len(raw) >= 2:
+        return raw[1:-1]
+    return raw
+
+
 @dataclass(frozen=True, slots=True)
 class ParsedToolCall:
     id: str
@@ -237,9 +251,7 @@ def _parse_parameter_value(state, value_start, schema, values, name, probe):
         if schema["type"] in {"array", "object"}:
             return None
         search_from = value_end + len(_PARAMETER_END)
-    raw = text[value_start:value_end]
-    if raw.startswith("\n") and raw.endswith("\n") and len(raw) >= 2:
-        raw = raw[1:-1]
+    raw = _strip_grammar_newline_wrapper(text[value_start:value_end])
     value = _coerce_value(raw, schema["type"])
     if not _validate_value(value, schema):
         return None
@@ -318,8 +330,7 @@ def _classify_free_string(state, value_start, values, name, probe):
 
 
 def _materialize_span(text: str, span: _FreeStringSpan) -> str | None:
-    raw = text[span.start : span.end]
-    value = raw[1:-1] if raw.startswith("\n") and raw.endswith("\n") and len(raw) >= 2 else raw
+    value = _strip_grammar_newline_wrapper(text[span.start : span.end])
     return None if _contains_unpaired_surrogate(value) else value
 
 
