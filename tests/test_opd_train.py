@@ -9719,3 +9719,417 @@ def test_overrides_floor_max_num_seqs_for_a_tiny_opd_rollout_batch():
         for value in build_opd_overrides(_config(train_batch_size=1, group_size=1))
     )
     assert overrides["actor_rollout_ref.rollout.max_num_seqs"] == "16"
+
+
+def _padded_teacher_batch(sample_lengths, *, prompt_width, response_width):
+    """Build the padded, mask-carrying batch the OPD trainer actually hands to the loss.
+
+    verl's list_of_dict_to_tensordict stacks a field when every sample's tensor shares one
+    shape and nests only when they differ, so a batch whose completions were all truncated at
+    max_completion_tokens arrives padded rather than nested. Prompts are left-padded and
+    responses right-padded, exactly as the attention mask records.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.bridging.prompts import encode_shifted_group_metadata
+
+    teacher, prompts, responses, masks = [], [], [], []
+    for prompt_len, response_len in sample_lengths:
+        _ids, logprobs = encode_shifted_group_metadata(
+            prompt_len, response_len, [(list(range(response_len)), -1.5)]
+        )
+        row = torch.tensor(logprobs, dtype=torch.float32)
+        teacher.append(
+            torch.cat(
+                [
+                    torch.zeros(prompt_width - prompt_len),
+                    row,
+                    torch.zeros(response_width - response_len),
+                ]
+            )
+        )
+        prompts.append(
+            torch.cat(
+                [
+                    torch.zeros(prompt_width - prompt_len, dtype=torch.int64),
+                    torch.arange(1, prompt_len + 1, dtype=torch.int64),
+                ]
+            )
+        )
+        responses.append(
+            torch.cat(
+                [
+                    torch.arange(1, response_len + 1, dtype=torch.int64),
+                    torch.zeros(response_width - response_len, dtype=torch.int64),
+                ]
+            )
+        )
+        masks.append(
+            torch.cat(
+                [
+                    torch.zeros(prompt_width - prompt_len, dtype=torch.int64),
+                    torch.ones(prompt_len + response_len, dtype=torch.int64),
+                    torch.zeros(response_width - response_len, dtype=torch.int64),
+                ]
+            )
+        )
+
+    data = TensorDict(
+        {
+            "prompts": torch.stack(prompts),
+            "responses": torch.stack(responses),
+            "attention_mask": torch.stack(masks),
+        },
+        batch_size=[len(sample_lengths)],
+    )
+    return torch.stack(teacher).unsqueeze(-1), data
+
+
+def _nested_teacher_batch(sample_lengths):
+    """The same samples in the nested layout verl's padding helper already supports."""
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.bridging.prompts import encode_shifted_group_metadata
+
+    rows, prompts, responses = [], [], []
+    for prompt_len, response_len in sample_lengths:
+        _ids, logprobs = encode_shifted_group_metadata(
+            prompt_len, response_len, [(list(range(response_len)), -1.5)]
+        )
+        rows.append(torch.tensor(logprobs, dtype=torch.float32).unsqueeze(-1))
+        prompts.append(torch.arange(1, prompt_len + 1, dtype=torch.int64))
+        responses.append(torch.arange(1, response_len + 1, dtype=torch.int64))
+
+    data = TensorDict(
+        {
+            "prompts": torch.nested.as_nested_tensor(prompts, layout=torch.jagged),
+            "responses": torch.nested.as_nested_tensor(responses, layout=torch.jagged),
+        },
+        batch_size=[len(sample_lengths)],
+    )
+    return torch.nested.as_nested_tensor(rows, layout=torch.jagged), data
+
+
+def _reference_no_padding_2_padding(tensor, data):
+    """Stand-in for verl's helper, matching the pinned implementation's contract.
+
+    Reads tensor.values() only when nested, otherwise treats the input as already flattened
+    to total_nnz -- which is why a padded (bsz, seq_len, *) tensor trips its assertion.
+
+    verl is not installed in the offline CI environment, so importing the real helper here
+    would skip these tests rather than run them. The test below pins this body against the
+    pinned source instead, so a drift fails loudly wherever verl IS installed.
+    """
+    torch = pytest.importorskip("torch")
+
+    values = tensor.values() if tensor.is_nested else tensor
+    prompt_ids, response_ids = data["prompts"], data["responses"]
+    max_response_len = data.get("max_response_len", -1)
+    if prompt_ids.is_nested:
+        prompt_lens = prompt_ids.offsets().diff()
+        response_lens = response_ids.offsets().diff()
+        if max_response_len < 0:
+            max_response_len = int(response_lens.max().item())
+    else:
+        attention_mask = data["attention_mask"]
+        assert not attention_mask.is_nested
+        prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
+        response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
+        max_response_len = response_ids.shape[1]
+
+    sequence_offsets = (prompt_lens + response_lens).cumsum(dim=0)
+    assert sequence_offsets[-1].item() == values.shape[0]
+    # the pinned helper's own guard: the slice below reads seq_offset - resp_len - 1.
+    assert not prompt_lens.eq(0).any(), f"prompt_len must be > 0, got {prompt_lens}"
+
+    skip_padding = (0, 0) * (values.ndim - 1)
+    sliced = [
+        torch.nn.functional.pad(
+            values[offset - resp_len - 1 : offset - 1],
+            (*skip_padding, 0, max_response_len - resp_len),
+        )
+        for resp_len, offset in zip(response_lens, sequence_offsets, strict=True)
+    ]
+    return torch.stack(sliced, dim=0)
+
+
+def test_reference_helper_agrees_with_the_real_pinned_verl_function():
+    """Pin the stand-in above against verl itself wherever verl is installed.
+
+    The offline CI image has no verl, so the tests around it must use the stand-in or they
+    would skip instead of running. That makes the stand-in a drift risk: it could diverge from
+    the pinned helper and keep passing. This test closes that gap on any environment that does
+    have verl, so a divergence fails somewhere rather than nowhere.
+
+    It proves agreement with the INSTALLED verl, not with the pin by construction. The two are
+    the same function today, but an environment installed off a different verl would move this
+    oracle with it. `test_verl_pin_is_an_immutable_commit_on_the_freesolo_fork` guards the pin.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+    padding = pytest.importorskip("verl.workers.utils.padding")
+
+    samples = [(100, 1024), (120, 900), (90, 1024)]
+    rows, prompts, responses, masks = [], [], [], []
+    prompt_width = max(prompt_len for prompt_len, _ in samples)
+    response_width = max(response_len for _, response_len in samples)
+    for prompt_len, response_len in samples:
+        rows.append(torch.arange(1, prompt_len + response_len + 1, dtype=torch.float32))
+        prompts.append(torch.arange(1, prompt_len + 1))
+        responses.append(torch.arange(1, response_len + 1))
+        masks.append(
+            torch.tensor(
+                [0] * (prompt_width - prompt_len)
+                + [1] * (prompt_len + response_len)
+                + [0] * (response_width - response_len)
+            )
+        )
+
+    nested_data = TensorDict(
+        {
+            "prompts": torch.nested.as_nested_tensor(prompts, layout=torch.jagged),
+            "responses": torch.nested.as_nested_tensor(responses, layout=torch.jagged),
+        },
+        batch_size=[len(samples)],
+    )
+    strided_data = TensorDict(
+        {
+            "prompts": torch.zeros(len(samples), prompt_width, dtype=torch.int64),
+            "responses": torch.zeros(len(samples), response_width, dtype=torch.int64),
+            "attention_mask": torch.stack(masks),
+        },
+        batch_size=[len(samples)],
+    )
+
+    for data in (nested_data, strided_data):
+        packed = torch.cat(rows).unsqueeze(-1)
+        assert torch.equal(
+            _reference_no_padding_2_padding(packed, data),
+            padding.no_padding_2_padding(packed, data),
+        )
+
+
+def test_padded_teacher_tensor_trips_the_verl_total_nnz_assertion():
+    """The layout that crashed a paid 8xH200 OPD run, reproduced against verl's contract.
+
+    Once every completion is truncated at max_completion_tokens the samples share one shape,
+    so the teacher tensor is stacked rather than nested and its leading dimension is the
+    batch size instead of total_nnz.
+    """
+    pytest.importorskip("torch")
+
+    teacher, data = _padded_teacher_batch([(120, 1024)] * 16, prompt_width=120, response_width=1024)
+    assert not teacher.is_nested
+    assert teacher.shape[0] == 16
+    assert int(data["attention_mask"].sum().item()) == 16 * (120 + 1024)
+    with pytest.raises(AssertionError):
+        _reference_no_padding_2_padding(teacher, data)
+
+
+@pytest.mark.parametrize(
+    "sample_lengths",
+    [
+        pytest.param([(120, 1024)] * 16, id="all-truncated"),
+        pytest.param([(120, 1024), (120, 800), (120, 512)], id="some-stopped-early"),
+    ],
+)
+def test_packed_full_sequence_matches_verls_nested_result(sample_lengths):
+    """The padded path must return exactly what verl produces from the same samples.
+
+    Not crashing is not enough: a wrong slice would silently train against misaligned teacher
+    logprobs, so this pins value equality against the nested layout verl already handles.
+    """
+    torch = pytest.importorskip("torch")
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    padded, padded_data = _padded_teacher_batch(
+        sample_lengths, prompt_width=120, response_width=1024
+    )
+    nested, nested_data = _nested_teacher_batch(sample_lengths)
+
+    packed = _packed_full_sequence(padded, padded_data)
+    actual = _reference_no_padding_2_padding(packed, padded_data)
+    expected = _reference_no_padding_2_padding(nested, nested_data)
+
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)
+
+
+def test_packed_full_sequence_leaves_a_nested_batch_untouched():
+    """A nested batch already satisfies verl's contract and must pass straight through."""
+    pytest.importorskip("torch")
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    nested, data = _nested_teacher_batch([(120, 1024), (120, 800)])
+    assert _packed_full_sequence(nested, data) is nested
+
+
+def test_packed_full_sequence_rejects_a_tensor_that_is_not_full_width():
+    """A teacher narrower than the mask must fail loudly rather than pack misaligned tokens."""
+    torch = pytest.importorskip("torch")
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    _teacher, data = _padded_teacher_batch([(120, 1024)] * 4, prompt_width=120, response_width=1024)
+    response_only = torch.zeros(4, 1024, 1)
+    with pytest.raises(IndexError):
+        _packed_full_sequence(response_only, data)
+
+
+@pytest.mark.parametrize("nested_prompts", [False, True])
+def test_packed_full_sequence_selects_by_mask_not_by_prefix(nested_prompts):
+    """verl pads a teacher row on BOTH sides, so a length can never say where the real tokens sit.
+
+    `_pad_teacher_outputs` left-pads by `prompt_width - prompt_length` and right-pads the
+    response. Selecting the first `length` positions therefore takes pad and drops real teacher
+    logprobs, which trains against silently misaligned supervision rather than crashing. The
+    values here are all nonzero so a prefix select cannot coincidentally match.
+
+    Both prompt layouts are covered because the mask, not the prompts field, decides which
+    positions are real. Reading the layout instead of the mask passes the strided case and
+    quietly mis-slices the nested one.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    samples = [(100, 1024), (120, 900), (90, 1024)]
+    prompt_width = max(prompt_len for prompt_len, _ in samples)
+    response_width = max(response_len for _, response_len in samples)
+
+    rows, expected, masks = [], [], []
+    for prompt_len, response_len in samples:
+        real = torch.arange(1, prompt_len + response_len + 1, dtype=torch.float32).unsqueeze(-1)
+        expected.append(real)
+        # exactly verl's padding: left on the prompt half, right on the response half.
+        rows.append(
+            torch.cat(
+                [
+                    real.new_zeros(prompt_width - prompt_len, 1),
+                    real,
+                    real.new_zeros(response_width - response_len, 1),
+                ]
+            )
+        )
+        masks.append(
+            torch.tensor(
+                [0] * (prompt_width - prompt_len)
+                + [1] * (prompt_len + response_len)
+                + [0] * (response_width - response_len)
+            )
+        )
+
+    if nested_prompts:
+        fields = {
+            "prompts": torch.nested.as_nested_tensor(
+                [torch.arange(1, prompt_len + 1) for prompt_len, _ in samples], layout=torch.jagged
+            ),
+            "responses": torch.nested.as_nested_tensor(
+                [torch.arange(1, response_len + 1) for _, response_len in samples],
+                layout=torch.jagged,
+            ),
+        }
+    else:
+        fields = {
+            "prompts": torch.zeros(len(samples), prompt_width, dtype=torch.int64),
+            "responses": torch.zeros(len(samples), response_width, dtype=torch.int64),
+        }
+    data = TensorDict(
+        {**fields, "attention_mask": torch.stack(masks)},
+        batch_size=[len(samples)],
+    )
+
+    packed = _packed_full_sequence(torch.stack(rows), data)
+    assert torch.equal(packed, torch.cat(expected))
+
+
+def test_packed_full_sequence_refuses_a_padded_teacher_with_no_mask():
+    """Without a mask there is no way to locate the real tokens, so fail rather than guess.
+
+    A nested-prompt batch need not carry `attention_mask`. verl stacks the teacher field only
+    when every sequence shares one length, so an unmasked stack should already be full-width.
+    If it is not, the batch violates that expectation and any selection would be a guess.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    samples = [(100, 1024), (120, 900), (90, 1024)]
+    prompts = [torch.arange(1, prompt_len + 1) for prompt_len, _ in samples]
+    responses = [torch.arange(1, response_len + 1) for _, response_len in samples]
+    data = TensorDict(
+        {
+            "prompts": torch.nested.as_nested_tensor(prompts, layout=torch.jagged),
+            "responses": torch.nested.as_nested_tensor(responses, layout=torch.jagged),
+        },
+        batch_size=[len(samples)],
+    )
+    assert "attention_mask" not in data
+
+    width = max(prompt_len + response_len for prompt_len, response_len in samples)
+    with pytest.raises(AssertionError, match="carries no attention mask"):
+        _packed_full_sequence(torch.zeros(len(samples), width, 1), data)
+
+
+def test_packed_full_sequence_refuses_a_strided_batch_with_no_mask():
+    """A strided batch carries neither a mask nor offsets, so nothing locates the real tokens.
+
+    The producer always writes `attention_mask`, so this is unreachable today. It is pinned
+    anyway because the alternative is an `AttributeError` from reading `.offsets()` off a
+    strided tensor, which reads as a coding slip rather than the batch being unusable.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    prompt_width, response_width = 120, 1024
+    data = TensorDict(
+        {
+            "prompts": torch.zeros(2, prompt_width, dtype=torch.int64),
+            "responses": torch.zeros(2, response_width, dtype=torch.int64),
+        },
+        batch_size=[2],
+    )
+    assert "attention_mask" not in data
+
+    with pytest.raises(AssertionError, match="carries no attention mask"):
+        _packed_full_sequence(torch.zeros(2, prompt_width + response_width, 1), data)
+
+
+def test_packed_full_sequence_flattens_a_full_unmasked_stack():
+    """The reachable no-mask case: prompt lengths differ but every total is equal.
+
+    Prompts nest because their lengths differ, while the teacher field stacks because the
+    totals agree. Nothing was padded, so every position is real and the whole stack flattens.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    samples = [(100, 1024), (120, 1004)]
+    prompts = [torch.arange(1, prompt_len + 1) for prompt_len, _ in samples]
+    responses = [torch.arange(1, response_len + 1) for _, response_len in samples]
+    data = TensorDict(
+        {
+            "prompts": torch.nested.as_nested_tensor(prompts, layout=torch.jagged),
+            "responses": torch.nested.as_nested_tensor(responses, layout=torch.jagged),
+        },
+        batch_size=[len(samples)],
+    )
+
+    width = samples[0][0] + samples[0][1]
+    assert {prompt_len + response_len for prompt_len, response_len in samples} == {width}
+    teacher = torch.arange(1, len(samples) * width + 1, dtype=torch.float32).reshape(
+        len(samples), width, 1
+    )
+
+    packed = _packed_full_sequence(teacher, data)
+    assert torch.equal(packed, teacher.flatten(0, 1))

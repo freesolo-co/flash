@@ -1392,145 +1392,6 @@ def test_post_launch_interrupt_does_not_layer_a_run_label_reap_on_exact_cleanup(
     assert reaped == []  # ... so the run-wide reap must NOT also fire
 
 
-def test_interrupt_while_the_cacheless_launch_request_is_in_flight_reaps_by_label(monkeypatch):
-    """The cache-less retry's request can bill a box whose id never came back.
-
-    The guard used to disarm on every exit from that helper, so an interrupt mid-request left the
-    instance owned by nobody: no exact id to terminate, and the coarse reap already stood down.
-    """
-    import flash.providers.lambda_.jobs as jobs
-    from flash.providers.lambda_.client import api as lambda_api
-
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
-    monkeypatch.setattr(
-        lambda_api, "ensure_filesystem", lambda n, r, deadline_at=None: f"/lambda/nfs/{n}"
-    )
-    reaped: list[str] = []
-    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
-
-    calls: list[str] = []
-
-    def fake_launch(*, file_system_names=None, **_kwargs):
-        calls.append("cold" if file_system_names is None else "cached")
-        if file_system_names is None:
-            raise KeyboardInterrupt  # interrupt with the cache-less create request in flight
-        raise lambda_api.LambdaApiError(
-            "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
-        )
-
-    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
-
-    with pytest.raises(KeyboardInterrupt):
-        _launch(
-            jobs,
-            _spec(network_volume="flash-weights"),
-            instances=[_inst()],
-            attempt=0,
-        )
-
-    assert calls == ["cached", "cold"]
-    assert reaped == ["flash-1700000000-abcd1234"]  # only the label can name that box
-
-
-def test_cacheless_ambiguous_reject_keeps_the_guard_armed_through_reconciliation(monkeypatch):
-    """The cache-less leg's own AMBIGUOUS reject must not stand the guard down before it reconciles.
-
-    The main walk splits clean from ambiguous before disarming; this helper is a second, separate
-    handler and needs the same split. Disarming on every rejection here loses the only handle on a
-    box the provider may have billed but never named: if anything between the disarm and
-    _abort_ambiguous_launch raises, the outer handler finds an unarmed guard and the instance bills
-    until a later orphan sweep.
-    """
-    import flash.providers.lambda_.jobs as jobs
-    from flash.providers.lambda_.client import api as lambda_api
-
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
-    monkeypatch.setattr(
-        lambda_api, "ensure_filesystem", lambda n, r, deadline_at=None: f"/lambda/nfs/{n}"
-    )
-    calls: list[str] = []
-
-    def fake_launch(*, file_system_names=None, **_kwargs):
-        calls.append("cold" if file_system_names is None else "cached")
-        if file_system_names is None:
-            # a 500 is ambiguous: the create may have been accepted before the response was lost.
-            raise lambda_api.LambdaApiError("POST -> HTTP 500")
-        raise lambda_api.LambdaApiError(
-            "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
-        )
-
-    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
-    # reconciliation observes nothing, so it raises UnreconciledCreateError rather than cleaning
-    # up: the guard must still be armed when that reaches the outer handler.
-    monkeypatch.setattr(lambda_api, "list_instances", list)
-    reaped: list[str] = []
-    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
-
-    with pytest.raises(jobs.UnreconciledCreateError):
-        _launch(
-            jobs,
-            _spec(network_volume="flash-weights"),
-            instances=[_inst()],
-            attempt=0,
-        )
-
-    assert calls == ["cached", "cold"]
-    # the cache-less create is ambiguous, so the guard stayed armed with no id and the outer
-    # handler swept the label -- the only thing that can find a box rented but never named.
-    assert reaped == ["flash-1700000000-abcd1234"]
-
-
-def test_cacheless_retry_that_never_reaches_its_request_does_not_reap_the_run_label(monkeypatch):
-    """A deadline miss before the cache-less create rented nothing, so the label must not be reaped.
-
-    terminate_run_instances(run_id) kills every concurrently-launched seed sharing the run id. Only
-    a window where this seed may hold an unnamed box justifies that, and the preflight is not one:
-    require_create_allowance raises before any create is issued.
-    """
-    import flash.providers.lambda_.jobs as jobs
-    from flash.providers.lambda_.client import api as lambda_api
-
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
-    monkeypatch.setattr(
-        lambda_api, "ensure_filesystem", lambda n, r, deadline_at=None: f"/lambda/nfs/{n}"
-    )
-    reaped: list[str] = []
-    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
-
-    calls: list[str] = []
-
-    def fake_launch(*, file_system_names=None, **_kwargs):
-        calls.append("cold" if file_system_names is None else "cached")
-        if file_system_names is None:
-            raise AssertionError("the cache-less request must not be issued past the deadline")
-        raise lambda_api.LambdaApiError(
-            "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
-        )
-
-    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
-
-    # the allowance check fails only on the retry, so the cached attempt still runs and rejects.
-    seen = []
-
-    def fake_allowance(_deadline_at):
-        seen.append(1)
-        if len(seen) > 1:
-            raise TimeoutError("no create allowance left")
-
-    monkeypatch.setattr(jobs, "require_create_allowance", fake_allowance)
-
-    with pytest.raises(TimeoutError):
-        _launch(
-            jobs,
-            _spec(network_volume="flash-weights"),
-            instances=[_inst()],
-            attempt=0,
-        )
-
-    assert calls == ["cached"]  # the cold request was never issued
-    assert reaped == []  # so no concurrent seed of this run was terminated
-
-
 @pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
 def test_interrupt_after_publication_returns_terminates_only_this_instance(
     monkeypatch, interrupt_type
@@ -1686,23 +1547,31 @@ def test_cache_payload_points_base_model_prefetch_at_the_bind(monkeypatch):
     assert payload["cache_host_mount"] == "/lambda/nfs/flash-weights"
 
 
-def test_cache_falls_back_to_cold_when_filesystem_unavailable(monkeypatch):
+def test_cache_discovery_failure_never_launches_cold(monkeypatch):
     jobs, lambda_api, calls = _wire_launch(monkeypatch)
-    monkeypatch.setattr(
-        lambda_api,
-        "ensure_filesystem",
-        lambda n, r, deadline_at=None: (_ for _ in ()).throw(
-            lambda_api.LambdaApiError("filesystem quota exceeded")
-        ),
-    )
-    _launch(jobs, _spec(network_volume="flash-weights"), instances=[_inst()], attempt=0)
-    assert calls[0]["fs"] is None  # no filesystem attached
-    assert "/weight-cache" not in calls[0]["user_data"]  # cold user_data, no bind
+    attempted_regions = []
+
+    def unavailable(name, region, deadline_at=None):
+        attempted_regions.append(region)
+        raise lambda_api.LambdaApiError("filesystem quota exceeded")
+
+    monkeypatch.setattr(lambda_api, "ensure_filesystem", unavailable)
+    instances = [_inst(region="us-east-1"), _inst(region="us-west-2")]
+
+    with pytest.raises(lambda_api.LambdaApiError, match="all 2 Lambda region"):
+        _launch(
+            jobs,
+            _spec(network_volume="flash-weights"),
+            instances=instances,
+            attempt=0,
+        )
+
+    assert attempted_regions == ["us-east-1", "us-west-2"]
+    assert calls == []
 
 
-def test_filesystem_attach_reject_retries_same_region_cold(monkeypatch):
-    """A clean reject whose error mentions the FILESYSTEM retries THIS region cache-less before
-    walking — so a best-effort attach can't make a region the cold path would have served fail."""
+def test_filesystem_attach_reject_walks_cached_regions_without_cold_create(monkeypatch):
+    """a cache attach rejection stays inside the cached region walk."""
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
@@ -1714,57 +1583,26 @@ def test_filesystem_attach_reject_retries_same_region_cold(monkeypatch):
 
     def fake_launch(*, region_name, file_system_names=None, user_data=None, **kw):
         calls.append({"region": region_name, "fs": file_system_names})
-        if file_system_names:  # the CACHED launch is rejected for a filesystem-attach reason
-            raise lambda_api.LambdaApiError(
-                "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
-            )
-        return "i-cold"  # the cold retry (no fs) succeeds in the SAME region
-
-    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
-    h = _launch(
-        jobs,
-        _spec(network_volume="flash-weights"),
-        instances=[_inst(region="us-east-1")],
-        attempt=0,
-    )
-    assert h.region == "us-east-1"  # served by the SAME region, not lost to the walk
-    assert [c["fs"] for c in calls] == [["flash-weights"], None]  # cached attempt, then cold retry
-    assert all(c["region"] == "us-east-1" for c in calls)
-
-
-def test_filesystem_reject_rechecks_deadline_before_cacheless_creation(monkeypatch):
-    import flash.providers.lambda_.jobs as jobs
-    from flash.providers.lambda_.client import api as lambda_api
-
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
-    monkeypatch.setattr(
-        lambda_api,
-        "ensure_filesystem",
-        lambda name, region, deadline_at=None: f"/lambda/nfs/{name}",
-    )
-    now = {"value": 100.0}
-    monkeypatch.setattr(jobs.time, "time", lambda: now["value"])
-    calls = []
-
-    def fake_launch(*, file_system_names=None, **_kwargs):
-        calls.append(file_system_names)
-        now["value"] = 141.0
         raise lambda_api.LambdaApiError(
             "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
         )
 
     monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
+    monkeypatch.setattr(jobs, "usable_instances", lambda *_args, **_kwargs: [])
+    instances = [_inst(region="us-east-1"), _inst(region="us-west-2")]
 
-    with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
+    with pytest.raises(lambda_api.LambdaApiError, match="all 2 Lambda region"):
         _launch(
             jobs,
             _spec(network_volume="flash-weights"),
-            instances=[_inst(region="us-east-1")],
+            instances=instances,
             attempt=0,
-            deadline_at=200.0,
         )
 
-    assert calls == [["flash-weights"]]
+    assert calls == [
+        {"region": "us-east-1", "fs": ["flash-weights"]},
+        {"region": "us-west-2", "fs": ["flash-weights"]},
+    ]
 
 
 def test_capacity_reject_does_not_trigger_cold_fs_retry(monkeypatch):
@@ -1890,7 +1728,7 @@ def test_no_cache_never_touches_filesystems(monkeypatch):
 
 def test_cache_ensured_per_region_in_the_walk(monkeypatch):
     """Lazy per-region: the FS is ensured ONLY in the region the run actually lands in (walk skips on
-    capacity, ensuring then launching cold/cache per region)."""
+    capacity, ensuring then launching with the cache per region)."""
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
@@ -3307,57 +3145,6 @@ def test_launch_success_say_baseexception_does_not_trigger_run_wide_reap(
 
 
 @pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
-def test_cacheless_retry_success_say_baseexception_does_not_trigger_run_wide_reap(
-    monkeypatch, interrupt_type
-):
-    """The same BaseException-during-say property as the primary success route, but through the
-    cache-less retry (_retry_launch_without_cache): once it is entered it owns the exact cleanup
-    for whatever box it rents internally, so the outer run-wide reap must not also fire."""
-    import flash.providers.lambda_.jobs as jobs
-    from flash.providers.lambda_.client import api as lambda_api
-
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
-
-    def fake_launch(*, file_system_names=None, **_kwargs):
-        if file_system_names:  # the cached attempt is rejected for a filesystem-attach reason
-            raise lambda_api.LambdaApiError(
-                "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
-            )
-        return "i-cold"  # the cache-less retry succeeds
-
-    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
-    monkeypatch.setattr(
-        lambda_api, "ensure_filesystem", lambda n, r, deadline_at=None: f"/lambda/nfs/{n}"
-    )
-
-    def raising_say(_log):
-        def _say(msg):
-            if "cold, cache-less" in msg:  # only the retry's own success message raises
-                raise interrupt_type("log stream closed")
-
-        return _say
-
-    monkeypatch.setattr(jobs, "make_say", raising_say)
-    terminated = []
-    monkeypatch.setattr(
-        lambda_api, "terminate_instance_confirmed", lambda iid: terminated.append(iid)
-    )
-    reaped = []
-    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
-
-    with pytest.raises(interrupt_type):
-        _launch(
-            jobs,
-            _spec(network_volume="flash-weights"),
-            instances=[_inst(region="us-east-1")],
-            attempt=0,
-        )
-
-    assert terminated == ["i-cold"]  # the cache-less retry's own exact cleanup ran
-    assert reaped == []  # the outer coarse label reap must not also fire
-
-
-@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
 def test_interrupt_while_building_the_success_message_terminates_only_this_instance(
     monkeypatch, interrupt_type
 ):
@@ -3426,63 +3213,6 @@ def test_launch_rejected_by_the_apis_own_allowance_check_does_not_reap_the_run(m
         _launch(jobs, _spec(), instances=[_inst()], attempt=0)
 
     assert reaped == []  # nothing was rented, so no seed of this run may be terminated
-    assert terminated == []
-
-
-@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
-def test_cacheless_clean_reject_say_baseexception_does_not_trigger_run_wide_reap(
-    monkeypatch, interrupt_type
-):
-    """A CLEAN cold rejection rents nothing, so a raising diagnostic on that path must not reap.
-
-    The cache-less retry arms the coarse guard around its own launch request. When that request is
-    cleanly rejected the guard has to stand down BEFORE the rejection is logged: the log stream can
-    be closed, and an armed guard on that path sweeps the run label and terminates every other
-    concurrent seed sharing it over a request that rented nothing."""
-    import flash.providers.lambda_.jobs as jobs
-    from flash.providers.lambda_.client import api as lambda_api
-
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
-
-    def fake_launch(*, file_system_names=None, **_kwargs):
-        if file_system_names:  # the cached attempt is rejected for a filesystem-attach reason
-            raise lambda_api.LambdaApiError(
-                "POST /instance-operations/launch -> HTTP 400: file_system_names not attachable"
-            )
-        # the cache-less retry is CLEANLY rejected too: HTTP 4xx, nothing rented
-        raise lambda_api.LambdaApiError(
-            "POST /instance-operations/launch -> HTTP 400: no capacity in region"
-        )
-
-    monkeypatch.setattr(lambda_api, "launch_instance", fake_launch)
-    monkeypatch.setattr(
-        lambda_api, "ensure_filesystem", lambda n, r, deadline_at=None: f"/lambda/nfs/{n}"
-    )
-
-    def raising_say(_log):
-        def _say(msg):
-            if "also rejected cold" in msg:  # only the cold-rejection diagnostic raises
-                raise interrupt_type("log stream closed")
-
-        return _say
-
-    monkeypatch.setattr(jobs, "make_say", raising_say)
-    terminated = []
-    monkeypatch.setattr(
-        lambda_api, "terminate_instance_confirmed", lambda iid: terminated.append(iid)
-    )
-    reaped = []
-    monkeypatch.setattr(jobs, "terminate_run_instances", lambda run_id: reaped.append(run_id) or [])
-
-    with pytest.raises(interrupt_type):
-        _launch(
-            jobs,
-            _spec(network_volume="flash-weights"),
-            instances=[_inst(region="us-east-1")],
-            attempt=0,
-        )
-
-    assert reaped == []  # nothing was rented, so no run-label sweep may fire
     assert terminated == []
 
 

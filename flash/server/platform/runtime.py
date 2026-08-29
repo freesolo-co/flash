@@ -269,54 +269,97 @@ def _fail_blocked_recovery(
     return applied
 
 
-def _start_resubmit(
-    spec,
-    *,
-    expected_remote: dict | None = None,
-    expected_state: str | None = None,
-) -> bool:
-    from flash.runner.accounting.reconciliation import _compare_and_prepare_resubmit
-    from flash.runner.lifecycle.attempts import _verified_opd_next_attempt
-    from flash.runner.lifecycle.status import source_snapshot_from_status
+def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
+    """Claim one provider-clear handleless launch without advancing an active claim."""
+    from flash.runner.lifecycle.attempts import (
+        _verified_opd_retry_state,
+        active_launch_claim_from_raw,
+        claim_is_live,
+        reserve_handleless_recovery_launch,
+    )
+    from flash.runner.lifecycle.status import (
+        _load_status_json,
+        decode_next_attempt,
+        source_snapshot_from_status,
+    )
     from flash.runner.supervise.lifecycle import _run_job_background
 
     try:
         source_snapshot_from_status(get_status(spec.run_id), required=True)
     except Exception as exc:
-        _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
+        _fail_blocked_recovery(spec, str(exc), expected_remote=None)
         return False
     reason = _recovery_block_reason(spec)
     if reason is not None:
         if _recovery_wall_deadline_is_open(spec):
             return False
-        _fail_blocked_recovery(spec, reason, expected_remote=expected_remote)
+        _fail_blocked_recovery(spec, reason, expected_remote=None)
         return False
+    raw = _load_status_json(spec.run_id)
+    stale_claim = active_launch_claim_from_raw(raw)
+    if stale_claim is not None and claim_is_live(spec.run_id, stale_claim):
+        return None
+    revision = world_size = None
+    verified_attempt = None
     if spec.algorithm == "opd":
+        # reclaiming a stale claim is not exempt. the lost worker can cross `optimizer.step()` and
+        # upload its mutation marker before provider cleanup finds and terminates it, so the claim's
+        # pre-launch resume evidence is already stale. reverify every attempt the counter names and
+        # carry that revision instead of the one the claim pinned.
         try:
-            _verified_opd_next_attempt(spec.run_id)
+            verified_attempt, revision, world_size = _verified_opd_retry_state(spec.run_id)
+            if verified_attempt != decode_next_attempt(raw):
+                raise RuntimeError("opd recovery attempt identity changed")
         except Exception as exc:
-            _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
+            _fail_blocked_recovery(spec, str(exc), expected_remote=None)
             return False
-    if not _compare_and_prepare_resubmit(
+    reservation = reserve_handleless_recovery_launch(
         spec.run_id,
-        expected_remote,
         expected_state=expected_state,
-    ):
-        return False
+        provider_clear_confirmed=True,
+        expected_stale_claim=stale_claim,
+        expected_next_attempt=verified_attempt,
+        resume_revision=revision,
+        resume_world_size=world_size,
+    )
+    if reservation.active:
+        return None
+    if reservation.claim is None:
+        if reservation.retry_plan is not None and not reservation.retry_plan.retry:
+            _fail_blocked_recovery(
+                spec,
+                "retry policy rejected handleless replacement",
+                expected_remote=None,
+            )
+            return False
+        return None
     with contextlib.suppress(Exception):
         _append_run_log(
             spec.run_id,
             "control plane restarted without a durable handle; resubmitting",
         )
-    threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
+    try:
+        threading.Thread(
+            target=_run_job_background,
+            args=(spec, None, reservation.claim),
+            daemon=True,
+        ).start()
+    except Exception:
+        # nothing will ever run `_run_job_background`, so its `finally` cannot consume the claim.
+        # the caller retries, and an unconsumed claim reads as live to each later pass, which then
+        # defers until the wall deadline instead of launching the recovered run.
+        from flash.runner.supervise.lifecycle import _consume_reserved_claim
+
+        _consume_reserved_claim(spec.run_id, reservation.claim)
+        raise
     return True
 
 
 def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | None:
-    from flash.runner.lifecycle.attempts import _latest_reserved_attempt
+    from flash.runner.lifecycle.attempts import latest_reserved_attempt
     from flash.runner.supervise.lifecycle import _completed_attempt_metrics
 
-    attempt = _latest_reserved_attempt(spec.run_id)
+    attempt = latest_reserved_attempt(spec.run_id)
     if attempt is None:
         return None
     providers = {
@@ -399,11 +442,10 @@ def _deferred_resubmit_loop(spec) -> None:
             clear = False
         if clear:
             try:
-                started = _start_resubmit(
-                    spec,
-                    expected_remote=None,
-                    expected_state=status.state,
-                )
+                started = _start_handleless_resubmit(spec, status.state)
+                if started is None:
+                    time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                    continue
             except Exception:
                 time.sleep(_DEFERRED_RECOVERY_RETRY_S)
                 continue
@@ -780,7 +822,7 @@ def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
         # fail closed in _confirm_run_clear (unenumerable recorded Vast) and defer forever. The guard
         # still runs for `provisioning`/`running`, the states that could have attempted a create.
         if prior_state == "queued" or _confirm_run_clear(spec):
-            if _start_resubmit(spec, expected_remote=None, expected_state=prior_state):
+            if _start_handleless_resubmit(spec, prior_state):
                 continue
             try:
                 current = get_status(spec.run_id)

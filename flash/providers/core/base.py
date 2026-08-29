@@ -929,9 +929,8 @@ class Provider(Protocol):
 
     # NOTE: ``supports_weight_cache: bool`` is an OPTIONAL capability attr (read via
     # ``getattr(prov, "supports_weight_cache", False)``, off this Protocol for the same isinstance
-    # reason as below): True only for the provider that offers the shared weight-cache network volume
-    # (RunPod). The runner gates its one-shot cache-less retry fallback on it; every other provider
-    # defaults False.
+    # reason as below): True for providers that attach the managed shared weight cache. The runner
+    # gates its one-shot cache-less retry fallback on it; every other provider defaults False.
 
     # ``run_instances_remaining(run_id)`` is optional and must stay off this runtime-checkable
     # protocol. callers use getattr in server/_runtime.py. ``[]`` confirms clear; non-empty means a

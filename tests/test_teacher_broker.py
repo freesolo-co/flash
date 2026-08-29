@@ -1834,11 +1834,11 @@ def test_current_nonterminal_attempt_is_checked_on_every_admission(monkeypatch):
     monkeypatch.setattr(
         runner_status, "get_status", lambda _run_id: SimpleNamespace(state="running")
     )
-    monkeypatch.setattr(runner_attempts, "_latest_reserved_attempt", lambda _run_id: 2)
+    monkeypatch.setattr(runner_attempts, "latest_reserved_attempt", lambda _run_id: 2)
     monkeypatch.setattr(runner_state, "_internal_spec_from_status", lambda _status: spec)
     teacher_broker._require_current_attempt(capability)
 
-    monkeypatch.setattr(runner_attempts, "_latest_reserved_attempt", lambda _run_id: 3)
+    monkeypatch.setattr(runner_attempts, "latest_reserved_attempt", lambda _run_id: 3)
     with pytest.raises(teacher_broker.TeacherBrokerError, match="attempt_replaced"):
         teacher_broker._require_current_attempt(capability)
 

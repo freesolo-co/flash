@@ -939,7 +939,11 @@ def _spec(run_id="flash-1700000001-rt01", **gpu_kw) -> JobSpec:
 def _alloc():
     from flash.providers.core.base import Allocation, Candidate
 
-    candidates = (Candidate("runpod", "RTX 4090", 0.69, 24),)
+    candidates = (
+        Candidate("runpod", "RTX 4090", 0.69, 24),
+        Candidate("runpod", "H100", 3.29, 80),
+        Candidate("runpod", "B200", 5.89, 180),
+    )
     return Allocation(
         provider="runpod",
         gpu="RTX 4090",
@@ -1067,10 +1071,11 @@ def test_unconfirmed_instance_teardown_fails_terminal_and_reaps(orch, monkeypatc
     submits = []
     gc_calls = []
     vast_candidate = Candidate("vast", "RTX 4090", 0.5, 24)
+    vast_larger = Candidate("vast", "H100", 1.0, 80)
     monkeypatch.setattr(
         allocator,
         "allocate",
-        lambda *a, **k: Allocation("vast", "RTX 4090", 0.5, 12, (vast_candidate,)),
+        lambda *a, **k: Allocation("vast", "RTX 4090", 0.5, 12, (vast_candidate, vast_larger)),
     )
 
     class _RaisingVast:
@@ -1120,10 +1125,11 @@ def test_unconfirmed_lambda_teardown_blocks_replacement_and_preserves_handle(orc
     submits = []
     gc_calls = []
     candidate = Candidate("lambda", "A10", 1.29, 24)
+    larger = Candidate("lambda", "H100", 3.29, 80)
     monkeypatch.setattr(
         allocator,
         "allocate",
-        lambda *a, **k: Allocation("lambda", "A10", 1.29, 12, (candidate,)),
+        lambda *a, **k: Allocation("lambda", "A10", 1.29, 12, (candidate, larger)),
     )
 
     def fake_submit(run_spec, log=None, on_handle=None, attempt=0, **_kwargs):

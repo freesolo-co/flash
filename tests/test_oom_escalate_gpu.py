@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import types
 
 import pytest
@@ -267,15 +266,19 @@ def _card(gpu, vram):
     return types.SimpleNamespace(gpu=gpu, vram_gb=vram, provider="runpod", hourly_usd=1.0)
 
 
-def test_oom_escalated_keeps_only_strictly_larger_cards():
-    from flash.runner.supervise.lifecycle import _oom_escalated
+def test_retry_filter_keeps_only_strictly_larger_cards():
+    from flash.runner.supervise.retry_decision import _strictly_larger_candidates
 
-    cands = [_card("A100", 80), _card("A100b", 80), _card("Pro6000", 96), _card("B200", 180)]
-    assert [c.gpu for c in _oom_escalated(cands, 0)] == [
-        c.gpu for c in cands
-    ]  # no OOM -> unchanged
-    assert {c.gpu for c in _oom_escalated(cands, 80)} == {"Pro6000", "B200"}  # >80 only
-    assert _oom_escalated(cands, 180) == []  # OOM'd the biggest -> nowhere larger
+    candidates = [_card("A100", 80), _card("A100b", 80), _card("Pro6000", 96), _card("B200", 180)]
+
+    assert [candidate.gpu for candidate in _strictly_larger_candidates(candidates, 0)] == [
+        candidate.gpu for candidate in candidates
+    ]
+    assert [candidate.gpu for candidate in _strictly_larger_candidates(candidates, 80)] == [
+        "Pro6000",
+        "B200",
+    ]
+    assert _strictly_larger_candidates(candidates, 180) == ()
 
 
 def _shape(gpu, vram, count):
@@ -288,7 +291,10 @@ def test_sft_oom_escalation_uses_the_ranks_that_joined():
     from flash.providers.core.allocator import _executed_width, _fitting_candidates
     from flash.providers.core.base import Candidate
     from flash.providers.core.sharding import combined_vram_gb
-    from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
+    from flash.runner.supervise.retry_decision import (
+        _candidate_usable_vram_gb,
+        _strictly_larger_candidates,
+    )
 
     failed = Candidate("runpod", "RTX 4090", 0.69, 24, 4)
     fallback = Candidate("runpod", "A100 SXM 40GB", 1.0, 40, 1)
@@ -304,14 +310,17 @@ def test_sft_oom_escalation_uses_the_ranks_that_joined():
     assert _candidate_usable_vram_gb(failed) == pytest.approx(combined_vram_gb(24, 2))
     assert _candidate_usable_vram_gb(failed) == pytest.approx(35.2)
     assert _candidate_usable_vram_gb(failed) != pytest.approx(combined_vram_gb(24, 4))
-    assert _oom_escalated([fallback], _candidate_usable_vram_gb(failed)) == [fallback]
+    assert _strictly_larger_candidates([fallback], _candidate_usable_vram_gb(failed)) == (fallback,)
 
 
 def test_non_sft_oom_escalation_still_uses_every_rented_card():
     from flash.providers.core.allocator import _executed_width, _fitting_candidates
     from flash.providers.core.base import Candidate
     from flash.providers.core.sharding import combined_vram_gb
-    from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
+    from flash.runner.supervise.retry_decision import (
+        _candidate_usable_vram_gb,
+        _strictly_larger_candidates,
+    )
 
     failed = Candidate("runpod", "RTX 4090", 0.69, 24, 4)
     fallback = Candidate("runpod", "A100 SXM 40GB", 1.0, 40, 1)
@@ -324,53 +333,7 @@ def test_non_sft_oom_escalation_still_uses_every_rented_card():
     assert failed.executed_gpu_count == failed.gpu_count == 4
     assert _candidate_usable_vram_gb(failed) == pytest.approx(combined_vram_gb(24, 4))
     assert _candidate_usable_vram_gb(failed) == pytest.approx(62.4)
-    assert _oom_escalated([fallback], _candidate_usable_vram_gb(failed)) == []
-
-
-def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
-    from flash.providers.core.allocator import _executed_width, _fitting_candidates
-    from flash.providers.core.base import Candidate, PollResult
-    from flash.runner.supervise import attempt_supervision
-    from flash.runner.supervise.lifecycle import _oom_escalated, _RetryBudget
-
-    failed = _fitting_candidates(
-        [Candidate("runpod", "RTX 4090", 0.69, 24, 4)],
-        35,
-        _executed_width("sft", {"batch_size": 8}, {"sft_retained_examples": 10}),
-    )[0]
-    ctx = types.SimpleNamespace(
-        raise_if_cancelled=lambda: None,
-        last_handle=None,
-        spec=types.SimpleNamespace(run_id="run"),
-        last_detail="",
-        oom_vram_floor=0.0,
-        drop_weight_cache=False,
-        retry_budget=_RetryBudget(0, 1, 0),
-        failed_providers=set(),
-        tried_classes=set(),
-        capacity_refusals={},
-        seed=1,
-        log=io.StringIO(),
-    )
-    prepared = types.SimpleNamespace(attempt=0)
-    outcome = attempt_supervision._AttemptOutcome(
-        result=PollResult(False, failure="oom", detail="cuda oom"),
-        chosen=failed,
-        candidates=(failed,),
-        run_spec=types.SimpleNamespace(gpu=types.SimpleNamespace(network_volume=None)),
-    )
-    monkeypatch.setattr(
-        attempt_supervision._lifecycle, "_await_runpod_completed_metrics", lambda *a, **k: None
-    )
-    monkeypatch.setattr(
-        "flash.runner.lifecycle.deadlines._load_run_deadline_at", lambda _run_id: None
-    )
-
-    decision = attempt_supervision._handle_failure(ctx, prepared, outcome)
-
-    assert decision.retry is True
-    assert ctx.oom_vram_floor == pytest.approx(35.2)
-    assert failed not in _oom_escalated([failed], ctx.oom_vram_floor)
+    assert _strictly_larger_candidates([fallback], _candidate_usable_vram_gb(failed)) == ()
 
 
 def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():
@@ -384,21 +347,26 @@ def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():
     paid attempt to reach the same OOM.
     """
     from flash.providers.core.sharding import combined_vram_gb
-    from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
+    from flash.runner.supervise.retry_decision import (
+        _candidate_usable_vram_gb,
+        _strictly_larger_candidates,
+    )
 
     single_h200 = _shape("H200", 141, 1)
     pair_h100 = _shape("H100x2", 80, 2)
     assert combined_vram_gb(80, 2) < 141  # the premise: the pair is the smaller shape
 
     floor = _candidate_usable_vram_gb(single_h200)
-    assert pair_h100 not in _oom_escalated([pair_h100], floor)
+    assert pair_h100 not in _strictly_larger_candidates([pair_h100], floor)
 
     # and the floor is recorded on the same scale: a sharded shape that OOMs must not write a floor
     # so inflated that genuinely larger single cards get filtered out. 3x40 raw-counts as 120 GB,
     # which would wrongly exclude a 96 GB card that the fit model rates higher (89.6 GB usable).
     triple_40 = _shape("L40Sx3", 40, 3)
     single_96 = _shape("Pro6000", 96, 1)
-    assert single_96 in _oom_escalated([single_96], _candidate_usable_vram_gb(triple_40))
+    assert single_96 in _strictly_larger_candidates(
+        [single_96], _candidate_usable_vram_gb(triple_40)
+    )
 
 
 def test_surfaced_worker_flags_reads_both_flags_in_one_pass():

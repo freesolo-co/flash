@@ -21,8 +21,8 @@ class _CoarseReapGuard:
 
     Armed for exactly the window a launch request is in flight with no instance id in hand, when
     the label reap is the ONLY thing that can find a box that is rented but not yet named. It is
-    an object rather than a local so the cache-less retry can arm it around its own request
-    instead of the caller arming across that whole call.
+    an object rather than a local so each region can arm it around its own request instead of the
+    caller arming across the whole walk.
 
     ``owns`` narrows the guard the instant an id exists. Ownership transfer would otherwise span
     two statements (the publication helper returns, then the caller disarms), and an interrupt

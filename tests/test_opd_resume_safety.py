@@ -117,7 +117,11 @@ def _remote(*, attempt: int = 0) -> dict:
         "key_fingerprint": _RUNPOD_FINGERPRINT,
         "job_id": f"job-{attempt}",
         "attempt": attempt,
+        "launch_claim_token": f"claim-{attempt}",
         "started_ts": float(attempt + 1),
+        "allocated_gpu": "RTX 4090",
+        "allocated_gpu_count": 1,
+        "allocated_usable_vram_gb": 24.0,
     }
 
 
@@ -182,8 +186,12 @@ def test_status_initialization_stamps_opd_contract_only_when_explicit(monkeypatc
             ),
             _opd_retry_contract_version=OPD_RETRY_CONTRACT_VERSION,
         )
-    assert runner_attempts._reserve_attempt("contract-sft") == 0
-    assert runner_attempts._reserve_attempt("contract-grpo") == 0
+    sft_claim = runner_attempts.reserve_verified_attempt_launch("contract-sft")
+    grpo_claim = runner_attempts.reserve_verified_attempt_launch("contract-grpo")
+    assert sft_claim is not None
+    assert sft_claim.attempt == 0
+    assert grpo_claim is not None
+    assert grpo_claim.attempt == 0
 
 
 def test_marker_path_and_canonical_exact_schema():
@@ -569,9 +577,32 @@ def test_initial_contracted_opd_reservation_skips_empty_attempt_query(monkeypatc
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not query HF")),
     )
 
-    snapshot = runner_attempts._verified_opd_next_attempt(spec.run_id)
-    assert snapshot == 0
-    assert runner_attempts._reserve_attempt(spec.run_id, expected_next_attempt=snapshot) == 0
+    claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert claim is not None
+    assert claim.attempt == 0
+    assert claim.resume_revision is None
+    assert claim.resume_world_size is None
+
+
+def test_opd_launch_claim_persists_verified_resume_revision_and_world_size(monkeypatch, tmp_path):
+    from flash.providers.artifacts import hf as hf_artifacts
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _opd_spec("opd-resume-claim")
+    _save_status(spec, next_attempt=0)
+    monkeypatch.setattr(
+        hf_artifacts,
+        "verify_opd_replacement_safe",
+        lambda **_kwargs: ("checkpoint-revision", 2),
+    )
+
+    claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+
+    assert claim is not None
+    assert claim.resume_revision == "checkpoint-revision"
+    assert claim.resume_world_size == 2
+    raw = runner_status._load_status_json(spec.run_id)
+    assert raw[runner_state._ACTIVE_LAUNCH_CLAIM_KEY] == claim.to_dict()
 
 
 def test_retry_gate_uses_authoritative_jobspec_seed(monkeypatch, tmp_path):
@@ -598,22 +629,25 @@ def test_precontract_opd_fails_closed(monkeypatch, tmp_path):
     _save_status(spec, contracted=False)
 
     with pytest.raises(RuntimeError, match="contract is missing or invalid"):
-        runner_attempts._verified_opd_next_attempt(spec.run_id)
+        runner_attempts._verified_opd_retry_state(spec.run_id)
     with pytest.raises(RuntimeError, match="contract is missing or invalid"):
-        runner_attempts._reserve_attempt(spec.run_id, expected_next_attempt=0)
+        runner_attempts.reserve_verified_attempt_launch(spec.run_id)
 
 
 def test_next_attempt_cas_race_blocks_opd_reservation(monkeypatch, tmp_path):
+    from flash.providers.artifacts import hf as hf_artifacts
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = _opd_spec("opd-cas")
     _save_status(spec, next_attempt=0)
-    snapshot = runner_attempts._verified_opd_next_attempt(spec.run_id)
-    status = runner_status.get_status(spec.run_id)
-    runner_state._save_status(status, _next_attempt=1)
 
-    with pytest.raises(RuntimeError, match="changed after retry verification"):
-        runner_attempts._reserve_attempt(spec.run_id, expected_next_attempt=snapshot)
+    def advance_attempt(**_kwargs):
+        runner_state._save_status(runner_status.get_status(spec.run_id), _next_attempt=1)
+        return
+
+    monkeypatch.setattr(hf_artifacts, "verify_opd_replacement_safe", advance_attempt)
+
+    assert runner_attempts.reserve_verified_attempt_launch(spec.run_id) is None
     assert runner_status._load_status_json(spec.run_id)[runner_state._NEXT_ATTEMPT_KEY] == 1
 
 
@@ -629,6 +663,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     spec = _opd_spec("automatic-retry-absent")
     _save_status(spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    larger = Candidate("runpod", "H100", 3.29, 80)
     monkeypatch.setattr(
         allocator,
         "allocate",
@@ -637,7 +672,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
             gpu="RTX 4090",
             hourly_usd=0.69,
             min_vram_gb=24,
-            candidates=(candidate,),
+            candidates=(candidate, larger),
         ),
     )
     monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
@@ -675,7 +710,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
 
     assert metrics == {
         "train_tokens": 1,
-        "allocated_gpu": "RTX 4090",
+        "allocated_gpu": "H100",
         # stamped alongside the gpu so cost attribution prices the class on the substrate
         # that actually billed it.
         "allocated_provider": "runpod",
@@ -702,6 +737,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
     spec = _opd_spec("automatic-retry-pinned")
     _save_status(spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
     candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    larger = Candidate("runpod", "H100", 3.29, 80)
     monkeypatch.setattr(
         allocator,
         "allocate",
@@ -710,7 +746,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
             gpu="RTX 4090",
             hourly_usd=0.69,
             min_vram_gb=24,
-            candidates=(candidate,),
+            candidates=(candidate, larger),
         ),
     )
     monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
@@ -772,7 +808,7 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
 
     assert metrics == {
         "train_tokens": 1,
-        "allocated_gpu": "RTX 4090",
+        "allocated_gpu": "H100",
         # stamped alongside the gpu so cost attribution prices the class on the substrate
         # that actually billed it.
         "allocated_provider": "runpod",
@@ -1287,22 +1323,31 @@ def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width(
 
 def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
     """a filtered rental reports the incompatible execution width, not its card count."""
+    from flash.core.spec import JobSpec
     from flash.providers.core.base import Allocation, Candidate
+    from flash.runner.lifecycle.attempts import AttemptLaunchClaim
     from flash.runner.supervise.attempt_supervision import (
         _build_candidate_plan,
         _pinned_to_resume_width,
     )
+    from flash.runner.supervise.retry_decision import RetryState
 
     rented_two_executes_one = Candidate("runpod", "h100", 1.0, 80, 2, 1)
     allocation = Allocation("runpod", "h100", 1.0, 80, (rented_two_executes_one,), gpu_count=2)
     filtered = _pinned_to_resume_width(allocation, 2)
+
     ctx = SimpleNamespace(
-        oom_vram_floor=0.0,
         last_detail=None,
-        spec=SimpleNamespace(run_id="flash-r1"),
+        seed=42,
         log=io.StringIO(),
     )
-    prepared = SimpleNamespace(resume_world_size=2)
+    spec = JobSpec(run_id="opd-width-diagnostic", model="Qwen/Qwen3.5-9B", algorithm="opd")
+    prepared = (
+        AttemptLaunchClaim(0, "opd-width", "revision", 2),
+        spec,
+        {},
+        RetryState.initial_for_spec(spec),
+    )
 
     assert filtered.candidates == ()
     assert _build_candidate_plan(ctx, prepared, filtered) is None
@@ -1310,9 +1355,7 @@ def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
         "no candidate executing at checkpoint world size 2 is available, and this retry must "
         "preserve that executed rank width"
     )
-    assert ctx.log.getvalue() == (
-        "run=flash-r1 no candidate executes at pinned OPD checkpoint world size 2; not retrying\n"
-    )
+    assert ctx.log.getvalue() == ""
 
 
 class _IntSubclass(int):
