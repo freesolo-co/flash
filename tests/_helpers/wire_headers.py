@@ -15,5 +15,5 @@ def sent_headers(request: urllib.request.Request) -> dict[str, str]:
     """the merged header view `do_open` builds, in the same precedence order."""
 
     headers = dict(request.unredirected_hdrs)
-    headers.update(request.headers)
+    headers.update({k: v for k, v in request.headers.items() if k not in headers})
     return headers
