@@ -81,7 +81,7 @@ class FakeAuthorizer:
         self.calls: list[tuple[str, str]] = []
         self._raises = raises
 
-    async def __call__(self, token: str, adapter_id: str) -> str:
+    async def __call__(self, token: str, adapter_id: str, scope: dict | None = None) -> str:
         self.calls.append((token, adapter_id))
         if self._raises is not None:
             raise self._raises

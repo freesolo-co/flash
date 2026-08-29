@@ -410,6 +410,7 @@ def test_one_engine_class_per_distinct_engine_key(modal_app_module):
     """a loraengine class is built for each active gpu tier and concurrency key."""
     assert set(modal_app_module.ENGINE_BY_KEY) == {
         ("L40S", 16),
+        ("H100", 16),
         ("H200", 16),
     }
 
@@ -446,11 +447,12 @@ def test_9b_routes_to_l40s(modal_app_module):
     assert by_key[("L40S", 16)].__name__ == "LoraEngine_L40S_c16"
 
 
-def test_pending_qwen38_candidate_has_no_active_engine_dispatch(modal_app_module):
-    with pytest.raises(ValueError, match="Unsupported base model"):
-        gpu_for("Qwen/Qwen3.8-27B")
-    with pytest.raises(ValueError, match="Unsupported base model"):
-        modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B")
+def test_27b_routes_to_h100(modal_app_module):
+    """The dense 27B runs its FP8 checkpoint on the H100 tier (8-seq -> (H100, 16))."""
+    by_key = modal_app_module.ENGINE_BY_KEY
+    assert gpu_for("Qwen/Qwen3.8-27B") == "H100"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B") is by_key[("H100", 16)]
+    assert by_key[("H100", 16)].pinned_gpu == "H100"
 
 
 def test_35b_moe_routes_to_h200(modal_app_module):
@@ -796,14 +798,14 @@ def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path
     assert getattr(args, "max_num_batched_tokens", None) is None
 
 
-def test_qwen38_candidate_immutable_args_fail_closed_when_vllm_drops_revision_support():
+def test_qwen38_immutable_args_fail_closed_when_vllm_drops_revision_support():
     from flash.serving.src.engine import boot
-    from flash.serving.src.engine.model_config import _QWEN38_HOSTED_CANDIDATE
+    from flash.serving.src.engine.model_config import engine_overrides_for
 
     with pytest.raises(RuntimeError, match=r"cannot pin.*missing engine args"):
         boot._required_immutable_args(
             "Qwen/Qwen3.8-27B",
-            _QWEN38_HOSTED_CANDIDATE["engine"],
+            engine_overrides_for("Qwen/Qwen3.8-27B"),
             {"model"},
         )
 
