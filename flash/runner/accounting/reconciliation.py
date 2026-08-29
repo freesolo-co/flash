@@ -363,10 +363,30 @@ def _hashable(value: object) -> object:
     The lenient key is built from a record that failed strict validation, so every field is
     arbitrary JSON -- `attempt` can be a list, and so can a resource id. The drain puts these keys
     in a `set`, so one unhashable field would raise `TypeError` there and strand every well-formed
-    sibling still billing. `repr` is deterministic for a given value, which is all the key needs:
-    equal values still produce equal keys on both the drain and the compare-and-remove.
+    sibling still billing.
+
+    Two properties make this a key rather than just a hash. It must survive a persist, because the
+    two sides run on either side of one: the drain keys the in-memory record, and the
+    compare-and-remove keys it after `_save_status_unlocked` rewrote it with
+    `json.dump(sort_keys=True)`. A mapping comes back key-sorted, so an insertion-ordered `repr`
+    would key the same record differently on the two sides, removal would match nothing, and every
+    later startup would re-tear-down an endpoint already confirmed gone. Sorting the pairs here is
+    what makes both sides agree.
+
+    And it must not conflate shapes, because two different records sharing a key means the drain
+    dedupes one of them away and never deletes it. A container serialized to a bare string collides
+    with a scalar string holding that same text, so every value carries its type tag.
     """
-    return value if isinstance(value, (str, int, float, bool, type(None))) else repr(value)
+    if isinstance(value, dict):
+        return ("dict", tuple(sorted((_hashable(k), _hashable(v)) for k, v in value.items())))
+    if isinstance(value, (list, tuple)):
+        return ("seq", tuple(_hashable(entry) for entry in value))
+    # bool before int: `True == 1` and they hash alike, so the tag is the only thing separating them.
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, (str, int, float, type(None))):
+        return (type(value).__name__, value)
+    return ("repr", repr(value))
 
 
 def _uncanonical_cleanup_remote_key(record: object) -> tuple | None:

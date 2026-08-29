@@ -3377,6 +3377,71 @@ def test_unconfirmed_endpoint_reclaim_is_retried_on_the_next_startup(monkeypatch
     assert runner_status.endpoint_reclaim_types(run_id) == ()
 
 
+def test_failed_terminal_write_leaves_the_run_recoverable_for_a_later_retry(monkeypatch, tmp_path):
+    """An unconfirmed inline teardown is retried because the write that failed left no terminal state.
+
+    The inline fallback is the one path with no durable marker to retry from, so its retry evidence
+    has to be the run record itself. `fail_with_cleanup_intent` writes the terminal state and the
+    marker in ONE `_save_status_unlocked`, so the write either lands both or neither -- there is no
+    reachable `failed`-without-marker record. When it raises, the run stays `provisioning`, stays in
+    `_RECOVERABLE`, and the next boot re-enumerates it and calls the provider again.
+    """
+    import flash.providers.runpod.serverless.endpoints as serverless
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="reclaim-unwritable", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    raw = spec.to_dict()
+    raw["gpu"]["type"] = "RTX 5090"
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=raw)
+    )
+    path = runner_state.runs_file_path(spec.run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    # unactivatable spec: recovery routes this run to `_fail_unrecoverable_run`.
+    stored["spec"]["model"] = "Qwen/retired-model-that-no-build-can-activate"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    def unwritable(_run_id, _detail):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(runner_status, "fail_with_cleanup_intent", unwritable)
+    monkeypatch.setattr(providers, "configured_providers", list)
+    monkeypatch.setattr(runner_reconciliation, "_drain_cleanup_remotes", lambda _run_id: None)
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
+
+    attempts: list[str] = []
+
+    def unavailable(gpu_type: str, _run_id: str) -> list[dict]:
+        attempts.append(gpu_type)
+        return [{"success": False, "name": gpu_type, "message": "provider unavailable"}]
+
+    monkeypatch.setattr(serverless, "terminate_endpoint", unavailable)
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target, self._args = target, args
+
+        def start(self):
+            self._target(*self._args)
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+    assert attempts == ["RTX 5090"], "the inline fallback never reached the provider"
+    assert runner_status.get_status(spec.run_id).state == "provisioning", (
+        "a write that raised must not leave the run terminal, or nothing reconsiders it"
+    )
+
+    attempts.clear()
+    runtime.recover_runs()
+    assert attempts == ["RTX 5090"], "the unconfirmed reclaim was not retried on the next boot"
+
+
 def test_confirmed_endpoint_reclaim_is_not_retried(monkeypatch, tmp_path):
     """A confirmed teardown clears the marker, so later startups must not re-call the provider."""
     import flash.server.platform.runtime as runtime

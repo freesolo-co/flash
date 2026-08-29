@@ -664,7 +664,11 @@ def _reclaim_unhandled_endpoints(run_id: str, unmarked: Sequence[str] = ()) -> N
         confirmed = terminate_persisted_endpoints(gpu_types, run_id)
     if confirmed and marked:
         with contextlib.suppress(Exception):
-            clear_endpoint_reclaim_intent(run_id)
+            # retire only what this reclaim actually terminated. the provider call above runs
+            # unlocked and slowly, and a second quarantine inside that window can extend the marker
+            # with a class never passed to it -- dropping the whole key would erase that class and
+            # leave its endpoint billing with nothing naming it.
+            clear_endpoint_reclaim_intent(run_id, marked)
 
 
 def _teardown_failed_recovery(
@@ -706,7 +710,11 @@ def _fail_unrecoverable_run(status: RunStatus, detail: str) -> None:
     its worker is still billing now, so teardown runs inline on this thread, addressed by the
     classes read here rather than by the marker that could not be written.
     """
-    from flash.runner.lifecycle.status import fail_with_cleanup_intent, reclaimable_gpu_types
+    from flash.runner.lifecycle.status import (
+        fail_with_cleanup_intent,
+        has_teardown_address,
+        reclaimable_gpu_types,
+    )
 
     unmarked: Sequence[str] = ()
     try:
@@ -716,8 +724,8 @@ def _fail_unrecoverable_run(status: RunStatus, detail: str) -> None:
             "run %s: could not record terminal cleanup intent", status.run_id, exc_info=True
         )
         persisted, durable = status, False
-        if not status.remote:
-            with contextlib.suppress(Exception):
+        with contextlib.suppress(Exception):
+            if not has_teardown_address(status.remote):
                 unmarked = reclaimable_gpu_types(status)
     else:
         if persisted is None:
@@ -733,7 +741,7 @@ def _fail_unrecoverable_run(status: RunStatus, detail: str) -> None:
 def _quarantine_corrupt_recovery_record(
     run_id: str, exc: Exception
 ) -> tuple[RunStatus | None, bool]:
-    from flash.runner.lifecycle.status import _quarantine_corrupt_status
+    from flash.runner.lifecycle.status import QuarantineWriteFailed, _quarantine_corrupt_status
 
     _log.warning(
         "quarantining run %s: persisted status could not be decoded",
@@ -747,8 +755,20 @@ def _quarantine_corrupt_recovery_record(
     # the full exception stays server-side in the `exc_info=True` warning above.
     detail = f"unrecoverable: persisted status cannot be decoded: {type(exc).__name__}"
     status, quarantined = None, False
-    with contextlib.suppress(Exception):
+    try:
         status, quarantined = _quarantine_corrupt_status(run_id, detail)
+    except QuarantineWriteFailed as failure:
+        # the envelope never landed, so this record keeps its corrupt bytes and stays unrecoverable
+        # every boot -- but its worker is billing now and the classes that name it die with this
+        # frame. Tear down inline off the salvage the write carried out, the same way
+        # `_fail_unrecoverable_run` falls back when its own terminal write fails.
+        _log.warning("run %s: could not install quarantine envelope", run_id, exc_info=True)
+        _teardown_failed_recovery(
+            failure.salvaged, intent_is_durable=False, unmarked=failure.reclaim
+        )
+        return None, False
+    except Exception:
+        return None, False
     if quarantined and status is not None:
         with contextlib.suppress(Exception):
             _append_run_log(run_id, detail)
