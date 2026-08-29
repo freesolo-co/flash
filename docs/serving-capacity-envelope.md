@@ -162,8 +162,8 @@ model/tokenizer/processor provenance, and 32768 configured context runs before a
 teardown is confirmed after each model:
 
 ```
-modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary --ceiling-usd 4
-modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep --bucket short_interactive --ceiling-usd 9
+modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary --ceiling-usd 6
+modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep --bucket short_interactive --ceiling-usd 16
 ```
 
 `--ceiling-usd` is required and has no default: both commands allocate a GPU, and a spend ceiling
@@ -171,11 +171,22 @@ that a caller can forget to pass is not a ceiling. The entrypoint reserves the l
 GPU-seconds against it and raises `BudgetExceeded` BEFORE allocating, so a ceiling below the lane's
 own cost refuses the run rather than discovering the overrun partway through. The values above are
 per-invocation ceilings for a 9B L40S lane; a larger model or a wider bucket selection needs a
-correspondingly larger one. They are stated ABOVE what each lane reserves, because a documented
-ceiling below the lane's own reservation is a command that cannot run: the canary reserves
-`2700s boot + 5 x 900s warmups = 7200s` ($3.90 at the recorded L40S rate) and the single-bucket
-sweep reserves `2700 + 4500 + 6 x 420 + 6 x 900 = 15120s` ($8.20). A full three-bucket sweep
-reserves 32040s ($17.37) and needs a ceiling above that.
+correspondingly larger one. They are stated above what each lane reserves AND above its
+submission stop, because a documented ceiling a lane cannot clear is a command that cannot run.
+
+The canary reserves `2700s boot + 5 x 900s warmups = 7200s` ($3.90 at the recorded L40S rate). The
+single-bucket sweep reserves `7200 + 6 x 420 windows + 6 x 900 drains + 7200 replacement = 22320s`
+($12.10); a full three-bucket sweep reserves 53640s ($29.07) and needs a ceiling above $37.
+
+That trailing `replacement` term is the non-obvious one. `max_containers=1` caps how many replicas
+run at once; it does NOT pin successive `.remote()` calls to the container the previous bucket
+booted. A bucket can therefore land on a cold replacement and pay another boot plus its warmups,
+which bills whether or not the reservation admitted it.
+
+A lane also has to clear its submission stop, not merely its ceiling: `reserve()` refuses at 80% of
+the ceiling so settlement lag and teardown stay funded. A lane consequently needs a ceiling around
+`1.25x` its own reservation -- $4.88 for the canary, $15.12 for the single-bucket sweep -- and the
+values above sit above those thresholds.
 
 The boot dominates cost (~960s of ~1000s per cell in a prior campaign), so one boot runs a whole
 bucket's concurrency grid rather than one cell. `budget.py` reserves before allocation and raises

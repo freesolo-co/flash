@@ -1,8 +1,13 @@
 """Isolated Modal app measuring the hosted per-model capacity envelope.
 
-Run:
-    modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary
-    modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep
+Run (``--ceiling-usd`` is REQUIRED; ``main`` exits on the zero default, so a command without it
+cannot run. The figures below are worst-case RESERVATIONS, deliberately far above expected spend,
+and each also clears the 80% submission stop ``reserve`` enforces -- see
+docs/serving-capacity-envelope.md):
+    modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary \
+        --ceiling-usd 6
+    modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep \
+        --bucket short_interactive --ceiling-usd 16
 
 Each model is measured on ITS OWN production tier (L40S / H100 / H200), not on one shared card, so
 the envelope describes the capacity a customer actually gets rather than a hypothetical uniform
@@ -117,6 +122,12 @@ from flash.serving.bench.driver import REQUEST_TIMEOUT_SECONDS  # noqa: E402
 from flash.serving.bench.workload import BUCKETS, concurrency_grid  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
 
+# How many warmup requests a cold container issues. Shared by `_run_canary`, `_ensure_warm`, the
+# method timeout and both budget estimators, so the bound reserved and the bound enforced cannot
+# drift from the number actually issued. Defined here because `_worst_case_bucket_seconds` runs at
+# import time to derive TIMEOUT_SECONDS.
+CANARY_WARMUP_REQUESTS = 5
+
 
 def _worst_case_bucket_seconds() -> float:
     """Longest a single ``run_bucket`` call can legitimately take, from the preregistered bounds.
@@ -129,7 +140,13 @@ def _worst_case_bucket_seconds() -> float:
         len(concurrency_grid(int(bench_engine_overrides_for(base_model).get("max_num_seqs", 8))))
         for base_model in BENCH_MODELS
     )
-    return points * (max(bucket.max_seconds for bucket in BUCKETS) + REQUEST_TIMEOUT_SECONDS)
+    cells = points * (max(bucket.max_seconds for bucket in BUCKETS) + REQUEST_TIMEOUT_SECONDS)
+    # A bucket landing on a COLD replacement container warms it first -- the path `_ensure_warm`
+    # exists to handle -- and those warmups are SEQUENTIAL, each bounded by REQUEST_TIMEOUT_SECONDS.
+    # Timing only the cells would kill that legitimate path mid-flight, and because the timeout fires
+    # before `run_bucket` returns, the bucket's artifact is never written: the run loses the
+    # measurement it already paid for.
+    return cells + REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS
 
 
 # Derived, never typed: widening a bucket or the concurrency grid raises this automatically instead
@@ -207,9 +224,10 @@ def _build_bench_engine(gpu: str, class_name: str) -> Any:
             bucket_name: str,
             concurrency_points: list[int],
             block: int = 0,
+            invocation: str = "",
         ) -> dict[str, Any]:
             """Measure one bucket across its concurrency grid on this container."""
-            return await _run_bucket(self, bucket_name, concurrency_points, block)
+            return await _run_bucket(self, bucket_name, concurrency_points, block, invocation)
 
     _Engine.pinned_gpu = gpu
     _Engine.__name__ = class_name
@@ -341,6 +359,7 @@ async def _run_bucket(
     bucket_name: str,
     concurrency_points: list[int],
     block: int,
+    invocation: str = "",
 ) -> dict[str, Any]:
     """One bucket's whole concurrency grid on one already-booted engine.
 
@@ -370,6 +389,7 @@ async def _run_bucket(
             bucket,
             concurrency,
             block,
+            invocation=invocation,
         )
         cells.append(result)
         records.extend(cell_records)
@@ -389,6 +409,9 @@ async def _run_bucket(
         "base_model": engine.base_model,
         "bucket": bucket_name,
         "block": block,
+        # Recorded so a rerun's artifact is distinguishable from the run it replaced, and so the
+        # prompts it sent can be reconstructed exactly.
+        "invocation": invocation,
         "cells": [cell.to_json() for cell in cells],
         "curve": summarize_curve(cells),
         "records": [record.to_json() for record in records],
@@ -443,10 +466,6 @@ def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, An
 # Conservative per-lane GPU-second estimates, used to reserve against the ceiling BEFORE any
 # allocation. Deliberately generous: a reservation that overestimates stops a lane early, while one
 # that underestimates lets a lane overspend, and only the second failure costs money.
-# How many warmup requests the canary issues. Shared by `_run_canary` and the sweep estimate so the
-# reserved worst case cannot drift from the number actually issued.
-CANARY_WARMUP_REQUESTS = 5
-# One cold boot, amortized across a whole sweep because the boot dominates cost.
 MODES = ("canary", "sweep")
 
 
@@ -491,7 +510,15 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     canary = REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS
     # The boot is reserved at the ceiling Modal actually allows a stuck boot to reach, not at a
     # typical observed boot. Same reasoning as the canary lane.
-    return float(STARTUP_TIMEOUT_SECONDS) + canary + measured + drains
+    boot = float(STARTUP_TIMEOUT_SECONDS)
+    # Every bucket is a SEPARATE remote call, and `max_containers=1` caps simultaneous replicas
+    # without pinning successive calls to one container -- which is exactly why `_ensure_warm`
+    # exists. So each call can land on a replacement container and bill another cold boot plus
+    # another sequential warmup. Reserving one boot for the whole campaign left that bounded,
+    # handled, and entirely foreseeable path unfunded, so a sweep accepted under its ceiling could
+    # bill past it once per selected bucket. Priced per call, since that is where the exposure is.
+    replacements = (boot + canary) * len(selected)
+    return boot + canary + measured + drains + replacements
 
 
 @app.local_entrypoint()
@@ -575,9 +602,16 @@ def main(
 
     overrides = bench_engine_overrides_for(base_model)
     grid = list(concurrency_grid(int(overrides.get("max_num_seqs", 8))))
+    # One nonce per sweep invocation, keying every measured prompt HEADER. A retry at the same block
+    # would otherwise re-send byte-identical prompts, and inside Modal's 120s scaledown the previous
+    # container and its prefix cache are still alive: the driver would score those hits
+    # ERROR_CACHE_CONTAMINATED and throw away a paid rerun whose engine was healthy. The filler body
+    # is keyed separately and does not move, so the workload stays reproducible.
+    invocation = uuid.uuid4().hex[:12]
+    print(f"[bench] invocation nonce {invocation}", flush=True)
     results = []
     for name in [b.name for b in selected]:
-        payload = engine.run_bucket.remote(name, grid, block)
+        payload = engine.run_bucket.remote(name, grid, block, invocation)
         results.append(payload)
         _write_artifact(payload, f"sweep-{base_model.replace('/', '_')}-{name}-b{block}.json")
     _write_artifact(
@@ -586,6 +620,7 @@ def main(
             "gpu": expected_gpu,
             "mode": mode,
             "grid": grid,
+            "invocation": invocation,
             "engine_catalog": provenance,
             "workload_checksum": workload_checksum(),
             "buckets": [

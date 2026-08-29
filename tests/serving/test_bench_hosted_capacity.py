@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import inspect
 import re
 import tomllib
@@ -23,6 +24,7 @@ from unittest import mock
 import pytest
 
 from flash.serving.bench.budget import (
+    SUBMISSION_STOP_FRACTION,
     BudgetExceeded,
     BudgetLedger,
     UnknownGpuRate,
@@ -35,6 +37,8 @@ from flash.serving.bench.catalog import (
     bench_catalog_summary,
     bench_engine_overrides_for,
     bench_gpu_for,
+    immutable_serving_revisions,
+    tokenizer_model_for,
 )
 from flash.serving.bench.driver import (
     REQUEST_TIMEOUT_SECONDS,
@@ -68,6 +72,7 @@ from flash.serving.bench.workload import (
     TEMPERATURE,
     build_prompt_text,
     concurrency_grid,
+    corpus_seed,
     request_uid,
     reseed_prompt,
     workload_checksum,
@@ -679,11 +684,32 @@ def test_a_ledger_has_no_default_ceiling() -> None:
 
 
 def test_ledger_refuses_a_reservation_past_the_ceiling() -> None:
-    ledger = BudgetLedger(ceiling_usd=20.0)
-    ledger.reserve("lane-a", 3600 * 4, "H200")  # $18.16
-    with pytest.raises(BudgetExceeded):
+    ledger = BudgetLedger(ceiling_usd=25.0)
+    ledger.reserve("lane-a", 3600 * 4, "H200")  # $18.16, under the $20 stop
+    with pytest.raises(BudgetExceeded, match="ceiling"):
         ledger.reserve("lane-b", 3600 * 4, "H200")
-    assert ledger.committed_usd <= 20.0
+    assert ledger.committed_usd <= 25.0
+
+
+def test_reserve_refuses_in_the_band_between_the_stop_and_the_ceiling() -> None:
+    """``reserve`` is gated on the SUBMISSION STOP, not merely on the ceiling.
+
+    Gating only the ceiling made the stop advisory: a lane projecting between the stop and the
+    ceiling was admitted, consuming the very reserve held back for delayed charges and teardown, and
+    the reserve survived only where a caller remembered to ask ``can_submit`` first. Every caller of
+    ``reserve`` is starting a new lane, so the stop is the correct bar for all of them.
+
+    On a $25 ceiling the stop is $20. After $18.16 is held, a $4.54 H200 hour projects to $22.70 --
+    UNDER the ceiling and OVER the stop, which is exactly the band the ceiling check cannot see.
+    """
+    ledger = BudgetLedger(ceiling_usd=25.0)
+    ledger.reserve("lane-a", 3600 * 4, "H200")  # $18.16
+    assert ledger.can_submit(3600, "H200") is False
+    with pytest.raises(BudgetExceeded, match="submission stop"):
+        ledger.reserve("lane-b", 3600, "H200")
+    # The band is real: the refused lane would have stayed under the ceiling.
+    assert ledger.committed_usd + usd_for_gpu_seconds(3600, "H200") < ledger.ceiling_usd
+    assert ledger.committed_usd <= ledger.submission_stop_usd
 
 
 def test_submission_stops_before_the_reserve_is_consumed() -> None:
@@ -1567,14 +1593,17 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     windows = float(bucket.max_seconds) * points
     drains = REQUEST_TIMEOUT_SECONDS * points
     canary = REQUEST_TIMEOUT_SECONDS * constants["CANARY_WARMUP_REQUESTS"]
+    startup = constants["STARTUP_TIMEOUT_SECONDS"]
+    # `max_containers=1` caps SIMULTANEOUS replicas; it does not pin successive `.remote()` calls to
+    # one container. Every bucket call can therefore land on a cold replacement and pay another boot
+    # plus its warmups, which bills whether or not the reservation admits it.
+    replacements = (startup + canary) * 1
 
     assert estimate >= windows + drains + canary, (
         "the estimate omits the canary or the per-cell drain tails"
     )
     # The boot is reserved at the ceiling Modal lets a stuck boot reach, not a typical observed one.
-    assert estimate == pytest.approx(
-        constants["STARTUP_TIMEOUT_SECONDS"] + canary + windows + drains
-    )
+    assert estimate == pytest.approx(startup + canary + windows + drains + replacements)
 
 
 def test_a_bucket_landing_on_a_cold_container_warms_itself_before_measuring() -> None:
@@ -1652,6 +1681,7 @@ def test_bench_container_timeout_covers_the_whole_grid_it_runs() -> None:
         "_worst_case_bucket_seconds",
         "TIMEOUT_HEADROOM_SECONDS",
         "TIMEOUT_SECONDS",
+        "CANARY_WARMUP_REQUESTS",
         BENCH_MODELS=BENCH_MODELS,
         bench_engine_overrides_for=bench_engine_overrides_for,
         concurrency_grid=concurrency_grid,
@@ -1666,7 +1696,11 @@ def test_bench_container_timeout_covers_the_whole_grid_it_runs() -> None:
         for model in BENCH_MODELS
     )
     widest = max(bucket.max_seconds for bucket in BUCKETS)
-    worst = points * (widest + REQUEST_TIMEOUT_SECONDS)
+    # A bucket that lands on a cold replacement warms it SEQUENTIALLY before the first cell. Those
+    # warmups run inside the method, so a timeout sized to the grid alone kills the call mid-warmup
+    # -- and because the timeout fires before `run_bucket` returns, the artifact is never written.
+    warmups = REQUEST_TIMEOUT_SECONDS * namespace["CANARY_WARMUP_REQUESTS"]
+    worst = points * (widest + REQUEST_TIMEOUT_SECONDS) + warmups
     assert namespace["_worst_case_bucket_seconds"]() == worst
     assert timeout >= worst, (
         f"container timeout {timeout}s is below the {worst}s its own grid is allowed to take; "
@@ -1790,6 +1824,9 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
         + REQUEST_TIMEOUT_SECONDS * warmups
         + bucket.max_seconds * points
         + REQUEST_TIMEOUT_SECONDS * points
+        # one replacement boot + warmup per bucket call, since `max_containers=1` does not pin
+        # successive `.remote()` calls to the container the previous bucket booted
+        + (startup + REQUEST_TIMEOUT_SECONDS * warmups) * 1
     )
     assert sweep == expected
     assert sweep - canary >= bucket.max_seconds * points, "the sweep does not price its own cells"
@@ -1833,9 +1870,13 @@ def test_documented_ceilings_exceed_what_each_lane_reserves() -> None:
     }
     for mode, seconds in reserved.items():
         cost = usd_for_gpu_seconds(seconds, gpu)
-        assert documented[mode] >= cost, (
+        # A ceiling merely ABOVE the cost is still not runnable: `reserve` refuses at the
+        # submission stop, so the documented value has to clear cost / SUBMISSION_STOP_FRACTION.
+        required = cost / SUBMISSION_STOP_FRACTION
+        assert documented[mode] >= required, (
             f"documented --ceiling-usd {documented[mode]} for the {mode} lane is below the "
-            f"${cost:.2f} it reserves; the command raises BudgetExceeded before allocating"
+            f"${required:.2f} its ${cost:.2f} reservation needs to clear the submission stop; "
+            "the command raises BudgetExceeded before allocating"
         )
 
 
@@ -1878,3 +1919,84 @@ def test_a_cell_with_no_in_window_successes_is_degraded() -> None:
     healthy = _cell(1, 100.0, 2.0)
     summary = summarize_curve([healthy, replace(cell, concurrency=2)])
     assert summary["saturation_concurrency"] == 2
+
+
+def test_catalog_summary_records_the_immutable_revisions_it_measures() -> None:
+    """A repo NAME is a moving target; the envelope has to name the commits it measured.
+
+    The 27B engine pins weights to a commit in the ``-FP8`` repo and its tokenizer/processor to a
+    DIFFERENT commit in the base repo. A summary carrying only repo names lets two runs months apart
+    report the same "model" while serving different weights, and nothing in the artifact can tell
+    them apart -- which silently voids every comparison the envelope exists to support.
+    """
+    summary = {row["base_model"]: row for row in bench_catalog_summary()}
+    assert set(summary) == set(BENCH_MODELS)
+    for model, row in summary.items():
+        assert row["tokenizer_model"] == tokenizer_model_for(model)
+        assert row["immutable_revisions"] == immutable_serving_revisions(model)
+        assert row["serve_model_id"], "the served model id is what the request actually names"
+
+    # The 27B is the case that makes this load-bearing: its tokenizer does not come from the repo
+    # its weights come from, so one repo name cannot identify the pair.
+    weights = summary["Qwen/Qwen3.8-27B"]["serve_model_id"]
+    tokenizer = summary["Qwen/Qwen3.8-27B"]["tokenizer_model"]
+    assert weights != tokenizer, (
+        "the 27B tokenizer is expected to come from the base repo, not the FP8 weights repo; "
+        "if this converged, the summary no longer proves the two are pinned separately"
+    )
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_a_non_finite_ceiling_is_refused(bad: float) -> None:
+    """A non-finite ceiling passes every comparison the ledger makes, so it bounds nothing.
+
+    ``nan <= 0`` is False and ``inf <= 0`` is False, so the positivity check admits both. Then
+    ``projected > nan`` is False for every projection and every finite projection is below ``inf``,
+    so ``reserve`` would approve unbounded spend while reporting a configured ceiling. Finiteness is
+    therefore checked BEFORE positivity.
+    """
+    with pytest.raises(ValueError, match="finite"):
+        BudgetLedger(ceiling_usd=bad)
+    with pytest.raises(ValueError, match="finite"):
+        BudgetLedger(ceiling_usd=10.0, submission_stop_usd=bad)
+
+
+def test_request_uid_separates_invocations_without_moving_the_corpus() -> None:
+    """A retry must not re-send byte-identical prompts, and must not change the workload either.
+
+    Without the nonce the id depends only on grid coordinates, so a rerun at the same block reissues
+    every prompt verbatim; inside Modal's 120s scaledown the container and its prefix cache survive
+    and the driver scores the hits ERROR_CACHE_CONTAMINATED -- discarding a paid rerun whose engine
+    was healthy. The nonce must reach the UID only: ``corpus_seed`` keys the filler BODY, so moving
+    it would vary the prompt text alongside the one variable a curve exists to isolate.
+    """
+    first = request_uid("short_interactive", 4, 0, 7, invocation="aaaa1111")
+    second = request_uid("short_interactive", 4, 0, 7, invocation="bbbb2222")
+    assert first != second, "two invocations reissue the same prompt id"
+    assert request_uid("short_interactive", 4, 0, 7) != first, "the nonce is not in the id"
+
+    # Same coordinates, different invocations -> same corpus. The workload stays reproducible.
+    assert corpus_seed("short_interactive", 0, 7) == corpus_seed("short_interactive", 0, 7)
+    for uid in (first, second):
+        assert uid.startswith("short_interactive-c4-b0-i7"), (
+            "the nonce must be a SUFFIX; prefixing it would break the coordinate parsing"
+        )
+
+
+def test_cell_result_json_carries_the_degraded_verdict() -> None:
+    """``asdict`` serializes FIELDS only, so a computed verdict is absent from every artifact.
+
+    The report contract distinguishes ``degraded`` from ``feasible``, and a consumer that cannot read
+    it has to reimplement the property against the exact source revision that produced the file just
+    to learn which cell the harness classified as failed, or why a saturation scan stopped where it
+    did.
+    """
+    degraded = _cell(concurrency=8, tps=10.0, p95=4.0, feasible=False)
+    healthy = _cell(concurrency=1, tps=40.0, p95=1.0)
+    assert degraded.to_json()["degraded"] is True
+    assert healthy.to_json()["degraded"] is False
+    # The serialized value is the property, not an independently maintained field.
+    assert degraded.to_json()["degraded"] == degraded.degraded
+    assert "degraded" not in {f.name for f in dataclasses.fields(CellResult)}, (
+        "if `degraded` became a real field this test no longer proves the property is serialized"
+    )

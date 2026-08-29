@@ -198,7 +198,14 @@ class CellResult:
         return self.error_bound_resolved and not self.feasible
 
     def to_json(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        # `asdict` serializes FIELDS only, so the computed verdict would be absent from every
+        # published artifact. The report contract distinguishes `degraded` from `feasible` and
+        # `error_bound_resolved`, and a consumer that cannot read it has to reimplement the property
+        # against the exact source revision that produced the file just to learn which cell the
+        # harness classified as failed, or why the saturation scan stopped where it did.
+        data["degraded"] = self.degraded
+        return data
 
 
 def reduce_cell(

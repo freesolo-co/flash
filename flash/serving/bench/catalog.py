@@ -23,7 +23,9 @@ from flash.serving.src.engine.model_config import (
     base_models,
     engine_overrides_for,
     gpu_for,
+    immutable_serving_revisions,
     serve_model_for,
+    tokenizer_model_for,
 )
 
 # The models under measurement ARE the deployed catalog, in its declared order. Derived rather than
@@ -63,7 +65,15 @@ def bench_engine_overrides_for(base_model: str) -> dict[str, Any]:
 
 
 def bench_catalog_summary() -> list[dict[str, Any]]:
-    """Provenance rows recorded in the report manifest."""
+    """Provenance rows recorded in the report manifest.
+
+    The IMMUTABLE pins travel with the row, not just the repository names. A repository name alone
+    identifies a moving target: the 27B engine pins its weights to a commit in the ``-FP8`` repo and
+    its tokenizer and processor to a DIFFERENT commit in the base repo, so once either repository
+    advances, a published capacity number could no longer be tied to the exact weights or tokenizer
+    that produced it. ``immutable_serving_revisions`` returns only the keys the engine actually
+    pins, so a model without pins contributes an empty mapping rather than invented ones.
+    """
     rows = []
     for model in bench_base_models():
         overrides = bench_engine_overrides_for(model)
@@ -72,6 +82,8 @@ def bench_catalog_summary() -> list[dict[str, Any]]:
                 "base_model": model,
                 "gpu": bench_gpu_for(model),
                 "serve_model_id": overrides.get("serve_model_id") or serve_model_for(model),
+                "tokenizer_model": tokenizer_model_for(model),
+                "immutable_revisions": immutable_serving_revisions(model),
                 "max_model_len": overrides.get("max_model_len"),
                 "max_num_seqs": overrides.get("max_num_seqs"),
                 "quantization": overrides.get("quantization", "fp8"),

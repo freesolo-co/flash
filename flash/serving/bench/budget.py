@@ -17,6 +17,7 @@ Three conservative choices, all deliberate:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -104,10 +105,19 @@ class BudgetLedger:
     entries: list[LedgerEntry] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        # Finiteness is checked BEFORE positivity, because the positivity test cannot catch either
+        # non-finite spelling: `nan <= 0` is False and `inf <= 0` is False, so both would install a
+        # ceiling this ledger can never enforce. `projected > nan` is False for every projection, and
+        # every finite projection is below `inf`, so `reserve` would approve unbounded spend while
+        # reporting a configured ceiling.
+        if not math.isfinite(self.ceiling_usd):
+            raise ValueError("ceiling_usd must be a finite dollar amount")
         if self.ceiling_usd <= 0:
             raise ValueError("ceiling_usd must be positive and explicitly authorized")
         if self.submission_stop_usd is None:
             self.submission_stop_usd = self.ceiling_usd * SUBMISSION_STOP_FRACTION
+        elif not math.isfinite(self.submission_stop_usd):
+            raise ValueError("submission_stop_usd must be a finite dollar amount")
 
     @property
     def committed_usd(self) -> float:
@@ -129,13 +139,28 @@ class BudgetLedger:
     def reserve(
         self, label: str, estimated_seconds: float, gpu: str, note: str = ""
     ) -> LedgerEntry:
-        """Reserve headroom for a lane, or raise ``BudgetExceeded``."""
+        """Reserve headroom for a NEW lane, or raise ``BudgetExceeded``.
+
+        Gated on ``can_submit`` -- i.e. on ``submission_stop_usd`` -- and not on the raw ceiling.
+        Checking only the ceiling here made the submission stop advisory: a lane projecting between
+        the stop and the ceiling was admitted, consuming the very reserve held back for delayed
+        charges and teardown, and the reserve existed only in whatever code remembered to call
+        ``can_submit`` first. Every caller of ``reserve`` is starting a new lane, so the stop is the
+        correct bar for all of them.
+        """
         amount = usd_for_gpu_seconds(estimated_seconds, gpu)
         projected = self.committed_usd + amount
         if projected > self.ceiling_usd:
             raise BudgetExceeded(
                 f"reserving {label!r} on {gpu} (${amount:.2f}) would reach ${projected:.2f}, "
                 f"over the ${self.ceiling_usd:.2f} ceiling"
+            )
+        if not self.can_submit(estimated_seconds, gpu):
+            stop = self.submission_stop_usd or self.ceiling_usd
+            raise BudgetExceeded(
+                f"reserving {label!r} on {gpu} (${amount:.2f}) would reach ${projected:.2f}, "
+                f"past the ${stop:.2f} submission stop held back for delayed charges and teardown "
+                f"under the ${self.ceiling_usd:.2f} ceiling"
             )
         entry = LedgerEntry(label=label, gpu=gpu, reserved_usd=amount, note=note)
         self.entries.append(entry)

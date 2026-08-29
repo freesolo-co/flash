@@ -285,6 +285,7 @@ def _build_prompt_pool(
     concurrency: int,
     block: int,
     min_requests: int,
+    invocation: str = "",
 ) -> list[tuple[str, list[dict[str, Any]], int]]:
     """Fit every prompt the cell can need BEFORE the measured window opens.
 
@@ -302,11 +303,13 @@ def _build_prompt_pool(
     size = max(concurrency, min_requests + concurrency)
     pool: list[tuple[str, list[dict[str, Any]], int]] = []
     for index in range(size):
-        uid = request_uid(bucket.name, concurrency, block, index)
+        uid = request_uid(bucket.name, concurrency, block, index, invocation)
         messages, exact = fit_prompt_to_tokens(
             tokenizer,
             uid,
             bucket.target_input_tokens,
+            # No invocation nonce here, on purpose: the BODY stays keyed to the grid coordinates so
+            # a rerun sends the same corpus, while the uid-derived header makes each request unique.
             corpus=corpus_seed(bucket.name, block, index),
         )
         pool.append((uid, messages, exact))
@@ -373,6 +376,7 @@ def _prompt_issuer(
     concurrency: int,
     block: int,
     min_requests: int,
+    invocation: str = "",
 ) -> Callable[[], tuple[str, list[dict[str, Any]], int]]:
     """Build the cell's whole prompt pool, and return a callable handing out one prompt per call.
 
@@ -390,6 +394,7 @@ def _prompt_issuer(
         concurrency=concurrency,
         block=block,
         min_requests=min_requests,
+        invocation=invocation,
     )
     issued = 0
 
@@ -400,7 +405,7 @@ def _prompt_issuer(
         uid, messages, exact = pool[index % len(pool)]
         if index < len(pool):
             return uid, messages, exact
-        wrapped_uid = request_uid(bucket.name, concurrency, block, index)
+        wrapped_uid = request_uid(bucket.name, concurrency, block, index, invocation)
         return wrapped_uid, reseed_prompt(messages, wrapped_uid), exact
 
     return _next_prompt
@@ -417,6 +422,7 @@ async def run_cell(
     min_seconds: float | None = None,
     min_requests: int | None = None,
     max_seconds: float | None = None,
+    invocation: str = "",
 ) -> tuple[CellResult, list[RequestRecord]]:
     """Hold ``concurrency`` requests in flight until the cell's floors are met.
 
@@ -441,7 +447,12 @@ async def run_cell(
     # latency. At 8k and 31k input that distortion is larger than the effect being measured. So the
     # whole pool is built BEFORE the clock starts, and the measured loop only pops from it.
     _next_prompt = _prompt_issuer(
-        tokenizer, bucket, concurrency=concurrency, block=block, min_requests=min_requests
+        tokenizer,
+        bucket,
+        concurrency=concurrency,
+        block=block,
+        min_requests=min_requests,
+        invocation=invocation,
     )
 
     origin = time.monotonic()

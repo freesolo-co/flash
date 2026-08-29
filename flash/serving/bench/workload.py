@@ -154,9 +154,21 @@ def _deterministic_words(seed_material: str, count: int) -> list[str]:
     return words
 
 
-def request_uid(bucket: str, concurrency: int, block: int, index: int) -> str:
-    """Stable unique id for one request. Keys the prompt HEADER, never the filler body."""
-    return f"{bucket}-c{concurrency}-b{block}-i{index}"
+def request_uid(bucket: str, concurrency: int, block: int, index: int, invocation: str = "") -> str:
+    """Stable unique id for one request. Keys the prompt HEADER, never the filler body.
+
+    ``invocation`` is a per-sweep nonce and it is what makes a RETRY safe. Without it the id depends
+    only on the grid coordinates, so re-running a failed sweep at the same block re-sends every
+    prompt byte-for-byte; within Modal's 120s scaledown the container and its prefix cache survive,
+    and ``_validate`` correctly scores those cache hits ERROR_CACHE_CONTAMINATED -- invalidating a
+    paid rerun whose engine was perfectly healthy.
+
+    It deliberately does NOT reach ``corpus_seed``. The filler body stays keyed to the grid
+    coordinates alone, so the semantic workload is still reproducible across invocations and a
+    curve's points still differ only in offered load; only the per-request header moves.
+    """
+    suffix = f"-x{invocation}" if invocation else ""
+    return f"{bucket}-c{concurrency}-b{block}-i{index}{suffix}"
 
 
 def corpus_seed(bucket: str, block: int, index: int) -> str:
