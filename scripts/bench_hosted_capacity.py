@@ -224,6 +224,26 @@ def _engine_for(base_model: str) -> Any:
     return ENGINE_BY_GPU[bench_gpu_for(base_model)]
 
 
+async def _ensure_warm(engine: Any) -> dict[str, Any] | None:
+    """Warm THIS container if it has not been warmed yet, and report whether it had to.
+
+    `max_containers=1` caps simultaneous replicas; it does NOT pin successive remote calls to one
+    container. Modal may replace or preempt the container between the canary and a bucket, so a
+    sweep whose gate passed on container A can measure its first cells on a freshly booted
+    container B -- paying compile and lazy-workspace costs inside the measured window while the
+    report says the warmup gate passed.
+
+    The flag lives on the container instance, so it is FALSE exactly when this process has not run
+    a warmup, which is the condition that matters. A returned dict means this container was cold
+    and warmed itself; None means it was already warm.
+    """
+    if getattr(engine, "_bench_warmed", False):
+        return None
+    warm = await _run_warmup(engine, CANARY_WARMUP_REQUESTS)
+    engine._bench_warmed = True
+    return warm
+
+
 async def _run_warmup(engine: Any, requests: int) -> dict[str, Any]:
     """Sequential warmups on ``engine``, reported separately from the envelope."""
     import time
@@ -232,6 +252,8 @@ async def _run_warmup(engine: Any, requests: int) -> dict[str, Any]:
     from flash.serving.bench.workload import BUCKETS_BY_NAME, fit_prompt_to_tokens
 
     bucket = BUCKETS_BY_NAME["short_interactive"]
+    # This container has now paid its one-time costs, so a bucket landing here need not repeat them.
+    engine._bench_warmed = True
     origin = time.monotonic()
     out = []
     exact = 0
@@ -274,6 +296,10 @@ async def _run_bucket(
     from flash.serving.bench.workload import BUCKETS_BY_NAME
 
     bucket = BUCKETS_BY_NAME[bucket_name]
+    # A replacement container measures cold otherwise; see `_ensure_warm`. Recorded in the payload
+    # so a reader can tell a bucket that inherited the canary's warm container from one that had to
+    # warm itself, rather than having to assume every bucket ran on the gated container.
+    cold_start_warmup = await _ensure_warm(engine)
     cells = []
     records = []
     for concurrency in concurrency_points:
@@ -309,6 +335,9 @@ async def _run_bucket(
         "curve": summarize_curve(cells),
         "records": [record.to_json() for record in records],
         "provenance": probe_all(engine.base_model, engine),
+        # Non-None when THIS container was cold and warmed itself, i.e. it is not the container the
+        # canary gated. None means it inherited the gated warm container.
+        "cold_start_warmup": cold_start_warmup,
         # The resolved engine shape, so a cell's numbers stay interpretable after catalog drift.
         "engine_catalog": next(
             (row for row in bench_catalog_summary() if row["base_model"] == engine.base_model),
@@ -343,7 +372,7 @@ def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, An
             "Triton on Blackwell. Results describe the SLOW prefill path.",
             flush=True,
         )
-    warm = engine.warmup.remote(5)
+    warm = engine.warmup.remote(CANARY_WARMUP_REQUESTS)
     print(json.dumps(warm, indent=2), flush=True)
     # `run_request` converts exceptions, timeouts, malformed streams and cache-verification failures
     # into records with ok=False rather than raising, so `warmup.remote` returns normally even when
@@ -365,6 +394,9 @@ def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, An
 # Conservative per-lane GPU-second estimates, used to reserve against the ceiling BEFORE any
 # allocation. Deliberately generous: a reservation that overestimates stops a lane early, while one
 # that underestimates lets a lane overspend, and only the second failure costs money.
+# How many warmup requests the canary issues. Shared by `_run_canary` and the sweep estimate so the
+# reserved worst case cannot drift from the number actually issued.
+CANARY_WARMUP_REQUESTS = 5
 ESTIMATED_CANARY_GPU_SECONDS = 1200.0
 # One cold boot, amortized across a whole sweep because the boot dominates cost.
 ESTIMATED_BOOT_GPU_SECONDS = 1200.0
@@ -378,16 +410,31 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     the direction that refuses a run rather than the direction that overspends: every cell is priced
     at its bucket's `max_seconds`, even though a cell that meets its floors early exits sooner.
 
+    EVERY bounded paid phase is reserved, not just the measured windows. A sweep bills for four
+    things, and pricing only the third would let an accepted run exceed its own ceiling:
+
+    1. the cold boot;
+    2. the canary, which always runs before the sweep and whose 5 warmup requests are SEQUENTIAL,
+       so worst case each one consumes its own `REQUEST_TIMEOUT_SECONDS`;
+    3. each cell's measured window, bounded by the bucket's `max_seconds`;
+    4. each cell's DRAIN, which waits up to `REQUEST_TIMEOUT_SECONDS` for requests still in flight
+       when the window closed. This is the largest omission: at 900s per cell it can exceed the
+       measured time it follows, and it happens after every cell, not once per sweep.
+
     The grid width comes from the engine's real `max_num_seqs`, so it tracks the catalog rather than
     a hardcoded six.
     """
     from flash.serving.bench.catalog import bench_engine_overrides_for
+    from flash.serving.bench.driver import REQUEST_TIMEOUT_SECONDS
     from flash.serving.bench.workload import concurrency_grid
 
     overrides = bench_engine_overrides_for(base_model)
     points = len(list(concurrency_grid(int(overrides.get("max_num_seqs", 8)))))
+    cells = points * len(selected)
     measured = sum(float(bucket.max_seconds) * points for bucket in selected)
-    return ESTIMATED_BOOT_GPU_SECONDS + measured
+    drains = REQUEST_TIMEOUT_SECONDS * cells
+    canary = REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS
+    return ESTIMATED_BOOT_GPU_SECONDS + canary + measured + drains
 
 
 @app.local_entrypoint()

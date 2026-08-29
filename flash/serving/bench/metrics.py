@@ -152,6 +152,11 @@ class CellResult:
     # Teardown time after the window closed, at falling concurrency. Reported so a reader can see
     # how much tail was excluded rather than having to trust that some was.
     drain_seconds: float = 0.0
+    # Successes that FINISHED inside the window, i.e. the ones the rates below are built from.
+    # `succeeded` counts every success including drain completions; this counts the numerator. The
+    # two differ by exactly the work that landed in the tail, so a reader can see how much of the
+    # cell's output was excluded from the rates rather than inferring it.
+    succeeded_in_window: int = 0
     error_breakdown: dict[str, int] = field(default_factory=dict)
     attempted_rps: float = 0.0
     successful_rps: float = 0.0
@@ -199,6 +204,7 @@ def reduce_cell(
     block: int,
     wall_seconds: float,
     drain_seconds: float = 0.0,
+    window_seconds: float | None = None,
     sample_floor_p99: int = 400,
     max_error_rate: float = 0.01,
 ) -> CellResult:
@@ -209,16 +215,38 @@ def reduce_cell(
     successes = [record for record in records if record.ok]
     failures = [record for record in records if not record.ok]
 
+    # Rates divide by the steady-state window, so their numerators must contain only work that
+    # happened INSIDE it. A cell that closes its window with `concurrency` requests still in flight
+    # then completes them during the drain: counting those completions against the shorter window
+    # credits tail work to steady-state time and inflates RPS and token throughput by roughly the
+    # in-flight fraction -- largest exactly where the window is shortest relative to a request, i.e.
+    # the near-32k cells whose numbers matter most.
+    #
+    # `window_seconds=None` means the caller is not distinguishing (a single window with no drain),
+    # so every success counts. Records with no `finished_at` cannot be placed and are excluded from
+    # the numerator rather than assumed to be in-window.
+    in_window = (
+        successes
+        if window_seconds is None
+        else [
+            record
+            for record in successes
+            if record.finished_at is not None and record.finished_at <= window_seconds
+        ]
+    )
+
     error_breakdown: dict[str, int] = {}
     for record in failures:
         key = record.error or ERROR_ENGINE
         error_breakdown[key] = error_breakdown.get(key, 0) + 1
 
-    completion_total = sum(record.completion_tokens or 0 for record in successes)
-    prompt_total = sum(record.prompt_tokens or 0 for record in successes)
+    completion_total = sum(record.completion_tokens or 0 for record in in_window)
+    prompt_total = sum(record.prompt_tokens or 0 for record in in_window)
 
-    ttft_values = [value for record in successes if (value := record.ttft) is not None]
-    latency_values = [value for record in successes if (value := record.latency) is not None]
+    # Latency and TTFT are also window-scoped. A drain completion ran at FALLING concurrency, on a
+    # progressively idler engine, so its latency describes a load the cell was not measuring.
+    ttft_values = [value for record in in_window if (value := record.ttft) is not None]
+    latency_values = [value for record in in_window if (value := record.latency) is not None]
 
     error_rate = (len(failures) / attempted) if attempted else 0.0
     upper_bound = wilson_upper_bound(len(failures), attempted)
@@ -241,8 +269,9 @@ def reduce_cell(
         succeeded=len(successes),
         failed=len(failures),
         error_breakdown=error_breakdown,
+        succeeded_in_window=len(in_window),
         attempted_rps=attempted / wall_seconds,
-        successful_rps=len(successes) / wall_seconds,
+        successful_rps=len(in_window) / wall_seconds,
         output_tokens_per_second=completion_total / wall_seconds,
         total_tokens_per_second=(completion_total + prompt_total) / wall_seconds,
         prompt_tokens_total=prompt_total,
@@ -307,8 +336,15 @@ def summarize_curve(
         None,
     )
 
+    # `pairwise` yields (0,1), (1,2), ... so it only ever TESTS the second element of each pair.
+    # The first cell's own degradation would therefore never be seen: a concurrency-1 cell that is
+    # already degraded, followed by a usable cell, reported saturation at some later concurrency or
+    # None, contradicting the documented definition of "the first degraded point".
     saturation: int | None = None
-    for previous, current in pairwise(ordered):
+    if ordered and ordered[0].degraded:
+        saturation = ordered[0].concurrency
+    pairs = [] if saturation is not None else list(pairwise(ordered))
+    for previous, current in pairs:
         if current.degraded:
             saturation = current.concurrency
             break

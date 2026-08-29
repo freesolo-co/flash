@@ -37,6 +37,7 @@ from flash.serving.bench.catalog import (
 )
 from flash.serving.bench.driver import (
     REQUEST_TIMEOUT_SECONDS,
+    _absorb_event,
     _build_prompt_pool,
     _drain,
     _prompt_issuer,
@@ -1417,3 +1418,166 @@ def test_the_summary_artifact_names_which_bucket_each_curve_came_from() -> None:
     keys = {k.value for k in element.elt.keys if isinstance(k, ast.Constant)}
     assert "bucket" in keys, "the summary emits curves with no bucket label"
     assert "curve" in keys, "the summary dropped the curve alongside its label"
+
+
+# ── Round-3 review findings ──────────────────────────────────────────────────────────────────
+
+
+def test_drain_completions_are_counted_but_excluded_from_the_rate_numerators() -> None:
+    """A request that finished during the drain must not be credited to the window.
+
+    The window closes with `concurrency` requests still in flight; those finish afterwards, at
+    falling load. Summing them into the numerator while dividing by the shorter pre-drain window
+    reports throughput the engine never sustained, and the overstatement is largest exactly where
+    the window is shortest relative to one request.
+    """
+    in_window = [_record(f"w{i}", tokens=100, latency=5.0) for i in range(2)]
+    # Finished at 30s, well past the 10s window: these are drain completions.
+    drained = [_record(f"d{i}", tokens=100, latency=30.0) for i in range(4)]
+
+    result = reduce_cell(
+        in_window + drained,
+        base_model="Qwen/Qwen3.5-9B",
+        bucket="short_interactive",
+        concurrency=2,
+        block=0,
+        wall_seconds=10.0,
+        window_seconds=10.0,
+    )
+
+    # Every record is still attempted, and every success is still counted.
+    assert result.attempted == 6, "drained records were dropped from the attempt denominator"
+    assert result.succeeded == 6, "drained successes were dropped from the success count"
+    # But only the two in-window completions drive the rates.
+    assert result.succeeded_in_window == 2
+    assert result.successful_rps == pytest.approx(0.2), "drain completions inflated RPS"
+    assert result.output_tokens_per_second == pytest.approx(20.0), (
+        "drain completions inflated token throughput"
+    )
+    assert result.completion_tokens_total == 200, "token total counted post-window work"
+
+
+def test_drain_latency_is_excluded_because_it_ran_at_falling_concurrency() -> None:
+    """A drain completion's latency describes an idler engine than the cell was measuring."""
+    records = [
+        _record("in", latency=2.0, ttft=0.5),
+        _record("drained", latency=40.0, ttft=9.0),
+    ]
+    result = reduce_cell(
+        records,
+        base_model="Qwen/Qwen3.5-9B",
+        bucket="short_interactive",
+        concurrency=1,
+        block=0,
+        wall_seconds=5.0,
+        window_seconds=5.0,
+    )
+    assert result.latency_seconds["p50"] == pytest.approx(2.0), "drain latency entered the sample"
+    assert result.ttft_seconds["p50"] == pytest.approx(0.5), "drain TTFT entered the sample"
+
+
+def test_saturation_reports_the_first_cell_when_it_is_already_degraded() -> None:
+    """`pairwise` only ever tests the SECOND element, so cell 0's degradation was invisible."""
+    degraded_first = _cell(concurrency=1, tps=10.0, p95=1.0, feasible=False)
+    healthy_later = _cell(concurrency=2, tps=100.0, p95=1.0)
+    assert degraded_first.degraded, "fixture is wrong: the first cell must be degraded"
+
+    summary = summarize_curve([degraded_first, healthy_later])
+    assert summary["saturation_concurrency"] == 1, (
+        "saturation skipped the first cell and reported a later concurrency or None"
+    )
+
+
+def test_ttft_comes_from_the_ready_event_not_the_first_visible_text() -> None:
+    """A first token decoding to "" must not push TTFT out to a later token.
+
+    `ready` fires immediately after vLLM's first output, so it is the end of prefill even when the
+    detokenizer is still buffering bytes. Timing from first non-empty text silently overstates
+    prefill latency, always in the same direction.
+    """
+    outcome = _StreamOutcome()
+    _absorb_event({"type": "ready"}, outcome, 1.0)
+    _absorb_event({"type": "delta", "text": ""}, outcome, 2.0)
+    _absorb_event({"type": "delta", "text": "hi"}, outcome, 5.0)
+    assert outcome.first_token_at == pytest.approx(1.0), (
+        "TTFT was taken from the first visible text rather than the ready event"
+    )
+
+
+def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
+    """The ceiling is only real if the reservation covers every phase that bills.
+
+    The canary always runs, and a drain follows EVERY cell; at 900s each those tails can exceed the
+    measured time they follow. An estimate covering only the windows can accept a run that then
+    bills past its own ceiling.
+    """
+    from flash.serving.bench.driver import REQUEST_TIMEOUT_SECONDS
+    from flash.serving.bench.workload import BUCKETS_BY_NAME, concurrency_grid
+
+    # The module imports modal at top level, so the estimator is extracted and executed on its own,
+    # the same way this file already reads `_bench_class_name`.
+    tree = ast.parse(BENCH_APP.read_text(encoding="utf-8"))
+    fn = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_sweep_gpu_seconds_estimate"
+    )
+    constants = {
+        node.targets[0].id: node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Constant)
+    }
+    namespace: dict = dict(constants)
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<bench>", "exec"), namespace)
+    estimate_for = namespace["_sweep_gpu_seconds_estimate"]
+
+    bucket = BUCKETS_BY_NAME["short_interactive"]
+    estimate = estimate_for("Qwen/Qwen3.5-9B", [bucket])
+
+    points = len(list(concurrency_grid(8)))
+    windows = float(bucket.max_seconds) * points
+    drains = REQUEST_TIMEOUT_SECONDS * points
+    canary = REQUEST_TIMEOUT_SECONDS * constants["CANARY_WARMUP_REQUESTS"]
+
+    assert estimate >= windows + drains + canary, (
+        "the estimate omits the canary or the per-cell drain tails"
+    )
+    assert estimate == pytest.approx(
+        constants["ESTIMATED_BOOT_GPU_SECONDS"] + canary + windows + drains
+    )
+
+
+def test_a_bucket_landing_on_a_cold_container_warms_itself_before_measuring() -> None:
+    """`max_containers=1` caps simultaneous replicas; it does not pin successive calls to one.
+
+    So a bucket can land on a container the canary never gated, and would otherwise pay compile and
+    lazy-workspace costs inside its measured window.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+    }
+    # An `in source` substring check would also match the COMMENT that explains the call, so
+    # deleting the call itself would leave this test green. Match the call node instead.
+    called = {
+        child.func.id
+        for child in ast.walk(nodes["_run_bucket"])
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+    }
+    assert "_ensure_warm" in called, "a replacement container measures cold"
+
+    warm_called = {
+        child.func.id
+        for child in ast.walk(nodes["_ensure_warm"])
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+    }
+    assert "_run_warmup" in warm_called, "the cold path does not actually warm up"
+    attributes = {
+        child.attr for child in ast.walk(nodes["_ensure_warm"]) if isinstance(child, ast.Attribute)
+    }
+    assert "_bench_warmed" in attributes, "warmth is not tracked per container"

@@ -137,10 +137,23 @@ def _absorb_event(event: dict[str, Any], outcome: _StreamOutcome, now: float) ->
     if type(reported) is bool:
         outcome.cached_tokens_reported = reported
 
-    if kind == "delta":
+    if kind == "ready":
+        # The authoritative first-output timestamp. Production yields `ready` immediately after
+        # `anext(output_stream)` returns vLLM's first output (see serving/src/engine/generation.py),
+        # so it marks the end of prefill regardless of what that output DECODES to.
+        #
+        # Timestamping from the first non-empty delta instead would measure time-to-first-visible-
+        # TEXT: a first token that decodes to "" -- a control token, or a partial UTF-8 sequence the
+        # detokenizer is still buffering -- pushes TTFT out to a later token and overstates prefill.
+        # That error is silent and always in the same direction.
+        if outcome.first_token_at is None:
+            outcome.first_token_at = now
+    elif kind == "delta":
         text = event.get("text") or ""
         if text:
             outcome.delta_tokens += 1
+            # Fallback only. A stream that somehow emitted no `ready` still gets a TTFT rather
+            # than None, but `ready` always wins when present because it fires strictly earlier.
             if outcome.first_token_at is None:
                 outcome.first_token_at = now
     elif kind == "choice_finished":
@@ -517,8 +530,11 @@ async def run_cell(
     # with concurrency, so it would bend the curve downward at the high end and manufacture a knee
     # that the engine does not have.
     #
-    # Drained records are still COUNTED. They belong in the attempt denominator and the error
-    # breakdown; it is only the time axis that stops at the window.
+    # Drained records are still COUNTED in the attempt denominator and the error breakdown. What
+    # they are excluded from is the RATE and LATENCY numerators: a request that completed during the
+    # tail did its work at falling concurrency, so crediting it to the window would divide
+    # window-plus-tail output by window-only time. `window_seconds` is what lets `reduce_cell` tell
+    # the two apart -- records carry `finished_at` on the same monotonic origin.
     total_seconds = time.monotonic() - origin
     window_seconds = measured_seconds if measured_seconds else total_seconds
     result = reduce_cell(
@@ -529,6 +545,7 @@ async def run_cell(
         block=block,
         wall_seconds=window_seconds,
         drain_seconds=total_seconds - window_seconds,
+        window_seconds=window_seconds,
     )
     return result, records
 
