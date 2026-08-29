@@ -12,7 +12,7 @@ import os
 import threading
 
 from flash.adapters.artifacts import attempt_scoped_artifact_name
-from flash.core.spec import JobSpec
+from flash.core.spec import JobSpec, persisted_gpu_types
 from flash.runner.lifecycle.state import RunStatus, adapter_prefix, runs_file_path
 from flash.runner.lifecycle.status import get_status
 from flash.server.platform import db
@@ -614,8 +614,13 @@ def _owes_endpoint_reclaim(status: RunStatus) -> bool:
     teardown instead. Shared because the persist and the attempt happen on different threads and
     must agree -- an intent recorded under a wider condition than the attempt leaves a marker
     nothing ever clears, and a narrower one leaves the endpoint this fix exists to reclaim.
+
+    The GPU class is part of that agreement, not an extra precaution. `terminate_persisted_endpoints`
+    reports unconfirmed for a spec naming no class, because it cannot derive the one address this
+    reclaim has; recording intent for such a record would leave a marker every boot retries and no
+    provider answer can ever clear.
     """
-    return not status.remote and status.state == "failed"
+    return not status.remote and status.state == "failed" and bool(persisted_gpu_types(status.spec))
 
 
 def _startup_cleanup_bg(status: RunStatus) -> None:
@@ -836,23 +841,31 @@ def _classify_recoverable_runs(
                     exc_info=True,
                 )
                 detail = f"unrecoverable: persisted spec cannot be activated: {exc}"
-                with contextlib.suppress(Exception):
-                    _update(status.run_id, "failed", error=detail)
-                with contextlib.suppress(Exception):
-                    _append_run_log(status.run_id, detail)
                 # The aborted attempt may STILL have registered its uniquely-named RunPod
                 # endpoint before crashing (the exact leak the good-spec branch's
                 # `_gc_run_endpoints` guards against). The `sweep_orphans` dispatch below is a
                 # no-op for RunPod, and the periodic idle reaper would only reclaim this after its
-                # 15-min idle grace — so tear it down by name HERE for immediate cleanup. The
-                # `_update` above just terminalized it on disk, which is this reclaim's
-                # precondition; it does not write back to `status`, so there is no state to test --
-                # which is also why the intent is recorded unconditionally here rather than through
-                # `_owes_endpoint_reclaim`, whose terminal check would read the stale in-memory
-                # state. Recorded FIRST, so a crash or provider outage inside the one attempt leaves
-                # a marker the next startup retries instead of an endpoint nothing revisits.
+                # 15-min idle grace -- so tear it down by name below for immediate cleanup.
+                #
+                # The marker goes down BEFORE the terminalizing `_update`, because that write is
+                # what drops this run from `_RECOVERABLE`. A crash in the window between them would
+                # otherwise leave a terminal run with no marker and nothing that revisits it:
+                # `_classify_recoverable_runs` skips it and RunPod's orphan sweep is a no-op, so the
+                # endpoint bills untouched. Written first, the worst case is a marker for an
+                # endpoint that was never created, which the reclaim below resolves into a
+                # confirmed-clear result and clears on this same boot.
+                #
+                # `_owes_endpoint_reclaim` is not consulted, because its terminal check would read
+                # the in-memory state this branch has not written yet. Its other half -- a derivable
+                # GPU class -- is applied here, so both paths still record intent under exactly the
+                # condition `terminate_persisted_endpoints` can confirm.
+                if persisted_gpu_types(status.spec):
+                    with contextlib.suppress(Exception):
+                        persist_endpoint_reclaim_intent(status.run_id)
                 with contextlib.suppress(Exception):
-                    persist_endpoint_reclaim_intent(status.run_id)
+                    _update(status.run_id, "failed", error=detail)
+                with contextlib.suppress(Exception):
+                    _append_run_log(status.run_id, detail)
                 _reclaim_unhandled_endpoints(status)
                 continue
             # reap run-scoped resources from the parseable public spec before touching the private

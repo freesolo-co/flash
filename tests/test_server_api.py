@@ -6798,11 +6798,12 @@ _OSERROR_SENTINEL_PATH = "/var/lib/flash/internal/runs/bad-run.json"
             b'{"run_id":"bad-run","state":"queued","spec":{},"recursion_sentinel":true}',
             id="decoder-recursion",
         ),
-        # a read failure is not a decode failure. `_load_status_json` turns only a MISSING file into
-        # `FileNotFoundError`; `PermissionError`, `ESTALE`, and `EIO` propagate from the bare
-        # `open()`/`json.load()` beneath that check, so without `OSError` in the recovery tuple one
-        # unreadable file aborts classification before any later run is reattached or resubmitted.
-        # Bytes cannot express an unreadable file, so the sentinel below makes the read itself raise.
+        # a read failure is not a decode failure, and the two need OPPOSITE remedies. `OSError` has
+        # to be in `_RECOVERY_RECORD_ERRORS` or one unreadable file aborts classification before any
+        # later run is reattached; but it must NOT be quarantined, because the bytes were never seen
+        # and terminalizing them would destroy a possibly-live run's only handle. The assertions
+        # below split on this param for exactly that reason. Bytes cannot express an unreadable
+        # file, so the sentinel below makes the read itself raise.
         pytest.param(
             b'{"run_id":"bad-run","state":"queued","spec":{},"oserror_sentinel":true}',
             id="record-read-oserror",
@@ -6908,21 +6909,33 @@ def test_recover_runs_corrupt_status_is_quarantined_per_record(monkeypatch, tmp_
     assert attached == []
     assert sweep_scopes == [(set(), {"bad-run", "healthy-run"})]
 
+    quarantine_files = list((tmp_path / "runs").glob("bad-run.json.corrupt-*"))
+    record_path = tmp_path / "runs" / "bad-run.json"
+
+    if bad_payload.endswith(b'"oserror_sentinel":true}'):
+        # an unreadable record is not a corrupt one. the bytes were never seen, so nothing about
+        # this row is known to be malformed, and quarantining anyway would publish `spec = {}` and
+        # `remote = None` over a record whose handle was never read and terminalize a possibly-live
+        # run. isolating the row for this boot is the whole remedy: healthy-run above still
+        # recovered, and bad-run's durable bytes and state have to survive for the next boot to
+        # read once the storage answers again.
+        assert quarantine_files == []
+        assert record_path.read_bytes() == bad_payload
+        assert not os.path.exists(runner_state.runs_file_path("bad-run", ".log"))
+        return
+
     bad_status = runner_status.get_status("bad-run")
     assert bad_status.state == "failed"
     assert bad_status.error
     assert "persisted status cannot be decoded" in bad_status.error
     assert "unrecoverable" in runner_status.get_logs("bad-run")
     # the decode failure's own text never reaches the submitter. `RunStatus.error` is returned by
-    # both run routes and `detail` is appended verbatim to the run log, so an `OSError` rendered in
-    # full would publish the internal status-file path. the exception TYPE is the whole payload.
+    # both run routes and `detail` is appended verbatim to the run log, so an error rendered in
+    # full could publish the internal status-file path. the exception TYPE is the whole payload.
     bad_log = runner_status.get_logs("bad-run")
     for surface in (bad_status.error, bad_log):
         assert _OSERROR_SENTINEL_PATH not in surface
         assert "Permission denied" not in surface
-    if bad_payload.endswith(b'"oserror_sentinel":true}'):
-        assert bad_status.error.endswith("PermissionError")
-    quarantine_files = list((tmp_path / "runs").glob("bad-run.json.corrupt-*"))
     assert len(quarantine_files) == 1
     assert quarantine_files[0].read_bytes() == bad_payload
 

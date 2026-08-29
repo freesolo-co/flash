@@ -331,6 +331,36 @@ def test_failed_rest_sweep_is_reported_rather_than_read_as_confirmed_clear(monke
     ), "a failed REST sweep was reported as confirmed-clear"
 
 
+def test_spec_without_a_gpu_class_is_reported_unconfirmed(monkeypatch) -> None:
+    """Deriving zero endpoint names is not the same as confirming no endpoint exists.
+
+    An empty result from an actual call proves a specific derived name is absent. Zero derived names
+    means the provider was never asked -- and a corrupt record that lost its GPU class can still
+    have an endpoint billing under the name the intact record would have produced. Returning `True`
+    there clears the caller's retry marker on the strength of a check that never ran.
+    """
+    import flash.providers.runpod.serverless.endpoints as serverless
+    from flash.providers.runpod.execution import provider as runpod
+
+    calls: list[str] = []
+
+    def terminate(gpu_type: str, _run_id: str) -> list[dict]:
+        calls.append(gpu_type)
+        return []
+
+    monkeypatch.setattr(serverless, "terminate_endpoint", terminate)
+
+    for spec in ({}, {"gpu": {}}, {"gpu": {"type": []}}, {"gpu": {"type": 7}}, None):
+        assert not runpod.terminate_persisted_endpoints(spec, "flash-cleanup"), (
+            f"a spec deriving no endpoint name was reported confirmed-clear: {spec!r}"
+        )
+    assert calls == [], "a name was derived from a spec carrying no gpu class"
+
+    # the contrast: one derived name, actually asked, and the provider answered that it is gone.
+    assert runpod.terminate_persisted_endpoints({"gpu": {"type": "RTX 5090"}}, "flash-cleanup")
+    assert calls == ["RTX 5090"]
+
+
 def test_effective_spec_carries_the_allocated_card_count(orch) -> None:
     base = _spec(type="")
 

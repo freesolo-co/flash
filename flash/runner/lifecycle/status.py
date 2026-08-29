@@ -413,7 +413,18 @@ def _quarantine_corrupt_status(run_id: str, detail: str) -> tuple[RunStatus | No
             return repaired, False
         try:
             raw = _load_status_json(run_id)
-        except (UnicodeDecodeError, ValueError, TypeError, RecursionError, OSError):
+        except FileNotFoundError:
+            return None, False
+        except OSError:
+            # the bytes were never read, so nothing about this record is known to be malformed.
+            # `PermissionError`, `ESTALE` and `EIO` all arrive here, and they say the storage is
+            # unreadable right now, not that the content is corrupt. quarantining anyway would
+            # publish `spec = {}` and `remote = None` over a record whose handle was never seen and
+            # terminalize a possibly-live run, destroying the only address its worker has. leave the
+            # durable bytes untouched and report no quarantine: the caller skips this one row for
+            # this boot and a later one reads it once the storage answers again.
+            return None, False
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
             raw = None
         else:
             # a read that only failed transiently is not a corrupt record. the recheck above reports
@@ -433,6 +444,17 @@ def _quarantine_corrupt_status(run_id: str, detail: str) -> tuple[RunStatus | No
         cleanup_remotes = _durable_teardown_intent(failed.remote, cleanup_remotes)
         if cleanup_remotes is not None:
             data[state._CLEANUP_REMOTES_KEY] = cleanup_remotes
+        # this write replaces the record wholesale, so an unreclaimed marker already on disk has to
+        # be carried across it or quarantine destroys the very evidence it exists to preserve. the
+        # marker means a previous boot recorded an endpoint owed by derived name and no provider has
+        # confirmed it gone; losing it here strands that endpoint exactly as a lost handle would,
+        # because the envelope is terminal and no later boot reconsiders a terminal run.
+        if (
+            raw is not None
+            and _describes_run(run_id, raw)
+            and raw.get(state._ENDPOINT_RECLAIM_KEY) is True
+        ):
+            data[state._ENDPOINT_RECLAIM_KEY] = True
         fd, tmp = tempfile.mkstemp(dir=state.RUNS_DIR, prefix=f"{run_id}.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as file:

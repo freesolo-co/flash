@@ -3402,6 +3402,85 @@ def test_reclaim_marker_never_reaches_the_public_status_projection(monkeypatch, 
     assert runner_state._ENDPOINT_RECLAIM_KEY not in runner_status.get_status(run_id).to_dict()
 
 
+def test_quarantine_carries_an_unreclaimed_marker_across_the_envelope(monkeypatch, tmp_path):
+    """Quarantine replaces the record wholesale, so it must not delete a pending reclaim marker.
+
+    The envelope is rebuilt from `_status_storage_dict`, which carries no private key at all. A run
+    whose earlier boot recorded an owed endpoint and never got a provider answer would therefore
+    come out of quarantine with the marker gone -- and because quarantine also terminalizes the run,
+    `_RECOVERABLE` skips it forever and RunPod's no-op `sweep_orphans` never sees the endpoint. The
+    marker is the only evidence that survives the crash, so the write that destroys it is the write
+    that strands the billing.
+    """
+    run_id = "reclaim-carried"
+    _quarantine_handleless_run(monkeypatch, tmp_path, run_id)
+    runner_status.persist_endpoint_reclaim_intent(run_id)
+    assert runner_status.endpoint_reclaim_pending(run_id) is True
+
+    status, quarantined = runner_status._quarantine_corrupt_status(run_id, "boom")
+
+    assert quarantined
+    assert status is not None
+    assert status.state == "failed"
+    assert runner_status.endpoint_reclaim_pending(run_id) is True
+
+
+def test_quarantine_does_not_inject_a_marker_from_a_foreign_record(monkeypatch, tmp_path):
+    """The carried marker is only trustworthy while the bytes name this run.
+
+    `_describes_run` already gates the salvage, and the marker has to ride the same gate: a record
+    that names some other run cannot vouch for this run's endpoint, so honouring its marker would
+    leave a permanent retry against a name this run never allocated.
+    """
+    run_id = "reclaim-foreign"
+    _quarantine_handleless_run(monkeypatch, tmp_path, run_id)
+    path = runner_state.runs_file_path(run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["run_id"] = "some-other-run"
+    stored[runner_state._ENDPOINT_RECLAIM_KEY] = True
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    status, quarantined = runner_status._quarantine_corrupt_status(run_id, "boom")
+
+    assert quarantined
+    assert status is not None
+    assert runner_status.endpoint_reclaim_pending(run_id) is False
+
+
+def test_reclaim_marker_is_not_recorded_without_a_derivable_endpoint_name(monkeypatch, tmp_path):
+    """A record that lost its GPU class has no address to reclaim, so it must not be marked.
+
+    `terminate_persisted_endpoints` reports unconfirmed for a spec naming no class, because it never
+    asked the provider anything. Writing the marker anyway would create one no boot can ever clear:
+    every startup would re-run a reclaim that derives zero names, get `False` back, and keep it.
+    """
+    import flash.server.platform.runtime as runtime
+
+    run_id = "reclaim-classless"
+    _quarantine_handleless_run(monkeypatch, tmp_path, run_id)
+    path = runner_state.runs_file_path(run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"]["gpu"].pop("type")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": run_id}])
+
+    calls: list[str] = []
+
+    def terminate(gpu_type: str, _run_id: str) -> list[dict]:
+        calls.append(gpu_type)
+        return []
+
+    _run_recovery_with_inline_threads(monkeypatch, terminate)
+
+    assert calls == [], "a name was derived from a record carrying no gpu class"
+    assert runner_status.get_status(run_id).state == "failed"
+    assert runner_status.endpoint_reclaim_pending(run_id) is False
+
+
 def test_recover_runs_reattaches_confirmed_teardown_marker(monkeypatch, tmp_path):
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec

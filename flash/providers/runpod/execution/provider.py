@@ -25,13 +25,22 @@ def terminate_persisted_endpoints(spec: Any, run_id: str) -> bool:
     case -- no endpoint matched the derived name in any configured account -- while any
     `success: False` entry is an unconfirmed deletion or an account it could not enumerate.
 
+    A spec naming no GPU class is NOT that case, so it reports unconfirmed. An empty result proves
+    a specific derived name is absent; zero derived names means the provider was never asked, and a
+    corrupt record that lost its GPU class can still have an endpoint billing under the name the
+    intact record would have produced. Returning `True` there would clear the retry marker on the
+    strength of a check that never ran, which is the one outcome the marker exists to prevent.
+
     Each class stays isolated: one failure is recorded and the rest are still attempted.
     """
     from flash.core.spec import persisted_gpu_types
     from flash.providers.runpod.serverless.endpoints import terminate_endpoint
 
+    gpu_types = persisted_gpu_types(spec)
+    if not gpu_types:
+        return False
     confirmed = True
-    for gpu_type in persisted_gpu_types(spec):
+    for gpu_type in gpu_types:
         try:
             results = terminate_endpoint(gpu_type, run_id)
         except Exception:
