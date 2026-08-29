@@ -269,16 +269,18 @@ def _resumes_missing_parameter(text: str, incomplete: int, missing: set[str]) ->
     valid assignment remains reachable. abandoning there would hide the competing
     interpretation and let an ambiguous candidate parse as one structured call.
     """
-    value_end = _find_parameter_end(text, _PARAMETER_END, incomplete)
-    if value_end < 0:
-        return False
-    following = _skip_whitespace(text, value_end + len(_PARAMETER_END))
-    if not text.startswith(_PARAMETER_START, following):
-        return False
-    name_end = text.find(">", following + len(_PARAMETER_START))
-    if name_end < 0:
-        return False
-    return text[following + len(_PARAMETER_START) : name_end] in missing
+    search_from = incomplete
+    while (value_end := _find_parameter_end(text, _PARAMETER_END, search_from)) >= 0:
+        search_from = value_end + len(_PARAMETER_END)
+        following = _skip_whitespace(text, search_from)
+        if not text.startswith(_PARAMETER_START, following):
+            continue
+        name_end = text.find(">", following + len(_PARAMETER_START))
+        if name_end < 0:
+            return False
+        if text[following + len(_PARAMETER_START) : name_end] in missing:
+            return True
+    return False
 
 
 def _classify_free_string(state, value_start, values, name, probe):

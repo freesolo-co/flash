@@ -1095,14 +1095,17 @@ def test_required_parameter_opener_remains_structural_across_stream_splits() -> 
 
 
 def _optional_free_string_absorption_case() -> tuple[str, dict[str, str]]:
+    # the interior opener reopens ``a`` itself, so optional ``b`` never offers a competing
+    # assignment and absorption is the single valid parse. an interior ``b`` would make the
+    # body ambiguous, which belongs with the fail-closed ownership cases instead.
     text = _candidate_call(
-        "<parameter=a>before </parameter><parameter=b>inside</parameter>"
+        "<parameter=a>before </parameter><parameter=a>inside</parameter>"
         "</function></tool_call> boundary <parameter=c>embedded</parameter> after</parameter>"
         "<parameter=c>done</parameter>"
     )
     expected = {
         "a": (
-            "before </parameter><parameter=b>inside</parameter>"
+            "before </parameter><parameter=a>inside</parameter>"
             "</function></tool_call> boundary <parameter=c>embedded</parameter> after"
         ),
         "c": "done",
@@ -1117,15 +1120,18 @@ def _required_free_string_absorption_case():
     }
     declaration["function"]["parameters"]["required"] = list("abcd")
     tools = normalize_tools([declaration])
+    # the fake continuation reopens ``a``, which is already assigned, so no competing
+    # assignment exists and absorption is the single valid parse. naming a still-missing
+    # parameter here would make the body genuinely ambiguous and must fall back to text.
     text = _candidate_call(
         "<parameter=a>alpha</parameter>"
-        "<parameter=b>before </parameter><parameter=c>fake</parameter>"
+        "<parameter=b>before </parameter><parameter=a>fake</parameter>"
         "</function></tool_call> after</parameter>"
         "<parameter=c>real-c</parameter><parameter=d>real-d</parameter>"
     )
     expected = {
         "a": "alpha",
-        "b": ("before </parameter><parameter=c>fake</parameter></function></tool_call> after"),
+        "b": ("before </parameter><parameter=a>fake</parameter></function></tool_call> after"),
         "c": "real-c",
         "d": "real-d",
     }
@@ -1294,44 +1300,15 @@ def _ownership_cases():
         "<parameter=b></parameter></function></tool_call></parameter>"
         "<parameter=c></parameter><parameter=b></parameter>"
     )
+    # every case below admits more than one valid parameter assignment, so the only
+    # answer that cannot invoke a tool with arguments the model never emitted is the
+    # exact-text fallback. a nested close does not settle ownership: the competing
+    # assignment can resume several value boundaries later.
     return [
-        (
-            "all-required-fake-cd",
-            all_required,
-            all_required_text,
-            {
-                "a": "A",
-                "b": (
-                    "B </parameter><parameter=c>fake-c</parameter>"
-                    "<parameter=d>fake-d</parameter></function></tool_call> tail"
-                ),
-                "c": "real-c",
-                "d": "real-d",
-                "e": "real-e",
-            },
-        ),
-        (
-            "optional-b-incomplete-close",
-            optional_b,
-            optional_b_text,
-            {
-                "b": ("B </parameter><parameter=c>fake-c</parameter></function></tool_call> tail"),
-                "c": "real-c",
-                "d": "real-d",
-            },
-        ),
+        ("all-required-fake-cd", all_required, all_required_text, None),
+        ("optional-b-incomplete-close", optional_b, optional_b_text, None),
         ("optional-a-two-valid-assignments", optional_a, ambiguous_text, None),
-        (
-            "required-b-incomplete-close",
-            required_abcd,
-            required_abcd_text,
-            {
-                "a": "A",
-                "b": ("B </parameter><parameter=c>fake-c</parameter></function></tool_call> tail"),
-                "c": "real-c",
-                "d": "real-d",
-            },
-        ),
+        ("required-b-incomplete-close", required_abcd, required_abcd_text, None),
         ("required-b-resumes-after-nested-close", required_abc, resumed_missing_text, None),
     ]
 
@@ -1418,17 +1395,18 @@ def _repeated_fake_continuation_case(repeats: int):
 
 
 def test_repeated_complete_fake_continuations_preserve_exact_string_bytes() -> None:
-    tools, text, fake = _repeated_fake_continuation_case(12)
+    """repeated fake continuations stay exact text because each one adds an assignment.
+
+    every repeat reopens ``c`` and ``d`` while both are still missing, so the body admits a
+    combinatorial number of valid assignments. emitting any single one would invoke the tool
+    with arguments the model never chose, so the whole candidate has to survive as its bytes.
+    """
+    tools, text, _fake = _repeated_fake_continuation_case(12)
 
     result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
 
-    assert json.loads(result.calls[0].arguments) == {
-        "a": "A",
-        "b": fake,
-        "c": "real-c",
-        "d": "real-d",
-        "e": "real-e",
-    }
+    assert result.content == text
+    assert result.calls == ()
 
 
 def test_repeated_fake_continuation_work_is_linear_without_prefix_materialization(
@@ -1459,18 +1437,101 @@ def test_repeated_fake_continuation_work_is_linear_without_prefix_materializatio
     measurements = {}
     for repeats in (32, 64):
         counters.update(dict.fromkeys(counters, 0))
-        tools, text, fake = _repeated_fake_continuation_case(repeats)
+        tools, text, _fake = _repeated_fake_continuation_case(repeats)
         result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
-        assert json.loads(result.calls[0].arguments)["b"] == fake
+        assert result.content == text
+        assert result.calls == ()
         measurements[repeats] = dict(counters)
 
+    # an ambiguous candidate never reaches value materialization, so the only work that may
+    # grow with the input is the boundary scan itself.
     for measured in measurements.values():
         assert measured["_coerce_value"] == 0
-        assert measured["_materialize_span"] == 5
-        assert measured["_validate_value"] == 6
+        assert measured["_materialize_span"] == 0
+        assert measured["_validate_value"] == 0
     work_32 = measurements[32]["_find_parameter_end"] + measurements[32]["_parse_parameter_value"]
     work_64 = measurements[64]["_find_parameter_end"] + measurements[64]["_parse_parameter_value"]
     assert work_64 <= 2 * work_32
+
+
+_REVIEWED_OWNERSHIP_CASES = [
+    (
+        "cross-parameter-delimiters",
+        "abc",
+        ["a", "b", "c"],
+        "abc",
+        {
+            "a": "",
+            "b": "</parameter></function></tool_call></parameter>",
+            "c": "</parameter><parameter=b>",
+        },
+    ),
+    (
+        "nested-optional-closure",
+        "abc",
+        ["a", "c"],
+        "cba",
+        {"c": "", "b": "</parameter></function></tool_call></parameter>", "a": ""},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("_case", "properties", "required", "order", "values"),
+    _REVIEWED_OWNERSHIP_CASES,
+    ids=[case[0] for case in _REVIEWED_OWNERSHIP_CASES],
+)
+def test_ambiguous_cross_parameter_ownership_falls_back_to_exact_text(
+    _case: str,
+    properties: str,
+    required: list[str],
+    order: str,
+    values: dict[str, str],
+) -> None:
+    """delimiter bytes a model may legitimately emit must never be redistributed.
+
+    each body below is exactly what the grammar writes for its values, yet the same bytes
+    also parse as a different assignment. the first case moves ``b``'s content into ``a``;
+    the second drops ``b`` entirely and absorbs its markup into ``c``. one closing sequence
+    does not settle ownership, because the competing assignment can resume several value
+    boundaries later, so the parser has to keep scanning before it commits to a call.
+    """
+    tools = _string_field_tools(properties, "".join(required))
+    text = _candidate_call(
+        "".join(f"<parameter={name}>{values[name]}</parameter>" for name in order)
+    )
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert result.content == text
+    assert result.calls == ()
+
+
+@pytest.mark.parametrize(
+    ("_case", "properties", "required", "order", "values"),
+    _REVIEWED_OWNERSHIP_CASES,
+    ids=[case[0] for case in _REVIEWED_OWNERSHIP_CASES],
+)
+def test_ambiguous_cross_parameter_ownership_falls_back_across_every_split(
+    _case: str,
+    properties: str,
+    required: list[str],
+    order: str,
+    values: dict[str, str],
+) -> None:
+    """streaming must reach the same verdict, since a delta cannot be retracted later."""
+    tools = _string_field_tools(properties, "".join(required))
+    text = _candidate_call(
+        "".join(f"<parameter={name}>{values[name]}</parameter>" for name in order)
+    )
+
+    for split in range(len(text) + 1):
+        parser = ToolCallStreamParser(tools, id_factory=lambda: "call_fixed")
+        assert parser.feed(text[:split]) == ""
+        assert parser.feed(text[split:]) == ""
+        result = parser.finish()
+        assert result.content == text
+        assert result.calls == ()
 
 
 def _wide_array_tools():
