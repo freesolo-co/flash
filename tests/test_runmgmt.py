@@ -3628,6 +3628,54 @@ def test_reclaim_marker_survives_a_spec_that_later_lost_its_gpu_class(monkeypatc
     assert runner_status.endpoint_reclaim_types(run_id) == ()
 
 
+@pytest.mark.parametrize(
+    "remote",
+    [
+        {"provider": None, "endpoint_id": "ep-live"},
+        {"endpoint_id": "ep-live"},
+        {"provider": 7, "endpoint_id": "ep-live"},
+        {"provider": "runpod", "endpoint_id": ["ep-live"]},
+    ],
+    ids=["null-provider", "absent-provider", "numeric-provider", "list-endpoint-id"],
+)
+def test_a_handle_the_drain_refuses_does_not_suppress_the_reclaim_marker(
+    monkeypatch, tmp_path, remote
+):
+    """The two teardown mechanisms must be exhaustive, so neither may claim what it cannot delete.
+
+    Each remote here names an endpoint id but no addressable resource, and the drain refuses all of
+    them. Deciding addressability by any looser test than the drain's own admission -- bare
+    truthiness of the id fields, say -- reports an address, suppresses the marker in favour of it,
+    and then deletes nothing: `_RECOVERABLE` has dropped the terminalized run and RunPod's
+    `sweep_orphans` is a no-op, so the endpoint bills with both mechanisms declining it.
+    """
+    import flash.server.platform.runtime as runtime
+
+    run_id = "reclaim-unaddressable"
+    _quarantine_handleless_run(monkeypatch, tmp_path, run_id)
+    path = runner_state.runs_file_path(run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["remote"] = remote
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": run_id}])
+
+    calls: list[str] = []
+
+    def terminate(gpu_type: str, _run_id: str) -> list[dict]:
+        calls.append(gpu_type)
+        return [{"success": True, "name": gpu_type, "message": "deleted via REST API"}]
+
+    _run_recovery_with_inline_threads(monkeypatch, terminate)
+
+    assert runner_reconciliation._drainable_cleanup_remotes(run_id) == [], (
+        "the drain admitted a record it cannot address"
+    )
+    assert calls == ["RTX 5090"], "an unaddressable handle suppressed the only working mechanism"
+    assert runner_status.endpoint_reclaim_types(run_id) == ()
+
+
 def test_recover_runs_reattaches_confirmed_teardown_marker(monkeypatch, tmp_path):
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec

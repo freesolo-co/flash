@@ -41,13 +41,11 @@ def _salvage_teardown_handle(remote: object) -> dict | None:
     these verbatim for exactly this reason, and `_strict_teardown_handle` resolves the short
     fingerprint itself.
     """
-    from flash.runner.accounting.reconciliation import (
-        _canonical_cleanup_remote,
-        _uncanonical_teardown_record,
-    )
+    from flash.runner.accounting.reconciliation import _teardown_target
 
     with contextlib.suppress(Exception):
-        return _canonical_cleanup_remote(remote) or _uncanonical_teardown_record(remote)
+        target = _teardown_target(remote)
+        return None if target is None else target[0]
     return None
 
 
@@ -195,15 +193,17 @@ def has_teardown_address(remote: object) -> bool:
 
     The reclaim marker is the fallback for a run whose endpoint has no handle, so what decides
     between the two mechanisms is whether the handle is *addressable* -- not whether the field is
-    truthy. A partial remote such as `{"provider": "runpod"}` is truthy and names nothing: the drain
-    rejects it because `_teardown_removal_key` is `None`, so gating on `bool(remote)` would suppress
-    the marker in favour of a record that will never be acted on, and the endpoint bills with both
-    mechanisms silently declining it. Deciding on the same key the drain selects by means exactly one
-    of the two always applies.
-    """
-    from flash.runner.accounting.reconciliation import _teardown_removal_key
+    truthy. A partial remote such as `{"provider": "runpod"}` is truthy and names nothing, so gating
+    on `bool(remote)` would suppress the marker in favour of a record that will never be acted on,
+    and the endpoint bills with both mechanisms silently declining it.
 
-    return _teardown_removal_key(remote) is not None
+    Asking `_teardown_target` is what makes the two mechanisms exhaustive, and asking it rather than
+    a second predicate of its own is what keeps them so: any looser test here admits a handle the
+    drain then refuses, which is the same billing endpoint reached by the opposite route.
+    """
+    from flash.runner.accounting.reconciliation import _teardown_target
+
+    return _teardown_target(remote) is not None
 
 
 def _durable_teardown_intent(remote: dict | None, cleanup_remotes: list | None) -> list | None:
@@ -215,19 +215,20 @@ def _durable_teardown_intent(remote: dict | None, cleanup_remotes: list | None) 
     because it is already terminal, and RunPod's `sweep_orphans` is a no-op. Recording the intent
     inside the same atomic write means the next boot's ordinary cleanup drain finds it.
 
-    The drain tolerates handles the strict reader rejects at every stage it has -- the snapshot
-    falls back to `_drainable_cleanup_remotes`, teardown selects by `_teardown_removal_key`, and
-    removal preserves unrecognized siblings verbatim -- so the lenient handle
-    `_salvage_teardown_handle` keeps is persisted here rather than dropped.
+    Only a handle the drain will admit is recorded, and it is recorded in the exact admitted form,
+    because this list has one consumer and writing anything else into it stores an address nothing
+    reads. A handle refused here is not lost: the caller has already established there is no
+    teardown address, which is precisely the condition the reclaim marker covers.
     """
-    from flash.runner.accounting.reconciliation import _teardown_removal_key
+    from flash.runner.accounting.reconciliation import _teardown_removal_key, _teardown_target
 
-    key = _teardown_removal_key(remote)
-    if key is None:
+    target = _teardown_target(remote)
+    if target is None:
         return cleanup_remotes
+    record, key = target
     records = list(cleanup_remotes or [])
     if all(_teardown_removal_key(existing) != key for existing in records):
-        records.append(dict(remote or {}))
+        records.append(record)
     return records
 
 

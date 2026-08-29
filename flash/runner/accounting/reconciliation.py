@@ -400,22 +400,51 @@ def _uncanonical_cleanup_remote_key(record: object) -> tuple | None:
     return (_hashable(record.get("provider")), _hashable(record.get("attempt")), identity)
 
 
+def _teardown_target(remote: object) -> tuple[dict, tuple] | None:
+    """The record the teardown drain will act on, paired with the identity it selects by.
+
+    THE single answer to "can this handle be torn down", shared by every caller that asks. Admission
+    and keying have to come from one derivation, because a record admitted by one and keyed by
+    another is a resource nothing deletes. That is not hypothetical: keying leniently on bare
+    truthiness accepts `{"provider": None, "endpoint_id": "ep-live"}` while the drain refuses it for
+    naming no provider, so `has_teardown_address` reports an address, the reclaim marker is
+    suppressed in favour of it, and the endpoint bills with both mechanisms declining it. Returning
+    the admitted record together with its key makes that disagreement unrepresentable.
+
+    Lenient does not mean unvalidated. A record earns the lenient branch by naming a provider and a
+    resource id as nonempty strings -- enough for `_strict_teardown_handle` to address it -- which
+    is what `_uncanonical_teardown_record` enforces. Dropping the branch entirely is not an option:
+    `key_fingerprint` is validated at exactly 68 chars while a deployed release writes the 16-char
+    form, so every endpoint that release created fails strict canonicalization and would strand.
+
+    The two key shapes cannot be confused for each other: the strict key is the 2-tuple
+    `(identity, attempt)` and the lenient one is a 3-tuple, so they never compare equal and a record
+    that canonicalizes is matched by its strict key on both sides of a persist.
+    """
+    canonical = _canonical_cleanup_remote(remote)
+    if canonical is not None:
+        strict_key = _cleanup_remote_key(canonical)
+        if strict_key is not None:
+            return canonical, strict_key
+    record = _uncanonical_teardown_record(remote)
+    if record is None:
+        return None
+    lenient_key = _uncanonical_cleanup_remote_key(record)
+    if lenient_key is None:
+        return None
+    return record, lenient_key
+
+
 def _teardown_removal_key(record: object) -> tuple | None:
     """The identity the teardown path selects a record by, strict when possible.
 
-    THE single derivation shared by the drain and the compare-and-remove that clears what the drain
-    confirmed deleted. It has to be one function: the drain admits uncanonical records so a resource
-    that fails strict validation still gets deleted, and if removal derived its key strictly instead
-    it would return `None` for exactly those records and clear nothing -- so a confirmed-deleted
-    resource would stay on disk and every later sweep would tear down something already gone,
-    forever. That is the failure the lenient branch below exists to prevent, reintroduced through
-    the key rather than through the reader.
-
-    The two shapes cannot be confused for each other: the strict key is the 2-tuple
-    `(identity, attempt)` and the lenient one is a 3-tuple, so they never compare equal and a record
-    that canonicalizes is matched by its strict key on both sides.
+    Shared by the drain and by the compare-and-remove that clears what the drain confirmed deleted.
+    Both must derive it identically: if removal keyed strictly while the drain admitted leniently,
+    removal would return `None` for exactly the lenient records, clear nothing, and every later
+    sweep would re-tear-down a resource already confirmed gone, forever.
     """
-    return _cleanup_remote_key(record) or _uncanonical_cleanup_remote_key(record)
+    target = _teardown_target(record)
+    return None if target is None else target[1]
 
 
 def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
@@ -443,14 +472,11 @@ def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
     records: list[dict] = []
     seen = set()
     for item in value:
-        record = _canonical_cleanup_remote(item)
-        if record is None:
-            record = _uncanonical_teardown_record(item)
-        key = _teardown_removal_key(record)
-        if record is None or key is None or key in seen:
+        target = _teardown_target(item)
+        if target is None or target[1] in seen:
             continue
-        records.append(record)
-        seen.add(key)
+        records.append(target[0])
+        seen.add(target[1])
     return records
 
 

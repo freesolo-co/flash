@@ -1470,6 +1470,53 @@ def test_terminate_reports_an_unconfirmed_rest_delete_as_failure(monkeypatch):
     } in out
 
 
+@pytest.mark.parametrize(
+    "break_registry",
+    ["auth", "lookup"],
+)
+def test_terminate_sweeps_rest_when_the_local_registry_is_unusable(monkeypatch, break_registry):
+    """A local SDK failure must not skip the only mechanism that can still find the endpoint.
+
+    The registry leg and the per-account REST sweep are independent: the sweep exists precisely for
+    an endpoint the local registry cannot see. Both failures modelled here -- no credentials in this
+    process, and a registry that will not enumerate -- are the ordinary conditions that produce such
+    an endpoint, so returning on either one deletes nothing and leaves it billing. The local failure
+    still has to be reported alongside the sweep's result rather than swallowed.
+    """
+    deleted = []
+    target = _fake_sdk_with_orphan(
+        monkeypatch,
+        rest_find=lambda t: [{"id": "ep-orphan", "name": t}],
+        rest_delete=lambda eid: deleted.append(eid) or True,
+    )
+    if break_registry == "auth":
+        import flash.providers.runpod.client.auth as auth
+
+        monkeypatch.setattr(
+            auth, "ensure_auth", lambda: (_ for _ in ()).throw(RuntimeError("no key"))
+        )
+        expected = "flash unavailable"
+    else:
+        import types as _types
+
+        broken = _types.ModuleType("runpod_flash.core.resources.resource_manager")
+
+        def _explode():
+            raise RuntimeError("registry unreadable")
+
+        broken.ResourceManager = lambda: _types.SimpleNamespace(list_all_resources=_explode)
+        monkeypatch.setitem(sys.modules, "runpod_flash.core.resources.resource_manager", broken)
+        expected = "resource lookup failed"
+
+    out = ftrain.terminate_endpoint("RTX 5090", "flash-q-1")
+
+    assert deleted == ["ep-orphan"], "a local SDK failure skipped the registry-less REST sweep"
+    assert {"success": True, "name": target, "message": "deleted via REST API"} in out
+    assert any(expected in str(r.get("message")) for r in out), (
+        "the local registry failure must still be reported, not swallowed by the sweep"
+    )
+
+
 def test_terminate_keeps_undeploy_failures_when_rest_enumeration_is_unreachable(monkeypatch):
     """terminate_endpoint is best-effort: it must never raise, and never lose what it learned.
 

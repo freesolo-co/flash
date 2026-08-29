@@ -837,10 +837,16 @@ def _select_endpoint_resources(resources: dict, target: str) -> list[str]:
     ]
 
 
-def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dict]:
-    """Delete the remote Flash endpoint(s) for a run via the RunPod API. Best-effort, never raises."""
-    friendly = canonical_gpu(friendly_gpu)
-    target = endpoint_name(friendly, _run_suffix(run_id))
+def _undeploy_registered_endpoints(target: str, run_suffix: str | None) -> list[dict]:
+    """Undeploy whatever the local SDK registry knows about `target`, reporting failures as rows.
+
+    Every exit is a list, never a raise and never a short-circuit, because this is only the first of
+    two independent teardown mechanisms. The second -- the per-account REST sweep in the caller --
+    is the one that finds an endpoint the registry has lost, which is exactly what a container
+    restart or a missing API key produces. Returning early on a local failure would skip it, so an
+    unimportable SDK (the common case: no credentials in this process) would leave a live endpoint
+    billing with the only mechanism that could still see it never consulted.
+    """
     # Serialize isolation + lookup + undeploy: isolate_flash_state swaps process-wide globals,
     # and a concurrent call could swap the registry scope between our lookup and undeploy.
     with FLASH_SDK_LOCK:
@@ -848,7 +854,7 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             from flash.providers.runpod.client.auth import ensure_auth
 
             ensure_auth()
-            isolate_flash_state(_run_suffix(run_id))
+            isolate_flash_state(run_suffix)
             from runpod_flash.core.resources.resource_manager import ResourceManager
         except Exception as exc:
             detail = sanitize_diagnostic(exc, limit=1000)
@@ -887,34 +893,40 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
-                results = asyncio.run(_undeploy_all())
-            else:
-                # Running event loop (FastAPI lifespan etc) — run in a daemon thread.
-                _out: list = []
-                _err: list = []
+                return asyncio.run(_undeploy_all())
+            # Running event loop (FastAPI lifespan etc) — run in a daemon thread.
+            _out: list = []
+            _err: list = []
 
-                def _run_undeploy() -> None:
-                    try:
-                        _out.append(asyncio.run(_undeploy_all()))
-                    except Exception as _e:
-                        _err.append(_e)
+            def _run_undeploy() -> None:
+                try:
+                    _out.append(asyncio.run(_undeploy_all()))
+                except Exception as _e:
+                    _err.append(_e)
 
-                _t = threading.Thread(target=_run_undeploy, daemon=True)
-                _t.start()
-                _t.join(timeout=30)
-                if _err:
-                    raise _err[0]
-                if not _out:
-                    raise TimeoutError("undeploy timed out after 30s")
-                results = _out[0]
+            _t = threading.Thread(target=_run_undeploy, daemon=True)
+            _t.start()
+            _t.join(timeout=30)
+            if _err:
+                raise _err[0]
+            if not _out:
+                raise TimeoutError("undeploy timed out after 30s")
+            return _out[0]
         except Exception as exc:
-            results = [
+            return [
                 {
                     "success": False,
                     "name": target,
                     "message": sanitize_diagnostic(exc, limit=1000),
                 }
             ]
+
+
+def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dict]:
+    """Delete the remote Flash endpoint(s) for a run via the RunPod API. Best-effort, never raises."""
+    friendly = canonical_gpu(friendly_gpu)
+    target = endpoint_name(friendly, _run_suffix(run_id))
+    results = _undeploy_registered_endpoints(target, _run_suffix(run_id))
 
     # registry-less cleanup must inspect every configured account and exact retry suffix.
     try:
