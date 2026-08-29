@@ -436,6 +436,35 @@ def test_string_enum_rejects_unrepresentable_structural_delimiter(enum_value: st
         normalize_tools([declaration])
 
 
+@pytest.mark.parametrize(
+    "enum_value",
+    ["\nleading", "trailing\n"],
+    ids=["leading-newline", "trailing-newline"],
+)
+def test_string_enum_rejects_grammar_formatting_newline(enum_value: str) -> None:
+    """a member whose own newline the grammar's formatting strips cannot round-trip.
+
+    the wire form is ``<parameter=name>\\n<value>\\n</parameter>`` and the runtime strips one
+    leading and one trailing newline back off, so ``"\\nfoo"`` and ``"foo"`` are the same bytes.
+    accepting the declaration would let a generated call decode as a DIFFERENT valid member.
+    """
+    declaration = _exact_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"]["label"]["enum"] = [enum_value]
+
+    with pytest.raises(ValueError, match="unrepresentable tool grammar delimiter"):
+        normalize_tools([declaration])
+
+
+def test_string_enum_keeps_interior_newline_members() -> None:
+    """only the stripped positions are ambiguous; an interior newline round-trips exactly."""
+    declaration = _exact_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"]["label"]["enum"] = ["a\nb"]
+
+    tools = normalize_tools([declaration])
+
+    assert tools[0].parameters["properties"]["label"]["enum"] == ["a\nb"]
+
+
 def _property_name_tool(property_name: str, *, nested: bool) -> list[dict[str, object]]:
     property_schema: dict[str, object] = {"type": "string"}
     if nested:
