@@ -29,6 +29,7 @@ from flash.serve.request.openai import (
     reject_tool_capability,
 )
 from flash.serve.request.streaming import _complete_sse_frames
+from flash.serve.request.tool_calls import detached_template_messages
 from flash.serve.request.transport import OpenAIStreamResponse
 from flash.server.routes.serving_revisions import _authorized_chat_checkpoint
 
@@ -771,36 +772,52 @@ def test_finite_exponent_tool_history_is_accepted(argument: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("argument", "reason"),
+    "argument",
     [
-        ('{"value":1.' + "0" * 309 + "1e309}", "not representable as a native template number"),
-        ('{"value":1e-400}', "not representable as a native template number"),
-        (
-            '{"value":9007199254740993.1}',
-            "not representable as a native template number",
-        ),
-        ('{"value":NaN}', "arguments must encode a JSON object"),
-        ('{"value":Infinity}', "arguments must encode a JSON object"),
-        ('{"value":-Infinity}', "arguments must encode a JSON object"),
+        '{"value":NaN}',
+        '{"value":Infinity}',
+        '{"value":-Infinity}',
     ],
-    ids=[
-        "overflow",
-        "nonzero-underflow",
-        "lossy-nonintegral",
-        "nan",
-        "infinity",
-        "negative-infinity",
-    ],
+    ids=["nan", "infinity", "negative-infinity"],
 )
-def test_unrepresentable_or_nonfinite_tool_history_is_a_request_error(
-    argument: str, reason: str
-) -> None:
-    with pytest.raises(OpenAIRequestError, match=reason):
+def test_nonfinite_tool_history_is_a_request_error(argument: str) -> None:
+    """a non-finite constant is not JSON and has no faithful rendering at all."""
+    with pytest.raises(OpenAIRequestError, match="arguments must encode a JSON object"):
         parse_chat_request(
             {"messages": _historical_tool_messages(argument)},
             require_model=False,
             allow_managed_selectors=True,
         )
+
+
+@pytest.mark.parametrize(
+    ("argument", "rendered"),
+    [
+        ('{"value":1.' + "0" * 309 + "1e309}", "1" + "0" * 309 + ".1"),
+        ('{"value":1e-400}', "1e-400"),
+        ('{"value":9007199254740993.1}', "9007199254740993.1"),
+    ],
+    ids=["overflow", "nonzero-underflow", "lossy-nonintegral"],
+)
+def test_finite_number_no_native_value_carries_renders_exactly(
+    argument: str, rendered: str
+) -> None:
+    """a finite number keeps its exact text rather than rounding or being refused.
+
+    each of these overflows, underflows, or loses digits when forced through a python
+    float, which is why they used to be rejected. the template renders a scalar through
+    ``string``, so the exact literal reaches the model unchanged and the prior call the
+    model sees is the one it actually made.
+    """
+    normalized = parse_chat_request(
+        {"messages": _historical_tool_messages(argument)},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    detached = detached_template_messages(normalized.messages)
+    values = detached[0]["tool_calls"][0]["function"]["arguments"]
+    assert values["value"] == rendered
 
 
 @pytest.mark.parametrize(
@@ -822,23 +839,34 @@ def test_oversized_integer_tool_history_is_a_request_error(argument: str) -> Non
 
 
 @pytest.mark.parametrize(
-    "argument",
+    ("argument", "rendered"),
     [
-        '{"direct":1e1024}',
-        '{"nested":{"value":1e1024}}',
-        '{"values":[1e1024]}',
+        ('{"direct":1e1024}', "1e+1024"),
+        ('{"nested":{"value":1e1024}}', '{"value": 1e+1024}'),
+        ('{"values":[1e1024,2]}', "[1e+1024, 2]"),
+        ('{"pair":{"a":1e1024,"b":2}}', '{"a": 1e+1024, "b": 2}'),
     ],
-    ids=["direct", "nested", "list"],
+    ids=["direct", "nested", "list", "pair"],
 )
-def test_expanded_integer_tool_history_over_template_limit_is_a_request_error(
-    argument: str,
+def test_compact_exponent_tool_history_renders_without_expanding(
+    argument: str, rendered: str
 ) -> None:
-    with pytest.raises(OpenAIRequestError, match="expanded integer exceeds 1024-digit"):
-        parse_chat_request(
-            {"messages": _historical_tool_messages(argument)},
-            require_model=False,
-            allow_managed_selectors=True,
-        )
+    """a compact exponent survives as history because the template never expands it.
+
+    the grammar template sends a scalar through ``string`` and a container through
+    ``tojson``, neither of which needs the fixed expansion. expanding here would turn a
+    seven-character literal into a thousand-digit prompt and eventually trip python's own
+    integer-to-string limit, so the exact compact text is what the model must see.
+    """
+    normalized = parse_chat_request(
+        {"messages": _historical_tool_messages(argument)},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    detached = detached_template_messages(normalized.messages)
+    values = detached[0]["tool_calls"][0]["function"]["arguments"]
+    assert next(iter(values.values())) == rendered
 
 
 @pytest.mark.parametrize("argument", ['{"text":"\\ud800"}', '{"text":"\\udc00"}'])

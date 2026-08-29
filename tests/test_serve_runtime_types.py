@@ -1053,14 +1053,21 @@ def test_historical_integer_lexeme_limit_detaches_exactly_and_rejects_overflow()
     ],
     ids=["direct", "nested", "list"],
 )
-def test_expanded_historical_integer_over_template_limit_rejects_before_rendering(
+def test_compact_historical_exponent_is_accepted_without_expanding(
     arguments: str,
 ) -> None:
+    """the runtime accepts what the template can render, so a compact exponent survives.
+
+    the significand bound still rejects an oversized literal; only the expanded-integer
+    conversion is gone, because the template renders these compactly and expanding them
+    would inflate the prompt and eventually hit python's integer-to-string limit.
+    """
     messages = _runtime_tool_history("call_1")
     messages[1]["tool_calls"][0]["function"]["arguments"] = arguments
 
-    with pytest.raises(RuntimeConfigurationError, match="expanded integer exceeds 1024-digit"):
-        GenerationRequest(messages=messages)
+    request = GenerationRequest(messages=messages)
+
+    assert request.messages[1]["tool_calls"][0]["function"]["arguments"] == arguments
 
 
 def test_detached_history_arguments_are_objects_without_caller_mutation() -> None:

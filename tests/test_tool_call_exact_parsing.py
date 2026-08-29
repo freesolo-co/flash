@@ -9,6 +9,7 @@ import pytest
 
 import flash.serve.request.tool_calls as request_tool_calls_module
 import flash.serve.runtime.tool_calls as tool_calls_module
+from flash.serve.request.openai import parse_chat_request
 from flash.serve.request.tool_calls import (
     normalize_tools,
     tools_wire,
@@ -1532,6 +1533,41 @@ def test_ambiguous_cross_parameter_ownership_falls_back_across_every_split(
         result = parser.finish()
         assert result.content == text
         assert result.calls == ()
+
+
+def _numeric_replay_tools():
+    declaration = _delimiter_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"] = {"x": {"type": "integer"}}
+    declaration["function"]["parameters"]["required"] = ["x"]
+    return normalize_tools([declaration])
+
+
+@pytest.mark.parametrize(
+    "emitted", ["1", "1e300", "1e2000", "1e100000"], ids=["one", "native", "huge", "enormous"]
+)
+def test_generated_numeric_call_replays_as_valid_history(emitted: str) -> None:
+    """a call flash emits must be a call flash accepts back.
+
+    the follow-up turn resends the assistant call alongside its tool result, so a value the
+    parser emits but the request layer refuses would strand the model with a call it can
+    never supply a result for. compact exponents render exactly, so they stay legal history.
+    """
+    text = _candidate_call(f"<parameter=x>{emitted}</parameter>")
+    result = parse_qwen3_coder_output(
+        text, _numeric_replay_tools(), id_factory=lambda: "call_fixed"
+    )
+    call = result.calls[0]
+
+    parse_chat_request(
+        {
+            "messages": [
+                {"role": "assistant", "content": None, "tool_calls": [call.wire()]},
+                {"role": "tool", "tool_call_id": call.id, "content": "ok"},
+            ]
+        },
+        require_model=False,
+        allow_managed_selectors=True,
+    )
 
 
 def _wide_array_tools():

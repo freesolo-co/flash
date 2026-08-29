@@ -367,7 +367,9 @@ def _validate_history_calls(
             raise error_type(f"{path} function arguments must encode a JSON object") from exc
         _validate_tool_argument_complexity(decoded, path, error_type)
         try:
-            _native_json_value(decoded)
+            # validate through the same rendering the template will perform, so history is
+            # accepted exactly when flash can reproduce it faithfully.
+            _template_json_object(arguments)
         except ValueError as exc:
             raise error_type(f"{path} {exc}") from exc
         calls.append((call_id, name))
@@ -485,7 +487,47 @@ def _decode_json_object(value: str) -> dict[str, Any]:
 
 
 def _template_json_object(value: str) -> dict[str, Any]:
-    return _native_json_value(_decode_json_object(value))
+    decoded = _decode_json_object(value)
+    return {name: _template_argument_value(item) for name, item in decoded.items()}
+
+
+def _template_argument_value(value: Any) -> Any:
+    """render one tool argument the way the grammar template will consume it.
+
+    the template sends a mapping or sequence through ``tojson`` and every other value
+    through ``string``. a number that no native python value can carry faithfully is
+    therefore pre-rendered here as its exact compact text, which ``string`` passes
+    through unchanged and ``tojson`` never sees. the whole container has to be
+    pre-rendered together, because ``tojson`` cannot serialize a nested ``Decimal``.
+    """
+    try:
+        return _native_json_value(value)
+    except _InexactTemplateNumber:
+        if type(value) in {list, dict}:
+            return _dump_template_json(value)
+        return _dump_exact_json(value)
+
+
+def _dump_template_json(value: Any) -> str:
+    """serialize a container exactly, matching what the template's ``tojson`` emits.
+
+    transformers replaces jinja's ``tojson`` with plain ``json.dumps`` at default
+    spacing and without html escaping, so the pre-rendered form has to use the same
+    separators to stay byte-identical to a natively rendered container.
+    """
+    if type(value) is list:
+        return "[" + ", ".join(_dump_template_json(item) for item in value) + "]"
+    if type(value) is dict:
+        members = (
+            f"{json.dumps(key, ensure_ascii=False)}: {_dump_template_json(item)}"
+            for key, item in value.items()
+        )
+        return "{" + ", ".join(members) + "}"
+    return _dump_exact_json(value)
+
+
+class _InexactTemplateNumber(ValueError):
+    """raised when no native template value carries a decimal without changing it."""
 
 
 def _native_json_value(value: Any) -> Any:
@@ -494,25 +536,32 @@ def _native_json_value(value: Any) -> Any:
             digits, exponent = value.as_tuple().digits, value.as_tuple().exponent
             expanded_digits = 1 if value.is_zero() else len(digits) + exponent
             if expanded_digits > _MAX_FIXED_DECIMAL_DIGITS:
-                raise ValueError(
+                # expanding here would turn a compact literal into thousands of prompt
+                # characters and eventually trip python's own integer-to-string limit.
+                # the exact compact text renders identically, so hand it back instead.
+                raise _InexactTemplateNumber(
                     f"expanded integer exceeds {_MAX_FIXED_DECIMAL_DIGITS}-digit template limit"
                 )
             return int(value)
         try:
             converted = float(value)
         except (OverflowError, ValueError) as exc:
-            raise ValueError(
+            raise _InexactTemplateNumber(
                 "decimal number is not representable as a native template number"
             ) from exc
         if not math.isfinite(converted) or (converted == 0.0 and value != 0):
-            raise ValueError("decimal number is not representable as a native template number")
+            raise _InexactTemplateNumber(
+                "decimal number is not representable as a native template number"
+            )
         # the template renders the float back as its shortest repr, so a value whose repr does not
         # decode to the emitted decimal would show the model a different prior call. this is the
         # rendered identity, not exact binary64 storage: 0.0125 is stored approximately but still
         # renders as itself, while 9007199254740993.1 renders as 9007199254740994.0. the integral
         # branch above already refuses what it cannot expand; refuse here rather than round silently.
         if Decimal(repr(converted)) != value:
-            raise ValueError("decimal number is not representable as a native template number")
+            raise _InexactTemplateNumber(
+                "decimal number is not representable as a native template number"
+            )
         return converted
     if type(value) is list:
         return [_native_json_value(item) for item in value]
