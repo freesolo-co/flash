@@ -602,7 +602,7 @@ def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypa
         assert runner_status.get_status("fa").finished_at == teardown
 
 
-def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
+def test_persist_metrics_unstamped_zero_uses_wall_projection(monkeypatch):
     import json
     import os
 
@@ -612,7 +612,7 @@ def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
         from flash.core.spec import JobSpec
 
         spec = JobSpec(run_id="r0", model="Qwen/Qwen3.5-9B", algorithm="grpo")
-        # A zero placeholder is not a settled provider cost; use the wall-pricing fallback.
+        # No provider stamped the field, so this zero is a placeholder: use wall pricing.
         metrics = {
             "cost_usd": 0.0,
             "wall_seconds": 1.0,
@@ -624,6 +624,118 @@ def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
         assert on_disk["cost_usd"] == 1.0
         # No allocated_provider stamped -> say so, rather than attributing the cost to RunPod.
         assert on_disk["notes"]["provider"] == "unknown"
+
+
+@pytest.mark.parametrize("provider", ["lambda", "vast"])
+@pytest.mark.parametrize("stamped", [0.0, "0.0", 0, "0"])
+def test_persist_metrics_keeps_provider_authoritative_zero(monkeypatch, provider, stamped):
+    """Lambda and Vast stamp cost themselves, so their zero is settled, not missing.
+
+    A run torn down before it billed legitimately prices at zero. Re-deriving it from the wall rate
+    would invent a charge the provider never made.
+    """
+    import json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(runner_state, "RESULTS_DIR", tmp)
+        monkeypatch.setattr(runner_costs, "_gpu_rate", lambda gpu, provider="": 3600.0)
+        from flash.core.spec import JobSpec
+
+        spec = JobSpec(run_id=f"r-{provider}-zero", model="Qwen/Qwen3.5-9B", algorithm="grpo")
+        out = runner_status._persist_metrics(
+            spec,
+            {
+                "cost_usd": stamped,
+                "wall_seconds": 1.0,
+                "allocated_gpu": "RTX 5090",
+                "allocated_provider": provider,
+            },
+        )
+        assert out == 0.0
+        with open(os.path.join(runner_state.artifacts_dir(spec), "metrics.json")) as f:
+            on_disk = json.load(f)
+        assert on_disk["cost_usd"] == 0.0
+
+
+def test_persist_metrics_runpod_zero_is_an_unset_placeholder(monkeypatch):
+    """RunPod never stamps ``cost_usd``, so a zero there must still fall back to the wall rate."""
+    import json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(runner_state, "RESULTS_DIR", tmp)
+        monkeypatch.setattr(runner_costs, "_gpu_rate", lambda gpu, provider="": 3600.0)
+        from flash.core.spec import JobSpec
+
+        spec = JobSpec(run_id="r-runpod-zero", model="Qwen/Qwen3.5-9B", algorithm="grpo")
+        out = runner_status._persist_metrics(
+            spec,
+            {
+                "cost_usd": 0.0,
+                "wall_seconds": 1.0,
+                "allocated_gpu": "RTX 5090",
+                "allocated_provider": "runpod",
+            },
+        )
+        assert out == 1.0
+        with open(os.path.join(runner_state.artifacts_dir(spec), "metrics.json")) as f:
+            on_disk = json.load(f)
+        assert on_disk["cost_usd"] == 1.0
+        assert on_disk["notes"]["provider"] == "runpod"
+
+
+def test_persist_metrics_normalizes_a_string_cost(monkeypatch):
+    """A provider-stamped cost can arrive as a JSON string; it is still authoritative."""
+    import json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(runner_state, "RESULTS_DIR", tmp)
+        monkeypatch.setattr(runner_costs, "_gpu_rate", lambda gpu, provider="": 3600.0)
+        from flash.core.spec import JobSpec
+
+        spec = JobSpec(run_id="r-str-cost", model="Qwen/Qwen3.5-9B", algorithm="grpo")
+        out = runner_status._persist_metrics(
+            spec,
+            {
+                "cost_usd": "2.5",
+                "wall_seconds": 1.0,
+                "allocated_gpu": "RTX 5090",
+                "allocated_provider": "lambda",
+            },
+        )
+        assert out == pytest.approx(2.5)
+        with open(os.path.join(runner_state.artifacts_dir(spec), "metrics.json")) as f:
+            on_disk = json.load(f)
+        # persisted as a number so downstream float() and JSON readers agree
+        assert on_disk["cost_usd"] == pytest.approx(2.5)
+
+
+def test_persist_metrics_falls_back_on_an_unparseable_cost(monkeypatch):
+    """A malformed stamp is not a settled charge; price it from the wall rather than crashing."""
+    import json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(runner_state, "RESULTS_DIR", tmp)
+        monkeypatch.setattr(runner_costs, "_gpu_rate", lambda gpu, provider="": 3600.0)
+        from flash.core.spec import JobSpec
+
+        spec = JobSpec(run_id="r-bad-cost", model="Qwen/Qwen3.5-9B", algorithm="grpo")
+        out = runner_status._persist_metrics(
+            spec,
+            {
+                "cost_usd": "not-a-number",
+                "wall_seconds": 1.0,
+                "allocated_gpu": "RTX 5090",
+                "allocated_provider": "lambda",
+            },
+        )
+        assert out == 1.0
+        with open(os.path.join(runner_state.artifacts_dir(spec), "metrics.json")) as f:
+            on_disk = json.load(f)
+        assert on_disk["cost_usd"] == 1.0
 
 
 def test_persist_metrics_attributes_the_provider_that_billed_the_run(monkeypatch):

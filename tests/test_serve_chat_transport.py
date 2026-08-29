@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
 import flash.serve.request.transport as transport
@@ -144,6 +145,60 @@ def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
             timeout_s=5.0,
             retry_unavailable=True,
         )
+
+
+def test_smoke_classifier_retries_exact_pre_header_capacity_envelope():
+    response = httpx.Response(
+        503,
+        headers={"Retry-After": "1.25"},
+        json={"error": {"type": "server_error", "code": "serving_capacity_unavailable"}},
+    )
+
+    retryable = transport.retryable_smoke_unavailable(
+        response,
+        requested_model="run-1",
+        expected_checkpoint_id="run-1/final",
+    )
+
+    assert retryable is not None
+    assert retryable.code == "serving_capacity_unavailable"
+    assert retryable.retry_after_seconds == 1.25
+
+
+def test_smoke_classifier_does_not_retry_arbitrary_429():
+    response = httpx.Response(
+        429,
+        headers={"Retry-After": "1.25"},
+        json={"error": {"type": "server_error", "code": "rate_limit_exceeded"}},
+    )
+
+    assert (
+        transport.retryable_smoke_unavailable(
+            response,
+            requested_model="run-1",
+            expected_checkpoint_id="run-1/final",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("retry_after", [None, "", "0", "nan", "inf", "invalid"])
+def test_smoke_classifier_rejects_malformed_traffic_retry_headers(retry_after):
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    response = httpx.Response(
+        503,
+        headers=headers,
+        json={"error": {"type": "server_error", "code": "serving_capacity_unavailable"}},
+    )
+
+    assert (
+        transport.retryable_smoke_unavailable(
+            response,
+            requested_model="run-1",
+            expected_checkpoint_id="run-1/final",
+        )
+        is None
+    )
 
 
 def test_chat_posts_to_freesolo_serving(monkeypatch):
