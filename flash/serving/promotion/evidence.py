@@ -21,9 +21,18 @@ from typing import Any
 
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
-# an undelivered row older than this is not "in flight", it is wedged. the outbox worker claims and
-# delivers continuously, so a healthy loop never leaves a row sitting this long.
-_STALL_AGE_SECONDS = 120
+# an undelivered row older than this is not "in flight", it is wedged.
+#
+# the threshold has to clear the outbox's OWN retry budget, or a transient billing 5xx reads as a
+# stall and rolls back a healthy release. `DurableUsageOutbox._retry_or_quarantine` retries 8 times
+# with `min(2 ** (attempt - 1), 300)` seconds of backoff plus up to 20% jitter, each attempt runs
+# against a 10s client timeout, and the worker wakes on a 2s poll. that is ~154s of backoff, ~80s of
+# attempts and ~16s of polling: a row still retrying legitimately can be ~250s old. past the budget
+# the row is quarantined, so it leaves `oldest_undelivered_age_seconds` on its own.
+#
+# 360 sits above that worst case with margin and still well under the settlement horizon, so a row
+# older than this is not retrying -- no healthy path leaves one undelivered that long.
+_STALL_AGE_SECONDS = 360
 
 _MISSING = object()
 

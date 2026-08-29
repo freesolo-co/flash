@@ -161,9 +161,20 @@ def test_an_expired_lease_blocks_promotion():
 
 def test_a_row_undelivered_past_the_stall_threshold_blocks_promotion():
     """Age separates "in flight" from "stuck" without needing to know whose row it is."""
-    assert verify_accounting(_evidence(oldest_undelivered_age_seconds=119)).ok
-    verdict = verify_accounting(_evidence(oldest_undelivered_age_seconds=120))
+    assert verify_accounting(_evidence(oldest_undelivered_age_seconds=359)).ok
+    verdict = verify_accounting(_evidence(oldest_undelivered_age_seconds=360))
     assert verdict.reason == ACCOUNTING_STALLED
+
+
+def test_a_row_still_inside_the_outbox_retry_budget_does_not_block_promotion():
+    """A transient billing 5xx must not read as a wedged loop and roll back a healthy release.
+
+    `DurableUsageOutbox` retries 8 times with exponential backoff plus jitter, each attempt bounded
+    by a 10s client timeout and woken on a 2s poll, so a row that is legitimately still retrying can
+    be ~250s old. A threshold under that budget fails releases for a downstream hiccup that the
+    outbox is already handling on its own.
+    """
+    assert verify_accounting(_evidence(oldest_undelivered_age_seconds=250)).ok
 
 
 def _body(**overrides):
@@ -247,10 +258,10 @@ def test_a_fractional_age_is_the_normal_wire_shape_not_a_malformed_body():
     assert verify_accounting(parse_accounting(_body(oldest_undelivered_age_seconds=0.5))).ok
     assert verify_accounting(parse_accounting(_body(expired_leases=0.0))).ok
 
-    stalled = parse_accounting(_body(oldest_undelivered_age_seconds=119.9))
+    stalled = parse_accounting(_body(oldest_undelivered_age_seconds=359.9))
     assert stalled is not None
     assert verify_accounting(stalled).ok
-    verdict = verify_accounting(parse_accounting(_body(oldest_undelivered_age_seconds=120.1)))
+    verdict = verify_accounting(parse_accounting(_body(oldest_undelivered_age_seconds=360.1)))
     assert verdict.ok is False
     assert verdict.reason == ACCOUNTING_STALLED
 

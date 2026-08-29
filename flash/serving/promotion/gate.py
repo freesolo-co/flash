@@ -80,6 +80,11 @@ _DEFAULT_CANARY_TIMEOUT_SECONDS = 420.0
 # `DurableUsageOutbox` leases for 60s and the replacement worker reclaims on its next sweep, so a
 # deploy-induced expiry clears well inside this window while a genuinely wedged loop never does. A
 # deadline at or below the lease would turn every deploy into a rollback of a healthy release.
+#
+# this is deliberately SHORTER than `_STALL_AGE_SECONDS`, and the two are not in tension: this
+# deadline bounds how long the gate waits for a reclaim, while the threshold decides what counts
+# as wedged in the first place. a row still inside the outbox retry budget already reads healthy
+# on the first poll, so there is nothing for a longer deadline here to wait out.
 _DEFAULT_ACCOUNTING_DEADLINE_SECONDS = 180.0
 _ACCOUNTING_POLL_SECONDS = 5.0
 _BACKLOG_SNAPSHOT_RPC = "serving_usage_backlog_snapshot"
