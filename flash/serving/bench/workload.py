@@ -33,6 +33,10 @@ N_CHOICES = 1
 # (lora_engine._thinking_default); a trained adapter would not, which is one reason this campaign is
 # base-only.
 ENABLE_THINKING = True
+# How far an assembled prompt may sit from its bucket's target and still count as that bucket. The
+# fitter accepts within this band, so the engine-side check must use the SAME number: a tighter one
+# would reject prompts the fitter deliberately returned.
+PROMPT_TOKEN_TOLERANCE = 16
 
 
 @dataclass(frozen=True)
@@ -151,37 +155,90 @@ def _deterministic_words(seed_material: str, count: int) -> list[str]:
 
 
 def request_uid(bucket: str, concurrency: int, block: int, index: int) -> str:
-    """Stable unique id for one request; also the prompt's uniqueness seed."""
+    """Stable unique id for one request. Keys the prompt HEADER, never the filler body."""
     return f"{bucket}-c{concurrency}-b{block}-i{index}"
 
 
-def build_prompt_text(uid: str, approximate_tokens: int) -> str:
+def corpus_seed(bucket: str, block: int, index: int) -> str:
+    """Seed for a prompt's filler BODY. Deliberately carries no concurrency.
+
+    ``request_uid`` must carry the concurrency point, because every request needs an id unique
+    across the whole cell. Seeding the body from that id too gave every concurrency point a
+    DIFFERENT corpus, so a curve varied the prompt text alongside the one variable it exists to
+    isolate. Two points then differed in offered load AND in which words were sent, and the tokenizer
+    does not treat every word stream identically.
+
+    Holding the body constant down the grid and letting only the per-request header differ leaves
+    concurrency as the sole difference between points, which is what the curve claims to show.
+    """
+    return f"{bucket}-b{block}-i{index}"
+
+
+def _prompt_header(uid: str) -> str:
+    """The per-request head of a prompt: a digest first, so character ZERO differs per request.
+
+    An earlier form led with ``f"trace {uid}"``, which shares its first ~24 characters across every
+    request in a bucket ("trace short_interactive-c4-b0-i" and so on). That shared run is shorter
+    than one vLLM cache block today, so it probably would not have been cached, but "probably
+    shorter than a block the current build happens to use" is not a property this benchmark should
+    rest on. Leading with the digest makes the divergence unconditional.
+    """
+    nonce = hashlib.sha256(uid.encode("utf-8")).hexdigest()[:16]
+    return f"{nonce} trace {uid}"
+
+
+def build_prompt_text(uid: str, approximate_tokens: int, *, corpus: str | None = None) -> str:
     """A request-unique prompt of roughly ``approximate_tokens`` tokens.
 
-    A per-request digest leads the text so character ZERO differs between requests. An earlier form
-    led with ``f"trace {uid}"``, which shares its first ~24 characters across every request in a
-    bucket ("trace short_interactive-c4-b0-i" and so on). That shared run is shorter than one vLLM
-    cache block today, so it probably would not have been cached, but "probably shorter than a block
-    the current build happens to use" is not a property this benchmark should rest on. Leading with
-    the digest makes the divergence unconditional.
+    ``corpus`` seeds the filler body and defaults to ``uid``. Pass a ``corpus_seed`` to hold the body
+    fixed across concurrency points while the header stays request-unique.
 
     The returned length is approximate; ``measure_prompt_tokens`` performs the exact fit against the
     real tokenizer and chat template.
     """
     # ~0.75 words per token for this vocabulary; the exact fit corrects the remainder.
     word_count = max(1, int(approximate_tokens * 0.75))
-    words = _deterministic_words(uid, word_count)
-    nonce = hashlib.sha256(uid.encode("utf-8")).hexdigest()[:16]
-    return f"{nonce} trace {uid}\n" + " ".join(words)
+    words = _deterministic_words(corpus or uid, word_count)
+    return _prompt_header(uid) + "\n" + " ".join(words)
 
 
-def messages_for(uid: str, approximate_tokens: int) -> list[dict[str, Any]]:
+def reseed_prompt(messages: list[dict[str, Any]], uid: str) -> list[dict[str, Any]]:
+    """Re-key an already-fitted prompt to a new request id WITHOUT re-tokenizing.
+
+    A cell can outrun its prompt pool while it waits on ``min_seconds``. Re-sending a pooled prompt
+    is not a cheap reuse: the engine serves it from prefix cache, ``_validate`` correctly marks it
+    ERROR_CACHE_CONTAMINATED, and so the FASTER a cell runs the more artificial error rate it
+    accumulates -- precisely inverting what the curve is meant to show.
+
+    Refitting on the fly is not the answer either. Fitting is repeated synchronous tokenization, and
+    on the event loop it blocks consumption of every other in-flight stream, which is the exact
+    distortion ``_build_prompt_pool`` exists to keep out of the measured window.
+
+    So the filler body is reused verbatim and only the header is rewritten. The header carries the
+    per-request digest, so the new prompt still diverges from every other at character ZERO and
+    cannot share a cache block. Its assembled length moves only by the header's own width, which
+    ``PROMPT_TOKEN_TOLERANCE`` accommodates.
+    """
+    reseeded: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, str):
+            reseeded.append(message)
+            continue
+        body = content.split("\n", 1)[1] if "\n" in content else ""
+        reseeded.append({**message, "content": _prompt_header(uid) + "\n" + body})
+    return reseeded
+
+
+def messages_for(
+    uid: str, approximate_tokens: int, *, corpus: str | None = None
+) -> list[dict[str, Any]]:
     """The chat messages for one request: a single user turn, no system prompt.
 
     No system prompt on purpose. A shared system prompt is the canonical prefix-cache hit, and it
     would be shared across every request in the run.
     """
-    return [{"role": "user", "content": build_prompt_text(uid, approximate_tokens)}]
+    return [{"role": "user", "content": build_prompt_text(uid, approximate_tokens, corpus=corpus)}]
 
 
 def measure_prompt_tokens(tokenizer: Any, messages: list[dict[str, Any]]) -> int:
@@ -200,7 +257,8 @@ def fit_prompt_to_tokens(
     uid: str,
     target_tokens: int,
     *,
-    tolerance: int = 16,
+    corpus: str | None = None,
+    tolerance: int = PROMPT_TOKEN_TOLERANCE,
     max_iterations: int = 12,
 ) -> tuple[list[dict[str, Any]], int]:
     """Binary-search a prompt whose ASSEMBLED length is within ``tolerance`` of ``target_tokens``.
@@ -212,7 +270,7 @@ def fit_prompt_to_tokens(
     best: tuple[list[dict[str, Any]], int] | None = None
     for _ in range(max_iterations):
         guess = (low + high) // 2
-        messages = messages_for(uid, guess)
+        messages = messages_for(uid, guess, corpus=corpus)
         actual = measure_prompt_tokens(tokenizer, messages)
         if best is None or abs(actual - target_tokens) < abs(best[1] - target_tokens):
             best = (messages, actual)
@@ -280,14 +338,17 @@ __all__ = [
     "BUCKETS_BY_NAME",
     "ENABLE_THINKING",
     "N_CHOICES",
+    "PROMPT_TOKEN_TOLERANCE",
     "TEMPERATURE",
     "TOP_P",
     "Bucket",
     "build_prompt_text",
     "concurrency_grid",
+    "corpus_seed",
     "fit_prompt_to_tokens",
     "measure_prompt_tokens",
     "messages_for",
     "request_uid",
+    "reseed_prompt",
     "workload_checksum",
 ]

@@ -248,6 +248,9 @@ async def _run_warmup(engine: Any, requests: int) -> dict[str, Any]:
             concurrency=1,
             block=0,
             origin=origin,
+            # The warmup is the gate that runs before any sweep, so it is the cheapest place to
+            # discover that the engine sizes prompts differently than the fitter does.
+            expected_prompt_tokens=exact,
         )
         out.append(record.to_json())
     return {"warmups": out, "assembled_prompt_tokens": exact}
@@ -363,8 +366,28 @@ def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, An
 # allocation. Deliberately generous: a reservation that overestimates stops a lane early, while one
 # that underestimates lets a lane overspend, and only the second failure costs money.
 ESTIMATED_CANARY_GPU_SECONDS = 1200.0
-ESTIMATED_SWEEP_GPU_SECONDS = 3600.0
+# One cold boot, amortized across a whole sweep because the boot dominates cost.
+ESTIMATED_BOOT_GPU_SECONDS = 1200.0
 MODES = ("canary", "sweep")
+
+
+def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
+    """Worst-case GPU-seconds for the selected buckets, from their own preregistered bounds.
+
+    Deliberately an UPPER bound. A reservation is a spending authorization, so it must be wrong in
+    the direction that refuses a run rather than the direction that overspends: every cell is priced
+    at its bucket's `max_seconds`, even though a cell that meets its floors early exits sooner.
+
+    The grid width comes from the engine's real `max_num_seqs`, so it tracks the catalog rather than
+    a hardcoded six.
+    """
+    from flash.serving.bench.catalog import bench_engine_overrides_for
+    from flash.serving.bench.workload import concurrency_grid
+
+    overrides = bench_engine_overrides_for(base_model)
+    points = len(list(concurrency_grid(int(overrides.get("max_num_seqs", 8)))))
+    measured = sum(float(bucket.max_seconds) * points for bucket in selected)
+    return ESTIMATED_BOOT_GPU_SECONDS + measured
 
 
 @app.local_entrypoint()
@@ -397,10 +420,27 @@ def main(
             "--ceiling-usd is required and must be positive: this entrypoint allocates a GPU, so "
             "it refuses to run against an unauthorized budget"
         )
+    # Submit-time, not on a rented GPU. `--bucket` is only indexed inside `run_bucket` on the
+    # remote side, so a typo used to pay for a full cold boot and warmup before failing with no
+    # measurement. Every argument that can be checked without a card is checked here.
+    selected = [b for b in BUCKETS if not bucket or b.name == bucket]
+    if bucket and not selected:
+        raise SystemExit(
+            f"unknown --bucket {bucket!r}; expected one of {', '.join(b.name for b in BUCKETS)}"
+        )
 
     expected_gpu = bench_gpu_for(base_model)
     ledger = BudgetLedger(ceiling_usd=ceiling_usd)
-    estimate = ESTIMATED_CANARY_GPU_SECONDS if mode == "canary" else ESTIMATED_SWEEP_GPU_SECONDS
+    # Reserve the WORST CASE of the work actually selected, not a flat per-mode constant. A sweep
+    # without `--bucket` runs every bucket, and each bucket's grid can burn `max_seconds` at every
+    # concurrency point; a single 3600s reservation let a campaign whose own preregistered bounds
+    # permit far more be accepted under a ceiling it cannot honour. The ceiling is only real if the
+    # reservation covers the whole campaign before the first remote call.
+    estimate = (
+        ESTIMATED_CANARY_GPU_SECONDS
+        if mode == "canary"
+        else _sweep_gpu_seconds_estimate(base_model, selected)
+    )
     # Raises BudgetExceeded rather than allocating. This is the line that makes the ceiling real.
     ledger.reserve(f"{mode}:{base_model}", estimate, expected_gpu)
 
@@ -431,9 +471,8 @@ def main(
 
     overrides = bench_engine_overrides_for(base_model)
     grid = list(concurrency_grid(int(overrides.get("max_num_seqs", 8))))
-    buckets = [bucket] if bucket else [b.name for b in BUCKETS]
     results = []
-    for name in buckets:
+    for name in [b.name for b in selected]:
         payload = engine.run_bucket.remote(name, grid, block)
         results.append(payload)
         _write_artifact(payload, f"sweep-{base_model.replace('/', '_')}-{name}-b{block}.json")
@@ -445,7 +484,9 @@ def main(
             "grid": grid,
             "engine_catalog": provenance,
             "workload_checksum": workload_checksum(),
-            "buckets": [payload["curve"] for payload in results],
+            "buckets": [
+                {"bucket": payload["bucket"], "curve": payload["curve"]} for payload in results
+            ],
             "budget": ledger.to_json(),
         },
         f"summary-{base_model.replace('/', '_')}-b{block}.json",

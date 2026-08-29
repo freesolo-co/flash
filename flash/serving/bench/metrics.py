@@ -33,6 +33,9 @@ ERROR_CACHE_UNVERIFIED = "cache_unverified"
 ERROR_PROVENANCE = "provenance_mismatch"
 ERROR_TOKEN_MISMATCH = "token_mismatch"
 ERROR_CONTEXT_OVERFLOW = "context_overflow"
+# The engine received a prompt whose length disagrees with what the fitter measured offline. Such a
+# request belongs to a different input-size bucket and must not be averaged into this one.
+ERROR_PROMPT_LENGTH = "prompt_length_mismatch"
 
 
 @dataclass
@@ -50,6 +53,9 @@ class RequestRecord:
     block: int
     # Monotonic seconds relative to the cell's start.
     started_at: float
+    # The assembled length the fitter measured for this prompt, checked against what the engine
+    # reports so a mis-sized prompt cannot be counted into the wrong bucket.
+    expected_prompt_tokens: int | None = None
     first_token_at: float | None = None
     finished_at: float | None = None
     prompt_tokens: int | None = None
@@ -137,10 +143,15 @@ class CellResult:
     bucket: str
     concurrency: int
     block: int
+    # The steady-state measurement window: the span over which `concurrency` requests were held in
+    # flight. Every rate below is per THIS second count, not per total elapsed time.
     wall_seconds: float
     attempted: int
     succeeded: int
     failed: int
+    # Teardown time after the window closed, at falling concurrency. Reported so a reader can see
+    # how much tail was excluded rather than having to trust that some was.
+    drain_seconds: float = 0.0
     error_breakdown: dict[str, int] = field(default_factory=dict)
     attempted_rps: float = 0.0
     successful_rps: float = 0.0
@@ -187,6 +198,7 @@ def reduce_cell(
     concurrency: int,
     block: int,
     wall_seconds: float,
+    drain_seconds: float = 0.0,
     sample_floor_p99: int = 400,
     max_error_rate: float = 0.01,
 ) -> CellResult:
@@ -224,6 +236,7 @@ def reduce_cell(
         concurrency=concurrency,
         block=block,
         wall_seconds=wall_seconds,
+        drain_seconds=drain_seconds,
         attempted=attempted,
         succeeded=len(successes),
         failed=len(failures),
@@ -335,6 +348,7 @@ __all__ = [
     "ERROR_MALFORMED_STREAM",
     "ERROR_MISSING_USAGE",
     "ERROR_NO_FINISH_REASON",
+    "ERROR_PROMPT_LENGTH",
     "ERROR_PROVENANCE",
     "ERROR_TIMEOUT",
     "ERROR_TOKEN_MISMATCH",

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections.abc import Callable
 from typing import Any
 
 from flash.serving.bench.metrics import (
@@ -26,6 +27,7 @@ from flash.serving.bench.metrics import (
     ERROR_MALFORMED_STREAM,
     ERROR_MISSING_USAGE,
     ERROR_NO_FINISH_REASON,
+    ERROR_PROMPT_LENGTH,
     ERROR_TIMEOUT,
     ERROR_TOKEN_MISMATCH,
     CellResult,
@@ -34,11 +36,14 @@ from flash.serving.bench.metrics import (
 )
 from flash.serving.bench.workload import (
     ENABLE_THINKING,
+    PROMPT_TOKEN_TOLERANCE,
     TEMPERATURE,
     TOP_P,
     Bucket,
+    corpus_seed,
     fit_prompt_to_tokens,
     request_uid,
+    reseed_prompt,
 )
 
 # A request that has produced nothing for this long is counted as a timeout rather than waited on.
@@ -186,6 +191,19 @@ def _validate(outcome: _StreamOutcome, record: RequestRecord) -> None:
         record.error = ERROR_MALFORMED_STREAM
         record.error_detail = "no content delta observed"
         return
+    # The fitter measured this prompt's assembled length offline; the engine reports what it
+    # actually received. A bucket claims a specific input size, so a request the engine sized
+    # differently belongs to a DIFFERENT bucket and must not be averaged into this one. The pooled
+    # prompts are reseeded per request, which moves the header but not the body, so the tolerance
+    # this compares against is the same one the fit was accepted under.
+    expected = record.expected_prompt_tokens
+    if expected is not None and abs(outcome.prompt_tokens - expected) > PROMPT_TOKEN_TOLERANCE:
+        record.error = ERROR_PROMPT_LENGTH
+        record.error_detail = (
+            f"engine reported {outcome.prompt_tokens} prompt tokens; fitted {expected} "
+            f"(tolerance {PROMPT_TOKEN_TOLERANCE})"
+        )
+        return
     record.ok = True
 
 
@@ -200,6 +218,7 @@ async def run_request(
     concurrency: int,
     block: int,
     origin: float,
+    expected_prompt_tokens: int | None = None,
 ) -> RequestRecord:
     """Issue one streamed request and return its evidence record. Never raises."""
     record = RequestRecord(
@@ -209,6 +228,7 @@ async def run_request(
         concurrency=concurrency,
         block=block,
         started_at=time.monotonic() - origin,
+        expected_prompt_tokens=expected_prompt_tokens,
     )
     outcome = _StreamOutcome()
     payload = _payload_for(base_model, messages, max_tokens, uid)
@@ -256,18 +276,121 @@ def _build_prompt_pool(
     """Fit every prompt the cell can need BEFORE the measured window opens.
 
     Each entry is request-unique from its first token, so no two requests share a prefix and the
-    engine's prefix cache cannot turn a measurement into a lookup. The pool is sized past the
-    request floor because a cell may overrun it while waiting on `min_seconds`; if it does wrap, it
-    reuses a prompt, and that reuse is caught by the cache-contamination check rather than passing
-    silently as a fast success.
+    engine's prefix cache cannot turn a measurement into a lookup.
+
+    The filler body is seeded WITHOUT the concurrency point (`corpus_seed`), so every point on a
+    curve sends the same corpus and differs only in offered load. The per-request header still
+    carries the uid digest, so requests remain mutually unique.
+
+    A cell can still outrun this pool while waiting on `min_seconds`, so the caller reseeds a pooled
+    prompt rather than re-sending it; see `reseed_prompt`. The pool is therefore sized for the depth
+    the cell is expected to need, not for a bound it is forbidden to exceed.
     """
     size = max(concurrency, min_requests + concurrency)
     pool: list[tuple[str, list[dict[str, Any]], int]] = []
     for index in range(size):
         uid = request_uid(bucket.name, concurrency, block, index)
-        messages, exact = fit_prompt_to_tokens(tokenizer, uid, bucket.target_input_tokens)
+        messages, exact = fit_prompt_to_tokens(
+            tokenizer,
+            uid,
+            bucket.target_input_tokens,
+            corpus=corpus_seed(bucket.name, block, index),
+        )
         pool.append((uid, messages, exact))
     return pool
+
+
+async def _drain(
+    in_flight: set[asyncio.Task[RequestRecord]],
+    *,
+    base_model: str,
+    bucket: str,
+    concurrency: int,
+    block: int,
+    spawned_at: dict[asyncio.Task[RequestRecord], float],
+    spawned_uid: dict[asyncio.Task[RequestRecord], str],
+) -> list[RequestRecord]:
+    """Let the still-in-flight requests finish, and return a record for every one of them.
+
+    Drain rather than abandon. Two reasons, and the ORDER matters:
+
+    1. An orphaned request keeps occupying the engine during the NEXT cell and contaminates it.
+    2. Cancelling first and awaiting second silently DELETES those requests from the attempt
+       denominator: `task.cancel()` raises CancelledError at the await point, the suppress swallows
+       it, and the append never runs. An overloaded cell then reports a cleaner error rate than it
+       earned, which is the exact direction a capacity claim must not err.
+
+    So issued work finishes on its own (each request carries its own REQUEST_TIMEOUT_SECONDS, so
+    this terminates) and every record is counted. Only a task still pending after that bound is
+    cancelled, and it is recorded as a timeout rather than dropped.
+    """
+    drained: list[RequestRecord] = []
+    done, still_pending = await asyncio.wait(in_flight, timeout=REQUEST_TIMEOUT_SECONDS)
+    for task in done:
+        with contextlib.suppress(asyncio.CancelledError):
+            drained.append(task.result())
+    for task in still_pending:
+        task.cancel()
+    for task in still_pending:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+        # `started_at` is REQUIRED and has no default. Omitting it raised TypeError here, which
+        # aborted the whole bucket and discarded every record accumulated during the expensive
+        # sweep -- the exact loss this drain exists to prevent. The task's own start offset is
+        # carried on the task so a drained record keeps its real origin.
+        drained.append(
+            RequestRecord(
+                uid=spawned_uid.get(task, f"drain-{id(task):x}"),
+                base_model=base_model,
+                bucket=bucket,
+                concurrency=concurrency,
+                block=block,
+                started_at=spawned_at.get(task, 0.0),
+                error=ERROR_TIMEOUT,
+                error_detail="request did not finish within the drain bound",
+            )
+        )
+    return drained
+
+
+def _prompt_issuer(
+    tokenizer: Any,
+    bucket: Bucket,
+    *,
+    concurrency: int,
+    block: int,
+    min_requests: int,
+) -> Callable[[], tuple[str, list[dict[str, Any]], int]]:
+    """Build the cell's whole prompt pool, and return a callable handing out one prompt per call.
+
+    Each call returns (uid, messages, fitted_length).
+
+    Past the end of the pool the prompt is RESEEDED, never reused. Re-sending a pooled prompt would
+    hit the engine's prefix cache, which `_validate` correctly rejects as ERROR_CACHE_CONTAMINATED
+    -- so a cell that ran FASTER, and therefore wrapped, would earn an error rate for being fast.
+    Reseeding rewrites only the per-request header, so the new prompt diverges at character zero
+    without paying for tokenization inside the measured window.
+    """
+    pool = _build_prompt_pool(
+        tokenizer,
+        bucket,
+        concurrency=concurrency,
+        block=block,
+        min_requests=min_requests,
+    )
+    issued = 0
+
+    def _next_prompt() -> tuple[str, list[dict[str, Any]], int]:
+        nonlocal issued
+        index = issued
+        issued += 1
+        uid, messages, exact = pool[index % len(pool)]
+        if index < len(pool):
+            return uid, messages, exact
+        wrapped_uid = request_uid(bucket.name, concurrency, block, index)
+        return wrapped_uid, reseed_prompt(messages, wrapped_uid), exact
+
+    return _next_prompt
 
 
 async def run_cell(
@@ -304,27 +427,16 @@ async def run_cell(
     # replacement fit blocks consumption of the OTHER in-flight streams, inflating their TTFT and
     # latency. At 8k and 31k input that distortion is larger than the effect being measured. So the
     # whole pool is built BEFORE the clock starts, and the measured loop only pops from it.
-    pool = _build_prompt_pool(
-        tokenizer,
-        bucket,
-        concurrency=concurrency,
-        block=block,
-        min_requests=min_requests,
+    _next_prompt = _prompt_issuer(
+        tokenizer, bucket, concurrency=concurrency, block=block, min_requests=min_requests
     )
-    issued = 0
-
-    def _next_prompt() -> tuple[str, list[dict[str, Any]], int]:
-        nonlocal issued
-        uid, messages, exact = pool[issued % len(pool)]
-        issued += 1
-        return uid, messages, exact
 
     origin = time.monotonic()
     spawned_at: dict[asyncio.Task[RequestRecord], float] = {}
     spawned_uid: dict[asyncio.Task[RequestRecord], str] = {}
 
     def _spawn() -> asyncio.Task[RequestRecord]:
-        uid, messages, _ = _next_prompt()
+        uid, messages, exact = _next_prompt()
         started_at = time.monotonic() - origin
         task = asyncio.create_task(
             run_request(
@@ -337,6 +449,7 @@ async def run_cell(
                 concurrency=concurrency,
                 block=block,
                 origin=origin,
+                expected_prompt_tokens=exact,
             )
         )
         spawned_at[task] = started_at
@@ -344,9 +457,21 @@ async def run_cell(
         return task
 
     in_flight = {_spawn() for _ in range(concurrency)}
+    # Set when the steady-state window closes, BEFORE draining. See the wall-clock note below.
+    measured_seconds: float | None = None
     try:
         while True:
-            done, pending = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+            # Bounded by the cell's own remaining time. An unbounded wait returns only when a request
+            # completes, so `max_seconds` could not bind: a cell whose requests all stalled -- the
+            # exact shape of an overloaded engine -- sat until every request hit its individual
+            # 900s timeout instead of stopping at the bucket's bound. `max_seconds` is what keeps a
+            # degenerate cell from spending the sweep's whole budget.
+            remaining = max_seconds - (time.monotonic() - origin)
+            if remaining <= 0:
+                break
+            done, pending = await asyncio.wait(
+                in_flight, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
             in_flight = set(pending)
             records.extend(task.result() for task in done)
             elapsed = time.monotonic() - origin
@@ -356,6 +481,9 @@ async def run_cell(
             for _ in done:
                 in_flight.add(_spawn())
     finally:
+        # The measured window ends HERE, with `concurrency` requests still in flight. Everything
+        # after this point is teardown at falling load.
+        measured_seconds = time.monotonic() - origin
         # Drain rather than abandon. Two reasons, and the ORDER matters:
         #
         # 1. An orphaned request keeps occupying the engine during the NEXT cell and contaminates it.
@@ -368,40 +496,39 @@ async def run_cell(
         # REQUEST_TIMEOUT_SECONDS, so this terminates) and count every record. Only a task still
         # pending after that bound is cancelled, and it is recorded as a timeout rather than dropped.
         if in_flight:
-            done, still_pending = await asyncio.wait(in_flight, timeout=REQUEST_TIMEOUT_SECONDS)
-            for task in done:
-                with contextlib.suppress(asyncio.CancelledError):
-                    records.append(task.result())
-            for task in still_pending:
-                task.cancel()
-            for task in still_pending:
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-                # `started_at` is REQUIRED and has no default. Omitting it raised TypeError here,
-                # which aborted the whole bucket and discarded every record accumulated during the
-                # expensive sweep -- the exact loss this drain exists to prevent. The task's own
-                # start offset is carried on the task so a drained record keeps its real origin.
-                records.append(
-                    RequestRecord(
-                        uid=spawned_uid.get(task, f"drain-{id(task):x}"),
-                        base_model=base_model,
-                        bucket=bucket.name,
-                        concurrency=concurrency,
-                        block=block,
-                        started_at=spawned_at.get(task, 0.0),
-                        error=ERROR_TIMEOUT,
-                        error_detail="request did not finish within the drain bound",
-                    )
+            records.extend(
+                await _drain(
+                    in_flight,
+                    base_model=base_model,
+                    bucket=bucket.name,
+                    concurrency=concurrency,
+                    block=block,
+                    spawned_at=spawned_at,
+                    spawned_uid=spawned_uid,
                 )
+            )
 
-    wall_seconds = time.monotonic() - origin
+    # Rates are divided by the STEADY-STATE window, not by wall time including the drain.
+    #
+    # The drain runs at falling concurrency: no request is replaced, so the last one finishes alone
+    # on an otherwise idle engine. Counting that tail in the denominator divides steady-state work by
+    # steady-state-plus-idle time and understates every rate. The bias is worst exactly where the
+    # numbers matter most -- a near-32k cell can drain for minutes after a 60s window -- and it grows
+    # with concurrency, so it would bend the curve downward at the high end and manufacture a knee
+    # that the engine does not have.
+    #
+    # Drained records are still COUNTED. They belong in the attempt denominator and the error
+    # breakdown; it is only the time axis that stops at the window.
+    total_seconds = time.monotonic() - origin
+    window_seconds = measured_seconds if measured_seconds else total_seconds
     result = reduce_cell(
         records,
         base_model=base_model,
         bucket=bucket.name,
         concurrency=concurrency,
         block=block,
-        wall_seconds=wall_seconds,
+        wall_seconds=window_seconds,
+        drain_seconds=total_seconds - window_seconds,
     )
     return result, records
 

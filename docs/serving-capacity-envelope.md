@@ -153,9 +153,16 @@ model/tokenizer/processor provenance, and 32768 configured context runs before a
 teardown is confirmed after each model:
 
 ```
-modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary
-modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep --bucket short_interactive
+modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary --ceiling-usd 3
+modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep --bucket short_interactive --ceiling-usd 5
 ```
+
+`--ceiling-usd` is required and has no default: both commands allocate a GPU, and a spend ceiling
+that a caller can forget to pass is not a ceiling. The entrypoint reserves the lane's worst-case
+GPU-seconds against it and raises `BudgetExceeded` BEFORE allocating, so a ceiling below the lane's
+own cost refuses the run rather than discovering the overrun partway through. The values above are
+per-invocation ceilings for a 9B L40S lane; a larger model or a wider bucket selection needs a
+correspondingly larger one.
 
 The boot dominates cost (~960s of ~1000s per cell in a prior campaign), so one boot runs a whole
 bucket's concurrency grid rather than one cell. `budget.py` reserves before allocation and raises

@@ -16,6 +16,7 @@ import re
 import tomllib
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -37,6 +38,8 @@ from flash.serving.bench.catalog import (
 from flash.serving.bench.driver import (
     REQUEST_TIMEOUT_SECONDS,
     _build_prompt_pool,
+    _drain,
+    _prompt_issuer,
     _StreamOutcome,
     _validate,
     base_model_record,
@@ -45,6 +48,7 @@ from flash.serving.bench.driver import (
 from flash.serving.bench.metrics import (
     ERROR_CACHE_CONTAMINATED,
     ERROR_CACHE_UNVERIFIED,
+    ERROR_PROMPT_LENGTH,
     ERROR_TIMEOUT,
     CellResult,
     RequestRecord,
@@ -58,10 +62,12 @@ from flash.serving.bench.workload import (
     BUCKETS,
     BUCKETS_BY_NAME,
     ENABLE_THINKING,
+    PROMPT_TOKEN_TOLERANCE,
     TEMPERATURE,
     build_prompt_text,
     concurrency_grid,
     request_uid,
+    reseed_prompt,
     workload_checksum,
 )
 from flash.serving.src.engine.model_config import SERVING_MODELS, gpu_for
@@ -778,14 +784,15 @@ def test_the_drain_counts_unfinished_requests_instead_of_dropping_them() -> None
     runs -- so an overloaded cell reports a CLEANER error rate than it earned. That is the one
     direction a capacity claim must never err in.
     """
-    source = inspect.getsource(run_cell)
-    drain = source.split("if in_flight:")[-1]
+    # `run_cell` delegates the drain to `_drain`, and calls it inside its `finally`.
+    assert "_drain(" in inspect.getsource(run_cell), "run_cell no longer drains"
+    drain = inspect.getsource(_drain)
     assert "timeout=REQUEST_TIMEOUT_SECONDS" in drain, "the drain must be bounded, not unbounded"
     assert "still_pending" in drain
     assert "ERROR_TIMEOUT" in drain, "a cancelled request must be RECORDED as a timeout"
     # The record is appended after the cancel, outside the suppress that swallows CancelledError.
     cancel_at = drain.index("task.cancel()")
-    append_at = drain.index("records.append", cancel_at)
+    append_at = drain.index("drained.append", cancel_at)
     assert append_at > cancel_at
 
 
@@ -881,8 +888,7 @@ def test_a_drained_request_records_a_timeout_instead_of_raising() -> None:
     """The drain fallback must CONSTRUCT. `started_at` is required and has no default, so omitting
     it raised TypeError here, aborting the bucket and discarding every record of an expensive
     sweep -- the exact loss the drain exists to prevent."""
-    source = inspect.getsource(run_cell)
-    drain = source.split("if in_flight:")[-1]
+    drain = inspect.getsource(_drain)
     assert "started_at=" in drain, "drain builds RequestRecord without its required started_at"
 
     required = {
@@ -911,34 +917,101 @@ def test_a_drained_request_records_a_timeout_instead_of_raising() -> None:
 def test_prompts_are_fitted_before_the_clock_starts() -> None:
     """Fitting is repeated synchronous tokenization. On the event loop it blocks other in-flight
     streams and inflates their TTFT, which at 31k input exceeds the effect being measured."""
+    # `run_cell` builds the pool through `_prompt_issuer`, which fits every prompt eagerly and
+    # returns a callable that only pops. The ordering assertion is against run_cell; the "no fitting
+    # after the clock starts" assertion has to cover both, since the pop lives in the helper.
     source = inspect.getsource(run_cell)
-    pool_at = source.index("_build_prompt_pool(")
+    pool_at = source.index("_prompt_issuer(")
     origin_at = source.index("origin = time.monotonic()")
     assert pool_at < origin_at, "prompt pool must be built before the measured window opens"
     assert "fit_prompt_to_tokens" not in source[origin_at:], "fitting leaked into the measured loop"
 
+    issuer = inspect.getsource(_prompt_issuer)
+    handout = issuer[issuer.index("def _next_prompt") :]
+    assert "fit_prompt_to_tokens" not in handout, "fitting leaked into the per-request hand-out"
 
-def test_the_prompt_pool_covers_the_cells_request_floor() -> None:
-    """A pool shorter than the floor would wrap and re-send a prompt, which the engine's prefix
-    cache turns into a lookup rather than a measurement."""
-    fitted: list[str] = []
 
-    def fake_fit(_tokenizer: object, uid: str, target: int) -> tuple[list[dict[str, str]], int]:
-        fitted.append(uid)
-        return [{"role": "user", "content": uid}], target
+def _fake_pool(concurrency: int, block: int = 0) -> tuple[list[Any], list[tuple[str, str | None]]]:
+    """Build a pool with the fitter stubbed; returns the pool and the (uid, corpus) calls made."""
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_fit(
+        _tokenizer: object, uid: str, target: int, *, corpus: str | None = None, **_kw: object
+    ) -> tuple[list[dict[str, str]], int]:
+        calls.append((uid, corpus))
+        # Mirror the real prompt's shape: a per-request header line, then the corpus-seeded body.
+        return [{"role": "user", "content": f"{uid}\nbody-{corpus}"}], target
 
     bucket = BUCKETS_BY_NAME["short_interactive"]
     with mock.patch("flash.serving.bench.driver.fit_prompt_to_tokens", fake_fit):
         pool = _build_prompt_pool(
-            object(), bucket, concurrency=8, block=0, min_requests=bucket.min_requests
+            object(),
+            bucket,
+            concurrency=concurrency,
+            block=block,
+            min_requests=bucket.min_requests,
         )
+    return pool, calls
+
+
+def test_the_prompt_pool_covers_the_cells_request_floor() -> None:
+    """A pool shorter than the floor would wrap more often, and every wrap must be reseeded."""
+    bucket = BUCKETS_BY_NAME["short_interactive"]
+    pool, calls = _fake_pool(concurrency=8)
     assert len(pool) >= bucket.min_requests
     uids = [uid for uid, _, _ in pool]
     # Compare the sorted list to its deduplicated form rather than only counting: a length check
     # alone reads clean when a uid is MISSING and another is duplicated, which is the exact shape a
     # broken index would produce.
     assert sorted(uids) == sorted({*uids}), "pool contains duplicate prompts"
-    assert len(fitted) == len(pool)
+    assert len(calls) == len(pool)
+
+
+def test_the_filler_corpus_is_held_constant_across_concurrency_points() -> None:
+    """A curve must vary offered load and NOTHING else.
+
+    Seeding the prompt body from `request_uid` gave every concurrency point a different corpus, so
+    two points on one curve differed in load AND in which words were sent. The body is now seeded
+    from `corpus_seed`, which carries no concurrency.
+    """
+    _, low = _fake_pool(concurrency=2)
+    _, high = _fake_pool(concurrency=16)
+
+    low_corpora = [corpus for _, corpus in low]
+    high_corpora = [corpus for _, corpus in high]
+    shared = min(len(low_corpora), len(high_corpora))
+    assert low_corpora[:shared] == high_corpora[:shared], (
+        "the filler corpus changed with concurrency, so the curve varies more than load"
+    )
+    # The uids still carry it, because a request needs an id unique across the whole cell.
+    assert [uid for uid, _ in low][:shared] != [uid for uid, _ in high][:shared]
+    for _, corpus in low:
+        assert corpus is not None
+        assert "-c" not in corpus, f"corpus seed leaked a concurrency point: {corpus!r}"
+
+
+def test_a_cell_that_outruns_its_pool_reseeds_instead_of_reusing_a_prompt() -> None:
+    """Re-sending a pooled prompt is served from prefix cache, which `_validate` marks
+    ERROR_CACHE_CONTAMINATED -- so the FASTER a cell ran, the more error rate it would earn."""
+    pool, _ = _fake_pool(concurrency=4)
+    first_uid, first_messages, _ = pool[0]
+
+    wrapped_uid = request_uid("short_interactive", 4, 0, len(pool))
+    reseeded = reseed_prompt(first_messages, wrapped_uid)
+
+    original = first_messages[0]["content"]
+    rewritten = reseeded[0]["content"]
+    assert rewritten != original, "reseeding produced the identical prompt"
+    assert rewritten[0] != original[0], "prompts must diverge at character ZERO, not later"
+    # The body is reused verbatim: reseeding must not re-tokenize inside the measured window.
+    assert rewritten.split("\n", 1)[1] == original.split("\n", 1)[1]
+    assert first_uid not in rewritten, "the reseeded prompt still carries the original request id"
+
+    # And the driver actually takes this path rather than merely being able to.
+    issuer = inspect.getsource(_prompt_issuer)
+    nxt = issuer[issuer.index("def _next_prompt") :]
+    assert "reseed_prompt(" in nxt, "the wrap path re-sends a pooled prompt instead of reseeding it"
+    assert "_prompt_issuer(" in inspect.getsource(run_cell), "run_cell bypasses the issuer"
 
 
 def test_no_ttfa_is_published_because_the_raw_stream_cannot_measure_it() -> None:
@@ -1112,3 +1185,235 @@ def test_the_gpu_identity_gate_refuses_to_pass_when_the_probe_cannot_read_a_devi
     assert gpu_matches({"gpu": {"name": "NVIDIA H200 141GB HBM3e"}}, "H200") is True
     # Substring match would make this true; token match must reject it.
     assert gpu_matches({"gpu": {"name": "NVIDIA L40S"}}, "L4") is False
+
+
+# ── round-2: the measured window, its bound, and what is counted into it ──────────────────────
+
+
+def test_the_cell_wait_is_bounded_so_max_seconds_can_actually_bind() -> None:
+    """An unbounded `asyncio.wait` returns only when a request COMPLETES.
+
+    A cell whose requests all stall -- the exact shape of an overloaded engine, which is the
+    interesting end of the curve -- would then sit until every request hit its individual 900s
+    timeout, ignoring the bucket's `max_seconds` entirely. At three buckets times six concurrency
+    points that is the difference between a bounded sweep and one that outruns its budget.
+    """
+    source = inspect.getsource(run_cell)
+    loop = source[source.index("in_flight = {_spawn()") : source.index("finally:")]
+    wait_call = loop[loop.index("await asyncio.wait(") :]
+    assert "timeout=" in wait_call[: wait_call.index(")")], (
+        "the steady-state wait is unbounded, so max_seconds cannot bind"
+    )
+    assert "remaining" in loop, "the wait bound is not the cell's remaining time"
+    assert "max_seconds - (" in loop, "the wait bound must derive from max_seconds, not a constant"
+
+
+class _SlowEngine:
+    """Fake engine whose requests take `delay` seconds and stream one valid, uncached response."""
+
+    def __init__(self, delay: float, prompt_tokens: int) -> None:
+        self.delay = delay
+        self.prompt_tokens = prompt_tokens
+
+    async def _stream_generate(
+        self, _payload: Any, _forwarded: Any, _lora: Any, _generation_id: Any
+    ) -> Any:
+        await asyncio.sleep(self.delay)
+        usage = {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": 4,
+            "cached_tokens": 0,
+            "cached_tokens_reported": True,
+        }
+        yield {"type": "delta", "text": "a", **usage}
+        yield {"type": "choice_finished", "finish_reason": "stop", **usage}
+        yield {"type": "final", **usage}
+
+
+async def _run_draining_cell() -> Any:
+    """One cell whose `max_seconds` expires while every request is still in flight.
+
+    The window must therefore close at ~`max_seconds` and the drain must run AFTER it, so
+    `wall_seconds + drain_seconds` is the full wall time and `wall_seconds` alone is the window.
+    """
+    bucket = replace(
+        BUCKETS_BY_NAME["short_interactive"],
+        min_seconds=0.05,
+        min_requests=1,
+        max_seconds=0.1,
+    )
+    pool, _ = _fake_pool(concurrency=2)
+    engine = _SlowEngine(delay=0.45, prompt_tokens=bucket.target_input_tokens)
+    with mock.patch("flash.serving.bench.driver._build_prompt_pool", return_value=pool):
+        return await run_cell(engine, object(), "m", bucket, concurrency=2, block=0)
+
+
+def test_throughput_excludes_the_drain_tail_but_still_counts_its_records() -> None:
+    """The drain runs at FALLING concurrency: the last request finishes alone on an idle engine.
+
+    Dividing steady-state work by steady-state-plus-idle time understates every rate, and the bias
+    grows with concurrency -- which would bend the curve down at the high end and manufacture a knee
+    the engine does not have. The records still belong in the denominator of the ERROR rate.
+
+    Driven behaviorally rather than by reading the source: a source-text assertion still passes
+    when `window_seconds` is reassigned to the full wall clock further down.
+    """
+    result, records = asyncio.run(_run_draining_cell())
+
+    # Every request outlives the window, so the entire cell is drain.
+    assert result.wall_seconds < 0.4, (
+        f"the measured window ({result.wall_seconds:.3f}s) swallowed the drain tail"
+    )
+    assert result.drain_seconds > 0.2, "the drain was not accounted for separately"
+    # Drained records still count as attempts -- dropping them would flatter the error rate.
+    assert len(records) == 2
+    assert result.attempted == 2
+
+
+def test_rates_divide_by_the_window_while_the_error_rate_divides_by_every_attempt() -> None:
+    """Arithmetic, not structure: a drained failure must lower nothing but the success rate."""
+    records = [
+        RequestRecord(
+            uid=f"r{i}",
+            base_model="m",
+            bucket="b",
+            concurrency=4,
+            block=0,
+            started_at=0.0,
+            finished_at=1.0,
+            first_token_at=0.1,
+            prompt_tokens=100,
+            completion_tokens=50,
+            cached_tokens=0,
+            cached_tokens_reported=True,
+            finish_reason="stop",
+            ok=True,
+        )
+        for i in range(8)
+    ]
+    records.append(
+        RequestRecord(
+            uid="drained",
+            base_model="m",
+            bucket="b",
+            concurrency=4,
+            block=0,
+            started_at=9.0,
+            error=ERROR_TIMEOUT,
+        )
+    )
+    cell = reduce_cell(
+        records,
+        base_model="m",
+        bucket="b",
+        concurrency=4,
+        block=0,
+        wall_seconds=10.0,
+        drain_seconds=40.0,
+    )
+    # 8 successes over the 10s WINDOW, not over the 50s that includes the drain.
+    assert cell.successful_rps == pytest.approx(0.8)
+    assert cell.output_tokens_per_second == pytest.approx(40.0)
+    assert cell.drain_seconds == pytest.approx(40.0)
+    # The drained request is an attempt and a failure.
+    assert cell.attempted == 9
+    assert cell.failed == 1
+    assert cell.error_rate == pytest.approx(1 / 9)
+
+
+def test_a_prompt_the_engine_sized_differently_is_rejected_not_averaged_in() -> None:
+    """A bucket claims a specific input size. A request the engine sized differently belongs to a
+    different bucket, so counting it would silently widen the shape the numbers describe."""
+    record = RequestRecord(
+        uid="u",
+        base_model="m",
+        bucket="near_32k",
+        concurrency=1,
+        block=0,
+        started_at=0.0,
+        expected_prompt_tokens=31744,
+    )
+    outcome = _StreamOutcome()
+    outcome.saw_final = True
+    outcome.finish_reason = "stop"
+    outcome.prompt_tokens = 512
+    outcome.completion_tokens = 64
+    outcome.cached_tokens = 0
+    outcome.cached_tokens_reported = True
+    outcome.first_token_at = 0.1
+    _validate(outcome, record)
+    assert record.ok is False
+    assert record.error == ERROR_PROMPT_LENGTH
+
+    # Inside the fitter's own tolerance it passes: the check must not be stricter than the fit.
+    ok_record = replace(record, error=None, error_detail=None, ok=False)
+    outcome.prompt_tokens = 31744 + PROMPT_TOKEN_TOLERANCE
+    _validate(outcome, ok_record)
+    assert ok_record.ok is True
+
+    # And the driver actually supplies the expectation rather than discarding it.
+    source = inspect.getsource(run_cell)
+    assert "expected_prompt_tokens=exact" in source, "the fitted length is discarded at spawn"
+
+
+def test_the_reservation_prices_a_sweep_from_its_buckets_own_bounds() -> None:
+    """A flat estimate under-reserves a wide sweep, so the ceiling would be checked against a number
+    unrelated to what the run can actually spend. The reservation must be an UPPER bound."""
+    source = BENCH_APP.read_text(encoding="utf-8")
+    assert "_sweep_gpu_seconds_estimate" in source
+    assert "ESTIMATED_SWEEP_GPU_SECONDS" not in source, "the flat sweep estimate is still in use"
+    fn = source[source.index("def _sweep_gpu_seconds_estimate") :]
+    fn = fn[: fn.index("\n\n\n")]
+    assert "max_seconds" in fn, "cells must be priced at their bucket's worst case"
+    assert "concurrency_grid" in fn, "the grid width must come from the engine, not a constant"
+
+
+def test_an_unknown_bucket_is_rejected_before_a_gpu_is_rented() -> None:
+    """`--bucket` was only indexed on the remote side, so a typo paid for a full cold boot and
+    warmup before failing with no measurement. Everything checkable without a card is checked here.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    main = source[source.index("def main(") :]
+    guard = main.index("unknown --bucket")
+    # The guard must precede every remote call, i.e. every place a GPU can be allocated.
+    for remote in (".remote(", "_run_canary(", "_run_bucket("):
+        first = main.find(remote)
+        if first != -1:
+            assert guard < first, f"the bucket guard runs after {remote}, which allocates a GPU"
+
+
+def test_the_documented_paid_commands_pass_the_required_ceiling() -> None:
+    """`--ceiling-usd` is required and has no default, so a documented command missing it fails at
+    the point a reader has already decided to spend money."""
+    doc = (REPO_ROOT / "docs" / "serving-capacity-envelope.md").read_text(encoding="utf-8")
+    commands = [
+        line for line in doc.splitlines() if line.startswith("modal run scripts/bench_hosted")
+    ]
+    assert commands, "the doc no longer shows a paid command"
+    for command in commands:
+        assert "--ceiling-usd" in command, f"documented paid command omits the ceiling: {command}"
+
+
+def test_the_summary_artifact_names_which_bucket_each_curve_came_from() -> None:
+    """A list of curves without their bucket names is unreadable once more than one bucket runs."""
+    # Parsed, not sliced: `{"bucket": payload["bucket"], ...}` contains both `]` and `],` inside
+    # itself, so every string-slice boundary lands in the middle of a subscript.
+    #
+    # Anchored on the "buckets" key's own VALUE. A bare walk for any dict carrying both keys also
+    # matches the per-bucket payload built earlier in that file, so it stayed green even when the
+    # summary itself dropped the label.
+    tree = ast.parse(BENCH_APP.read_text(encoding="utf-8"))
+    values = [
+        value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        for key, value in zip(node.keys, node.values, strict=True)
+        if isinstance(key, ast.Constant) and key.value == "buckets"
+    ]
+    assert len(values) == 1, f"expected exactly one 'buckets' summary entry, found {len(values)}"
+    element = values[0]
+    assert isinstance(element, ast.ListComp), "the summary's buckets entry is not a comprehension"
+    assert isinstance(element.elt, ast.Dict), "each summary entry must be a labelled dict"
+    keys = {k.value for k in element.elt.keys if isinstance(k, ast.Constant)}
+    assert "bucket" in keys, "the summary emits curves with no bucket label"
+    assert "curve" in keys, "the summary dropped the curve alongside its label"
