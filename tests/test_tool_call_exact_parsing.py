@@ -1419,10 +1419,19 @@ def test_repeated_fake_continuation_work_is_linear_without_prefix_materializatio
     counting invocations alone would certify a parser that makes ``2n`` calls while each
     one scans an ``O(n)`` suffix, so the aggregate distance every ``find`` actually
     traverses is what gets measured here.
+
+    both bounds observe the module-level ``_find_parameter_end`` alias, so a rescan that
+    called ``str.find`` directly would stay invisible to them. reroute the scan through the
+    alias rather than loosening these assertions if that ever becomes reachable.
     """
     originals = {
         name: getattr(tool_calls_module, name)
-        for name in ("_materialize_span", "_coerce_value", "_validate_value")
+        for name in (
+            "_materialize_span",
+            "_coerce_value",
+            "_validate_value",
+            "_parse_parameter_value",
+        )
     }
     counters = dict.fromkeys(originals, 0)
 
@@ -1437,11 +1446,13 @@ def test_repeated_fake_continuation_work_is_linear_without_prefix_materializatio
         monkeypatch.setattr(tool_calls_module, name, counted(name))
 
     find_parameter_end = tool_calls_module._find_parameter_end
-    scanned = {"distance": 0}
+    scanned = {"distance": 0, "finds": 0}
 
     def measured_find(text, needle, start):
         found = find_parameter_end(text, needle, start)
-        scanned["distance"] += len(text) - start if found < 0 else found - start
+        # a match reads the needle it matched, and a miss reads to the end of the text.
+        scanned["distance"] += len(text) - start if found < 0 else found - start + len(needle)
+        scanned["finds"] += 1
         return found
 
     monkeypatch.setattr(tool_calls_module, "_find_parameter_end", measured_find)
@@ -1449,7 +1460,7 @@ def test_repeated_fake_continuation_work_is_linear_without_prefix_materializatio
     measurements = {}
     for repeats in (32, 64, 128, 256):
         counters.update(dict.fromkeys(counters, 0))
-        scanned["distance"] = 0
+        scanned.update({"distance": 0, "finds": 0})
         tools, text, _fake = _repeated_fake_continuation_case(repeats)
         result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
         assert result.content == text
@@ -1459,19 +1470,21 @@ def test_repeated_fake_continuation_work_is_linear_without_prefix_materializatio
         assert counters["_coerce_value"] == 0
         assert counters["_materialize_span"] == 0
         assert counters["_validate_value"] == 0
-        measurements[repeats] = (scanned["distance"], len(text))
+        calls = scanned["finds"] + counters["_parse_parameter_value"]
+        measurements[repeats] = (scanned["distance"], len(text), calls)
 
     # the growth bound is stated against input characters, not repeat count: a repeat carries
     # a long value, so doubling the repeats multiplies the text by 1.96 to 2.02 rather than
-    # by two. measured through width 16384, characters read per input character converge from
-    # 0.664 to 0.721 and each step multiplies the distance by 2.01 to 2.04, so both bounds
-    # hold with headroom as the fixture grows. 2.1 is what makes the ratio load-bearing: an
-    # ``L * log L`` scan over these same lengths grows by 2.12 to 2.16, which a looser
-    # threshold reads as linear, and ``L ** 1.5`` grows by 2.75 to 2.86.
-    for distance, length in measurements.values():
+    # by two. the scan reads ``len(text) - 129`` characters at every width here, and 2.1 is
+    # what makes the ratio load-bearing: an ``L * log L`` scan over these lengths grows by
+    # 2.12 to 2.16, which a looser threshold reads as linear, and ``L ** 1.5`` by 2.75 to
+    # 2.86. distance alone would still miss a rescan that repeats work without moving the
+    # endpoint it returns, so the number of boundary calls is bounded next to it.
+    for distance, length, _calls in measurements.values():
         assert distance <= length
     for narrower, wider in pairwise(sorted(measurements)):
         assert measurements[wider][0] <= 2.1 * measurements[narrower][0]
+        assert measurements[wider][2] <= 2.1 * measurements[narrower][2]
 
 
 _REVIEWED_OWNERSHIP_CASES = [
@@ -1632,14 +1645,20 @@ def test_recursion_during_classification_falls_back_to_exact_text(monkeypatch) -
     assert result.calls == ()
     assert calls["count"] > 0
 
+    buffered_calls = calls["count"]
     parser = ToolCallStreamParser(tools, id_factory=lambda: "call_fixed")
     assert parser.feed(text) == ""
     streamed = parser.finish()
     assert streamed.content == text
     assert streamed.calls == ()
+    # the streamed subcase has to reach classification too, or it would pass just as well
+    # against a finish() that returned exact text without ever descending.
+    assert calls["count"] > buffered_calls
 
-    # a candidate that exhausted the stack must not leave the parser unable to classify the
-    # next one, so the same input parses normally again once the descent succeeds.
+    # the injected failure raises before touching anything, so this only confirms the fixture
+    # and the patch are restored, not that a genuine stack exhaustion leaves no residue. the
+    # real evidence for that is structural: `work` is the only caller-owned object mutated
+    # before the descent, and both callers discard it when `_EXHAUSTED` comes back.
     monkeypatch.setattr(tool_calls_module, "_parse_parameters", original)
     assert parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed").calls != ()
 
