@@ -5,7 +5,7 @@ cannot run. The figures below are worst-case RESERVATIONS, deliberately far abov
 and each also clears the 80% submission stop ``reserve`` enforces -- see
 docs/serving-capacity-envelope.md):
     modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary \
-        --ceiling-usd 6
+        --ceiling-usd 7
     modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep \
         --bucket short_interactive --ceiling-usd 16
 
@@ -38,6 +38,7 @@ serving stack rather than a benchmark-only reimplementation.
 
 import json
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -477,8 +478,15 @@ def _canary_gpu_seconds_estimate() -> float:
     `CANARY_WARMUP_REQUESTS` SEQUENTIAL warmups each of which the driver allows to run to
     `REQUEST_TIMEOUT_SECONDS`. Reserving less accepts a ceiling the lane's own bounds permit it to
     exceed, which is precisely what `BudgetLedger` exists to prevent.
+
+    The canary itself makes TWO remote calls -- `probe.remote()` then `warmup.remote()` -- and
+    `max_containers=1` caps simultaneous replicas without binding successive calls to one container.
+    So the warmup can land on a replacement that pays its own cold boot, exactly the case
+    `_ensure_warm` exists to handle on the sweep side. Both boots are reserved here; the warmup
+    requests are counted once because a replacement runs the same five, not a second set.
     """
-    return float(STARTUP_TIMEOUT_SECONDS) + REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS
+    calls = 2
+    return float(STARTUP_TIMEOUT_SECONDS) * calls + REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS
 
 
 def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
@@ -573,7 +581,13 @@ def main(
         else _sweep_gpu_seconds_estimate(base_model, selected)
     )
     # Raises BudgetExceeded rather than allocating. This is the line that makes the ceiling real.
-    ledger.reserve(f"{mode}:{base_model}", estimate, expected_gpu)
+    entry = ledger.reserve(f"{mode}:{base_model}", estimate, expected_gpu)
+    # The reservation is the WORST CASE, deliberately generous. Publishing it as the cost would
+    # overstate every campaign by the margin that makes the ceiling safe, so the lane is settled
+    # against measured wall time before the artifact is written and `settled_usd` replaces the
+    # reservation in `committed_usd`. Billing starts at the first remote call, so the clock starts
+    # here rather than at process start, which would bill local argument checking.
+    lane_started = time.monotonic()
 
     catalog = {row["base_model"]: row for row in bench_catalog_summary()}
     # The resolved engine shape travels WITH the numbers. Without it a published capacity figure
@@ -585,6 +599,7 @@ def main(
     gate = _run_canary(base_model, engine, expected_gpu)
 
     if mode == "canary":
+        ledger.settle(entry, time.monotonic() - lane_started, note="measured canary wall")
         _write_artifact(
             {
                 "base_model": base_model,
@@ -614,6 +629,7 @@ def main(
         payload = engine.run_bucket.remote(name, grid, block, invocation)
         results.append(payload)
         _write_artifact(payload, f"sweep-{base_model.replace('/', '_')}-{name}-b{block}.json")
+    ledger.settle(entry, time.monotonic() - lane_started, note="measured sweep wall")
     _write_artifact(
         {
             "base_model": base_model,

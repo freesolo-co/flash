@@ -15,6 +15,7 @@ import dataclasses
 import inspect
 import re
 import tomllib
+import types
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -855,8 +856,8 @@ def test_gdn_probe_records_unknown_rather_than_assuming_the_fast_path() -> None:
 def test_gdn_probe_invokes_the_resolver_rather_than_checking_it_exists() -> None:
     """Presence of ``_resolve_gdn_prefill_backend`` says nothing about which backend it picks."""
     source = inspect.getsource(probe_gdn_backend)
-    assert "resolver()" in source, "the resolver must be CALLED, not merely found"
-    call_at = source.index("resolver()")
+    assert "resolver(**kwargs)" in source, "the resolver must be CALLED, not merely found"
+    call_at = source.index("resolver(**kwargs)")
     present_at = source.index('result["resolver_present"]')
     assert call_at > present_at
 
@@ -1813,7 +1814,10 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
     warmups = namespace["CANARY_WARMUP_REQUESTS"]
 
     canary = namespace["_canary_gpu_seconds_estimate"]()
-    assert canary == startup + REQUEST_TIMEOUT_SECONDS * warmups
+    # TWO boots: `_run_canary` calls `probe.remote()` then `warmup.remote()`, and `max_containers=1`
+    # bounds simultaneous replicas without binding successive calls to one container, so the warmup
+    # can land on a replacement that boots again.
+    assert canary == startup * 2 + REQUEST_TIMEOUT_SECONDS * warmups
     assert canary >= startup, "the canary reserves less than a stuck boot alone would bill"
 
     bucket = BUCKETS_BY_NAME["short_interactive"]
@@ -2000,3 +2004,188 @@ def test_cell_result_json_carries_the_degraded_verdict() -> None:
     assert "degraded" not in {f.name for f in dataclasses.fields(CellResult)}, (
         "if `degraded` became a real field this test no longer proves the property is serialized"
     )
+
+
+def test_workload_checksum_covers_prompt_construction_not_just_token_counts() -> None:
+    """Two campaigns can agree on every token count and still measure different work.
+
+    The digest previously named only bucket dimensions and decoding, so the filler vocabulary, the
+    fit tolerance, and the concurrency grid could all change without moving it -- and a published
+    result would claim a preregistered workload it did not run. Each is mutated independently here,
+    because a digest that happens to include one of them still lets the other two drift.
+    """
+    baseline = workload_checksum()
+
+    with mock.patch("flash.serving.bench.workload.PROMPT_TOKEN_TOLERANCE", 999):
+        assert workload_checksum() != baseline, "the fit tolerance is not in the checksum"
+
+    with mock.patch(
+        "flash.serving.bench.workload._FILLER_WORDS", ("alpha", "beta", "gamma", "delta")
+    ):
+        assert workload_checksum() != baseline, "the filler vocabulary is not in the checksum"
+
+    def _narrower_grid(max_num_seqs: int) -> tuple[int, ...]:
+        return (1, max_num_seqs)
+
+    with mock.patch("flash.serving.bench.workload.concurrency_grid", _narrower_grid):
+        assert workload_checksum() != baseline, "the concurrency grid is not in the checksum"
+
+    # And the digest is still stable when nothing moves, so the test above is detecting the mutation
+    # rather than nondeterminism in the digest itself.
+    assert workload_checksum() == baseline
+
+
+def test_documented_rate_denominator_matches_the_one_reduce_cell_uses() -> None:
+    """The doc must describe the denominator the code divides by.
+
+    An earlier round moved rates onto the pre-drain window but left the prose saying "full wall
+    time", which is the kind of drift a reader cannot detect from either artifact alone. Rather than
+    grep for a phrase, this computes a cell whose drain would change the answer and asserts the code
+    excludes it -- then asserts the doc does not describe the excluded behaviour.
+    """
+    records = [
+        _record("in-window", latency=10.0, tokens=100),
+        # Finishes AFTER the 20s window closed: a drain completion.
+        _record("in-drain", latency=45.0, tokens=100),
+    ]
+    result = reduce_cell(
+        records,
+        base_model="Qwen/Qwen3.5-9B",
+        bucket="short_interactive",
+        concurrency=2,
+        block=0,
+        wall_seconds=20.0,
+        drain_seconds=25.0,
+        window_seconds=20.0,
+    )
+    assert result.succeeded == 2, "both requests did succeed"
+    assert result.succeeded_in_window == 1, "only one finished inside the window"
+    # 1 in-window success over the 20s window, NOT 2 over 45s.
+    assert result.successful_rps == pytest.approx(1 / 20.0)
+    assert result.output_tokens_per_second == pytest.approx(100 / 20.0)
+
+    doc = (REPO_ROOT / "docs" / "serving-capacity-envelope.md").read_text(encoding="utf-8")
+    assert "full wall time" not in doc, (
+        "the doc still describes rates over full wall time, but reduce_cell divides by the "
+        "pre-drain window"
+    )
+    assert "steady-state window" in doc
+
+
+def _fake_gdn_modules(leaf: Any) -> dict[str, Any]:
+    """Every ancestor package, because ``from a.b.c import d`` imports ``a.b.c`` first.
+
+    Registering only the leaf leaves the import raising ModuleNotFoundError, the resolver unreached,
+    and a test that would pass against a probe which never calls it.
+    """
+    parent = "vllm.model_executor.layers.mamba.gdn"
+    modules: dict[str, Any] = {}
+    parts = parent.split(".")
+    for depth in range(1, len(parts) + 1):
+        modules[".".join(parts[:depth])] = types.ModuleType(".".join(parts[:depth]))
+    modules[parent].qwen_gdn_linear_attn = leaf
+    modules[f"{parent}.qwen_gdn_linear_attn"] = leaf
+    return modules
+
+
+def test_gdn_probe_reports_a_signature_mismatch_rather_than_an_unknown_backend() -> None:
+    """A mis-called resolver must not read as "this build cannot be probed".
+
+    The resolver takes build-dependent arguments, so a bare ``resolver()`` raises TypeError on
+    exactly the builds that HAVE it. That was swallowed into ``reason`` and the probe returned
+    ``resolved=None`` -- indistinguishable from a build with no resolver, so the canary could not
+    tell a broken probe from an absent one, and the Blackwell Triton fallback stayed invisible.
+    """
+    calls: dict[str, Any] = {}
+
+    def _resolver(linear_key_head_dim: int) -> str:
+        calls["linear_key_head_dim"] = linear_key_head_dim
+        return "flashinfer"
+
+    module = mock.Mock()
+    module._resolve_gdn_prefill_backend = _resolver
+
+    with (
+        mock.patch.dict("sys.modules", _fake_gdn_modules(module)),
+        mock.patch(
+            "flash.serving.bench.probe._gdn_config_values",
+            return_value={"linear_key_head_dim": 128},
+        ),
+        mock.patch(
+            "flash.serving.bench.probe.probe_cutlass_integrity",
+            return_value={"checked": False},
+        ),
+    ):
+        result = probe_gdn_backend("Qwen/Qwen3.5-9B")
+
+    assert calls == {"linear_key_head_dim": 128}, "the resolver was not called with its parameters"
+    assert result["resolved"] == "flashinfer"
+    assert not result.get("resolver_signature_mismatch")
+
+    # A resolver whose required parameter the config cannot supply is a SIGNATURE problem, and must
+    # be labelled as one rather than reported as an unresolved backend.
+    def _needs_unknown(some_new_parameter: int) -> str:  # pragma: no cover - never called
+        return "flashinfer"
+
+    module._resolve_gdn_prefill_backend = _needs_unknown
+    with (
+        mock.patch.dict("sys.modules", _fake_gdn_modules(module)),
+        mock.patch("flash.serving.bench.probe._gdn_config_values", return_value={}),
+        mock.patch(
+            "flash.serving.bench.probe.probe_cutlass_integrity",
+            return_value={"checked": False},
+        ),
+    ):
+        mismatch = probe_gdn_backend("Qwen/Qwen3.5-9B")
+
+    assert mismatch["resolved"] is None
+    assert mismatch["resolver_signature_mismatch"] is True
+    assert "signature unsupported" in mismatch["reason"]
+
+
+def test_the_paid_entrypoint_settles_its_reservation() -> None:
+    """A published budget that only ever shows the worst case is not a cost report.
+
+    ``reserve`` is deliberately generous so the ceiling is safe; if nothing settles it, every
+    artifact reports that generous number as the spend. The entrypoint must call ``settle`` on both
+    lanes, so this asserts against the SOURCE that the calls exist on each path.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    main = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == "main"
+    )
+    settles = [
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "settle"
+    ]
+    assert len(settles) == 2, (
+        "expected the canary lane and the sweep lane each to settle their reservation; "
+        f"found {len(settles)}"
+    )
+    # And the reservation is bound, not discarded -- `settle` needs the entry `reserve` returned.
+    assert re.search(r"entry\s*=\s*ledger\.reserve\(", source), (
+        "the ledger entry is not captured, so nothing can be settled against it"
+    )
+
+
+def test_settling_replaces_the_reservation_in_the_committed_total() -> None:
+    """Settlement has to MOVE the committed total, not merely annotate the entry."""
+    ledger = BudgetLedger(ceiling_usd=50.0)
+    entry = ledger.reserve("sweep:Qwen/Qwen3.5-9B", 9000.0, "L40S")
+    reserved_total = ledger.committed_usd
+    assert reserved_total > 0
+
+    # The lane actually ran a tenth of its worst case.
+    ledger.settle(entry, 900.0, note="measured sweep wall")
+    assert entry.gpu_seconds == 900.0
+    assert entry.settled_usd == pytest.approx(usd_for_gpu_seconds(900.0, "L40S"))
+    assert ledger.committed_usd < reserved_total, (
+        "committed_usd still reports the reservation after settlement"
+    )
+    assert ledger.committed_usd == pytest.approx(entry.settled_usd)

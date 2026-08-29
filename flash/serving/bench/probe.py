@@ -22,6 +22,7 @@ not to a measurement tool that would then be measuring its own side effect.
 from __future__ import annotations
 
 import contextlib
+import inspect
 from typing import Any
 
 
@@ -114,6 +115,51 @@ def probe_cutlass_integrity() -> dict[str, Any]:
     }
 
 
+def _gdn_config_values(base_model: str) -> dict[str, Any]:
+    """GDN geometry from the model's own config, for binding the resolver's parameters.
+
+    Read from the checkpoint rather than hardcoded: ``linear_key_head_dim == 128`` is the condition
+    the resolver tests on SM10.x, so supplying a guessed 128 would make the probe answer its own
+    question and report the fast path for a model that does not qualify.
+    """
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+    text_config = getattr(config, "text_config", config)
+    values: dict[str, Any] = {}
+    for name in (
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+    ):
+        found = getattr(text_config, name, getattr(config, name, None))
+        if found is not None:
+            values[name] = found
+    return values
+
+
+def _gdn_resolver_kwargs(resolver: Any, base_model: str) -> dict[str, Any]:
+    """Bind only the parameters this build's resolver actually declares.
+
+    Signature-driven rather than hardcoded, because the resolver is vLLM-internal and its parameters
+    move between builds; a fixed argument list would break on the next bump exactly as the zero-arg
+    call broke on this one. A REQUIRED parameter that the config cannot supply raises, and the caller
+    records that as a signature mismatch rather than as an unknown backend.
+    """
+    signature = inspect.signature(resolver)
+    available = _gdn_config_values(base_model)
+    kwargs: dict[str, Any] = {}
+    for name, parameter in signature.parameters.items():
+        if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
+            continue
+        if name in available:
+            kwargs[name] = available[name]
+        elif parameter.default is parameter.empty:
+            raise TypeError(f"resolver requires {name!r}, which this model config does not supply")
+    return kwargs
+
+
 def probe_gdn_backend(base_model: str) -> dict[str, Any]:
     """What the GDN prefill resolver would choose for this model on this card.
 
@@ -138,8 +184,27 @@ def probe_gdn_backend(base_model: str) -> dict[str, Any]:
     # is `warning_once` then a silent Triton fallback -- the boot succeeds, serves, and bills the
     # fast-card rate while running the slow kernel. So call it and record what it actually returned;
     # an unresolved probe stays None and the report may not claim a backend.
+    # The resolver is vLLM-internal and takes build-dependent arguments (recent builds require the
+    # GDN head dims), so a bare `resolver()` raises TypeError on exactly the builds that HAVE it.
+    # That exception was swallowed into `reason` and the probe returned resolved=None -- the same
+    # unknown a build with no resolver at all produces, so the canary could not tell "this build
+    # cannot be probed" from "this call was made wrong". Bind the declared parameters from the
+    # model config and record a signature mismatch distinctly rather than as an unknown backend.
     try:
-        resolved = resolver()
+        kwargs = _gdn_resolver_kwargs(resolver, base_model)
+    except Exception as exc:
+        result["reason"] = f"resolver signature unsupported: {type(exc).__name__}: {exc}"
+        result["resolver_signature_mismatch"] = True
+        return result
+    result["resolver_kwargs"] = sorted(kwargs)
+    try:
+        resolved = resolver(**kwargs)
+    except TypeError as exc:
+        # A TypeError here is an ARGUMENT problem, not a backend answer. Kept distinct so the report
+        # cannot read a mis-called probe as evidence about which kernel ran.
+        result["reason"] = f"resolver rejected arguments: {exc}"
+        result["resolver_signature_mismatch"] = True
+        return result
     except Exception as exc:
         result["reason"] = f"resolver raised: {type(exc).__name__}: {exc}"
         return result

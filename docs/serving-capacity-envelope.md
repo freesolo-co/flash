@@ -66,13 +66,21 @@ then past it, so the knee is bracketed rather than assumed. Decoding is fixed at
 
 Per cell (model × bucket × concurrency):
 
-- **requests/sec** — `successful_rps`, successes over full wall time.
-- **tokens/sec** — `output_tokens_per_second`, engine-reported completion tokens over full wall
-  time. Engine-authoritative, never counted from the text.
+- **requests/sec** — `successful_rps`, successes that *finished inside the measurement window*
+  over that window's duration.
+- **tokens/sec** — `output_tokens_per_second`, engine-reported completion tokens from those same
+  in-window successes, over the window. Engine-authoritative, never counted from the text.
 - **concurrency** — the closed-loop level held for the cell; the envelope reports the ceiling, the
   knee, and the saturation point derived across the sweep.
-- **TTFT** — `ttft_seconds`, p50/p95/p99.
-- **latency** — `latency_seconds`, p50/p95/p99, flagged `p99_descriptive_only` under 400 samples.
+- **TTFT** — `ttft_seconds`, p50/p95/p99, in-window requests only.
+- **latency** — `latency_seconds`, p50/p95/p99, in-window requests only, flagged
+  `p99_descriptive_only` under 400 samples.
+
+Both rate denominators are the **steady-state window**, excluding the drain. A cell that closes its
+window with requests still in flight finishes them at falling concurrency, on a progressively idler
+engine; counting that tail in either the numerator or the denominator would misreport the load the
+cell was actually holding. `drain_seconds` is published alongside, so the excluded tail is visible
+rather than merely omitted.
 - **error rate** — observed rate plus a Wilson one-sided 95% upper bound.
 
 ## Results
@@ -162,7 +170,7 @@ model/tokenizer/processor provenance, and 32768 configured context runs before a
 teardown is confirmed after each model:
 
 ```
-modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary --ceiling-usd 6
+modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary --ceiling-usd 7
 modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep --bucket short_interactive --ceiling-usd 16
 ```
 
@@ -174,9 +182,11 @@ per-invocation ceilings for a 9B L40S lane; a larger model or a wider bucket sel
 correspondingly larger one. They are stated above what each lane reserves AND above its
 submission stop, because a documented ceiling a lane cannot clear is a command that cannot run.
 
-The canary reserves `2700s boot + 5 x 900s warmups = 7200s` ($3.90 at the recorded L40S rate). The
-single-bucket sweep reserves `7200 + 6 x 420 windows + 6 x 900 drains + 7200 replacement = 22320s`
-($12.10); a full three-bucket sweep reserves 53640s ($29.07) and needs a ceiling above $37.
+The canary reserves `2 x 2700s boot + 5 x 900s warmups = 9900s` ($5.37 at the recorded L40S rate) —
+two boots because `_run_canary` makes two remote calls, `probe` then `warmup`, and the second can
+land on a replacement. The single-bucket sweep reserves
+`7200 + 6 x 420 windows + 6 x 900 drains + 7200 replacement = 22320s` ($12.10); a full three-bucket
+sweep reserves 53640s ($29.07) and needs a ceiling above $37.
 
 That trailing `replacement` term is the non-obvious one. `max_containers=1` caps how many replicas
 run at once; it does NOT pin successive `.remote()` calls to the container the previous bucket

@@ -318,6 +318,12 @@ def concurrency_grid(max_num_seqs: int) -> tuple[int, ...]:
     return tuple(sorted(set(points)))
 
 
+# The grid cap the checksum digests. All three benchmark tiers declare `max_num_seqs=8`, so this
+# fixes the digest at the shape actually measured; the ALGORITHM is what is being pinned, and a
+# change to it moves the checksum at this cap just as it would at any other.
+_CHECKSUM_GRID_CAP = 8
+
+
 def workload_checksum() -> str:
     """Digest of the preregistered contract, recorded in the report.
 
@@ -335,6 +341,15 @@ def workload_checksum() -> str:
             f"top_p={TOP_P}",
             f"n={N_CHOICES}",
             f"thinking={ENABLE_THINKING}",
+            # The prompt CONSTRUCTION, not just the bucket dimensions. Two campaigns can agree on
+            # every token count and still measure different work: the filler vocabulary decides what
+            # the model actually reads, the fit tolerance decides how far an assembled prompt may sit
+            # from its target, and the concurrency grid decides which points the curve contains.
+            # Digesting only the dimensions let all three change without moving the checksum, so a
+            # published result could claim a preregistered workload it did not run.
+            f"tolerance={PROMPT_TOKEN_TOLERANCE}",
+            f"filler={hashlib.sha256(chr(31).join(_FILLER_WORDS).encode()).hexdigest()[:16]}",
+            f"grid={','.join(str(point) for point in concurrency_grid(_CHECKSUM_GRID_CAP))}",
             *(
                 f"{b.name}:{b.target_input_tokens}:{b.max_output_tokens}"
                 f":{b.min_requests}:{b.min_seconds}:{b.max_seconds}"
