@@ -264,6 +264,10 @@ def measure_prompt_tokens(tokenizer: Any, messages: list[dict[str, Any]]) -> int
     return len(tokenizer(rendered, add_special_tokens=False)["input_ids"])
 
 
+class PromptFitError(RuntimeError):
+    """A prompt could not be fitted inside its bucket's tolerance."""
+
+
 def fit_prompt_to_tokens(
     tokenizer: Any,
     uid: str,
@@ -277,6 +281,13 @@ def fit_prompt_to_tokens(
 
     Returns ``(messages, exact_assembled_tokens)``. Every request records its exact measured length,
     so a bucket is reported by what was actually sent rather than by what was requested.
+
+    Raises ``PromptFitError`` when the search cannot land inside ``tolerance``. Returning the best
+    near-miss instead would put a materially mis-sized prompt into the advertised bucket: the driver
+    checks the engine's reported length against this FITTED count, not against
+    ``bucket.target_input_tokens``, so an out-of-band fit is transmitted faithfully and validates
+    cleanly while the published bucket label is wrong. A bucket that cannot be fitted is a workload
+    defect to surface before the window opens, not a number to publish.
     """
     low, high = 1, max(2, target_tokens * 2)
     best: tuple[list[dict[str, Any]], int] | None = None
@@ -295,6 +306,11 @@ def fit_prompt_to_tokens(
         if low > high:
             break
     assert best is not None
+    if abs(best[1] - target_tokens) > tolerance:
+        raise PromptFitError(
+            f"could not fit a prompt within {tolerance} tokens of {target_tokens} in "
+            f"{max_iterations} iterations; closest was {best[1]}"
+        )
     return best
 
 
@@ -369,6 +385,7 @@ __all__ = [
     "TEMPERATURE",
     "TOP_P",
     "Bucket",
+    "PromptFitError",
     "build_prompt_text",
     "concurrency_grid",
     "corpus_seed",

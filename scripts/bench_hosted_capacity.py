@@ -119,7 +119,10 @@ from flash.serving.bench.catalog import (  # noqa: E402
     bench_engine_overrides_for,
     bench_gpu_for,
 )
-from flash.serving.bench.driver import REQUEST_TIMEOUT_SECONDS  # noqa: E402
+from flash.serving.bench.driver import (  # noqa: E402
+    REQUEST_TIMEOUT_SECONDS,
+    prompt_fit_seconds_bound,
+)
 from flash.serving.bench.workload import BUCKETS, concurrency_grid  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
 
@@ -403,8 +406,16 @@ async def _run_bucket(
         )
         # Stop climbing once the engine is failing outright: further points would spend GPU time
         # measuring progressively deeper failure, which the envelope does not need.
-        if result.succeeded == 0:
-            print(f"[bench] halting {bucket_name}: no successes at c={concurrency}", flush=True)
+        #
+        # Gated on the IN-WINDOW count, not `succeeded`. A cell whose requests all complete during
+        # the drain has zero steady-state throughput -- it is already classified degraded and its
+        # published rates are 0 -- yet `succeeded` stays positive, so climbing continued and bought
+        # another full window-and-drain tail per remaining point.
+        if result.succeeded_in_window == 0:
+            print(
+                f"[bench] halting {bucket_name}: no steady-state successes at c={concurrency}",
+                flush=True,
+            )
             break
     return {
         "base_model": engine.base_model,
@@ -502,7 +513,9 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     1. the cold boot;
     2. the canary, which always runs before the sweep and whose 5 warmup requests are SEQUENTIAL,
        so worst case each one consumes its own `REQUEST_TIMEOUT_SECONDS`;
-    3. each cell's measured window, bounded by the bucket's `max_seconds`;
+    3. each cell's measured window, bounded by the bucket's `max_seconds`, PLUS the prompt
+       fitting that precedes it -- excluded from the window on purpose so tokenization cannot
+       distort the measurement, but still executed on the rented GPU and therefore billed;
     4. each cell's DRAIN, which waits up to `REQUEST_TIMEOUT_SECONDS` for requests still in flight
        when the window closed. This is the largest omission: at 900s per cell it can exceed the
        measured time it follows, and it happens after every cell, not once per sweep.
@@ -514,6 +527,10 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     points = len(list(concurrency_grid(int(overrides.get("max_num_seqs", 8)))))
     cells = points * len(selected)
     measured = sum(float(bucket.max_seconds) * points for bucket in selected)
+    # Prompt fitting runs inside the container BEFORE each cell's window opens, so it is
+    # billed but appears in no `max_seconds`. Per cell, not per bucket: every concurrency
+    # point rebuilds its own pool.
+    fitting = sum(prompt_fit_seconds_bound(bucket) * points for bucket in selected)
     drains = REQUEST_TIMEOUT_SECONDS * cells
     canary = REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS
     # The boot is reserved at the ceiling Modal actually allows a stuck boot to reach, not at a
@@ -526,7 +543,7 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     # handled, and entirely foreseeable path unfunded, so a sweep accepted under its ceiling could
     # bill past it once per selected bucket. Priced per call, since that is where the exposure is.
     replacements = (boot + canary) * len(selected)
-    return boot + canary + measured + drains + replacements
+    return boot + canary + measured + fitting + drains + replacements
 
 
 @app.local_entrypoint()

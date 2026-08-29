@@ -42,6 +42,7 @@ from flash.serving.bench.catalog import (
     tokenizer_model_for,
 )
 from flash.serving.bench.driver import (
+    _POOL_PERIOD_SLACK,
     REQUEST_TIMEOUT_SECONDS,
     _absorb_event,
     _build_prompt_pool,
@@ -50,6 +51,7 @@ from flash.serving.bench.driver import (
     _StreamOutcome,
     _validate,
     base_model_record,
+    prompt_fit_seconds_bound,
     run_cell,
 )
 from flash.serving.bench.metrics import (
@@ -1582,6 +1584,7 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     namespace.update(
         bench_engine_overrides_for=bench_engine_overrides_for,
         concurrency_grid=concurrency_grid,
+        prompt_fit_seconds_bound=prompt_fit_seconds_bound,
         REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
     )
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "<bench>", "exec"), namespace)
@@ -1592,6 +1595,8 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
 
     points = len(list(concurrency_grid(8)))
     windows = float(bucket.max_seconds) * points
+    # Billed on the container but outside every `max_seconds`, so it is reserved separately.
+    fitting = prompt_fit_seconds_bound(bucket) * points
     drains = REQUEST_TIMEOUT_SECONDS * points
     canary = REQUEST_TIMEOUT_SECONDS * constants["CANARY_WARMUP_REQUESTS"]
     startup = constants["STARTUP_TIMEOUT_SECONDS"]
@@ -1604,7 +1609,7 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
         "the estimate omits the canary or the per-cell drain tails"
     )
     # The boot is reserved at the ceiling Modal lets a stuck boot reach, not a typical observed one.
-    assert estimate == pytest.approx(startup + canary + windows + drains + replacements)
+    assert estimate == pytest.approx(startup + canary + windows + fitting + drains + replacements)
 
 
 def test_a_bucket_landing_on_a_cold_container_warms_itself_before_measuring() -> None:
@@ -1808,6 +1813,7 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
         "STARTUP_TIMEOUT_SECONDS",
         bench_engine_overrides_for=bench_engine_overrides_for,
         concurrency_grid=concurrency_grid,
+        prompt_fit_seconds_bound=prompt_fit_seconds_bound,
         REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
     )
     startup = namespace["STARTUP_TIMEOUT_SECONDS"]
@@ -1827,6 +1833,9 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
         startup
         + REQUEST_TIMEOUT_SECONDS * warmups
         + bucket.max_seconds * points
+        # Prompt fitting runs on the rented container before each cell's window opens, so it is
+        # billed even though it is deliberately outside `max_seconds`.
+        + prompt_fit_seconds_bound(bucket) * points
         + REQUEST_TIMEOUT_SECONDS * points
         # one replacement boot + warmup per bucket call, since `max_containers=1` does not pin
         # successive `.remote()` calls to the container the previous bucket booted
@@ -1855,6 +1864,7 @@ def test_documented_ceilings_exceed_what_each_lane_reserves() -> None:
         "STARTUP_TIMEOUT_SECONDS",
         bench_engine_overrides_for=bench_engine_overrides_for,
         concurrency_grid=concurrency_grid,
+        prompt_fit_seconds_bound=prompt_fit_seconds_bound,
         REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
     )
     doc = (REPO_ROOT / "docs" / "serving-capacity-envelope.md").read_text(encoding="utf-8")
@@ -2189,3 +2199,117 @@ def test_settling_replaces_the_reservation_in_the_committed_total() -> None:
         "committed_usd still reports the reservation after settlement"
     )
     assert ledger.committed_usd == pytest.approx(entry.settled_usd)
+
+
+def test_prompt_pool_period_does_not_depend_on_concurrency():
+    """R7: two points on ONE curve must send the same corpus sequence.
+
+    Sizing the pool as ``min_requests + concurrency`` moved the wrap point per point, so request 301
+    reused corpus 0 at c=1 but corpus 301 at c=16. Completion lengths then differed between points
+    for a reason that is not offered load, and the derived knee moved with it.
+    """
+    bucket = BUCKETS_BY_NAME["short_interactive"]
+    low, low_calls = _fake_pool(concurrency=1)
+    high, high_calls = _fake_pool(concurrency=16)
+
+    assert len(low) == len(high) == bucket.min_requests + _POOL_PERIOD_SLACK
+    # The corpus seeds are the load-bearing part: they are what the wrap point used to shift.
+    assert [corpus for _, corpus in low_calls] == [corpus for _, corpus in high_calls]
+
+
+def test_prompt_fit_raises_rather_than_publishing_an_out_of_band_prompt():
+    """R7: a prompt the search cannot fit is a workload defect, not a number to publish.
+
+    The driver validates the engine's reported length against the FITTED count, so a near-miss
+    transmits faithfully and validates cleanly while the published bucket label is wrong.
+    """
+    from flash.serving.bench.workload import PromptFitError, fit_prompt_to_tokens
+
+    class _StuckTokenizer:
+        """Always reports the same length, so the search can never converge."""
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "x"
+
+        def __call__(self, text, **kwargs):
+            # One token regardless of input, so no guess can approach a 4096-token target.
+            return {"input_ids": [0]}
+
+    with pytest.raises(PromptFitError):
+        fit_prompt_to_tokens(_StuckTokenizer(), "uid", 4096)
+
+
+def test_prompt_fit_seconds_bound_scales_with_input_size_and_depth():
+    """R7: fitting is billed GPU wall time and must be reserved.
+
+    It is excluded from ``max_seconds`` on purpose -- tokenization must not compete with the
+    measured window -- so the reservation is the only place it can be funded.
+    """
+    short = prompt_fit_seconds_bound(BUCKETS_BY_NAME["short_interactive"])
+    near = prompt_fit_seconds_bound(BUCKETS_BY_NAME["near_32k"])
+    assert short > 0.0
+    # 31744 input tokens per prompt dwarfs 512, even though near_32k pools far fewer prompts.
+    assert near > short
+
+
+def test_sweep_estimate_includes_prompt_fitting():
+    """R7: the reservation must exceed the same sweep priced without the fitting term."""
+    namespace = _bench_namespace(
+        "_sweep_gpu_seconds_estimate",
+        "CANARY_WARMUP_REQUESTS",
+        "STARTUP_TIMEOUT_SECONDS",
+        REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
+        bench_engine_overrides_for=bench_engine_overrides_for,
+        concurrency_grid=concurrency_grid,
+        prompt_fit_seconds_bound=prompt_fit_seconds_bound,
+    )
+    model = "Qwen/Qwen3.5-9B"
+    selected = [BUCKETS_BY_NAME["near_32k"]]
+    total = namespace["_sweep_gpu_seconds_estimate"](model, selected)
+
+    points = len(
+        list(concurrency_grid(int(bench_engine_overrides_for(model).get("max_num_seqs", 8))))
+    )
+    fitting = prompt_fit_seconds_bound(selected[0]) * points
+    assert fitting > 0.0
+
+    # Prove the term is genuinely INSIDE the total, not merely smaller than it: re-price the same
+    # sweep with fitting stubbed to zero and require the difference to be exactly the fitting.
+    zeroed = _bench_namespace(
+        "_sweep_gpu_seconds_estimate",
+        "CANARY_WARMUP_REQUESTS",
+        "STARTUP_TIMEOUT_SECONDS",
+        REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
+        bench_engine_overrides_for=bench_engine_overrides_for,
+        concurrency_grid=concurrency_grid,
+        prompt_fit_seconds_bound=lambda bucket: 0.0,
+    )["_sweep_gpu_seconds_estimate"](model, selected)
+    assert total - zeroed == pytest.approx(fitting)
+
+
+def test_gdn_probe_reads_the_served_checkpoint_not_the_logical_name():
+    """R7: geometry must come from the weights the engine loaded.
+
+    The 9B and 27B engines serve separate ``-FP8`` repositories and the 27B pins a
+    ``model_revision``. Probing the mutable logical name could report a backend for a checkpoint
+    nobody served once that repository advances.
+    """
+    from flash.serving.bench.catalog import bench_engine_overrides_for
+    from flash.serving.bench.probe import _served_checkpoint
+
+    for base_model in BENCH_MODELS:
+        overrides = bench_engine_overrides_for(base_model)
+        repo, revision = _served_checkpoint(base_model)
+        assert repo == overrides["serve_model_id"]
+        assert revision == overrides.get("model_revision")
+
+
+def test_early_stop_gates_on_steady_state_successes():
+    """R7: a cell whose successes all land in the DRAIN publishes zero throughput.
+
+    Gating the climb on ``succeeded`` kept it positive there, so the sweep bought another full
+    window-and-drain tail per remaining point after the cell was already classified degraded.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    assert "result.succeeded_in_window == 0" in source
+    assert "if result.succeeded == 0:" not in source

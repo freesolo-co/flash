@@ -184,9 +184,15 @@ submission stop, because a documented ceiling a lane cannot clear is a command t
 
 The canary reserves `2 x 2700s boot + 5 x 900s warmups = 9900s` ($5.37 at the recorded L40S rate) —
 two boots because `_run_canary` makes two remote calls, `probe` then `warmup`, and the second can
-land on a replacement. The single-bucket sweep reserves
-`7200 + 6 x 420 windows + 6 x 900 drains + 7200 replacement = 22320s` ($12.10); a full three-bucket
-sweep reserves 53640s ($29.07) and needs a ceiling above $37.
+land on a replacement. The single-bucket `short_interactive` sweep reserves 22719s ($12.31): boot,
+canary, `6 x 420` windows, `6 x 900` drains, one replacement boot-plus-canary, and 399s of prompt
+fitting. A full three-bucket sweep reserves 60146s ($32.60) and needs a ceiling above $41.
+
+Prompt fitting is in the reservation but deliberately not in any `max_seconds`. It runs before a
+cell's clock starts, so tokenization cannot compete with the measured window for CPU — but it runs
+on the rented GPU container, so it bills. Leaving it out of the reservation while leaving it out of
+the window funded neither, and at 31k input it is the single largest unreserved term: 3870s across
+the `near_32k` grid against 399s for `short_interactive`.
 
 That trailing `replacement` term is the non-obvious one. `max_containers=1` caps how many replicas
 run at once; it does NOT pin successive `.remote()` calls to the container the previous bucket
@@ -195,8 +201,10 @@ which bills whether or not the reservation admitted it.
 
 A lane also has to clear its submission stop, not merely its ceiling: `reserve()` refuses at 80% of
 the ceiling so settlement lag and teardown stay funded. A lane consequently needs a ceiling around
-`1.25x` its own reservation -- $4.88 for the canary, $15.12 for the single-bucket sweep -- and the
-values above sit above those thresholds.
+`1.25x` its own reservation -- $6.71 for the canary and $15.39 for the single-bucket
+`short_interactive` sweep -- and the `--ceiling-usd 7` and `--ceiling-usd 16` above clear those
+thresholds. A larger tier needs proportionally more: the same canary is $12.48 on the 35B's H200,
+so it needs a ceiling above $15.60.
 
 The boot dominates cost (~960s of ~1000s per cell in a prior campaign), so one boot runs a whole
 bucket's concurrency grid rather than one cell. `budget.py` reserves before allocation and raises

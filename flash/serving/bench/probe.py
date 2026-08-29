@@ -115,16 +115,39 @@ def probe_cutlass_integrity() -> dict[str, Any]:
     }
 
 
+def _served_checkpoint(base_model: str) -> tuple[str, str | None]:
+    """The repo and revision the ENGINE loads, which is not always the logical base model.
+
+    The 9B and 27B engines serve separate ``-FP8`` repositories, and the 27B pins a
+    ``model_revision``. Reading geometry from the mutable logical name could therefore feed the
+    resolver different head dims than the running engine once that repository advances, and the
+    published backend provenance would describe a checkpoint nobody served.
+    """
+    from flash.serving.bench.catalog import bench_engine_overrides_for
+
+    try:
+        overrides = bench_engine_overrides_for(base_model)
+    except Exception:
+        return base_model, None
+    repo = overrides.get("serve_model_id") or base_model
+    revision = overrides.get("model_revision")
+    return str(repo), (str(revision) if revision else None)
+
+
 def _gdn_config_values(base_model: str) -> dict[str, Any]:
-    """GDN geometry from the model's own config, for binding the resolver's parameters.
+    """GDN geometry from the served checkpoint's own config, for binding the resolver's parameters.
 
     Read from the checkpoint rather than hardcoded: ``linear_key_head_dim == 128`` is the condition
     the resolver tests on SM10.x, so supplying a guessed 128 would make the probe answer its own
     question and report the fast path for a model that does not qualify.
+
+    Read from the SERVED repo at its pinned revision, not the logical base model, so the geometry
+    belongs to the weights the engine actually loaded.
     """
     from transformers import AutoConfig
 
-    config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+    repo, revision = _served_checkpoint(base_model)
+    config = AutoConfig.from_pretrained(repo, revision=revision, trust_remote_code=True)
     text_config = getattr(config, "text_config", config)
     values: dict[str, Any] = {}
     for name in (
@@ -197,6 +220,8 @@ def probe_gdn_backend(base_model: str) -> dict[str, Any]:
         result["resolver_signature_mismatch"] = True
         return result
     result["resolver_kwargs"] = sorted(kwargs)
+    probed_repo, probed_revision = _served_checkpoint(base_model)
+    result["config_source"] = {"repo": probed_repo, "revision": probed_revision}
     try:
         resolved = resolver(**kwargs)
     except TypeError as exc:

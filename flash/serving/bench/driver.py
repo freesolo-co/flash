@@ -278,6 +278,39 @@ async def run_request(
     return record
 
 
+# Prompts fitted beyond `min_requests` so a cell that runs ahead of `min_seconds` does not wrap.
+# Fixed, NOT a function of concurrency: a concurrency-dependent period makes the wrap point differ
+# between points on the same curve, so two points would send different corpora and the difference
+# would be read as a load effect.
+_POOL_PERIOD_SLACK = 64
+
+# Conservative per-call bound on one `fit_prompt_to_tokens` tokenization. Deliberately far slower
+# than a real fast tokenizer: this funds a reservation, so it must err toward refusing a run.
+_PROMPT_FIT_FIXED_SECONDS = 0.005
+_PROMPT_FIT_SECONDS_PER_TOKEN = 2e-5  # 50k tokens/s
+_PROMPT_FIT_MAX_ITERATIONS = 12
+
+
+def prompt_fit_seconds_bound(bucket: Bucket, *, min_requests: int | None = None) -> float:
+    """Upper bound on the wall time one cell spends fitting prompts.
+
+    This time is NOT inside `bucket.max_seconds` and must not be: fitting runs before the clock
+    starts, precisely so tokenization never competes with the measured window (see
+    `_build_prompt_pool`). But it still runs INSIDE the GPU container, so it is billed. Excluding it
+    from the window is a measurement decision; excluding it from the reservation was a funding gap,
+    and at 31k input it is the largest unreserved term in a cell.
+
+    Bounded at the binary search's iteration cap rather than its typical depth, because a
+    reservation is an authorization to spend.
+    """
+    depth = bucket.min_requests if min_requests is None else min_requests
+    prompts = depth + _POOL_PERIOD_SLACK
+    per_call = _PROMPT_FIT_FIXED_SECONDS + _PROMPT_FIT_SECONDS_PER_TOKEN * float(
+        bucket.target_input_tokens
+    )
+    return prompts * _PROMPT_FIT_MAX_ITERATIONS * per_call
+
+
 def _build_prompt_pool(
     tokenizer: Any,
     bucket: Bucket,
@@ -299,8 +332,20 @@ def _build_prompt_pool(
     A cell can still outrun this pool while waiting on `min_seconds`, so the caller reseeds a pooled
     prompt rather than re-sending it; see `reseed_prompt`. The pool is therefore sized for the depth
     the cell is expected to need, not for a bound it is forbidden to exceed.
+
+    The pool PERIOD is deliberately independent of `concurrency`. Sizing it as
+    `min_requests + concurrency` made the wrap point differ per point on the curve, so request 301
+    reused corpus 0 at c=1 but corpus 301 at c=16 -- two points on one curve then sent different
+    semantic prompt sequences, which moves completion lengths and the derived knee for a reason that
+    has nothing to do with offered load. `_POOL_PERIOD_SLACK` widens the pool enough that a cell
+    running ahead of `min_seconds` still has unwrapped prompts, without making the period a function
+    of the point being measured. Requests stay mutually unique past the wrap because the reseeded
+    header carries the uid digest.
     """
-    size = max(concurrency, min_requests + concurrency)
+    size = min_requests + _POOL_PERIOD_SLACK
+    # No `max(concurrency, ...)` floor: reinstating one would put concurrency back into the
+    # period. A pool shorter than one in-flight set is harmless anyway -- wrapped requests are
+    # RESEEDED, so they diverge at character zero and cannot share a cache block.
     pool: list[tuple[str, list[dict[str, Any]], int]] = []
     for index in range(size):
         uid = request_uid(bucket.name, concurrency, block, index, invocation)
@@ -564,6 +609,7 @@ async def run_cell(
 __all__ = [
     "REQUEST_TIMEOUT_SECONDS",
     "base_model_record",
+    "prompt_fit_seconds_bound",
     "run_cell",
     "run_request",
 ]
