@@ -680,7 +680,12 @@ def _quarantine_corrupt_recovery_record(
         run_id,
         exc_info=True,
     )
-    detail = f"unrecoverable: persisted status cannot be decoded: {exc}"
+    # Only the exception TYPE goes in the durable detail. `detail` reaches the submitter twice --
+    # persisted as `RunStatus.error` (returned by both run routes) and appended to the run log --
+    # and `_RECOVERY_RECORD_ERRORS` includes `OSError`, whose text carries the internal status-file
+    # path. The type still separates the corruption classes an operator would triage differently;
+    # the full exception stays server-side in the `exc_info=True` warning above.
+    detail = f"unrecoverable: persisted status cannot be decoded: {type(exc).__name__}"
     status, quarantined = None, False
     with contextlib.suppress(Exception):
         status, quarantined = _quarantine_corrupt_status(run_id, detail)

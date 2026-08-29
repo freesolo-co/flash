@@ -6748,6 +6748,10 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     )
 
 
+# an internal path an operator would recognize and a submitter must never receive.
+_OSERROR_SENTINEL_PATH = "/var/lib/flash/internal/runs/bad-run.json"
+
+
 @pytest.mark.parametrize(
     "bad_payload",
     [
@@ -6851,7 +6855,9 @@ def test_recover_runs_corrupt_status_is_quarantined_per_record(monkeypatch, tmp_
                     if value.get("recursion_sentinel"):
                         raise RecursionError("maximum recursion depth exceeded while decoding")
                     if value.get("oserror_sentinel"):
-                        raise PermissionError(13, "Permission denied")
+                        # carries a filename the way a real `open()` failure does, so the
+                        # persisted-detail assertion below is testing the actual leak vector.
+                        raise PermissionError(13, "Permission denied", _OSERROR_SENTINEL_PATH)
                 return value
 
         monkeypatch.setattr(runner_status, "json", _FailingJson())
@@ -6896,6 +6902,15 @@ def test_recover_runs_corrupt_status_is_quarantined_per_record(monkeypatch, tmp_
     assert bad_status.error
     assert "persisted status cannot be decoded" in bad_status.error
     assert "unrecoverable" in runner_status.get_logs("bad-run")
+    # the decode failure's own text never reaches the submitter. `RunStatus.error` is returned by
+    # both run routes and `detail` is appended verbatim to the run log, so an `OSError` rendered in
+    # full would publish the internal status-file path. the exception TYPE is the whole payload.
+    bad_log = runner_status.get_logs("bad-run")
+    for surface in (bad_status.error, bad_log):
+        assert _OSERROR_SENTINEL_PATH not in surface
+        assert "Permission denied" not in surface
+    if bad_payload.endswith(b'"oserror_sentinel":true}'):
+        assert bad_status.error.endswith("PermissionError")
     quarantine_files = list((tmp_path / "runs").glob("bad-run.json.corrupt-*"))
     assert len(quarantine_files) == 1
     assert quarantine_files[0].read_bytes() == bad_payload
