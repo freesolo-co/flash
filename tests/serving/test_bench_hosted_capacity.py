@@ -14,6 +14,7 @@ import asyncio
 import inspect
 import re
 import tomllib
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -501,7 +502,11 @@ def test_cache_contaminated_requests_are_errors_not_successes() -> None:
 
 
 def _cell(concurrency: int, tps: float, p95: float, feasible: bool = True) -> CellResult:
-    """A deep cell: 600 attempts resolves the Wilson bound, so ``feasible`` means what it says."""
+    """A deep cell: 600 attempts resolves the Wilson bound, so ``feasible`` means what it says.
+
+    No drain, so every success landed inside the window -- which is what makes this cell a valid
+    stand-in for a real one rather than one that reads as degraded for lack of steady-state work.
+    """
     return CellResult(
         base_model="Qwen/Qwen3.5-9B",
         bucket="short_interactive",
@@ -510,6 +515,7 @@ def _cell(concurrency: int, tps: float, p95: float, feasible: bool = True) -> Ce
         wall_seconds=60.0,
         attempted=600,
         succeeded=600 if feasible else 300,
+        succeeded_in_window=600 if feasible else 300,
         failed=0 if feasible else 300,
         error_rate=0.0 if feasible else 0.5,
         output_tokens_per_second=tps,
@@ -529,6 +535,7 @@ def _shallow_cell(concurrency: int, tps: float, p95: float) -> CellResult:
         wall_seconds=60.0,
         attempted=20,
         succeeded=20,
+        succeeded_in_window=20,
         failed=0,
         error_rate=0.0,
         output_tokens_per_second=tps,
@@ -1098,12 +1105,25 @@ def test_the_canary_refuses_a_sweep_when_warmup_generation_failed() -> None:
     """`run_request` turns exceptions, timeouts and malformed streams into ok=False records rather
     than raising, so `warmup.remote` returns normally against a wholly broken path."""
     source = BENCH_APP.read_text()
-    gate = source[source.index("def _run_canary(") :]
-    gate = gate[: gate.index("\ndef ")]
+    tree = ast.parse(source)
+    nodes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+    }
+    # The check lives in one shared predicate so the canary gate and the cold-container path cannot
+    # drift; assert the call rather than the inlined body, and assert the predicate does the reading.
+    called = {
+        child.func.id
+        for child in ast.walk(nodes["_run_canary"])
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+    }
+    assert "_require_healthy_warmup" in called, "the canary no longer checks its warmup records"
 
-    assert '"warmups"' in gate, "the gate reads a key the warmup payload does not emit"
-    assert 'get("ok")' in gate
-    assert "raise RuntimeError" in gate
+    predicate = ast.get_source_segment(source, nodes["_require_healthy_warmup"]) or ""
+    assert '"warmups"' in predicate, "the gate reads a key the warmup payload does not emit"
+    assert 'get("ok")' in predicate
+    assert "raise RuntimeError" in predicate
 
     warmup = source[source.index("async def _run_warmup(") :]
     emitted = warmup[: warmup.index("\nasync def ")]
@@ -1529,7 +1549,14 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
         and isinstance(node.targets[0], ast.Name)
         and isinstance(node.value, ast.Constant)
     }
+    # The estimator now resolves the catalog and grid from module scope rather than local imports,
+    # so the lifted function needs them supplied.
     namespace: dict = dict(constants)
+    namespace.update(
+        bench_engine_overrides_for=bench_engine_overrides_for,
+        concurrency_grid=concurrency_grid,
+        REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
+    )
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "<bench>", "exec"), namespace)
     estimate_for = namespace["_sweep_gpu_seconds_estimate"]
 
@@ -1544,8 +1571,9 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     assert estimate >= windows + drains + canary, (
         "the estimate omits the canary or the per-cell drain tails"
     )
+    # The boot is reserved at the ceiling Modal lets a stuck boot reach, not a typical observed one.
     assert estimate == pytest.approx(
-        constants["ESTIMATED_BOOT_GPU_SECONDS"] + canary + windows + drains
+        constants["STARTUP_TIMEOUT_SECONDS"] + canary + windows + drains
     )
 
 
@@ -1581,3 +1609,272 @@ def test_a_bucket_landing_on_a_cold_container_warms_itself_before_measuring() ->
         child.attr for child in ast.walk(nodes["_ensure_warm"]) if isinstance(child, ast.Attribute)
     }
     assert "_bench_warmed" in attributes, "warmth is not tracked per container"
+
+
+# ── Round-4: lane bounds, warmup health, and window-scoped degradation ────────────────────────
+
+
+def _bench_namespace(*names: str, **injected: Any) -> dict[str, Any]:
+    """Exec named top-level defs/assignments out of the Modal script, without importing it.
+
+    The script has a module-level ``import modal`` and builds Modal classes at import time, so it
+    cannot be imported in a unit test. Lifting the exact nodes keeps these tests against the real
+    source rather than a transcription of it, so editing the script breaks the test.
+    """
+    tree = ast.parse(BENCH_APP.read_text(encoding="utf-8"))
+    wanted = set(names)
+
+    def _defines(node: ast.stmt) -> set[str]:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            return {node.name}
+        if isinstance(node, ast.Assign):
+            return {t.id for t in node.targets if isinstance(t, ast.Name)}
+        return set()
+
+    body = [node for node in tree.body if _defines(node) & wanted]
+    missing = wanted - {name for node in body for name in _defines(node)}
+    assert not missing, f"the bench script no longer defines {sorted(missing)}"
+    namespace: dict[str, Any] = {"Any": Any, "uuid": uuid, **injected}
+    exec(compile(ast.Module(body=body, type_ignores=[]), "<bench>", "exec"), namespace)
+    return namespace
+
+
+def test_bench_container_timeout_covers_the_whole_grid_it_runs() -> None:
+    """A bucket runs its ENTIRE concurrency grid on one boot, so the ceiling must cover the sum.
+
+    The failure this guards is expensive and silent-until-the-end: a timeout below the grid's own
+    preregistered bounds kills ``run_bucket`` after the run has already paid for every cell, and the
+    artifact is never persisted -- full cost, zero evidence. The ceiling is DERIVED from the bucket
+    and grid bounds here for the same reason it is derived in the script: widening a bucket must
+    raise it automatically instead of quietly reintroducing the gap.
+    """
+    namespace = _bench_namespace(
+        "_worst_case_bucket_seconds",
+        "TIMEOUT_HEADROOM_SECONDS",
+        "TIMEOUT_SECONDS",
+        BENCH_MODELS=BENCH_MODELS,
+        bench_engine_overrides_for=bench_engine_overrides_for,
+        concurrency_grid=concurrency_grid,
+        BUCKETS=BUCKETS,
+        REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
+    )
+    timeout = namespace["TIMEOUT_SECONDS"]
+
+    # Recompute the worst case independently of the script's own helper.
+    points = max(
+        len(list(concurrency_grid(int(bench_engine_overrides_for(model).get("max_num_seqs", 8)))))
+        for model in BENCH_MODELS
+    )
+    widest = max(bucket.max_seconds for bucket in BUCKETS)
+    worst = points * (widest + REQUEST_TIMEOUT_SECONDS)
+    assert namespace["_worst_case_bucket_seconds"]() == worst
+    assert timeout >= worst, (
+        f"container timeout {timeout}s is below the {worst}s its own grid is allowed to take; "
+        "the bucket would be killed after paying for every cell and persist no artifact"
+    )
+    assert timeout > worst, "no headroom: the timeout would fire exactly at the bound"
+
+
+def test_warmup_prompts_are_unique_across_invocations() -> None:
+    """Fixed warmup UIDs collide with a RETAINED prefix cache and refuse a healthy engine.
+
+    Prompts are derived from the UID, so a fixed ``warmup-{i}`` reissues the same five prompts every
+    invocation. Inside the scaledown window the container survives, the second canary hits vLLM's
+    retained prefix cache, and the driver scores it ``ERROR_CACHE_CONTAMINATED`` -- correctly, since
+    a cached request measures nothing. The engine was fine; the harness refused it.
+    """
+    issued: list[str] = []
+
+    class _Record:
+        def to_json(self) -> dict[str, Any]:
+            return {"ok": True}
+
+    async def _fake_run_request(
+        engine: Any, base_model: str, messages: Any, max_tokens: int, uid: str, **kw: Any
+    ) -> Any:
+        issued.append(uid)
+        return _Record()
+
+    def _fake_fit(tokenizer: Any, uid: str, target: int) -> tuple[list[dict[str, str]], int]:
+        return ([{"role": "user", "content": uid}], target)
+
+    namespace = _bench_namespace("_run_warmup")
+    engine = mock.Mock(tokenizer=object(), base_model="Qwen/Qwen3.5-9B")
+    with (
+        mock.patch("flash.serving.bench.driver.run_request", _fake_run_request),
+        mock.patch("flash.serving.bench.workload.fit_prompt_to_tokens", _fake_fit),
+    ):
+        asyncio.run(namespace["_run_warmup"](engine, 5))
+        first = list(issued)
+        issued.clear()
+        asyncio.run(namespace["_run_warmup"](engine, 5))
+
+    assert len(set(first)) == 5, "warmup UIDs collide WITHIN one invocation"
+    assert not set(first) & set(issued), (
+        "warmup UIDs repeat ACROSS invocations, so a surviving container serves the second canary "
+        "from its retained prefix cache and the run is refused as cache-contaminated"
+    )
+
+
+def test_a_cold_replacement_container_checks_its_own_warmup_health() -> None:
+    """``run_request`` returns ``ok=False`` records instead of raising, so a warmup 'succeeds'.
+
+    The canary gate checks its warmup records. A container Modal replaces mid-sweep warms itself
+    through a different path, and trusting it because the canary passed on a DIFFERENT container
+    would start paid measurement against a generation path already known to be broken.
+    """
+    calls: list[int] = []
+
+    async def _fake_run_warmup(engine: Any, requests: int) -> dict[str, Any]:
+        calls.append(requests)
+        return {"warmups": [{"ok": True}, {"ok": False, "error": "cache_contaminated"}]}
+
+    namespace = _bench_namespace(
+        "_ensure_warm",
+        "_require_healthy_warmup",
+        "CANARY_WARMUP_REQUESTS",
+        _run_warmup=_fake_run_warmup,
+    )
+    namespace["_run_warmup"] = _fake_run_warmup
+    engine = mock.Mock()
+    del engine._bench_warmed  # a freshly booted container has never been warmed
+
+    with pytest.raises(RuntimeError, match="replacement-container warmup failed 1/2"):
+        asyncio.run(namespace["_ensure_warm"](engine))
+    assert calls, "the cold path never ran a warmup at all"
+
+
+def test_healthy_warmup_predicate_rejects_an_empty_or_failed_result() -> None:
+    """One predicate, so the canary gate and the cold-container path cannot drift apart."""
+    namespace = _bench_namespace("_require_healthy_warmup")
+    check = namespace["_require_healthy_warmup"]
+
+    check({"warmups": [{"ok": True}]}, "canary")  # the healthy case must not raise
+    with pytest.raises(RuntimeError, match="returned no records"):
+        check({"warmups": []}, "canary")
+    with pytest.raises(RuntimeError, match="returned no records"):
+        check(None, "canary")
+    with pytest.raises(RuntimeError, match="canary warmup failed 1/1"):
+        check({"warmups": [{"ok": False, "error": "timeout"}]}, "canary")
+
+
+def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> None:
+    """A reservation must price the boot Modal PERMITS, not a boot typically observed.
+
+    ``startup_timeout=STARTUP_TIMEOUT_SECONDS`` is how long a stuck boot bills for, so reserving a
+    typical 1200s boot accepts a ceiling the lane's own configuration lets it exceed -- which is the
+    single thing ``BudgetLedger`` exists to prevent. Both lanes are checked together because the
+    canary previously used a flat constant that the sweep-side fix did not reach.
+    """
+    namespace = _bench_namespace(
+        "_canary_gpu_seconds_estimate",
+        "_sweep_gpu_seconds_estimate",
+        "CANARY_WARMUP_REQUESTS",
+        "STARTUP_TIMEOUT_SECONDS",
+        bench_engine_overrides_for=bench_engine_overrides_for,
+        concurrency_grid=concurrency_grid,
+        REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
+    )
+    startup = namespace["STARTUP_TIMEOUT_SECONDS"]
+    warmups = namespace["CANARY_WARMUP_REQUESTS"]
+
+    canary = namespace["_canary_gpu_seconds_estimate"]()
+    assert canary == startup + REQUEST_TIMEOUT_SECONDS * warmups
+    assert canary >= startup, "the canary reserves less than a stuck boot alone would bill"
+
+    bucket = BUCKETS_BY_NAME["short_interactive"]
+    sweep = namespace["_sweep_gpu_seconds_estimate"]("Qwen/Qwen3.5-9B", [bucket])
+    points = len(list(concurrency_grid(8)))
+    expected = (
+        startup
+        + REQUEST_TIMEOUT_SECONDS * warmups
+        + bucket.max_seconds * points
+        + REQUEST_TIMEOUT_SECONDS * points
+    )
+    assert sweep == expected
+    assert sweep - canary >= bucket.max_seconds * points, "the sweep does not price its own cells"
+
+    source = BENCH_APP.read_text(encoding="utf-8")
+    for stale in ("ESTIMATED_CANARY_GPU_SECONDS", "ESTIMATED_BOOT_GPU_SECONDS"):
+        assert stale not in source, f"{stale} is a flat constant that cannot track the bounds"
+
+
+def test_documented_ceilings_exceed_what_each_lane_reserves() -> None:
+    """A documented ceiling below the lane's own reservation is a command that cannot run.
+
+    ``--ceiling-usd`` is reserved against BEFORE allocation and raises ``BudgetExceeded``, so a
+    copy-pasteable command whose ceiling is under its reservation fails every time it is run. The
+    doc numbers are checked against the estimators rather than pinned, so raising a reservation
+    fails here instead of shipping a broken runbook.
+    """
+    namespace = _bench_namespace(
+        "_canary_gpu_seconds_estimate",
+        "_sweep_gpu_seconds_estimate",
+        "CANARY_WARMUP_REQUESTS",
+        "STARTUP_TIMEOUT_SECONDS",
+        bench_engine_overrides_for=bench_engine_overrides_for,
+        concurrency_grid=concurrency_grid,
+        REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
+    )
+    doc = (REPO_ROOT / "docs" / "serving-capacity-envelope.md").read_text(encoding="utf-8")
+    model = "Qwen/Qwen3.5-9B"
+    gpu = bench_gpu_for(model)
+    documented = {
+        match.group(1): float(match.group(2))
+        for match in re.finditer(r"--mode (canary|sweep) .*?--ceiling-usd (\d+(?:\.\d+)?)", doc)
+    }
+    assert set(documented) == {"canary", "sweep"}, "the runbook lost one of its two commands"
+
+    reserved = {
+        "canary": namespace["_canary_gpu_seconds_estimate"](),
+        "sweep": namespace["_sweep_gpu_seconds_estimate"](
+            model, [BUCKETS_BY_NAME["short_interactive"]]
+        ),
+    }
+    for mode, seconds in reserved.items():
+        cost = usd_for_gpu_seconds(seconds, gpu)
+        assert documented[mode] >= cost, (
+            f"documented --ceiling-usd {documented[mode]} for the {mode} lane is below the "
+            f"${cost:.2f} it reserves; the command raises BudgetExceeded before allocating"
+        )
+
+
+def test_a_cell_with_no_in_window_successes_is_degraded() -> None:
+    """Drain completions keep ``succeeded`` positive on a cell whose steady-state rate is ZERO.
+
+    A cell so slow that nothing finishes inside its window still accumulates successes during the
+    drain. Testing ``succeeded`` there reads a cell delivering no throughput as usable, and because
+    its in-window latency sample is empty the saturation scan can skip past it and publish no
+    saturation at all -- the load ceiling would be reported as higher than the last concurrency the
+    engine actually served.
+    """
+    window, drain = 60.0, 900.0
+    records = []
+    for index in range(8):
+        record = _record(f"r{index}", latency=window + 100.0 + index)
+        # Every request finishes AFTER the window closed: real drain completions, not lost records.
+        record.first_token_at = window + 50.0
+        records.append(record)
+
+    cell = reduce_cell(
+        records,
+        base_model="Qwen/Qwen3.5-9B",
+        bucket="near_32k",
+        concurrency=8,
+        block=0,
+        wall_seconds=window + drain,
+        drain_seconds=drain,
+        window_seconds=window,
+    )
+
+    assert cell.succeeded == 8, "the drained requests must stay in the attempt accounting"
+    assert cell.succeeded_in_window == 0
+    assert cell.successful_rps == 0.0
+    assert cell.output_tokens_per_second == 0.0
+    assert not cell.feasible, "a cell with no in-window success cannot be called feasible"
+    assert cell.degraded, "zero steady-state throughput read as a usable cell"
+
+    # And the curve must saturate AT it rather than scanning past an empty latency sample.
+    healthy = _cell(1, 100.0, 2.0)
+    summary = summarize_curve([healthy, replace(cell, concurrency=2)])
+    assert summary["saturation_concurrency"] == 2

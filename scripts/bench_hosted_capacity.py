@@ -33,6 +33,7 @@ serving stack rather than a benchmark-only reimplementation.
 
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -50,9 +51,13 @@ CACHE_MOUNT = "/vol/bench-cache"
 
 # The 35B needs ~17 min of engine init before it serves a token; the ceiling bounds a stuck boot.
 STARTUP_TIMEOUT_SECONDS = 2700
-# A near-32k bucket runs its whole concurrency grid on one boot, so the container must outlive the
-# sum of the grid's cells plus teardown, not just one cell.
-TIMEOUT_SECONDS = 7200
+# A bucket runs its whole concurrency grid on one boot, so the container must outlive the sum of the
+# grid's cells AND their drains, not just the measured windows. The widest preregistered lane is
+# near_32k: 6 concurrency points x (600s window + 900s drain) = 9000s, and a 420s bucket still needs
+# 7920s. A 7200s ceiling terminated `run_bucket` before the most expensive bucket could persist its
+# artifact, so the run paid for the whole grid and published nothing. Derived below from the
+# preregistered bounds rather than typed, so widening a bucket cannot silently reintroduce the gap.
+TIMEOUT_HEADROOM_SECONDS = 900
 # Short: the container is torn down as soon as its lane finishes, and an idle benchmark card is pure
 # waste. Production's window is sized to amortize cold boots across real traffic; there is none here.
 SCALEDOWN_WINDOW_SECONDS = 120
@@ -108,7 +113,28 @@ from flash.serving.bench.catalog import (  # noqa: E402
     bench_engine_overrides_for,
     bench_gpu_for,
 )
+from flash.serving.bench.driver import REQUEST_TIMEOUT_SECONDS  # noqa: E402
+from flash.serving.bench.workload import BUCKETS, concurrency_grid  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
+
+
+def _worst_case_bucket_seconds() -> float:
+    """Longest a single ``run_bucket`` call can legitimately take, from the preregistered bounds.
+
+    Every concurrency point pays its bucket's ``max_seconds`` window plus a drain bounded by
+    ``REQUEST_TIMEOUT_SECONDS``. The widest grid across all bench models decides the ceiling, since
+    one ``timeout`` covers every tier's class.
+    """
+    points = max(
+        len(concurrency_grid(int(bench_engine_overrides_for(base_model).get("max_num_seqs", 8))))
+        for base_model in BENCH_MODELS
+    )
+    return points * (max(bucket.max_seconds for bucket in BUCKETS) + REQUEST_TIMEOUT_SECONDS)
+
+
+# Derived, never typed: widening a bucket or the concurrency grid raises this automatically instead
+# of silently reintroducing a ceiling below the work the grid is allowed to do.
+TIMEOUT_SECONDS = int(_worst_case_bucket_seconds() + TIMEOUT_HEADROOM_SECONDS)
 
 
 class _BenchEngineImpl(_LoraEngineImpl):
@@ -224,6 +250,27 @@ def _engine_for(base_model: str) -> Any:
     return ENGINE_BY_GPU[bench_gpu_for(base_model)]
 
 
+def _require_healthy_warmup(warm: Any, label: str) -> None:
+    """Raise unless every warmup record succeeded.
+
+    `run_request` converts exceptions, timeouts, malformed streams and cache-verification failures
+    into records with `ok=False` rather than raising, so a warmup call returns NORMALLY even when
+    the generation path is entirely broken. Without this check a warmup would wave through paid work
+    already known to be invalid -- and that is true of a replacement container's self-warmup just as
+    much as of the canary gate, so both paths share this one predicate.
+    """
+    records = warm.get("warmups") if isinstance(warm, dict) else None
+    if not isinstance(records, list) or not records:
+        raise RuntimeError(f"{label} warmup returned no records: {warm!r}")
+    failed = [record for record in records if not record.get("ok")]
+    if failed:
+        reasons = sorted({str(record.get("error")) for record in failed})
+        raise RuntimeError(
+            f"{label} warmup failed {len(failed)}/{len(records)} requests ({', '.join(reasons)}); "
+            "refusing to start paid work against a broken generation path"
+        )
+
+
 async def _ensure_warm(engine: Any) -> dict[str, Any] | None:
     """Warm THIS container if it has not been warmed yet, and report whether it had to.
 
@@ -240,6 +287,10 @@ async def _ensure_warm(engine: Any) -> dict[str, Any] | None:
     if getattr(engine, "_bench_warmed", False):
         return None
     warm = await _run_warmup(engine, CANARY_WARMUP_REQUESTS)
+    # A cold replacement container is exactly where an unhealthy engine surfaces, so its warmup gets
+    # the same check the canary gate applies rather than being trusted because the canary passed on
+    # a DIFFERENT container.
+    _require_healthy_warmup(warm, "replacement-container")
     engine._bench_warmed = True
     return warm
 
@@ -257,8 +308,15 @@ async def _run_warmup(engine: Any, requests: int) -> dict[str, Any]:
     origin = time.monotonic()
     out = []
     exact = 0
+    # Prompts are derived from the UID, so a fixed `warmup-{i}` reissued the SAME five prompts on
+    # every invocation. Within the 120s scaledown window the container survives, and the second
+    # canary hits a retained prefix cache -- which the driver correctly scores as
+    # ERROR_CACHE_CONTAMINATED, refusing the sweep even though generation was healthy. A nonce per
+    # invocation makes each warmup prompt request-unique from its first token, like every other
+    # prompt the harness issues.
+    nonce = uuid.uuid4().hex[:12]
     for index in range(requests):
-        uid = f"warmup-{index}"
+        uid = f"warmup-{nonce}-{index}"
         messages, exact = fit_prompt_to_tokens(engine.tokenizer, uid, bucket.target_input_tokens)
         record = await run_request(
             engine,
@@ -378,16 +436,7 @@ def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, An
     # into records with ok=False rather than raising, so `warmup.remote` returns normally even when
     # the generation path is entirely broken. Without this check the cheap gate would wave through an
     # expensive sweep already known to be invalid.
-    records = warm.get("warmups") if isinstance(warm, dict) else None
-    if not isinstance(records, list) or not records:
-        raise RuntimeError(f"canary warmup returned no records: {warm!r}")
-    failed = [record for record in records if not record.get("ok")]
-    if failed:
-        reasons = sorted({str(record.get("error")) for record in failed})
-        raise RuntimeError(
-            f"canary warmup failed {len(failed)}/{len(records)} requests ({', '.join(reasons)}); "
-            "refusing to start a paid sweep against a broken generation path"
-        )
+    _require_healthy_warmup(warm, "canary")
     return {"probe": probe, "warmup": warm}
 
 
@@ -397,10 +446,20 @@ def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, An
 # How many warmup requests the canary issues. Shared by `_run_canary` and the sweep estimate so the
 # reserved worst case cannot drift from the number actually issued.
 CANARY_WARMUP_REQUESTS = 5
-ESTIMATED_CANARY_GPU_SECONDS = 1200.0
 # One cold boot, amortized across a whole sweep because the boot dominates cost.
-ESTIMATED_BOOT_GPU_SECONDS = 1200.0
 MODES = ("canary", "sweep")
+
+
+def _canary_gpu_seconds_estimate() -> float:
+    """Worst-case billed GPU-seconds for a canary lane.
+
+    A flat constant here was the same defect the sweep estimator had, in a lane the sweep fix did
+    not touch: the canary bills for a boot Modal allows to run to `STARTUP_TIMEOUT_SECONDS`, plus
+    `CANARY_WARMUP_REQUESTS` SEQUENTIAL warmups each of which the driver allows to run to
+    `REQUEST_TIMEOUT_SECONDS`. Reserving less accepts a ceiling the lane's own bounds permit it to
+    exceed, which is precisely what `BudgetLedger` exists to prevent.
+    """
+    return float(STARTUP_TIMEOUT_SECONDS) + REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS
 
 
 def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
@@ -424,17 +483,15 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     The grid width comes from the engine's real `max_num_seqs`, so it tracks the catalog rather than
     a hardcoded six.
     """
-    from flash.serving.bench.catalog import bench_engine_overrides_for
-    from flash.serving.bench.driver import REQUEST_TIMEOUT_SECONDS
-    from flash.serving.bench.workload import concurrency_grid
-
     overrides = bench_engine_overrides_for(base_model)
     points = len(list(concurrency_grid(int(overrides.get("max_num_seqs", 8)))))
     cells = points * len(selected)
     measured = sum(float(bucket.max_seconds) * points for bucket in selected)
     drains = REQUEST_TIMEOUT_SECONDS * cells
     canary = REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS
-    return ESTIMATED_BOOT_GPU_SECONDS + canary + measured + drains
+    # The boot is reserved at the ceiling Modal actually allows a stuck boot to reach, not at a
+    # typical observed boot. Same reasoning as the canary lane.
+    return float(STARTUP_TIMEOUT_SECONDS) + canary + measured + drains
 
 
 @app.local_entrypoint()
@@ -484,7 +541,7 @@ def main(
     # permit far more be accepted under a ceiling it cannot honour. The ceiling is only real if the
     # reservation covers the whole campaign before the first remote call.
     estimate = (
-        ESTIMATED_CANARY_GPU_SECONDS
+        _canary_gpu_seconds_estimate()
         if mode == "canary"
         else _sweep_gpu_seconds_estimate(base_model, selected)
     )

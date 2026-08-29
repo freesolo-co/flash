@@ -153,8 +153,8 @@ model/tokenizer/processor provenance, and 32768 configured context runs before a
 teardown is confirmed after each model:
 
 ```
-modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary --ceiling-usd 3
-modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep --bucket short_interactive --ceiling-usd 5
+modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary --ceiling-usd 4
+modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep --bucket short_interactive --ceiling-usd 9
 ```
 
 `--ceiling-usd` is required and has no default: both commands allocate a GPU, and a spend ceiling
@@ -162,7 +162,11 @@ that a caller can forget to pass is not a ceiling. The entrypoint reserves the l
 GPU-seconds against it and raises `BudgetExceeded` BEFORE allocating, so a ceiling below the lane's
 own cost refuses the run rather than discovering the overrun partway through. The values above are
 per-invocation ceilings for a 9B L40S lane; a larger model or a wider bucket selection needs a
-correspondingly larger one.
+correspondingly larger one. They are stated ABOVE what each lane reserves, because a documented
+ceiling below the lane's own reservation is a command that cannot run: the canary reserves
+`2700s boot + 5 x 900s warmups = 7200s` ($3.90 at the recorded L40S rate) and the single-bucket
+sweep reserves `2700 + 4500 + 6 x 420 + 6 x 900 = 15120s` ($8.20). A full three-bucket sweep
+reserves 32040s ($17.37) and needs a ceiling above that.
 
 The boot dominates cost (~960s of ~1000s per cell in a prior campaign), so one boot runs a whole
 bucket's concurrency grid rather than one cell. `budget.py` reserves before allocation and raises

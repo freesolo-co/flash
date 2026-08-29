@@ -183,9 +183,15 @@ class CellResult:
 
         Distinct from ``not feasible``, which is also true for a cell that merely ran too few
         requests. A shallow clean cell is undecided; only an observed rate above the bar, a resolved
-        bound that still misses it, or zero successes is evidence of failure.
+        bound that still misses it, or zero IN-WINDOW successes is evidence of failure.
+
+        The test is ``succeeded_in_window``, not ``succeeded``. A cell so slow that nothing finishes
+        inside its window still accumulates successes during the drain, so ``succeeded`` stays
+        positive while every rate this cell reports is zero -- a cell delivering no steady-state
+        throughput would read as usable, and because its in-window latency sample is empty the
+        saturation scan could skip past it and publish no saturation at all.
         """
-        if not self.succeeded:
+        if not self.succeeded_in_window:
             return True
         if self.error_rate > self.max_error_rate:
             return True
@@ -282,10 +288,11 @@ def reduce_cell(
         error_rate_upper_bound=upper_bound,
         error_bound_resolved=bound_resolved,
         max_error_rate=max_error_rate,
-        # Feasibility needs real successes AND statistical support, so a cell that ran two requests
-        # cleanly cannot be called feasible. Read it with error_bound_resolved: feasible=False with
+        # Feasibility needs real IN-WINDOW successes AND statistical support, so neither a cell that
+        # ran two requests cleanly nor one whose only completions arrived during the drain can be
+        # called feasible. Read it with error_bound_resolved: feasible=False with
         # error_bound_resolved=False means undecided, not failed.
-        feasible=bool(successes) and upper_bound < max_error_rate,
+        feasible=bool(in_window) and upper_bound < max_error_rate,
         replica_ids=replica_ids,
     )
 
