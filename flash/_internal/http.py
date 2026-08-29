@@ -1,4 +1,4 @@
-"""authenticated stdlib HTTP that cannot leak a credential across a redirect.
+"""authenticated stdlib HTTP that does not let the stdlib replay a credential across a redirect.
 
 `urllib.request.Request` keeps two header bags. `headers` survives a redirect:
 `HTTPRedirectHandler.redirect_request` builds the follow-up request by copying it, stripping only
@@ -77,13 +77,21 @@ def _urlopen_no_redirect(
     timeout: float,
     urlopen: _UrlOpen | None = None,
 ):
-    """open one authenticated request so that no redirect can carry its credential.
+    """open one authenticated request through a transport that refuses redirects.
 
     the transport is read at call time rather than bound at import, because many tests replace
     `urllib.request.urlopen` with a fake. a replaced transport is called directly: it is not the
     stdlib opener stack, so routing it through a no-redirect opener would not reach it. every
     authenticated call site in flash passes either nothing or `urllib.request.urlopen` itself, so
     production always takes the refusing opener below; the direct branch exists for those fakes.
+
+    that makes the refusal guarantee conditional on the transport, and the condition is the global
+    being the one this module imported. rebinding `urllib.request.urlopen` after import - a test
+    fake, an apm shim installed at runtime - routes the call to the direct branch, which does not
+    refuse. relocation still runs first and still holds, so the credential cannot ride a hop the
+    replacement forwards as handed over; what is lost is refusal, and with it containment of the
+    two rebuild-and-handler gaps the module docstring names. a replacement transport owns its own
+    redirect policy.
     """
 
     _move_credentials_to_the_unredirected_bag(request)
