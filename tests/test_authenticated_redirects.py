@@ -238,3 +238,64 @@ def test_a_redirect_does_not_mutate_the_process_global_opener(redirect_servers) 
     assert exc_info.value.code == 302
     assert sink_seen == []
     assert urllib.request._opener is before
+
+
+def test_a_proxy_credential_added_mid_open_never_reaches_the_redirect_target(
+    monkeypatch,
+) -> None:
+    """a credential a handler adds while opening must land in the bag a redirect cannot copy.
+
+    relocating the request's own headers once is not enough. a credentialed `ProxyHandler` calls
+    `add_header("Proxy-Authorization", ...)` during `proxy_open`, after any one-shot sweep has
+    finished, so the proxy's own secret would ride a redirect out to the target host.
+    """
+    sink_seen: list[str | None] = []
+
+    class SinkHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            sink_seen.append(self.headers.get("Proxy-Authorization"))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    sink = ThreadingHTTPServer(("127.0.0.1", 0), SinkHandler)
+    sink_url = f"http://127.0.0.1:{sink.server_address[1]}"
+
+    class ProxyHandlerServer(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"{sink_url}/steal")
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandlerServer)
+    proxy_port = proxy.server_address[1]
+    for server in (sink, proxy):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    # the proxy carries userinfo, so urllib injects Proxy-Authorization mid-open. the sink is
+    # exempt from the proxy, so the redirected hop is made directly to it.
+    monkeypatch.setenv("http_proxy", f"http://proxyuser:proxypw@127.0.0.1:{proxy_port}/")
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+
+    # a wrapper that follows redirects and honours the proxy env, standing in for an APM or
+    # compatibility shim. `urlopen`'s cached global opener would not pick the env up here.
+    def _delegating_wrapper(request, **kwargs):
+        return urllib.request.build_opener().open(request, **kwargs)
+
+    try:
+        req = urllib.request.Request(
+            "http://proxied.invalid/x", headers={"Authorization": "Bearer secret"}
+        )
+        with _urlopen_no_redirect(req, timeout=5, urlopen=_delegating_wrapper) as resp:
+            resp.read()
+    finally:
+        for server in (proxy, sink):
+            server.shutdown()
+            server.server_close()
+
+    assert sink_seen == [None]
