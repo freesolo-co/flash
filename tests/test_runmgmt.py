@@ -3029,14 +3029,16 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
 
     runtime.recover_runs()
 
-    # recover_runs also backgrounds a _drain_cleanup_remotes_bg thread per known run (see
-    # recover_runs) so a slow/outage-hit provider teardown can't block the startup path; check
-    # for the resubmit-loop thread specifically rather than asserting the full thread list.
+    # recover_runs also backgrounds a _startup_cleanup_bg thread per known run (see recover_runs)
+    # so a slow/outage-hit provider teardown can't block the startup path; check for the
+    # resubmit-loop thread specifically rather than asserting the full thread list.
     assert (runtime._deferred_resubmit_loop, (spec,), True) in started
-    drain_calls = [
-        args for target, args, _daemon in started if target.__name__ == "_drain_cleanup_remotes_bg"
+    cleanup_calls = [
+        args[0].run_id
+        for target, args, _daemon in started
+        if target.__name__ == "_startup_cleanup_bg"
     ]
-    assert drain_calls == [(spec.run_id,)]
+    assert cleanup_calls == [spec.run_id]
 
 
 @pytest.mark.parametrize("retired_model", _RETIRED_MODELS)
@@ -3235,6 +3237,120 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
     status = runner_status.get_status(spec.run_id)
     assert status.state == "failed"
     assert "unsupported model" in (status.error or "")
+
+
+def _quarantine_handleless_run(monkeypatch, tmp_path, run_id: str) -> None:
+    """Persist a run whose status decodes only far enough to be quarantined, with no handle."""
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id=run_id, model="Qwen/Qwen3.5-9B", algorithm="sft")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=run_id, state="provisioning", spec=spec.to_dict())
+    )
+    path = runner_state.runs_file_path(run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    # the field `_validate_recovery_status` rejects, so recovery quarantines this record and
+    # terminalizes it -- the state in which nothing else ever reclaims its endpoint.
+    stored["submitted_instance_providers"] = 7
+    # quarantine lifts `spec` verbatim, and the endpoint name is derived from its GPU class.
+    stored["spec"]["gpu"]["type"] = "RTX 5090"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+
+def _run_recovery_with_inline_threads(monkeypatch, terminate) -> None:
+    import flash.providers.runpod.serverless.endpoints as serverless
+    import flash.server.platform.runtime as runtime
+    from flash.providers.core import registry as providers
+
+    monkeypatch.setattr(providers, "configured_providers", list)
+    monkeypatch.setattr(runner_reconciliation, "_drain_cleanup_remotes", lambda _run_id: None)
+    monkeypatch.setattr(serverless, "terminate_endpoint", terminate)
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target, self._args = target, args
+
+        def start(self):
+            self._target(*self._args)
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    runtime.recover_runs()
+
+
+def test_unconfirmed_endpoint_reclaim_is_retried_on_the_next_startup(monkeypatch, tmp_path):
+    """A provider failure during the one reclaim attempt must not strand a billing endpoint.
+
+    `_reclaim_unhandled_endpoints` gets a single daemon-thread attempt, and quarantine has just made
+    the run terminal -- so without a durable marker, a transient failure there leaves an endpoint
+    that `_RECOVERABLE` skips forever and RunPod's no-op `sweep_orphans` never sees.
+    """
+    import flash.server.platform.runtime as runtime
+
+    run_id = "reclaim-retry"
+    _quarantine_handleless_run(monkeypatch, tmp_path, run_id)
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": run_id}])
+
+    attempts: list[str] = []
+
+    def failing(gpu_type: str, _run_id: str) -> list[dict]:
+        attempts.append(gpu_type)
+        return [
+            {"success": False, "name": gpu_type, "message": "REST endpoint deletion unconfirmed"}
+        ]
+
+    _run_recovery_with_inline_threads(monkeypatch, failing)
+
+    assert attempts, "quarantine never attempted the name-derived reclaim"
+    assert runner_status.get_status(run_id).state == "failed"
+    assert runner_status.endpoint_reclaim_pending(run_id) is True
+
+    # the next boot reconsiders the terminal run purely because the marker is set.
+    confirmed: list[str] = []
+
+    def succeeding(gpu_type: str, _run_id: str) -> list[dict]:
+        confirmed.append(gpu_type)
+        return [{"success": True, "name": gpu_type, "message": "deleted via REST API"}]
+
+    _run_recovery_with_inline_threads(monkeypatch, succeeding)
+
+    assert confirmed == attempts
+    assert runner_status.endpoint_reclaim_pending(run_id) is False
+
+
+def test_confirmed_endpoint_reclaim_is_not_retried(monkeypatch, tmp_path):
+    """A confirmed teardown clears the marker, so later startups must not re-call the provider."""
+    import flash.server.platform.runtime as runtime
+
+    run_id = "reclaim-once"
+    _quarantine_handleless_run(monkeypatch, tmp_path, run_id)
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": run_id}])
+
+    calls: list[str] = []
+
+    def succeeding(gpu_type: str, _run_id: str) -> list[dict]:
+        calls.append(gpu_type)
+        return [{"success": True, "name": gpu_type, "message": "deleted via REST API"}]
+
+    _run_recovery_with_inline_threads(monkeypatch, succeeding)
+    first = list(calls)
+    assert first, "quarantine never attempted the name-derived reclaim"
+    assert runner_status.endpoint_reclaim_pending(run_id) is False
+
+    _run_recovery_with_inline_threads(monkeypatch, succeeding)
+    assert calls == first
+
+
+def test_reclaim_marker_never_reaches_the_public_status_projection(monkeypatch, tmp_path):
+    """The marker is operational state, not something a submitter's status response should carry."""
+    run_id = "reclaim-private"
+    _quarantine_handleless_run(monkeypatch, tmp_path, run_id)
+    runner_status.persist_endpoint_reclaim_intent(run_id)
+
+    assert runner_status.endpoint_reclaim_pending(run_id) is True
+    assert runner_state._ENDPOINT_RECLAIM_KEY not in runner_status.get_status(run_id).to_dict()
 
 
 def test_recover_runs_reattaches_confirmed_teardown_marker(monkeypatch, tmp_path):

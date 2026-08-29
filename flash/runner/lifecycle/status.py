@@ -284,6 +284,46 @@ def persist_teardown_intent(run_id: str) -> None:
         state._save_status_unlocked(status, _cleanup_remotes=records)
 
 
+def persist_endpoint_reclaim_intent(run_id: str) -> None:
+    """Mark a handle-less terminal run as still owing an endpoint reclaim by derived name.
+
+    `persist_teardown_intent` covers the run that DID persist a handle. This covers the one that did
+    not: RunPod accepted the create, then the response or the handle write was lost, so the only
+    address the endpoint has is the name `terminate_endpoint` rebuilds from the run id and GPU class.
+    That address cannot be expressed as a `cleanup_remotes` record -- `_uncanonical_cleanup_remote_key`
+    returns `None` without an `endpoint_id` or `instance_id`, so the drain skips it, and
+    `_delete_runpod_endpoint` would reject it outright -- hence a separate flag rather than a
+    synthetic handle the drain can only loop on.
+
+    The flag is what makes the reclaim survive. `_reclaim_unhandled_endpoints` runs once, on a daemon
+    thread, and swallows failures per endpoint; a process exit or a transient provider outage there
+    leaves an endpoint that no later boot revisits, because the run is terminal and RunPod's
+    `sweep_orphans` is a no-op. Written before the thread is launched and cleared only on confirmed
+    success, it turns that one attempt into one the next startup repeats.
+    """
+    with state._status_guard(run_id):
+        raw = _load_status_json(run_id)
+        if raw.get(state._ENDPOINT_RECLAIM_KEY) is True:
+            return
+        state._save_status_unlocked(_runstatus_from_json(raw), _endpoint_reclaim_pending=True)
+
+
+def clear_endpoint_reclaim_intent(run_id: str) -> None:
+    """Drop the reclaim flag once every derived endpoint is confirmed gone."""
+    with state._status_guard(run_id):
+        raw = _load_status_json(run_id)
+        if state._ENDPOINT_RECLAIM_KEY not in raw:
+            return
+        state._save_status_unlocked(_runstatus_from_json(raw), _endpoint_reclaim_pending=None)
+
+
+def endpoint_reclaim_pending(run_id: str) -> bool:
+    """Whether this run still owes a name-derived endpoint reclaim."""
+    with contextlib.suppress(Exception):
+        return _load_status_json(run_id).get(state._ENDPOINT_RECLAIM_KEY) is True
+    return False
+
+
 def _salvage_corrupt_record(
     run_id: str, raw: dict | None, detail: str, now: float
 ) -> tuple[RunStatus, list | None]:

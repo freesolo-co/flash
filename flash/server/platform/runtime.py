@@ -606,12 +606,35 @@ def _drain_cleanup_remotes_bg(run_id: str) -> None:
         _drain_cleanup_remotes(run_id)
 
 
+def _owes_endpoint_reclaim(status: RunStatus) -> bool:
+    """Whether this envelope is the handle-less terminal case `_reclaim_unhandled_endpoints` covers.
+
+    Quarantine writes `failed` only when it could NOT keep a settled outcome, so that state is the
+    signal that this run's worker was never released; a handle-backed run is covered by the direct
+    teardown instead. Shared because the persist and the attempt happen on different threads and
+    must agree -- an intent recorded under a wider condition than the attempt leaves a marker
+    nothing ever clears, and a narrower one leaves the endpoint this fix exists to reclaim.
+    """
+    return not status.remote and status.state == "failed"
+
+
+def _startup_cleanup_bg(status: RunStatus) -> None:
+    """Resume the durable per-run cleanups a previous boot may not have finished.
+
+    Launched for EVERY persisted run, terminal ones included, which is what makes the reclaim marker
+    worth writing: a `failed` run is dropped by `_RECOVERABLE` a few lines below, so this thread is
+    the only startup path that still reaches it.
+    """
+    _drain_cleanup_remotes_bg(status.run_id)
+    from flash.runner.lifecycle.status import endpoint_reclaim_pending
+
+    if endpoint_reclaim_pending(status.run_id):
+        _reclaim_unhandled_endpoints(status)
+
+
 def _teardown_failed_recovery_bg(status: RunStatus) -> None:
     _teardown_unrecoverable_remote(status)
-    # quarantine writes `failed` only when it could NOT keep a settled outcome, so that state is
-    # the signal that this run's worker was never released. a handle-backed run is already covered
-    # by the direct teardown above.
-    if not status.remote and status.state == "failed":
+    if _owes_endpoint_reclaim(status):
         _reclaim_unhandled_endpoints(status)
     # direct teardown can record an unconfirmed handle after an earlier drain took its snapshot.
     _drain_cleanup_remotes_bg(status.run_id)
@@ -637,11 +660,20 @@ def _reclaim_unhandled_endpoints(status: RunStatus) -> None:
     Suppressed so it can never re-abort recovery, and a no-op for a foreign or identity-less
     quarantine record: that salvages `spec = {}`, so `persisted_gpu_types` yields nothing and the
     name is never guessed from a record that cannot vouch for the run id.
+
+    This runs on a daemon thread and gets exactly one attempt, so the marker its caller persisted is
+    dropped only once the provider CONFIRMS every derived name is gone. A killed process or a
+    transient provider failure leaves it set, and `_startup_cleanup_bg` tries again next boot.
     """
     from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
+    from flash.runner.lifecycle.status import clear_endpoint_reclaim_intent
 
+    confirmed = False
     with contextlib.suppress(Exception):
-        terminate_persisted_endpoints(status.spec, status.run_id)
+        confirmed = terminate_persisted_endpoints(status.spec, status.run_id)
+    if confirmed:
+        with contextlib.suppress(Exception):
+            clear_endpoint_reclaim_intent(status.run_id)
 
 
 def _teardown_failed_recovery(status: RunStatus) -> None:
@@ -662,10 +694,16 @@ def _teardown_failed_recovery(status: RunStatus) -> None:
     ordinary `_update` has no such write and depends on this one. It stays on the startup thread on
     purpose -- a durable record the teardown thread might never reach is not a durable record.
     """
-    from flash.runner.lifecycle.status import persist_teardown_intent
+    from flash.runner.lifecycle.status import (
+        persist_endpoint_reclaim_intent,
+        persist_teardown_intent,
+    )
 
     with contextlib.suppress(Exception):
         persist_teardown_intent(status.run_id)
+    if _owes_endpoint_reclaim(status):
+        with contextlib.suppress(Exception):
+            persist_endpoint_reclaim_intent(status.run_id)
     with contextlib.suppress(Exception):
         threading.Thread(target=_teardown_failed_recovery_bg, args=(status,), daemon=True).start()
 
@@ -711,6 +749,7 @@ def _classify_recoverable_runs(
         _get_recovery_status,
         _update,
         effective_spec_from_status,
+        persist_endpoint_reclaim_intent,
         reallocation_spec_from_status,
     )
     from flash.runner.supervise.attach import attach_run
@@ -726,12 +765,10 @@ def _classify_recoverable_runs(
             status, quarantined = _quarantine_corrupt_recovery_record(row["run_id"], exc)
             if quarantined or status is None:
                 continue
-        # drain cleanup remotes in the background. provider outages can block each teardown through
+        # resume durable cleanups in the background. provider outages can block each teardown through
         # retry/backoff; serial startup cleanup can exceed HEALTHCHECK grace and create a restart loop.
         # recovery below does not depend on completion.
-        threading.Thread(
-            target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
-        ).start()
+        threading.Thread(target=_startup_cleanup_bg, args=(status,), daemon=True).start()
         if status.state not in _RECOVERABLE:
             continue
         if status.remote is None and status.cleanup_confirmed_remote is not None:
@@ -793,7 +830,13 @@ def _classify_recoverable_runs(
                 # no-op for RunPod, and the periodic idle reaper would only reclaim this after its
                 # 15-min idle grace — so tear it down by name HERE for immediate cleanup. The
                 # `_update` above just terminalized it on disk, which is this reclaim's
-                # precondition; it does not write back to `status`, so there is no state to test.
+                # precondition; it does not write back to `status`, so there is no state to test --
+                # which is also why the intent is recorded unconditionally here rather than through
+                # `_owes_endpoint_reclaim`, whose terminal check would read the stale in-memory
+                # state. Recorded FIRST, so a crash or provider outage inside the one attempt leaves
+                # a marker the next startup retries instead of an endpoint nothing revisits.
+                with contextlib.suppress(Exception):
+                    persist_endpoint_reclaim_intent(status.run_id)
                 _reclaim_unhandled_endpoints(status)
                 continue
             # reap run-scoped resources from the parseable public spec before touching the private
