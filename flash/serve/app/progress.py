@@ -20,10 +20,16 @@ _FILESYSTEM_USAGE_STAGES = frozenset(
 )
 
 
+def boot_elapsed_seconds() -> float:
+    """return elapsed process boot time for persisted replica telemetry."""
+
+    return max(0.0, time.perf_counter() - _STARTED_AT)
+
+
 def emit_boot_progress(phase: str, /, **context: object) -> None:
     """emit one flushed, single-line startup marker with only caller-selected context."""
 
-    elapsed = time.perf_counter() - _STARTED_AT
+    elapsed = boot_elapsed_seconds()
     fields = "".join(
         f" {name}={json.dumps(str(value), ensure_ascii=True)}" for name, value in context.items()
     )
