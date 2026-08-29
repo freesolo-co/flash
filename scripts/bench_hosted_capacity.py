@@ -448,6 +448,31 @@ def _write_artifact(payload: dict[str, Any], name: str) -> Path:
     return path
 
 
+def _require_resolved_gdn_backend(probe: dict[str, Any]) -> None:
+    """Raise unless the probe established WHICH GDN prefill backend the engine chose.
+
+    The harness documents the kernel path as a publication gate, but the gate only checked card
+    identity and Cutlass integrity. `probe_gdn_backend` records `resolved=None` whenever the
+    resolver is absent, its signature moved, or the served config would not load -- and none of
+    those stop the engine from booting, serving, and billing. So a healthy warmup waved through a
+    sweep whose kernel path was never established, and the envelope would be published without the
+    one label that makes a Blackwell number interpretable.
+
+    Unknown is not a backend. Refuse here, where the cost is one canary, rather than after a paid
+    sweep whose numbers cannot be attributed to a kernel.
+    """
+    gdn = probe.get("gdn_prefill") or {}
+    if gdn.get("resolved"):
+        return
+    detail = str(gdn.get("reason") or "probe recorded no reason")
+    if gdn.get("resolver_signature_mismatch"):
+        detail = f"resolver signature mismatch: {detail}"
+    raise RuntimeError(
+        "GDN prefill backend is unresolved "
+        f"({detail}); refusing to start paid work whose kernel path cannot be labelled"
+    )
+
+
 def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, Any]:
     """Boot, verify the card and kernel path, and warm up. The cheap gate before any sweep."""
     from flash.serving.bench.probe import gpu_matches
@@ -456,6 +481,7 @@ def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, An
     print(json.dumps(probe, indent=2), flush=True)
     if not gpu_matches(probe, expected_gpu):
         raise RuntimeError(f"expected {expected_gpu}, got {(probe.get('gpu') or {}).get('name')!r}")
+    _require_resolved_gdn_backend(probe)
     cutlass = (probe.get("gdn_prefill") or {}).get("cutlass") or {}
     if cutlass.get("checked") and not cutlass.get("intact"):
         # A warning, not a failure: the campaign measures the shipped dev runtime as it is. The
@@ -543,7 +569,13 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     # handled, and entirely foreseeable path unfunded, so a sweep accepted under its ceiling could
     # bill past it once per selected bucket. Priced per call, since that is where the exposure is.
     replacements = (boot + canary) * len(selected)
-    return boot + canary + measured + fitting + drains + replacements
+    # The canary is TWO separately bootable remote calls -- `probe.remote()` then `warmup.remote()`
+    # -- so a sweep makes `len(selected) + 2` of them, not `len(selected) + 1`. The canary lane
+    # already prices both; this lane priced only the initial boot, under-reserving every sweep by a
+    # whole `STARTUP_TIMEOUT_SECONDS` whenever the warmup landed on its own cold replacement. The
+    # warmup requests are NOT doubled: a replacement runs the same five, not a second set.
+    canary_replacement_boot = boot
+    return boot + canary_replacement_boot + canary + measured + fitting + drains + replacements
 
 
 @app.local_entrypoint()

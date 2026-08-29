@@ -1604,12 +1604,17 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     # one container. Every bucket call can therefore land on a cold replacement and pay another boot
     # plus its warmups, which bills whether or not the reservation admits it.
     replacements = (startup + canary) * 1
+    # `_run_canary` is TWO separately bootable remote calls, `probe` then `warmup`, so the sweep
+    # reserves the second canary boot exactly as the canary lane does.
+    canary_replacement_boot = startup
 
     assert estimate >= windows + drains + canary, (
         "the estimate omits the canary or the per-cell drain tails"
     )
     # The boot is reserved at the ceiling Modal lets a stuck boot reach, not a typical observed one.
-    assert estimate == pytest.approx(startup + canary + windows + fitting + drains + replacements)
+    assert estimate == pytest.approx(
+        startup + canary_replacement_boot + canary + windows + fitting + drains + replacements
+    )
 
 
 def test_a_bucket_landing_on_a_cold_container_warms_itself_before_measuring() -> None:
@@ -1831,6 +1836,9 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
     points = len(list(concurrency_grid(8)))
     expected = (
         startup
+        # The canary's SECOND boot: `probe` and `warmup` are separate remote calls, so the sweep
+        # reserves both exactly as the canary lane does.
+        + startup
         + REQUEST_TIMEOUT_SECONDS * warmups
         + bucket.max_seconds * points
         # Prompt fitting runs on the rented container before each cell's window opens, so it is
@@ -2313,3 +2321,98 @@ def test_early_stop_gates_on_steady_state_successes():
     source = BENCH_APP.read_text(encoding="utf-8")
     assert "result.succeeded_in_window == 0" in source
     assert "if result.succeeded == 0:" not in source
+
+
+def test_canary_gate_refuses_an_unresolved_gdn_backend() -> None:
+    """An unknown kernel path must stop the lane, not be waved through by a healthy warmup.
+
+    `probe_gdn_backend` records `resolved=None` when the resolver is missing, its signature moved,
+    or the served config would not load. None of those stop the engine booting, serving, and
+    billing, so without this gate a sweep could be paid for and published with no evidence of which
+    GDN prefill kernel produced the numbers -- the one label that makes a Blackwell result
+    interpretable.
+    """
+    # Assert the CALL SITE, not only the predicate. A helper that nothing invokes is exactly the
+    # reported defect -- `_run_canary` gated on card identity and Cutlass integrity and never read
+    # `resolved` -- so a test that only exercises the predicate passes against the broken gate.
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+    }
+    called = {
+        child.func.id
+        for child in ast.walk(nodes["_run_canary"])
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+    }
+    assert "_require_resolved_gdn_backend" in called, (
+        "the canary no longer checks which GDN backend resolved"
+    )
+
+    namespace = _bench_namespace("_require_resolved_gdn_backend")
+    require = namespace["_require_resolved_gdn_backend"]
+
+    # A resolved backend passes.
+    require({"gdn_prefill": {"resolved": "flashinfer"}})
+
+    # Unresolved for any reason must raise, and the reason must survive into the message.
+    for probe, expected in (
+        (
+            {"gdn_prefill": {"resolved": None, "reason": "vllm build has no resolver"}},
+            "no resolver",
+        ),
+        (
+            {
+                "gdn_prefill": {
+                    "resolved": None,
+                    "reason": "resolver requires 'linear_key_head_dim'",
+                    "resolver_signature_mismatch": True,
+                }
+            },
+            "signature mismatch",
+        ),
+        ({"gdn_prefill": {}}, "no reason"),
+        ({}, "no reason"),
+    ):
+        with pytest.raises(RuntimeError, match="unresolved"):
+            require(probe)
+        with pytest.raises(RuntimeError, match=expected):
+            require(probe)
+
+
+def test_sweep_reserves_both_canary_boots() -> None:
+    """The sweep makes `len(buckets) + 2` separately bootable calls, so it reserves that many boots.
+
+    `probe.remote()` and `warmup.remote()` are distinct calls and `max_containers=1` caps
+    simultaneous replicas without pinning successive calls to one container, so each can pay its own
+    cold boot. Reserving only the initial boot under-reserved every sweep by a full
+    `STARTUP_TIMEOUT_SECONDS`, which is precisely the overrun the ledger exists to refuse.
+    """
+    namespace = _bench_namespace(
+        "_sweep_gpu_seconds_estimate",
+        "CANARY_WARMUP_REQUESTS",
+        "STARTUP_TIMEOUT_SECONDS",
+        bench_engine_overrides_for=bench_engine_overrides_for,
+        concurrency_grid=concurrency_grid,
+        prompt_fit_seconds_bound=prompt_fit_seconds_bound,
+        REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
+    )
+    startup = namespace["STARTUP_TIMEOUT_SECONDS"]
+    estimate_for = namespace["_sweep_gpu_seconds_estimate"]
+
+    for count in (1, 2, 3):
+        selected = list(BUCKETS)[:count]
+        estimate = estimate_for("Qwen/Qwen3.5-9B", selected)
+        points = len(list(concurrency_grid(8)))
+        windows = sum(float(b.max_seconds) * points for b in selected)
+        fitting = sum(prompt_fit_seconds_bound(b) * points for b in selected)
+        drains = REQUEST_TIMEOUT_SECONDS * points * count
+        warmups = REQUEST_TIMEOUT_SECONDS * namespace["CANARY_WARMUP_REQUESTS"]
+        # Boots reserved: initial + canary replacement + one per bucket call.
+        boots = startup * (count + 2)
+        expected = boots + warmups * (count + 1) + windows + fitting + drains
+        assert estimate == pytest.approx(expected), (
+            f"{count}-bucket sweep must reserve {count + 2} boots"
+        )

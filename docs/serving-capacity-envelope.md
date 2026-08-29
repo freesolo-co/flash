@@ -171,7 +171,7 @@ teardown is confirmed after each model:
 
 ```
 modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary --ceiling-usd 7
-modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep --bucket short_interactive --ceiling-usd 16
+modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep --bucket short_interactive --ceiling-usd 18
 ```
 
 `--ceiling-usd` is required and has no default: both commands allocate a GPU, and a spend ceiling
@@ -184,9 +184,14 @@ submission stop, because a documented ceiling a lane cannot clear is a command t
 
 The canary reserves `2 x 2700s boot + 5 x 900s warmups = 9900s` ($5.37 at the recorded L40S rate) —
 two boots because `_run_canary` makes two remote calls, `probe` then `warmup`, and the second can
-land on a replacement. The single-bucket `short_interactive` sweep reserves 22719s ($12.31): boot,
-canary, `6 x 420` windows, `6 x 900` drains, one replacement boot-plus-canary, and 399s of prompt
-fitting. A full three-bucket sweep reserves 60146s ($32.60) and needs a ceiling above $41.
+land on a replacement. The single-bucket `short_interactive` sweep reserves 25419s ($13.78): both
+canary boots, the canary warmups, `6 x 420` windows, `6 x 900` drains, one replacement
+boot-plus-canary, and 399s of prompt fitting. A full three-bucket sweep reserves 62846s ($34.06)
+and needs a ceiling above $43.
+
+The sweep reserves the canary's SECOND boot for the same reason the canary lane does: `probe` and
+`warmup` are separate remote calls, so a sweep makes `len(buckets) + 2` separately bootable calls.
+Pricing only the initial boot under-reserved every sweep by a whole 2700s startup timeout.
 
 Prompt fitting is in the reservation but deliberately not in any `max_seconds`. It runs before a
 cell's clock starts, so tokenization cannot compete with the measured window for CPU — but it runs
@@ -201,8 +206,8 @@ which bills whether or not the reservation admitted it.
 
 A lane also has to clear its submission stop, not merely its ceiling: `reserve()` refuses at 80% of
 the ceiling so settlement lag and teardown stay funded. A lane consequently needs a ceiling around
-`1.25x` its own reservation -- $6.71 for the canary and $15.39 for the single-bucket
-`short_interactive` sweep -- and the `--ceiling-usd 7` and `--ceiling-usd 16` above clear those
+`1.25x` its own reservation -- $6.71 for the canary and $17.22 for the single-bucket
+`short_interactive` sweep -- and the `--ceiling-usd 7` and `--ceiling-usd 18` above clear those
 thresholds. A larger tier needs proportionally more: the same canary is $12.48 on the 35B's H200,
 so it needs a ceiling above $15.60.
 
