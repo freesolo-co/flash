@@ -1460,10 +1460,14 @@ def test_repeated_fake_continuation_work_is_linear_without_prefix_materializatio
         assert counters["_validate_value"] == 0
         measurements[repeats] = (scanned["distance"], len(text))
 
+    # the scan reads about 0.7 characters per input character and doubling the width
+    # doubles the distance, so these bounds hold with real headroom while still rejecting
+    # superlinear growth: doubling an ``n log n`` scan at these widths multiplies the
+    # distance by roughly 2.4, which a looser ratio would wave through as linear.
     for distance, length in measurements.values():
-        assert distance <= 2 * length
-    assert measurements[64][0] <= 2.5 * measurements[32][0]
-    assert measurements[128][0] <= 2.5 * measurements[64][0]
+        assert distance <= length
+    assert measurements[64][0] <= 2.2 * measurements[32][0]
+    assert measurements[128][0] <= 2.2 * measurements[64][0]
 
 
 _REVIEWED_OWNERSHIP_CASES = [
