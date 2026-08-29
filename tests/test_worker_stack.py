@@ -770,6 +770,31 @@ def test_finalize_preserves_terminal_heartbeat_fields(monkeypatch):
     assert emitted[-1][1]["metrics_last"] == metrics_last
 
 
+def test_finalize_uploads_metrics_before_done(monkeypatch):
+    from unittest.mock import mock_open
+
+    from flash.engine.result.accounting import RunMetrics
+    from flash.engine.worker.train.core.lifecycle import finalize
+
+    uploads = []
+    monkeypatch.setattr(RunMetrics, "save", lambda self, path: None)
+    monkeypatch.setattr(
+        finalize.hf_io,
+        "hf_upload_file",
+        lambda local_path, remote_name, **kwargs: uploads.append((remote_name, kwargs)),
+    )
+    monkeypatch.setattr(finalize.heartbeat_io, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
+    monkeypatch.setattr("builtins.open", mock_open())
+
+    finalize._finalize(RunMetrics(phase="rl"))
+
+    assert uploads == [
+        ("metrics.json", {"required": True}),
+        ("DONE", {"required": True}),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Hopper fla GDN fast-path fallback: when the healthy fla+tilelang stack can't be
 # Hopper fla GDN fast-path fallback: when the healthy fla+tilelang stack can't be assembled (probe
