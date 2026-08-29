@@ -127,6 +127,12 @@ SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     # ~1010s cold boot (35B bf16, 67 GiB + ~377s torch.compile). Break-even AND a ~17-min
     # user-visible stall on a miss both argue for keeping the full window here.
     "H200": 1800,
+    # B200 now carries ALL three hosted models, so its hold is sized by the slowest of them (the 35B
+    # bf16 boot, ~1010s of engine init) rather than by the fastest. an explicit entry also keeps the
+    # tier off DEFAULT_SCALEDOWN_WINDOW_SECONDS, which coincides with 1800 today but would drift
+    # silently if that default ever moved. the idle tax per cold wake is ~$3.13 at $6.25/h, the
+    # highest of any tier here -- that is the cost side of consolidating onto one card.
+    "B200": 1800,
 }
 
 
@@ -225,6 +231,36 @@ image = (
     .pip_install_from_pyproject(
         str(REPO_DIR / "pyproject.toml"),
         optional_dependencies=["serve-runtime", "serving"],
+    )
+    # repair the cute-dsl install AFTER the resolve above. `nvidia-cutlass-dsl-libs-base` and
+    # `-libs-cu13` both ship into the shared `nvidia_cutlass_dsl/` namespace and write many of the
+    # SAME paths with DIFFERENT content; whichever extracts last wins, and with a parallel installer
+    # the order is racy (NVIDIA/cutlass#3170, #3259). vllm 0.23.0 gates its flashinfer blackwell gdn
+    # prefill kernel on `_is_libs_cu13_install_intact()`
+    # (`model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py`), which re-hashes every file the
+    # `-libs-cu13` wheel claims and returns False on ANY mismatch.
+    #
+    # measured 2026-08-23 across four independently-built serving venvs on this vllm pin: 23, 26, 99
+    # and 99 of 200 files mismatched, so the corruption is the norm, not an edge case. verified end
+    # to end against vllm's OWN `_is_libs_cu13_install_intact()` on a copy of the real serving venv:
+    # False before this step, True after.
+    #
+    # the reinstall pins to the version already resolved above rather than naming one. unpinned,
+    # `--no-deps` ignores the resolved pin and takes the newest release (observed: the resolve gives
+    # the whole cute-dsl stack 4.5.2, and a bare reinstall pulled `-libs-cu13` 4.7.0 while
+    # `nvidia-cutlass-dsl` and `-libs-base` stayed at 4.5.2). that still satisfies the intactness
+    # check, because it re-hashes `-libs-cu13` against its OWN RECORD, so a uniformly-newer variant
+    # looks intact. that is exactly why the check cannot catch the skew this would introduce.
+    #
+    # why this matters on blackwell specifically: the flashinfer gdn path needs SM10.x +
+    # `linear_key_head_dim == 128` (true for every served Qwen3.5/3.6) + cuda>=13 (torch 2.11.0+cu130
+    # satisfies it) + this intactness check. only the last one fails, and it fails SILENTLY: the
+    # resolver falls through to triton/FLA after a single `warning_once`, so a blackwell tier boots,
+    # serves, and bills the blackwell rate while running the slower kernel. SM90 (H100/H200) is
+    # unaffected because it takes flashinfer with no further constraints.
+    .run_commands(
+        'pip install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==$('
+        "pip show nvidia-cutlass-dsl-libs-cu13 | awk '/^Version:/{print $2}')\"",
     )
     # copy the fail-closed repair into the image before running it. this is a build-time source
     # backport, not a runtime hook: it verifies exact vllm 0.23.0 pre/post hashes without importing

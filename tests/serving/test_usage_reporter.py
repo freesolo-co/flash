@@ -522,6 +522,16 @@ def test_lora_engine_health_reports_served_model_and_baked_config(modal_app_modu
         "prompt_token_cache_size": 2048,
         "prompt_token_cache_entries": 1,
         "max_model_len": 32768,
+        # Which GDN prefill kernel vLLM resolved. All three fields are None here and that is the
+        # CORRECT answer, not a gap: vLLM is absent offline and the fake torch above exposes no
+        # get_device_capability, so nothing can be proven. The contract is that an unprovable
+        # backend reports None rather than a confident value -- a report that guessed "flashinfer"
+        # would let a silently-downgraded Blackwell tier pass its canary.
+        "gdn_prefill_backend": {
+            "resolved": None,
+            "libs_cu13_intact": None,
+            "compute_capability": None,
+        },
     }
 
 

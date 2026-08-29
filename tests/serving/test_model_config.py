@@ -109,14 +109,16 @@ def test_no_bitsandbytes_anywhere() -> None:
         assert entry.get("load_format") != "bitsandbytes"
 
 
-def test_9b_has_l40s_rank128_serving_overrides() -> None:
+def test_9b_has_b200_rank128_serving_overrides() -> None:
     ov = engine_overrides_for("Qwen/Qwen3.5-9B")
     assert ov["max_loras"] == 16
     assert ov["max_lora_rank"] == 128
     assert ov["max_model_len"] == 32768
     assert ov["max_num_seqs"] == 8
-    # the 9B uses L40S because L4 and 2xL4 OOM at rank-128 x 16 plus 32k context.
-    assert gpu_for("Qwen/Qwen3.5-9B") == "L40S"
+    # the 9B serves on B200. the rank-128 x 16 plus 32k shape was sized on the L40S (48 GiB) after L4
+    # and 2xL4 OOMed; the 180 GiB B200 is a strict superset of that fit, so the shape carries over and
+    # the card is the only changed variable.
+    assert gpu_for("Qwen/Qwen3.5-9B") == "B200"
     assert ov["gpu_memory_utilization"] == 0.90
     assert (
         ov["enforce_eager"] is False
@@ -156,11 +158,12 @@ def test_qwen38_27b_is_active_on_h100_with_pinned_immutable_revisions() -> None:
     assert "language_model_only" not in ov
 
 
-def test_35b_has_h200_bf16_rank64_six_loras_overrides() -> None:
-    # the 35B MoE runs bf16 on the H200 with rank 64 at 6 hot slots and CUDA graphs on. bf16 is the
+def test_35b_has_b200_bf16_rank64_six_loras_overrides() -> None:
+    # the 35B MoE runs bf16 on the B200 with rank 64 at 6 hot slots and CUDA graphs on. bf16 is the
     # only config where full all-expert LoRA and graphs coexist (FP8 forces eager on the A100 and
     # fails the fp8e4nv fused-MoE-LoRA kernel on H200/B200); see SERVING_MODELS for the full rationale.
-    assert gpu_for("Qwen/Qwen3.6-35B-A3B") == "H200"
+    # the move to B200 does NOT revisit the dtype: quantization stays None for that same reason.
+    assert gpu_for("Qwen/Qwen3.6-35B-A3B") == "B200"
     ov = engine_overrides_for("Qwen/Qwen3.6-35B-A3B")
     assert ov["max_loras"] == 6
     assert ov["max_lora_rank"] == 64
@@ -170,4 +173,4 @@ def test_35b_has_h200_bf16_rank64_six_loras_overrides() -> None:
     assert (
         ov["gpu_memory_utilization"] == 0.90
     )  # headroom above the weights + 6 x 64 LoRA buffer for KV + graphs
-    assert ov["enforce_eager"] is False  # CUDA graphs on for the bf16/H200 path
+    assert ov["enforce_eager"] is False  # CUDA graphs on for the bf16 path

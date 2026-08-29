@@ -5,6 +5,7 @@ token accounting, and the vLLM AsyncEngineArgs compatibility probes. None of the
 state, so they are testable without constructing an engine.
 """
 
+import contextlib
 import hashlib
 import time
 from pathlib import Path
@@ -232,3 +233,61 @@ def enforce_expected_checkpoint(record: Any, expected_checkpoint: str | None) ->
             "Re-deploy the intended step or drop the expectation."
         )
     return active_checkpoint
+
+
+def gdn_prefill_backend_report() -> dict[str, Any]:
+    """What GDN prefill kernel vLLM ACTUALLY resolved, read from vLLM's own decision.
+
+    Every hosted base is a Qwen3 GDN-hybrid, and vllm 0.23.0 picks this kernel per-arch in
+    ``_resolve_gdn_prefill_backend``. SM90 takes FlashInfer unconditionally; SM10.x (Blackwell)
+    additionally requires an intact ``nvidia-cutlass-dsl-libs-cu13`` install, and when that term is
+    false it emits one ``warning_once`` and returns ``"triton"``. It does not raise. So an
+    unrepaired B200 boots green, serves correct output, and bills the Blackwell rate while running
+    the slower kernel -- the failure is invisible to every liveness signal we have.
+
+    This reports the resolver's own answer so the canary can assert it. When the resolver cannot be
+    reached (import moved, signature changed), ``resolved`` stays ``None`` rather than guessing:
+    an unknown backend must never read as a proven one. ``libs_cu13_intact`` is vLLM's own
+    predicate, not a reimplementation of the gate, and is reported separately because it is the
+    single term that the serving image's cuTe-DSL repair exists to satisfy.
+    """
+    report: dict[str, Any] = {
+        "resolved": None,
+        "libs_cu13_intact": None,
+        "compute_capability": None,
+    }
+    with contextlib.suppress(Exception):
+        import torch
+
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability(0)
+            report["compute_capability"] = f"{major}.{minor}"
+
+    try:
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as _gdn
+    except Exception:
+        return report
+
+    # the predicate is lru_cached; unwrap so a cache primed during a different phase of startup
+    # cannot answer for the live process.
+    intact = getattr(_gdn, "_is_libs_cu13_install_intact", None)
+    if intact is not None:
+        with contextlib.suppress(Exception):
+            report["libs_cu13_intact"] = bool(getattr(intact, "__wrapped__", intact)())
+
+    resolve = getattr(_gdn, "_resolve_gdn_prefill_backend", None)
+    if resolve is not None:
+        with contextlib.suppress(Exception):
+            import inspect
+
+            # bind by NAME against the real signature: the resolver's parameters have moved across
+            # vllm releases, and a positional call that silently binds the wrong argument would
+            # produce a confident wrong answer, which is worse than None.
+            supplied = {"backend": "auto", "linear_key_head_dim": 128, "head_k_dim": 128}
+            params = inspect.signature(resolve).parameters
+            if set(params) <= set(supplied):
+                outcome = resolve(**{name: supplied[name] for name in params})
+                # returns ``(backend, resolved)``; take the resolved element either way.
+                report["resolved"] = str(outcome[-1] if isinstance(outcome, tuple) else outcome)
+
+    return report
