@@ -1602,6 +1602,61 @@ def test_generated_numeric_call_replays_as_valid_history(emitted: str) -> None:
     )
 
 
+def _empty_argument_tools():
+    declaration = _delimiter_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"] = {}
+    declaration["function"]["parameters"]["required"] = []
+    return normalize_tools([declaration])
+
+
+def _repeated_empty_calls(count: int) -> str:
+    name = _empty_argument_tools()[0].name
+    return "".join(f"<tool_call><function={name}></function></tool_call>" for _ in range(count))
+
+
+@pytest.mark.parametrize("count", [408, 409], ids=["largest-replayable", "first-unreplayable"])
+def test_generated_call_count_never_exceeds_what_history_accepts(count: int) -> None:
+    """the parser must not emit more calls than the follow-up request can carry.
+
+    replaying the turn resends every call alongside its own tool result, and that structure
+    alone exhausts the message budget past 408 calls even with empty arguments. emitting 409
+    would handto the client a response flash then rejects, stranding calls that can never be
+    answered, so the whole candidate stays exact text instead.
+    """
+    tools = _empty_argument_tools()
+    text = _repeated_empty_calls(count)
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    if count > 408:
+        assert result.content == text
+        assert result.calls == ()
+        return
+
+    assert len(result.calls) == count
+    parse_chat_request(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {**call.wire(), "id": f"{call.id}{index}"}
+                        for index, call in enumerate(result.calls)
+                    ],
+                },
+                *(
+                    {"role": "tool", "tool_call_id": f"{call.id}{index}", "content": "ok"}
+                    for index, call in enumerate(result.calls)
+                ),
+            ],
+            "tools": [tool.wire() for tool in tools],
+        },
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+
 def _wide_optional_string_tools(count: int):
     declaration = _delimiter_tools()[0].wire()
     declaration["function"]["parameters"]["properties"] = {
@@ -2112,19 +2167,24 @@ def _integer_calls(count: int) -> tuple[object, str]:
     return tools, text
 
 
-def test_exactly_512_calls_remain_supported() -> None:
-    tools, text = _integer_calls(512)
-    next_id = iter(f"call_{index}" for index in range(512)).__next__
+def test_exactly_the_replayable_call_count_remains_supported() -> None:
+    """the largest emittable batch is the largest the follow-up request can carry back.
+
+    this used to allow 512, but replaying 409 calls with their tool results already exceeds
+    the message budget, so the parser was handing back responses flash then rejected.
+    """
+    tools, text = _integer_calls(408)
+    next_id = iter(f"call_{index}" for index in range(408)).__next__
 
     result = parse_qwen3_coder_output(text, tools, id_factory=next_id)
 
     assert result.content is None
-    assert len(result.calls) == 512
-    assert result.calls[-1].id == "call_511"
+    assert len(result.calls) == 408
+    assert result.calls[-1].id == "call_407"
 
 
-def test_513_calls_reject_before_call_id_creation() -> None:
-    tools, text = _integer_calls(513)
+def test_one_call_past_the_replayable_count_rejects_before_call_id_creation() -> None:
+    tools, text = _integer_calls(409)
     id_calls = 0
 
     def make_id() -> str:

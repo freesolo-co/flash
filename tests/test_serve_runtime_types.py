@@ -1125,14 +1125,17 @@ def test_detached_history_arguments_are_native_json_values_without_stringified_c
     converted = detached_template_messages(messages)
     detached = converted[0]["tool_calls"][0]["function"]["arguments"]
 
+    # a top-level bool or null is pre-rendered because the template spells a scalar with
+    # ``string``, which would emit python's ``True`` and ``None``. inside a container
+    # ``tojson`` already spells them correctly, so those stay native.
     assert detached == {
         "direct": 1.25,
         "integral": 9007199254740993,
         "nested": {"value": 25},
         "values": [0.625, 100],
         "text": "exact",
-        "enabled": True,
-        "empty": None,
+        "enabled": "true",
+        "empty": "null",
     }
     json.dumps(detached, allow_nan=False)
     assert type(detached["nested"]) is dict

@@ -27,10 +27,18 @@ from flash.serve.request.tool_calls import (
     _skip_whitespace,
     _validate_tool_argument_complexity,
 )
+from flash.serve.request.validation import MAX_MESSAGE_NODES
 
 _CALL_BOUNDARY_RE = re.compile(r"</function>\s*</tool_call>\s*(<tool_call>)\s*<function=([^>]+)>")
 _PARAMETER_OPEN_RE = re.compile(r"<parameter=([^>]+)>")
 _AMBIGUOUS, _EXHAUSTED = object(), object()
+# a parsed call has to survive being replayed as history, and the follow-up request carries
+# the assistant turn plus one tool result per call. each pair costs ten nodes against the
+# message budget on top of the turn's own fixed overhead, so emitting more calls than fit
+# would hand back a response flash then refuses. the exact-text fallback is honest instead.
+# the measured boundary is 408 accepted and 409 rejected, which this reproduces exactly.
+_REPLAY_NODES_PER_CALL, _REPLAY_TURN_NODES = 10, 16
+_MAX_REPLAYABLE_CALLS = (MAX_MESSAGE_NODES - _REPLAY_TURN_NODES) // _REPLAY_NODES_PER_CALL
 
 
 def _strip_grammar_newline_wrapper(raw: str) -> str:
@@ -130,7 +138,8 @@ def parse_qwen3_coder_output(
     content = text[:first] or None
     tool_map = {tool.name: tool for tool in tools}
     candidates = [match.start(1) for match in _CALL_BOUNDARY_RE.finditer(text, first) if match[2] in tool_map]  # fmt: skip
-    if len(candidates) >= 512:
+    # ``candidates`` holds the calls after the first, so the emitted count is one more.
+    if len(candidates) + 1 > _MAX_REPLAYABLE_CALLS:
         return ToolParseResult(content=text, calls=())
     opener_positions: dict[str, list[int]] = {}
     for match in _PARAMETER_OPEN_RE.finditer(text, first, len(text)):

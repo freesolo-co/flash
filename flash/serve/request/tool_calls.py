@@ -499,7 +499,14 @@ def _template_argument_value(value: Any) -> Any:
     therefore pre-rendered here as its exact compact text, which ``string`` passes
     through unchanged and ``tojson`` never sees. the whole container has to be
     pre-rendered together, because ``tojson`` cannot serialize a nested ``Decimal``.
+
+    booleans and nulls need the same treatment for a different reason: ``string`` spells
+    them ``True`` and ``None``, so replaying an emitted ``{"enabled": true}`` would show
+    the model python syntax the grammar never produces. inside a container ``tojson``
+    already spells them correctly, so only the scalar position is pre-rendered.
     """
+    if value is None or type(value) is bool:
+        return _dump_exact_json(value)
     try:
         return _native_json_value(value)
     except _InexactTemplateNumber:

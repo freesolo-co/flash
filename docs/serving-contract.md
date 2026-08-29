@@ -87,7 +87,13 @@ Generated and historical JSON numeric literals support at most 1024 significand 
 generated candidates remain exact text and oversized history is rejected. Exponent magnitude is not
 part of this bound. A historical value that no native template number carries faithfully, because it
 would overflow, underflow, or lose digits, is rendered as its exact compact text instead of being
-converted or rejected, and a container holding such a value is rendered exactly as a whole. Every
+converted or rejected, and a container holding such a value is rendered exactly as a whole. A
+top-level boolean or null argument is likewise pre-rendered as `true`, `false`, or `null`, because the
+template spells a scalar with `string` and would otherwise show the model Python's `True` and `None`;
+inside a container those values stay native, since the template's `tojson` already spells them
+correctly. A response carries at most 408 tool calls, the largest batch whose replay as an assistant
+turn plus one tool result per call still fits the message-complexity budget; a longer run of
+candidates stays exact text rather than becoming calls the next request would reject. Every
 accepted call therefore replays as itself, so a generated call is always valid history. These local
 serving-contract bounds do not depend on Python's process-wide integer conversion limit. Unsupported
 keywords and `strict: true` are rejected.

@@ -847,8 +847,21 @@ def test_oversized_integer_tool_history_is_a_request_error(argument: str) -> Non
         ('{"pair":{"a":1e1024,"b":2}}', '{"a": 1e+1024, "b": 2}'),
         ('{"mixed":{"trailing":1.2300,"huge":1e1024}}', '{"trailing": 1.23, "huge": 1e+1024}'),
         ('{"signed":{"zero":-0.0,"huge":1e1024}}', '{"zero": 0, "huge": 1e+1024}'),
+        ('{"enabled":true}', "true"),
+        ('{"disabled":false}', "false"),
+        ('{"value":null}', "null"),
     ],
-    ids=["direct", "nested", "list", "pair", "mixed-native-leaf", "mixed-signed-zero"],
+    ids=[
+        "direct",
+        "nested",
+        "list",
+        "pair",
+        "mixed-native-leaf",
+        "mixed-signed-zero",
+        "scalar-true",
+        "scalar-false",
+        "scalar-null",
+    ],
 )
 def test_compact_exponent_tool_history_renders_without_expanding(
     argument: str, rendered: str
@@ -869,6 +882,36 @@ def test_compact_exponent_tool_history_renders_without_expanding(
     detached = detached_template_messages(normalized.messages)
     values = detached[0]["tool_calls"][0]["function"]["arguments"]
     assert next(iter(values.values())) == rendered
+
+
+@pytest.mark.parametrize(
+    ("argument", "rendered"),
+    [
+        ('{"wrapped":{"enabled":true,"value":null}}', '{"enabled": true, "value": null}'),
+        ('{"listed":[true,false,null]}', "[true, false, null]"),
+    ],
+    ids=["nested", "listed"],
+)
+def test_contained_boolean_and_null_history_keeps_native_values(
+    argument: str, rendered: str
+) -> None:
+    """a bool or null inside a container stays native, because ``tojson`` spells it right.
+
+    only the scalar position needs pre-rendering: there the template uses ``string``, which
+    would emit python's ``True`` and ``None``. pre-rendering a container as well would hand
+    ``tojson`` a string and quote the whole structure, so the two positions differ.
+    """
+    normalized = parse_chat_request(
+        {"messages": _historical_tool_messages(argument)},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    detached = detached_template_messages(normalized.messages)
+    values = detached[0]["tool_calls"][0]["function"]["arguments"]
+    value = next(iter(values.values()))
+    assert not isinstance(value, str)
+    assert json.dumps(value, ensure_ascii=False) == rendered
 
 
 @pytest.mark.parametrize("argument", ['{"text":"\\ud800"}', '{"text":"\\udc00"}'])
