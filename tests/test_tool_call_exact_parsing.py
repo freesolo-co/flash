@@ -438,31 +438,78 @@ def test_string_enum_rejects_unrepresentable_structural_delimiter(enum_value: st
 
 @pytest.mark.parametrize(
     "enum_value",
-    ["\nleading", "trailing\n"],
-    ids=["leading-newline", "trailing-newline"],
+    ["\nleading", "trailing\n", "a\nb"],
+    ids=["leading-newline", "trailing-newline", "interior-newline"],
 )
-def test_string_enum_rejects_grammar_formatting_newline(enum_value: str) -> None:
-    """a member whose own newline the grammar's formatting strips cannot round-trip.
+def test_string_enum_accepts_newline_members(enum_value: str) -> None:
+    """every newline position round-trips, so no member needs declaration-time rejection.
 
-    the wire form is ``<parameter=name>\\n<value>\\n</parameter>`` and the runtime strips one
-    leading and one trailing newline back off, so ``"\\nfoo"`` and ``"foo"`` are the same bytes.
-    accepting the declaration would let a generated call decode as a DIFFERENT valid member.
+    the runtime strips the grammar's newline wrapper only when BOTH sides are present, so a
+    one-sided newline is the value's own and survives. these members are representable.
     """
     declaration = _exact_tools()[0].wire()
     declaration["function"]["parameters"]["properties"]["label"]["enum"] = [enum_value]
 
-    with pytest.raises(ValueError, match="unrepresentable tool grammar delimiter"):
-        normalize_tools([declaration])
-
-
-def test_string_enum_keeps_interior_newline_members() -> None:
-    """only the stripped positions are ambiguous; an interior newline round-trips exactly."""
-    declaration = _exact_tools()[0].wire()
-    declaration["function"]["parameters"]["properties"]["label"]["enum"] = ["a\nb"]
-
     tools = normalize_tools([declaration])
 
-    assert tools[0].parameters["properties"]["label"]["enum"] == ["a\nb"]
+    assert tools[0].parameters["properties"]["label"]["enum"] == [enum_value]
+
+
+@pytest.mark.parametrize(
+    ("emitted", "decoded"),
+    [
+        ("\nfoo\n", "foo"),
+        ("\nfoo", "\nfoo"),
+        ("foo\n", "foo\n"),
+        ("foo", "foo"),
+        ("\n\nfoo\n", "\nfoo"),
+        ("\nfoo\n\n", "foo\n"),
+    ],
+    ids=["wrapped", "leading-only", "trailing-only", "bare", "wrapped-leading", "wrapped-trailing"],
+)
+def test_free_string_strips_only_the_complete_newline_wrapper(emitted: str, decoded: str) -> None:
+    """a one-sided newline is data, not framing, so it must survive the parse.
+
+    stripping each side independently collapses four distinct wire forms onto one value, which
+    silently invokes the tool with different arguments than the model emitted.
+    """
+    text = _exact_call().replace(
+        "<parameter=label>ok</parameter>", f"<parameter=label>{emitted}</parameter>"
+    )
+
+    result = parse_qwen3_coder_output(text, _exact_tools(), id_factory=lambda: "call_fixed")
+
+    assert json.loads(result.calls[0].arguments)["label"] == decoded
+
+
+@pytest.mark.parametrize(
+    ("member", "emitted"),
+    [
+        ("\nfoo", "\nfoo"),
+        ("foo\n", "foo\n"),
+        ("\nfoo", "\n\nfoo\n"),
+        ("a\nb", "\na\nb\n"),
+    ],
+    ids=["bare-leading", "bare-trailing", "wrapped-leading", "wrapped-interior"],
+)
+def test_enum_member_with_newline_round_trips_through_the_grammar(
+    member: str, emitted: str
+) -> None:
+    """an enum member carrying a newline stays selectable, so it needs no declaration-time ban.
+
+    enums take the schema-directed value path rather than the free-string path, so the wrapper
+    rule has to hold there too or the member decodes to a different one and fails validation.
+    """
+    declaration = _exact_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"]["label"]["enum"] = [member]
+    tools = normalize_tools([declaration])
+    text = _exact_call().replace(
+        "<parameter=label>ok</parameter>", f"<parameter=label>{emitted}</parameter>"
+    )
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert json.loads(result.calls[0].arguments)["label"] == member
 
 
 def _property_name_tool(property_name: str, *, nested: bool) -> list[dict[str, object]]:

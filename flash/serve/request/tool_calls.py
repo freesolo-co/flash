@@ -683,14 +683,6 @@ def _identifier_name(value: object, path: str, error_type: type[Exception]) -> s
 
 
 def _string_enum_conflicts_with_tool_grammar(value: str) -> bool:
-    # the grammar writes a value as `<parameter=name>\n<value>\n</parameter>`, and the runtime
-    # strips one leading and one trailing newline back off. a member that itself begins or ends
-    # with a newline is therefore indistinguishable on the wire from the member without it, so
-    # an emitted `"\nfoo"` decodes as `"foo"` and silently invokes the tool with a different
-    # enum member. that value has no exact representation in this grammar; reject the
-    # declaration rather than accept one that cannot round-trip.
-    if value.startswith("\n") or value.endswith("\n"):
-        return True
     cursor = 0
     while True:
         cursor = value.find(_PARAMETER_END, cursor)

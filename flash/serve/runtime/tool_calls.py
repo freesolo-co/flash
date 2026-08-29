@@ -238,8 +238,8 @@ def _parse_parameter_value(state, value_start, schema, values, name, probe):
             return None
         search_from = value_end + len(_PARAMETER_END)
     raw = text[value_start:value_end]
-    raw = raw[1:] if raw.startswith("\n") else raw
-    raw = raw[:-1] if raw.endswith("\n") else raw
+    if raw.startswith("\n") and raw.endswith("\n") and len(raw) >= 2:
+        raw = raw[1:-1]
     value = _coerce_value(raw, schema["type"])
     if not _validate_value(value, schema):
         return None
@@ -318,7 +318,8 @@ def _classify_free_string(state, value_start, values, name, probe):
 
 
 def _materialize_span(text: str, span: _FreeStringSpan) -> str | None:
-    value = text[span.start : span.end].removeprefix("\n").removesuffix("\n")
+    raw = text[span.start : span.end]
+    value = raw[1:-1] if raw.startswith("\n") and raw.endswith("\n") and len(raw) >= 2 else raw
     return None if _contains_unpaired_surrogate(value) else value
 
 
