@@ -410,16 +410,42 @@ def test_one_engine_class_per_distinct_engine_key(modal_app_module):
     """a loraengine class is built for each active gpu tier and concurrency key."""
     assert set(modal_app_module.ENGINE_BY_KEY) == {
         ("L40S", 16),
-        ("H100", 16),
-        ("H200", 16),
+        ("H100", 8),
+        ("H200", 8),
     }
+
+
+def test_modal_never_admits_more_requests_than_the_engine_can_decode(modal_app_module):
+    """The load-bearing invariant: max_inputs counts REQUESTS, max_num_seqs counts vLLM SEQUENCES.
+    Admitting more requests than the engine has decode slots makes Modal queue the surplus INSIDE
+    the container instead of autoscaling -- measured at ~1.98x per-request slowdown with flat
+    container throughput. Asserted for every active model, not just today's two."""
+    mod = modal_app_module
+    for base_model in mod.base_models():
+        max_inputs, target_inputs = mod._engine_concurrency(base_model)
+        seqs = mod.engine_overrides_for(base_model)["max_num_seqs"]
+        assert max_inputs <= seqs, base_model
+        assert target_inputs <= max_inputs, base_model
+
+
+def test_engine_concurrency_rejects_admitting_more_requests_than_decode_slots(
+    modal_app_module, monkeypatch
+):
+    """A catalog that admits more requests than the engine decodes must fail closed at import,
+    not silently reintroduce in-container queueing."""
+    mod = modal_app_module
+    monkeypatch.setattr(
+        mod, "engine_overrides_for", lambda _bm: {"max_num_seqs": 8, "max_inputs": 9}
+    )
+    with pytest.raises(ValueError, match="exceeds max_num_seqs"):
+        mod._engine_concurrency("overcommitted")
 
 
 def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, monkeypatch):
     mod = modal_app_module
 
     monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {"max_num_seqs": 8})
-    assert mod._engine_concurrency("valid") == (16, 12)
+    assert mod._engine_concurrency("valid") == (8, 6)
 
     monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {})
     assert mod._engine_concurrency("defaulted") == (64, 48)
@@ -448,19 +474,19 @@ def test_9b_routes_to_l40s(modal_app_module):
 
 
 def test_27b_routes_to_h100(modal_app_module):
-    """The dense 27B runs its FP8 checkpoint on the H100 tier (8-seq -> (H100, 16))."""
+    """The dense 27B runs its FP8 checkpoint on the H100 tier (8-seq -> (H100, 8))."""
     by_key = modal_app_module.ENGINE_BY_KEY
     assert gpu_for("Qwen/Qwen3.8-27B") == "H100"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B") is by_key[("H100", 16)]
-    assert by_key[("H100", 16)].pinned_gpu == "H100"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B") is by_key[("H100", 8)]
+    assert by_key[("H100", 8)].pinned_gpu == "H100"
 
 
 def test_35b_moe_routes_to_h200(modal_app_module):
-    """The 35B-A3B MoE runs bf16 on the H200 tier ((H200, 16))."""
+    """The 35B-A3B MoE runs bf16 on the H200 tier ((H200, 8))."""
     by_key = modal_app_module.ENGINE_BY_KEY
     assert gpu_for("Qwen/Qwen3.6-35B-A3B") == "H200"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-35B-A3B") is by_key[("H200", 16)]
-    assert by_key[("H200", 16)].pinned_gpu == "H200"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-35B-A3B") is by_key[("H200", 8)]
+    assert by_key[("H200", 8)].pinned_gpu == "H200"
 
 
 def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module):
@@ -488,7 +514,7 @@ def test_each_tier_class_records_its_pinned_gpu(modal_app_module):
     for (gpu, _max_inputs), cls in by_key.items():
         assert cls.pinned_gpu == gpu
     assert by_key[("L40S", 16)].pinned_gpu == "L40S"
-    assert by_key[("H200", 16)].pinned_gpu == "H200"
+    assert by_key[("H200", 8)].pinned_gpu == "H200"
 
 
 def test_tier_class_identity_is_fixed_before_decoration(modal_app_module):
@@ -792,7 +818,9 @@ def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path
     assert args.max_loras == 16
     assert args.max_lora_rank == 128
     assert args.max_model_len == 32768
-    assert args.max_num_seqs == 8
+    # 16 decode slots so Modal's 16 admitted requests are all decodable at n=1 (see
+    # _engine_concurrency). costs ~0.38 GiB of per-sequence GatedDeltaNet recurrent state.
+    assert args.max_num_seqs == 16
     assert args.gpu_memory_utilization == 0.90  # 0.90 leaves CUDA-graph capture headroom (was 0.98)
     assert args.enforce_eager is False  # CUDA graphs ON: ~10x faster decode on the hybrid GDN model
     assert getattr(args, "max_num_batched_tokens", None) is None

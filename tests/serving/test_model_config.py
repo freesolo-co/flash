@@ -114,7 +114,9 @@ def test_9b_has_l40s_rank128_serving_overrides() -> None:
     assert ov["max_loras"] == 16
     assert ov["max_lora_rank"] == 128
     assert ov["max_model_len"] == 32768
-    assert ov["max_num_seqs"] == 8
+    # 16 decode slots, matching the 16 requests Modal admits, so an n=1 burst is fully decodable.
+    assert ov["max_num_seqs"] == 16
+    assert ov["max_inputs"] == 16
     # the 9B uses L40S because L4 and 2xL4 OOM at rank-128 x 16 plus 32k context.
     assert gpu_for("Qwen/Qwen3.5-9B") == "L40S"
     assert ov["gpu_memory_utilization"] == 0.90

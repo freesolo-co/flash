@@ -127,6 +127,10 @@ SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     # ~1010s cold boot (35B bf16, 67 GiB + ~377s torch.compile). Break-even AND a ~17-min
     # user-visible stall on a miss both argue for keeping the full window here.
     "H200": 1800,
+    # Blackwell has no entry until a tier actually ships on it. Left deliberately absent rather than
+    # guessed: the break-even window is the tier's own measured cold boot, and at $6.25/hr (B200)
+    # the 1800s default costs $3.13 per cold wake -- the most expensive idle tax in this table. Add
+    # the measured value with the tier, never ahead of it.
 }
 
 
@@ -239,6 +243,24 @@ image = (
         "python /root/patch_vllm_moe_lora.py --verify && "
         "rm /root/patch_vllm_moe_lora.py"
     )
+    # restore the cu13 cutlass-dsl content that the -libs-base wheel can overwrite. both wheels
+    # extract into one namespace and write shared paths with different content, so a parallel
+    # installer decides the winner by race (NVIDIA/cutlass #3170, #3259). vllm gates FlashInfer GDN
+    # prefill on sm10.x behind `_is_libs_cu13_install_intact()` and falls through to Triton after a
+    # `warning_once` -- so on Blackwell an unrepaired image still boots, still serves, and still
+    # bills the Blackwell rate while running the slower kernel. sm90 takes FlashInfer unconditionally,
+    # which is why the current H100/H200 tiers never needed this. unconditional and idempotent: the
+    # race does not fire on every build, and one clean build proves nothing about the next.
+    .add_local_file(
+        str(REPO_DIR / "docker" / "repair_cutlass_dsl.py"),
+        remote_path="/root/repair_cutlass_dsl.py",
+        copy=True,
+    )
+    .run_commands(
+        "python /root/repair_cutlass_dsl.py && "
+        "python /root/repair_cutlass_dsl.py --verify && "
+        "rm /root/repair_cutlass_dsl.py"
+    )
     # no in-engine kernel-patching hook is installed. under vllm v1 the model runs in a separate
     # enginecore process, so patches applied in this process never reach the model. a prior attempt's
     # extra cuda context and gpu self-tests also stole the post-init slack flashinfer needs for its
@@ -317,17 +339,29 @@ from flash.serving.src.engine.model_config import (  # noqa: E402
 
 
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
-    """(max_inputs, target_inputs) sized to the model's REAL vLLM concurrency (``max_num_seqs``).
+    """(max_inputs, target_inputs) — how many LOGICAL REQUESTS Modal packs onto one container.
 
-    Modal's ``max_inputs`` is how many requests it packs onto ONE container before it must add
-    another. If it far exceeds the engine's ``max_num_seqs`` (e.g. the global 64 on the 35B, which
-    decodes only 8 at a time), Modal piles requests 9..64 INSIDE the container instead of autoscaling
-    — high latency and no scale-out until ~target_inputs are packed. So cap ``max_inputs`` near the
-    engine's capacity with a small boot buffer (2x, so a cold-booting replacement doesn't reject
-    bursts), bounded by the global ``MAX_INPUTS``; scale out at 3/4 of that. Models that leave
-    ``max_num_seqs`` at the vLLM default keep the global sizing."""
-    seqs = int(engine_overrides_for(base_model).get("max_num_seqs", MAX_INPUTS))
-    max_inputs = max(8, min(MAX_INPUTS, seqs * 2))
+    ``max_inputs`` counts requests; ``max_num_seqs`` counts vLLM child SEQUENCES. They are not the
+    same quantity: OpenAI ``n`` is accepted 1..4 (``validate_choice_count``), so one admitted request
+    can fan out to four sequences. Deriving one from the other therefore cannot hold at both ends of
+    the ``n`` range, which is why each model now states its request concurrency explicitly.
+
+    Sizing rule: ``max_inputs`` must not exceed what the engine can actually DECODE, or Modal packs
+    the surplus INSIDE the container (they sit in vLLM's waiting queue) instead of autoscaling — the
+    measured failure mode, ~1.98x per-request slowdown with FLAT container throughput. Scale out at
+    3/4 of that so a new container is already booting before the current one is saturated.
+
+    Consequence worth stating: a model whose ``max_inputs`` drops also scales out EARLIER, and boot
+    is not free (the 35B is ~17 min). That is the intended trade — queueing behind a saturated engine
+    is unbounded, whereas the boot is paid once and overlaps the requests that triggered it."""
+    overrides = engine_overrides_for(base_model)
+    seqs = int(overrides.get("max_num_seqs", MAX_INPUTS))
+    max_inputs = int(overrides.get("max_inputs", min(MAX_INPUTS, seqs)))
+    if max_inputs > seqs:
+        raise ValueError(
+            f"{base_model}: max_inputs={max_inputs} exceeds max_num_seqs={seqs}, so Modal would "
+            f"queue {max_inputs - seqs} request(s) inside the container instead of autoscaling"
+        )
     target_inputs = max(1, max_inputs * 3 // 4)
     return max_inputs, target_inputs
 

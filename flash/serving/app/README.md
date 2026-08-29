@@ -180,9 +180,22 @@ cold-boot smoke test first.
 | Qwen3.8-27B               | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | **H100**‡ | 16 × 64        | 32768   |
 | Qwen3.6-35B-A3B (MoE, VL) | official **bf16** (`Qwen/Qwen3.6-35B-A3B`)   | **H200**† | 6 × 64         | 32768   |
 
-§ 9B (L40S) runs **16 × 128** at 32k context with `max_num_seqs=8`, CUDA graphs
+§ 9B (L40S) runs **16 × 128** at 32k context with `max_num_seqs=16`, CUDA graphs
 (`enforce_eager=False`), and `gpu_memory_utilization=0.90`. Its rank-128 × 16 buffer OOMed an L4 and
 2×L4 in the real-GPU sweep, so it runs on the 48 GiB L40S, the cheapest Ada card that fits it at 32k.
+
+### Requests versus sequences
+
+`max_inputs` (Modal) counts logical **requests**; `max_num_seqs` (vLLM) counts child **sequences**.
+They are different quantities: OpenAI `n` is accepted 1..4, so one admitted request can fan out to
+four sequences. Each model states both explicitly, and `_engine_concurrency` refuses to start a model
+whose `max_inputs` exceeds its `max_num_seqs` — admitting more requests than the engine can decode
+makes Modal queue the surplus _inside_ the container rather than autoscaling, which was measured at
+~1.98x per-request slowdown with flat container throughput.
+
+At `n > 1` a model is still oversubscribed by design: the alternative is refusing requests the engine
+could interleave. `n` is not known at admission time, so this boundary is scheduling policy, not a
+guarantee. These caps bound in-container queueing; they are not an availability or latency SLA.
 
 ‡ 27B (H100, 80 GiB) runs **16 × 64** at 32k with `max_num_seqs=8`, CUDA graphs
 (`enforce_eager=False`), and `gpu_memory_utilization=0.90`, qualified by a real-GPU canary on the exact

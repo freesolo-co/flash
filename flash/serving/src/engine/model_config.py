@@ -57,7 +57,22 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_loras": 16,
             "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (cheap on the 9 GiB FP8 9B); 32k context.
             "max_model_len": 32768,
-            "max_num_seqs": 8,
+            # 16 decode slots, matching max_inputs below so Modal never packs a request this engine
+            # cannot decode. this is a HYBRID GatedDeltaNet (24 of 32 layers linear), so each slot
+            # costs a ~49 MiB recurrent+conv state that is CONSTANT in context length rather than the
+            # ~1 MiB logits share a dense model would charge. 8 -> 16 costs ~0.38 GiB (0.9% of the
+            # 43.2 GiB budget), taken out of the KV pool: ~25k tokens, about 62 requests of headroom
+            # at this tier's measured 407-token p99 (1.2% of its window; 71,453 real requests). the
+            # queueing it removes was measured twice on live traffic: per-request throughput is flat
+            # at ~43.7 tok/s up to ~15 concurrent, then collapses to ~20.5 (2.13x) by 30-33.
+            # NOT free beyond that state: max_num_seqs also raises vLLM's CUDA-graph capture ceiling
+            # (min(seqs*2, 512, max_num_batched_tokens)), so the ladder goes 5 -> 7 rungs and, with
+            # LoRA specialization doubling each rung, 10 -> 14 captures. small, but it is why this
+            # needs a real-GPU cold boot to confirm rather than arithmetic alone.
+            "max_num_seqs": 16,
+            # logical REQUESTS Modal packs per container (see _engine_concurrency). equal to
+            # max_num_seqs so an n=1 burst is fully decodable; n>1 still oversubscribes by design.
+            "max_inputs": 16,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },
@@ -98,8 +113,21 @@ SERVING_MODELS: list[dict[str, Any]] = [
             # is LoRA-specialized, so adapters serve under graphs too.
             "enforce_eager": False,
             # Startup memory-profiling runs max_num_seqs sequences; cap low so the 248k-vocab logits +
-            # all-expert MoE activations don't spike the profiling peak.
+            # all-expert MoE activations don't spike the profiling peak. this is the tier the
+            # documented profiling OOM actually came from, so it stays at 8 until a real-GPU boot
+            # confirms the peak at a higher cap — the arithmetic says a slot costs only ~61 MiB
+            # (0.38% of budget), but that arithmetic does not model the all-expert activation spike.
+            # a slot here also costs far more KV than the 9B's: this tier's measured p99 total is
+            # 8,712 tokens (26.6% of its 32k window, driven by completions hitting an 8k generation
+            # cap) versus the 9B's 407, so at p99 its ~85 MiB of KV OUTWEIGHS the recurrent state.
+            # size this tier against KV, not against the 9B's state-bound answer.
             "max_num_seqs": 8,
+            # logical REQUESTS per container, held equal to max_num_seqs so Modal autoscales instead
+            # of queueing inside an engine that decodes 8 (see _engine_concurrency). PREVENTIVE on
+            # this tier, not corrective: per-replica telemetry shows offered load never reached 9+
+            # here, so the surplus admission slots were never exercised. the measured degradation is
+            # on the 9B/4B; this removes the same hazard where a container is most expensive.
+            "max_inputs": 8,
             "reasoning_parser": "qwen3",
             # NB: the vision encoder is now LOADED (no language_model_only) — flash adapters adapt the
             # full multimodal tree, so their vision-tower LoRA keys must have real modules to bind to.
@@ -128,6 +156,11 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_lora_rank": 64,
             "max_model_len": 32768,
             "max_num_seqs": 8,
+            # logical REQUESTS per container, held equal to max_num_seqs so Modal autoscales rather
+            # than queueing the surplus inside an engine that decodes 8 (see _engine_concurrency).
+            # this tier was activated by #1333 and has never been load-measured, so it keeps the
+            # conservative 1:1 admission until the capacity sweep gives it a measured value.
+            "max_inputs": 8,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },
