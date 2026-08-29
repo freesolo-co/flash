@@ -87,6 +87,26 @@ def probe_b300(base_model: str, max_num_seqs: int, plan: list[dict]) -> dict[str
     return _probe(base_model, max_num_seqs, "B300", plan)
 
 
+# the three tiers that actually ship today. they are NOT Blackwell, so the sm10.x cutlass/GDN gate
+# above does not apply to them: sm90 (H100/H200) takes FlashInfer GDN prefill unconditionally and
+# the L40S is sm89, where that code path is not reached at all. the triton abort therefore stays
+# armed for every card but can only fire on Blackwell, which is exactly where a silent fallback
+# would otherwise bill the premium rate for the slower kernel.
+@app.function(gpu="L40S", timeout=_PROBE_TIMEOUT_SECONDS, secrets=_HF_SECRET)
+def probe_l40s(base_model: str, max_num_seqs: int, plan: list[dict]) -> dict[str, Any]:
+    return _probe(base_model, max_num_seqs, "L40S", plan)
+
+
+@app.function(gpu="H100", timeout=_PROBE_TIMEOUT_SECONDS, secrets=_HF_SECRET)
+def probe_h100(base_model: str, max_num_seqs: int, plan: list[dict]) -> dict[str, Any]:
+    return _probe(base_model, max_num_seqs, "H100", plan)
+
+
+@app.function(gpu="H200", timeout=_PROBE_TIMEOUT_SECONDS, secrets=_HF_SECRET)
+def probe_h200(base_model: str, max_num_seqs: int, plan: list[dict]) -> dict[str, Any]:
+    return _probe(base_model, max_num_seqs, "H200", plan)
+
+
 def _probe(base_model: str, max_num_seqs: int, gpu: str, plan: list[dict]) -> dict[str, Any]:
     """boot the real engine once, then run every load cell in ``plan`` against that one engine.
 
@@ -351,7 +371,13 @@ def probe(
     """
 
     cells = json.loads(plan) if plan else _default_plan(max_num_seqs)
-    fn = {"B200": probe_b200, "B300": probe_b300}[gpu.upper()]
+    fn = {
+        "B200": probe_b200,
+        "B300": probe_b300,
+        "L40S": probe_l40s,
+        "H100": probe_h100,
+        "H200": probe_h200,
+    }[gpu.upper()]
     out = fn.remote(base_model, max_num_seqs, cells)
     print("BENCH_JSON_START")
     print(json.dumps(out, indent=2, default=str))
