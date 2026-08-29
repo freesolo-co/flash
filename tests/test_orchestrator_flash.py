@@ -47,7 +47,10 @@ def test_run_job_persists_flash_metrics(monkeypatch):
             captured["source_snapshot"] = kwargs["source_snapshot"]
             persisted = runner_status.get_status(spec.run_id)
             assert persisted.source_snapshot == SOURCE_SNAPSHOT
-            attempt = runner_attempts._reserve_attempt(spec.run_id)
+            claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+            assert claim is not None
+            attempt = claim.attempt
+            runner_attempts.release_launch_claim(spec.run_id, claim)
             return {
                 "arm": "runpod",
                 "phase": spec.phase,

@@ -318,6 +318,7 @@ def _write_child_shims(
         ("train/opd/child/plugin.py", "flash_opd_plugin.py"),
         ("train/opd/child/bridge.py", "flash_opd_bridge.py"),
         ("train/opd/child/structured.py", "flash_opd_structured.py"),
+        ("train/opd/child/tensors.py", "flash_opd_tensors.py"),
         ("train/opd/child/multiturn.py", "flash_opd_multiturn.py"),
         ("train/opd/child/entry.py", "flash_opd_entry.py"),
         ("train/opd/child/replay_guard.py", "flash_opd_replay_guard.py"),
