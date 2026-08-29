@@ -7,6 +7,7 @@ from threading import Event
 
 import flash.runner.supervise.transitions as runner_transitions
 from flash.core.spec import JobSpec
+from flash.runner.lifecycle.status import _RECOVERY_RECORD_ERRORS
 from flash.runner.results.verified_revisions import verified_checkpoint_generation
 from flash.serve.contract.errors import AdapterConfigMissing, ServingError
 from flash.server.asgi import app as _app
@@ -42,6 +43,12 @@ def recover_deployments() -> int:
         try:
             status = _app.get_status(row["run_id"])
         except FileNotFoundError:
+            continue
+        except _RECOVERY_RECORD_ERRORS:
+            # a record `recover_runs` could not quarantine -- an unwritable runs directory, say --
+            # still fails to decode here. this runs synchronously in the lifespan, so raising would
+            # abort startup readiness for every other deployment over one unreadable row. the
+            # quarantine attempt already logged it; skipping is what keeps one bad record local.
             continue
         state = (status.deployment or {}).get("state")
         if state not in _DEPLOYMENT_BUSY_STATES and state not in _DEPLOYMENT_READY_STATES:
