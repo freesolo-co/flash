@@ -1616,15 +1616,15 @@ def _repeated_empty_calls(count: int) -> str:
     return "".join(f"<tool_call><function={name}></function></tool_call>" for _ in range(count))
 
 
-@pytest.mark.parametrize("count", [408, 409], ids=["largest-replayable", "first-unreplayable"])
-def test_generated_call_count_never_exceeds_what_history_accepts(count: int) -> None:
+@pytest.mark.parametrize("count", [408, 409], ids=["best-case-ceiling", "past-every-continuation"])
+def test_generated_call_count_stops_where_no_continuation_could_carry_it(count: int) -> None:
     """the parser stops emitting once no follow-up shape could carry the batch.
 
-    replaying the turn resends every call alongside its own tool result, and with a bare
-    assistant turn and plain string results that structure exhausts the message budget past
-    408 calls even with empty arguments. the ceiling only bounds a runaway generation: it is
-    not a promise that 408 replays, because prior history and richer result shapes shrink the
-    same budget. ``test_replay_budget_depends_on_history_and_result_shape`` pins that.
+    the cheapest continuation is a minimal prior message with plain string results, and even
+    that exhausts the budget past 408 calls with empty arguments, so 409 could not replay
+    under any shape. passing at 408 is not the converse promise: prior history and richer
+    result shapes shrink the same budget well below it, which
+    ``test_replay_budget_depends_on_history_and_result_shape`` pins.
     """
     tools = _empty_argument_tools()
     text = _repeated_empty_calls(count)
@@ -1731,6 +1731,61 @@ def test_replay_budget_depends_on_history_and_result_shape(kwargs, largest: int)
     """
     assert _replay_accepted(largest, **kwargs)
     assert not _replay_accepted(largest + 1, **kwargs)
+
+
+def test_each_extra_result_block_costs_three_nodes() -> None:
+    """the ``+3`` per additional text block that the parser comment cites.
+
+    the block cost is what makes a fixed ceiling unable to promise replay, since the client
+    chooses how many blocks each result carries. pinning it here keeps the published figure
+    honest if the walker's accounting ever changes.
+    """
+
+    def largest(blocks: int) -> int:
+        low, high = 0, 512
+        while low < high:
+            middle = (low + high + 1) // 2
+            messages = _replay_messages(middle, result_shape="string")
+            for message in messages:
+                if message["role"] == "tool":
+                    message["content"] = [{"type": "text", "text": "ok"}] * blocks
+            try:
+                detached_messages(
+                    messages,
+                    sequence_types=(list, tuple),
+                    sequence_error="messages must be a list",
+                    error_type=OpenAIRequestError,
+                )
+            except OpenAIRequestError as exc:
+                if "complexity" not in str(exc):
+                    raise
+                high = middle - 1
+            else:
+                low = middle
+        return low
+
+    # a call plus a one-block result costs 13 nodes and a two-block result 16, so the same
+    # budget admits 314 and 255 calls. that difference is the third block node made visible.
+    assert (largest(1), largest(2)) == (314, 255)
+
+
+def test_argument_content_does_not_change_the_replay_budget() -> None:
+    """``arguments`` is a JSON string, so its size never moves the boundary.
+
+    this is why the cap is stated structurally rather than against argument complexity, and
+    it is the claim that made the original empty-``{}`` measurement generalize at all.
+    """
+    for arguments in ("{}", '{"query":"x"}', '{"blob":"' + "x" * 100_000 + '"}'):
+        messages = _replay_messages(408)
+        for message in messages:
+            for call in message.get("tool_calls", ()):
+                call["function"]["arguments"] = arguments
+        detached_messages(
+            messages,
+            sequence_types=(list, tuple),
+            sequence_error="messages must be a list",
+            error_type=OpenAIRequestError,
+        )
 
 
 def test_long_history_leaves_no_room_for_even_one_call() -> None:
@@ -2282,11 +2337,13 @@ def _integer_calls(count: int) -> tuple[object, str]:
     return tools, text
 
 
-def test_exactly_the_replayable_call_count_remains_supported() -> None:
-    """the largest emittable batch is the largest the follow-up request can carry back.
+def test_exactly_the_best_case_ceiling_remains_supported() -> None:
+    """the largest emittable batch is the largest any continuation could carry back.
 
     this used to allow 512, but replaying 409 calls with their tool results already exceeds
-    the message budget, so the parser was handing back responses flash then rejected.
+    the message budget under the cheapest continuation, so the parser was handing back
+    responses flash then rejected. emitting 408 does not promise this batch replays; it
+    promises only that no smaller ceiling is required to rule out every continuation.
     """
     tools, text = _integer_calls(408)
     next_id = iter(f"call_{index}" for index in range(408)).__next__
@@ -2298,7 +2355,7 @@ def test_exactly_the_replayable_call_count_remains_supported() -> None:
     assert result.calls[-1].id == "call_407"
 
 
-def test_one_call_past_the_replayable_count_rejects_before_call_id_creation() -> None:
+def test_one_call_past_the_best_case_ceiling_rejects_before_call_id_creation() -> None:
     tools, text = _integer_calls(409)
     id_calls = 0
 

@@ -33,16 +33,19 @@ _CALL_BOUNDARY_RE = re.compile(r"</function>\s*</tool_call>\s*(<tool_call>)\s*<f
 _PARAMETER_OPEN_RE = re.compile(r"<parameter=([^>]+)>")
 _AMBIGUOUS, _EXHAUSTED = object(), object()
 # an emitted call is only useful if the client can replay it, and the follow-up request carries
-# the whole prior conversation plus the assistant turn and one result per call. replaying one
-# call costs six nodes in the assistant turn plus the result message, which is four nodes as a
-# plain string, five with the optional ``name``, and seven for a single text block with three
-# more for each additional block. the client picks that shape, so the worst-case cost per call
-# is unbounded and no fixed ceiling here can promise replayability: with a history of 1360 text
-# blocks the budget is already too small for a single call. this bound only keeps a runaway
-# generation from producing a response no conversation could ever replay, and the request layer
-# stays the authority that accepts or rejects the follow-up.
-_REPLAY_NODES_PER_CALL, _REPLAY_TURN_NODES = 10, 16
-_MAX_REPLAYABLE_CALLS = (MAX_MESSAGE_NODES - _REPLAY_TURN_NODES) // _REPLAY_NODES_PER_CALL
+# the whole prior conversation plus the assistant turn and one result per call. the cheapest
+# possible continuation costs eight nodes of fixed overhead (the root list, one minimal prior
+# message, and the assistant turn) and ten nodes per call: six in the assistant turn plus a
+# four-node plain-string result. that is the floor, not the typical case. the optional ``name``
+# makes a result five nodes, a single text block seven, and each further block three more, and
+# the prior conversation competes for the same budget, so a batch at this ceiling usually will
+# not replay: with a history of 1360 text blocks there is no room for even one call. this is
+# therefore only a best-case bound that stops the parser emitting a batch no continuation could
+# ever carry. the request layer stays the authority on whether a follow-up is accepted.
+_MIN_REPLAY_NODES_PER_CALL, _MIN_REPLAY_FIXED_NODES = 10, 8
+_MAX_POTENTIALLY_REPLAYABLE_CALLS = (
+    MAX_MESSAGE_NODES - _MIN_REPLAY_FIXED_NODES
+) // _MIN_REPLAY_NODES_PER_CALL
 
 
 def _strip_grammar_newline_wrapper(raw: str) -> str:
@@ -143,7 +146,7 @@ def parse_qwen3_coder_output(
     tool_map = {tool.name: tool for tool in tools}
     candidates = [match.start(1) for match in _CALL_BOUNDARY_RE.finditer(text, first) if match[2] in tool_map]  # fmt: skip
     # ``candidates`` holds the calls after the first, so the emitted count is one more.
-    if len(candidates) + 1 > _MAX_REPLAYABLE_CALLS:
+    if len(candidates) + 1 > _MAX_POTENTIALLY_REPLAYABLE_CALLS:
         return ToolParseResult(content=text, calls=())
     opener_positions: dict[str, list[int]] = {}
     for match in _PARAMETER_OPEN_RE.finditer(text, first, len(text)):
