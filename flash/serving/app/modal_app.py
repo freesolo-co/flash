@@ -849,6 +849,42 @@ def router():
     )
 
 
+# Blackwell tiers whose GDN prefill kernel is gated on an intact cuTe-DSL install. SM90 (H100/H200)
+# takes FlashInfer with no further constraints, so only these need the assertion.
+_GDN_GATED_GPUS = frozenset({"B200"})
+
+
+def _degraded_gdn_backend(gpu: str, report: object) -> str | None:
+    """Reason a warmed engine must be treated as FAILED, or ``None`` when it is acceptable.
+
+    A silently-downgraded Blackwell engine is the one failure mode that passes every liveness signal
+    we have: vllm's resolver emits a single ``warning_once`` and returns ``"triton"`` rather than
+    raising, so the container boots, serves correct output, reports ``ok: True``, and bills the
+    Blackwell rate while running the slower kernel. Warm-up only ever caught exceptions, which means
+    the health field reporting this was decorative -- nothing asserted it.
+
+    ``resolved: None`` is rejected here, not tolerated. It means the resolver could not be reached
+    (import moved, signature changed), and an unprovable backend must never pass a gate whose whole
+    purpose is proving it. Non-gated tiers are exempt because the term does not apply to them.
+    """
+    if gpu not in _GDN_GATED_GPUS:
+        return None
+    if not isinstance(report, dict):
+        return f"health report is {type(report).__name__}, not a dict, so the gdn backend is unprovable"
+    backend = report.get("gdn_prefill_backend")
+    if not isinstance(backend, dict):
+        return "health report carries no gdn_prefill_backend, so the kernel is unprovable"
+    resolved = backend.get("resolved")
+    if resolved == "flashinfer":
+        return None
+    intact = backend.get("libs_cu13_intact")
+    return (
+        f"gdn prefill backend resolved to {resolved!r}, not 'flashinfer' "
+        f"(libs_cu13_intact={intact!r}) -- this {gpu} would bill the blackwell rate while "
+        "running the slower kernel; the image's cute-dsl repair is the thing to check"
+    )
+
+
 @app.local_entrypoint()
 def start_all(base_model: str | None = None) -> None:
     """Explicitly boot deployed gpu engines and wait for them to report healthy.
@@ -856,6 +892,9 @@ def start_all(base_model: str | None = None) -> None:
     Normal deploys leave gpu engines at zero until inference or adapter registration reaches the
     matching base model. This manual diagnostic can boot one model with ``--base-model`` or every
     catalog model without changing the scale-to-zero deployment.
+
+    Booting is necessary but not sufficient: on a gated tier this also asserts the resolved GDN
+    prefill kernel, because a degraded engine boots green and only shows up on the bill.
     """
     from flash.serving.src.engine.model_config import base_models, gpu_for
 
@@ -871,11 +910,17 @@ def start_all(base_model: str | None = None) -> None:
         started[bm] = instance.health.spawn()
     for bm, handle in started.items():
         try:
-            print(f"started {bm}: {handle.get(timeout=1800)}", flush=True)
+            report = handle.get(timeout=1800)
+            print(f"started {bm}: {report}", flush=True)
         except Exception as exc:  # report per-model startup failures, keep going
             failure = f"{bm}: {type(exc).__name__}: {exc}"
             failures.append(failure)
             print(f"FAILED  {failure}", flush=True)
+            continue
+        degraded = _degraded_gdn_backend(gpu_for(bm), report)
+        if degraded is not None:
+            failures.append(f"{bm}: {degraded}")
+            print(f"FAILED  {bm}: {degraded}", flush=True)
     if failures:
         raise RuntimeError(
             f"serving warm failed for {len(failures)} model(s): {'; '.join(failures)}"

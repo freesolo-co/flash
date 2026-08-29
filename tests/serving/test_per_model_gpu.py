@@ -591,6 +591,77 @@ def test_start_all_raises_after_any_engine_fails(modal_app_module, monkeypatch):
     assert sorted(spawned) == ["boom", "ok"]
 
 
+def test_start_all_fails_a_blackwell_engine_that_booted_on_the_slow_kernel(
+    modal_app_module, monkeypatch
+):
+    """Booting green is not passing: a degraded B200 must be reported as a warm-up FAILURE.
+
+    vllm's GDN resolver does not raise when the cuTe-DSL install is corrupt -- it emits one
+    `warning_once` and returns "triton". So the container boots, serves correct output and reports
+    ok:True while running the slower kernel at the Blackwell rate. `start_all` previously only ever
+    caught exceptions, which meant the health field reporting the backend was decorative.
+    """
+    from flash.serving.src.engine import model_config
+
+    mod = modal_app_module
+    monkeypatch.setattr(model_config, "base_models", lambda: ["degraded"])
+    monkeypatch.setattr(model_config, "gpu_for", lambda _bm: "B200")
+    monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {})
+
+    def _from_name(_app_name: str, _cls_name: str):
+        def _factory(base_model: str):
+            class _Health:
+                @staticmethod
+                def spawn():
+                    return type(
+                        "H",
+                        (),
+                        {
+                            "get": lambda _self, timeout=0: {
+                                "ok": True,
+                                "gdn_prefill_backend": {
+                                    "resolved": "triton",
+                                    "libs_cu13_intact": False,
+                                    "compute_capability": "10.0",
+                                },
+                            }
+                        },
+                    )()
+
+            return type("Instance", (), {"health": _Health()})()
+
+        return _factory
+
+    monkeypatch.setattr(mod.modal.Cls, "from_name", _from_name)
+
+    with pytest.raises(RuntimeError, match="triton"):
+        mod.start_all()
+
+
+def test_degraded_gdn_backend_gate_rejects_unproven_and_exempts_non_gated_tiers():
+    """`resolved: None` must FAIL, not pass. Unprovable is not the same as fine.
+
+    None means the resolver could not be reached at all, so a gate whose entire purpose is proving
+    the kernel cannot treat it as proof. SM90 tiers take FlashInfer unconditionally, so the term
+    does not apply to them and they stay exempt.
+    """
+    from flash.serving.app.modal_app import _degraded_gdn_backend
+
+    flashinfer = {"gdn_prefill_backend": {"resolved": "flashinfer", "libs_cu13_intact": True}}
+    assert _degraded_gdn_backend("B200", flashinfer) is None
+
+    unproven = {"gdn_prefill_backend": {"resolved": None, "libs_cu13_intact": None}}
+    assert _degraded_gdn_backend("B200", unproven) is not None
+
+    # a report missing the field entirely is equally unprovable, not equally fine.
+    assert _degraded_gdn_backend("B200", {"ok": True}) is not None
+    assert _degraded_gdn_backend("B200", "not-a-dict") is not None
+
+    # non-gated tiers: FlashInfer is unconditional on SM90, so nothing to assert.
+    for gpu in ("H100", "H200", "L40S", "L4"):
+        assert _degraded_gdn_backend(gpu, unproven) is None
+
+
 def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_module, monkeypatch):
     """The pool never updates autoscaling and still dispatches demand-driven remote calls."""
     mod = modal_app_module
