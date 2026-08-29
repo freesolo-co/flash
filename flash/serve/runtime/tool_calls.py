@@ -192,7 +192,14 @@ def _parse_tool_call(text, cursor, scope_end, tools, opener_positions, work):
         index = bisect_left(positions, scope_end)
         if index and positions[index - 1] >= name_end:
             openers[parameter_name] = positions[index - 1]
-    count, cursor, values, _ = _parse_parameters((text, tool, openers), name_end + 1, {}, None)
+    try:
+        count, cursor, values, _ = _parse_parameters((text, tool, openers), name_end + 1, {}, None)
+    except RecursionError:
+        # a long run of parameters descends once per value, so a schema wide enough to
+        # declare hundreds of them can exhaust the interpreter stack before the work
+        # budget notices. that is a candidate flash cannot finish classifying, which is
+        # the same answer the budget already gives: keep the exact text.
+        return _EXHAUSTED
     if count != 1 or cursor is None or values is None:
         return _AMBIGUOUS if count == 2 else None
     for key, value in values.items():

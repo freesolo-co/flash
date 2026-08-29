@@ -1570,6 +1570,45 @@ def test_generated_numeric_call_replays_as_valid_history(emitted: str) -> None:
     )
 
 
+def _wide_optional_string_tools(count: int):
+    declaration = _delimiter_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"] = {
+        f"p{index}": {"type": "string"} for index in range(count)
+    }
+    declaration["function"]["parameters"]["required"] = []
+    return normalize_tools([declaration])
+
+
+def _wide_optional_string_call(count: int) -> str:
+    return _candidate_call("".join(f"<parameter=p{index}>v</parameter>" for index in range(count)))
+
+
+@pytest.mark.parametrize("count", [332, 511], ids=["first-leaking-width", "widest-declarable"])
+def test_wide_optional_parameter_run_falls_back_instead_of_exhausting_the_stack(
+    count: int,
+) -> None:
+    """a candidate too deep to classify keeps its bytes rather than raising.
+
+    the parser descends once per parameter value, so a schema wide enough to declare
+    hundreds of optional strings can exhaust the interpreter stack before the work budget
+    notices. both widths here are legal declarations, so a RecursionError escaping to the
+    caller would turn a servable request into a 500 instead of ordinary assistant text.
+    """
+    tools = _wide_optional_string_tools(count)
+    text = _wide_optional_string_call(count)
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert result.content == text
+    assert result.calls == ()
+
+    parser = ToolCallStreamParser(tools, id_factory=lambda: "call_fixed")
+    assert parser.feed(text) == ""
+    streamed = parser.finish()
+    assert streamed.content == text
+    assert streamed.calls == ()
+
+
 def _wide_array_tools():
     declaration = _delimiter_tools()[0].wire()
     declaration["function"]["parameters"]["properties"] = {
