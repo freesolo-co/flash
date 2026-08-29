@@ -608,30 +608,36 @@ def _drain_cleanup_remotes_bg(run_id: str) -> None:
 
 def _teardown_failed_recovery_bg(status: RunStatus) -> None:
     _teardown_unrecoverable_remote(status)
-    _terminate_handleless_endpoints(status)
+    # quarantine writes `failed` only when it could NOT keep a settled outcome, so that state is
+    # the signal that this run's worker was never released. a handle-backed run is already covered
+    # by the direct teardown above.
+    if not status.remote and status.state == "failed":
+        _reclaim_unhandled_endpoints(status)
     # direct teardown can record an unconfirmed handle after an earlier drain took its snapshot.
     _drain_cleanup_remotes_bg(status.run_id)
 
 
-def _terminate_handleless_endpoints(status: RunStatus) -> None:
+def _reclaim_unhandled_endpoints(status: RunStatus) -> None:
     """Reclaim a terminalized run's endpoint when no handle was ever persisted to tear down.
 
     The crash window a non-idempotent create leaves behind: RunPod accepted the endpoint, then the
     response or the handle write was lost. `_teardown_unrecoverable_remote` has nothing to act on,
     `RunpodProvider.sweep_orphans` returns `[]` unconditionally, and the run is now terminal and so
     dropped from `_RECOVERABLE` -- no later startup reconsiders it while it can still bill. The
-    handle-less parse-failure branch in `_classify_recoverable_runs` already terminates by
-    reconstructed name for exactly this reason; a record too corrupt to decode reaches teardown
-    through quarantine instead and needs the same reclaim.
+    endpoint name is derived deterministically from the run id and GPU class
+    (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW persisted status, so
+    this works where `_gc_run_endpoints` cannot: it needs a parsed `JobSpec`.
 
-    Gated on `failed` because that is what quarantine writes when it could NOT keep a settled
-    outcome: a retained `done` or `deployed` envelope describes a run whose training endpoint is
-    already released. A foreign or identity-less record salvages `spec = {}`, so
-    `persisted_gpu_types` yields nothing and this is a no-op -- the name is never guessed from a
-    record that cannot vouch for the run id.
+    Callers own the precondition, because the two differ on where the terminal state lives. A
+    record too corrupt to decode carries it on the quarantine envelope in hand; a record whose spec
+    merely failed to parse has just been terminalized on disk by `_update`, which does not write
+    back to `status`. Both call it only for a handle-less run that is now terminally failed -- a
+    settled `done` or `deployed` run's training endpoint is already released.
+
+    Suppressed so it can never re-abort recovery, and a no-op for a foreign or identity-less
+    quarantine record: that salvages `spec = {}`, so `persisted_gpu_types` yields nothing and the
+    name is never guessed from a record that cannot vouch for the run id.
     """
-    if status.remote or status.state != "failed":
-        return
     from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
 
     with contextlib.suppress(Exception):
@@ -768,15 +774,10 @@ def _classify_recoverable_runs(
                 # endpoint before crashing (the exact leak the good-spec branch's
                 # `_gc_run_endpoints` guards against). The `sweep_orphans` dispatch below is a
                 # no-op for RunPod, and the periodic idle reaper would only reclaim this after its
-                # 15-min idle grace — so tear it down by name HERE for immediate cleanup.
-                # `_gc_run_endpoints` needs a parsed `JobSpec`, which we don't have; but the
-                # endpoint name is derived deterministically from the run id + GPU class
-                # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
-                # persisted status without parsing the spec. Terminate by that reconstructed
-                # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
-                from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
-
-                terminate_persisted_endpoints(status.spec, status.run_id)
+                # 15-min idle grace — so tear it down by name HERE for immediate cleanup. The
+                # `_update` above just terminalized it on disk, which is this reclaim's
+                # precondition; it does not write back to `status`, so there is no state to test.
+                _reclaim_unhandled_endpoints(status)
                 continue
             # reap run-scoped resources from the parseable public spec before touching the private
             # warm-start snapshot. source drift or snapshot tampering must not strand an endpoint.
