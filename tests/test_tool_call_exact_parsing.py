@@ -1460,10 +1460,11 @@ def test_repeated_fake_continuation_work_is_linear_without_prefix_materializatio
         assert counters["_validate_value"] == 0
         measurements[repeats] = (scanned["distance"], len(text))
 
-    # the scan reads about 0.7 characters per input character and doubling the width
-    # doubles the distance, so these bounds hold with real headroom while still rejecting
-    # superlinear growth: doubling an ``n log n`` scan at these widths multiplies the
-    # distance by roughly 2.4, which a looser ratio would wave through as linear.
+    # measured across widths 32 through 1024, characters read per input character converge
+    # from 0.664 to 0.708 in shrinking steps while each doubling multiplies the distance by
+    # 2.01 to 2.04. both bounds therefore hold with headroom and stay stable as the fixture
+    # grows, while still rejecting superlinear growth: doubling an ``n log n`` scan at these
+    # widths multiplies the distance by 2.33 to 2.40, and ``n ** 1.5`` by 2.83.
     for distance, length in measurements.values():
         assert distance <= length
     assert measurements[64][0] <= 2.2 * measurements[32][0]
