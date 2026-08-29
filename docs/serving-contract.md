@@ -91,10 +91,13 @@ converted or rejected, and a container holding such a value is rendered exactly 
 top-level boolean or null argument is likewise pre-rendered as `true`, `false`, or `null`, because the
 template spells a scalar with `string` and would otherwise show the model Python's `True` and `None`;
 inside a container those values stay native, since the template's `tojson` already spells them
-correctly. A response carries at most 408 tool calls, the largest batch whose replay as an assistant
-turn plus one tool result per call still fits the message-complexity budget; a longer run of
-candidates stays exact text rather than becoming calls the next request would reject. Every
-accepted call therefore replays as itself, so a generated call is always valid history. These local
+correctly. A response carries at most 408 tool calls, and a longer run of candidates stays exact text. That
+ceiling bounds a runaway generation; it does not promise the batch replays. Replay cost depends on
+the follow-up request as a whole: the prior conversation shares the same message-complexity budget,
+and each result costs four nodes as a plain string, five with the optional `name`, and seven for a
+single text block plus three for each additional block. A long enough history leaves no room for
+even one call. Clients that intend to continue the tool lifecycle should therefore be prepared for
+the follow-up to be rejected for complexity, and keep tool conversations short. These local
 serving-contract bounds do not depend on Python's process-wide integer conversion limit. Unsupported
 keywords and `strict: true` are rejected.
 

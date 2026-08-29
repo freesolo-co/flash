@@ -32,11 +32,15 @@ from flash.serve.request.validation import MAX_MESSAGE_NODES
 _CALL_BOUNDARY_RE = re.compile(r"</function>\s*</tool_call>\s*(<tool_call>)\s*<function=([^>]+)>")
 _PARAMETER_OPEN_RE = re.compile(r"<parameter=([^>]+)>")
 _AMBIGUOUS, _EXHAUSTED = object(), object()
-# a parsed call has to survive being replayed as history, and the follow-up request carries
-# the assistant turn plus one tool result per call. each pair costs ten nodes against the
-# message budget on top of the turn's own fixed overhead, so emitting more calls than fit
-# would hand back a response flash then refuses. the exact-text fallback is honest instead.
-# the measured boundary is 408 accepted and 409 rejected, which this reproduces exactly.
+# an emitted call is only useful if the client can replay it, and the follow-up request carries
+# the whole prior conversation plus the assistant turn and one result per call. replaying one
+# call costs six nodes in the assistant turn plus the result message, which is four nodes as a
+# plain string, five with the optional ``name``, and seven for a single text block with three
+# more for each additional block. the client picks that shape, so the worst-case cost per call
+# is unbounded and no fixed ceiling here can promise replayability: with a history of 1360 text
+# blocks the budget is already too small for a single call. this bound only keeps a runaway
+# generation from producing a response no conversation could ever replay, and the request layer
+# stays the authority that accepts or rejects the follow-up.
 _REPLAY_NODES_PER_CALL, _REPLAY_TURN_NODES = 10, 16
 _MAX_REPLAYABLE_CALLS = (MAX_MESSAGE_NODES - _REPLAY_TURN_NODES) // _REPLAY_NODES_PER_CALL
 

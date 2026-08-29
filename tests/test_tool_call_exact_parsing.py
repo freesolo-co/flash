@@ -5,18 +5,20 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 from itertools import pairwise
+from typing import Any
 
 import pytest
 
 import flash.serve.request.tool_calls as request_tool_calls_module
 import flash.serve.runtime.tool_calls as tool_calls_module
-from flash.serve.request.openai import parse_chat_request
+from flash.serve.request.openai import OpenAIRequestError, parse_chat_request
 from flash.serve.request.tool_calls import (
     normalize_tools,
     tools_wire,
     validate_tool_history,
     validate_tool_stop_sequences,
 )
+from flash.serve.request.validation import detached_messages
 from flash.serve.runtime.tool_calls import ToolCallStreamParser, parse_qwen3_coder_output
 
 
@@ -1616,12 +1618,13 @@ def _repeated_empty_calls(count: int) -> str:
 
 @pytest.mark.parametrize("count", [408, 409], ids=["largest-replayable", "first-unreplayable"])
 def test_generated_call_count_never_exceeds_what_history_accepts(count: int) -> None:
-    """the parser must not emit more calls than the follow-up request can carry.
+    """the parser stops emitting once no follow-up shape could carry the batch.
 
-    replaying the turn resends every call alongside its own tool result, and that structure
-    alone exhausts the message budget past 408 calls even with empty arguments. emitting 409
-    would handto the client a response flash then rejects, stranding calls that can never be
-    answered, so the whole candidate stays exact text instead.
+    replaying the turn resends every call alongside its own tool result, and with a bare
+    assistant turn and plain string results that structure exhausts the message budget past
+    408 calls even with empty arguments. the ceiling only bounds a runaway generation: it is
+    not a promise that 408 replays, because prior history and richer result shapes shrink the
+    same budget. ``test_replay_budget_depends_on_history_and_result_shape`` pins that.
     """
     tools = _empty_argument_tools()
     text = _repeated_empty_calls(count)
@@ -1655,6 +1658,118 @@ def test_generated_call_count_never_exceeds_what_history_accepts(count: int) -> 
         require_model=False,
         allow_managed_selectors=True,
     )
+
+
+def _replay_messages(count: int, *, prior: int = 0, result_shape: str = "string"):
+    """the follow-up a client sends after receiving ``count`` calls."""
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "hi"}]
+    for index in range(prior):
+        messages.append({"role": "assistant", "content": f"a{index}"})
+        messages.append({"role": "user", "content": f"u{index}"})
+    messages.append(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": f"call_{index}",
+                    "type": "function",
+                    "function": {"name": "probe", "arguments": "{}"},
+                }
+                for index in range(count)
+            ],
+        }
+    )
+    for index in range(count):
+        result: dict[str, Any] = {"role": "tool", "tool_call_id": f"call_{index}"}
+        if result_shape == "named":
+            result["name"] = "probe"
+            result["content"] = "ok"
+        elif result_shape == "block":
+            result["content"] = [{"type": "text", "text": "ok"}]
+        else:
+            result["content"] = "ok"
+        messages.append(result)
+    return messages
+
+
+def _replay_accepted(count: int, **kwargs) -> bool:
+    try:
+        detached_messages(
+            _replay_messages(count, **kwargs),
+            sequence_types=(list, tuple),
+            sequence_error="messages must be a list",
+            error_type=OpenAIRequestError,
+        )
+    except OpenAIRequestError as exc:
+        if "complexity" in str(exc):
+            return False
+        raise
+    return True
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "largest"),
+    [
+        ({}, 408),
+        ({"prior": 2}, 407),
+        ({"prior": 100}, 348),
+        ({"result_shape": "named"}, 371),
+        ({"result_shape": "block"}, 314),
+    ],
+    ids=["baseline", "short-history", "long-history", "named-result", "text-block-result"],
+)
+def test_replay_budget_depends_on_history_and_result_shape(kwargs, largest: int) -> None:
+    """the emitted-call ceiling cannot promise replayability, and this records why.
+
+    every one of these follow-ups is well-formed and uses only supported shapes, yet each
+    admits a different number of calls, all at or below the 408 the parser will emit. prior
+    conversation competes for the same budget, and a result costs four nodes as a string,
+    five with the optional ``name``, and seven as a single text block. a ceiling chosen for
+    one shape is therefore wrong for the others, which is why the contract documents the
+    follow-up as rejectable instead of claiming every emitted call replays.
+    """
+    assert _replay_accepted(largest, **kwargs)
+    assert not _replay_accepted(largest + 1, **kwargs)
+
+
+def test_long_history_leaves_no_room_for_even_one_call() -> None:
+    """the strongest form: an accepted request can admit zero replayable calls.
+
+    a history flash accepts on its own can already consume so much of the budget that
+    replaying a single call overflows it. no positive ceiling in the parser can prevent
+    this, so the parser must not advertise a replay guarantee it cannot keep.
+    """
+    history = [{"role": "user", "content": [{"type": "text", "text": "x"} for _ in range(1364)]}]
+    detached_messages(
+        history,
+        sequence_types=(list, tuple),
+        sequence_error="messages must be a list",
+        error_type=OpenAIRequestError,
+    )
+
+    follow_up = [
+        *history,
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "probe", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_0", "content": "ok"},
+    ]
+    with pytest.raises(OpenAIRequestError, match="complexity"):
+        detached_messages(
+            follow_up,
+            sequence_types=(list, tuple),
+            sequence_error="messages must be a list",
+            error_type=OpenAIRequestError,
+        )
 
 
 def _wide_optional_string_tools(count: int):
