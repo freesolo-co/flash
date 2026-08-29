@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+from itertools import pairwise
 
 import pytest
 
@@ -1446,7 +1447,7 @@ def test_repeated_fake_continuation_work_is_linear_without_prefix_materializatio
     monkeypatch.setattr(tool_calls_module, "_find_parameter_end", measured_find)
 
     measurements = {}
-    for repeats in (32, 64, 128):
+    for repeats in (32, 64, 128, 256):
         counters.update(dict.fromkeys(counters, 0))
         scanned["distance"] = 0
         tools, text, _fake = _repeated_fake_continuation_case(repeats)
@@ -1460,15 +1461,17 @@ def test_repeated_fake_continuation_work_is_linear_without_prefix_materializatio
         assert counters["_validate_value"] == 0
         measurements[repeats] = (scanned["distance"], len(text))
 
-    # measured across widths 32 through 1024, characters read per input character converge
-    # from 0.664 to 0.708 in shrinking steps while each doubling multiplies the distance by
-    # 2.01 to 2.04. both bounds therefore hold with headroom and stay stable as the fixture
-    # grows, while still rejecting superlinear growth: doubling an ``n log n`` scan at these
-    # widths multiplies the distance by 2.33 to 2.40, and ``n ** 1.5`` by 2.83.
+    # the growth bound is stated against input characters, not repeat count: a repeat carries
+    # a long value, so doubling the repeats multiplies the text by 1.96 to 2.02 rather than
+    # by two. measured through width 16384, characters read per input character converge from
+    # 0.664 to 0.721 and each step multiplies the distance by 2.01 to 2.04, so both bounds
+    # hold with headroom as the fixture grows. 2.1 is what makes the ratio load-bearing: an
+    # ``L * log L`` scan over these same lengths grows by 2.12 to 2.16, which a looser
+    # threshold reads as linear, and ``L ** 1.5`` grows by 2.75 to 2.86.
     for distance, length in measurements.values():
         assert distance <= length
-    assert measurements[64][0] <= 2.2 * measurements[32][0]
-    assert measurements[128][0] <= 2.2 * measurements[64][0]
+    for narrower, wider in pairwise(sorted(measurements)):
+        assert measurements[wider][0] <= 2.1 * measurements[narrower][0]
 
 
 _REVIEWED_OWNERSHIP_CASES = [
