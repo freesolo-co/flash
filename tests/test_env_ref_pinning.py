@@ -58,14 +58,15 @@ def test_submit_context_preserves_controller_staged_identity_without_resolving(m
         io.StringIO(),
         None,
         valid_source_snapshot(),
-        0,
+        None,
     )
     assert context.spec.environment.package == spec.environment.package
     assert context.spec.environment.resolved_sha == _SHA
 
 
 def test_attempt_shape_rebuild_preserves_staged_package() -> None:
-    from flash.runner.supervise.lifecycle import _drop_weight_cache, _spec_with_gpu
+    from flash.runner.supervise.lifecycle import _spec_with_gpu
+    from flash.runner.supervise.retry_decision import _drop_weight_cache
 
     spec = _staged_spec()
     shaped = _spec_with_gpu(spec, "H100", 2)
