@@ -7,6 +7,7 @@ distinct token resolves to its own run-ownership identity via ``db.ensure_extern
 
 from __future__ import annotations
 
+import errno
 import importlib
 import itertools
 import json
@@ -6976,12 +6977,17 @@ def test_quarantine_keeps_the_stored_terminal_timestamp(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("stored", [1000, "1000", None, True, float("nan"), -1.0, 0.0])
 def test_quarantine_rejects_an_unusable_terminal_timestamp(monkeypatch, tmp_path, stored):
-    """Only a finite positive real is usable as the billing boundary; the rest fall back to `now`.
+    """Only a finite positive real is usable as the billing boundary; the rest are left unset.
 
     `_terminal_ts` raises on `None` and `float()` raises on a string, so lifting either verbatim
     would abort reconciliation rather than merely mis-bill. `True` is an `int` to `isinstance`, and
     a non-positive or non-finite value cannot bound an interval, so each is refused the same way
     `_instance_realized_cost` guards `started_ts`. An integer boundary is legitimate and is kept.
+
+    Refused leaves `finished_at` unset rather than substituting the restart instant: `_due()`
+    returns `False` while it is `None`, so the settled record stays out of realized-cost
+    reconciliation exactly as it did before quarantine ran. Stamping `now` would admit it after the
+    settle delay and bill from the handle's `started_ts` through the restart.
     """
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
@@ -6996,15 +7002,102 @@ def test_quarantine_rejects_an_unusable_terminal_timestamp(monkeypatch, tmp_path
     ).encode()
     with open(runner_state.runs_file_path("ts-run", ".json"), "wb") as file:
         file.write(payload)
-    before = time.time()
 
     status, _ = runner_status._quarantine_corrupt_status("ts-run", "boom")
 
     assert status is not None
+    assert status.state == "done"
     if stored == 1000 and not isinstance(stored, bool):
         assert status.finished_at == 1000.0
     else:
-        assert status.finished_at >= before
+        assert status.finished_at is None
+
+
+def test_quarantine_keeps_a_valid_source_descriptor_when_another_field_failed(
+    monkeypatch, tmp_path
+):
+    """Provenance is only dropped when the descriptor itself is what failed.
+
+    `source_snapshot` cannot be lifted verbatim -- re-lifting a malformed descriptor would rebuild a
+    record `get_status` rejects exactly the way it rejected the one being quarantined. But blanket
+    clearing it is equally wrong, because it is rarely the field that failed: here the descriptor is
+    perfectly valid and the decode dies in the `RunStatus` constructor on a missing required `spec`.
+    Erasing it then costs a settled run its provenance permanently -- `_validated_terminal_source`
+    in `flash/server/domain/registry/runs.py` runs `parse_descriptor` on it and reports
+    `artifactsComplete: false` forever without it. So it is revalidated, not copied and not dropped.
+    """
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+
+    def _write(run_id, snapshot):
+        # no `spec` key: the descriptor parses, and the decode dies in the constructor instead.
+        payload = json.dumps(
+            {"run_id": run_id, "state": "done", "source_snapshot": snapshot}
+        ).encode()
+        with open(runner_state.runs_file_path(run_id, ".json"), "wb") as file:
+            file.write(payload)
+
+    _write("prov-valid", _SOURCE_SNAPSHOT)
+    _write("prov-broken", {"kind": "invalid"})
+    with pytest.raises(TypeError):
+        runner_status.get_status("prov-valid")
+
+    kept, kept_quarantined = runner_status._quarantine_corrupt_status("prov-valid", "boom")
+    cleared, cleared_quarantined = runner_status._quarantine_corrupt_status("prov-broken", "boom")
+
+    assert kept_quarantined
+    assert cleared_quarantined
+    assert kept is not None
+    assert cleared is not None
+    # normalized through the same validator the reader uses, so it reads back rather than re-failing.
+    assert kept.source_snapshot == _SOURCE_SNAPSHOT
+    assert runner_status.get_status("prov-valid").source_snapshot == _SOURCE_SNAPSHOT
+    # the descriptor itself was the corruption here, so it cannot be carried into the envelope.
+    assert cleared.source_snapshot is None
+    assert runner_status.get_status("prov-broken").source_snapshot is None
+
+
+def test_quarantine_declines_a_record_that_only_failed_to_read_transiently(monkeypatch, tmp_path):
+    """A read that failed transiently is not a corrupt record and must not be terminalized.
+
+    `_load_status_json` reports `ESTALE` and `EIO` through the same `OSError` arm the recheck uses
+    for undecodable bytes, so a third read that suddenly succeeds proves nothing on its own.
+    Quarantining on that alone rewrites a live `running` record to `failed` and tears its worker
+    down because a stale NFS handle cleared. The bytes have to be decoded and validated with
+    exactly what the recheck used, and only what still fails is corrupt.
+    """
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    run_id = "transient-run"
+    remote = {"provider": "runpod", "endpoint_id": "ep-live", "attempt": 0}
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=run_id,
+            state="running",
+            spec={"run_id": run_id},
+            remote=dict(remote),
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
+    )
+    original = runner_status.get_status
+
+    def stale_read(requested):
+        raise OSError(errno.ESTALE, "stale file handle")
+
+    monkeypatch.setattr(runner_status, "get_status", stale_read)
+
+    status, quarantined = runner_status._quarantine_corrupt_status(run_id, "boom")
+
+    monkeypatch.setattr(runner_status, "get_status", original)
+    assert quarantined is False
+    assert status is not None
+    assert status.state == "running"
+    assert status.remote == remote
+    # the live record is untouched: no envelope written, no sidecar, and the handle still attached.
+    persisted = runner_status.get_status(run_id)
+    assert persisted.state == "running"
+    assert persisted.error is None
+    assert persisted.remote == remote
+    assert list((tmp_path / "runs").glob(f"{run_id}.json.corrupt-*")) == []
 
 
 def test_quarantine_keeps_the_adapter_reference_of_a_deployed_run(monkeypatch, tmp_path):

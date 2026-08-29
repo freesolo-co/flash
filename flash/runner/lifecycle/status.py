@@ -113,8 +113,8 @@ def _describes_run(run_id: str, raw: dict | None) -> bool:
 
 
 # quarantine owns these; every other readable field is lifted verbatim. `source_snapshot` is
-# controlled because it is the one field that fails closed -- re-lifting it would rebuild a record
-# just as unreadable as the one being quarantined.
+# controlled because it is the one field that fails closed, so it cannot be copied verbatim -- it is
+# revalidated by `_salvaged_source_snapshot` and kept only when the descriptor itself still parses.
 _QUARANTINE_CONTROLLED = frozenset(
     {"run_id", "state", "error", "finished_at", "updated_at", "remote", "source_snapshot"}
 )
@@ -146,7 +146,7 @@ _QUARANTINE_MAPPING_FALLBACKS: dict[str, dict | None] = {
 }
 
 
-def _salvaged_finished_at(raw: dict, now: float) -> float:
+def _salvaged_finished_at(raw: dict) -> float | None:
     """The record's own terminal timestamp, which billing treats as the teardown boundary.
 
     `finished_at` is stamped once on the first terminal transition and is documented on `RunStatus`
@@ -157,15 +157,47 @@ def _salvaged_finished_at(raw: dict, now: float) -> float:
     entire outage as wall time.
 
     Anything that is not a finite positive real is unusable as that boundary -- `_terminal_ts`
-    raises on `None` and `float()` raises on a string -- so those fall back to `now`, using the
-    same guards `_instance_realized_cost` applies to `started_ts`.
+    raises on `None` and `float()` raises on a string -- and is refused by the same guards
+    `_instance_realized_cost` applies to `started_ts`. Refused means `None`, NOT `now`: for a
+    settled record the restart instant is not a worse boundary, it is a fabricated one, and
+    substituting it makes `_due()` newly true (it returns `False` while `finished_at is None`), so
+    reconciliation would bill from the handle's `started_ts` through the restart -- potentially days
+    of usage that never happened. Leaving it unset keeps the record out of that pass entirely, which
+    is what the pre-quarantine record already did.
     """
     stored = raw.get("finished_at")
     if isinstance(stored, bool) or not isinstance(stored, (int, float)):
-        return now
+        return None
     if not math.isfinite(stored) or stored <= 0:
-        return now
+        return None
     return float(stored)
+
+
+def _salvaged_source_snapshot(raw: dict) -> dict | None:
+    """The record's own source descriptor when it still parses, else nothing.
+
+    `source_snapshot` is the one lifted field that fails closed, so it cannot be copied verbatim:
+    re-lifting a malformed descriptor would rebuild a record `get_status` rejects exactly the way it
+    rejected the one being quarantined. But blanket-dropping it is equally wrong, because this is
+    rarely the field that failed -- a missing required `spec` raises `TypeError` from the
+    `RunStatus` constructor with the descriptor perfectly valid. Erasing it then costs a settled run
+    its provenance permanently: `_validated_terminal_source` in
+    `flash/server/domain/registry/runs.py` calls `parse_descriptor` on it, and without it the run
+    reports `artifactsComplete: false` forever even though its artifacts are complete.
+
+    So parse it here, independently of whatever else failed, and keep it only when it is itself
+    valid. `parse_descriptor` is the same validator both the decode path and that reader use, and
+    its normalized `to_dict()` is what `_runstatus_from_json` would have stored.
+    """
+    stored = raw.get("source_snapshot")
+    if stored is None:
+        return None
+    from flash.snapshot.archive import parse_descriptor
+
+    try:
+        return parse_descriptor(stored).to_dict()
+    except SourceSnapshotError:
+        return None
 
 
 def _durable_teardown_intent(remote: dict | None, cleanup_remotes: list | None) -> list | None:
@@ -193,6 +225,33 @@ def _durable_teardown_intent(remote: dict | None, cleanup_remotes: list | None) 
     return records
 
 
+def persist_teardown_intent(run_id: str) -> None:
+    """Record the run's own active handle as durable cleanup intent, then leave the record alone.
+
+    The counterpart to `_durable_teardown_intent` for a record that is already on disk. Quarantine
+    can fold the intent into the one write it is already making; a run terminalized by an ordinary
+    `_update` cannot, and dispatching teardown for it without this leaves the same crash window --
+    the handle lives only in `status.remote`, which no later boot acts on once the run is terminal.
+
+    Deliberately lenient and quiet. Siblings are read verbatim and matched by
+    `_teardown_removal_key`, the same leniency `_durable_teardown_intent` relies on, so a legacy
+    short-fingerprint handle is preserved rather than dropped -- `_record_cleanup_remote` refuses
+    exactly those, and the strict `_cleanup_remotes_from_raw` raises on them. It does not report the
+    write either: this only makes an already-persisted handle drainable, and it runs on the startup
+    thread, where a blocking status report is the stall the threaded teardown exists to avoid.
+    Already-recorded intent short-circuits before any write.
+    """
+    with state._status_guard(run_id):
+        raw = _load_status_json(run_id)
+        status = _runstatus_from_json(raw)
+        stored = raw.get(state._CLEANUP_REMOTES_KEY)
+        existing = list(stored) if isinstance(stored, list) else []
+        records = _durable_teardown_intent(status.remote, existing)
+        if records is None or len(records) == len(existing):
+            return
+        state._save_status_unlocked(status, _cleanup_remotes=records)
+
+
 def _salvage_corrupt_record(
     run_id: str, raw: dict | None, detail: str, now: float
 ) -> tuple[RunStatus, list | None]:
@@ -212,7 +271,7 @@ def _salvage_corrupt_record(
     """
     values: dict = {"spec": {}, "state": "failed", "remote": None}
     cleanup_remotes = None
-    finished_at = now
+    finished_at: float | None = now
     if raw is not None and _describes_run(run_id, raw):
         values.update(
             {
@@ -224,10 +283,11 @@ def _salvage_corrupt_record(
         for key, fallback in _QUARANTINE_MAPPING_FALLBACKS.items():
             if not isinstance(values.get(key), dict):
                 values[key] = dict(fallback) if fallback is not None else None
+        values["source_snapshot"] = _salvaged_source_snapshot(raw)
         stored_state = raw.get("state")
         if isinstance(stored_state, str) and stored_state in _QUARANTINE_RETAINED_STATES:
             values["state"] = stored_state
-            finished_at = _salvaged_finished_at(raw, now)
+            finished_at = _salvaged_finished_at(raw)
         values["remote"] = _salvage_teardown_handle(raw.get("remote"))
         stored_cleanup = raw.get(state._CLEANUP_REMOTES_KEY)
         if isinstance(stored_cleanup, list):
@@ -272,6 +332,19 @@ def _quarantine_corrupt_status(run_id: str, detail: str) -> tuple[RunStatus | No
             raw = _load_status_json(run_id)
         except (UnicodeDecodeError, ValueError, TypeError, RecursionError, OSError):
             raw = None
+        else:
+            # a read that only failed transiently is not a corrupt record. the recheck above reports
+            # `ESTALE` and `EIO` through the same `OSError` arm it uses for undecodable bytes, so
+            # this third read succeeding proves nothing on its own -- quarantining on it would
+            # rewrite a live `running` record to `failed` and tear its remote down because a stale
+            # handle cleared. decode and validate the bytes with exactly what the recheck used, and
+            # treat only what still fails as corrupt.
+            try:
+                recovered = _validate_recovery_status(run_id, _runstatus_from_json(raw))
+            except _RECOVERY_RECORD_ERRORS:
+                pass
+            else:
+                return recovered, False
         failed, cleanup_remotes = _salvage_corrupt_record(run_id, raw, detail, time.time())
         data = state._status_storage_dict(failed)
         cleanup_remotes = _durable_teardown_intent(failed.remote, cleanup_remotes)

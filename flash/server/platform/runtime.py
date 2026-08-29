@@ -653,7 +653,19 @@ def _teardown_failed_recovery(status: RunStatus) -> None:
     HEALTHCHECK grace and turn into a restart loop. The direct teardown is the slower half -- it
     makes live provider calls per handle -- so leaving it on the startup thread would have kept
     exactly the stall the threaded drain exists to avoid.
+
+    Recording the intent first is what makes deferring the rest safe. A process exit between this
+    call and the provider delete would otherwise leave the handle only in `status.remote`, which
+    nothing reclaims once the run is terminal: `_classify_recoverable_runs` skips it and RunPod's
+    `sweep_orphans` is a no-op. Quarantine folds the same intent into its own atomic envelope write,
+    so for that caller this is a read that finds it already there; a run terminalized by the
+    ordinary `_update` has no such write and depends on this one. It stays on the startup thread on
+    purpose -- a durable record the teardown thread might never reach is not a durable record.
     """
+    from flash.runner.lifecycle.status import persist_teardown_intent
+
+    with contextlib.suppress(Exception):
+        persist_teardown_intent(status.run_id)
     with contextlib.suppress(Exception):
         threading.Thread(target=_teardown_failed_recovery_bg, args=(status,), daemon=True).start()
 

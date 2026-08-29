@@ -3036,6 +3036,10 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_model_was_removed(
         runner_status.effective_spec_from_status(runner_status.get_status("recover-unparseable"))
     monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": "recover-unparseable"}])
     monkeypatch.setattr(runner_reconciliation, "_drain_cleanup_remotes", lambda _run_id: None)
+    # the teardown now has durable intent to retract, so it reaches the confirmed-removal report.
+    # that report blocks on a reporter thread the fake `Thread` below never starts, and the target
+    # runs inline on this thread rather than the background one production gives it.
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
     monkeypatch.setattr(providers, "configured_providers", list)
     torn: list[tuple[dict, str]] = []
 
@@ -3065,6 +3069,75 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_model_was_removed(
     status = runner_status.get_status("recover-unparseable")
     assert status.state == "failed"
     assert "persisted spec cannot be activated" in (status.error or "")
+
+
+def test_recover_runs_records_teardown_intent_for_an_update_terminalized_run(monkeypatch, tmp_path):
+    """A run `_update` terminalizes needs its handle durable before teardown is dispatched.
+
+    Quarantine folds the same intent into the atomic envelope write it is already making. This
+    branch has no such write: `_update` terminalizes the record on disk but does not write back to
+    the in-memory `RunStatus`, so the handle exists only in `status.remote`. A process exit between
+    that transition and the provider delete would strand it -- `_classify_recoverable_runs` skips a
+    terminal record and RunPod's `sweep_orphans` returns `[]` unconditionally, so nothing reclaims
+    the endpoint and it bills forever. Asserting the endpoint is eventually torn down would pass
+    without the durable write, so this reads the record back while the teardown thread is still
+    merely queued -- exactly the state a crash in that window would leave on disk.
+    """
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+    from flash.providers.core import registry as providers
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    run_id = "intent-unparseable"
+    remote = _runpod_remote(endpoint_id="ep-intent")
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=run_id,
+            state="running",
+            spec=JobSpec(run_id=run_id, model="Qwen/Qwen3.5-9B", algorithm="sft").to_dict(),
+            remote=dict(remote),
+            source_snapshot=_SOURCE_SNAPSHOT,
+        )
+    )
+    stored_path = runner_state.runs_file_path(run_id, ".json")
+    with open(stored_path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"]["model"] = _RETIRED_MODELS[0]
+    with open(stored_path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": run_id}])
+    monkeypatch.setattr(providers, "configured_providers", list)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    torn: list[str] = []
+    monkeypatch.setattr(
+        "flash.runner.supervise.lifecycle._strict_teardown_handle",
+        lambda handle, torn_run_id: torn.append(handle["endpoint_id"]) or True,
+    )
+    deferred: list = []
+
+    class Thread:
+        def __init__(self, *, target, args=(), daemon=False):
+            self._target, self._args = target, args
+
+        def start(self):
+            deferred.append(lambda: self._target(*self._args))
+
+    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+
+    runtime.recover_runs()
+
+    # nothing has run yet, so what is on disk is exactly what a crash in this window would leave.
+    assert torn == []
+    with open(stored_path, encoding="utf-8") as handle:
+        persisted = json.load(handle)
+    assert persisted["state"] == "failed"
+    recorded = persisted[runner_state._CLEANUP_REMOTES_KEY]
+    assert [record["endpoint_id"] for record in recorded] == ["ep-intent"]
+    # and the deferred teardown still does its half, so the intent is not a substitute for it.
+    for run in deferred:
+        run()
+    assert "ep-intent" in torn
 
 
 @pytest.mark.parametrize("retired_model", _RETIRED_MODELS)
