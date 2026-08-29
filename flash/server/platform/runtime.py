@@ -692,18 +692,34 @@ def _teardown_failed_recovery(status: RunStatus) -> None:
     `sweep_orphans` is a no-op. Quarantine folds the same intent into its own atomic envelope write,
     so for that caller this is a read that finds it already there; a run terminalized by the
     ordinary `_update` has no such write and depends on this one. It stays on the startup thread on
-    purpose -- a durable record the teardown thread might never reach is not a durable record.
+    purpose -- a durable record the teardown thread might never reach is not a durable record. And
+    if the write itself fails, the same reasoning forces the teardown back onto this thread too:
+    deferral is only safe because a retryable marker survives it.
     """
     from flash.runner.lifecycle.status import (
         persist_endpoint_reclaim_intent,
         persist_teardown_intent,
     )
 
-    with contextlib.suppress(Exception):
+    try:
         persist_teardown_intent(status.run_id)
-    if _owes_endpoint_reclaim(status):
-        with contextlib.suppress(Exception):
+        if _owes_endpoint_reclaim(status):
             persist_endpoint_reclaim_intent(status.run_id)
+    except Exception:
+        # a full or failing disk takes away the very thing that makes deferral safe, so the two
+        # halves share a fate: with no marker to retry from, this in-process attempt is the only
+        # reclamation left and has to finish before recovery moves on. blocking startup while an
+        # already-degraded host tears one worker down beats deferring to a thread whose crash
+        # nothing would ever notice -- `_classify_recoverable_runs` skips the terminal run and
+        # RunPod's orphan sweep is a no-op, so the endpoint would just keep billing.
+        _log.warning(
+            "run %s: cleanup intent is not durable; tearing down inline",
+            status.run_id,
+            exc_info=True,
+        )
+        with contextlib.suppress(Exception):
+            _teardown_failed_recovery_bg(status)
+        return
     with contextlib.suppress(Exception):
         threading.Thread(target=_teardown_failed_recovery_bg, args=(status,), daemon=True).start()
 

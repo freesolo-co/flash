@@ -3280,6 +3280,55 @@ def _run_recovery_with_inline_threads(monkeypatch, terminate) -> None:
     runtime.recover_runs()
 
 
+def test_teardown_runs_inline_when_the_cleanup_intent_cannot_be_persisted(monkeypatch, tmp_path):
+    """Deferring teardown to a thread is only safe while a retryable marker survives the process.
+
+    On a full or failing disk both intent writes fail, so nothing would reconsider this run: it is
+    already terminal, `_classify_recoverable_runs` skips it, and RunPod's orphan sweep is a no-op.
+    The teardown therefore has to complete before recovery moves on, even though that costs startup
+    time -- a background attempt whose crash nothing observes would leave the endpoint billing.
+    """
+    import flash.providers.runpod.serverless.endpoints as serverless
+    import flash.runner.lifecycle.status as lifecycle_status
+    import flash.server.platform.runtime as runtime
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id="intent-undurable", model="Qwen/Qwen3.5-9B", algorithm="sft")
+    raw = spec.to_dict()
+    raw["gpu"]["type"] = "RTX 5090"
+    status = runner_state.RunStatus(run_id=spec.run_id, state="failed", spec=raw)
+
+    def unwritable(_run_id):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(lifecycle_status, "persist_teardown_intent", unwritable)
+    monkeypatch.setattr(lifecycle_status, "persist_endpoint_reclaim_intent", unwritable)
+    monkeypatch.setattr(runner_reconciliation, "_drain_cleanup_remotes", lambda _run_id: None)
+
+    attempts = []
+
+    def terminate(gpu_type, _run_id=None):
+        attempts.append(gpu_type)
+        return [{"success": True, "name": gpu_type, "message": "deleted via REST API"}]
+
+    monkeypatch.setattr(serverless, "terminate_endpoint", terminate)
+
+    class DeadThread:
+        """A thread that is started but never runs -- the process exits first."""
+
+        def __init__(self, *, target, args=(), daemon=False):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(runtime.threading, "Thread", DeadThread)
+    runtime._teardown_failed_recovery(status)
+
+    assert attempts == ["RTX 5090"], "teardown was deferred to a thread with no durable marker"
+
+
 def test_unconfirmed_endpoint_reclaim_is_retried_on_the_next_startup(monkeypatch, tmp_path):
     """A provider failure during the one reclaim attempt must not strand a billing endpoint.
 
