@@ -31,6 +31,7 @@ import flash.runner.supervise.lifecycle as runner_lifecycle
 import flash.runner.supervise.recovery as runner_recovery
 import flash.runner.supervise.transitions as runner_transitions
 from flash.server.platform import db as _db_mod
+from flash.snapshot.archive import SourceSnapshotError
 from tests._helpers.chat_provenance import managed_chat_result as _managed_chat_result
 from tests._helpers.source_snapshot import valid_source_snapshot
 
@@ -4056,6 +4057,14 @@ def test_replay_status_reports_mirrors_all_persisted_outcomes_sequentially(monke
 
 
 def test_replay_status_reports_skips_unreadable_records_and_continues(monkeypatch):
+    """Every error one unreadable record can raise must cost only that record its replay.
+
+    `SourceSnapshotError` and `RecursionError` are the two that are easy to miss: the first is a
+    `RuntimeError` raised by `parse_descriptor` inside `get_status`, and neither is an `OSError`,
+    `TypeError` or `ValueError`. Either escaping ends the loop at that row, so every LATER run --
+    `run-last` here -- silently stops being mirrored to the registry. That is why this shares
+    `_RECOVERY_RECORD_ERRORS` with the recovery pass rather than restating a narrower tuple.
+    """
     from flash.server.routes import serving
 
     first = SimpleNamespace(run_id="run-first")
@@ -4066,6 +4075,8 @@ def test_replay_status_reports_skips_unreadable_records_and_continues(monkeypatc
         "run-os-error": OSError("unreadable"),
         "run-type-error": TypeError("invalid type"),
         "run-value-error": ValueError("invalid value"),
+        "run-snapshot-error": SourceSnapshotError("malformed source snapshot"),
+        "run-recursion-error": RecursionError("record nested too deeply"),
         "run-last": last,
     }
     reported = []
@@ -7307,6 +7318,48 @@ def test_quarantine_drops_a_deployment_state_its_readers_cannot_test(monkeypatch
     state = (runner_status.get_status("unhashable-deployment").deployment or {}).get("state")
     assert state not in serving_revisions._DEPLOYMENT_BUSY_STATES
     assert state not in serving_revisions._DEPLOYMENT_READY_STATES
+
+
+def test_recovery_rejects_a_provider_list_the_phantom_guard_cannot_iterate(monkeypatch, tmp_path):
+    """A non-list `submitted_instance_providers` must not reach `_confirm_run_clear`.
+
+    The field is otherwise decodable, so nothing before this boundary looks at it. `_confirm_run_clear`
+    then runs `{str(name) for name in recorded_raw}` with no guard of its own, and its caller at the
+    second `_resubmit_recovered_runs` site is unwrapped -- so the `TypeError` leaves `recover_runs()`,
+    which the lifespan does not suppress, and startup aborts for every other run over this one record.
+
+    Rejecting rather than coercing to `[]` is the point: this field is the fail-CLOSED phantom guard,
+    and an empty set reads as "no instance provider could have owned the lost create", clearing the
+    run to resubmit and putting a SECOND worker on the same seed-scoped artifacts.
+    """
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    os.makedirs(runner_state.RUNS_DIR, exist_ok=True)
+    payload = json.dumps(
+        {
+            "run_id": "unreadable-providers",
+            "state": "provisioning",
+            "spec": {},
+            "submitted_instance_providers": 7,
+        }
+    ).encode()
+    with open(runner_state.runs_file_path("unreadable-providers", ".json"), "wb") as file:
+        file.write(payload)
+
+    # plain reads stay tolerant; only the recovery boundary rejects.
+    assert runner_status.get_status("unreadable-providers").submitted_instance_providers == 7
+    with pytest.raises(TypeError):
+        runner_status._get_recovery_status("unreadable-providers")
+
+    status, quarantined = runner_status._quarantine_corrupt_status("unreadable-providers", "boom")
+    assert quarantined
+    assert status is not None
+    # salvaged to the field's own pre-feature value. lifting the rejected value verbatim would fail
+    # the same validation next boot and quarantine the envelope again, leaking a `.corrupt-` copy
+    # per restart -- so re-running quarantine over the repaired record must be a no-op.
+    assert status.submitted_instance_providers is None
+    assert runner_status._quarantine_corrupt_status("unreadable-providers", "boom")[1] is False
+    corrupt = [name for name in os.listdir(runner_state.RUNS_DIR) if ".corrupt-" in name]
+    assert len(corrupt) == 1
 
 
 def test_quarantine_does_not_lift_a_record_naming_a_different_run(monkeypatch, tmp_path):

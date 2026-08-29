@@ -97,7 +97,13 @@ def replay_status_reports(stop: Event | None = None) -> int:
         try:
             status = _app.get_status(row["run_id"])
             _report_status(status)
-        except (OSError, TypeError, ValueError):
+        except _RECOVERY_RECORD_ERRORS:
+            # the same tuple `recover_deployments` above skips on, for the same reason: a record
+            # quarantine could not rewrite still fails to decode here. the narrower tuple this
+            # replaces omitted `SourceSnapshotError` (a `RuntimeError`, raised by `parse_descriptor`
+            # inside `get_status`) and `RecursionError`, either of which would escape this loop and
+            # end the replay at that row -- so every LATER run's persisted status silently stops
+            # being mirrored to the registry because one earlier record is unreadable.
             continue
         replayed += 1
     return replayed

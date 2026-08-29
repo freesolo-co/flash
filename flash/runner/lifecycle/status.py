@@ -64,6 +64,17 @@ def _validate_recovery_status(run_id: str, status: RunStatus) -> RunStatus:
         raise ValueError(f"stored run status id does not match {run_id}")
     if not isinstance(status.state, str):
         raise TypeError(f"stored run status state must be a string for {run_id}")
+    recorded = status.submitted_instance_providers
+    if recorded is not None and not isinstance(recorded, list):
+        # `_confirm_run_clear` iterates this field as `{str(name) for name in recorded_raw}` with no
+        # guard of its own, and its caller at the second `_resubmit_recovered_runs` site is the one
+        # that is not wrapped -- so a stored `7` raises `TypeError` out of `recover_runs()`, which
+        # the lifespan does not suppress, aborting startup for every other run. Rejecting here
+        # routes it to quarantine like any other undecodable field instead of normalizing it: the
+        # field is the fail-CLOSED phantom guard, and silently coercing an unreadable value to `[]`
+        # would read as "no instance provider could have taken the lost create" and clear the run
+        # for resubmit, which is exactly the second billing worker the guard exists to prevent.
+        raise TypeError(f"stored submitted instance providers must be a list for {run_id}")
     return status
 
 
@@ -306,6 +317,15 @@ def _salvage_corrupt_record(
                 values[key] = dict(fallback) if fallback is not None else None
         if isinstance(values.get("deployment"), dict):
             values["deployment"] = _salvaged_deployment(values["deployment"])
+        if not isinstance(values.get("submitted_instance_providers"), list):
+            # the value `_validate_recovery_status` just rejected would be lifted verbatim, so the
+            # envelope would fail the same validation on the next boot and quarantine itself again,
+            # leaking a `.corrupt-` copy every restart. `None` is the field's own "record predates
+            # the feature" value and is what the salvaged record can honestly claim: the submit-time
+            # provider set is exactly what was unreadable. it costs this record nothing, because
+            # quarantine has just made it terminal and `_confirm_run_clear` only ever runs for a
+            # `_RECOVERABLE` one.
+            values["submitted_instance_providers"] = None
         values["source_snapshot"] = _salvaged_source_snapshot(raw)
         stored_state = raw.get("state")
         if isinstance(stored_state, str) and stored_state in _QUARANTINE_RETAINED_STATES:
