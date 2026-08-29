@@ -382,15 +382,40 @@ def _env_name_error(raw: str) -> str:
     return f"env name invalid: {text!r} has no usable characters"
 
 
+def _validate_env_entrypoint_source(source: bytes) -> None:
+    """Reject exact Python bytes that cannot execute as an environment module."""
+    compile(source, _ENV_ENTRYPOINT, "exec")
+
+
+def _decode_env_entrypoint_source(source: bytes) -> tuple[str, str]:
+    """Decode Python bytes with the interpreter's encoding-cookie and BOM contract."""
+    import io
+    import tokenize
+
+    encoding, _ = tokenize.detect_encoding(io.BytesIO(source).readline)
+    return source.decode(encoding), encoding
+
+
+def _python_preamble_lines(lines: list[str]) -> int:
+    """Return the shebang and encoding-cookie lines that must remain first."""
+    if not lines:
+        return 0
+    encoding_cookie = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*[-\w.]+", re.ASCII)
+    blank_or_comment = re.compile(r"^[ \t\f]*(?:#|[\r\n]|$)", re.ASCII)
+    if encoding_cookie.match(lines[0]):
+        return 1
+    if len(lines) > 1 and blank_or_comment.match(lines[0]) and encoding_cookie.match(lines[1]):
+        return 2
+    return 1 if lines[0].startswith("#!") else 0
+
+
 def _with_syspath_bootstrap(env_source: str) -> str:
-    """Prepend a sys.path bootstrap so a published env can resolve shipped sibling helpers."""
+    """Insert the sys.path bootstrap after the Python module preamble."""
     import ast
 
-    try:
-        tree = ast.parse(env_source)
-    except SyntaxError:
-        return _ENV_SYSPATH_BOOTSTRAP + env_source
-    insert_after = 0
+    tree = ast.parse(env_source, filename=_ENV_ENTRYPOINT)
+    lines = env_source.splitlines(keepends=True)
+    insert_after = _python_preamble_lines(lines)
     body = tree.body
     i = 0
     if (
@@ -399,13 +424,27 @@ def _with_syspath_bootstrap(env_source: str) -> str:
         and isinstance(getattr(body[0], "value", None), ast.Constant)
         and isinstance(body[0].value.value, str)
     ):
-        insert_after = body[0].end_lineno or 0
+        insert_after = max(insert_after, body[0].end_lineno or 0)
         i = 1
     while i < len(body) and isinstance(body[i], ast.ImportFrom) and body[i].module == "__future__":
-        insert_after = body[i].end_lineno or insert_after
+        insert_after = max(insert_after, body[i].end_lineno or 0)
         i += 1
-    lines = env_source.splitlines(keepends=True)
-    return "".join(lines[:insert_after]) + _ENV_SYSPATH_BOOTSTRAP + "".join(lines[insert_after:])
+    prefix = "".join(lines[:insert_after])
+    if prefix and not prefix.endswith(("\n", "\r")):
+        prefix += "\n"
+    published_source = prefix + _ENV_SYSPATH_BOOTSTRAP + "".join(lines[insert_after:])
+    if not env_source.endswith(("\n", "\r")):
+        published_source = published_source.removesuffix("\n")
+    return published_source
+
+
+def _prepare_env_entrypoint_source(env_source: bytes) -> bytes:
+    """Validate the authored bytes and return the exact validated archive bytes."""
+    _validate_env_entrypoint_source(env_source)
+    decoded_source, encoding = _decode_env_entrypoint_source(env_source)
+    published_source = _with_syspath_bootstrap(decoded_source).encode(encoding)
+    _validate_env_entrypoint_source(published_source)
+    return published_source
 
 
 def _raise_walk_error(error: OSError) -> None:
@@ -675,6 +714,18 @@ def cmd_env_push(args) -> int:
         return _err(str(exc))
 
     try:
+        published_source = _prepare_env_entrypoint_source(entrypoint.read_bytes())
+    except (SyntaxError, UnicodeError, ValueError) as exc:
+        location = (
+            f"line {exc.lineno}" if getattr(exc, "lineno", None) is not None else "unknown line"
+        )
+        return _err(
+            f"cannot publish {src}: environment entrypoint has invalid Python syntax ({location})"
+        )
+    except OSError:
+        return _err(f"cannot publish {src}: environment entrypoint could not be read")
+
+    try:
         _check_env_push_limits(
             env_root,
             entrypoint=entrypoint,
@@ -686,8 +737,7 @@ def cmd_env_push(args) -> int:
 
     with tempfile.TemporaryDirectory(prefix="flash-env-push-") as tmp:
         pkg = Path(tmp)
-        module_source = entrypoint.read_text()
-        (pkg / _ENV_ENTRYPOINT).write_text(_with_syspath_bootstrap(module_source))
+        (pkg / _ENV_ENTRYPOINT).write_bytes(published_source)
         _write_entrypoint_alias(pkg, entrypoint=entrypoint)
         _copy_env_sidecars(
             env_root,

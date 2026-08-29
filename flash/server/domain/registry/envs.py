@@ -13,6 +13,8 @@ import tarfile
 import tempfile
 import time
 import urllib.parse
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from flash.envs.loading.loader import _github_token
@@ -200,17 +202,89 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
         raise EnvPublishError(f"env package could not be extracted: {exc}") from exc
 
 
+def _token_representation_pattern(token: str) -> re.Pattern[str]:
+    encoded = urllib.parse.quote(token, safe="")
+    parts = []
+    cursor = 0
+    for match in re.finditer(r"%[0-9A-F]{2}", encoded):
+        parts.append(re.escape(encoded[cursor : match.start()]))
+        octet = match.group()[1:]
+        parts.append(
+            "%"
+            + "".join(
+                f"[{digit.lower()}{digit.upper()}]" if digit in "ABCDEF" else digit
+                for digit in octet
+            )
+        )
+        cursor = match.end()
+    parts.append(re.escape(encoded[cursor:]))
+    return re.compile(f"(?:{re.escape(token)}|{''.join(parts)})")
+
+
 def _redact(value: str, token: str) -> str:
     if not token:
         return value
-    return value.replace(token, "<redacted>").replace(
-        urllib.parse.quote(token, safe=""), "<redacted>"
-    )
+    return _token_representation_pattern(token).sub("<redacted>", value)
 
 
-def _credentialed_repo_url(repo: str, token: str) -> str:
-    quoted = urllib.parse.quote(token, safe="")
-    return f"https://x-access-token:{quoted}@github.com/{repo}.git"
+def _repo_url(repo: str) -> str:
+    return f"https://github.com/{repo}.git"
+
+
+@contextmanager
+def _git_credential_env(token: str) -> Iterator[dict[str, str]]:
+    """Yield a git environment backed by short-lived, mode-restricted askpass files."""
+    with tempfile.TemporaryDirectory(prefix="flash-git-auth-") as tmp:
+        auth_dir = Path(tmp)
+        token_file = auth_dir / "token"
+        askpass = auth_dir / "askpass.sh"
+        token_fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.fchmod(token_fd, 0o600)
+        with os.fdopen(token_fd, "w", encoding="utf-8") as stream:
+            stream.write(token)
+        askpass_fd = os.open(askpass, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+        os.fchmod(askpass_fd, 0o700)
+        with os.fdopen(askpass_fd, "w", encoding="utf-8") as stream:
+            stream.write(
+                "#!/bin/sh\n"
+                'case "$1" in\n'
+                "  *Username*) printf '%s\\n' x-access-token ;;\n"
+                '  *Password*) exec cat "$FLASH_GIT_TOKEN_FILE" ;;\n'
+                "  *) exit 1 ;;\n"
+                "esac\n"
+            )
+
+        token_pattern = _token_representation_pattern(token) if token else None
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key
+            not in {
+                "GH_TOKEN",
+                "GITHUB_PAT",
+                "GITHUB_TOKEN",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_PARAMETERS",
+            }
+            and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+            and not (
+                token_pattern
+                and (
+                    token_pattern.search(key) is not None or token_pattern.search(value) is not None
+                )
+            )
+        }
+        env.update(
+            {
+                "GIT_ASKPASS": str(askpass),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "credential.helper",
+                "GIT_CONFIG_VALUE_0": "",
+                "GIT_TERMINAL_PROMPT": "0",
+                "FLASH_GIT_TOKEN_FILE": str(token_file),
+            }
+        )
+        yield env
 
 
 def _checkout_child(checkout: Path, publish_root: str, *, operation: str) -> Path:
@@ -230,16 +304,16 @@ def _run_git(
     # instead of a misleading "upload" on the delete path. The trailing preposition mirrors the
     # wording used elsewhere in this module ("environments to Freesolo" for upload, "from Freesolo"
     # for delete — see `_staged_has_changes` / `delete_package`).
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     try:
-        proc = subprocess.run(
-            ["git", *args],
-            cwd=cwd,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_S,
-        )
+        with _git_credential_env(token) as env:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=cwd,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=_GIT_TIMEOUT_S,
+            )
     except FileNotFoundError as exc:
         direction = "from" if operation in {"delete", "download"} else "to"
         raise EnvPublishError(
@@ -251,7 +325,7 @@ def _run_git(
             status=504,
         ) from exc
     if proc.returncode != 0:
-        output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
+        output = _redact(f"{proc.stdout or ''}\n{proc.stderr or ''}".strip(), token)
         cmd = "git " + " ".join(args)
         raise EnvPublishError(
             _redact(
@@ -260,6 +334,30 @@ def _run_git(
             status=502,
         )
     return proc
+
+
+def _clone_hub_checkout(
+    *,
+    parent: Path,
+    checkout: Path,
+    repo: str,
+    token: str,
+    operation: str,
+    shallow: bool = False,
+) -> None:
+    args = ["clone"]
+    if shallow:
+        args.extend(["--depth", "1"])
+    args.extend(
+        [
+            "--branch",
+            _GITHUB_BRANCH,
+            "--single-branch",
+            _repo_url(repo),
+            str(checkout),
+        ]
+    )
+    _run_git(parent, args, token=token, operation=operation)
 
 
 def _is_retryable_git_publish_error(message: str) -> bool:
@@ -304,13 +402,15 @@ def _commit_environment_update(
     _run_git(checkout, ["config", "user.email", "bot@freesolo.co"], token=token)
     _run_git(checkout, ["add", "-A", "--", publish_root], token=token)
     try:
-        proc = subprocess.run(
-            ["git", "diff", "--cached", "--quiet", "--", publish_root],
-            cwd=checkout,
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_S,
-        )
+        with _git_credential_env(token) as env:
+            proc = subprocess.run(
+                ["git", "diff", "--cached", "--quiet", "--", publish_root],
+                cwd=checkout,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=_GIT_TIMEOUT_S,
+            )
     except subprocess.TimeoutExpired as exc:
         raise EnvPublishError(
             f"Freesolo environment upload git command timed out after {_GIT_TIMEOUT_S}s",
@@ -349,7 +449,7 @@ def _push_environment_delete(*, checkout: Path, publish_root: str, token: str) -
         token=token,
         operation="delete",
     )
-    if _staged_has_changes(checkout):
+    if _staged_has_changes(checkout, token=token):
         _run_git(checkout, ["commit", "--amend", "--no-edit"], token=token, operation="delete")
     _run_git(
         checkout, ["push", "origin", f"HEAD:{_GITHUB_BRANCH}"], token=token, operation="delete"
@@ -367,17 +467,12 @@ def _github_publish_once(
     with tempfile.TemporaryDirectory(prefix="flash-env-hub-") as tmp:
         tmp_path = Path(tmp)
         checkout = tmp_path / "environment-hub"
-        _run_git(
-            tmp_path,
-            [
-                "clone",
-                "--branch",
-                _GITHUB_BRANCH,
-                "--single-branch",
-                _credentialed_repo_url(repo, token),
-                str(checkout),
-            ],
+        _clone_hub_checkout(
+            parent=tmp_path,
+            checkout=checkout,
+            repo=repo,
             token=token,
+            operation="upload",
         )
         _copy_package_to_checkout(source=dest, checkout=checkout, publish_root=publish_root)
         if _commit_environment_update(
@@ -600,20 +695,13 @@ def _github_download_once(*, repo: str, token: str, publish_root: str) -> bytes:
     with tempfile.TemporaryDirectory(prefix="flash-env-hub-") as tmp:
         tmp_path = Path(tmp)
         checkout = tmp_path / "environment-hub"
-        _run_git(
-            tmp_path,
-            [
-                "clone",
-                "--depth",
-                "1",
-                "--branch",
-                _GITHUB_BRANCH,
-                "--single-branch",
-                _credentialed_repo_url(repo, token),
-                str(checkout),
-            ],
+        _clone_hub_checkout(
+            parent=tmp_path,
+            checkout=checkout,
+            repo=repo,
             token=token,
             operation="download",
+            shallow=True,
         )
         target = _checkout_child(checkout, publish_root, operation="download")
         if not target.is_dir():
@@ -696,15 +784,17 @@ def list_namespace_slugs(*, key: dict) -> list[str]:
         raise EnvPublishError(f"Freesolo environment list failed: {exc}", status=502) from exc
 
 
-def _staged_has_changes(checkout: Path) -> bool:
+def _staged_has_changes(checkout: Path, *, token: str = "") -> bool:
     try:
-        proc = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=checkout,
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_S,
-        )
+        with _git_credential_env(token) as env:
+            proc = subprocess.run(
+                ["git", "diff", "--cached", "--quiet"],
+                cwd=checkout,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=_GIT_TIMEOUT_S,
+            )
     except FileNotFoundError as exc:
         raise EnvPublishError(
             "git is required to delete environments from Freesolo", status=503
@@ -720,7 +810,9 @@ def _staged_has_changes(checkout: Path) -> bool:
     if proc.returncode not in (0, 1):
         output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
         raise EnvPublishError(
-            f"Freesolo environment delete failed during staged diff check: {output}",
+            _redact(
+                f"Freesolo environment delete failed during staged diff check: {output}", token
+            ),
             status=502,
         )
     return proc.returncode == 1
@@ -730,16 +822,10 @@ def _github_delete_once(*, repo: str, token: str, publish_root: str, message: st
     with tempfile.TemporaryDirectory(prefix="flash-env-hub-") as tmp:
         tmp_path = Path(tmp)
         checkout = tmp_path / "environment-hub"
-        _run_git(
-            tmp_path,
-            [
-                "clone",
-                "--branch",
-                _GITHUB_BRANCH,
-                "--single-branch",
-                _credentialed_repo_url(repo, token),
-                str(checkout),
-            ],
+        _clone_hub_checkout(
+            parent=tmp_path,
+            checkout=checkout,
+            repo=repo,
             token=token,
             operation="delete",
         )
@@ -758,7 +844,7 @@ def _github_delete_once(*, repo: str, token: str, publish_root: str, message: st
             token=token,
             operation="delete",
         )
-        if not _staged_has_changes(checkout):
+        if not _staged_has_changes(checkout, token=token):
             # The directory was present on disk but untracked (never committed) — nothing to push.
             return False
         _run_git(checkout, ["commit", "-m", message], token=token, operation="delete")

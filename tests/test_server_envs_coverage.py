@@ -56,9 +56,9 @@ def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
 
 
 def test_pure_url_and_redact_helpers():
-    # _credentialed_repo_url percent-encodes the token into the https remote.
-    url = envs._credentialed_repo_url("owner/repo", "tok/with:chars")
-    assert url == "https://x-access-token:tok%2Fwith%3Achars@github.com/owner/repo.git"
+    # the repository url is always credential-free.
+    url = envs._repo_url("owner/repo")
+    assert url == "https://github.com/owner/repo.git"
 
     # _redact with an empty token is a no-op (the early-return branch).
     assert envs._redact("nothing to redact", "") == "nothing to redact"
