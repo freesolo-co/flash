@@ -291,9 +291,7 @@ def test_terminate_persisted_endpoints_isolates_each_gpu_failure(monkeypatch) ->
 
     monkeypatch.setattr(serverless, "terminate_endpoint", terminate)
 
-    runpod.terminate_persisted_endpoints(
-        {"gpu": {"type": ["RTX 5090", "A100 PCIe"]}}, "flash-cleanup"
-    )
+    runpod.terminate_persisted_endpoints(["RTX 5090", "A100 PCIe"], "flash-cleanup")
     assert calls == ["RTX 5090", "A100 PCIe"]
 
 
@@ -326,12 +324,12 @@ def test_failed_rest_sweep_is_reported_rather_than_read_as_confirmed_clear(monke
     results = serverless.terminate_endpoint("RTX 5090", "flash-cleanup")
     assert [entry["success"] for entry in results] == [False], results
 
-    assert not runpod.terminate_persisted_endpoints(
-        {"gpu": {"type": ["RTX 5090"]}}, "flash-cleanup"
-    ), "a failed REST sweep was reported as confirmed-clear"
+    assert not runpod.terminate_persisted_endpoints(["RTX 5090"], "flash-cleanup"), (
+        "a failed REST sweep was reported as confirmed-clear"
+    )
 
 
-def test_spec_without_a_gpu_class_is_reported_unconfirmed(monkeypatch) -> None:
+def test_no_gpu_class_to_derive_from_is_reported_unconfirmed(monkeypatch) -> None:
     """Deriving zero endpoint names is not the same as confirming no endpoint exists.
 
     An empty result from an actual call proves a specific derived name is absent. Zero derived names
@@ -350,14 +348,14 @@ def test_spec_without_a_gpu_class_is_reported_unconfirmed(monkeypatch) -> None:
 
     monkeypatch.setattr(serverless, "terminate_endpoint", terminate)
 
-    for spec in ({}, {"gpu": {}}, {"gpu": {"type": []}}, {"gpu": {"type": 7}}, None):
-        assert not runpod.terminate_persisted_endpoints(spec, "flash-cleanup"), (
-            f"a spec deriving no endpoint name was reported confirmed-clear: {spec!r}"
+    for gpu_types in ((), [], ""):
+        assert not runpod.terminate_persisted_endpoints(gpu_types, "flash-cleanup"), (
+            f"deriving no endpoint name was reported confirmed-clear: {gpu_types!r}"
         )
-    assert calls == [], "a name was derived from a spec carrying no gpu class"
+    assert calls == [], "a name was derived without a gpu class"
 
     # the contrast: one derived name, actually asked, and the provider answered that it is gone.
-    assert runpod.terminate_persisted_endpoints({"gpu": {"type": "RTX 5090"}}, "flash-cleanup")
+    assert runpod.terminate_persisted_endpoints(["RTX 5090"], "flash-cleanup")
     assert calls == ["RTX 5090"]
 
 

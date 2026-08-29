@@ -18,9 +18,10 @@ import math
 import os
 import tempfile
 import time
+from typing import Any
 
 from flash.core.catalog import validate_model_for_algorithm
-from flash.core.spec import JobSpec
+from flash.core.spec import JobSpec, persisted_gpu_types
 from flash.core.spec_persistence import validate_persisted_spec_envelope
 from flash.runner.lifecycle import attempts, preparation, reporting, state
 from flash.runner.lifecycle.state import RunStatus
@@ -78,7 +79,29 @@ def _validate_recovery_status(run_id: str, status: RunStatus) -> RunStatus:
     return status
 
 
+# a storage blip must not strand a run for the whole process lifetime. `recover_runs()` runs once,
+# at lifespan startup, and nothing else enumerates the durable records -- a row skipped for an
+# unreadable status is never reconsidered, while its worker keeps billing. so re-read a bounded
+# number of times before giving up, and only for the errors that say the STORAGE was unreadable
+# (`PermissionError`, `ESTALE`, `EIO`). undecodable BYTES are quarantine's job and re-reading them
+# just repeats the same failure, and `FileNotFoundError` -- an `OSError` subclass, so its clause
+# comes first -- means the record is gone rather than briefly unavailable.
+_RECOVERY_READ_ATTEMPTS = 3
+_RECOVERY_READ_BACKOFF_S = 0.2
+
+
 def _get_recovery_status(run_id: str) -> RunStatus:
+    """The validated record, retrying only a transient storage failure."""
+    delay = _RECOVERY_READ_BACKOFF_S
+    for _ in range(_RECOVERY_READ_ATTEMPTS - 1):
+        try:
+            return _validate_recovery_status(run_id, get_status(run_id))
+        except FileNotFoundError:
+            raise
+        except OSError:
+            time.sleep(delay)
+            delay *= 2
+    # the last attempt is unguarded so its failure reaches the caller as itself.
     return _validate_recovery_status(run_id, get_status(run_id))
 
 
@@ -257,59 +280,83 @@ def _durable_teardown_intent(remote: dict | None, cleanup_remotes: list | None) 
     return records
 
 
-def persist_teardown_intent(run_id: str) -> None:
-    """Record the run's own active handle as durable cleanup intent, then leave the record alone.
+def fail_with_cleanup_intent(run_id: str, detail: str) -> RunStatus | None:
+    """Terminalize an unrecoverable run and record what it still owes, in ONE durable write.
 
-    The counterpart to `_durable_teardown_intent` for a record that is already on disk. Quarantine
-    can fold the intent into the one write it is already making; a run terminalized by an ordinary
-    `_update` cannot, and dispatching teardown for it without this leaves the same crash window --
-    the handle lives only in `status.remote`, which no later boot acts on once the run is terminal.
+    Recovery marks a run `failed` and then has to release whatever it rented. Those are two halves
+    of a single fact, and splitting them across writes is what leaves an unreachable record: the
+    terminal write is exactly what drops the run from `_RECOVERABLE`, so a crash before the intent
+    lands means no later boot revisits it -- `_classify_recoverable_runs` skips it and RunPod's
+    `sweep_orphans` is a no-op -- while its worker bills on. Writing intent first only inverts the
+    window. So both go into the same `_save_status_unlocked` under the same guard, the way
+    quarantine already folds them into its one atomic envelope.
 
-    Deliberately lenient and quiet. Siblings are read verbatim and matched by
-    `_teardown_removal_key`, the same leniency `_durable_teardown_intent` relies on, so a legacy
-    short-fingerprint handle is preserved rather than dropped -- `_record_cleanup_remote` refuses
-    exactly those, and the strict `_cleanup_remotes_from_raw` raises on them. It does not report the
-    write either: this only makes an already-persisted handle drainable, and it runs on the startup
-    thread, where a blocking status report is the stall the threaded teardown exists to avoid.
-    Already-recorded intent short-circuits before any write.
+    Which intent applies follows from the record, not from the caller: a persisted handle becomes a
+    drainable `cleanup_remotes` record, and a handle-less run whose only address is its derived
+    endpoint name gets the reclaim marker instead. Both can be absent, and then this is just the
+    terminal write.
+
+    Returns the persisted status so the caller can dispatch teardown from it, or `None` when the
+    sticky compare-and-set refused the transition -- an already-settled run keeps its state, and
+    nothing is written.
     """
     with state._status_guard(run_id):
         raw = _load_status_json(run_id)
         status = _runstatus_from_json(raw)
+        if not _apply_transition(
+            status, "failed", allow_from_terminal=False, updates={"error": detail}
+        ):
+            return None
         stored = raw.get(state._CLEANUP_REMOTES_KEY)
         existing = list(stored) if isinstance(stored, list) else []
         records = _durable_teardown_intent(status.remote, existing)
-        if records is None or len(records) == len(existing):
-            return
-        state._save_status_unlocked(status, _cleanup_remotes=records)
+        cleanup = (
+            records if records is not None and records != existing else state._PRIVATE_VALUE_UNSET
+        )
+        reclaim: object = state._PRIVATE_VALUE_UNSET
+        if not status.remote and not _stored_reclaim_types(raw):
+            gpu_types = reclaimable_gpu_types(raw)
+            if gpu_types:
+                reclaim = list(gpu_types)
+        state._save_status_unlocked(
+            status, _cleanup_remotes=cleanup, _endpoint_reclaim_pending=reclaim
+        )
+    reporting._report_status(status)
+    return status
 
 
-def persist_endpoint_reclaim_intent(run_id: str) -> None:
-    """Mark a handle-less terminal run as still owing an endpoint reclaim by derived name.
+def reclaimable_gpu_types(status: Any) -> tuple[str, ...]:
+    """Every GPU class a handle-less run could have created an endpoint under.
 
-    `persist_teardown_intent` covers the run that DID persist a handle. This covers the one that did
-    not: RunPod accepted the create, then the response or the handle write was lost, so the only
-    address the endpoint has is the name `terminate_endpoint` rebuilds from the run id and GPU class.
-    That address cannot be expressed as a `cleanup_remotes` record -- `_uncanonical_cleanup_remote_key`
-    returns `None` without an `endpoint_id` or `instance_id`, so the drain skips it, and
-    `_delete_runpod_endpoint` would reject it outright -- hence a separate flag rather than a
-    synthetic handle the drain can only loop on.
-
-    The flag is what makes the reclaim survive. `_reclaim_unhandled_endpoints` runs once, on a daemon
-    thread, and swallows failures per endpoint; a process exit or a transient provider outage there
-    leaves an endpoint that no later boot revisits, because the run is terminal and RunPod's
-    `sweep_orphans` is a no-op. Written before the thread is launched and cleared only on confirmed
-    success, it turns that one attempt into one the next startup repeats.
+    The endpoint is named from the class the deploy actually used, which is the WORKER spec's --
+    `_persist_effective_worker_spec` commits that snapshot before `_submit_provider` creates the
+    endpoint, so it is on disk whenever a lost handle is possible. Reading only `spec` misses the
+    auto-selected run entirely: an unpinned spec persists `gpu.type = ""`, the class is resolved
+    during allocation, and `reallocation_spec_from_status` exists precisely because the two halves
+    legitimately differ. Both are returned, worker half first, because an attempt that failed over
+    can have left an endpoint under either.
     """
-    with state._status_guard(run_id):
-        raw = _load_status_json(run_id)
-        if raw.get(state._ENDPOINT_RECLAIM_KEY) is True:
-            return
-        state._save_status_unlocked(_runstatus_from_json(raw), _endpoint_reclaim_pending=True)
+
+    def field(name: str) -> Any:
+        return status.get(name) if isinstance(status, dict) else getattr(status, name, None)
+
+    preparation = field("effective_preparation")
+    worker_spec = preparation.get("worker_spec") if isinstance(preparation, dict) else None
+    return tuple(
+        dict.fromkeys(persisted_gpu_types(worker_spec) + persisted_gpu_types(field("spec")))
+    )
+
+
+def _stored_reclaim_types(raw: dict) -> tuple[str, ...]:
+    """The frozen classes a stored marker names, ignoring any other shape."""
+    stored = raw.get(state._ENDPOINT_RECLAIM_KEY)
+    if not isinstance(stored, list):
+        return ()
+    return tuple(dict.fromkeys(entry for entry in stored if isinstance(entry, str) and entry))
 
 
 def clear_endpoint_reclaim_intent(run_id: str) -> None:
-    """Drop the reclaim flag once every derived endpoint is confirmed gone."""
+    """Drop the reclaim marker once every derived endpoint is confirmed gone."""
     with state._status_guard(run_id):
         raw = _load_status_json(run_id)
         if state._ENDPOINT_RECLAIM_KEY not in raw:
@@ -317,11 +364,11 @@ def clear_endpoint_reclaim_intent(run_id: str) -> None:
         state._save_status_unlocked(_runstatus_from_json(raw), _endpoint_reclaim_pending=None)
 
 
-def endpoint_reclaim_pending(run_id: str) -> bool:
-    """Whether this run still owes a name-derived endpoint reclaim."""
+def endpoint_reclaim_types(run_id: str) -> tuple[str, ...]:
+    """Classes this run still owes a name-derived endpoint reclaim under, if any."""
     with contextlib.suppress(Exception):
-        return _load_status_json(run_id).get(state._ENDPOINT_RECLAIM_KEY) is True
-    return False
+        return _stored_reclaim_types(_load_status_json(run_id))
+    return ()
 
 
 def _salvage_corrupt_record(
@@ -444,17 +491,26 @@ def _quarantine_corrupt_status(run_id: str, detail: str) -> tuple[RunStatus | No
         cleanup_remotes = _durable_teardown_intent(failed.remote, cleanup_remotes)
         if cleanup_remotes is not None:
             data[state._CLEANUP_REMOTES_KEY] = cleanup_remotes
-        # this write replaces the record wholesale, so an unreclaimed marker already on disk has to
-        # be carried across it or quarantine destroys the very evidence it exists to preserve. the
-        # marker means a previous boot recorded an endpoint owed by derived name and no provider has
-        # confirmed it gone; losing it here strands that endpoint exactly as a lost handle would,
-        # because the envelope is terminal and no later boot reconsiders a terminal run.
-        if (
-            raw is not None
-            and _describes_run(run_id, raw)
-            and raw.get(state._ENDPOINT_RECLAIM_KEY) is True
-        ):
-            data[state._ENDPOINT_RECLAIM_KEY] = True
+        # this write replaces the record wholesale, so the endpoint address it is about to destroy
+        # has to be lifted into the envelope now or nothing can ever reach that endpoint again. two
+        # sources feed one marker: classes an earlier boot already froze, and classes the corrupt
+        # bytes themselves still name. `_teardown_failed_recovery` cannot do this afterwards -- it
+        # reads the envelope, whose `spec` is `{}` -- and no later boot revisits a terminal run, so
+        # a handle-less endpoint left unaddressed here bills untouched.
+        #
+        # Folded into the SAME atomic write as the terminal state, not persisted beside it. The two
+        # are one fact: this run is failed AND still owes an endpoint. Split across two writes, a
+        # crash between them leaves exactly the unreachable terminal record this marker exists to
+        # prevent, and quarantine's whole contract is that the envelope replaces the record in one
+        # `os.replace`.
+        #
+        # Skipped when a handle survived salvage: `cleanup_remotes` above already addresses that
+        # worker, and a marker cleared only by a confirmed name-derived delete would otherwise
+        # outlive the teardown that actually released it.
+        if raw is not None and _describes_run(run_id, raw) and not failed.remote:
+            reclaim = tuple(dict.fromkeys(_stored_reclaim_types(raw) + reclaimable_gpu_types(raw)))
+            if reclaim:
+                data[state._ENDPOINT_RECLAIM_KEY] = list(reclaim)
         fd, tmp = tempfile.mkstemp(dir=state.RUNS_DIR, prefix=f"{run_id}.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as file:
@@ -849,6 +905,36 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     return float(cost)
 
 
+def _apply_transition(
+    status: RunStatus, new_state: str, *, allow_from_terminal: bool, updates: dict
+) -> bool:
+    """Apply the sticky terminal compare-and-set in memory. The caller owns the lock and the write.
+
+    Split out so a transition that must also persist cleanup intent can do both in ONE write:
+    `fail_with_cleanup_intent` needs exactly this mutation, under the same guard, with private keys
+    added to the same `_save_status_unlocked` call.
+    """
+    if (
+        status.state in state.TERMINAL_STATES
+        and new_state != status.state
+        and not allow_from_terminal
+    ):
+        return False
+    was_terminal = status.state in state.TERMINAL_STATES
+    status.state = new_state
+    status.updated_at = time.time()
+    if not was_terminal and new_state in state.TERMINAL_STATES and status.finished_at is None:
+        status.finished_at = status.updated_at
+    for key, value in updates.items():
+        if (
+            key in {"lifecycle_started_attempt", "lifecycle_progressed_attempt"}
+            and getattr(status, key) is not None
+        ):
+            continue
+        setattr(status, key, value)
+    return True
+
+
 def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
     """Atomically transition run state with terminal-stickiness. Returns False if rejected.
 
@@ -857,29 +943,12 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
     transition (e.g. the recovery path resuming ``_run_training``) must check this return so a run
     concurrently flipped terminal does not get resumed.
     """
-    report_status: RunStatus | None = None
     with state._status_guard(run_id):
         status = get_status(run_id)
-        if (
-            status.state in state.TERMINAL_STATES
-            and new_state != status.state
-            and not allow_from_terminal
+        if not _apply_transition(
+            status, new_state, allow_from_terminal=allow_from_terminal, updates=updates
         ):
             return False
-        was_terminal = status.state in state.TERMINAL_STATES
-        status.state = new_state
-        status.updated_at = time.time()
-        if not was_terminal and new_state in state.TERMINAL_STATES and status.finished_at is None:
-            status.finished_at = status.updated_at
-        for key, value in updates.items():
-            if (
-                key in {"lifecycle_started_attempt", "lifecycle_progressed_attempt"}
-                and getattr(status, key) is not None
-            ):
-                continue
-            setattr(status, key, value)
         state._save_status_unlocked(status)
-        report_status = status
-    if report_status is not None:
-        reporting._report_status(report_status)
+    reporting._report_status(status)
     return True

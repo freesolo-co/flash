@@ -37,7 +37,9 @@ _NEXT_ATTEMPT_KEY = "next_attempt"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"
 # a handle-less run whose endpoint may still exist under its derived name. `cleanup_remotes` cannot
 # carry this: every stage of that drain keys on a persisted resource id, which is exactly what this
-# run never wrote.
+# run never wrote. the value is the FROZEN list of gpu classes the endpoint could have been created
+# under, not a bare flag: the name is derived from the class, so a later corruption that drops
+# `spec.gpu.type` would strand a flag that no provider call can ever clear.
 _ENDPOINT_RECLAIM_KEY = "endpoint_reclaim_pending"
 _OPD_RETRY_CONTRACT_KEY = OPD_RETRY_CONTRACT_STATUS_KEY
 _PRIVATE_STATUS_KEYS = frozenset(
@@ -333,7 +335,7 @@ def _save_status(
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
-    _endpoint_reclaim_pending: bool | object | None = _PRIVATE_VALUE_UNSET,
+    _endpoint_reclaim_pending: list[str] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import deadlines
@@ -371,7 +373,7 @@ def _save_status_unlocked(
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
-    _endpoint_reclaim_pending: bool | object | None = _PRIVATE_VALUE_UNSET,
+    _endpoint_reclaim_pending: list[str] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import reporting

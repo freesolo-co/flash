@@ -3199,6 +3199,9 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
     with open(path, encoding="utf-8") as handle:
         stored = json.load(handle)
     stored["spec"]["model"] = retired_model
+    # the endpoint name is derived from the gpu class, so name one: without it the run is
+    # unaddressable and reclaim correctly declines to guess (see the provider-routing suite).
+    stored["spec"]["gpu"]["type"] = "RTX 5090"
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(stored, handle)
 
@@ -3217,9 +3220,14 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
         runtime, "_start_resubmit", lambda *_args, **_kwargs: pytest.fail("resubmit")
     )
     terminated = []
+
+    def terminate_persisted(gpu_types, run_id):
+        terminated.append((tuple(gpu_types), run_id))
+        return True
+
     monkeypatch.setattr(
         "flash.providers.runpod.execution.provider.terminate_persisted_endpoints",
-        lambda raw_spec, run_id: terminated.append((raw_spec["model"], run_id)),
+        terminate_persisted,
     )
 
     class Thread:
@@ -3233,7 +3241,7 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
 
     runtime.recover_runs()
 
-    assert terminated == [(retired_model, spec.run_id)]
+    assert terminated == [(("RTX 5090",), spec.run_id)]
     status = runner_status.get_status(spec.run_id)
     assert status.state == "failed"
     assert "unsupported model" in (status.error or "")
@@ -3283,13 +3291,12 @@ def _run_recovery_with_inline_threads(monkeypatch, terminate) -> None:
 def test_teardown_runs_inline_when_the_cleanup_intent_cannot_be_persisted(monkeypatch, tmp_path):
     """Deferring teardown to a thread is only safe while a retryable marker survives the process.
 
-    On a full or failing disk both intent writes fail, so nothing would reconsider this run: it is
+    On a full or failing disk the terminal write fails, so nothing would reconsider this run: it is
     already terminal, `_classify_recoverable_runs` skips it, and RunPod's orphan sweep is a no-op.
     The teardown therefore has to complete before recovery moves on, even though that costs startup
     time -- a background attempt whose crash nothing observes would leave the endpoint billing.
     """
     import flash.providers.runpod.serverless.endpoints as serverless
-    import flash.runner.lifecycle.status as lifecycle_status
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
 
@@ -3297,13 +3304,14 @@ def test_teardown_runs_inline_when_the_cleanup_intent_cannot_be_persisted(monkey
     spec = JobSpec(run_id="intent-undurable", model="Qwen/Qwen3.5-9B", algorithm="sft")
     raw = spec.to_dict()
     raw["gpu"]["type"] = "RTX 5090"
-    status = runner_state.RunStatus(run_id=spec.run_id, state="failed", spec=raw)
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=raw)
+    )
 
-    def unwritable(_run_id):
+    def unwritable(_run_id, _detail):
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(lifecycle_status, "persist_teardown_intent", unwritable)
-    monkeypatch.setattr(lifecycle_status, "persist_endpoint_reclaim_intent", unwritable)
+    monkeypatch.setattr(runner_status, "fail_with_cleanup_intent", unwritable)
     monkeypatch.setattr(runner_reconciliation, "_drain_cleanup_remotes", lambda _run_id: None)
 
     attempts = []
@@ -3324,7 +3332,7 @@ def test_teardown_runs_inline_when_the_cleanup_intent_cannot_be_persisted(monkey
             pass
 
     monkeypatch.setattr(runtime.threading, "Thread", DeadThread)
-    runtime._teardown_failed_recovery(status)
+    runtime._fail_unrecoverable_run(runner_status.get_status(spec.run_id), "spec is unactivatable")
 
     assert attempts == ["RTX 5090"], "teardown was deferred to a thread with no durable marker"
 
@@ -3354,7 +3362,7 @@ def test_unconfirmed_endpoint_reclaim_is_retried_on_the_next_startup(monkeypatch
 
     assert attempts, "quarantine never attempted the name-derived reclaim"
     assert runner_status.get_status(run_id).state == "failed"
-    assert runner_status.endpoint_reclaim_pending(run_id) is True
+    assert runner_status.endpoint_reclaim_types(run_id) == ("RTX 5090",)
 
     # the next boot reconsiders the terminal run purely because the marker is set.
     confirmed: list[str] = []
@@ -3366,7 +3374,7 @@ def test_unconfirmed_endpoint_reclaim_is_retried_on_the_next_startup(monkeypatch
     _run_recovery_with_inline_threads(monkeypatch, succeeding)
 
     assert confirmed == attempts
-    assert runner_status.endpoint_reclaim_pending(run_id) is False
+    assert runner_status.endpoint_reclaim_types(run_id) == ()
 
 
 def test_confirmed_endpoint_reclaim_is_not_retried(monkeypatch, tmp_path):
@@ -3386,7 +3394,7 @@ def test_confirmed_endpoint_reclaim_is_not_retried(monkeypatch, tmp_path):
     _run_recovery_with_inline_threads(monkeypatch, succeeding)
     first = list(calls)
     assert first, "quarantine never attempted the name-derived reclaim"
-    assert runner_status.endpoint_reclaim_pending(run_id) is False
+    assert runner_status.endpoint_reclaim_types(run_id) == ()
 
     _run_recovery_with_inline_threads(monkeypatch, succeeding)
     assert calls == first
@@ -3396,9 +3404,9 @@ def test_reclaim_marker_never_reaches_the_public_status_projection(monkeypatch, 
     """The marker is operational state, not something a submitter's status response should carry."""
     run_id = "reclaim-private"
     _quarantine_handleless_run(monkeypatch, tmp_path, run_id)
-    runner_status.persist_endpoint_reclaim_intent(run_id)
+    runner_status._quarantine_corrupt_status(run_id, "boom")
 
-    assert runner_status.endpoint_reclaim_pending(run_id) is True
+    assert runner_status.endpoint_reclaim_types(run_id) == ("RTX 5090",)
     assert runner_state._ENDPOINT_RECLAIM_KEY not in runner_status.get_status(run_id).to_dict()
 
 
@@ -3414,15 +3422,21 @@ def test_quarantine_carries_an_unreclaimed_marker_across_the_envelope(monkeypatc
     """
     run_id = "reclaim-carried"
     _quarantine_handleless_run(monkeypatch, tmp_path, run_id)
-    runner_status.persist_endpoint_reclaim_intent(run_id)
-    assert runner_status.endpoint_reclaim_pending(run_id) is True
+    path = runner_state.runs_file_path(run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    # a class the current spec no longer names: only the marker still addresses that endpoint, so
+    # losing it loses the address outright rather than merely re-deriving it a moment later.
+    stored[runner_state._ENDPOINT_RECLAIM_KEY] = ["H100 PCIe"]
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
 
     status, quarantined = runner_status._quarantine_corrupt_status(run_id, "boom")
 
     assert quarantined
     assert status is not None
     assert status.state == "failed"
-    assert runner_status.endpoint_reclaim_pending(run_id) is True
+    assert runner_status.endpoint_reclaim_types(run_id) == ("H100 PCIe", "RTX 5090")
 
 
 def test_quarantine_does_not_inject_a_marker_from_a_foreign_record(monkeypatch, tmp_path):
@@ -3438,7 +3452,7 @@ def test_quarantine_does_not_inject_a_marker_from_a_foreign_record(monkeypatch, 
     with open(path, encoding="utf-8") as handle:
         stored = json.load(handle)
     stored["run_id"] = "some-other-run"
-    stored[runner_state._ENDPOINT_RECLAIM_KEY] = True
+    stored[runner_state._ENDPOINT_RECLAIM_KEY] = ["H100 PCIe"]
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(stored, handle)
 
@@ -3446,7 +3460,7 @@ def test_quarantine_does_not_inject_a_marker_from_a_foreign_record(monkeypatch, 
 
     assert quarantined
     assert status is not None
-    assert runner_status.endpoint_reclaim_pending(run_id) is False
+    assert runner_status.endpoint_reclaim_types(run_id) == ()
 
 
 def test_reclaim_marker_is_not_recorded_without_a_derivable_endpoint_name(monkeypatch, tmp_path):
@@ -3478,7 +3492,75 @@ def test_reclaim_marker_is_not_recorded_without_a_derivable_endpoint_name(monkey
 
     assert calls == [], "a name was derived from a record carrying no gpu class"
     assert runner_status.get_status(run_id).state == "failed"
-    assert runner_status.endpoint_reclaim_pending(run_id) is False
+    assert runner_status.endpoint_reclaim_types(run_id) == ()
+
+
+def test_auto_selected_run_is_reclaimed_under_its_allocated_class(monkeypatch, tmp_path):
+    """An unpinned spec never names the class its endpoint was actually created under.
+
+    `gpu.type` persists as `""` when allocation picks the card, and the resolved class lands only in
+    `effective_preparation.worker_spec` -- written before the endpoint is created, so it is on disk
+    exactly when a lost handle is possible. Deriving the reclaim address from `spec` alone finds
+    nothing here and quarantine terminalizes the run, so the endpoint bills with no name left to
+    delete it by.
+    """
+    import flash.server.platform.runtime as runtime
+
+    run_id = "reclaim-auto"
+    _quarantine_handleless_run(monkeypatch, tmp_path, run_id)
+    path = runner_state.runs_file_path(run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"]["gpu"]["type"] = ""
+    stored["effective_preparation"] = {"worker_spec": {"gpu": {"type": "A100 PCIe"}}}
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": run_id}])
+
+    calls: list[str] = []
+
+    def terminate(gpu_type: str, _run_id: str) -> list[dict]:
+        calls.append(gpu_type)
+        return [{"success": True, "name": gpu_type, "message": "deleted via REST API"}]
+
+    _run_recovery_with_inline_threads(monkeypatch, terminate)
+
+    assert calls == ["A100 PCIe"], "the allocated class never reached the provider"
+    assert runner_status.endpoint_reclaim_types(run_id) == ()
+
+
+def test_reclaim_marker_survives_a_spec_that_later_lost_its_gpu_class(monkeypatch, tmp_path):
+    """The frozen classes are the address, so corruption after the marker must not strand it.
+
+    This is why the marker carries classes rather than a boolean. A flag would say an endpoint is
+    owed while the record it would be re-derived from no longer names one: every boot would derive
+    zero names, get unconfirmed back, and keep a marker no provider call can ever clear.
+    """
+    import flash.server.platform.runtime as runtime
+
+    run_id = "reclaim-corrupted"
+    _quarantine_handleless_run(monkeypatch, tmp_path, run_id)
+    runner_status._quarantine_corrupt_status(run_id, "boom")
+    assert runner_status.endpoint_reclaim_types(run_id) == ("RTX 5090",)
+
+    path = runner_state.runs_file_path(run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["spec"] = {}
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": run_id}])
+
+    calls: list[str] = []
+
+    def terminate(gpu_type: str, _run_id: str) -> list[dict]:
+        calls.append(gpu_type)
+        return [{"success": True, "name": gpu_type, "message": "deleted via REST API"}]
+
+    _run_recovery_with_inline_threads(monkeypatch, terminate)
+
+    assert calls == ["RTX 5090"], "the frozen class did not survive the emptied spec"
+    assert runner_status.endpoint_reclaim_types(run_id) == ()
 
 
 def test_recover_runs_reattaches_confirmed_teardown_marker(monkeypatch, tmp_path):

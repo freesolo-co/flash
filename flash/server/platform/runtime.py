@@ -10,9 +10,10 @@ import contextlib
 import logging
 import os
 import threading
+from collections.abc import Sequence
 
 from flash.adapters.artifacts import attempt_scoped_artifact_name
-from flash.core.spec import JobSpec, persisted_gpu_types
+from flash.core.spec import JobSpec
 from flash.runner.lifecycle.state import RunStatus, adapter_prefix, runs_file_path
 from flash.runner.lifecycle.status import get_status
 from flash.server.platform import db
@@ -606,23 +607,6 @@ def _drain_cleanup_remotes_bg(run_id: str) -> None:
         _drain_cleanup_remotes(run_id)
 
 
-def _owes_endpoint_reclaim(status: RunStatus) -> bool:
-    """Whether this envelope is the handle-less terminal case `_reclaim_unhandled_endpoints` covers.
-
-    Quarantine writes `failed` only when it could NOT keep a settled outcome, so that state is the
-    signal that this run's worker was never released; a handle-backed run is covered by the direct
-    teardown instead. Shared because the persist and the attempt happen on different threads and
-    must agree -- an intent recorded under a wider condition than the attempt leaves a marker
-    nothing ever clears, and a narrower one leaves the endpoint this fix exists to reclaim.
-
-    The GPU class is part of that agreement, not an extra precaution. `terminate_persisted_endpoints`
-    reports unconfirmed for a spec naming no class, because it cannot derive the one address this
-    reclaim has; recording intent for such a record would leave a marker every boot retries and no
-    provider answer can ever clear.
-    """
-    return not status.remote and status.state == "failed" and bool(persisted_gpu_types(status.spec))
-
-
 def _startup_cleanup_bg(status: RunStatus) -> None:
     """Resume the durable per-run cleanups a previous boot may not have finished.
 
@@ -631,21 +615,17 @@ def _startup_cleanup_bg(status: RunStatus) -> None:
     the only startup path that still reaches it.
     """
     _drain_cleanup_remotes_bg(status.run_id)
-    from flash.runner.lifecycle.status import endpoint_reclaim_pending
-
-    if endpoint_reclaim_pending(status.run_id):
-        _reclaim_unhandled_endpoints(status)
+    _reclaim_unhandled_endpoints(status.run_id)
 
 
-def _teardown_failed_recovery_bg(status: RunStatus) -> None:
+def _teardown_failed_recovery_bg(status: RunStatus, unmarked: Sequence[str] = ()) -> None:
     _teardown_unrecoverable_remote(status)
-    if _owes_endpoint_reclaim(status):
-        _reclaim_unhandled_endpoints(status)
+    _reclaim_unhandled_endpoints(status.run_id, unmarked)
     # direct teardown can record an unconfirmed handle after an earlier drain took its snapshot.
     _drain_cleanup_remotes_bg(status.run_id)
 
 
-def _reclaim_unhandled_endpoints(status: RunStatus) -> None:
+def _reclaim_unhandled_endpoints(run_id: str, unmarked: Sequence[str] = ()) -> None:
     """Reclaim a terminalized run's endpoint when no handle was ever persisted to tear down.
 
     The crash window a non-idempotent create leaves behind: RunPod accepted the endpoint, then the
@@ -653,80 +633,101 @@ def _reclaim_unhandled_endpoints(status: RunStatus) -> None:
     `RunpodProvider.sweep_orphans` returns `[]` unconditionally, and the run is now terminal and so
     dropped from `_RECOVERABLE` -- no later startup reconsiders it while it can still bill. The
     endpoint name is derived deterministically from the run id and GPU class
-    (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW persisted status, so
-    this works where `_gc_run_endpoints` cannot: it needs a parsed `JobSpec`.
+    (`endpoint_name(gpu, _run_suffix(run_id))`), so this works where `_gc_run_endpoints` cannot: it
+    needs a parsed `JobSpec`.
 
-    Callers own the precondition, because the two differ on where the terminal state lives. A
-    record too corrupt to decode carries it on the quarantine envelope in hand; a record whose spec
-    merely failed to parse has just been terminalized on disk by `_update`, which does not write
-    back to `status`. Both call it only for a handle-less run that is now terminally failed -- a
-    settled `done` or `deployed` run's training endpoint is already released.
+    Normally driven by the persisted marker, which is also the precondition: the terminal write
+    decides that one is owed (`fail_with_cleanup_intent`, or quarantine's envelope) and freezes the
+    GPU classes into it, so a status whose spec has since been emptied by quarantine -- or that never
+    named a class, because allocation chose it -- is still addressable. A run with no marker has
+    nothing owed and this is a no-op. `unmarked` covers the one case where no marker could be
+    written at all: the terminal write itself failed, so the caller passes the classes it read
+    in-process and this is the only reclamation attempt that will ever happen.
 
-    Suppressed so it can never re-abort recovery, and a no-op for a foreign or identity-less
-    quarantine record: that salvages `spec = {}`, so `persisted_gpu_types` yields nothing and the
-    name is never guessed from a record that cannot vouch for the run id.
-
-    This runs on a daemon thread and gets exactly one attempt, so the marker its caller persisted is
-    dropped only once the provider CONFIRMS every derived name is gone. A killed process or a
-    transient provider failure leaves it set, and `_startup_cleanup_bg` tries again next boot.
+    Suppressed so it can never re-abort recovery. This runs on a daemon thread and gets exactly one
+    attempt, so the marker is dropped only once the provider CONFIRMS every derived name is gone. A
+    killed process or a transient provider failure leaves it set, and `_startup_cleanup_bg` -- which
+    runs for EVERY persisted run, terminal ones included -- tries again next boot.
     """
     from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
-    from flash.runner.lifecycle.status import clear_endpoint_reclaim_intent
-
-    confirmed = False
-    with contextlib.suppress(Exception):
-        confirmed = terminate_persisted_endpoints(status.spec, status.run_id)
-    if confirmed:
-        with contextlib.suppress(Exception):
-            clear_endpoint_reclaim_intent(status.run_id)
-
-
-def _teardown_failed_recovery(status: RunStatus) -> None:
-    """Release a failed run's rented worker without holding up startup.
-
-    Both halves go on the one background thread for the same reason the drain alone already did:
-    a provider outage blocks each teardown through its own retry and backoff, `recover_runs()` runs
-    synchronously before the ASGI lifespan yields, and serial startup cleanup can exceed the
-    HEALTHCHECK grace and turn into a restart loop. The direct teardown is the slower half -- it
-    makes live provider calls per handle -- so leaving it on the startup thread would have kept
-    exactly the stall the threaded drain exists to avoid.
-
-    Recording the intent first is what makes deferring the rest safe. A process exit between this
-    call and the provider delete would otherwise leave the handle only in `status.remote`, which
-    nothing reclaims once the run is terminal: `_classify_recoverable_runs` skips it and RunPod's
-    `sweep_orphans` is a no-op. Quarantine folds the same intent into its own atomic envelope write,
-    so for that caller this is a read that finds it already there; a run terminalized by the
-    ordinary `_update` has no such write and depends on this one. It stays on the startup thread on
-    purpose -- a durable record the teardown thread might never reach is not a durable record. And
-    if the write itself fails, the same reasoning forces the teardown back onto this thread too:
-    deferral is only safe because a retryable marker survives it.
-    """
     from flash.runner.lifecycle.status import (
-        persist_endpoint_reclaim_intent,
-        persist_teardown_intent,
+        clear_endpoint_reclaim_intent,
+        endpoint_reclaim_types,
     )
 
-    try:
-        persist_teardown_intent(status.run_id)
-        if _owes_endpoint_reclaim(status):
-            persist_endpoint_reclaim_intent(status.run_id)
-    except Exception:
-        # a full or failing disk takes away the very thing that makes deferral safe, so the two
-        # halves share a fate: with no marker to retry from, this in-process attempt is the only
-        # reclamation left and has to finish before recovery moves on. blocking startup while an
-        # already-degraded host tears one worker down beats deferring to a thread whose crash
-        # nothing would ever notice -- `_classify_recoverable_runs` skips the terminal run and
-        # RunPod's orphan sweep is a no-op, so the endpoint would just keep billing.
-        _log.warning(
-            "run %s: cleanup intent is not durable; tearing down inline",
-            status.run_id,
-            exc_info=True,
-        )
+    marked = endpoint_reclaim_types(run_id)
+    gpu_types = marked or tuple(unmarked)
+    if not gpu_types:
+        return
+    confirmed = False
+    with contextlib.suppress(Exception):
+        confirmed = terminate_persisted_endpoints(gpu_types, run_id)
+    if confirmed and marked:
         with contextlib.suppress(Exception):
-            _teardown_failed_recovery_bg(status)
+            clear_endpoint_reclaim_intent(run_id)
+
+
+def _teardown_failed_recovery(
+    status: RunStatus, *, intent_is_durable: bool, unmarked: Sequence[str] = ()
+) -> None:
+    """Release a failed run's rented worker without holding up startup.
+
+    Teardown goes on a background thread for the reason the drain alone already did: a provider
+    outage blocks each delete through its own retry and backoff, `recover_runs()` runs synchronously
+    before the ASGI lifespan yields, and serial startup cleanup can exceed the HEALTHCHECK grace and
+    turn into a restart loop.
+
+    Deferral is only safe when the intent behind it is on disk -- that durable record is what makes
+    a thread that never runs recoverable, since nothing revisits a terminal run otherwise
+    (`_classify_recoverable_runs` skips it, RunPod's `sweep_orphans` is a no-op). Callers persist
+    that intent in the same write that terminalizes the run and report here whether it landed. When
+    it did not, a full or failing disk has taken away the retry, so this in-process attempt is the
+    only reclamation left and has to finish before recovery moves on: blocking startup while an
+    already-degraded host tears one worker down beats deferring to a thread whose crash nothing
+    would ever notice. It also carries `unmarked` -- the GPU classes the failed write would have
+    frozen into the marker -- because with nothing on disk that in-memory list is the run's only
+    remaining address.
+    """
+    if not intent_is_durable:
+        _log.warning("run %s: cleanup intent is not durable; tearing down inline", status.run_id)
+        with contextlib.suppress(Exception):
+            _teardown_failed_recovery_bg(status, unmarked)
         return
     with contextlib.suppress(Exception):
         threading.Thread(target=_teardown_failed_recovery_bg, args=(status,), daemon=True).start()
+
+
+def _fail_unrecoverable_run(status: RunStatus, detail: str) -> None:
+    """Terminalize an unrecoverable run, then release whatever it still holds.
+
+    One durable write records both the terminal state and the cleanup it owes, so no crash window
+    exists where the run is `failed` -- and therefore dropped from `_RECOVERABLE` -- with its
+    endpoint unaddressed. A write that fails leaves the run non-terminal and retried next boot, but
+    its worker is still billing now, so teardown runs inline on this thread, addressed by the
+    classes read here rather than by the marker that could not be written.
+    """
+    from flash.runner.lifecycle.status import fail_with_cleanup_intent, reclaimable_gpu_types
+
+    unmarked: Sequence[str] = ()
+    try:
+        persisted = fail_with_cleanup_intent(status.run_id, detail)
+    except Exception:
+        _log.warning(
+            "run %s: could not record terminal cleanup intent", status.run_id, exc_info=True
+        )
+        persisted, durable = status, False
+        if not status.remote:
+            with contextlib.suppress(Exception):
+                unmarked = reclaimable_gpu_types(status)
+    else:
+        if persisted is None:
+            # the sticky compare-and-set refused: the run settled concurrently and owns its own
+            # cleanup. nothing was written and nothing here should act on it.
+            return
+        durable = True
+    with contextlib.suppress(Exception):
+        _append_run_log(status.run_id, detail)
+    _teardown_failed_recovery(persisted, intent_is_durable=durable, unmarked=unmarked)
 
 
 def _quarantine_corrupt_recovery_record(
@@ -751,7 +752,9 @@ def _quarantine_corrupt_recovery_record(
     if quarantined and status is not None:
         with contextlib.suppress(Exception):
             _append_run_log(run_id, detail)
-        _teardown_failed_recovery(status)
+        # the envelope IS the durable intent: quarantine folds cleanup and reclaim into the same
+        # atomic `os.replace` that installs the terminal record.
+        _teardown_failed_recovery(status, intent_is_durable=True)
     return status, quarantined
 
 
@@ -770,7 +773,6 @@ def _classify_recoverable_runs(
         _get_recovery_status,
         _update,
         effective_spec_from_status,
-        persist_endpoint_reclaim_intent,
         reallocation_spec_from_status,
     )
     from flash.runner.supervise.attach import attach_run
@@ -815,11 +817,7 @@ def _classify_recoverable_runs(
                     exc_info=True,
                 )
                 detail = f"unrecoverable: persisted spec cannot be activated: {exc}"
-                with contextlib.suppress(Exception):
-                    _update(status.run_id, "failed", error=detail)
-                with contextlib.suppress(Exception):
-                    _append_run_log(status.run_id, detail)
-                _teardown_failed_recovery(status)
+                _fail_unrecoverable_run(status, detail)
                 continue
             # Only handle-backed runs are kept by the sweep; a handle-less run is being
             # resubmitted, so its stale half-rented instance (if any) must NOT be shielded.
@@ -841,32 +839,13 @@ def _classify_recoverable_runs(
                     exc_info=True,
                 )
                 detail = f"unrecoverable: persisted spec cannot be activated: {exc}"
-                # The aborted attempt may STILL have registered its uniquely-named RunPod
-                # endpoint before crashing (the exact leak the good-spec branch's
-                # `_gc_run_endpoints` guards against). The `sweep_orphans` dispatch below is a
-                # no-op for RunPod, and the periodic idle reaper would only reclaim this after its
-                # 15-min idle grace -- so tear it down by name below for immediate cleanup.
-                #
-                # The marker goes down BEFORE the terminalizing `_update`, because that write is
-                # what drops this run from `_RECOVERABLE`. A crash in the window between them would
-                # otherwise leave a terminal run with no marker and nothing that revisits it:
-                # `_classify_recoverable_runs` skips it and RunPod's orphan sweep is a no-op, so the
-                # endpoint bills untouched. Written first, the worst case is a marker for an
-                # endpoint that was never created, which the reclaim below resolves into a
-                # confirmed-clear result and clears on this same boot.
-                #
-                # `_owes_endpoint_reclaim` is not consulted, because its terminal check would read
-                # the in-memory state this branch has not written yet. Its other half -- a derivable
-                # GPU class -- is applied here, so both paths still record intent under exactly the
-                # condition `terminate_persisted_endpoints` can confirm.
-                if persisted_gpu_types(status.spec):
-                    with contextlib.suppress(Exception):
-                        persist_endpoint_reclaim_intent(status.run_id)
-                with contextlib.suppress(Exception):
-                    _update(status.run_id, "failed", error=detail)
-                with contextlib.suppress(Exception):
-                    _append_run_log(status.run_id, detail)
-                _reclaim_unhandled_endpoints(status)
+                # The aborted attempt may STILL have registered its uniquely-named RunPod endpoint
+                # before crashing (the exact leak the good-spec branch's `_gc_run_endpoints` guards
+                # against). The `sweep_orphans` dispatch below is a no-op for RunPod, and the
+                # periodic idle reaper would only reclaim this after its 15-min idle grace -- so the
+                # terminal write records a reclaim marker naming the classes the endpoint could
+                # exist under, and teardown resolves it by derived name.
+                _fail_unrecoverable_run(status, detail)
                 continue
             # reap run-scoped resources from the parseable public spec before touching the private
             # warm-start snapshot. source drift or snapshot tampering must not strand an endpoint.
