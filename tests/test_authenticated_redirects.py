@@ -323,3 +323,18 @@ def test_relocation_keeps_the_credential_the_wire_was_already_carrying() -> None
 
     assert sent_headers(request)["Authorization"] == "Bearer canonical"
     assert "Authorization" not in request.headers
+
+
+def test_sent_headers_collapses_case_colliding_entries_the_way_do_open_does() -> None:
+    """`do_open` title-cases after merging, so a case collision resolves to the `headers` value.
+
+    the exact-key merge gives `unredirected_hdrs` precedence, but the `.title()` pass runs after it
+    and collapses the two spellings onto one key. a helper that stopped before that step would
+    report both entries surviving and would score a mixed-casing regression as safe.
+    """
+    request = urllib.request.Request("http://example.invalid/x")
+    request.add_unredirected_header("Authorization", "Bearer canonical")
+    # not `add_header`: it capitalizes, and the collision only exists for unequal exact keys.
+    request.headers["authorization"] = "Bearer redirectable"
+
+    assert sent_headers(request) == {"Authorization": "Bearer redirectable"}

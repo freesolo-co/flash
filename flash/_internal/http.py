@@ -6,16 +6,21 @@ content headers. `unredirected_hdrs` does not survive, and `AbstractHTTPHandler.
 application code that writes `Request(url, headers={"Authorization": ...})` lands the credential in
 the surviving bag, so the stdlib replays the token against whatever host the `Location` names.
 
-the fix is to move the caller's credential into the bag a redirect cannot copy. that holds whatever
-transport runs, which is what makes it the guarantee rather than the redirect refusal below: an
-identity check on the transport cannot tell a test fake from a tracing or compatibility wrapper that
-delegates to the real stdlib, and the wrapper's inner call follows redirects normally.
+the fix is to move the caller's credential into the bag a redirect cannot copy. it survives any
+transport that forwards the request as it was handed over, so it still holds for a tracing or
+compatibility wrapper that only delegates.
 
-it covers the credential the caller supplied, which is the one flash owns. a credential a handler
-adds mid-open cannot be covered here: `redirect_request` builds each hop as a fresh `Request`, so
-anything scoped to the object we were handed is gone by the second hop. a credentialed
-`ProxyHandler` re-adds `Proxy-Authorization` to that fresh request, and no amount of work on ours
-reaches it. containing that is the redirect refusal's job, not this function's.
+two things it does not cover, both because the credential ends up on an object this module never
+touched:
+
+- a transport that rebuilds the request. `Request.header_items()` merges both bags, so a wrapper
+  that reconstructs with `Request(url, headers=dict(req.header_items()))` puts the credential back
+  in the redirectable bag, and its inner call follows redirects normally.
+- a credential a handler adds mid-open. `redirect_request` builds each hop as a fresh `Request`, so
+  anything scoped to the object we were handed is gone by the second hop; a credentialed
+  `ProxyHandler` re-adds `Proxy-Authorization` to that fresh request and no work on ours reaches it.
+
+containing either is the redirect refusal's job, not this function's.
 
 on top of that the stdlib path refuses the hop outright. no flash or freesolo endpoint answers 3xx,
 so this rejects rather than deciding which hops are safe, and surfaces as an `HTTPError` that every
@@ -76,9 +81,9 @@ def _urlopen_no_redirect(
 
     the transport is read at call time rather than bound at import, because many tests replace
     `urllib.request.urlopen` with a fake. a replaced transport is called directly: it is not the
-    stdlib opener stack, so routing it through a no-redirect opener would not reach it. that
-    dispatch is a compatibility concern rather than the security boundary: the relocation above
-    already ran, so a transport this check misjudges still cannot leak the credential.
+    stdlib opener stack, so routing it through a no-redirect opener would not reach it. every
+    authenticated call site in flash passes either nothing or `urllib.request.urlopen` itself, so
+    production always takes the refusing opener below; the direct branch exists for those fakes.
     """
 
     _move_credentials_to_the_unredirected_bag(request)

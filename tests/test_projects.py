@@ -156,7 +156,7 @@ def test_internal_project_validation_uses_internal_service_endpoint(monkeypatch)
         "url": "https://freesolo.test/api/flash/projects/validate/internal",
         "headers": {
             "Authorization": "Bearer service-internal-key",
-            "Content-type": "application/json",
+            "Content-Type": "application/json",
         },
         "body": {"orgId": "org-one", "projectId": project_id},
         "timeout": 10.0,

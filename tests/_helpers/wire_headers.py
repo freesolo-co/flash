@@ -12,8 +12,13 @@ import urllib.request
 
 
 def sent_headers(request: urllib.request.Request) -> dict[str, str]:
-    """the merged header view `do_open` builds, in the same precedence order."""
+    """the merged header view `do_open` builds, in the same precedence order and casing.
+
+    the `.title()` pass is part of the merge, not cosmetic: it runs last, so two entries differing
+    only in case collapse to one and the `headers` value wins even though `unredirected_hdrs` had
+    precedence in the exact-key merge above it.
+    """
 
     headers = dict(request.unredirected_hdrs)
     headers.update({k: v for k, v in request.headers.items() if k not in headers})
-    return headers
+    return {name.title(): value for name, value in headers.items()}

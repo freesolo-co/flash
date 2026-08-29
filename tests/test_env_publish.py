@@ -612,7 +612,7 @@ def test_require_environment_project_posts_strict_validation(monkeypatch):
         "method": "POST",
         "headers": {
             "Authorization": "Bearer internal-secret",
-            "Content-type": "application/json",
+            "Content-Type": "application/json",
         },
         "body": {
             "orgId": "org-A",

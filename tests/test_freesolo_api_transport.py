@@ -241,7 +241,7 @@ def test_request_sends_the_body_as_json_and_omits_it_when_absent(monkeypatch):
 
     assert seen[0][1] is None
     assert json.loads(seen[1][1]) == {"name": "n"}
-    assert seen[1][2]["Content-type"] == "application/json"
+    assert seen[1][2]["Content-Type"] == "application/json"
     assert seen[1][3] == 7.0
 
 
