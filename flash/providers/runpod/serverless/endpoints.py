@@ -955,6 +955,16 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
                 }
             )
     except Exception as exc:
+        # this sweep is the real cleanup for a registry-less endpoint, so a failure here has to be
+        # reported rather than only logged: callers read an empty result as "nothing is billing",
+        # and a swallowed listing error would clear their retry marker while an endpoint survives.
         logger.warning("REST endpoint cleanup failed for %s: %s", target, exc)
+        results.append(
+            {
+                "success": False,
+                "name": target,
+                "message": f"REST endpoint cleanup failed: {sanitize_diagnostic(exc, limit=1000)}",
+            }
+        )
 
     return results
