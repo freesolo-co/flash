@@ -91,16 +91,17 @@ converted or rejected, and a container holding such a value is rendered exactly 
 top-level boolean or null argument is likewise pre-rendered as `true`, `false`, or `null`, because the
 template spells a scalar with `string` and would otherwise show the model Python's `True` and `None`;
 inside a container those values stay native, since the template's `tojson` already spells them
-correctly. A response carries at most 408 tool calls, and a longer run of candidates stays exact text. That
-ceiling bounds a runaway generation; it does not promise the batch replays. Replay cost depends on
+correctly. A response carries at most 408 tool calls, and a longer run of candidates stays exact text. That is
+the most any continuation could carry, not a promise that this batch replays. Replay cost depends on
 the follow-up request as a whole: the prior conversation shares the same message-complexity budget,
 and each result costs four nodes as a plain string, five with the optional `name`, and seven for a
 single text block plus three for each additional block. A long enough history leaves no room for
 even one call. Clients that intend to continue the tool lifecycle must therefore not assume any
 positive call count replays under every history: a follow-up that exceeds the budget is rejected
-with `messages exceed the supported complexity`, and the remedy is to shorten prior history, drop
-optional result `name` fields, use plain string results rather than text blocks, or request fewer
-calls. These local
+with `messages exceed the supported complexity`. The budget counts structure rather than text, so
+the remedies are to send fewer messages or fewer content blocks, drop optional result `name` fields,
+use plain string results rather than text blocks, or request fewer calls; shortening the text inside
+a message does not help, because a string is one node however long it is. These local
 serving-contract bounds do not depend on Python's process-wide integer conversion limit. Unsupported
 keywords and `strict: true` are rejected.
 
