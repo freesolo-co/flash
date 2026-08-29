@@ -278,8 +278,16 @@ def _quarantine_corrupt_status(run_id: str, detail: str) -> tuple[RunStatus | No
             reclaim = tuple(dict.fromkeys(_stored_reclaim_types(raw) + reclaimable_gpu_types(raw)))
             if reclaim:
                 data[state._ENDPOINT_RECLAIM_KEY] = list(reclaim)
-        fd, tmp = tempfile.mkstemp(dir=state.RUNS_DIR, prefix=f"{run_id}.", suffix=".tmp")
+        tmp: str | None = None
         try:
+            # inside the try because creating the temp file is the FIRST thing that fails on the
+            # storage this whole path exists to survive: a full disk raises `ENOSPC` here, a
+            # read-only runs directory `EACCES`, and neither ever reaches `os.fdopen` below. Left
+            # outside, that `OSError` propagates as itself into the caller's broad `except`, which
+            # returns without tearing anything down -- so the salvage and the reclaim classes
+            # computed just above die unused, and the exact storage failure this frame is built to
+            # carry teardown out of is the one it drops it on.
+            fd, tmp = tempfile.mkstemp(dir=state.RUNS_DIR, prefix=f"{run_id}.", suffix=".tmp")
             with os.fdopen(fd, "w") as file:
                 json.dump(data, file, indent=2, sort_keys=True)
                 file.flush()
@@ -302,8 +310,11 @@ def _quarantine_corrupt_status(run_id: str, detail: str) -> tuple[RunStatus | No
                 failed, data.get(state._ENDPOINT_RECLAIM_KEY) or ()
             ) from exc
         finally:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(tmp)
+            # `tmp` stays None when mkstemp itself failed: there is no temp file to remove, and
+            # unlinking `None` would raise out of the `finally` and replace the carrier exception.
+            if tmp is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp)
 
 
 def source_snapshot_from_status(status: RunStatus, *, required: bool = False) -> dict | None:

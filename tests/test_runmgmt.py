@@ -3676,6 +3676,38 @@ def test_a_handle_the_drain_refuses_does_not_suppress_the_reclaim_marker(
     assert runner_status.endpoint_reclaim_types(run_id) == ()
 
 
+def test_a_full_disk_at_temp_creation_still_carries_the_teardown_out(monkeypatch, tmp_path):
+    """The carrier must cover the storage failure that arrives FIRST, not only the later ones.
+
+    A full disk fails at `mkstemp` -- before any write, link or replace -- which is the single most
+    likely way this path breaks and the exact reason it carries teardown out by exception at all.
+    Raised outside the handler that builds `QuarantineWriteFailed`, it reaches the caller's broad
+    `except` as a bare `OSError`, which returns without tearing anything down: the salvaged handle
+    and the reclaim classes computed moments earlier die with the frame, the record keeps its
+    corrupt bytes so no later boot re-derives them, and the endpoint bills unaddressed.
+    """
+    import flash.server.platform.runtime as runtime
+
+    run_id = "reclaim-nospace"
+    _quarantine_handleless_run(monkeypatch, tmp_path, run_id)
+    monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": run_id}])
+    monkeypatch.setattr(
+        runner_state.tempfile,
+        "mkstemp",
+        lambda *_a, **_kw: (_ for _ in ()).throw(OSError(28, "No space left on device")),
+    )
+
+    calls: list[str] = []
+
+    def terminate(gpu_type: str, _run_id: str) -> list[dict]:
+        calls.append(gpu_type)
+        return [{"success": True, "name": gpu_type, "message": "deleted via REST API"}]
+
+    _run_recovery_with_inline_threads(monkeypatch, terminate)
+
+    assert calls == ["RTX 5090"], "a full disk at temp creation dropped the salvaged teardown"
+
+
 def test_recover_runs_reattaches_confirmed_teardown_marker(monkeypatch, tmp_path):
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
