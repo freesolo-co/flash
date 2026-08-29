@@ -1571,7 +1571,7 @@ def test_github_publish_once_commits_pull_rebases_and_pushes(tmp_path, monkeypat
     package.mkdir()
     (package / "environment.py").write_text("def load_environment(**k): pass\n")
 
-    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
 
     envs._github_publish_once(
         dest=package,
@@ -1611,7 +1611,7 @@ def test_github_publish_once_pushes_toml_configs(tmp_path, monkeypatch):
     (configs / "sft.toml").write_text(sft_config)
     (configs / "opd_thinking.toml").write_text(opd_config)
 
-    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
 
     envs._github_publish_once(
         dest=package,
@@ -1782,7 +1782,7 @@ def test_github_delete_once_removes_dir_and_pushes(tmp_path, monkeypatch):
     _git(seed, "remote", "add", "origin", str(remote))
     _git(seed, "push", "origin", "main")
 
-    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
     removed = envs._github_delete_once(
         repo="ignored/repo", token="tok", publish_root="ns/project/env", message="Delete test env"
     )
@@ -1809,7 +1809,7 @@ def test_github_delete_once_idempotent_when_absent(tmp_path, monkeypatch):
     _git(seed, "remote", "add", "origin", str(remote))
     _git(seed, "push", "origin", "main")
 
-    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
     removed = envs._github_delete_once(
         repo="ignored/repo", token="tok", publish_root="ns/project/absent", message="Delete absent"
     )
@@ -1864,7 +1864,7 @@ def test_github_delete_once_reapplies_removal_after_concurrent_publish(tmp_path,
     _git(seed, "remote", "add", "origin", str(remote))
     _git(seed, "push", "origin", "main")
 
-    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
 
     # Inject the concurrent publish exactly once, right as the original delete commit is staged
     # (the first `_staged_has_changes` call) — before `_push_environment_delete` rebases — by pushing
@@ -1872,8 +1872,8 @@ def test_github_delete_once_reapplies_removal_after_concurrent_publish(tmp_path,
     real_staged = envs._staged_has_changes
     state = {"injected": False}
 
-    def staged_with_injection(checkout):
-        result = real_staged(checkout)
+    def staged_with_injection(checkout, *, token=""):
+        result = real_staged(checkout, token=token)
         if not state["injected"]:
             state["injected"] = True
             other = tmp_path / "other"
