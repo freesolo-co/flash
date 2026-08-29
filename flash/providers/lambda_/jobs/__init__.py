@@ -314,7 +314,7 @@ def _rent_instance(
     """Rent one box and return its handle, owing nothing rented behind on any exit.
 
     The whole rent-to-handle window lives here because its ORDER is the correctness argument, and
-    both call sites (the region walk and its cache-less retry) need exactly the same order:
+    every region in the launch walk needs exactly the same order:
 
     - ``arm`` immediately before the request and only then. A deadline miss in the precheck rents
       nothing, and an armed guard there would reap by run label, killing every other concurrent
@@ -354,46 +354,6 @@ def _rent_instance(
         # this instance is now terminated by id, so the outer coarse reap must not also fire.
         _mark_exact_cleanup(error)
         raise
-
-
-def _retry_launch_without_cache(
-    plan: _LaunchPlan, inst: LambdaInstance, say, reap
-) -> tuple[LambdaJobHandle | None, Exception | None]:
-    """Rent a cache-less box for this region; return ``(handle, None)`` or ``(None, rejection)``.
-
-    The arm/own/return ordering lives in ``_rent_instance``. What is specific here is the
-    rejection policy, which mirrors the main walk's: a CLEAN reject rented nothing and stands the
-    guard down before anything below can raise, while an AMBIGUOUS one may have billed a box and
-    keeps the guard armed across reconciliation.
-    """
-    say(f"retrying {inst.region} WITHOUT the weight cache (attach may have caused the reject)")
-    try:
-        return _rent_instance(
-            plan,
-            inst,
-            say,
-            reap,
-            user_data=plan.cold_user_data,
-            file_system_names=None,
-            describe=lambda instance_id: (
-                f"launched lambda instance {instance_id} (cold, cache-less): {inst.gpu} "
-                f"{inst.instance_type} in {inst.region} attempt={plan.attempt} seed={plan.seed}"
-            ),
-        ), None
-    except lambda_api.LambdaApiError as error:
-        clean = _launch_rejection_is_clean(error)
-        if clean:
-            # rented nothing: stand down on the FIRST statement, before the diagnostic and the say
-            # below, either of which can raise while armed and would then reap by run label,
-            # killing every other concurrent seed over a request that rented nothing.
-            reap.disarm()
-        cold_detail = sanitize_diagnostic(error, limit=1000)
-        if not clean:
-            # may have billed a box: the guard stays ARMED across reconciliation, which always
-            # raises, so an unnamed instance still has something able to find it.
-            _abort_ambiguous_launch(plan.spec.run_id, type(error).__name__)
-        say(f"region {inst.region} also rejected cold: {cold_detail}")
-        return None, error
 
 
 def _refresh_launch_candidates(
@@ -495,11 +455,7 @@ def _build_launch_plan(
 def _region_launch_inputs(
     plan: _LaunchPlan, inst: LambdaInstance, say
 ) -> tuple[str | None, list[str] | None, Exception | None]:
-    """Resolve one region's ``(user_data, file_system_names)``, falling back cold on a cache miss.
-
-    Returns ``(None, None, error)`` when the region must be skipped: a preload that trained on a
-    cache-less box would warm nothing, so it walks on instead of falling back.
-    """
+    """Resolve one region's cached launch inputs or return its attachment failure."""
     if not plan.cache_name:
         return plan.cold_user_data, None, None
     try:
@@ -527,14 +483,9 @@ def _region_launch_inputs(
         return region_user_data, [plan.cache_name], None
     except Exception as e:
         detail = sanitize_diagnostic(e, limit=1000)
-        # preload must not fall back cold because it would train instead of warming the cache.
-        if plan.mode == "preload":
-            say(
-                f"weight cache unavailable in {inst.region} ({detail}); skipping (preload needs it)"
-            )
-            return None, None, e
-        say(f"weight cache unavailable in {inst.region} ({detail}); launching cold")
-        return plan.cold_user_data, None, e
+        suffix = " (preload needs it)" if plan.mode == "preload" else ""
+        say(f"weight cache unavailable in {inst.region} ({detail}); skipping{suffix}")
+        return None, None, e
 
 
 def launch_and_submit(
@@ -620,24 +571,6 @@ def launch_and_submit(
                     )
                     _abort_ambiguous_launch(spec.run_id, type(e).__name__)
                 say(f"region {inst.region} ({inst.gpu} {inst.instance_type}) rejected: {detail}")
-                # Filesystem-attach errors: retry once without the cache before walking (clean reject = safe).
-                fs_attach_reject = fs_names and any(
-                    tok in str(e).lower() for tok in ("file_system", "filesystem", "file-system")
-                )
-                if mode != "preload" and fs_attach_reject:
-                    # the cache-less retry rents its own box, and arms the guard itself immediately
-                    # before that request: an interrupt while it is in flight can leave an instance
-                    # created but unnamed, and only the run-label reap can find it. Arming across
-                    # the whole call instead would reap on paths that rented nothing (a deadline
-                    # miss in the precheck, a raising preamble) or that already cleaned up exactly.
-                    handle, last_err = _retry_launch_without_cache(plan, inst, say, reap)
-                    if handle is not None:
-                        # the retry's box is rented and owned by exact id; keep the guard holding
-                        # it until the caller has the handle, exactly as the primary path does.
-                        return handle
-                    # nothing stayed rented: the retry disarmed on its reject paths, and this
-                    # keeps the walk's next region from inheriting a guard it did not arm.
-                    reap.disarm()
                 # Preload must not refresh to a different region (would warm the wrong one).
                 if mode != "preload" and not candidates and not refreshed:
                     refreshed = True

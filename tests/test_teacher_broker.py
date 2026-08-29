@@ -1836,11 +1836,11 @@ def test_current_nonterminal_attempt_is_checked_on_every_admission(monkeypatch):
     monkeypatch.setattr(
         runner_status, "get_status", lambda _run_id: SimpleNamespace(state="running")
     )
+    monkeypatch.setattr(runner_attempts, "latest_reserved_attempt", lambda _run_id: 2)
     monkeypatch.setattr(runner_state, "_internal_spec_from_status", lambda _status: spec)
-    monkeypatch.setattr(runner_attempts, "_latest_reserved_attempt", lambda _run_id: 2)
     teacher_broker._require_current_attempt(capability)
 
-    monkeypatch.setattr(runner_attempts, "_latest_reserved_attempt", lambda _run_id: 3)
+    monkeypatch.setattr(runner_attempts, "latest_reserved_attempt", lambda _run_id: 3)
     with pytest.raises(teacher_broker.TeacherBrokerError, match="attempt_replaced"):
         teacher_broker._require_current_attempt(capability)
 
@@ -1880,7 +1880,7 @@ def test_teacher_authorization_rejects_public_worker_disagreement(monkeypatch):
         "scoring_mode": teacher_broker.PARASAIL_SCORING_MODE,
     }
     monkeypatch.setattr(runner_status, "get_status", lambda _run_id: status)
-    monkeypatch.setattr(runner_attempts, "_latest_reserved_attempt", lambda _run_id: 0)
+    monkeypatch.setattr(runner_attempts, "latest_reserved_attempt", lambda _run_id: 0)
 
     with pytest.raises(teacher_broker.TeacherBrokerError, match="run_scope_invalid"):
         teacher_broker._require_current_attempt(capability)
@@ -1927,7 +1927,7 @@ def test_a_live_run_keeps_scoring_after_its_model_leaves_the_catalog(monkeypatch
         "scoring_mode": teacher_broker.PARASAIL_SCORING_MODE,
     }
     monkeypatch.setattr(runner_status, "get_status", lambda _run_id: status)
-    monkeypatch.setattr(runner_attempts, "_latest_reserved_attempt", lambda _run_id: 0)
+    monkeypatch.setattr(runner_attempts, "latest_reserved_attempt", lambda _run_id: 0)
 
     # the model is gone from the catalog exactly as a retirement would leave it.
     def _retired(model_id, algorithm):

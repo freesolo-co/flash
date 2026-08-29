@@ -189,7 +189,6 @@ def submit_run(
         failure_detail_reader=failure_reader,
         current_attempt=attempt_id,
         **deadline_kwargs(runpod_polling.poll_job, deadline_at),
-        on_last_gpu=on_last_gpu,
         # the count actually rented for this attempt, which allocation may have resolved to fewer
         # cards than the spec's ceiling named -- so read the effective spec, not the run's request.
         **stall_kwargs(on_last_gpu=on_last_gpu, gpu_count=gpu_count_of(spec)),
