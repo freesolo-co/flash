@@ -1413,15 +1413,15 @@ def test_repeated_complete_fake_continuations_preserve_exact_string_bytes() -> N
 def test_repeated_fake_continuation_work_is_linear_without_prefix_materialization(
     monkeypatch,
 ) -> None:
+    """the boundary scan must stay linear in characters read, not merely in calls made.
+
+    counting invocations alone would certify a parser that makes ``2n`` calls while each
+    one scans an ``O(n)`` suffix, so the aggregate distance every ``find`` actually
+    traverses is what gets measured here.
+    """
     originals = {
         name: getattr(tool_calls_module, name)
-        for name in (
-            "_find_parameter_end",
-            "_materialize_span",
-            "_coerce_value",
-            "_validate_value",
-            "_parse_parameter_value",
-        )
+        for name in ("_materialize_span", "_coerce_value", "_validate_value")
     }
     counters = dict.fromkeys(originals, 0)
 
@@ -1435,24 +1435,35 @@ def test_repeated_fake_continuation_work_is_linear_without_prefix_materializatio
     for name in originals:
         monkeypatch.setattr(tool_calls_module, name, counted(name))
 
+    find_parameter_end = tool_calls_module._find_parameter_end
+    scanned = {"distance": 0}
+
+    def measured_find(text, needle, start):
+        found = find_parameter_end(text, needle, start)
+        scanned["distance"] += len(text) - start if found < 0 else found - start
+        return found
+
+    monkeypatch.setattr(tool_calls_module, "_find_parameter_end", measured_find)
+
     measurements = {}
-    for repeats in (32, 64):
+    for repeats in (32, 64, 128):
         counters.update(dict.fromkeys(counters, 0))
+        scanned["distance"] = 0
         tools, text, _fake = _repeated_fake_continuation_case(repeats)
         result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
         assert result.content == text
         assert result.calls == ()
-        measurements[repeats] = dict(counters)
+        # an ambiguous candidate never reaches value materialization, so the only work that
+        # may grow with the input is the boundary scan itself.
+        assert counters["_coerce_value"] == 0
+        assert counters["_materialize_span"] == 0
+        assert counters["_validate_value"] == 0
+        measurements[repeats] = (scanned["distance"], len(text))
 
-    # an ambiguous candidate never reaches value materialization, so the only work that may
-    # grow with the input is the boundary scan itself.
-    for measured in measurements.values():
-        assert measured["_coerce_value"] == 0
-        assert measured["_materialize_span"] == 0
-        assert measured["_validate_value"] == 0
-    work_32 = measurements[32]["_find_parameter_end"] + measurements[32]["_parse_parameter_value"]
-    work_64 = measurements[64]["_find_parameter_end"] + measurements[64]["_parse_parameter_value"]
-    assert work_64 <= 2 * work_32
+    for distance, length in measurements.values():
+        assert distance <= 2 * length
+    assert measurements[64][0] <= 2.5 * measurements[32][0]
+    assert measurements[128][0] <= 2.5 * measurements[64][0]
 
 
 _REVIEWED_OWNERSHIP_CASES = [
@@ -1581,6 +1592,48 @@ def _wide_optional_string_tools(count: int):
 
 def _wide_optional_string_call(count: int) -> str:
     return _candidate_call("".join(f"<parameter=p{index}>v</parameter>" for index in range(count)))
+
+
+def test_recursion_during_classification_falls_back_to_exact_text(monkeypatch) -> None:
+    """the RecursionError handler itself is pinned, not the width that happens to trip it.
+
+    the width at which the classifier exhausts the stack depends on the ambient recursion
+    limit, so a raised limit in ci or a future interpreter would leave the width-based
+    cases green with the handler deleted. injecting the error directly keeps the branch
+    covered no matter how deep the interpreter lets the parser descend.
+    """
+    # both parameters are required so the body admits exactly one assignment. an all-optional
+    # body of the same shape falls back on its own merits, which would hide the injection.
+    declaration = _wide_optional_string_tools(2)[0].wire()
+    declaration["function"]["parameters"]["required"] = ["p0", "p1"]
+    tools = normalize_tools([declaration])
+    text = _wide_optional_string_call(2)
+    assert parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed").calls != ()
+
+    original = tool_calls_module._parse_parameters
+    calls = {"count": 0}
+
+    def exhausting(*args, **kwargs):
+        calls["count"] += 1
+        raise RecursionError("injected")
+
+    monkeypatch.setattr(tool_calls_module, "_parse_parameters", exhausting)
+
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+    assert result.content == text
+    assert result.calls == ()
+    assert calls["count"] > 0
+
+    parser = ToolCallStreamParser(tools, id_factory=lambda: "call_fixed")
+    assert parser.feed(text) == ""
+    streamed = parser.finish()
+    assert streamed.content == text
+    assert streamed.calls == ()
+
+    # a candidate that exhausted the stack must not leave the parser unable to classify the
+    # next one, so the same input parses normally again once the descent succeeds.
+    monkeypatch.setattr(tool_calls_module, "_parse_parameters", original)
+    assert parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed").calls != ()
 
 
 @pytest.mark.parametrize("count", [332, 511], ids=["first-leaking-width", "widest-declarable"])
