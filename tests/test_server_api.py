@@ -5881,7 +5881,7 @@ def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
     gced = []
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda s: gced.append(s.run_id))
     resubmitted = []
-    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s: resubmitted.append(s.run_id))
+    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s, **_kw: resubmitted.append(s.run_id))
 
     # a handle-less run may have left a phantom instance from a non-idempotent create (Vast PUT
     # /asks) that surfaces via eventual consistency. Recovery must force-reap the run's label across
@@ -6041,7 +6041,7 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "phantom-1"}])
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda s: None)
     resubmitted = []
-    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s: resubmitted.append(s.run_id))
+    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s, **_kw: resubmitted.append(s.run_id))
 
     reaped = []
 
@@ -6108,7 +6108,7 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "unconf-1"}])
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda s: None)
     resubmitted = []
-    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s: resubmitted.append(s.run_id))
+    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s, **_kw: resubmitted.append(s.run_id))
 
     import flash.server.platform.runtime as rt
     from flash.providers.core import registry as providers_mod
@@ -6165,7 +6165,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
     resubmitted = []
     done = threading.Event()
 
-    def fake_run_job(s):
+    def fake_run_job(s, **_kwargs):
         resubmitted.append(s.run_id)
         done.set()
 
@@ -6231,7 +6231,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
     resubmitted = []
     done = threading.Event()
     monkeypatch.setattr(
-        runner_lifecycle, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set())
+        runner_lifecycle, "_run_job", lambda s, **_kw: (resubmitted.append(s.run_id), done.set())
     )
 
     from flash.providers.core import registry as providers_mod
@@ -6283,7 +6283,7 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
     resubmitted = []
     done = threading.Event()
     monkeypatch.setattr(
-        runner_lifecycle, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set())
+        runner_lifecycle, "_run_job", lambda s, **_kw: (resubmitted.append(s.run_id), done.set())
     )
 
     class _NewVast:
@@ -6345,7 +6345,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
     resubmitted = []
     done = threading.Event()
     monkeypatch.setattr(
-        runner_lifecycle, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set())
+        runner_lifecycle, "_run_job", lambda s, **_kw: (resubmitted.append(s.run_id), done.set())
     )
     monkeypatch.setattr(rt, "_DEFERRED_RECOVERY_RETRY_S", 0.01)  # fast background retry
 
@@ -6412,7 +6412,12 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
     resubmitted = []
     done = threading.Event()
 
-    def fake_run_job(s):
+    claims = []
+
+    def fake_run_job(s, **kwargs):
+        # recovery must hand the background launch the attempt it durably reserved, so the
+        # replacement runs under that exact claim rather than reserving a second one.
+        claims.append(kwargs.get("reserved_claim"))
         resubmitted.append(s.run_id)
         done.set()
 
@@ -6438,6 +6443,10 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
 
     assert done.wait(timeout=5), "a confirmed-clear run must still resubmit"
     assert resubmitted == ["clear-1"]
+    assert len(claims) == 1
+    # recovery must hand the launch the attempt it reserved, not let it reserve a second one.
+    assert claims[0] is not None
+    assert claims[0].attempt == 0
 
 
 def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
@@ -6518,7 +6527,7 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
     resubmitted: list[tuple[str, int]] = []
     done = threading.Event()
 
-    def fake_run_job(s):
+    def fake_run_job(s, **_kwargs):
         resubmitted.append((s.train.init_from_adapter, s.train.lora_rank))
         done.set()
 
@@ -6605,7 +6614,7 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
     monkeypatch.setattr(
         runner_lifecycle,
         "_run_job",
-        lambda s: pytest.fail("drifted warm-start source must not be resubmitted"),
+        lambda s, **_kw: pytest.fail("drifted warm-start source must not be resubmitted"),
     )
 
     app_mod.recover_runs()
@@ -6710,7 +6719,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     resubmitted = []
     done = threading.Event()
 
-    def fake_run_job(s):
+    def fake_run_job(s, **_kwargs):
         resubmitted.append(s.run_id)
         done.set()
 

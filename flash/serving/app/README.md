@@ -27,6 +27,12 @@ The routing layer (`src/router.py`) carries no `modal`/`vllm` imports and is exh
 unit-tested in `tests/serving/test_router.py` (multi-base-model dispatch, shared-GPU multi-LoRA,
 register-routing, OpenAI shape, auth, 404s) — run with `uv run pytest tests/serving/`.
 
+Operator load tests use the isolated `flash.serving.loadtest` package, documented in
+[`docs/hosted-inference-load-testing.md`](../../../docs/hosted-inference-load-testing.md). It is
+never imported by production serving. It drives only `GET /healthz` and `POST /v1/chat/completions`,
+manages no Modal lifecycle, and cannot by itself prove replica scale-out, cold state, GPU identity,
+the cause of a capacity rejection, or an availability SLA.
+
 Persistence is only for hydration and recovery. On startup each base model's engine loads
 _its_ ready adapters from the `hosted_lora_adapters` Supabase table; `POST /adapters`
 registers a new adapter on its base model's engine and tracks it in the router.
