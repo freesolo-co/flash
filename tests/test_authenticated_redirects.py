@@ -11,12 +11,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from flash._internal.http import _urlopen_no_redirect
+from flash._internal.http import (
+    _move_credentials_to_the_unredirected_bag,
+    _urlopen_no_redirect,
+)
 from flash.client.freesolo_api import _freesolo_request, verify_freesolo_key
 from flash.client.http import ApiClient, ApiError
 from flash.server.billing.charges import BillingError, _post_billing
 from flash.server.platform import auth
 from flash.server.platform import internal_client as ic
+from tests._helpers.wire_headers import sent_headers
 
 
 @contextmanager
@@ -240,20 +244,20 @@ def test_a_redirect_does_not_mutate_the_process_global_opener(redirect_servers) 
     assert urllib.request._opener is before
 
 
-def test_a_proxy_credential_added_mid_open_never_reaches_the_redirect_target(
+def test_the_callers_credential_survives_two_redirect_hops_through_a_delegating_transport(
     monkeypatch,
 ) -> None:
-    """a credential a handler adds while opening must land in the bag a redirect cannot copy.
+    """flash's own credential must not reach a redirect target, however many hops it takes.
 
-    relocating the request's own headers once is not enough. a credentialed `ProxyHandler` calls
-    `add_header("Proxy-Authorization", ...)` during `proxy_open`, after any one-shot sweep has
-    finished, so the proxy's own secret would ride a redirect out to the target host.
+    two hops rather than one, because the stdlib builds each hop as a fresh `Request`. anything
+    scoped to the object we were handed is gone by the second hop, so a one-hop test cannot tell a
+    real containment guarantee from one that only holds for the request we happened to touch.
     """
     sink_seen: list[str | None] = []
 
     class SinkHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            sink_seen.append(self.headers.get("Proxy-Authorization"))
+            sink_seen.append(self.headers.get("Authorization"))
             self.send_response(200)
             self.end_headers()
 
@@ -263,10 +267,15 @@ def test_a_proxy_credential_added_mid_open_never_reaches_the_redirect_target(
     sink = ThreadingHTTPServer(("127.0.0.1", 0), SinkHandler)
     sink_url = f"http://127.0.0.1:{sink.server_address[1]}"
 
+    hops: list[str | None] = []
+
     class ProxyHandlerServer(BaseHTTPRequestHandler):
         def do_GET(self):
+            hops.append(self.headers.get("Authorization"))
+            # hop one redirects to a second proxied host; hop two out to the exempt sink.
+            location = "http://second.invalid/y" if len(hops) == 1 else f"{sink_url}/steal"
             self.send_response(302)
-            self.send_header("Location", f"{sink_url}/steal")
+            self.send_header("Location", location)
             self.end_headers()
 
         def log_message(self, *_args):
@@ -277,8 +286,6 @@ def test_a_proxy_credential_added_mid_open_never_reaches_the_redirect_target(
     for server in (sink, proxy):
         threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    # the proxy carries userinfo, so urllib injects Proxy-Authorization mid-open. the sink is
-    # exempt from the proxy, so the redirected hop is made directly to it.
     monkeypatch.setenv("http_proxy", f"http://proxyuser:proxypw@127.0.0.1:{proxy_port}/")
     monkeypatch.setenv("no_proxy", "127.0.0.1")
 
@@ -289,7 +296,7 @@ def test_a_proxy_credential_added_mid_open_never_reaches_the_redirect_target(
 
     try:
         req = urllib.request.Request(
-            "http://proxied.invalid/x", headers={"Authorization": "Bearer secret"}
+            "http://proxied.invalid/x", headers={"Authorization": "Bearer flash-secret"}
         )
         with _urlopen_no_redirect(req, timeout=5, urlopen=_delegating_wrapper) as resp:
             resp.read()
@@ -298,4 +305,21 @@ def test_a_proxy_credential_added_mid_open_never_reaches_the_redirect_target(
             server.shutdown()
             server.server_close()
 
+    assert hops == ["Bearer flash-secret", None]
     assert sink_seen == [None]
+
+
+def test_relocation_keeps_the_credential_the_wire_was_already_carrying() -> None:
+    """a duplicate across both bags must not change which principal is authenticated.
+
+    `do_open` gives `unredirected_hdrs` precedence, so an entry already there is the value being
+    sent. promoting the redirectable duplicate over it would silently swap the credential.
+    """
+    request = urllib.request.Request("http://example.invalid/x")
+    request.add_unredirected_header("Authorization", "Bearer canonical")
+    request.add_header("Authorization", "Bearer other")
+
+    _move_credentials_to_the_unredirected_bag(request)
+
+    assert sent_headers(request)["Authorization"] == "Bearer canonical"
+    assert "Authorization" not in request.headers
