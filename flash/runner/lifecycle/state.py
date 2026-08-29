@@ -35,12 +35,19 @@ _UNDEPLOYABLE_STATES = TERMINAL_STATES - {"done"}
 _RUN_DEADLINE_AT_KEY = "run_deadline_at"
 _NEXT_ATTEMPT_KEY = "next_attempt"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"
+# a handle-less run whose endpoint may still exist under its derived name. `cleanup_remotes` cannot
+# carry this: every stage of that drain keys on a persisted resource id, which is exactly what this
+# run never wrote. the value is the FROZEN list of gpu classes the endpoint could have been created
+# under, not a bare flag: the name is derived from the class, so a later corruption that drops
+# `spec.gpu.type` would strand a flag that no provider call can ever clear.
+_ENDPOINT_RECLAIM_KEY = "endpoint_reclaim_pending"
 _OPD_RETRY_CONTRACT_KEY = OPD_RETRY_CONTRACT_STATUS_KEY
 _PRIVATE_STATUS_KEYS = frozenset(
     {
         _RUN_DEADLINE_AT_KEY,
         _NEXT_ATTEMPT_KEY,
         _CLEANUP_REMOTES_KEY,
+        _ENDPOINT_RECLAIM_KEY,
         _OPD_RETRY_CONTRACT_KEY,
     }
 )
@@ -328,6 +335,7 @@ def _save_status(
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
+    _endpoint_reclaim_pending: list[str] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import deadlines
@@ -354,6 +362,7 @@ def _save_status(
             _run_deadline_at=_run_deadline_at,
             _next_attempt=_next_attempt,
             _cleanup_remotes=_cleanup_remotes,
+            _endpoint_reclaim_pending=_endpoint_reclaim_pending,
             _opd_retry_contract_version=_opd_retry_contract_version,
         )
 
@@ -364,6 +373,7 @@ def _save_status_unlocked(
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
+    _endpoint_reclaim_pending: list[str] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import reporting
@@ -385,6 +395,7 @@ def _save_status_unlocked(
         _RUN_DEADLINE_AT_KEY: _run_deadline_at,
         _NEXT_ATTEMPT_KEY: _next_attempt,
         _CLEANUP_REMOTES_KEY: _cleanup_remotes,
+        _ENDPOINT_RECLAIM_KEY: _endpoint_reclaim_pending,
         _OPD_RETRY_CONTRACT_KEY: _opd_retry_contract_version,
     }
     data = _status_storage_dict(status)

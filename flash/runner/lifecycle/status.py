@@ -15,13 +15,30 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import tempfile
 import time
+from collections.abc import Sequence
 
 from flash.core.catalog import validate_model_for_algorithm
 from flash.core.spec import JobSpec
 from flash.core.spec_persistence import validate_persisted_spec_envelope
 from flash.runner.lifecycle import attempts, preparation, reporting, state
+from flash.runner.lifecycle.salvage import (
+    QuarantineWriteFailed,
+    _describes_run,
+    _durable_teardown_intent,
+    _salvage_corrupt_record,
+    _stored_reclaim_types,
+    has_teardown_address,
+    reclaimable_gpu_types,
+)
 from flash.runner.lifecycle.state import RunStatus
+from flash.snapshot.archive import SourceSnapshotError
+
+# `salvage` holds the pure half of quarantine -- what a corrupt record still says and what address
+# survives it -- while this module owns the lock, the atomic write, and the terminal transition. the
+# names above are used here AND re-exported by that import: `runtime.py` and `attach.py` bind
+# `has_teardown_address`, `reclaimable_gpu_types`, and `QuarantineWriteFailed` from this module.
 
 # every other collaborator is reached through `runner.` rather than bound here. `RUNS_DIR`,
 # `get_status`, `_update`, `effective_spec_from_status`, `_gpu_rate`, `_internal_spec_from_status`
@@ -54,6 +71,250 @@ def _load_status_json(run_id: str) -> dict:
 
 def get_status(run_id: str) -> RunStatus:
     return _runstatus_from_json(_load_status_json(run_id))
+
+
+def _validate_recovery_status(run_id: str, status: RunStatus) -> RunStatus:
+    if status.run_id != run_id:
+        raise ValueError(f"stored run status id does not match {run_id}")
+    if not isinstance(status.state, str):
+        raise TypeError(f"stored run status state must be a string for {run_id}")
+    recorded = status.submitted_instance_providers
+    if recorded is not None and not isinstance(recorded, list):
+        # `_confirm_run_clear` iterates this field as `{str(name) for name in recorded_raw}` with no
+        # guard of its own, and its caller at the second `_resubmit_recovered_runs` site is the one
+        # that is not wrapped -- so a stored `7` raises `TypeError` out of `recover_runs()`, which
+        # the lifespan does not suppress, aborting startup for every other run. Rejecting here
+        # routes it to quarantine like any other undecodable field instead of normalizing it: the
+        # field is the fail-CLOSED phantom guard, and silently coercing an unreadable value to `[]`
+        # would read as "no instance provider could have taken the lost create" and clear the run
+        # for resubmit, which is exactly the second billing worker the guard exists to prevent.
+        raise TypeError(f"stored submitted instance providers must be a list for {run_id}")
+    return status
+
+
+# a storage blip must not strand a run for the whole process lifetime. `recover_runs()` runs once,
+# at lifespan startup, and nothing else enumerates the durable records -- a row skipped for an
+# unreadable status is never reconsidered, while its worker keeps billing. so re-read a bounded
+# number of times before giving up, and only for the errors that say the STORAGE was unreadable
+# (`PermissionError`, `ESTALE`, `EIO`). undecodable BYTES are quarantine's job and re-reading them
+# just repeats the same failure, and `FileNotFoundError` -- an `OSError` subclass, so its clause
+# comes first -- means the record is gone rather than briefly unavailable.
+_RECOVERY_READ_ATTEMPTS = 3
+_RECOVERY_READ_BACKOFF_S = 0.2
+
+
+def _get_recovery_status(run_id: str) -> RunStatus:
+    """The validated record, retrying only a transient storage failure."""
+    delay = _RECOVERY_READ_BACKOFF_S
+    for _ in range(_RECOVERY_READ_ATTEMPTS - 1):
+        try:
+            return _validate_recovery_status(run_id, get_status(run_id))
+        except FileNotFoundError:
+            raise
+        except OSError:
+            time.sleep(delay)
+            delay *= 2
+    # the last attempt is unguarded so its failure reaches the caller as itself.
+    return _validate_recovery_status(run_id, get_status(run_id))
+
+
+def fail_with_cleanup_intent(run_id: str, detail: str) -> RunStatus | None:
+    """Terminalize an unrecoverable run and record what it still owes, in ONE durable write.
+
+    Recovery marks a run `failed` and then has to release whatever it rented. Those are two halves
+    of a single fact, and splitting them across writes is what leaves an unreachable record: the
+    terminal write is exactly what drops the run from `_RECOVERABLE`, so a crash before the intent
+    lands means no later boot revisits it -- `_classify_recoverable_runs` skips it and RunPod's
+    `sweep_orphans` is a no-op -- while its worker bills on. Writing intent first only inverts the
+    window. So both go into the same `_save_status_unlocked` under the same guard, the way
+    quarantine already folds them into its one atomic envelope.
+
+    Which intent applies follows from the record, not from the caller: a persisted handle becomes a
+    drainable `cleanup_remotes` record, and a handle-less run whose only address is its derived
+    endpoint name gets the reclaim marker instead. Both can be absent, and then this is just the
+    terminal write.
+
+    Returns the persisted status so the caller can dispatch teardown from it, or `None` when the
+    sticky compare-and-set refused the transition -- an already-settled run keeps its state, and
+    nothing is written.
+    """
+    with state._status_guard(run_id):
+        raw = _load_status_json(run_id)
+        status = _runstatus_from_json(raw)
+        if not _apply_transition(
+            status, "failed", allow_from_terminal=False, updates={"error": detail}
+        ):
+            return None
+        stored = raw.get(state._CLEANUP_REMOTES_KEY)
+        existing = list(stored) if isinstance(stored, list) else []
+        records = _durable_teardown_intent(status.remote, existing)
+        cleanup = (
+            records if records is not None and records != existing else state._PRIVATE_VALUE_UNSET
+        )
+        reclaim: object = state._PRIVATE_VALUE_UNSET
+        if not has_teardown_address(status.remote) and not _stored_reclaim_types(raw):
+            gpu_types = reclaimable_gpu_types(raw)
+            if gpu_types:
+                reclaim = list(gpu_types)
+        state._save_status_unlocked(
+            status, _cleanup_remotes=cleanup, _endpoint_reclaim_pending=reclaim
+        )
+    reporting._report_status(status)
+    return status
+
+
+def clear_endpoint_reclaim_intent(run_id: str, confirmed: Sequence[str]) -> None:
+    """Retire the classes a reclaim just confirmed gone, keeping any the marker has since gained.
+
+    The reclaim reads the marker, calls the provider unlocked -- deletes retry and back off, so this
+    is long -- and only then clears. A second quarantine of the same run inside that window extends
+    the marker with a class this reclaim never terminated, and dropping the key wholesale would
+    erase it unchecked: the endpoint bills with nothing left naming it. Subtracting only what the
+    provider confirmed leaves that new class marked, so the next `_startup_cleanup_bg` reclaims it.
+    """
+    retire = set(confirmed)
+    with state._status_guard(run_id):
+        raw = _load_status_json(run_id)
+        if state._ENDPOINT_RECLAIM_KEY not in raw:
+            return
+        remaining = [entry for entry in _stored_reclaim_types(raw) if entry not in retire]
+        state._save_status_unlocked(
+            _runstatus_from_json(raw), _endpoint_reclaim_pending=remaining or None
+        )
+
+
+def endpoint_reclaim_types(run_id: str) -> tuple[str, ...]:
+    """Classes this run still owes a name-derived endpoint reclaim under, if any."""
+    with contextlib.suppress(Exception):
+        return _stored_reclaim_types(_load_status_json(run_id))
+    return ()
+
+
+# what one unreadable record can raise without implicating any other run. `OSError` is here because
+# `_load_status_json` only converts a missing file into `FileNotFoundError`; every other read
+# failure -- `PermissionError`, `ESTALE`, `EIO` -- propagates from the bare `open()`/`json.load()`
+# beneath it, and escaping this tuple would abort the whole classification pass before later
+# runs are reattached or resubmitted. `FileNotFoundError` is a subclass, so every handler for
+# these must order its `except FileNotFoundError` clause first; both call sites in this module do.
+_RECOVERY_RECORD_ERRORS = (
+    UnicodeDecodeError,
+    ValueError,
+    TypeError,
+    RecursionError,
+    OSError,
+    SourceSnapshotError,
+)
+
+
+def _quarantine_corrupt_status(run_id: str, detail: str) -> tuple[RunStatus | None, bool]:
+    """Preserve a still-unreadable status record and atomically install a failed envelope."""
+    path = state.runs_file_path(run_id, ".json")
+    quarantine_path = state.runs_file_path(run_id, f".json.corrupt-{time.time_ns()}")
+    os.makedirs(state.RUNS_DIR, exist_ok=True)
+    with state._status_guard(run_id):
+        try:
+            repaired = _get_recovery_status(run_id)
+        except FileNotFoundError:
+            return None, False
+        except _RECOVERY_RECORD_ERRORS:
+            pass
+        else:
+            return repaired, False
+        try:
+            raw = _load_status_json(run_id)
+        except FileNotFoundError:
+            return None, False
+        except OSError:
+            # the bytes were never read, so nothing about this record is known to be malformed.
+            # `PermissionError`, `ESTALE` and `EIO` all arrive here, and they say the storage is
+            # unreadable right now, not that the content is corrupt. quarantining anyway would
+            # publish `spec = {}` and `remote = None` over a record whose handle was never seen and
+            # terminalize a possibly-live run, destroying the only address its worker has. leave the
+            # durable bytes untouched and report no quarantine: the caller skips this one row for
+            # this boot and a later one reads it once the storage answers again.
+            return None, False
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
+            raw = None
+        else:
+            # a read that only failed transiently is not a corrupt record. the recheck above reports
+            # `ESTALE` and `EIO` through the same `OSError` arm it uses for undecodable bytes, so
+            # this third read succeeding proves nothing on its own -- quarantining on it would
+            # rewrite a live `running` record to `failed` and tear its remote down because a stale
+            # handle cleared. decode and validate the bytes with exactly what the recheck used, and
+            # treat only what still fails as corrupt.
+            try:
+                recovered = _validate_recovery_status(run_id, _runstatus_from_json(raw))
+            except _RECOVERY_RECORD_ERRORS:
+                pass
+            else:
+                return recovered, False
+        failed, cleanup_remotes = _salvage_corrupt_record(run_id, raw, detail, time.time())
+        data = state._status_storage_dict(failed)
+        cleanup_remotes = _durable_teardown_intent(failed.remote, cleanup_remotes)
+        if cleanup_remotes is not None:
+            data[state._CLEANUP_REMOTES_KEY] = cleanup_remotes
+        # this write replaces the record wholesale, so the endpoint address it is about to destroy
+        # has to be lifted into the envelope now or nothing can ever reach that endpoint again. two
+        # sources feed one marker: classes an earlier boot already froze, and classes the corrupt
+        # bytes themselves still name. `_teardown_failed_recovery` cannot do this afterwards -- it
+        # reads the envelope, whose `spec` is `{}` -- and no later boot revisits a terminal run, so
+        # a handle-less endpoint left unaddressed here bills untouched.
+        #
+        # Folded into the SAME atomic write as the terminal state, not persisted beside it. The two
+        # are one fact: this run is failed AND still owes an endpoint. Split across two writes, a
+        # crash between them leaves exactly the unreachable terminal record this marker exists to
+        # prevent, and quarantine's whole contract is that the envelope replaces the record in one
+        # `os.replace`.
+        #
+        # Skipped when an ADDRESSABLE handle survived salvage: `cleanup_remotes` above already
+        # addresses that worker, and a marker cleared only by a confirmed name-derived delete would
+        # otherwise outlive the teardown that actually released it. A truthy but unaddressable
+        # remnant is not that -- the drain declines it -- so it must not suppress the marker.
+        if (
+            raw is not None
+            and _describes_run(run_id, raw)
+            and not has_teardown_address(failed.remote)
+        ):
+            reclaim = tuple(dict.fromkeys(_stored_reclaim_types(raw) + reclaimable_gpu_types(raw)))
+            if reclaim:
+                data[state._ENDPOINT_RECLAIM_KEY] = list(reclaim)
+        tmp: str | None = None
+        try:
+            # inside the try because creating the temp file is the FIRST thing that fails on the
+            # storage this whole path exists to survive: a full disk raises `ENOSPC` here, a
+            # read-only runs directory `EACCES`, and neither ever reaches `os.fdopen` below. Left
+            # outside, that `OSError` propagates as itself into the caller's broad `except`, which
+            # returns without tearing anything down -- so the salvage and the reclaim classes
+            # computed just above die unused, and the exact storage failure this frame is built to
+            # carry teardown out of is the one it drops it on.
+            fd, tmp = tempfile.mkstemp(dir=state.RUNS_DIR, prefix=f"{run_id}.", suffix=".tmp")
+            with os.fdopen(fd, "w") as file:
+                json.dump(data, file, indent=2, sort_keys=True)
+                file.flush()
+                os.fsync(file.fileno())
+            os.link(path, quarantine_path)
+            dir_fd = os.open(state.RUNS_DIR, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+                os.replace(tmp, path)
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+            return failed, True
+        except Exception as exc:
+            # the salvage is the only thing that ever knew this record's address, and it dies with
+            # this frame unless it escapes: the envelope was not installed, so the classes come from
+            # the corrupt bytes, which the caller cannot re-read (the same failing storage) and the
+            # envelope no longer holds. Carry it out so the caller can still tear the worker down.
+            raise QuarantineWriteFailed(
+                failed, data.get(state._ENDPOINT_RECLAIM_KEY) or ()
+            ) from exc
+        finally:
+            # `tmp` stays None when mkstemp itself failed: there is no temp file to remove, and
+            # unlinking `None` would raise out of the `finally` and replace the carrier exception.
+            if tmp is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp)
 
 
 def source_snapshot_from_status(status: RunStatus, *, required: bool = False) -> dict | None:
@@ -430,6 +691,36 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
     return float(cost)
 
 
+def _apply_transition(
+    status: RunStatus, new_state: str, *, allow_from_terminal: bool, updates: dict
+) -> bool:
+    """Apply the sticky terminal compare-and-set in memory. The caller owns the lock and the write.
+
+    Split out so a transition that must also persist cleanup intent can do both in ONE write:
+    `fail_with_cleanup_intent` needs exactly this mutation, under the same guard, with private keys
+    added to the same `_save_status_unlocked` call.
+    """
+    if (
+        status.state in state.TERMINAL_STATES
+        and new_state != status.state
+        and not allow_from_terminal
+    ):
+        return False
+    was_terminal = status.state in state.TERMINAL_STATES
+    status.state = new_state
+    status.updated_at = time.time()
+    if not was_terminal and new_state in state.TERMINAL_STATES and status.finished_at is None:
+        status.finished_at = status.updated_at
+    for key, value in updates.items():
+        if (
+            key in {"lifecycle_started_attempt", "lifecycle_progressed_attempt"}
+            and getattr(status, key) is not None
+        ):
+            continue
+        setattr(status, key, value)
+    return True
+
+
 def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, **updates) -> bool:
     """Atomically transition run state with terminal-stickiness. Returns False if rejected.
 
@@ -438,29 +729,12 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
     transition (e.g. the recovery path resuming ``_run_training``) must check this return so a run
     concurrently flipped terminal does not get resumed.
     """
-    report_status: RunStatus | None = None
     with state._status_guard(run_id):
         status = get_status(run_id)
-        if (
-            status.state in state.TERMINAL_STATES
-            and new_state != status.state
-            and not allow_from_terminal
+        if not _apply_transition(
+            status, new_state, allow_from_terminal=allow_from_terminal, updates=updates
         ):
             return False
-        was_terminal = status.state in state.TERMINAL_STATES
-        status.state = new_state
-        status.updated_at = time.time()
-        if not was_terminal and new_state in state.TERMINAL_STATES and status.finished_at is None:
-            status.finished_at = status.updated_at
-        for key, value in updates.items():
-            if (
-                key in {"lifecycle_started_attempt", "lifecycle_progressed_attempt"}
-                and getattr(status, key) is not None
-            ):
-                continue
-            setattr(status, key, value)
         state._save_status_unlocked(status)
-        report_status = status
-    if report_status is not None:
-        reporting._report_status(report_status)
+    reporting._report_status(status)
     return True

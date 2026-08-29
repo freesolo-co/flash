@@ -291,10 +291,72 @@ def test_terminate_persisted_endpoints_isolates_each_gpu_failure(monkeypatch) ->
 
     monkeypatch.setattr(serverless, "terminate_endpoint", terminate)
 
-    runpod.terminate_persisted_endpoints(
-        {"gpu": {"type": ["RTX 5090", "A100 PCIe"]}}, "flash-cleanup"
-    )
+    runpod.terminate_persisted_endpoints(["RTX 5090", "A100 PCIe"], "flash-cleanup")
     assert calls == ["RTX 5090", "A100 PCIe"]
+
+
+def test_failed_rest_sweep_is_reported_rather_than_read_as_confirmed_clear(monkeypatch) -> None:
+    """A swallowed REST failure must not look like "no endpoint is billing".
+
+    For a registry-less endpoint the Flash resource list is empty and the REST sweep is the real
+    cleanup, so if enumeration raises there is no evidence either way. Callers treat an empty result
+    as confirmed-clear and drop their retry marker, which would strand a live endpoint billing until
+    it happened to go idle for the reaper grace.
+    """
+    import flash.providers.runpod.client.api as runpod_api
+    import flash.providers.runpod.serverless.endpoints as serverless
+    from flash.providers.runpod.execution import provider as runpod
+
+    class NoResources:
+        def list_all_resources(self):
+            return {}
+
+    monkeypatch.setattr(serverless, "ensure_auth", lambda: None, raising=False)
+    monkeypatch.setattr(serverless, "isolate_flash_state", lambda _suffix: None)
+    monkeypatch.setattr(serverless, "_select_endpoint_resources", lambda _resources, _target: [])
+    monkeypatch.setattr(serverless, "ResourceManager", NoResources, raising=False)
+
+    def unreachable():
+        raise RuntimeError("runpod api unreachable")
+
+    monkeypatch.setattr(runpod_api, "list_endpoints_by_key", unreachable)
+
+    results = serverless.terminate_endpoint("RTX 5090", "flash-cleanup")
+    assert [entry["success"] for entry in results] == [False], results
+
+    assert not runpod.terminate_persisted_endpoints(["RTX 5090"], "flash-cleanup"), (
+        "a failed REST sweep was reported as confirmed-clear"
+    )
+
+
+def test_no_gpu_class_to_derive_from_is_reported_unconfirmed(monkeypatch) -> None:
+    """Deriving zero endpoint names is not the same as confirming no endpoint exists.
+
+    An empty result from an actual call proves a specific derived name is absent. Zero derived names
+    means the provider was never asked -- and a corrupt record that lost its GPU class can still
+    have an endpoint billing under the name the intact record would have produced. Returning `True`
+    there clears the caller's retry marker on the strength of a check that never ran.
+    """
+    import flash.providers.runpod.serverless.endpoints as serverless
+    from flash.providers.runpod.execution import provider as runpod
+
+    calls: list[str] = []
+
+    def terminate(gpu_type: str, _run_id: str) -> list[dict]:
+        calls.append(gpu_type)
+        return []
+
+    monkeypatch.setattr(serverless, "terminate_endpoint", terminate)
+
+    for gpu_types in ((), [], ""):
+        assert not runpod.terminate_persisted_endpoints(gpu_types, "flash-cleanup"), (
+            f"deriving no endpoint name was reported confirmed-clear: {gpu_types!r}"
+        )
+    assert calls == [], "a name was derived without a gpu class"
+
+    # the contrast: one derived name, actually asked, and the provider answered that it is gone.
+    assert runpod.terminate_persisted_endpoints(["RTX 5090"], "flash-cleanup")
+    assert calls == ["RTX 5090"]
 
 
 def test_effective_spec_carries_the_allocated_card_count(orch) -> None:

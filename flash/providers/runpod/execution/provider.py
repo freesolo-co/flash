@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import contextlib
+from collections.abc import Sequence
 from typing import Any
 
 from flash.providers._lifecycle.net.deadline import deadline_kwargs
@@ -17,14 +17,42 @@ from flash.providers.core.base import (
 )
 
 
-def terminate_persisted_endpoints(spec: Any, run_id: str) -> None:
-    """Best-effort teardown for every GPU class named by a raw persisted spec."""
-    from flash.core.spec import persisted_gpu_types
+def terminate_persisted_endpoints(gpu_types: Sequence[str], run_id: str) -> bool:
+    """Best-effort teardown of this run's derived endpoint under every named GPU class.
+
+    Reports whether every class came back reclaimed, so a caller retrying this across restarts can
+    tell "nothing is left billing" from "the provider never answered". `terminate_endpoint` never
+    raises and returns one entry per endpoint it acted on, so an empty list is the confirmed-clear
+    case -- no endpoint matched the derived name in any configured account -- while any
+    `success: False` entry is an unconfirmed deletion or an account it could not enumerate.
+
+    No classes is NOT that case, so it reports unconfirmed. An empty result proves a specific
+    derived name is absent; zero derived names means the provider was never asked, and a record
+    that lost its GPU class can still have an endpoint billing under the name the intact record
+    would have produced. Returning `True` there would clear the retry marker on the strength of a
+    check that never ran, which is the one outcome the marker exists to prevent.
+
+    Classes are passed in rather than read from a spec because the endpoint's only address is the
+    class the deploy actually used, and for an auto-selected run that class was never written to
+    the public spec at all. `reclaimable_gpu_types` owns that resolution; this stays the provider
+    call it names.
+
+    Each class stays isolated: one failure is recorded and the rest are still attempted.
+    """
     from flash.providers.runpod.serverless.endpoints import terminate_endpoint
 
-    for gpu_type in persisted_gpu_types(spec):
-        with contextlib.suppress(Exception):
-            terminate_endpoint(gpu_type, run_id)
+    if not gpu_types:
+        return False
+    confirmed = True
+    for gpu_type in gpu_types:
+        try:
+            results = terminate_endpoint(gpu_type, run_id)
+        except Exception:
+            confirmed = False
+            continue
+        if any(not entry.get("success", False) for entry in results or ()):
+            confirmed = False
+    return confirmed
 
 
 class RunpodProvider:

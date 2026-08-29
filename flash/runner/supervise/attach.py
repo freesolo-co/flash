@@ -577,8 +577,11 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     _compare_and_fail_remote(run_id, persisted_remote, detail)
     if not confirmed_teardown:
         from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
+        from flash.runner.lifecycle.status import reclaimable_gpu_types
 
-        terminate_persisted_endpoints(status.spec, run_id)
+        # the deploy names its endpoint from the class it actually used, which for an auto-selected
+        # run lives in the effective worker spec rather than the authored one.
+        terminate_persisted_endpoints(reclaimable_gpu_types(status), run_id)
     print(f"attach: {run_id} {detail}", file=log)
     return get_status(run_id)
 

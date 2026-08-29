@@ -357,32 +357,94 @@ def _uncanonical_teardown_record(item: object) -> dict | None:
     return dict(item)
 
 
+def _hashable(value: object) -> object:
+    """A stable hashable stand-in for a JSON value of any shape.
+
+    The lenient key is built from a record that failed strict validation, so every field is
+    arbitrary JSON -- `attempt` can be a list, and so can a resource id. The drain puts these keys
+    in a `set`, so one unhashable field would raise `TypeError` there and strand every well-formed
+    sibling still billing.
+
+    Two properties make this a key rather than just a hash. It must survive a persist, because the
+    two sides run on either side of one: the drain keys the in-memory record, and the
+    compare-and-remove keys it after `_save_status_unlocked` rewrote it with
+    `json.dump(sort_keys=True)`. A mapping comes back key-sorted, so an insertion-ordered `repr`
+    would key the same record differently on the two sides, removal would match nothing, and every
+    later startup would re-tear-down an endpoint already confirmed gone. Sorting the pairs here is
+    what makes both sides agree.
+
+    And it must not conflate shapes, because two different records sharing a key means the drain
+    dedupes one of them away and never deletes it. A container serialized to a bare string collides
+    with a scalar string holding that same text, so every value carries its type tag.
+    """
+    if isinstance(value, dict):
+        return ("dict", tuple(sorted((_hashable(k), _hashable(v)) for k, v in value.items())))
+    if isinstance(value, (list, tuple)):
+        return ("seq", tuple(_hashable(entry) for entry in value))
+    # bool before int: `True == 1` and they hash alike, so the tag is the only thing separating them.
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, (str, int, float, type(None))):
+        return (type(value).__name__, value)
+    return ("repr", repr(value))
+
+
 def _uncanonical_cleanup_remote_key(record: object) -> tuple | None:
     """Dedupe key for a record the strict reader cannot canonicalize."""
     if not isinstance(record, dict):
         return None
-    identity = tuple(record.get(field) for field in _RESOURCE_ID_FIELDS)
-    if not any(identity):
+    raw_identity = tuple(record.get(field) for field in _RESOURCE_ID_FIELDS)
+    if not any(raw_identity):
         return None
-    return (record.get("provider"), record.get("attempt"), identity)
+    identity = tuple(_hashable(field) for field in raw_identity)
+    return (_hashable(record.get("provider")), _hashable(record.get("attempt")), identity)
+
+
+def _teardown_target(remote: object) -> tuple[dict, tuple] | None:
+    """The record the teardown drain will act on, paired with the identity it selects by.
+
+    THE single answer to "can this handle be torn down", shared by every caller that asks. Admission
+    and keying have to come from one derivation, because a record admitted by one and keyed by
+    another is a resource nothing deletes. That is not hypothetical: keying leniently on bare
+    truthiness accepts `{"provider": None, "endpoint_id": "ep-live"}` while the drain refuses it for
+    naming no provider, so `has_teardown_address` reports an address, the reclaim marker is
+    suppressed in favour of it, and the endpoint bills with both mechanisms declining it. Returning
+    the admitted record together with its key makes that disagreement unrepresentable.
+
+    Lenient does not mean unvalidated. A record earns the lenient branch by naming a provider and a
+    resource id as nonempty strings -- enough for `_strict_teardown_handle` to address it -- which
+    is what `_uncanonical_teardown_record` enforces. Dropping the branch entirely is not an option:
+    `key_fingerprint` is validated at exactly 68 chars while a deployed release writes the 16-char
+    form, so every endpoint that release created fails strict canonicalization and would strand.
+
+    The two key shapes cannot be confused for each other: the strict key is the 2-tuple
+    `(identity, attempt)` and the lenient one is a 3-tuple, so they never compare equal and a record
+    that canonicalizes is matched by its strict key on both sides of a persist.
+    """
+    canonical = _canonical_cleanup_remote(remote)
+    if canonical is not None:
+        strict_key = _cleanup_remote_key(canonical)
+        if strict_key is not None:
+            return canonical, strict_key
+    record = _uncanonical_teardown_record(remote)
+    if record is None:
+        return None
+    lenient_key = _uncanonical_cleanup_remote_key(record)
+    if lenient_key is None:
+        return None
+    return record, lenient_key
 
 
 def _teardown_removal_key(record: object) -> tuple | None:
     """The identity the teardown path selects a record by, strict when possible.
 
-    THE single derivation shared by the drain and the compare-and-remove that clears what the drain
-    confirmed deleted. It has to be one function: the drain admits uncanonical records so a resource
-    that fails strict validation still gets deleted, and if removal derived its key strictly instead
-    it would return `None` for exactly those records and clear nothing -- so a confirmed-deleted
-    resource would stay on disk and every later sweep would tear down something already gone,
-    forever. That is the failure the lenient branch below exists to prevent, reintroduced through
-    the key rather than through the reader.
-
-    The two shapes cannot be confused for each other: the strict key is the 2-tuple
-    `(identity, attempt)` and the lenient one is a 3-tuple, so they never compare equal and a record
-    that canonicalizes is matched by its strict key on both sides.
+    Shared by the drain and by the compare-and-remove that clears what the drain confirmed deleted.
+    Both must derive it identically: if removal keyed strictly while the drain admitted leniently,
+    removal would return `None` for exactly the lenient records, clear nothing, and every later
+    sweep would re-tear-down a resource already confirmed gone, forever.
     """
-    return _cleanup_remote_key(record) or _uncanonical_cleanup_remote_key(record)
+    target = _teardown_target(record)
+    return None if target is None else target[1]
 
 
 def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
@@ -410,14 +472,11 @@ def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
     records: list[dict] = []
     seen = set()
     for item in value:
-        record = _canonical_cleanup_remote(item)
-        if record is None:
-            record = _uncanonical_teardown_record(item)
-        key = _teardown_removal_key(record)
-        if record is None or key is None or key in seen:
+        target = _teardown_target(item)
+        if target is None or target[1] in seen:
             continue
-        records.append(record)
-        seen.add(key)
+        records.append(target[0])
+        seen.add(target[1])
     return records
 
 

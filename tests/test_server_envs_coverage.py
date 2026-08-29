@@ -587,6 +587,42 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
     assert all(status.deployment["state"] == "failed" for status in reported)
 
 
+def test_recover_deployments_skips_a_record_quarantine_could_not_rewrite(monkeypatch):
+    """One undecodable row must not abort startup recovery for every other deployment.
+
+    `recover_runs` quarantines an undecodable status record ahead of this pass, but its own write
+    can fail -- an unwritable runs directory, say -- and then the record still fails to decode
+    here, through the identical `_runstatus_from_json` path. This runs synchronously in the
+    lifespan, so an escaping decode error would leave every later run's interrupted deployment
+    recorded as live forever.
+    """
+    rows = [{"run_id": "r-corrupt"}, {"run_id": "r-busy"}]
+    monkeypatch.setattr(serving.db, "all_runs", lambda: rows)
+
+    def fake_get_status(run_id):
+        if run_id == "r-corrupt":
+            # what a truncated status file raises: `JSONDecodeError` is a `ValueError`, which is in
+            # `_RECOVERY_RECORD_ERRORS`. the corrupt row is first, so a raise never reaches r-busy.
+            raise json.JSONDecodeError("Expecting value", "", 0)
+        return types.SimpleNamespace(run_id=run_id, state="done", deployment={"state": "queued"})
+
+    monkeypatch.setattr(serving._app, "get_status", fake_get_status)
+    marked: list[str] = []
+    monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
+    monkeypatch.setattr(
+        runner_transitions,
+        "mark_deployment_failed",
+        lambda run_id, failed: (
+            marked.append(run_id),
+            types.SimpleNamespace(run_id=run_id, state="done", deployment=failed),
+        )[1],
+    )
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+
+    assert serving_completion.recover_deployments() == 1
+    assert marked == ["r-busy"], "the undecodable row stranded the deployment behind it"
+
+
 def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
     statuses = [
         types.SimpleNamespace(run_id="r-settled", deployment={"state": "queued"}),

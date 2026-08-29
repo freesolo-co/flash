@@ -10,10 +10,11 @@ import contextlib
 import logging
 import os
 import threading
+from collections.abc import Sequence
 
 from flash.adapters.artifacts import attempt_scoped_artifact_name
 from flash.core.spec import JobSpec
-from flash.runner.lifecycle.state import adapter_prefix, runs_file_path
+from flash.runner.lifecycle.state import RunStatus, adapter_prefix, runs_file_path
 from flash.runner.lifecycle.status import get_status
 from flash.server.platform import db
 
@@ -552,7 +553,10 @@ def _teardown_unrecoverable_remote(status) -> None:
     runs off the persisted handle alone, so it works for exactly the spec the parse rejected.
     Best-effort and fully suppressed: recovery must finish for every other run regardless.
     """
-    from flash.runner.accounting.reconciliation import _record_cleanup_remote
+    from flash.runner.accounting.reconciliation import (
+        _compare_and_remove_cleanup_remote,
+        _record_cleanup_remote,
+    )
     from flash.runner.supervise.lifecycle import _strict_teardown_handle
 
     remote = dict(status.remote or {})
@@ -563,8 +567,15 @@ def _teardown_unrecoverable_remote(status) -> None:
     except Exception:
         # unconfirmed deletion: leave it recorded for the cleanup drain rather than dropping it.
         deleted = False
-    if not deleted:
-        with contextlib.suppress(Exception):
+    with contextlib.suppress(Exception):
+        if deleted:
+            # quarantine records this same handle durably before dispatching teardown, so that a
+            # crash in between still leaves it for the next boot's drain. Once deletion is
+            # confirmed that window is closed, and leaving the record behind would make the drain
+            # that runs immediately after this call bill a second teardown for a resource already
+            # gone. Same confirmed-deletion bookkeeping `_drain_cleanup_remotes` applies per record.
+            _compare_and_remove_cleanup_remote(status.run_id, remote)
+        else:
             _record_cleanup_remote(status.run_id, remote)
 
 
@@ -596,6 +607,177 @@ def _drain_cleanup_remotes_bg(run_id: str) -> None:
         _drain_cleanup_remotes(run_id)
 
 
+def _startup_cleanup_bg(status: RunStatus) -> None:
+    """Resume the durable per-run cleanups a previous boot may not have finished.
+
+    Launched for EVERY persisted run, terminal ones included, which is what makes the reclaim marker
+    worth writing: a `failed` run is dropped by `_RECOVERABLE` a few lines below, so this thread is
+    the only startup path that still reaches it.
+    """
+    _drain_cleanup_remotes_bg(status.run_id)
+    _reclaim_unhandled_endpoints(status.run_id)
+
+
+def _teardown_failed_recovery_bg(status: RunStatus, unmarked: Sequence[str] = ()) -> None:
+    _teardown_unrecoverable_remote(status)
+    _reclaim_unhandled_endpoints(status.run_id, unmarked)
+    # direct teardown can record an unconfirmed handle after an earlier drain took its snapshot.
+    _drain_cleanup_remotes_bg(status.run_id)
+
+
+def _reclaim_unhandled_endpoints(run_id: str, unmarked: Sequence[str] = ()) -> None:
+    """Reclaim a terminalized run's endpoint when no handle was ever persisted to tear down.
+
+    The crash window a non-idempotent create leaves behind: RunPod accepted the endpoint, then the
+    response or the handle write was lost. `_teardown_unrecoverable_remote` has nothing to act on,
+    `RunpodProvider.sweep_orphans` returns `[]` unconditionally, and the run is now terminal and so
+    dropped from `_RECOVERABLE` -- no later startup reconsiders it while it can still bill. The
+    endpoint name is derived deterministically from the run id and GPU class
+    (`endpoint_name(gpu, _run_suffix(run_id))`), so this works where `_gc_run_endpoints` cannot: it
+    needs a parsed `JobSpec`.
+
+    Normally driven by the persisted marker, which is also the precondition: the terminal write
+    decides that one is owed (`fail_with_cleanup_intent`, or quarantine's envelope) and freezes the
+    GPU classes into it, so a status whose spec has since been emptied by quarantine -- or that never
+    named a class, because allocation chose it -- is still addressable. A run with no marker has
+    nothing owed and this is a no-op. `unmarked` covers the one case where no marker could be
+    written at all: the terminal write itself failed, so the caller passes the classes it read
+    in-process and this is the only reclamation attempt that will ever happen.
+
+    Suppressed so it can never re-abort recovery. This runs on a daemon thread and gets exactly one
+    attempt, so the marker is dropped only once the provider CONFIRMS every derived name is gone. A
+    killed process or a transient provider failure leaves it set, and `_startup_cleanup_bg` -- which
+    runs for EVERY persisted run, terminal ones included -- tries again next boot.
+    """
+    from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
+    from flash.runner.lifecycle.status import (
+        clear_endpoint_reclaim_intent,
+        endpoint_reclaim_types,
+    )
+
+    marked = endpoint_reclaim_types(run_id)
+    gpu_types = marked or tuple(unmarked)
+    if not gpu_types:
+        return
+    confirmed = False
+    with contextlib.suppress(Exception):
+        confirmed = terminate_persisted_endpoints(gpu_types, run_id)
+    if confirmed and marked:
+        with contextlib.suppress(Exception):
+            # retire only what this reclaim actually terminated. the provider call above runs
+            # unlocked and slowly, and a second quarantine inside that window can extend the marker
+            # with a class never passed to it -- dropping the whole key would erase that class and
+            # leave its endpoint billing with nothing naming it.
+            clear_endpoint_reclaim_intent(run_id, marked)
+
+
+def _teardown_failed_recovery(
+    status: RunStatus, *, intent_is_durable: bool, unmarked: Sequence[str] = ()
+) -> None:
+    """Release a failed run's rented worker without holding up startup.
+
+    Teardown goes on a background thread for the reason the drain alone already did: a provider
+    outage blocks each delete through its own retry and backoff, `recover_runs()` runs synchronously
+    before the ASGI lifespan yields, and serial startup cleanup can exceed the HEALTHCHECK grace and
+    turn into a restart loop.
+
+    Deferral is only safe when the intent behind it is on disk -- that durable record is what makes
+    a thread that never runs recoverable, since nothing revisits a terminal run otherwise
+    (`_classify_recoverable_runs` skips it, RunPod's `sweep_orphans` is a no-op). Callers persist
+    that intent in the same write that terminalizes the run and report here whether it landed. When
+    it did not, a full or failing disk has taken away the retry, so this in-process attempt is the
+    only reclamation left and has to finish before recovery moves on: blocking startup while an
+    already-degraded host tears one worker down beats deferring to a thread whose crash nothing
+    would ever notice. It also carries `unmarked` -- the GPU classes the failed write would have
+    frozen into the marker -- because with nothing on disk that in-memory list is the run's only
+    remaining address.
+    """
+    if not intent_is_durable:
+        _log.warning("run %s: cleanup intent is not durable; tearing down inline", status.run_id)
+        with contextlib.suppress(Exception):
+            _teardown_failed_recovery_bg(status, unmarked)
+        return
+    with contextlib.suppress(Exception):
+        threading.Thread(target=_teardown_failed_recovery_bg, args=(status,), daemon=True).start()
+
+
+def _fail_unrecoverable_run(status: RunStatus, detail: str) -> None:
+    """Terminalize an unrecoverable run, then release whatever it still holds.
+
+    One durable write records both the terminal state and the cleanup it owes, so no crash window
+    exists where the run is `failed` -- and therefore dropped from `_RECOVERABLE` -- with its
+    endpoint unaddressed. A write that fails leaves the run non-terminal and retried next boot, but
+    its worker is still billing now, so teardown runs inline on this thread, addressed by the
+    classes read here rather than by the marker that could not be written.
+    """
+    from flash.runner.lifecycle.status import (
+        fail_with_cleanup_intent,
+        has_teardown_address,
+        reclaimable_gpu_types,
+    )
+
+    unmarked: Sequence[str] = ()
+    try:
+        persisted = fail_with_cleanup_intent(status.run_id, detail)
+    except Exception:
+        _log.warning(
+            "run %s: could not record terminal cleanup intent", status.run_id, exc_info=True
+        )
+        persisted, durable = status, False
+        with contextlib.suppress(Exception):
+            if not has_teardown_address(status.remote):
+                unmarked = reclaimable_gpu_types(status)
+    else:
+        if persisted is None:
+            # the sticky compare-and-set refused: the run settled concurrently and owns its own
+            # cleanup. nothing was written and nothing here should act on it.
+            return
+        durable = True
+    with contextlib.suppress(Exception):
+        _append_run_log(status.run_id, detail)
+    _teardown_failed_recovery(persisted, intent_is_durable=durable, unmarked=unmarked)
+
+
+def _quarantine_corrupt_recovery_record(
+    run_id: str, exc: Exception
+) -> tuple[RunStatus | None, bool]:
+    from flash.runner.lifecycle.status import QuarantineWriteFailed, _quarantine_corrupt_status
+
+    _log.warning(
+        "quarantining run %s: persisted status could not be decoded",
+        run_id,
+        exc_info=True,
+    )
+    # Only the exception TYPE goes in the durable detail. `detail` reaches the submitter twice --
+    # persisted as `RunStatus.error` (returned by both run routes) and appended to the run log --
+    # and `_RECOVERY_RECORD_ERRORS` includes `OSError`, whose text carries the internal status-file
+    # path. The type still separates the corruption classes an operator would triage differently;
+    # the full exception stays server-side in the `exc_info=True` warning above.
+    detail = f"unrecoverable: persisted status cannot be decoded: {type(exc).__name__}"
+    status, quarantined = None, False
+    try:
+        status, quarantined = _quarantine_corrupt_status(run_id, detail)
+    except QuarantineWriteFailed as failure:
+        # the envelope never landed, so this record keeps its corrupt bytes and stays unrecoverable
+        # every boot -- but its worker is billing now and the classes that name it die with this
+        # frame. Tear down inline off the salvage the write carried out, the same way
+        # `_fail_unrecoverable_run` falls back when its own terminal write fails.
+        _log.warning("run %s: could not install quarantine envelope", run_id, exc_info=True)
+        _teardown_failed_recovery(
+            failure.salvaged, intent_is_durable=False, unmarked=failure.reclaim
+        )
+        return None, False
+    except Exception:
+        return None, False
+    if quarantined and status is not None:
+        with contextlib.suppress(Exception):
+            _append_run_log(run_id, detail)
+        # the envelope IS the durable intent: quarantine folds cleanup and reclaim into the same
+        # atomic `os.replace` that installs the terminal record.
+        _teardown_failed_recovery(status, intent_is_durable=True)
+    return status, quarantined
+
+
 def _classify_recoverable_runs(
     active: set[str], known: set[str], resubmit: list[tuple[JobSpec, str]]
 ) -> None:
@@ -607,9 +789,10 @@ def _classify_recoverable_runs(
     """
     from flash.runner.lifecycle.preparation import _mark_warmstart_source
     from flash.runner.lifecycle.status import (
+        _RECOVERY_RECORD_ERRORS,
+        _get_recovery_status,
         _update,
         effective_spec_from_status,
-        get_status,
         reallocation_spec_from_status,
     )
     from flash.runner.supervise.attach import attach_run
@@ -618,15 +801,17 @@ def _classify_recoverable_runs(
     for row in db.all_runs():
         known.add(row["run_id"])
         try:
-            status = get_status(row["run_id"])
+            status = _get_recovery_status(row["run_id"])
         except FileNotFoundError:
             continue
-        # drain cleanup remotes in the background. provider outages can block each teardown through
+        except _RECOVERY_RECORD_ERRORS as exc:
+            status, quarantined = _quarantine_corrupt_recovery_record(row["run_id"], exc)
+            if quarantined or status is None:
+                continue
+        # resume durable cleanups in the background. provider outages can block each teardown through
         # retry/backoff; serial startup cleanup can exceed HEALTHCHECK grace and create a restart loop.
         # recovery below does not depend on completion.
-        threading.Thread(
-            target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
-        ).start()
+        threading.Thread(target=_startup_cleanup_bg, args=(status,), daemon=True).start()
         if status.state not in _RECOVERABLE:
             continue
         if status.remote is None and status.cleanup_confirmed_remote is not None:
@@ -652,22 +837,7 @@ def _classify_recoverable_runs(
                     exc_info=True,
                 )
                 detail = f"unrecoverable: persisted spec cannot be activated: {exc}"
-                with contextlib.suppress(Exception):
-                    _update(status.run_id, "failed", error=detail)
-                with contextlib.suppress(Exception):
-                    _append_run_log(status.run_id, detail)
-                _teardown_unrecoverable_remote(status)
-                # If that teardown could not confirm deletion it records the handle for the cleanup
-                # drain -- but this run's drain was dispatched above and has already taken its
-                # snapshot, of a list that did not yet contain this record.
-                # `_drain_cleanup_remotes` returns early on an empty snapshot, so nothing would
-                # retry it before the next restart. Dispatch a second drain now that the record
-                # exists. A double teardown of one handle is safe: `_strict_teardown_handle` is
-                # idempotent and the record is removed by compare-and-remove only on a confirmed
-                # delete.
-                threading.Thread(
-                    target=_drain_cleanup_remotes_bg, args=(status.run_id,), daemon=True
-                ).start()
+                _fail_unrecoverable_run(status, detail)
                 continue
             # Only handle-backed runs are kept by the sweep; a handle-less run is being
             # resubmitted, so its stale half-rented instance (if any) must NOT be shielded.
@@ -689,23 +859,13 @@ def _classify_recoverable_runs(
                     exc_info=True,
                 )
                 detail = f"unrecoverable: persisted spec cannot be activated: {exc}"
-                with contextlib.suppress(Exception):
-                    _update(status.run_id, "failed", error=detail)
-                with contextlib.suppress(Exception):
-                    _append_run_log(status.run_id, detail)
-                # The aborted attempt may STILL have registered its uniquely-named RunPod
-                # endpoint before crashing (the exact leak the good-spec branch's
-                # `_gc_run_endpoints` guards against). The `sweep_orphans` dispatch below is a
-                # no-op for RunPod, and the periodic idle reaper would only reclaim this after its
-                # 15-min idle grace — so tear it down by name HERE for immediate cleanup.
-                # `_gc_run_endpoints` needs a parsed `JobSpec`, which we don't have; but the
-                # endpoint name is derived deterministically from the run id + GPU class
-                # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
-                # persisted status without parsing the spec. Terminate by that reconstructed
-                # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
-                from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
-
-                terminate_persisted_endpoints(status.spec, status.run_id)
+                # The aborted attempt may STILL have registered its uniquely-named RunPod endpoint
+                # before crashing (the exact leak the good-spec branch's `_gc_run_endpoints` guards
+                # against). The `sweep_orphans` dispatch below is a no-op for RunPod, and the
+                # periodic idle reaper would only reclaim this after its 15-min idle grace -- so the
+                # terminal write records a reclaim marker naming the classes the endpoint could
+                # exist under, and teardown resolves it by derived name.
+                _fail_unrecoverable_run(status, detail)
                 continue
             # reap run-scoped resources from the parseable public spec before touching the private
             # warm-start snapshot. source drift or snapshot tampering must not strand an endpoint.
