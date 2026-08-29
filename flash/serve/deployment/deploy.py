@@ -347,6 +347,10 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
         raise serving_errors.ServingError(
             f"serving_contract_unsupported: serving health check at {url} {detail}"
         ) from exc
+    if health.ok is False:
+        raise serving_errors.ServingError(
+            f"serving_contract_unsupported: serving health check at {url} reported ok=false"
+        )
     advertised = set(health.capabilities)
     missing = sorted(required - advertised)
     if missing:

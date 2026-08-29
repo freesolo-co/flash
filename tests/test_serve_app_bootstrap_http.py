@@ -743,6 +743,9 @@ def test_nonstream_reasoning_accounting_provenance_and_structured_precedence() -
     )
 
     assert response.status_code == 200
+    assert response.headers["content-type"] == "application/json"
+    assert "cache-control" not in response.headers
+    assert "x-accel-buffering" not in response.headers
     payload = response.json()
     message = payload["choices"][0]["message"]
     assert message == {"role": "assistant", "content": "answer", "reasoning_content": "why"}
@@ -839,6 +842,10 @@ def test_stream_primes_before_200_splits_reasoning_and_emits_one_real_finish() -
     payloads = _sse_payloads(response)
 
     assert response.status_code == 200
+    assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert response.text.startswith("data: ")
     assert payloads[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
     deltas = [
         payload["choices"][0]["delta"]

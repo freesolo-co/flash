@@ -17,6 +17,7 @@ from pathlib import Path
 
 from flash.cli.commands.env.ops.push import (
     _ENV_EVALUATIONS_SIDECAR,
+    _decode_env_entrypoint_source,
     _ignore_env_push_path,
     _raise_walk_error,
 )
@@ -149,6 +150,18 @@ def _imported_module_names(tree, *, relative_names_are_siblings: bool = True) ->
     return names
 
 
+def _read_env_module_source(path: Path) -> str:
+    """Read one packaged Python file under the interpreter's own encoding contract.
+
+    the publish path decodes the entrypoint with `tokenize.detect_encoding`, so a file carrying a
+    non-utf-8 encoding cookie is publishable. reading it as utf-8 here raises instead, and every
+    caller below treats that as "no imports" -- so the sibling helpers never enter the archive and
+    `env push` exits 0 with an environment that only fails once a gpu has been rented. one decoder
+    for both paths is what keeps "publishable" and "walked for imports" the same set of files.
+    """
+    return _decode_env_entrypoint_source(path.read_bytes())[0]
+
+
 def _helper_imports(helper: Path, *, env_root: Path) -> set[str]:
     """Return imports needed by a packaged helper.
 
@@ -160,7 +173,7 @@ def _helper_imports(helper: Path, *, env_root: Path) -> set[str]:
         return set()
     try:
         return _imported_module_names(
-            ast.parse(helper.read_text(encoding="utf-8"), filename=str(helper)),
+            ast.parse(_read_env_module_source(helper), filename=str(helper)),
             relative_names_are_siblings=helper.parent == env_root,
         )
     except (OSError, SyntaxError, UnicodeDecodeError):
@@ -295,7 +308,7 @@ def _iter_env_sidecar_files(
         # GPU has been rented and the worker imports the module. parsed with the same reader as
         # every other module here, so a lazily imported helper (inside load_environment) counts.
         try:
-            entry_tree = ast.parse(entrypoint.read_text(encoding="utf-8"), filename=str(entrypoint))
+            entry_tree = ast.parse(_read_env_module_source(entrypoint), filename=str(entrypoint))
         except (OSError, SyntaxError, UnicodeDecodeError):
             # the entrypoint is validated for syntax on its own path, and a push that cannot read
             # it fails there with a better message. an unreadable file here just means no closure.
@@ -325,7 +338,7 @@ def _iter_env_sidecar_files(
                 yielded.add(sidecar)
                 yield sidecar, sidecar.relative_to(env_root)
             try:
-                tree = ast.parse(sidecar.read_text(encoding="utf-8"), filename=str(sidecar))
+                tree = ast.parse(_read_env_module_source(sidecar), filename=str(sidecar))
             except SyntaxError as exc:
                 raise ValueError(
                     f"{sidecar}: invalid evaluation sidecar syntax: {exc.msg}"
