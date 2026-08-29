@@ -775,11 +775,22 @@ def test_finite_exponent_tool_history_is_accepted(argument: str) -> None:
     [
         ('{"value":1.' + "0" * 309 + "1e309}", "not representable as a native template number"),
         ('{"value":1e-400}', "not representable as a native template number"),
+        (
+            '{"value":9007199254740993.1}',
+            "not representable as a native template number",
+        ),
         ('{"value":NaN}', "arguments must encode a JSON object"),
         ('{"value":Infinity}', "arguments must encode a JSON object"),
         ('{"value":-Infinity}', "arguments must encode a JSON object"),
     ],
-    ids=["overflow", "nonzero-underflow", "nan", "infinity", "negative-infinity"],
+    ids=[
+        "overflow",
+        "nonzero-underflow",
+        "lossy-nonintegral",
+        "nan",
+        "infinity",
+        "negative-infinity",
+    ],
 )
 def test_unrepresentable_or_nonfinite_tool_history_is_a_request_error(
     argument: str, reason: str

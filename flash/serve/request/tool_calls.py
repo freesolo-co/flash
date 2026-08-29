@@ -506,6 +506,13 @@ def _native_json_value(value: Any) -> Any:
             ) from exc
         if not math.isfinite(converted) or (converted == 0.0 and value != 0):
             raise ValueError("decimal number is not representable as a native template number")
+        # the template renders the float back as its shortest repr, so a value whose repr does not
+        # decode to the emitted decimal would show the model a different prior call. this is the
+        # rendered identity, not exact binary64 storage: 0.0125 is stored approximately but still
+        # renders as itself, while 9007199254740993.1 renders as 9007199254740994.0. the integral
+        # branch above already refuses what it cannot expand; refuse here rather than round silently.
+        if Decimal(repr(converted)) != value:
+            raise ValueError("decimal number is not representable as a native template number")
         return converted
     if type(value) is list:
         return [_native_json_value(item) for item in value]
