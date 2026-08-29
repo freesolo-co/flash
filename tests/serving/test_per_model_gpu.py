@@ -408,16 +408,23 @@ assert "flash.serving.src.io.multimodal" not in sys.modules
 
 def test_one_engine_class_per_distinct_engine_key(modal_app_module):
     """a loraengine class is built for each active gpu tier and concurrency key."""
+    # two classes, not one: modal.concurrent is fixed per class, so the 35B (held at 8 seqs while its
+    # profiling-peak OOM hazard is unproven at 16) cannot share a class with the 9B/27B at 16.
     assert set(modal_app_module.ENGINE_BY_KEY) == {
         ("B200", 16),
+        ("B200", 8),
     }
 
 
 def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, monkeypatch):
     mod = modal_app_module
 
+    # admission is 1:1 with decode capacity, so an 8-seq engine admits 8 and scales out at 6.
     monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {"max_num_seqs": 8})
-    assert mod._engine_concurrency("valid") == (16, 12)
+    assert mod._engine_concurrency("valid") == (8, 6)
+
+    monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {"max_num_seqs": 16})
+    assert mod._engine_concurrency("raised") == (16, 12)
 
     monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {})
     assert mod._engine_concurrency("defaulted") == (64, 48)
@@ -438,27 +445,29 @@ def test_class_names_are_distinct_and_modal_safe(modal_app_module):
 
 
 def test_9b_routes_to_b200(modal_app_module):
-    """Rank-128 LoRA serving for 9B uses the B200 tier (8-seq -> (B200, 16))."""
+    """Rank-128 LoRA serving for 9B uses the B200 tier (16-seq -> (B200, 16))."""
     by_key = modal_app_module.ENGINE_BY_KEY
     assert gpu_for("Qwen/Qwen3.5-9B") == "B200"
     assert modal_app_module._engine_cls_for("Qwen/Qwen3.5-9B") is by_key[("B200", 16)]
     assert by_key[("B200", 16)].__name__ == "LoraEngine_B200_c16"
 
 
-def test_27b_routes_to_h100(modal_app_module):
-    """The dense 27B runs its FP8 checkpoint on the H100 tier (8-seq -> (H100, 16))."""
+def test_27b_routes_to_b200(modal_app_module):
+    """The dense 27B runs its FP8 checkpoint on the B200 tier (16-seq -> (B200, 16))."""
     by_key = modal_app_module.ENGINE_BY_KEY
-    assert gpu_for("Qwen/Qwen3.8-27B") == "H100"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B") is by_key[("H100", 16)]
-    assert by_key[("H100", 16)].pinned_gpu == "H100"
+    assert gpu_for("Qwen/Qwen3.8-27B") == "B200"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B") is by_key[("B200", 16)]
+    assert by_key[("B200", 16)].pinned_gpu == "B200"
 
 
-def test_35b_moe_routes_to_b200(modal_app_module):
-    """The 35B-A3B MoE runs bf16 on the B200 tier ((B200, 16))."""
+def test_35b_moe_routes_to_b200_at_eight_seqs(modal_app_module):
+    """The 35B-A3B MoE runs bf16 on the B200 tier, held at 8 seqs -> its own (B200, 8) class."""
     by_key = modal_app_module.ENGINE_BY_KEY
     assert gpu_for("Qwen/Qwen3.6-35B-A3B") == "B200"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-35B-A3B") is by_key[("B200", 16)]
-    assert by_key[("B200", 16)].pinned_gpu == "B200"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-35B-A3B") is by_key[("B200", 8)]
+    assert by_key[("B200", 8)].pinned_gpu == "B200"
+    # it must NOT share the 16-seq class with the other two tiers.
+    assert by_key[("B200", 8)] is not by_key[("B200", 16)]
 
 
 def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module):
@@ -789,7 +798,7 @@ def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path
     assert args.max_loras == 16
     assert args.max_lora_rank == 128
     assert args.max_model_len == 32768
-    assert args.max_num_seqs == 8
+    assert args.max_num_seqs == 16
     assert args.gpu_memory_utilization == 0.90  # 0.90 leaves CUDA-graph capture headroom (was 0.98)
     assert args.enforce_eager is False  # CUDA graphs ON: ~10x faster decode on the hybrid GDN model
     assert getattr(args, "max_num_batched_tokens", None) is None

@@ -73,7 +73,14 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_loras": 16,
             "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (cheap on the 9 GiB FP8 9B); 32k context.
             "max_model_len": 32768,
-            "max_num_seqs": 8,
+            # 16, not 8. modal admission is now sized 1:1 to this number (see _engine_concurrency),
+            # so this IS the container's throughput. the cost of a slot on this hybrid model is its
+            # per-sequence GatedDeltaNet recurrent state, which is allocated per slot and is CONSTANT
+            # in context length (~49 MiB/seq across the 24 linear layers, roughly 50x the logits
+            # buffer) -- so 8 extra slots is well under a GiB on a 180 GiB B200, against 48 GiB on
+            # the L40S this tier used to run. verify on the tier's cold-boot canary: the figure is
+            # derived from the published config shapes, not read from vLLM's allocator.
+            "max_num_seqs": 16,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },
@@ -118,6 +125,11 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "enforce_eager": False,
             # Startup memory-profiling runs max_num_seqs sequences; cap low so the 248k-vocab logits +
             # all-expert MoE activations don't spike the profiling peak.
+            # HELD AT 8 while the 9B and 27B go to 16. this is the one tier whose profiling peak is a
+            # documented OOM hazard (see boot.py), and at p99 it is KV-bound rather than state-bound
+            # (~85 MiB/seq of KV at an 8,712-token p99, on top of ~61 MiB/seq of recurrent state), so
+            # raising it is not the sub-GiB change it is on the 9B. it needs its own real-GPU canary
+            # before it moves; do not raise it on the strength of the other two tiers.
             "max_num_seqs": 8,
             "reasoning_parser": "qwen3",
             # NB: the vision encoder is now LOADED (no language_model_only) — flash adapters adapt the
@@ -127,7 +139,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
             # carried to the 180 GiB B200.
         },
     },
-    # 27B dense on an H100 (80 GiB). the real-GPU canary measured the load at 44.25 GiB -- above the
+    # 27B dense, now on a B200 (180 GiB). the H100 (80 GiB) real-GPU canary measured the load at 44.25 GiB -- above the
     # FP8 weight size alone, because the vision tower and the non-quantized tensors stay bf16 -- which
     # still leaves 23.07 GiB of KV cache (350,981 tokens, 10.71x concurrency at 32k) after the 16
     # rank-64 LoRA buffers and a 0.35 GiB graph capture. every repository here is pinned to an
@@ -147,7 +159,10 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_loras": 16,
             "max_lora_rank": 64,
             "max_model_len": 32768,
-            "max_num_seqs": 8,
+            # 16, matching the 9B: dense (no MoE activation spike) and the B200 more than doubles the
+            # 80 GiB H100 this was canaried on, where 23.07 GiB of KV already gave 10.71x concurrency
+            # at 32k. confirm on the B200 canary.
+            "max_num_seqs": 16,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },

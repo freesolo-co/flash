@@ -353,17 +353,27 @@ from flash.serving.src.engine.model_config import (  # noqa: E402
 
 
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
-    """(max_inputs, target_inputs) sized to the model's REAL vLLM concurrency (``max_num_seqs``).
+    """(max_inputs, target_inputs) sized 1:1 to the model's REAL vLLM concurrency (``max_num_seqs``).
 
-    Modal's ``max_inputs`` is how many requests it packs onto ONE container before it must add
-    another. If it far exceeds the engine's ``max_num_seqs`` (e.g. the global 64 on the 35B, which
-    decodes only 8 at a time), Modal piles requests 9..64 INSIDE the container instead of autoscaling
-    — high latency and no scale-out until ~target_inputs are packed. So cap ``max_inputs`` near the
-    engine's capacity with a small boot buffer (2x, so a cold-booting replacement doesn't reject
-    bursts), bounded by the global ``MAX_INPUTS``; scale out at 3/4 of that. Models that leave
-    ``max_num_seqs`` at the vLLM default keep the global sizing."""
-    seqs = int(engine_overrides_for(base_model).get("max_num_seqs", MAX_INPUTS))
-    max_inputs = max(8, min(MAX_INPUTS, seqs * 2))
+    Modal's ``max_inputs`` counts REQUESTS packed onto one container; vLLM's ``max_num_seqs`` is how
+    many sequences that container can actually decode at once. When admission exceeds decode capacity,
+    Modal piles the surplus INSIDE the container instead of adding one, and scale-out waits for
+    ``target_inputs``. The old 2x buffer admitted 16 onto every 8-sequence engine: the loadtest
+    measured a 1.98-2.13x per-request slowdown with container throughput flat at 1.01x, i.e. pure
+    queueing, and the wait showed up in TTFT rather than in per-request tok/s.
+
+    So admit exactly what the engine decodes and scale out at 3/4 of that. Throughput is raised by
+    lifting the ENGINE cap (``max_num_seqs`` in model_config) rather than by over-admitting against a
+    fixed one. Models that leave ``max_num_seqs`` at the vLLM default keep the global sizing.
+
+    Caveat this deliberately does not cover: OpenAI ``n`` can fan one request out to as many as four
+    sequences, so an all-``n=4`` workload still queues behind the sequence budget. Sizing every
+    container for that rare worst case would leave ordinary ``n=1`` traffic underutilizing the GPU and
+    cold-booting expensive replicas early, so the common case wins here."""
+    configured = engine_overrides_for(base_model).get("max_num_seqs")
+    if configured is None:
+        return MAX_INPUTS, TARGET_INPUTS
+    max_inputs = max(1, min(MAX_INPUTS, int(configured)))
     target_inputs = max(1, max_inputs * 3 // 4)
     return max_inputs, target_inputs
 
