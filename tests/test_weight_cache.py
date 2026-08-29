@@ -752,13 +752,13 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
 # lifecycle._drop_weight_cache + the no-capacity fallback
 # ---------------------------------------------------------------------------
 def test_drop_weight_cache_clears_volume():
-    from flash.runner.supervise.lifecycle import _drop_weight_cache
+    from flash.runner.supervise.retry_decision import _drop_weight_cache
 
     assert _drop_weight_cache(_vol_spec()).gpu.network_volume is None
 
 
 def test_drop_weight_cache_noop_without_volume():
-    from flash.runner.supervise.lifecycle import _drop_weight_cache
+    from flash.runner.supervise.retry_decision import _drop_weight_cache
 
     spec = JobSpec(model="m")
     assert _drop_weight_cache(spec) is spec  # no copy when there's nothing to drop
@@ -769,7 +769,7 @@ def test_drop_weight_cache_preserves_non_shared_escape_hatch_volume():
     # that is the deliberate escape-hatch isolation the run opted into. Only the SHARED
     # platform cache (WEIGHT_CACHE_VOLUME_NAME) is dropped.
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
-    from flash.runner.supervise.lifecycle import _drop_weight_cache
+    from flash.runner.supervise.retry_decision import _drop_weight_cache
 
     custom = _vol_spec(name="org-1234-private")
     assert custom.gpu.network_volume != WEIGHT_CACHE_VOLUME_NAME

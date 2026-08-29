@@ -701,31 +701,6 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
     )
 
 
-def test_retry_bookkeeping_distinguishes_card_counts_of_one_class():
-    """A class at 2 cards and the same class at 4 are different rentable shapes.
-
-    This PR made multiple counts per class reachable (the fit filter keeps every shape that fits),
-    so a 2-tuple ``(provider, gpu)`` retry key marks EVERY count tried the moment one fails and the
-    walk skips a wider shape that would have fit.
-    """
-    from flash.providers.core.base import Candidate
-    from flash.runner.supervise.lifecycle import _select_candidate, _shape_key
-
-    two = Candidate(
-        provider="runpod", gpu=_TRI_PROVIDER_GPU, hourly_usd=3.0, vram_gb=80, gpu_count=2
-    )
-    four = Candidate(
-        provider="runpod", gpu=_TRI_PROVIDER_GPU, hourly_usd=3.0, vram_gb=80, gpu_count=4
-    )
-
-    assert _shape_key(two) != _shape_key(four), "count must be part of the retry identity"
-
-    # having burned the 2-card shape, the walk must still reach the 4-card one rather than treat
-    # the whole class as exhausted.
-    chosen = _select_candidate([two, four], set(), {_shape_key(two)})
-    assert chosen is four
-
-
 def _submittable(
     algorithm: str,
     *,

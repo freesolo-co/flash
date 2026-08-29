@@ -31,7 +31,7 @@ from flash.providers.runpod.serverless.endpoints import (
     _select_endpoint_resources,
     endpoint_name,
 )
-from tests._helpers.runner import provisioned_status
+from tests._helpers.runner import provisioned_status, save_provisioned_status
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 _RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
@@ -47,6 +47,12 @@ def _remote(endpoint_id, job_id, attempt):
         "job_id": job_id,
         "attempt": attempt,
         "started_ts": float(attempt + 1),
+        # a live persisted handle carries the token that authorized its attempt and the allocation
+        # stamp retry reconstructs its candidate from. both are written by the same persist.
+        "launch_claim_token": f"token-{endpoint_id}-{attempt}",
+        "allocated_gpu": "RTX 5090",
+        "allocated_gpu_count": 1,
+        "allocated_usable_vram_gb": 32.0,
     }
 
 
@@ -792,7 +798,16 @@ def test_cancel_run_failed_teardown_does_not_replace_racing_public_remote(tmp_pa
 
     assert out.state == "cancelled"
     assert raw["remote"] == replacement_remote
-    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [original_remote, replacement_remote]
+    # cleanup records are canonical teardown identities, not launch authorizations: the launch
+    # token and the allocation stamp are both dropped by the provider handle canonicalization.
+    from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
+
+    assert raw[runner_state._CLEANUP_REMOTES_KEY] == [
+        RunpodJobHandle.from_dict(remote).to_dict()
+        for remote in (original_remote, replacement_remote)
+    ]
+    for record in raw[runner_state._CLEANUP_REMOTES_KEY]:
+        assert "launch_claim_token" not in record
 
 
 def test_cancel_run_marks_billing_failed_when_pricing_falls_back(tmp_path, monkeypatch):
@@ -935,7 +950,7 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
     spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-recover-active"})
     st = provisioned_status(spec, state="running", remote=_remote("ep-1", "job-1", 0))
     st.source_snapshot = _SOURCE_SNAPSHOT
-    runner_state._save_status(st)
+    save_provisioned_status(st)
 
     training_calls = {"n": 0}
     monkeypatch.setattr(
@@ -952,7 +967,9 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
 
     out = runner_attach.attach_run(spec.run_id)
     assert training_calls["n"] == 1, "a still-active run must resume training (no regression)"
-    assert out.state == "running"
+    # the replacement attempt is reserved as `provisioning`; the real `_run_training` (stubbed
+    # here) is what flips it back to `running`. what matters is that the run stays live.
+    assert out.state not in runner_state.TERMINAL_STATES
 
 
 def test_run_training_bails_on_terminal_before_paid_work(tmp_path, monkeypatch):
