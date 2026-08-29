@@ -151,6 +151,13 @@ def parse_qwen3_coder_output(
     opener_positions: dict[str, list[int]] = {}
     for match in _PARAMETER_OPEN_RE.finditer(text, first, len(text)):
         opener_positions.setdefault(match[1], []).append(match.start())
+    # the ownership pass below re-parses each candidate against every later boundary, so its
+    # work is quadratic in candidates while the text grows only linearly with them. a call
+    # whose own string argument repeats the boundary text therefore falls back to exact text
+    # once it carries about seven repetitions. that is a deliberate limit, not an oversight:
+    # the same quadratic cost is what a dense run of invalid candidates buys, so no budget
+    # admits the honest case indefinitely without also funding the adversarial one. the
+    # fallback is lossless, so the cost of the limit is a structured call becoming exact text.
     work = [min(16 * 1024 * 1024, 4 * len(text))]
     confirmed = [len(text)]
     parsed: list[tuple[str, dict[str, Any]]] = []

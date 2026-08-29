@@ -917,6 +917,51 @@ def _structural_string_call() -> str:
     )
 
 
+def _repeated_boundary_call(repeats: int) -> str:
+    """one valid call whose own argument repeats the full call-boundary text."""
+    boundary = "</function></tool_call><tool_call><function=store>"
+    argument = json.dumps({"text": "x" + boundary * repeats})
+    return (
+        f"<tool_call><function=store><parameter=nested>{argument}</parameter>"
+        "</function></tool_call>"
+    )
+
+
+@pytest.mark.parametrize(
+    ("repeats", "parses"),
+    [(1, True), (6, True), (7, False), (20, False)],
+    ids=["single", "last-parsed", "first-fallback", "well-past"],
+)
+def test_boundary_text_inside_an_argument_falls_back_past_the_work_budget(
+    repeats: int, parses: bool
+) -> None:
+    """a boundary repeated inside an argument costs quadratic ownership work, then falls back.
+
+    candidate discovery stays context blind because a boundary inside a string value is only
+    distinguishable from a real one by parsing it, which is what the ownership pass does.
+    that pass re-parses each candidate against every later boundary, so its work grows with
+    the square of the candidates while the text grows only linearly: six repetitions parse
+    and seven do not.
+
+    widening the budget to admit more of them was tried and reverted. the honest case and a
+    dense run of invalid candidates consume the same quadratic work, so any budget that
+    accepts more valid repetitions funds the adversarial case by the same factor, as
+    ``test_dense_invalid_declared_candidates_have_bounded_segmentation_work`` pins. the
+    fallback is lossless, so the limit costs a structured call, never the content.
+    """
+    text = _repeated_boundary_call(repeats)
+
+    result = parse_qwen3_coder_output(text, _delimiter_tools(), id_factory=lambda: "call_fixed")
+
+    if not parses:
+        assert result.calls == ()
+        assert result.content == text
+        return
+
+    boundary = "</function></tool_call><tool_call><function=store>"
+    assert json.loads(result.calls[0].arguments) == {"nested": {"text": "x" + boundary * repeats}}
+
+
 def test_unconstrained_string_preserves_structural_function_close_text() -> None:
     result = parse_qwen3_coder_output(
         _structural_string_call(),

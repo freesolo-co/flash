@@ -547,7 +547,10 @@ class _InexactTemplateNumber(ValueError):
 
 def _native_json_value(value: Any) -> Any:
     if type(value) is Decimal:
-        if _decimal_is_integral(value):
+        # negative zero is integral, but ``int`` drops the sign and would replay ``-0.0`` as
+        # ``0``. the float path below carries it: ``float`` keeps the sign and the template
+        # renders it back as ``-0.0``, so let signed zero fall through to it.
+        if _decimal_is_integral(value) and not (value.is_zero() and value.is_signed()):
             digits, exponent = value.as_tuple().digits, value.as_tuple().exponent
             expanded_digits = 1 if value.is_zero() else len(digits) + exponent
             if expanded_digits > _MAX_FIXED_DECIMAL_DIGITS:

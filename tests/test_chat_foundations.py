@@ -846,7 +846,7 @@ def test_oversized_integer_tool_history_is_a_request_error(argument: str) -> Non
         ('{"values":[1e1024,2]}', "[1e+1024, 2]"),
         ('{"pair":{"a":1e1024,"b":2}}', '{"a": 1e+1024, "b": 2}'),
         ('{"mixed":{"trailing":1.2300,"huge":1e1024}}', '{"trailing": 1.23, "huge": 1e+1024}'),
-        ('{"signed":{"zero":-0.0,"huge":1e1024}}', '{"zero": 0, "huge": 1e+1024}'),
+        ('{"signed":{"zero":-0.0,"huge":1e1024}}', '{"zero": -0.0, "huge": 1e+1024}'),
         ('{"enabled":true}', "true"),
         ('{"disabled":false}', "false"),
         ('{"value":null}', "null"),
@@ -912,6 +912,56 @@ def test_contained_boolean_and_null_history_keeps_native_values(
     value = next(iter(values.values()))
     assert not isinstance(value, str)
     assert json.dumps(value, ensure_ascii=False) == rendered
+
+
+@pytest.mark.parametrize(
+    ("argument", "rendered"),
+    [
+        ('{"zero":-0.0}', "-0.0"),
+        ('{"nested":{"zero":-0.0}}', '{"zero": -0.0}'),
+        # the positive zero alongside it still collapses to an integer, which is what makes
+        # this pair show that only the sign, not the decimal point, is what gets preserved.
+        ('{"listed":[-0.0,0.0]}', "[-0.0, 0]"),
+    ],
+    ids=["scalar", "nested", "listed"],
+)
+def test_negative_zero_history_keeps_its_sign(argument: str, rendered: str) -> None:
+    """a negative zero must replay as ``-0.0``, not as ``0``.
+
+    ``-0.0`` is integral, so the decimal path used to hand it to ``int`` and drop the sign,
+    showing the model a different prior call than the one flash emitted. ``float`` carries
+    the sign and renders it back exactly, so signed zero takes that path instead. positive
+    zero has no sign to lose and stays an integer.
+    """
+    normalized = parse_chat_request(
+        {"messages": _historical_tool_messages(argument)},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    detached = detached_template_messages(normalized.messages)
+    values = detached[0]["tool_calls"][0]["function"]["arguments"]
+    value = next(iter(values.values()))
+    assert not isinstance(value, str)
+    assert json.dumps(value, ensure_ascii=False) == rendered
+
+
+def test_positive_zero_history_stays_an_integer() -> None:
+    """the control for ``test_negative_zero_history_keeps_its_sign``.
+
+    without this, widening the integral branch to send every zero through ``float`` would
+    pass the signed-zero test while silently changing ``0`` into ``0.0`` for everyone else.
+    """
+    normalized = parse_chat_request(
+        {"messages": _historical_tool_messages('{"zero":0.0}')},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    detached = detached_template_messages(normalized.messages)
+    value = next(iter(detached[0]["tool_calls"][0]["function"]["arguments"].values()))
+    assert value == 0
+    assert type(value) is int
 
 
 @pytest.mark.parametrize("argument", ['{"text":"\\ud800"}', '{"text":"\\udc00"}'])
