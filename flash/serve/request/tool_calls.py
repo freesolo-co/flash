@@ -523,7 +523,15 @@ def _dump_template_json(value: Any) -> str:
             for key, item in value.items()
         )
         return "{" + ", ".join(members) + "}"
-    return _dump_exact_json(value)
+    try:
+        # a leaf the template can carry natively must render exactly as it would have
+        # without the inexact sibling that forced this container to be pre-rendered.
+        # dumping every leaf exactly instead would make one argument's spelling depend
+        # on another's magnitude, so ``1.2300`` would keep its trailing zeros and
+        # ``-0.0`` its sign only when some unrelated value happened to be oversized.
+        return json.dumps(_native_json_value(value), ensure_ascii=False)
+    except _InexactTemplateNumber:
+        return _dump_exact_json(value)
 
 
 class _InexactTemplateNumber(ValueError):

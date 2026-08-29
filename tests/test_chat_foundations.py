@@ -845,8 +845,10 @@ def test_oversized_integer_tool_history_is_a_request_error(argument: str) -> Non
         ('{"nested":{"value":1e1024}}', '{"value": 1e+1024}'),
         ('{"values":[1e1024,2]}', "[1e+1024, 2]"),
         ('{"pair":{"a":1e1024,"b":2}}', '{"a": 1e+1024, "b": 2}'),
+        ('{"mixed":{"trailing":1.2300,"huge":1e1024}}', '{"trailing": 1.23, "huge": 1e+1024}'),
+        ('{"signed":{"zero":-0.0,"huge":1e1024}}', '{"zero": 0, "huge": 1e+1024}'),
     ],
-    ids=["direct", "nested", "list", "pair"],
+    ids=["direct", "nested", "list", "pair", "mixed-native-leaf", "mixed-signed-zero"],
 )
 def test_compact_exponent_tool_history_renders_without_expanding(
     argument: str, rendered: str
