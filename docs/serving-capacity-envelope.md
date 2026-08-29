@@ -91,6 +91,15 @@ and ~$20 including canaries and one failed boot:
 `test_the_planned_sweep_costs_what_the_plan_quoted` pins those numbers against the pricing code, so
 the quote presented for authorization is reproducible from the code that would spend.
 
+Those are EXPECTED costs: cells that meet their floors early exit early, and a boot that works takes
+nothing like its permitted ceiling. The `--ceiling-usd` figures under "Running it" are a different
+quantity and are deliberately much larger, because a reservation must be wrong in the direction that
+refuses a run rather than the direction that overspends. Every cell is priced at its bucket's
+`max_seconds`, every request at `REQUEST_TIMEOUT_SECONDS`, and the boot at the full
+`STARTUP_TIMEOUT_SECONDS` a stuck boot is allowed to bill. Authorizing the expected ~$8 while
+passing a ceiling that only covers ~$8 would refuse the run before it allocated; authorize against
+the reservation and expect to be billed the smaller number.
+
 When the sweep runs, the tables land here — one per model, one row per bucket and concurrency
 point, plus the derived curve (`throughput_ceiling_tokens_per_second`, `knee_concurrency`,
 `saturation_concurrency`).
