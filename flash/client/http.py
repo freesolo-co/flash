@@ -442,6 +442,36 @@ class ApiClient:
                 return _read_capped_response(resp, max_bytes)
             return resp.read()
 
+    def _paged(self, path: str, field: str, timeout: float | None = None) -> list[dict]:
+        """Follow a listing's cursors to completion, returning every item in server order.
+
+        The server bounds how much work one request may do; it does not truncate the listing. That
+        distinction is the caller's contract: `deployments()` consumers scan the result for a run id
+        and would silently report a run as absent if a page were mistaken for the whole answer.
+
+        A server that keeps handing back a cursor would page forever, so the walk stops if a cursor
+        ever repeats -- an unadvancing cursor cannot produce new items, and looping on it would hang
+        the CLI instead of failing it.
+        """
+        items: list[dict] = []
+        seen: set[str] = set()
+        cursor: str | None = None
+        while True:
+            query = f"?cursor={urllib.parse.quote(cursor, safe='')}" if cursor else ""
+            page = self._request(
+                "GET",
+                f"{path}{query}",
+                timeout=timeout,
+                require={field: [dict]},
+            )
+            items.extend(page[field])
+            cursor = page.get("next_cursor")
+            if not isinstance(cursor, str) or not cursor:
+                return items
+            if cursor in seen:
+                raise ClientError(f"{path} paged with a repeating cursor")
+            seen.add(cursor)
+
     def me(self) -> dict:
         return self._request("GET", "/v1/me")
 
@@ -561,7 +591,7 @@ class ApiClient:
         return self._request("POST", "/v1/runs", body=body, require={"run_id": str})
 
     def list_runs(self) -> list[dict]:
-        return self._request("GET", "/v1/runs", require={"runs": [dict]})["runs"]
+        return self._paged("/v1/runs", "runs")
 
     def get_run(self, run_id: str) -> dict:
         return self._request("GET", f"/v1/runs/{run_id}")
@@ -669,9 +699,7 @@ class ApiClient:
         return self._request("DELETE", f"/v1/runs/{run_id}/deploy?checkpoint_id={quoted}")
 
     def deployments(self, timeout: float | None = None) -> list[dict]:
-        return self._request(
-            "GET", "/v1/deployments", timeout=timeout, require={"deployments": [dict]}
-        )["deployments"]
+        return self._paged("/v1/deployments", "deployments", timeout=timeout)
 
     def _serving_deployment(
         self,

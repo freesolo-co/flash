@@ -3681,7 +3681,7 @@ def test_recover_deployments_recovers_busy_states_on_startup_regardless_of_age(
     marked = []
     reported = []
     monkeypatch.setattr(
-        serving.db,
+        _db_mod,
         "all_runs",
         lambda: [{"run_id": status.run_id} for status in statuses.values()],
     )
@@ -4040,7 +4040,7 @@ def test_replay_status_reports_mirrors_all_persisted_outcomes_sequentially(monke
     complete = SimpleNamespace(run_id="run-complete", deployment=None)
     reported = []
     monkeypatch.setattr(
-        serving.db, "all_runs", lambda: [{"run_id": "run-ready"}, {"run_id": "run-complete"}]
+        _db_mod, "all_runs", lambda: [{"run_id": "run-ready"}, {"run_id": "run-complete"}]
     )
     monkeypatch.setattr(
         serving._app,
@@ -4068,7 +4068,7 @@ def test_replay_status_reports_skips_unreadable_records_and_continues(monkeypatc
         "run-last": last,
     }
     reported = []
-    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": run_id} for run_id in outcomes])
+    monkeypatch.setattr(_db_mod, "all_runs", lambda: [{"run_id": run_id} for run_id in outcomes])
 
     def get_status(run_id):
         outcome = outcomes[run_id]
@@ -4104,7 +4104,7 @@ def test_replay_status_reports_repairs_malformed_report_sequence_and_continues(m
     )
     statuses = {status.run_id: status for status in (malformed, valid)}
     delivered = []
-    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": key} for key in statuses])
+    monkeypatch.setattr(_db_mod, "all_runs", lambda: [{"run_id": key} for key in statuses])
     monkeypatch.setattr(serving._app, "get_status", statuses.__getitem__)
     monkeypatch.setattr(runner_reporting, "_send_status_report", delivered.append)
 
@@ -4128,7 +4128,7 @@ def test_replay_status_reports_stops_between_items(monkeypatch):
         "run-b": SimpleNamespace(run_id="run-b"),
     }
     reported = []
-    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": key} for key in statuses])
+    monkeypatch.setattr(_db_mod, "all_runs", lambda: [{"run_id": key} for key in statuses])
     monkeypatch.setattr(serving._app, "get_status", statuses.__getitem__)
 
     def report(status):
@@ -4149,7 +4149,7 @@ def test_replay_status_reports_continues_after_report_failure(monkeypatch):
     statuses = {status.run_id: status for status in (failing, valid)}
     reported = []
     monkeypatch.setattr(
-        serving.db,
+        _db_mod,
         "all_runs",
         lambda: [{"run_id": run_id} for run_id in statuses],
     )
@@ -4272,7 +4272,7 @@ def test_legacy_replay_sequence_advances_first_post_restart_save(api, monkeypatc
     ):
         values.pop(run_id, None)
     reported = []
-    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": run_id}])
+    monkeypatch.setattr(_db_mod, "all_runs", lambda: [{"run_id": run_id}])
     monkeypatch.setattr(
         runner_reporting, "_send_status_report", lambda status: reported.append(status) or True
     )

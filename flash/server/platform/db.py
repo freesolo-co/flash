@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_key_idx ON runs(key_id);
+CREATE INDEX IF NOT EXISTS runs_key_page_idx ON runs(key_id, created_at, run_id);
 CREATE TABLE IF NOT EXISTS teacher_capabilities (
   id                    INTEGER PRIMARY KEY AUTOINCREMENT,
   token_hash            TEXT NOT NULL UNIQUE,
@@ -382,13 +383,27 @@ def run_owner(run_id: str) -> int | None:
         return row["key_id"] if row else None
 
 
-def runs_for_key(key_id: int) -> list[dict]:
+def runs_for_key(
+    key_id: int, *, after: tuple[float, str] | None = None, limit: int = 0
+) -> list[dict]:
+    """One owner's runs in creation order, optionally as a bounded keyset page.
+
+    `created_at` alone is not a unique key: two runs recorded inside the same clock tick share it,
+    and paging on a non-unique column either repeats or skips the tied rows. The key is the
+    `(created_at, run_id)` pair, which the primary key makes unique, so `after` names the exact row
+    the previous page ended on rather than a timestamp that may match several.
+    """
+    query = "SELECT run_id, kind, created_at FROM runs WHERE key_id = ?"
+    params: list[object] = [key_id]
+    if after is not None:
+        query += " AND (created_at, run_id) > (?, ?)"
+        params.extend(after)
+    query += " ORDER BY created_at, run_id"
+    if limit > 0:
+        query += " LIMIT ?"
+        params.append(limit)
     with _connect() as conn:
-        rows = conn.execute(
-            "SELECT run_id, kind, created_at FROM runs WHERE key_id = ? ORDER BY created_at",
-            (key_id,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in conn.execute(query, params).fetchall()]
 
 
 def all_runs() -> list[dict]:
