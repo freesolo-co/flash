@@ -35,6 +35,7 @@ from flash.serve.runtime import (
 )
 from flash.serve.runtime.multimodal import prepare_multimodal_request
 from flash.serve.runtime.prompt import PromptPreparer, resolve_thinking
+from flash.serve.runtime.tool_calls import parse_qwen3_coder_output
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}}
@@ -921,6 +922,75 @@ def _runtime_tools():
             }
         ]
     )
+
+
+def _container_tools():
+    return normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "record",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"rows": {"type": "array", "items": {"type": "string"}}},
+                        "required": ["rows"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+
+
+def _container_call(argument: str) -> str:
+    return (
+        "<tool_call>\n<function=record>\n<parameter=rows>\n"
+        f"{argument}\n</parameter>\n</function>\n</tool_call>"
+    )
+
+
+@pytest.mark.parametrize(
+    ("argument", "expected"),
+    [
+        ('["plain"]', ["plain"]),
+        # the end token inside a string literal does not close the value, so the parse must run
+        # past it to the real one. a scan that hops between quotes has to keep this property.
+        ('["</parameter>"]', ["</parameter>"]),
+        ('["a", "</parameter>", "b"]', ["a", "</parameter>", "b"]),
+        # an escaped quote does not leave the string, so the token after it is still quoted.
+        (r'["a\"</parameter>"]', ['a"</parameter>']),
+        # the escape is itself escaped, so the next quote does close the string.
+        (r'["a\\", "</parameter>"]', ["a\\", "</parameter>"]),
+        # many short strings before the token, which is where a per-segment research would
+        # degrade even though the verdict stays correct.
+        ('["x", "x", "x", "x", "x", "x", "x", "x"]', ["x"] * 8),
+    ],
+    ids=["plain", "quoted-token", "token-between", "escaped-quote", "escaped-escape", "segments"],
+)
+def test_a_json_container_argument_ends_at_the_unquoted_token(
+    argument: str, expected: object
+) -> None:
+    """the end token counts only outside a string literal, whatever the scan strategy is."""
+    result = parse_qwen3_coder_output(_container_call(argument), _container_tools())
+
+    assert [call.name for call in result.calls] == ["record"]
+    assert json.loads(result.calls[0].arguments) == {"rows": expected}
+
+
+@pytest.mark.parametrize(
+    "argument",
+    ['["unterminated', '["a", "b"', '["a"] trailing'],
+    ids=["unterminated-string", "unterminated-array", "no-end-token"],
+)
+def test_a_json_container_argument_without_an_unquoted_token_is_not_a_call(argument: str) -> None:
+    """no end token outside a string means no complete call, so the text survives verbatim."""
+    text = _container_call(argument).removesuffix("\n</parameter>\n</function>\n</tool_call>")
+
+    result = parse_qwen3_coder_output(text, _container_tools())
+
+    assert result.calls == ()
+    assert result.content == text
 
 
 @pytest.mark.parametrize(

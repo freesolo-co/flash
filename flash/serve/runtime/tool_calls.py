@@ -475,21 +475,36 @@ def _bounded_parameter_end(text: str, cursor: int, work: list[int]) -> int | obj
 
 
 def _find_json_container_end(text: str, cursor: int, work: list[int]) -> int | object:
-    start = cursor
-    in_string = False
-    escaped = False
+    """offset of the end token that closes a json value, skipping one inside a string literal.
+
+    only a quote can change whether the end token counts, so the scan hops between quotes natively
+    instead of stepping per character. a replay argument runs to the megabytes and this parses on the
+    request path, so stepping would hold the event loop for seconds. the end token's position is
+    monotone in the cursor, so it is located once and only relocated after the cursor passes it,
+    which keeps a payload of many short strings linear rather than one search per segment.
+    """
+    start, in_string = cursor, False
+    closing = text.find(_PARAMETER_END, cursor)
     while cursor < len(text):
-        character = text[cursor]
-        if escaped:
-            escaped = False
-        elif in_string and character == "\\":
-            escaped = True
-        elif character == '"':
-            in_string = not in_string
-        elif not in_string and text.startswith(_PARAMETER_END, cursor):
-            scanned = cursor - start + len(_PARAMETER_END)
-            return cursor if _consume_work(work, scanned) else _EXHAUSTED
-        cursor += 1
+        quote = text.find('"', cursor)
+        if in_string:
+            if quote < 0:
+                break
+            # a quote closes the string only when the backslashes before it pair off entirely.
+            run = quote
+            while run > cursor and text[run - 1] == "\\":
+                run -= 1
+            in_string = (quote - run) % 2 == 1
+            cursor = quote + 1
+            continue
+        if 0 <= closing < cursor:
+            closing = text.find(_PARAMETER_END, cursor)
+        if closing >= 0 and (quote < 0 or closing < quote):
+            scanned = closing - start + len(_PARAMETER_END)
+            return closing if _consume_work(work, scanned) else _EXHAUSTED
+        if quote < 0:
+            break
+        cursor, in_string = quote + 1, True
     return -1 if _consume_work(work, len(text) - start) else _EXHAUSTED
 
 

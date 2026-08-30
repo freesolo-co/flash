@@ -714,6 +714,32 @@ def test_the_surrogate_boundary_matches_what_utf_8_refuses_to_encode(codepoint: 
         assert normalize_tools(declaration)
 
 
+def test_an_ascii_declaration_is_settled_without_scanning_for_surrogates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """the ascii flag settles the common declaration, so the range scan never runs on it.
+
+    the verdict alone cannot show this: scanning every argument returns the same answer, only
+    slower, so without a spy the fast path could be dropped and every test would still pass.
+    """
+    searched: list[str] = []
+    real = request_tool_calls_module._SURROGATE_RANGE
+
+    class _CountingRange:
+        def search(self, value: str) -> object:
+            searched.append(value)
+            return real.search(value)
+
+    monkeypatch.setattr(request_tool_calls_module, "_SURROGATE_RANGE", _CountingRange())
+
+    assert normalize_tools(_unicode_declaration("function-description", "plain ascii only"))
+    assert searched == []
+
+    # a non-ascii declaration still has to be scanned, or the guard would be skipping real work.
+    assert normalize_tools(_unicode_declaration("function-description", "réponse détaillée"))
+    assert "réponse détaillée" in searched
+
+
 @pytest.mark.parametrize("order", [(0xD800, 0xDC00), (0xDC00, 0xD800)])
 def test_adjacent_raw_surrogate_code_units_are_still_unpaired(order: tuple[int, int]) -> None:
     # two raw surrogate code units side by side are not a non-bmp character: the pair only exists
