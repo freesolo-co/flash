@@ -10,12 +10,14 @@ from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 from PIL import Image
 from pydantic import ValidationError
 
 import flash.serve.request.openai as openai_module
+import flash.serve.request.text_scan as text_scan
 import flash.serve.request.tool_calls as request_tool_calls_module
 import flash.serve.runtime.tool_calls as tool_calls_module
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
@@ -4040,3 +4042,61 @@ def test_generated_oversize_integer_lexemes_fall_back_without_interpreter_errors
     assert buffered == streamed
     assert buffered.content == text
     assert buffered.calls == ()
+
+
+def test_whitespace_scanning_matches_stepping_and_stays_native() -> None:
+    """the whitespace scan must measure a run natively and keep the stepping semantics exactly.
+
+    a tool declaration reaches the megabytes on the request path, so stepping per character holds
+    the event loop for seconds on a run of spaces. the replacement has to agree with stepping on
+    every input, including the past-the-end cursor that must come back unchanged rather than
+    clamped to the length, because callers compare the returned offset against their own bounds.
+    """
+
+    def stepping(text: str, cursor: int) -> int:
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        return cursor
+
+    # `\s` and `str.isspace` have to accept the same set, or the scan silently reclassifies a
+    # separator. exhaustive over every codepoint rather than sampled.
+    assert not [
+        code
+        for code in range(0x110000)
+        if bool(text_scan._LEADING_WHITESPACE_RE.match(chr(code)).end()) != chr(code).isspace()
+    ]
+
+    alphabet = " \t\n\r\f\v\u00a0\u2003\u3000xy"
+    random.seed(20260830)
+    cases = [("", 0), ("", 5), ("  ", 0), ("  ", 2), ("  ", 9), ("x", 1), ("x", 99), ("  a", 0)]
+    cases += [
+        (
+            "".join(random.choice(alphabet) for _ in range(random.randint(0, 14))),
+            random.randint(0, 16),
+        )
+        for _ in range(20_000)
+    ]
+    assert not [
+        (text, cursor)
+        for text, cursor in cases
+        if text_scan.skip_whitespace(text, cursor) != stepping(text, cursor)
+    ]
+
+    # a cursor past the end returns the cursor, not the length. stepping never moved it, and a
+    # clamp here would silently rewrite an out-of-range offset into a valid-looking one.
+    assert text_scan.skip_whitespace("ab", 7) == 7
+
+    # the run is measured in one match rather than one per character, which is the regression
+    # this guards: stepping over this many spaces costs seconds on the request path.
+    calls = 0
+    pattern = text_scan._LEADING_WHITESPACE_RE
+
+    class _CountingPattern:
+        def match(self, text: str, position: int):
+            nonlocal calls
+            calls += 1
+            return pattern.match(text, position)
+
+    with mock.patch.object(text_scan, "_LEADING_WHITESPACE_RE", _CountingPattern()):
+        assert text_scan.skip_whitespace(" " * 2_000_000 + "x", 0) == 2_000_000
+    assert calls == 1, calls

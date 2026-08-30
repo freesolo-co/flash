@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from decimal import DecimalException
 from typing import Any, NamedTuple
 
+from flash.serve.request.text_scan import skip_whitespace as _skip_whitespace
 from flash.serve.request.tool_calls import (
     _FUNCTION_END,
     _FUNCTION_START,
@@ -25,7 +26,6 @@ from flash.serve.request.tool_calls import (
     _json_values_equal,
     _load_exact_json,
     _matches_type,
-    _skip_whitespace,
     _validate_tool_argument_complexity,
 )
 from flash.serve.request.validation import MAX_MESSAGE_NODES

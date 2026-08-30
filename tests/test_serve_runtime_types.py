@@ -8,6 +8,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from collections import UserDict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -1054,8 +1055,17 @@ def test_an_unterminated_escaped_string_settles_without_backtracking(
     and never consults the pattern at all, which would leave this asserting nothing.
     """
     pattern = runtime_tool_calls._STRING_BODY_RE
-    # pinned exactly: dropping either possessive quantifier is the regression this guards.
-    assert pattern.pattern == r'(?:[^"\\]++|\\.)*+"', pattern.pattern
+    # the property, not the spelling: either possessive quantifier alone already makes this
+    # single-pass, so pinning the exact text would fail a valid equivalent. what must hold is that
+    # an unterminated body settles in time that stays linear rather than exploding on the split.
+    scaling = []
+    for width in (2_000, 4_000, 8_000):
+        unterminated = '"' + "a" * width + '\\"' + "b" * width
+        start = time.perf_counter()
+        assert pattern.match(unterminated, 1) is None
+        scaling.append(time.perf_counter() - start)
+    # a backtracking spelling is superlinear here and blows past this long before the last width.
+    assert max(scaling) < 0.5, scaling
 
     matches = 0
 

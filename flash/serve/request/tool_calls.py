@@ -11,6 +11,8 @@ from decimal import Decimal, DecimalException
 from typing import Any
 
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES, TEXT_TYPES
+from flash.serve.request.text_scan import skip_whitespace as _skip_whitespace
+from flash.serve.request.text_scan import strings_overlap as _strings_overlap
 from flash.serve.request.tool_template import last_query_index, rendered_turn_prefix
 
 TOOL_PARSER_QWEN3_CODER = "qwen3_coder"
@@ -146,14 +148,19 @@ def validate_tool_stop_sequences(
     for tool in tools:
         markers.append(f"{_FUNCTION_START}{tool.name}>")
         markers.extend(f"{_PARAMETER_START}{name}>" for name in tool.parameters["properties"])
+    # both checks are predicates on one stop value, so a repeat can only repeat its own verdict,
+    # and `merge_stop_sequences` drops it before generation. bounding the scan by the distinct
+    # values keeps a caller from buying event-loop time by the copy.
+    distinct_stop = dict.fromkeys(stop)
     marker_chars = sum(len(marker) for marker in markers)
-    stop_chars = sum(len(stop_value) for stop_value in stop)
-    if len(stop) * marker_chars + len(markers) * stop_chars > 16 * 1024 * 1024:
+    stop_chars = sum(len(stop_value) for stop_value in distinct_stop)
+    if len(distinct_stop) * marker_chars + len(markers) * stop_chars > 16 * 1024 * 1024:
         raise error_type("active tool stop validation exceeds the supported complexity")
     if any(
-        _strings_overlap(stop_value, marker) for stop_value in stop for marker in markers
+        _strings_overlap(stop_value, marker) for stop_value in distinct_stop for marker in markers
     ) or any(
-        stop_value and _skip_whitespace(stop_value, 0) == len(stop_value) for stop_value in stop
+        stop_value and _skip_whitespace(stop_value, 0) == len(stop_value)
+        for stop_value in distinct_stop
     ):
         raise error_type(
             "stop sequences cannot overlap qwen tool-call grammar markers or whitespace separators "
@@ -975,18 +982,3 @@ def _string_enum_conflicts_with_tool_grammar(value: str) -> bool:
         if value.startswith((_PARAMETER_START, _FUNCTION_END), following):
             return True
         cursor += len(_PARAMETER_END)
-
-
-def _strings_overlap(left: str, right: str) -> bool:
-    if left in right or right in left:
-        return True
-    limit = min(len(left), len(right))
-    return any(
-        left[-size:] == right[:size] or right[-size:] == left[:size] for size in range(1, limit)
-    )
-
-
-def _skip_whitespace(text: str, cursor: int) -> int:
-    while cursor < len(text) and text[cursor].isspace():
-        cursor += 1
-    return cursor

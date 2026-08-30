@@ -13,6 +13,7 @@ from flash.serve.app.openai import nonstream_response
 from flash.serve.deployment import deploy
 from flash.serve.request.openai import (
     OpenAIRequestError,
+    merge_stop_sequences,
     parse_chat_request,
     reject_thinking_logprobs,
 )
@@ -232,7 +233,10 @@ def _wide_tool() -> list[dict]:
 
 
 def test_canonical_active_tool_stop_validation_has_an_aggregate_complexity_bound():
-    stops = ["!" * 4096] * 64
+    # distinct values, because the bound is on the work the scan actually does. a repeated stop
+    # can only repeat its own verdict and is dropped by ``merge_stop_sequences`` before it reaches
+    # generation, so validation deduplicates first and a repeated value buys no work to bound.
+    stops = [f"{index:04d}" + "!" * 4092 for index in range(64)]
 
     with pytest.raises(OpenAIRequestError, match="stop validation exceeds"):
         parse_chat_request(
@@ -242,8 +246,31 @@ def test_canonical_active_tool_stop_validation_has_an_aggregate_complexity_bound
         )
 
 
-def test_canonical_tool_choice_none_bypasses_active_stop_complexity_bound():
+def test_canonical_repeated_stop_values_are_not_charged_to_the_complexity_bound():
+    """a repeated stop must not buy validation work by the copy.
+
+    the scan is a predicate on one stop value, so a duplicate can only repeat its own verdict,
+    and ``merge_stop_sequences`` drops it before generation ever sees it. sending the same value
+    many times must therefore cost what sending it once costs, rather than letting an untrusted
+    caller hold the event loop for the product of the repeat count and the declared markers.
+    """
+    # the same total bytes as the rejected list above, in one repeated value.
     stops = ["!" * 4096] * 64
+
+    request = parse_chat_request(
+        _payload(tools=_wide_tool(), stop=stops),
+        require_model=True,
+        allow_managed_selectors=False,
+    )
+
+    # accepted, and the repeats never reach generation.
+    assert merge_stop_sequences((), request.stop) == ["!" * 4096]
+
+
+def test_canonical_tool_choice_none_bypasses_active_stop_complexity_bound():
+    # distinct for the same reason as the bound test above: a repeated value is deduplicated
+    # before the scan, so it would clear this bound without exercising the bypass.
+    stops = [f"{index:04d}" + "!" * 4092 for index in range(64)]
 
     request = parse_chat_request(
         _payload(tools=_wide_tool(), tool_choice="none", stop=stops),
