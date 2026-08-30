@@ -1013,6 +1013,31 @@ def test_heartbeat_ignores_generation_terminalized_before_terminal_rpc_returns(
     assert outbox._background_error is None
 
 
+def test_background_failure_refuses_new_work_but_still_settles_admitted_work() -> None:
+    """a dead delivery worker must not strand the charge for a request already served.
+
+    admission is the gate that refuses new chargeable traffic. once a request has passed it and
+    generated, the terminal rpcs are idempotent, so refusing to attempt one loses the charge for
+    work the customer already received.
+    """
+
+    event = _usage_event()
+    client = _QueuedClient([(200, [{"state": "completed", "replay": False}])])
+    outbox = DurableUsageOutbox(
+        _outbox_settings(),
+        client=client,
+        worker_id="worker-1",
+    )
+    outbox._background_error = RuntimeError("permanent delivery failure")
+
+    with pytest.raises(UsageOutboxError):
+        outbox.assert_healthy()
+
+    asyncio.run(outbox.finalize(event))
+
+    assert client.calls[-1][0].endswith("/rpc/finalize_serving_usage")
+
+
 def test_shutdown_timeout_is_observable_without_erasing_generation(monkeypatch) -> None:
     import flash.serving.src.accounting.usage_outbox as usage_outbox_module
 

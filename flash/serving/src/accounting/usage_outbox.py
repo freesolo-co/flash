@@ -417,7 +417,9 @@ class DurableUsageOutbox:
     async def _terminal_rpc(
         self, name: str, event: UsageEvent, *, failure_code: str | None = None
     ) -> None:
-        self._raise_background_error()
+        # a background delivery failure refuses NEW work at admission; it must not refuse to
+        # settle work already performed. the terminal rpcs are idempotent, so attempting one after
+        # the worker died is safe, while skipping it drops the charge for a served request.
         request_id = event.identity.request_id
         self._terminal_generations.add(request_id)
         try:
