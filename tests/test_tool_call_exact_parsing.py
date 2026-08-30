@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import time
 from decimal import Decimal
 from itertools import pairwise
 from typing import Any
 
 import pytest
 
+import flash.serve.request.openai as openai_module
 import flash.serve.request.tool_calls as request_tool_calls_module
 import flash.serve.runtime.tool_calls as tool_calls_module
 from flash.serve.request.openai import OpenAIRequestError, parse_chat_request
@@ -993,25 +995,22 @@ def test_whitespace_runs_charge_the_shared_parser_budget(monkeypatch) -> None:
     assert calls * spaces <= charged <= budget + 1
 
 
-def test_unterminated_parameter_openers_charge_before_large_parse(monkeypatch) -> None:
-    charged = 0
-    original = tool_calls_module._consume_work
+def test_unterminated_parameter_openers_charge_before_large_parse() -> None:
+    # measure the whole parse rather than one helper, so an unbudgeted opener scan
+    # reintroduced anywhere on the path still fails this test.
+    def elapsed(count: int) -> float:
+        text = "<tool_call><function=store>" + "<parameter=" * count
+        start = time.perf_counter()
+        result = parse_qwen3_coder_output(text, _delimiter_tools())
+        duration = time.perf_counter() - start
+        assert result.content == text
+        assert result.calls == ()
+        return duration
 
-    def measured(work: list[int], amount: int) -> bool:
-        nonlocal charged
-        charged += amount
-        return original(work, amount)
-
-    monkeypatch.setattr(tool_calls_module, "_consume_work", measured)
-    small = "<tool_call><function=store>" + "<parameter=" * 512
-    work = [4 * len(small)]
-    assert tool_calls_module._index_parameter_openers(small, 0, work) == {}
-    assert charged == len(small)
-
-    large = "<tool_call><function=store>" + "<parameter=" * 12_000
-    result = parse_qwen3_coder_output(large, _delimiter_tools())
-    assert result.content == large
-    assert result.calls == ()
+    baseline = max(elapsed(6_000), 1e-4)
+    # a quadratic opener scan grows about sixteenfold when the input quadruples. anything
+    # near linear stays far below this bound even on a loaded machine.
+    assert elapsed(24_000) < baseline * 8
 
 
 def test_property_opener_rebuilds_stop_at_the_shared_parser_budget(monkeypatch) -> None:
@@ -1172,14 +1171,17 @@ def test_scalar_history_rejects_declared_parameter_injection_that_does_not_round
 
 
 def _measure_history_replay_validation(monkeypatch) -> list[None]:
+    # patch the public entry point where the request path binds it, rather than a private
+    # helper, so reverting the production change fails these cases on replay behavior instead
+    # of on a renamed private symbol.
     calls: list[None] = []
-    original = request_tool_calls_module._validate_template_roundtrip
+    original = openai_module.validate_tool_history_replay
 
     def measured(*args, **kwargs):
         calls.append(None)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(request_tool_calls_module, "_validate_template_roundtrip", measured)
+    monkeypatch.setattr(openai_module, "validate_tool_history_replay", measured)
     return calls
 
 
@@ -1271,6 +1273,54 @@ def test_scalar_history_replay_closure_with_any_current_declaration(
 
     assert validation_calls == [None]
     assert json.loads(request.messages[0]["tool_calls"][0]["function"]["arguments"]) == {"x": value}
+
+
+def _repeated_call_messages(count: int, arguments: dict[str, Any]) -> list[dict[str, Any]]:
+    calls = [
+        {
+            "id": f"call_{index}",
+            "type": "function",
+            "function": {"name": "store", "arguments": json.dumps(arguments)},
+        }
+        for index in range(count)
+    ]
+    return [
+        {"role": "assistant", "content": None, "tool_calls": calls},
+        *({"role": "tool", "tool_call_id": call["id"], "content": "ok"} for call in calls),
+    ]
+
+
+@pytest.mark.parametrize("declaration", ["none", "matched"])
+def test_repeated_calls_that_the_template_renders_ambiguously_are_rejected(
+    declaration: str,
+) -> None:
+    # two identical two-parameter calls render as one block whose second call supplies a
+    # competing assignment for the first, so the parser recovers no calls at all. validating
+    # each call on its own cannot see that, because the ambiguity only exists across calls.
+    payload: dict[str, Any] = {"messages": _repeated_call_messages(2, {"x": "plain", "y": "plain"})}
+    if declaration == "matched":
+        payload["tools"] = tools_wire(_history_replay_tools())
+
+    with pytest.raises(OpenAIRequestError, match="cannot be replayed exactly"):
+        parse_chat_request(payload, require_model=False, allow_managed_selectors=True)
+
+
+@pytest.mark.parametrize("count", [2, 3, 5])
+@pytest.mark.parametrize("declaration", ["none", "matched"])
+def test_repeated_unambiguous_calls_still_replay(count: int, declaration: str) -> None:
+    # the turn-level probe must reject only genuine ambiguity. a single declared parameter
+    # leaves no competing scope, so the parser reproduces every call and replay closure holds.
+    messages = _repeated_call_messages(count, {"x": "plain"})
+    payload: dict[str, Any] = {"messages": messages}
+    if declaration == "matched":
+        declared = _history_replay_tools()[0].wire()
+        declared["function"]["parameters"]["properties"].pop("y", None)
+        declared["function"]["parameters"]["required"] = ["x"]
+        payload["tools"] = [declared]
+
+    request = parse_chat_request(payload, require_model=False, allow_managed_selectors=True)
+
+    assert len(request.messages[0]["tool_calls"]) == count
 
 
 def test_undeclared_history_uses_a_self_derived_replay_probe() -> None:

@@ -210,7 +210,11 @@ def validate_tool_history_replay(
     for message_index, message in enumerate(messages):
         if message.get("role") != "assistant":
             continue
-        for call_index, call in enumerate(message.get("tool_calls", ())):
+        calls = tuple(message.get("tool_calls", ()))
+        if not calls:
+            continue
+        probe: list[tuple[FunctionTool, dict[str, Any], dict[str, Any]]] = []
+        for call_index, call in enumerate(calls):
             function = call["function"]
             try:
                 arguments = _decode_json_object(function["arguments"])
@@ -221,9 +225,16 @@ def validate_tool_history_replay(
                     # absent from this historical call is deliberately plain content, because no
                     # such parameter exists in the replay probe.
                     tool = _historical_replay_tool(function["name"], arguments)
-                _template_json_object(function["arguments"], replay_tool=tool)
+                probe.append((tool, arguments, _template_json_object(function["arguments"])))
             except ValueError as exc:
                 raise error_type(f"message {message_index} tool call {call_index} {exc}") from exc
+        # the template renders the whole assistant turn as one block, and a competing assignment
+        # in a later call can only be seen against that block. validating calls one at a time
+        # would accept a turn the parser rejects as ambiguous.
+        try:
+            _validate_template_roundtrip(probe)
+        except ValueError as exc:
+            raise error_type(f"message {message_index} {exc}") from exc
 
 
 def detached_template_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -515,12 +526,9 @@ def _decode_json_object(value: str) -> dict[str, Any]:
     return decoded
 
 
-def _template_json_object(value: str, *, replay_tool: FunctionTool | None = None) -> dict[str, Any]:
+def _template_json_object(value: str) -> dict[str, Any]:
     decoded = _decode_json_object(value)
-    rendered = {name: _template_argument_value(item) for name, item in decoded.items()}
-    if replay_tool is not None:
-        _validate_template_roundtrip(replay_tool, decoded, rendered)
-    return rendered
+    return {name: _template_argument_value(item) for name, item in decoded.items()}
 
 
 def _historical_replay_tool(name: str, arguments: Mapping[str, Any]) -> FunctionTool:
@@ -557,26 +565,28 @@ def _historical_replay_type(value: Any) -> str:
 
 
 def _validate_template_roundtrip(
-    tool: FunctionTool,
-    decoded: dict[str, Any],
-    rendered: dict[str, Any],
+    probe: Sequence[tuple[FunctionTool, dict[str, Any], dict[str, Any]]],
 ) -> None:
     from flash.serve.runtime.tool_calls import parse_qwen3_coder_output
 
-    parameters = "".join(
-        f"{_PARAMETER_START}{field}>\n{_render_template_argument(rendered[field])}\n"
-        f"{_PARAMETER_END}"
-        for field in decoded
+    text = "".join(
+        f"{TOOL_CALL_START}{_FUNCTION_START}{tool.name}>"
+        + "".join(
+            f"{_PARAMETER_START}{field}>\n{_render_template_argument(rendered[field])}\n"
+            f"{_PARAMETER_END}"
+            for field in decoded
+        )
+        + f"{_FUNCTION_END}{TOOL_CALL_END}"
+        for tool, decoded, rendered in probe
     )
-    text = (
-        f"{TOOL_CALL_START}{_FUNCTION_START}{tool.name}>{parameters}{_FUNCTION_END}{TOOL_CALL_END}"
-    )
-    result = parse_qwen3_coder_output(text, (tool,), id_factory=lambda: "call_replay")
-    if len(result.calls) != 1:
-        raise ValueError("function arguments cannot be replayed exactly by the tool template")
-    replayed = _decode_json_object(result.calls[0].arguments)
-    if not _json_values_equal(replayed, decoded):
-        raise ValueError("function arguments cannot be replayed exactly by the tool template")
+    failure = "tool calls cannot be replayed exactly by the tool template"
+    seen: dict[str, FunctionTool] = {tool.name: tool for tool, _, _ in probe}
+    result = parse_qwen3_coder_output(text, tuple(seen.values()), id_factory=lambda: "call_replay")
+    if len(result.calls) != len(probe):
+        raise ValueError(failure)
+    for call, (_, decoded, _) in zip(result.calls, probe, strict=True):
+        if not _json_values_equal(_decode_json_object(call.arguments), decoded):
+            raise ValueError(failure)
 
 
 def _render_template_argument(value: Any) -> str:
