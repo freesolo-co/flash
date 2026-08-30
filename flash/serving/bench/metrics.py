@@ -56,6 +56,10 @@ class RequestRecord:
     # The assembled length the fitter measured for this prompt, checked against what the engine
     # reports so a mis-sized prompt cannot be counted into the wrong bucket.
     expected_prompt_tokens: int | None = None
+    # The bucket's advertised input size. Checked independently of `expected_prompt_tokens`: a
+    # reseeded prompt carries the pooled prompt's fitted count, so that field alone measures drift
+    # from a stale value and the two allowances compose to twice the tolerance.
+    bucket_target_tokens: int | None = None
     first_token_at: float | None = None
     finished_at: float | None = None
     prompt_tokens: int | None = None

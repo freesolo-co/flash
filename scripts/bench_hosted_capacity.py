@@ -36,6 +36,7 @@ serving stack rather than a benchmark-only reimplementation.
 # `AttributeError: 'str' object has no attribute '__name__'` at decoration time. flash/serving/app/
 # modal_app.py omits the import for the same reason.
 
+import asyncio
 import json
 import os
 import time
@@ -391,10 +392,10 @@ async def _run_bucket(
     The boot dominates cost (~960s of ~1000s per cell in the prior campaign), so the grid runs
     against a single engine rather than paying a boot per point.
     """
-    from flash.serving.bench.catalog import bench_catalog_summary
+    from flash.serving.bench.catalog import bench_catalog_summary, bench_gpu_for
     from flash.serving.bench.driver import run_cell
     from flash.serving.bench.metrics import summarize_curve
-    from flash.serving.bench.probe import probe_all
+    from flash.serving.bench.probe import gpu_matches
     from flash.serving.bench.workload import BUCKETS_BY_NAME
 
     bucket = BUCKETS_BY_NAME[bucket_name]
@@ -408,7 +409,17 @@ async def _run_bucket(
     # and the provenance below is read only AFTER the whole grid, far too late to refuse anything.
     # Probing here means an unresolved kernel path costs one bucket's boot instead of producing a
     # publishable artifact whose numbers cannot be attributed to a kernel.
-    provenance = probe_all(engine.base_model, engine)
+    provenance = await _probe_in_container_within_bound(engine)
+    # Card identity too, not only the kernel path. `_run_canary` checks `gpu_matches` against the
+    # container IT probed; a replacement container reporting a different accelerator would otherwise
+    # be measured and published under the catalog's expected label, which is the one attribution the
+    # whole campaign rests on. The mismatch would sit in raw provenance, unread.
+    expected_gpu = bench_gpu_for(engine.base_model)
+    if not gpu_matches(provenance, expected_gpu):
+        raise RuntimeError(
+            f"bucket {bucket_name!r} container is {(provenance.get('gpu') or {}).get('name')!r}, "
+            f"expected {expected_gpu}; refusing to attribute a measurement to the wrong card"
+        )
     _require_resolved_gdn_backend(provenance)
     cells = []
     records = []
@@ -500,6 +511,36 @@ def _probe_within_bound(engine: Any) -> dict[str, Any]:
             f"provenance probe exceeded {PROBE_TIMEOUT_SECONDS}s; container terminated. The probe "
             "reads NVML and the served config, so this is a stall rather than slow work, and its "
             "cost is not reserved by either lane estimate"
+        ) from None
+
+
+async def _probe_in_container_within_bound(engine: Any) -> dict[str, Any]:
+    """`probe_all` for the container we are ALREADY running inside, under the probe's own bound.
+
+    `_probe_within_bound` cannot serve here: it spawns a remote call, and `_run_bucket` executes
+    inside the container, so `probe_all` is an ordinary in-process call. But it is the same stall
+    risk with the same funding -- both estimators reserve `PROBE_TIMEOUT_SECONDS` per bucket, while
+    an unbounded call would run until the class-wide method timeout, blow past the bucket's
+    reservation, and take the whole paid artifact down with it when Modal terminates `run_bucket`.
+
+    Run in a worker thread so the bound is enforceable: `probe_all` is synchronous (NVML, the vLLM
+    resolver, `AutoConfig.from_pretrained`), and awaiting it directly would pin the event loop where
+    no timeout could fire. The thread is abandoned rather than joined on timeout -- Python cannot
+    interrupt a blocked C call -- but the bucket then raises, so the container is torn down instead
+    of continuing to bill against a reservation it has already exceeded.
+    """
+    loop = asyncio.get_running_loop()
+    from flash.serving.bench.probe import probe_all
+
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, probe_all, engine.base_model, engine),
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        raise RuntimeError(
+            f"in-container provenance probe exceeded {PROBE_TIMEOUT_SECONDS}s; this bucket reserved "
+            "exactly that much for it, so continuing would overrun the lane's reservation"
         ) from None
 
 

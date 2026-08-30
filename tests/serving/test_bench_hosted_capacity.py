@@ -2504,10 +2504,24 @@ def test_each_bucket_gates_the_container_it_actually_measures_on() -> None:
 
     # And the artifact must carry the probe the gate ACCEPTED. Re-probing at serialization time
     # would report a container state nothing refused.
-    assert "probe_all(engine.base_model, engine)" in source
-    assert source.count("probe_all(engine.base_model, engine)") == 1, (
+    assert "_probe_in_container_within_bound" in called, (
+        "the in-container probe is unbounded; it can outrun the bucket's own reservation"
+    )
+    body_src = ast.get_source_segment(source, run_bucket) or ""
+    assert body_src.count("_probe_in_container_within_bound(engine)") == 1, (
         "the bucket probes twice; the published provenance is then not the gated one"
     )
+    # Card identity on THIS container too, not only the kernel path: a replacement container on a
+    # different accelerator would otherwise be published under the catalog's expected GPU label.
+    assert "gpu_matches" in called, "a bucket can publish a measurement taken on an unverified card"
+    gpu_line = min(
+        child.lineno
+        for child in ast.walk(run_bucket)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Name)
+        and child.func.id == "gpu_matches"
+    )
+    assert gpu_line < loop_line, "the card check runs after cells the run has already paid for"
 
 
 def test_the_probe_call_is_bounded_below_the_class_method_timeout() -> None:
@@ -2605,3 +2619,155 @@ def test_the_module_runbook_ceilings_clear_their_own_submission_stop() -> None:
             f"the module docstring's --ceiling-usd {documented[mode]} for the {mode} lane is "
             f"below the ${required:.2f} its reservation needs to clear the submission stop"
         )
+
+
+def test_the_in_container_probe_is_bounded_by_the_probe_allowance() -> None:
+    """`_run_bucket` runs INSIDE the container, so `probe_all` there is a local call.
+
+    `_probe_within_bound` cannot cover it -- that helper spawns a remote call. But it is the same
+    stall with the same funding: both estimators reserve exactly `PROBE_TIMEOUT_SECONDS` per bucket,
+    and an unbounded in-process probe would run to the class-wide method timeout, overrun the
+    bucket's reservation, and lose the whole paid artifact when Modal terminates `run_bucket`.
+
+    Bounded via a worker thread, because `probe_all` is synchronous: awaited directly it would pin
+    the event loop where no timeout could fire.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+    }
+    helper = nodes["_probe_in_container_within_bound"]
+    src = ast.get_source_segment(source, helper) or ""
+    assert "wait_for" in src, "an unbounded in-process probe cannot be interrupted"
+    assert "timeout=PROBE_TIMEOUT_SECONDS" in src, (
+        "the probe is bounded by something other than the allowance both estimators reserve"
+    )
+    assert "run_in_executor" in src, (
+        "a synchronous probe awaited on the event loop cannot be timed out"
+    )
+
+
+def test_an_explicit_zero_submission_stop_permits_no_spend() -> None:
+    """`submission_stop_usd=0` is the emergency stop, not an unset value.
+
+    The guard read `self.submission_stop_usd or self.ceiling_usd`, so an explicit zero was falsy and
+    restored the FULL ceiling -- admitting reservations in the one configuration whose entire
+    purpose is to admit none.
+    """
+    from flash.serving.bench.budget import BudgetExceeded, BudgetLedger
+
+    ledger = BudgetLedger(ceiling_usd=100.0, submission_stop_usd=0.0)
+    assert ledger.submission_stop_usd == 0.0, "an explicit stop must survive construction"
+    assert not ledger.can_submit(1.0, "L40S"), "a zero stop permits no new submission"
+    with pytest.raises(BudgetExceeded):
+        ledger.reserve("any", 1.0, "L40S")
+
+    with pytest.raises(ValueError, match="must not be negative"):
+        BudgetLedger(ceiling_usd=100.0, submission_stop_usd=-1.0)
+
+
+def test_the_workload_checksum_covers_the_construction_implementation() -> None:
+    """Editing prompt construction must move the checksum.
+
+    An enumeration of inputs (filler vocabulary, tolerance, grid) covers only what someone
+    remembered to list. `_prompt_header`, `build_prompt_text`, `corpus_seed`, `reseed_prompt` and
+    the fitting logic all change what the model reads or how a prompt is assembled, and every one
+    of them sat outside the digest -- so two materially different workload contracts could publish
+    under one checksum.
+    """
+    from flash.serving.bench import workload
+
+    assert workload._CONSTRUCTION_SOURCES, "no construction source is digested"
+    for name in (
+        "_prompt_header",
+        "build_prompt_text",
+        "corpus_seed",
+        "reseed_prompt",
+        "fit_prompt_to_tokens",
+    ):
+        assert name in workload._CONSTRUCTION_SOURCES, (
+            f"{name} can change without moving the digest"
+        )
+
+    before = workload.workload_checksum()
+    original = workload._prompt_header
+
+    def _edited(uid: str) -> str:
+        return "DIFFERENT" + original(uid)
+
+    workload._prompt_header = _edited
+    try:
+        assert workload.workload_checksum() != before, (
+            "prompt construction changed but the checksum did not"
+        )
+    finally:
+        workload._prompt_header = original
+    assert workload.workload_checksum() == before, "the digest is not stable across restoration"
+
+
+def test_the_catalog_row_carries_the_whole_resolved_override_mapping() -> None:
+    """A curve is only interpretable against the exact engine shape that produced it.
+
+    The row promoted a hand-picked subset, omitting capacity-defining settings such as
+    `gpu_memory_utilization`, `enforce_eager`, `max_num_batched_tokens` and `pin_loras`. Once
+    production drifts, an artifact holding only the subset still looks plausible while no longer
+    identifying the shape it measured.
+    """
+    from flash.serving.bench.catalog import bench_catalog_summary, bench_engine_overrides_for
+
+    for row in bench_catalog_summary():
+        assert row["engine_overrides"] == bench_engine_overrides_for(row["base_model"]), (
+            f"{row['base_model']} publishes a subset of the overrides it actually ran"
+        )
+
+
+def test_a_reseeded_prompt_is_validated_against_the_bucket_target() -> None:
+    """A wrapped request must not drift two tolerances out of its published bucket.
+
+    `reseed_prompt` rewrites the header without re-tokenizing, so the record still carries the
+    POOLED prompt's fitted count. Checking only against that stale value allows another full
+    tolerance on top of a fit that may already sit a tolerance from the target, so a request up to
+    `2 * PROMPT_TOKEN_TOLERANCE` out of bucket could be counted in it. The bucket label is the
+    published claim, so the engine's own count has to satisfy it.
+    """
+    import inspect
+
+    from flash.serving.bench import driver
+    from flash.serving.bench.metrics import RequestRecord
+    from flash.serving.bench.workload import PROMPT_TOKEN_TOLERANCE
+
+    assert "bucket_target_tokens" in inspect.signature(driver.run_request).parameters, (
+        "the bucket target never reaches the record, so it cannot be validated"
+    )
+    assert "bucket_target_tokens" in RequestRecord.__dataclass_fields__
+
+    validate = driver._validate
+    target = 512
+    # Fitted a full tolerance BELOW target; engine reports a full tolerance below the fit. Within
+    # tolerance of `expected`, but 2x out from the bucket the number would be published under.
+    fitted = target - PROMPT_TOKEN_TOLERANCE
+    reported = fitted - PROMPT_TOKEN_TOLERANCE
+    record = RequestRecord(
+        uid="u",
+        base_model="Qwen/Qwen3.5-9B",
+        bucket="short_interactive",
+        concurrency=1,
+        block=0,
+        started_at=0.0,
+        expected_prompt_tokens=fitted,
+        bucket_target_tokens=target,
+    )
+    outcome = driver._StreamOutcome()
+    outcome.saw_final = True
+    outcome.finish_reason = "stop"
+    outcome.prompt_tokens = reported
+    outcome.completion_tokens = 32
+    outcome.cached_tokens = 0
+    outcome.cached_tokens_reported = True
+    outcome.first_token_at = 0.1
+    validate(outcome, record)
+    assert not record.ok, "a request two tolerances out of bucket was counted in it"
+    assert record.error == driver.ERROR_PROMPT_LENGTH

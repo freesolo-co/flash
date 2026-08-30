@@ -217,6 +217,20 @@ def _validate(outcome: _StreamOutcome, record: RequestRecord) -> None:
             f"(tolerance {PROMPT_TOKEN_TOLERANCE})"
         )
         return
+    # Against the BUCKET TARGET as well, not only the fitted count. A reseeded prompt carries the
+    # pooled prompt's `exact`, but rewriting the header moves its real length, so the check above
+    # measures drift from a stale value. The fit itself may already sit a full tolerance from the
+    # target, so the two allowances compose: a wrapped request could land 2x tolerance out of bucket
+    # and still be counted in it. The bucket label is the claim being published, so it is what the
+    # engine's own count has to satisfy.
+    target = record.bucket_target_tokens
+    if target is not None and abs(outcome.prompt_tokens - target) > PROMPT_TOKEN_TOLERANCE:
+        record.error = ERROR_PROMPT_LENGTH
+        record.error_detail = (
+            f"engine reported {outcome.prompt_tokens} prompt tokens; bucket target {target} "
+            f"(tolerance {PROMPT_TOKEN_TOLERANCE})"
+        )
+        return
     record.ok = True
 
 
@@ -232,6 +246,7 @@ async def run_request(
     block: int,
     origin: float,
     expected_prompt_tokens: int | None = None,
+    bucket_target_tokens: int | None = None,
 ) -> RequestRecord:
     """Issue one streamed request and return its evidence record. Never raises."""
     record = RequestRecord(
@@ -242,6 +257,7 @@ async def run_request(
         block=block,
         started_at=time.monotonic() - origin,
         expected_prompt_tokens=expected_prompt_tokens,
+        bucket_target_tokens=bucket_target_tokens,
     )
     outcome = _StreamOutcome()
     payload = _payload_for(base_model, messages, max_tokens, uid)
@@ -519,6 +535,7 @@ async def run_cell(
                 block=block,
                 origin=origin,
                 expected_prompt_tokens=exact,
+                bucket_target_tokens=bucket.target_input_tokens,
             )
         )
         spawned_at[task] = started_at

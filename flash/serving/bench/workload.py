@@ -339,6 +339,27 @@ def concurrency_grid(max_num_seqs: int) -> tuple[int, ...]:
 # change to it moves the checksum at this cap just as it would at any other.
 _CHECKSUM_GRID_CAP = 8
 
+# The functions whose source defines prompt semantics. Named explicitly rather than digesting the
+# whole module so unrelated edits (docstrings elsewhere, new helpers, `__all__`) do not invalidate
+# comparability between campaigns that ran the same prompt contract.
+_CONSTRUCTION_SOURCES: tuple[str, ...] = (
+    "_prompt_header",
+    "build_prompt_text",
+    "corpus_seed",
+    "reseed_prompt",
+    "messages_for",
+    "measure_prompt_tokens",
+    "fit_prompt_to_tokens",
+)
+
+
+def _construction_digest() -> str:
+    """Digest of the prompt-construction implementation itself."""
+    import inspect
+
+    joined = chr(31).join(inspect.getsource(globals()[name]) for name in _CONSTRUCTION_SOURCES)
+    return hashlib.sha256(joined.encode()).hexdigest()[:16]
+
 
 def workload_checksum() -> str:
     """Digest of the preregistered contract, recorded in the report.
@@ -365,6 +386,14 @@ def workload_checksum() -> str:
             # published result could claim a preregistered workload it did not run.
             f"tolerance={PROMPT_TOKEN_TOLERANCE}",
             f"filler={hashlib.sha256(chr(31).join(_FILLER_WORDS).encode()).hexdigest()[:16]}",
+            # The construction CODE, not an enumeration of its inputs. Listing the filler vocabulary
+            # and tolerance still left `_prompt_header`, `build_prompt_text`, `corpus_seed`,
+            # `reseed_prompt` and the fitting/template logic outside the digest -- and every one of
+            # them changes what the model reads, what the cache sees, or how a prompt is assembled.
+            # An enumeration can only ever cover the inputs someone remembered; digesting the source
+            # covers the next edit too, so two materially different workload contracts cannot share
+            # a checksum.
+            f"construction={_construction_digest()}",
             f"grid={','.join(str(point) for point in concurrency_grid(_CHECKSUM_GRID_CAP))}",
             *(
                 f"{b.name}:{b.target_input_tokens}:{b.max_output_tokens}"

@@ -89,6 +89,14 @@ def bench_catalog_summary() -> list[dict[str, Any]]:
                 "quantization": overrides.get("quantization", "fp8"),
                 "max_loras": overrides.get("max_loras"),
                 "max_lora_rank": overrides.get("max_lora_rank"),
+                # The whole resolved mapping, not only the fields promoted above. Those are kept as
+                # top-level keys because readers and tests index them by name, but a hand-picked
+                # subset omits capacity-defining settings -- `gpu_memory_utilization`,
+                # `enforce_eager`, `max_num_batched_tokens`, `pin_loras`, `reasoning_parser` -- and
+                # the 35B curve is only interpretable against the exact engine shape that produced
+                # it. Once production drifts, an artifact without this cannot say which shape it
+                # measured, and the promoted subset would silently stay plausible.
+                "engine_overrides": overrides,
             }
         )
     return rows

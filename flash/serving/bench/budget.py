@@ -118,6 +118,8 @@ class BudgetLedger:
             self.submission_stop_usd = self.ceiling_usd * SUBMISSION_STOP_FRACTION
         elif not math.isfinite(self.submission_stop_usd):
             raise ValueError("submission_stop_usd must be a finite dollar amount")
+        elif self.submission_stop_usd < 0:
+            raise ValueError("submission_stop_usd must not be negative")
 
     @property
     def committed_usd(self) -> float:
@@ -134,7 +136,11 @@ class BudgetLedger:
         and teardown is never consumed by a new submission.
         """
         projected = self.committed_usd + usd_for_gpu_seconds(estimated_seconds, gpu)
-        return projected <= (self.submission_stop_usd or self.ceiling_usd)
+        # `is None` rather than truthiness: an explicit `submission_stop_usd=0` is the emergency
+        # stop, and `or` would read it as unset and restore the full ceiling -- permitting spend in
+        # the one configuration whose whole purpose is to permit none.
+        stop = self.ceiling_usd if self.submission_stop_usd is None else self.submission_stop_usd
+        return projected <= stop
 
     def reserve(
         self, label: str, estimated_seconds: float, gpu: str, note: str = ""
@@ -156,7 +162,9 @@ class BudgetLedger:
                 f"over the ${self.ceiling_usd:.2f} ceiling"
             )
         if not self.can_submit(estimated_seconds, gpu):
-            stop = self.submission_stop_usd or self.ceiling_usd
+            stop = (
+                self.ceiling_usd if self.submission_stop_usd is None else self.submission_stop_usd
+            )
             raise BudgetExceeded(
                 f"reserving {label!r} on {gpu} (${amount:.2f}) would reach ${projected:.2f}, "
                 f"past the ${stop:.2f} submission stop held back for delayed charges and teardown "
