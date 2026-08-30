@@ -337,9 +337,10 @@ def _index_parameter_openers(
     # two things have to stay off the per-opener path for that to hold on a run of openers that do
     # share a delimiter. the delimiter search is not restarted, because the first `>` at or after a
     # later opener is the one already found unless that one now lies behind it: each search
-    # therefore begins strictly later than the last and the scan crosses the text once. and no name
-    # is ever cut out of the text: openers sharing one far delimiter spell out names as long as the
-    # run itself, so copying each to hash it costs the square of the run's length in slices alone.
+    # therefore begins strictly later than the last and the scan crosses the text once. and a name
+    # is cut out of the text only at a width some declaration holds: openers sharing one far
+    # delimiter spell out names as long as the run itself, so copying every one of them to hash it
+    # would cost the square of the run's length in slices alone.
     #
     # a name equals a declaration only if it is exactly as wide, so a width no declaration holds is
     # settled without reading the opener at all. bounding the width by the longest declared name
@@ -347,10 +348,13 @@ def _index_parameter_openers(
     # historical call, so one key as long as the run makes every opener in it wide enough to copy.
     #
     # the widths a declaration does hold are few, and only they can copy an opener out to hash it.
-    # each is charged against the budget, which is what keeps a run of openers at a declared width
-    # proportional to the text: the copies at one width sum to the run's length, and a declaration
-    # holds a bounded number of widths. comparing against the names of that width one at a time
-    # would instead cost their count per opener, which a wide schema alone makes quadratic.
+    # that is what keeps the copying proportional to the text rather than to its square: the
+    # openers ending at one delimiter have distinct widths, so it copies at most one name per
+    # declared width, and each of those names is at most as long as the distance it spans.
+    #
+    # the span is charged against the budget once, above, and the copies are not charged again.
+    # they cannot exceed it by more than the number of declared widths, and billing the same
+    # characters a second time exhausts calls that parse without the width check at all.
     positions: dict[str, array[int]] = {}
     widths = frozenset(len(name) for name in declared)
     cursor, name_end = text.find(_PARAMETER_START, start), -1
@@ -361,13 +365,10 @@ def _index_parameter_openers(
             if name_end < 0:
                 # no delimiter remains, so no opener can be completed in what is left.
                 break
-        if name_end - name_start in widths:
-            if not _consume_work(work, name_end - name_start):
-                return _EXHAUSTED
-            if (name := text[name_start:name_end]) in declared:
-                if (found := positions.get(name)) is None:
-                    found = positions[name] = array("q")
-                found.append(cursor)
+        if name_end - name_start in widths and (name := text[name_start:name_end]) in declared:
+            if (found := positions.get(name)) is None:
+                found = positions[name] = array("q")
+            found.append(cursor)
         # a name may span a later `<parameter=`, exactly as the parser reads it, so the next search
         # starts after this opener's own marker rather than after the name it took. that keeps an
         # opener nested inside a rejected name discoverable while still advancing every step.

@@ -4895,6 +4895,43 @@ def test_a_wide_schema_does_not_cost_its_width_at_every_opener() -> None:
     assert wide < 10 * max(narrow, 0.001), (narrow, wide)
 
 
+def test_bounding_the_read_names_does_not_spend_the_parse_budget() -> None:
+    """holding the copying down must not charge the caller for the span it already charged.
+
+    the index charges its whole span once, up front. a value quoting openers whose widths a wide
+    declaration happens to hold makes it read a name at each of them, and charging those reads
+    again bills the same characters twice: a call well inside the budget then reports exhausted
+    and falls back to text, silently losing a tool call the model emitted correctly.
+    """
+    # widths the declaration holds, so every quoted opener in the value is read rather than skipped.
+    names = ["data", *("a" * width for width in (11, 22, 33, 44, 55))]
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "store",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {name: {"type": "string"} for name in names},
+                        "required": ["data"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+    # each group of six markers shares the `>` that ends it, so the widths run 11 through 66 and
+    # five of those six are declared. the value is ordinary text to the parser, and must survive.
+    value = ("<parameter=" * 6 + ">") * 8
+    text = f"<tool_call><function=store><parameter=data>{value}</parameter></function></tool_call>"
+
+    parsed = parse_qwen3_coder_output(text, tools)
+
+    assert len(parsed.calls) == 1, parsed
+    assert json.loads(parsed.calls[0].arguments) == {"data": value}
+
+
 def test_inert_enum_delimiters_are_not_stepped_one_at_a_time() -> None:
     """an enum value full of delimiters that cannot close it must not cost one step each.
 
