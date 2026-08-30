@@ -562,6 +562,38 @@ def test_source_cache_reclaims_only_unprotected_sources(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_source_cache_reclaims_a_source_once_its_loaded_reference_is_released(
+    tmp_path: Path,
+) -> None:
+    """a loaded source must stop being protected once the engine drops its weights.
+
+    `loaded` outliving the adapter is what pinned every served source for the life of the
+    replica, so the budget filled with adapters nothing could reach.
+    """
+
+    root = tmp_path / "replica"
+    root.mkdir()
+    cache = ReplicaSourceCache(root, max_bytes=1024)
+    source = root / "sources" / "served"
+    source.mkdir(parents=True)
+    (source / "adapter_model.safetensors").write_bytes(b"z" * 64)
+    ident = ("org/served", "model", "e" * 40, "f" * 64, None)
+    key = ("org-1", "served/step-1")
+
+    async def scenario() -> None:
+        await cache.mark_loaded(key, ident, source)
+        assert cache._states[ident].protected
+
+        await cache.release_loaded(key, ident)
+        assert not cache._states[ident].protected
+
+        await cache.remove_if_unreferenced(ident)
+        assert ident not in cache._states
+        assert not source.exists()
+
+    asyncio.run(scenario())
+
+
 def test_source_cache_rejects_a_directory_outside_the_replica_root(tmp_path: Path) -> None:
     root = tmp_path / "replica"
     root.mkdir()

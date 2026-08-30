@@ -242,6 +242,21 @@ class ReplicaSourceCache:
             state.size_bytes = size_bytes
             state.loaded.add(adapter_key)
 
+    async def release_loaded(self, adapter_key: CheckpointKey, ident: SourceIdent) -> None:
+        """drop the loaded reference once the weights are gone from the engine.
+
+        `loaded` keeps a source protected for as long as vllm still holds its weights. without
+        this transition the reference outlives the adapter, so `protected` never clears and the
+        directory is retained for the life of the replica.
+        """
+        async with self._lock:
+            state = self._states.get(ident)
+            if state is None:
+                return
+            state.loaded.discard(adapter_key)
+            state.last_used = time.monotonic()
+            await self._reclaim_locked()
+
     @asynccontextmanager
     async def active(self, ident: SourceIdent, directory: Path) -> AsyncIterator[None]:
         directory = self._contained(directory)
@@ -403,13 +418,40 @@ class LoraLifecycleMixin:
             entries.pop(adapter_key)
             return
         if not entry.tombstoned:
-            entries[adapter_key] = _LoraEntry(
+            entry = _LoraEntry(
                 entry.source_ident,
                 entry.lora_request,
                 entry.state,
                 entry.in_flight,
                 True,
             )
+            entries[adapter_key] = entry
+        if entry.in_flight == 0:
+            await self._release_tombstoned_locked(adapter_key, entry)
+
+    async def _release_tombstoned_locked(
+        self, adapter_key: CheckpointKey, entry: _LoraEntry
+    ) -> None:
+        """drop a drained tombstoned adapter from the engine and release its source.
+
+        tombstoning alone stops new requests but leaves the weights resident, so a replica that
+        served an adapter keeps its vllm slot and source bytes until the container exits. the
+        caller holds the adapter lock and has already observed `in_flight == 0`.
+        """
+        await self._remove_lora(entry.lora_request)
+        self._entries().pop(adapter_key, None)
+        manager = getattr(self, "_source_cache", None)
+        if manager is not None:
+            await manager.release_loaded(adapter_key, entry.source_ident)
+            await manager.remove_if_unreferenced(entry.source_ident)
+
+    async def _remove_lora(self, lora_request: Any) -> None:
+        remove = getattr(self.engine, "remove_lora", None)
+        if remove is None or lora_request is None:
+            return
+        result = remove(lora_request.lora_int_id)
+        if inspect.isawaitable(result):
+            await result
 
     async def _pin_lora(self, lora_request: Any) -> None:
         pin = getattr(self.engine, "pin_lora", None)
