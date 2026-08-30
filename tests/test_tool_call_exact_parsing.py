@@ -1471,16 +1471,20 @@ def test_an_image_after_a_tool_response_keeps_the_turn_an_ordinary_query(spellin
     assert request.messages[1]["reasoning_content"] == "<tool_call>"
 
 
-def test_an_image_between_the_tool_response_tags_does_not_close_the_query_span() -> None:
+@pytest.mark.parametrize("spelling", ["image_url", "input_image", "image"])
+def test_an_image_between_the_tool_response_tags_does_not_close_the_query_span(
+    spelling: str,
+) -> None:
     # the macro emits blocks in list order, so a placeholder BETWEEN the tags leaves the turn
     # still starting and ending with them: it stays a synthesized tool response and the earlier
     # reasoning marker does render, which the parser cannot replay. an implementation that
     # rendered the text first and appended images would read this as an ordinary query and accept
-    # a turn that really parses to one call rather than two.
+    # a turn that really parses to one call rather than two. every spelling canonicalizes to the
+    # same placeholder, so order has to hold for each one rather than for the first one tested.
     messages = _query_span_messages(
         [
             {"type": "text", "text": "<tool_response>"},
-            _image_block("image_url"),
+            _image_block(spelling),
             {"type": "text", "text": "</tool_response>"},
         ]
     )
