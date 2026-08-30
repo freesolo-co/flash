@@ -79,6 +79,7 @@ from flash.serving.bench.workload import (
     BUCKETS,
     BUCKETS_BY_NAME,
     ENABLE_THINKING,
+    N_CHOICES,
     PROMPT_TOKEN_TOLERANCE,
     TEMPERATURE,
     build_prompt_text,
@@ -3424,10 +3425,11 @@ def test_the_pool_arms_the_watchdog_around_its_whole_fitting_loop() -> None:
     from flash.serving.bench import driver as driver_module
 
     source = inspect.getsource(driver_module._build_prompt_pool)
-    assert "_arm_fitting_watchdog(bound" in source, (
-        "the pool does not arm the watchdog at its bound"
-    )
-    assert "_disarm_fitting_watchdog()" in source, (
+    assert "fitting_watchdog(bound" in source, "the pool does not arm the watchdog at its bound"
+    # The scope IS the release: `fitting_watchdog` disarms in a `finally`, so it covers the raising
+    # path a trailing disarm statement misses. See
+    # `test_the_fitting_watchdog_is_released_when_a_fit_raises`.
+    assert "with fitting_watchdog(" in source, (
         "the pool leaves the watchdog armed after fitting, so it can kill a container mid-measurement"
     )
     tree = ast.parse(textwrap.dedent(source))
@@ -3718,6 +3720,125 @@ def test_the_execution_digest_covers_the_abandonment_policy() -> None:
         )
     finally:
         driver_module._cell_is_conclusively_failed = original
+    assert workload_module._execution_digest() == before, (
+        "the digest is not stable across a restore"
+    )
+
+
+def test_the_fitting_watchdog_is_released_when_a_fit_raises() -> None:
+    """A raised fit must not leave a process-wide deadline armed on a retained container.
+
+    `fit_prompt_to_tokens` raising is ordinary: a tokenizer that cannot reach the bucket's target
+    length says so. The watchdog it runs under is `faulthandler`'s PROCESS-wide deadline, and the
+    Modal container outlives the call, so an arm that leaks past the raise stays live and ends some
+    later, unrelated call on that container -- the next probe, warmup or bucket -- at a bound that
+    belonged to a lane which already returned. Enforced structurally, since a trailing disarm
+    statement is exactly what an exception skips.
+    """
+    from flash.serving.bench import driver as driver_module
+
+    source = textwrap.dedent(inspect.getsource(driver_module._build_prompt_pool))
+    assert "with fitting_watchdog(" in source, (
+        "the pool arms its watchdog without scoping it, so a raised fit leaks the deadline"
+    )
+    assert "_arm_fitting_watchdog(" not in source, (
+        "the pool still arms the watchdog directly, bypassing the scope that releases it"
+    )
+
+    # Behavioural, not just structural: a raising fit must leave nothing armed.
+    armed: list[float] = []
+    original_fit = driver_module.fit_prompt_to_tokens
+    original_dump = driver_module.faulthandler.dump_traceback_later
+    original_cancel = driver_module.faulthandler.cancel_dump_traceback_later
+
+    def exploding_fit(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("cannot fit this bucket")
+
+    def record_dump(timeout: float, **kwargs: Any) -> None:
+        armed.append(timeout)
+
+    def record_cancel() -> None:
+        armed.clear()
+
+    try:
+        driver_module.fit_prompt_to_tokens = exploding_fit
+        driver_module.faulthandler.dump_traceback_later = record_dump
+        driver_module.faulthandler.cancel_dump_traceback_later = record_cancel
+        with pytest.raises(RuntimeError, match="cannot fit"):
+            driver_module._build_prompt_pool(
+                object(),
+                BUCKETS[0],
+                concurrency=1,
+                block=0,
+                min_requests=1,
+            )
+    finally:
+        driver_module.fit_prompt_to_tokens = original_fit
+        driver_module.faulthandler.dump_traceback_later = original_dump
+        driver_module.faulthandler.cancel_dump_traceback_later = original_cancel
+        driver_module._fitting_watchdog_armed = False
+
+    assert armed == [], (
+        "a raised fit left the process-wide fitting deadline armed on a retained container"
+    )
+
+
+def test_every_request_sends_the_preregistered_choice_count() -> None:
+    """`n` must be SENT, not inherited from the serving default the checksum does not cover.
+
+    `workload_checksum()` records `n=N_CHOICES`. Omitting the field from the payload made that claim
+    rest on `OpenAIGenerateRequest.n`, a separate default in production code. The two are equal
+    today and independent tomorrow: raising the production default would make every request generate
+    multiple choices -- different generation work, different token usage, different latency -- under
+    a checksum still asserting one choice, so the artifact could not be distinguished from a valid
+    campaign's.
+    """
+    from flash.serving.bench import driver as driver_module
+
+    payload = driver_module._payload_for(
+        "Qwen/Qwen3.5-9B", [{"role": "user", "content": "x"}], 8, "u"
+    )
+    assert "n" in payload, (
+        "the payload omits n, so the measured choice count is the serving default, not the "
+        "preregistered one the checksum records"
+    )
+    assert payload["n"] == N_CHOICES, (
+        f"the payload sends n={payload['n']} but the checksum records n={N_CHOICES}"
+    )
+
+
+def test_the_execution_digest_covers_the_request_spawner() -> None:
+    """Retuning what each request is issued with must move the digest.
+
+    `_make_spawner` decides when the measurement clock starts and passes the bucket output limit,
+    the fitted length, the bucket target and the invocation identity into every request. Changing
+    any of them alters records and rates while every source and constant otherwise digested stays
+    byte-identical, letting two materially different campaigns publish one checksum.
+    """
+    from flash.serving.bench import driver as driver_module
+    from flash.serving.bench import workload as workload_module
+
+    assert "_make_spawner" in workload_module._DRIVER_SOURCES, (
+        "changing what every request is issued with does not move the execution digest"
+    )
+    assert hasattr(driver_module, "_make_spawner"), (
+        "_DRIVER_SOURCES names _make_spawner, which no longer exists"
+    )
+
+    before = workload_module._execution_digest()
+    original = driver_module._make_spawner
+    try:
+
+        def _make_spawner(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - never called
+            """A spawner that issues different work."""
+            return original(*args, **kwargs)
+
+        driver_module._make_spawner = _make_spawner
+        assert workload_module._execution_digest() != before, (
+            "rewriting the request spawner leaves the digest unchanged"
+        )
+    finally:
+        driver_module._make_spawner = original
     assert workload_module._execution_digest() == before, (
         "the digest is not stable across a restore"
     )

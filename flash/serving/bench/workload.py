@@ -394,6 +394,13 @@ _DRIVER_SOURCES: tuple[str, ...] = (
     "run_cell",
     "run_request",
     "_drain",
+    # Where the measurement clock STARTS, and what every request is issued with. `_make_spawner`
+    # passes the bucket's output limit, the fitted prompt length, the bucket target and the
+    # invocation identity into each request, and decides the instant a spawn is timestamped from.
+    # Changing any of those moves the records and the derived rates while every source and constant
+    # already digested stays byte-identical -- so two materially different campaigns could publish
+    # one `workload_checksum`.
+    "_make_spawner",
     # When a bucket sweep ABANDONS a grid. This decides which cells exist in the published curve at
     # all, so loosening it turns a halted sweep into a longer one -- more concurrency points, a
     # different ceiling and knee -- while every prompt, every request and every metric function

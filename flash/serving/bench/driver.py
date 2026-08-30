@@ -39,6 +39,7 @@ from flash.serving.bench.metrics import (
 )
 from flash.serving.bench.workload import (
     ENABLE_THINKING,
+    N_CHOICES,
     PROMPT_TOKEN_TOLERANCE,
     TEMPERATURE,
     TOP_P,
@@ -93,6 +94,12 @@ def _payload_for(
         "max_tokens": max_tokens,
         "temperature": TEMPERATURE,
         "top_p": TOP_P,
+        # Sent, not inherited. `workload_checksum` records `n=N_CHOICES`, but omitting the field
+        # made that claim rest on `OpenAIGenerateRequest`'s SEPARATE default. The two are equal
+        # today and independent: a production change to that default would have every request
+        # generate multiple choices -- different generation work, different usage -- under a
+        # checksum still asserting one, so the artifact could not be told from a valid campaign.
+        "n": N_CHOICES,
         "chat_template_kwargs": {"enable_thinking": ENABLE_THINKING},
     }
 
@@ -461,32 +468,37 @@ def _build_prompt_pool(
     # yields: a single blocked tokenizer call is a C call Python cannot interrupt.
     bound = prompt_fit_seconds_bound(bucket, min_requests=min_requests)
     deadline = time.monotonic() + bound
-    _arm_fitting_watchdog(bound, label=f"{bucket.name} pool")
-    for index in range(size):
-        if time.monotonic() > deadline:
-            # Ends the process rather than raising, matching `_probe_in_container_within_bound`. A
-            # raise would unwind into the same container that is still billing, and the reservation
-            # this loop just exceeded is the one that authorized the spend. Flushed first because
-            # `os._exit` skips atexit handlers, and this line is the only record of why the lane died.
-            print(
-                f"[bench] prompt fitting for {bucket.name} exceeded its reserved bound after "
-                f"{index}/{size} prompts; ending the container rather than billing past the "
-                f"reservation",
-                flush=True,
+    # Scoped rather than armed-and-disarmed in a straight line. `fit_prompt_to_tokens` can RAISE --
+    # a tokenizer that cannot reach the bucket's target length says so -- and a raise leaves by a
+    # path no trailing disarm statement sits on. The deadline is PROCESS-wide and the Modal
+    # container is retained, so an escaped arm stays live and ends a later unrelated call on that
+    # container: the next probe, warmup or bucket, killed at a bound belonging to a lane that
+    # already returned.
+    with fitting_watchdog(bound, label=f"{bucket.name} pool"):
+        for index in range(size):
+            if time.monotonic() > deadline:
+                # Ends the process rather than raising, matching `_probe_in_container_within_bound`. A
+                # raise would unwind into the same container that is still billing, and the reservation
+                # this loop just exceeded is the one that authorized the spend. Flushed first because
+                # `os._exit` skips atexit handlers, and this line is the only record of why the lane died.
+                print(
+                    f"[bench] prompt fitting for {bucket.name} exceeded its reserved bound after "
+                    f"{index}/{size} prompts; ending the container rather than billing past the "
+                    f"reservation",
+                    flush=True,
+                )
+                sys.stderr.flush()
+                os._exit(75)
+            uid = request_uid(bucket.name, concurrency, block, index, invocation)
+            messages, exact = fit_prompt_to_tokens(
+                tokenizer,
+                uid,
+                bucket.target_input_tokens,
+                # No invocation nonce here, on purpose: the BODY stays keyed to the grid coordinates so
+                # a rerun sends the same corpus, while the uid-derived header makes each request unique.
+                corpus=corpus_seed(bucket.name, block, index),
             )
-            sys.stderr.flush()
-            os._exit(75)
-        uid = request_uid(bucket.name, concurrency, block, index, invocation)
-        messages, exact = fit_prompt_to_tokens(
-            tokenizer,
-            uid,
-            bucket.target_input_tokens,
-            # No invocation nonce here, on purpose: the BODY stays keyed to the grid coordinates so
-            # a rerun sends the same corpus, while the uid-derived header makes each request unique.
-            corpus=corpus_seed(bucket.name, block, index),
-        )
-        pool.append((uid, messages, exact))
-    _disarm_fitting_watchdog()
+            pool.append((uid, messages, exact))
     return pool
 
 
