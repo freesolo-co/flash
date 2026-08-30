@@ -116,7 +116,6 @@ ROUTER_TIMEOUT_SECONDS = STARTUP_TIMEOUT_SECONDS + TIMEOUT_SECONDS
 # The H200 keeps a LONGER hold than break-even alone would suggest: the 35B's boot is ~1010s of
 # engine init (67 GiB of weights + ~377s torch.compile + graph capture), so a miss is a ~17-minute
 # user-visible stall. Cost and latency point the same way there, and the window stays at 1800s.
-DEFAULT_SCALEDOWN_WINDOW_SECONDS = 1800
 SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     # ~60s cold boot (small FP8 checkpoints, cached compile artifacts on the shared volume).
     "L4": 300,
@@ -127,12 +126,32 @@ SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     # ~1010s cold boot (35B bf16, 67 GiB + ~377s torch.compile). Break-even AND a ~17-min
     # user-visible stall on a miss both argue for keeping the full window here.
     "H200": 1800,
+    # Blackwell. No cold-boot canary has run on either card yet, so both hold the H200's window as a
+    # placeholder: it is the longest we ship, and a too-long hold overpays for idle rather than
+    # cold-cycling a user request. Replace each with its measured boot time when the canary runs.
+    "B200": 1800,
+    "B300": 1800,
 }
+# The tiers this app is allowed to run an engine on. `gpu` in the serving catalog is a plain string,
+# so a typo ("b200", "B2OO") or an unvalidated new card used to fall through `dict.get` to a default
+# window and deploy anyway, at that card's real hourly rate. Membership here is the one gate.
+SUPPORTED_GPUS: frozenset[str] = frozenset(SCALEDOWN_WINDOW_SECONDS_BY_GPU)
 
 
 def scaledown_window_for(gpu: str) -> int:
-    """Idle seconds before ``gpu``'s engine containers scale down (see the table above)."""
-    return SCALEDOWN_WINDOW_SECONDS_BY_GPU.get(gpu, DEFAULT_SCALEDOWN_WINDOW_SECONDS)
+    """Idle seconds before ``gpu``'s engine containers scale down (see the table above).
+
+    Raises ``ValueError`` for a tier this app has no window for, rather than silently applying a
+    default to an unrecognized card.
+    """
+    try:
+        return SCALEDOWN_WINDOW_SECONDS_BY_GPU[gpu]
+    except KeyError:
+        supported = ", ".join(sorted(SUPPORTED_GPUS))
+        raise ValueError(
+            f"Unsupported serving GPU tier {gpu!r}; supported tiers: {supported}. "
+            "Add the tier to SCALEDOWN_WINDOW_SECONDS_BY_GPU with its measured cold-boot window."
+        ) from None
 
 
 # gpu model engines scale to zero. inference and adapter registration remote calls start the matching
