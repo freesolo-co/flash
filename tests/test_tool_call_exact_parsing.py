@@ -4342,38 +4342,67 @@ def test_a_replay_probe_sees_openers_named_outside_the_declaration_charset() -> 
     named for such a key invisible, so a closer that genuinely hands off to it read as inert and a
     replayable history was rejected as unreplayable.
     """
-    arguments = {"good": "prefix</parameter>x", "bad.name": "b"}
-    history = [
-        {"role": "user", "content": "hi"},
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "hist", "arguments": json.dumps(arguments)},
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
-    ]
-    # no current declaration, so the probe's names come straight from the historical keys.
-    validate_tool_history_replay(history, None, error_type=OpenAIRequestError)
+    # each of these keys is outside what `_identifier_name` admits, and `<` is outside even the
+    # grammar's own markers, yet the parser ends a name at the first `>` and nothing narrower. a
+    # scan that stops the run at any of these characters cannot see the opener the key spells.
+    for key in ("bad.name", "bad<name", "bad name", "", "é", "x" * 200):
+        arguments = {"good": "prefix</parameter>x", key: "b"}
+        history = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "hist", "arguments": json.dumps(arguments)},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]
+        # no current declaration, so the probe's names come straight from the historical keys.
+        validate_tool_history_replay(history, None, error_type=OpenAIRequestError)
 
-    # the scan itself must find the boundary that hands off to the dotted name.
-    assert (
-        text_scan.find_viable_parameter_end(
-            "</parameter>\n<parameter=bad.name>", 0, frozenset(arguments)
+        # the scan itself must find the boundary that hands off to the key's opener.
+        assert (
+            text_scan.find_viable_parameter_end(
+                f"</parameter>\n<parameter={key}>", 0, frozenset(arguments)
+            )
+            == 0
+        ), key
+        # and must still reject a name no side declares, whatever characters it carries.
+        assert (
+            text_scan.find_viable_parameter_end(
+                f"</parameter>\n<parameter=other{key}z>", 0, frozenset(arguments)
+            )
+            == -1
+        ), key
+
+    # a key carrying `>` is a different case and must stay rejected: the parser reads the name as
+    # ending at that `>`, so the template cannot spell the key back and the history is genuinely
+    # unreplayable. widening the run past the delimiter would claim a replay the parser cannot do.
+    with pytest.raises(OpenAIRequestError):
+        validate_tool_history_replay(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "hist",
+                                "arguments": json.dumps({"a>b": "v"}),
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            ],
+            None,
+            error_type=OpenAIRequestError,
         )
-        == 0
-    )
-    # and must still reject a name no side declares, whatever characters it carries.
-    assert (
-        text_scan.find_viable_parameter_end(
-            "</parameter>\n<parameter=other.name>", 0, frozenset(arguments)
-        )
-        == -1
-    )
 
 
 def test_a_wide_catalog_costs_no_per_declaration_pattern_construction() -> None:
