@@ -153,14 +153,15 @@ def parse_qwen3_coder_output(
         if (tool := tool_map.get(match[2])) is not None
         and _candidate_body_can_start(text, match.end(), tool)
     ]
-    # ``candidates`` holds the calls after the first, so the emitted count is one more.
-    if len(candidates) + 1 > _MAX_POTENTIALLY_REPLAYABLE_CALLS:
-        return ToolParseResult(content=text, calls=())
+    # ``candidates`` is a context-blind scan, so a boundary quoted inside a json string argument
+    # looks like a call here. the emitted-call ceiling is applied after parsing, where the real
+    # count is known; this budget only has to bound the work that reaching that point costs.
     # each call scans its declared parameters once, so a schema with many optional properties
     # costs work that the generated text does not pay for. that scan is bounded by the schema
     # node limit, so charging it here keeps a minimal valid call parseable under any declaration.
     declared = max((len(tool.parameters["properties"]) for tool in tools), default=0)
-    work = [min(_work_limit, 4 * len(text) + (len(candidates) + 1) * declared)]
+    scans = min(len(candidates) + 1, _MAX_POTENTIALLY_REPLAYABLE_CALLS)
+    work = [min(_work_limit, 4 * len(text) + scans * declared)]
     opener_positions = _index_parameter_openers(text, first, work)
     if opener_positions is _EXHAUSTED:
         return ToolParseResult(content=text, calls=())
@@ -182,6 +183,9 @@ def parse_qwen3_coder_output(
                 confirmed.append(start)
                 parsed.append(parsed_call[1])
     if confirmed[-1] != first:
+        return ToolParseResult(content=text, calls=())
+    # only now is the emitted count real, rather than the context-blind candidate estimate.
+    if len(parsed) > _MAX_POTENTIALLY_REPLAYABLE_CALLS:
         return ToolParseResult(content=text, calls=())
     boundaries = confirmed[::-1]
     parsed.reverse()

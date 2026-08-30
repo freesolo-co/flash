@@ -1171,6 +1171,124 @@ def test_minimal_call_parses_under_any_declared_property_count(declared: int) ->
     assert [call.name for call in result.calls] == ["f"]
 
 
+@pytest.mark.parametrize("declared", [10, 139, 140, 300, 511])
+def test_replay_accepts_every_call_the_parser_emits_under_wide_declarations(
+    declared: int,
+) -> None:
+    # closure: a call the generation parser is willing to emit must be accepted back as history.
+    # the replay budget therefore has to grant the same declaration work generation grants.
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            f"p{index}": {"type": "string"} for index in range(declared)
+                        },
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+    emitted = parse_qwen3_coder_output("<tool_call><function=f></function></tool_call>", tools)
+    assert emitted.tools_called
+
+    request = parse_chat_request(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_fixed",
+                            "type": "function",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_fixed", "content": "ok"},
+            ],
+            "tools": tools_wire(tools),
+            "tool_choice": "auto",
+        },
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    assert request.messages[0]["tool_calls"][0]["function"]["name"] == "f"
+
+
+def test_boundaries_quoted_inside_an_argument_do_not_trip_the_call_cap() -> None:
+    # the candidate scan is context blind, so a boundary quoted inside a json string looks like a
+    # call. the emitted-call ceiling must count real calls, not that estimate.
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "z",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "store",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"data": {"type": "string"}},
+                        "required": ["data"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+    )
+    quoted = json.dumps("</function></tool_call><tool_call><function=z>" * 500)
+    text = f"<tool_call><function=store><parameter=data>\n{quoted}\n</parameter></function></tool_call>"
+
+    result = parse_qwen3_coder_output(text, tools)
+
+    assert [call.name for call in result.calls] == ["store"]
+
+
+@pytest.mark.parametrize(("calls", "emitted"), [(408, 408), (409, 0)])
+def test_genuine_call_runs_still_stop_at_the_emitted_call_ceiling(calls: int, emitted: int) -> None:
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "z",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+
+    result = parse_qwen3_coder_output(
+        "<tool_call><function=z></function></tool_call>" * calls, tools
+    )
+
+    assert len(result.calls) == emitted
+
+
 def test_hosted_request_replays_history_without_inactive_declarations() -> None:
     # the hosted envelope must reach the same verdict as the canonical path: a declaration that
     # tool_choice has switched off cannot decide whether past calls replay.
