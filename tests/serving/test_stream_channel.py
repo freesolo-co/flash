@@ -2721,3 +2721,24 @@ def test_installed_modal_154_contract_uses_only_spawned_channel_transport() -> N
     instance = module._engine_cls_for(base_model)()
     assert hasattr(instance.stream_generate_call.spawn, "aio")
     assert not hasattr(instance, "stream_generate")
+
+
+def test_stream_generate_call_matches_the_real_engine_owner_signature() -> None:
+    """the owner hook the stream channel calls must exist on the engine it drives.
+
+    the channel tests drive a permissive fake owner, so a kwarg the real engine does not accept
+    stays invisible until activation wires the two together. binding the real signature is what
+    turns that into a failing test instead of a TypeError on the first hydrated request.
+    """
+
+    from flash.serving.src.engine.lora_engine import _LoraEngineImpl
+
+    signature = inspect.signature(_LoraEngineImpl._stream_generate)
+    signature.bind(
+        None,
+        {},
+        None,
+        None,
+        None,
+        pre_generate_check=lambda: None,
+    )
