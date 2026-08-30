@@ -456,7 +456,7 @@ def test_vast_rejects_an_offer_whose_card_count_disagrees():
 
 
 def test_lambda_submit_requests_the_allocated_card_count():
-    """``submit_run_lambda`` must ask for gpu.count cards, not one.
+    """``submit_attempt_lambda`` must ask for gpu.count cards, not one.
 
     This is the expensive half of the contract: the worker spawns gpu.count ranks regardless, so a
     single-card rental oversubscribes one card while the run bills for the full wall time.
@@ -473,7 +473,7 @@ def test_lambda_submit_requests_the_allocated_card_count():
     try:
         monkey.setattr(lj, "usable_instances", fake_usable)
         with pytest.raises(lj.lambda_api.LambdaApiError):
-            lj.submit_run_lambda(
+            lj.submit_attempt_lambda(
                 _submittable("grpo", count=4, provider="lambda"),
                 42,
                 deadline_at=9_999_999_999.0,
@@ -484,7 +484,7 @@ def test_lambda_submit_requests_the_allocated_card_count():
 
 
 def test_vast_submit_requests_the_allocated_card_count():
-    """``submit_run_vast`` must search for gpu.count cards, not one. Same billing exposure."""
+    """``submit_attempt_vast`` must search for gpu.count cards, not one. Same billing exposure."""
     import flash.providers.vast.jobs as vj
 
     seen: dict = {}
@@ -497,7 +497,7 @@ def test_vast_submit_requests_the_allocated_card_count():
     try:
         monkey.setattr(vj, "usable_offers", fake_offers)
         with pytest.raises(vj.vast_api.VastApiError):
-            vj.submit_run_vast(
+            vj.submit_attempt_vast(
                 _submittable("grpo", count=4, provider="vast"),
                 42,
                 deadline_at=9_999_999_999.0,
@@ -547,7 +547,6 @@ def test_lambda_capacity_refresh_keeps_the_allocated_card_count():
         monkey.setattr(lj, "usable_instances", fake_usable)
         handle = lj.launch_and_submit(
             spec,
-            seed=spec.seed,
             instances=[_inst("us-east-1")],
             source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=9_999_999_999.0,
@@ -599,7 +598,6 @@ def test_vast_capacity_refresh_keeps_the_allocated_card_count():
         monkey.setattr(vj, "usable_offers", fake_usable)
         handle = vj.deploy_and_submit(
             spec,
-            seed=spec.seed,
             offers=[_offer(1)],
             source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=9_999_999_999.0,
@@ -642,7 +640,6 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
             monkey.setattr(lambda_api, "launch_instance", lambda **_kw: "i-1")
             handle = lj.launch_and_submit(
                 spec,
-                seed=spec.seed,
                 instances=[inst],
                 source_snapshot=_SOURCE_SNAPSHOT,
                 deadline_at=9_999_999_999.0,
@@ -673,7 +670,6 @@ def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
             monkey.setattr(vast_api, "create_instance", lambda *_a, **_kw: 4242)
             handle = vj.deploy_and_submit(
                 spec,
-                seed=spec.seed,
                 offers=[offer],
                 source_snapshot=_SOURCE_SNAPSHOT,
                 deadline_at=9_999_999_999.0,
