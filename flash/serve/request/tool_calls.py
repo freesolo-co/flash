@@ -580,13 +580,42 @@ def _validate_template_roundtrip(
         for tool, decoded, rendered in probe
     )
     failure = "tool calls cannot be replayed exactly by the tool template"
-    seen: dict[str, FunctionTool] = {tool.name: tool for tool, _, _ in probe}
-    result = parse_qwen3_coder_output(text, tuple(seen.values()), id_factory=lambda: "call_replay")
+    result = parse_qwen3_coder_output(
+        text, _merged_replay_tools(probe), id_factory=lambda: "call_replay"
+    )
     if len(result.calls) != len(probe):
         raise ValueError(failure)
     for call, (_, decoded, _) in zip(result.calls, probe, strict=True):
         if not _json_values_equal(_decode_json_object(call.arguments), decoded):
             raise ValueError(failure)
+
+
+def _merged_replay_tools(
+    probe: Sequence[tuple[FunctionTool, dict[str, Any], dict[str, Any]]],
+) -> tuple[FunctionTool, ...]:
+    # one turn can call the same function twice with different optional arguments, so the
+    # parser needs every key any of those calls used. keeping only one tool per name would
+    # leave the other call's parameters undeclared and reject a history the parser emits.
+    # a declared tool is one shared object for every call naming it, so only self-derived
+    # probes can differ under the same name.
+    merged: dict[str, FunctionTool] = {}
+    for tool, _, _ in probe:
+        existing = merged.get(tool.name)
+        if existing is None or existing is tool:
+            merged[tool.name] = tool
+            continue
+        properties = {**existing.parameters["properties"], **tool.parameters["properties"]}
+        merged[tool.name] = FunctionTool(
+            tool.name,
+            None,
+            {
+                "type": "object",
+                "properties": properties,
+                "required": [],
+                "additionalProperties": False,
+            },
+        )
+    return tuple(merged.values())
 
 
 def _render_template_argument(value: Any) -> str:
