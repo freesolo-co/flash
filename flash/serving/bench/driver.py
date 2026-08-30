@@ -300,6 +300,22 @@ async def run_request(
     except TimeoutError:
         failure = ERROR_TIMEOUT
         failure_detail = f"exceeded {REQUEST_TIMEOUT_SECONDS}s"
+    except asyncio.CancelledError:
+        # Caught SEPARATELY because `CancelledError` derives from BaseException, so the `except
+        # Exception` below never sees it. `_drain` cancels a request still pending at the cell
+        # bound, and a request whose `final` already arrived can be sitting in generator cleanup at
+        # that moment -- the completion was served, the stream just had not finished closing. Left
+        # to propagate, it escaped this function entirely, `_drain` never received a record, and the
+        # synthetic ERROR_TIMEOUT it substitutes counted an already-served completion as a failure.
+        # That is the same error-rate inflation the delivered-final routing below exists to prevent,
+        # arriving by the one path that routing could not observe.
+        failure = ERROR_ENGINE
+        failure_detail = "cancelled during stream cleanup"
+        # Re-raised below ONLY when nothing was delivered. A cancellation that interrupted a request
+        # mid-stream is a real cancellation and must keep propagating, or `_drain` would lose the
+        # bounded-reap accounting that decides whether the container is still usable.
+        if outcome.final_at is None:
+            raise
     except Exception as exc:
         failure = ERROR_ENGINE
         # Type and message only. A full traceback can carry paths and, in principle, credentials.
@@ -647,6 +663,16 @@ async def _drain(
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(75)
+        # A task that finished under cancellation carries its OWN record, and that record is the
+        # evidence -- not the synthetic one below. `run_request` swallows a cancellation whose
+        # `final` already arrived and returns the validated success with a cleanup fault attached,
+        # so the task completes normally rather than raising. Substituting a timeout here would
+        # discard a served completion and count it as a failure, which is exactly the inflation the
+        # delivered-final routing exists to prevent. A task cancelled with nothing delivered still
+        # raises, so `result()` raises too and the synthetic record below is what it gets.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            drained.append(task.result())
+            continue
         # `started_at` is REQUIRED and has no default. Omitting it raised TypeError here, which
         # aborted the whole bucket and discarded every record accumulated during the expensive
         # sweep -- the exact loss this drain exists to prevent. The task's own start offset is

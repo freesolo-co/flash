@@ -421,6 +421,22 @@ _DRIVER_SOURCES: tuple[str, ...] = (
     # digest can reach it.
     "grid_should_halt",
 )
+# What CONDITIONING every measured cell is preceded by. The warmup is what moves compilation and
+# lazy-initialization cost out of the measured window, so its request shape and sequencing decide
+# which startup cost the published curve excludes. It ran on every canary and every cold replacement
+# while living outside this digest entirely, so two campaigns that excluded materially different
+# startup costs compared as if they had measured the same thing.
+#
+# Its own tuple because it lives in `bench.warmup`, a sibling of `driver`: the warmup imports FROM
+# the driver, so re-exporting it back through the driver would be a cycle. What the digest needs is
+# only that the source is reachable, not which module holds it.
+_WARMUP_SOURCES: tuple[str, ...] = ("run_warmup",)
+_WARMUP_CONSTANTS: tuple[str, ...] = (
+    # How many warmups precede a measured cell. `run_warmup` is digested, but its source only names
+    # the count its caller passes, so going from five warmups to one would leave every source digest
+    # byte-identical while changing how much compilation cost the curve excludes.
+    "CANARY_WARMUP_REQUESTS",
+)
 _METRIC_SOURCES: tuple[str, ...] = (
     # The reduction arithmetic and the curve's ceiling/knee/saturation rules. Their THRESHOLDS are
     # keyword defaults in these signatures -- no caller overrides one -- so digesting the source
@@ -477,15 +493,17 @@ def _execution_digest() -> str:
     """
     import inspect
 
-    from flash.serving.bench import driver, metrics
+    from flash.serving.bench import driver, metrics, warmup
 
     parts = [inspect.getsource(getattr(driver, name)) for name in _DRIVER_SOURCES]
+    parts += [inspect.getsource(getattr(warmup, name)) for name in _WARMUP_SOURCES]
     parts += [inspect.getsource(getattr(metrics, name)) for name in _METRIC_SOURCES]
     parts += [
         inspect.getsource(getattr(getattr(metrics, cls), prop).fget)
         for cls, prop in _METRIC_PROPERTIES
     ]
     parts += [f"{name}={getattr(driver, name)!r}" for name in _DRIVER_CONSTANTS]
+    parts += [f"{name}={getattr(warmup, name)!r}" for name in _WARMUP_CONSTANTS]
     # Every error code is part of the contract: renaming or adding one changes how a failed attempt
     # is reported, and a consumer comparing two campaigns' failure breakdowns needs that to move.
     parts += [

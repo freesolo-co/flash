@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import tomllib
 import types
 import uuid
@@ -66,6 +67,7 @@ from flash.serving.bench.driver import (
 from flash.serving.bench.metrics import (
     ERROR_CACHE_CONTAMINATED,
     ERROR_CACHE_UNVERIFIED,
+    ERROR_ENGINE,
     ERROR_PROMPT_LENGTH,
     ERROR_TIMEOUT,
     CellResult,
@@ -76,6 +78,11 @@ from flash.serving.bench.metrics import (
     wilson_upper_bound,
 )
 from flash.serving.bench.probe import gpu_matches, probe_gdn_backend, probe_gpu
+from flash.serving.bench.warmup import (
+    CANARY_WARMUP_REQUESTS,
+    run_warmup,
+    warmup_fit_seconds_bound,
+)
 from flash.serving.bench.workload import (
     BUCKETS,
     BUCKETS_BY_NAME,
@@ -1221,8 +1228,10 @@ def test_the_canary_refuses_a_sweep_when_warmup_generation_failed() -> None:
     assert 'get("ok")' in predicate
     assert "raise RuntimeError" in predicate
 
-    warmup = source[source.index("async def _run_warmup(") :]
-    emitted = warmup[: warmup.index("\nasync def ")]
+    # Read from `bench.warmup`: the warmup moved out of the script so `_execution_digest` reaches
+    # it, and the gate that consumes this key still lives in the script. The two modules are
+    # exactly where the key can drift, so the assertion has to span them.
+    emitted = inspect.getsource(run_warmup)
     assert '"warmups"' in emitted, "warmup payload key drifted from the gate that reads it"
 
 
@@ -1662,6 +1671,9 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
         REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
         WARMUP_FIT_SECONDS_BOUND=warmup_fit,
         _FUNDED_WARMUP_FIT_SECONDS=warmup_fit + fitting_watchdog_grace_seconds(),
+        # The count moved into `bench.warmup` so `_execution_digest` reaches it; the script imports
+        # it, so the lifted estimator resolves it from here rather than from a lifted assignment.
+        CANARY_WARMUP_REQUESTS=CANARY_WARMUP_REQUESTS,
         fitting_watchdog_grace_seconds=fitting_watchdog_grace_seconds,
         drain_reap_seconds=drain_reap_seconds,
         run_request_bound_seconds=run_request_bound_seconds,
@@ -1689,7 +1701,7 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     # timeout plus a reap for a stream that ignored cancellation. Both are billed.
     canary = (
         run_request_bound_seconds() + warmup_fit + fitting_watchdog_grace_seconds()
-    ) * constants["CANARY_WARMUP_REQUESTS"]
+    ) * CANARY_WARMUP_REQUESTS
     startup = constants["STARTUP_TIMEOUT_SECONDS"]
     # `max_containers=1` caps SIMULTANEOUS replicas; it does not pin successive `.remote()` calls to
     # one container. Every bucket call can therefore land on a cold replacement and pay another boot
@@ -1733,6 +1745,8 @@ def test_a_bucket_landing_on_a_cold_container_warms_itself_before_measuring() ->
     So a bucket can land on a container the canary never gated, and would otherwise pay compile and
     lazy-workspace costs inside its measured window.
     """
+    from flash.serving.bench import driver as driver_module
+
     source = BENCH_APP.read_text(encoding="utf-8")
     tree = ast.parse(source)
     nodes = {
@@ -1754,7 +1768,7 @@ def test_a_bucket_landing_on_a_cold_container_warms_itself_before_measuring() ->
         for child in ast.walk(nodes["_ensure_warm"])
         if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
     }
-    assert "_run_warmup" in warm_called, "the cold path does not actually warm up"
+    assert "run_warmup" in warm_called, "the cold path does not actually warm up"
     # Read through `getattr` with a default, since a freshly booted container has no such
     # attribute at all, so the name appears as a string constant rather than an attribute access.
     read_names = {
@@ -1769,19 +1783,38 @@ def test_a_bucket_landing_on_a_cold_container_warms_itself_before_measuring() ->
     # The flag is SET by the warmup that knows whether it worked, not by the caller that merely
     # asked for one; see the failed-warmup guard. Assert the reader still short-circuits on it and
     # that exactly one place writes it, so a second writer cannot reintroduce an unvalidated warm.
-    writers = {
-        name
-        for name, node in nodes.items()
-        if any(
-            isinstance(target, ast.Attribute) and target.attr == "_bench_warmed"
-            for child in ast.walk(node)
-            if isinstance(child, ast.Assign)
-            for target in child.targets
-        )
-    }
-    assert writers == {"_run_warmup"}, (
-        f"the warmed flag is written by {sorted(writers)}; exactly one writer, the warmup itself, "
-        "may set it, or a caller can mark a container warm that no warmup validated"
+    def _writers(module: ast.Module) -> set[str]:
+        return {
+            node.name
+            for node in ast.walk(module)
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            and any(
+                isinstance(target, ast.Attribute) and target.attr == "_bench_warmed"
+                for child in ast.walk(node)
+                if isinstance(child, ast.Assign)
+                for target in child.targets
+            )
+        }
+
+    # Checked across ALL THREE modules because the warmup moved out of the script and into
+    # `bench.warmup`: a script-only scan now finds no writer at all and would pass vacuously,
+    # including on a version where some caller in the driver sets the flag itself.
+    from flash.serving.bench import warmup as warmup_module
+
+    script_writers = _writers(tree)
+    driver_writers = _writers(ast.parse(inspect.getsource(driver_module)))
+    warmup_writers = _writers(ast.parse(inspect.getsource(warmup_module)))
+    assert script_writers == set(), (
+        f"the script writes the warmed flag from {sorted(script_writers)}; only the warmup that "
+        "knows whether generation worked may set it"
+    )
+    assert driver_writers == set(), (
+        f"the driver writes the warmed flag from {sorted(driver_writers)}; only the warmup that "
+        "knows whether generation worked may set it"
+    )
+    assert warmup_writers == {"run_warmup"}, (
+        f"the warmed flag is written by {sorted(warmup_writers)}; exactly one writer, the warmup "
+        "itself, may set it, or a caller can mark a container warm that no warmup validated"
     )
 
 
@@ -1822,6 +1855,12 @@ def _bench_namespace(*names: str, **injected: Any) -> dict[str, Any]:
         # exact drift between what is enforced and what is reserved these tests exist to catch.
         "fitting_watchdog_grace_seconds": fitting_watchdog_grace_seconds,
         "drain_reap_seconds": drain_reap_seconds,
+        # Moved into the driver so `_execution_digest` reaches the warmup contract. The script
+        # imports them, so they are no longer liftable nodes -- supplied here as the REAL driver
+        # objects, which keeps every lifted caller running against the code that actually ships.
+        "CANARY_WARMUP_REQUESTS": CANARY_WARMUP_REQUESTS,
+        "warmup_fit_seconds_bound": warmup_fit_seconds_bound,
+        "run_warmup": run_warmup,
         # The warmup awaits its request through the driver's enforced bound, which permits the
         # request timeout plus a reap for a stream that ignored cancellation. Reserving the
         # nominal timeout instead would leave that reap funded by nothing.
@@ -1845,7 +1884,6 @@ def test_bench_container_timeout_covers_the_whole_grid_it_runs() -> None:
         "_worst_case_bucket_seconds",
         "TIMEOUT_HEADROOM_SECONDS",
         "TIMEOUT_SECONDS",
-        "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
         "_FUNDED_WARMUP_FIT_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
@@ -1890,9 +1928,9 @@ def test_bench_container_timeout_covers_the_whole_grid_it_runs() -> None:
     # -- and because the timeout fires before `run_bucket` returns, the artifact is never written.
     # Each of those warmups also FITS a prompt first, under its own watchdog, so the method clock
     # runs through the funded fit as well as the request.
-    warmups = (run_request_bound_seconds() + namespace["_FUNDED_WARMUP_FIT_SECONDS"]) * namespace[
-        "CANARY_WARMUP_REQUESTS"
-    ]
+    warmups = (
+        run_request_bound_seconds() + namespace["_FUNDED_WARMUP_FIT_SECONDS"]
+    ) * CANARY_WARMUP_REQUESTS
     worst = points * widest + warmups + namespace["PROBE_TIMEOUT_SECONDS"]
     assert namespace["_worst_case_bucket_seconds"]() == worst
     # Guard the direction that costs money: the grid's own fitting must be INSIDE the bound.
@@ -1931,17 +1969,16 @@ def test_warmup_prompts_are_unique_across_invocations() -> None:
     def _fake_fit(tokenizer: Any, uid: str, target: int) -> tuple[list[dict[str, str]], int]:
         return ([{"role": "user", "content": uid}], target)
 
-    # `_run_warmup` now bounds its own prompt fit, so the lifted function needs that bound.
-    namespace = _bench_namespace("_run_warmup", WARMUP_FIT_SECONDS_BOUND=_WARMUP_FIT_BOUND)
+    # Called directly: the warmup lives in `bench.warmup` now, so there is nothing to lift.
     engine = mock.Mock(tokenizer=object(), base_model="Qwen/Qwen3.5-9B")
     with (
         mock.patch("flash.serving.bench.driver.run_request", _fake_run_request),
-        mock.patch("flash.serving.bench.workload.fit_prompt_to_tokens", _fake_fit),
+        mock.patch("flash.serving.bench.warmup.fit_prompt_to_tokens", _fake_fit),
     ):
-        asyncio.run(namespace["_run_warmup"](engine, 5))
+        asyncio.run(run_warmup(engine, 5))
         first = list(issued)
         issued.clear()
-        asyncio.run(namespace["_run_warmup"](engine, 5))
+        asyncio.run(run_warmup(engine, 5))
 
     assert len(set(first)) == 5, "warmup UIDs collide WITHIN one invocation"
     assert not set(first) & set(issued), (
@@ -1966,13 +2003,11 @@ def test_a_cold_replacement_container_checks_its_own_warmup_health() -> None:
     namespace = _bench_namespace(
         "_ensure_warm",
         "_require_healthy_warmup",
-        "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
         "_FUNDED_WARMUP_FIT_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
-        _run_warmup=_fake_run_warmup,
+        run_warmup=_fake_run_warmup,
     )
-    namespace["_run_warmup"] = _fake_run_warmup
     engine = mock.Mock()
     del engine._bench_warmed  # a freshly booted container has never been warmed
 
@@ -1985,7 +2020,7 @@ def test_a_failed_warmup_leaves_the_container_unwarmed_so_a_retry_reruns_it() ->
     """A rejected warmup must not leave the container flagged warm.
 
     ``_ensure_warm`` short-circuits on ``_bench_warmed``, so whoever sets that flag decides whether
-    a later bucket warms at all. Setting it on entry to ``_run_warmup`` records INTENT: a warmup
+    a later bucket warms at all. Setting it on entry to ``run_warmup`` records INTENT: a warmup
     whose records come back ``ok=False`` -- or that raises part way, since the fit watchdog and the
     request bound both raise -- still leaves the flag true. ``_ensure_warm`` raises and the attempt
     is refused, but the flag outlives the refusal, so a retry inside the scaledown window lands on
@@ -2003,13 +2038,9 @@ def test_a_failed_warmup_leaves_the_container_unwarmed_so_a_retry_reruns_it() ->
     def _fake_fit(tokenizer: Any, uid: str, target: int) -> tuple[list[dict[str, str]], int]:
         return ([{"role": "user", "content": uid}], target)
 
-    namespace = _bench_namespace(
-        "_run_warmup",
-        "_ensure_warm",
-        "_require_healthy_warmup",
-        "CANARY_WARMUP_REQUESTS",
-        WARMUP_FIT_SECONDS_BOUND=_WARMUP_FIT_BOUND,
-    )
+    # `run_warmup` is NOT faked here: the flag write under test is inside it, and the helper's
+    # defaults supply the real `bench.warmup` function the lifted `_ensure_warm` resolves.
+    namespace = _bench_namespace("_ensure_warm", "_require_healthy_warmup")
 
     # 1. Records returned ok=False: the warmup completes, so only an outcome check can catch it.
     async def _unhealthy(
@@ -2021,7 +2052,7 @@ def test_a_failed_warmup_leaves_the_container_unwarmed_so_a_retry_reruns_it() ->
     del engine._bench_warmed  # a freshly booted container has never been warmed
     with (
         mock.patch("flash.serving.bench.driver.run_request", _unhealthy),
-        mock.patch("flash.serving.bench.workload.fit_prompt_to_tokens", _fake_fit),
+        mock.patch("flash.serving.bench.warmup.fit_prompt_to_tokens", _fake_fit),
         pytest.raises(RuntimeError, match="replacement-container warmup failed"),
     ):
         asyncio.run(namespace["_ensure_warm"](engine))
@@ -2040,7 +2071,7 @@ def test_a_failed_warmup_leaves_the_container_unwarmed_so_a_retry_reruns_it() ->
     del engine._bench_warmed
     with (
         mock.patch("flash.serving.bench.driver.run_request", _raises),
-        mock.patch("flash.serving.bench.workload.fit_prompt_to_tokens", _fake_fit),
+        mock.patch("flash.serving.bench.warmup.fit_prompt_to_tokens", _fake_fit),
         pytest.raises(TimeoutError),
     ):
         asyncio.run(namespace["_ensure_warm"](engine))
@@ -2058,7 +2089,7 @@ def test_a_failed_warmup_leaves_the_container_unwarmed_so_a_retry_reruns_it() ->
     del engine._bench_warmed
     with (
         mock.patch("flash.serving.bench.driver.run_request", _healthy),
-        mock.patch("flash.serving.bench.workload.fit_prompt_to_tokens", _fake_fit),
+        mock.patch("flash.serving.bench.warmup.fit_prompt_to_tokens", _fake_fit),
     ):
         assert asyncio.run(namespace["_ensure_warm"](engine)) is not None
     assert engine._bench_warmed is True, "a healthy warmup no longer marks the container warm"
@@ -2090,7 +2121,6 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
     namespace = _bench_namespace(
         "_canary_gpu_seconds_estimate",
         "_sweep_gpu_seconds_estimate",
-        "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
         "_FUNDED_WARMUP_FIT_SECONDS",
         "TIMEOUT_HEADROOM_SECONDS",
@@ -2103,7 +2133,7 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
         REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
     )
     startup = namespace["STARTUP_TIMEOUT_SECONDS"]
-    warmups = namespace["CANARY_WARMUP_REQUESTS"]
+    warmups = CANARY_WARMUP_REQUESTS
     # A warmup bills its prompt fit as well as its request: the fit runs outside `run_request`, on
     # the same rented container. Priced at the FUNDED figure, not the nominal bound: the watchdog
     # ends the container at `bound + grace`, so the grace is billable time the lane permits itself.
@@ -2180,7 +2210,6 @@ def test_documented_ceilings_exceed_what_each_lane_reserves() -> None:
     namespace = _bench_namespace(
         "_canary_gpu_seconds_estimate",
         "_sweep_gpu_seconds_estimate",
-        "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
         "_FUNDED_WARMUP_FIT_SECONDS",
         "TIMEOUT_HEADROOM_SECONDS",
@@ -2593,7 +2622,6 @@ def test_sweep_estimate_includes_prompt_fitting():
     """R7: the reservation must exceed the same sweep priced without the fitting term."""
     namespace = _bench_namespace(
         "_sweep_gpu_seconds_estimate",
-        "CANARY_WARMUP_REQUESTS",
         "TIMEOUT_HEADROOM_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
@@ -2621,7 +2649,6 @@ def test_sweep_estimate_includes_prompt_fitting():
     # sweep with fitting stubbed to zero and require the difference to be exactly the fitting.
     zeroed = _bench_namespace(
         "_sweep_gpu_seconds_estimate",
-        "CANARY_WARMUP_REQUESTS",
         "TIMEOUT_HEADROOM_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
@@ -2762,7 +2789,6 @@ def test_sweep_reserves_one_boot_per_separately_bootable_call() -> None:
     """
     namespace = _bench_namespace(
         "_sweep_gpu_seconds_estimate",
-        "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
         "_FUNDED_WARMUP_FIT_SECONDS",
         "TIMEOUT_HEADROOM_SECONDS",
@@ -2793,7 +2819,7 @@ def test_sweep_reserves_one_boot_per_separately_bootable_call() -> None:
         # and is priced at the funded figure because its watchdog ends at `bound + grace`.
         warmups = (
             run_request_bound_seconds() + namespace["_FUNDED_WARMUP_FIT_SECONDS"]
-        ) * namespace["CANARY_WARMUP_REQUESTS"]
+        ) * CANARY_WARMUP_REQUESTS
         # Boots reserved: initial + canary replacement + one per bucket call.
         boots = startup * (count + 1)
         # Each separately bootable call can leave a container billing through its scaledown window.
@@ -2925,7 +2951,6 @@ def test_the_probe_call_is_bounded_below_the_class_method_timeout() -> None:
         "STARTUP_TIMEOUT_SECONDS",
         "TIMEOUT_SECONDS",
         "TIMEOUT_HEADROOM_SECONDS",
-        "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
         "_FUNDED_WARMUP_FIT_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
@@ -2966,7 +2991,6 @@ def test_the_module_runbook_ceilings_clear_their_own_submission_stop() -> None:
     namespace = _bench_namespace(
         "_canary_gpu_seconds_estimate",
         "_sweep_gpu_seconds_estimate",
-        "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
         "_FUNDED_WARMUP_FIT_SECONDS",
         "TIMEOUT_HEADROOM_SECONDS",
@@ -3213,7 +3237,7 @@ def test_the_canary_certifies_one_container_in_one_remote_call() -> None:
     assert "async def certify(" in factory, "no single method probes and warms one container"
     # Probe THEN warm, so a container that fails its gate never pays for warmup requests.
     assert factory.index("_probe_in_container_within_bound(self)") < factory.index(
-        "_run_warmup(self, requests)"
+        "run_warmup(self, requests)"
     ), "the canary warms before it probes, paying for a container it may reject"
 
 
@@ -3764,22 +3788,23 @@ def test_warmups_reserve_and_bound_the_fit_that_precedes_each_request() -> None:
         for node in tree.body
         if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
     }
+    # The warmup itself lives in the driver now; the estimators that must FUND it stay in the
+    # script, so this guard reads one function from each module.
+    warmup_node = ast.parse(textwrap.dedent(inspect.getsource(run_warmup))).body[0]
     withs = [
         ast.unparse(item.context_expr)
-        for node in ast.walk(nodes["_run_warmup"])
+        for node in ast.walk(warmup_node)
         if isinstance(node, ast.With | ast.AsyncWith)
         for item in node.items
     ]
     assert any("fitting_watchdog" in expr for expr in withs), (
         "a warmup fit is unguarded, so a stuck tokenizer call bills to the class method timeout"
     )
-    assert any("WARMUP_FIT_SECONDS_BOUND" in expr for expr in withs), (
+    assert any("warmup_fit_seconds_bound" in expr for expr in withs), (
         "the warmup guard does not use the bound the estimators reserve"
     )
 
-    calls = [
-        ast.unparse(node) for node in ast.walk(nodes["_run_warmup"]) if isinstance(node, ast.Call)
-    ]
+    calls = [ast.unparse(node) for node in ast.walk(warmup_node) if isinstance(node, ast.Call)]
     assert any("fit_prompt_to_tokens" in call for call in calls)
 
     # Both estimators must price the fit, not just the request.
@@ -4649,10 +4674,10 @@ def test_a_container_that_fails_its_gates_is_refused_before_it_is_warmed() -> No
     ]
     assert "_probe_in_container_within_bound" in order, "certify no longer probes its container"
     assert "_gate_container_provenance" in order, "certify warms a container it never gated"
-    assert "_run_warmup" in order, "certify no longer warms"
+    assert "run_warmup" in order, "certify no longer warms"
     body = ast.get_source_segment(source, certify) or ""
     gate_at = body.index("_gate_container_provenance")
-    warm_at = body.index("_run_warmup")
+    warm_at = body.index("run_warmup")
     probe_at = body.index("_probe_in_container_within_bound")
     assert probe_at < gate_at < warm_at, (
         "certify warms before it gates, so a container already known to be unpublishable still "
@@ -5195,7 +5220,6 @@ def test_the_reservation_covers_the_method_timeout_headroom_it_authorizes() -> N
         names = [
             "_canary_gpu_seconds_estimate",
             "_sweep_gpu_seconds_estimate",
-            "CANARY_WARMUP_REQUESTS",
             "SCALEDOWN_WINDOW_SECONDS",
             "STARTUP_TIMEOUT_SECONDS",
             "PROBE_TIMEOUT_SECONDS",
@@ -5231,3 +5255,213 @@ def test_the_reservation_covers_the_method_timeout_headroom_it_authorizes() -> N
         "the canary lane reserves less than the method-timeout headroom its single call is "
         "permitted to bill, so an accepted canary can exceed its own ceiling"
     )
+
+
+# ── Round-25: cancelled cleanup after a delivered final, and the warmup contract ───────────────
+
+
+def test_a_cancellation_after_the_final_keeps_the_served_completion() -> None:
+    """R25: a completion already delivered must not become an error because the drain cancelled it.
+
+    `_drain` cancels whatever is still pending at the cell bound, and a request whose `final` event
+    already arrived can be sitting in generator cleanup at that instant -- the response was served,
+    the stream simply had not finished closing. `CancelledError` derives from `BaseException`, so
+    the `except Exception` arm in `run_request` never saw it: the cancellation escaped the function
+    entirely, `_drain` got no record, and the synthetic timeout it substitutes counted an
+    already-served completion as a failure. That inflates the error rate under exactly the slow
+    cleanup the delivered-final routing exists to keep out of the numbers, and it inflates it in the
+    direction a capacity claim must never err.
+
+    Both halves are asserted because they are separate defects: `run_request` must swallow the
+    cancellation, AND `_drain` must prefer the task's own record over its synthetic one. Fixing
+    either alone still discards the completion.
+    """
+    from flash.serving.bench import driver as driver_module
+
+    origin = time.monotonic()
+
+    class _StallsAfterFinal:
+        """Delivers a complete response, then hangs in generator cleanup.
+
+        This is the real shape of the defect: the `final` event has ARRIVED, so the completion was
+        served, and the drain's cancel then lands while the generator is still closing.
+        """
+
+        def _stream_generate(self, payload, forwarded, _lora, _gid):  # type: ignore[no-untyped-def]
+            async def _gen():
+                yield {"type": "ready"}
+                yield {"type": "token", "text": "hi"}
+                yield {"type": "choice_finished", "finish_reason": "stop"}
+                yield {
+                    "type": "final",
+                    "prompt_tokens": 512,
+                    "completion_tokens": 8,
+                    "cached_tokens": 0,
+                    "cached_tokens_reported": True,
+                }
+                # The stall the drain cancels into.
+                await asyncio.sleep(3600)
+
+            return _gen()
+
+    async def _exercise() -> list[RequestRecord]:
+        # The REAL `run_request`, not a stand-in: the swallow under test lives inside it, and a fake
+        # coroutine would prove only the drain half of the fix.
+        task = asyncio.ensure_future(
+            driver_module.run_request(
+                engine=_StallsAfterFinal(),
+                base_model="Qwen/Qwen3.5-9B",
+                bucket="short_interactive",
+                concurrency=1,
+                block=0,
+                uid="uid-final",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=8,
+                origin=origin,
+                expected_prompt_tokens=512,
+                bucket_target_tokens=512,
+            )
+        )
+        # Let the stream run to its `final` and settle into the stall. Cancelling before that would
+        # be the OTHER case -- nothing delivered -- which the next test covers.
+        await asyncio.sleep(0.05)
+        # Presented to the drain as still pending, which is what puts it on the cancel-and-reap
+        # path where the synthetic timeout used to be substituted unconditionally.
+        with mock.patch.object(
+            driver_module.asyncio, "wait", mock.AsyncMock(return_value=(set(), {task}))
+        ):
+            return await driver_module._drain(
+                {task},
+                base_model="Qwen/Qwen3.5-9B",
+                bucket="short_interactive",
+                concurrency=1,
+                block=0,
+                spawned_at={},
+                spawned_uid={},
+            )
+
+    drained = asyncio.run(_exercise())
+
+    assert len(drained) == 1, "the drain lost the record the task carried"
+    kept = drained[0]
+    assert kept.ok is True, (
+        "a completion that was served and then cancelled during stream cleanup was recorded as a "
+        "failure; the error rate now counts a delivered response against the engine"
+    )
+    assert kept.error is None, f"the served completion carries error {kept.error!r}"
+    assert kept.uid == "uid-final", "the synthetic record displaced the task's own evidence"
+    # The unhealthy close is still PUBLISHED rather than absorbed into a clean success.
+    assert kept.cleanup_error == ERROR_ENGINE, "the cleanup fault was swallowed with the record"
+
+
+def test_a_cancellation_with_nothing_delivered_still_counts_as_a_failure() -> None:
+    """R25: the converse. Swallowing every cancellation would hide genuine mid-stream kills.
+
+    A request cancelled before its `final` arrived is a real cancellation: nothing was served, and
+    the record must stay a failure. `run_request` re-raises in that case, so `result()` raises in
+    the drain and the synthetic record is what the attempt gets -- which keeps the request in the
+    denominator instead of deleting it. Without this direction the fix above would read as green
+    while quietly converting every cancelled request into a success.
+    """
+    from flash.serving.bench import driver as driver_module
+
+    origin = time.monotonic()
+
+    class _StallsBeforeFinal:
+        """Opens the stream and then hangs, with no terminal event ever delivered."""
+
+        def _stream_generate(self, payload, forwarded, _lora, _gid):  # type: ignore[no-untyped-def]
+            async def _gen():
+                yield {"type": "ready"}
+                yield {"type": "token", "text": "hi"}
+                await asyncio.sleep(3600)
+
+            return _gen()
+
+    async def _exercise() -> list[RequestRecord]:
+        # Again the REAL `run_request`, so the re-raise under test is the one that actually runs.
+        task = asyncio.ensure_future(
+            driver_module.run_request(
+                engine=_StallsBeforeFinal(),
+                base_model="Qwen/Qwen3.5-9B",
+                bucket="short_interactive",
+                concurrency=1,
+                block=0,
+                uid="uid-nothing",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=8,
+                origin=origin,
+                expected_prompt_tokens=512,
+                bucket_target_tokens=512,
+            )
+        )
+        await asyncio.sleep(0.05)
+        with mock.patch.object(
+            driver_module.asyncio, "wait", mock.AsyncMock(return_value=(set(), {task}))
+        ):
+            return await driver_module._drain(
+                {task},
+                base_model="Qwen/Qwen3.5-9B",
+                bucket="short_interactive",
+                concurrency=1,
+                block=0,
+                spawned_at={"__missing__": 0.0},  # type: ignore[dict-item]
+                spawned_uid={},
+            )
+
+    drained = asyncio.run(_exercise())
+
+    assert len(drained) == 1, "a cancelled request was DELETED from the attempt denominator"
+    assert drained[0].ok is False, (
+        "a request cancelled with nothing delivered was recorded as a success, so a cell that "
+        "ended mid-stream reports a cleaner error rate than it earned"
+    )
+    assert drained[0].error == ERROR_TIMEOUT
+    assert drained[0].uid != "uid-nothing", (
+        "the request's own record survived a cancellation that delivered nothing, so the "
+        "swallow above is unconditional and every cancelled request now reads as served"
+    )
+
+
+def test_the_warmup_contract_is_inside_the_execution_digest() -> None:
+    """R25: what CONDITIONS every measured cell must move the checksum.
+
+    The warmup is what moves compilation and lazy-initialization cost out of the measured window,
+    so its request count, prompt shape and sequencing decide which startup cost the published curve
+    excludes. It ran before every canary and every cold replacement while living in the entrypoint
+    script -- which `_execution_digest` does not read at all -- so going from five warmups to one,
+    or warming concurrently instead of sequentially, left `workload_checksum` byte-identical. Two
+    campaigns that excluded materially different startup costs then compared as if they had
+    measured the same thing.
+
+    Digested through its OWN tuples rather than the driver's, because the warmup imports from the
+    driver: re-exporting it back through the driver to reuse `_DRIVER_SOURCES` would be a cycle.
+    The count is digested BY VALUE rather than by source, because `run_warmup`'s own source only
+    names the number its caller passes.
+    """
+    from flash.serving.bench import warmup as warmup_module
+    from flash.serving.bench import workload
+
+    assert "run_warmup" in workload._WARMUP_SOURCES, (
+        "the warmup that precedes every measured cell is outside the execution digest, so its "
+        "prompt shape and sequencing can change without moving the checksum"
+    )
+    assert "CANARY_WARMUP_REQUESTS" in workload._WARMUP_CONSTANTS, (
+        "the warmup COUNT is not digested; `run_warmup` names it rather than revealing it, so "
+        "five warmups and one warmup produce the same checksum"
+    )
+
+    # Not merely listed: the digest must actually MOVE when either one changes.
+    baseline = workload.workload_checksum()
+    with mock.patch.object(warmup_module, "CANARY_WARMUP_REQUESTS", 1):
+        assert workload.workload_checksum() != baseline, (
+            "the warmup count is named in _WARMUP_CONSTANTS but does not move the checksum"
+        )
+
+    async def _different_warmup(engine: Any, requests: int) -> dict[str, Any]:
+        return {"warmups": [], "assembled_prompt_tokens": 0}
+
+    with mock.patch.object(warmup_module, "run_warmup", _different_warmup):
+        assert workload.workload_checksum() != baseline, (
+            "the warmup body is named in _WARMUP_SOURCES but does not move the checksum"
+        )

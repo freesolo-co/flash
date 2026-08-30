@@ -142,29 +142,26 @@ from flash.serving.bench.driver import (  # noqa: E402
     prompt_fit_seconds_bound,
     run_request_bound_seconds,
 )
+from flash.serving.bench.warmup import (  # noqa: E402
+    CANARY_WARMUP_REQUESTS,
+    run_warmup,
+    warmup_fit_seconds_bound,
+)
 from flash.serving.bench.workload import (  # noqa: E402
     BUCKETS,
-    BUCKETS_BY_NAME,
     concurrency_grid,
 )
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
 
-# How many warmup requests a cold container issues. Shared by `_run_canary`, `_ensure_warm`, the
-# method timeout and both budget estimators, so the bound reserved and the bound enforced cannot
-# drift from the number actually issued. Defined here because `_worst_case_bucket_seconds` runs at
-# import time to derive TIMEOUT_SECONDS.
-CANARY_WARMUP_REQUESTS = 5
-
-# Wall time one warmup prompt fit is allowed. A warmup fits ONE `short_interactive` prompt, so it is
-# priced from that bucket's own bound at a pool of one rather than from a cell's whole pool.
+# Wall time one warmup prompt fit is allowed, and what that fit can BILL. The bound and the warmup
+# count both live in the driver so `_execution_digest` reaches them; they are read here so the bound
+# reserved and the bound enforced cannot drift from the number actually issued.
 #
-# `_FUNDED_WARMUP_FIT_SECONDS` is what that fit can BILL, which is NOT the bound it is nominally
-# held to: the watchdog ends the container at `bound + grace`, so the grace is time the lane permits
-# itself to spend and must be reserved with the bound. Reserving the nominal bound alone left every
-# armed watchdog able to bill past its own authorization.
-WARMUP_FIT_SECONDS_BOUND = prompt_fit_seconds_bound(
-    BUCKETS_BY_NAME["short_interactive"], min_requests=1
-)
+# `_FUNDED_WARMUP_FIT_SECONDS` is NOT the bound the fit is nominally held to: the watchdog ends the
+# container at `bound + grace`, so the grace is time the lane permits itself to spend and must be
+# reserved with the bound. Reserving the nominal bound alone left every armed watchdog able to bill
+# past its own authorization.
+WARMUP_FIT_SECONDS_BOUND = warmup_fit_seconds_bound()
 _FUNDED_WARMUP_FIT_SECONDS = WARMUP_FIT_SECONDS_BOUND + fitting_watchdog_grace_seconds()
 
 
@@ -299,7 +296,7 @@ def _build_bench_engine(gpu: str, class_name: str) -> Any:
             # hand. Refusing here ends the call at the probe, which is the whole reason the probe
             # runs first.
             _gate_container_provenance(self, provenance, "canary")
-            warm = await _run_warmup(self, requests)
+            warm = await run_warmup(self, requests)
             return {"probe": provenance, "warmup": warm}
 
         @modal.method()
@@ -309,7 +306,7 @@ def _build_bench_engine(gpu: str, class_name: str) -> Any:
             Their timings are reported but never merged into the envelope: the first request after
             boot pays one-time costs that would distort every percentile it entered.
             """
-            return await _run_warmup(self, requests)
+            return await run_warmup(self, requests)
 
         @modal.method()
         async def run_bucket(
@@ -397,71 +394,12 @@ async def _ensure_warm(engine: Any) -> dict[str, Any] | None:
     """
     if getattr(engine, "_bench_warmed", False):
         return None
-    warm = await _run_warmup(engine, CANARY_WARMUP_REQUESTS)
+    warm = await run_warmup(engine, CANARY_WARMUP_REQUESTS)
     # A cold replacement container is exactly where an unhealthy engine surfaces, so its warmup gets
     # the same check the canary gate applies rather than being trusted because the canary passed on
     # a DIFFERENT container.
     _require_healthy_warmup(warm, "replacement-container")
     return warm
-
-
-async def _run_warmup(engine: Any, requests: int) -> dict[str, Any]:
-    """Sequential warmups on ``engine``, reported separately from the envelope."""
-    import time
-
-    from flash.serving.bench.driver import fitting_watchdog, run_request_within_bound
-    from flash.serving.bench.workload import BUCKETS_BY_NAME, fit_prompt_to_tokens
-
-    bucket = BUCKETS_BY_NAME["short_interactive"]
-    origin = time.monotonic()
-    out = []
-    exact = 0
-    # Prompts are derived from the UID, so a fixed `warmup-{i}` reissued the SAME five prompts on
-    # every invocation. Within the 120s scaledown window the container survives, and the second
-    # canary hits a retained prefix cache -- which the driver correctly scores as
-    # ERROR_CACHE_CONTAMINATED, refusing the sweep even though generation was healthy. A nonce per
-    # invocation makes each warmup prompt request-unique from its first token, like every other
-    # prompt the harness issues.
-    nonce = uuid.uuid4().hex[:12]
-    for index in range(requests):
-        uid = f"warmup-{nonce}-{index}"
-        # Bounded by the same enforcement the cell pool uses. This fit runs BEFORE `run_request`, so
-        # the 900s request timeout that both estimators price a warmup at does not cover it; without
-        # a watchdog a stalled tokenizer here billed to the class-wide timeout instead.
-        with fitting_watchdog(WARMUP_FIT_SECONDS_BOUND, label=f"warmup-{index}"):
-            messages, exact = fit_prompt_to_tokens(
-                engine.tokenizer, uid, bucket.target_input_tokens
-            )
-        # Bounded, unlike a bare `run_request`. Its `wait_for` waits for cancellation CLEANUP to
-        # finish, so a stream whose close blocks keeps the call open past the request timeout with
-        # no exception raised. A measured cell survives that because `_drain` awaits a shielded
-        # task; this warmup awaits directly, so it needs the same enforcement or one hung close
-        # bills to the class-wide method timeout against a `REQUEST_TIMEOUT_SECONDS` reservation.
-        record = await run_request_within_bound(
-            engine,
-            engine.base_model,
-            messages,
-            bucket.max_output_tokens,
-            uid,
-            bucket="warmup",
-            concurrency=1,
-            block=0,
-            origin=origin,
-            # The warmup is the gate that runs before any sweep, so it is the cheapest place to
-            # discover that the engine sizes prompts differently than the fitter does.
-            expected_prompt_tokens=exact,
-        )
-        out.append(record.to_json())
-    # Marked HERE, after the requests ran, and only when they all succeeded. Set before the loop it
-    # recorded intent rather than outcome: a warmup that returned failed records -- or raised part
-    # way, since `fitting_watchdog` and the request bound both raise -- still left the container
-    # flagged warm. `_ensure_warm` rejects that attempt, but the flag outlives the rejection, so a
-    # retry inside the scaledown window short-circuits at the flag check and measures on a container
-    # whose generation path was never proven. Every caller reads the same flag, so the one place
-    # that knows whether the warmup actually worked is the one place that sets it.
-    if out and all(record.get("ok") for record in out):
-        engine._bench_warmed = True
-    return {"warmups": out, "assembled_prompt_tokens": exact}
 
 
 async def _run_bucket(
