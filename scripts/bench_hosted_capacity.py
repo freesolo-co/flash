@@ -285,6 +285,13 @@ def _build_bench_engine(gpu: str, class_name: str) -> Any:
             method, boot is governed by `startup_timeout` and the 300s covers only probe work.
             """
             provenance = await _probe_in_container_within_bound(self)
+            # Gate BEFORE warming. The gates used to run only in `_run_canary`, after this method
+            # returned both payloads, so a container on the wrong card or with an unresolved kernel
+            # path still paid for `requests` sequential warmups -- each able to spend its fitting
+            # allowance plus the full request bound -- before anything read the probe already in
+            # hand. Refusing here ends the call at the probe, which is the whole reason the probe
+            # runs first.
+            _gate_container_provenance(self, provenance, "canary")
             warm = await _run_warmup(self, requests)
             return {"probe": provenance, "warmup": warm}
 
@@ -462,10 +469,9 @@ async def _run_bucket(
     The boot dominates cost (~960s of ~1000s per cell in the prior campaign), so the grid runs
     against a single engine rather than paying a boot per point.
     """
-    from flash.serving.bench.catalog import bench_catalog_summary, bench_gpu_for
+    from flash.serving.bench.catalog import bench_catalog_summary
     from flash.serving.bench.driver import grid_should_halt, run_cell
     from flash.serving.bench.metrics import summarize_curve
-    from flash.serving.bench.probe import gpu_matches
     from flash.serving.bench.workload import BUCKETS_BY_NAME
 
     bucket = BUCKETS_BY_NAME[bucket_name]
@@ -482,18 +488,11 @@ async def _run_bucket(
     # kernel path already made it unpublishable. The probe is comparatively cheap and answers the
     # only question that can reject the container, so it goes first.
     provenance = await _probe_in_container_within_bound(engine)
-    # Card identity too, not only the kernel path. `_run_canary` checks `gpu_matches` against the
-    # container IT probed; a replacement container reporting a different accelerator would otherwise
-    # be measured and published under the catalog's expected label, which is the one attribution the
-    # whole campaign rests on. The mismatch would sit in raw provenance, unread.
-    expected_gpu = bench_gpu_for(engine.base_model)
-    if not gpu_matches(provenance, expected_gpu):
-        raise RuntimeError(
-            f"bucket {bucket_name!r} container is {(provenance.get('gpu') or {}).get('name')!r}, "
-            f"expected {expected_gpu}; refusing to attribute a measurement to the wrong card"
-        )
-    _require_resolved_gdn_backend(provenance)
-    _require_resolved_checkpoint(provenance, f"bucket {bucket_name!r}")
+    # Card identity too, not only the kernel path. A replacement container reporting a different
+    # accelerator would otherwise be measured and published under the catalog's expected label,
+    # which is the one attribution the whole campaign rests on, and the mismatch would sit in raw
+    # provenance, unread.
+    _gate_container_provenance(engine, provenance, f"bucket {bucket_name!r}")
     # A replacement container measures cold otherwise; see `_ensure_warm`. Recorded in the payload
     # so a reader can tell a bucket that inherited the canary's warm container from one that had to
     # warm itself, rather than having to assume every bucket ran on the gated container.
@@ -624,6 +623,30 @@ async def _probe_in_container_within_bound(engine: Any) -> dict[str, Any]:
         os._exit(70)
 
 
+def _gate_container_provenance(engine: Any, probe: dict[str, Any], where: str) -> None:
+    """Refuse this container unless its card, kernel path and checkpoints are publishable.
+
+    The three gates always travel together, and they exist to be applied BEFORE anything expensive
+    runs on the container they judge. Keeping them in one place is what stops a caller from
+    acquiring the probe and then spending on the container anyway: `certify` did exactly that,
+    probing first but warming unconditionally and leaving the refusal to its client-side caller, so
+    a container already known to be on the wrong card burned CANARY_WARMUP_REQUESTS sequential
+    warmups -- each able to spend its fitting allowance plus the full request bound -- before
+    anything looked at the probe it was holding.
+    """
+    from flash.serving.bench.catalog import bench_gpu_for
+    from flash.serving.bench.probe import gpu_matches
+
+    expected_gpu = bench_gpu_for(engine.base_model)
+    if not gpu_matches(probe, expected_gpu):
+        raise RuntimeError(
+            f"{where} container is {(probe.get('gpu') or {}).get('name')!r}, "
+            f"expected {expected_gpu}; refusing to attribute a measurement to the wrong card"
+        )
+    _require_resolved_gdn_backend(probe)
+    _require_resolved_checkpoint(probe, where)
+
+
 def _require_resolved_gdn_backend(probe: dict[str, Any]) -> None:
     """Raise unless the probe established WHICH GDN prefill backend the engine chose.
 
@@ -738,6 +761,11 @@ def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, An
     probe = certified["probe"]
     warm = certified["warmup"]
     print(json.dumps(probe, indent=2), flush=True)
+    # `certify` already gated this container and would have raised before warming it, so reaching
+    # here means those gates passed. This check is NOT that one repeated: the container gates itself
+    # against `bench_gpu_for(self.base_model)`, its OWN idea of which card it should hold, so it
+    # cannot detect a container wired to a different model than the caller asked for. Comparing
+    # against the `expected_gpu` this lane was called with is the only place that mismatch surfaces.
     if not gpu_matches(probe, expected_gpu):
         raise RuntimeError(f"expected {expected_gpu}, got {(probe.get('gpu') or {}).get('name')!r}")
     _require_resolved_gdn_backend(probe)

@@ -2815,9 +2815,21 @@ def test_each_bucket_gates_the_container_it_actually_measures_on() -> None:
         for child in ast.walk(run_bucket)
         if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
     }
-    assert "_require_resolved_gdn_backend" in called, (
+    # Reached through the shared gate. The bucket used to invoke `_require_resolved_gdn_backend`
+    # itself; the same three gates now live in `_gate_container_provenance` so that no caller can
+    # hold a probe without applying it. The property under test is unchanged -- this bucket refuses
+    # an unresolved kernel path before it measures -- so resolve the call through the helper rather
+    # than pinning a call name the policy no longer keeps here.
+    assert "_gate_container_provenance" in called, (
         "a bucket can measure and publish on a container whose kernel path was never established"
     )
+    helper = nodes["_gate_container_provenance"]
+    assert any(
+        isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Name)
+        and child.func.id == "_require_resolved_gdn_backend"
+        for child in ast.walk(helper)
+    ), "the shared gate no longer establishes the kernel path"
 
     # The gate must precede the first cell, or it refuses nothing that was not already paid for.
     body = run_bucket.body
@@ -2826,7 +2838,7 @@ def test_each_bucket_gates_the_container_it_actually_measures_on() -> None:
         for child in ast.walk(run_bucket)
         if isinstance(child, ast.Call)
         and isinstance(child.func, ast.Name)
-        and child.func.id == "_require_resolved_gdn_backend"
+        and child.func.id == "_gate_container_provenance"
     )
     loop_line = min(child.lineno for child in body if isinstance(child, ast.For | ast.AsyncFor))
     assert gate_line < loop_line, "the kernel gate runs after cells the run has already paid for"
@@ -2842,15 +2854,14 @@ def test_each_bucket_gates_the_container_it_actually_measures_on() -> None:
     )
     # Card identity on THIS container too, not only the kernel path: a replacement container on a
     # different accelerator would otherwise be published under the catalog's expected GPU label.
-    assert "gpu_matches" in called, "a bucket can publish a measurement taken on an unverified card"
-    gpu_line = min(
-        child.lineno
-        for child in ast.walk(run_bucket)
-        if isinstance(child, ast.Call)
+    # The check now travels inside the shared gate, whose call site is already asserted above to
+    # precede the first cell, so the card is verified before anything is paid for.
+    assert any(
+        isinstance(child, ast.Call)
         and isinstance(child.func, ast.Name)
         and child.func.id == "gpu_matches"
-    )
-    assert gpu_line < loop_line, "the card check runs after cells the run has already paid for"
+        for child in ast.walk(helper)
+    ), "a bucket can publish a measurement taken on an unverified card"
 
 
 def test_the_probe_call_is_bounded_below_the_class_method_timeout() -> None:
@@ -4253,8 +4264,13 @@ def test_both_paid_paths_gate_on_a_named_checkpoint() -> None:
     than only the helper.
     """
     source = BENCH_APP.read_text(encoding="utf-8")
+    # The canary keeps its own client-side call: it re-checks what `certify` returned, since the
+    # container can only gate against its own `base_model`. The in-container paths reach the same
+    # requirement through the shared gate, which is applied on BOTH before anything is warmed.
     assert '_require_resolved_checkpoint(probe, "canary")' in source
-    assert '_require_resolved_checkpoint(provenance, f"bucket {bucket_name!r}")' in source
+    assert "_require_resolved_checkpoint(probe, where)" in source
+    assert '_gate_container_provenance(self, provenance, "canary")' in source
+    assert '_gate_container_provenance(engine, provenance, f"bucket {bucket_name!r}")' in source
 
 
 def test_a_replacement_container_is_probed_before_it_is_warmed() -> None:
@@ -4270,12 +4286,13 @@ def test_a_replacement_container_is_probed_before_it_is_warmed() -> None:
         for node in tree.body
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_bucket"
     )
+    # `gpu_matches` and the two `_require_*` predicates now live inside `_gate_container_provenance`
+    # so that both in-container callers apply the identical sequence. What must still hold here is
+    # the ordering: probe, gate, and only then pay for warmups.
     watched = {
         "_ensure_warm",
         "_probe_in_container_within_bound",
-        "_require_resolved_gdn_backend",
-        "_require_resolved_checkpoint",
-        "gpu_matches",
+        "_gate_container_provenance",
     }
     order = [
         (node.func.id, node.lineno)
@@ -4288,9 +4305,7 @@ def test_a_replacement_container_is_probed_before_it_is_warmed() -> None:
     assert "_ensure_warm" in positions, "the bucket no longer warms a cold replacement"
     for gate in (
         "_probe_in_container_within_bound",
-        "gpu_matches",
-        "_require_resolved_gdn_backend",
-        "_require_resolved_checkpoint",
+        "_gate_container_provenance",
     ):
         assert gate in positions, f"{gate} is not applied by the bucket"
         assert positions[gate] < positions["_ensure_warm"], (
@@ -4464,3 +4479,114 @@ def test_the_lane_gates_checkpoint_identity_before_it_summarizes() -> None:
     assert gate, "the lane never compares checkpoints across buckets"
     writes = [line for name, line in calls if name == "_write_artifact"]
     assert max(writes) > gate[0], "the drift gate runs after every artifact is already written"
+
+
+def test_a_container_that_fails_its_gates_is_refused_before_it_is_warmed() -> None:
+    """`certify` must reject on the probe, not after paying for five warmups.
+
+    The gates used to live only in `_run_canary`, which reads what `certify` returns -- so `certify`
+    probed, then warmed unconditionally, and only afterwards did anything look at the probe it was
+    already holding. A container on the wrong card or with an unresolved kernel path therefore ran
+    CANARY_WARMUP_REQUESTS sequential warmups first, each able to spend its fitting allowance plus
+    the full request bound, before being refused for a reason known before the first one started.
+
+    Ordering is the whole property, so this asserts on ordering: the warmup must not have been
+    entered at all, which is stronger than the refusal merely happening.
+    """
+    namespace = _bench_namespace(
+        "_gate_container_provenance",
+        "_require_resolved_gdn_backend",
+        "_require_resolved_checkpoint",
+    )
+    gate = namespace["_gate_container_provenance"]
+    model = BENCH_MODELS[0]
+    engine = types.SimpleNamespace(base_model=model)
+    right_card = bench_gpu_for(model)
+
+    def _probe(gpu_name: str, *, gdn: bool = True, commit: str = "a" * 40) -> dict[str, Any]:
+        return {
+            "gpu": {"name": gpu_name},
+            "gdn_prefill": {"resolved": "flashinfer" if gdn else None, "reason": "unavailable"},
+            "resolved_revisions": {
+                "model": {"repo": model, "commit": commit, "source": "snapshot-contents"},
+                "tokenizer": {"repo": model, "commit": commit, "source": "snapshot-contents"},
+            },
+        }
+
+    # A healthy probe passes, so the gate is not simply refusing everything.
+    gate(engine, _probe(right_card), "canary")
+
+    # Each of the three rejections a container can earn.
+    with pytest.raises(RuntimeError, match="refusing to attribute a measurement to the wrong card"):
+        gate(engine, _probe("NVIDIA GeForce RTX 4090"), "canary")
+    with pytest.raises(RuntimeError, match="GDN prefill backend is unresolved"):
+        gate(engine, _probe(right_card, gdn=False), "canary")
+    with pytest.raises(RuntimeError, match="resolved to no commit"):
+        gate(engine, _probe(right_card, commit=""), "canary")
+
+    # And `certify` must apply it BETWEEN the probe and the warmup. Read from the real source: the
+    # method is built inside `_build_bench_engine`, so it cannot be lifted and executed on its own.
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    certify = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "certify"
+    )
+    order = [
+        name.func.id if isinstance(name.func, ast.Name) else getattr(name.func, "attr", "")
+        for name in ast.walk(certify)
+        if isinstance(name, ast.Call)
+    ]
+    assert "_probe_in_container_within_bound" in order, "certify no longer probes its container"
+    assert "_gate_container_provenance" in order, "certify warms a container it never gated"
+    assert "_run_warmup" in order, "certify no longer warms"
+    body = ast.get_source_segment(source, certify) or ""
+    gate_at = body.index("_gate_container_provenance")
+    warm_at = body.index("_run_warmup")
+    probe_at = body.index("_probe_in_container_within_bound")
+    assert probe_at < gate_at < warm_at, (
+        "certify warms before it gates, so a container already known to be unpublishable still "
+        "pays for every warmup"
+    )
+
+
+def test_the_provenance_gates_live_in_one_place_so_a_caller_cannot_skip_them() -> None:
+    """Three gates that must travel together, applied by one helper.
+
+    `_run_bucket` and `certify` both refuse a container on card, kernel path and checkpoints. Held
+    as three separate call sequences, a third caller -- or an edit to one of the two -- can drop a
+    gate silently, which is exactly how `certify` came to hold the probe without applying it.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    helper = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_gate_container_provenance"
+    )
+    inner = {
+        call.func.id
+        for call in ast.walk(helper)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    }
+    assert {"_require_resolved_gdn_backend", "_require_resolved_checkpoint"} <= inner, (
+        "the shared gate no longer applies both provenance requirements"
+    )
+
+    # Nobody re-implements the sequence. The canary keeps its own `gpu_matches` check against the
+    # gpu the CALLER expects -- the container can only check its own `base_model` -- but the two
+    # in-container callers must reach the requirements through the shared helper.
+    for name in ("_run_bucket",):
+        node = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef | ast.FunctionDef) and n.name == name
+        )
+        calls = {
+            c.func.id for c in ast.walk(node) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+        }
+        assert "_gate_container_provenance" in calls, f"{name} does not use the shared gate"
+        assert not {"_require_resolved_gdn_backend", "_require_resolved_checkpoint"} & calls, (
+            f"{name} re-implements the gate sequence instead of using the shared helper"
+        )
