@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import dataclasses
+import hashlib
 import inspect
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1881,6 +1884,7 @@ def test_bench_container_timeout_covers_the_whole_grid_it_runs() -> None:
     raise it automatically instead of quietly reintroducing the gap.
     """
     namespace = _bench_namespace(
+        "bucket_call_priced_seconds",
         "_worst_case_bucket_seconds",
         "TIMEOUT_HEADROOM_SECONDS",
         "TIMEOUT_SECONDS",
@@ -2954,6 +2958,7 @@ def test_the_probe_call_is_bounded_below_the_class_method_timeout() -> None:
         "WARMUP_FIT_SECONDS_BOUND",
         "_FUNDED_WARMUP_FIT_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
+        "bucket_call_priced_seconds",
         "_worst_case_bucket_seconds",
         BENCH_MODELS=BENCH_MODELS,
         bench_engine_overrides_for=bench_engine_overrides_for,
@@ -4556,7 +4561,11 @@ def test_the_warmup_reservation_funds_the_enforced_bound() -> None:
     assert "REQUEST_TIMEOUT_SECONDS + _FUNDED_WARMUP_FIT_SECONDS" not in source, (
         "a warmup is still priced at the nominal request timeout it is no longer bounded by"
     )
-    assert source.count("run_request_bound_seconds() + _FUNDED_WARMUP_FIT_SECONDS") == 3, (
+    # Four sites: the two per-call priced bounds (`bucket_call_priced_seconds`,
+    # `certify_call_priced_seconds`) that each call is now ENFORCED at, plus the canary and sweep
+    # estimators that reserve against them. The bound and the reservation must price a warmup
+    # identically or a call is authorized to spend more than it was funded for.
+    assert source.count("run_request_bound_seconds() + _FUNDED_WARMUP_FIT_SECONDS") == 4, (
         "not every warmup reservation site funds the enforced bound"
     )
 
@@ -4662,10 +4671,12 @@ def test_a_container_that_fails_its_gates_is_refused_before_it_is_warmed() -> No
     # method is built inside `_build_bench_engine`, so it cannot be lifted and executed on its own.
     source = BENCH_APP.read_text(encoding="utf-8")
     tree = ast.parse(source)
+    # `certify` delegates its body to `_certify` so the whole call can be held to its priced
+    # bound; the probe/gate/warm sequence this asserts lives there.
     certify = next(
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "certify"
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_certify"
     )
     order = [
         name.func.id if isinstance(name.func, ast.Name) else getattr(name.func, "attr", "")
@@ -5465,3 +5476,223 @@ def test_the_warmup_contract_is_inside_the_execution_digest() -> None:
         assert workload.workload_checksum() != baseline, (
             "the warmup body is named in _WARMUP_SOURCES but does not move the checksum"
         )
+
+
+def test_every_call_is_bounded_at_what_its_own_phases_reserve() -> None:
+    """No remote call may be authorized to run longer than the reservation that funded it.
+
+    `TIMEOUT_SECONDS` is one class-wide number derived from the WIDEST bucket, and Modal applies it
+    to every method. So a `short_interactive` call was permitted to bill 19439s while the estimator
+    priced it at 13989s, and the canary 19439s against 5309s -- thousands of authorized-but-
+    unreserved GPU-seconds per call, in the one direction a budget must never err.
+
+    The repair bounds each call at its OWN priced phases rather than raising the reservation to
+    cover slack the call's bounds make unreachable (that would have inflated a canary from $4.89 to
+    $12.06 and refused runs that cannot cost that much). This asserts the property that makes the
+    ceiling real: for every bucket and every grid width, the bound the call is held to is exactly
+    what the estimator reserves for it, and never the class-wide grant.
+    """
+    namespace = _bench_namespace(
+        "bucket_call_priced_seconds",
+        "certify_call_priced_seconds",
+        "_worst_case_bucket_seconds",
+        "TIMEOUT_SECONDS",
+        "TIMEOUT_HEADROOM_SECONDS",
+        "PROBE_TIMEOUT_SECONDS",
+        "WARMUP_FIT_SECONDS_BOUND",
+        "_FUNDED_WARMUP_FIT_SECONDS",
+        bench_engine_overrides_for=bench_engine_overrides_for,
+        concurrency_grid=concurrency_grid,
+        prompt_fit_seconds_bound=prompt_fit_seconds_bound,
+        REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
+        BENCH_MODELS=BENCH_MODELS,
+        BUCKETS=BUCKETS,
+    )
+    priced_bucket = namespace["bucket_call_priced_seconds"]
+    priced_certify = namespace["certify_call_priced_seconds"]
+    class_timeout = namespace["TIMEOUT_SECONDS"]
+
+    points = len(list(concurrency_grid(8)))
+    # The canary is the widest gap: its phases are a probe plus five warmups, against a ceiling
+    # derived from a full near_32k grid.
+    assert priced_certify() < class_timeout, (
+        "the canary's bound must be its own phases, not the class-wide grant"
+    )
+    for bucket in BUCKETS:
+        bound = priced_bucket(bucket, points)
+        assert bound <= class_timeout, (
+            f"{bucket.name} is priced above the class timeout that terminates it"
+        )
+    # The narrow buckets must be bounded STRICTLY below the widest, or the bound is the class-wide
+    # grant wearing a different name and the defect is intact.
+    widest = max(priced_bucket(bucket, points) for bucket in BUCKETS)
+    narrow = min(priced_bucket(bucket, points) for bucket in BUCKETS)
+    assert narrow < widest, (
+        "every bucket priced identically means the bound is not per-call; a short bucket would "
+        "again be authorized to spend the widest bucket's ceiling"
+    )
+    # And the ceiling itself is still derived from the same terms, so widening a bucket moves the
+    # bound and the reservation together instead of reopening the gap.
+    assert namespace["_worst_case_bucket_seconds"]() == pytest.approx(widest)
+
+
+def test_the_bounded_call_ends_the_container_rather_than_billing_past_its_bound() -> None:
+    """A call that outlives its priced bound must stop billing, not return and leave work running.
+
+    Raising would let the coroutine stay pinned in an uninterruptible engine call, still on the GPU
+    through the scaledown window, still spending against a reservation it has already exceeded. The
+    file ends the process for exactly this in two other places; this asserts the new bound does too,
+    driving the real helper rather than a stand-in.
+    """
+    namespace = _bench_namespace(
+        "_within_call_bound",
+        asyncio=asyncio,
+        contextlib=contextlib,
+        os=os,
+        sys=sys,
+        drain_reap_seconds=lambda: 0.01,
+    )
+    within = namespace["_within_call_bound"]
+
+    exits: list[int] = []
+    namespace["os"] = types.SimpleNamespace(_exit=lambda code: exits.append(code))
+
+    async def _stalls() -> str:
+        await asyncio.sleep(30)
+        return "never"
+
+    async def _returns() -> str:
+        return "done"
+
+    # The fast path is untouched: a call inside its bound returns its own value.
+    assert asyncio.run(within(_returns(), 5.0, "fast")) == "done"
+
+    # The slow path ends the container instead of returning or raising past the bound.
+    asyncio.run(within(_stalls(), 0.05, "stalled"))
+    assert exits == [75], (
+        "a call that outlived its priced bound must end the container; returning or raising leaves "
+        "it billing on the GPU against a reservation it already exceeded"
+    )
+
+
+def test_the_serving_sources_the_image_uploads_are_recorded_in_every_artifact() -> None:
+    """An edit to the serving engine must move recorded provenance.
+
+    The image does ``.add_local_python_source("flash")`` -- the WHOLE package -- but until this
+    guard nothing in an artifact covered it. ``workload_checksum()`` digests a named list of bench
+    functions and reads only from ``flash.serving.bench``; ``_serving_patch_identity()`` digests the
+    vLLM patch alone. So editing ``flash/serving/src/engine/generation.py`` or ``lora_engine.py``
+    changed what every measured request executed while the patch digest, the workload checksum, the
+    resolved package versions and the checkpoint commits all stayed byte-identical. Two campaigns
+    running materially different serving code would compare as compatible.
+
+    The digest must be over CONTENT, not a version string: a hand-maintained constant moves when
+    someone remembers to move it, which is the same defect one level up.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+
+    # Every provenance block that records the patch must also record the sources, or an artifact
+    # from the un-covered path is exactly as unfalsifiable as before.
+    assert source.count('"serving_patch": _serving_patch_identity()') == source.count(
+        '"serving_source": _serving_source_identity()'
+    ), "a provenance block records the vLLM patch but not the flash sources shipped beside it"
+
+    namespace = _bench_namespace(
+        "_serving_source_identity",
+        REPO_DIR=REPO_ROOT,
+        hashlib=hashlib,
+    )
+    identity = namespace["_serving_source_identity"]()
+    assert identity["package"] == "flash"
+    assert identity["file_count"] > 100, (
+        "the digest covers a handful of files; it is not reading the uploaded package"
+    )
+    assert len(identity["sha256"]) == 64
+
+    # The property that makes it evidence: editing a serving file the digest is supposed to cover
+    # must change the value. Done against a COPY of the tree so the real checkout is untouched.
+    with tempfile.TemporaryDirectory(dir="/mnt/resource") as tmp:
+        mirror = Path(tmp) / "repo"
+        (mirror / "flash").mkdir(parents=True)
+        shutil.copytree(REPO_ROOT / "flash", mirror / "flash", dirs_exist_ok=True)
+        mirrored = _bench_namespace("_serving_source_identity", REPO_DIR=mirror, hashlib=hashlib)[
+            "_serving_source_identity"
+        ]
+        before = mirrored()
+        assert before["sha256"] == identity["sha256"], (
+            "an identical copy of the tree digests differently; the digest is not content-addressed"
+        )
+
+        engine_file = mirror / "flash" / "serving" / "src" / "engine" / "generation.py"
+        assert engine_file.exists(), "the serving generation module moved; repoint this guard"
+        engine_file.write_bytes(engine_file.read_bytes() + b"\n# edited\n")
+        assert mirrored()["sha256"] != before["sha256"], (
+            "editing the serving generation path left the recorded source identity unchanged"
+        )
+
+        # A rename with identical bytes must move it too: the module path decides what an import
+        # resolves to, so a moved file changes execution even when nothing inside it changed.
+        engine_file.write_bytes(engine_file.read_bytes().replace(b"\n# edited\n", b""))
+        assert mirrored()["sha256"] == before["sha256"]
+        renamed = engine_file.with_name("generation_moved.py")
+        engine_file.rename(renamed)
+        assert mirrored()["sha256"] != before["sha256"], (
+            "renaming a serving module left the recorded source identity unchanged"
+        )
+
+
+def test_the_probe_records_the_driver_the_kernels_actually_dispatch_through() -> None:
+    """`torch.version.cuda` is a build-time constant of the wheel, not the host's driver.
+
+    It reports the CUDA toolkit torch was COMPILED against, so it is identical on every host running
+    the same pinned image. What dispatches kernels -- and what moves the performance of an unchanged
+    image -- is the host NVIDIA driver. Without it, two blocks measured months apart on the same
+    image can differ materially while every recorded version string stays byte-identical, and the
+    difference is unexplainable from the artifact.
+    """
+    import flash.serving.bench.probe as probe_module
+
+    calls: list[str] = []
+
+    class _FakeNvml:
+        NVML_SUCCESS = 0
+
+        def nvmlInit(self) -> None:
+            calls.append("init")
+
+        def nvmlShutdown(self) -> None:
+            calls.append("shutdown")
+
+        def nvmlDeviceGetCount(self) -> int:
+            return 1
+
+        def nvmlDeviceGetHandleByIndex(self, index: int) -> object:
+            return object()
+
+        # Returned as BYTES, the way pynvml's C-binding build does. The driver read must decode it
+        # the same way the device name does, or the artifact carries a `b'580.65.06'` repr.
+        def nvmlDeviceGetName(self, handle: object) -> bytes:
+            return b"NVIDIA B200"
+
+        def nvmlDeviceGetCudaComputeCapability(self, handle: object) -> tuple[int, int]:
+            return (10, 0)
+
+        def nvmlDeviceGetMemoryInfo(self, handle: object) -> object:
+            return types.SimpleNamespace(total=183_000_000_000)
+
+        def nvmlSystemGetDriverVersion(self) -> bytes:
+            calls.append("driver")
+            return b"580.65.06"
+
+    with mock.patch.dict(sys.modules, {"pynvml": _FakeNvml()}):
+        result = probe_module.probe_gpu()
+
+    assert result["available"] is True
+    assert "driver" in calls, "the probe never asked NVML for the host driver version"
+    assert result.get("driver_version") == "580.65.06", (
+        "the driver version is missing or undecoded; an artifact cannot explain a driver-driven "
+        "performance change without it"
+    )
+    # It must be a SEPARATE field, not a replacement: the toolkit torch was built against still
+    # explains an ABI mismatch, and conflating the two loses which one moved.
+    assert result["driver_version"] != result.get("cuda_version")

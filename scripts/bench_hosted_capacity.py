@@ -149,6 +149,7 @@ from flash.serving.bench.warmup import (  # noqa: E402
 )
 from flash.serving.bench.workload import (  # noqa: E402
     BUCKETS,
+    Bucket,
     concurrency_grid,
 )
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
@@ -165,52 +166,62 @@ WARMUP_FIT_SECONDS_BOUND = warmup_fit_seconds_bound()
 _FUNDED_WARMUP_FIT_SECONDS = WARMUP_FIT_SECONDS_BOUND + fitting_watchdog_grace_seconds()
 
 
-def _worst_case_bucket_seconds() -> float:
-    """Longest a single ``run_bucket`` call can legitimately take, from the preregistered bounds.
+def bucket_call_priced_seconds(bucket: Bucket, points: int) -> float:
+    """Everything ONE ``run_bucket`` call is priced for, at that call's own bucket and grid width.
 
-    Every concurrency point pays its bucket's ``max_seconds`` window plus a drain bounded by
-    ``REQUEST_TIMEOUT_SECONDS``. The widest grid across all bench models decides the ceiling, since
-    one ``timeout`` covers every tier's class.
+    The single source both the estimator and the enforcement read. `TIMEOUT_SECONDS` is one
+    class-wide number derived from the WIDEST bucket, so Modal permits a `short_interactive` call to
+    run 19439s while this function prices it at 13989s -- thousands of authorized-but-unreserved
+    GPU-seconds per call, in the one direction a budget must never err. Reserving that whole grant
+    instead would be worse: it funds slack the call's own bounds make unreachable, inflating a
+    canary from $4.89 to $12.06 and refusing runs that cannot cost that much.
+
+    So the call is bounded at what it is priced for, and the two numbers come from HERE rather than
+    being written twice. Widening a bucket or the grid moves the bound and the reservation together.
     """
-    points = max(
-        len(concurrency_grid(int(bench_engine_overrides_for(base_model).get("max_num_seqs", 8))))
-        for base_model in BENCH_MODELS
-    )
-    # Priced per bucket and maximized, not by maximizing each term independently: the widest bucket
-    # is the one that has to fit inside this timeout, and mixing one bucket's window with another's
-    # fitting would describe a bucket that does not exist.
-    #
-    # Prompt fitting is inside this bound even though it is outside `max_seconds`. It runs in the
-    # container before each cell's window opens, so the method clock is running through it, and at
-    # near_32k it is the largest single term after the windows themselves. The budget estimator was
-    # taught this last round; omitting it HERE left the same phase unbounded in the place that
-    # actually kills the call -- Modal would terminate `run_bucket` mid-grid and the bucket's
-    # artifact would never be written, losing every cell the run had already paid for.
-    #
-    # Both bounded tails are here for the same reason: a drain that has to reap an uncancellable
-    # task costs `drain_reap_seconds()` past its own timeout, and a pool's watchdog ends the
-    # container at `bound + grace` rather than at the bound. Pricing the nominal halves alone would
-    # let the METHOD timeout fire while a phase the code still permits is legitimately running.
-    cells = points * max(
+    per_cell = (
         bucket.max_seconds
         + REQUEST_TIMEOUT_SECONDS
         + drain_reap_seconds()
         + prompt_fit_seconds_bound(bucket)
         + fitting_watchdog_grace_seconds()
-        for bucket in BUCKETS
     )
-    # A bucket landing on a COLD replacement container warms it first -- the path `_ensure_warm`
-    # exists to handle -- and those warmups are SEQUENTIAL, each bounded by REQUEST_TIMEOUT_SECONDS.
-    # Timing only the cells would kill that legitimate path mid-flight, and because the timeout fires
-    # before `run_bucket` returns, the bucket's artifact is never written: the run loses the
-    # measurement it already paid for.
-    #
-    # The bucket's own provenance probe is bounded separately and included for the same reason.
     return (
-        cells
+        per_cell * points
         + (run_request_bound_seconds() + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
         + PROBE_TIMEOUT_SECONDS
     )
+
+
+def certify_call_priced_seconds() -> float:
+    """Everything ONE ``certify`` call is priced for: its probe plus its sequential warmups.
+
+    Same contract as `bucket_call_priced_seconds`, for the lane that has no bucket. The canary's
+    phases total ~5309s against a 19439s class timeout, so it carried the largest unreserved grant
+    of any call in the campaign.
+    """
+    return (
+        PROBE_TIMEOUT_SECONDS
+        + (run_request_bound_seconds() + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
+    )
+
+
+def _worst_case_bucket_seconds() -> float:
+    """Longest a single ``run_bucket`` call can legitimately take, from the preregistered bounds.
+
+    The widest grid across all bench models decides the ceiling, since one ``timeout`` covers every
+    tier's class. Priced per bucket and maximized, not by maximizing each term independently: the
+    widest bucket is the one that has to fit inside this timeout, and mixing one bucket's window
+    with another's fitting would describe a bucket that does not exist.
+
+    Every term lives in `bucket_call_priced_seconds`, which is also what each call is BOUNDED at, so
+    this ceiling and the per-call enforcement can no longer disagree about what a call may spend.
+    """
+    points = max(
+        len(concurrency_grid(int(bench_engine_overrides_for(base_model).get("max_num_seqs", 8))))
+        for base_model in BENCH_MODELS
+    )
+    return max(bucket_call_priced_seconds(bucket, points) for bucket in BUCKETS)
 
 
 # Derived, never typed: widening a bucket or the concurrency grid raises this automatically instead
@@ -288,6 +299,13 @@ def _build_bench_engine(gpu: str, class_name: str) -> Any:
             a 300s bound would have cancelled its first probe every time. Inside the already-loaded
             method, boot is governed by `startup_timeout` and the 300s covers only probe work.
             """
+            return await _within_call_bound(
+                self._certify(requests),
+                certify_call_priced_seconds(),
+                "certify",
+            )
+
+        async def _certify(self, requests: int) -> dict[str, Any]:
             provenance = await _probe_in_container_within_bound(self)
             # Gate BEFORE warming. The gates used to run only in `_run_canary`, after this method
             # returned both payloads, so a container on the wrong card or with an unresolved kernel
@@ -317,7 +335,13 @@ def _build_bench_engine(gpu: str, class_name: str) -> Any:
             invocation: str = "",
         ) -> dict[str, Any]:
             """Measure one bucket across its concurrency grid on this container."""
-            return await _run_bucket(self, bucket_name, concurrency_points, block, invocation)
+            from flash.serving.bench.workload import BUCKETS_BY_NAME
+
+            return await _within_call_bound(
+                _run_bucket(self, bucket_name, concurrency_points, block, invocation),
+                bucket_call_priced_seconds(BUCKETS_BY_NAME[bucket_name], len(concurrency_points)),
+                f"run_bucket {bucket_name!r}",
+            )
 
     _Engine.pinned_gpu = gpu
     _Engine.__name__ = class_name
@@ -502,6 +526,46 @@ async def _run_bucket(
     }
 
 
+def _serving_source_identity() -> dict[str, Any]:
+    """Content identity of the `flash` package the image copies into the container.
+
+    `.add_local_python_source("flash")` ships the WHOLE package, but nothing recorded in an artifact
+    covered it. `workload_checksum()` digests a named list of bench functions and constants, and it
+    reads only from `flash.serving.bench`; `_serving_patch_identity()` digests the vLLM patch alone.
+    So an edit to `flash/serving/src/engine/generation.py`, `lora_engine.py` or the boot path changed
+    what every measured request executed while the patch digest, the workload checksum, the resolved
+    package versions and the checkpoint commits all stayed byte-identical -- two campaigns running
+    different serving code comparing as compatible, which is the failure the provenance block exists
+    to make impossible.
+
+    Digested by CONTENT, not by a version string or a git SHA. A hand-maintained constant is
+    self-attested: it moves when someone remembers to move it, which is the same class of defect. A
+    git SHA additionally reports nothing about uncommitted edits, and this harness is developed on a
+    working tree -- the tree that gets uploaded is the one that must be named.
+
+    Path and content are both fed in, so a rename with identical bytes moves the digest: the module
+    path decides what imports resolve to, and a moved file changes execution even when nothing
+    inside it changed.
+    """
+    root = REPO_DIR / "flash"
+    files = sorted(path for path in root.rglob("*.py") if "__pycache__" not in path.parts)
+    if not files:
+        # An empty tree means the upload would ship nothing and the run would fail on import
+        # anyway. Recording an empty digest instead would be an artifact asserting provenance for
+        # sources that were never there.
+        raise RuntimeError(f"no python sources under {root}; the image would upload an empty flash")
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(REPO_DIR)).encode())
+        digest.update(b"\x1f")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return {
+        "package": "flash",
+        "file_count": len(files),
+        "sha256": digest.hexdigest(),
+    }
+
+
 def _serving_patch_identity() -> dict[str, str]:
     """Content identity of the vLLM patch baked into the measured image.
 
@@ -541,6 +605,37 @@ def _write_artifact(payload: dict[str, Any], name: str, *, invocation: str = "")
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print(f"[bench] wrote {path}", flush=True)
     return path
+
+
+async def _within_call_bound(coro: Any, bound_seconds: float, label: str) -> Any:
+    """Run one remote method under the bound its own phases were RESERVED at.
+
+    Modal enforces `TIMEOUT_SECONDS`, one class-wide number derived from the widest bucket. Every
+    narrower call therefore carried a grant far above its reservation -- 5450s for
+    `short_interactive`, 14130s for the canary -- billable before Modal would terminate it and
+    funded by nothing. Bounding here makes the enforcement match the estimator instead of raising
+    the reservation to cover slack these calls can never legitimately reach.
+
+    Ends the container rather than raising when the work outlives the bound. Same reasoning as
+    `_probe_in_container_within_bound`: a coroutine pinned in an uninterruptible engine call keeps
+    billing on the GPU through the scaledown window whatever this frame returns, so the only way it
+    stops spending against an already-exceeded reservation is for the process to end.
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=bound_seconds)
+    except TimeoutError:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
+            await asyncio.wait_for(asyncio.shield(task), timeout=drain_reap_seconds())
+        print(
+            f"[bench] FATAL: {label} exceeded its {bound_seconds:.0f}s priced bound; ending the "
+            "container so a call cannot bill past the reservation that authorized it",
+            flush=True,
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(75)
 
 
 async def _probe_in_container_within_bound(engine: Any) -> dict[str, Any]:
@@ -782,9 +877,9 @@ def _canary_gpu_seconds_estimate() -> float:
     calls = 1
     return (
         float(STARTUP_TIMEOUT_SECONDS) * calls
-        # Same grant as the sweep: `certify.remote()` runs under `TIMEOUT_SECONDS`, which exceeds
-        # the phases below by `TIMEOUT_HEADROOM_SECONDS`. That slack is billable before Modal
-        # terminates the call, so the lane reserves it rather than letting it overrun the ceiling.
+        # Same slack as the sweep: `certify.remote()` is held to `certify_call_priced_seconds()`,
+        # the phases below, and this covers the interval between that bound firing and the container
+        # ending. It is billable time the lane permits itself, so the lane reserves it.
         + float(TIMEOUT_HEADROOM_SECONDS) * calls
         + PROBE_TIMEOUT_SECONDS
         # Each warmup pays its request timeout PLUS the fit that precedes it. The fit happens
@@ -867,12 +962,13 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     # call returns, allocated and billing with no work in it. `len(selected) + 1` calls, each able
     # to land on its own container, so the tail is priced per call rather than once per sweep.
     scaledown = float(SCALEDOWN_WINDOW_SECONDS) * (len(selected) + 1)
-    # `TIMEOUT_SECONDS` is the class-wide method timeout, and it is deliberately the worst-case
-    # bucket PLUS `TIMEOUT_HEADROOM_SECONDS`. Modal enforces that larger number, so a call is
-    # permitted to bill the headroom on top of every phase priced above before it is terminated --
-    # scheduling and cleanup slack that is granted, billable, and reserved by nothing. Priced once
-    # per separately bootable call, which is where the grant is issued: each `run_bucket.remote()`
-    # plus the canary's `certify.remote()` carries its own method timeout.
+    # Scheduling and cleanup slack around each call's own bound. Every call is now held to
+    # `bucket_call_priced_seconds` / `certify_call_priced_seconds` -- the same terms priced above --
+    # rather than to the class-wide `TIMEOUT_SECONDS` derived from the WIDEST bucket. Before that
+    # bound existed, Modal permitted a `short_interactive` call to bill 5450s past everything
+    # reserved here, and the canary 14130s. `TIMEOUT_HEADROOM_SECONDS` covers the interval between
+    # a call's bound firing and its container actually ending; priced once per separately bootable
+    # call, which is where each bound is issued.
     headroom = float(TIMEOUT_HEADROOM_SECONDS) * (len(selected) + 1)
     return (
         boot
@@ -998,6 +1094,7 @@ def main(
                     "warmup": gate["warmup"],
                     "workload_checksum": workload_checksum(),
                     "serving_patch": _serving_patch_identity(),
+                    "serving_source": _serving_source_identity(),
                     "invocation": invocation,
                     "budget": ledger.to_json(),
                 },
@@ -1031,6 +1128,7 @@ def main(
                     "engine_catalog": provenance,
                     "workload_checksum": workload_checksum(),
                     "serving_patch": _serving_patch_identity(),
+                    "serving_source": _serving_source_identity(),
                 },
                 f"sweep-{base_model.replace('/', '_')}-{name}-b{block}.json",
                 invocation=invocation,
@@ -1066,6 +1164,7 @@ def main(
                 # weights or which runtime produced its curves once either moves.
                 "workload_checksum": workload_checksum(),
                 "serving_patch": _serving_patch_identity(),
+                "serving_source": _serving_source_identity(),
                 "buckets": [
                     {"bucket": payload["bucket"], "curve": payload["curve"]} for payload in results
                 ],
@@ -1100,6 +1199,7 @@ def main(
                     "engine_catalog": provenance,
                     "workload_checksum": workload_checksum(),
                     "serving_patch": _serving_patch_identity(),
+                    "serving_source": _serving_source_identity(),
                     "budget": ledger.to_json(),
                 },
                 f"failed-{mode}-{base_model.replace('/', '_')}-b{block}.json",

@@ -64,12 +64,24 @@ def probe_gpu() -> dict[str, Any]:
             name = name.decode("utf-8", "replace")
         major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
         memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        # The DRIVER version, which `torch.version.cuda` below does not report. That attribute is
+        # the CUDA toolkit torch was COMPILED against -- a build-time constant of the wheel, so it
+        # is identical across every host running the same image. The kernels actually dispatched,
+        # and the perf of an unchanged image, move with the host driver instead. Two blocks
+        # measured months apart on the same pinned image can therefore differ materially while
+        # every recorded version string stays byte-identical, which is exactly the unexplainable
+        # drift the provenance record exists to prevent. Same bytes-vs-str decode as the device
+        # name above: NVML returns either depending on the pynvml build.
+        driver = pynvml.nvmlSystemGetDriverVersion()
+        if isinstance(driver, bytes):
+            driver = driver.decode("utf-8", "replace")
         result: dict[str, Any] = {
             "available": True,
             "device_count": count,
             "name": str(name),
             "compute_capability": f"{major}.{minor}",
             "total_memory_bytes": int(memory.total),
+            "driver_version": str(driver),
             "source": "nvml",
         }
     except Exception as exc:
