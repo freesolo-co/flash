@@ -442,8 +442,64 @@ def _snapshots_holding(root: Path, role: str) -> list[str]:
     return [entry.name for entry in sorted(found, key=lambda e: e.stat().st_mtime)]
 
 
+def _tokenizer_vocab(tokenizer: Any) -> dict[str, Any] | None:
+    """The loaded tokenizer's own vocabulary, as the serialized snapshot files spell it.
+
+    Read from ``backend_tokenizer.to_str()`` rather than ``get_vocab()``: the serialized form is
+    the same structure ``tokenizer.json`` stores, so a loaded tokenizer and an on-disk snapshot are
+    directly comparable. Only ``model.vocab`` is used. Neighbouring fields (``merges``,
+    ``added_tokens``) are re-normalized by the installed ``tokenizers`` version on load, so they
+    differ from the file even when the file is exactly the one that was loaded; the vocabulary does
+    not, and it is the field that actually differs between two different tokenizer trees.
+
+    Returns ``None`` when the object exposes no serializable backend, which makes the caller fall
+    back to reporting ambiguity rather than guessing.
+    """
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        return None
+    try:
+        vocab = json.loads(backend.to_str()).get("model", {}).get("vocab")
+    # Broad on purpose: a slow tokenizer, an unserializable backend, or a future schema change must
+    # degrade to "cannot disambiguate", never kill a probe that has already paid for its boot.
+    except Exception:
+        return None
+    return vocab if isinstance(vocab, dict) else None
+
+
+def _snapshot_holding_this_tokenizer(root: Path, holders: list[str], tokenizer: Any) -> str | None:
+    """The one candidate snapshot whose ``tokenizer.json`` matches the tokenizer THIS process loaded.
+
+    ``refs/<revision>`` is per-repository and records only the last download, so when an unpinned
+    repository advances mid-boot it names the newest tree for every role. The parent process
+    assembles benchmark prompts with the tokenizer it loaded BEFORE the engine's own download, and
+    reporting the ref for that role publishes a commit the prompts never came from -- while looking
+    exactly like a resolved one. Comparing content answers which tree was loaded without depending
+    on when it was loaded.
+
+    ``None`` when zero or several candidates match, so the caller reports ambiguity instead of
+    choosing. Several matching means the trees are byte-equal in the only field that could
+    distinguish them, which does not license naming one of their commits.
+    """
+    loaded = _tokenizer_vocab(tokenizer)
+    if not loaded:
+        return None
+    matches = []
+    for commit in holders:
+        path = root / "snapshots" / commit / "tokenizer.json"
+        try:
+            on_disk = json.loads(path.read_text()).get("model", {}).get("vocab")
+        # A candidate that cannot be read is simply not a match; an unreadable sibling must not
+        # prevent the readable one from resolving.
+        except Exception:
+            continue
+        if on_disk == loaded:
+            matches.append(commit)
+    return matches[0] if len(matches) == 1 else None
+
+
 def _local_snapshot_commit(
-    repo: str, revision: str | None, role: str = "model"
+    repo: str, revision: str | None, role: str = "model", tokenizer: Any = None
 ) -> tuple[str | None, str | None]:
     """The commit of the cached snapshot ``role`` was actually loaded from, and how it was found.
 
@@ -486,9 +542,21 @@ def _local_snapshot_commit(
     if len(holders) == 1:
         return holders[0], "snapshot-contents"
     if holders:
-        # Several snapshots carry this role. If the ref is among them the repository simply has
-        # older trees cached and the ref still names the current one; otherwise the ref points
-        # somewhere this role was never downloaded to, so report the ambiguity instead of choosing.
+        # Several snapshots carry this role. When the caller handed us the tokenizer this process
+        # actually loaded, ask which candidate it came from: the ref cannot answer that. It is
+        # per-repository and holds only the last download, so an unpinned repository that advanced
+        # between the parent's tokenizer load and the engine's own weight fetch leaves the ref
+        # naming the newer tree -- and because the ref IS among the holders, the branch below would
+        # return it with a resolved-looking source that the publication gate accepts. The prompts
+        # were built with the older tree, so that is false provenance, not ambiguity.
+        if tokenizer is not None:
+            matched = _snapshot_holding_this_tokenizer(root, holders, tokenizer)
+            if matched:
+                return matched, "snapshot-contents-verified"
+            return holders[-1], "snapshot-contents-ambiguous"
+        # If the ref is among them the repository simply has older trees cached and the ref still
+        # names the current one; otherwise the ref points somewhere this role was never downloaded
+        # to, so report the ambiguity instead of choosing.
         if ref_commit and ref_commit in holders:
             return ref_commit, "local-cache-ref"
         return holders[-1], "snapshot-contents-ambiguous"
@@ -498,7 +566,7 @@ def _local_snapshot_commit(
     return None, None
 
 
-def probe_resolved_revisions(base_model: str) -> dict[str, Any]:
+def probe_resolved_revisions(base_model: str, tokenizer: Any = None) -> dict[str, Any]:
     """The commit each served repository RESOLVED to, for repositories production leaves unpinned.
 
     `immutable_serving_revisions` reports only what the engine explicitly pins, and two of the three
@@ -516,6 +584,13 @@ def probe_resolved_revisions(base_model: str) -> dict[str, Any]:
     that refuses to publish belongs to the caller, and it cannot make that decision from a
     fabricated hash. `pinned` distinguishes a commit production guaranteed from one this run merely
     observed, because only the former is reproducible.
+
+    `tokenizer` is the object the PARENT process loaded and builds every benchmark prompt with. It
+    is passed rather than re-derived because the cache alone cannot say which tree that was: the
+    parent loads its tokenizer before `AsyncLLMEngine.from_engine_args` runs, so an unpinned
+    repository that advances in between leaves two snapshots holding tokenizer files and the ref
+    naming the later one. Matching the loaded object's own vocabulary identifies its tree
+    regardless of what downloaded afterwards.
     """
     from flash.serving.src.engine.model_config import (
         immutable_serving_revisions,
@@ -536,7 +611,12 @@ def probe_resolved_revisions(base_model: str) -> dict[str, Any]:
     for role, (repo, revision) in targets.items():
         entry: dict[str, Any] = {"repo": repo, "pinned": revision}
         try:
-            commit, source = _local_snapshot_commit(repo, revision, role)
+            # Only the tokenizer role can be content-matched: it is the one whose loaded object
+            # this process holds. The weights live in the EngineCore process and the processor is
+            # absent for text-only models.
+            commit, source = _local_snapshot_commit(
+                repo, revision, role, tokenizer if role == "tokenizer" else None
+            )
             entry["commit"] = commit
             entry["source"] = source
             if commit is None:
@@ -553,14 +633,21 @@ def probe_resolved_revisions(base_model: str) -> dict[str, Any]:
 
 
 def probe_all(base_model: str, engine: Any | None = None) -> dict[str, Any]:
-    """The full provenance block stored with each model's results."""
+    """The full provenance block stored with each model's results.
+
+    The engine's `tokenizer` attribute is the very object the driver fits prompts with, so passing
+    it makes the recorded tokenizer commit describe the tree that produced the measured tokens
+    rather than whatever the shared cache ref points at by probe time.
+    """
     # Revisions FIRST, before anything that reads a checkpoint. `_local_snapshot_commit` reports an
     # unpinned model's commit from the cache's `refs/main`, which is mutable state a Hub-touching
     # load can rewrite underneath it. `_gdn_config_values` is pinned to the local cache so it cannot
     # do that, but the order is the second, independent guarantee: provenance is captured before any
     # later-added probe gets the chance to refresh a ref and silently re-date the measurement.
     payload: dict[str, Any] = {
-        "resolved_revisions": probe_resolved_revisions(base_model),
+        "resolved_revisions": probe_resolved_revisions(
+            base_model, getattr(engine, "tokenizer", None)
+        ),
         "runtime_packages": probe_runtime_packages(),
         "gpu": probe_gpu(),
         "gdn_prefill": probe_gdn_backend(base_model),

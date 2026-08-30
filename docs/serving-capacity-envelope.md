@@ -170,8 +170,8 @@ model/tokenizer/processor provenance, and 32768 configured context runs before a
 teardown is confirmed after each model:
 
 ```
-modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary --ceiling-usd 6
-modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep --bucket short_interactive --ceiling-usd 17
+modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary --ceiling-usd 8
+modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep --bucket short_interactive --ceiling-usd 19
 ```
 
 `--ceiling-usd` is required and has no default: both commands allocate a GPU, and a spend ceiling
@@ -219,11 +219,11 @@ which bills whether or not the reservation admitted it.
 
 A lane also has to clear its submission stop, not merely its ceiling: `reserve()` refuses at 80% of
 the ceiling so settlement lag and teardown stay funded. A lane consequently needs a ceiling around
-`1.25x` its own reservation -- $5.51 for the canary and $16.90 for the single-bucket
-`short_interactive` sweep -- and the `--ceiling-usd 6` and `--ceiling-usd 17` above clear those
-thresholds. A larger tier needs proportionally more: the same canary is $10.25 on the 35B's H200,
-so it needs a ceiling above $12.81, and that model's single-bucket sweep reserves $31.45 and needs
-one above $39.31.
+`1.25x` its own reservation -- $6.12 for the canary and $18.12 for the single-bucket
+`short_interactive` sweep -- and the `--ceiling-usd 8` and `--ceiling-usd 19` above clear those
+thresholds. A larger tier needs proportionally more: the same canary is $11.39 on the 35B's H200,
+so it needs a ceiling above $14.24, and that model's single-bucket sweep reserves $33.72 and needs
+one above $42.15.
 
 The boot dominates cost (~960s of ~1000s per cell in a prior campaign), so one boot runs a whole
 bucket's concurrency grid rather than one cell. `budget.py` reserves before allocation and raises

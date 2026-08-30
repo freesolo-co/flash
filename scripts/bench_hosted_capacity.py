@@ -5,9 +5,9 @@ cannot run. The figures below are worst-case RESERVATIONS, deliberately far abov
 and each also clears the 80% submission stop ``reserve`` enforces -- see
 docs/serving-capacity-envelope.md):
     modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary \
-        --ceiling-usd 7
+        --ceiling-usd 8
     modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep \
-        --bucket short_interactive --ceiling-usd 18
+        --bucket short_interactive --ceiling-usd 19
 
 Each model is measured on ITS OWN production tier (L40S / H100 / H200), not on one shared card, so
 the envelope describes the capacity a customer actually gets rather than a hypothetical uniform
@@ -819,6 +819,10 @@ def _canary_gpu_seconds_estimate() -> float:
     calls = 1
     return (
         float(STARTUP_TIMEOUT_SECONDS) * calls
+        # Same grant as the sweep: `certify.remote()` runs under `TIMEOUT_SECONDS`, which exceeds
+        # the phases below by `TIMEOUT_HEADROOM_SECONDS`. That slack is billable before Modal
+        # terminates the call, so the lane reserves it rather than letting it overrun the ceiling.
+        + float(TIMEOUT_HEADROOM_SECONDS) * calls
         + PROBE_TIMEOUT_SECONDS
         # Each warmup pays its request timeout PLUS the fit that precedes it. The fit happens
         # outside `run_request`, so pricing a warmup at the request timeout alone left an
@@ -900,6 +904,13 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     # call returns, allocated and billing with no work in it. `len(selected) + 1` calls, each able
     # to land on its own container, so the tail is priced per call rather than once per sweep.
     scaledown = float(SCALEDOWN_WINDOW_SECONDS) * (len(selected) + 1)
+    # `TIMEOUT_SECONDS` is the class-wide method timeout, and it is deliberately the worst-case
+    # bucket PLUS `TIMEOUT_HEADROOM_SECONDS`. Modal enforces that larger number, so a call is
+    # permitted to bill the headroom on top of every phase priced above before it is terminated --
+    # scheduling and cleanup slack that is granted, billable, and reserved by nothing. Priced once
+    # per separately bootable call, which is where the grant is issued: each `run_bucket.remote()`
+    # plus the canary's `certify.remote()` carries its own method timeout.
+    headroom = float(TIMEOUT_HEADROOM_SECONDS) * (len(selected) + 1)
     return (
         boot
         + canary_replacement_boot
@@ -910,6 +921,7 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
         + drains
         + replacements
         + scaledown
+        + headroom
     )
 
 

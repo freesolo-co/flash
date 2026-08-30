@@ -1705,6 +1705,9 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     # `min_containers=0` does not release the GPU at the last return -- each separately bootable
     # call can leave a container alive and billing for its whole scaledown window.
     scaledown = float(constants["SCALEDOWN_WINDOW_SECONDS"]) * 2
+    # Modal enforces `TIMEOUT_SECONDS`, which is the worst-case bucket PLUS this headroom, so each
+    # separately bootable call may bill the slack on top of every phase above before being killed.
+    headroom = float(constants["TIMEOUT_HEADROOM_SECONDS"]) * 2
 
     assert estimate >= windows + drains + canary, (
         "the estimate omits the canary or the per-cell drain tails"
@@ -1720,6 +1723,7 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
         + drains
         + replacements
         + scaledown
+        + headroom
     )
 
 
@@ -2089,6 +2093,7 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
         "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
         "_FUNDED_WARMUP_FIT_SECONDS",
+        "TIMEOUT_HEADROOM_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
@@ -2110,6 +2115,9 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
     ), "the funded warmup fit dropped the watchdog grace it is supposed to cover"
     # The container keeps billing through its scaledown window after the last call returns.
     scaledown = float(namespace["SCALEDOWN_WINDOW_SECONDS"])
+    # `TIMEOUT_SECONDS` exceeds the phases priced here by this much, and Modal enforces the larger
+    # number, so every separately bootable call may bill the slack before being terminated.
+    headroom = float(namespace["TIMEOUT_HEADROOM_SECONDS"])
 
     canary = namespace["_canary_gpu_seconds_estimate"]()
     # ONE boot: `certify.remote()` probes and warms the same container in a single call, so a
@@ -2119,7 +2127,11 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
     # method timeout.
     assert (
         canary
-        == startup * 1 + namespace["PROBE_TIMEOUT_SECONDS"] + (per_warmup * warmups) + scaledown
+        == startup * 1
+        + namespace["PROBE_TIMEOUT_SECONDS"]
+        + (per_warmup * warmups)
+        + scaledown
+        + headroom * 1
     )
     assert canary >= startup, "the canary reserves less than a stuck boot alone would bill"
 
@@ -2146,6 +2158,8 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
         + namespace["PROBE_TIMEOUT_SECONDS"] * 2
         # one scaledown tail per separately bootable call
         + scaledown * 2
+        # one method-timeout grant per separately bootable call, for the same reason
+        + headroom * 2
     )
     assert sweep == expected
     assert sweep - canary >= bucket.max_seconds * points, "the sweep does not price its own cells"
@@ -2169,6 +2183,7 @@ def test_documented_ceilings_exceed_what_each_lane_reserves() -> None:
         "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
         "_FUNDED_WARMUP_FIT_SECONDS",
+        "TIMEOUT_HEADROOM_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
@@ -2579,6 +2594,7 @@ def test_sweep_estimate_includes_prompt_fitting():
     namespace = _bench_namespace(
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
+        "TIMEOUT_HEADROOM_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
@@ -2606,6 +2622,7 @@ def test_sweep_estimate_includes_prompt_fitting():
     zeroed = _bench_namespace(
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
+        "TIMEOUT_HEADROOM_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
@@ -2748,6 +2765,7 @@ def test_sweep_reserves_one_boot_per_separately_bootable_call() -> None:
         "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
         "_FUNDED_WARMUP_FIT_SECONDS",
+        "TIMEOUT_HEADROOM_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
@@ -2783,7 +2801,19 @@ def test_sweep_reserves_one_boot_per_separately_bootable_call() -> None:
         # One bounded probe per bucket call plus the canary's own, each capped by its own bound
         # rather than by the class method timeout.
         probes = namespace["PROBE_TIMEOUT_SECONDS"] * (count + 1)
-        expected = boots + probes + warmups * (count + 1) + windows + fitting + drains + scaledown
+        # Each call is enforced at `TIMEOUT_SECONDS`, which exceeds the phases above by this much;
+        # the slack is billable before Modal terminates the call, so it is reserved per call.
+        headroom = float(namespace["TIMEOUT_HEADROOM_SECONDS"]) * (count + 1)
+        expected = (
+            boots
+            + probes
+            + warmups * (count + 1)
+            + windows
+            + fitting
+            + drains
+            + scaledown
+            + headroom
+        )
         assert estimate == pytest.approx(expected), (
             f"{count}-bucket sweep must reserve {count + 1} boots"
         )
@@ -2939,6 +2969,7 @@ def test_the_module_runbook_ceilings_clear_their_own_submission_stop() -> None:
         "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
         "_FUNDED_WARMUP_FIT_SECONDS",
+        "TIMEOUT_HEADROOM_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
@@ -4867,3 +4898,176 @@ def test_the_summary_carries_the_checkpoint_the_sweep_accepted() -> None:
 
 def _is_empty_dict(node: ast.expr) -> bool:
     return isinstance(node, ast.Dict) and not node.keys
+
+
+def test_the_tokenizer_commit_names_the_tree_the_prompts_were_built_from() -> None:
+    """R23: the ref must not stand in for the tokenizer this process actually loaded.
+
+    The parent loads its tokenizer in `load_engine_config`, BEFORE `AsyncLLMEngine.from_engine_args`
+    downloads the weights. On the 35B, model and tokenizer share one unpinned repository, so the
+    engine's own fetch can land a second snapshot and advance `refs/main` to it. Both snapshots then
+    hold tokenizer files and the ref names the newer one -- and because the ref is among the
+    holders, the resolver used to return it under a source the publication gate ACCEPTS. The
+    measured tokens were produced by the older tree, so that is false provenance rather than
+    ambiguity, and nothing downstream could tell the difference.
+    """
+    from flash.serving.bench import probe as probe_module
+
+    loaded_commit = "1111111111111111111111111111111111111111"
+    advanced_commit = "2222222222222222222222222222222222222222"
+
+    # The vocabulary the PARENT's tokenizer holds. Only `model.vocab` is compared, because
+    # `tokenizers` re-normalizes the neighbouring fields on load.
+    loaded_vocab = {"hello": 0, "world": 1}
+    advanced_vocab = {"hello": 0, "world": 1, "later": 2}
+
+    class _Backend:
+        def to_str(self) -> str:
+            return json.dumps({"model": {"vocab": loaded_vocab}})
+
+    class _LoadedTokenizer:
+        backend_tokenizer = _Backend()
+
+    with tempfile.TemporaryDirectory() as cache:
+        repos = {
+            role: entry["repo"]
+            for role, entry in probe_module.probe_resolved_revisions("Qwen/Qwen3.6-35B-A3B").items()
+        }
+        assert repos["model"] == repos["tokenizer"], (
+            "the 35B no longer shares one repository across roles, so this race needs rechecking"
+        )
+        root = Path(cache) / f"models--{repos['tokenizer'].replace('/', '--')}"
+
+        for commit, vocab in ((loaded_commit, loaded_vocab), (advanced_commit, advanced_vocab)):
+            snapshot = root / "snapshots" / commit
+            snapshot.mkdir(parents=True)
+            (snapshot / "tokenizer.json").write_text(json.dumps({"model": {"vocab": vocab}}))
+        refs = root / "refs"
+        refs.mkdir(parents=True)
+        # The engine's later download advanced the ref past the tree the parent loaded.
+        (refs / "main").write_text(f"{advanced_commit}\n")
+
+        with mock.patch("huggingface_hub.constants.HF_HUB_CACHE", cache):
+            resolved = probe_module.probe_resolved_revisions(
+                "Qwen/Qwen3.6-35B-A3B", _LoadedTokenizer()
+            )
+            # The load-bearing arm: with no tokenizer to compare against, the ref is all the cache
+            # can offer and the answer must NOT be a confident one.
+            blind = probe_module.probe_resolved_revisions("Qwen/Qwen3.6-35B-A3B")
+
+    assert resolved["tokenizer"]["commit"] == loaded_commit, (
+        "the tokenizer commit names the tree the ENGINE's download advanced to, so the published "
+        "curve credits its prompts to a tokenizer they were never built with"
+    )
+    assert resolved["tokenizer"]["source"] == "snapshot-contents-verified", (
+        "a content-matched commit must be reported under its own source, so an artifact can say "
+        "the identification was verified rather than inferred from a repository-wide ref"
+    )
+    assert blind["tokenizer"]["commit"] != loaded_commit, (
+        "the ref alone identified the loaded tree, so this cache no longer reproduces the race and "
+        "the content match above proves nothing"
+    )
+    assert blind["tokenizer"]["source"] != "snapshot-contents-verified", (
+        "a probe with no loaded tokenizer claimed a verified match, so the source label does not "
+        "depend on the comparison it names"
+    )
+
+
+def test_probe_all_forwards_the_tokenizer_the_driver_fits_prompts_with() -> None:
+    """R23: the content match is only reachable if the engine's own tokenizer is passed to it.
+
+    `probe_all` is what every lane calls. A resolver that can disambiguate but is never handed the
+    loaded object would leave the defect exactly where it was, with a helper that looks like a fix.
+    """
+    from flash.serving.bench import probe as probe_module
+
+    seen: list[Any] = []
+
+    def _record(base_model: str, tokenizer: Any = None) -> dict[str, Any]:
+        seen.append(tokenizer)
+        return {}
+
+    sentinel = object()
+
+    class _Engine:
+        base_model = "Qwen/Qwen3.6-35B-A3B"
+        tokenizer = sentinel
+
+    with (
+        mock.patch.object(probe_module, "probe_resolved_revisions", _record),
+        mock.patch.object(probe_module, "probe_runtime_packages", return_value={}),
+        mock.patch.object(probe_module, "probe_gpu", return_value={}),
+        mock.patch.object(probe_module, "probe_gdn_backend", return_value={}),
+        mock.patch.object(probe_module, "probe_engine_kv_cache", return_value={}),
+    ):
+        probe_module.probe_all("Qwen/Qwen3.6-35B-A3B", _Engine())
+
+    assert seen == [sentinel], (
+        "probe_all did not forward the engine's tokenizer, so the loaded tree can never be "
+        "content-matched and the tokenizer commit falls back to the repository-wide ref"
+    )
+
+
+def test_the_reservation_covers_the_method_timeout_headroom_it_authorizes() -> None:
+    """R23: Modal enforces TIMEOUT_SECONDS, which exceeds every phase the estimators price.
+
+    `TIMEOUT_SECONDS` is the worst-case bucket PLUS `TIMEOUT_HEADROOM_SECONDS`. That slack is
+    granted per call and billable before Modal terminates it, so a reservation stopping at the named
+    phases lets a sweep bill the headroom once per separately bootable call beyond its ceiling --
+    the one direction a budget must never err.
+
+    Measured by re-pricing the SAME estimator with the headroom constant zeroed, so the guard reads
+    the term out of the real arithmetic instead of restating it. A reservation that ignores the
+    constant produces an identical number both ways and fails here.
+    """
+
+    def _namespace(headroom: float | None) -> dict[str, Any]:
+        injected: dict[str, Any] = {
+            "REQUEST_TIMEOUT_SECONDS": REQUEST_TIMEOUT_SECONDS,
+            "bench_engine_overrides_for": bench_engine_overrides_for,
+            "concurrency_grid": concurrency_grid,
+            "prompt_fit_seconds_bound": prompt_fit_seconds_bound,
+            # Held FIXED across both namespaces: the headroom delta must isolate the headroom, so
+            # every other term has to price identically on each side.
+            "WARMUP_FIT_SECONDS_BOUND": _WARMUP_FIT_BOUND,
+            "_FUNDED_WARMUP_FIT_SECONDS": _WARMUP_FIT_BOUND + fitting_watchdog_grace_seconds(),
+        }
+        names = [
+            "_canary_gpu_seconds_estimate",
+            "_sweep_gpu_seconds_estimate",
+            "CANARY_WARMUP_REQUESTS",
+            "SCALEDOWN_WINDOW_SECONDS",
+            "STARTUP_TIMEOUT_SECONDS",
+            "PROBE_TIMEOUT_SECONDS",
+        ]
+        if headroom is None:
+            names.append("TIMEOUT_HEADROOM_SECONDS")
+        else:
+            injected["TIMEOUT_HEADROOM_SECONDS"] = headroom
+        return _bench_namespace(*names, **injected)
+
+    real = _namespace(None)
+    headroom = float(real["TIMEOUT_HEADROOM_SECONDS"])
+    assert headroom > 0, "the headroom is zero, so this guard can no longer detect its omission"
+    zeroed = _namespace(0.0)
+
+    model = "Qwen/Qwen3.5-9B"
+    for selected in ([BUCKETS_BY_NAME["near_32k"]], list(BUCKETS)):
+        charged = real["_sweep_gpu_seconds_estimate"](model, selected) - zeroed[
+            "_sweep_gpu_seconds_estimate"
+        ](model, selected)
+        # Once per separately bootable call: every bucket's `run_bucket.remote()` plus the canary's
+        # `certify.remote()`, each of which carries its own method timeout.
+        assert charged == pytest.approx(headroom * (len(selected) + 1)), (
+            f"the sweep over {len(selected)} bucket(s) reserves {charged}s of method-timeout "
+            f"headroom but its calls are permitted to bill {headroom * (len(selected) + 1)}s, so "
+            "an accepted sweep can spend past its ceiling"
+        )
+
+    canary_charged = (
+        real["_canary_gpu_seconds_estimate"]() - zeroed["_canary_gpu_seconds_estimate"]()
+    )
+    assert canary_charged == pytest.approx(headroom), (
+        "the canary lane reserves less than the method-timeout headroom its single call is "
+        "permitted to bill, so an accepted canary can exceed its own ceiling"
+    )
