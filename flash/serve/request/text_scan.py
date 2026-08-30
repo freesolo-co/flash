@@ -22,6 +22,24 @@ VIABLE_PARAMETER_END_RE = re.compile(
 )
 
 
+def viable_parameter_end_re(names: frozenset[str]) -> re.Pattern[str]:
+    """the same scan, narrowed to openers a declaration actually names.
+
+    an opener the schema never declared cannot continue a call, so a closer followed by one is as
+    inert as a closer followed by ordinary text. spelling the declared names into the pattern lets
+    the engine skip those too, rather than returning each as a candidate for python to reject: a
+    value quoting an undeclared opener a million times otherwise costs a million loop passes.
+    """
+    if not names:
+        # nothing can continue the call but its end, so only that pairing is worth finding.
+        return re.compile(rf"{re.escape(PARAMETER_END)}\s*{re.escape(FUNCTION_END)}")
+    declared = "|".join(re.escape(name) for name in sorted(names))
+    return re.compile(
+        rf"{re.escape(PARAMETER_END)}\s*"
+        rf"(?:{re.escape(PARAMETER_START)}(?:{declared})>|{re.escape(FUNCTION_END)})"
+    )
+
+
 def strings_overlap(left: str, right: str) -> bool:
     """whether either string contains the other or their ends and starts share a run."""
 

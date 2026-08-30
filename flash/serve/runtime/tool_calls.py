@@ -9,6 +9,7 @@ from bisect import bisect_left
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import DecimalException
+from functools import lru_cache
 from typing import Any, NamedTuple
 
 from flash.serve.request import text_scan
@@ -29,7 +30,6 @@ from flash.serve.request.validation import MAX_MESSAGE_NODES
 
 _FUNCTION_START, _FUNCTION_END = text_scan.FUNCTION_START, text_scan.FUNCTION_END
 _PARAMETER_START, _PARAMETER_END = text_scan.PARAMETER_START, text_scan.PARAMETER_END
-_VIABLE_PARAMETER_END_RE = text_scan.VIABLE_PARAMETER_END_RE
 _CALL_BOUNDARY_RE = re.compile(r"</function>\s*</tool_call>\s*(<tool_call>)\s*<function=([^>]+)>")
 _PARAMETER_OPEN_RE = re.compile(r"<parameter=([A-Za-z0-9_-]{1,64})>")
 _WHITESPACE_RE = re.compile(r"\s*")
@@ -38,10 +38,6 @@ _WHITESPACE_RE = re.compile(r"\s*")
 # one way to match at each position and the engine cannot backtrack: an unterminated string fails
 # in one pass rather than retrying every split of the run.
 _STRING_BODY_RE = re.compile(r'(?:[^"\\]++|\\.)*+"', re.DOTALL)
-# an inert closer and the whitespace run behind it. stepping weighed that run twice, once reaching
-# the next closer and once measuring the run itself, so a native skip that weighs the span once has
-# to add the runs back to exhaust at the same point.
-_INERT_CLOSER_RUN_RE = re.compile(rf"{re.escape(_PARAMETER_END)}(\s*)")
 _AMBIGUOUS, _EXHAUSTED = object(), object()
 # an emitted call is only useful if the client can replay it, and the follow-up request carries
 # the whole prior conversation plus the assistant turn and one result per call. the cheapest
@@ -281,7 +277,9 @@ def _parse_tool_call(text, cursor, scope_end, tools, opener_positions, work):
         if index and positions[index - 1] >= name_end:
             openers[parameter_name] = positions[index - 1]
     try:
-        parsed = _parse_parameters((text, tool, openers, work), name_end + 1, {}, None)
+        parsed = _parse_parameters(
+            (text, tool, openers, work, _viable_end_re(tool)), name_end + 1, {}, None
+        )
     except RecursionError:
         # a long run of parameters descends once per value, so a schema wide enough to
         # declare hundreds of them can exhaust the interpreter stack before the work
@@ -348,7 +346,7 @@ def _bounded_whitespace_end(text: str, cursor: int, work: list[int]) -> int | ob
 
 
 def _parse_parameters(state, cursor, values, probe):
-    text, tool, _, work = state
+    text, tool, _, work, _viable = state
     parsed_values = dict(values)
     while True:
         cursor = _bounded_whitespace_end(text, cursor, work)
@@ -378,7 +376,7 @@ def _parse_parameters(state, cursor, values, probe):
 
 
 def _parse_parameter_value(state, value_start, schema, values, name, probe):
-    text, tool, _, work = state
+    text, tool, _, work, _viable = state
     if schema["type"] == "string" and "enum" not in schema:
         missing = frozenset(set(tool.parameters["required"]) - {*values, name})
         return _classify_free_string(
@@ -421,7 +419,7 @@ def _resumes_missing_parameter(state, incomplete: int, missing: set[str]) -> boo
     valid assignment remains reachable. abandoning there would hide the competing
     interpretation and let an ambiguous candidate parse as one structured call.
     """
-    text, _, _, work = state
+    text, _, _, work, _viable = state
     search_from = incomplete
     while True:
         value_end = _bounded_parameter_end(text, search_from, work)
@@ -442,8 +440,34 @@ def _resumes_missing_parameter(state, incomplete: int, missing: set[str]) -> boo
             return True
 
 
+@lru_cache(maxsize=256)
+def _viable_end_re_for(names: frozenset[str]) -> re.Pattern[str]:
+    return text_scan.viable_parameter_end_re(names)
+
+
+def _viable_end_re(tool: FunctionTool) -> re.Pattern[str]:
+    """the closer scan narrowed to this tool's declared parameter names.
+
+    the pattern depends only on the names, so it is built once per distinct declaration rather
+    than once per candidate: a response carrying hundreds of calls against one tool compiles it
+    once. the cache is bounded because an unbounded one would be keyed by untrusted schema names.
+    """
+    return _viable_end_re_for(frozenset(tool.parameters["properties"]))
+
+
+def _declares_next_parameter(text: str, cursor: int, tool) -> bool:
+    """whether an opener at the cursor names a parameter this tool actually declares."""
+
+    if not text.startswith(_PARAMETER_START, cursor):
+        return False
+    name_end = text.find(">", cursor + len(_PARAMETER_START))
+    if name_end < 0:
+        return False
+    return text[cursor + len(_PARAMETER_START) : name_end] in tool.parameters["properties"]
+
+
 def _classify_free_string(state, value_start, values, name, probe):
-    text, tool, openers, work = state
+    text, tool, openers, work, viable_end_re = state
     origin, depth, origin_missing = probe
     count, witness_cursor, witness_values = 0, None, None
     search_from = value_start
@@ -457,23 +481,23 @@ def _classify_free_string(state, value_start, values, name, probe):
         following = _bounded_whitespace_end(text, cursor, work)
         if following is _EXHAUSTED:
             return _EXHAUSTED
-        is_parameter = text.startswith(_PARAMETER_START, following)
+        # a closer only ends this value if what follows can continue the call, and an opener naming
+        # something the schema never declared cannot: `_parse_parameters` would reject it on sight.
+        # deciding that here rather than one frame down keeps a value that quotes an undeclared
+        # opener a million times from paying for a million rejected recursive branches.
+        is_parameter = _declares_next_parameter(text, following, tool)
         is_function = text.startswith(_FUNCTION_END, following)
         if not is_parameter and not is_function:
             # this closer cannot end the value, and neither can any closer before the next one
             # that is followed by a parameter or the function end. a free-string argument reaches
             # the megabytes, so stepping to each inert closer in python holds the event loop for
             # seconds; the engine finds the next viable one in a single native scan.
-            viable = _VIABLE_PARAMETER_END_RE.search(text, cursor)
+            viable = viable_end_re.search(text, cursor)
             skip_to = len(text) if viable is None else viable.start()
-            # stepping weighed each skipped closer twice over: once for the span that reached it
-            # and again for the whitespace run behind it. the span below is weighed once, so the
-            # repeated runs are added back to exhaust at the same point. the run behind the closer
-            # already passed is paid for above, so only the ones inside the span are counted.
-            repeated = sum(
-                len(run[1]) for run in _INERT_CLOSER_RUN_RE.finditer(text, cursor, skip_to)
-            )
-            if not _consume_work(work, skip_to - cursor + repeated):
+            # the span is charged once, for the one native scan that measured it. weighing it by
+            # the character is what the skip removed, so charging as if it had happened would put
+            # a python loop over every closer back on the request path to buy nothing.
+            if not _consume_work(work, skip_to - cursor):
                 return _EXHAUSTED
             search_from = skip_to
             if viable is None:

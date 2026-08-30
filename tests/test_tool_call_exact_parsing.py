@@ -4212,24 +4212,28 @@ def test_inert_free_string_closers_are_skipped_natively() -> None:
             }
         ]
     )
-    # whitespace behind each closer is load-bearing: stepping charged that run twice, so a native
-    # skip that charges the span only once would move the exhaustion point without changing any
-    # parse result. an inert run with no whitespace cannot see that difference.
+    # each closer carries a whitespace run, so a skip that stepped per closer would show up both in
+    # the search count below and in the work charged further down.
     body = "</parameter>   x" * 200_000
     text = (
         f"<tool_call><function=store><parameter=data>\n{body}\n</parameter></function></tool_call>"
     )
 
     searches = 0
-    pattern = tool_calls_module._VIABLE_PARAMETER_END_RE
+    build = tool_calls_module._viable_end_re
 
-    class _CountingPattern:
-        def search(self, text: str, position: int):
-            nonlocal searches
-            searches += 1
-            return pattern.search(text, position)
+    def counting_build(tool):
+        pattern = build(tool)
 
-    with mock.patch.object(tool_calls_module, "_VIABLE_PARAMETER_END_RE", _CountingPattern()):
+        class _CountingPattern:
+            def search(self, text: str, position: int):
+                nonlocal searches
+                searches += 1
+                return pattern.search(text, position)
+
+        return _CountingPattern()
+
+    with mock.patch.object(tool_calls_module, "_viable_end_re", counting_build):
         result = parse_qwen3_coder_output(text, tools, _work_limit=None)
 
     # the value still parses exactly, closers and all.
@@ -4238,49 +4242,107 @@ def test_inert_free_string_closers_are_skipped_natively() -> None:
     # one native search settles the whole inert run rather than 200k python iterations.
     assert searches == 1, searches
 
-    # the accounting scan that reproduces the old whitespace charge is a separate pass, and it is
-    # the one a test measuring only the viable-closer search would miss. it must also settle the
-    # run in a bounded number of python-level scans rather than one per closer skipped.
-    accounting = [0]
-    real_pattern = tool_calls_module._INERT_CLOSER_RUN_RE
+    # the skip must stay proportional to the span it settles, so the work charged for a value grows
+    # with its length rather than with how many closers happen to sit inside it. an inert run and an
+    # ordinary run of the same size must exhaust at the same point, or the charge is measuring the
+    # delimiters rather than the text and an untrusted value can be priced by its punctuation.
+    def min_work(value: str) -> int:
+        probe = (
+            f"<tool_call><function=store><parameter=data>\n{value}\n"
+            "</parameter></function></tool_call>"
+        )
 
-    class CountingPattern:
-        # a compiled pattern's methods are read-only, so the module attribute is swapped for a
-        # wrapper rather than the bound method being patched in place.
-        def finditer(self, *args, **kwargs):
-            accounting[0] += 1
-            return real_pattern.finditer(*args, **kwargs)
+        def parses(limit: int) -> bool:
+            return bool(parse_qwen3_coder_output(probe, tools, _work_limit=limit).calls)
 
-    with mock.patch.object(tool_calls_module, "_INERT_CLOSER_RUN_RE", CountingPattern()):
-        counted = parse_qwen3_coder_output(text, tools, _work_limit=None)
-    # the wrapper must not have changed the answer, or the count would describe another program.
-    assert [call.name for call in counted.calls] == ["store"]
-    assert accounting[0] == 1, accounting[0]
+        low, high = 1, 200_000
+        assert parses(high)
+        while low < high:
+            middle = (low + high) // 2
+            if parses(middle):
+                high = middle
+            else:
+                low = middle + 1
+        return low
 
-    # the skip must also cost exactly what stepping cost. the smallest work limit that still
-    # parses is the observable exhaustion point, so undercharging here would let a payload the
-    # old parser rejected become acceptable purely by taking the fast path.
-    probe = (
-        "<tool_call><function=store><parameter=data>\n"
-        + ("</parameter>" + " " * 64 + "x") * 12
-        + "\n</parameter></function></tool_call>"
+    length = 12_000
+    plain = min_work("z" * length)
+    # the same number of characters, carrying one inert closer or six hundred of them. if the skip
+    # charged per closer the cost would climb with the count; instead it settles toward the cost of
+    # ordinary text of that length, because what is charged is the span the native scan measured.
+    charges = {
+        closers: min_work(
+            ("</parameter>" + " " * (length // closers - len("</parameter>") - 1) + "x") * closers
+        )
+        for closers in (6, 60, 600)
+    }
+    assert max(charges.values()) < 1.1 * plain, charges
+    assert charges[600] < charges[60] < charges[6], charges
+
+
+def test_undeclared_openers_do_not_each_open_a_parse_branch() -> None:
+    """a closer followed by an opener the schema never declared cannot end the value.
+
+    `_parse_parameters` rejects an undeclared name on sight, so treating each one as a boundary
+    spent a recursive branch per occurrence to reach that same answer. narrowing the closer scan
+    to declared names lets the engine skip them instead: a value quoting one a million times is
+    settled by the same single native search as a value quoting none.
+    """
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "store",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"data": {"type": "string"}},
+                        "required": ["data"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
     )
 
-    def parses(limit: int) -> bool:
-        return bool(parse_qwen3_coder_output(probe, tools, _work_limit=limit).calls)
+    def passes(body: str) -> tuple[int, int]:
+        """(closer searches, parse branches) spent on a value with this body."""
+        text = (
+            f"<tool_call><function=store><parameter=data>\n{body}\n"
+            "</parameter></function></tool_call>"
+        )
+        searches, branches = [0], [0]
+        build, real = tool_calls_module._viable_end_re, tool_calls_module._parse_parameters
 
-    low, high = 1, 40_000
-    assert parses(high)
-    while low < high:
-        middle = (low + high) // 2
-        if parses(middle):
-            high = middle
-        else:
-            low = middle + 1
-    # measured against the stepping implementation this skip replaced, which exhausted at exactly
-    # this limit. weighing the skipped span once and dropping the repeated whitespace runs yields
-    # 2008 instead, so a payload stepping rejected would become acceptable by taking the fast path.
-    assert low == 2712, low
+        def counting_build(tool):
+            pattern = build(tool)
+
+            class _CountingPattern:
+                def search(self, text: str, position: int):
+                    searches[0] += 1
+                    return pattern.search(text, position)
+
+            return _CountingPattern()
+
+        def counting_parse(*args, **kwargs):
+            branches[0] += 1
+            return real(*args, **kwargs)
+
+        with (
+            mock.patch.object(tool_calls_module, "_viable_end_re", counting_build),
+            mock.patch.object(tool_calls_module, "_parse_parameters", counting_parse),
+        ):
+            result = parse_qwen3_coder_output(text, tools, _work_limit=None)
+        # the value is unchanged: whatever it quotes is still part of its text.
+        assert [call.name for call in result.calls] == ["store"]
+        assert json.loads(result.calls[0].arguments)["data"] == body
+        return searches[0], branches[0]
+
+    # neither pass may scale with how many times the value quotes an opener the schema never
+    # declared. a scan that returned each one as a candidate would cost a search and a rejected
+    # branch per occurrence, which is what made an 8 MiB argument take seconds.
+    quoted = "</parameter><parameter=nope>"
+    assert passes(quoted) == passes(quoted * 1_000) == passes(quoted * 100_000), passes(quoted)
 
 
 def test_opener_index_retains_only_declared_parameter_names() -> None:
