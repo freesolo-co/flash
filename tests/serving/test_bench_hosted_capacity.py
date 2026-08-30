@@ -13,6 +13,8 @@ import ast
 import asyncio
 import dataclasses
 import inspect
+import json
+import os
 import re
 import tomllib
 import types
@@ -1604,9 +1606,10 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     # one container. Every bucket call can therefore land on a cold replacement and pay another boot
     # plus its warmups, which bills whether or not the reservation admits it.
     replacements = (startup + canary) * 1
-    # `_run_canary` is TWO separately bootable remote calls, `probe` then `warmup`, so the sweep
-    # reserves the second canary boot exactly as the canary lane does.
-    canary_replacement_boot = startup
+    # `_run_canary` is now ONE remote call: `certify.remote()` probes and warms the SAME container,
+    # so there is no gap between two calls for a replacement to land in and no second canary boot to
+    # reserve. Reserving it anyway would refuse runs that cannot cost that much.
+    canary_replacement_boot = 0.0
     # The canary's probe plus one per bucket: `_run_bucket` gates the container it measured on, and
     # each probe is bounded by `PROBE_TIMEOUT_SECONDS` rather than the class method timeout.
     probes = constants["PROBE_TIMEOUT_SECONDS"] * 2
@@ -1854,12 +1857,12 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
     warmups = namespace["CANARY_WARMUP_REQUESTS"]
 
     canary = namespace["_canary_gpu_seconds_estimate"]()
-    # TWO boots: `_run_canary` calls `probe.remote()` then `warmup.remote()`, and `max_containers=1`
-    # bounds simultaneous replicas without binding successive calls to one container, so the warmup
-    # can land on a replacement that boots again.
-    # The probe is bounded separately and reserved: on the class method timeout a stalled probe
-    # would bill hours against a lane whose estimate assigned it zero.
-    assert canary == startup * 2 + namespace["PROBE_TIMEOUT_SECONDS"] + (
+    # ONE boot: `certify.remote()` probes and warms the same container in a single call, so a
+    # replacement cannot land between a probe and a warmup and no second boot is billable.
+    # The probe is still reserved: it runs inside that call, AFTER `@enter`, so it is billed on top
+    # of the boot rather than overlapping it, and it is bounded so a stall cannot reach the class
+    # method timeout.
+    assert canary == startup * 1 + namespace["PROBE_TIMEOUT_SECONDS"] + (
         REQUEST_TIMEOUT_SECONDS * warmups
     )
     assert canary >= startup, "the canary reserves less than a stuck boot alone would bill"
@@ -1869,9 +1872,8 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
     points = len(list(concurrency_grid(8)))
     expected = (
         startup
-        # The canary's SECOND boot: `probe` and `warmup` are separate remote calls, so the sweep
-        # reserves both exactly as the canary lane does.
-        + startup
+        # No second canary boot: `certify.remote()` probes and warms one container, so there is no
+        # gap between two calls for a replacement to land in.
         + REQUEST_TIMEOUT_SECONDS * warmups
         + bucket.max_seconds * points
         # Prompt fitting runs on the rented container before each cell's window opens, so it is
@@ -2420,13 +2422,14 @@ def test_canary_gate_refuses_an_unresolved_gdn_backend() -> None:
             require(probe)
 
 
-def test_sweep_reserves_both_canary_boots() -> None:
-    """The sweep makes `len(buckets) + 2` separately bootable calls, so it reserves that many boots.
+def test_sweep_reserves_one_boot_per_separately_bootable_call() -> None:
+    """The sweep makes `len(buckets) + 1` separately bootable calls, so it reserves that many boots.
 
-    `probe.remote()` and `warmup.remote()` are distinct calls and `max_containers=1` caps
-    simultaneous replicas without pinning successive calls to one container, so each can pay its own
-    cold boot. Reserving only the initial boot under-reserved every sweep by a full
-    `STARTUP_TIMEOUT_SECONDS`, which is precisely the overrun the ledger exists to refuse.
+    `max_containers=1` caps simultaneous replicas without pinning successive calls to one container,
+    so every bucket call can pay its own cold boot. The canary contributes ONE: `certify.remote()`
+    probes and warms the same container, so unlike the old `probe`/`warmup` pair there is no gap for
+    a replacement to land in. A reservation must be wrong toward refusing a run, but reserving a
+    boot that cannot happen refuses runs that would have fit.
     """
     namespace = _bench_namespace(
         "_sweep_gpu_seconds_estimate",
@@ -2450,13 +2453,13 @@ def test_sweep_reserves_both_canary_boots() -> None:
         drains = REQUEST_TIMEOUT_SECONDS * points * count
         warmups = REQUEST_TIMEOUT_SECONDS * namespace["CANARY_WARMUP_REQUESTS"]
         # Boots reserved: initial + canary replacement + one per bucket call.
-        boots = startup * (count + 2)
+        boots = startup * (count + 1)
         # One bounded probe per bucket call plus the canary's own, each capped by its own bound
         # rather than by the class method timeout.
         probes = namespace["PROBE_TIMEOUT_SECONDS"] * (count + 1)
         expected = boots + probes + warmups * (count + 1) + windows + fitting + drains
         assert estimate == pytest.approx(expected), (
-            f"{count}-bucket sweep must reserve {count + 2} boots"
+            f"{count}-bucket sweep must reserve {count + 1} boots"
         )
 
 
@@ -2539,15 +2542,20 @@ def test_the_probe_call_is_bounded_below_the_class_method_timeout() -> None:
         for node in tree.body
         if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
     }
-    called = {
-        child.func.id
-        for child in ast.walk(nodes["_run_canary"])
-        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
-    }
-    assert "_probe_within_bound" in called, "the canary probes on the unbounded class timeout"
+    # The canary must certify ONE container: a probe and a warmup issued as two remote calls could
+    # land on different containers, and the artifact would then pair container A's accepted
+    # provenance with container B's generation health.
+    canary_src = ast.get_source_segment(source, nodes["_run_canary"]) or ""
+    assert "certify.remote(" in canary_src, (
+        "the canary probes and warms separately; it cannot certify one container"
+    )
+    assert "warmup.remote(" not in canary_src, (
+        "a second remote call reopens the split between probed and measured containers"
+    )
 
     namespace = _bench_namespace(
         "PROBE_TIMEOUT_SECONDS",
+        "STARTUP_TIMEOUT_SECONDS",
         "TIMEOUT_SECONDS",
         "TIMEOUT_HEADROOM_SECONDS",
         "CANARY_WARMUP_REQUESTS",
@@ -2564,16 +2572,16 @@ def test_the_probe_call_is_bounded_below_the_class_method_timeout() -> None:
         "a probe bound at or above the method timeout bounds nothing"
     )
 
-    # The wait must be OURS, and a timeout must tear the container down: returning while a stuck
-    # probe keeps billing would defeat the bound.
-    helper = nodes["_probe_within_bound"]
-    src = ast.get_source_segment(source, helper) or ""
-    assert "spawn()" in src, "a blocking .remote() cannot be bounded by the caller"
-    assert "timeout=PROBE_TIMEOUT_SECONDS" in src, (
-        "the wait is not bounded by the probe's own bound"
+    # The bound must cover probe WORK only. Bounding a spawned call timed the cold `@enter` model
+    # load too, and the 35B/H200 engine takes roughly 17 minutes to initialize -- a 300s bound would
+    # have cancelled its first probe every time, despite the class allowing a 2700s startup. Inside
+    # the already-loaded method, boot is governed by `startup_timeout` instead.
+    assert bound < namespace["STARTUP_TIMEOUT_SECONDS"], (
+        "a probe bound above the startup allowance would never bind probe work"
     )
-    assert "terminate_containers=True" in src, (
-        "a timed-out probe keeps billing unless its container is terminated"
+    certify_src = ast.get_source_segment(source, nodes["_build_bench_engine"]) or ""
+    assert "_probe_in_container_within_bound(self)" in certify_src, (
+        "the probe is bounded outside the container, so its bound also times the cold boot"
     )
 
 
@@ -2771,3 +2779,148 @@ def test_a_reseeded_prompt_is_validated_against_the_bucket_target() -> None:
     validate(outcome, record)
     assert not record.ok, "a request two tolerances out of bucket was counted in it"
     assert record.error == driver.ERROR_PROMPT_LENGTH
+
+
+def test_a_timed_out_in_container_probe_terminates_the_container() -> None:
+    """Abandoning the future does not stop the thread; only ending the process does.
+
+    `run_in_executor` hands `probe_all` to a worker thread, and a thread blocked in
+    `AutoConfig.from_pretrained` or an NVML C call cannot be interrupted from Python. Raising on
+    timeout fails the call but leaves the container alive through its scaledown window with the
+    stuck thread still on the GPU -- still billing past the reservation the bound exists to enforce,
+    and still available to a retry that would inherit it. A spawned call had
+    `terminate_containers=True` for exactly this; from inside, the equivalent is to exit.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+    }
+    src = ast.get_source_segment(source, nodes["_probe_in_container_within_bound"]) or ""
+    assert "os._exit" in src, (
+        "the timed-out probe keeps billing: nothing terminates the container it is stuck in"
+    )
+    # A raise would be caught by the same event loop the stuck thread is already outliving, so the
+    # handler must not merely raise.
+    handler = next(
+        node
+        for node in ast.walk(nodes["_probe_in_container_within_bound"])
+        if isinstance(node, ast.ExceptHandler)
+    )
+    assert not any(isinstance(child, ast.Raise) for child in ast.walk(handler)), (
+        "raising leaves the container alive with an uninterruptible thread on the GPU"
+    )
+
+
+def test_the_canary_certifies_one_container_in_one_remote_call() -> None:
+    """Provenance and generation health must describe the SAME container.
+
+    `max_containers=1` caps simultaneous replicas without pinning successive calls to one container,
+    so a probe call and a warmup call could land on different containers. The canary would then
+    accept container A's GDN backend and card while reporting container B's warmup records -- and B
+    is free to hold an unresolved backend or a different accelerator.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+    }
+    canary_src = ast.get_source_segment(source, nodes["_run_canary"]) or ""
+    assert canary_src.count(".remote(") == 1, (
+        "the canary makes more than one remote call, so a replacement can split what it certifies"
+    )
+    assert "certify.remote(" in canary_src
+
+    factory = ast.get_source_segment(source, nodes["_build_bench_engine"]) or ""
+    assert "async def certify(" in factory, "no single method probes and warms one container"
+    # Probe THEN warm, so a container that fails its gate never pays for warmup requests.
+    assert factory.index("_probe_in_container_within_bound(self)") < factory.index(
+        "_run_warmup(self, requests)"
+    ), "the canary warms before it probes, paying for a container it may reject"
+
+
+def test_the_probe_bound_does_not_time_the_cold_boot() -> None:
+    """The 300s allowance must cover probe work, not model loading.
+
+    Bounding a spawned call timed the whole invocation including the class `@enter` load. The
+    35B/H200 engine needs roughly 17 minutes to initialize, so its first probe would have been
+    cancelled every time despite `startup_timeout=STARTUP_TIMEOUT_SECONDS` permitting 2700s.
+    """
+    namespace = _bench_namespace("PROBE_TIMEOUT_SECONDS", "STARTUP_TIMEOUT_SECONDS")
+    assert namespace["PROBE_TIMEOUT_SECONDS"] < namespace["STARTUP_TIMEOUT_SECONDS"], (
+        "a probe bound at or above the startup allowance cannot bind probe work alone"
+    )
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+    }
+    # Bounded from INSIDE the loaded method. A spawned-and-bounded probe would reintroduce the
+    # boot-inclusive timer wholesale, so the helper that did it must stay gone.
+    assert "_probe_within_bound" not in nodes, (
+        "the spawned probe helper is back; its bound times the cold boot too"
+    )
+    factory = ast.get_source_segment(source, nodes["_build_bench_engine"]) or ""
+    assert "_probe_in_container_within_bound(self)" in factory
+
+
+def test_the_construction_digest_covers_the_helpers_the_prompts_call() -> None:
+    """`inspect.getsource` reads a function's own text, never its callees.
+
+    `_deterministic_words` decides every filler body and `request_uid` decides every header and
+    cache key, so an edit to either changes the workload materially -- while changing no source that
+    was being digested. Two different workloads would publish under one checksum.
+    """
+    from flash.serving.bench import workload
+
+    for name in ("_deterministic_words", "request_uid"):
+        assert name in workload._CONSTRUCTION_SOURCES, (
+            f"{name} can change without moving the digest"
+        )
+
+    before = workload.workload_checksum()
+    original = workload._deterministic_words
+
+    def _edited(seed_material: str, count: int) -> list[str]:
+        return ["different"] * count
+
+    workload._deterministic_words = _edited
+    try:
+        assert workload.workload_checksum() != before, (
+            "the filler-body generator changed but the checksum did not"
+        )
+    finally:
+        workload._deterministic_words = original
+    assert workload.workload_checksum() == before
+
+
+def test_a_retry_cannot_destroy_the_prior_invocations_artifacts(tmp_path) -> None:
+    """`write_text` truncates, and every artifact name repeats on a retry.
+
+    The filenames key on model, bucket and block -- all of which a rerun repeats -- so a second run
+    silently overwrote the first run's per-bucket evidence and its summary. That inverts the point
+    of the invocation nonce, which exists to make retries distinguishable; their evidence is the
+    part worth distinguishing.
+    """
+    namespace = _bench_namespace("_write_artifact", os=os, json=json, Path=Path)
+    write = namespace["_write_artifact"]
+
+    os.environ["BENCH_OUT_DIR"] = str(tmp_path)
+    try:
+        first = write({"run": 1}, "summary-model-b0.json", invocation="aaaaaaaaaaaa")
+        second = write({"run": 2}, "summary-model-b0.json", invocation="bbbbbbbbbbbb")
+        assert first != second, "two invocations collided on one path"
+        assert json.loads(first.read_text())["run"] == 1, "the first run's evidence was destroyed"
+        assert json.loads(second.read_text())["run"] == 2
+
+        # Even within one invocation, a repeated name must refuse rather than truncate.
+        with pytest.raises(RuntimeError, match="refusing to overwrite"):
+            write({"run": 3}, "summary-model-b0.json", invocation="aaaaaaaaaaaa")
+    finally:
+        os.environ.pop("BENCH_OUT_DIR", None)

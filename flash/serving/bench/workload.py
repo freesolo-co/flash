@@ -343,6 +343,14 @@ _CHECKSUM_GRID_CAP = 8
 # whole module so unrelated edits (docstrings elsewhere, new helpers, `__all__`) do not invalidate
 # comparability between campaigns that ran the same prompt contract.
 _CONSTRUCTION_SOURCES: tuple[str, ...] = (
+    # `_deterministic_words` decides every filler body and `request_uid` decides every header and
+    # cache key, so either can change the workload materially. Neither appeared in any source
+    # digested below -- they are CALLED by the digested functions, and `inspect.getsource` reads a
+    # function's own text, not its callees. Listed explicitly rather than walked transitively:
+    # a transitive walk would sweep in `hashlib` and the tokenizer and make the digest move for
+    # reasons that are not the workload.
+    "_deterministic_words",
+    "request_uid",
     "_prompt_header",
     "build_prompt_text",
     "corpus_seed",

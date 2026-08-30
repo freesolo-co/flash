@@ -39,6 +39,7 @@ serving stack rather than a benchmark-only reimplementation.
 import asyncio
 import json
 import os
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -234,6 +235,25 @@ def _build_bench_engine(gpu: str, class_name: str) -> Any:
             from flash.serving.bench.probe import probe_all
 
             return probe_all(self.base_model, self)
+
+        @modal.method()
+        async def certify(self, requests: int = 5) -> dict[str, Any]:
+            """Probe AND warm up THIS container, in one remote invocation.
+
+            Two separate calls could not certify one container. `max_containers=1` caps simultaneous
+            replicas without pinning successive calls to one container, so Modal could replace the
+            container between them and the canary would combine container A's accepted provenance
+            with container B's generation health -- B free to hold an unresolved GDN backend or a
+            different card while its warmup passed.
+
+            The probe bound also only means something here. Bounding the SPAWNED call timed the cold
+            `@enter` model load too, and the 35B/H200 engine needs roughly 17 minutes to initialize:
+            a 300s bound would have cancelled its first probe every time. Inside the already-loaded
+            method, boot is governed by `startup_timeout` and the 300s covers only probe work.
+            """
+            provenance = await _probe_in_container_within_bound(self)
+            warm = await _run_warmup(self, requests)
+            return {"probe": provenance, "warmup": warm}
 
         @modal.method()
         async def warmup(self, requests: int = 5) -> dict[str, Any]:
@@ -481,43 +501,33 @@ async def _run_bucket(
     }
 
 
-def _write_artifact(payload: dict[str, Any], name: str) -> Path:
+def _write_artifact(payload: dict[str, Any], name: str, *, invocation: str = "") -> Path:
+    """Write one artifact, scoped to its invocation so a retry cannot destroy the prior evidence.
+
+    `write_text` truncates, and the filenames key only on model, bucket and block -- all of which a
+    retry repeats. So a second run at the same block silently overwrote the first run's per-bucket
+    artifacts and its summary, which is the opposite of what the invocation nonce was added for:
+    the nonce exists to make retries distinguishable, and the evidence they produce is the part
+    worth distinguishing. Each invocation gets its own subdirectory.
+    """
     out_dir = Path(os.environ.get("BENCH_OUT_DIR", "/tmp/flash-bench"))
+    if invocation:
+        out_dir = out_dir / invocation
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / name
+    if path.exists():
+        raise RuntimeError(
+            f"refusing to overwrite existing artifact {path}; a paid run already wrote it"
+        )
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print(f"[bench] wrote {path}", flush=True)
     return path
 
 
-def _probe_within_bound(engine: Any) -> dict[str, Any]:
-    """Run the provenance probe under `PROBE_TIMEOUT_SECONDS`, not the class method timeout.
-
-    `probe.remote()` inherits the class's `timeout`, which is sized for a whole concurrency grid --
-    hours. But the probe only reads NVML, asks vLLM's resolver for its GDN choice, and loads the
-    served config, so anything approaching that ceiling is a stall, not work. Left on the class
-    bound, a probe hung in `AutoConfig.from_pretrained` would bill the full method timeout against
-    a lane whose estimate assigned the probe zero seconds.
-
-    Spawned rather than called so the wait is OURS to bound, and cancelled with the container torn
-    down on timeout: returning while a stuck probe keeps billing would defeat the bound.
-    """
-    call = engine.probe.spawn()
-    try:
-        return call.get(timeout=PROBE_TIMEOUT_SECONDS)
-    except TimeoutError:
-        call.cancel(terminate_containers=True)
-        raise RuntimeError(
-            f"provenance probe exceeded {PROBE_TIMEOUT_SECONDS}s; container terminated. The probe "
-            "reads NVML and the served config, so this is a stall rather than slow work, and its "
-            "cost is not reserved by either lane estimate"
-        ) from None
-
-
 async def _probe_in_container_within_bound(engine: Any) -> dict[str, Any]:
     """`probe_all` for the container we are ALREADY running inside, under the probe's own bound.
 
-    `_probe_within_bound` cannot serve here: it spawns a remote call, and `_run_bucket` executes
+    A spawned remote probe cannot serve here: `_run_bucket` executes
     inside the container, so `probe_all` is an ordinary in-process call. But it is the same stall
     risk with the same funding -- both estimators reserve `PROBE_TIMEOUT_SECONDS` per bucket, while
     an unbounded call would run until the class-wide method timeout, blow past the bucket's
@@ -525,9 +535,9 @@ async def _probe_in_container_within_bound(engine: Any) -> dict[str, Any]:
 
     Run in a worker thread so the bound is enforceable: `probe_all` is synchronous (NVML, the vLLM
     resolver, `AutoConfig.from_pretrained`), and awaiting it directly would pin the event loop where
-    no timeout could fire. The thread is abandoned rather than joined on timeout -- Python cannot
-    interrupt a blocked C call -- but the bucket then raises, so the container is torn down instead
-    of continuing to bill against a reservation it has already exceeded.
+    no timeout could fire. Timing out cannot stop that thread -- Python cannot interrupt a blocked C
+    call -- so the handler ends the process rather than raising, which is the only way a thread that
+    outlives its bound stops billing against the reservation it has already exceeded.
     """
     loop = asyncio.get_running_loop()
     from flash.serving.bench.probe import probe_all
@@ -538,10 +548,23 @@ async def _probe_in_container_within_bound(engine: Any) -> dict[str, Any]:
             timeout=PROBE_TIMEOUT_SECONDS,
         )
     except TimeoutError:
-        raise RuntimeError(
-            f"in-container provenance probe exceeded {PROBE_TIMEOUT_SECONDS}s; this bucket reserved "
-            "exactly that much for it, so continuing would overrun the lane's reservation"
-        ) from None
+        # Kill the CONTAINER, not just the wait. Timing out the future does not stop the worker
+        # thread: `probe_all` blocked in `AutoConfig.from_pretrained` or an NVML C call cannot be
+        # interrupted from Python, and raising here only fails the call -- the container survives
+        # its scaledown window with the stuck thread still on the GPU, still billing past the
+        # reservation this bound exists to enforce, and available to a retry that would inherit it.
+        # A spawned call would cancel with `terminate_containers=True` for exactly this; from
+        # inside the container the equivalent is to end the process. `os._exit` rather than
+        # `sys.exit`: an exception would be swallowed by the same event loop the stuck thread
+        # is already outliving.
+        print(
+            f"[bench] FATAL: in-container provenance probe exceeded {PROBE_TIMEOUT_SECONDS}s; "
+            "terminating the container so a thread that cannot be interrupted stops billing",
+            flush=True,
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(70)
 
 
 def _require_resolved_gdn_backend(probe: dict[str, Any]) -> None:
@@ -573,7 +596,9 @@ def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, An
     """Boot, verify the card and kernel path, and warm up. The cheap gate before any sweep."""
     from flash.serving.bench.probe import gpu_matches
 
-    probe = _probe_within_bound(engine)
+    certified = engine.certify.remote(CANARY_WARMUP_REQUESTS)
+    probe = certified["probe"]
+    warm = certified["warmup"]
     print(json.dumps(probe, indent=2), flush=True)
     if not gpu_matches(probe, expected_gpu):
         raise RuntimeError(f"expected {expected_gpu}, got {(probe.get('gpu') or {}).get('name')!r}")
@@ -587,7 +612,6 @@ def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, An
             "Triton on Blackwell. Results describe the SLOW prefill path.",
             flush=True,
         )
-    warm = engine.warmup.remote(CANARY_WARMUP_REQUESTS)
     print(json.dumps(warm, indent=2), flush=True)
     # `run_request` converts exceptions, timeouts, malformed streams and cache-verification failures
     # into records with ok=False rather than raising, so `warmup.remote` returns normally even when
@@ -612,13 +636,13 @@ def _canary_gpu_seconds_estimate() -> float:
     `REQUEST_TIMEOUT_SECONDS`. Reserving less accepts a ceiling the lane's own bounds permit it to
     exceed, which is precisely what `BudgetLedger` exists to prevent.
 
-    The canary itself makes TWO remote calls -- `probe.remote()` then `warmup.remote()` -- and
-    `max_containers=1` caps simultaneous replicas without binding successive calls to one container.
-    So the warmup can land on a replacement that pays its own cold boot, exactly the case
-    `_ensure_warm` exists to handle on the sweep side. Both boots are reserved here; the warmup
-    requests are counted once because a replacement runs the same five, not a second set.
+    The canary makes ONE remote call: `certify.remote()` probes and warms the same container, so a
+    replacement cannot split provenance from generation health. That also collapses the second boot
+    this lane used to reserve -- there is no longer a second call for a replacement to land on. The
+    probe runs INSIDE that call, after `@enter`, so it is billed on top of the boot rather than
+    overlapping it.
     """
-    calls = 2
+    calls = 1
     return (
         float(STARTUP_TIMEOUT_SECONDS) * calls
         + PROBE_TIMEOUT_SECONDS
@@ -669,12 +693,12 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     # handled, and entirely foreseeable path unfunded, so a sweep accepted under its ceiling could
     # bill past it once per selected bucket. Priced per call, since that is where the exposure is.
     replacements = (boot + canary) * len(selected)
-    # The canary is TWO separately bootable remote calls -- `probe.remote()` then `warmup.remote()`
-    # -- so a sweep makes `len(selected) + 2` of them, not `len(selected) + 1`. The canary lane
-    # already prices both; this lane priced only the initial boot, under-reserving every sweep by a
-    # whole `STARTUP_TIMEOUT_SECONDS` whenever the warmup landed on its own cold replacement. The
-    # warmup requests are NOT doubled: a replacement runs the same five, not a second set.
-    canary_replacement_boot = boot
+    # The canary is now ONE remote call (`certify.remote()` probes and warms the same container), so
+    # a sweep makes `len(selected) + 1` separately bootable calls rather than `+ 2`. The second boot
+    # this lane reserved was funding a replacement landing between the old `probe`/`warmup` pair;
+    # with no gap between them there is nothing left for a replacement to land in, and reserving it
+    # anyway would refuse runs that cannot cost that much.
+    canary_replacement_boot = 0.0
     # The canary's probe, plus one per bucket: `_run_bucket` probes the container it actually
     # measured on. Each is bounded by `PROBE_TIMEOUT_SECONDS` rather than the class method timeout,
     # so this is the exposure the bound permits, not a guess at typical probe time.
@@ -758,6 +782,11 @@ def main(
     provenance = catalog.get(base_model)
 
     engine = _engine_for(base_model)(base_model=base_model)
+    # One nonce per lane invocation, keying prompt headers AND the artifact directory. Allocated
+    # before the canary so the canary lane's artifact is invocation-scoped too: it is paid evidence
+    # and a rerun would otherwise truncate it exactly as a sweep rerun did.
+    invocation = uuid.uuid4().hex[:12]
+    print(f"[bench] invocation nonce {invocation}", flush=True)
     gate = _run_canary(base_model, engine, expected_gpu)
 
     if mode == "canary":
@@ -771,26 +800,30 @@ def main(
                 "probe": gate["probe"],
                 "warmup": gate["warmup"],
                 "workload_checksum": workload_checksum(),
+                "invocation": invocation,
                 "budget": ledger.to_json(),
             },
             f"canary-{base_model.replace('/', '_')}.json",
+            invocation=invocation,
         )
         return
 
     overrides = bench_engine_overrides_for(base_model)
     grid = list(concurrency_grid(int(overrides.get("max_num_seqs", 8))))
-    # One nonce per sweep invocation, keying every measured prompt HEADER. A retry at the same block
-    # would otherwise re-send byte-identical prompts, and inside Modal's 120s scaledown the previous
+    # The nonce allocated above keys every measured prompt HEADER. A retry at the same block would
+    # otherwise re-send byte-identical prompts, and inside Modal's 120s scaledown the previous
     # container and its prefix cache are still alive: the driver would score those hits
     # ERROR_CACHE_CONTAMINATED and throw away a paid rerun whose engine was healthy. The filler body
     # is keyed separately and does not move, so the workload stays reproducible.
-    invocation = uuid.uuid4().hex[:12]
-    print(f"[bench] invocation nonce {invocation}", flush=True)
     results = []
     for name in [b.name for b in selected]:
         payload = engine.run_bucket.remote(name, grid, block, invocation)
         results.append(payload)
-        _write_artifact(payload, f"sweep-{base_model.replace('/', '_')}-{name}-b{block}.json")
+        _write_artifact(
+            payload,
+            f"sweep-{base_model.replace('/', '_')}-{name}-b{block}.json",
+            invocation=invocation,
+        )
     ledger.settle(entry, time.monotonic() - lane_started, note="measured sweep wall")
     _write_artifact(
         {
@@ -807,4 +840,5 @@ def main(
             "budget": ledger.to_json(),
         },
         f"summary-{base_model.replace('/', '_')}-b{block}.json",
+        invocation=invocation,
     )
