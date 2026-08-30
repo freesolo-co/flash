@@ -491,10 +491,9 @@ def _find_json_container_end(text: str, cursor: int, work: list[int]) -> int | o
             if quote < 0:
                 break
             # a quote closes the string only when the backslashes before it pair off entirely.
-            run = quote
-            while run > cursor and text[run - 1] == "\\":
-                run -= 1
-            in_string = (quote - run) % 2 == 1
+            # `rstrip` measures that run natively, so an argument made of backslashes costs a
+            # bounded operation rather than one interpreter step per character.
+            in_string = (quote - cursor - len(text[cursor:quote].rstrip("\\"))) % 2 == 1
             cursor = quote + 1
             continue
         if 0 <= closing < cursor:

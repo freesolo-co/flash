@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 from PIL import Image
 
+import flash.serve.runtime.tool_calls as runtime_tool_calls
 from flash.serve.request.openai import parse_chat_request
 from flash.serve.request.tool_calls import (
     FunctionTool,
@@ -976,6 +977,66 @@ def test_a_json_container_argument_ends_at_the_unquoted_token(
 
     assert [call.name for call in result.calls] == ["record"]
     assert json.loads(result.calls[0].arguments) == {"rows": expected}
+
+
+@pytest.mark.parametrize("pairs", range(6))
+def test_an_even_backslash_run_leaves_the_quote_closing(pairs: int) -> None:
+    """every backslash is escaped, so the quote after them still ends the string.
+
+    the run is measured natively rather than stepped through, so the parity has to stay exact at
+    every length where a bounded measurement and a per-character walk could disagree.
+    """
+    run = "\\\\" * pairs
+    argument = '["a' + run + '", "</parameter>"]'
+
+    result = parse_qwen3_coder_output(_container_call(argument), _container_tools())
+
+    assert [call.name for call in result.calls] == ["record"]
+    assert json.loads(result.calls[0].arguments) == {"rows": json.loads(argument)}
+
+
+@pytest.mark.parametrize("pairs", range(6))
+def test_an_odd_backslash_run_escapes_the_quote_that_follows(pairs: int) -> None:
+    """the last backslash escapes the quote, so the string runs on and swallows the token."""
+    # the trailing quote is escaped, so the value only ends at the second `"` and the end token
+    # between them is quoted. a parity that miscounted by one would end the value early instead.
+    run = "\\\\" * pairs
+    argument = '["a' + run + '\\"</parameter>b"]'
+
+    result = parse_qwen3_coder_output(_container_call(argument), _container_tools())
+
+    assert [call.name for call in result.calls] == ["record"]
+    assert json.loads(result.calls[0].arguments) == {"rows": json.loads(argument)}
+
+
+def test_locating_a_container_end_does_not_research_the_token_per_string() -> None:
+    """the end token is located once, not once per string segment in the argument.
+
+    researching it per segment is semantically identical and only costs time, so no verdict can
+    detect it. an argument of many short strings then pays one scan of the remaining text per
+    string, which is the quadratic shape this bound exists to prevent.
+    """
+    segments = 200
+    argument = "[" + ", ".join(f'"{index}"' for index in range(segments)) + "]"
+    searches = 0
+
+    class _CountingText(str):
+        """the scanned text, counting searches for the end token. `str` cannot be patched."""
+
+        __slots__ = ()
+
+        def find(self, sub: str, *args: int) -> int:
+            nonlocal searches
+            if sub == runtime_tool_calls._PARAMETER_END:
+                searches += 1
+            return str.find(self, sub, *args)
+
+    scanned = _CountingText(argument + runtime_tool_calls._PARAMETER_END)
+    end = runtime_tool_calls._find_json_container_end(scanned, 0, [10**9])
+
+    assert end == len(argument)
+    # a handful of searches for the whole argument, not one per string segment.
+    assert searches < segments
 
 
 @pytest.mark.parametrize(
