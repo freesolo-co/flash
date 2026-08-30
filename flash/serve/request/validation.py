@@ -11,7 +11,11 @@ import warnings
 from collections.abc import Mapping
 from typing import Any
 
-from flash.serve.contract.protocol import TEXT_TYPES, reject_non_finite_json_constant
+from flash.serve.contract.protocol import (
+    IMAGE_TYPES,
+    TEXT_TYPES,
+    reject_non_finite_json_constant,
+)
 from flash.serve.request.tool_calls import validate_tool_history
 
 MAX_IMAGES = 4
@@ -22,7 +26,6 @@ MAX_TOTAL_DECODED_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_CHARS = len("data:image/webp;base64,") + 4 * ((MAX_COMPRESSED_BYTES + 2) // 3)
 MAX_MESSAGE_NODES = 4096
 MAX_MESSAGE_DEPTH = 256
-IMAGE_TYPES = frozenset({"image_url", "input_image", "image"})
 ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
 MIME_TO_FORMAT = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}
 DATA_URI_RE = re.compile(r"\Adata:(image/[^;,]+);base64,(.*)\Z", re.DOTALL)

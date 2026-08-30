@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import random
 from decimal import Decimal
@@ -10,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from PIL import Image
 from pydantic import ValidationError
 
 import flash.serve.request.openai as openai_module
@@ -1410,6 +1413,42 @@ def test_reasoning_before_the_last_query_does_not_reject_a_replayable_turn() -> 
     later = _history_replay_arguments({"x": "second"})
     later[0]["tool_calls"][0]["id"] = later[1]["tool_call_id"] = "call_second"
     messages = [{"role": "user", "content": "q1"}, *earlier, {"role": "user", "content": "q2"}]
+    messages.extend(later)
+
+    request = parse_chat_request(
+        {"messages": messages}, require_model=False, allow_managed_selectors=True
+    )
+
+    assert request.messages[1]["reasoning_content"] == "<tool_call>"
+
+
+def _png_data_uri() -> str:
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 2), (10, 20, 30)).save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+def test_an_image_after_a_tool_response_keeps_the_turn_an_ordinary_query() -> None:
+    # the template renders an image as a placeholder rather than dropping it, so a turn whose text
+    # block looks like a synthesized tool response but that ends with an image does not end with
+    # `</tool_response>` and still closes the query span. reading only the text blocks would move
+    # the span earlier and reject the preceding turn for reasoning the model never sees.
+    earlier = _history_replay_messages("value")
+    earlier[0]["content"] = "fine"
+    earlier[0]["reasoning_content"] = "<tool_call>"
+    later = _history_replay_arguments({"x": "second"})
+    later[0]["tool_calls"][0]["id"] = later[1]["tool_call_id"] = "call_second"
+    messages = [
+        {"role": "user", "content": "q1"},
+        *earlier,
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<tool_response>x</tool_response>"},
+                {"type": "image_url", "image_url": {"url": _png_data_uri()}},
+            ],
+        },
+    ]
     messages.extend(later)
 
     request = parse_chat_request(
