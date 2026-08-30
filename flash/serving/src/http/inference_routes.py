@@ -22,7 +22,7 @@ from flash.serve.request.openai import (
     reject_thinking_logprobs,
 )
 from flash.serving.src.accounting.usage import captured_now, new_request_identity
-from flash.serving.src.accounting.usage_outbox import UsageOutboxError
+from flash.serving.src.accounting.usage_outbox import CapturedPrice, UsageOutboxError
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.io.multimodal import _prepare_generate_request
 from flash.serving.src.io.provenance import _checkpoint_provenance, _provenance_headers
@@ -50,9 +50,13 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
         payload.adapter_id, org_id=context.traffic_org_id(traffic)
     )
     context.reject_unsettleable_thinking(payload, target)
-    await _prepare_generate_request(payload, target)
+    price = _capture_price(context, traffic, target)
     identity = new_request_identity(request, traffic=traffic)
     admitted_at = captured_now()
+    usage_session = await _admit_usage(
+        context, identity, traffic, requested, target, price, admitted_at
+    )
+    await _prepare_admitted_request(context, usage_session, payload, target)
     try:
         result = await _await_until_disconnect(
             request,
@@ -60,9 +64,7 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
                 payload,
                 requested,
                 target,
-                identity=identity,
-                traffic=traffic,
-                captured_at=admitted_at,
+                usage_session=usage_session,
                 expected_checkpoint=_expected_checkpoint(request),
             ),
         )
@@ -85,9 +87,13 @@ async def generate_for_adapter(
         req.adapter_id, org_id=context.traffic_org_id(traffic)
     )
     context.reject_unsettleable_thinking(req, target)
-    await _prepare_generate_request(req, target)
+    price = _capture_price(context, traffic, target)
     identity = new_request_identity(request, traffic=traffic)
     admitted_at = captured_now()
+    usage_session = await _admit_usage(
+        context, identity, traffic, requested, target, price, admitted_at
+    )
+    await _prepare_admitted_request(context, usage_session, req, target)
     try:
         result = await _await_until_disconnect(
             request,
@@ -95,9 +101,7 @@ async def generate_for_adapter(
                 req,
                 requested,
                 target,
-                identity=identity,
-                traffic=traffic,
-                captured_at=admitted_at,
+                usage_session=usage_session,
                 expected_checkpoint=_expected_checkpoint(request),
             ),
         )
@@ -106,6 +110,42 @@ async def generate_for_adapter(
             status.HTTP_503_SERVICE_UNAVAILABLE, "durable serving accounting unavailable"
         ) from exc
     return _inference_json_response(result, target)
+
+
+def _capture_price(context: ServingContext, traffic: Any, target: Any) -> CapturedPrice:
+    try:
+        return context.capture_price(traffic, target)
+    except UsageOutboxError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "durable serving accounting unavailable"
+        ) from exc
+
+
+async def _admit_usage(
+    context: ServingContext,
+    identity: Any,
+    traffic: Any,
+    requested: Any,
+    target: Any,
+    price: CapturedPrice,
+    admitted_at: Any,
+) -> Any:
+    try:
+        return await context.admit_usage(identity, traffic, requested, target, price, admitted_at)
+    except UsageOutboxError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "durable serving accounting unavailable"
+        ) from exc
+
+
+async def _prepare_admitted_request(
+    context: ServingContext, usage_session: Any, payload: Any, target: Any
+) -> None:
+    try:
+        await _prepare_generate_request(payload, target)
+    except BaseException:
+        await context.fail_usage(usage_session, "request_preparation_failed")
+        raise
 
 
 def _path_adapter_id(adapter_id: str) -> str:
@@ -161,12 +201,16 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     }
     req = _parse_openai_generate(generate_fields)
     context.reject_unsettleable_thinking(req, target)
+    price = _capture_price(context, traffic, target)
     stream = normalized.stream
     include_usage = normalized.include_usage
-    await _prepare_generate_request(req, target)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     identity = new_request_identity(request, openai_completion_id=completion_id, traffic=traffic)
     admitted_at = captured_now()
+    usage_session = await _admit_usage(
+        context, identity, traffic, requested, target, price, admitted_at
+    )
+    await _prepare_admitted_request(context, usage_session, req, target)
     created = int(time.time())
     if stream:
         return await _stream_chat_completion(
@@ -179,9 +223,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
             completion_id=completion_id,
             created=created,
             include_usage=include_usage,
-            identity=identity,
-            traffic=traffic,
-            admitted_at=admitted_at,
+            usage_session=usage_session,
         )
 
     try:
@@ -191,9 +233,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
                 req,
                 requested,
                 target,
-                identity=identity,
-                traffic=traffic,
-                captured_at=admitted_at,
+                usage_session=usage_session,
                 expected_checkpoint=_expected_checkpoint(request),
             ),
         )
@@ -251,10 +291,49 @@ async def _discard_prepared_stream(usage_session: Any, events: Any) -> None:
         first = await anext(events)
         if first.get("prompt_tokens") is not None and first.get("completion_tokens") is not None:
             await usage_session.fail(first, "client_disconnected")
+        else:
+            await usage_session.fail_admission("client_disconnected")
     except StopAsyncIteration:
         pass
     finally:
         await _close_async_iterator(events)
+
+
+def _streaming_response(
+    context: ServingContext,
+    req: Any,
+    requested: Any,
+    prepared: tuple[Any, dict[str, str], bool, dict[str, Any]],
+    usage_session: Any,
+    *,
+    adapter_id: str,
+    completion_id: str,
+    created: int,
+    include_usage: bool,
+) -> StreamingResponse:
+    events, checkpoint_headers, thinking, _ = prepared
+    return StreamingResponse(
+        context.chat_stream(
+            record=requested,
+            events=events,
+            adapter_id=adapter_id,
+            completion_id=completion_id,
+            created=created,
+            include_usage=include_usage,
+            usage_session=usage_session,
+            thinking=thinking,
+            choice_count=getattr(req, "n", 1),
+        ),
+        media_type="text/event-stream",
+        # disable proxy and cdn buffering so each sse chunk reaches the client immediately.
+        # without x-accel-buffering, nginx accumulates tokens until its output buffer fills,
+        # adding 100+ ms of hidden ttft for small completions.
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+            **checkpoint_headers,
+        },
+    )
 
 
 async def _stream_chat_completion(
@@ -268,62 +347,39 @@ async def _stream_chat_completion(
     completion_id: str,
     created: int,
     include_usage: bool,
-    identity: Any,
-    traffic: Any,
-    admitted_at: Any,
+    usage_session: Any,
 ) -> StreamingResponse:
     preparation = asyncio.create_task(
         context.prepare_stream(
             req,
             requested,
             target,
-            generation_id=identity.request_id,
+            generation_id=usage_session.identity.request_id,
             expected_checkpoint=_expected_checkpoint(request),
         )
     )
     disconnect = asyncio.create_task(_wait_for_disconnect(request))
     prepared = None
-    usage_session = None
     transferred = False
+    failure_code = "generation_failed"
     try:
         done, _ = await asyncio.wait({preparation, disconnect}, return_when=asyncio.FIRST_COMPLETED)
         if preparation not in done:
             disconnect.result()
+            failure_code = "client_disconnected"
             raise asyncio.CancelledError
         prepared = preparation.result()
-        events, checkpoint_headers, thinking, first = prepared
-        usage_session = context.usage_session(
-            identity, traffic, requested, target, first, admitted_at
-        )
-        try:
-            await usage_session.capture(first)
-        except UsageOutboxError as exc:
-            await _close_async_iterator(events)
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "durable serving accounting unavailable",
-            ) from exc
-        response = StreamingResponse(
-            context.chat_stream(
-                record=requested,
-                events=events,
-                adapter_id=adapter_id,
-                completion_id=completion_id,
-                created=created,
-                include_usage=include_usage,
-                usage_session=usage_session,
-                thinking=thinking,
-                choice_count=getattr(req, "n", 1),
-            ),
-            media_type="text/event-stream",
-            # Disable proxy and CDN buffering so each SSE chunk reaches the client immediately.
-            # Without X-Accel-Buffering, Nginx accumulates tokens until its output buffer fills,
-            # adding 100+ ms of hidden TTFT for small completions.
-            headers={
-                "X-Accel-Buffering": "no",
-                "Cache-Control": "no-cache",
-                **checkpoint_headers,
-            },
+        usage_session = usage_session.with_attestation(prepared[3])
+        response = _streaming_response(
+            context,
+            req,
+            requested,
+            prepared,
+            usage_session,
+            adapter_id=adapter_id,
+            completion_id=completion_id,
+            created=created,
+            include_usage=include_usage,
         )
         transferred = True
         return response
@@ -336,10 +392,8 @@ async def _stream_chat_completion(
         )
         if prepared is None and isinstance(preparation_result, tuple):
             prepared = preparation_result
+            usage_session = usage_session.with_attestation(prepared[3])
         if prepared is not None and not transferred:
-            if usage_session is None:
-                first = prepared[3]
-                usage_session = context.usage_session(
-                    identity, traffic, requested, target, first, admitted_at
-                )
             await _discard_prepared_stream(usage_session, prepared[0])
+        elif prepared is None:
+            await context.fail_usage(usage_session, failure_code)

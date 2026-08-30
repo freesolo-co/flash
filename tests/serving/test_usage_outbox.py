@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import re
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 from flash.serving.src.accounting.usage import (
     _FREESOLO_USD_PER_MTOK,
     build_usage_session,
+    capture_authoritative_price,
     freesolo_price,
     new_generation_id,
 )
@@ -45,7 +47,7 @@ from flash.serving.src.io.streaming import (
     openai_chat_stream,
 )
 from flash.serving.src.store.settings import Settings
-from tests.serving.conftest import attest
+from tests.serving.conftest import RecordingUsageStore, attest
 
 BASE_MODEL = "Qwen/Qwen3.5-9B"
 
@@ -447,11 +449,11 @@ def test_stream_finalization_preserves_first_event_attestation() -> None:
         FreesoloOrgTrafficPrincipal(orgId="org-1"),
         record,
         record,
-        ready,
+        price=freesolo_price(record.base_model),
         deployment_id="deployment-1",
         serving_release="release-1",
         captured_at=datetime.now(UTC),
-    )
+    ).with_attestation(ready)
 
     asyncio.run(session.finalize(final))
 
@@ -562,7 +564,7 @@ def test_openrouter_event_omits_org_and_billable_requested_adapter() -> None:
         principal,
         record,
         record,
-        result,
+        price=capture_authoritative_price(principal, record),
         deployment_id="deployment-1",
         serving_release="release-1",
         captured_at=datetime.now(UTC),
@@ -606,7 +608,7 @@ def _usage_event() -> UsageEvent:
         FreesoloOrgTrafficPrincipal(orgId="org-1"),
         record,
         record,
-        result,
+        price=freesolo_price(record.base_model),
         deployment_id="deployment-1",
         serving_release="release-1",
         captured_at=datetime(2026, 8, 24, 12, 0, tzinfo=UTC),
@@ -766,6 +768,33 @@ def test_slow_capture_starts_full_heartbeat_lease_after_rpc_success() -> None:
     assert sleeps == [0.05, 20.0, 20.0]
     assert client.calls[-1][0].endswith("/rpc/finalize_serving_usage")
     assert outbox._background_error is None
+
+
+def test_price_admission_capture_replays_same_identity_after_response_loss() -> None:
+    event = _usage_event()
+    client = _QueuedClient(
+        [
+            httpx.ConnectError("response lost after commit"),
+            (
+                200,
+                [
+                    {
+                        "state": "in_progress",
+                        "lease_seconds": 120,
+                        "heartbeat_seconds": 20,
+                    }
+                ],
+            ),
+        ]
+    )
+    outbox = DurableUsageOutbox(
+        _outbox_settings(), client=client, worker_id="worker-1", sleep=_no_sleep
+    )
+
+    asyncio.run(outbox.capture(event))
+
+    assert client.calls[0] == client.calls[1]
+    assert event.identity.request_id in outbox._active_generations
 
 
 def test_finalize_uses_exact_owner_epoch_and_stops_heartbeating() -> None:
@@ -1509,13 +1538,9 @@ def test_finalize_authoritative_empty_day_uses_exact_typed_payload() -> None:
 class _StreamSession:
     def __init__(self, *, fail_finalize: bool = False) -> None:
         self.fail_finalize = fail_finalize
-        self.captured: list[dict[str, Any]] = []
         self.finalized: list[dict[str, Any]] = []
         self.failed: list[tuple[dict[str, Any], str]] = []
         self.relinquished = 0
-
-    async def capture(self, result: dict[str, Any]) -> None:
-        self.captured.append(result.copy())
 
     async def finalize(self, result: dict[str, Any]) -> None:
         if self.fail_finalize:
@@ -1524,6 +1549,19 @@ class _StreamSession:
 
     async def fail(self, result: dict[str, Any], code: str) -> None:
         self.failed.append((result.copy(), code))
+
+    async def fail_admission(self, code: str) -> None:
+        await self.fail(
+            {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cached_tokens": 0,
+                "cached_tokens_reported": False,
+                "reasoning_tokens": 0,
+                "thinking": False,
+            },
+            code,
+        )
 
     def relinquish(self) -> None:
         self.relinquished += 1
@@ -1567,6 +1605,150 @@ def _stream_events(generation_id: str):
     return events()
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("engine_error", "engine_failed"),
+        ("disconnect", "client_disconnected"),
+        ("missing_terminal", "engine_terminal_missing"),
+        ("stream_exception", "stream_failed"),
+    ],
+)
+def test_admitted_stream_failure_before_native_usage_terminalizes_zero_once(
+    failure: str, expected_code: str
+) -> None:
+    record = _revision()
+    store = RecordingUsageStore()
+    identity = RequestIdentity(request_id=new_generation_id(), correlation_id="correlation-1")
+    session = build_usage_session(
+        store,
+        identity,
+        FreesoloOrgTrafficPrincipal(orgId="org-1"),
+        record,
+        record,
+        price=freesolo_price(record.base_model),
+        deployment_id="deployment-1",
+        serving_release="release-1",
+        captured_at=datetime.now(UTC),
+    )
+
+    async def events():
+        if failure == "engine_error":
+            yield {"type": "error", "message": "engine failed", "code": 502}
+            return
+        if failure == "disconnect":
+            disconnected.set()
+            await asyncio.Event().wait()
+            return
+        if failure == "missing_terminal":
+            yield {"type": "ready"}
+            return
+        raise RuntimeError("stream failed before native usage")
+        yield {}
+
+    async def run() -> None:
+        await session.admit()
+        await _produce_openai_chat_stream(
+            AdapterRouter([record]),
+            asyncio.Queue(),
+            disconnected,
+            record=record,
+            events=events(),
+            adapter_id=record.adapter_id,
+            completion_id="chatcmpl-pre-usage-failure",
+            created=123,
+            include_usage=True,
+            usage_session=session,
+            thinking=False,
+        )
+
+    disconnected = asyncio.Event()
+    asyncio.run(run())
+
+    assert len(store.captured) == 1
+    assert store.finalized == []
+    assert len(store.failed) == 1
+    failed_event, code = store.failed[0]
+    assert code == expected_code
+    assert failed_event.identity == store.captured[0].identity
+    assert failed_event.target == store.captured[0].target
+    assert failed_event.price is store.captured[0].price
+    assert failed_event.facts.prompt_tokens == 0
+    assert failed_event.facts.completion_tokens == 0
+    assert failed_event.facts.cached_tokens == 0
+    assert failed_event.facts.reasoning_tokens == 0
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["engine_error", "disconnect", "missing_terminal"],
+)
+def test_a_failed_terminal_write_still_releases_the_admitted_generation(failure: str) -> None:
+    """A terminal failure that cannot be recorded must not leave the generation heartbeating.
+
+    The store relinquishes on a successful terminal rpc, so a raising one is the only path that can
+    strand the admission capture in `in_progress` with its lease alive. Every one of these callers
+    is ending the stream, so nothing later would release it.
+    """
+    record = _revision()
+    released: list[str] = []
+
+    class _RaisingFailStore(RecordingUsageStore):
+        async def fail(self, event: UsageEvent, code: str) -> None:
+            raise UsageOutboxError("terminal write lost")
+
+        def relinquish(self, request_id: str) -> None:
+            released.append(request_id)
+
+    store = _RaisingFailStore()
+    identity = RequestIdentity(request_id=new_generation_id(), correlation_id="correlation-1")
+    session = build_usage_session(
+        store,
+        identity,
+        FreesoloOrgTrafficPrincipal(orgId="org-1"),
+        record,
+        record,
+        price=freesolo_price(record.base_model),
+        deployment_id="deployment-1",
+        serving_release="release-1",
+        captured_at=datetime.now(UTC),
+    )
+
+    async def events():
+        if failure == "engine_error":
+            yield {"type": "error", "message": "engine failed", "code": 502}
+            return
+        if failure == "disconnect":
+            disconnected.set()
+            await asyncio.Event().wait()
+            return
+        yield {"type": "ready"}
+
+    async def run() -> None:
+        await session.admit()
+        await _produce_openai_chat_stream(
+            AdapterRouter([record]),
+            asyncio.Queue(),
+            disconnected,
+            record=record,
+            events=events(),
+            adapter_id=record.adapter_id,
+            completion_id="chatcmpl-terminal-write-lost",
+            created=123,
+            include_usage=True,
+            usage_session=session,
+            thinking=False,
+        )
+
+    disconnected = asyncio.Event()
+    # a disconnected client has no one left to receive an SSE error, so the outbox failure
+    # propagates there rather than being rendered. the release still has to have happened.
+    with contextlib.suppress(UsageOutboxError):
+        asyncio.run(run())
+
+    assert released == [identity.request_id], "the admitted generation must be released"
+
+
 def test_stream_finalizes_before_successful_terminal_usage_event() -> None:
     session = _StreamSession()
     generation_id = new_generation_id()
@@ -1591,7 +1773,7 @@ def test_stream_finalizes_before_successful_terminal_usage_event() -> None:
 
     assert len(session.finalized) == 1
     assert session.finalized[0]["type"] == "final"
-    assert session.captured == []
+    assert session.failed == []
     terminal_index = next(i for i, chunk in enumerate(chunks) if b'"usage"' in chunk)
     assert chunks[terminal_index + 1] == _sse("[DONE]")
 
@@ -1659,7 +1841,7 @@ def test_final_event_wins_same_tick_disconnect_and_emits_one_terminal_pair() -> 
     assert chunks[-1] == _sse("[DONE]")
 
 
-def test_stream_finalization_failure_emits_terminal_sse_error_and_snapshot() -> None:
+def test_stream_finalization_failure_emits_terminal_sse_error_and_failure_snapshot() -> None:
     session = _StreamSession(fail_finalize=True)
     generation_id = new_generation_id()
     record = _revision()
@@ -1684,26 +1866,21 @@ def test_stream_finalization_failure_emits_terminal_sse_error_and_snapshot() -> 
     assert not any(b'"usage"' in chunk for chunk in chunks)
     assert any(b'"type":"accounting_error"' in chunk for chunk in chunks)
     assert chunks[-1] == _sse("[DONE]")
-    assert session.captured[-1]["type"] == "final"
+    assert len(session.failed) == 1
+    assert session.failed[0][1] == "finalization_failed"
+    assert session.failed[0][0]["type"] == "final"
+    assert session.failed[0][0]["completion_tokens"] == 1
     assert session.relinquished == 1
 
 
-def test_failed_stream_finalization_relinquishes_heartbeat_for_stale_recovery() -> None:
+def test_failed_stream_finalization_uses_terminal_failure_without_second_capture() -> None:
     event = _usage_event()
     record = _revision()
     client = _QueuedClient(
         [
-            (500, {"error": "finalize failed"}),
-            (
-                200,
-                [
-                    {
-                        "state": "in_progress",
-                        "lease_seconds": 120,
-                        "heartbeat_seconds": 20,
-                    }
-                ],
-            ),
+            httpx.ConnectError("finalize response lost"),
+            httpx.ConnectError("finalize retry failed"),
+            (200, [{"state": "failed", "replay": False}]),
             (200, []),
         ]
     )
@@ -1715,7 +1892,7 @@ def test_failed_stream_finalization_relinquishes_heartbeat_for_stale_recovery() 
         event.principal,
         record,
         record,
-        {"checkpoint": record.checkpoint, "lora_request_adapter": record.adapter_id},
+        price=freesolo_price(record.base_model),
         deployment_id="deployment-1",
         serving_release="release-1",
         captured_at=event.captured_at,
@@ -1744,11 +1921,25 @@ def test_failed_stream_finalization_relinquishes_heartbeat_for_stale_recovery() 
     assert any(b'"type":"accounting_error"' in chunk for chunk in chunks)
     assert event.identity.request_id not in outbox._active_generations
     assert event.identity.request_id not in outbox._generation_lease_deadlines
-    assert [call[0].rsplit("/", 1)[-1] for call in client.calls] == [
+    rpc_names = [call[0].rsplit("/", 1)[-1] for call in client.calls]
+    assert rpc_names == [
         "finalize_serving_usage",
-        "capture_serving_usage",
+        "finalize_serving_usage",
+        "fail_serving_generation",
         "recover_stale_serving_generations",
     ]
+    assert client.calls[0] == client.calls[1]
+    assert "capture_serving_usage" not in rpc_names
+    _, finalize_payload = client.calls[0]
+    _, failure_payload = client.calls[2]
+    assert failure_payload["p_event"] == finalize_payload["p_event"]
+    assert failure_payload["p_generation_owner_id"] == finalize_payload["p_generation_owner_id"]
+    assert (
+        failure_payload["p_generation_owner_epoch"] == finalize_payload["p_generation_owner_epoch"]
+    )
+    assert failure_payload["p_event"]["request_id"] == event.identity.request_id
+    assert failure_payload["p_event"]["completion_tokens"] == 1
+    assert failure_payload["p_failure_code"] == "finalization_failed"
 
 
 def test_pre_response_disconnect_persists_ready_snapshot_and_closes_iterator() -> None:

@@ -249,9 +249,6 @@ class _UsageSession:
     async def fail(self, event: dict[str, Any], reason: str) -> None:
         self.failed.append((event, reason))
 
-    async def capture(self, _event: dict[str, Any]) -> None:
-        return None
-
     def relinquish(self) -> None:
         return None
 
