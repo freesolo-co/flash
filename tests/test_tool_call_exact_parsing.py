@@ -4793,6 +4793,12 @@ def test_the_opener_index_sees_every_name_a_replay_probe_can_declare() -> None:
             "a": array("q", [offset])
         }, nested
 
+    # the same nesting where the inner name is empty, so the delimiter sits exactly at the name
+    # start. a scan that treats a zero-width name as nothing to record drops a declarable opener.
+    assert tool_calls_module._index_parameter_openers(
+        "<parameter=<parameter=>", 0, frozenset({""}), [10**9]
+    ) == {"": array("q", [11])}
+
 
 def test_unterminated_openers_do_not_rescan_the_tail_for_each_one() -> None:
     """reading the name by its delimiter must not retry the run at every opener it cannot end.
@@ -4834,6 +4840,59 @@ def test_unterminated_openers_do_not_rescan_the_tail_for_each_one() -> None:
         # the ratio is asserted rather than an absolute time, which would only measure the runner.
         small, large = elapsed(4_000, tail), elapsed(16_000, tail)
         assert large < 8 * max(small, 0.001), (tail, small, large)
+
+
+def test_a_declared_name_as_long_as_the_run_does_not_widen_the_scan() -> None:
+    """a declaration is untrusted too, so no opener may be copied out to be compared.
+
+    a replay probe declares the keys of a historical call, and a key carries anything, so one key
+    can be as long as the whole generation. bounding the copy by the longest declared name is
+    therefore no bound at all: such a key makes every opener in a run wide enough to cut out, and a
+    run sharing one far delimiter spells out a name per opener that shrinks by a constant. copying
+    them costs the square of the run's length before a single comparison, on the synchronous parse
+    path, and the work budget charges the span once beforehand so it cannot stop it.
+    """
+
+    def elapsed(count: int) -> float:
+        # the key is the run itself, so it grows with the text. a key of some fixed width would
+        # leave only the openers within that width of the delimiter wide enough to cut out, which
+        # is a constant number of them however long the run gets, and would measure nothing.
+        text = "<parameter=" * count + ">"
+        key = text[len("<parameter=") : -1]
+        start = time.perf_counter()
+        # the first opener is the only one whose name is the whole key; the rest are shorter.
+        assert tool_calls_module._index_parameter_openers(text, 0, frozenset({key}), [10**9]) == {
+            key: array("q", [0])
+        }
+        return time.perf_counter() - start
+
+    # quadratic growth quadruples for each doubling; reading only declared widths stays inside it.
+    small, large = elapsed(8_000), elapsed(32_000)
+    assert large < 8 * max(small, 0.001), (small, large)
+
+
+def test_a_wide_schema_does_not_cost_its_width_at_every_opener() -> None:
+    """settling an opener must not walk the declared names that happen to share its width.
+
+    a schema may declare hundreds of parameters, and nothing stops them being the same length, so
+    comparing an opener against each name of its width costs their count at every opener. that is
+    the declaration's width times the generation's length, which both an ordinary wide schema and
+    an untrusted generation reach. one hash of the name settles it against all of them at once.
+    """
+    # one width, so a per-name comparison has no narrowing left to do. the openers match nothing,
+    # which is the worst case for it: every name of the width is compared before the miss.
+    declared = frozenset(f"{index:012d}" for index in range(2_000))
+    text = "<parameter=zzzzzzzzzzzz>" * 20_000
+
+    def elapsed(names: frozenset[str]) -> float:
+        start = time.perf_counter()
+        assert tool_calls_module._index_parameter_openers(text, 0, names, [10**9]) == {}
+        return time.perf_counter() - start
+
+    # the same text against a schema 100x narrower. a scan that walks the width's names grows with
+    # the declaration; hashing the name once does not, so the two stay within an order of each other.
+    narrow, wide = elapsed(frozenset(sorted(declared)[:20])), elapsed(declared)
+    assert wide < 10 * max(narrow, 0.001), (narrow, wide)
 
 
 def test_inert_enum_delimiters_are_not_stepped_one_at_a_time() -> None:
