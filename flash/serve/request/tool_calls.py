@@ -14,7 +14,6 @@ from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES, TEXT_TYPES
 from flash.serve.request import text_scan
 from flash.serve.request.text_scan import TOOL_CALL_END, TOOL_CALL_START
 from flash.serve.request.text_scan import skip_whitespace as _skip_whitespace
-from flash.serve.request.text_scan import strings_overlap as _strings_overlap
 from flash.serve.request.tool_template import last_query_index, rendered_turn_prefix
 
 _FUNCTION_START, _FUNCTION_END = text_scan.FUNCTION_START, text_scan.FUNCTION_END
@@ -165,9 +164,7 @@ def validate_tool_stop_sequences(
     stop_chars = sum(len(stop_value) for stop_value in distinct_stop)
     if len(distinct_stop) * marker_chars + len(markers) * stop_chars > 16 * 1024 * 1024:
         raise error_type("active tool stop validation exceeds the supported complexity")
-    if any(
-        _strings_overlap(stop_value, marker) for stop_value in distinct_stop for marker in markers
-    ) or any(
+    if any(text_scan.overlaps_any(stop_value, markers) for stop_value in distinct_stop) or any(
         stop_value and _skip_whitespace(stop_value, 0) == len(stop_value)
         for stop_value in distinct_stop
     ):
@@ -305,6 +302,7 @@ def _normalize_schema(
     budget: list[int],
     enum_budget: list[int],
     root: bool = False,
+    direct: bool = False,
 ) -> dict[str, Any]:
     if type(raw) is not dict:
         raise error_type(f"{path} must be a JSON Schema object")
@@ -345,8 +343,14 @@ def _normalize_schema(
         detached = _json_copy(enum, path, error_type)
         if any(not _matches_type(item, schema_type) for item in detached):
             raise error_type(f"{path}.enum values must match {schema_type}")
-        if schema_type == "string" and any(
-            _string_enum_conflicts_with_tool_grammar(item) for item in detached
+        # only a value the grammar writes directly between its own delimiters can be made
+        # unreadable by carrying one. a string nested inside a container is written as part of that
+        # container's json, which `_find_json_container_end` delimits by brace depth and quoting,
+        # so the same characters round trip there and rejecting them would refuse a valid schema.
+        if (
+            direct
+            and schema_type == "string"
+            and any(_string_enum_conflicts_with_tool_grammar(item) for item in detached)
         ):
             raise error_type(f"{path}.enum contains an unrepresentable tool grammar delimiter")
         fingerprints = [_json_value_fingerprint(item) for item in detached]
@@ -377,6 +381,9 @@ def _normalize_schema(
                 depth=depth + 1,
                 budget=budget,
                 enum_budget=enum_budget,
+                # a property of the root object is written as its own parameter value, so a string
+                # one is bounded by the grammar. anything deeper is inside rendered json.
+                direct=root,
             )
             for name, child in properties.items()
         }
