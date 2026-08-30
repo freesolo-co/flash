@@ -146,11 +146,21 @@ def _gdn_config_values(base_model: str) -> dict[str, Any]:
 
     Read from the SERVED repo at its pinned revision, not the logical base model, so the geometry
     belongs to the weights the engine actually loaded.
+
+    Pinned to the LOCAL cache. An unpinned model resolves through `refs/main`, and a network-capable
+    load would re-resolve that ref and rewrite it to whatever the Hub holds NOW -- so this probe
+    could advance the very file `_local_snapshot_commit` reads, and the artifact would attribute a
+    measured number to a commit the engine never loaded. The engine has already downloaded this
+    config by the time any probe runs, so the local read is the same bytes; if it somehow is not
+    cached, raising is correct, because the caller records the failure and the gate refuses to
+    publish rather than guessing a revision.
     """
     from transformers import AutoConfig
 
     repo, revision = _served_checkpoint(base_model)
-    config = AutoConfig.from_pretrained(repo, revision=revision, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(
+        repo, revision=revision, trust_remote_code=True, local_files_only=True
+    )
     text_config = getattr(config, "text_config", config)
     values: dict[str, Any] = {}
     for name in (
@@ -423,10 +433,15 @@ def probe_resolved_revisions(base_model: str) -> dict[str, Any]:
 
 def probe_all(base_model: str, engine: Any | None = None) -> dict[str, Any]:
     """The full provenance block stored with each model's results."""
+    # Revisions FIRST, before anything that reads a checkpoint. `_local_snapshot_commit` reports an
+    # unpinned model's commit from the cache's `refs/main`, which is mutable state a Hub-touching
+    # load can rewrite underneath it. `_gdn_config_values` is pinned to the local cache so it cannot
+    # do that, but the order is the second, independent guarantee: provenance is captured before any
+    # later-added probe gets the chance to refresh a ref and silently re-date the measurement.
     payload: dict[str, Any] = {
+        "resolved_revisions": probe_resolved_revisions(base_model),
         "gpu": probe_gpu(),
         "gdn_prefill": probe_gdn_backend(base_model),
-        "resolved_revisions": probe_resolved_revisions(base_model),
     }
     if engine is not None:
         payload["kv_cache"] = probe_engine_kv_cache(engine)

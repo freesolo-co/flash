@@ -394,6 +394,11 @@ _DRIVER_SOURCES: tuple[str, ...] = (
     "run_cell",
     "run_request",
     "_drain",
+    # When a bucket sweep ABANDONS a grid. This decides which cells exist in the published curve at
+    # all, so loosening it turns a halted sweep into a longer one -- more concurrency points, a
+    # different ceiling and knee -- while every prompt, every request and every metric function
+    # stays byte-identical.
+    "_cell_is_conclusively_failed",
 )
 _METRIC_SOURCES: tuple[str, ...] = (
     # The reduction arithmetic and the curve's ceiling/knee/saturation rules. Their THRESHOLDS are
@@ -414,6 +419,9 @@ _DRIVER_CONSTANTS: tuple[str, ...] = (
     "_PROMPT_FIT_FIXED_SECONDS",
     "_PROMPT_FIT_SECONDS_PER_TOKEN",
     "_PROMPT_FIT_MAX_ITERATIONS",
+    # Read only by `_cell_is_conclusively_failed`, whose source names it without revealing its
+    # value, so retuning the abandonment threshold would leave the source digest byte-identical.
+    "_CONCLUSIVE_FAILURE_ATTEMPTS",
 )
 
 

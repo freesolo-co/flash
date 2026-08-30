@@ -130,6 +130,8 @@ from flash.serving.bench.catalog import (  # noqa: E402
 )
 from flash.serving.bench.driver import (  # noqa: E402
     REQUEST_TIMEOUT_SECONDS,
+    drain_reap_seconds,
+    fitting_watchdog_grace_seconds,
     prompt_fit_seconds_bound,
 )
 from flash.serving.bench.workload import (  # noqa: E402
@@ -147,11 +149,15 @@ CANARY_WARMUP_REQUESTS = 5
 
 # Wall time one warmup prompt fit is allowed. A warmup fits ONE `short_interactive` prompt, so it is
 # priced from that bucket's own bound at a pool of one rather than from a cell's whole pool.
-# Enforced by `fitting_watchdog` and reserved below, so the bound funded and the bound enforced are
-# the same number.
+#
+# `_FUNDED_WARMUP_FIT_SECONDS` is what that fit can BILL, which is NOT the bound it is nominally
+# held to: the watchdog ends the container at `bound + grace`, so the grace is time the lane permits
+# itself to spend and must be reserved with the bound. Reserving the nominal bound alone left every
+# armed watchdog able to bill past its own authorization.
 WARMUP_FIT_SECONDS_BOUND = prompt_fit_seconds_bound(
     BUCKETS_BY_NAME["short_interactive"], min_requests=1
 )
+_FUNDED_WARMUP_FIT_SECONDS = WARMUP_FIT_SECONDS_BOUND + fitting_watchdog_grace_seconds()
 
 
 def _worst_case_bucket_seconds() -> float:
@@ -175,8 +181,17 @@ def _worst_case_bucket_seconds() -> float:
     # taught this last round; omitting it HERE left the same phase unbounded in the place that
     # actually kills the call -- Modal would terminate `run_bucket` mid-grid and the bucket's
     # artifact would never be written, losing every cell the run had already paid for.
+    #
+    # Both bounded tails are here for the same reason: a drain that has to reap an uncancellable
+    # task costs `drain_reap_seconds()` past its own timeout, and a pool's watchdog ends the
+    # container at `bound + grace` rather than at the bound. Pricing the nominal halves alone would
+    # let the METHOD timeout fire while a phase the code still permits is legitimately running.
     cells = points * max(
-        bucket.max_seconds + REQUEST_TIMEOUT_SECONDS + prompt_fit_seconds_bound(bucket)
+        bucket.max_seconds
+        + REQUEST_TIMEOUT_SECONDS
+        + drain_reap_seconds()
+        + prompt_fit_seconds_bound(bucket)
+        + fitting_watchdog_grace_seconds()
         for bucket in BUCKETS
     )
     # A bucket landing on a COLD replacement container warms it first -- the path `_ensure_warm`
@@ -186,7 +201,11 @@ def _worst_case_bucket_seconds() -> float:
     # measurement it already paid for.
     #
     # The bucket's own provenance probe is bounded separately and included for the same reason.
-    return cells + REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS + PROBE_TIMEOUT_SECONDS
+    return (
+        cells
+        + (REQUEST_TIMEOUT_SECONDS + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
+        + PROBE_TIMEOUT_SECONDS
+    )
 
 
 # Derived, never typed: widening a bucket or the concurrency grid raises this automatically instead
@@ -667,8 +686,11 @@ def _canary_gpu_seconds_estimate() -> float:
         + PROBE_TIMEOUT_SECONDS
         # Each warmup pays its request timeout PLUS the fit that precedes it. The fit happens
         # outside `run_request`, so pricing a warmup at the request timeout alone left an
-        # enforced-but-unfunded phase; `WARMUP_FIT_SECONDS_BOUND` is the bound the watchdog kills at.
-        + (REQUEST_TIMEOUT_SECONDS + WARMUP_FIT_SECONDS_BOUND) * CANARY_WARMUP_REQUESTS
+        # enforced-but-unfunded phase. The watchdog does not kill at `WARMUP_FIT_SECONDS_BOUND`, it
+        # kills at that bound PLUS its grace, so the grace is billable time the lane deliberately
+        # permits; reserving only the nominal bound leaves it funded by nothing. Priced per warmup
+        # because the watchdog is armed and disarmed around each one separately.
+        + (REQUEST_TIMEOUT_SECONDS + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
         # The container survives its scaledown window after the last call returns, still allocated
         # and still billing. A reservation that stops at the final return under-reserves every lane
         # by that tail.
@@ -706,9 +728,18 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     # Prompt fitting runs inside the container BEFORE each cell's window opens, so it is
     # billed but appears in no `max_seconds`. Per cell, not per bucket: every concurrency
     # point rebuilds its own pool.
-    fitting = sum(prompt_fit_seconds_bound(bucket) * points for bucket in selected)
-    drains = REQUEST_TIMEOUT_SECONDS * cells
-    canary = (REQUEST_TIMEOUT_SECONDS + WARMUP_FIT_SECONDS_BOUND) * CANARY_WARMUP_REQUESTS
+    # Each cell's pool arms its own watchdog, which terminates at bound + grace rather than at the
+    # bound, so the grace is reserved once per cell alongside the fitting it guards.
+    fitting = sum(
+        (prompt_fit_seconds_bound(bucket) + fitting_watchdog_grace_seconds()) * points
+        for bucket in selected
+    )
+    # A drain waits `REQUEST_TIMEOUT_SECONDS` in `asyncio.wait`, and a task that ignores
+    # cancellation then costs a further `drain_reap_seconds()` before the container is ended. Both
+    # are bounded and both are billed, so both are reserved; pricing only the first left the reap
+    # interval funded by nothing at every concurrency point.
+    drains = (REQUEST_TIMEOUT_SECONDS + drain_reap_seconds()) * cells
+    canary = (REQUEST_TIMEOUT_SECONDS + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
     # The boot is reserved at the ceiling Modal actually allows a stuck boot to reach, not at a
     # typical observed boot. Same reasoning as the canary lane.
     boot = float(STARTUP_TIMEOUT_SECONDS)

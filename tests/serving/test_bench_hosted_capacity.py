@@ -17,9 +17,9 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
-import time
 import tomllib
 import types
 import uuid
@@ -57,6 +57,8 @@ from flash.serving.bench.driver import (
     _StreamOutcome,
     _validate,
     base_model_record,
+    drain_reap_seconds,
+    fitting_watchdog_grace_seconds,
     prompt_fit_seconds_bound,
     run_cell,
 )
@@ -1657,6 +1659,9 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
         prompt_fit_seconds_bound=prompt_fit_seconds_bound,
         REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
         WARMUP_FIT_SECONDS_BOUND=warmup_fit,
+        _FUNDED_WARMUP_FIT_SECONDS=warmup_fit + fitting_watchdog_grace_seconds(),
+        fitting_watchdog_grace_seconds=fitting_watchdog_grace_seconds,
+        drain_reap_seconds=drain_reap_seconds,
     )
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "<bench>", "exec"), namespace)
     estimate_for = namespace["_sweep_gpu_seconds_estimate"]
@@ -1666,13 +1671,20 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
 
     points = len(list(concurrency_grid(8)))
     windows = float(bucket.max_seconds) * points
-    # Billed on the container but outside every `max_seconds`, so it is reserved separately.
-    fitting = prompt_fit_seconds_bound(bucket) * points
-    drains = REQUEST_TIMEOUT_SECONDS * points
+    # Billed on the container but outside every `max_seconds`, so it is reserved separately. Each
+    # cell's pool arms its own watchdog, which ends the container at `bound + grace`, so the grace
+    # is reserved once per cell alongside the fitting it guards.
+    fitting = (prompt_fit_seconds_bound(bucket) + fitting_watchdog_grace_seconds()) * points
+    # A drain waits its own timeout and then up to `drain_reap_seconds()` for a task that ignored
+    # cancellation. Both are bounded and both bill, so pricing only the first left the reap interval
+    # funded by nothing at every single concurrency point.
+    drains = (REQUEST_TIMEOUT_SECONDS + drain_reap_seconds()) * points
     # Each warmup pays its fit as well as its request: the fit runs outside `run_request` and is
     # billed on the same container, so pricing a warmup at the request timeout alone left an
-    # enforced-but-unfunded phase.
-    canary = (REQUEST_TIMEOUT_SECONDS + warmup_fit) * constants["CANARY_WARMUP_REQUESTS"]
+    # enforced-but-unfunded phase. Priced at the funded fit, which includes the watchdog grace.
+    canary = (REQUEST_TIMEOUT_SECONDS + warmup_fit + fitting_watchdog_grace_seconds()) * constants[
+        "CANARY_WARMUP_REQUESTS"
+    ]
     startup = constants["STARTUP_TIMEOUT_SECONDS"]
     # `max_containers=1` caps SIMULTANEOUS replicas; it does not pin successive `.remote()` calls to
     # one container. Every bucket call can therefore land on a cold replacement and pay another boot
@@ -1772,6 +1784,11 @@ def _bench_namespace(*names: str, **injected: Any) -> dict[str, Any]:
         "uuid": uuid,
         "BUCKETS_BY_NAME": BUCKETS_BY_NAME,
         "prompt_fit_seconds_bound": prompt_fit_seconds_bound,
+        # The REAL accessors, not stand-in numbers. Both report intervals the driver enforces, so a
+        # test that hardcoded them would keep passing after the driver retuned one -- which is the
+        # exact drift between what is enforced and what is reserved these tests exist to catch.
+        "fitting_watchdog_grace_seconds": fitting_watchdog_grace_seconds,
+        "drain_reap_seconds": drain_reap_seconds,
         **injected,
     }
     exec(compile(ast.Module(body=body, type_ignores=[]), "<bench>", "exec"), namespace)
@@ -1793,6 +1810,7 @@ def test_bench_container_timeout_covers_the_whole_grid_it_runs() -> None:
         "TIMEOUT_SECONDS",
         "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
+        "_FUNDED_WARMUP_FIT_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
         BENCH_MODELS=BENCH_MODELS,
@@ -1816,14 +1834,28 @@ def test_bench_container_timeout_covers_the_whole_grid_it_runs() -> None:
     # container before each cell's window opens, so the method clock runs through it. The budget
     # estimator already reserved it; omitting it here left the same phase unbounded in the place
     # that actually terminates the call.
+    #
+    # The two bounded TAILS belong here too. A drain waits its own timeout and then up to
+    # `drain_reap_seconds()` for a task that ignored cancellation, and a pool's watchdog ends the
+    # container at `bound + grace`, not at the bound. Both are time the code still permits, so a
+    # method timeout priced at the nominal halves can fire while a legitimate phase is running --
+    # killing `run_bucket` before it writes the artifact the run already paid for.
     widest = max(
-        bucket.max_seconds + REQUEST_TIMEOUT_SECONDS + prompt_fit_seconds_bound(bucket)
+        bucket.max_seconds
+        + REQUEST_TIMEOUT_SECONDS
+        + drain_reap_seconds()
+        + prompt_fit_seconds_bound(bucket)
+        + fitting_watchdog_grace_seconds()
         for bucket in BUCKETS
     )
     # A bucket that lands on a cold replacement warms it SEQUENTIALLY before the first cell. Those
     # warmups run inside the method, so a timeout sized to the grid alone kills the call mid-warmup
     # -- and because the timeout fires before `run_bucket` returns, the artifact is never written.
-    warmups = REQUEST_TIMEOUT_SECONDS * namespace["CANARY_WARMUP_REQUESTS"]
+    # Each of those warmups also FITS a prompt first, under its own watchdog, so the method clock
+    # runs through the funded fit as well as the request.
+    warmups = (REQUEST_TIMEOUT_SECONDS + namespace["_FUNDED_WARMUP_FIT_SECONDS"]) * namespace[
+        "CANARY_WARMUP_REQUESTS"
+    ]
     worst = points * widest + warmups + namespace["PROBE_TIMEOUT_SECONDS"]
     assert namespace["_worst_case_bucket_seconds"]() == worst
     # Guard the direction that costs money: the grid's own fitting must be INSIDE the bound.
@@ -1899,6 +1931,7 @@ def test_a_cold_replacement_container_checks_its_own_warmup_health() -> None:
         "_require_healthy_warmup",
         "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
+        "_FUNDED_WARMUP_FIT_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         _run_warmup=_fake_run_warmup,
     )
@@ -1938,6 +1971,7 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
+        "_FUNDED_WARMUP_FIT_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
@@ -1949,8 +1983,12 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
     startup = namespace["STARTUP_TIMEOUT_SECONDS"]
     warmups = namespace["CANARY_WARMUP_REQUESTS"]
     # A warmup bills its prompt fit as well as its request: the fit runs outside `run_request`, on
-    # the same rented container, and is the bound the fitting watchdog kills at.
-    per_warmup = REQUEST_TIMEOUT_SECONDS + namespace["WARMUP_FIT_SECONDS_BOUND"]
+    # the same rented container. Priced at the FUNDED figure, not the nominal bound: the watchdog
+    # ends the container at `bound + grace`, so the grace is billable time the lane permits itself.
+    per_warmup = REQUEST_TIMEOUT_SECONDS + namespace["_FUNDED_WARMUP_FIT_SECONDS"]
+    assert namespace["_FUNDED_WARMUP_FIT_SECONDS"] == pytest.approx(
+        namespace["WARMUP_FIT_SECONDS_BOUND"] + fitting_watchdog_grace_seconds()
+    ), "the funded warmup fit dropped the watchdog grace it is supposed to cover"
     # The container keeps billing through its scaledown window after the last call returns.
     scaledown = float(namespace["SCALEDOWN_WINDOW_SECONDS"])
 
@@ -1976,9 +2014,12 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
         + per_warmup * warmups
         + bucket.max_seconds * points
         # Prompt fitting runs on the rented container before each cell's window opens, so it is
-        # billed even though it is deliberately outside `max_seconds`.
-        + prompt_fit_seconds_bound(bucket) * points
-        + REQUEST_TIMEOUT_SECONDS * points
+        # billed even though it is deliberately outside `max_seconds`. Each cell's pool arms its own
+        # watchdog, which ends the container at `bound + grace`, so the grace is reserved per cell.
+        + (prompt_fit_seconds_bound(bucket) + fitting_watchdog_grace_seconds()) * points
+        # Each drain waits its timeout and then up to `drain_reap_seconds()` for a task that ignored
+        # cancellation; both are bounded and both bill.
+        + (REQUEST_TIMEOUT_SECONDS + drain_reap_seconds()) * points
         # one replacement boot + warmup per bucket call, since `max_containers=1` does not pin
         # successive `.remote()` calls to the container the previous bucket booted
         + (startup + per_warmup * warmups) * 1
@@ -2008,6 +2049,7 @@ def test_documented_ceilings_exceed_what_each_lane_reserves() -> None:
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
+        "_FUNDED_WARMUP_FIT_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
@@ -2428,6 +2470,7 @@ def test_sweep_estimate_includes_prompt_fitting():
         # Held FIXED on both sides rather than lifted: recomputing it through the stub below would
         # zero the canary's fitting term too, and the difference would stop isolating cell fitting.
         WARMUP_FIT_SECONDS_BOUND=_WARMUP_FIT_BOUND,
+        _FUNDED_WARMUP_FIT_SECONDS=_WARMUP_FIT_BOUND + fitting_watchdog_grace_seconds(),
     )
     model = "Qwen/Qwen3.5-9B"
     selected = [BUCKETS_BY_NAME["near_32k"]]
@@ -2452,7 +2495,10 @@ def test_sweep_estimate_includes_prompt_fitting():
         concurrency_grid=concurrency_grid,
         prompt_fit_seconds_bound=lambda bucket, **kw: 0.0,
         WARMUP_FIT_SECONDS_BOUND=_WARMUP_FIT_BOUND,
+        _FUNDED_WARMUP_FIT_SECONDS=_WARMUP_FIT_BOUND + fitting_watchdog_grace_seconds(),
     )["_sweep_gpu_seconds_estimate"](model, selected)
+    # Only the per-cell FIT is stubbed away; the watchdog grace reserved beside it is a constant the
+    # stub cannot zero, so it cancels in the difference and the isolation stays exact.
     assert total - zeroed == pytest.approx(fitting)
 
 
@@ -2556,6 +2602,7 @@ def test_sweep_reserves_one_boot_per_separately_bootable_call() -> None:
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
+        "_FUNDED_WARMUP_FIT_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
@@ -2572,10 +2619,16 @@ def test_sweep_reserves_one_boot_per_separately_bootable_call() -> None:
         estimate = estimate_for("Qwen/Qwen3.5-9B", selected)
         points = len(list(concurrency_grid(8)))
         windows = sum(float(b.max_seconds) * points for b in selected)
-        fitting = sum(prompt_fit_seconds_bound(b) * points for b in selected)
-        drains = REQUEST_TIMEOUT_SECONDS * points * count
-        # A warmup bills its prompt fit as well as its request; the fit runs outside `run_request`.
-        warmups = (REQUEST_TIMEOUT_SECONDS + namespace["WARMUP_FIT_SECONDS_BOUND"]) * namespace[
+        # Per cell, the fit plus the grace its watchdog terminates at.
+        fitting = sum(
+            (prompt_fit_seconds_bound(b) + fitting_watchdog_grace_seconds()) * points
+            for b in selected
+        )
+        # Per cell, the drain timeout plus the reap a task that ignored cancellation costs.
+        drains = (REQUEST_TIMEOUT_SECONDS + drain_reap_seconds()) * points * count
+        # A warmup bills its prompt fit as well as its request; the fit runs outside `run_request`,
+        # and is priced at the funded figure because its watchdog ends at `bound + grace`.
+        warmups = (REQUEST_TIMEOUT_SECONDS + namespace["_FUNDED_WARMUP_FIT_SECONDS"]) * namespace[
             "CANARY_WARMUP_REQUESTS"
         ]
         # Boots reserved: initial + canary replacement + one per bucket call.
@@ -2688,6 +2741,7 @@ def test_the_probe_call_is_bounded_below_the_class_method_timeout() -> None:
         "TIMEOUT_HEADROOM_SECONDS",
         "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
+        "_FUNDED_WARMUP_FIT_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "_worst_case_bucket_seconds",
         BENCH_MODELS=BENCH_MODELS,
@@ -2728,6 +2782,7 @@ def test_the_module_runbook_ceilings_clear_their_own_submission_stop() -> None:
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
         "WARMUP_FIT_SECONDS_BOUND",
+        "_FUNDED_WARMUP_FIT_SECONDS",
         "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
@@ -3287,54 +3342,77 @@ def test_provenance_records_a_resolved_commit_for_unpinned_repositories() -> Non
         assert entry["reason"], f"{role} lost the failure reason"
 
 
-def test_the_fitting_bound_is_enforced_by_a_timer_off_the_blocked_thread() -> None:
-    """A deadline checked between iterations cannot bound a call that never returns.
+def test_the_fitting_bound_is_enforced_against_a_call_holding_the_gil() -> None:
+    """The bound must be enforced by a mechanism that does NOT need the GIL to run.
 
-    `_build_prompt_pool`'s per-prompt check is the only point its loop yields, and
-    `fit_prompt_to_tokens` calls a Rust tokenizer extension that holds the GIL. A call that blocks --
-    or that merely starts just under the deadline -- never gives the loop a chance to check anything,
-    so the reserved bound is exceeded on a container that is still billing. The enforcement that
-    survives that is a timer scheduled on a DIFFERENT thread, which fires regardless of what the
-    tokenizer is doing.
+    This is the failure mode a `threading.Timer` could not cover, and it was verified by direct
+    measurement rather than reasoning: a timer armed at 1s did not fire during a 60s GIL-holding C
+    call, because its callback is PYTHON and must first acquire the very GIL the stalled call is
+    holding. `faulthandler`'s watchdog runs in C and calls `_exit` without touching the GIL, so it
+    fires on schedule.
+
+    That distinction is the whole point of the watchdog: `fit_prompt_to_tokens` calls a Rust
+    tokenizer extension, so the exact call this guards is the one that holds the GIL while the
+    container keeps billing. Asserted end-to-end in a subprocess -- an in-process test cannot
+    observe its own termination, and a source-grep would keep passing if the mechanism silently
+    stopped working.
+    """
+    program = textwrap.dedent(
+        """
+        import sys
+        from flash.serving.bench import driver
+
+        # Shrink the grace so the test costs ~1s instead of ~30. The MECHANISM under test is
+        # unchanged; only the deadline moves.
+        driver._FITTING_WATCHDOG_GRACE_SECONDS = 0.5
+        driver._arm_fitting_watchdog(0.5, label="gil-probe")
+        # A single C call holding the GIL for far longer than the deadline. A Python-level timer
+        # cannot preempt this; the watchdog must.
+        sum(range(1, 6_000_000_000))
+        # Only reachable if the watchdog never fired.
+        sys.exit(0)
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        timeout=120,
+    )
+    assert completed.returncode != 0, (
+        "the fitting watchdog did not end a process blocked in a GIL-holding C call, so a stuck "
+        "tokenizer outlives its bound while the container keeps billing"
+    )
+    assert b"gil-probe" in completed.stdout + completed.stderr, (
+        "the watchdog terminated without naming what it was guarding, leaving an unexplained exit"
+    )
+
+
+def test_the_fitting_watchdog_disarms_and_supersedes_cleanly() -> None:
+    """A watchdog must not outlive the fitting it guards, nor leave an earlier deadline running.
+
+    Both directions kill a HEALTHY container: a watchdog left armed after its loop finishes fires
+    against work that already succeeded, and a superseded one fires against a bound that is no
+    longer being enforced. `faulthandler` keeps a single process-wide deadline, so re-arming must
+    replace rather than stack.
     """
     from flash.serving.bench import driver as driver_module
 
-    source = inspect.getsource(driver_module._arm_fitting_watchdog)
-    assert "threading.Timer" in source, (
-        "the bound is not enforced off the blocked thread, so a stuck tokenizer call outlasts it"
-    )
-    assert "os._exit" in inspect.getsource(driver_module._fitting_overrun), (
-        "the watchdog raises, but an exception cannot be delivered into a thread stuck in a C call"
-    )
-
-    # The timer must outlast the bound it guards, or a final fit that legitimately starts just
+    # The grace must outlast the bound it guards, or a final fit that legitimately starts just
     # inside the bound is killed while doing exactly what it was reserved to do.
     assert driver_module._FITTING_WATCHDOG_GRACE_SECONDS > 0.0
 
-    fired: list[tuple[str, float]] = []
-    with mock.patch.object(driver_module, "_fitting_overrun", lambda *a: fired.append(a)):
-        driver_module._arm_fitting_watchdog(0.01, label="probe")
-        assert driver_module._fitting_watchdog is not None, "no watchdog was armed"
-        driver_module._disarm_fitting_watchdog()
-        assert driver_module._fitting_watchdog is None, (
-            "the watchdog outlives the fitting it guards"
-        )
-        time.sleep(0.05 + driver_module._FITTING_WATCHDOG_GRACE_SECONDS * 0)
-    assert not fired, "a disarmed watchdog still fired, which would kill a healthy container"
+    assert not driver_module._fitting_watchdog_armed, "a watchdog leaked from an earlier test"
+    driver_module._arm_fitting_watchdog(600.0, label="probe")
+    assert driver_module._fitting_watchdog_armed, "no watchdog was armed"
+    driver_module._disarm_fitting_watchdog()
+    assert not driver_module._fitting_watchdog_armed, "the watchdog outlives the fitting it guards"
 
-    # Arming twice must not leave the first timer running: it would fire against a bound that is no
-    # longer the one being enforced.
-    driver_module._arm_fitting_watchdog(600.0, label="first")
-    first = driver_module._fitting_watchdog
-    driver_module._arm_fitting_watchdog(600.0, label="second")
-    try:
-        assert driver_module._fitting_watchdog is not first, (
-            "the previous watchdog was not replaced"
-        )
-        first.join(timeout=5.0)
-        assert not first.is_alive(), "a superseded watchdog is still armed"
-    finally:
-        driver_module._disarm_fitting_watchdog()
+    # Re-arming, then disarming ONCE, must leave nothing running -- otherwise a stacked deadline
+    # from the first arm would still terminate a healthy container.
+    with driver_module.fitting_watchdog(600.0, label="outer"):
+        driver_module._arm_fitting_watchdog(600.0, label="inner")
+    assert not driver_module._fitting_watchdog_armed, "a superseded watchdog is still armed"
 
 
 def test_the_pool_arms_the_watchdog_around_its_whole_fitting_loop() -> None:
@@ -3401,7 +3479,7 @@ def test_warmups_reserve_and_bound_the_fit_that_precedes_each_request() -> None:
     # Both estimators must price the fit, not just the request.
     for name in ("_canary_gpu_seconds_estimate", "_sweep_gpu_seconds_estimate"):
         body = ast.unparse(nodes[name])
-        assert "WARMUP_FIT_SECONDS_BOUND" in body, (
+        assert "_FUNDED_WARMUP_FIT_SECONDS" in body, (
             f"{name} funds warmup requests but not their fits"
         )
 
@@ -3544,6 +3622,102 @@ def test_the_execution_digest_covers_the_functions_that_schedule_the_work() -> N
         )
     finally:
         driver_module.run_cell = original
+    assert workload_module._execution_digest() == before, (
+        "the digest is not stable across a restore"
+    )
+
+
+def test_provenance_is_captured_before_any_probe_that_could_rewrite_it() -> None:
+    """The revision must be read before anything that can advance the ref it reads.
+
+    `_local_snapshot_commit` reports an unpinned model's commit from the HF cache's `refs/main`,
+    which is mutable. A network-capable checkpoint load re-resolves that ref and rewrites it to
+    whatever the Hub holds now, so a probe running first could advance the very file the revision
+    probe reads -- and the artifact would attribute a measured number to a commit the engine never
+    loaded.
+
+    Two independent guarantees, asserted separately because either alone can be lost in a refactor:
+    the config read is pinned to the local cache, and revisions are captured first regardless.
+    """
+    import ast
+    import inspect
+
+    from flash.serving.bench import probe as probe_module
+
+    source = inspect.getsource(probe_module._gdn_config_values)
+    call = next(
+        node
+        for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "from_pretrained"
+    )
+    pinned = [kw for kw in call.keywords if kw.arg == "local_files_only"]
+    assert pinned, "the config load may reach the Hub and rewrite the ref the revision probe reads"
+    assert pinned[0].value.value is True, (
+        "local_files_only is passed but not enabled, so the load can still reach the Hub"
+    )
+
+    body = ast.parse(textwrap.dedent(inspect.getsource(probe_module.probe_all))).body[0]
+    keys: list[str] = []
+    for node in ast.walk(body):
+        if isinstance(node, ast.Dict):
+            keys = [k.value for k in node.keys if isinstance(k, ast.Constant)]
+            break
+    assert keys[:1] == ["resolved_revisions"], (
+        f"provenance is not captured first; probe_all builds {keys}"
+    )
+
+
+def test_the_execution_digest_covers_the_abandonment_policy() -> None:
+    """Which cells EXIST in a published curve is a measurement decision, not an implementation one.
+
+    `_cell_is_conclusively_failed` decides when a bucket sweep stops opening concurrency points, so
+    loosening it turns a halted sweep into a longer one: more points, a different ceiling and a
+    different knee, while every prompt, every request and every metric function stays byte-identical.
+
+    Its threshold needs separate cover from its source. The function's body names
+    `_CONCLUSIVE_FAILURE_ATTEMPTS` but never reveals the value, so retuning the constant alone leaves
+    `inspect.getsource` byte-identical -- the digest would not move for a change that alters which
+    cells were measured.
+    """
+    from flash.serving.bench import driver as driver_module
+    from flash.serving.bench import workload as workload_module
+
+    assert "_cell_is_conclusively_failed" in workload_module._DRIVER_SOURCES, (
+        "the abandonment policy decides which cells exist but does not move the digest"
+    )
+    assert hasattr(driver_module, "_cell_is_conclusively_failed"), (
+        "_DRIVER_SOURCES names a function that no longer exists"
+    )
+    assert "_CONCLUSIVE_FAILURE_ATTEMPTS" in workload_module._DRIVER_CONSTANTS, (
+        "retuning the abandonment threshold leaves the digest unchanged"
+    )
+
+    before = workload_module._execution_digest()
+    original_threshold = driver_module._CONCLUSIVE_FAILURE_ATTEMPTS
+    try:
+        # A threshold retune with no source change anywhere must still move the digest.
+        driver_module._CONCLUSIVE_FAILURE_ATTEMPTS = original_threshold * 2
+        assert workload_module._execution_digest() != before, (
+            "retuning how many attempts abandon a grid leaves the digest unchanged"
+        )
+    finally:
+        driver_module._CONCLUSIVE_FAILURE_ATTEMPTS = original_threshold
+
+    original = driver_module._cell_is_conclusively_failed
+    try:
+
+        def _cell_is_conclusively_failed(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+            """A different abandonment rule."""
+            return original(*args, **kwargs)
+
+        driver_module._cell_is_conclusively_failed = _cell_is_conclusively_failed
+        assert workload_module._execution_digest() != before, (
+            "rewriting the abandonment rule leaves the digest unchanged"
+        )
+    finally:
+        driver_module._cell_is_conclusively_failed = original
     assert workload_module._execution_digest() == before, (
         "the digest is not stable across a restore"
     )

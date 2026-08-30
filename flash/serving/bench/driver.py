@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import faulthandler
 import os
 import sys
-import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -336,55 +336,50 @@ def prompt_fit_seconds_bound(bucket: Bucket, *, min_requests: int | None = None)
 
 
 _FITTING_WATCHDOG_GRACE_SECONDS = 30.0
-_fitting_watchdog: threading.Timer | None = None
-
-
-def _fitting_overrun(label: str, bound: float) -> None:
-    """End the container when a single fitting call has run past the bound that funded it."""
-    print(
-        f"[bench] prompt fitting for {label} blocked past its reserved {bound:.0f}s bound inside a "
-        f"single tokenizer call; ending the container rather than billing past the reservation",
-        flush=True,
-    )
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(75)
+_fitting_watchdog_armed = False
 
 
 def _arm_fitting_watchdog(bound: float, *, label: str) -> None:
-    """Arm a timer that can end the container from OUTSIDE a blocked tokenizer call.
+    """Arm a watchdog that can end the container from OUTSIDE a blocked tokenizer call.
 
-    The per-prompt deadline check below cannot fire while a fit is executing: `fit_prompt_to_tokens`
-    calls into the tokenizer, which for the fast tokenizers is a Rust extension holding the GIL for
-    the duration. A call that blocks -- or merely starts just under the deadline and runs long, which
-    is likeliest on the final `near_32k` entry -- never returns control to the loop, so the deadline
-    is checked again only after the overrun it exists to prevent. Meanwhile the container keeps
-    billing against the class-wide `TIMEOUT_SECONDS`, which is sized for the largest bucket and is
-    therefore far more GPU time than a short lane reserved.
+    The per-prompt deadline check in the pool loop cannot fire while a fit is executing:
+    `fit_prompt_to_tokens` calls into the tokenizer, which for the fast tokenizers is a Rust
+    extension holding the GIL for the duration. A call that blocks -- or merely starts just under
+    the deadline and runs long, which is likeliest on the final `near_32k` entry -- never returns
+    control to the loop, so the deadline is checked again only after the overrun it exists to
+    prevent. Meanwhile the container keeps billing against the class-wide `TIMEOUT_SECONDS`, which
+    is sized for the largest bucket and is therefore far more GPU time than a short lane reserved.
 
-    A timer thread is the enforcement that survives that: it is not scheduled by the blocked thread,
-    so it fires regardless of what the tokenizer is doing. It ends the process rather than raising
-    for the same reason the loop guard does -- an exception cannot even be delivered into a thread
-    stuck in a C call, and the container is still billing either way.
+    `faulthandler` rather than a `threading.Timer`, and the difference is the whole point. A timer
+    fires a PYTHON callback, so it must acquire the GIL to run -- the same GIL the stalled Rust call
+    is holding. In the exact scenario this watchdog exists for, a timer therefore never executes and
+    the bound is unenforced; measured directly, a timer armed at 1s did not fire during a 60s C call,
+    while `dump_traceback_later` terminated the process on schedule. `faulthandler`'s watchdog thread
+    runs in C and calls `_exit` without touching the GIL, so it fires regardless of what the
+    tokenizer is doing. It also prints the stalled thread's traceback, which names the blocked call.
+
+    `exit=True` is what makes this an enforcement rather than a diagnostic: without it the handler
+    dumps a traceback and lets the container keep billing.
 
     The grace period covers the case where the LAST call starts legitimately just inside the bound:
     without it the watchdog would kill a lane whose fitting was about to complete on time.
     """
-    global _fitting_watchdog
-    _disarm_fitting_watchdog()
-    timer = threading.Timer(
-        bound + _FITTING_WATCHDOG_GRACE_SECONDS, _fitting_overrun, (label, bound)
+    global _fitting_watchdog_armed
+    print(
+        f"[bench] fitting watchdog armed for {label}: the container ends if a single tokenizer "
+        f"call blocks past {bound:.0f}s + {_FITTING_WATCHDOG_GRACE_SECONDS:.0f}s grace",
+        flush=True,
     )
-    timer.daemon = True
-    timer.start()
-    _fitting_watchdog = timer
+    # Cancels any watchdog already armed, so nesting cannot leave an earlier deadline running.
+    faulthandler.dump_traceback_later(bound + _FITTING_WATCHDOG_GRACE_SECONDS, exit=True)
+    _fitting_watchdog_armed = True
 
 
 def _disarm_fitting_watchdog() -> None:
-    global _fitting_watchdog
-    if _fitting_watchdog is not None:
-        _fitting_watchdog.cancel()
-        _fitting_watchdog = None
+    global _fitting_watchdog_armed
+    if _fitting_watchdog_armed:
+        faulthandler.cancel_dump_traceback_later()
+        _fitting_watchdog_armed = False
 
 
 @contextlib.contextmanager
@@ -401,6 +396,25 @@ def fitting_watchdog(bound: float, *, label: str) -> Any:
         yield
     finally:
         _disarm_fitting_watchdog()
+
+
+def fitting_watchdog_grace_seconds() -> float:
+    """Grace the fitting watchdog allows past a bound before ending the container.
+
+    Exposed so the estimators reserve what the watchdog actually terminates at rather than the
+    nominal bound. A lane that reserves the bound but permits the grace can bill past its own
+    authorization, which is the failure `BudgetLedger` exists to make impossible.
+    """
+    return _FITTING_WATCHDOG_GRACE_SECONDS
+
+
+def drain_reap_seconds() -> float:
+    """How long a drain waits for a task that ignored cancellation, past the drain's own timeout.
+
+    Exposed for the same reason as the watchdog grace: it is bounded, billed, and happens at every
+    concurrency point, so it belongs in the reservation rather than in unfunded slack.
+    """
+    return _DRAIN_REAP_SECONDS
 
 
 def _build_prompt_pool(
@@ -810,7 +824,9 @@ async def run_cell(
 __all__ = [
     "REQUEST_TIMEOUT_SECONDS",
     "base_model_record",
+    "drain_reap_seconds",
     "fitting_watchdog",
+    "fitting_watchdog_grace_seconds",
     "prompt_fit_seconds_bound",
     "run_cell",
     "run_request",
