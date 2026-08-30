@@ -136,7 +136,7 @@ def _stream_usage_fields(
         "completion_tokens": len(completion_token_ids),
         "cached_tokens": _num_cached_tokens(request_output),
         "cached_tokens_reported": _cached_tokens_reported(request_output),
-        "inference_time_seconds": time.time() - start,
+        "inference_time_seconds": time.monotonic() - start,
         "request_id": request_id,
         "engine_replica_id": engine_replica_id,
         "checkpoint": checkpoint,
