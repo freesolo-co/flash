@@ -4100,3 +4100,133 @@ def test_whitespace_scanning_matches_stepping_and_stays_native() -> None:
     with mock.patch.object(text_scan, "_LEADING_WHITESPACE_RE", _CountingPattern()):
         assert text_scan.skip_whitespace(" " * 2_000_000 + "x", 0) == 2_000_000
     assert calls == 1, calls
+
+
+def test_schema_node_budget_spans_the_whole_tool_list() -> None:
+    """the node ceiling is a request budget, not a per-declaration one.
+
+    charging it per declaration lets the tool maximum multiply it, so a caller could send many
+    times the node ceiling the contract names while every individual declaration stayed under it.
+    that buys synchronous normalization work on the request path proportional to the product.
+    """
+    from flash.serve.request.tool_calls import _MAX_SCHEMA_NODES, _MAX_TOOLS
+
+    def declarations(count: int, properties: int) -> list[dict]:
+        schema = {
+            "type": "object",
+            "properties": {f"p{index}": {"type": "string"} for index in range(properties)},
+            "required": [],
+            "additionalProperties": False,
+        }
+        return [
+            {"type": "function", "function": {"name": f"t{index}", "parameters": schema}}
+            for index in range(count)
+        ]
+
+    # a list whose total stays under the ceiling is accepted, including at the tool maximum.
+    normalize_tools(declarations(_MAX_TOOLS, 1), error_type=OpenAIRequestError)
+    normalize_tools(declarations(16, 10), error_type=OpenAIRequestError)
+
+    # each declaration here is individually legal, so only an aggregate budget rejects the list.
+    per_tool = _MAX_SCHEMA_NODES // 2
+    with pytest.raises(OpenAIRequestError, match="exceeds"):
+        normalize_tools(declarations(_MAX_TOOLS, per_tool), error_type=OpenAIRequestError)
+
+    # and the rejection lands on a later declaration, proving the budget carried across the list
+    # rather than resetting: the first one alone is under the ceiling and normalizes fine.
+    normalize_tools(declarations(1, per_tool), error_type=OpenAIRequestError)
+
+
+def test_inert_free_string_closers_are_skipped_natively() -> None:
+    """an argument full of closers that cannot end it must not cost one python step each.
+
+    only a ``</parameter>`` followed, after whitespace, by the next parameter or the function end
+    can close a free-string value. replay parses with no fixed work cap, so stepping to each inert
+    closer let a single accepted request hold the event loop for seconds.
+    """
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "store",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"data": {"type": "string"}},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+    body = "</parameter>x" * 200_000
+    text = (
+        f"<tool_call><function=store><parameter=data>\n{body}\n</parameter></function></tool_call>"
+    )
+
+    searches = 0
+    pattern = tool_calls_module._VIABLE_PARAMETER_END_RE
+
+    class _CountingPattern:
+        def search(self, text: str, position: int):
+            nonlocal searches
+            searches += 1
+            return pattern.search(text, position)
+
+    with mock.patch.object(tool_calls_module, "_VIABLE_PARAMETER_END_RE", _CountingPattern()):
+        result = parse_qwen3_coder_output(text, tools, _work_limit=None)
+
+    # the value still parses exactly, closers and all.
+    assert [call.name for call in result.calls] == ["store"]
+    assert json.loads(result.calls[0].arguments)["data"] == body
+    # one native search settles the whole inert run rather than 200k python iterations.
+    assert searches == 1, searches
+
+
+def test_opener_index_retains_only_declared_parameter_names() -> None:
+    """openers naming something the schema never declares are never read, so none are kept.
+
+    both readers look positions up by a declared parameter name. retaining the rest let an
+    untrusted argument spend hundreds of megabytes on offsets nothing consults.
+    """
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "store",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"data": {"type": "string"}},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+    undeclared = "<parameter=nope>" * 50_000
+    text = (
+        f"<tool_call><function=store><parameter=data>\n{undeclared}\n"
+        "</parameter></function></tool_call>"
+    )
+
+    captured: dict[str, list[int]] = {}
+    original = tool_calls_module._index_parameter_openers
+
+    def spy(text: str, start: int, declared, work):
+        result = original(text, start, declared, work)
+        if isinstance(result, dict):
+            captured.update(result)
+        return result
+
+    with mock.patch.object(tool_calls_module, "_index_parameter_openers", spy):
+        result = parse_qwen3_coder_output(text, tools, _work_limit=None)
+
+    # parsing is unchanged: the undeclared openers are still part of the value's text.
+    assert [call.name for call in result.calls] == ["store"]
+    assert json.loads(result.calls[0].arguments)["data"] == undeclared
+    # and not one of the 50k undeclared openers was retained.
+    assert "nope" not in captured, sorted(captured)
+    assert set(captured) <= {"data"}, sorted(captured)

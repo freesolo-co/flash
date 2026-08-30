@@ -61,7 +61,10 @@ def normalize_tools(
         raise error_type(f"tools may contain at most {_MAX_TOOLS} declarations")
     normalized: list[FunctionTool] = []
     names: set[str] = set()
-    enum_budget = [0]
+    # both budgets span the whole list. resetting the node budget per declaration would let the
+    # tool maximum multiply it, so a request could carry many times the node ceiling it names
+    # while every individual declaration stayed under it.
+    budget, enum_budget = [0], [0]
     for index, raw in enumerate(value):
         if type(raw) is not dict or set(raw) != {"type", "function"}:
             raise error_type(f"tools[{index}] must contain exactly type and function")
@@ -86,7 +89,6 @@ def normalize_tools(
         description = function.get("description")
         if description is not None and type(description) is not str:
             raise error_type(f"tools[{index}].function.description must be a string")
-        budget = [0]
         parameters = _normalize_schema(function["parameters"], f"tools[{index}].function.parameters", error_type, depth=0, budget=budget, enum_budget=enum_budget, root=True)  # fmt: skip
         normalized.append(FunctionTool(name, description, parameters))
     if any(

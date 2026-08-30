@@ -38,6 +38,12 @@ _WHITESPACE_RE = re.compile(r"\s*")
 # one way to match at each position and the engine cannot backtrack: an unterminated string fails
 # in one pass rather than retrying every split of the run.
 _STRING_BODY_RE = re.compile(r'(?:[^"\\]++|\\.)*+"', re.DOTALL)
+# a ``</parameter>`` that could actually end a value: only one followed, after whitespace, by the
+# next parameter or the function end can, and every other one is inert. searching for the pair
+# lets the engine skip the inert ones natively instead of stepping to each in python.
+_VIABLE_PARAMETER_END_RE = re.compile(
+    rf"{re.escape(_PARAMETER_END)}\s*(?:{re.escape(_PARAMETER_START)}|{re.escape(_FUNCTION_END)})"
+)
 _AMBIGUOUS, _EXHAUSTED = object(), object()
 # an emitted call is only useful if the client can replay it, and the follow-up request carries
 # the whole prior conversation plus the assistant turn and one result per call. the cheapest
@@ -171,7 +177,8 @@ def parse_qwen3_coder_output(
     # fixed cap here would make replay the narrower side and reject a call generation just emitted.
     budget = 4 * len(text) + scans * declared
     work = [budget if _work_limit is None else min(_work_limit, budget)]
-    opener_positions = _index_parameter_openers(text, first, work)
+    declared_names = frozenset(name for tool in tools for name in tool.parameters["properties"])
+    opener_positions = _index_parameter_openers(text, first, declared_names, work)
     if opener_positions is _EXHAUSTED:
         return ToolParseResult(content=text, calls=())
     # call-boundary discovery advances monotonically. opener discovery limits names to the
@@ -288,13 +295,21 @@ def _consume_work(work: list[int], amount: int) -> bool:
 
 
 def _index_parameter_openers(
-    text: str, start: int, work: list[int]
+    text: str, start: int, declared: frozenset[str], work: list[int]
 ) -> dict[str, list[int]] | object:
+    """offsets of every ``<parameter=name>`` opener, for the names a declaration can ask about.
+
+    both readers look positions up by a declared parameter name, so an opener naming anything
+    else can never be consulted. keeping one would let an untrusted argument spend hundreds of
+    megabytes on offsets nothing reads, so the index retains only what the schema can reach and
+    its size is bounded by the declaration rather than by the length of the generated text.
+    """
     if not _consume_work(work, len(text) - start):
         return _EXHAUSTED
     positions: dict[str, list[int]] = {}
     for match in _PARAMETER_OPEN_RE.finditer(text, start, len(text)):
-        positions.setdefault(match[1], []).append(match.start())
+        if match[1] in declared:
+            positions.setdefault(match[1], []).append(match.start())
     return positions
 
 
@@ -422,7 +437,18 @@ def _classify_free_string(state, value_start, values, name, probe):
         is_parameter = text.startswith(_PARAMETER_START, following)
         is_function = text.startswith(_FUNCTION_END, following)
         if not is_parameter and not is_function:
-            search_from = cursor
+            # this closer cannot end the value, and neither can any closer before the next one
+            # that is followed by a parameter or the function end. a free-string argument reaches
+            # the megabytes, so stepping to each inert closer in python holds the event loop for
+            # seconds; the engine finds the next viable one in a single native scan. work is
+            # charged for the whole span skipped, so the exhaustion point is unchanged.
+            viable = _VIABLE_PARAMETER_END_RE.search(text, cursor)
+            skip_to = len(text) if viable is None else viable.start()
+            if not _consume_work(work, skip_to - cursor):
+                return _EXHAUSTED
+            search_from = skip_to
+            if viable is None:
+                return count, witness_cursor, witness_values, None
             continue
         if is_function:
             function_end = _bounded_whitespace_end(text, following + len(_FUNCTION_END), work)
