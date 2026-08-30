@@ -134,7 +134,7 @@ def _rollout_batch_for_quote(spec) -> int:
 
 
 def spec_steps(spec) -> int:
-    """Per-seed optimizer steps implied by a train spec (mirrors the worker).
+    """Per-run optimizer steps implied by a train spec (mirrors the worker).
 
     sft reads the horizon its workload profile measured: the profile already resolved epochs,
     retained rows, realized batch, and ``max_steps`` against the exact tokenized dataset, so

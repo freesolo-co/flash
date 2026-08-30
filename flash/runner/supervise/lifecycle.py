@@ -6,7 +6,7 @@ import contextlib
 import os
 import time
 
-from flash.core.spec import JobSpec, gpu_count_of, require_matching_seed
+from flash.core.spec import JobSpec, gpu_count_of
 from flash.runner.lifecycle.attempts import AttemptLaunchClaim
 
 _STAGED_ENVIRONMENT_RETRY_S = 5.0
@@ -141,21 +141,37 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-def _submit_seed_supervised(
+def _drop_weight_cache(spec: JobSpec) -> JobSpec:
+    """Spec with the SHARED weight-cache volume removed for an unrestricted cross-region retry.
+
+    Only drops the platform-managed shared cache (WEIGHT_CACHE_VOLUME_NAME); a custom per-org
+    network_volume is the user's own choice and is preserved across retries.
+    """
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
+
+    if getattr(spec.gpu, "network_volume", None) != WEIGHT_CACHE_VOLUME_NAME:
+        return spec
+    d = spec.to_internal_dict()
+    d["gpu"] = {**d["gpu"], "network_volume": None}
+    return JobSpec.from_dict(d)
+
+
+def _run_attempts_supervised(
     spec: JobSpec,
-    seed: int,
     log,
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     reserved_claim: AttemptLaunchClaim | None = None,
 ) -> dict:
-    """Run one seed with persisted authorization for every replacement attempt."""
-    seed = require_matching_seed(spec, seed)
-    from flash.runner.supervise.seed_submission import submit_seed_supervised
+    """Run one run's attempts with bounded auto-retry on infra-shaped failures.
 
-    return submit_seed_supervised(
+    Retries resume from the latest HF checkpoint on a fresh host. Genuine worker errors fail fast.
+    ``attempt_start`` offsets persisted identities without expanding this invocation's retry budget.
+    """
+    from flash.runner.supervise.attempt_supervision import run_attempts_supervised
+
+    return run_attempts_supervised(
         spec,
-        seed,
         log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
@@ -195,8 +211,9 @@ def _run_job_inner(
     try:
         # dev replaced the explicit code upload with managed source snapshots, so staging only has
         # to pin the environment package before the provider is allocated. the staged package rides
-        # into the persisted snapshot at the per-attempt persist in `_submit_seed_supervised`, which
-        # already runs after this with the fully planned spec -- persisting a second time here would
+        # into the persisted snapshot at the per-attempt persist in `_run_attempts_supervised`,
+        # which already runs after this with the fully planned spec -- persisting a second time
+        # here would
         # hash a half-planned spec no later integrity check can reproduce.
         deadline_at = _load_run_deadline_at(spec.run_id)
         spec = stage_environment_package(spec, deadline_at=deadline_at)
@@ -240,7 +257,7 @@ def _run_training(
         validate_terminal_source_metrics,
     )
     from flash.runner.supervise.errors import _RunCancelled
-    from flash.runner.supervise.lifecycle import _submit_seed_supervised
+    from flash.runner.supervise.lifecycle import _run_attempts_supervised
 
     if spec.algorithm == "opd":
         from flash.server.domain.teacher.broker import preflight_validate_managed_teacher
@@ -266,9 +283,8 @@ def _run_training(
         file=log,
         flush=True,
     )
-    metrics = _submit_seed_supervised(
+    metrics = _run_attempts_supervised(
         spec,
-        spec.seed,
         log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,

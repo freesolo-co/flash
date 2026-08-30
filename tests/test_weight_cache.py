@@ -382,7 +382,7 @@ def test_weight_cache_env_custom_mount():
 def test_build_worker_env_sets_base_model_cache_with_volume():
     from flash.providers._lifecycle.net.worker import build_worker_env
 
-    env = build_worker_env(_vol_spec(), 0)
+    env = build_worker_env(_vol_spec())
     assert env["FLASH_WEIGHT_CACHE_DIR"] == "/runpod-volume/hf-cache/hub"
     # The leak fix: no process-global HF_HOME redirect, so env/reward downloads use the ephemeral cache.
     assert "HF_HOME" not in env
@@ -391,7 +391,7 @@ def test_build_worker_env_sets_base_model_cache_with_volume():
 def test_build_worker_env_no_cache_without_volume():
     from flash.providers._lifecycle.net.worker import build_worker_env
 
-    env = build_worker_env(JobSpec(model="m", seed=0), 0)
+    env = build_worker_env(JobSpec(model="m", seed=0))
     # Without a volume the base-model cache var must NOT be set (pointing at a missing mount).
     assert "FLASH_WEIGHT_CACHE_DIR" not in env
     assert "HF_HOME" not in env
@@ -558,13 +558,12 @@ def test_instance_payload_strips_runpod_volume_redirect():
     spec = JobSpec.from_dict(
         {**_vol_spec().to_internal_dict(), "run_id": "r", "model": "Qwen/Qwen3.5-9B"}
     )
-    assert build_worker_env(spec, 0)["FLASH_WEIGHT_CACHE_DIR"].startswith(
+    assert build_worker_env(spec)["FLASH_WEIGHT_CACHE_DIR"].startswith(
         "/runpod-volume"
     )  # leak source
     for arm in ("lambda",):
         env = _instance.build_payload(
             spec,
-            seed=0,
             attempt=0,
             arm=arm,
             source_snapshot=_SOURCE_SNAPSHOT,
@@ -872,14 +871,14 @@ def _supervised_walk(monkeypatch, failures):
 
         seen: list = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             seen.append((spec.gpu.network_volume, spec.gpu.type))
             fail = failures.get(attempt)
             if fail:
                 return jobs.PollResult(False, failure=fail, detail="x")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(
             provider_worker, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT
         )
@@ -1639,7 +1638,6 @@ def test_instance_build_payload_preload_mode():
     spec = _preload_spec()
     p = _instance.build_payload(
         spec,
-        spec.seed,
         0,
         arm="lambda",
         source_snapshot=_SOURCE_SNAPSHOT,
@@ -1663,7 +1661,6 @@ def test_instance_build_payload_no_mode_by_default():
     spec = _preload_spec()
     p = _instance.build_payload(
         spec,
-        spec.seed,
         0,
         arm="lambda",
         source_snapshot=_SOURCE_SNAPSHOT,
@@ -1822,7 +1819,6 @@ def test_build_payload_carries_mount_marker_for_nfs_cache():
     spec = _preload_spec()
     p = _instance.build_payload(
         spec,
-        spec.seed,
         0,
         arm="lambda",
         source_snapshot=_SOURCE_SNAPSHOT,
@@ -1881,7 +1877,6 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
     spec = _preload_spec()
     jobs.launch_and_submit(
         spec,
-        seed=spec.seed,
         instances=[_inst()],
         attempt=0,
         mode="preload",
@@ -1970,11 +1965,7 @@ def _wire_warm(monkeypatch, marker):
         ),
     )
 
-    def fake_launch(spec, seed, instances, attempt=0, mode=None, models=None, **k):
-        # the preload launch must thread the spec's authoritative seed: the real
-        # build_payload/build_worker_env path calls require_matching_seed, so a stale seed=0
-        # against the default spec.seed would crash every real preload launch.
-        assert seed == spec.seed, (seed, spec.seed)
+    def fake_launch(spec, instances, attempt=0, mode=None, models=None, **k):
         launched.append((instances[0].region, mode, tuple(models or [])))
 
     monkeypatch.setattr(lj, "launch_and_submit", fake_launch)
@@ -2326,7 +2317,7 @@ def test_warm_falls_back_to_a_pricier_class_when_the_cheap_one_is_rejected(monke
     )
     tried = []
 
-    def picky_launch(spec, seed, instances, **k):
+    def picky_launch(spec, instances, **k):
         tried.append(instances[0].gpu)
         if instances[0].gpu == "A10":
             raise RuntimeError("no capacity for A10 in us-east-1")
@@ -2356,7 +2347,7 @@ def test_warm_stops_the_ladder_on_an_ambiguous_create(monkeypatch):
     )
     tried = []
 
-    def ambiguous_launch(spec, seed, instances, **k):
+    def ambiguous_launch(spec, instances, **k):
         tried.append(instances[0].gpu)
         raise UnreconciledCreateError("ambiguous Lambda launch; refusing another create")
 
@@ -2394,7 +2385,7 @@ def test_warm_ensures_the_region_filesystem_once_before_the_class_ladder(monkeyp
         lambda name, region, **k: ensured.append((name, region)) or f"/lambda/nfs/{name}",
     )
 
-    def no_capacity(spec, seed, instances, **k):
+    def no_capacity(spec, instances, **k):
         tried.append(instances[0].gpu)
         raise RuntimeError("all 1 Lambda region(s) rejected the launch (no capacity): full")
 
@@ -2428,7 +2419,7 @@ def test_warm_skips_a_region_whose_created_filesystem_is_not_yet_listed(monkeypa
     monkeypatch.setattr(
         lj,
         "launch_and_submit",
-        lambda spec, seed, instances, **k: tried.append(instances[0].gpu),
+        lambda spec, instances, **k: tried.append(instances[0].gpu),
     )
     res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
 
@@ -2463,7 +2454,7 @@ def test_warm_does_not_launch_while_the_filesystem_is_unconfirmed(monkeypatch):
     monkeypatch.setattr(
         lj,
         "launch_and_submit",
-        lambda spec, seed, instances, **k: tried.append(instances[0].gpu),
+        lambda spec, instances, **k: tried.append(instances[0].gpu),
     )
     res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
 
@@ -2520,7 +2511,7 @@ def test_warm_still_walks_the_ladder_when_lambda_was_never_reached(monkeypatch):
         # the exact text RestClient.missing_key_message builds in flash/providers/_lifecycle/net/http.py
         raise RuntimeError("LAMBDA_API_KEY not configured on the control-plane host")
 
-    def rejected(spec, seed, instances, **k):
+    def rejected(spec, instances, **k):
         tried.append(instances[0].gpu)
         raise RuntimeError("all 1 Lambda region(s) rejected the launch (no capacity): full")
 
@@ -2642,10 +2633,10 @@ def test_warm_incomplete_summary_does_not_contradict_the_warmed_count(monkeypatc
 
     real_launch = lj.launch_and_submit
 
-    def one_region_fails(spec, seed, instances, **k):
+    def one_region_fails(spec, instances, **k):
         if instances[0].region == "us-west-2":
             raise RuntimeError("all 1 Lambda region(s) rejected the launch (no capacity): full")
-        return real_launch(spec, seed, instances, **k)
+        return real_launch(spec, instances, **k)
 
     monkeypatch.setattr(lj, "usable_instances", flaky)
     monkeypatch.setattr(lj, "launch_and_submit", one_region_fails)
@@ -4452,7 +4443,7 @@ def test_a_quota_retry_does_not_re_grow_the_same_account(monkeypatch):
 def test_the_grow_reserve_does_not_reject_a_launchable_deploy(monkeypatch):
     """Regression: the reserve is a spending cap, not an admission test.
 
-    `submit_run` cannot add headroom to its wall deadline. Admission charges only this attempt's
+    `submit_attempt` cannot add headroom to its wall deadline. Admission charges only this attempt's
     grow; the full pool reserve still limits later spending.
     """
     import runpod_flash
@@ -4483,7 +4474,7 @@ def test_the_grow_reserve_does_not_reject_a_launchable_deploy(monkeypatch):
 
     monkeypatch.setattr(runpod_flash, "Endpoint", _endpoint)
 
-    # exactly what submit_run passes: the managed cache attached, deadline handed over unpadded
+    # exactly what submit_attempt passes: the managed cache attached, deadline handed over unpadded
     with pytest.raises(RuntimeError, match=r"reached the provider"):
         job_execution.deploy_train_endpoint(
             "RTX 4090",

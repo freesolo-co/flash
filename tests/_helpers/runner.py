@@ -25,7 +25,7 @@ def provisioned_status(spec, *, state="running", **kwargs):
     ``_internal_spec_from_status`` / ``effective_spec_from_status``: run_id, train.hf_repo,
     gpu.max_wall_seconds, gpu.max_retries, ...). A run only acquires a durable provider handle
     *after* this snapshot is persisted (``_persist_effective_worker_spec`` runs before
-    ``submit_run``), so a fixture with ``remote=`` must carry it too -- otherwise recovery falls
+    ``submit_attempt``), so a fixture with ``remote=`` must carry it too -- otherwise recovery falls
     back to the lossy public spec and reconstructs a ``run_id="local"`` placeholder.
 
     ``run_id`` / ``spec`` / ``effective_preparation`` default to the provisioned shape but stay

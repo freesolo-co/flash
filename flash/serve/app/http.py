@@ -201,7 +201,15 @@ def create_app(
             choice_count=parsed.generation.n,
             include_usage=parsed.include_usage,
         )
-        return StreamingResponse(body, media_type="text/event-stream", headers=headers)
+        return StreamingResponse(
+            body,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                **headers,
+            },
+        )
 
     return app
 

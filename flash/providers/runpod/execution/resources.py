@@ -20,6 +20,7 @@ from flash.providers._lifecycle.net.deadline import (
     remaining_seconds,
 )
 from flash.providers.runpod.client import api as runpod_api
+from flash.providers.runpod.serverless.naming import run_target_of
 
 # Growing an existing cache volume is best-effort reconciliation, so it gets a short fixed ceiling
 # rather than a share of the run deadline. An unreachable account would otherwise burn retries and
@@ -175,6 +176,12 @@ def _sweep_idle_flash_endpoints(
 ) -> int:
     """Delete idle, ORPHANED flash training endpoints and return the count deleted.
 
+    ``protected`` and ``known`` may hold either an exact endpoint name or a run-scoped target. An
+    attempt endpoint is named ``<target>-a<n>``, so a target entry covers every attempt of that run
+    rather than only the one attempt whose name happened to be persisted, while an exact name still
+    protects a single endpoint (the deploy-time quota sweep and the warm-preload endpoints, which
+    carry no attempt at all).
+
     The scope flags protect other planes and live runs; `min_idle_s` requires persistent idleness.
     List accounts independently so one bad key cannot block healthy cleanup.
     """
@@ -206,10 +213,16 @@ def _sweep_idle_flash_endpoints(
                 eid = ep.get("id")
                 if not (eid and _is_flash_endpoint(ep_name)):
                     continue
-                canon = canonical_endpoint_name(ep_name)
-                if canon in protected:
+                # an endpoint answers to either identity it carries: its own name, and -- when it
+                # is an attempt endpoint named ``<target>-a<n>`` -- the run target covering every
+                # attempt of that run. a warm endpoint carries no attempt, so only its own name.
+                identities = {canonical_endpoint_name(ep_name)}
+                target = run_target_of(ep_name)
+                if target is not None:
+                    identities.add(target)
+                if identities & protected:
                     continue
-                if known is not None and canon not in known:
+                if known is not None and not (identities & known):
                     continue
                 try:
                     health = (
