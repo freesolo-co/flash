@@ -369,6 +369,69 @@ def _construction_digest() -> str:
     return hashlib.sha256(joined.encode()).hexdigest()[:16]
 
 
+# The driver and metric code that decides what is actually SENT and how a curve is reduced. The
+# prompt contract above fixes what a prompt says; these fix which prompts get issued, which attempts
+# become errors, and where the curve is declared saturated. A campaign that changed any of them
+# measured different work, so it must not be able to claim this checksum.
+#
+# Imported lazily inside the digest, not at module scope: `driver` imports `workload`, so a
+# module-scope import here would be circular.
+_DRIVER_SOURCES: tuple[str, ...] = (
+    # What each request asks the engine for, and who issues it when.
+    "_payload_for",
+    "_prompt_issuer",
+    "_build_prompt_pool",
+    # What counts as a valid sample. `_validate` and `_absorb_event` decide which attempts become
+    # errors, which is the error-rate numerator itself.
+    "_absorb_event",
+    "_validate",
+)
+_METRIC_SOURCES: tuple[str, ...] = (
+    # The reduction arithmetic and the curve's ceiling/knee/saturation rules. Their THRESHOLDS are
+    # keyword defaults in these signatures -- no caller overrides one -- so digesting the source
+    # covers the threshold values too.
+    "percentile",
+    "_distribution",
+    "wilson_upper_bound",
+    "reduce_cell",
+    "summarize_curve",
+)
+# Module CONSTANTS are digested by value, not by source. A constant's name is all that appears in
+# the function text that reads it, so retuning `_POOL_PERIOD_SLACK` from 64 to 128 would leave every
+# source digest above byte-identical while changing which prompts the pool wraps to.
+_DRIVER_CONSTANTS: tuple[str, ...] = (
+    "REQUEST_TIMEOUT_SECONDS",
+    "_POOL_PERIOD_SLACK",
+    "_PROMPT_FIT_FIXED_SECONDS",
+    "_PROMPT_FIT_SECONDS_PER_TOKEN",
+    "_PROMPT_FIT_MAX_ITERATIONS",
+)
+
+
+def _execution_digest() -> str:
+    """Digest of the driver and metric behaviour that produced a curve.
+
+    Separate from `_construction_digest` on purpose: the two answer different questions. The
+    construction digest says "these prompts"; this one says "issued this way, and reduced by these
+    rules". Reporting them as one value would make a driver retune indistinguishable from a prompt
+    change when a stale artifact is being explained.
+    """
+    import inspect
+
+    from flash.serving.bench import driver, metrics
+
+    parts = [inspect.getsource(getattr(driver, name)) for name in _DRIVER_SOURCES]
+    parts += [inspect.getsource(getattr(metrics, name)) for name in _METRIC_SOURCES]
+    parts += [f"{name}={getattr(driver, name)!r}" for name in _DRIVER_CONSTANTS]
+    # Every error code is part of the contract: renaming or adding one changes how a failed attempt
+    # is reported, and a consumer comparing two campaigns' failure breakdowns needs that to move.
+    parts += [
+        f"{name}={getattr(metrics, name)!r}"
+        for name in sorted(n for n in dir(metrics) if n.startswith("ERROR_"))
+    ]
+    return hashlib.sha256(chr(31).join(parts).encode()).hexdigest()[:16]
+
+
 def workload_checksum() -> str:
     """Digest of the preregistered contract, recorded in the report.
 
@@ -402,6 +465,12 @@ def workload_checksum() -> str:
             # covers the next edit too, so two materially different workload contracts cannot share
             # a checksum.
             f"construction={_construction_digest()}",
+            # The EXECUTION contract, not just the prompt contract. `_payload_for`, `_prompt_issuer`,
+            # the pool period, the request timeout and the reduction/saturation thresholds all change
+            # which prompts are issued, which attempts become errors, or where the curve saturates --
+            # and none of them appear in any prompt-construction source. Two materially different
+            # campaigns could otherwise publish the same checksum.
+            f"execution={_execution_digest()}",
             f"grid={','.join(str(point) for point in concurrency_grid(_CHECKSUM_GRID_CAP))}",
             *(
                 f"{b.name}:{b.target_input_tokens}:{b.max_output_tokens}"

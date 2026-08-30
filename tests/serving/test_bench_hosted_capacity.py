@@ -16,6 +16,8 @@ import inspect
 import json
 import os
 import re
+import subprocess
+import textwrap
 import tomllib
 import types
 import uuid
@@ -858,12 +860,54 @@ def test_gdn_probe_records_unknown_rather_than_assuming_the_fast_path() -> None:
 
 
 def test_gdn_probe_invokes_the_resolver_rather_than_checking_it_exists() -> None:
-    """Presence of ``_resolve_gdn_prefill_backend`` says nothing about which backend it picks."""
-    source = inspect.getsource(probe_gdn_backend)
+    """Presence of ``_resolve_gdn_prefill_backend`` says nothing about which backend it picks.
+
+    The call lives in `_gdn_backend_in_process` because the resolver reaches
+    `torch.cuda.get_device_capability` and would create a CUDA context; see the isolation test
+    below. It is still the resolver's own decision being recorded, not a reproduction of its rule.
+    """
+    from flash.serving.bench.probe import _gdn_backend_in_process
+
+    source = inspect.getsource(_gdn_backend_in_process)
     assert "resolver(**kwargs)" in source, "the resolver must be CALLED, not merely found"
     call_at = source.index("resolver(**kwargs)")
     present_at = source.index('result["resolver_present"]')
     assert call_at > present_at
+
+
+def test_the_gdn_resolver_never_runs_in_the_engine_parent_process() -> None:
+    """The resolver must run in a throwaway child, never beside the engine it certifies.
+
+    `_resolve_gdn_prefill_backend` queries `current_platform.get_device_capability`, whose CUDA
+    implementation calls `torch.cuda.get_device_capability`. Running that here would create a CUDA
+    context in the long-lived Modal parent -- defeating `probe_gpu`'s deliberate NVML-only design
+    and consuming the post-init headroom whose absence OOM-killed the 35B engine's first-request
+    workspace. The probe would then break the engine it exists to certify.
+
+    Deliberately NOT re-derived from the NVML capability already collected: that would be a second
+    implementation of a vLLM-internal rule, free to drift from the one the engine actually runs.
+    """
+    from flash.serving.bench import probe as probe_module
+
+    wrapper = inspect.getsource(probe_module.probe_gdn_backend)
+    assert "subprocess.run" in wrapper, "the resolver is not isolated in a child process"
+    assert "_gdn_backend_in_process" in wrapper, "the child does not run the real resolver"
+    # No shell, and the model name travels as data rather than in the command.
+    assert "shell=True" not in wrapper
+    assert "sys.executable" in wrapper
+
+    # Every failure mode degrades to an unresolved probe; a gate must never see an invented backend.
+    for stub in (
+        mock.Mock(side_effect=subprocess.TimeoutExpired(cmd="x", timeout=1.0)),
+        mock.Mock(side_effect=OSError("no interpreter")),
+        mock.Mock(return_value=types.SimpleNamespace(returncode=1, stdout="", stderr="boom")),
+        mock.Mock(return_value=types.SimpleNamespace(returncode=0, stdout="not json", stderr="")),
+    ):
+        with mock.patch("flash.serving.bench.probe.subprocess.run", stub):
+            result = probe_module.probe_gdn_backend("Qwen/Qwen3.5-9B")
+        assert result["resolved"] is None, "a failed subprocess produced a backend anyway"
+        assert result.get("reason"), "an unresolved probe must say why"
+        assert result["subprocess_isolated"] is True
 
 
 # ── Sample depth is a property of the request shape ───────────────────────────────────────────
@@ -2158,6 +2202,8 @@ def test_gdn_probe_reports_a_signature_mismatch_rather_than_an_unknown_backend()
         calls["linear_key_head_dim"] = linear_key_head_dim
         return "flashinfer"
 
+    from flash.serving.bench.probe import _gdn_backend_in_process
+
     module = mock.Mock()
     module._resolve_gdn_prefill_backend = _resolver
 
@@ -2172,7 +2218,9 @@ def test_gdn_probe_reports_a_signature_mismatch_rather_than_an_unknown_backend()
             return_value={"checked": False},
         ),
     ):
-        result = probe_gdn_backend("Qwen/Qwen3.5-9B")
+        # The in-process helper, because `sys.modules` patches cannot cross into a child process.
+        # This exercises the resolver contract; the isolation itself is asserted separately.
+        result = _gdn_backend_in_process("Qwen/Qwen3.5-9B")
 
     assert calls == {"linear_key_head_dim": 128}, "the resolver was not called with its parameters"
     assert result["resolved"] == "flashinfer"
@@ -2192,7 +2240,7 @@ def test_gdn_probe_reports_a_signature_mismatch_rather_than_an_unknown_backend()
             return_value={"checked": False},
         ),
     ):
-        mismatch = probe_gdn_backend("Qwen/Qwen3.5-9B")
+        mismatch = _gdn_backend_in_process("Qwen/Qwen3.5-9B")
 
     assert mismatch["resolved"] is None
     assert mismatch["resolver_signature_mismatch"] is True
@@ -2220,9 +2268,12 @@ def test_the_paid_entrypoint_settles_its_reservation() -> None:
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "settle"
     ]
-    assert len(settles) == 2, (
-        "expected the canary lane and the sweep lane each to settle their reservation; "
-        f"found {len(settles)}"
+    # Three: the canary lane, the sweep lane, and the failure handler that settles a lane which
+    # died mid-flight. A failed lane has already spent its boot and probe, so leaving it unsettled
+    # would under-report the campaign's committed spend exactly where the accounting matters most.
+    assert len(settles) == 3, (
+        "expected the canary lane, the sweep lane, and the failure path each to settle their "
+        f"reservation; found {len(settles)}"
     )
     # And the reservation is bound, not discarded -- `settle` needs the entry `reserve` returned.
     assert re.search(r"entry\s*=\s*ledger\.reserve\(", source), (
@@ -2924,3 +2975,213 @@ def test_a_retry_cannot_destroy_the_prior_invocations_artifacts(tmp_path) -> Non
             write({"run": 3}, "summary-model-b0.json", invocation="aaaaaaaaaaaa")
     finally:
         os.environ.pop("BENCH_OUT_DIR", None)
+
+
+def test_the_workload_checksum_covers_the_driver_and_metric_contract() -> None:
+    """A driver retune or a metric threshold change must move the checksum.
+
+    The construction digest answers "which prompts"; it says nothing about which prompts get
+    ISSUED, which attempts become errors, or where a curve is declared saturated. Two campaigns
+    could differ in the pool period, the request timeout or the saturation thresholds and still
+    publish the same contract identifier, which is exactly the claim a checksum exists to prevent.
+
+    Constants are checked separately from function sources on purpose: a constant's NAME is all
+    that appears in the text of the function reading it, so a pure retune leaves every source
+    digest byte-identical.
+    """
+    from flash.serving.bench import driver, metrics
+    from flash.serving.bench import workload as workload_module
+
+    before = workload_module.workload_checksum()
+
+    # A metric threshold, carried as a keyword default rather than a module constant.
+    original_reduce = metrics.reduce_cell
+
+    def _retuned(*args: Any, **kwargs: Any) -> Any:
+        return original_reduce(*args, **kwargs)
+
+    metrics.reduce_cell = _retuned
+    try:
+        assert workload_module.workload_checksum() != before, (
+            "the reduction implementation is not in the checksum"
+        )
+    finally:
+        metrics.reduce_cell = original_reduce
+    assert workload_module.workload_checksum() == before, "the digest is not stable across restore"
+
+    # A pure constant retune: no function source changes at all.
+    original_slack = driver._POOL_PERIOD_SLACK
+    driver._POOL_PERIOD_SLACK = original_slack + 1
+    try:
+        assert workload_module.workload_checksum() != before, (
+            "_POOL_PERIOD_SLACK is not in the checksum, so a pool retune is invisible"
+        )
+    finally:
+        driver._POOL_PERIOD_SLACK = original_slack
+
+    original_timeout = driver.REQUEST_TIMEOUT_SECONDS
+    driver.REQUEST_TIMEOUT_SECONDS = original_timeout + 1.0
+    try:
+        assert workload_module.workload_checksum() != before, (
+            "REQUEST_TIMEOUT_SECONDS is not in the checksum, so what counts as a timeout can move"
+        )
+    finally:
+        driver.REQUEST_TIMEOUT_SECONDS = original_timeout
+
+    assert workload_module.workload_checksum() == before, "the digest is not stable across restore"
+
+
+def test_the_construction_and_execution_digests_are_reported_separately() -> None:
+    """Prompt contract and execution contract must be distinguishable in the material.
+
+    Collapsing them into one value would make a driver retune indistinguishable from a prompt
+    change when a stale artifact has to be explained, which is the whole reason the digest is
+    recorded rather than a bare version number.
+    """
+    from flash.serving.bench import workload as workload_module
+
+    source = inspect.getsource(workload_module.workload_checksum)
+    assert "construction=" in source
+    assert "execution=" in source
+    assert workload_module._construction_digest() != workload_module._execution_digest()
+
+
+def test_every_bucket_artifact_carries_its_own_workload_checksum() -> None:
+    """Per-bucket files are written eagerly, so each must be self-describing.
+
+    They exist precisely because a later bucket can fail; at that point they are the only surviving
+    evidence of a boot that was already paid for. A payload with measurements but no contract
+    identifier cannot say which prompts and reduction rules produced it.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    main = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    bucket_writes = [
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_write_artifact"
+        and any(
+            isinstance(arg, ast.Constant) is False and "sweep-" in ast.unparse(arg)
+            for arg in node.args
+        )
+    ]
+    assert bucket_writes, "no per-bucket artifact write found"
+    for call in bucket_writes:
+        payload = ast.unparse(call.args[0])
+        assert "workload_checksum()" in payload, (
+            "a per-bucket artifact is persisted without its workload checksum"
+        )
+        assert "**payload" in payload, "the bucket artifact no longer carries the remote payload"
+
+
+def test_a_failed_paid_lane_settles_and_records_its_spend() -> None:
+    """A lane that dies mid-sweep has already spent; the accounting must survive it.
+
+    The reservation and elapsed wall live only in the local process, so without this the boot,
+    probe and cells a failed lane paid for leave no evidence and the campaign's committed spend is
+    silently under-reported. The handler must account and RE-RAISE, never rescue.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    main = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    handlers = [node for node in ast.walk(main) if isinstance(node, ast.Try)]
+    assert handlers, "the paid section is not wrapped in failure handling"
+
+    guarding = []
+    for try_node in handlers:
+        body = ast.unparse(try_node)
+        if "_run_canary" in body and "run_bucket" in body:
+            guarding.append(try_node)
+    assert guarding, "the wrapped region does not cover both the canary and the bucket calls"
+
+    for try_node in guarding:
+        for handler in try_node.handlers:
+            text = ast.unparse(handler)
+            assert "ledger.settle" in text, "a failed lane does not settle its elapsed spend"
+            assert "_write_artifact" in text, "a failed lane writes no accounting artifact"
+            assert any(
+                isinstance(node, ast.Raise) and node.exc is None for node in ast.walk(handler)
+            ), "the failure handler swallows the exception instead of re-raising it"
+            # BaseException, not Exception: a Modal timeout or an interrupt spends exactly the same
+            # GPU-seconds as an error does.
+            assert "BaseException" in ast.unparse(handler.type), (
+                "the handler misses interrupts and timeouts, which bill like any other failure"
+            )
+
+
+def test_prompt_fitting_enforces_the_bound_it_reserves() -> None:
+    """The fitting loop must obey `prompt_fit_seconds_bound`, not merely be estimated by it.
+
+    Unenforced, a slow tokenizer keeps billing against the class's shared `TIMEOUT_SECONDS` --
+    which for a short-only sweep is sized for `near_32k`, i.e. far more GPU time than the lane
+    reserved. It must END THE PROCESS rather than raise, matching the probe bound: a raise unwinds
+    into a container that is still billing.
+    """
+    from flash.serving.bench import driver as driver_module
+
+    source = inspect.getsource(driver_module._build_prompt_pool)
+    assert "prompt_fit_seconds_bound" in source, (
+        "the pool does not derive a deadline from its bound"
+    )
+    assert "os._exit" in source, "an exceeded fitting bound does not end the container"
+
+    tree = ast.parse(textwrap.dedent(source))
+    func = tree.body[0]
+    assert isinstance(func, ast.FunctionDef)
+    guards = [
+        node
+        for node in ast.walk(func)
+        if isinstance(node, ast.If) and "deadline" in ast.unparse(node.test)
+    ]
+    assert guards, "no deadline check inside the fitting loop"
+    for guard in guards:
+        assert not [node for node in ast.walk(guard) if isinstance(node, ast.Raise)], (
+            "the deadline raises instead of exiting, so the container keeps billing while unwinding"
+        )
+
+
+def test_provenance_records_a_resolved_commit_for_unpinned_repositories() -> None:
+    """Two of three hosted models pin nothing, so the run must record what it actually loaded.
+
+    Without this an artifact carries a mutable repository name and no commit: once the repository
+    advances, the curve can no longer identify the checkpoint that produced it. A failure to resolve
+    must be recorded with its reason, never invented -- a fabricated hash is worse than none.
+    """
+    from flash.serving.bench import probe as probe_module
+
+    assert "resolved_revisions" in inspect.getsource(probe_module.probe_all), (
+        "probe_all does not record resolved revisions"
+    )
+
+    class _Info:
+        sha = "0123456789abcdef0123456789abcdef01234567"
+
+    class _Api:
+        def model_info(self, repo: str, revision: str | None = None) -> Any:
+            return _Info()
+
+    with mock.patch.dict("sys.modules", {"huggingface_hub": mock.MagicMock(HfApi=_Api)}):
+        resolved = probe_module.probe_resolved_revisions("Qwen/Qwen3.5-9B")
+    assert set(resolved) == {"model", "tokenizer", "processor"}
+    for role, entry in resolved.items():
+        assert entry["commit"] == _Info.sha, f"{role} did not record a resolved commit"
+        assert entry["repo"], f"{role} did not record its repository"
+        # `pinned` distinguishes a production guarantee from an observation; the 9B pins nothing.
+        assert entry["pinned"] is None
+
+    # A hub failure degrades to a recorded reason rather than killing a lane that already paid.
+    class _Broken:
+        def model_info(self, repo: str, revision: str | None = None) -> Any:
+            raise RuntimeError("hub unavailable")
+
+    with mock.patch.dict("sys.modules", {"huggingface_hub": mock.MagicMock(HfApi=_Broken)}):
+        degraded = probe_module.probe_resolved_revisions("Qwen/Qwen3.5-9B")
+    for role, entry in degraded.items():
+        assert entry["commit"] is None, f"{role} invented a commit"
+        assert "hub unavailable" in entry["reason"], f"{role} lost the failure reason"

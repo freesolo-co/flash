@@ -37,6 +37,7 @@ serving stack rather than a benchmark-only reimplementation.
 # modal_app.py omits the import for the same reason.
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -787,58 +788,102 @@ def main(
     # and a rerun would otherwise truncate it exactly as a sweep rerun did.
     invocation = uuid.uuid4().hex[:12]
     print(f"[bench] invocation nonce {invocation}", flush=True)
-    gate = _run_canary(base_model, engine, expected_gpu)
+    # Every line below is billable, so a failure here is a failure that has already SPENT. The
+    # reservation and the elapsed wall exist only in this process; without this handler a lane
+    # that dies mid-sweep leaves no accounting evidence for the boot, probe and cells it paid
+    # for, and the ledger would silently under-report the campaign's real committed spend.
+    try:
+        gate = _run_canary(base_model, engine, expected_gpu)
 
-    if mode == "canary":
-        ledger.settle(entry, time.monotonic() - lane_started, note="measured canary wall")
+        if mode == "canary":
+            ledger.settle(entry, time.monotonic() - lane_started, note="measured canary wall")
+            _write_artifact(
+                {
+                    "base_model": base_model,
+                    "gpu": expected_gpu,
+                    "mode": "canary",
+                    "engine_catalog": provenance,
+                    "probe": gate["probe"],
+                    "warmup": gate["warmup"],
+                    "workload_checksum": workload_checksum(),
+                    "invocation": invocation,
+                    "budget": ledger.to_json(),
+                },
+                f"canary-{base_model.replace('/', '_')}.json",
+                invocation=invocation,
+            )
+            return
+
+        overrides = bench_engine_overrides_for(base_model)
+        grid = list(concurrency_grid(int(overrides.get("max_num_seqs", 8))))
+        # The nonce allocated above keys every measured prompt HEADER. A retry at the same block would
+        # otherwise re-send byte-identical prompts, and inside Modal's 120s scaledown the previous
+        # container and its prefix cache are still alive: the driver would score those hits
+        # ERROR_CACHE_CONTAMINATED and throw away a paid rerun whose engine was healthy. The filler body
+        # is keyed separately and does not move, so the workload stays reproducible.
+        results = []
+        for name in [b.name for b in selected]:
+            payload = engine.run_bucket.remote(name, grid, block, invocation)
+            results.append(payload)
+            # The contract travels WITH each bucket, not only with the summary. These files are written
+            # eagerly because a later bucket can fail, and then they are the only surviving evidence for
+            # a boot that was already paid for. A payload carrying measurements but no checksum cannot
+            # say which prompt, driver and metric contract produced them, which is exactly the question
+            # a partial artifact exists to answer. `engine_catalog` rides along for the same reason.
+            _write_artifact(
+                {
+                    **payload,
+                    "base_model": base_model,
+                    "gpu": expected_gpu,
+                    "invocation": invocation,
+                    "engine_catalog": provenance,
+                    "workload_checksum": workload_checksum(),
+                },
+                f"sweep-{base_model.replace('/', '_')}-{name}-b{block}.json",
+                invocation=invocation,
+            )
+        ledger.settle(entry, time.monotonic() - lane_started, note="measured sweep wall")
         _write_artifact(
             {
                 "base_model": base_model,
                 "gpu": expected_gpu,
-                "mode": "canary",
-                "engine_catalog": provenance,
-                "probe": gate["probe"],
-                "warmup": gate["warmup"],
-                "workload_checksum": workload_checksum(),
+                "mode": mode,
+                "grid": grid,
                 "invocation": invocation,
+                "engine_catalog": provenance,
+                "workload_checksum": workload_checksum(),
+                "buckets": [
+                    {"bucket": payload["bucket"], "curve": payload["curve"]} for payload in results
+                ],
                 "budget": ledger.to_json(),
             },
-            f"canary-{base_model.replace('/', '_')}.json",
+            f"summary-{base_model.replace('/', '_')}-b{block}.json",
             invocation=invocation,
         )
-        return
-
-    overrides = bench_engine_overrides_for(base_model)
-    grid = list(concurrency_grid(int(overrides.get("max_num_seqs", 8))))
-    # The nonce allocated above keys every measured prompt HEADER. A retry at the same block would
-    # otherwise re-send byte-identical prompts, and inside Modal's 120s scaledown the previous
-    # container and its prefix cache are still alive: the driver would score those hits
-    # ERROR_CACHE_CONTAMINATED and throw away a paid rerun whose engine was healthy. The filler body
-    # is keyed separately and does not move, so the workload stays reproducible.
-    results = []
-    for name in [b.name for b in selected]:
-        payload = engine.run_bucket.remote(name, grid, block, invocation)
-        results.append(payload)
-        _write_artifact(
-            payload,
-            f"sweep-{base_model.replace('/', '_')}-{name}-b{block}.json",
-            invocation=invocation,
-        )
-    ledger.settle(entry, time.monotonic() - lane_started, note="measured sweep wall")
-    _write_artifact(
-        {
-            "base_model": base_model,
-            "gpu": expected_gpu,
-            "mode": mode,
-            "grid": grid,
-            "invocation": invocation,
-            "engine_catalog": provenance,
-            "workload_checksum": workload_checksum(),
-            "buckets": [
-                {"bucket": payload["bucket"], "curve": payload["curve"]} for payload in results
-            ],
-            "budget": ledger.to_json(),
-        },
-        f"summary-{base_model.replace('/', '_')}-b{block}.json",
-        invocation=invocation,
-    )
+    except BaseException as exc:
+        # Settle FIRST, then write. Settling replaces the worst-case reservation with the wall
+        # actually elapsed, so the artifact records what this lane really cost rather than what
+        # it was authorized to cost. `BaseException` on purpose: a KeyboardInterrupt or a Modal
+        # timeout kills the lane exactly like an error does, and the GPU-seconds are just as
+        # spent. The exception is re-raised unchanged -- this handler accounts, it never rescues.
+        if entry.settled_usd is None:
+            ledger.settle(entry, time.monotonic() - lane_started, note="failed lane wall")
+        with contextlib.suppress(Exception):
+            # Suppressed: a failure to write the accounting record must not replace the
+            # exception that explains why the lane died.
+            _write_artifact(
+                {
+                    "base_model": base_model,
+                    "gpu": expected_gpu,
+                    "mode": mode,
+                    "outcome": "failed",
+                    "failure": f"{type(exc).__name__}: {exc}",
+                    "invocation": invocation,
+                    "engine_catalog": provenance,
+                    "workload_checksum": workload_checksum(),
+                    "budget": ledger.to_json(),
+                },
+                f"failed-{mode}-{base_model.replace('/', '_')}-b{block}.json",
+                invocation=invocation,
+            )
+        raise

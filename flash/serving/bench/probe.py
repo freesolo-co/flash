@@ -23,6 +23,9 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import json
+import subprocess
+import sys
 from typing import Any
 
 
@@ -183,12 +186,14 @@ def _gdn_resolver_kwargs(resolver: Any, base_model: str) -> dict[str, Any]:
     return kwargs
 
 
-def probe_gdn_backend(base_model: str) -> dict[str, Any]:
-    """What the GDN prefill resolver would choose for this model on this card.
+def _gdn_backend_in_process(base_model: str) -> dict[str, Any]:
+    """Ask the resolver directly. Runs ONLY in the throwaway child, never in the parent.
 
     Best-effort by design: the resolver is internal to vLLM and its signature may move between
     builds. A failed probe is recorded as unknown rather than being allowed to assert the fast path
     by omission.
+
+    `probe_gdn_backend` explains why this must not run in the engine's own process.
     """
     result: dict[str, Any] = {"base_model": base_model, "resolved": None}
     try:
@@ -241,6 +246,78 @@ def probe_gdn_backend(base_model: str) -> dict[str, Any]:
     return result
 
 
+def probe_gdn_backend(base_model: str, *, timeout: float = 120.0) -> dict[str, Any]:
+    """What the GDN prefill resolver would choose, asked from a THROWAWAY child process.
+
+    The resolver is not a passive read. In pinned vLLM 0.23.0 it queries
+    ``current_platform.get_device_capability``, whose CUDA implementation calls
+    ``torch.cuda.get_device_capability`` -- so asking it initializes a CUDA context in whatever
+    process asks. That is exactly the cost ``probe_gpu`` goes out of its way to avoid: this probe
+    runs in the long-lived Modal class process, and a prior campaign's extra parent-process context
+    stole the post-init headroom EngineCore needs for FlashInfer's first-request decode workspace,
+    OOM-killing the 35B engine on its first request. Since the canary probes before every warmup and
+    every bucket, an in-process resolver call would let the certification perturb or kill the very
+    engine it exists to certify.
+
+    So the resolver runs in a child that exits immediately, taking its CUDA context with it. The
+    parent reads back only JSON. The NVML-based capability in ``probe_gpu`` is deliberately NOT used
+    to reproduce the resolver's decision instead: re-deriving the branch here would be a second
+    implementation of a vLLM-internal rule, free to drift from the one the engine actually runs, and
+    the entire point of this probe is to report what vLLM chose rather than what we predict it chose.
+
+    A child that crashes, times out, or returns unparseable output is recorded as unknown, never as
+    the fast path -- same contract as every other failure mode here.
+    """
+    payload = json.dumps(base_model)
+    program = (
+        "import json,sys;"
+        "from flash.serving.bench.probe import _gdn_backend_in_process as p;"
+        "sys.stdout.write(json.dumps(p(json.loads(sys.stdin.read()))))"
+    )
+    try:
+        # Fixed argv, no shell: the model name travels as JSON on stdin, not in the command.
+        completed = subprocess.run(
+            [sys.executable, "-c", program],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "base_model": base_model,
+            "resolved": None,
+            "reason": f"resolver subprocess exceeded {timeout}s",
+            "subprocess_isolated": True,
+        }
+    except Exception as exc:
+        return {
+            "base_model": base_model,
+            "resolved": None,
+            "reason": f"resolver subprocess failed to start: {type(exc).__name__}: {exc}",
+            "subprocess_isolated": True,
+        }
+
+    if completed.returncode != 0:
+        return {
+            "base_model": base_model,
+            "resolved": None,
+            "reason": f"resolver subprocess exited {completed.returncode}: {completed.stderr[-400:]}",
+            "subprocess_isolated": True,
+        }
+    try:
+        result = json.loads(completed.stdout)
+    except ValueError as exc:
+        return {
+            "base_model": base_model,
+            "resolved": None,
+            "reason": f"resolver subprocess returned unparseable output: {exc}",
+            "subprocess_isolated": True,
+        }
+    result["subprocess_isolated"] = True
+    return result
+
+
 def probe_engine_kv_cache(engine: Any) -> dict[str, Any]:
     """KV-cache block counts from the running engine, when its build exposes them.
 
@@ -260,11 +337,60 @@ def probe_engine_kv_cache(engine: Any) -> dict[str, Any]:
     return out
 
 
+def probe_resolved_revisions(base_model: str) -> dict[str, Any]:
+    """The commit each served repository RESOLVED to, for repositories production leaves unpinned.
+
+    `immutable_serving_revisions` reports only what the engine explicitly pins, and two of the three
+    hosted models pin nothing: their artifacts would carry a mutable repository name and no commit,
+    so once the repository advances an old curve could no longer identify the weights or tokenizer
+    that produced it. A published capacity number that cannot name its checkpoint is not evidence.
+
+    Asked from inside the container, where the weights were actually downloaded -- resolving this at
+    submit time would report whatever the repository points at now, which is not necessarily what
+    the paid run loaded.
+
+    Fail-soft by design: a missing commit is recorded with its reason and never invented. The gate
+    that refuses to publish belongs to the caller, and it cannot make that decision from a
+    fabricated hash. `pinned` distinguishes a commit production guaranteed from one this run merely
+    observed, because only the former is reproducible.
+    """
+    from flash.serving.src.engine.model_config import (
+        immutable_serving_revisions,
+        tokenizer_model_for,
+    )
+
+    pins = immutable_serving_revisions(base_model)
+    served_repo, served_revision = _served_checkpoint(base_model)
+    tokenizer_repo = tokenizer_model_for(base_model)
+
+    targets = {
+        "model": (served_repo, served_revision or pins.get("model_revision")),
+        "tokenizer": (tokenizer_repo, pins.get("tokenizer_revision")),
+        "processor": (tokenizer_repo, pins.get("processor_revision")),
+    }
+
+    resolved: dict[str, Any] = {}
+    for role, (repo, revision) in targets.items():
+        entry: dict[str, Any] = {"repo": repo, "pinned": revision}
+        try:
+            from huggingface_hub import HfApi
+
+            entry["commit"] = HfApi().model_info(repo, revision=revision or "main").sha
+        # Broad on purpose: a hub outage, an auth failure and a renamed repo must all degrade
+        # to a recorded reason rather than killing a lane that has already paid for its boot.
+        except Exception as exc:
+            entry["commit"] = None
+            entry["reason"] = f"{type(exc).__name__}: {exc}"
+        resolved[role] = entry
+    return resolved
+
+
 def probe_all(base_model: str, engine: Any | None = None) -> dict[str, Any]:
     """The full provenance block stored with each model's results."""
     payload: dict[str, Any] = {
         "gpu": probe_gpu(),
         "gdn_prefill": probe_gdn_backend(base_model),
+        "resolved_revisions": probe_resolved_revisions(base_model),
     }
     if engine is not None:
         payload["kv_cache"] = probe_engine_kv_cache(engine)
@@ -298,4 +424,5 @@ __all__ = [
     "probe_engine_kv_cache",
     "probe_gdn_backend",
     "probe_gpu",
+    "probe_resolved_revisions",
 ]

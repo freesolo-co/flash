@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
+import sys
 import time
 from collections.abc import Callable
 from typing import Any
@@ -363,7 +365,27 @@ def _build_prompt_pool(
     # period. A pool shorter than one in-flight set is harmless anyway -- wrapped requests are
     # RESEEDED, so they diverge at character zero and cannot share a cache block.
     pool: list[tuple[str, list[dict[str, Any]], int]] = []
+    # The bound this loop was RESERVED under, enforced rather than assumed. `prompt_fit_seconds_bound`
+    # funds a tokenization rate the sweep estimate is built on; nothing made the fit obey it, so a
+    # tokenizer running slower than assumed would keep billing against the class's shared
+    # `TIMEOUT_SECONDS` -- which for a short-only sweep is sized for `near_32k`, i.e. far more GPU
+    # time than this lane reserved. Checked per prompt because that is the only point the loop
+    # yields: a single blocked tokenizer call is a C call Python cannot interrupt.
+    deadline = time.monotonic() + prompt_fit_seconds_bound(bucket, min_requests=min_requests)
     for index in range(size):
+        if time.monotonic() > deadline:
+            # Ends the process rather than raising, matching `_probe_in_container_within_bound`. A
+            # raise would unwind into the same container that is still billing, and the reservation
+            # this loop just exceeded is the one that authorized the spend. Flushed first because
+            # `os._exit` skips atexit handlers, and this line is the only record of why the lane died.
+            print(
+                f"[bench] prompt fitting for {bucket.name} exceeded its reserved bound after "
+                f"{index}/{size} prompts; ending the container rather than billing past the "
+                f"reservation",
+                flush=True,
+            )
+            sys.stderr.flush()
+            os._exit(75)
         uid = request_uid(bucket.name, concurrency, block, index, invocation)
         messages, exact = fit_prompt_to_tokens(
             tokenizer,

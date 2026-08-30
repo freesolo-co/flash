@@ -182,23 +182,25 @@ per-invocation ceilings for a 9B L40S lane; a larger model or a wider bucket sel
 correspondingly larger one. They are stated above what each lane reserves AND above its
 submission stop, because a documented ceiling a lane cannot clear is a command that cannot run.
 
-The canary reserves `2 x 2700s boot + 300s probe + 5 x 900s warmups = 10200s` ($5.53 at the
-recorded L40S rate) — two boots because `_run_canary` makes two remote calls, `probe` then
-`warmup`, and the second can land on a replacement. The single-bucket `short_interactive` sweep
-reserves 26019s ($14.10): both canary boots, the canary warmups, two bounded probes, `6 x 420`
-windows, `6 x 900` drains, one replacement boot-plus-canary, and 399s of prompt fitting. A full
-three-bucket sweep reserves 64046s ($34.71) and needs a ceiling above $44.
+The canary reserves `2700s boot + 300s probe + 5 x 900s warmups = 7500s` ($4.07 at the recorded
+L40S rate) — ONE boot, because `_run_canary` makes a single `certify.remote()` call that probes and
+warms the same container. The single-bucket `short_interactive` sweep reserves 23319s ($12.64): the
+canary term, one boot per bucket call, two bounded probes, `6 x 420` windows, `6 x 900` drains, and
+399s of prompt fitting. A full three-bucket sweep reserves 61346s ($33.25) and needs a ceiling
+above $42.
 
 The probe is bounded at `PROBE_TIMEOUT_SECONDS` (300s) rather than inheriting the class method
 timeout, and reserved once per canary plus once per bucket. It only reads NVML, asks vLLM's resolver
 which GDN prefill backend it chose, and loads the served config, so anything near that bound is a
 stall — but on the class timeout a stall would have billed hours against a lane whose estimate
-assigned the probe nothing at all. `_probe_within_bound` spawns the call, waits its own bound, and
-tears the container down on timeout, so the bound funded is the bound enforced.
+assigned the probe nothing at all. `_probe_in_container_within_bound` runs inside the already-loaded
+method, so the 300s covers probe work rather than the cold model load, and it ENDS THE PROCESS on
+timeout rather than raising: timing out a future does not stop the worker thread, and a thread stuck
+in an uninterruptible C call would otherwise keep billing through the container's scaledown window.
 
-The sweep reserves the canary's SECOND boot for the same reason the canary lane does: `probe` and
-`warmup` are separate remote calls, so a sweep makes `len(buckets) + 2` separately bootable calls.
-Pricing only the initial boot under-reserved every sweep by a whole 2700s startup timeout.
+A sweep makes `len(buckets) + 1` separately bootable calls: the canary's single `certify` call plus
+one per bucket. There is no second canary boot to reserve, because there is no longer a gap between
+a probe call and a warmup call for a replacement container to land in.
 
 Prompt fitting is in the reservation AND in the method timeout, but deliberately not in any
 `max_seconds`. It runs before a cell's clock starts, so tokenization cannot compete with the
@@ -215,10 +217,10 @@ which bills whether or not the reservation admitted it.
 
 A lane also has to clear its submission stop, not merely its ceiling: `reserve()` refuses at 80% of
 the ceiling so settlement lag and teardown stay funded. A lane consequently needs a ceiling around
-`1.25x` its own reservation -- $6.91 for the canary and $17.63 for the single-bucket
+`1.25x` its own reservation -- $5.08 for the canary and $15.80 for the single-bucket
 `short_interactive` sweep -- and the `--ceiling-usd 7` and `--ceiling-usd 18` above clear those
-thresholds. A larger tier needs proportionally more: the same canary is $12.86 on the 35B's H200,
-so it needs a ceiling above $16.08.
+thresholds. A larger tier needs proportionally more: the same canary is $9.46 on the 35B's H200,
+so it needs a ceiling above $11.82.
 
 The boot dominates cost (~960s of ~1000s per cell in a prior campaign), so one boot runs a whole
 bucket's concurrency grid rather than one cell. `budget.py` reserves before allocation and raises
