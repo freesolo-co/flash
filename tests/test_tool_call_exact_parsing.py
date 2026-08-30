@@ -1330,10 +1330,18 @@ def test_merged_self_derived_declarations_stay_within_the_schema_budget() -> Non
         ("</tool_call>", True),
         ("<tool_call>", False),
         ("a <tool_call> b", False),
+        # the template splits content on `</think>` and keeps only what follows the last one, so a
+        # marker it discards must not reject a turn whose real render replays correctly.
+        ("before</think><tool_call></think>after", True),
+        ("<think>plan</think><tool_call>", False),
+        # supported text blocks are concatenated into that same prefix, including across a split.
+        ([{"type": "text", "text": "done"}], True),
+        ([{"type": "text", "text": "<tool_call>"}], False),
+        ([{"type": "text", "text": "<tool_"}, {"type": "input_text", "text": "call>"}], False),
     ],
 )
 def test_assistant_content_markers_are_replayed_with_the_call_blocks(
-    content: str | None, accepted: bool
+    content: Any, accepted: bool
 ) -> None:
     # the qwen template renders assistant content immediately before the call blocks, so a start
     # marker in content becomes the parser's first candidate and swallows the whole turn as text.
@@ -1353,6 +1361,46 @@ def test_assistant_content_markers_are_replayed_with_the_call_blocks(
     )
 
     assert request.messages[0]["content"] == content
+
+
+@pytest.mark.parametrize(("reasoning", "accepted"), [("plan", True), ("<tool_call>", False)])
+def test_assistant_reasoning_markers_are_replayed_with_the_call_blocks(
+    reasoning: str, accepted: bool
+) -> None:
+    # the template renders reasoning inside `<think>` ahead of both the answer and the calls, so a
+    # marker there steals the parse exactly as one in content does. the leading query matters: the
+    # block is rendered only for turns after it, and without one the template refuses the history.
+    messages = [{"role": "user", "content": "q"}, *_history_replay_messages("value")]
+    messages[1]["content"] = "done"
+    messages[1]["reasoning_content"] = reasoning
+
+    if not accepted:
+        with pytest.raises(OpenAIRequestError, match="cannot be replayed exactly"):
+            parse_chat_request(
+                {"messages": messages}, require_model=False, allow_managed_selectors=True
+            )
+        return
+
+    parse_chat_request({"messages": messages}, require_model=False, allow_managed_selectors=True)
+
+
+def test_reasoning_before_the_last_query_does_not_reject_a_replayable_turn() -> None:
+    # the template renders the `<think>` block only for turns after the last ordinary user query.
+    # an earlier turn's reasoning is dropped, so a marker there cannot steal the parse and must
+    # not be validated as though the model would see it.
+    earlier = _history_replay_messages("value")
+    earlier[0]["content"] = "fine"
+    earlier[0]["reasoning_content"] = "<tool_call>"
+    later = _history_replay_arguments({"x": "second"})
+    later[0]["tool_calls"][0]["id"] = later[1]["tool_call_id"] = "call_second"
+    messages = [{"role": "user", "content": "q1"}, *earlier, {"role": "user", "content": "q2"}]
+    messages.extend(later)
+
+    request = parse_chat_request(
+        {"messages": messages}, require_model=False, allow_managed_selectors=True
+    )
+
+    assert request.messages[1]["reasoning_content"] == "<tool_call>"
 
 
 @pytest.mark.parametrize(
