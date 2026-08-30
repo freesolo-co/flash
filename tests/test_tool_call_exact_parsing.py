@@ -1319,6 +1319,43 @@ def test_merged_self_derived_declarations_stay_within_the_schema_budget() -> Non
 
 
 @pytest.mark.parametrize(
+    ("content", "accepted"),
+    [
+        (None, True),
+        ("", True),
+        ("done", True),
+        # only a complete start marker steals the parse. a partial prefix or a stray end tag
+        # renders as ordinary text, so rejecting them would refuse turns the model can replay.
+        ("<tool_c", True),
+        ("</tool_call>", True),
+        ("<tool_call>", False),
+        ("a <tool_call> b", False),
+    ],
+)
+def test_assistant_content_markers_are_replayed_with_the_call_blocks(
+    content: str | None, accepted: bool
+) -> None:
+    # the qwen template renders assistant content immediately before the call blocks, so a start
+    # marker in content becomes the parser's first candidate and swallows the whole turn as text.
+    # a probe built from the call blocks alone would validate a string the model never sees.
+    messages = _history_replay_messages("value")
+    messages[0]["content"] = content
+
+    if not accepted:
+        with pytest.raises(OpenAIRequestError, match="cannot be replayed exactly"):
+            parse_chat_request(
+                {"messages": messages}, require_model=False, allow_managed_selectors=True
+            )
+        return
+
+    request = parse_chat_request(
+        {"messages": messages}, require_model=False, allow_managed_selectors=True
+    )
+
+    assert request.messages[0]["content"] == content
+
+
+@pytest.mark.parametrize(
     ("left", "right", "accepted"), [(255, 255, True), (255, 256, True), (256, 256, False)]
 )
 def test_merged_self_derived_declarations_stay_under_the_property_ceiling(

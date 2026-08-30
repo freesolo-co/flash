@@ -235,7 +235,7 @@ def validate_tool_history_replay(
         # in a later call can only be seen against that block. validating calls one at a time
         # would accept a turn the parser rejects as ambiguous.
         try:
-            _validate_template_roundtrip(probe)
+            _validate_template_roundtrip(probe, message.get("content"))
         except ValueError as exc:
             raise error_type(f"message {message_index} {exc}") from exc
 
@@ -573,6 +573,7 @@ def _historical_replay_type(value: Any) -> str:
 
 def _validate_template_roundtrip(
     probe: Sequence[tuple[FunctionTool, dict[str, Any], dict[str, Any]]],
+    content: Any = None,
 ) -> None:
     from flash.serve.runtime.tool_calls import parse_qwen3_coder_output
 
@@ -582,6 +583,14 @@ def _validate_template_roundtrip(
     # rather than joining first, so an expanding history is rejected before it is materialized.
     blocks: list[str] = []
     size = 0
+    # the template renders assistant content immediately before the call blocks, so a start
+    # marker inside it becomes the parser's first candidate and swallows the whole turn as
+    # text. the probe has to carry that prefix or it validates a string the model never sees.
+    if isinstance(content, str) and content:
+        blocks.append(f"{content}\n\n")
+        size += len(blocks[-1])
+        if size > _MAX_REPLAY_TEMPLATE_CHARS:
+            raise ValueError(failure)
     for tool, decoded, rendered in probe:
         blocks.append(
             f"{TOOL_CALL_START}{_FUNCTION_START}{tool.name}>"
