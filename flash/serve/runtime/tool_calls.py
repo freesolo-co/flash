@@ -30,13 +30,6 @@ from flash.serve.request.validation import MAX_MESSAGE_NODES
 _FUNCTION_START, _FUNCTION_END = text_scan.FUNCTION_START, text_scan.FUNCTION_END
 _PARAMETER_START, _PARAMETER_END = text_scan.PARAMETER_START, text_scan.PARAMETER_END
 _CALL_BOUNDARY_RE = re.compile(r"</function>\s*</tool_call>\s*(<tool_call>)\s*<function=([^>]+)>")
-# the name run is the parser's own, which ends at the first `>` and admits nothing narrower. a
-# replay probe derives its names from the keys of a historical call, which never pass
-# `_identifier_name`, so indexing only the charset a public declaration may hold left the opener a
-# key like `weird key` spells out of the index entirely, and a history the template renders exactly
-# was rejected as unreplayable. the index is filtered against `declared` below, so widening the run
-# here retains no more offsets than before: the names it now sees are ones a reader can ask for.
-_PARAMETER_OPEN_RE = re.compile(r"<parameter=([^>]*)>")
 _WHITESPACE_RE = re.compile(r"\s*")
 # the body of a json string literal up to and including its closing quote. the ordinary run and
 # the escape start on disjoint characters and both quantifiers are possessive, so there is exactly
@@ -316,6 +309,13 @@ def _index_parameter_openers(
     else can never be consulted. keeping one would let an untrusted argument spend hundreds of
     megabytes on offsets nothing reads, so the index retains only what the schema can reach.
 
+    a declared name is whatever the schema holds, which for a replay probe is the keys of a
+    historical call: those never pass `_identifier_name`, so reading the name by the charset a
+    public declaration may hold left the opener a key like `weird key` spells out of the index,
+    and a history the template renders exactly was rejected as unreplayable. that widens what a
+    single untrusted argument can retain, since it may now quote a non-identifier declared name a
+    million times, but not beyond the input-proportional worst case an identifier name already had.
+
     a declared name is a different matter: a single valid argument may quote its own parameter
     a million times, and every one of those offsets is genuinely reachable, because the readers
     ask for the greatest offset below a scope end that is not known until the call is parsed.
@@ -328,12 +328,28 @@ def _index_parameter_openers(
     # one pass over the text, not one per declared name: a wide schema may declare hundreds of
     # parameters, and scanning the whole input for each of them would cost more on an ordinary
     # request than the quoted-opener shape this index is guarding against costs today.
+    #
+    # the name is read the way the parser reads it, by the next `>`, rather than matched by a
+    # pattern. a pattern whose name run is the parser's must retry that run at every `<parameter=`
+    # it cannot terminate, which is quadratic on a run of unterminated openers, and this executes
+    # synchronously on model output. finding each opener and then its delimiter never revisits a
+    # character, so a malformed megabyte costs one pass.
     positions: dict[str, array[int]] = {}
-    for match in _PARAMETER_OPEN_RE.finditer(text, start, len(text)):
-        if match[1] in declared:
-            if (found := positions.get(match[1])) is None:
-                found = positions[match[1]] = array("q")
-            found.append(match.start())
+    cursor = text.find(_PARAMETER_START, start)
+    while cursor >= 0:
+        name_start = cursor + len(_PARAMETER_START)
+        name_end = text.find(">", name_start)
+        if name_end < 0:
+            # no delimiter remains, so no opener can be completed in what is left.
+            break
+        if (name := text[name_start:name_end]) in declared:
+            if (found := positions.get(name)) is None:
+                found = positions[name] = array("q")
+            found.append(cursor)
+        # a name may span a later `<parameter=`, exactly as the parser reads it, so the next search
+        # starts after this opener's own marker rather than after the name it took. that keeps an
+        # opener nested inside a rejected name discoverable while still advancing every step.
+        cursor = text.find(_PARAMETER_START, name_start)
     return positions
 
 

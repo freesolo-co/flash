@@ -8,6 +8,7 @@ import json
 import random
 import re
 import sys
+import time
 import tracemalloc
 from array import array
 from decimal import Decimal
@@ -3750,16 +3751,15 @@ def test_many_calls_scan_only_bounded_call_ranges(monkeypatch) -> None:
         "b": {"type": "integer"},
     }
     tools = normalize_tools([declaration])
-    original = tool_calls_module._PARAMETER_OPEN_RE
+    original = tool_calls_module._index_parameter_openers
     examined = 0
 
-    class MeasuredOpeners:
-        def finditer(self, text: str, start: int, end: int):
-            nonlocal examined
-            examined += end - start
-            return original.finditer(text, start, end)
+    def measured(text: str, start: int, declared, work):
+        nonlocal examined
+        examined += len(text) - start
+        return original(text, start, declared, work)
 
-    monkeypatch.setattr(tool_calls_module, "_PARAMETER_OPEN_RE", MeasuredOpeners())
+    monkeypatch.setattr(tool_calls_module, "_index_parameter_openers", measured)
     measurements = {}
     for count in (32, 64, 128):
         examined = 0
@@ -4751,7 +4751,7 @@ def test_the_opener_index_sees_every_name_a_replay_probe_can_declare() -> None:
     renders exactly was rejected as unreplayable. the index is filtered against the declared names
     either way, so seeing these costs no offsets a reader cannot ask for.
     """
-    for key in ("weird key", "bad.name", "bad<name", "", "é", "x" * 200):
+    for key in ("weird key", "bad.name", "bad<name", "", "é", "x" * 200, "slash/key", "a\tb"):
         # `a`'s value quotes `a`'s own opener, so the index must hold both names to settle the
         # boundary. the second key is what the narrow charset dropped, and dropping it left the
         # value's quoted opener looking like a handoff to a name nothing declared.
@@ -4771,11 +4771,56 @@ def test_the_opener_index_sees_every_name_a_replay_probe_can_declare() -> None:
         ]
         # no current declaration, so the probe's names come straight from the historical keys.
         validate_tool_history_replay(history, None, error_type=OpenAIRequestError)
-        assert tool_calls_module._PARAMETER_OPEN_RE.fullmatch(f"<parameter={key}>"), key
+        assert tool_calls_module._index_parameter_openers(
+            f"<parameter={key}>", 0, frozenset({key}), [10**9]
+        ) == {key: array("q", [0])}, key
 
     # a name carrying `>` is still not one the parser can read back: it ends the name at that `>`.
     # indexing the longer run would record an opener no lookup can ever match.
-    assert not tool_calls_module._PARAMETER_OPEN_RE.fullmatch("<parameter=a>b>")
+    assert (
+        tool_calls_module._index_parameter_openers(
+            "<parameter=a>b>", 0, frozenset({"a>b"}), [10**9]
+        )
+        == {}
+    )
+
+
+def test_unterminated_openers_do_not_rescan_the_tail_for_each_one() -> None:
+    """reading the name by its delimiter must not retry the run at every opener it cannot end.
+
+    the index reads a name the way the parser does, to the next `>`. expressing that as a pattern
+    makes the engine retry the whole remaining tail from every `<parameter=` that never terminates,
+    which is quadratic: a 132 KiB run of them cost seconds. this runs synchronously on model output
+    in both serving paths, and the work budget charges the span once before the scan, so it cannot
+    stop it. a malformed generation must stay proportional to its length.
+    """
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "store",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"data": {"type": "string"}},
+                        "required": ["data"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+
+    def elapsed(count: int) -> float:
+        text = "<tool_call><function=store>" + "<parameter=" * count
+        start = time.perf_counter()
+        assert parse_qwen3_coder_output(text, tools).calls == ()
+        return time.perf_counter() - start
+
+    # quadratic growth quadruples for each doubling, so a linear scan is far inside this bound. the
+    # ratio is asserted rather than an absolute time, which would only measure the runner.
+    small, large = elapsed(4_000), elapsed(16_000)
+    assert large < 8 * max(small, 0.001), (small, large)
 
 
 def test_inert_enum_delimiters_are_not_stepped_one_at_a_time() -> None:
