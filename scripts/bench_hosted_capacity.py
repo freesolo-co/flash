@@ -44,6 +44,7 @@ import os
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -817,26 +818,29 @@ def _checkpoint_identity(probe: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _require_one_checkpoint(payloads: list[tuple[str, dict[str, Any]]]) -> dict[str, str]:
-    """Refuse to publish one envelope over buckets that measured different checkpoints.
+def _require_one_identity(
+    payloads: list[tuple[str, dict[str, Any]]],
+    extract: Callable[[dict[str, Any]], dict[str, str]],
+    subject: str,
+) -> dict[str, str]:
+    """Refuse to publish one envelope over buckets that disagree on `extract`'s identity.
 
     `max_containers=1` caps simultaneous replicas without pinning successive `.remote()` calls to
-    one container, and the catalog names repositories by a MUTABLE label. So a Hub repo that
-    advances mid-sweep, or a preempted container replaced between buckets, can leave bucket A
-    measured on one commit and bucket B on another. Each payload records its own resolved revisions
-    and each is individually checked non-null, but the summary then aggregates every curve as if
-    one model produced them -- and a ceiling, knee and saturation point computed across two
-    checkpoints describes no model that exists.
+    one container, so every axis below can differ between two buckets of the same sweep: a Hub repo
+    that advances mid-sweep, a preempted container replaced on a host carrying a different driver,
+    or a replacement that resolved a different kernel. Each payload gates ITSELF and passes, and the
+    summary then aggregates every curve as if one engine produced them -- a ceiling, knee and
+    saturation point computed across two of anything describes no engine that exists.
 
     Refusing is the honest option rather than picking a winner: both halves are real measurements,
     and which one the envelope should describe is not a question this harness can answer. The
     artifacts are already written per bucket, so nothing paid for is lost -- what is refused is
     presenting them as one curve.
 
-    Returns the one identity every payload agreed on, so the caller can publish the commits it
-    ACCEPTED rather than re-deriving them from a repository that may since have advanced.
+    Returns the one identity every payload agreed on, so the caller can publish what it ACCEPTED
+    rather than re-deriving it from state that may since have moved.
     """
-    identities = [(where, _checkpoint_identity(probe)) for where, probe in payloads]
+    identities = [(where, extract(probe)) for where, probe in payloads]
     if not identities:
         return {}
     _, first = identities[0]
@@ -844,41 +848,31 @@ def _require_one_checkpoint(payloads: list[tuple[str, dict[str, Any]]]) -> dict[
         if identity == first:
             continue
         raise RuntimeError(
-            f"{where} measured checkpoint {identity} but the canary measured {first}; refusing to "
-            "publish curves from different checkpoints as one capacity envelope"
+            f"{where} measured {subject} {identity} but the canary measured {first}; refusing to "
+            f"publish curves from different {subject}s as one capacity envelope"
         )
     return first
 
 
-def _require_one_dispatch_stack(payloads: list[tuple[str, dict[str, Any]]]) -> dict[str, str]:
-    """Refuse to publish one envelope over buckets whose kernels dispatched through different stacks.
-
-    Sibling of `_require_one_checkpoint`, for the same reason and by the same mechanism: each
-    bucket is a separately bootable `.remote()` call, so a preempted or replaced container can land
-    on a host carrying a different NVIDIA driver mid-rollout. The driver is what the kernels
-    actually dispatch through, so two buckets can measure the same weights on the same card model
-    and still be produced by different execution stacks. The per-bucket probes already captured
-    that distinction; the summary was throwing it away and fusing the curves regardless.
+def _dispatch_stack_identity(probe: dict[str, Any]) -> dict[str, str]:
+    """The kernel-dispatch stack a probe ran through, as a comparable identity.
 
     `torch`/`vllm` versions come from the image and are identical by construction, so the driver is
-    the field that can actually differ between containers. Returns the identity every payload
-    agreed on, so the summary can publish the stack it ACCEPTED.
+    the field that can actually differ between containers. The driver is what the kernels actually
+    dispatch through, so two buckets can measure the same weights on the same card model and still
+    be produced by different execution stacks.
     """
-    identities = []
-    for where, probe in payloads:
-        gpu = probe.get("gpu") or {}
-        identities.append((where, {"driver_version": str(gpu.get("driver_version") or "")}))
-    if not identities:
-        return {}
-    _, first = identities[0]
-    for where, identity in identities[1:]:
-        if identity == first:
-            continue
-        raise RuntimeError(
-            f"{where} measured through driver {identity} but the canary measured {first}; refusing "
-            "to publish curves from different kernel-dispatch stacks as one capacity envelope"
-        )
-    return first
+    return {"driver_version": str(((probe.get("gpu") or {}).get("driver_version")) or "")}
+
+
+def _gdn_backend_identity(probe: dict[str, Any]) -> dict[str, str]:
+    """The GDN prefill backend a probe resolved, as a comparable identity.
+
+    Publication-critical: FlashInfer and the Triton fallback are materially different speeds, so a
+    curve is uninterpretable without the label. `_require_resolved_gdn_backend` refuses an
+    unresolved backend per container, which is why this can compare the value directly.
+    """
+    return {"resolved": str(((probe.get("gdn_prefill") or {}).get("resolved")) or "")}
 
 
 def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, Any]:
@@ -1159,10 +1153,17 @@ def _run_sweep_lane(
     gated = [("canary", gate["probe"])] + [
         (f"bucket {p['bucket']!r}", p.get("provenance") or {}) for p in results
     ]
-    accepted_checkpoint = _require_one_checkpoint(gated)
-    # Same aggregation hazard, different axis: the checkpoint gate proves every bucket measured the
-    # same WEIGHTS, this one proves they measured through the same kernel-dispatch stack.
-    accepted_dispatch_stack = _require_one_dispatch_stack(gated)
+    accepted_checkpoint = _require_one_identity(gated, _checkpoint_identity, "checkpoint")
+    # Same aggregation hazard, three axes. The checkpoint gate proves every bucket measured the
+    # same WEIGHTS; the dispatch stack proves they measured through the same driver; the GDN
+    # backend proves they measured through the same prefill kernel, which is the difference
+    # between FlashInfer and the slower Triton fallback.
+    accepted_dispatch_stack = _require_one_identity(
+        gated, _dispatch_stack_identity, "kernel-dispatch stack"
+    )
+    accepted_gdn_backend = _require_one_identity(
+        gated, _gdn_backend_identity, "GDN prefill backend"
+    )
     lane.settle("measured sweep wall plus scaledown tail")
     lane.write(
         {
@@ -1172,6 +1173,10 @@ def _run_sweep_lane(
             # named a runtime resolved once and silently spanned hosts that dispatched through
             # different ones.
             "accepted_dispatch_stack": accepted_dispatch_stack,
+            # The prefill kernel every bucket agreed on. Without it a summary archived apart from
+            # its sibling bucket files cannot say whether the reported curves ran on FlashInfer or
+            # the slower Triton fallback -- and the harness names that backend a publication gate.
+            "accepted_gdn_backend": accepted_gdn_backend,
             "runtime_packages": (gate["probe"].get("runtime_packages") or {}),
             "buckets": [
                 {"bucket": payload["bucket"], "curve": payload["curve"]} for payload in results

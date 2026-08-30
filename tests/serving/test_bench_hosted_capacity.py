@@ -4599,8 +4599,12 @@ def test_curves_from_different_checkpoints_are_not_published_as_one_envelope() -
     then fuses their curves into a single ceiling, knee and saturation point describing no model
     that exists.
     """
-    namespace = _bench_namespace("_checkpoint_identity", "_require_one_checkpoint")
-    require = namespace["_require_one_checkpoint"]
+    namespace = _bench_namespace("_checkpoint_identity", "_require_one_identity")
+    gate = namespace["_require_one_identity"]
+    checkpoint_identity = namespace["_checkpoint_identity"]
+
+    def require(payloads: list[tuple[str, dict[str, Any]]]) -> dict[str, str]:
+        return gate(payloads, checkpoint_identity, "checkpoint")
 
     def _probe(model: str, tokenizer: str) -> dict[str, Any]:
         return {
@@ -4637,9 +4641,9 @@ def test_the_lane_gates_checkpoint_identity_before_it_summarizes() -> None:
         (ast.unparse(node.func), node.lineno)
         for node in ast.walk(fn)
         if isinstance(node, ast.Call)
-        and ast.unparse(node.func) in {"_require_one_checkpoint", "lane.write"}
+        and ast.unparse(node.func) in {"_require_one_identity", "lane.write"}
     ]
-    gate = [line for name, line in calls if name == "_require_one_checkpoint"]
+    gate = [line for name, line in calls if name == "_require_one_identity"]
     assert gate, "the lane never compares checkpoints across buckets"
     writes = [line for name, line in calls if name == "lane.write"]
     assert max(writes) > gate[0], "the drift gate runs after every artifact is already written"
@@ -5094,7 +5098,7 @@ def test_the_summary_carries_the_checkpoint_the_sweep_accepted() -> None:
     gate = next(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_require_one_checkpoint"
+        if isinstance(node, ast.FunctionDef) and node.name == "_require_one_identity"
     )
     returns = [
         node
@@ -5106,7 +5110,7 @@ def test_the_summary_carries_the_checkpoint_the_sweep_accepted() -> None:
     assert returns, "the gate discards the identity it accepted instead of returning it"
 
     sweep_body = source[source.index("def _run_sweep_lane(") :]
-    assert "accepted_checkpoint = _require_one_checkpoint(" in sweep_body, (
+    assert "accepted_checkpoint = _require_one_identity(" in sweep_body, (
         "the accepted identity is not captured from the gate"
     )
     summary = sweep_body[sweep_body.index('f"summary-') - 2000 : sweep_body.index('f"summary-')]
@@ -5853,8 +5857,12 @@ def test_one_envelope_cannot_span_two_kernel_dispatch_stacks() -> None:
     stack. The per-bucket probes captured the distinction and the summary discarded it, keeping
     only the canary's runtime packages and combining the curves regardless.
     """
-    namespace = _bench_namespace("_require_one_dispatch_stack")
-    require = namespace["_require_one_dispatch_stack"]
+    namespace = _bench_namespace("_require_one_identity", "_dispatch_stack_identity")
+    gate = namespace["_require_one_identity"]
+    dispatch_identity = namespace["_dispatch_stack_identity"]
+
+    def require(payloads: list[tuple[str, dict[str, Any]]]) -> dict[str, str]:
+        return gate(payloads, dispatch_identity, "kernel-dispatch stack")
 
     same = [
         ("canary", {"gpu": {"driver_version": "580.65.06"}}),
@@ -5868,6 +5876,49 @@ def test_one_envelope_cannot_span_two_kernel_dispatch_stacks() -> None:
     ]
     with pytest.raises(RuntimeError, match="kernel-dispatch stacks"):
         require(drifted)
+
+
+def test_the_summary_names_the_gdn_backend_that_produced_its_curves() -> None:
+    """A summary archived apart from its bucket files must still name its prefill kernel.
+
+    FlashInfer and the Triton fallback are materially different speeds, and the harness names the
+    GDN backend a publication gate -- `_require_resolved_gdn_backend` refuses to start paid work
+    whose kernel path cannot be labelled. But the summary carried the accepted checkpoint, the
+    accepted driver and the runtime packages while dropping every probe's `gdn_prefill`, so the one
+    artifact that presents the envelope could not say which kernel produced it. Each bucket is a
+    separately bootable call, so the backend is also an axis two buckets can genuinely disagree on.
+    """
+    namespace = _bench_namespace("_require_one_identity", "_gdn_backend_identity")
+    gate = namespace["_require_one_identity"]
+    gdn_identity = namespace["_gdn_backend_identity"]
+
+    def require(payloads: list[tuple[str, dict[str, Any]]]) -> dict[str, str]:
+        return gate(payloads, gdn_identity, "GDN prefill backend")
+
+    same = [
+        ("canary", {"gdn_prefill": {"resolved": "flashinfer"}}),
+        ("bucket 'short_interactive'", {"gdn_prefill": {"resolved": "flashinfer"}}),
+    ]
+    assert require(same) == {"resolved": "flashinfer"}
+
+    drifted = [
+        ("canary", {"gdn_prefill": {"resolved": "flashinfer"}}),
+        ("bucket 'near_32k'", {"gdn_prefill": {"resolved": "triton"}}),
+    ]
+    with pytest.raises(RuntimeError, match="GDN prefill backends"):
+        require(drifted)
+
+    # The accepted backend must reach the artifact, not merely be compared and discarded: the
+    # finding is about what a detached summary can identify, so the gate alone does not close it.
+    source = BENCH_APP.read_text(encoding="utf-8")
+    sweep_body = source[source.index("def _run_sweep_lane(") :]
+    assert "accepted_gdn_backend = _require_one_identity(" in sweep_body, (
+        "the sweep never establishes one GDN backend across its buckets"
+    )
+    summary = sweep_body[sweep_body.index('f"summary-') - 2500 : sweep_body.index('f"summary-')]
+    assert '"accepted_gdn_backend": accepted_gdn_backend' in summary, (
+        "the summary payload omits the GDN prefill backend the sweep accepted"
+    )
 
 
 def test_the_serving_sources_the_image_uploads_are_recorded_in_every_artifact() -> None:
