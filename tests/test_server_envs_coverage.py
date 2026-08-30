@@ -56,9 +56,9 @@ def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
 
 
 def test_pure_url_and_redact_helpers():
-    # _credentialed_repo_url percent-encodes the token into the https remote.
-    url = envs._credentialed_repo_url("owner/repo", "tok/with:chars")
-    assert url == "https://x-access-token:tok%2Fwith%3Achars@github.com/owner/repo.git"
+    # the repository url is always credential-free.
+    url = envs._repo_url("owner/repo")
+    assert url == "https://github.com/owner/repo.git"
 
     # _redact with an empty token is a no-op (the early-return branch).
     assert envs._redact("nothing to redact", "") == "nothing to redact"
@@ -1571,6 +1571,27 @@ def test_run_deployment_smoke_retries_recognized_cold_503(monkeypatch):
     assert sleeps == [0.25]
     assert len(calls) == 2
     assert 0 < calls[1]["timeout_s"] <= calls[0]["timeout_s"] <= 10.0
+
+
+def test_run_deployment_smoke_retries_capacity_unavailable_within_deadline(monkeypatch):
+    calls = []
+    sleeps = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise serving.RetryableServingUnavailable("serving_capacity_unavailable", 1.0)
+        return _smoke_response("The answer is 4")
+
+    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving.time, "sleep", sleeps.append)
+
+    out = _run_smoke(_smoke_spec(thinking=False), budget_s=3.0)
+
+    assert out["verify_sample"] == "The answer is 4"
+    assert sleeps == [1.0]
+    assert len(calls) == 2
+    assert all(0 < call["timeout_s"] <= 3.0 for call in calls)
 
 
 def test_run_deployment_smoke_retry_stays_inside_wall_clock_budget(monkeypatch):
