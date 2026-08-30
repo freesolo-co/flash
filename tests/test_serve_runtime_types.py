@@ -1039,6 +1039,39 @@ def test_generation_request_validates_tool_history_without_current_tools() -> No
         GenerationRequest(messages=messages)
 
 
+@pytest.mark.parametrize(("fields", "accepted"), [(255, True), (256, False)])
+def test_generation_request_enforces_the_replay_declaration_ceiling(
+    fields: int, accepted: bool
+) -> None:
+    # the runtime type is publicly constructible, so it is a validation entry point in its own
+    # right. two same-name calls with disjoint integer keys union to 510 or 512 properties, which
+    # straddles the root-property budget a declared schema is normalized to.
+    calls = [
+        {
+            "id": f"call_{index}",
+            "type": "function",
+            "function": {
+                "name": "f",
+                "arguments": json.dumps({f"c{index}_p{key}": key for key in range(fields)}),
+            },
+        }
+        for index in range(2)
+    ]
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": calls},
+        *({"role": "tool", "tool_call_id": item["id"], "content": "ok"} for item in calls),
+    ]
+
+    if not accepted:
+        with pytest.raises(RuntimeConfigurationError, match="cannot be replayed exactly"):
+            GenerationRequest(messages=messages)
+        return
+
+    request = GenerationRequest(messages=messages)
+
+    assert [item["function"]["name"] for item in request.messages[0]["tool_calls"]] == ["f", "f"]
+
+
 def test_generation_request_ignores_inactive_tools_during_history_replay() -> None:
     declaration = _runtime_tools()[0].wire()
     declaration["function"]["parameters"]["properties"] = {"new": {"type": "string"}}
