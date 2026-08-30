@@ -293,19 +293,35 @@ async def run_request(
         ):
             _absorb_event(event, outcome, time.monotonic() - origin)
 
+    failure: str | None = None
+    failure_detail: str | None = None
     try:
         await asyncio.wait_for(_consume(), timeout=REQUEST_TIMEOUT_SECONDS)
     except TimeoutError:
-        record.error = ERROR_TIMEOUT
-        record.error_detail = f"exceeded {REQUEST_TIMEOUT_SECONDS}s"
+        failure = ERROR_TIMEOUT
+        failure_detail = f"exceeded {REQUEST_TIMEOUT_SECONDS}s"
     except Exception as exc:
-        record.error = ERROR_ENGINE
+        failure = ERROR_ENGINE
         # Type and message only. A full traceback can carry paths and, in principle, credentials.
-        record.error_detail = f"{type(exc).__name__}: {exc}"[:500]
+        failure_detail = f"{type(exc).__name__}: {exc}"[:500]
     finally:
-        # A successful record finishes when its `final` event ARRIVED. The fallback clock is kept
-        # for every other path -- a timeout or an engine error has no delivered terminal event, and
-        # the wall it consumed is exactly what those records are meant to report.
+        # WHERE the failure landed decides what it means. `_consume` keeps iterating after the
+        # terminal event -- the generator still has to finish and close -- so an aclose that raises,
+        # or a drain slow enough to hit the request timeout, arrives with the completion ALREADY
+        # delivered. Charging that to the request would report a served response as an engine error
+        # or a timeout, inflating the error rate under exactly the slow cleanup the `final_at`
+        # timestamp below exists to keep out of latency. It is recorded as a cleanup failure
+        # instead: the request is validated on its own evidence, and the unhealthy stream is still
+        # published rather than absorbed into a success.
+        if failure is not None and outcome.final_at is not None:
+            record.cleanup_error = failure
+            record.cleanup_error_detail = failure_detail
+        else:
+            record.error = failure
+            record.error_detail = failure_detail
+        # A delivered record finishes when its `final` event ARRIVED. The fallback clock is kept for
+        # every other path -- a timeout or an engine error with no terminal event has nothing to
+        # timestamp, and the wall it consumed is exactly what those records are meant to report.
         drained_at = time.monotonic() - origin
         record.finished_at = (
             outcome.final_at

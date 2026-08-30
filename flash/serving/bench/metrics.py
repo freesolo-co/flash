@@ -72,6 +72,14 @@ class RequestRecord:
     ok: bool = False
     error: str | None = None
     error_detail: str | None = None
+    # A failure raised AFTER the terminal event was delivered, i.e. while the stream was closing.
+    # Held apart from `error` because the two say different things: `error` means this request was
+    # not served, while a cleanup failure means it was served by an engine whose stream then
+    # misbehaved. Folding them together would either report a delivered completion as a failed
+    # request or hide an unhealthy container behind a success; kept separate, the record is counted
+    # as the success it is and the cleanup fault is still published per cell.
+    cleanup_error: str | None = None
+    cleanup_error_detail: str | None = None
 
     @property
     def latency(self) -> float | None:
@@ -177,6 +185,13 @@ class CellResult:
     # for want of data, not because the cell erred. Separating the two keeps "we did not look long
     # enough" from being published as "this cell failed".
     error_bound_resolved: bool = False
+    # Requests whose terminal event was DELIVERED and whose stream then failed to close cleanly.
+    # They are counted as successes above, because the completion was served; this is the separate
+    # channel that keeps an unhealthy stream or container visible instead of absorbed. It does not
+    # enter `error_rate`: a served response is not a failed request, and quietly counting it as one
+    # would put the harness back to inflating the error rate under slow cleanup.
+    cleanup_faults: int = 0
+    cleanup_breakdown: dict[str, int] = field(default_factory=dict)
     feasible: bool = False
     max_error_rate: float = 0.01
     replica_ids: list[str] = field(default_factory=list)
@@ -257,6 +272,14 @@ def reduce_cell(
         key = record.error or ERROR_ENGINE
         error_breakdown[key] = error_breakdown.get(key, 0) + 1
 
+    # Over ALL records, not just failures: a cleanup fault rides on a record that succeeded.
+    cleanup_breakdown: dict[str, int] = {}
+    for record in records:
+        if record.cleanup_error:
+            cleanup_breakdown[record.cleanup_error] = (
+                cleanup_breakdown.get(record.cleanup_error, 0) + 1
+            )
+
     completion_total = sum(record.completion_tokens or 0 for record in in_window)
     prompt_total = sum(record.prompt_tokens or 0 for record in in_window)
 
@@ -286,6 +309,8 @@ def reduce_cell(
         succeeded=len(successes),
         failed=len(failures),
         error_breakdown=error_breakdown,
+        cleanup_faults=sum(cleanup_breakdown.values()),
+        cleanup_breakdown=cleanup_breakdown,
         succeeded_in_window=len(in_window),
         attempted_rps=attempted / wall_seconds,
         successful_rps=len(in_window) / wall_seconds,

@@ -83,6 +83,12 @@ cell was actually holding. `drain_seconds` is published alongside, so the exclud
 rather than merely omitted.
 - **error rate** — observed rate plus a Wilson one-sided 95% upper bound.
 
+A request whose terminal event was DELIVERED and whose stream then failed to close cleanly is a
+success, not an error: the completion was served, and charging the cleanup to the request would
+inflate the error rate under exactly the slow teardown the delivered-final clock exists to keep out
+of latency. Those faults are published separately as `cleanup_faults` and `cleanup_breakdown`, so an
+unhealthy stream or container stays visible instead of being absorbed into a clean cell.
+
 ## Results
 
 **Not yet measured.** The harness is complete and validated allocation-free; no GPU has been
@@ -182,14 +188,22 @@ per-invocation ceilings for a 9B L40S lane; a larger model or a wider bucket sel
 correspondingly larger one. They are stated above what each lane reserves AND above its
 submission stop, because a documented ceiling a lane cannot clear is a command that cannot run.
 
-The canary reserves `2700s boot + 300s probe + 5 x 1001.887s warmups + 120s scaledown = 8129s` ($4.41 at
-the recorded L40S rate) — ONE boot, because `_run_canary` makes a single `certify.remote()` call
-that probes and warms the same container. Each warmup is priced at its request timeout PLUS the
+The canary reserves
+`2700s boot + 900s method-timeout headroom + 300s probe + 5 x 1001.887s warmups + 120s scaledown = 9029s`
+($4.89 at the recorded L40S rate) — ONE boot, because `_run_canary` makes a single `certify.remote()`
+call that probes and warms the same container. Each warmup is priced at its request timeout PLUS the
 fit that precedes it, and that fit is funded at the bound the watchdog actually terminates on
-(bound + grace), not the nominal bound. The single-bucket `short_interactive` sweep reserves 24938s
-($13.52): the canary term, one boot per bucket call, two bounded probes, `6 x 420` windows,
-`6 x 930` drains, and 579s of funded prompt fitting. A full three-bucket sweep reserves 64944s
-($35.20 on L40S) and needs a ceiling above $44.
+(bound + grace), not the nominal bound. The single-bucket `short_interactive` sweep reserves 26738s
+($14.49): the canary term once per separately bootable call, one boot per call, two bounded probes,
+`6 x 420` windows, `6 x 930` drains, 579s of funded prompt fitting, and one scaledown tail plus one
+headroom grant per call. A full three-bucket sweep reserves 68544s ($37.15 on L40S) and needs a
+ceiling above $47.
+
+Every figure here is what the estimators in `scripts/bench_hosted_capacity.py` actually compute, not
+a separately maintained transcription: retuning a bound moves the reservation the ceiling is checked
+against, so a stale number in this runbook would authorize a run the code then refuses. The two
+`--ceiling-usd` values above are asserted against the estimators by
+`test_documented_ceilings_exceed_what_each_lane_reserves`.
 
 The probe is bounded at `PROBE_TIMEOUT_SECONDS` (300s) rather than inheriting the class method
 timeout, and reserved once per canary plus once per bucket. It only reads NVML, asks vLLM's resolver

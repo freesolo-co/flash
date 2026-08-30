@@ -4805,6 +4805,166 @@ def test_a_failed_record_still_reports_the_wall_it_consumed() -> None:
     )
 
 
+def test_a_final_delivered_before_a_failing_cleanup_is_still_a_success() -> None:
+    """R24: a fault raised AFTER the terminal event must not report a served response as failed.
+
+    `_consume` keeps iterating past `final` -- the generator still has to finish and close -- so an
+    `aclose` that raises arrives with the completion already delivered. Charging it to the request
+    turns a served response into an engine error, inflating the error rate under exactly the slow
+    cleanup the `final_at` timestamp exists to keep out of latency.
+    """
+    import time
+
+    from flash.serving.bench import driver
+    from flash.serving.bench.metrics import ERROR_ENGINE
+
+    origin = time.monotonic()
+
+    class _FailsAfterFinal:
+        def _stream_generate(self, payload, forwarded, _lora, _gid):  # type: ignore[no-untyped-def]
+            async def _gen():
+                yield {"type": "ready", "engine_replica_id": "r0"}
+                yield {"type": "delta", "text": "hi"}
+                yield {"type": "choice_finished", "finish_reason": "stop"}
+                yield {
+                    "type": "final",
+                    "prompt_tokens": 512,
+                    "completion_tokens": 8,
+                    "cached_tokens": 0,
+                    "cached_tokens_reported": True,
+                }
+                raise RuntimeError("aclose exploded")
+
+            return _gen()
+
+    record = asyncio.run(
+        driver.run_request(
+            engine=_FailsAfterFinal(),
+            base_model="acme/model",
+            bucket="b",
+            concurrency=1,
+            block=0,
+            uid="u2",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=8,
+            origin=origin,
+            expected_prompt_tokens=512,
+            bucket_target_tokens=512,
+        )
+    )
+
+    assert record.error is None, (
+        "a completion delivered before a failing cleanup is reported as a failed request "
+        f"({record.error}: {record.error_detail})"
+    )
+    assert record.ok, "the delivered completion was never validated"
+    # The unhealthy stream is not absorbed into the success -- it is published on its own channel.
+    assert record.cleanup_error == ERROR_ENGINE
+    assert "aclose exploded" in (record.cleanup_error_detail or "")
+
+
+def test_a_cleanup_fault_is_published_without_entering_the_error_rate() -> None:
+    """R24: a served-then-unhealthy request counts as a success AND stays visible.
+
+    Folding the fault into `error_rate` would put the harness back to reporting delivered
+    completions as failures; dropping it entirely would hide an unhealthy container behind a clean
+    cell. The reduction has to do both.
+    """
+    from flash.serving.bench.metrics import ERROR_ENGINE, RequestRecord, reduce_cell
+
+    def _served(uid: str, cleanup: str | None) -> RequestRecord:
+        record = RequestRecord(
+            uid=uid,
+            base_model="acme/model",
+            bucket="b",
+            concurrency=1,
+            block=0,
+            started_at=0.0,
+            first_token_at=0.1,
+            finished_at=1.0,
+            prompt_tokens=512,
+            completion_tokens=8,
+            cached_tokens=0,
+            cached_tokens_reported=True,
+            finish_reason="stop",
+            ok=True,
+        )
+        record.cleanup_error = cleanup
+        return record
+
+    cell = reduce_cell(
+        [_served("a", None), _served("b", ERROR_ENGINE), _served("c", ERROR_ENGINE)],
+        base_model="acme/model",
+        bucket="b",
+        concurrency=1,
+        block=0,
+        wall_seconds=10.0,
+    )
+
+    assert cell.succeeded == 3, "a cleanup fault removed a delivered completion from the successes"
+    assert cell.error_rate == 0.0, "a cleanup fault entered the error rate"
+    assert cell.cleanup_faults == 2, (
+        "cleanup faults are not published, so an unhealthy cell reads clean"
+    )
+    assert cell.cleanup_breakdown == {ERROR_ENGINE: 2}
+
+
+def test_the_execution_digest_covers_the_drain_reap_interval() -> None:
+    """R24: `_drain` is digested, but its source only NAMES the reap interval.
+
+    Retuning it changes how long a cancelled request may clean up and whether the container is
+    terminated -- so which timeout records and which bucket artifacts survive a drain -- while every
+    digested source stays byte-identical.
+    """
+    from flash.serving.bench import workload
+
+    assert "_DRAIN_REAP_SECONDS" in workload._DRIVER_CONSTANTS, (
+        "the reap interval is not digested, so two campaigns with different drain cleanup "
+        "behaviour publish the same workload_checksum"
+    )
+
+
+def test_every_artifact_records_the_applied_vllm_patch() -> None:
+    """R24: the image REWRITES installed vLLM files, and no version string reports it.
+
+    `runtime_packages` reads distribution metadata, which the patch does not touch, so two images
+    built from different patch contents resolve identical versions, checkpoints and workload
+    checksums while measuring different kernel and LoRA execution.
+    """
+    import hashlib
+
+    tree = ast.parse(BENCH_APP.read_text(encoding="utf-8"))
+    writes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_write_artifact"
+    ]
+    assert writes, "the bench script writes no artifacts"
+    for call in writes:
+        payload = call.args[0]
+        assert isinstance(payload, ast.Dict), (
+            f"artifact payload at line {call.lineno} is not a dict"
+        )
+        keys = {k.value for k in payload.keys if isinstance(k, ast.Constant)}
+        assert "serving_patch" in keys, (
+            f"the artifact written at line {call.lineno} cannot say which vLLM patch it measured"
+        )
+
+    # `REPO_DIR` is derived from the script's `__file__`, which an exec'd node does not have, so it
+    # is injected as the real checkout root rather than lifted.
+    namespace = _bench_namespace(
+        "_serving_patch_identity", "MOE_LORA_PATCH", REPO_DIR=REPO_ROOT, hashlib=hashlib, Path=Path
+    )
+    identity = namespace["_serving_patch_identity"]()
+    patch = REPO_ROOT / "docker" / "patch_vllm_moe_lora.py"
+    assert identity["path"] == "docker/patch_vllm_moe_lora.py"
+    assert identity["sha256"] == hashlib.sha256(patch.read_bytes()).hexdigest(), (
+        "the recorded identity does not digest the patch the image actually applies"
+    )
+
+
 def test_the_execution_digest_covers_the_forwarded_base_model_record() -> None:
     """R22: the record that routes generation must move the checksum.
 

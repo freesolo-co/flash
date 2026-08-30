@@ -459,6 +459,11 @@ _DRIVER_CONSTANTS: tuple[str, ...] = (
     # Read only by `_cell_is_conclusively_failed`, whose source names it without revealing its
     # value, so retuning the abandonment threshold would leave the source digest byte-identical.
     "_CONCLUSIVE_FAILURE_ATTEMPTS",
+    # How long `_drain` lets a cancelled request clean up before the container is torn down. `_drain`
+    # is digested, but its source only NAMES this constant, so retuning the reap interval changes
+    # which timeout records and which bucket artifacts survive a drain -- and whether the container
+    # is terminated at all -- while every source digest stays byte-identical.
+    "_DRAIN_REAP_SECONDS",
 )
 
 

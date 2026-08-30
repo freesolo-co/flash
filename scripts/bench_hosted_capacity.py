@@ -38,6 +38,7 @@ serving stack rather than a benchmark-only reimplementation.
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import sys
@@ -49,6 +50,12 @@ from typing import Any
 import modal
 
 REPO_DIR = Path(__file__).resolve().parent.parent
+# The image REWRITES installed vLLM files with this patch, so the kernel and LoRA code actually
+# executed is not the code any version string names. `runtime_packages` reports distribution
+# metadata, which the patch does not touch: two images built from different patch contents resolve
+# identical vLLM versions, identical checkpoints and an identical `workload_checksum`, while
+# measuring different execution. Hashing the patch is what makes those two runs distinguishable.
+MOE_LORA_PATCH = REPO_DIR / "docker" / "patch_vllm_moe_lora.py"
 
 # Distinct from APP_NAME in flash/serving/app/modal_app.py. If these ever collide, deploying the
 # benchmark would overwrite production serving.
@@ -93,7 +100,7 @@ image = (
         optional_dependencies=["serve-runtime", "serving"],
     )
     .add_local_file(
-        str(REPO_DIR / "docker" / "patch_vllm_moe_lora.py"),
+        str(MOE_LORA_PATCH),
         remote_path="/root/patch_vllm_moe_lora.py",
         copy=True,
     )
@@ -554,6 +561,24 @@ async def _run_bucket(
             (row for row in bench_catalog_summary() if row["base_model"] == engine.base_model),
             None,
         ),
+    }
+
+
+def _serving_patch_identity() -> dict[str, str]:
+    """Content identity of the vLLM patch baked into the measured image.
+
+    Read from the repository, not from the container: `run_commands` deletes the file after applying
+    it, so the container cannot report what it was built with. Both sides come from the same
+    checkout, and the image copies this exact file in, so the digest names what ran.
+
+    Raises rather than defaulting. A missing patch means the image build below would fail anyway,
+    and an artifact carrying an empty or absent identity is precisely the unfalsifiable provenance
+    this exists to prevent.
+    """
+    data = MOE_LORA_PATCH.read_bytes()
+    return {
+        "path": str(MOE_LORA_PATCH.relative_to(REPO_DIR)),
+        "sha256": hashlib.sha256(data).hexdigest(),
     }
 
 
@@ -1034,6 +1059,7 @@ def main(
                     "probe": gate["probe"],
                     "warmup": gate["warmup"],
                     "workload_checksum": workload_checksum(),
+                    "serving_patch": _serving_patch_identity(),
                     "invocation": invocation,
                     "budget": ledger.to_json(),
                 },
@@ -1066,6 +1092,7 @@ def main(
                     "invocation": invocation,
                     "engine_catalog": provenance,
                     "workload_checksum": workload_checksum(),
+                    "serving_patch": _serving_patch_identity(),
                 },
                 f"sweep-{base_model.replace('/', '_')}-{name}-b{block}.json",
                 invocation=invocation,
@@ -1100,6 +1127,7 @@ def main(
                 # envelope -- without these it names a mutable repository and cannot say which
                 # weights or which runtime produced its curves once either moves.
                 "workload_checksum": workload_checksum(),
+                "serving_patch": _serving_patch_identity(),
                 "buckets": [
                     {"bucket": payload["bucket"], "curve": payload["curve"]} for payload in results
                 ],
@@ -1133,6 +1161,7 @@ def main(
                     "invocation": invocation,
                     "engine_catalog": provenance,
                     "workload_checksum": workload_checksum(),
+                    "serving_patch": _serving_patch_identity(),
                     "budget": ledger.to_json(),
                 },
                 f"failed-{mode}-{base_model.replace('/', '_')}-b{block}.json",
