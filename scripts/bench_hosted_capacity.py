@@ -724,7 +724,7 @@ def _checkpoint_identity(probe: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _require_one_checkpoint(payloads: list[tuple[str, dict[str, Any]]]) -> None:
+def _require_one_checkpoint(payloads: list[tuple[str, dict[str, Any]]]) -> dict[str, str]:
     """Refuse to publish one envelope over buckets that measured different checkpoints.
 
     `max_containers=1` caps simultaneous replicas without pinning successive `.remote()` calls to
@@ -739,10 +739,13 @@ def _require_one_checkpoint(payloads: list[tuple[str, dict[str, Any]]]) -> None:
     and which one the envelope should describe is not a question this harness can answer. The
     artifacts are already written per bucket, so nothing paid for is lost -- what is refused is
     presenting them as one curve.
+
+    Returns the one identity every payload agreed on, so the caller can publish the commits it
+    ACCEPTED rather than re-deriving them from a repository that may since have advanced.
     """
     identities = [(where, _checkpoint_identity(probe)) for where, probe in payloads]
     if not identities:
-        return
+        return {}
     _, first = identities[0]
     for where, identity in identities[1:]:
         if identity == first:
@@ -751,6 +754,7 @@ def _require_one_checkpoint(payloads: list[tuple[str, dict[str, Any]]]) -> None:
             f"{where} measured checkpoint {identity} but the canary measured {first}; refusing to "
             "publish curves from different checkpoints as one capacity envelope"
         )
+    return first
 
 
 def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, Any]:
@@ -1058,7 +1062,7 @@ def main(
         # its own container's provenance, but nothing compared those containers to each other: a
         # repo that advanced mid-sweep, or a replacement container, leaves buckets measured on
         # different commits and the summary below would fuse their curves into one envelope.
-        _require_one_checkpoint(
+        accepted_checkpoint = _require_one_checkpoint(
             [("canary", gate["probe"])]
             + [(f"bucket {p['bucket']!r}", p.get("provenance") or {}) for p in results]
         )
@@ -1075,6 +1079,14 @@ def main(
                 "grid": grid,
                 "invocation": invocation,
                 "engine_catalog": provenance,
+                "accepted_checkpoint": accepted_checkpoint,
+                "runtime_packages": (gate["probe"].get("runtime_packages") or {}),
+                # The commits this sweep ACCEPTED, and the library versions it resolved. Neither is
+                # recoverable from `engine_catalog`: its `immutable_revisions` is empty for the two
+                # unpinned models, and the image installs from dependency ranges. The bucket
+                # artifacts carry both, but the summary is the file that presents the combined
+                # envelope -- without these it names a mutable repository and cannot say which
+                # weights or which runtime produced its curves once either moves.
                 "workload_checksum": workload_checksum(),
                 "buckets": [
                     {"bucket": payload["bucket"], "curve": payload["curve"]} for payload in results

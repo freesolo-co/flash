@@ -4670,3 +4670,200 @@ def test_the_provenance_gates_live_in_one_place_so_a_caller_cannot_skip_them() -
         assert not {"_require_resolved_gdn_backend", "_require_resolved_checkpoint"} & calls, (
             f"{name} re-implements the gate sequence instead of using the shared helper"
         )
+
+
+def test_a_successful_record_finishes_when_its_final_event_arrived() -> None:
+    """R22: generator cleanup after the terminal event must not be charged to the request.
+
+    `run_request` awaits the whole `async for`, so a post-loop clock also includes the async
+    generator's close. A slow or blocked `aclose` inflates latency and can push an
+    already-delivered response past the in-window cutoff, dropping a real completion out of the
+    throughput numerator -- one-directional bias, largest exactly under load.
+    """
+    import time
+
+    from flash.serving.bench import driver
+
+    origin = time.monotonic()
+
+    class _SlowClose:
+        """Delivers a clean stream, then stalls in cleanup exactly like a blocked aclose."""
+
+        def _stream_generate(self, payload, forwarded, _lora, _gid):  # type: ignore[no-untyped-def]
+            async def _gen():
+                yield {"type": "ready", "engine_replica_id": "r0"}
+                yield {"type": "delta", "text": "hi"}
+                yield {"type": "choice_finished", "finish_reason": "stop"}
+                yield {
+                    "type": "final",
+                    "prompt_tokens": 512,
+                    "completion_tokens": 8,
+                    "cached_tokens": 0,
+                    "cached_tokens_reported": True,
+                }
+                await asyncio.sleep(0.35)
+
+            return _gen()
+
+    record = asyncio.run(
+        driver.run_request(
+            engine=_SlowClose(),
+            base_model="acme/model",
+            bucket="b",
+            concurrency=1,
+            block=0,
+            uid="u0",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=8,
+            origin=origin,
+            expected_prompt_tokens=512,
+            bucket_target_tokens=512,
+        )
+    )
+
+    assert record.error is None, record.error_detail
+    assert record.finished_at is not None
+    assert record.finished_at < 0.3, (
+        "a successful record is still timestamped after generator cleanup, so post-delivery "
+        f"stalling is billed as latency (finished_at={record.finished_at})"
+    )
+
+
+def test_a_failed_record_still_reports_the_wall_it_consumed() -> None:
+    """The delivered-final clock is for successes only.
+
+    A timeout or engine error has no delivered terminal event, and the wall those records consumed
+    is exactly what they exist to report -- so they must keep the post-drain clock.
+    """
+    import time
+
+    from flash.serving.bench import driver
+    from flash.serving.bench.metrics import ERROR_ENGINE
+
+    origin = time.monotonic()
+
+    class _Broken:
+        def _stream_generate(self, payload, forwarded, _lora, _gid):  # type: ignore[no-untyped-def]
+            async def _gen():
+                yield {"type": "ready"}
+                await asyncio.sleep(0.2)
+                raise RuntimeError("engine died")
+
+            return _gen()
+
+    record = asyncio.run(
+        driver.run_request(
+            engine=_Broken(),
+            base_model="acme/model",
+            bucket="b",
+            concurrency=1,
+            block=0,
+            uid="u1",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=8,
+            origin=origin,
+            expected_prompt_tokens=512,
+            bucket_target_tokens=512,
+        )
+    )
+
+    assert record.error == ERROR_ENGINE
+    assert record.finished_at is not None
+    assert record.finished_at >= 0.2, (
+        "a failed record no longer reports the wall it actually consumed"
+    )
+
+
+def test_the_execution_digest_covers_the_forwarded_base_model_record() -> None:
+    """R22: the record that routes generation must move the checksum.
+
+    `run_request` is digested but only NAMES `base_model_record`. Flipping `serve_base_model` sends
+    every request down the adapter path, and flipping `thinking` changes the default the engine
+    applies to every completion -- materially different generation work under a checksum that never
+    moved.
+    """
+    from flash.serving.bench import driver
+    from flash.serving.bench import workload as workload_module
+
+    assert "base_model_record" in workload_module._DRIVER_SOURCES, (
+        "the forwarded registration is not part of the driver source digest"
+    )
+
+    before = workload_checksum()
+    original = driver.base_model_record
+
+    def _rerouted(base_model: str) -> dict[str, object]:
+        record = original(base_model)
+        record["serve_base_model"] = False
+        return record
+
+    try:
+        driver.base_model_record = _rerouted  # type: ignore[assignment]
+        assert workload_checksum() != before, (
+            "rerouting every request through the adapter path left the checksum unchanged"
+        )
+    finally:
+        driver.base_model_record = original  # type: ignore[assignment]
+
+
+def test_the_probe_records_the_runtime_versions_that_can_move_the_curve() -> None:
+    """R22: Torch and CUDA alone do not identify this runtime.
+
+    The image installs from `pyproject.toml` ranges rather than a lockfile, so two builds of the
+    same commit can resolve different Transformers, tokenizers or kernel libraries -- changing
+    prompt assembly or execution -- while every checksum, checkpoint and catalog row matches.
+    """
+    from flash.serving.bench import probe as probe_module
+
+    for name in ("transformers", "tokenizers", "vllm", "huggingface-hub"):
+        assert name in probe_module._RUNTIME_PACKAGES, (
+            f"{name} can change the measured curve but is not recorded"
+        )
+
+    resolved = probe_module.probe_runtime_packages()
+    assert set(resolved) == set(probe_module._RUNTIME_PACKAGES), (
+        "the probe does not report every package it declares"
+    )
+    # Fail-soft: an absent distribution is recorded as None, never invented and never raised.
+    assert resolved["transformers"] is None or isinstance(resolved["transformers"], str)
+
+    source = inspect.getsource(probe_module.probe_all)
+    assert '"runtime_packages"' in source, "probe_all omits the resolved runtime identity"
+
+
+def test_the_summary_carries_the_checkpoint_the_sweep_accepted() -> None:
+    """R22: the combined envelope must name the weights that produced its curves.
+
+    `engine_catalog.immutable_revisions` is empty for the two unpinned models, so without the
+    accepted commits the summary -- the artifact that presents the envelope -- identifies its
+    weights only by a mutable repository name.
+    """
+    source = BENCH_APP.read_text()
+    tree = ast.parse(source)
+    gate = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_require_one_checkpoint"
+    )
+    returns = [
+        node
+        for node in ast.walk(gate)
+        if isinstance(node, ast.Return)
+        and node.value is not None
+        and not _is_empty_dict(node.value)
+    ]
+    assert returns, "the gate discards the identity it accepted instead of returning it"
+
+    main_body = source[source.index("def main(") :]
+    assert "accepted_checkpoint = _require_one_checkpoint(" in main_body, (
+        "the accepted identity is not captured from the gate"
+    )
+    summary = main_body[main_body.index('f"summary-') - 2000 : main_body.index('f"summary-')]
+    assert '"accepted_checkpoint": accepted_checkpoint' in summary, (
+        "the summary payload omits the checkpoint the sweep accepted"
+    )
+    assert '"runtime_packages"' in summary, "the summary payload omits the resolved runtime"
+
+
+def _is_empty_dict(node: ast.expr) -> bool:
+    return isinstance(node, ast.Dict) and not node.keys

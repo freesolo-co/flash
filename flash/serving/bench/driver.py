@@ -112,6 +112,7 @@ class _StreamOutcome:
         "cached_tokens_reported",
         "completion_tokens",
         "delta_tokens",
+        "final_at",
         "finish_reason",
         "first_token_at",
         "prompt_tokens",
@@ -122,6 +123,7 @@ class _StreamOutcome:
 
     def __init__(self) -> None:
         self.first_token_at: float | None = None
+        self.final_at: float | None = None
         self.prompt_tokens: int | None = None
         self.completion_tokens: int | None = None
         self.cached_tokens: int | None = None
@@ -177,6 +179,13 @@ def _absorb_event(event: dict[str, Any], outcome: _StreamOutcome, now: float) ->
             outcome.finish_reason = reason
     elif kind == "final":
         outcome.saw_final = True
+        # The moment the terminal event was DELIVERED, not the moment the caller finished draining
+        # the generator. `run_request` awaits the whole `async for`, so its post-loop clock also
+        # includes the async-generator close -- an aclose that blocks, or a slow cleanup under load,
+        # is charged to the request as latency and can push an already-delivered response past the
+        # in-window cutoff, dropping real completions out of the throughput numerator. The bias is
+        # one-directional and largest exactly when the engine is most loaded.
+        outcome.final_at = now
 
 
 def _validate(outcome: _StreamOutcome, record: RequestRecord) -> None:
@@ -294,7 +303,15 @@ async def run_request(
         # Type and message only. A full traceback can carry paths and, in principle, credentials.
         record.error_detail = f"{type(exc).__name__}: {exc}"[:500]
     finally:
-        record.finished_at = time.monotonic() - origin
+        # A successful record finishes when its `final` event ARRIVED. The fallback clock is kept
+        # for every other path -- a timeout or an engine error has no delivered terminal event, and
+        # the wall it consumed is exactly what those records are meant to report.
+        drained_at = time.monotonic() - origin
+        record.finished_at = (
+            outcome.final_at
+            if record.error is None and outcome.final_at is not None
+            else drained_at
+        )
         record.first_token_at = outcome.first_token_at
         record.prompt_tokens = outcome.prompt_tokens
         record.completion_tokens = outcome.completion_tokens

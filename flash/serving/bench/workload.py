@@ -378,6 +378,13 @@ def _construction_digest() -> str:
 # module-scope import here would be circular.
 _DRIVER_SOURCES: tuple[str, ...] = (
     # What each request asks the engine for, and who issues it when.
+    # `run_request` is digested, but its source only NAMES `base_model_record`. The record that
+    # helper returns is what routes generation: `serve_base_model` decides base weights versus the
+    # adapter path, and `thinking` decides which default the engine applies to every completion.
+    # Either flipping would change the generation work behind every measured token while every
+    # digested source stayed byte-identical, so two campaigns running materially different
+    # workloads would compare as compatible.
+    "base_model_record",
     "_payload_for",
     "_prompt_issuer",
     "_build_prompt_pool",

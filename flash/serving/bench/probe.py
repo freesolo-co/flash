@@ -89,6 +89,50 @@ def probe_gpu() -> dict[str, Any]:
     return result
 
 
+# The libraries whose version decides prompt assembly or engine execution, and therefore the
+# measured curve. The benchmark image installs from `pyproject.toml` RANGES rather than from a
+# lockfile, so two builds of the same commit can resolve different versions of any of these while
+# every source-level checksum, checkpoint commit and catalog row stays identical.
+_RUNTIME_PACKAGES: tuple[str, ...] = (
+    "torch",
+    "vllm",
+    "transformers",
+    "tokenizers",
+    "huggingface-hub",
+    "flashinfer-python",
+    "xformers",
+    "nvidia-cutlass-dsl-libs-cu13",
+)
+
+
+def probe_runtime_packages() -> dict[str, Any]:
+    """The versions the image actually RESOLVED for the libraries that can move the curve.
+
+    Torch and CUDA alone do not identify this runtime. A Transformers or tokenizers bump changes
+    chat-template rendering and therefore the prompt token counts every bucket is defined by; a vLLM
+    or kernel-library bump changes execution. Because the image installs from dependency ranges,
+    those can all differ between two builds that report the same commit, checksum and checkpoints --
+    and the artifacts would present the resulting curves as comparable.
+
+    Read from installed DISTRIBUTION metadata rather than module attributes: it covers packages that
+    expose no ``__version__`` and needs no import, so probing cannot itself initialize a runtime.
+    Fail-soft per package, like the rest of this module -- a missing distribution is recorded as
+    absent rather than killing a lane that has already paid for its boot.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    resolved: dict[str, str | None] = {}
+    for name in _RUNTIME_PACKAGES:
+        try:
+            resolved[name] = version(name)
+        except PackageNotFoundError:
+            resolved[name] = None
+        # Broad on purpose: a malformed dist-info must degrade to a recorded absence, not an error.
+        except Exception:
+            resolved[name] = None
+    return resolved
+
+
 def probe_cutlass_integrity() -> dict[str, Any]:
     """Run vLLM's OWN ``_is_libs_cu13_install_intact`` check, uncached.
 
@@ -517,6 +561,7 @@ def probe_all(base_model: str, engine: Any | None = None) -> dict[str, Any]:
     # later-added probe gets the chance to refresh a ref and silently re-date the measurement.
     payload: dict[str, Any] = {
         "resolved_revisions": probe_resolved_revisions(base_model),
+        "runtime_packages": probe_runtime_packages(),
         "gpu": probe_gpu(),
         "gdn_prefill": probe_gdn_backend(base_model),
     }
