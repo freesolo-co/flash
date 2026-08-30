@@ -51,13 +51,18 @@ def rendered_turn_prefix(message: Mapping[str, Any], with_reasoning: bool) -> st
     normalized = messages_for_chat_template([dict(message)])[0]
     reasoning = normalized.get("reasoning_content")
     content = _flatten_text(normalized.get("content"))
-    if reasoning is None and isinstance(content, str) and THINK_END in content:
-        # absent an explicit reasoning field the template splits the content itself. it takes
-        # reasoning from before the FIRST `</think>` but the answer from after the LAST one, so
-        # the two splits are not symmetric and cannot share one partition.
-        reasoning = content.partition(THINK_END)[0].rstrip("\n").rpartition(THINK_START)[2]
-        reasoning = reasoning.lstrip("\n")
-        content = content.rpartition(THINK_END)[2].lstrip("\n")
+    if not isinstance(reasoning, str):
+        # the template gates on `reasoning_content is string`, so a non-string value is discarded
+        # rather than stringified, and it falls back to splitting the content itself. keying this
+        # on absence instead would skip that split whenever the field merely exists, rejecting a
+        # turn whose markers the split discards.
+        reasoning = None
+        if isinstance(content, str) and THINK_END in content:
+            # it takes reasoning from before the FIRST `</think>` but the answer from after the
+            # LAST one, so the two splits are not symmetric and cannot share one partition.
+            reasoning = content.partition(THINK_END)[0].rstrip("\n").rpartition(THINK_START)[2]
+            reasoning = reasoning.lstrip("\n")
+            content = content.rpartition(THINK_END)[2].lstrip("\n")
     prefix = ""
     # the `<think>` block is rendered only for turns after the last ordinary user query. an
     # earlier turn's reasoning is dropped, so including it would reject a replayable turn.

@@ -1384,6 +1384,22 @@ def test_assistant_reasoning_markers_are_replayed_with_the_call_blocks(
     parse_chat_request({"messages": messages}, require_model=False, allow_managed_selectors=True)
 
 
+@pytest.mark.parametrize("reasoning", [["<tool_call>"], {"a": "<tool_call>"}, 5, True])
+def test_non_string_reasoning_falls_back_to_the_template_content_split(reasoning: Any) -> None:
+    # the template gates on `reasoning_content is string`, so it discards a non-string value
+    # instead of rendering it and splits the content itself. keying the fallback on absence would
+    # skip that split whenever the field merely exists, rejecting a turn the model replays.
+    messages = [{"role": "user", "content": "q"}, *_history_replay_messages("value")]
+    messages[1]["content"] = "a</think><tool_call></think>b"
+    messages[1]["reasoning_content"] = reasoning
+
+    request = parse_chat_request(
+        {"messages": messages}, require_model=False, allow_managed_selectors=True
+    )
+
+    assert request.messages[1]["reasoning_content"] == reasoning
+
+
 def test_reasoning_before_the_last_query_does_not_reject_a_replayable_turn() -> None:
     # the template renders the `<think>` block only for turns after the last ordinary user query.
     # an earlier turn's reasoning is dropped, so a marker there cannot steal the parse and must
