@@ -4784,6 +4784,15 @@ def test_the_opener_index_sees_every_name_a_replay_probe_can_declare() -> None:
         == {}
     )
 
+    # a name runs to the first `>`, so one opener's name can span a later opener's marker. the
+    # inner one is a real position a reader may ask for, so the scan resumes after this opener's
+    # own marker rather than after the name it took. resuming past the name drops the inner offset
+    # while leaving every parse result unchanged, which is why it is pinned on the index directly.
+    for nested, offset in (("<parameter=x<parameter=a>", 12), ("<parameter=<parameter=a>", 11)):
+        assert tool_calls_module._index_parameter_openers(nested, 0, frozenset({"a"}), [10**9]) == {
+            "a": array("q", [offset])
+        }, nested
+
 
 def test_unterminated_openers_do_not_rescan_the_tail_for_each_one() -> None:
     """reading the name by its delimiter must not retry the run at every opener it cannot end.
@@ -4811,16 +4820,20 @@ def test_unterminated_openers_do_not_rescan_the_tail_for_each_one() -> None:
         ]
     )
 
-    def elapsed(count: int) -> float:
-        text = "<tool_call><function=store>" + "<parameter=" * count
+    def elapsed(count: int, tail: str) -> float:
+        text = "<tool_call><function=store>" + "<parameter=" * count + tail
         start = time.perf_counter()
         assert parse_qwen3_coder_output(text, tools).calls == ()
         return time.perf_counter() - start
 
-    # quadratic growth quadruples for each doubling, so a linear scan is far inside this bound. the
-    # ratio is asserted rather than an absolute time, which would only measure the runner.
-    small, large = elapsed(4_000), elapsed(16_000)
-    assert large < 8 * max(small, 0.001), (small, large)
+    # both shapes, because they exercise different halves of the scan. with no delimiter the first
+    # search fails and the loop stops, so it cannot show a delimiter search that restarts; with one
+    # far delimiter every opener shares it, which is what re-finding it per opener makes quadratic.
+    for tail in ("", ">"):
+        # quadratic growth quadruples for each doubling, so a linear scan is far inside this bound.
+        # the ratio is asserted rather than an absolute time, which would only measure the runner.
+        small, large = elapsed(4_000, tail), elapsed(16_000, tail)
+        assert large < 8 * max(small, 0.001), (tail, small, large)
 
 
 def test_inert_enum_delimiters_are_not_stepped_one_at_a_time() -> None:

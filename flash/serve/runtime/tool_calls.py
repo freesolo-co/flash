@@ -332,17 +332,26 @@ def _index_parameter_openers(
     # the name is read the way the parser reads it, by the next `>`, rather than matched by a
     # pattern. a pattern whose name run is the parser's must retry that run at every `<parameter=`
     # it cannot terminate, which is quadratic on a run of unterminated openers, and this executes
-    # synchronously on model output. finding each opener and then its delimiter never revisits a
-    # character, so a malformed megabyte costs one pass.
+    # synchronously on model output.
+    #
+    # two things have to stay off the per-opener path for that to hold on a run of openers that do
+    # share a delimiter. the delimiter search is not restarted, because the first `>` at or after a
+    # later opener is the one already found unless that one now lies behind it: each search
+    # therefore begins strictly later than the last and the scan crosses the text once. and a name
+    # longer than the longest declared one is never cut out of the text, because no such string can
+    # be declared; measuring it is enough. copying each would make a megabyte of openers sharing
+    # one far delimiter cost the square of its length in slices alone.
     positions: dict[str, array[int]] = {}
-    cursor = text.find(_PARAMETER_START, start)
+    longest = max((len(name) for name in declared), default=0)
+    cursor, name_end = text.find(_PARAMETER_START, start), -1
     while cursor >= 0:
         name_start = cursor + len(_PARAMETER_START)
-        name_end = text.find(">", name_start)
-        if name_end < 0:
-            # no delimiter remains, so no opener can be completed in what is left.
-            break
-        if (name := text[name_start:name_end]) in declared:
+        if name_end < name_start:
+            name_end = text.find(">", name_start)
+            if name_end < 0:
+                # no delimiter remains, so no opener can be completed in what is left.
+                break
+        if name_end - name_start <= longest and (name := text[name_start:name_end]) in declared:
             if (found := positions.get(name)) is None:
                 found = positions[name] = array("q")
             found.append(cursor)
