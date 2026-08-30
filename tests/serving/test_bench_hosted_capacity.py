@@ -2526,9 +2526,35 @@ def test_early_stop_gates_on_steady_state_successes():
     Gating the climb on ``succeeded`` kept it positive there, so the sweep bought another full
     window-and-drain tail per remaining point after the cell was already classified degraded.
     """
-    source = BENCH_APP.read_text(encoding="utf-8")
+    from flash.serving.bench.driver import grid_should_halt
+
+    source = inspect.getsource(grid_should_halt)
     assert "result.succeeded_in_window == 0" in source
-    assert "if result.succeeded == 0:" not in source
+    assert "result.succeeded == 0" not in source
+    # The script must CONSULT it, not carry its own copy. A predicate nothing calls would leave the
+    # inline policy in place while this test passed against the unused helper.
+    script = BENCH_APP.read_text(encoding="utf-8")
+    assert "if grid_should_halt(result):" in script
+    assert "if result.succeeded_in_window == 0:" not in script
+
+    # And it must actually decide. `succeeded` stays positive in the halting case on purpose: that
+    # is the exact cell -- every success landed in the drain -- that gating on `succeeded` kept
+    # climbing past.
+    def _at(in_window: int) -> CellResult:
+        return CellResult(
+            base_model="Qwen/Qwen3.5-9B",
+            bucket="short_interactive",
+            concurrency=8,
+            block=0,
+            wall_seconds=60.0,
+            attempted=10,
+            succeeded=4,
+            succeeded_in_window=in_window,
+            failed=6,
+        )
+
+    assert grid_should_halt(_at(0)) is True
+    assert grid_should_halt(_at(1)) is False
 
 
 def test_canary_gate_refuses_an_unresolved_gdn_backend() -> None:
@@ -3842,3 +3868,196 @@ def test_the_execution_digest_covers_the_request_spawner() -> None:
     assert workload_module._execution_digest() == before, (
         "the digest is not stable across a restore"
     )
+
+
+def test_the_drain_reap_is_bounded_across_the_whole_pending_set() -> None:
+    """R16: one reap allowance per CELL, not one per pending task.
+
+    Both estimators fund `drain_reap_seconds()` once per cell. Applying that timeout separately
+    inside the loop over pending requests multiplies it by the number of tasks: cancelled engine
+    streams that serialize their cleanup let a concurrency-16 cell spend 16 x 30s reaping against a
+    30s reservation, billing past the ceiling `BudgetLedger` exists to enforce.
+
+    Driven by a FAKE clock rather than real waits. Tasks that honour cancellation promptly return
+    before their timeout, so no wall time passes and a per-task bound looks identical to a shared
+    one; the reported defect is specifically about cleanups that DO consume their allowance. The
+    clock advances by whatever each wait was granted, which reproduces that serialization exactly
+    and makes the requested timeouts -- the thing under test -- deterministic.
+    """
+    from flash.serving.bench import driver as driver_module
+
+    granted: list[float] = []
+    now = [1000.0]
+
+    async def _recording_wait_for(
+        awaitable: Any,
+        # Mirrors asyncio.wait_for's own signature -- the granted timeout IS what this test records,
+        # so the parameter cannot be renamed away.
+        timeout: float | None = None,  # noqa: ASYNC109
+    ) -> Any:
+        granted.append(float(timeout if timeout is not None else 0.0))
+        # A cleanup that used its whole allowance, which is the case that multiplies.
+        now[0] += float(timeout or 0.0)
+        return await awaitable
+
+    async def _finishes() -> Any:
+        return None
+
+    async def _exercise() -> None:
+        tasks = {asyncio.ensure_future(_finishes()) for _ in range(4)}
+        await asyncio.sleep(0)
+        # Every task is pending as far as the drain is concerned, so all four enter the reap.
+        # `monotonic` must be a lambda, not `return_value=`: the fake clock has to be read at call
+        # time so the advance inside `_recording_wait_for` is visible to the next iteration.
+        with (
+            mock.patch.object(driver_module, "_DRAIN_REAP_SECONDS", 30.0),
+            mock.patch.object(driver_module.time, "monotonic", lambda: now[0]),  # noqa: PT008
+            mock.patch.object(driver_module.asyncio, "wait_for", _recording_wait_for),
+            mock.patch.object(
+                driver_module.asyncio, "wait", mock.AsyncMock(return_value=(set(), tasks))
+            ),
+        ):
+            await driver_module._drain(
+                tasks,
+                base_model="Qwen/Qwen3.5-9B",
+                bucket="short_interactive",
+                concurrency=4,
+                block=0,
+                spawned_at={},
+                spawned_uid={},
+            )
+
+    asyncio.run(_exercise())
+
+    assert granted, "no reap timeout was ever applied"
+    assert sum(granted) <= 30.0 + 1e-6, (
+        f"the reap was granted {sum(granted):.1f}s against a 30s per-cell reservation: the bound "
+        "is being applied per task rather than across the pending set"
+    )
+    # Not vacuous: the first task must really get the allowance, so this cannot pass by never
+    # reaping at all.
+    assert granted[0] == pytest.approx(30.0)
+
+
+def test_the_grid_stop_policy_is_digested() -> None:
+    """R16: the predicate that ABANDONS a concurrency grid must move the execution digest.
+
+    `_cell_is_conclusively_failed` stops replacing requests within one cell; the decision that ends
+    the grid lived inline in the entrypoint script, outside every digested source. Loosening it
+    would change which cells the published curve contains -- and with them the ceiling, knee and
+    saturation point -- while `workload_checksum` stayed byte-identical, so two incompatible
+    campaigns could claim one checksum.
+    """
+    from flash.serving.bench import driver as driver_module
+    from flash.serving.bench import workload as workload_module
+
+    assert "grid_should_halt" in workload_module._DRIVER_SOURCES
+    assert hasattr(driver_module, "grid_should_halt")
+
+    before = workload_module.workload_checksum()
+    original = driver_module.grid_should_halt
+
+    def _looser(result: CellResult) -> bool:
+        return result.succeeded == 0
+
+    try:
+        driver_module.grid_should_halt = _looser  # type: ignore[assignment]
+        assert workload_module.workload_checksum() != before, (
+            "retuning the grid stop policy left the checksum unchanged"
+        )
+    finally:
+        driver_module.grid_should_halt = original  # type: ignore[assignment]
+    assert workload_module.workload_checksum() == before
+
+
+def test_an_unnamed_checkpoint_refuses_publication() -> None:
+    """R16: a curve that cannot name its weights must not be measured, let alone published.
+
+    `probe_resolved_revisions` is fail-soft: it records `commit=None` with a reason rather than
+    inventing a hash. Nothing refused on that, so a missing or unreadable cache ref would publish a
+    measurement identified only by a mutable repository name -- and two of the three hosted models
+    pin nothing, so once that repository advances the artifact can no longer say what it ran on.
+    """
+    namespace = _bench_namespace("_require_resolved_checkpoint")
+    require = namespace["_require_resolved_checkpoint"]
+
+    good = {
+        "resolved_revisions": {
+            "model": {"repo": "a/b", "commit": "c" * 40},
+            "tokenizer": {"repo": "a/b", "commit": "d" * 40},
+            # Absent for text-only models, and resolves against the tokenizer repository, so it is
+            # deliberately not required.
+            "processor": {"repo": "a/b", "commit": None, "reason": "no processor"},
+        }
+    }
+    require(good, "canary")
+
+    for missing in ("model", "tokenizer"):
+        broken = {
+            "resolved_revisions": {
+                role: dict(entry) for role, entry in good["resolved_revisions"].items()
+            }
+        }
+        broken["resolved_revisions"][missing] = {
+            "repo": "a/b",
+            "commit": None,
+            "reason": "no local snapshot found for the loaded repository",
+        }
+        with pytest.raises(RuntimeError, match="cannot name the weights"):
+            require(broken, "canary")
+    # An absent block is not a pass either.
+    with pytest.raises(RuntimeError, match="cannot name the weights"):
+        require({}, "canary")
+
+
+def test_both_paid_paths_gate_on_a_named_checkpoint() -> None:
+    """R16: the gate must be CALLED on the canary and on every bucket, before the grid opens.
+
+    A predicate nothing invokes is exactly the reported defect, so assert the call sites rather
+    than only the helper.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    assert '_require_resolved_checkpoint(probe, "canary")' in source
+    assert '_require_resolved_checkpoint(provenance, f"bucket {bucket_name!r}")' in source
+
+
+def test_a_replacement_container_is_probed_before_it_is_warmed() -> None:
+    """R16: gate the container BEFORE paying five sequential warmups on it.
+
+    A cold replacement whose card or kernel path fails the publication gate was warmed first: each
+    warmup can spend its fitting allowance plus the full request timeout, so the harness could burn
+    roughly an hour of paid GPU time on a container it was always going to reject.
+    """
+    tree = ast.parse(BENCH_APP.read_text(encoding="utf-8"))
+    fn = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_bucket"
+    )
+    watched = {
+        "_ensure_warm",
+        "_probe_in_container_within_bound",
+        "_require_resolved_gdn_backend",
+        "_require_resolved_checkpoint",
+        "gpu_matches",
+    }
+    order = [
+        (node.func.id, node.lineno)
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in watched
+    ]
+    positions = dict(order)
+    assert "_ensure_warm" in positions, "the bucket no longer warms a cold replacement"
+    for gate in (
+        "_probe_in_container_within_bound",
+        "gpu_matches",
+        "_require_resolved_gdn_backend",
+        "_require_resolved_checkpoint",
+    ):
+        assert gate in positions, f"{gate} is not applied by the bucket"
+        assert positions[gate] < positions["_ensure_warm"], (
+            f"{gate} runs AFTER the warmup, so a rejectable container is paid for before it is "
+            "refused"
+        )

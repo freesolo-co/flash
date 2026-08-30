@@ -406,6 +406,13 @@ _DRIVER_SOURCES: tuple[str, ...] = (
     # different ceiling and knee -- while every prompt, every request and every metric function
     # stays byte-identical.
     "_cell_is_conclusively_failed",
+    # When the sweep abandons the rest of the GRID, as opposed to one cell's replacements.
+    # `_run_bucket` consults this predicate to decide whether to climb to the next concurrency
+    # point, so loosening it changes which cells exist in the published curve at all -- and with
+    # them the ceiling, knee and saturation point -- while every other digested source stays
+    # byte-identical. It lives in the driver rather than inline in the entrypoint precisely so this
+    # digest can reach it.
+    "grid_should_halt",
 )
 _METRIC_SOURCES: tuple[str, ...] = (
     # The reduction arithmetic and the curve's ceiling/knee/saturation rules. Their THRESHOLDS are

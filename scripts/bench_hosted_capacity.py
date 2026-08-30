@@ -451,22 +451,24 @@ async def _run_bucket(
     against a single engine rather than paying a boot per point.
     """
     from flash.serving.bench.catalog import bench_catalog_summary, bench_gpu_for
-    from flash.serving.bench.driver import run_cell
+    from flash.serving.bench.driver import grid_should_halt, run_cell
     from flash.serving.bench.metrics import summarize_curve
     from flash.serving.bench.probe import gpu_matches
     from flash.serving.bench.workload import BUCKETS_BY_NAME
 
     bucket = BUCKETS_BY_NAME[bucket_name]
-    # A replacement container measures cold otherwise; see `_ensure_warm`. Recorded in the payload
-    # so a reader can tell a bucket that inherited the canary's warm container from one that had to
-    # warm itself, rather than having to assume every bucket ran on the gated container.
-    cold_start_warmup = await _ensure_warm(engine)
     # Gate THIS container before opening its first cell, not the one the canary happened to land on.
     # `max_containers=1` caps simultaneous replicas without pinning successive calls to one
     # container, so the canary's probe describes a container this bucket may never have touched --
     # and the provenance below is read only AFTER the whole grid, far too late to refuse anything.
     # Probing here means an unresolved kernel path costs one bucket's boot instead of producing a
     # publishable artifact whose numbers cannot be attributed to a kernel.
+    #
+    # BEFORE the warmup, not after. Warming a cold replacement runs CANARY_WARMUP_REQUESTS
+    # sequential requests, each able to spend its fitting allowance plus the full request timeout,
+    # so gating afterwards spent roughly an hour of paid GPU time on a container whose card or
+    # kernel path already made it unpublishable. The probe is comparatively cheap and answers the
+    # only question that can reject the container, so it goes first.
     provenance = await _probe_in_container_within_bound(engine)
     # Card identity too, not only the kernel path. `_run_canary` checks `gpu_matches` against the
     # container IT probed; a replacement container reporting a different accelerator would otherwise
@@ -479,6 +481,11 @@ async def _run_bucket(
             f"expected {expected_gpu}; refusing to attribute a measurement to the wrong card"
         )
     _require_resolved_gdn_backend(provenance)
+    _require_resolved_checkpoint(provenance, f"bucket {bucket_name!r}")
+    # A replacement container measures cold otherwise; see `_ensure_warm`. Recorded in the payload
+    # so a reader can tell a bucket that inherited the canary's warm container from one that had to
+    # warm itself, rather than having to assume every bucket ran on the gated container.
+    cold_start_warmup = await _ensure_warm(engine)
     cells = []
     records = []
     for concurrency in concurrency_points:
@@ -505,11 +512,11 @@ async def _run_bucket(
         # Stop climbing once the engine is failing outright: further points would spend GPU time
         # measuring progressively deeper failure, which the envelope does not need.
         #
-        # Gated on the IN-WINDOW count, not `succeeded`. A cell whose requests all complete during
-        # the drain has zero steady-state throughput -- it is already classified degraded and its
-        # published rates are 0 -- yet `succeeded` stays positive, so climbing continued and bought
-        # another full window-and-drain tail per remaining point.
-        if result.succeeded_in_window == 0:
+        # The predicate lives in the driver, not inline here, so `_execution_digest` covers it. As
+        # an inline `result.succeeded_in_window == 0` it sat outside every digested source, and
+        # loosening it would have changed which cells the published curve contains -- a different
+        # ceiling, knee and saturation point -- under an unchanged `workload_checksum`.
+        if grid_should_halt(result):
             print(
                 f"[bench] halting {bucket_name}: no steady-state successes at c={concurrency}",
                 flush=True,
@@ -630,6 +637,33 @@ def _require_resolved_gdn_backend(probe: dict[str, Any]) -> None:
     )
 
 
+def _require_resolved_checkpoint(probe: dict[str, Any], where: str) -> None:
+    """Raise unless the probe named the commit for the weights and the tokenizer it measured on.
+
+    `probe_resolved_revisions` is fail-soft by design: it records `commit=None` with a reason rather
+    than inventing a hash, because a fabricated commit is worse than none. That makes the REFUSAL
+    this caller's job, and until now nothing did it -- the GPU and GDN gates say which card and
+    kernel produced a number, not which weights. Two of the three hosted models pin nothing, so a
+    missing or unreadable cache ref would publish a curve identified only by a mutable repository
+    name; once that repository advances, the artifact can no longer say what it measured.
+
+    The `processor` role is deliberately NOT required. It resolves against the tokenizer repository
+    and is absent for text-only models, so demanding it would refuse containers whose provenance is
+    complete. Model and tokenizer are what a curve must be able to name.
+    """
+    resolved = probe.get("resolved_revisions") or {}
+    for role in ("model", "tokenizer"):
+        entry = resolved.get(role) or {}
+        if entry.get("commit"):
+            continue
+        reason = str(entry.get("reason") or "probe recorded no reason")
+        repo = entry.get("repo") or "<unknown repository>"
+        raise RuntimeError(
+            f"{where}: {role} checkpoint for {repo!r} resolved to no commit ({reason}); refusing "
+            "to publish a measurement that cannot name the weights it ran on"
+        )
+
+
 def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, Any]:
     """Boot, verify the card and kernel path, and warm up. The cheap gate before any sweep."""
     from flash.serving.bench.probe import gpu_matches
@@ -641,6 +675,10 @@ def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, An
     if not gpu_matches(probe, expected_gpu):
         raise RuntimeError(f"expected {expected_gpu}, got {(probe.get('gpu') or {}).get('name')!r}")
     _require_resolved_gdn_backend(probe)
+    # Same gate the buckets apply. The canary is the cheap place to discover that the cache cannot
+    # name the weights: failing here costs one boot, while discovering it after a sweep means the
+    # whole paid artifact is unpublishable.
+    _require_resolved_checkpoint(probe, "canary")
     cutlass = (probe.get("gdn_prefill") or {}).get("cutlass") or {}
     if cutlass.get("checked") and not cutlass.get("intact"):
         # A warning, not a failure: the campaign measures the shipped dev runtime as it is. The

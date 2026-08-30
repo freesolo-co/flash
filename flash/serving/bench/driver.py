@@ -533,21 +533,33 @@ async def _drain(
             drained.append(task.result())
     for task in still_pending:
         task.cancel()
+    # ONE deadline across the whole pending set, not one per task. `_DRAIN_REAP_SECONDS` is
+    # reserved once per cell by both estimators, but a per-task bound multiplies it by the number of
+    # pending requests: cancelled engine streams that serialize their cleanup would let a
+    # concurrency-16 cell spend 16 x 30s reaping against a 30s reservation, billing past the
+    # ceiling `BudgetLedger` exists to enforce. The deadline is fixed before the loop, so the reap
+    # costs what it reserved no matter how many tasks are in it.
+    reap_deadline = time.monotonic() + _DRAIN_REAP_SECONDS
     for task in still_pending:
         # Bounded. `Task.cancel()` only REQUESTS cancellation: if the engine's stream does not
         # cooperate -- an async-generator close blocked in a backend call, say -- an unbounded
         # `await task` sits here until the class-wide method timeout kills the container, losing the
-        # whole bucket artifact this drain exists to preserve. The reap gets a slice of the same
-        # allowance the sweep already reserved for the drain.
-        with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
-            await asyncio.wait_for(asyncio.shield(task), timeout=_DRAIN_REAP_SECONDS)
+        # whole bucket artifact this drain exists to preserve.
+        remaining = reap_deadline - time.monotonic()
+        # Never below zero: `wait_for` treats a negative timeout as already expired, but passing one
+        # explicitly is clearer than relying on that, and it keeps a task that is ALREADY done from
+        # being reported as uncancellable merely because earlier tasks used the whole allowance.
+        if remaining > 0:
+            with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
         if not task.done():
             # The record below is still appended, so the request keeps its place in the attempt
             # denominator; what is unrecoverable is the container, which now holds a task pinned
             # inside the engine and would contaminate every later cell on it.
             print(
-                f"[bench] {bucket} c={concurrency} left an uncancellable request after "
-                f"{_DRAIN_REAP_SECONDS:.0f}s; ending the container rather than measuring around it",
+                f"[bench] {bucket} c={concurrency} left an uncancellable request within the "
+                f"cell's shared {_DRAIN_REAP_SECONDS:.0f}s reap; ending the container rather than "
+                "measuring around it",
                 flush=True,
             )
             sys.stdout.flush()
@@ -631,6 +643,25 @@ def _cell_is_conclusively_failed(records: list[RequestRecord]) -> bool:
     if len(records) < _CONCLUSIVE_FAILURE_ATTEMPTS:
         return False
     return not any(record.error is None for record in records)
+
+
+def grid_should_halt(result: CellResult) -> bool:
+    """True once a cell fails so completely that climbing further would only buy deeper failure.
+
+    Lives here, beside `_cell_is_conclusively_failed`, because the two are the same KIND of
+    decision at different scopes: that one stops replacing requests within a cell, this one
+    abandons the rest of the concurrency grid. Keeping the grid policy inline in the entrypoint
+    script put it outside `_execution_digest`'s reach, so loosening it would change which cells
+    exist in the published curve -- and therefore the ceiling, knee and saturation point -- while
+    every digested source stayed byte-identical, letting two incompatible campaigns publish one
+    `workload_checksum`.
+
+    Gated on the IN-WINDOW count, not `succeeded`. A cell whose requests all complete during the
+    drain has zero steady-state throughput -- it is already classified degraded and its published
+    rates are 0 -- yet `succeeded` stays positive, so climbing continued and bought another full
+    window-and-drain tail per remaining point.
+    """
+    return result.succeeded_in_window == 0
 
 
 def _make_spawner(
@@ -839,6 +870,7 @@ __all__ = [
     "drain_reap_seconds",
     "fitting_watchdog",
     "fitting_watchdog_grace_seconds",
+    "grid_should_halt",
     "prompt_fit_seconds_bound",
     "run_cell",
     "run_request",
