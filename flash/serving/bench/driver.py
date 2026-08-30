@@ -415,6 +415,55 @@ def fitting_watchdog_grace_seconds() -> float:
     return _FITTING_WATCHDOG_GRACE_SECONDS
 
 
+async def run_request_within_bound(*args: Any, **kwargs: Any) -> RequestRecord:
+    """`run_request`, but with its timeout enforced even if stream cleanup hangs.
+
+    `run_request` wraps generation in `asyncio.wait_for`, which is NOT an upper bound on the call.
+    When the timeout fires, `wait_for` cancels the inner coroutine and then WAITS for that
+    cancellation to complete: an `_stream_generate` whose `aclose()` blocks in a backend call
+    therefore holds `run_request` open indefinitely, and no `TimeoutError` is ever raised. Measured
+    cells survive this because `_drain` awaits a shielded TASK and keeps control regardless of what
+    the cancellation does, but the warmup path awaits `run_request` directly -- outside `_drain` --
+    while both estimators reserve exactly `REQUEST_TIMEOUT_SECONDS` for it. One such request would
+    bill to the class-wide method timeout, far past the reservation `BudgetLedger` exists to
+    enforce, and take the bucket's artifact down with the container.
+
+    Same enforcement as the drain's reap, for the same reason: run it as a task, shield the await so
+    the timeout returns control here rather than propagating into the task, and end the container if
+    the task is still pinned inside the engine afterwards. A container holding an uncancellable
+    request cannot be measured around -- every later cell on it would inherit the occupancy.
+    """
+    task = asyncio.ensure_future(run_request(*args, **kwargs))
+    bound = REQUEST_TIMEOUT_SECONDS + _DRAIN_REAP_SECONDS
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=bound)
+    except (TimeoutError, asyncio.CancelledError):
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
+            await asyncio.wait_for(asyncio.shield(task), timeout=_DRAIN_REAP_SECONDS)
+        if not task.done():
+            print(
+                f"[bench] a request outside a measured cell ignored cancellation past its "
+                f"{bound:.0f}s bound plus a {_DRAIN_REAP_SECONDS:.0f}s reap; ending the container "
+                "rather than billing an unbounded call",
+                flush=True,
+            )
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(75)
+        raise
+
+
+def run_request_bound_seconds() -> float:
+    """Worst-case billed seconds for one `run_request_within_bound` call.
+
+    Exposed so the estimators reserve what the bound actually permits rather than the nominal
+    request timeout. The enforced path can spend the request timeout, then a reap for a stream that
+    ignored cancellation -- both bounded, both billed on the container.
+    """
+    return REQUEST_TIMEOUT_SECONDS + 2 * _DRAIN_REAP_SECONDS
+
+
 def drain_reap_seconds() -> float:
     """How long a drain waits for a task that ignored cancellation, past the drain's own timeout.
 
@@ -874,4 +923,6 @@ __all__ = [
     "prompt_fit_seconds_bound",
     "run_cell",
     "run_request",
+    "run_request_bound_seconds",
+    "run_request_within_bound",
 ]

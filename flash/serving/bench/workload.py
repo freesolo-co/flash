@@ -424,6 +424,13 @@ _METRIC_SOURCES: tuple[str, ...] = (
     "reduce_cell",
     "summarize_curve",
 )
+# Properties are digested SEPARATELY because `getattr(metrics, name)` reaches module-level objects
+# only. `CellResult.degraded` is a property on the dataclass, so it stayed invisible above even
+# though `summarize_curve` -- which IS digested -- calls it on every cell to choose the usable
+# points and to locate saturation. Retuning it (dropping the zero-in-window-success test, say, or
+# comparing against a different error bound) would move the ceiling, the knee and the saturation
+# point of every published curve while each digested source stayed byte-identical.
+_METRIC_PROPERTIES: tuple[tuple[str, str], ...] = (("CellResult", "degraded"),)
 # Module CONSTANTS are digested by value, not by source. A constant's name is all that appears in
 # the function text that reads it, so retuning `_POOL_PERIOD_SLACK` from 64 to 128 would leave every
 # source digest above byte-identical while changing which prompts the pool wraps to.
@@ -453,6 +460,10 @@ def _execution_digest() -> str:
 
     parts = [inspect.getsource(getattr(driver, name)) for name in _DRIVER_SOURCES]
     parts += [inspect.getsource(getattr(metrics, name)) for name in _METRIC_SOURCES]
+    parts += [
+        inspect.getsource(getattr(getattr(metrics, cls), prop).fget)
+        for cls, prop in _METRIC_PROPERTIES
+    ]
     parts += [f"{name}={getattr(driver, name)!r}" for name in _DRIVER_CONSTANTS]
     # Every error code is part of the contract: renaming or adding one changes how a failed attempt
     # is reported, and a consumer comparing two campaigns' failure breakdowns needs that to move.

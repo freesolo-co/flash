@@ -133,6 +133,7 @@ from flash.serving.bench.driver import (  # noqa: E402
     drain_reap_seconds,
     fitting_watchdog_grace_seconds,
     prompt_fit_seconds_bound,
+    run_request_bound_seconds,
 )
 from flash.serving.bench.workload import (  # noqa: E402
     BUCKETS,
@@ -203,7 +204,7 @@ def _worst_case_bucket_seconds() -> float:
     # The bucket's own provenance probe is bounded separately and included for the same reason.
     return (
         cells
-        + (REQUEST_TIMEOUT_SECONDS + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
+        + (run_request_bound_seconds() + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
         + PROBE_TIMEOUT_SECONDS
     )
 
@@ -395,7 +396,7 @@ async def _run_warmup(engine: Any, requests: int) -> dict[str, Any]:
     """Sequential warmups on ``engine``, reported separately from the envelope."""
     import time
 
-    from flash.serving.bench.driver import fitting_watchdog, run_request
+    from flash.serving.bench.driver import fitting_watchdog, run_request_within_bound
     from flash.serving.bench.workload import BUCKETS_BY_NAME, fit_prompt_to_tokens
 
     bucket = BUCKETS_BY_NAME["short_interactive"]
@@ -420,7 +421,12 @@ async def _run_warmup(engine: Any, requests: int) -> dict[str, Any]:
             messages, exact = fit_prompt_to_tokens(
                 engine.tokenizer, uid, bucket.target_input_tokens
             )
-        record = await run_request(
+        # Bounded, unlike a bare `run_request`. Its `wait_for` waits for cancellation CLEANUP to
+        # finish, so a stream whose close blocks keeps the call open past the request timeout with
+        # no exception raised. A measured cell survives that because `_drain` awaits a shielded
+        # task; this warmup awaits directly, so it needs the same enforcement or one hung close
+        # bills to the class-wide method timeout against a `REQUEST_TIMEOUT_SECONDS` reservation.
+        record = await run_request_within_bound(
             engine,
             engine.base_model,
             messages,
@@ -664,6 +670,49 @@ def _require_resolved_checkpoint(probe: dict[str, Any], where: str) -> None:
         )
 
 
+def _checkpoint_identity(probe: dict[str, Any]) -> dict[str, str]:
+    """The model and tokenizer commits a probe resolved, as a comparable identity.
+
+    Only the two roles `_require_resolved_checkpoint` requires. `processor` resolves against the
+    tokenizer repository and is absent for text-only models, so including it would make two
+    identical containers compare unequal.
+    """
+    resolved = probe.get("resolved_revisions") or {}
+    return {
+        role: str(((resolved.get(role) or {}).get("commit")) or "")
+        for role in ("model", "tokenizer")
+    }
+
+
+def _require_one_checkpoint(payloads: list[tuple[str, dict[str, Any]]]) -> None:
+    """Refuse to publish one envelope over buckets that measured different checkpoints.
+
+    `max_containers=1` caps simultaneous replicas without pinning successive `.remote()` calls to
+    one container, and the catalog names repositories by a MUTABLE label. So a Hub repo that
+    advances mid-sweep, or a preempted container replaced between buckets, can leave bucket A
+    measured on one commit and bucket B on another. Each payload records its own resolved revisions
+    and each is individually checked non-null, but the summary then aggregates every curve as if
+    one model produced them -- and a ceiling, knee and saturation point computed across two
+    checkpoints describes no model that exists.
+
+    Refusing is the honest option rather than picking a winner: both halves are real measurements,
+    and which one the envelope should describe is not a question this harness can answer. The
+    artifacts are already written per bucket, so nothing paid for is lost -- what is refused is
+    presenting them as one curve.
+    """
+    identities = [(where, _checkpoint_identity(probe)) for where, probe in payloads]
+    if not identities:
+        return
+    _, first = identities[0]
+    for where, identity in identities[1:]:
+        if identity == first:
+            continue
+        raise RuntimeError(
+            f"{where} measured checkpoint {identity} but the canary measured {first}; refusing to "
+            "publish curves from different checkpoints as one capacity envelope"
+        )
+
+
 def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, Any]:
     """Boot, verify the card and kernel path, and warm up. The cheap gate before any sweep."""
     from flash.serving.bench.probe import gpu_matches
@@ -728,7 +777,7 @@ def _canary_gpu_seconds_estimate() -> float:
         # kills at that bound PLUS its grace, so the grace is billable time the lane deliberately
         # permits; reserving only the nominal bound leaves it funded by nothing. Priced per warmup
         # because the watchdog is armed and disarmed around each one separately.
-        + (REQUEST_TIMEOUT_SECONDS + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
+        + (run_request_bound_seconds() + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
         # The container survives its scaledown window after the last call returns, still allocated
         # and still billing. A reservation that stops at the final return under-reserves every lane
         # by that tail.
@@ -777,7 +826,7 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     # are bounded and both are billed, so both are reserved; pricing only the first left the reap
     # interval funded by nothing at every concurrency point.
     drains = (REQUEST_TIMEOUT_SECONDS + drain_reap_seconds()) * cells
-    canary = (REQUEST_TIMEOUT_SECONDS + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
+    canary = (run_request_bound_seconds() + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
     # The boot is reserved at the ceiling Modal actually allows a stuck boot to reach, not at a
     # typical observed boot. Same reasoning as the canary lane.
     boot = float(STARTUP_TIMEOUT_SECONDS)
@@ -960,6 +1009,14 @@ def main(
                 f"sweep-{base_model.replace('/', '_')}-{name}-b{block}.json",
                 invocation=invocation,
             )
+        # BEFORE the summary, after every per-bucket artifact is safely on disk. Each bucket gated
+        # its own container's provenance, but nothing compared those containers to each other: a
+        # repo that advanced mid-sweep, or a replacement container, leaves buckets measured on
+        # different commits and the summary below would fuse their curves into one envelope.
+        _require_one_checkpoint(
+            [("canary", gate["probe"])]
+            + [(f"bucket {p['bucket']!r}", p.get("provenance") or {}) for p in results]
+        )
         ledger.settle(
             entry,
             _billable_lane_seconds(time.monotonic() - lane_started),

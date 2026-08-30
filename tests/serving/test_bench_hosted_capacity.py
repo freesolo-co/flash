@@ -61,6 +61,7 @@ from flash.serving.bench.driver import (
     fitting_watchdog_grace_seconds,
     prompt_fit_seconds_bound,
     run_cell,
+    run_request_bound_seconds,
 )
 from flash.serving.bench.metrics import (
     ERROR_CACHE_CONTAMINATED,
@@ -1663,6 +1664,7 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
         _FUNDED_WARMUP_FIT_SECONDS=warmup_fit + fitting_watchdog_grace_seconds(),
         fitting_watchdog_grace_seconds=fitting_watchdog_grace_seconds,
         drain_reap_seconds=drain_reap_seconds,
+        run_request_bound_seconds=run_request_bound_seconds,
     )
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "<bench>", "exec"), namespace)
     estimate_for = namespace["_sweep_gpu_seconds_estimate"]
@@ -1683,9 +1685,11 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     # Each warmup pays its fit as well as its request: the fit runs outside `run_request` and is
     # billed on the same container, so pricing a warmup at the request timeout alone left an
     # enforced-but-unfunded phase. Priced at the funded fit, which includes the watchdog grace.
-    canary = (REQUEST_TIMEOUT_SECONDS + warmup_fit + fitting_watchdog_grace_seconds()) * constants[
-        "CANARY_WARMUP_REQUESTS"
-    ]
+    # The canary's warmups await through the driver's ENFORCED bound, which permits the request
+    # timeout plus a reap for a stream that ignored cancellation. Both are billed.
+    canary = (
+        run_request_bound_seconds() + warmup_fit + fitting_watchdog_grace_seconds()
+    ) * constants["CANARY_WARMUP_REQUESTS"]
     startup = constants["STARTUP_TIMEOUT_SECONDS"]
     # `max_containers=1` caps SIMULTANEOUS replicas; it does not pin successive `.remote()` calls to
     # one container. Every bucket call can therefore land on a cold replacement and pay another boot
@@ -1790,6 +1794,10 @@ def _bench_namespace(*names: str, **injected: Any) -> dict[str, Any]:
         # exact drift between what is enforced and what is reserved these tests exist to catch.
         "fitting_watchdog_grace_seconds": fitting_watchdog_grace_seconds,
         "drain_reap_seconds": drain_reap_seconds,
+        # The warmup awaits its request through the driver's enforced bound, which permits the
+        # request timeout plus a reap for a stream that ignored cancellation. Reserving the
+        # nominal timeout instead would leave that reap funded by nothing.
+        "run_request_bound_seconds": run_request_bound_seconds,
         **injected,
     }
     exec(compile(ast.Module(body=body, type_ignores=[]), "<bench>", "exec"), namespace)
@@ -1854,7 +1862,7 @@ def test_bench_container_timeout_covers_the_whole_grid_it_runs() -> None:
     # -- and because the timeout fires before `run_bucket` returns, the artifact is never written.
     # Each of those warmups also FITS a prompt first, under its own watchdog, so the method clock
     # runs through the funded fit as well as the request.
-    warmups = (REQUEST_TIMEOUT_SECONDS + namespace["_FUNDED_WARMUP_FIT_SECONDS"]) * namespace[
+    warmups = (run_request_bound_seconds() + namespace["_FUNDED_WARMUP_FIT_SECONDS"]) * namespace[
         "CANARY_WARMUP_REQUESTS"
     ]
     worst = points * widest + warmups + namespace["PROBE_TIMEOUT_SECONDS"]
@@ -1986,7 +1994,9 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
     # A warmup bills its prompt fit as well as its request: the fit runs outside `run_request`, on
     # the same rented container. Priced at the FUNDED figure, not the nominal bound: the watchdog
     # ends the container at `bound + grace`, so the grace is billable time the lane permits itself.
-    per_warmup = REQUEST_TIMEOUT_SECONDS + namespace["_FUNDED_WARMUP_FIT_SECONDS"]
+    # The warmup awaits through the driver's ENFORCED bound, not the nominal request timeout:
+    # a stream that ignores cancellation costs a further reap, and it is billed.
+    per_warmup = run_request_bound_seconds() + namespace["_FUNDED_WARMUP_FIT_SECONDS"]
     assert namespace["_FUNDED_WARMUP_FIT_SECONDS"] == pytest.approx(
         namespace["WARMUP_FIT_SECONDS_BOUND"] + fitting_watchdog_grace_seconds()
     ), "the funded warmup fit dropped the watchdog grace it is supposed to cover"
@@ -2655,9 +2665,9 @@ def test_sweep_reserves_one_boot_per_separately_bootable_call() -> None:
         drains = (REQUEST_TIMEOUT_SECONDS + drain_reap_seconds()) * points * count
         # A warmup bills its prompt fit as well as its request; the fit runs outside `run_request`,
         # and is priced at the funded figure because its watchdog ends at `bound + grace`.
-        warmups = (REQUEST_TIMEOUT_SECONDS + namespace["_FUNDED_WARMUP_FIT_SECONDS"]) * namespace[
-            "CANARY_WARMUP_REQUESTS"
-        ]
+        warmups = (
+            run_request_bound_seconds() + namespace["_FUNDED_WARMUP_FIT_SECONDS"]
+        ) * namespace["CANARY_WARMUP_REQUESTS"]
         # Boots reserved: initial + canary replacement + one per bucket call.
         boots = startup * (count + 1)
         # Each separately bootable call can leave a container billing through its scaledown window.
@@ -4061,3 +4071,170 @@ def test_a_replacement_container_is_probed_before_it_is_warmed() -> None:
             f"{gate} runs AFTER the warmup, so a rejectable container is paid for before it is "
             "refused"
         )
+
+
+def test_the_degraded_verdict_is_digested() -> None:
+    """R17: the predicate that classifies a cell as FAILED must move the execution digest.
+
+    `summarize_curve` is digested, but it delegates to `CellResult.degraded` to choose which cells
+    are usable and where saturation begins. The digest resolves `getattr(metrics, name)`, which
+    reaches module-level objects only, so the property's body sat outside every digested source:
+    dropping its zero-in-window-success test would move the ceiling, knee and saturation point of
+    every published curve while `workload_checksum` stayed byte-identical.
+    """
+    from flash.serving.bench import metrics as metrics_module
+    from flash.serving.bench import workload as workload_module
+
+    assert ("CellResult", "degraded") in workload_module._METRIC_PROPERTIES
+
+    before = workload_module.workload_checksum()
+    original = metrics_module.CellResult.degraded
+
+    def _looser(self: CellResult) -> bool:
+        # Drops the `succeeded_in_window` test -- the exact retune that would silently republish a
+        # zero-throughput cell as usable.
+        return self.error_rate > self.max_error_rate
+
+    try:
+        metrics_module.CellResult.degraded = property(_looser)  # type: ignore[assignment]
+        assert workload_module.workload_checksum() != before, (
+            "retuning the degraded verdict left the checksum unchanged"
+        )
+    finally:
+        metrics_module.CellResult.degraded = original  # type: ignore[assignment]
+    assert workload_module.workload_checksum() == before
+
+
+def test_a_warmup_request_is_bounded_against_a_hung_stream_close() -> None:
+    """R17: `run_request`'s own timeout is not an upper bound when cancellation cleanup hangs.
+
+    `asyncio.wait_for` cancels the inner coroutine and then WAITS for that cancellation to finish,
+    so a stream whose close blocks holds `run_request` open with no `TimeoutError` ever raised. A
+    measured cell survives it because `_drain` awaits a shielded task; the warmup awaited directly,
+    while both estimators reserve only the request timeout for it.
+
+    Driven IN A SUBPROCESS under a hard wall-clock kill, because the unbounded form of this defect
+    hangs rather than fails. An in-process ceiling cannot cover it: every such ceiling is an asyncio
+    timer, and the two things that would neuter one here are exactly what the unbounded path does --
+    it never raises, so nothing propagates, and any fake clock installed to keep the enforced path
+    fast also freezes the event loop's own timer clock (`driver.time` IS the `time` module), so the
+    ceiling can never expire. `subprocess.run(timeout=...)` is enforced by the OS and needs neither.
+
+    The bound under test is shrunk so the enforced path returns in ~1s rather than the real
+    timeout. Only the deadline moves; the MECHANISM is unchanged.
+    """
+    program = textwrap.dedent(
+        """
+        import asyncio, sys
+        from flash.serving.bench import driver
+
+        driver.REQUEST_TIMEOUT_SECONDS = 0.5
+        driver._DRAIN_REAP_SECONDS = 0.5
+
+        async def _hangs(*a, **k):
+            # Never completes, and ignores cancellation the way a blocked `aclose()` does.
+            await asyncio.Event().wait()
+
+        driver.run_request = _hangs
+        # The enforced path ends the container rather than billing an unbounded call. Record that
+        # instead of dying, so the exit code below distinguishes enforced from unbounded.
+        driver.os._exit = lambda code: sys.exit(7)
+
+        async def _main():
+            try:
+                await driver.run_request_within_bound(None, "m", [], 1, "uid")
+            except (TimeoutError, asyncio.CancelledError):
+                sys.exit(8)
+
+        asyncio.run(_main())
+        sys.exit(0)
+        """
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", program],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            cwd=str(REPO_ROOT),
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            "the warmup awaited a request with no enforceable bound: it never returned, so a "
+            "stream whose close hangs would bill to the class-wide method timeout"
+        )
+    assert completed.returncode in {7, 8}, (
+        f"expected the bound to be enforced (exit 7 or 8), got {completed.returncode}: "
+        f"{completed.stdout}{completed.stderr}"
+    )
+
+
+def test_the_warmup_reservation_funds_the_enforced_bound() -> None:
+    """R17: reserving the nominal request timeout under-funds a path the code itself permits."""
+    from flash.serving.bench import driver as driver_module
+
+    assert driver_module.run_request_bound_seconds() > driver_module.REQUEST_TIMEOUT_SECONDS, (
+        "the enforced bound collapsed to the request timeout, so the reap is funded by nothing"
+    )
+    source = BENCH_APP.read_text(encoding="utf-8")
+    assert "REQUEST_TIMEOUT_SECONDS + _FUNDED_WARMUP_FIT_SECONDS" not in source, (
+        "a warmup is still priced at the nominal request timeout it is no longer bounded by"
+    )
+    assert source.count("run_request_bound_seconds() + _FUNDED_WARMUP_FIT_SECONDS") == 3, (
+        "not every warmup reservation site funds the enforced bound"
+    )
+
+
+def test_curves_from_different_checkpoints_are_not_published_as_one_envelope() -> None:
+    """R17: each bucket gates its OWN container; nothing compared those containers to each other.
+
+    A Hub repo that advances mid-sweep, or a replacement container, leaves bucket A measured on one
+    commit and bucket B on another. Every payload passes its own non-null check, and the summary
+    then fuses their curves into a single ceiling, knee and saturation point describing no model
+    that exists.
+    """
+    namespace = _bench_namespace("_checkpoint_identity", "_require_one_checkpoint")
+    require = namespace["_require_one_checkpoint"]
+
+    def _probe(model: str, tokenizer: str) -> dict[str, Any]:
+        return {
+            "resolved_revisions": {
+                "model": {"commit": model, "repo": "Qwen/Qwen3.5-9B"},
+                "tokenizer": {"commit": tokenizer, "repo": "Qwen/Qwen3.5-9B"},
+            }
+        }
+
+    # Same checkpoint everywhere: publishes.
+    require([("canary", _probe("aaa", "bbb")), ("bucket 'short'", _probe("aaa", "bbb"))])
+
+    # A processor role present on one side only must NOT split an otherwise identical identity:
+    # it resolves against the tokenizer repo and is absent for text-only models.
+    with_processor = _probe("aaa", "bbb")
+    with_processor["resolved_revisions"]["processor"] = {"commit": "ccc", "repo": "x"}
+    require([("canary", _probe("aaa", "bbb")), ("bucket 'short'", with_processor)])
+
+    for drifted in (_probe("zzz", "bbb"), _probe("aaa", "zzz")):
+        with pytest.raises(RuntimeError, match="different checkpoints"):
+            require([("canary", _probe("aaa", "bbb")), ("bucket 'short'", drifted)])
+
+
+def test_the_lane_gates_checkpoint_identity_before_it_summarizes() -> None:
+    """R17: the drift gate is worthless if the summary is written before it runs."""
+    tree = ast.parse(BENCH_APP.read_text(encoding="utf-8"))
+    fn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == "main"
+    )
+    calls = [
+        (node.func.id, node.lineno)
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"_require_one_checkpoint", "_write_artifact"}
+    ]
+    gate = [line for name, line in calls if name == "_require_one_checkpoint"]
+    assert gate, "the lane never compares checkpoints across buckets"
+    writes = [line for name, line in calls if name == "_write_artifact"]
+    assert max(writes) > gate[0], "the drift gate runs after every artifact is already written"
