@@ -1751,10 +1751,34 @@ def test_a_bucket_landing_on_a_cold_container_warms_itself_before_measuring() ->
         if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
     }
     assert "_run_warmup" in warm_called, "the cold path does not actually warm up"
-    attributes = {
+    # Read through `getattr` with a default, since a freshly booted container has no such
+    # attribute at all, so the name appears as a string constant rather than an attribute access.
+    read_names = {
         child.attr for child in ast.walk(nodes["_ensure_warm"]) if isinstance(child, ast.Attribute)
+    } | {
+        child.value
+        for child in ast.walk(nodes["_ensure_warm"])
+        if isinstance(child, ast.Constant) and isinstance(child.value, str)
     }
-    assert "_bench_warmed" in attributes, "warmth is not tracked per container"
+    assert "_bench_warmed" in read_names, "warmth is not tracked per container"
+
+    # The flag is SET by the warmup that knows whether it worked, not by the caller that merely
+    # asked for one; see the failed-warmup guard. Assert the reader still short-circuits on it and
+    # that exactly one place writes it, so a second writer cannot reintroduce an unvalidated warm.
+    writers = {
+        name
+        for name, node in nodes.items()
+        if any(
+            isinstance(target, ast.Attribute) and target.attr == "_bench_warmed"
+            for child in ast.walk(node)
+            if isinstance(child, ast.Assign)
+            for target in child.targets
+        )
+    }
+    assert writers == {"_run_warmup"}, (
+        f"the warmed flag is written by {sorted(writers)}; exactly one writer, the warmup itself, "
+        "may set it, or a caller can mark a container warm that no warmup validated"
+    )
 
 
 # ── Round-4: lane bounds, warmup health, and window-scoped degradation ────────────────────────
@@ -1951,6 +1975,90 @@ def test_a_cold_replacement_container_checks_its_own_warmup_health() -> None:
     with pytest.raises(RuntimeError, match="replacement-container warmup failed 1/2"):
         asyncio.run(namespace["_ensure_warm"](engine))
     assert calls, "the cold path never ran a warmup at all"
+
+
+def test_a_failed_warmup_leaves_the_container_unwarmed_so_a_retry_reruns_it() -> None:
+    """A rejected warmup must not leave the container flagged warm.
+
+    ``_ensure_warm`` short-circuits on ``_bench_warmed``, so whoever sets that flag decides whether
+    a later bucket warms at all. Setting it on entry to ``_run_warmup`` records INTENT: a warmup
+    whose records come back ``ok=False`` -- or that raises part way, since the fit watchdog and the
+    request bound both raise -- still leaves the flag true. ``_ensure_warm`` raises and the attempt
+    is refused, but the flag outlives the refusal, so a retry inside the scaledown window lands on
+    the same container, short-circuits at the flag check, and measures a generation path no warmup
+    ever validated. Both failure shapes are checked because they reach the flag differently.
+    """
+
+    class _Record:
+        def __init__(self, ok: bool) -> None:
+            self._ok = ok
+
+        def to_json(self) -> dict[str, Any]:
+            return {"ok": self._ok, "error": None if self._ok else "cache_contaminated"}
+
+    def _fake_fit(tokenizer: Any, uid: str, target: int) -> tuple[list[dict[str, str]], int]:
+        return ([{"role": "user", "content": uid}], target)
+
+    namespace = _bench_namespace(
+        "_run_warmup",
+        "_ensure_warm",
+        "_require_healthy_warmup",
+        "CANARY_WARMUP_REQUESTS",
+        WARMUP_FIT_SECONDS_BOUND=_WARMUP_FIT_BOUND,
+    )
+
+    # 1. Records returned ok=False: the warmup completes, so only an outcome check can catch it.
+    async def _unhealthy(
+        engine: Any, base_model: str, messages: Any, max_tokens: int, uid: str, **kw: Any
+    ) -> Any:
+        return _Record(ok=False)
+
+    engine = mock.Mock(tokenizer=object(), base_model="Qwen/Qwen3.5-9B")
+    del engine._bench_warmed  # a freshly booted container has never been warmed
+    with (
+        mock.patch("flash.serving.bench.driver.run_request", _unhealthy),
+        mock.patch("flash.serving.bench.workload.fit_prompt_to_tokens", _fake_fit),
+        pytest.raises(RuntimeError, match="replacement-container warmup failed"),
+    ):
+        asyncio.run(namespace["_ensure_warm"](engine))
+    assert getattr(engine, "_bench_warmed", False) is False, (
+        "a warmup whose records failed left the container flagged warm, so a retry inside the "
+        "scaledown window short-circuits and measures an engine no warmup ever validated"
+    )
+
+    # 2. The warmup raises part way, the shape the fit watchdog and the request bound produce.
+    async def _raises(
+        engine: Any, base_model: str, messages: Any, max_tokens: int, uid: str, **kw: Any
+    ) -> Any:
+        raise TimeoutError("stream close hung past the enforced bound")
+
+    engine = mock.Mock(tokenizer=object(), base_model="Qwen/Qwen3.5-9B")
+    del engine._bench_warmed
+    with (
+        mock.patch("flash.serving.bench.driver.run_request", _raises),
+        mock.patch("flash.serving.bench.workload.fit_prompt_to_tokens", _fake_fit),
+        pytest.raises(TimeoutError),
+    ):
+        asyncio.run(namespace["_ensure_warm"](engine))
+    assert getattr(engine, "_bench_warmed", False) is False, (
+        "a warmup that raised left the container flagged warm"
+    )
+
+    # A healthy warmup must still mark the container, or every bucket repays the one-time costs.
+    async def _healthy(
+        engine: Any, base_model: str, messages: Any, max_tokens: int, uid: str, **kw: Any
+    ) -> Any:
+        return _Record(ok=True)
+
+    engine = mock.Mock(tokenizer=object(), base_model="Qwen/Qwen3.5-9B")
+    del engine._bench_warmed
+    with (
+        mock.patch("flash.serving.bench.driver.run_request", _healthy),
+        mock.patch("flash.serving.bench.workload.fit_prompt_to_tokens", _fake_fit),
+    ):
+        assert asyncio.run(namespace["_ensure_warm"](engine)) is not None
+    assert engine._bench_warmed is True, "a healthy warmup no longer marks the container warm"
+    assert asyncio.run(namespace["_ensure_warm"](engine)) is None, "the warm container re-warmed"
 
 
 def test_healthy_warmup_predicate_rejects_an_empty_or_failed_result() -> None:
@@ -3316,6 +3424,124 @@ def test_prompt_fitting_enforces_the_bound_it_reserves() -> None:
     for guard in guards:
         assert not [node for node in ast.walk(guard) if isinstance(node, ast.Raise)], (
             "the deadline raises instead of exiting, so the container keeps billing while unwinding"
+        )
+
+
+def test_provenance_reads_the_snapshot_each_role_was_actually_loaded_from() -> None:
+    """``refs/<rev>`` is per-REPOSITORY; provenance is per-ROLE, and the two diverge mid-boot.
+
+    The 35B serves its weights and its tokenizer from ONE unpinned repository. If that repository
+    advances between the two downloads a cold boot resolves the weights to commit A, then the
+    tokenizer fetch re-resolves the moving ref and lands B -- and afterwards ``refs/main`` holds
+    only B. Reading that file for both roles records the weights as B, a commit they never came
+    from, and nothing downstream can tell it from correct provenance: the publication gate only
+    checks that a commit is PRESENT, and the cross-bucket check only compares identities that are
+    wrong in the same way.
+
+    A snapshot directory contains exactly the files its own download fetched, so it answers the
+    per-role question the shared ref cannot. This reproduces the split directly.
+    """
+    from flash.serving.bench import probe as probe_module
+
+    older = "1111111111111111111111111111111111111111"
+    newer = "2222222222222222222222222222222222222222"
+
+    with tempfile.TemporaryDirectory() as cache:
+        repos = {
+            role: entry["repo"]
+            for role, entry in probe_module.probe_resolved_revisions("Qwen/Qwen3.6-35B-A3B").items()
+        }
+        assert repos["model"] == repos["tokenizer"], (
+            "the 35B no longer shares one repository across roles, so this race needs rechecking"
+        )
+        root = Path(cache) / f"models--{repos['model'].replace('/', '--')}"
+
+        # The weights landed in the OLDER snapshot; the tokenizer fetch then advanced the ref.
+        model_snapshot = root / "snapshots" / older
+        model_snapshot.mkdir(parents=True)
+        (model_snapshot / "config.json").write_text("{}")
+        tokenizer_snapshot = root / "snapshots" / newer
+        tokenizer_snapshot.mkdir(parents=True)
+        (tokenizer_snapshot / "tokenizer.json").write_text("{}")
+        refs = root / "refs"
+        refs.mkdir(parents=True)
+        (refs / "main").write_text(f"{newer}\n")
+
+        with mock.patch("huggingface_hub.constants.HF_HUB_CACHE", cache):
+            resolved = probe_module.probe_resolved_revisions("Qwen/Qwen3.6-35B-A3B")
+
+    assert resolved["model"]["commit"] == older, (
+        "the weights were recorded at the commit the TOKENIZER download advanced the ref to, so "
+        "the published curve names a checkpoint its weights never came from"
+    )
+    assert resolved["tokenizer"]["commit"] == newer, "the tokenizer lost its own snapshot"
+    assert resolved["model"]["source"] == "snapshot-contents"
+    assert resolved["model"]["commit"] != resolved["tokenizer"]["commit"], (
+        "the split the race produces was collapsed, so it can no longer be seen at all"
+    )
+
+
+def test_ambiguous_and_missing_snapshots_are_reported_rather_than_guessed() -> None:
+    """A commit must never be invented, and a genuinely ambiguous cache must say so.
+
+    Re-downloading a repository leaves several snapshots holding the same role, which is ordinary:
+    when the ref names one of them it is still the authority. When it does not -- the ref points at
+    a tree this role was never downloaded into -- the cache cannot say which snapshot was loaded,
+    and reporting a definite-looking commit there would be exactly the false confidence the
+    per-role read exists to remove.
+    """
+    from flash.serving.bench import probe as probe_module
+
+    first = "1111111111111111111111111111111111111111"
+    second = "2222222222222222222222222222222222222222"
+    elsewhere = "3333333333333333333333333333333333333333"
+    repo = probe_module.probe_resolved_revisions("Qwen/Qwen3.5-9B")["model"]["repo"]
+
+    def _cache_with(ref_commit: str) -> Any:
+        cache = tempfile.mkdtemp()
+        root = Path(cache) / f"models--{repo.replace('/', '--')}"
+        for commit in (first, second):
+            snapshot = root / "snapshots" / commit
+            snapshot.mkdir(parents=True)
+            (snapshot / "config.json").write_text("{}")
+        (root / "refs").mkdir(parents=True)
+        (root / "refs" / "main").write_text(f"{ref_commit}\n")
+        return cache
+
+    # The ref names one of the snapshots holding the role: ordinary, and the ref is authoritative.
+    with mock.patch("huggingface_hub.constants.HF_HUB_CACHE", _cache_with(second)):
+        commit, source = probe_module._local_snapshot_commit(repo, None, "model")
+    assert (commit, source) == (second, "local-cache-ref")
+
+    # The ref points where this role was never downloaded: the ambiguity must be visible.
+    with mock.patch("huggingface_hub.constants.HF_HUB_CACHE", _cache_with(elsewhere)):
+        commit, source = probe_module._local_snapshot_commit(repo, None, "model")
+    assert source == "snapshot-contents-ambiguous", (
+        "an unresolvable cache reported a commit as though it were certain"
+    )
+
+    # And the publication gate must refuse it. A guess that reaches the artifact reads exactly like
+    # a resolved commit, so presence alone is not the bar.
+    namespace = _bench_namespace("_require_resolved_checkpoint")
+    ambiguous = {
+        "resolved_revisions": {
+            "model": {"repo": repo, "commit": first, "source": "snapshot-contents-ambiguous"},
+            "tokenizer": {"repo": repo, "commit": first, "source": "snapshot-contents"},
+        }
+    }
+    with pytest.raises(RuntimeError, match="could not be resolved to one snapshot"):
+        namespace["_require_resolved_checkpoint"](ambiguous, "canary")
+
+    # A pin that is already a hash needs no cache at all, and an empty cache invents nothing.
+    with (
+        tempfile.TemporaryDirectory() as empty,
+        mock.patch("huggingface_hub.constants.HF_HUB_CACHE", empty),
+    ):
+        assert probe_module._local_snapshot_commit(repo, None, "model") == (None, None)
+        pinned = "0123456789abcdef0123456789abcdef01234567"
+        assert probe_module._local_snapshot_commit(repo, pinned, "model") == (
+            pinned,
+            "pinned-hash",
         )
 
 

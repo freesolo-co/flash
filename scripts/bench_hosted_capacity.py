@@ -388,7 +388,6 @@ async def _ensure_warm(engine: Any) -> dict[str, Any] | None:
     # the same check the canary gate applies rather than being trusted because the canary passed on
     # a DIFFERENT container.
     _require_healthy_warmup(warm, "replacement-container")
-    engine._bench_warmed = True
     return warm
 
 
@@ -400,8 +399,6 @@ async def _run_warmup(engine: Any, requests: int) -> dict[str, Any]:
     from flash.serving.bench.workload import BUCKETS_BY_NAME, fit_prompt_to_tokens
 
     bucket = BUCKETS_BY_NAME["short_interactive"]
-    # This container has now paid its one-time costs, so a bucket landing here need not repeat them.
-    engine._bench_warmed = True
     origin = time.monotonic()
     out = []
     exact = 0
@@ -441,6 +438,15 @@ async def _run_warmup(engine: Any, requests: int) -> dict[str, Any]:
             expected_prompt_tokens=exact,
         )
         out.append(record.to_json())
+    # Marked HERE, after the requests ran, and only when they all succeeded. Set before the loop it
+    # recorded intent rather than outcome: a warmup that returned failed records -- or raised part
+    # way, since `fitting_watchdog` and the request bound both raise -- still left the container
+    # flagged warm. `_ensure_warm` rejects that attempt, but the flag outlives the rejection, so a
+    # retry inside the scaledown window short-circuits at the flag check and measures on a container
+    # whose generation path was never proven. Every caller reads the same flag, so the one place
+    # that knows whether the warmup actually worked is the one place that sets it.
+    if out and all(record.get("ok") for record in out):
+        engine._bench_warmed = True
     return {"warmups": out, "assembled_prompt_tokens": exact}
 
 
@@ -660,6 +666,17 @@ def _require_resolved_checkpoint(probe: dict[str, Any], where: str) -> None:
     resolved = probe.get("resolved_revisions") or {}
     for role in ("model", "tokenizer"):
         entry = resolved.get(role) or {}
+        # An AMBIGUOUS commit is refused as firmly as a missing one. The probe reports that source
+        # when several cached snapshots hold this role and the repository ref names none of them,
+        # so the commit it returns is a best guess at which tree was loaded. A guess that reaches
+        # the artifact is indistinguishable from a resolved commit downstream, which is the one
+        # failure this gate exists to prevent -- a curve that cannot truthfully name its weights.
+        if entry.get("source") == "snapshot-contents-ambiguous":
+            raise RuntimeError(
+                f"{where}: {role} checkpoint for {entry.get('repo')!r} could not be resolved to one "
+                f"snapshot (candidate {entry.get('commit')!r} is a guess); refusing to publish a "
+                "measurement whose weights cannot be named with certainty"
+            )
         if entry.get("commit"):
             continue
         reason = str(entry.get("reason") or "probe recorded no reason")

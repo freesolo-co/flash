@@ -26,6 +26,7 @@ import inspect
 import json
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -347,21 +348,58 @@ def probe_engine_kv_cache(engine: Any) -> dict[str, Any]:
     return out
 
 
-def _local_snapshot_commit(repo: str, revision: str | None) -> tuple[str | None, str | None]:
-    """The commit hash of the locally cached snapshot for ``repo``, and how it was determined.
+# The files whose presence identifies a snapshot as holding a given role's artifacts. A snapshot
+# directory contains exactly the files THAT download fetched, so these markers are what distinguish
+# the tree the weights came from from the tree the tokenizer came from when the two differ.
+_ROLE_MARKERS: dict[str, tuple[str, ...]] = {
+    "model": ("config.json", "model.safetensors", "model.safetensors.index.json"),
+    "tokenizer": ("tokenizer.json", "tokenizer_config.json"),
+    "processor": ("preprocessor_config.json", "processor_config.json"),
+}
 
-    Two shapes, in order of authority:
+
+def _snapshots_holding(root: Path, role: str) -> list[str]:
+    """Commits whose cached snapshot actually contains ``role``'s files, newest mtime last."""
+    snapshots = root / "snapshots"
+    if not snapshots.is_dir():
+        return []
+    markers = _ROLE_MARKERS.get(role, ())
+    found = [
+        entry
+        for entry in snapshots.iterdir()
+        if entry.is_dir() and any((entry / marker).exists() for marker in markers)
+    ]
+    return [entry.name for entry in sorted(found, key=lambda e: e.stat().st_mtime)]
+
+
+def _local_snapshot_commit(
+    repo: str, revision: str | None, role: str = "model"
+) -> tuple[str | None, str | None]:
+    """The commit of the cached snapshot ``role`` was actually loaded from, and how it was found.
+
+    Three shapes, in order of authority:
 
     * a pinned revision that is already a 40-character hash IS the commit, and the snapshot
       directory's existence confirms the engine loaded that exact tree;
-    * otherwise the cache's `refs/<revision>` file records the commit the last download resolved to,
-      which is what the running engine is holding.
+    * otherwise the snapshot directory that CONTAINS this role's files names the commit that role
+      came from;
+    * otherwise the cache's `refs/<revision>` file records the commit the last download resolved to.
 
-    Returns `(None, None)` when neither is available. A missing snapshot must not fall back to a Hub
+    The middle shape exists because `refs/<revision>` is per-REPOSITORY while provenance is
+    per-ROLE. An unpinned repository that advances mid-boot is downloaded twice -- weights resolve
+    to commit A, then the tokenizer fetch re-resolves the moving ref and lands B -- and the ref file
+    afterwards holds only B. Reading it for both roles records the weights as B as well: a commit
+    the weights never came from, on the one hosted model whose model and tokenizer share a single
+    unpinned repository, and it is indistinguishable from correct provenance downstream. A snapshot
+    directory holds exactly the files its own download fetched, so asking which snapshot contains
+    this role's files answers the per-role question the ref file cannot.
+
+    Ambiguity is reported, never guessed: when several snapshots hold the role and none is the ref,
+    the source records that rather than picking one.
+
+    Returns `(None, None)` when nothing is available. A missing snapshot must not fall back to a Hub
     lookup: the whole point is to report what this container loaded, and the Hub cannot answer that.
     """
-    from pathlib import Path
-
     from huggingface_hub.constants import HF_HUB_CACHE
 
     ref = revision or "main"
@@ -370,10 +408,23 @@ def _local_snapshot_commit(repo: str, revision: str | None) -> tuple[str | None,
 
     root = Path(HF_HUB_CACHE) / f"models--{repo.replace('/', '--')}"
     ref_file = root / "refs" / ref
+    ref_commit = ""
     if ref_file.is_file():
-        commit = ref_file.read_text().strip()
-        if commit:
-            return commit, "local-cache-ref"
+        ref_commit = ref_file.read_text().strip()
+
+    holders = _snapshots_holding(root, role)
+    if len(holders) == 1:
+        return holders[0], "snapshot-contents"
+    if holders:
+        # Several snapshots carry this role. If the ref is among them the repository simply has
+        # older trees cached and the ref still names the current one; otherwise the ref points
+        # somewhere this role was never downloaded to, so report the ambiguity instead of choosing.
+        if ref_commit and ref_commit in holders:
+            return ref_commit, "local-cache-ref"
+        return holders[-1], "snapshot-contents-ambiguous"
+
+    if ref_commit:
+        return ref_commit, "local-cache-ref"
     return None, None
 
 
@@ -415,7 +466,7 @@ def probe_resolved_revisions(base_model: str) -> dict[str, Any]:
     for role, (repo, revision) in targets.items():
         entry: dict[str, Any] = {"repo": repo, "pinned": revision}
         try:
-            commit, source = _local_snapshot_commit(repo, revision)
+            commit, source = _local_snapshot_commit(repo, revision, role)
             entry["commit"] = commit
             entry["source"] = source
             if commit is None:
