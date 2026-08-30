@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -52,6 +53,11 @@ from flash.serving.bench.workload import (
 # Sized well above the near-32k prefill so a slow-but-working request is never miscounted as a
 # failure; the point is to bound a hung cell, not to trim the tail.
 REQUEST_TIMEOUT_SECONDS = 900.0
+
+# How long a cancelled-but-unfinished task is given to actually die. Small relative to the drain
+# allowance: by this point the request has already exceeded REQUEST_TIMEOUT_SECONDS and been
+# cancelled, so this covers cleanup, not work.
+_DRAIN_REAP_SECONDS = 30.0
 
 
 def base_model_record(base_model: str) -> dict[str, Any]:
@@ -329,6 +335,74 @@ def prompt_fit_seconds_bound(bucket: Bucket, *, min_requests: int | None = None)
     return prompts * _PROMPT_FIT_MAX_ITERATIONS * per_call
 
 
+_FITTING_WATCHDOG_GRACE_SECONDS = 30.0
+_fitting_watchdog: threading.Timer | None = None
+
+
+def _fitting_overrun(label: str, bound: float) -> None:
+    """End the container when a single fitting call has run past the bound that funded it."""
+    print(
+        f"[bench] prompt fitting for {label} blocked past its reserved {bound:.0f}s bound inside a "
+        f"single tokenizer call; ending the container rather than billing past the reservation",
+        flush=True,
+    )
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(75)
+
+
+def _arm_fitting_watchdog(bound: float, *, label: str) -> None:
+    """Arm a timer that can end the container from OUTSIDE a blocked tokenizer call.
+
+    The per-prompt deadline check below cannot fire while a fit is executing: `fit_prompt_to_tokens`
+    calls into the tokenizer, which for the fast tokenizers is a Rust extension holding the GIL for
+    the duration. A call that blocks -- or merely starts just under the deadline and runs long, which
+    is likeliest on the final `near_32k` entry -- never returns control to the loop, so the deadline
+    is checked again only after the overrun it exists to prevent. Meanwhile the container keeps
+    billing against the class-wide `TIMEOUT_SECONDS`, which is sized for the largest bucket and is
+    therefore far more GPU time than a short lane reserved.
+
+    A timer thread is the enforcement that survives that: it is not scheduled by the blocked thread,
+    so it fires regardless of what the tokenizer is doing. It ends the process rather than raising
+    for the same reason the loop guard does -- an exception cannot even be delivered into a thread
+    stuck in a C call, and the container is still billing either way.
+
+    The grace period covers the case where the LAST call starts legitimately just inside the bound:
+    without it the watchdog would kill a lane whose fitting was about to complete on time.
+    """
+    global _fitting_watchdog
+    _disarm_fitting_watchdog()
+    timer = threading.Timer(
+        bound + _FITTING_WATCHDOG_GRACE_SECONDS, _fitting_overrun, (label, bound)
+    )
+    timer.daemon = True
+    timer.start()
+    _fitting_watchdog = timer
+
+
+def _disarm_fitting_watchdog() -> None:
+    global _fitting_watchdog
+    if _fitting_watchdog is not None:
+        _fitting_watchdog.cancel()
+        _fitting_watchdog = None
+
+
+@contextlib.contextmanager
+def fitting_watchdog(bound: float, *, label: str) -> Any:
+    """Scope a fitting watchdog around any synchronous fit, not just the cell pool.
+
+    The warmup fits its prompts the same way a cell does, but OUTSIDE `run_request`, so the request
+    timeout that bounds every other generation never applies to it. Both estimators price a warmup
+    at exactly `REQUEST_TIMEOUT_SECONDS`; a tokenizer stalling there kept `certify`/`run_bucket`
+    alive to the class timeout instead, billing GPU-seconds no reservation covered.
+    """
+    _arm_fitting_watchdog(bound, label=label)
+    try:
+        yield
+    finally:
+        _disarm_fitting_watchdog()
+
+
 def _build_prompt_pool(
     tokenizer: Any,
     bucket: Bucket,
@@ -371,7 +445,9 @@ def _build_prompt_pool(
     # `TIMEOUT_SECONDS` -- which for a short-only sweep is sized for `near_32k`, i.e. far more GPU
     # time than this lane reserved. Checked per prompt because that is the only point the loop
     # yields: a single blocked tokenizer call is a C call Python cannot interrupt.
-    deadline = time.monotonic() + prompt_fit_seconds_bound(bucket, min_requests=min_requests)
+    bound = prompt_fit_seconds_bound(bucket, min_requests=min_requests)
+    deadline = time.monotonic() + bound
+    _arm_fitting_watchdog(bound, label=f"{bucket.name} pool")
     for index in range(size):
         if time.monotonic() > deadline:
             # Ends the process rather than raising, matching `_probe_in_container_within_bound`. A
@@ -396,6 +472,7 @@ def _build_prompt_pool(
             corpus=corpus_seed(bucket.name, block, index),
         )
         pool.append((uid, messages, exact))
+    _disarm_fitting_watchdog()
     return pool
 
 
@@ -431,8 +508,25 @@ async def _drain(
     for task in still_pending:
         task.cancel()
     for task in still_pending:
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
+        # Bounded. `Task.cancel()` only REQUESTS cancellation: if the engine's stream does not
+        # cooperate -- an async-generator close blocked in a backend call, say -- an unbounded
+        # `await task` sits here until the class-wide method timeout kills the container, losing the
+        # whole bucket artifact this drain exists to preserve. The reap gets a slice of the same
+        # allowance the sweep already reserved for the drain.
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
+            await asyncio.wait_for(asyncio.shield(task), timeout=_DRAIN_REAP_SECONDS)
+        if not task.done():
+            # The record below is still appended, so the request keeps its place in the attempt
+            # denominator; what is unrecoverable is the container, which now holds a task pinned
+            # inside the engine and would contaminate every later cell on it.
+            print(
+                f"[bench] {bucket} c={concurrency} left an uncancellable request after "
+                f"{_DRAIN_REAP_SECONDS:.0f}s; ending the container rather than measuring around it",
+                flush=True,
+            )
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(75)
         # `started_at` is REQUIRED and has no default. Omitting it raised TypeError here, which
         # aborted the whole bucket and discarded every record accumulated during the expensive
         # sweep -- the exact loss this drain exists to prevent. The task's own start offset is
@@ -494,6 +588,88 @@ def _prompt_issuer(
     return _next_prompt
 
 
+_CONCLUSIVE_FAILURE_ATTEMPTS = 64
+
+
+def _cell_is_conclusively_failed(records: list[RequestRecord]) -> bool:
+    """True once enough attempts have failed outright that more would add nothing.
+
+    Deliberately requires a floor of attempts rather than tripping on the first errors: a cell that
+    is merely overloaded produces a MIX, and its error rate is the measurement. What this catches is
+    the degenerate case -- many attempts, zero successes -- where the cell's verdict is already
+    fixed and every further respawn only inflates the artifact.
+
+    Not a substitute for the error rate. The records collected so far are still reduced and
+    reported, so the failed cell appears in the curve as a failed cell.
+    """
+    if len(records) < _CONCLUSIVE_FAILURE_ATTEMPTS:
+        return False
+    return not any(record.error is None for record in records)
+
+
+def _make_spawner(
+    engine: Any,
+    tokenizer: Any,
+    base_model: str,
+    bucket: Bucket,
+    *,
+    concurrency: int,
+    block: int,
+    min_requests: int,
+    invocation: str,
+) -> tuple[float, Callable[[], asyncio.Task[RequestRecord]], dict[Any, float], dict[Any, str]]:
+    """A launcher for one cell's requests, plus the books the drain needs to account for them.
+
+    Fitting is repeated synchronous tokenization. Done lazily it would run ON the event loop: the
+    first ``concurrency`` fits land inside the measured window as idle wall time, and every
+    replacement fit blocks consumption of the OTHER in-flight streams, inflating their TTFT and
+    latency. At 8k and 31k input that distortion is larger than the effect being measured. So the
+    whole pool is built HERE, and the cell's clock starts only AFTER it -- hence the returned
+    ``origin``. Starting the clock first would charge the cell's ``max_seconds`` for tokenization
+    that deliberately happens outside the measured window, shortening a near-32k window by minutes.
+
+    ``spawned_at`` and ``spawned_uid`` are returned rather than kept private because a request that
+    never finishes has no record of its own: the drain reconstructs one from these, and a task
+    missing from them would silently vanish from the attempt denominator.
+    """
+    _next_prompt = _prompt_issuer(
+        tokenizer,
+        bucket,
+        concurrency=concurrency,
+        block=block,
+        min_requests=min_requests,
+        invocation=invocation,
+    )
+    # The measured window opens HERE, after every prompt is fitted.
+    origin = time.monotonic()
+    spawned_at: dict[Any, float] = {}
+    spawned_uid: dict[Any, str] = {}
+
+    def _spawn() -> asyncio.Task[RequestRecord]:
+        uid, messages, exact = _next_prompt()
+        started_at = time.monotonic() - origin
+        task = asyncio.create_task(
+            run_request(
+                engine,
+                base_model,
+                messages,
+                bucket.max_output_tokens,
+                uid,
+                bucket=bucket.name,
+                concurrency=concurrency,
+                block=block,
+                origin=origin,
+                expected_prompt_tokens=exact,
+                bucket_target_tokens=bucket.target_input_tokens,
+            )
+        )
+        spawned_at[task] = started_at
+        spawned_uid[task] = uid
+        return task
+
+    return origin, _spawn, spawned_at, spawned_uid
+
+
 async def run_cell(
     engine: Any,
     tokenizer: Any,
@@ -524,45 +700,17 @@ async def run_cell(
 
     records: list[RequestRecord] = []
 
-    # Fitting is repeated synchronous tokenization. Done lazily it would run ON the event loop: the
-    # first `concurrency` fits land inside the measured window as idle wall time, and every
-    # replacement fit blocks consumption of the OTHER in-flight streams, inflating their TTFT and
-    # latency. At 8k and 31k input that distortion is larger than the effect being measured. So the
-    # whole pool is built BEFORE the clock starts, and the measured loop only pops from it.
-    _next_prompt = _prompt_issuer(
+    # `origin` comes back from the spawner because the clock starts AFTER the pool is fitted.
+    origin, _spawn, spawned_at, spawned_uid = _make_spawner(
+        engine,
         tokenizer,
+        base_model,
         bucket,
         concurrency=concurrency,
         block=block,
         min_requests=min_requests,
         invocation=invocation,
     )
-
-    origin = time.monotonic()
-    spawned_at: dict[asyncio.Task[RequestRecord], float] = {}
-    spawned_uid: dict[asyncio.Task[RequestRecord], str] = {}
-
-    def _spawn() -> asyncio.Task[RequestRecord]:
-        uid, messages, exact = _next_prompt()
-        started_at = time.monotonic() - origin
-        task = asyncio.create_task(
-            run_request(
-                engine,
-                base_model,
-                messages,
-                bucket.max_output_tokens,
-                uid,
-                bucket=bucket.name,
-                concurrency=concurrency,
-                block=block,
-                origin=origin,
-                expected_prompt_tokens=exact,
-                bucket_target_tokens=bucket.target_input_tokens,
-            )
-        )
-        spawned_at[task] = started_at
-        spawned_uid[task] = uid
-        return task
 
     in_flight = {_spawn() for _ in range(concurrency)}
     # Set when the steady-state window closes, BEFORE draining. See the wall-clock note below.
@@ -585,6 +733,20 @@ async def run_cell(
             elapsed = time.monotonic() - origin
             enough = len(records) >= min_requests and elapsed >= min_seconds
             if enough or elapsed >= max_seconds:
+                break
+            if _cell_is_conclusively_failed(records):
+                # A dead engine fails `_stream_generate` immediately, so every replacement completes
+                # as an error at once and the loop becomes a tight respawn against `min_seconds`.
+                # Self-healing is deliberately disabled, so nothing interrupts it: the cell
+                # accumulates hundreds of thousands of records and an artifact large enough to
+                # exhaust memory, destroying the evidence of the failure it already established.
+                # The result is conclusive long before the floor -- keep it and stop.
+                print(
+                    f"[bench] {bucket.name} c={concurrency} failed "
+                    f"{len(records)}/{len(records)} requests with no successes; ending the cell "
+                    f"rather than respawning against its time floor",
+                    flush=True,
+                )
                 break
             for _ in done:
                 in_flight.add(_spawn())
@@ -648,6 +810,7 @@ async def run_cell(
 __all__ = [
     "REQUEST_TIMEOUT_SECONDS",
     "base_model_record",
+    "fitting_watchdog",
     "prompt_fit_seconds_bound",
     "run_cell",
     "run_request",

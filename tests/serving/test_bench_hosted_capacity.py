@@ -17,7 +17,9 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import textwrap
+import time
 import tomllib
 import types
 import uuid
@@ -1000,14 +1002,24 @@ def test_a_drained_request_records_a_timeout_instead_of_raising() -> None:
 def test_prompts_are_fitted_before_the_clock_starts() -> None:
     """Fitting is repeated synchronous tokenization. On the event loop it blocks other in-flight
     streams and inflates their TTFT, which at 31k input exceeds the effect being measured."""
-    # `run_cell` builds the pool through `_prompt_issuer`, which fits every prompt eagerly and
-    # returns a callable that only pops. The ordering assertion is against run_cell; the "no fitting
-    # after the clock starts" assertion has to cover both, since the pop lives in the helper.
-    source = inspect.getsource(run_cell)
+    # `_make_spawner` builds the pool through `_prompt_issuer`, which fits every prompt eagerly,
+    # and only then starts the clock it returns -- so the ordering assertion is against the spawner.
+    # `run_cell` takes `origin` FROM it rather than starting its own, which is what keeps the two
+    # in that order; a `run_cell` that stamped its own origin could open the window before fitting.
+    from flash.serving.bench.driver import _make_spawner
+
+    source = inspect.getsource(_make_spawner)
     pool_at = source.index("_prompt_issuer(")
     origin_at = source.index("origin = time.monotonic()")
     assert pool_at < origin_at, "prompt pool must be built before the measured window opens"
     assert "fit_prompt_to_tokens" not in source[origin_at:], "fitting leaked into the measured loop"
+
+    cell = inspect.getsource(run_cell)
+    assert "origin, _spawn" in cell, "run_cell does not take its clock from the fitted pool"
+    assert "origin = time.monotonic()" not in cell, (
+        "run_cell stamps its own origin, so the window can open before the pool is fitted"
+    )
+    assert "fit_prompt_to_tokens" not in cell, "fitting leaked into the measured loop"
 
     issuer = inspect.getsource(_prompt_issuer)
     handout = issuer[issuer.index("def _next_prompt") :]
@@ -1094,7 +1106,12 @@ def test_a_cell_that_outruns_its_pool_reseeds_instead_of_reusing_a_prompt() -> N
     issuer = inspect.getsource(_prompt_issuer)
     nxt = issuer[issuer.index("def _next_prompt") :]
     assert "reseed_prompt(" in nxt, "the wrap path re-sends a pooled prompt instead of reseeding it"
-    assert "_prompt_issuer(" in inspect.getsource(run_cell), "run_cell bypasses the issuer"
+    from flash.serving.bench.driver import _make_spawner
+
+    assert "_prompt_issuer(" in inspect.getsource(_make_spawner), (
+        "the spawner run_cell uses bypasses the issuer"
+    )
+    assert "_make_spawner(" in inspect.getsource(run_cell), "run_cell bypasses the spawner"
 
 
 def test_no_ttfa_is_published_because_the_raw_stream_cannot_measure_it() -> None:
@@ -1447,9 +1464,13 @@ def test_a_prompt_the_engine_sized_differently_is_rejected_not_averaged_in() -> 
     _validate(outcome, ok_record)
     assert ok_record.ok is True
 
-    # And the driver actually supplies the expectation rather than discarding it.
-    source = inspect.getsource(run_cell)
-    assert "expected_prompt_tokens=exact" in source, "the fitted length is discarded at spawn"
+    # And the driver actually supplies the expectation rather than discarding it. The spawn lives
+    # in `_make_spawner`, which is the only place `run_cell` creates requests from.
+    from flash.serving.bench.driver import _make_spawner
+
+    assert "expected_prompt_tokens=exact" in inspect.getsource(_make_spawner), (
+        "the fitted length is discarded at spawn"
+    )
 
 
 def test_the_reservation_prices_a_sweep_from_its_buckets_own_bounds() -> None:
@@ -1627,11 +1648,15 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     # The estimator now resolves the catalog and grid from module scope rather than local imports,
     # so the lifted function needs them supplied.
     namespace: dict = dict(constants)
+    # Derived from real bench code rather than transcribed, so a change to how the script bounds a
+    # warmup fit still moves this expectation.
+    warmup_fit = prompt_fit_seconds_bound(BUCKETS_BY_NAME["short_interactive"], min_requests=1)
     namespace.update(
         bench_engine_overrides_for=bench_engine_overrides_for,
         concurrency_grid=concurrency_grid,
         prompt_fit_seconds_bound=prompt_fit_seconds_bound,
         REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
+        WARMUP_FIT_SECONDS_BOUND=warmup_fit,
     )
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "<bench>", "exec"), namespace)
     estimate_for = namespace["_sweep_gpu_seconds_estimate"]
@@ -1644,7 +1669,10 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     # Billed on the container but outside every `max_seconds`, so it is reserved separately.
     fitting = prompt_fit_seconds_bound(bucket) * points
     drains = REQUEST_TIMEOUT_SECONDS * points
-    canary = REQUEST_TIMEOUT_SECONDS * constants["CANARY_WARMUP_REQUESTS"]
+    # Each warmup pays its fit as well as its request: the fit runs outside `run_request` and is
+    # billed on the same container, so pricing a warmup at the request timeout alone left an
+    # enforced-but-unfunded phase.
+    canary = (REQUEST_TIMEOUT_SECONDS + warmup_fit) * constants["CANARY_WARMUP_REQUESTS"]
     startup = constants["STARTUP_TIMEOUT_SECONDS"]
     # `max_containers=1` caps SIMULTANEOUS replicas; it does not pin successive `.remote()` calls to
     # one container. Every bucket call can therefore land on a cold replacement and pay another boot
@@ -1657,6 +1685,9 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     # The canary's probe plus one per bucket: `_run_bucket` gates the container it measured on, and
     # each probe is bounded by `PROBE_TIMEOUT_SECONDS` rather than the class method timeout.
     probes = constants["PROBE_TIMEOUT_SECONDS"] * 2
+    # `min_containers=0` does not release the GPU at the last return -- each separately bootable
+    # call can leave a container alive and billing for its whole scaledown window.
+    scaledown = float(constants["SCALEDOWN_WINDOW_SECONDS"]) * 2
 
     assert estimate >= windows + drains + canary, (
         "the estimate omits the canary or the per-cell drain tails"
@@ -1671,6 +1702,7 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
         + fitting
         + drains
         + replacements
+        + scaledown
     )
 
 
@@ -1731,7 +1763,17 @@ def _bench_namespace(*names: str, **injected: Any) -> dict[str, Any]:
     body = [node for node in tree.body if _defines(node) & wanted]
     missing = wanted - {name for node in body for name in _defines(node)}
     assert not missing, f"the bench script no longer defines {sorted(missing)}"
-    namespace: dict[str, Any] = {"Any": Any, "uuid": uuid, **injected}
+    # `WARMUP_FIT_SECONDS_BOUND` is a module-level assignment whose RHS calls into the bench
+    # package, so lifting that node requires its dependencies in scope. Provided here rather than at
+    # each call site: the value is derived from real bench code either way, so the test still fails
+    # if the script changes how the bound is computed.
+    namespace: dict[str, Any] = {
+        "Any": Any,
+        "uuid": uuid,
+        "BUCKETS_BY_NAME": BUCKETS_BY_NAME,
+        "prompt_fit_seconds_bound": prompt_fit_seconds_bound,
+        **injected,
+    }
     exec(compile(ast.Module(body=body, type_ignores=[]), "<bench>", "exec"), namespace)
     return namespace
 
@@ -1750,6 +1792,8 @@ def test_bench_container_timeout_covers_the_whole_grid_it_runs() -> None:
         "TIMEOUT_HEADROOM_SECONDS",
         "TIMEOUT_SECONDS",
         "CANARY_WARMUP_REQUESTS",
+        "WARMUP_FIT_SECONDS_BOUND",
+        "SCALEDOWN_WINDOW_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
         BENCH_MODELS=BENCH_MODELS,
         bench_engine_overrides_for=bench_engine_overrides_for,
@@ -1818,7 +1862,8 @@ def test_warmup_prompts_are_unique_across_invocations() -> None:
     def _fake_fit(tokenizer: Any, uid: str, target: int) -> tuple[list[dict[str, str]], int]:
         return ([{"role": "user", "content": uid}], target)
 
-    namespace = _bench_namespace("_run_warmup")
+    # `_run_warmup` now bounds its own prompt fit, so the lifted function needs that bound.
+    namespace = _bench_namespace("_run_warmup", WARMUP_FIT_SECONDS_BOUND=_WARMUP_FIT_BOUND)
     engine = mock.Mock(tokenizer=object(), base_model="Qwen/Qwen3.5-9B")
     with (
         mock.patch("flash.serving.bench.driver.run_request", _fake_run_request),
@@ -1853,6 +1898,8 @@ def test_a_cold_replacement_container_checks_its_own_warmup_health() -> None:
         "_ensure_warm",
         "_require_healthy_warmup",
         "CANARY_WARMUP_REQUESTS",
+        "WARMUP_FIT_SECONDS_BOUND",
+        "SCALEDOWN_WINDOW_SECONDS",
         _run_warmup=_fake_run_warmup,
     )
     namespace["_run_warmup"] = _fake_run_warmup
@@ -1890,6 +1937,8 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
         "_canary_gpu_seconds_estimate",
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
+        "WARMUP_FIT_SECONDS_BOUND",
+        "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
         bench_engine_overrides_for=bench_engine_overrides_for,
@@ -1899,6 +1948,11 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
     )
     startup = namespace["STARTUP_TIMEOUT_SECONDS"]
     warmups = namespace["CANARY_WARMUP_REQUESTS"]
+    # A warmup bills its prompt fit as well as its request: the fit runs outside `run_request`, on
+    # the same rented container, and is the bound the fitting watchdog kills at.
+    per_warmup = REQUEST_TIMEOUT_SECONDS + namespace["WARMUP_FIT_SECONDS_BOUND"]
+    # The container keeps billing through its scaledown window after the last call returns.
+    scaledown = float(namespace["SCALEDOWN_WINDOW_SECONDS"])
 
     canary = namespace["_canary_gpu_seconds_estimate"]()
     # ONE boot: `certify.remote()` probes and warms the same container in a single call, so a
@@ -1906,8 +1960,9 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
     # The probe is still reserved: it runs inside that call, AFTER `@enter`, so it is billed on top
     # of the boot rather than overlapping it, and it is bounded so a stall cannot reach the class
     # method timeout.
-    assert canary == startup * 1 + namespace["PROBE_TIMEOUT_SECONDS"] + (
-        REQUEST_TIMEOUT_SECONDS * warmups
+    assert (
+        canary
+        == startup * 1 + namespace["PROBE_TIMEOUT_SECONDS"] + (per_warmup * warmups) + scaledown
     )
     assert canary >= startup, "the canary reserves less than a stuck boot alone would bill"
 
@@ -1918,7 +1973,7 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
         startup
         # No second canary boot: `certify.remote()` probes and warms one container, so there is no
         # gap between two calls for a replacement to land in.
-        + REQUEST_TIMEOUT_SECONDS * warmups
+        + per_warmup * warmups
         + bucket.max_seconds * points
         # Prompt fitting runs on the rented container before each cell's window opens, so it is
         # billed even though it is deliberately outside `max_seconds`.
@@ -1926,9 +1981,11 @@ def test_both_lane_estimates_reserve_a_boot_at_the_ceiling_modal_allows() -> Non
         + REQUEST_TIMEOUT_SECONDS * points
         # one replacement boot + warmup per bucket call, since `max_containers=1` does not pin
         # successive `.remote()` calls to the container the previous bucket booted
-        + (startup + REQUEST_TIMEOUT_SECONDS * warmups) * 1
+        + (startup + per_warmup * warmups) * 1
         # the canary's probe plus one per bucket: `_run_bucket` gates the container it measures on
         + namespace["PROBE_TIMEOUT_SECONDS"] * 2
+        # one scaledown tail per separately bootable call
+        + scaledown * 2
     )
     assert sweep == expected
     assert sweep - canary >= bucket.max_seconds * points, "the sweep does not price its own cells"
@@ -1950,6 +2007,8 @@ def test_documented_ceilings_exceed_what_each_lane_reserves() -> None:
         "_canary_gpu_seconds_estimate",
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
+        "WARMUP_FIT_SECONDS_BOUND",
+        "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
         bench_engine_overrides_for=bench_engine_overrides_for,
@@ -2349,17 +2408,26 @@ def test_prompt_fit_seconds_bound_scales_with_input_size_and_depth():
     assert near > short
 
 
+# The script's own warmup-fit bound, computed from real bench code so a change to how the script
+# bounds a single-prompt fit still moves every expectation derived from it.
+_WARMUP_FIT_BOUND = prompt_fit_seconds_bound(BUCKETS_BY_NAME["short_interactive"], min_requests=1)
+
+
 def test_sweep_estimate_includes_prompt_fitting():
     """R7: the reservation must exceed the same sweep priced without the fitting term."""
     namespace = _bench_namespace(
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
+        "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
         REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
         bench_engine_overrides_for=bench_engine_overrides_for,
         concurrency_grid=concurrency_grid,
         prompt_fit_seconds_bound=prompt_fit_seconds_bound,
+        # Held FIXED on both sides rather than lifted: recomputing it through the stub below would
+        # zero the canary's fitting term too, and the difference would stop isolating cell fitting.
+        WARMUP_FIT_SECONDS_BOUND=_WARMUP_FIT_BOUND,
     )
     model = "Qwen/Qwen3.5-9B"
     selected = [BUCKETS_BY_NAME["near_32k"]]
@@ -2376,12 +2444,14 @@ def test_sweep_estimate_includes_prompt_fitting():
     zeroed = _bench_namespace(
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
+        "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
         REQUEST_TIMEOUT_SECONDS=REQUEST_TIMEOUT_SECONDS,
         bench_engine_overrides_for=bench_engine_overrides_for,
         concurrency_grid=concurrency_grid,
-        prompt_fit_seconds_bound=lambda bucket: 0.0,
+        prompt_fit_seconds_bound=lambda bucket, **kw: 0.0,
+        WARMUP_FIT_SECONDS_BOUND=_WARMUP_FIT_BOUND,
     )["_sweep_gpu_seconds_estimate"](model, selected)
     assert total - zeroed == pytest.approx(fitting)
 
@@ -2485,6 +2555,8 @@ def test_sweep_reserves_one_boot_per_separately_bootable_call() -> None:
     namespace = _bench_namespace(
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
+        "WARMUP_FIT_SECONDS_BOUND",
+        "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
         bench_engine_overrides_for=bench_engine_overrides_for,
@@ -2502,13 +2574,18 @@ def test_sweep_reserves_one_boot_per_separately_bootable_call() -> None:
         windows = sum(float(b.max_seconds) * points for b in selected)
         fitting = sum(prompt_fit_seconds_bound(b) * points for b in selected)
         drains = REQUEST_TIMEOUT_SECONDS * points * count
-        warmups = REQUEST_TIMEOUT_SECONDS * namespace["CANARY_WARMUP_REQUESTS"]
+        # A warmup bills its prompt fit as well as its request; the fit runs outside `run_request`.
+        warmups = (REQUEST_TIMEOUT_SECONDS + namespace["WARMUP_FIT_SECONDS_BOUND"]) * namespace[
+            "CANARY_WARMUP_REQUESTS"
+        ]
         # Boots reserved: initial + canary replacement + one per bucket call.
         boots = startup * (count + 1)
+        # Each separately bootable call can leave a container billing through its scaledown window.
+        scaledown = float(namespace["SCALEDOWN_WINDOW_SECONDS"]) * (count + 1)
         # One bounded probe per bucket call plus the canary's own, each capped by its own bound
         # rather than by the class method timeout.
         probes = namespace["PROBE_TIMEOUT_SECONDS"] * (count + 1)
-        expected = boots + probes + warmups * (count + 1) + windows + fitting + drains
+        expected = boots + probes + warmups * (count + 1) + windows + fitting + drains + scaledown
         assert estimate == pytest.approx(expected), (
             f"{count}-bucket sweep must reserve {count + 1} boots"
         )
@@ -2610,6 +2687,8 @@ def test_the_probe_call_is_bounded_below_the_class_method_timeout() -> None:
         "TIMEOUT_SECONDS",
         "TIMEOUT_HEADROOM_SECONDS",
         "CANARY_WARMUP_REQUESTS",
+        "WARMUP_FIT_SECONDS_BOUND",
+        "SCALEDOWN_WINDOW_SECONDS",
         "_worst_case_bucket_seconds",
         BENCH_MODELS=BENCH_MODELS,
         bench_engine_overrides_for=bench_engine_overrides_for,
@@ -2648,6 +2727,8 @@ def test_the_module_runbook_ceilings_clear_their_own_submission_stop() -> None:
         "_canary_gpu_seconds_estimate",
         "_sweep_gpu_seconds_estimate",
         "CANARY_WARMUP_REQUESTS",
+        "WARMUP_FIT_SECONDS_BOUND",
+        "SCALEDOWN_WINDOW_SECONDS",
         "STARTUP_TIMEOUT_SECONDS",
         "PROBE_TIMEOUT_SECONDS",
         bench_engine_overrides_for=bench_engine_overrides_for,
@@ -3149,39 +3230,320 @@ def test_prompt_fitting_enforces_the_bound_it_reserves() -> None:
 def test_provenance_records_a_resolved_commit_for_unpinned_repositories() -> None:
     """Two of three hosted models pin nothing, so the run must record what it actually loaded.
 
-    Without this an artifact carries a mutable repository name and no commit: once the repository
-    advances, the curve can no longer identify the checkpoint that produced it. A failure to resolve
-    must be recorded with its reason, never invented -- a fabricated hash is worse than none.
+    Resolution reads the DOWNLOADED snapshot, never the Hub. Asking the Hub returns what the
+    repository points at now; for an unpinned repo that advanced between engine init and probe that
+    is false provenance, which is worse than none because it looks authoritative. A failure to
+    resolve must be recorded with its reason, never invented.
     """
     from flash.serving.bench import probe as probe_module
 
     assert "resolved_revisions" in inspect.getsource(probe_module.probe_all), (
         "probe_all does not record resolved revisions"
     )
+    source = inspect.getsource(probe_module.probe_resolved_revisions) + inspect.getsource(
+        probe_module._local_snapshot_commit
+    )
+    # A Hub lookup reports the repository's CURRENT head, not the commit this container loaded.
+    for hub_call in ("HfApi", "model_info"):
+        assert hub_call not in source, f"provenance asks the Hub via {hub_call}"
 
-    class _Info:
-        sha = "0123456789abcdef0123456789abcdef01234567"
+    sha = "0123456789abcdef0123456789abcdef01234567"
 
-    class _Api:
-        def model_info(self, repo: str, revision: str | None = None) -> Any:
-            return _Info()
+    with tempfile.TemporaryDirectory() as cache:
+        repos = {
+            entry["repo"]
+            for entry in probe_module.probe_resolved_revisions("Qwen/Qwen3.5-9B").values()
+        }
+        for repo in repos:
+            refs = Path(cache) / f"models--{repo.replace('/', '--')}" / "refs"
+            refs.mkdir(parents=True, exist_ok=True)
+            (refs / "main").write_text(f"{sha}\n")
 
-    with mock.patch.dict("sys.modules", {"huggingface_hub": mock.MagicMock(HfApi=_Api)}):
-        resolved = probe_module.probe_resolved_revisions("Qwen/Qwen3.5-9B")
+        with mock.patch("huggingface_hub.constants.HF_HUB_CACHE", cache):
+            resolved = probe_module.probe_resolved_revisions("Qwen/Qwen3.5-9B")
+
     assert set(resolved) == {"model", "tokenizer", "processor"}
     for role, entry in resolved.items():
-        assert entry["commit"] == _Info.sha, f"{role} did not record a resolved commit"
+        assert entry["commit"] == sha, f"{role} did not record the snapshot it loaded"
+        assert entry["source"] == "local-cache-ref", f"{role} lost how the commit was determined"
         assert entry["repo"], f"{role} did not record its repository"
         # `pinned` distinguishes a production guarantee from an observation; the 9B pins nothing.
         assert entry["pinned"] is None
 
-    # A hub failure degrades to a recorded reason rather than killing a lane that already paid.
-    class _Broken:
-        def model_info(self, repo: str, revision: str | None = None) -> Any:
-            raise RuntimeError("hub unavailable")
+    # A revision that is ALREADY a hash needs no cache lookup: the pin is the commit, so an empty
+    # cache must still resolve it rather than degrading.
+    commit, how = probe_module._local_snapshot_commit("Qwen/Qwen3.5-9B", sha)
+    assert (commit, how) == (sha, "pinned-hash")
 
-    with mock.patch.dict("sys.modules", {"huggingface_hub": mock.MagicMock(HfApi=_Broken)}):
+    # No snapshot degrades to a recorded reason rather than killing a lane that already paid, and
+    # never to a fabricated hash.
+    with (
+        tempfile.TemporaryDirectory() as empty,
+        mock.patch("huggingface_hub.constants.HF_HUB_CACHE", empty),
+    ):
         degraded = probe_module.probe_resolved_revisions("Qwen/Qwen3.5-9B")
     for role, entry in degraded.items():
         assert entry["commit"] is None, f"{role} invented a commit"
-        assert "hub unavailable" in entry["reason"], f"{role} lost the failure reason"
+        assert entry["reason"], f"{role} lost the failure reason"
+
+
+def test_the_fitting_bound_is_enforced_by_a_timer_off_the_blocked_thread() -> None:
+    """A deadline checked between iterations cannot bound a call that never returns.
+
+    `_build_prompt_pool`'s per-prompt check is the only point its loop yields, and
+    `fit_prompt_to_tokens` calls a Rust tokenizer extension that holds the GIL. A call that blocks --
+    or that merely starts just under the deadline -- never gives the loop a chance to check anything,
+    so the reserved bound is exceeded on a container that is still billing. The enforcement that
+    survives that is a timer scheduled on a DIFFERENT thread, which fires regardless of what the
+    tokenizer is doing.
+    """
+    from flash.serving.bench import driver as driver_module
+
+    source = inspect.getsource(driver_module._arm_fitting_watchdog)
+    assert "threading.Timer" in source, (
+        "the bound is not enforced off the blocked thread, so a stuck tokenizer call outlasts it"
+    )
+    assert "os._exit" in inspect.getsource(driver_module._fitting_overrun), (
+        "the watchdog raises, but an exception cannot be delivered into a thread stuck in a C call"
+    )
+
+    # The timer must outlast the bound it guards, or a final fit that legitimately starts just
+    # inside the bound is killed while doing exactly what it was reserved to do.
+    assert driver_module._FITTING_WATCHDOG_GRACE_SECONDS > 0.0
+
+    fired: list[tuple[str, float]] = []
+    with mock.patch.object(driver_module, "_fitting_overrun", lambda *a: fired.append(a)):
+        driver_module._arm_fitting_watchdog(0.01, label="probe")
+        assert driver_module._fitting_watchdog is not None, "no watchdog was armed"
+        driver_module._disarm_fitting_watchdog()
+        assert driver_module._fitting_watchdog is None, (
+            "the watchdog outlives the fitting it guards"
+        )
+        time.sleep(0.05 + driver_module._FITTING_WATCHDOG_GRACE_SECONDS * 0)
+    assert not fired, "a disarmed watchdog still fired, which would kill a healthy container"
+
+    # Arming twice must not leave the first timer running: it would fire against a bound that is no
+    # longer the one being enforced.
+    driver_module._arm_fitting_watchdog(600.0, label="first")
+    first = driver_module._fitting_watchdog
+    driver_module._arm_fitting_watchdog(600.0, label="second")
+    try:
+        assert driver_module._fitting_watchdog is not first, (
+            "the previous watchdog was not replaced"
+        )
+        first.join(timeout=5.0)
+        assert not first.is_alive(), "a superseded watchdog is still armed"
+    finally:
+        driver_module._disarm_fitting_watchdog()
+
+
+def test_the_pool_arms_the_watchdog_around_its_whole_fitting_loop() -> None:
+    """The bound and the watchdog must come from the SAME expression.
+
+    A watchdog armed at a hardcoded number would drift from the bound the ledger reserved, and the
+    lane would either die inside its funded time or bill past it.
+    """
+    from flash.serving.bench import driver as driver_module
+
+    source = inspect.getsource(driver_module._build_prompt_pool)
+    assert "_arm_fitting_watchdog(bound" in source, (
+        "the pool does not arm the watchdog at its bound"
+    )
+    assert "_disarm_fitting_watchdog()" in source, (
+        "the pool leaves the watchdog armed after fitting, so it can kill a container mid-measurement"
+    )
+    tree = ast.parse(textwrap.dedent(source))
+    assigns = {
+        target.id: ast.unparse(node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert "prompt_fit_seconds_bound" in assigns.get("bound", ""), (
+        "the bound is not derived from the reserved fitting bound"
+    )
+    assert "bound" in assigns.get("deadline", ""), "the loop deadline is not the armed bound"
+
+
+def test_warmups_reserve_and_bound_the_fit_that_precedes_each_request() -> None:
+    """Every warmup fits a prompt before it sends one, on the rented container.
+
+    The fit happens outside `run_request`, so pricing a warmup at `REQUEST_TIMEOUT_SECONDS` alone
+    left a phase that is enforced but unfunded -- and unguarded, since the pool's watchdog covers
+    only the sweep's own pools.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+    }
+    withs = [
+        ast.unparse(item.context_expr)
+        for node in ast.walk(nodes["_run_warmup"])
+        if isinstance(node, ast.With | ast.AsyncWith)
+        for item in node.items
+    ]
+    assert any("fitting_watchdog" in expr for expr in withs), (
+        "a warmup fit is unguarded, so a stuck tokenizer call bills to the class method timeout"
+    )
+    assert any("WARMUP_FIT_SECONDS_BOUND" in expr for expr in withs), (
+        "the warmup guard does not use the bound the estimators reserve"
+    )
+
+    calls = [
+        ast.unparse(node) for node in ast.walk(nodes["_run_warmup"]) if isinstance(node, ast.Call)
+    ]
+    assert any("fit_prompt_to_tokens" in call for call in calls)
+
+    # Both estimators must price the fit, not just the request.
+    for name in ("_canary_gpu_seconds_estimate", "_sweep_gpu_seconds_estimate"):
+        body = ast.unparse(nodes[name])
+        assert "WARMUP_FIT_SECONDS_BOUND" in body, (
+            f"{name} funds warmup requests but not their fits"
+        )
+
+
+def test_the_drain_reap_is_bounded_and_refuses_to_measure_around_a_live_request() -> None:
+    """`Task.cancel()` only REQUESTS cancellation.
+
+    If the engine's async-generator close is blocked in a backend call, an unbounded `await task`
+    after the cancel sits until the class-wide method timeout -- losing the whole bucket artifact the
+    drain exists to preserve. And a request still running into the next cell contaminates the
+    measurement that follows it, so a task that will not die must end the container rather than be
+    measured around.
+    """
+    from flash.serving.bench import driver as driver_module
+
+    source = inspect.getsource(driver_module._drain)
+    assert "asyncio.wait_for" in source, "the reap is unbounded and can reach the method timeout"
+    assert "_DRAIN_REAP_SECONDS" in source, "the reap bound is not the declared one"
+    assert "os._exit" in source, (
+        "an uncancellable request is measured around, contaminating the next cell"
+    )
+    # By the time the reap runs the request has already exceeded its own timeout and been
+    # cancelled, so this covers cleanup, not work, and must stay small next to the drain allowance.
+    assert 0.0 < driver_module._DRAIN_REAP_SECONDS < driver_module.REQUEST_TIMEOUT_SECONDS
+
+    tree = ast.parse(textwrap.dedent(source))
+    waits = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("wait_for")
+    ]
+    assert waits, "no bounded wait in the reap"
+    for wait in waits:
+        assert any(kw.arg == "timeout" for kw in wait.keywords), "the reap wait has no timeout"
+
+
+def test_a_cell_stops_only_after_a_conclusive_run_of_failures() -> None:
+    """A cell whose requests all fail measures nothing, but overload is itself the measurement.
+
+    So the stop needs an attempt floor: an error rate under saturation is the number the envelope is
+    for, and cutting that cell short would delete it. Zero successes across a large sample is a
+    different thing -- a broken engine billing for a window that cannot produce a curve point.
+    """
+    from flash.serving.bench import driver as driver_module
+
+    def _record(error: str | None) -> RequestRecord:
+        return RequestRecord(
+            uid="r",
+            base_model="m",
+            bucket="b",
+            concurrency=4,
+            block=0,
+            started_at=0.0,
+            ok=error is None,
+            error=error,
+        )
+
+    failed = [_record("boom") for _ in range(driver_module._CONCLUSIVE_FAILURE_ATTEMPTS)]
+    assert driver_module._cell_is_conclusively_failed(failed)
+
+    # One success anywhere in the sample means the engine is serving; the failures are data.
+    mixed = list(failed)
+    mixed[-1] = _record(None)
+    assert not driver_module._cell_is_conclusively_failed(mixed)
+    mixed = list(failed)
+    mixed[0] = _record(None)
+    assert not driver_module._cell_is_conclusively_failed(mixed)
+
+    # Below the floor a burst of failures is not yet conclusive.
+    assert not driver_module._cell_is_conclusively_failed(
+        failed[: driver_module._CONCLUSIVE_FAILURE_ATTEMPTS - 1]
+    )
+    assert not driver_module._cell_is_conclusively_failed([])
+    assert driver_module._CONCLUSIVE_FAILURE_ATTEMPTS >= 32, (
+        "the floor is low enough that a merely-overloaded cell is cut short"
+    )
+
+    assert "_cell_is_conclusively_failed" in inspect.getsource(driver_module.run_cell), (
+        "run_cell never consults the stop, so a dead engine bills its whole window"
+    )
+
+
+def test_every_lane_settles_the_scaledown_tail_it_keeps_billing() -> None:
+    """`min_containers=0` does not release the GPU at the last return.
+
+    The container lives out its `scaledown_window` still allocated and still billing. A settlement
+    REPLACES the conservative reservation, so omitting that tail silently under-reports every lane
+    in the one direction a budget must never err -- and the ledger is the only record of the spend.
+    """
+    namespace = _bench_namespace("_billable_lane_seconds", "SCALEDOWN_WINDOW_SECONDS")
+    window = float(namespace["SCALEDOWN_WINDOW_SECONDS"])
+    assert window > 0.0
+    assert namespace["_billable_lane_seconds"](100.0) == pytest.approx(100.0 + window)
+    # Zero measured wall still owes the tail: a lane that dies immediately after its first call
+    # still leaves a container allocated.
+    assert namespace["_billable_lane_seconds"](0.0) == pytest.approx(window)
+
+    # Every settle site must go through it, including the failure path -- a lane that dies mid-sweep
+    # has already spent, and that is exactly when accurate accounting matters most.
+    tree = ast.parse(BENCH_APP.read_text(encoding="utf-8"))
+    settles = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("settle")
+    ]
+    assert len(settles) >= 3, "expected a settle on the canary, sweep and failure paths"
+    for settle in settles:
+        assert any("_billable_lane_seconds" in ast.unparse(arg) for arg in settle.args), (
+            f"a settle site reports raw call wall and under-reports its lane: {ast.unparse(settle)}"
+        )
+
+
+def test_the_execution_digest_covers_the_functions_that_schedule_the_work() -> None:
+    """A digest over prompt and metric code alone cannot notice a scheduling change.
+
+    Replacement policy, window cutoff and drain handling all move attempts, rates and latency while
+    every prompt and metric function stays byte-identical. Two artifacts would then carry the same
+    digest and be compared as if produced by the same program.
+    """
+    from flash.serving.bench import driver as driver_module
+    from flash.serving.bench import workload as workload_module
+
+    for name in ("run_cell", "run_request", "_drain"):
+        assert name in workload_module._DRIVER_SOURCES, (
+            f"{name} schedules measured work but changing it does not move the digest"
+        )
+        assert hasattr(driver_module, name), f"_DRIVER_SOURCES names {name}, which no longer exists"
+
+    before = workload_module._execution_digest()
+    original = driver_module.run_cell
+    try:
+        # A scheduling change with no prompt or metric change must still move the digest.
+        def run_cell(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - never called
+            """A different scheduler."""
+            return original(*args, **kwargs)
+
+        driver_module.run_cell = run_cell
+        assert workload_module._execution_digest() != before, (
+            "rewriting the cell scheduler leaves the digest unchanged"
+        )
+    finally:
+        driver_module.run_cell = original
+    assert workload_module._execution_digest() == before, (
+        "the digest is not stable across a restore"
+    )

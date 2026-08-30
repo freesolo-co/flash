@@ -385,6 +385,15 @@ _DRIVER_SOURCES: tuple[str, ...] = (
     # errors, which is the error-rate numerator itself.
     "_absorb_event",
     "_validate",
+    # How the cell is SCHEDULED. `run_cell` owns the closed-loop replacement policy and the point
+    # the measured window closes, `run_request` applies the per-request timeout and builds each
+    # record, and `_drain` decides which in-flight requests still count toward the denominator. A
+    # change to any of them moves attempts, rates and latency samples while every prompt and every
+    # metric function stays byte-identical -- so omitting them let two materially different
+    # campaigns publish the same checksum.
+    "run_cell",
+    "run_request",
+    "_drain",
 )
 _METRIC_SOURCES: tuple[str, ...] = (
     # The reduction arithmetic and the curve's ceiling/knee/saturation rules. Their THRESHOLDS are

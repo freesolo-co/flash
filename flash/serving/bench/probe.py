@@ -337,6 +337,36 @@ def probe_engine_kv_cache(engine: Any) -> dict[str, Any]:
     return out
 
 
+def _local_snapshot_commit(repo: str, revision: str | None) -> tuple[str | None, str | None]:
+    """The commit hash of the locally cached snapshot for ``repo``, and how it was determined.
+
+    Two shapes, in order of authority:
+
+    * a pinned revision that is already a 40-character hash IS the commit, and the snapshot
+      directory's existence confirms the engine loaded that exact tree;
+    * otherwise the cache's `refs/<revision>` file records the commit the last download resolved to,
+      which is what the running engine is holding.
+
+    Returns `(None, None)` when neither is available. A missing snapshot must not fall back to a Hub
+    lookup: the whole point is to report what this container loaded, and the Hub cannot answer that.
+    """
+    from pathlib import Path
+
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    ref = revision or "main"
+    if len(ref) == 40 and all(c in "0123456789abcdef" for c in ref.lower()):
+        return ref.lower(), "pinned-hash"
+
+    root = Path(HF_HUB_CACHE) / f"models--{repo.replace('/', '--')}"
+    ref_file = root / "refs" / ref
+    if ref_file.is_file():
+        commit = ref_file.read_text().strip()
+        if commit:
+            return commit, "local-cache-ref"
+    return None, None
+
+
 def probe_resolved_revisions(base_model: str) -> dict[str, Any]:
     """The commit each served repository RESOLVED to, for repositories production leaves unpinned.
 
@@ -345,9 +375,11 @@ def probe_resolved_revisions(base_model: str) -> dict[str, Any]:
     so once the repository advances an old curve could no longer identify the weights or tokenizer
     that produced it. A published capacity number that cannot name its checkpoint is not evidence.
 
-    Asked from inside the container, where the weights were actually downloaded -- resolving this at
-    submit time would report whatever the repository points at now, which is not necessarily what
-    the paid run loaded.
+    Read from the DOWNLOADED SNAPSHOT, not from the Hub. Asking the Hub returns whatever the
+    repository points at now; for an unpinned repository that advanced between engine init and this
+    probe, that is a different commit than the one the curve was produced on, and recording it would
+    be false provenance -- worse than none, because it looks authoritative. The local cache is the
+    only place the actually-loaded commit exists.
 
     Fail-soft by design: a missing commit is recorded with its reason and never invented. The gate
     that refuses to publish belongs to the caller, and it cannot make that decision from a
@@ -373,13 +405,17 @@ def probe_resolved_revisions(base_model: str) -> dict[str, Any]:
     for role, (repo, revision) in targets.items():
         entry: dict[str, Any] = {"repo": repo, "pinned": revision}
         try:
-            from huggingface_hub import HfApi
-
-            entry["commit"] = HfApi().model_info(repo, revision=revision or "main").sha
-        # Broad on purpose: a hub outage, an auth failure and a renamed repo must all degrade
-        # to a recorded reason rather than killing a lane that has already paid for its boot.
+            commit, source = _local_snapshot_commit(repo, revision)
+            entry["commit"] = commit
+            entry["source"] = source
+            if commit is None:
+                entry["reason"] = "no local snapshot found for the loaded repository"
+        # Broad on purpose: a missing cache root, an unreadable ref file and an unexpected cache
+        # layout must all degrade to a recorded reason rather than killing a lane that has already
+        # paid for its boot.
         except Exception as exc:
             entry["commit"] = None
+            entry["source"] = None
             entry["reason"] = f"{type(exc).__name__}: {exc}"
         resolved[role] = entry
     return resolved

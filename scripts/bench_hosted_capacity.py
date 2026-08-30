@@ -132,7 +132,11 @@ from flash.serving.bench.driver import (  # noqa: E402
     REQUEST_TIMEOUT_SECONDS,
     prompt_fit_seconds_bound,
 )
-from flash.serving.bench.workload import BUCKETS, concurrency_grid  # noqa: E402
+from flash.serving.bench.workload import (  # noqa: E402
+    BUCKETS,
+    BUCKETS_BY_NAME,
+    concurrency_grid,
+)
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
 
 # How many warmup requests a cold container issues. Shared by `_run_canary`, `_ensure_warm`, the
@@ -140,6 +144,14 @@ from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
 # drift from the number actually issued. Defined here because `_worst_case_bucket_seconds` runs at
 # import time to derive TIMEOUT_SECONDS.
 CANARY_WARMUP_REQUESTS = 5
+
+# Wall time one warmup prompt fit is allowed. A warmup fits ONE `short_interactive` prompt, so it is
+# priced from that bucket's own bound at a pool of one rather than from a cell's whole pool.
+# Enforced by `fitting_watchdog` and reserved below, so the bound funded and the bound enforced are
+# the same number.
+WARMUP_FIT_SECONDS_BOUND = prompt_fit_seconds_bound(
+    BUCKETS_BY_NAME["short_interactive"], min_requests=1
+)
 
 
 def _worst_case_bucket_seconds() -> float:
@@ -364,7 +376,7 @@ async def _run_warmup(engine: Any, requests: int) -> dict[str, Any]:
     """Sequential warmups on ``engine``, reported separately from the envelope."""
     import time
 
-    from flash.serving.bench.driver import run_request
+    from flash.serving.bench.driver import fitting_watchdog, run_request
     from flash.serving.bench.workload import BUCKETS_BY_NAME, fit_prompt_to_tokens
 
     bucket = BUCKETS_BY_NAME["short_interactive"]
@@ -382,7 +394,13 @@ async def _run_warmup(engine: Any, requests: int) -> dict[str, Any]:
     nonce = uuid.uuid4().hex[:12]
     for index in range(requests):
         uid = f"warmup-{nonce}-{index}"
-        messages, exact = fit_prompt_to_tokens(engine.tokenizer, uid, bucket.target_input_tokens)
+        # Bounded by the same enforcement the cell pool uses. This fit runs BEFORE `run_request`, so
+        # the 900s request timeout that both estimators price a warmup at does not cover it; without
+        # a watchdog a stalled tokenizer here billed to the class-wide timeout instead.
+        with fitting_watchdog(WARMUP_FIT_SECONDS_BOUND, label=f"warmup-{index}"):
+            messages, exact = fit_prompt_to_tokens(
+                engine.tokenizer, uid, bucket.target_input_tokens
+            )
         record = await run_request(
             engine,
             engine.base_model,
@@ -647,7 +665,14 @@ def _canary_gpu_seconds_estimate() -> float:
     return (
         float(STARTUP_TIMEOUT_SECONDS) * calls
         + PROBE_TIMEOUT_SECONDS
-        + REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS
+        # Each warmup pays its request timeout PLUS the fit that precedes it. The fit happens
+        # outside `run_request`, so pricing a warmup at the request timeout alone left an
+        # enforced-but-unfunded phase; `WARMUP_FIT_SECONDS_BOUND` is the bound the watchdog kills at.
+        + (REQUEST_TIMEOUT_SECONDS + WARMUP_FIT_SECONDS_BOUND) * CANARY_WARMUP_REQUESTS
+        # The container survives its scaledown window after the last call returns, still allocated
+        # and still billing. A reservation that stops at the final return under-reserves every lane
+        # by that tail.
+        + float(SCALEDOWN_WINDOW_SECONDS)
     )
 
 
@@ -683,7 +708,7 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     # point rebuilds its own pool.
     fitting = sum(prompt_fit_seconds_bound(bucket) * points for bucket in selected)
     drains = REQUEST_TIMEOUT_SECONDS * cells
-    canary = REQUEST_TIMEOUT_SECONDS * CANARY_WARMUP_REQUESTS
+    canary = (REQUEST_TIMEOUT_SECONDS + WARMUP_FIT_SECONDS_BOUND) * CANARY_WARMUP_REQUESTS
     # The boot is reserved at the ceiling Modal actually allows a stuck boot to reach, not at a
     # typical observed boot. Same reasoning as the canary lane.
     boot = float(STARTUP_TIMEOUT_SECONDS)
@@ -704,6 +729,10 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     # measured on. Each is bounded by `PROBE_TIMEOUT_SECONDS` rather than the class method timeout,
     # so this is the exposure the bound permits, not a guess at typical probe time.
     probes = PROBE_TIMEOUT_SECONDS * (len(selected) + 1)
+    # Every separately bootable call can leave a container alive for its scaledown window after the
+    # call returns, allocated and billing with no work in it. `len(selected) + 1` calls, each able
+    # to land on its own container, so the tail is priced per call rather than once per sweep.
+    scaledown = float(SCALEDOWN_WINDOW_SECONDS) * (len(selected) + 1)
     return (
         boot
         + canary_replacement_boot
@@ -713,7 +742,23 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
         + fitting
         + drains
         + replacements
+        + scaledown
     )
+
+
+def _billable_lane_seconds(elapsed: float) -> float:
+    """Local call wall plus the scaledown tail the container keeps billing after the call returns.
+
+    A settlement REPLACES the conservative reservation with a measured number, so anything it omits
+    silently becomes an understatement of what the campaign spent -- and the ledger is the only
+    record of that. `min_containers=0` does not release the GPU at the last return: the container
+    lives out its `scaledown_window` still allocated. Settling at the local call wall alone reported
+    a lane as cheaper than it was, in the one direction a budget must never err.
+
+    Conservative rather than exact: the harness has no post-hoc teardown timestamp to read, so the
+    full window is charged even when Modal reclaims sooner.
+    """
+    return elapsed + float(SCALEDOWN_WINDOW_SECONDS)
 
 
 @app.local_entrypoint()
@@ -796,7 +841,11 @@ def main(
         gate = _run_canary(base_model, engine, expected_gpu)
 
         if mode == "canary":
-            ledger.settle(entry, time.monotonic() - lane_started, note="measured canary wall")
+            ledger.settle(
+                entry,
+                _billable_lane_seconds(time.monotonic() - lane_started),
+                note="measured canary wall plus scaledown tail",
+            )
             _write_artifact(
                 {
                     "base_model": base_model,
@@ -842,7 +891,11 @@ def main(
                 f"sweep-{base_model.replace('/', '_')}-{name}-b{block}.json",
                 invocation=invocation,
             )
-        ledger.settle(entry, time.monotonic() - lane_started, note="measured sweep wall")
+        ledger.settle(
+            entry,
+            _billable_lane_seconds(time.monotonic() - lane_started),
+            note="measured sweep wall plus scaledown tail",
+        )
         _write_artifact(
             {
                 "base_model": base_model,
@@ -867,7 +920,11 @@ def main(
         # timeout kills the lane exactly like an error does, and the GPU-seconds are just as
         # spent. The exception is re-raised unchanged -- this handler accounts, it never rescues.
         if entry.settled_usd is None:
-            ledger.settle(entry, time.monotonic() - lane_started, note="failed lane wall")
+            ledger.settle(
+                entry,
+                _billable_lane_seconds(time.monotonic() - lane_started),
+                note="failed lane wall plus scaledown tail",
+            )
         with contextlib.suppress(Exception):
             # Suppressed: a failure to write the accounting record must not replace the
             # exception that explains why the lane died.
