@@ -30,7 +30,13 @@ from flash.serve.request.validation import MAX_MESSAGE_NODES
 _FUNCTION_START, _FUNCTION_END = text_scan.FUNCTION_START, text_scan.FUNCTION_END
 _PARAMETER_START, _PARAMETER_END = text_scan.PARAMETER_START, text_scan.PARAMETER_END
 _CALL_BOUNDARY_RE = re.compile(r"</function>\s*</tool_call>\s*(<tool_call>)\s*<function=([^>]+)>")
-_PARAMETER_OPEN_RE = re.compile(r"<parameter=([A-Za-z0-9_-]{1,64})>")
+# the name run is the parser's own, which ends at the first `>` and admits nothing narrower. a
+# replay probe derives its names from the keys of a historical call, which never pass
+# `_identifier_name`, so indexing only the charset a public declaration may hold left the opener a
+# key like `weird key` spells out of the index entirely, and a history the template renders exactly
+# was rejected as unreplayable. the index is filtered against `declared` below, so widening the run
+# here retains no more offsets than before: the names it now sees are ones a reader can ask for.
+_PARAMETER_OPEN_RE = re.compile(r"<parameter=([^>]*)>")
 _WHITESPACE_RE = re.compile(r"\s*")
 # the body of a json string literal up to and including its closing quote. the ordinary run and
 # the escape start on disjoint characters and both quantifiers are possessive, so there is exactly

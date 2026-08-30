@@ -4742,6 +4742,42 @@ def test_opener_index_retains_only_declared_parameter_names() -> None:
     ), sys.getsizeof(offsets)
 
 
+def test_the_opener_index_sees_every_name_a_replay_probe_can_declare() -> None:
+    """the index's name run is the parser's, not a public declaration's.
+
+    a replay probe's parameter names are the keys of a historical call, which never pass
+    `_identifier_name`. indexing only the charset a declaration may hold left the opener such a key
+    spells invisible, so a value quoting it read as never handing off and a history the template
+    renders exactly was rejected as unreplayable. the index is filtered against the declared names
+    either way, so seeing these costs no offsets a reader cannot ask for.
+    """
+    for key in ("weird key", "bad.name", "bad<name", "", "é", "x" * 200):
+        # `a`'s value quotes `a`'s own opener, so the index must hold both names to settle the
+        # boundary. the second key is what the narrow charset dropped, and dropping it left the
+        # value's quoted opener looking like a handoff to a name nothing declared.
+        arguments = {"a": "</parameter><parameter=a>", key: "z"}
+        history = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "hist", "arguments": json.dumps(arguments)},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]
+        # no current declaration, so the probe's names come straight from the historical keys.
+        validate_tool_history_replay(history, None, error_type=OpenAIRequestError)
+        assert tool_calls_module._PARAMETER_OPEN_RE.fullmatch(f"<parameter={key}>"), key
+
+    # a name carrying `>` is still not one the parser can read back: it ends the name at that `>`.
+    # indexing the longer run would record an opener no lookup can ever match.
+    assert not tool_calls_module._PARAMETER_OPEN_RE.fullmatch("<parameter=a>b>")
+
+
 def test_inert_enum_delimiters_are_not_stepped_one_at_a_time() -> None:
     """an enum value full of delimiters that cannot close it must not cost one step each.
 
