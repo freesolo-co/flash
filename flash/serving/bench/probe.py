@@ -138,6 +138,21 @@ def _served_checkpoint(base_model: str) -> tuple[str, str | None]:
     return str(repo), (str(revision) if revision else None)
 
 
+def _config_checkpoint(base_model: str) -> tuple[str, str | None]:
+    """The repo and the exact revision the GDN config is read at.
+
+    Split out of `_gdn_config_values` so the probe REPORTS the revision it read rather than the
+    revision it asked for. Those differ for an unpinned repository, and a `config_source` naming
+    `None` while the load resolved a commit would make the artifact unfalsifiable exactly where the
+    provenance matters most.
+    """
+    repo, revision = _served_checkpoint(base_model)
+    if revision:
+        return repo, revision
+    commit, _source = _local_snapshot_commit(repo, None, "model")
+    return repo, (commit or None)
+
+
 def _gdn_config_values(base_model: str) -> dict[str, Any]:
     """GDN geometry from the served checkpoint's own config, for binding the resolver's parameters.
 
@@ -155,10 +170,21 @@ def _gdn_config_values(base_model: str) -> dict[str, Any]:
     config by the time any probe runs, so the local read is the same bytes; if it somehow is not
     cached, raising is correct, because the caller records the failure and the gate refuses to
     publish rather than guessing a revision.
+
+    Pinned to the CAPTURED COMMIT as well, not just to the cache. `local_files_only` stops the Hub
+    fetch but not the ref lookup: an unpinned repository still resolves `revision=None` through the
+    cache's mutable `refs/main`, which a tokenizer or processor download can advance mid-boot. On
+    the 35B model -- the one whose weights and tokenizer share a single unpinned repository -- that
+    leaves the newer config describing older running weights, and the resolver would bind head dims
+    the engine never loaded, publishing a GDN backend for a checkpoint nobody served. So resolve
+    against the commit `probe_resolved_revisions` already captured for the model role, which is the
+    snapshot the engine's own weights came from. When no commit was captured the ref is the only
+    thing available and the pre-existing behaviour stands; the revision gate refuses to publish such
+    a container anyway, so this cannot widen what a paid sweep may claim.
     """
     from transformers import AutoConfig
 
-    repo, revision = _served_checkpoint(base_model)
+    repo, revision = _config_checkpoint(base_model)
     config = AutoConfig.from_pretrained(
         repo, revision=revision, trust_remote_code=True, local_files_only=True
     )
@@ -236,7 +262,7 @@ def _gdn_backend_in_process(base_model: str) -> dict[str, Any]:
         result["resolver_signature_mismatch"] = True
         return result
     result["resolver_kwargs"] = sorted(kwargs)
-    probed_repo, probed_revision = _served_checkpoint(base_model)
+    probed_repo, probed_revision = _config_checkpoint(base_model)
     result["config_source"] = {"repo": probed_repo, "revision": probed_revision}
     try:
         resolved = resolver(**kwargs)

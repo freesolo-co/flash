@@ -430,7 +430,16 @@ _METRIC_SOURCES: tuple[str, ...] = (
 # points and to locate saturation. Retuning it (dropping the zero-in-window-success test, say, or
 # comparing against a different error bound) would move the ceiling, the knee and the saturation
 # point of every published curve while each digested source stayed byte-identical.
-_METRIC_PROPERTIES: tuple[tuple[str, str], ...] = (("CellResult", "degraded"),)
+_METRIC_PROPERTIES: tuple[tuple[str, str], ...] = (
+    ("CellResult", "degraded"),
+    # `reduce_cell` IS digested, but its source only NAMES `record.ttft` and `record.latency`; the
+    # arithmetic that turns three timestamps into a duration lives in these getters. Redefining
+    # either -- measuring latency from first token rather than from send, say -- would move every
+    # published TTFT and latency percentile while every digested source stayed byte-identical, so
+    # two campaigns under materially different metric contracts would compare as if they matched.
+    ("RequestRecord", "ttft"),
+    ("RequestRecord", "latency"),
+)
 # Module CONSTANTS are digested by value, not by source. A constant's name is all that appears in
 # the function text that reads it, so retuning `_POOL_PERIOD_SLACK` from 64 to 128 would leave every
 # source digest above byte-identical while changing which prompts the pool wraps to.

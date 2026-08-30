@@ -4346,6 +4346,84 @@ def test_the_degraded_verdict_is_digested() -> None:
     assert workload_module.workload_checksum() == before
 
 
+def test_the_execution_digest_covers_the_latency_and_ttft_arithmetic() -> None:
+    """R21: the getters that turn timestamps into durations must move the execution digest.
+
+    `reduce_cell` is digested, but its source only NAMES `record.ttft` and `record.latency` -- the
+    subtraction that defines each metric lives in the property bodies, which `getattr(metrics, name)`
+    cannot reach. Redefining either would move every published TTFT and latency percentile while
+    every digested source stayed byte-identical, so two campaigns run under materially different
+    metric contracts would compare as though they shared one.
+    """
+    from flash.serving.bench import metrics as metrics_module
+    from flash.serving.bench import workload as workload_module
+
+    for prop in ("ttft", "latency"):
+        assert ("RequestRecord", prop) in workload_module._METRIC_PROPERTIES
+
+    for prop in ("ttft", "latency"):
+        before = workload_module.workload_checksum()
+        original = getattr(metrics_module.RequestRecord, prop)
+
+        def _retuned(self: RequestRecord) -> float | None:
+            # Measures from FIRST TOKEN rather than from send -- a different metric contract that
+            # leaves every digested source byte-identical.
+            if self.first_token_at is None or self.finished_at is None:
+                return None
+            return self.finished_at - self.first_token_at
+
+        try:
+            setattr(metrics_module.RequestRecord, prop, property(_retuned))
+            assert workload_module.workload_checksum() != before, (
+                f"retuning RequestRecord.{prop} left the checksum unchanged"
+            )
+        finally:
+            setattr(metrics_module.RequestRecord, prop, original)
+        assert workload_module.workload_checksum() == before
+
+
+def test_the_gdn_config_is_read_at_the_commit_the_provenance_captured() -> None:
+    """R21: `local_files_only` pins the config to the cache, not to a COMMIT.
+
+    An unpinned repository passes `revision=None`, which still resolves through the cache's mutable
+    `refs/main`. A tokenizer or processor download can advance that ref during boot -- and the 35B
+    model is exactly the case where it can, because its weights and tokenizer share one unpinned
+    repository. The resolver would then bind head dims from a newer config while the engine runs
+    older weights, and the artifact would publish a GDN backend for a checkpoint nobody served.
+
+    So the config load must resolve against the commit `_local_snapshot_commit` reports for the
+    MODEL role, and `config_source` must name that same commit rather than the `None` that was
+    asked for.
+    """
+    from flash.serving.bench import probe as probe_module
+
+    captured = "a" * 40
+    with (
+        mock.patch.object(probe_module, "_served_checkpoint", return_value=("acme/unpinned", None)),
+        mock.patch.object(
+            probe_module, "_local_snapshot_commit", return_value=(captured, "snapshot-contents")
+        ),
+    ):
+        repo, revision = probe_module._config_checkpoint("acme/unpinned")
+
+    assert repo == "acme/unpinned"
+    assert revision == captured, (
+        "the config resolves through the mutable ref instead of the captured commit"
+    )
+
+    # A repository that pins its own revision keeps it: the pin IS the commit, and re-deriving it
+    # from the cache would make the probe depend on a download that may not have happened.
+    with (
+        mock.patch.object(
+            probe_module, "_served_checkpoint", return_value=("acme/pinned", "b" * 40)
+        ),
+        mock.patch.object(
+            probe_module, "_local_snapshot_commit", return_value=("c" * 40, "snapshot-contents")
+        ),
+    ):
+        assert probe_module._config_checkpoint("acme/pinned") == ("acme/pinned", "b" * 40)
+
+
 def test_a_warmup_request_is_bounded_against_a_hung_stream_close() -> None:
     """R17: `run_request`'s own timeout is not an upper bound when cancellation cleanup hangs.
 
