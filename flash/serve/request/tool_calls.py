@@ -790,8 +790,10 @@ def _contains_unpaired_surrogate(value: Any) -> bool:
             # walks a multi-megabyte argument in the interpreter, and history validation reaches
             # the same string several times. encoding it would answer the same question natively
             # but allocates a whole second copy, which turns a near-cap argument into a possible
-            # `MemoryError` on a path that must only ever return a verdict.
-            if _SURROGATE_RANGE.search(nested) is not None:
+            # `MemoryError` on a path that must only ever return a verdict. every surrogate is
+            # above the ascii range, so the cached ascii flag settles the common argument without
+            # scanning it at all.
+            if not nested.isascii() and _SURROGATE_RANGE.search(nested) is not None:
                 return True
         elif type(nested) is list:
             stack.extend(nested)
