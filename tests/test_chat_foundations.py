@@ -728,21 +728,21 @@ def test_historical_tool_argument_complexity_boundary_succeeds(argument: str) ->
 
 
 @pytest.mark.parametrize(
-    "argument",
+    ("argument", "match"),
     [
-        '{"days":1e99999999999999999999}',
-        '{"days":1e-99999999999999999999}',
-        '{"days":1,"days":2}',
-        '{"nested":{"days":1,"days":2}}',
+        ('{"days":1e1000001}', "numeric exponent exceeds 1000000 magnitude limit"),
+        ('{"days":1e-1000001}', "numeric exponent exceeds 1000000 magnitude limit"),
+        ('{"days":1,"days":2}', "arguments must encode a JSON object"),
+        ('{"nested":{"days":1,"days":2}}', "arguments must encode a JSON object"),
     ],
     ids=["positive-exponent", "negative-exponent", "duplicate-root", "duplicate-nested"],
 )
 def test_malformed_numeric_or_duplicate_key_tool_history_is_a_request_error(
-    argument: str,
+    argument: str, match: str
 ) -> None:
     messages = _historical_tool_messages(argument)
 
-    with pytest.raises(OpenAIRequestError, match="arguments must encode a JSON object"):
+    with pytest.raises(OpenAIRequestError, match=match):
         parse_chat_request(
             {"messages": messages},
             require_model=False,
@@ -962,6 +962,18 @@ def test_positive_zero_history_stays_an_integer() -> None:
     value = next(iter(detached[0]["tool_calls"][0]["function"]["arguments"].values()))
     assert value == 0
     assert type(value) is int
+
+
+def test_integer_negative_zero_history_keeps_its_exact_lexeme() -> None:
+    normalized = parse_chat_request(
+        {"messages": _historical_tool_messages('{"zero":-0}')},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    detached = detached_template_messages(normalized.messages)
+    value = next(iter(detached[0]["tool_calls"][0]["function"]["arguments"].values()))
+    assert value == "-0"
 
 
 @pytest.mark.parametrize("argument", ['{"text":"\\ud800"}', '{"text":"\\udc00"}'])

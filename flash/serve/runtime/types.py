@@ -15,6 +15,7 @@ from flash.serve.request.tool_calls import (
     tools_active,
     tools_wire,
     validate_tool_control_presence,
+    validate_tool_history_replay,
     validate_tool_stop_sequences,
 )
 from flash.serve.request.validation import (
@@ -511,6 +512,9 @@ class GenerationRequest:
                 raw_tools = tools_wire(tuple(raw_tools))
             normalized_tools = normalize_tools(raw_tools, error_type=RuntimeConfigurationError)
             object.__setattr__(self, "tools", normalized_tools)
+            validate_tool_history_replay(
+                self.messages or (), normalized_tools, error_type=RuntimeConfigurationError
+            )
             if self.tool_choice not in {"auto", "none"}:
                 raise RuntimeConfigurationError("tool_choice must be auto or none")
             if self.parallel_tool_calls is not True:

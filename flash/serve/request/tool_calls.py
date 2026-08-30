@@ -19,6 +19,7 @@ _PARAMETER_START, _PARAMETER_END = "<parameter=", "</parameter>"
 _NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _MAX_TOOLS, _MAX_SCHEMA_DEPTH, _MAX_SCHEMA_NODES, _MAX_ENUM_VALUES = 128, 8, 512, 128
 _MAX_FIXED_DECIMAL_DIGITS = _MAX_NUMERIC_LITERAL_DIGITS = 1024
+_MAX_NUMERIC_LITERAL_EXPONENT = 1_000_000
 _MAX_ENUM_INTEGER_MAGNITUDE = 10**_MAX_NUMERIC_LITERAL_DIGITS
 _SCHEMA_TYPES = frozenset(["array", "boolean", "integer", "null", "number", "object", "string"])  # fmt: skip
 _SCHEMA_KEYS = frozenset(["additionalProperties", "description", "enum", "items", "properties", "required", "type"])  # fmt: skip
@@ -197,6 +198,29 @@ def validate_tool_history(
         raise error_type("messages end before all tool calls were resolved")
 
 
+def validate_tool_history_replay(
+    messages: Sequence[Mapping[str, Any]],
+    tools: Sequence[FunctionTool] | None,
+    *,
+    error_type: type[Exception] = ValueError,
+) -> None:
+    """reject historical scalar strings the declared tool grammar cannot replay exactly."""
+    if tools is None:
+        return
+    tool_map = {tool.name: tool for tool in tools}
+    for message_index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        for call_index, call in enumerate(message.get("tool_calls", ())):
+            function = call["function"]
+            if (tool := tool_map.get(function["name"])) is None:
+                continue
+            try:
+                _template_json_object(function["arguments"], replay_tool=tool)
+            except ValueError as exc:
+                raise error_type(f"message {message_index} tool call {call_index} {exc}") from exc
+
+
 def detached_template_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     detached: list[dict[str, Any]] = []
     for message in messages:
@@ -362,7 +386,7 @@ def _validate_history_calls(
         except RecursionError as exc:
             raise error_type(f"{path} exceeds the supported tool argument complexity") from exc
         except ValueError as exc:
-            if str(exc).startswith("numeric literal exceeds"):
+            if str(exc).startswith(("numeric literal exceeds", "numeric exponent exceeds")):
                 raise error_type(f"{path} {exc}") from exc
             raise error_type(f"{path} function arguments must encode a JSON object") from exc
         _validate_tool_argument_complexity(decoded, path, error_type)
@@ -486,9 +510,60 @@ def _decode_json_object(value: str) -> dict[str, Any]:
     return decoded
 
 
-def _template_json_object(value: str) -> dict[str, Any]:
+def _template_json_object(value: str, *, replay_tool: FunctionTool | None = None) -> dict[str, Any]:
     decoded = _decode_json_object(value)
-    return {name: _template_argument_value(item) for name, item in decoded.items()}
+    rendered = {name: _template_argument_value(item) for name, item in decoded.items()}
+    if replay_tool is not None:
+        for name, item in decoded.items():
+            schema = replay_tool.parameters["properties"].get(name)
+            if (
+                type(item) is str
+                and _PARAMETER_END in item
+                and schema is not None
+                and schema["type"] == "string"
+                and "enum" not in schema
+            ):
+                _validate_template_scalar_roundtrip(replay_tool, name, item, decoded, rendered)
+    return rendered
+
+
+def _validate_template_scalar_roundtrip(
+    tool: FunctionTool,
+    name: str,
+    original: str,
+    decoded: dict[str, Any],
+    rendered: dict[str, Any],
+) -> None:
+    from flash.serve.runtime.tool_calls import parse_qwen3_coder_output
+
+    declared = tool.parameters["properties"]
+    present = set(decoded)
+    properties = {
+        field: {"type": "string"} if field in present else schema
+        for field, schema in declared.items()
+    }
+    properties.update((field, {"type": "string"}) for field in present if field not in properties)
+    probe_parameters = {
+        "type": "object",
+        "properties": properties,
+        "required": [name],
+        "additionalProperties": False,
+    }
+    probe = FunctionTool(tool.name, tool.description, probe_parameters)
+    parameters = "".join(
+        f"{_PARAMETER_START}{field}>"
+        f"{rendered[field] if field == name else 'placeholder'}{_PARAMETER_END}"
+        for field in decoded
+    )
+    text = (
+        f"{TOOL_CALL_START}{_FUNCTION_START}{tool.name}>{parameters}{_FUNCTION_END}{TOOL_CALL_END}"
+    )
+    result = parse_qwen3_coder_output(text, (probe,), id_factory=lambda: "call_replay")
+    if len(result.calls) != 1:
+        raise ValueError("function arguments cannot be replayed exactly by the tool template")
+    replayed = _decode_json_object(result.calls[0].arguments)
+    if replayed.get(name) != original:
+        raise ValueError("function arguments cannot be replayed exactly by the tool template")
 
 
 def _template_argument_value(value: Any) -> Any:
@@ -547,9 +622,11 @@ class _InexactTemplateNumber(ValueError):
 
 def _native_json_value(value: Any) -> Any:
     if type(value) is Decimal:
-        # negative zero is integral, but ``int`` drops the sign and would replay ``-0.0`` as
-        # ``0``. the float path below carries it: ``float`` keeps the sign and the template
-        # renders it back as ``-0.0``, so let signed zero fall through to it.
+        # signed decimal zero needs a native float to replay its decimal point, while signed
+        # integer zero has no native carrier and stays exact text. both avoid ``int`` dropping
+        # the sign, and integer schemas still canonicalize either form to a decimal integer.
+        if value.is_zero() and value.is_signed() and value.as_tuple().exponent == 0:
+            raise _InexactTemplateNumber("signed integer zero has no exact native template value")
         if _decimal_is_integral(value) and not (value.is_zero() and value.is_signed()):
             digits, exponent = value.as_tuple().digits, value.as_tuple().exponent
             expanded_digits = 1 if value.is_zero() else len(digits) + exponent
@@ -603,14 +680,23 @@ def _contains_unpaired_surrogate(value: Any) -> bool:
 
 
 def _parse_decimal_literal(value: str) -> Decimal:
-    digits = value.lower().lstrip("-").partition("e")[0].replace(".", "")
+    significand, separator, exponent = value.lower().lstrip("-").partition("e")
+    digits = significand.replace(".", "")
     if len(digits) > _MAX_NUMERIC_LITERAL_DIGITS:
         raise ValueError(f"numeric literal exceeds {_MAX_NUMERIC_LITERAL_DIGITS}-digit limit")
+    if separator:
+        magnitude = exponent.lstrip("+-0")
+        limit = str(_MAX_NUMERIC_LITERAL_EXPONENT)
+        if len(magnitude) > len(limit) or (len(magnitude) == len(limit) and magnitude > limit):
+            raise ValueError(
+                f"numeric exponent exceeds {_MAX_NUMERIC_LITERAL_EXPONENT} magnitude limit"
+            )
     return Decimal(value)
 
 
-def _parse_integer_literal(value: str) -> int:
-    return int(_parse_decimal_literal(value))
+def _parse_integer_literal(value: str) -> int | Decimal:
+    parsed = _parse_decimal_literal(value)
+    return parsed if parsed.is_zero() and parsed.is_signed() else int(parsed)
 
 
 def _raise_nonfinite(value: str) -> None:

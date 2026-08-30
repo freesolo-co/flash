@@ -144,20 +144,22 @@ def parse_qwen3_coder_output(
         return ToolParseResult(content=text, calls=())
     content = text[:first] or None
     tool_map = {tool.name: tool for tool in tools}
-    candidates = [match.start(1) for match in _CALL_BOUNDARY_RE.finditer(text, first) if match[2] in tool_map]  # fmt: skip
+    candidates = [
+        match.start(1)
+        for match in _CALL_BOUNDARY_RE.finditer(text, first)
+        if (tool := tool_map.get(match[2])) is not None
+        and _candidate_body_can_start(text, match.end(), tool)
+    ]
     # ``candidates`` holds the calls after the first, so the emitted count is one more.
     if len(candidates) + 1 > _MAX_POTENTIALLY_REPLAYABLE_CALLS:
         return ToolParseResult(content=text, calls=())
     opener_positions: dict[str, list[int]] = {}
     for match in _PARAMETER_OPEN_RE.finditer(text, first, len(text)):
         opener_positions.setdefault(match[1], []).append(match.start())
-    # the ownership pass below re-parses each candidate against every later boundary, so its
-    # work is quadratic in candidates while the text grows only linearly with them. a call
-    # whose own string argument repeats the boundary text therefore falls back to exact text
-    # once it carries about seven repetitions. that is a deliberate limit, not an oversight:
-    # the same quadratic cost is what a dense run of invalid candidates buys, so no budget
-    # admits the honest case indefinitely without also funding the adversarial one. the
-    # fallback is lossless, so the cost of the limit is a structured call becoming exact text.
+    # candidate discovery is context blind, so every apparent boundary still has to be
+    # classified. the shared budget charges the distance those classifications actually scan,
+    # while constant-time prefix and name rejections cost one unit. this keeps adversarial
+    # rescans bounded without billing an immediately rejected candidate for its whole suffix.
     work = [min(16 * 1024 * 1024, 4 * len(text))]
     confirmed = [len(text)]
     parsed: list[tuple[str, dict[str, Any]]] = []
@@ -196,12 +198,22 @@ class _FreeStringSpan(NamedTuple):
     end: int
 
 
+def _candidate_body_can_start(text: str, cursor: int, tool: FunctionTool) -> bool:
+    cursor = _skip_whitespace(text, cursor)
+    if text.startswith(_FUNCTION_END, cursor):
+        return not tool.parameters["required"]
+    if not text.startswith(_PARAMETER_START, cursor):
+        return False
+    name_end = text.find(">", cursor + len(_PARAMETER_START))
+    return (
+        name_end >= 0
+        and text[cursor + len(_PARAMETER_START) : name_end] in tool.parameters["properties"]
+    )
+
+
 def _parse_tool_call(text, cursor, scope_end, tools, opener_positions, work):
-    work[0] -= scope_end - cursor
-    if work[0] < 0:
-        return _EXHAUSTED
-    if not text.startswith(TOOL_CALL_START, cursor):
-        return None
+    if not _consume_work(work, 1) or not text.startswith(TOOL_CALL_START, cursor):
+        return _EXHAUSTED if work[0] < 0 else None
     cursor = _skip_whitespace(text, cursor + len(TOOL_CALL_START))
     if not text.startswith(_FUNCTION_START, cursor):
         return None
@@ -216,13 +228,16 @@ def _parse_tool_call(text, cursor, scope_end, tools, opener_positions, work):
         if index and positions[index - 1] >= name_end:
             openers[parameter_name] = positions[index - 1]
     try:
-        count, cursor, values, _ = _parse_parameters((text, tool, openers), name_end + 1, {}, None)
+        parsed = _parse_parameters((text, tool, openers, work), name_end + 1, {}, None)
     except RecursionError:
         # a long run of parameters descends once per value, so a schema wide enough to
         # declare hundreds of them can exhaust the interpreter stack before the work
         # budget notices. that is a candidate flash cannot finish classifying, which is
         # the same answer the budget already gives: keep the exact text.
         return _EXHAUSTED
+    if parsed is _EXHAUSTED:
+        return _EXHAUSTED
+    count, cursor, values, _ = parsed
     if count != 1 or cursor is None or values is None:
         return _AMBIGUOUS if count == 2 else None
     for key, value in values.items():
@@ -233,8 +248,13 @@ def _parse_tool_call(text, cursor, scope_end, tools, opener_positions, work):
     return (cursor, (name, values)) if _validate_value(values, tool.parameters) else None
 
 
+def _consume_work(work: list[int], amount: int) -> bool:
+    work[0] -= amount
+    return work[0] >= 0
+
+
 def _parse_parameters(state, cursor, values, probe):
-    text, tool, _ = state
+    text, tool, _, _ = state
     parsed_values = dict(values)
     while True:
         cursor = _skip_whitespace(text, cursor)
@@ -260,7 +280,7 @@ def _parse_parameters(state, cursor, values, probe):
 
 
 def _parse_parameter_value(state, value_start, schema, values, name, probe):
-    text, tool, _ = state
+    text, tool, _, work = state
     if schema["type"] == "string" and "enum" not in schema:
         missing = frozenset(set(tool.parameters["required"]) - {*values, name})
         return _classify_free_string(
@@ -269,10 +289,12 @@ def _parse_parameter_value(state, value_start, schema, values, name, probe):
     search_from = value_start
     while True:
         value_end = (
-            _find_json_container_end(text, search_from)
+            _find_json_container_end(text, search_from, work)
             if schema["type"] in {"array", "object"}
-            else _find_parameter_end(text, _PARAMETER_END, search_from)
+            else _bounded_parameter_end(text, search_from, work)
         )
+        if value_end is _EXHAUSTED:
+            return _EXHAUSTED
         if value_end < 0:
             return None
         following = _skip_whitespace(text, value_end + len(_PARAMETER_END))
@@ -291,7 +313,7 @@ def _parse_parameter_value(state, value_start, schema, values, name, probe):
         return None
 
 
-def _resumes_missing_parameter(text: str, incomplete: int, missing: set[str]) -> bool:
+def _resumes_missing_parameter(state, incomplete: int, missing: set[str]) -> bool | object:
     """report whether the span after ``incomplete`` reopens a still-missing parameter.
 
     a nested candidate that closes short normally ends the search, but when the very
@@ -299,8 +321,14 @@ def _resumes_missing_parameter(text: str, incomplete: int, missing: set[str]) ->
     valid assignment remains reachable. abandoning there would hide the competing
     interpretation and let an ambiguous candidate parse as one structured call.
     """
+    text, _, _, work = state
     search_from = incomplete
-    while (value_end := _find_parameter_end(text, _PARAMETER_END, search_from)) >= 0:
+    while True:
+        value_end = _bounded_parameter_end(text, search_from, work)
+        if value_end is _EXHAUSTED:
+            return _EXHAUSTED
+        if value_end < 0:
+            return False
         search_from = value_end + len(_PARAMETER_END)
         following = _skip_whitespace(text, search_from)
         if not text.startswith(_PARAMETER_START, following):
@@ -310,15 +338,19 @@ def _resumes_missing_parameter(text: str, incomplete: int, missing: set[str]) ->
             return False
         if text[following + len(_PARAMETER_START) : name_end] in missing:
             return True
-    return False
 
 
 def _classify_free_string(state, value_start, values, name, probe):
-    text, tool, openers = state
+    text, tool, openers, work = state
     origin, depth, origin_missing = probe
     count, witness_cursor, witness_values = 0, None, None
     search_from = value_start
-    while (value_end := _find_parameter_end(text, _PARAMETER_END, search_from)) >= 0:
+    while True:
+        value_end = _bounded_parameter_end(text, search_from, work)
+        if value_end is _EXHAUSTED:
+            return _EXHAUSTED
+        if value_end < 0:
+            return count, witness_cursor, witness_values, None
         cursor = value_end + len(_PARAMETER_END)
         following = _skip_whitespace(text, cursor)
         is_parameter = text.startswith(_PARAMETER_START, following)
@@ -342,16 +374,20 @@ def _classify_free_string(state, value_start, values, name, probe):
         branch_probe = (
             (origin, depth + 1, origin_missing) if ownership else probe if is_function else None
         )
-        branch_count, branch_cursor, branch_values, incomplete = _parse_parameters(
-            state, following, next_values, branch_probe
-        )
+        parsed = _parse_parameters(state, following, next_values, branch_probe)
+        if parsed is _EXHAUSTED:
+            return _EXHAUSTED
+        branch_count, branch_cursor, branch_values, incomplete = parsed
         count = min(2, count + branch_count)
         if count == 1 and branch_count:
             witness_cursor, witness_values = branch_cursor, branch_values
         elif count == 2:
             return 2, None, None, None
         if incomplete is not None and count == 0:
-            if origin != value_start and not _resumes_missing_parameter(text, incomplete, missing):
+            resumes = _resumes_missing_parameter(state, incomplete, missing)
+            if resumes is _EXHAUSTED:
+                return _EXHAUSTED
+            if origin != value_start and not resumes:
                 return count, witness_cursor, witness_values, incomplete
             search_from = incomplete
         else:
@@ -369,7 +405,14 @@ def _materialize_span(text: str, span: _FreeStringSpan) -> str | None:
 _find_parameter_end = str.find
 
 
-def _find_json_container_end(text: str, cursor: int) -> int:
+def _bounded_parameter_end(text: str, cursor: int, work: list[int]) -> int | object:
+    value_end = _find_parameter_end(text, _PARAMETER_END, cursor)
+    scanned = len(text) - cursor if value_end < 0 else value_end - cursor + len(_PARAMETER_END)
+    return value_end if _consume_work(work, scanned) else _EXHAUSTED
+
+
+def _find_json_container_end(text: str, cursor: int, work: list[int]) -> int | object:
+    start = cursor
     in_string = False
     escaped = False
     while cursor < len(text):
@@ -381,9 +424,10 @@ def _find_json_container_end(text: str, cursor: int) -> int:
         elif character == '"':
             in_string = not in_string
         elif not in_string and text.startswith(_PARAMETER_END, cursor):
-            return cursor
+            scanned = cursor - start + len(_PARAMETER_END)
+            return cursor if _consume_work(work, scanned) else _EXHAUSTED
         cursor += 1
-    return -1
+    return -1 if _consume_work(work, len(text) - start) else _EXHAUSTED
 
 
 def _coerce_value(value: str, schema_type: str) -> Any:

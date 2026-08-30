@@ -11,6 +11,7 @@ from flash.serve.request.tool_calls import (
     tools_active,
     tools_wire,
     validate_tool_control_presence,
+    validate_tool_history_replay,
     validate_tool_stop_sequences,
 )
 from flash.serve.request.validation import MAX_SOURCE_CHARS, has_image_blocks, normalize_messages
@@ -98,6 +99,8 @@ class OpenAIGenerateRequest(GenerateRequest):
                 error_type=ValueError,
                 max_source_chars=MAX_SOURCE_CHARS,
             )
+        normalized_tools = None if self.tools is None else normalize_tools(self.tools)
+        validate_tool_history_replay(self.messages or (), normalized_tools)
         if tools_active(self.tools, self.tool_choice):
             if self.messages is None:
                 raise ValueError("tools require chat messages")
@@ -107,7 +110,7 @@ class OpenAIGenerateRequest(GenerateRequest):
                 raise ValueError("tools cannot be combined with logprobs or structured outputs")
         validate_tool_stop_sequences(
             () if self.stop is None else (self.stop,) if isinstance(self.stop, str) else self.stop,
-            tools=None if self.tools is None else normalize_tools(self.tools),
+            tools=normalized_tools,
             tool_choice=self.tool_choice,
         )
         return self
