@@ -14,8 +14,10 @@ import pytest
 import flash.serve.request.openai as openai_module
 import flash.serve.request.tool_calls as request_tool_calls_module
 import flash.serve.runtime.tool_calls as tool_calls_module
+from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
 from flash.serve.request.openai import OpenAIRequestError, parse_chat_request
 from flash.serve.request.tool_calls import (
+    FunctionTool,
     detached_template_messages,
     normalize_tools,
     tools_wire,
@@ -24,6 +26,7 @@ from flash.serve.request.tool_calls import (
 )
 from flash.serve.request.validation import detached_messages
 from flash.serve.runtime.tool_calls import ToolCallStreamParser, parse_qwen3_coder_output
+from flash.serving.src.io.openai_request import OpenAIGenerateRequest
 
 
 def test_tools_wire_recursively_detaches_the_normalized_schema() -> None:
@@ -1108,6 +1111,80 @@ def test_long_trivial_history_is_not_rejected_by_the_generation_work_cap() -> No
     )
 
     assert len(request.messages[0]["tool_calls"][0]["function"]["arguments"]) > 8_500_000
+
+
+def test_history_that_renders_far_larger_than_the_request_is_rejected() -> None:
+    # a six-character literal renders as 1024 digits, so a request well under the transport cap
+    # can describe a rendered turn hundreds of megabytes wide. the ceiling must be measured on
+    # the rendered text, not on the request that carried it.
+    arguments = "{" + ",".join(f'"f{index}":1e1023' for index in range(511)) + "}"
+    calls = [
+        {
+            "id": f"call_{index}",
+            "type": "function",
+            "function": {"name": f"fn{index}", "arguments": arguments},
+        }
+        for index in range(408)
+    ]
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": calls},
+        *(
+            {"role": "tool", "tool_call_id": f"call_{index}", "content": "ok"}
+            for index in range(408)
+        ),
+    ]
+
+    assert len(json.dumps(messages)) < MAX_CHAT_REQUEST_BYTES
+    with pytest.raises(OpenAIRequestError, match="cannot be replayed exactly"):
+        parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+def test_hosted_request_replays_history_without_inactive_declarations() -> None:
+    # the hosted envelope must reach the same verdict as the canonical path: a declaration that
+    # tool_choice has switched off cannot decide whether past calls replay.
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_fixed",
+                    "type": "function",
+                    "function": {"name": "store", "arguments": '{"old": "x"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_fixed", "content": "ok"},
+    ]
+    inactive = tools_wire(
+        (
+            FunctionTool(
+                "store",
+                None,
+                {
+                    "type": "object",
+                    "properties": {"new": {"type": "string"}},
+                    "required": ["new"],
+                    "additionalProperties": False,
+                },
+            ),
+        )
+    )
+
+    request = OpenAIGenerateRequest(
+        adapter_id="adapter",
+        generation_id="generation",
+        messages=messages,
+        tools=inactive,
+        tool_choice="none",
+        parallel_tool_calls=True,
+    )
+
+    assert request.tool_choice == "none"
 
 
 @pytest.mark.parametrize(

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from decimal import Decimal, DecimalException
 from typing import Any
 
-from flash.serve.contract.protocol import TEXT_TYPES
+from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES, TEXT_TYPES
 
 TOOL_PARSER_QWEN3_CODER = "qwen3_coder"
 TOOL_CALL_START, TOOL_CALL_END = "<tool_call>", "</tool_call>"
@@ -19,6 +19,9 @@ _PARAMETER_START, _PARAMETER_END = "<parameter=", "</parameter>"
 _REPLAY_CONTAINER_TYPE = "replay_container"
 _NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _MAX_TOOLS, _MAX_SCHEMA_DEPTH, _MAX_SCHEMA_NODES, _MAX_ENUM_VALUES = 128, 8, 512, 128
+# the parser charges four work units per input character, so a request that stays under the
+# transport cap can never buy more parser work here than the fixed generation budget allows.
+_MAX_REPLAY_TEMPLATE_CHARS = MAX_CHAT_REQUEST_BYTES
 _MAX_FIXED_DECIMAL_DIGITS = _MAX_NUMERIC_LITERAL_DIGITS = 1024
 _MAX_NUMERIC_LITERAL_EXPONENT = 1_000_000
 _MAX_ENUM_INTEGER_MAGNITUDE = 10**_MAX_NUMERIC_LITERAL_DIGITS
@@ -573,17 +576,26 @@ def _validate_template_roundtrip(
 ) -> None:
     from flash.serve.runtime.tool_calls import parse_qwen3_coder_output
 
-    text = "".join(
-        f"{TOOL_CALL_START}{_FUNCTION_START}{tool.name}>"
-        + "".join(
-            f"{_PARAMETER_START}{field}>\n{_render_template_argument(rendered[field])}\n"
-            f"{_PARAMETER_END}"
-            for field in decoded
-        )
-        + f"{_FUNCTION_END}{TOOL_CALL_END}"
-        for tool, decoded, rendered in probe
-    )
     failure = "tool calls cannot be replayed exactly by the tool template"
+    # a short numeric literal renders as up to 1024 digits, so the rendered turn can be orders
+    # of magnitude larger than the request that carried it. accumulate under an explicit ceiling
+    # rather than joining first, so an expanding history is rejected before it is materialized.
+    blocks: list[str] = []
+    size = 0
+    for tool, decoded, rendered in probe:
+        blocks.append(
+            f"{TOOL_CALL_START}{_FUNCTION_START}{tool.name}>"
+            + "".join(
+                f"{_PARAMETER_START}{field}>\n{_render_template_argument(rendered[field])}\n"
+                f"{_PARAMETER_END}"
+                for field in decoded
+            )
+            + f"{_FUNCTION_END}{TOOL_CALL_END}"
+        )
+        size += len(blocks[-1])
+        if size > _MAX_REPLAY_TEMPLATE_CHARS:
+            raise ValueError(failure)
+    text = "".join(blocks)
     result = parse_qwen3_coder_output(
         text,
         _merged_replay_tools(probe),

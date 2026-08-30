@@ -100,7 +100,10 @@ class OpenAIGenerateRequest(GenerateRequest):
                 max_source_chars=MAX_SOURCE_CHARS,
             )
         normalized_tools = None if self.tools is None else normalize_tools(self.tools)
-        validate_tool_history_replay(self.messages or (), normalized_tools)
+        validate_tool_history_replay(
+            self.messages or (),
+            normalized_tools if tools_active(self.tools, self.tool_choice) else None,
+        )
         if tools_active(self.tools, self.tool_choice):
             if self.messages is None:
                 raise ValueError("tools require chat messages")
