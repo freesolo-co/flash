@@ -513,57 +513,43 @@ def _decode_json_object(value: str) -> dict[str, Any]:
 def _template_json_object(value: str, *, replay_tool: FunctionTool | None = None) -> dict[str, Any]:
     decoded = _decode_json_object(value)
     rendered = {name: _template_argument_value(item) for name, item in decoded.items()}
-    if replay_tool is not None:
-        for name, item in decoded.items():
-            schema = replay_tool.parameters["properties"].get(name)
-            if (
-                type(item) is str
-                and _PARAMETER_END in item
-                and schema is not None
-                and schema["type"] == "string"
-                and "enum" not in schema
-            ):
-                _validate_template_scalar_roundtrip(replay_tool, name, item, decoded, rendered)
+    if replay_tool is not None and any(
+        type(item) is str
+        and _PARAMETER_END in item
+        and (schema := replay_tool.parameters["properties"].get(name)) is not None
+        and schema["type"] == "string"
+        and "enum" not in schema
+        for name, item in decoded.items()
+    ):
+        _validate_template_scalar_roundtrip(replay_tool, decoded, rendered)
     return rendered
 
 
 def _validate_template_scalar_roundtrip(
     tool: FunctionTool,
-    name: str,
-    original: str,
     decoded: dict[str, Any],
     rendered: dict[str, Any],
 ) -> None:
     from flash.serve.runtime.tool_calls import parse_qwen3_coder_output
 
-    declared = tool.parameters["properties"]
-    present = set(decoded)
-    properties = {
-        field: {"type": "string"} if field in present else schema
-        for field, schema in declared.items()
-    }
-    properties.update((field, {"type": "string"}) for field in present if field not in properties)
-    probe_parameters = {
-        "type": "object",
-        "properties": properties,
-        "required": [name],
-        "additionalProperties": False,
-    }
-    probe = FunctionTool(tool.name, tool.description, probe_parameters)
     parameters = "".join(
-        f"{_PARAMETER_START}{field}>"
-        f"{rendered[field] if field == name else 'placeholder'}{_PARAMETER_END}"
+        f"{_PARAMETER_START}{field}>\n{_render_template_argument(rendered[field])}\n"
+        f"{_PARAMETER_END}"
         for field in decoded
     )
     text = (
         f"{TOOL_CALL_START}{_FUNCTION_START}{tool.name}>{parameters}{_FUNCTION_END}{TOOL_CALL_END}"
     )
-    result = parse_qwen3_coder_output(text, (probe,), id_factory=lambda: "call_replay")
+    result = parse_qwen3_coder_output(text, (tool,), id_factory=lambda: "call_replay")
     if len(result.calls) != 1:
         raise ValueError("function arguments cannot be replayed exactly by the tool template")
     replayed = _decode_json_object(result.calls[0].arguments)
-    if replayed.get(name) != original:
+    if not _json_values_equal(replayed, decoded):
         raise ValueError("function arguments cannot be replayed exactly by the tool template")
+
+
+def _render_template_argument(value: Any) -> str:
+    return _dump_template_json(value) if type(value) in {list, dict} else str(value)
 
 
 def _template_argument_value(value: Any) -> Any:

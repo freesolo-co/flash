@@ -31,6 +31,7 @@ from flash.serve.request.validation import MAX_MESSAGE_NODES
 
 _CALL_BOUNDARY_RE = re.compile(r"</function>\s*</tool_call>\s*(<tool_call>)\s*<function=([^>]+)>")
 _PARAMETER_OPEN_RE = re.compile(r"<parameter=([^>]+)>")
+_WHITESPACE_RE = re.compile(r"\s*")
 _AMBIGUOUS, _EXHAUSTED = object(), object()
 # an emitted call is only useful if the client can replay it, and the follow-up request carries
 # the whole prior conversation plus the assistant turn and one result per call. the cheapest
@@ -167,9 +168,13 @@ def parse_qwen3_coder_output(
         parsed_call = _parse_tool_call(text, start, confirmed[-1], tool_map, opener_positions, work)
         if parsed_call is _AMBIGUOUS or parsed_call is _EXHAUSTED:
             return ToolParseResult(content=text, calls=())
-        if parsed_call is not None and _skip_whitespace(text, parsed_call[0]) == confirmed[-1]:
-            confirmed.append(start)
-            parsed.append(parsed_call[1])
+        if parsed_call is not None:
+            parsed_end = _bounded_whitespace_end(text, parsed_call[0], work)
+            if parsed_end is _EXHAUSTED:
+                return ToolParseResult(content=text, calls=())
+            if parsed_end == confirmed[-1]:
+                confirmed.append(start)
+                parsed.append(parsed_call[1])
     if confirmed[-1] != first:
         return ToolParseResult(content=text, calls=())
     boundaries = confirmed[::-1]
@@ -178,8 +183,13 @@ def parse_qwen3_coder_output(
         if not any(schema["type"] == "string" and "enum" not in schema for schema in tool_map[name].parameters["properties"].values()):  # fmt: skip
             continue
         for scope_end in boundaries[index + 2 :]:
-            if (alternate := _parse_tool_call(text, start, scope_end, tool_map, opener_positions, work)) is _AMBIGUOUS or alternate is _EXHAUSTED or (alternate is not None and _skip_whitespace(text, alternate[0]) == scope_end):  # fmt: skip
+            alternate = _parse_tool_call(text, start, scope_end, tool_map, opener_positions, work)
+            if alternate is _AMBIGUOUS or alternate is _EXHAUSTED:
                 return ToolParseResult(content=text, calls=())
+            if alternate is not None:
+                alternate_end = _bounded_whitespace_end(text, alternate[0], work)
+                if alternate_end is _EXHAUSTED or alternate_end == scope_end:
+                    return ToolParseResult(content=text, calls=())
     try:
         for _, arguments in parsed:
             _validate_tool_argument_complexity(arguments, "generated tool call", ValueError)
@@ -214,15 +224,20 @@ def _candidate_body_can_start(text: str, cursor: int, tool: FunctionTool) -> boo
 def _parse_tool_call(text, cursor, scope_end, tools, opener_positions, work):
     if not _consume_work(work, 1) or not text.startswith(TOOL_CALL_START, cursor):
         return _EXHAUSTED if work[0] < 0 else None
-    cursor = _skip_whitespace(text, cursor + len(TOOL_CALL_START))
+    cursor = _bounded_whitespace_end(text, cursor + len(TOOL_CALL_START), work)
+    if cursor is _EXHAUSTED:
+        return _EXHAUSTED
     if not text.startswith(_FUNCTION_START, cursor):
         return None
     name_end = text.find(">", cursor + len(_FUNCTION_START))
     name = text[cursor + len(_FUNCTION_START) : name_end]
     if name_end < 0 or (tool := tools.get(name)) is None:
         return None
+    properties = tool.parameters["properties"]
     openers = {}
-    for parameter_name in tool.parameters["properties"]:
+    for parameter_name in properties:
+        if not _consume_work(work, 1):
+            return _EXHAUSTED
         positions = opener_positions.get(parameter_name, ())
         index = bisect_left(positions, scope_end)
         if index and positions[index - 1] >= name_end:
@@ -253,13 +268,28 @@ def _consume_work(work: list[int], amount: int) -> bool:
     return work[0] >= 0
 
 
+def _bounded_whitespace_end(text: str, cursor: int, work: list[int]) -> int | object:
+    limit = min(len(text), cursor + max(work[0], 0))
+    match = _WHITESPACE_RE.match(text, cursor, limit)
+    assert match is not None
+    end = match.end()
+    if end == limit and end < len(text) and text[end].isspace():
+        _consume_work(work, end - cursor + 1)
+        return _EXHAUSTED
+    return end if _consume_work(work, end - cursor) else _EXHAUSTED
+
+
 def _parse_parameters(state, cursor, values, probe):
-    text, tool, _, _ = state
+    text, tool, _, work = state
     parsed_values = dict(values)
     while True:
-        cursor = _skip_whitespace(text, cursor)
+        cursor = _bounded_whitespace_end(text, cursor, work)
+        if cursor is _EXHAUSTED:
+            return _EXHAUSTED
         if text.startswith(_FUNCTION_END, cursor):
-            outer = _skip_whitespace(text, cursor + len(_FUNCTION_END))
+            outer = _bounded_whitespace_end(text, cursor + len(_FUNCTION_END), work)
+            if outer is _EXHAUSTED:
+                return _EXHAUSTED
             if not text.startswith(TOOL_CALL_END, outer):
                 return 0, None, None, None
             outer += len(TOOL_CALL_END)
@@ -297,7 +327,9 @@ def _parse_parameter_value(state, value_start, schema, values, name, probe):
             return _EXHAUSTED
         if value_end < 0:
             return None
-        following = _skip_whitespace(text, value_end + len(_PARAMETER_END))
+        following = _bounded_whitespace_end(text, value_end + len(_PARAMETER_END), work)
+        if following is _EXHAUSTED:
+            return _EXHAUSTED
         if text.startswith((_PARAMETER_START, _FUNCTION_END), following):
             break
         if schema["type"] in {"array", "object"}:
@@ -330,7 +362,9 @@ def _resumes_missing_parameter(state, incomplete: int, missing: set[str]) -> boo
         if value_end < 0:
             return False
         search_from = value_end + len(_PARAMETER_END)
-        following = _skip_whitespace(text, search_from)
+        following = _bounded_whitespace_end(text, search_from, work)
+        if following is _EXHAUSTED:
+            return _EXHAUSTED
         if not text.startswith(_PARAMETER_START, following):
             continue
         name_end = text.find(">", following + len(_PARAMETER_START))
@@ -352,17 +386,21 @@ def _classify_free_string(state, value_start, values, name, probe):
         if value_end < 0:
             return count, witness_cursor, witness_values, None
         cursor = value_end + len(_PARAMETER_END)
-        following = _skip_whitespace(text, cursor)
+        following = _bounded_whitespace_end(text, cursor, work)
+        if following is _EXHAUSTED:
+            return _EXHAUSTED
         is_parameter = text.startswith(_PARAMETER_START, following)
         is_function = text.startswith(_FUNCTION_END, following)
         if not is_parameter and not is_function:
             search_from = cursor
             continue
-        if is_function and not text.startswith(
-            TOOL_CALL_END, _skip_whitespace(text, following + len(_FUNCTION_END))
-        ):
-            search_from = cursor
-            continue
+        if is_function:
+            function_end = _bounded_whitespace_end(text, following + len(_FUNCTION_END), work)
+            if function_end is _EXHAUSTED:
+                return _EXHAUSTED
+            if not text.startswith(TOOL_CALL_END, function_end):
+                search_from = cursor
+                continue
         next_values = {**values, name: _FreeStringSpan(value_start, value_end)}
         missing = set(tool.parameters["required"]) - set(next_values)
         content_viable = all(openers.get(field, -1) > following for field in missing) and (

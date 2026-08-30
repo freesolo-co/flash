@@ -958,7 +958,7 @@ def _repeated_boundary_call(repeats: int) -> str:
     )
 
 
-@pytest.mark.parametrize("repeats", [1, 7, 20, 100])
+@pytest.mark.parametrize("repeats", [1, 6, 7, 20, 100, 400])
 def test_boundary_text_inside_an_argument_parses_with_actual_work_accounting(
     repeats: int,
 ) -> None:
@@ -970,6 +970,61 @@ def test_boundary_text_inside_an_argument_parses_with_actual_work_accounting(
     boundary = "</function></tool_call><tool_call><function=store>"
     assert result.content is None
     assert json.loads(result.calls[0].arguments) == {"nested": {"text": "x" + boundary * repeats}}
+
+
+def test_whitespace_runs_charge_the_shared_parser_budget(monkeypatch) -> None:
+    tools = _delimiter_tools()
+    calls, spaces = 64, 1024
+    text = (f"<tool_call><function=store>{' ' * spaces}</function></tool_call>") * calls
+    charged = 0
+    original = tool_calls_module._consume_work
+
+    def measured(work: list[int], amount: int) -> bool:
+        nonlocal charged
+        charged += amount
+        return original(work, amount)
+
+    monkeypatch.setattr(tool_calls_module, "_consume_work", measured)
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    budget = 4 * len(text)
+    assert result.content == text
+    assert result.calls == ()
+    assert calls * spaces <= charged <= budget + 1
+
+
+def test_property_opener_rebuilds_stop_at_the_shared_parser_budget(monkeypatch) -> None:
+    declaration = _delimiter_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"] = {
+        f"p{index}": {"type": "string"} for index in range(128)
+    }
+    tools = normalize_tools([declaration])
+    text = "<tool_call><function=store></function></tool_call>" * 64
+    charged = searches = 0
+    original_bisect = tool_calls_module.bisect_left
+    original_consume = tool_calls_module._consume_work
+
+    def measured_bisect(positions, scope_end):
+        nonlocal searches
+        searches += 1
+        return original_bisect(positions, scope_end)
+
+    def measured_consume(work: list[int], amount: int) -> bool:
+        nonlocal charged
+        charged += amount
+        return original_consume(work, amount)
+
+    monkeypatch.setattr(tool_calls_module, "bisect_left", measured_bisect)
+    monkeypatch.setattr(tool_calls_module, "_consume_work", measured_consume)
+    result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
+
+    assert result.content == text
+    assert result.calls == ()
+    assert (
+        searches
+        <= charged
+        <= 4 * len(text) + len(declaration["function"]["parameters"]["properties"])
+    )
 
 
 def _history_replay_tools():
@@ -1048,6 +1103,31 @@ def test_scalar_history_accepts_declared_parameter_text_after_that_parameter_was
     )
     reparsed = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
     assert json.loads(reparsed.calls[0].arguments) == {"y": "already", "x": value}
+
+
+def test_scalar_history_roundtrip_is_independent_of_argument_order() -> None:
+    declaration = _delimiter_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"] = {
+        "x": {"type": "string"},
+        "z": {"type": "integer"},
+    }
+    declaration["function"]["parameters"]["required"] = ["x", "z"]
+    tools = normalize_tools([declaration])
+
+    for arguments in (
+        {"x": "a</parameter>b", "z": 1},
+        {"z": 1, "x": "a</parameter>b"},
+    ):
+        messages = _history_replay_messages("unused")
+        messages[0]["tool_calls"][0]["function"]["arguments"] = json.dumps(arguments)
+        request = parse_chat_request(
+            {"messages": messages, "tools": tools_wire(tools)},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+        assert request.messages[0]["tool_calls"][0]["function"]["arguments"] == json.dumps(
+            arguments
+        )
 
 
 def test_scalar_history_rejects_declared_parameter_injection_that_does_not_roundtrip() -> None:
