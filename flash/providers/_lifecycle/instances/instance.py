@@ -55,29 +55,28 @@ def run_label_prefix(run_id: str) -> str:
 
 
 def label_matches_run(label: str, prefix: str) -> bool:
-    """True iff ``label`` belongs to the run whose prefix is ``prefix`` — an EXACT match, or the prefix
-    followed by the ``-s`` seed boundary. Boundary-anchored so ``flash-100`` never matches
-    ``flash-1000-...`` (or vice versa). The single label-ownership test every instance provider's sweep
-    and run-scoped teardown shares."""
-    return label == prefix or label.startswith(prefix + "-s")
+    """True iff ``label`` belongs to the run whose prefix is ``prefix`` -- an EXACT match, or the
+    prefix followed by the ``-a`` attempt boundary. Boundary-anchored so ``flash-100`` never matches
+    ``flash-1000-...`` (or vice versa). The single label-ownership test every instance provider's
+    sweep and run-scoped teardown shares."""
+    return label == prefix or label.startswith(prefix + "-a")
 
 
-def instance_label(run_id: str, seed: int, attempt: int) -> str:
-    """Instance name: run-derived so ``sweep_orphans`` can tell ours from anything else on the
-    account, and bounded (via ``run_label_prefix``) so the provider never truncates it."""
-    try:
-        seed_i = int(seed)
-    except (TypeError, ValueError):
-        seed_i = 0
+def instance_label(run_id: str, attempt: int) -> str:
+    """Instance name: run plus the attempt executing on this host.
+
+    Run-derived so ``sweep_orphans`` can tell ours from anything else on the account, and bounded
+    (via ``run_label_prefix``) so the provider never truncates it. The seed is not part of the name:
+    a run has exactly one, so it distinguished nothing here while competing with the attempt for the
+    digit budget, and a truncated attempt is one two attempts of a run can collide on.
+    """
     attempt_i = _attempt_int(attempt)
     if attempt_i is None:
         raise ValueError("instance attempt identity is invalid")
-    seed_s, attempt_s = str(seed_i), str(attempt_i)
-    # Bound the whole suffix to _SUFFIX_BUDGET: split the digit budget between attempt and seed.
-    digit_budget = _SUFFIX_BUDGET - len("-s-a")
-    attempt_s = attempt_s[: max(1, min(len(attempt_s), max(1, digit_budget - 1)))]
-    seed_s = seed_s[: max(0, digit_budget - len(attempt_s))]
-    return f"{run_label_prefix(run_id)}-s{seed_s}-a{attempt_s}"
+    attempt_s = str(attempt_i)
+    if len(attempt_s) > _SUFFIX_BUDGET - len("-a"):
+        raise ValueError("instance attempt identity exceeds the provider name budget")
+    return f"{run_label_prefix(run_id)}-a{attempt_s}"
 
 
 @dataclass
@@ -183,7 +182,6 @@ fi
 
 def build_payload(
     spec,
-    seed: int,
     attempt: int,
     *,
     arm: str,
@@ -197,7 +195,6 @@ def build_payload(
     """The bootstrap's input — field-compatible with the RunPod ``_train_body`` payload, plus the
     bits the instance can't infer (HF prefix for markers, wall cap, attempt, and the substrate
     ``arm`` that the bootstrap stamps as FLASH_ARM + the marker name)."""
-    from flash.core.spec import require_matching_seed
     from flash.envs.loading.base import worker_pip_with_extras
     from flash.providers._lifecycle.net.worker import (
         build_worker_env,
@@ -205,12 +202,10 @@ def build_payload(
     )
     from flash.snapshot.archive import parse_descriptor
 
-    canonical_seed = require_matching_seed(spec, seed)
     # strip the runpod-only volume redirect; point base-model prefetch at this provider's cache unless the user overrode it.
     env = strip_runpod_volume_env(
         build_worker_env(
             spec,
-            canonical_seed,
             runtime_secrets=runtime_secrets,
         )
     )
