@@ -5611,7 +5611,9 @@ def test_the_serving_sources_the_image_uploads_are_recorded_in_every_artifact() 
 
     # The property that makes it evidence: editing a serving file the digest is supposed to cover
     # must change the value. Done against a COPY of the tree so the real checkout is untouched.
-    with tempfile.TemporaryDirectory(dir="/mnt/resource") as tmp:
+    # No `dir=` here: every other temp directory in this file honours TMPDIR, and pinning an
+    # absolute path made the guard pass locally and fail on CI, where /mnt/resource does not exist.
+    with tempfile.TemporaryDirectory() as tmp:
         mirror = Path(tmp) / "repo"
         (mirror / "flash").mkdir(parents=True)
         shutil.copytree(REPO_ROOT / "flash", mirror / "flash", dirs_exist_ok=True)
