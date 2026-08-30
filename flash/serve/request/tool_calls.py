@@ -637,6 +637,13 @@ def _merged_replay_tools(
             if merged_type is None:
                 raise ValueError("tool calls cannot be replayed exactly by the tool template")
             properties[name] = {"type": merged_type}
+        # a declared schema is normalized against the node budget, so one function can expose at
+        # most this many root properties. the union of self-derived probes has no such gate, and a
+        # turn repeating one name with disjoint keys could otherwise synthesize a declaration
+        # orders of magnitude wider than anything generation can emit. holding the union to the
+        # same budget costs no closure and keeps the parser's declaration scan proportional.
+        if len(properties) > _MAX_SCHEMA_NODES - 1:
+            raise ValueError("tool calls cannot be replayed exactly by the tool template")
         required = set(existing.parameters["required"]) & set(tool.parameters["required"])
         merged[tool.name] = FunctionTool(
             tool.name,

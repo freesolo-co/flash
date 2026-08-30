@@ -1284,6 +1284,74 @@ def test_replay_accepts_a_call_whose_argument_quotes_call_boundaries(
     }
 
 
+def test_merged_self_derived_declarations_stay_within_the_schema_budget() -> None:
+    # a declared schema is normalized against the node budget, so generation can never expose more
+    # than 511 root properties for one function. repeating one name with disjoint keys would
+    # otherwise union self-derived probes into a declaration orders of magnitude wider, and the
+    # parser charges a declaration scan per call against it.
+    calls = [
+        {
+            "id": f"call_{index}",
+            "type": "function",
+            "function": {
+                "name": "f",
+                "arguments": json.dumps({f"c{index}_p{field}": "v" for field in range(255)}),
+            },
+        }
+        for index in range(204)
+    ]
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": calls},
+        *(
+            {"role": "tool", "tool_call_id": f"call_{index}", "content": "ok"}
+            for index in range(204)
+        ),
+    ]
+
+    # this history is rejected either way, so asserting only the outcome would pass without the
+    # cap. assert the boundary that rejects it: the union must never reach the parser as a
+    # declaration wider than a declared schema could ever be.
+    probe = [
+        (
+            request_tool_calls_module._historical_replay_tool("f", arguments),
+            arguments,
+            arguments,
+        )
+        for arguments in (json.loads(call["function"]["arguments"]) for call in calls)
+    ]
+    with pytest.raises(ValueError, match="cannot be replayed exactly"):
+        request_tool_calls_module._merged_replay_tools(probe)
+
+    with pytest.raises(OpenAIRequestError, match="cannot be replayed exactly"):
+        parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+def test_merged_self_derived_declarations_stay_under_the_property_ceiling() -> None:
+    # the union is capped at the same root-property budget a declared schema is normalized to, so
+    # a turn that stays under it still merges and one that crosses it does not.
+    def merge(calls: int, fields: int) -> tuple[Any, ...]:
+        probe = []
+        for index in range(calls):
+            arguments = {f"c{index}_p{field}": "v" for field in range(fields)}
+            probe.append(
+                (
+                    request_tool_calls_module._historical_replay_tool("f", arguments),
+                    arguments,
+                    arguments,
+                )
+            )
+        return request_tool_calls_module._merged_replay_tools(probe)
+
+    assert len(merge(2, 255)[0].parameters["properties"]) == 510
+    assert len(merge(511, 1)[0].parameters["properties"]) == 511
+    with pytest.raises(ValueError, match="cannot be replayed exactly"):
+        merge(512, 1)
+
+
 def test_boundaries_quoted_inside_an_argument_do_not_trip_the_call_cap() -> None:
     # the candidate scan is context blind, so a boundary quoted inside a json string looks like a
     # call. the emitted-call ceiling must count real calls, not that estimate.
@@ -1404,6 +1472,50 @@ def test_hosted_request_applies_active_declarations_to_history_replay() -> None:
     # be rejected. without this, an envelope that ignored declarations entirely would still pass.
     with pytest.raises(ValidationError, match="cannot be replayed exactly"):
         _hosted_tool_request("auto")
+
+
+def test_hosted_request_accepts_unambiguous_history_under_active_declarations() -> None:
+    # the pair above is satisfied by an envelope that blanket-rejects every active tool history,
+    # so pin the accepting direction too: an unambiguous call must survive with tools active.
+    declarations = tools_wire(
+        (
+            FunctionTool(
+                "store",
+                None,
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}},
+                    "required": ["a"],
+                    "additionalProperties": False,
+                },
+            ),
+        )
+    )
+
+    request = OpenAIGenerateRequest(
+        adapter_id="adapter",
+        generation_id="generation",
+        messages=[
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_plain",
+                        "type": "function",
+                        "function": {"name": "store", "arguments": '{"a": "v"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_plain", "content": "ok"},
+        ],
+        tools=declarations,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    )
+
+    assert request.tool_choice == "auto"
+    assert request.messages[0]["tool_calls"][0]["function"]["arguments"] == '{"a": "v"}'
 
 
 @pytest.mark.parametrize(
