@@ -1428,34 +1428,67 @@ def _png_data_uri() -> str:
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
 
 
-def test_an_image_after_a_tool_response_keeps_the_turn_an_ordinary_query() -> None:
-    # the template renders an image as a placeholder rather than dropping it, so a turn whose text
-    # block looks like a synthesized tool response but that ends with an image does not end with
-    # `</tool_response>` and still closes the query span. reading only the text blocks would move
-    # the span earlier and reject the preceding turn for reasoning the model never sees.
+def _image_block(spelling: str) -> dict[str, Any]:
+    if spelling == "image_url":
+        return {"type": "image_url", "image_url": {"url": _png_data_uri()}}
+    return {"type": spelling, "image": _png_data_uri()}
+
+
+def _query_span_messages(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """a history whose middle user turn decides whether the first turn's reasoning renders."""
     earlier = _history_replay_messages("value")
     earlier[0]["content"] = "fine"
     earlier[0]["reasoning_content"] = "<tool_call>"
     later = _history_replay_arguments({"x": "second"})
     later[0]["tool_calls"][0]["id"] = later[1]["tool_call_id"] = "call_second"
-    messages = [
+    messages: list[dict[str, Any]] = [
         {"role": "user", "content": "q1"},
         *earlier,
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "<tool_response>x</tool_response>"},
-                {"type": "image_url", "image_url": {"url": _png_data_uri()}},
-            ],
-        },
+        {"role": "user", "content": blocks},
     ]
     messages.extend(later)
+    return messages
+
+
+@pytest.mark.parametrize("spelling", ["image_url", "input_image", "image"])
+def test_an_image_after_a_tool_response_keeps_the_turn_an_ordinary_query(spelling: str) -> None:
+    # the template renders an image as a placeholder rather than dropping it, so a turn whose text
+    # block looks like a synthesized tool response but that ends with an image does not end with
+    # `</tool_response>` and still closes the query span. reading only the text blocks would move
+    # the span earlier and reject the preceding turn for reasoning the model never sees. every
+    # accepted spelling reaches the same placeholder, so each one has to close the span.
+    messages = _query_span_messages(
+        [
+            {"type": "text", "text": "<tool_response>x</tool_response>"},
+            _image_block(spelling),
+        ]
+    )
 
     request = parse_chat_request(
         {"messages": messages}, require_model=False, allow_managed_selectors=True
     )
 
     assert request.messages[1]["reasoning_content"] == "<tool_call>"
+
+
+def test_an_image_between_the_tool_response_tags_does_not_close_the_query_span() -> None:
+    # the macro emits blocks in list order, so a placeholder BETWEEN the tags leaves the turn
+    # still starting and ending with them: it stays a synthesized tool response and the earlier
+    # reasoning marker does render, which the parser cannot replay. an implementation that
+    # rendered the text first and appended images would read this as an ordinary query and accept
+    # a turn that really parses to one call rather than two.
+    messages = _query_span_messages(
+        [
+            {"type": "text", "text": "<tool_response>"},
+            _image_block("image_url"),
+            {"type": "text", "text": "</tool_response>"},
+        ]
+    )
+
+    with pytest.raises(OpenAIRequestError, match="cannot be replayed exactly"):
+        parse_chat_request(
+            {"messages": messages}, require_model=False, allow_managed_selectors=True
+        )
 
 
 @pytest.mark.parametrize(
