@@ -286,6 +286,10 @@ def _normalize_schema(
     budget[0] += 1
     if depth > _MAX_SCHEMA_DEPTH or budget[0] > _MAX_SCHEMA_NODES:
         raise error_type(f"{path} exceeds the supported schema complexity")
+    non_string_keys = [key for key in raw if type(key) is not str]
+    if non_string_keys:
+        keywords = ", ".join(sorted(repr(key) for key in non_string_keys))
+        raise error_type(f"{path} uses unsupported schema keyword(s): {keywords}")
     unknown = set(raw) - _SCHEMA_KEYS
     if unknown:
         raise error_type(f"{path} uses unsupported schema keyword(s): {', '.join(sorted(unknown))}")
@@ -581,7 +585,10 @@ def _validate_template_roundtrip(
     )
     failure = "tool calls cannot be replayed exactly by the tool template"
     result = parse_qwen3_coder_output(
-        text, _merged_replay_tools(probe), id_factory=lambda: "call_replay"
+        text,
+        _merged_replay_tools(probe),
+        id_factory=lambda: "call_replay",
+        _work_limit=4 * len(text),
     )
     if len(result.calls) != len(probe):
         raise ValueError(failure)
@@ -593,9 +600,8 @@ def _validate_template_roundtrip(
 def _merged_replay_tools(
     probe: Sequence[tuple[FunctionTool, dict[str, Any], dict[str, Any]]],
 ) -> tuple[FunctionTool, ...]:
-    # one turn can call the same function twice with different optional arguments, so the
-    # parser needs every key any of those calls used. keeping only one tool per name would
-    # leave the other call's parameters undeclared and reject a history the parser emits.
+    # one turn can call the same function with different optional arguments, so the parser
+    # needs the union of observed keys, while only keys present in every call stay required.
     # a declared tool is one shared object for every call naming it, so only self-derived
     # probes can differ under the same name.
     merged: dict[str, FunctionTool] = {}
@@ -604,18 +610,36 @@ def _merged_replay_tools(
         if existing is None or existing is tool:
             merged[tool.name] = tool
             continue
-        properties = {**existing.parameters["properties"], **tool.parameters["properties"]}
+        properties = dict(existing.parameters["properties"])
+        for name, schema in tool.parameters["properties"].items():
+            prior = properties.get(name)
+            if prior is None:
+                properties[name] = schema
+                continue
+            merged_type = _merged_historical_replay_type(prior["type"], schema["type"])
+            if merged_type is None:
+                raise ValueError("tool calls cannot be replayed exactly by the tool template")
+            properties[name] = {"type": merged_type}
+        required = set(existing.parameters["required"]) & set(tool.parameters["required"])
         merged[tool.name] = FunctionTool(
             tool.name,
             None,
             {
                 "type": "object",
                 "properties": properties,
-                "required": [],
+                "required": [name for name in properties if name in required],
                 "additionalProperties": False,
             },
         )
     return tuple(merged.values())
+
+
+def _merged_historical_replay_type(left: str, right: str) -> str | None:
+    if left == right:
+        return left
+    if {left, right} == {"integer", "number"}:
+        return "number"
+    return None
 
 
 def _render_template_argument(value: Any) -> str:

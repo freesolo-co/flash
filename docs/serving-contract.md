@@ -83,9 +83,10 @@ names. Parameters use a bounded root-object JSON Schema profile with `properties
 `additionalProperties: false`, recursive scalar, object, and array types, descriptions, enums, and
 array `items`. Numeric enum members must be JSON integers; decimal and exponent numeric enum lexemes
 are rejected because Flash cannot preserve them exactly across every ingress and template boundary.
-Generated and historical JSON numeric literals support at most 1024 significand digits; oversized
-generated candidates remain exact text and oversized history is rejected. Exponent magnitude is not
-part of this bound. A historical value that no native template number carries faithfully, because it
+Generated and historical JSON numeric literals support at most 1024 significand digits and exponent
+magnitude at most 1,000,000; generated candidates outside either bound remain exact text, while
+history outside either bound is rejected. A historical value within those bounds that no native
+template number carries faithfully, because it
 would overflow, underflow, or lose digits, is rendered as its exact compact text instead of being
 converted or rejected, and a container holding such a value is rendered exactly as a whole. A
 top-level boolean or null argument is likewise pre-rendered as `true`, `false`, or `null`, because the

@@ -944,6 +944,19 @@ def test_generation_request_rejects_nonexact_tool_enum_json(enum_value: object) 
         )
 
 
+def test_generation_request_translates_non_string_schema_keywords() -> None:
+    declaration = _runtime_tools()[0].wire()
+    declaration["function"]["parameters"][5] = "boom"
+
+    with pytest.raises(RuntimeConfigurationError, match=r"unsupported schema keyword\(s\): 5"):
+        GenerationRequest(
+            messages=[{"role": "user", "content": "weather"}],
+            tools=[declaration],
+            tool_choice="auto",
+            parallel_tool_calls=True,
+        )
+
+
 def test_packaged_generation_request_rejects_active_tool_whitespace_stop() -> None:
     with pytest.raises(RuntimeConfigurationError, match="whitespace separators"):
         GenerationRequest(
@@ -1024,6 +1037,27 @@ def test_generation_request_validates_tool_history_without_current_tools() -> No
 
     with pytest.raises(RuntimeConfigurationError, match="cannot be replayed exactly"):
         GenerationRequest(messages=messages)
+
+
+def test_generation_request_ignores_inactive_tools_during_history_replay() -> None:
+    declaration = _runtime_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"] = {"new": {"type": "string"}}
+    declaration["function"]["parameters"]["required"] = []
+    messages = _runtime_tool_history("call_1")
+    messages[1]["tool_calls"][0]["function"] = {
+        "name": "weather",
+        "arguments": '{"old":"x"}',
+    }
+
+    without_tools = GenerationRequest(messages=messages)
+    inactive = GenerationRequest(
+        messages=messages,
+        tools=[declaration],
+        tool_choice="none",
+        parallel_tool_calls=True,
+    )
+
+    assert inactive.messages == without_tools.messages
 
 
 def test_historical_integer_lexeme_limit_detaches_exactly_and_rejects_overflow() -> None:

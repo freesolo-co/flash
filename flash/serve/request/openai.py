@@ -158,7 +158,8 @@ def parse_chat_request(
         raise OpenAIRequestError(str(exc)) from exc
     structured_outputs = _structured_outputs(payload)
     tools, tool_choice, parallel_tool_calls = _tool_controls(payload)
-    validate_tool_history_replay(messages, tools, error_type=OpenAIRequestError)
+    replay_tools = tools if tools_active(tools, tool_choice) else None
+    validate_tool_history_replay(messages, replay_tools, error_type=OpenAIRequestError)
     stop = _stop_values(payload.get("stop"))
     validate_tool_stop_sequences(
         stop,

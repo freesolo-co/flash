@@ -512,8 +512,11 @@ class GenerationRequest:
                 raw_tools = tools_wire(tuple(raw_tools))
             normalized_tools = normalize_tools(raw_tools, error_type=RuntimeConfigurationError)
             object.__setattr__(self, "tools", normalized_tools)
+            replay_tools = (
+                normalized_tools if tools_active(normalized_tools, self.tool_choice) else None
+            )
             validate_tool_history_replay(
-                self.messages or (), normalized_tools, error_type=RuntimeConfigurationError
+                self.messages or (), replay_tools, error_type=RuntimeConfigurationError
             )
             if self.tool_choice not in {"auto", "none"}:
                 raise RuntimeConfigurationError("tool_choice must be auto or none")

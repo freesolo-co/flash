@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-import time
+import random
 from decimal import Decimal
 from itertools import pairwise
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -66,6 +67,14 @@ def test_tool_enum_rejects_nonexact_json_containers(enum_value: object) -> None:
 
     with pytest.raises(ValueError, match=r"exact JSON values|string-keyed JSON objects"):
         normalize_tools(declaration)
+
+
+def test_non_string_schema_keyword_uses_the_requested_validation_error() -> None:
+    declaration = _exact_tools()[0].wire()
+    declaration["function"]["parameters"][5] = "boom"
+
+    with pytest.raises(ValueError, match=r"unsupported schema keyword\(s\): 5"):
+        normalize_tools([declaration])
 
 
 def test_parser_accepts_one_and_64_character_property_names() -> None:
@@ -417,6 +426,14 @@ def test_decimal_exponent_magnitude_boundary_remains_structured(raw_value: str) 
     assert json.loads(result.calls[0].arguments, parse_float=Decimal)["scalar"] == Decimal(
         raw_value
     )
+
+
+def test_serving_contract_documents_the_numeric_exponent_safety_bound() -> None:
+    contract = (Path(__file__).resolve().parents[1] / "docs/serving-contract.md").read_text()
+
+    assert "exponent\nmagnitude at most 1,000,000" in contract
+    assert "history outside either bound is rejected" in contract
+    assert "Exponent magnitude is not\npart of this bound" not in contract
 
 
 def test_generated_arguments_with_duplicate_object_keys_fall_back_exactly() -> None:
@@ -995,22 +1012,25 @@ def test_whitespace_runs_charge_the_shared_parser_budget(monkeypatch) -> None:
     assert calls * spaces <= charged <= budget + 1
 
 
-def test_unterminated_parameter_openers_charge_before_large_parse() -> None:
-    # measure the whole parse rather than one helper, so an unbudgeted opener scan
-    # reintroduced anywhere on the path still fails this test.
-    def elapsed(count: int) -> float:
-        text = "<tool_call><function=store>" + "<parameter=" * count
-        start = time.perf_counter()
-        result = parse_qwen3_coder_output(text, _delimiter_tools())
-        duration = time.perf_counter() - start
-        assert result.content == text
-        assert result.calls == ()
-        return duration
+def test_unterminated_parameter_openers_charge_before_large_parse(monkeypatch) -> None:
+    # observe the public parse path, so moving opener discovery outside the shared budget
+    # fails on missing accounting rather than scheduler-dependent elapsed time.
+    count = 24_000
+    text = "<tool_call><function=store>" + "<parameter=" * count
+    charges: list[int] = []
+    original = tool_calls_module._consume_work
 
-    baseline = max(elapsed(6_000), 1e-4)
-    # a quadratic opener scan grows about sixteenfold when the input quadruples. anything
-    # near linear stays far below this bound even on a loaded machine.
-    assert elapsed(24_000) < baseline * 8
+    def measured(work: list[int], amount: int) -> bool:
+        charges.append(amount)
+        return original(work, amount)
+
+    monkeypatch.setattr(tool_calls_module, "_consume_work", measured)
+    result = parse_qwen3_coder_output(text, _delimiter_tools())
+
+    assert result.content == text
+    assert result.calls == ()
+    assert charges[0] == len(text)
+    assert sum(charges) <= 4 * len(text) + 1
 
 
 def test_property_opener_rebuilds_stop_at_the_shared_parser_budget(monkeypatch) -> None:
@@ -1076,6 +1096,18 @@ def _history_replay_arguments(arguments: dict[str, Any]) -> list[dict[str, Any]]
         },
         {"role": "tool", "tool_call_id": "call_fixed", "content": "ok"},
     ]
+
+
+def test_long_trivial_history_is_not_rejected_by_the_generation_work_cap() -> None:
+    messages = _history_replay_arguments({"x": {"s": "a" * 8_500_000}})
+
+    request = parse_chat_request(
+        {"messages": messages},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    assert len(request.messages[0]["tool_calls"][0]["function"]["arguments"]) > 8_500_000
 
 
 @pytest.mark.parametrize(
@@ -1246,6 +1278,31 @@ def test_tools_none_rejects_history_that_fails_its_self_derived_probe() -> None:
         )
 
 
+def test_tool_choice_none_replays_history_without_inactive_declarations() -> None:
+    declaration = _history_replay_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"] = {"new": {"type": "string"}}
+    declaration["function"]["parameters"]["required"] = []
+    messages = _history_replay_arguments({"old": "x"})
+
+    without_tools = parse_chat_request(
+        {"messages": messages},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+    inactive = parse_chat_request(
+        {
+            "messages": messages,
+            "tools": [declaration],
+            "tool_choice": "none",
+            "parallel_tool_calls": True,
+        },
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    assert inactive.messages == without_tools.messages
+
+
 @pytest.mark.parametrize(
     "value",
     ["plain", "</parameter>", "<parameter=y>nested", "a</parameter>b"],
@@ -1305,8 +1362,8 @@ def test_repeated_calls_that_the_template_renders_ambiguously_are_rejected(
         parse_chat_request(payload, require_model=False, allow_managed_selectors=True)
 
 
-@pytest.mark.parametrize("count", [2, 3, 5])
-@pytest.mark.parametrize("declaration", ["none", "matched"])
+@pytest.mark.parametrize("count", [2, 3, 5, 10])
+@pytest.mark.parametrize("declaration", ["none", "unmatched", "matched"])
 def test_repeated_unambiguous_calls_still_replay(count: int, declaration: str) -> None:
     # the turn-level probe must reject only genuine ambiguity. a single declared parameter
     # leaves no competing scope, so the parser reproduces every call and replay closure holds.
@@ -1317,6 +1374,8 @@ def test_repeated_unambiguous_calls_still_replay(count: int, declaration: str) -
         declared["function"]["parameters"]["properties"].pop("y", None)
         declared["function"]["parameters"]["required"] = ["x"]
         payload["tools"] = [declared]
+    elif declaration == "unmatched":
+        payload["tools"] = tools_wire(_unmatched_replay_tools())
 
     request = parse_chat_request(payload, require_model=False, allow_managed_selectors=True)
 
@@ -1337,25 +1396,174 @@ def test_repeated_calls_with_different_optional_arguments_replay() -> None:
     emitted = parse_qwen3_coder_output(text, tools)
     assert [call.arguments for call in emitted.calls] == ['{"x":"one"}', '{"y":"two"}']
 
+    request = _replay_emitted_calls(emitted.calls, tools=None)
+
+    assert len(request.messages[0]["tool_calls"]) == 2
+
+
+def _replay_emitted_calls(calls, *, tools=None):
+    history_calls = [
+        {
+            "id": f"call_{index}",
+            "type": "function",
+            "function": {"name": call.name, "arguments": call.arguments},
+        }
+        for index, call in enumerate(calls)
+    ]
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": history_calls},
+        *({"role": "tool", "tool_call_id": call["id"], "content": "ok"} for call in history_calls),
+    ]
+    payload: dict[str, Any] = {"messages": messages}
+    if tools is not None:
+        payload.update(tools=tools_wire(tools), tool_choice="auto", parallel_tool_calls=True)
+    return parse_chat_request(
+        payload,
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+
+def _unmatched_replay_tools():
+    declaration = _history_replay_tools()[0].wire()
+    declaration["function"]["name"] = "other"
+    return normalize_tools([declaration])
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["emitted-order", "reversed-order"])
+@pytest.mark.parametrize("declaration", ["none", "unmatched", "matched"])
+def test_same_property_integer_and_number_probes_widen_without_order_dependence(
+    reverse: bool,
+    declaration: str,
+) -> None:
+    declared = _history_replay_tools()[0].wire()
+    declared["function"]["parameters"]["properties"] = {"x": {"type": "number"}}
+    declared["function"]["parameters"]["required"] = ["x"]
+    tools = normalize_tools([declared])
+    text = (
+        "<tool_call><function=store><parameter=x>1.5</parameter></function></tool_call>"
+        "<tool_call><function=store><parameter=x>1</parameter></function></tool_call>"
+    )
+    emitted = parse_qwen3_coder_output(text, tools)
+    calls = emitted.calls[::-1] if reverse else emitted.calls
+    current = (
+        None
+        if declaration == "none"
+        else _unmatched_replay_tools()
+        if declaration == "unmatched"
+        else tools
+    )
+
+    request = _replay_emitted_calls(calls, tools=current)
+
+    assert [
+        json.loads(call["function"]["arguments"])["x"] for call in request.messages[0]["tool_calls"]
+    ] == ([1, 1.5] if reverse else [1.5, 1])
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        (1, "text"),
+        (1, True),
+        (1, None),
+        (1, {"nested": 1}),
+        (1.5, "text"),
+        (1.5, True),
+        (1.5, None),
+        (1.5, {"nested": 1}),
+        ("text", True),
+        ("text", None),
+        ("text", {"nested": 1}),
+        (True, None),
+        (True, {"nested": 1}),
+        (None, {"nested": 1}),
+    ],
+)
+def test_incompatible_self_derived_property_types_are_rejected(left: Any, right: Any) -> None:
     calls = [
         {
             "id": f"call_{index}",
             "type": "function",
-            "function": {"name": "store", "arguments": call.arguments},
+            "function": {
+                "name": "store",
+                "arguments": json.dumps({"x": value}, separators=(",", ":")),
+            },
         }
-        for index, call in enumerate(emitted.calls)
+        for index, value in enumerate((left, right))
     ]
     messages = [
         {"role": "assistant", "content": None, "tool_calls": calls},
         *({"role": "tool", "tool_call_id": call["id"], "content": "ok"} for call in calls),
     ]
-    request = parse_chat_request(
-        {"messages": messages},
-        require_model=False,
-        allow_managed_selectors=True,
+
+    with pytest.raises(OpenAIRequestError, match="cannot be replayed exactly"):
+        parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["emitted-order", "reversed-order"])
+@pytest.mark.parametrize("declaration", ["none", "unmatched", "matched"])
+def test_merged_probe_keeps_properties_required_when_every_call_contains_them(
+    reverse: bool,
+    declaration: str,
+) -> None:
+    tools = _history_replay_tools()
+    text = (
+        "<tool_call><function=store><parameter=x>plain</parameter></function></tool_call>"
+        "<tool_call><function=store><parameter=y>a</parameter>b</parameter>"
+        "<parameter=x>a</function></tool_call>b</parameter></function></tool_call>"
+    )
+    emitted = parse_qwen3_coder_output(text, tools)
+    assert len(emitted.calls) == 2
+    calls = emitted.calls[::-1] if reverse else emitted.calls
+    current = (
+        None
+        if declaration == "none"
+        else _unmatched_replay_tools()
+        if declaration == "unmatched"
+        else tools
     )
 
+    request = _replay_emitted_calls(calls, tools=current)
+
     assert len(request.messages[0]["tool_calls"]) == 2
+
+
+def test_mixed_required_optional_probe_merge_fuzz_preserves_emitted_turns() -> None:
+    declaration = _history_replay_tools()[0].wire()
+    declaration["function"]["parameters"]["properties"] = {
+        "x": {"type": "number"},
+        "y": {"type": "integer"},
+        "z": {"type": "boolean"},
+    }
+    declaration["function"]["parameters"]["required"] = ["x"]
+    tools = normalize_tools([declaration])
+    unmatched = _unmatched_replay_tools()
+    generator = random.Random(70880)
+
+    for count in (2, 3, 5, 10):
+        for _ in range(5):
+            parts = []
+            for index in range(count):
+                fields = [f"<parameter=x>{'1.5' if generator.getrandbits(1) else '1'}</parameter>"]
+                if generator.getrandbits(1):
+                    fields.append(f"<parameter=y>{index}</parameter>")
+                if generator.getrandbits(1):
+                    fields.append(f"<parameter=z>{'true' if index % 2 else 'false'}</parameter>")
+                parts.append(
+                    "<tool_call><function=store>" + "".join(fields) + "</function></tool_call>"
+                )
+            emitted = parse_qwen3_coder_output("".join(parts), tools)
+            assert len(emitted.calls) == count
+            calls = list(emitted.calls)
+            generator.shuffle(calls)
+            for current in (None, unmatched, tools):
+                request = _replay_emitted_calls(calls, tools=current)
+                assert len(request.messages[0]["tool_calls"]) == count
 
 
 def test_undeclared_history_uses_a_self_derived_replay_probe() -> None:

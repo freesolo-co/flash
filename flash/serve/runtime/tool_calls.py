@@ -140,6 +140,7 @@ def parse_qwen3_coder_output(
     tools: Sequence[FunctionTool],
     *,
     id_factory: Callable[[], str] | None = None,
+    _work_limit: int = 16 * 1024 * 1024,
 ) -> ToolParseResult:
     first = text.find(TOOL_CALL_START)
     if first < 0:
@@ -155,7 +156,7 @@ def parse_qwen3_coder_output(
     # ``candidates`` holds the calls after the first, so the emitted count is one more.
     if len(candidates) + 1 > _MAX_POTENTIALLY_REPLAYABLE_CALLS:
         return ToolParseResult(content=text, calls=())
-    work = [min(16 * 1024 * 1024, 4 * len(text))]
+    work = [min(_work_limit, 4 * len(text))]
     opener_positions = _index_parameter_openers(text, first, work)
     if opener_positions is _EXHAUSTED:
         return ToolParseResult(content=text, calls=())
