@@ -4146,6 +4146,56 @@ def test_whitespace_scanning_matches_stepping_and_stays_native() -> None:
     assert calls == 1, calls
 
 
+def test_the_narrowed_closer_scan_finds_every_declared_name_and_no_other() -> None:
+    """spelling declared names into the scan must not change which closers are viable.
+
+    alternation is ordered, so a name that prefixes another could match first and then fail on the
+    closing ``>``. the declared set also comes from an untrusted declaration, so a name carrying
+    regex syntax would otherwise change the pattern's meaning rather than its literal text.
+    """
+    shadowing = [{"a", "ab"}, {"x", "xy", "xyz"}, {"dat", "data"}, {"n", "nn", "nnn"}]
+    for names in shadowing:
+        pattern = text_scan.viable_parameter_end_re(frozenset(names))
+        for name in names:
+            assert pattern.search(f"</parameter> <parameter={name}>"), (names, name)
+        for absent in ("abc", "xyzz", "datax", "nnnn", "zz"):
+            if absent not in names:
+                assert not pattern.search(f"</parameter> <parameter={absent}>"), (names, absent)
+        # the function end is always viable, whatever the declaration names.
+        assert pattern.search("</parameter>  </function>"), names
+
+    # with nothing declared only the function end can continue a call.
+    empty = text_scan.viable_parameter_end_re(frozenset())
+    assert empty.search("</parameter> </function>")
+    assert not empty.search("</parameter> <parameter=anything>")
+
+    # `normalize_tools` restricts property names to the opener charset, so regex syntax cannot
+    # reach the pattern. the escaping is asserted anyway, since the guarantee lives elsewhere.
+    for hostile in ("a|b", "a.b", "(a)", "a*"):
+        pattern = text_scan.viable_parameter_end_re(frozenset({hostile}))
+        assert pattern.search(f"</parameter> <parameter={hostile}>"), hostile
+        assert not pattern.search("</parameter> <parameter=a>"), hostile
+    for hostile in ("a.b", "(a)", "a*", "a|b"):
+        with pytest.raises(OpenAIRequestError, match="key is invalid"):
+            normalize_tools(
+                [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "store",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {hostile: {"type": "string"}},
+                                "required": [],
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                ],
+                error_type=OpenAIRequestError,
+            )
+
+
 def test_schema_node_budget_is_per_declaration_and_bounded_by_the_tool_maximum() -> None:
     """the node ceiling is per declaration, and the tool maximum bounds the list.
 
