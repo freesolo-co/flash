@@ -729,10 +729,13 @@ def test_openai_sse_keeps_repeated_delta_text(modal_app_module):
         if chunk != b"data: [DONE]\n\n"
     ]
     emitted_text = "".join(
-        payload["choices"][0]["delta"].get("content", "") for payload in payloads
+        payload["choices"][0]["delta"].get("content", "")
+        for payload in payloads
+        if payload["choices"]
     )
 
     assert emitted_text == "\n\ndone"
+    assert payloads[-1]["choices"] == []
     assert payloads[-1]["usage"] == {
         "prompt_tokens": 2,
         "completion_tokens": 3,
