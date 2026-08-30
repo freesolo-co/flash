@@ -4103,13 +4103,18 @@ def test_whitespace_scanning_matches_stepping_and_stays_native() -> None:
 
 
 def test_schema_node_budget_spans_the_whole_tool_list() -> None:
-    """the node ceiling is a request budget, not a per-declaration one.
+    """two ceilings: one per declaration, and a separate smaller one across the list.
 
-    charging it per declaration lets the tool maximum multiply it, so a caller could send many
-    times the node ceiling the contract names while every individual declaration stayed under it.
-    that buys synchronous normalization work on the request path proportional to the product.
+    charging only per declaration lets the tool maximum multiply it, so a caller could buy the
+    node ceiling once per tool and spend many times what the contract names on synchronous
+    normalization. charging one shared budget instead would reject ordinary multi-integration
+    lists, whose declarations are individually tiny, so the aggregate ceiling is its own number.
     """
-    from flash.serve.request.tool_calls import _MAX_SCHEMA_NODES, _MAX_TOOLS
+    from flash.serve.request.tool_calls import (
+        _MAX_SCHEMA_NODES,
+        _MAX_TOOLS,
+        _MAX_TOTAL_SCHEMA_NODES,
+    )
 
     def declarations(count: int, properties: int) -> list[dict]:
         schema = {
@@ -4123,18 +4128,26 @@ def test_schema_node_budget_spans_the_whole_tool_list() -> None:
             for index in range(count)
         ]
 
-    # a list whose total stays under the ceiling is accepted, including at the tool maximum.
-    normalize_tools(declarations(_MAX_TOOLS, 1), error_type=OpenAIRequestError)
-    normalize_tools(declarations(16, 10), error_type=OpenAIRequestError)
+    # the shapes an ordinary multi-integration caller sends: many small tools, a few larger ones.
+    # these are the ones a single shared budget rejected, so each is load-bearing here.
+    for count, properties in ((_MAX_TOOLS, 1), (_MAX_TOOLS, 4), (64, 8), (32, 16), (16, 10)):
+        normalize_tools(declarations(count, properties), error_type=OpenAIRequestError)
 
-    # each declaration here is individually legal, so only an aggregate budget rejects the list.
+    # each declaration here is individually legal, so only an aggregate ceiling rejects the list.
     per_tool = _MAX_SCHEMA_NODES // 2
-    with pytest.raises(OpenAIRequestError, match="exceeds"):
+    assert per_tool + 1 <= _MAX_SCHEMA_NODES
+    assert _MAX_TOOLS * (per_tool + 1) > _MAX_TOTAL_SCHEMA_NODES
+    with pytest.raises(OpenAIRequestError, match="in total"):
         normalize_tools(declarations(_MAX_TOOLS, per_tool), error_type=OpenAIRequestError)
 
     # and the rejection lands on a later declaration, proving the budget carried across the list
     # rather than resetting: the first one alone is under the ceiling and normalizes fine.
     normalize_tools(declarations(1, per_tool), error_type=OpenAIRequestError)
+
+    # the per-declaration ceiling is still enforced on its own, so one oversized declaration is
+    # rejected for its own size rather than for the share of the list total it happens to take.
+    with pytest.raises(OpenAIRequestError, match="exceeds"):
+        normalize_tools(declarations(1, _MAX_SCHEMA_NODES), error_type=OpenAIRequestError)
 
 
 def test_inert_free_string_closers_are_skipped_natively() -> None:
@@ -4160,7 +4173,10 @@ def test_inert_free_string_closers_are_skipped_natively() -> None:
             }
         ]
     )
-    body = "</parameter>x" * 200_000
+    # whitespace behind each closer is load-bearing: stepping charged that run twice, so a native
+    # skip that charges the span only once would move the exhaustion point without changing any
+    # parse result. an inert run with no whitespace cannot see that difference.
+    body = "</parameter>   x" * 200_000
     text = (
         f"<tool_call><function=store><parameter=data>\n{body}\n</parameter></function></tool_call>"
     )
@@ -4182,6 +4198,31 @@ def test_inert_free_string_closers_are_skipped_natively() -> None:
     assert json.loads(result.calls[0].arguments)["data"] == body
     # one native search settles the whole inert run rather than 200k python iterations.
     assert searches == 1, searches
+
+    # the skip must also cost exactly what stepping cost. the smallest work limit that still
+    # parses is the observable exhaustion point, so undercharging here would let a payload the
+    # old parser rejected become acceptable purely by taking the fast path.
+    probe = (
+        "<tool_call><function=store><parameter=data>\n"
+        + ("</parameter>" + " " * 64 + "x") * 12
+        + "\n</parameter></function></tool_call>"
+    )
+
+    def parses(limit: int) -> bool:
+        return bool(parse_qwen3_coder_output(probe, tools, _work_limit=limit).calls)
+
+    low, high = 1, 40_000
+    assert parses(high)
+    while low < high:
+        middle = (low + high) // 2
+        if parses(middle):
+            high = middle
+        else:
+            low = middle + 1
+    # measured against the stepping implementation this skip replaced, which exhausted at exactly
+    # this limit. weighing the skipped span once and dropping the repeated whitespace runs yields
+    # 2008 instead, so a payload stepping rejected would become acceptable by taking the fast path.
+    assert low == 2712, low
 
 
 def test_opener_index_retains_only_declared_parameter_names() -> None:

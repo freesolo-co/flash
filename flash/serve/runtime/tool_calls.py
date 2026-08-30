@@ -44,6 +44,10 @@ _STRING_BODY_RE = re.compile(r'(?:[^"\\]++|\\.)*+"', re.DOTALL)
 _VIABLE_PARAMETER_END_RE = re.compile(
     rf"{re.escape(_PARAMETER_END)}\s*(?:{re.escape(_PARAMETER_START)}|{re.escape(_FUNCTION_END)})"
 )
+# an inert closer and the whitespace run behind it. stepping weighed that run twice, once reaching
+# the next closer and once measuring the run itself, so a native skip that weighs the span once has
+# to add the runs back to exhaust at the same point.
+_INERT_CLOSER_RUN_RE = re.compile(rf"{re.escape(_PARAMETER_END)}(\s*)")
 _AMBIGUOUS, _EXHAUSTED = object(), object()
 # an emitted call is only useful if the client can replay it, and the follow-up request carries
 # the whole prior conversation plus the assistant turn and one result per call. the cheapest
@@ -440,11 +444,17 @@ def _classify_free_string(state, value_start, values, name, probe):
             # this closer cannot end the value, and neither can any closer before the next one
             # that is followed by a parameter or the function end. a free-string argument reaches
             # the megabytes, so stepping to each inert closer in python holds the event loop for
-            # seconds; the engine finds the next viable one in a single native scan. work is
-            # charged for the whole span skipped, so the exhaustion point is unchanged.
+            # seconds; the engine finds the next viable one in a single native scan.
             viable = _VIABLE_PARAMETER_END_RE.search(text, cursor)
             skip_to = len(text) if viable is None else viable.start()
-            if not _consume_work(work, skip_to - cursor):
+            # stepping weighed each skipped closer twice over: once for the span that reached it
+            # and again for the whitespace run behind it. the span below is weighed once, so the
+            # repeated runs are added back to exhaust at the same point. the run behind the closer
+            # already passed is paid for above, so only the ones inside the span are counted.
+            repeated = sum(
+                len(run[1]) for run in _INERT_CLOSER_RUN_RE.finditer(text, cursor, skip_to)
+            )
+            if not _consume_work(work, skip_to - cursor + repeated):
                 return _EXHAUSTED
             search_from = skip_to
             if viable is None:
