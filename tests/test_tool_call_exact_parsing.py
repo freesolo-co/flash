@@ -698,10 +698,10 @@ def test_surrogate_check_runs_after_structural_normalization() -> None:
 
 @pytest.mark.parametrize(
     "codepoint",
-    # the surrogate range and the codepoint on either side of it. utf-8 answers this natively
-    # rather than by a per-character scan, so the equivalence has to hold at the exact edges the
-    # codec rejects. these are codepoints rather than literals because a lone surrogate cannot be
-    # written as a distinguishable source character.
+    # the surrogate range and the codepoint on either side of it. the check is one native scan
+    # for exactly the range utf-8 refuses, so the equivalence has to hold at those precise edges.
+    # these are codepoints rather than literals because a lone surrogate cannot be written as a
+    # distinguishable source character.
     [0xD7FF, 0xD800, 0xDBFF, 0xDC00, 0xDFFF, 0xE000],
 )
 def test_the_surrogate_boundary_matches_what_utf_8_refuses_to_encode(codepoint: int) -> None:
@@ -712,6 +712,19 @@ def test_the_surrogate_boundary_matches_what_utf_8_refuses_to_encode(codepoint: 
             normalize_tools(declaration)
     else:
         assert normalize_tools(declaration)
+
+
+@pytest.mark.parametrize("order", [(0xD800, 0xDC00), (0xDC00, 0xD800)])
+def test_adjacent_raw_surrogate_code_units_are_still_unpaired(order: tuple[int, int]) -> None:
+    # two raw surrogate code units side by side are not a non-bmp character: the pair only exists
+    # as an escape that json decoding turns into one real codepoint. an implementation that read
+    # an adjacent high and low unit as "paired" would pass every single-codepoint row above while
+    # letting a string through that cannot be encoded or rendered.
+    adjacent = "".join(chr(unit) for unit in order)
+    declaration = _unicode_declaration("function-description", f"before{adjacent}after")
+
+    with pytest.raises(ValueError, match="tools cannot contain an unpaired surrogate"):
+        normalize_tools(declaration)
 
 
 def _enum_tool(enum: list[object]) -> list[dict[str, object]]:

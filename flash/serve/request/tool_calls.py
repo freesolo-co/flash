@@ -19,6 +19,8 @@ _FUNCTION_START, _FUNCTION_END = "<function=", "</function>"
 _PARAMETER_START, _PARAMETER_END = "<parameter=", "</parameter>"
 _REPLAY_CONTAINER_TYPE = "replay_container"
 _NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# built from chr() because a lone surrogate cannot be written as a source literal.
+_SURROGATE_RANGE = re.compile(f"[{chr(0xD800)}-{chr(0xDFFF)}]")
 _MAX_TOOLS, _MAX_SCHEMA_DEPTH, _MAX_SCHEMA_NODES, _MAX_ENUM_VALUES = 128, 8, 512, 128
 # the parser charges four work units per input character, so a request that stays under the
 # transport cap can never buy more parser work here than the fixed generation budget allows.
@@ -784,12 +786,12 @@ def _contains_unpaired_surrogate(value: Any) -> bool:
     while stack:
         nested = stack.pop()
         if type(nested) is str:
-            # a surrogate is exactly what utf-8 cannot encode, so the codec answers this in one
-            # native pass. scanning `ord` per character walks a multi-megabyte argument in the
-            # interpreter, and history validation reaches the same string several times.
-            try:
-                nested.encode("utf-8")
-            except UnicodeEncodeError:
+            # one native scan for the range utf-8 cannot encode. scanning `ord` per character
+            # walks a multi-megabyte argument in the interpreter, and history validation reaches
+            # the same string several times. encoding it would answer the same question natively
+            # but allocates a whole second copy, which turns a near-cap argument into a possible
+            # `MemoryError` on a path that must only ever return a verdict.
+            if _SURROGATE_RANGE.search(nested) is not None:
                 return True
         elif type(nested) is list:
             stack.extend(nested)
