@@ -1039,13 +1039,16 @@ def test_generation_request_validates_tool_history_without_current_tools() -> No
         GenerationRequest(messages=messages)
 
 
-@pytest.mark.parametrize(("fields", "accepted"), [(255, True), (256, False)])
+@pytest.mark.parametrize(
+    ("left", "right", "accepted"), [(255, 255, True), (255, 256, True), (256, 256, False)]
+)
 def test_generation_request_enforces_the_replay_declaration_ceiling(
-    fields: int, accepted: bool
+    left: int, right: int, accepted: bool
 ) -> None:
     # the runtime type is publicly constructible, so it is a validation entry point in its own
-    # right. two same-name calls with disjoint integer keys union to 510 or 512 properties, which
-    # straddles the root-property budget a declared schema is normalized to.
+    # right. two same-name calls with disjoint integer keys union to 510, 511, or 512 properties,
+    # walking right up to the root-property budget a declared schema is normalized to and one past
+    # it. the exact 511 row is what pins the boundary itself rather than a range that contains it.
     calls = [
         {
             "id": f"call_{index}",
@@ -1055,7 +1058,7 @@ def test_generation_request_enforces_the_replay_declaration_ceiling(
                 "arguments": json.dumps({f"c{index}_p{key}": key for key in range(fields)}),
             },
         }
-        for index in range(2)
+        for index, fields in enumerate((left, right))
     ]
     messages = [
         {"role": "assistant", "content": None, "tool_calls": calls},
