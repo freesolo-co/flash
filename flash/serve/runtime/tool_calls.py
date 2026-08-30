@@ -33,6 +33,11 @@ from flash.serve.request.validation import MAX_MESSAGE_NODES
 _CALL_BOUNDARY_RE = re.compile(r"</function>\s*</tool_call>\s*(<tool_call>)\s*<function=([^>]+)>")
 _PARAMETER_OPEN_RE = re.compile(r"<parameter=([A-Za-z0-9_-]{1,64})>")
 _WHITESPACE_RE = re.compile(r"\s*")
+# the body of a json string literal up to and including its closing quote. the ordinary run and
+# the escape start on disjoint characters and both quantifiers are possessive, so there is exactly
+# one way to match at each position and the engine cannot backtrack: an unterminated string fails
+# in one pass rather than retrying every split of the run.
+_STRING_BODY_RE = re.compile(r'(?:[^"\\]++|\\.)*+"', re.DOTALL)
 _AMBIGUOUS, _EXHAUSTED = object(), object()
 # an emitted call is only useful if the client can replay it, and the follow-up request carries
 # the whole prior conversation plus the assistant turn and one result per call. the cheapest
@@ -477,7 +482,7 @@ def _bounded_parameter_end(text: str, cursor: int, work: list[int]) -> int | obj
 def _find_json_container_end(text: str, cursor: int, work: list[int]) -> int | object:
     """offset of the end token that closes a json value, skipping one inside a string literal.
 
-    only a quote can change whether the end token counts, so the scan hops between quotes natively
+    only a quote can change whether the end token counts, so the scan hops between strings natively
     instead of stepping per character. a replay argument runs to the megabytes and this parses on the
     request path, so stepping would hold the event loop for seconds. the end token's position is
     monotone in the cursor, so it is located once and only relocated after the cursor passes it,
@@ -486,18 +491,27 @@ def _find_json_container_end(text: str, cursor: int, work: list[int]) -> int | o
     start, in_string = cursor, False
     closing = text.find(_PARAMETER_END, cursor)
     while cursor < len(text):
-        quote = text.find('"', cursor)
         if in_string:
+            quote = text.find('"', cursor)
             if quote < 0:
                 break
-            # a quote closes the string only when the backslashes before it pair off entirely.
-            # `rstrip` measures that run natively, so an argument made of backslashes costs a
-            # bounded operation rather than one interpreter step per character.
-            in_string = (quote - cursor - len(text[cursor:quote].rstrip("\\"))) % 2 == 1
-            cursor = quote + 1
+            # an escape-free segment reaches its closing quote in one native search, which is the
+            # ordinary case and the cheapest way to settle it.
+            if text.find("\\", cursor, quote) < 0:
+                cursor, in_string = quote + 1, False
+                continue
+            # otherwise the escapes decide where the string ends, so consume the body natively.
+            # both branches are possessive and start on disjoint characters, so the match is
+            # single-pass: an unterminated segment fails immediately instead of retrying every
+            # split of the run, and no slice of the segment is copied to weigh its backslashes.
+            body = _STRING_BODY_RE.match(text, cursor)
+            if body is None:
+                break
+            cursor, in_string = body.end(), False
             continue
         if 0 <= closing < cursor:
             closing = text.find(_PARAMETER_END, cursor)
+        quote = text.find('"', cursor)
         if closing >= 0 and (quote < 0 or closing < quote):
             scanned = closing - start + len(_PARAMETER_END)
             return closing if _consume_work(work, scanned) else _EXHAUSTED

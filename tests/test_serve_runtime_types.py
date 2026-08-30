@@ -7,6 +7,7 @@ import io
 import json
 import subprocess
 import sys
+import time
 from collections import UserDict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -1037,6 +1038,31 @@ def test_locating_a_container_end_does_not_research_the_token_per_string() -> No
     assert end == len(argument)
     # a handful of searches for the whole argument, not one per string segment.
     assert searches < segments
+
+
+def test_an_unterminated_escaped_string_settles_without_backtracking() -> None:
+    """an unterminated string is the regex failure path and must stay single-pass.
+
+    the ordinary run and the escape are both possessive and start on disjoint characters, so
+    there is one way to match at each position. written without those, the engine retries every
+    split of the run to prove failure and a thousand characters already run for seconds, which a
+    client reaches just by opening a string and never closing it.
+    """
+    pattern = runtime_tool_calls._STRING_BODY_RE.pattern
+    assert "++" in pattern, pattern
+    assert "*+" in pattern, pattern
+
+    argument = '["' + ("a" * 500_000) + ("\\a" * 250_000)
+    text = argument + runtime_tool_calls._PARAMETER_END
+    started = time.perf_counter()
+    end = runtime_tool_calls._find_json_container_end(text, 0, [10**9])
+    elapsed = time.perf_counter() - started
+
+    # the end token sits inside the unterminated string, so it cannot close the value.
+    assert end == -1
+    # a single pass is milliseconds; a backtracking one does not finish. the bound is loose
+    # enough that only the difference in kind can trip it.
+    assert elapsed < 2.0, elapsed
 
 
 @pytest.mark.parametrize(
