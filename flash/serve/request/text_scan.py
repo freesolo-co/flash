@@ -22,13 +22,13 @@ VIABLE_PARAMETER_END_RE = re.compile(
     rf"{re.escape(PARAMETER_END)}\s*(?:{re.escape(PARAMETER_START)}|{re.escape(FUNCTION_END)})"
 )
 # the same pairing, capturing the opener's name so the caller can reject one its schema never
-# declared. the name run is anything the grammar itself can write between the opener and its `>`,
-# not the narrower set a public declaration may hold: a replay probe derives its parameter names
-# from the keys of a historical call, which reach this scan without passing that validation. the
-# run stops at `<` as well as `>` so a truncated opener cannot swallow the one that follows it.
+# declared. the run is everything up to the first `>`, which is exactly how the parser delimits a
+# name (`text.find(">")`), and deliberately not the narrower set a public declaration may hold: a
+# replay probe derives its names from the keys of a historical call, which reach this scan without
+# passing that validation, so excluding any character a key may carry hides a real boundary.
 _NAMED_PARAMETER_END_RE = re.compile(
     rf"{re.escape(PARAMETER_END)}\s*"
-    rf"(?:{re.escape(PARAMETER_START)}([^<>]*)>|{re.escape(FUNCTION_END)})"
+    rf"(?:{re.escape(PARAMETER_START)}([^>]*)>|{re.escape(FUNCTION_END)})"
 )
 
 
@@ -44,13 +44,15 @@ def find_viable_parameter_end(text: str, cursor: int, declared: Container[str]) 
     carry hundreds of them: compiling that alternation costs more on one wide schema than every
     skip it saves, and the compilation is not work this parser can charge for.
     """
-    # one iteration rather than a search per rejection: the engine resumes from where it stopped,
-    # so a value quoting an undeclared opener a million times re-enters it once instead of a
-    # million times. no closer can begin inside a pairing just rejected, because the name charset
-    # excludes `<`, so continuing after it skips only spans that could not have started a match.
-    for found in _NAMED_PARAMETER_END_RE.finditer(text, cursor):
+    while (found := _NAMED_PARAMETER_END_RE.search(text, cursor)) is not None:
         if found[1] is None or found[1] in declared:
             return found.start()
+        # a name may itself contain `</parameter>`, because the parser ends a name at the first
+        # `>` and a replay key may carry anything. so the span just rejected can contain the start
+        # of a closer that does pair with a declared opener, and resuming past the whole match
+        # would step over it. resuming one character in is what keeps the scan exact; it is still
+        # linear in the input, because each pass starts strictly later than the last.
+        cursor = found.start() + 1
     return -1
 
 

@@ -4594,17 +4594,14 @@ def test_undeclared_openers_do_not_each_open_a_parse_branch() -> None:
         real = tool_calls_module._parse_parameters
 
         class _CountingPattern:
-            """counts entries into the engine, not calls to the helper wrapping it.
+            """counts entries into the regex engine, not calls to the helper wrapping it.
 
-            counting the helper hides the shape this test exists to catch: a scan that re-enters
-            the engine once per rejected opener calls the helper exactly once either way, so the
-            per-occurrence cost is invisible from outside it.
+            counting the helper hides what this test bounds: it is entered once per value either
+            way, so a scan that spends a branch on every quoted opener and one that skips them all
+            are indistinguishable from outside it. only the one method the scan uses is defined,
+            so a rewrite onto a different engine entry point fails here rather than being counted
+            under a rule that does not describe it.
             """
-
-            def finditer(self, text: str, position: int):
-                for match in real_pattern.finditer(text, position):
-                    searches[0] += 1
-                    yield match
 
             def search(self, text: str, position: int):
                 searches[0] += 1
@@ -4634,9 +4631,23 @@ def test_undeclared_openers_do_not_each_open_a_parse_branch() -> None:
     # the engine still visits each quoted pairing to reject it, so its entries do scale. that cost
     # is one match against a fixed pattern rather than a python frame, and it is charged as the
     # span it settles. asserting the entries are flat would be asserting something untrue, so what
-    # is pinned is that the visit stays a single pass: one entry per occurrence, not one restart of
-    # the scan per occurrence, which is what re-entering the engine on every rejection would cost.
+    # is pinned is that the visit stays one entry per occurrence and the value it settles on is
+    # exact: a value quoting nothing must not enter the engine per character either.
     assert (one[0], thousand[0], many[0]) == (1, 1_000, 100_000), (one, thousand, many)
+
+    # a rejected pairing can contain the start of a real one, because a name runs to the first `>`
+    # and so may swallow a whole `</parameter>`. the scan therefore resumes one character into the
+    # span it rejected rather than past it. settling the whole scan with one non-overlapping
+    # `finditer` pass would resume at the match end, step over the swallowed closer, and report no
+    # boundary at all, so the resume is asserted here rather than through the parser: the parser
+    # reaches the same text either way, by falling back to the end of input.
+    swallowed = (
+        "<tool_call><function=store><parameter=data>x"
+        "</parameter><parameter=n</parameter></function></tool_call>"
+    )
+    value_start = swallowed.index(">", swallowed.index("<parameter=")) + 1
+    boundary = text_scan.find_viable_parameter_end(swallowed, value_start, {"data"})
+    assert swallowed[boundary:] == "</parameter></function></tool_call>", (boundary, swallowed)
 
 
 def test_opener_index_retains_only_declared_parameter_names() -> None:
