@@ -784,7 +784,12 @@ def _contains_unpaired_surrogate(value: Any) -> bool:
     while stack:
         nested = stack.pop()
         if type(nested) is str:
-            if any(0xD800 <= ord(character) <= 0xDFFF for character in nested):
+            # a surrogate is exactly what utf-8 cannot encode, so the codec answers this in one
+            # native pass. scanning `ord` per character walks a multi-megabyte argument in the
+            # interpreter, and history validation reaches the same string several times.
+            try:
+                nested.encode("utf-8")
+            except UnicodeEncodeError:
                 return True
         elif type(nested) is list:
             stack.extend(nested)

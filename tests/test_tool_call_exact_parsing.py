@@ -696,6 +696,24 @@ def test_surrogate_check_runs_after_structural_normalization() -> None:
         normalize_tools(declaration)
 
 
+@pytest.mark.parametrize(
+    "codepoint",
+    # the surrogate range and the codepoint on either side of it. utf-8 answers this natively
+    # rather than by a per-character scan, so the equivalence has to hold at the exact edges the
+    # codec rejects. these are codepoints rather than literals because a lone surrogate cannot be
+    # written as a distinguishable source character.
+    [0xD7FF, 0xD800, 0xDBFF, 0xDC00, 0xDFFF, 0xE000],
+)
+def test_the_surrogate_boundary_matches_what_utf_8_refuses_to_encode(codepoint: int) -> None:
+    declaration = _unicode_declaration("function-description", f"before{chr(codepoint)}after")
+
+    if 0xD800 <= codepoint <= 0xDFFF:
+        with pytest.raises(ValueError, match="tools cannot contain an unpaired surrogate"):
+            normalize_tools(declaration)
+    else:
+        assert normalize_tools(declaration)
+
+
 def _enum_tool(enum: list[object]) -> list[dict[str, object]]:
     return [
         {
