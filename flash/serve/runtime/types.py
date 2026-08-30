@@ -528,6 +528,10 @@ class GenerationRequest:
                     raise RuntimeConfigurationError(
                         "tools cannot be combined with logprobs or structured outputs"
                     )
+        else:
+            validate_tool_history_replay(
+                self.messages or (), None, error_type=RuntimeConfigurationError
+            )
         # an empty sequence and none both mean "no stop sequences", so they normalize together.
         stop = _normalize_stop(self.stop, "stop")
         validate_tool_stop_sequences(

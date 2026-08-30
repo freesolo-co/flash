@@ -16,6 +16,7 @@ TOOL_PARSER_QWEN3_CODER = "qwen3_coder"
 TOOL_CALL_START, TOOL_CALL_END = "<tool_call>", "</tool_call>"
 _FUNCTION_START, _FUNCTION_END = "<function=", "</function>"
 _PARAMETER_START, _PARAMETER_END = "<parameter=", "</parameter>"
+_REPLAY_CONTAINER_TYPE = "replay_container"
 _NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _MAX_TOOLS, _MAX_SCHEMA_DEPTH, _MAX_SCHEMA_NODES, _MAX_ENUM_VALUES = 128, 8, 512, 128
 _MAX_FIXED_DECIMAL_DIGITS = _MAX_NUMERIC_LITERAL_DIGITS = 1024
@@ -204,18 +205,22 @@ def validate_tool_history_replay(
     *,
     error_type: type[Exception] = ValueError,
 ) -> None:
-    """reject historical scalar strings the declared tool grammar cannot replay exactly."""
-    if tools is None:
-        return
-    tool_map = {tool.name: tool for tool in tools}
+    """reject historical function arguments the qwen template cannot replay exactly."""
+    tool_map = {} if tools is None else {tool.name: tool for tool in tools}
     for message_index, message in enumerate(messages):
         if message.get("role") != "assistant":
             continue
         for call_index, call in enumerate(message.get("tool_calls", ())):
             function = call["function"]
-            if (tool := tool_map.get(function["name"])) is None:
-                continue
             try:
+                arguments = _decode_json_object(function["arguments"])
+                tool = tool_map.get(function["name"])
+                if tool is None:
+                    # without a declaration, this checks only whether the call is self-consistent
+                    # under a schema derived from its own keys and values. a marker naming a key
+                    # absent from this historical call is deliberately plain content, because no
+                    # such parameter exists in the replay probe.
+                    tool = _historical_replay_tool(function["name"], arguments)
                 _template_json_object(function["arguments"], replay_tool=tool)
             except ValueError as exc:
                 raise error_type(f"message {message_index} tool call {call_index} {exc}") from exc
@@ -513,19 +518,45 @@ def _decode_json_object(value: str) -> dict[str, Any]:
 def _template_json_object(value: str, *, replay_tool: FunctionTool | None = None) -> dict[str, Any]:
     decoded = _decode_json_object(value)
     rendered = {name: _template_argument_value(item) for name, item in decoded.items()}
-    if replay_tool is not None and any(
-        type(item) is str
-        and _PARAMETER_END in item
-        and (schema := replay_tool.parameters["properties"].get(name)) is not None
-        and schema["type"] == "string"
-        and "enum" not in schema
-        for name, item in decoded.items()
-    ):
-        _validate_template_scalar_roundtrip(replay_tool, decoded, rendered)
+    if replay_tool is not None:
+        _validate_template_roundtrip(replay_tool, decoded, rendered)
     return rendered
 
 
-def _validate_template_scalar_roundtrip(
+def _historical_replay_tool(name: str, arguments: Mapping[str, Any]) -> FunctionTool:
+    # container values are already exact json text at the template boundary, so their nested
+    # schema is unknowable and irrelevant here. the private parser-only type preserves the
+    # container boundary while the probe checks parameter ownership and scalar coercion.
+    return FunctionTool(
+        name,
+        None,
+        {
+            "type": "object",
+            "properties": {
+                field: {"type": _historical_replay_type(value)}
+                for field, value in arguments.items()
+            },
+            "required": list(arguments),
+            "additionalProperties": False,
+        },
+    )
+
+
+def _historical_replay_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "boolean"
+    if type(value) is int or (type(value) is Decimal and _decimal_is_integral(value)):
+        return "integer"
+    if type(value) in {Decimal, float}:
+        return "number"
+    if type(value) is str:
+        return "string"
+    return _REPLAY_CONTAINER_TYPE
+
+
+def _validate_template_roundtrip(
     tool: FunctionTool,
     decoded: dict[str, Any],
     rendered: dict[str, Any],

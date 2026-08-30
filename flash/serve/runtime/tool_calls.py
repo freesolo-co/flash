@@ -15,6 +15,7 @@ from flash.serve.request.tool_calls import (
     _FUNCTION_START,
     _PARAMETER_END,
     _PARAMETER_START,
+    _REPLAY_CONTAINER_TYPE,
     TOOL_CALL_END,
     TOOL_CALL_START,
     FunctionTool,
@@ -30,7 +31,7 @@ from flash.serve.request.tool_calls import (
 from flash.serve.request.validation import MAX_MESSAGE_NODES
 
 _CALL_BOUNDARY_RE = re.compile(r"</function>\s*</tool_call>\s*(<tool_call>)\s*<function=([^>]+)>")
-_PARAMETER_OPEN_RE = re.compile(r"<parameter=([^>]+)>")
+_PARAMETER_OPEN_RE = re.compile(r"<parameter=([A-Za-z0-9_-]{1,64})>")
 _WHITESPACE_RE = re.compile(r"\s*")
 _AMBIGUOUS, _EXHAUSTED = object(), object()
 # an emitted call is only useful if the client can replay it, and the follow-up request carries
@@ -154,14 +155,14 @@ def parse_qwen3_coder_output(
     # ``candidates`` holds the calls after the first, so the emitted count is one more.
     if len(candidates) + 1 > _MAX_POTENTIALLY_REPLAYABLE_CALLS:
         return ToolParseResult(content=text, calls=())
-    opener_positions: dict[str, list[int]] = {}
-    for match in _PARAMETER_OPEN_RE.finditer(text, first, len(text)):
-        opener_positions.setdefault(match[1], []).append(match.start())
-    # candidate discovery is context blind, so every apparent boundary still has to be
-    # classified. the shared budget charges the distance those classifications actually scan,
-    # while constant-time prefix and name rejections cost one unit. this keeps adversarial
-    # rescans bounded without billing an immediately rejected candidate for its whole suffix.
     work = [min(16 * 1024 * 1024, 4 * len(text))]
+    opener_positions = _index_parameter_openers(text, first, work)
+    if opener_positions is _EXHAUSTED:
+        return ToolParseResult(content=text, calls=())
+    # call-boundary discovery advances monotonically. opener discovery limits names to the
+    # declaration maximum and charges its full input span once. classification may revisit
+    # candidate spans, so those scans charge their actual distance while constant-time prefix and
+    # declared-name rejections charge one unit.
     confirmed = [len(text)]
     parsed: list[tuple[str, dict[str, Any]]] = []
     for start in reversed([first, *candidates]):
@@ -268,6 +269,17 @@ def _consume_work(work: list[int], amount: int) -> bool:
     return work[0] >= 0
 
 
+def _index_parameter_openers(
+    text: str, start: int, work: list[int]
+) -> dict[str, list[int]] | object:
+    if not _consume_work(work, len(text) - start):
+        return _EXHAUSTED
+    positions: dict[str, list[int]] = {}
+    for match in _PARAMETER_OPEN_RE.finditer(text, start, len(text)):
+        positions.setdefault(match[1], []).append(match.start())
+    return positions
+
+
 def _bounded_whitespace_end(text: str, cursor: int, work: list[int]) -> int | object:
     limit = min(len(text), cursor + max(work[0], 0))
     match = _WHITESPACE_RE.match(text, cursor, limit)
@@ -320,7 +332,7 @@ def _parse_parameter_value(state, value_start, schema, values, name, probe):
     while True:
         value_end = (
             _find_json_container_end(text, search_from, work)
-            if schema["type"] in {"array", "object"}
+            if schema["type"] in {"array", "object", _REPLAY_CONTAINER_TYPE}
             else _bounded_parameter_end(text, search_from, work)
         )
         if value_end is _EXHAUSTED:
@@ -332,7 +344,7 @@ def _parse_parameter_value(state, value_start, schema, values, name, probe):
             return _EXHAUSTED
         if text.startswith((_PARAMETER_START, _FUNCTION_END), following):
             break
-        if schema["type"] in {"array", "object"}:
+        if schema["type"] in {"array", "object", _REPLAY_CONTAINER_TYPE}:
             return None
         search_from = value_end + len(_PARAMETER_END)
     raw = _strip_grammar_newline_wrapper(text[value_start:value_end])
@@ -480,7 +492,7 @@ def _coerce_value(value: str, schema_type: str) -> Any:
         if stripped == "false":
             return False
         return value
-    if schema_type in {"array", "integer", "number", "object"}:
+    if schema_type in {"array", "integer", "number", "object", _REPLAY_CONTAINER_TYPE}:
         try:
             return _load_exact_json(value)
         except (RecursionError, TypeError, ValueError):
@@ -490,6 +502,8 @@ def _coerce_value(value: str, schema_type: str) -> Any:
 
 def _validate_value(value: Any, schema: Mapping[str, Any]) -> bool:
     schema_type = schema["type"]
+    if schema_type == _REPLAY_CONTAINER_TYPE:
+        return type(value) in {dict, list}
     if not _matches_type(value, schema_type):
         return False
     if schema_type == "string" and _contains_unpaired_surrogate(value):
