@@ -15,10 +15,12 @@ import contextlib
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
 from flash.serving.src.accounting.usage_outbox import OfflineUsageStore, UsageStore
+from flash.serving.src.engine.errors import ServingCapacityUnavailable
 from flash.serving.src.http.adapter_routes import adapter_router
 from flash.serving.src.http.body_limit import RequestBodyLimitMiddleware
 from flash.serving.src.http.context import APP_STATE_ATTR, ServingContext
@@ -100,6 +102,25 @@ def build_serving_app(
         lifespan=_lifespan_for(context, chat_authorizer),
     )
     setattr(api.state, APP_STATE_ATTR, context)
+
+    @api.exception_handler(ServingCapacityUnavailable)
+    async def _engine_capacity_unavailable(
+        _request: Request, exc: ServingCapacityUnavailable
+    ) -> JSONResponse:
+        # a retryable capacity refusal, not a server fault. the Retry-After header is what lets a
+        # client back off instead of treating this as a terminal failure.
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": str(exc.detail),
+                    "type": "server_error",
+                    "code": exc.code,
+                }
+            },
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
+
     # fastapi resolves body parameters before handlers run, so cap the raw receive channel first.
     api.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_CHAT_REQUEST_BYTES)
 

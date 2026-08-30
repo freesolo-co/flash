@@ -12,11 +12,16 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from modal.exception import ExecutionError, FunctionTimeoutError
+from modal.exception import ExecutionError, FunctionTimeoutError, ResourceExhaustedError
 from test_router import QWEN, _allow, _router_for
 
 from flash.client.http import ClientError
 from flash.serve.request.streaming import _openai_stream_content
+from flash.serving.src.engine.dispatch import (
+    CAPACITY_RETRY_AFTER_SECONDS,
+    AdmissionProtocolError,
+    PreHeaderDispatchExpired,
+)
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 
 
@@ -143,6 +148,54 @@ def test_undeserializable_remote_error_is_502_not_500(stream: bool) -> None:
     exc = ExecutionError("Could not deserialize remote exception due to local error")
     resp = _chat(_client(exc), stream=stream)
     assert resp.status_code == 502
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_pre_header_expiry_is_a_retryable_503_not_a_server_fault(stream: bool) -> None:
+    """A request that ran out of dispatch budget before reaching a gpu is capacity pressure.
+
+    It must be retryable: a 500 tells the caller the server is broken and a 504 tells it the work
+    took too long, but nothing has run yet. Only a 503 with Retry-After lets a client back off and
+    come back, which is the whole point of refusing before generation instead of queueing forever.
+    """
+    exc = PreHeaderDispatchExpired("request expired before gpu generation began")
+    resp = _chat(_client(exc), stream=stream)
+    assert resp.status_code == 503
+    assert resp.headers["Retry-After"] == str(CAPACITY_RETRY_AFTER_SECONDS)
+    assert resp.json()["error"]["code"] == "serving_capacity_unavailable"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_modal_resource_exhaustion_is_the_same_retryable_503(stream: bool) -> None:
+    """Modal refusing to place the call is the same condition, surfaced by the platform."""
+    exc = ResourceExhaustedError("no capacity available")
+    resp = _chat(_client(exc), stream=stream)
+    assert resp.status_code == 503
+    assert resp.headers["Retry-After"] == str(CAPACITY_RETRY_AFTER_SECONDS)
+    assert resp.json()["error"]["code"] == "serving_capacity_unavailable"
+
+
+def test_capacity_refusal_is_mapped_when_raised_while_building_the_stream() -> None:
+    """Dispatch expiry maps identically whether it is raised on construction or on advance."""
+    exc = PreHeaderDispatchExpired("request expired before gpu generation began")
+    resp = _chat(_client(exc, pool_cls=_SyncRaisingStreamPool), stream=True)
+    assert resp.status_code == 503
+    assert resp.headers["Retry-After"] == str(CAPACITY_RETRY_AFTER_SECONDS)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_untrustworthy_admission_is_a_502_not_an_unhandled_500(stream: bool) -> None:
+    """A malformed admission acknowledgement is an upstream protocol fault, like any other.
+
+    ``AdmissionProtocolError`` subclasses ``RuntimeError``, so before this it fell through every
+    branch and surfaced as an unhandled 500, blaming the router for a message the engine side got
+    wrong. It is mapped explicitly rather than by widening the ``RuntimeError`` case, because a
+    bare ``RuntimeError`` is exactly the router-side defect that must keep its 500.
+    """
+    exc = AdmissionProtocolError("mismatched non-streaming admission acknowledgement")
+    resp = _chat(_client(exc), stream=stream)
+    assert resp.status_code == 502
+    assert resp.status_code != 500
 
 
 def test_stream_dispatch_failure_is_mapped_even_when_raised_synchronously() -> None:

@@ -2699,3 +2699,46 @@ def test_channel_writes_only_protocol_envelopes_without_credentials() -> None:
             validate_control(value)
         else:
             validate_data(value)
+
+
+def test_installed_modal_154_contract_uses_only_spawned_channel_transport() -> None:
+    assert modal.__version__ == "1.5.4"
+    assert hasattr(modal.Queue.ephemeral, "aio")
+    assert "queue_id" in inspect.signature(modal.Queue.from_id).parameters
+    assert "partition" in inspect.signature(modal.Queue.put).parameters
+    assert "partition" in inspect.signature(modal.Queue.get).parameters
+    assert "partition" in inspect.signature(modal.Queue.clear).parameters
+    assert "terminate_containers" in inspect.signature(modal.FunctionCall.cancel).parameters
+
+    module = __import__("flash.serving.app.modal_app", fromlist=["_build_engine"])
+    source = inspect.getsource(module)
+    assert "@modal.method(is_generator=True)\n        async def stream_generate(" not in source
+    assert "@modal.method()\n        async def stream_generate_call(" in source
+    assert ".remote_gen" not in source
+    assert "stream_generate_cancellable" not in source
+
+    base_model = module.base_models()[0]
+    instance = module._engine_cls_for(base_model)()
+    assert hasattr(instance.stream_generate_call.spawn, "aio")
+    assert not hasattr(instance, "stream_generate")
+
+
+def test_stream_generate_call_matches_the_real_engine_owner_signature() -> None:
+    """the owner hook the stream channel calls must exist on the engine it drives.
+
+    the channel tests drive a permissive fake owner, so a kwarg the real engine does not accept
+    stays invisible until activation wires the two together. binding the real signature is what
+    turns that into a failing test instead of a TypeError on the first hydrated request.
+    """
+
+    from flash.serving.src.engine.lora_engine import _LoraEngineImpl
+
+    signature = inspect.signature(_LoraEngineImpl._stream_generate)
+    signature.bind(
+        None,
+        {},
+        None,
+        None,
+        None,
+        pre_generate_check=lambda: None,
+    )

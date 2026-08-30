@@ -15,6 +15,7 @@ from flash.serving.src.accounting.usage import (
     principal_for_trusted_internal,
 )
 from flash.serving.src.accounting.usage_outbox import RequestIdentity, UsageStore
+from flash.serving.src.engine.dispatch import new_pre_header_dispatch_deadline
 from flash.serving.src.http.headers import (
     _bearer_token,
     assert_internal,
@@ -122,6 +123,13 @@ class ServingContext:
         if self.reload_records is not None:
             await self.lookup.reload()
 
+    @staticmethod
+    def set_pre_header_dispatch_deadline(payload: Any) -> None:
+        # the absolute wall-clock instant after which this request must not start gpu generation.
+        # stamped once at the front door so every downstream hop races the same deadline instead of
+        # each restarting its own timer.
+        payload._pre_header_dispatch_deadline = new_pre_header_dispatch_deadline()
+
     async def unregister_safe(
         self,
         base_model: str,
@@ -129,7 +137,7 @@ class ServingContext:
         adapter_id: str,
         expected_generation: str | None,
     ) -> None:
-        # gpu cleanup may cold-start a scaled-to-zero engine. the engine compares this deployment
+        # gpu cleanup may reach a replacement container. the engine compares this deployment
         # generation under its per-adapter lock so stale cleanup cannot remove a redeployment of the
         # same immutable revision id. durable routing is already disabled, but an exact eviction
         # failure must remain observable rather than making the successful api response imply it ran.
@@ -152,6 +160,7 @@ class ServingContext:
         captured_at: Any,
         expected_checkpoint: str | None = None,
     ) -> dict[str, Any]:
+        self.set_pre_header_dispatch_deadline(payload)
         result = await generate_once(
             self.pool,
             self.router,
@@ -211,6 +220,7 @@ class ServingContext:
         generation_id: str,
         expected_checkpoint: str | None,
     ) -> tuple[AsyncIterator[dict[str, Any]], dict[str, str], bool, dict[str, Any]]:
+        self.set_pre_header_dispatch_deadline(payload)
         return await prepare_stream(
             self.pool,
             self.router,

@@ -9,7 +9,22 @@ from typing import Any
 
 from fastapi import HTTPException, status
 
+from flash.serving.src.engine.dispatch import (
+    CAPACITY_RETRY_AFTER_SECONDS,
+    AdmissionProtocolError,
+    PreHeaderDispatchExpired,
+)
 from flash.serving.src.http.routing import AdapterRouter
+
+
+class ServingCapacityUnavailable(HTTPException):
+    """A pre-header engine dispatch could not start within available capacity."""
+
+    code = "serving_capacity_unavailable"
+
+    def __init__(self, message: str) -> None:
+        self.retry_after_seconds = CAPACITY_RETRY_AFTER_SECONDS
+        super().__init__(status.HTTP_503_SERVICE_UNAVAILABLE, message)
 
 
 def value_error_http(router: AdapterRouter, adapter_id: str, exc: ValueError) -> HTTPException:
@@ -25,7 +40,7 @@ def value_error_http(router: AdapterRouter, adapter_id: str, exc: ValueError) ->
 
 def engine_error_http(
     router: AdapterRouter, adapter_id: str, exc: Exception
-) -> HTTPException | None:
+) -> HTTPException | ServingCapacityUnavailable | None:
     """Map an engine dispatch failure to a client-meaningful status.
 
     Returns ``None`` when ``exc`` is not a failure this layer can identify, so the caller
@@ -46,11 +61,44 @@ def engine_error_http(
     ``modal`` is imported lazily so this module keeps the no-modal-at-import-scope contract in
     router.py's docstring, which is what lets the routing layer be unit-tested against a fake pool.
     """
+    if isinstance(exc, PreHeaderDispatchExpired):
+        return ServingCapacityUnavailable(str(exc))
+    if isinstance(exc, AdmissionProtocolError):
+        # an untrustworthy acknowledgement is an upstream protocol fault, so it gets the same 502
+        # the other protocol failures get. matched on the exact type rather than by widening the
+        # RuntimeError case below, because a bare RuntimeError is the router-side defect that must
+        # keep its 500 instead of being disguised as an engine failure.
+        return HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "The serving engine failed to handle this request.",
+        )
     if isinstance(exc, ValueError):
         return value_error_http(router, adapter_id, exc)
-    from modal.exception import Error as ModalError
-    from modal.exception import FunctionTimeoutError
 
+    from flash.serving.src.stream_channel.protocol import (
+        ChannelErrorCode,
+        StreamChannelError,
+    )
+
+    if isinstance(exc, StreamChannelError):
+        if exc.code == ChannelErrorCode.DISPATCH_DEADLINE:
+            return ServingCapacityUnavailable(str(exc))
+        if exc.code != ChannelErrorCode.CANCELLED:
+            return HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                "The serving stream transport failed to handle this request.",
+            )
+        # a cancelled channel is the client going away, not a server fault. returning None lets
+        # the caller re-raise so the request unwinds without inventing a status for it.
+        return None
+
+    from modal.exception import Error as ModalError
+    from modal.exception import FunctionTimeoutError, ResourceExhaustedError
+
+    if isinstance(exc, ResourceExhaustedError):
+        return ServingCapacityUnavailable(
+            "The serving model could not accept this request before generation began."
+        )
     if isinstance(exc, FunctionTimeoutError):
         # checked before the ModalError branch below, which it subclasses. 504, not 500: the
         # request was well-formed and the upstream engine simply did not finish inside its

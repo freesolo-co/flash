@@ -12,6 +12,7 @@ import json
 import os
 import uuid
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -405,8 +406,27 @@ class _LoraEngineImpl(LoraLifecycleMixin):
         record_dict: dict[str, Any] | None = None,
         expected_checkpoint: str | None = None,
         generation_id: str | None = None,
+        pre_header_dispatch_deadline: float | None = None,
+        admission_queue_id: str | None = None,
+        invocation_nonce: str | None = None,
     ) -> dict[str, Any]:
+        from flash.serving.src.engine.dispatch import publish_admission_acknowledgement
         from flash.serving.src.engine.generation import generate
+
+        admit = None
+        if admission_queue_id is not None:
+            if not generation_id or not invocation_nonce:
+                raise ValueError("non-streaming admission identity is incomplete")
+
+            async def admit() -> None:
+                if pre_header_dispatch_deadline is None:
+                    raise ValueError("non-streaming admission deadline is missing")
+                await publish_admission_acknowledgement(
+                    admission_queue_id,
+                    generation_id=generation_id,
+                    invocation_nonce=invocation_nonce,
+                    deadline=pre_header_dispatch_deadline,
+                )
 
         return await generate(
             self,
@@ -414,6 +434,8 @@ class _LoraEngineImpl(LoraLifecycleMixin):
             record_dict,
             expected_checkpoint,
             generation_id,
+            pre_header_dispatch_deadline,
+            admit=admit,
         )
 
     async def _stream_generate(
@@ -422,6 +444,9 @@ class _LoraEngineImpl(LoraLifecycleMixin):
         record_dict: dict[str, Any] | None = None,
         expected_checkpoint: str | None = None,
         generation_id: str | None = None,
+        pre_header_dispatch_deadline: float | None = None,
+        *,
+        pre_generate_check: Callable[[], Awaitable[None]] | None = None,
     ):
         from flash.serving.src.engine.generation import stream_generate
 
@@ -431,6 +456,8 @@ class _LoraEngineImpl(LoraLifecycleMixin):
             record_dict,
             expected_checkpoint,
             generation_id,
+            pre_header_dispatch_deadline,
+            pre_generate_check=pre_generate_check,
         )
         try:
             async for event in stream:
