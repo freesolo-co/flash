@@ -156,7 +156,11 @@ def parse_qwen3_coder_output(
     # ``candidates`` holds the calls after the first, so the emitted count is one more.
     if len(candidates) + 1 > _MAX_POTENTIALLY_REPLAYABLE_CALLS:
         return ToolParseResult(content=text, calls=())
-    work = [min(_work_limit, 4 * len(text))]
+    # each call scans its declared parameters once, so a schema with many optional properties
+    # costs work that the generated text does not pay for. that scan is bounded by the schema
+    # node limit, so charging it here keeps a minimal valid call parseable under any declaration.
+    declared = max((len(tool.parameters["properties"]) for tool in tools), default=0)
+    work = [min(_work_limit, 4 * len(text) + (len(candidates) + 1) * declared)]
     opener_positions = _index_parameter_openers(text, first, work)
     if opener_positions is _EXHAUSTED:
         return ToolParseResult(content=text, calls=())

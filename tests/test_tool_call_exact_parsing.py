@@ -1009,7 +1009,8 @@ def test_whitespace_runs_charge_the_shared_parser_budget(monkeypatch) -> None:
     monkeypatch.setattr(tool_calls_module, "_consume_work", measured)
     result = parse_qwen3_coder_output(text, tools, id_factory=lambda: "call_fixed")
 
-    budget = 4 * len(text)
+    declared = len(tools[0].parameters["properties"])
+    budget = 4 * len(text) + calls * declared
     assert result.content == text
     assert result.calls == ()
     assert calls * spaces <= charged <= budget + 1
@@ -1063,11 +1064,9 @@ def test_property_opener_rebuilds_stop_at_the_shared_parser_budget(monkeypatch) 
 
     assert result.content == text
     assert result.calls == ()
-    assert (
-        searches
-        <= charged
-        <= 4 * len(text) + len(declaration["function"]["parameters"]["properties"])
-    )
+    # every call scans the declaration once, so the ceiling scales with calls, not with one copy.
+    declared = len(declaration["function"]["parameters"]["properties"])
+    assert searches <= charged <= 4 * len(text) + 64 * declared + 1
 
 
 def _history_replay_tools():
@@ -1141,6 +1140,35 @@ def test_history_that_renders_far_larger_than_the_request_is_rejected() -> None:
             require_model=False,
             allow_managed_selectors=True,
         )
+
+
+@pytest.mark.parametrize("declared", [10, 149, 150, 300, 511])
+def test_minimal_call_parses_under_any_declared_property_count(declared: int) -> None:
+    # each call scans its declared parameters once, which the generated text does not pay for.
+    # a schema wide enough to outweigh a short call must not silently degrade it to raw text.
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            f"p{index}": {"type": "string"} for index in range(declared)
+                        },
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+
+    result = parse_qwen3_coder_output("<tool_call><function=f></function></tool_call>", tools)
+
+    assert result.tools_called
+    assert [call.name for call in result.calls] == ["f"]
 
 
 def test_hosted_request_replays_history_without_inactive_declarations() -> None:
