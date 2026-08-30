@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from array import array
 from bisect import bisect_left
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -206,10 +207,13 @@ def parse_qwen3_coder_output(
             if parsed_end == confirmed[-1]:
                 confirmed.append(start)
                 parsed.append(parsed_call[1])
+                # `parsed` only grows, so once it passes the ceiling the result below is already
+                # decided and every remaining candidate is work spent on a rejected parse. this
+                # counts confirmed parses rather than candidate boundaries: a single call whose
+                # argument quotes many boundaries still confirms once, so quoting cannot trip it.
+                if len(parsed) > _MAX_POTENTIALLY_REPLAYABLE_CALLS:
+                    return ToolParseResult(content=text, calls=())
     if confirmed[-1] != first:
-        return ToolParseResult(content=text, calls=())
-    # only now is the emitted count real, rather than the context-blind candidate estimate.
-    if len(parsed) > _MAX_POTENTIALLY_REPLAYABLE_CALLS:
         return ToolParseResult(content=text, calls=())
     boundaries = confirmed[::-1]
     parsed.reverse()
@@ -304,20 +308,31 @@ def _consume_work(work: list[int], amount: int) -> bool:
 
 def _index_parameter_openers(
     text: str, start: int, declared: frozenset[str], work: list[int]
-) -> dict[str, list[int]] | object:
+) -> dict[str, array[int]] | object:
     """offsets of every ``<parameter=name>`` opener, for the names a declaration can ask about.
 
     both readers look positions up by a declared parameter name, so an opener naming anything
     else can never be consulted. keeping one would let an untrusted argument spend hundreds of
-    megabytes on offsets nothing reads, so the index retains only what the schema can reach and
-    its size is bounded by the declaration rather than by the length of the generated text.
+    megabytes on offsets nothing reads, so the index retains only what the schema can reach.
+
+    a declared name is a different matter: a single valid argument may quote its own parameter
+    a million times, and every one of those offsets is genuinely reachable, because the readers
+    ask for the greatest offset below a scope end that is not known until the call is parsed.
+    they cannot be dropped or collapsed without changing which opener a lookup finds, so they are
+    held in a compact integer array rather than a list of boxed python ints. the offsets are
+    discovered in increasing order, which is exactly the order ``bisect`` needs.
     """
     if not _consume_work(work, len(text) - start):
         return _EXHAUSTED
-    positions: dict[str, list[int]] = {}
+    # one pass over the text, not one per declared name: a wide schema may declare hundreds of
+    # parameters, and scanning the whole input for each of them would cost more on an ordinary
+    # request than the quoted-opener shape this index is guarding against costs today.
+    positions: dict[str, array[int]] = {}
     for match in _PARAMETER_OPEN_RE.finditer(text, start, len(text)):
         if match[1] in declared:
-            positions.setdefault(match[1], []).append(match.start())
+            if (found := positions.get(match[1])) is None:
+                found = positions[match[1]] = array("q")
+            found.append(match.start())
     return positions
 
 

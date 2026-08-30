@@ -26,12 +26,11 @@ _REPLAY_CONTAINER_TYPE = "replay_container"
 _NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # built from chr() because a lone surrogate cannot be written as a source literal.
 _SURROGATE_RANGE = re.compile(f"[{chr(0xD800)}-{chr(0xDFFF)}]")
+# the node ceiling is per declaration and the tool maximum bounds how many declarations there are,
+# so together they already cap a request at 128 x 512 nodes. normalizing that maximum, wiring it,
+# and normalizing it again through the serving envelope measures 0.22s, so a separate smaller
+# aggregate ceiling would reject valid catalogs without protecting against a measured cost.
 _MAX_TOOLS, _MAX_SCHEMA_DEPTH, _MAX_SCHEMA_NODES, _MAX_ENUM_VALUES = 128, 8, 512, 128
-# one declaration may spend the node ceiling above, but the list as a whole may not spend it once
-# per declaration: that would let the tool maximum multiply the work a request can buy. this bounds
-# the sum instead, and is sized so an ordinary multi-integration list stays comfortably inside it.
-# a declaration averaging sixteen nodes is the shape being protected, not a deep schema tree.
-_MAX_TOTAL_SCHEMA_NODES = _MAX_TOOLS * 16
 # the parser charges four work units per input character, so a request that stays under the
 # transport cap can never buy more parser work here than the fixed generation budget allows.
 _MAX_REPLAY_TEMPLATE_CHARS = MAX_CHAT_REQUEST_BYTES
@@ -69,9 +68,9 @@ def normalize_tools(
         raise error_type(f"tools may contain at most {_MAX_TOOLS} declarations")
     normalized: list[FunctionTool] = []
     names: set[str] = set()
-    # the node ceiling stays per declaration, so an ordinary list of many small tools is accepted
-    # as before. the running total below is what stops the tool maximum multiplying that ceiling.
-    enum_budget, total_nodes = [0], 0
+    # the enum budget spans the list because enum values are counted against one shared ceiling,
+    # while the node budget is per declaration: see the ceiling comments above.
+    enum_budget = [0]
     for index, raw in enumerate(value):
         if type(raw) is not dict or set(raw) != {"type", "function"}:
             raise error_type(f"tools[{index}] must contain exactly type and function")
@@ -98,11 +97,6 @@ def normalize_tools(
             raise error_type(f"tools[{index}].function.description must be a string")
         budget = [0]
         parameters = _normalize_schema(function["parameters"], f"tools[{index}].function.parameters", error_type, depth=0, budget=budget, enum_budget=enum_budget, root=True)  # fmt: skip
-        total_nodes += budget[0]
-        if total_nodes > _MAX_TOTAL_SCHEMA_NODES:
-            raise error_type(
-                f"tools may declare at most {_MAX_TOTAL_SCHEMA_NODES} schema nodes in total"
-            )
         normalized.append(FunctionTool(name, description, parameters))
     if any(
         _contains_unpaired_surrogate(tool.description)

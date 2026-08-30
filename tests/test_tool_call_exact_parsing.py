@@ -6,6 +6,8 @@ import base64
 import io
 import json
 import random
+import sys
+from array import array
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
@@ -1687,6 +1689,48 @@ def test_genuine_call_runs_still_stop_at_the_emitted_call_ceiling(calls: int, em
     )
 
     assert len(result.calls) == emitted
+
+
+def test_a_run_past_the_call_ceiling_stops_parsing_instead_of_finishing_the_chain() -> None:
+    """once the ceiling is passed the verdict is fixed, so the rest must not be parsed.
+
+    `parsed` only grows, so a chain longer than the ceiling is already rejected by its first
+    `_MAX_POTENTIALLY_REPLAYABLE_CALLS + 1` calls, and parsing the remainder is work spent on a
+    result that cannot change. counting confirmed parses rather than candidate boundaries is what
+    makes stopping sound: a single call whose argument quotes many boundaries confirms once.
+    """
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "z",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+    chain = "<tool_call><function=z></function></tool_call>" * 5_000
+
+    parses = [0]
+    real = tool_calls_module._parse_tool_call
+
+    def counting(*args, **kwargs):
+        parses[0] += 1
+        return real(*args, **kwargs)
+
+    with mock.patch.object(tool_calls_module, "_parse_tool_call", counting):
+        result = parse_qwen3_coder_output(chain, tools, _work_limit=None)
+
+    assert result.calls == ()
+    assert result.content == chain
+    # one parse per call up to the ceiling, then one more that passes it and ends the loop.
+    assert parses[0] == tool_calls_module._MAX_POTENTIALLY_REPLAYABLE_CALLS + 1, parses[0]
 
 
 def _hosted_tool_request(tool_choice: str) -> OpenAIGenerateRequest:
@@ -4102,19 +4146,15 @@ def test_whitespace_scanning_matches_stepping_and_stays_native() -> None:
     assert calls == 1, calls
 
 
-def test_schema_node_budget_spans_the_whole_tool_list() -> None:
-    """two ceilings: one per declaration, and a separate smaller one across the list.
+def test_schema_node_budget_is_per_declaration_and_bounded_by_the_tool_maximum() -> None:
+    """the node ceiling is per declaration, and the tool maximum bounds the list.
 
-    charging only per declaration lets the tool maximum multiply it, so a caller could buy the
-    node ceiling once per tool and spend many times what the contract names on synchronous
-    normalization. charging one shared budget instead would reject ordinary multi-integration
-    lists, whose declarations are individually tiny, so the aggregate ceiling is its own number.
+    a single shared budget across the list would reject ordinary multi-integration catalogs whose
+    declarations are individually tiny, and the two existing ceilings already cap a request at
+    `_MAX_TOOLS` x `_MAX_SCHEMA_NODES` nodes, whose full normalize-wire-renormalize round trip
+    measures a fraction of a second. so the pair is the bound, with no third smaller ceiling.
     """
-    from flash.serve.request.tool_calls import (
-        _MAX_SCHEMA_NODES,
-        _MAX_TOOLS,
-        _MAX_TOTAL_SCHEMA_NODES,
-    )
+    from flash.serve.request.tool_calls import _MAX_SCHEMA_NODES, _MAX_TOOLS
 
     def declarations(count: int, properties: int) -> list[dict]:
         schema = {
@@ -4129,25 +4169,24 @@ def test_schema_node_budget_spans_the_whole_tool_list() -> None:
         ]
 
     # the shapes an ordinary multi-integration caller sends: many small tools, a few larger ones.
-    # these are the ones a single shared budget rejected, so each is load-bearing here.
-    for count, properties in ((_MAX_TOOLS, 1), (_MAX_TOOLS, 4), (64, 8), (32, 16), (16, 10)):
+    # a single shared budget across the list rejected every one of these, so each is load-bearing.
+    for count, properties in ((_MAX_TOOLS, 1), (_MAX_TOOLS, 4), (_MAX_TOOLS, 16), (64, 8), (32, 16)):  # fmt: skip
         normalize_tools(declarations(count, properties), error_type=OpenAIRequestError)
 
-    # each declaration here is individually legal, so only an aggregate ceiling rejects the list.
-    per_tool = _MAX_SCHEMA_NODES // 2
-    assert per_tool + 1 <= _MAX_SCHEMA_NODES
-    assert _MAX_TOOLS * (per_tool + 1) > _MAX_TOTAL_SCHEMA_NODES
-    with pytest.raises(OpenAIRequestError, match="in total"):
-        normalize_tools(declarations(_MAX_TOOLS, per_tool), error_type=OpenAIRequestError)
+    # the largest list the two ceilings permit is accepted, since nothing smaller bounds the sum.
+    # `- 1` leaves room for the root object node, which counts against the per-declaration ceiling.
+    largest = declarations(_MAX_TOOLS, _MAX_SCHEMA_NODES - 1)
+    normalize_tools(largest, error_type=OpenAIRequestError)
 
-    # and the rejection lands on a later declaration, proving the budget carried across the list
-    # rather than resetting: the first one alone is under the ceiling and normalizes fine.
-    normalize_tools(declarations(1, per_tool), error_type=OpenAIRequestError)
-
-    # the per-declaration ceiling is still enforced on its own, so one oversized declaration is
-    # rejected for its own size rather than for the share of the list total it happens to take.
+    # the per-declaration ceiling is what rejects an oversized declaration, and it is charged per
+    # declaration rather than against a running total, so the first one over the line is the one
+    # named. one property past the ceiling is enough, with no dependence on how many tools precede.
     with pytest.raises(OpenAIRequestError, match="exceeds"):
         normalize_tools(declarations(1, _MAX_SCHEMA_NODES), error_type=OpenAIRequestError)
+    oversized = declarations(1, _MAX_SCHEMA_NODES)[0]
+    oversized["function"]["name"] = "late"
+    with pytest.raises(OpenAIRequestError, match=r"tools\[3\].*exceeds"):
+        normalize_tools([*declarations(3, 4), oversized], error_type=OpenAIRequestError)
 
 
 def test_inert_free_string_closers_are_skipped_natively() -> None:
@@ -4199,6 +4238,25 @@ def test_inert_free_string_closers_are_skipped_natively() -> None:
     # one native search settles the whole inert run rather than 200k python iterations.
     assert searches == 1, searches
 
+    # the accounting scan that reproduces the old whitespace charge is a separate pass, and it is
+    # the one a test measuring only the viable-closer search would miss. it must also settle the
+    # run in a bounded number of python-level scans rather than one per closer skipped.
+    accounting = [0]
+    real_pattern = tool_calls_module._INERT_CLOSER_RUN_RE
+
+    class CountingPattern:
+        # a compiled pattern's methods are read-only, so the module attribute is swapped for a
+        # wrapper rather than the bound method being patched in place.
+        def finditer(self, *args, **kwargs):
+            accounting[0] += 1
+            return real_pattern.finditer(*args, **kwargs)
+
+    with mock.patch.object(tool_calls_module, "_INERT_CLOSER_RUN_RE", CountingPattern()):
+        counted = parse_qwen3_coder_output(text, tools, _work_limit=None)
+    # the wrapper must not have changed the answer, or the count would describe another program.
+    assert [call.name for call in counted.calls] == ["store"]
+    assert accounting[0] == 1, accounting[0]
+
     # the skip must also cost exactly what stepping cost. the smallest work limit that still
     # parses is the observable exhaustion point, so undercharging here would let a payload the
     # old parser rejected become acceptable purely by taking the fast path.
@@ -4247,13 +4305,15 @@ def test_opener_index_retains_only_declared_parameter_names() -> None:
             }
         ]
     )
-    undeclared = "<parameter=nope>" * 50_000
+    # both an undeclared name, which is never consulted and so must not be retained at all, and a
+    # declared one, whose every offset is genuinely reachable and so must be retained compactly.
+    quoted = ("<parameter=nope>" + "<parameter=data>") * 50_000
     text = (
-        f"<tool_call><function=store><parameter=data>\n{undeclared}\n"
+        f"<tool_call><function=store><parameter=data>\n{quoted}\n"
         "</parameter></function></tool_call>"
     )
 
-    captured: dict[str, list[int]] = {}
+    captured: dict[str, object] = {}
     original = tool_calls_module._index_parameter_openers
 
     def spy(text: str, start: int, declared, work):
@@ -4265,12 +4325,25 @@ def test_opener_index_retains_only_declared_parameter_names() -> None:
     with mock.patch.object(tool_calls_module, "_index_parameter_openers", spy):
         result = parse_qwen3_coder_output(text, tools, _work_limit=None)
 
-    # parsing is unchanged: the undeclared openers are still part of the value's text.
+    # parsing is unchanged: the quoted openers are still part of the value's text.
     assert [call.name for call in result.calls] == ["store"]
-    assert json.loads(result.calls[0].arguments)["data"] == undeclared
+    assert json.loads(result.calls[0].arguments)["data"] == quoted
     # and not one of the 50k undeclared openers was retained.
     assert "nope" not in captured, sorted(captured)
-    assert set(captured) <= {"data"}, sorted(captured)
+    assert set(captured) == {"data"}, sorted(captured)
+    # the declared offsets cannot be dropped or collapsed, because a lookup asks for the greatest
+    # one below a scope end not known until the call is parsed. so the only saving available is how
+    # they are held: a compact integer array rather than a list of boxed python ints.
+    offsets = captured["data"]
+    assert isinstance(offsets, array), type(offsets)
+    assert len(offsets) == 50_001, len(offsets)
+    assert list(offsets) == sorted(offsets), "bisect requires increasing order"
+    # the saving is the boxed integers, which `getsizeof` does not charge to the list holding them,
+    # so the equivalent list is weighed with its elements rather than by its pointer array alone.
+    boxed = list(offsets)
+    assert sys.getsizeof(offsets) * 4 < sys.getsizeof(boxed) + sum(
+        sys.getsizeof(offset) for offset in boxed
+    ), sys.getsizeof(offsets)
 
 
 def test_inert_enum_delimiters_are_not_stepped_one_at_a_time() -> None:
