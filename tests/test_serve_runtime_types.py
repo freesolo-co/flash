@@ -5,9 +5,9 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 import subprocess
 import sys
-import time
 from collections import UserDict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -1040,29 +1040,46 @@ def test_locating_a_container_end_does_not_research_the_token_per_string() -> No
     assert searches < segments
 
 
-def test_an_unterminated_escaped_string_settles_without_backtracking() -> None:
+def test_an_unterminated_escaped_string_settles_without_backtracking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """an unterminated string is the regex failure path and must stay single-pass.
 
     the ordinary run and the escape are both possessive and start on disjoint characters, so
     there is one way to match at each position. written without those, the engine retries every
     split of the run to prove failure and a thousand characters already run for seconds, which a
     client reaches just by opening a string and never closing it.
-    """
-    pattern = runtime_tool_calls._STRING_BODY_RE.pattern
-    assert "++" in pattern, pattern
-    assert "*+" in pattern, pattern
 
-    argument = '["' + ("a" * 500_000) + ("\\a" * 250_000)
+    the argument needs a quote after the opening one, or the scan settles on the missing quote
+    and never consults the pattern at all, which would leave this asserting nothing.
+    """
+    pattern = runtime_tool_calls._STRING_BODY_RE
+    # pinned exactly: dropping either possessive quantifier is the regression this guards.
+    assert pattern.pattern == r'(?:[^"\\]++|\\.)*+"', pattern.pattern
+
+    matches = 0
+
+    class _CountingPattern:
+        """the string-body pattern, counting the matches the scan actually asks for."""
+
+        pattern = runtime_tool_calls._STRING_BODY_RE.pattern
+
+        def match(self, text: str, position: int) -> re.Match[str] | None:
+            nonlocal matches
+            matches += 1
+            return pattern.match(text, position)
+
+    monkeypatch.setattr(runtime_tool_calls, "_STRING_BODY_RE", _CountingPattern())
+
+    # the escaped quote keeps the string open, so the body is what has to prove it never closes.
+    argument = '["' + ("a" * 500_000) + '\\"' + ("b" * 500_000)
     text = argument + runtime_tool_calls._PARAMETER_END
-    started = time.perf_counter()
     end = runtime_tool_calls._find_json_container_end(text, 0, [10**9])
-    elapsed = time.perf_counter() - started
 
     # the end token sits inside the unterminated string, so it cannot close the value.
     assert end == -1
-    # a single pass is milliseconds; a backtracking one does not finish. the bound is loose
-    # enough that only the difference in kind can trip it.
-    assert elapsed < 2.0, elapsed
+    # without this the payload never reaches the pattern and the test proves nothing.
+    assert matches == 1, matches
 
 
 @pytest.mark.parametrize(
