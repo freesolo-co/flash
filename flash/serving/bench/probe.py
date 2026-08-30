@@ -433,8 +433,20 @@ def probe_engine_kv_cache(engine: Any) -> dict[str, Any]:
 # The files whose presence identifies a snapshot as holding a given role's artifacts. A snapshot
 # directory contains exactly the files THAT download fetched, so these markers are what distinguish
 # the tree the weights came from from the tree the tokenizer came from when the two differ.
+#
+# `config.json` is deliberately NOT a model marker. It is the one file every metadata-only fetch
+# pulls -- this probe's own `AutoConfig.from_pretrained` creates a snapshot containing nothing else
+# -- so accepting it made a weightless directory answer "which commit are the weights from". A real
+# cached `Qwen/Qwen3.5-0.8B` snapshot holding only config, tokenizer and vocab files reported
+# itself as the model commit. The weights are what a capacity number is attributed to, so the model
+# role requires a file that actually carries them.
 _ROLE_MARKERS: dict[str, tuple[str, ...]] = {
-    "model": ("config.json", "model.safetensors", "model.safetensors.index.json"),
+    "model": (
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+    ),
     "tokenizer": ("tokenizer.json", "tokenizer_config.json"),
     "processor": ("preprocessor_config.json", "processor_config.json"),
 }

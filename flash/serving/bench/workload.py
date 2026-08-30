@@ -390,6 +390,14 @@ _DRIVER_SOURCES: tuple[str, ...] = (
     "_build_prompt_pool",
     # What counts as a valid sample. `_validate` and `_absorb_event` decide which attempts become
     # errors, which is the error-rate numerator itself.
+    #
+    # `_StreamOutcome` rides with them because the accumulator's INITIAL state is half of that
+    # decision. `_validate` rejects on `cached_tokens_reported is not True` and on `saw_final`
+    # being false, so seeding either differently -- or pre-populating a usage field -- changes
+    # which requests become errors while `_absorb_event` and `_validate` stay byte-identical.
+    # Digesting the class picks up `__slots__` and `__init__` together, so a field appearing,
+    # disappearing or changing default all move the checksum.
+    "_StreamOutcome",
     "_absorb_event",
     "_validate",
     # How the cell is SCHEDULED. `run_cell` owns the closed-loop replacement policy and the point

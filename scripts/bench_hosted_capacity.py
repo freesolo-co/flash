@@ -526,6 +526,27 @@ async def _run_bucket(
     }
 
 
+def _harness_source_identity() -> dict[str, Any]:
+    """Content identity of THIS script, which `workload_checksum()` structurally cannot cover.
+
+    `workload_checksum()` digests named objects out of `flash.serving.bench`, and
+    `_serving_source_identity()` digests the `flash` package the image uploads. Neither can see
+    `scripts/`. But the scheduler lives here: `_run_bucket` owns the order concurrency points are
+    visited in, the warm engine they inherit, and the bucket, block and invocation it forwards into
+    `run_cell`. Reordering the grid, dropping the warmup, or passing a different block changes the
+    prompts issued and the cells the published curve contains -- a different ceiling, knee and
+    saturation point -- while every other recorded identity stays byte-identical.
+
+    Extracting `grid_should_halt` into the driver covered the stop predicate and nothing else. This
+    covers the loop that calls it.
+    """
+    path = Path(__file__).resolve()
+    return {
+        "script": path.name,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
 def _serving_source_identity() -> dict[str, Any]:
     """Content identity of the `flash` package the image copies into the container.
 
@@ -620,22 +641,36 @@ async def _within_call_bound(coro: Any, bound_seconds: float, label: str) -> Any
     `_probe_in_container_within_bound`: a coroutine pinned in an uninterruptible engine call keeps
     billing on the GPU through the scaledown window whatever this frame returns, so the only way it
     stops spending against an already-exceeded reservation is for the process to end.
+
+    `CancelledError` is caught alongside the timeout because `shield` cuts both ways. It is what
+    lets this function reap deliberately -- but when the OUTER frame is cancelled (a lane torn
+    down, a Modal timeout unwinding the caller) `wait_for` raises `CancelledError`, not
+    `TimeoutError`, and the shielded task survives the frame that was meant to bound it. Catching
+    only the timeout reaped nothing on that route: the frame unwound and the work stayed pinned in
+    the engine, still spending. Same hole, entered by the other door.
+
+    The exit is guarded on `not task.done()` on purpose. A task that finished during the reap has
+    stopped spending, so killing the container then would destroy the artifact of work that
+    completed inside its reservation. In that case the cancellation is re-raised unchanged, so the
+    caller still observes it.
     """
     task = asyncio.ensure_future(coro)
     try:
         return await asyncio.wait_for(asyncio.shield(task), timeout=bound_seconds)
-    except TimeoutError:
+    except (TimeoutError, asyncio.CancelledError):
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
             await asyncio.wait_for(asyncio.shield(task), timeout=drain_reap_seconds())
-        print(
-            f"[bench] FATAL: {label} exceeded its {bound_seconds:.0f}s priced bound; ending the "
-            "container so a call cannot bill past the reservation that authorized it",
-            flush=True,
-        )
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(75)
+        if not task.done():
+            print(
+                f"[bench] FATAL: {label} ignored cancellation past its {bound_seconds:.0f}s priced bound; ending the "
+                "container so a call cannot bill past the reservation that authorized it",
+                flush=True,
+            )
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(75)
+        raise
 
 
 async def _probe_in_container_within_bound(engine: Any) -> dict[str, Any]:
@@ -811,6 +846,37 @@ def _require_one_checkpoint(payloads: list[tuple[str, dict[str, Any]]]) -> dict[
         raise RuntimeError(
             f"{where} measured checkpoint {identity} but the canary measured {first}; refusing to "
             "publish curves from different checkpoints as one capacity envelope"
+        )
+    return first
+
+
+def _require_one_dispatch_stack(payloads: list[tuple[str, dict[str, Any]]]) -> dict[str, str]:
+    """Refuse to publish one envelope over buckets whose kernels dispatched through different stacks.
+
+    Sibling of `_require_one_checkpoint`, for the same reason and by the same mechanism: each
+    bucket is a separately bootable `.remote()` call, so a preempted or replaced container can land
+    on a host carrying a different NVIDIA driver mid-rollout. The driver is what the kernels
+    actually dispatch through, so two buckets can measure the same weights on the same card model
+    and still be produced by different execution stacks. The per-bucket probes already captured
+    that distinction; the summary was throwing it away and fusing the curves regardless.
+
+    `torch`/`vllm` versions come from the image and are identical by construction, so the driver is
+    the field that can actually differ between containers. Returns the identity every payload
+    agreed on, so the summary can publish the stack it ACCEPTED.
+    """
+    identities = []
+    for where, probe in payloads:
+        gpu = probe.get("gpu") or {}
+        identities.append((where, {"driver_version": str(gpu.get("driver_version") or "")}))
+    if not identities:
+        return {}
+    _, first = identities[0]
+    for where, identity in identities[1:]:
+        if identity == first:
+            continue
+        raise RuntimeError(
+            f"{where} measured through driver {identity} but the canary measured {first}; refusing "
+            "to publish curves from different kernel-dispatch stacks as one capacity envelope"
         )
     return first
 
@@ -1059,6 +1125,19 @@ def main(
     # here rather than at process start, which would bill local argument checking.
     lane_started = time.monotonic()
 
+    # FROZEN before the first remote call, not recomputed per artifact. Modal uploaded the image
+    # sources at `_engine_for(...)` below; a sweep then runs for hours. Recomputing these after
+    # `run_bucket.remote()` returns would record whatever the local checkout says THEN -- an edit,
+    # a branch switch, a `git pull` during the paid run -- and attribute it to code that is no
+    # longer what the container is executing. The values captured here are the ones that were true
+    # when the sources were uploaded, which is the only moment they describe the running container.
+    local_identity = {
+        "workload_checksum": workload_checksum(),
+        "serving_patch": _serving_patch_identity(),
+        "serving_source": _serving_source_identity(),
+        "harness_source": _harness_source_identity(),
+    }
+
     catalog = {row["base_model"]: row for row in bench_catalog_summary()}
     # The resolved engine shape travels WITH the numbers. Without it a published capacity figure
     # cannot be tied to the checkpoint, context limit, sequence cap, or LoRA allocation that
@@ -1092,9 +1171,7 @@ def main(
                     "engine_catalog": provenance,
                     "probe": gate["probe"],
                     "warmup": gate["warmup"],
-                    "workload_checksum": workload_checksum(),
-                    "serving_patch": _serving_patch_identity(),
-                    "serving_source": _serving_source_identity(),
+                    **local_identity,
                     "invocation": invocation,
                     "budget": ledger.to_json(),
                 },
@@ -1126,9 +1203,7 @@ def main(
                     "gpu": expected_gpu,
                     "invocation": invocation,
                     "engine_catalog": provenance,
-                    "workload_checksum": workload_checksum(),
-                    "serving_patch": _serving_patch_identity(),
-                    "serving_source": _serving_source_identity(),
+                    **local_identity,
                 },
                 f"sweep-{base_model.replace('/', '_')}-{name}-b{block}.json",
                 invocation=invocation,
@@ -1137,10 +1212,13 @@ def main(
         # its own container's provenance, but nothing compared those containers to each other: a
         # repo that advanced mid-sweep, or a replacement container, leaves buckets measured on
         # different commits and the summary below would fuse their curves into one envelope.
-        accepted_checkpoint = _require_one_checkpoint(
-            [("canary", gate["probe"])]
-            + [(f"bucket {p['bucket']!r}", p.get("provenance") or {}) for p in results]
-        )
+        gated = [("canary", gate["probe"])] + [
+            (f"bucket {p['bucket']!r}", p.get("provenance") or {}) for p in results
+        ]
+        accepted_checkpoint = _require_one_checkpoint(gated)
+        # Same aggregation hazard, different axis: the checkpoint gate proves every bucket measured
+        # the same WEIGHTS, this one proves they measured through the same kernel-dispatch stack.
+        accepted_dispatch_stack = _require_one_dispatch_stack(gated)
         ledger.settle(
             entry,
             _billable_lane_seconds(time.monotonic() - lane_started),
@@ -1155,6 +1233,10 @@ def main(
                 "invocation": invocation,
                 "engine_catalog": provenance,
                 "accepted_checkpoint": accepted_checkpoint,
+                # The driver every bucket agreed on, not just the canary's. Without it the summary
+                # named a runtime resolved once and silently spanned hosts that dispatched through
+                # different ones.
+                "accepted_dispatch_stack": accepted_dispatch_stack,
                 "runtime_packages": (gate["probe"].get("runtime_packages") or {}),
                 # The commits this sweep ACCEPTED, and the library versions it resolved. Neither is
                 # recoverable from `engine_catalog`: its `immutable_revisions` is empty for the two
@@ -1162,9 +1244,7 @@ def main(
                 # artifacts carry both, but the summary is the file that presents the combined
                 # envelope -- without these it names a mutable repository and cannot say which
                 # weights or which runtime produced its curves once either moves.
-                "workload_checksum": workload_checksum(),
-                "serving_patch": _serving_patch_identity(),
-                "serving_source": _serving_source_identity(),
+                **local_identity,
                 "buckets": [
                     {"bucket": payload["bucket"], "curve": payload["curve"]} for payload in results
                 ],
@@ -1197,9 +1277,7 @@ def main(
                     "failure": f"{type(exc).__name__}: {exc}",
                     "invocation": invocation,
                     "engine_catalog": provenance,
-                    "workload_checksum": workload_checksum(),
-                    "serving_patch": _serving_patch_identity(),
-                    "serving_source": _serving_source_identity(),
+                    **local_identity,
                     "budget": ledger.to_json(),
                 },
                 f"failed-{mode}-{base_model.replace('/', '_')}-b{block}.json",

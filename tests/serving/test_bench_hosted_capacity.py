@@ -3424,7 +3424,10 @@ def test_every_bucket_artifact_carries_its_own_workload_checksum() -> None:
     assert bucket_writes, "no per-bucket artifact write found"
     for call in bucket_writes:
         payload = ast.unparse(call.args[0])
-        assert "workload_checksum()" in payload, (
+        # The identities are FROZEN into `local_identity` before the first remote call and spread
+        # here, so the checksum reaches the artifact through the mapping rather than a call at the
+        # write site. Recomputing it here is the defect, not the contract.
+        assert "**local_identity" in payload or "workload_checksum()" in payload, (
             "a per-bucket artifact is persisted without its workload checksum"
         )
         assert "**payload" in payload, "the bucket artifact no longer carries the remote payload"
@@ -3531,6 +3534,9 @@ def test_provenance_reads_the_snapshot_each_role_was_actually_loaded_from() -> N
         model_snapshot = root / "snapshots" / older
         model_snapshot.mkdir(parents=True)
         (model_snapshot / "config.json").write_text("{}")
+        # Real weights, not configuration alone: a config-only tree no longer answers for the
+        # model role, because every metadata-only fetch creates one.
+        (model_snapshot / "model.safetensors").write_text("weights")
         tokenizer_snapshot = root / "snapshots" / newer
         tokenizer_snapshot.mkdir(parents=True)
         (tokenizer_snapshot / "tokenizer.json").write_text("{}")
@@ -3575,6 +3581,9 @@ def test_ambiguous_and_missing_snapshots_are_reported_rather_than_guessed() -> N
             snapshot = root / "snapshots" / commit
             snapshot.mkdir(parents=True)
             (snapshot / "config.json").write_text("{}")
+            # Weights, so both trees are genuine model candidates; ambiguity between two
+            # WEIGHT-bearing snapshots is what this test is about.
+            (snapshot / "model.safetensors").write_text("weights")
         (root / "refs").mkdir(parents=True)
         (root / "refs" / "main").write_text(f"{ref_commit}\n")
         return cache
@@ -4984,7 +4993,10 @@ def test_every_artifact_records_the_applied_vllm_patch() -> None:
             f"artifact payload at line {call.lineno} is not a dict"
         )
         keys = {k.value for k in payload.keys if isinstance(k, ast.Constant)}
-        assert "serving_patch" in keys, (
+        # `None` keys are `**` spreads. The frozen `local_identity` mapping carries
+        # `serving_patch`, so a payload spreading it satisfies this contract.
+        spreads = any(k is None for k in payload.keys)
+        assert "serving_patch" in keys or spreads, (
             f"the artifact written at line {call.lineno} cannot say which vLLM patch it measured"
         )
 
@@ -5557,8 +5569,15 @@ def test_the_bounded_call_ends_the_container_rather_than_billing_past_its_bound(
     exits: list[int] = []
     namespace["os"] = types.SimpleNamespace(_exit=lambda code: exits.append(code))
 
+    # Uncooperative on purpose: this stands in for a coroutine pinned in an uninterruptible engine
+    # call, which is the case the exit exists for. A task that STOPS when cancelled has stopped
+    # spending, and the bound correctly declines to kill the container for it -- that case is
+    # covered by `test_the_bounded_call_reaps_work_when_its_own_frame_is_cancelled`.
     async def _stalls() -> str:
-        await asyncio.sleep(30)
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            await asyncio.sleep(30)
         return "never"
 
     async def _returns() -> str:
@@ -5567,12 +5586,265 @@ def test_the_bounded_call_ends_the_container_rather_than_billing_past_its_bound(
     # The fast path is untouched: a call inside its bound returns its own value.
     assert asyncio.run(within(_returns(), 5.0, "fast")) == "done"
 
-    # The slow path ends the container instead of returning or raising past the bound.
-    asyncio.run(within(_stalls(), 0.05, "stalled"))
+    # The slow path ends the container instead of returning past the bound. The real `os._exit`
+    # halts the process here; the fake above only records, so execution continues into the
+    # trailing `raise` that exists for the case where the work DID stop during the reap. Catching
+    # it keeps the assertion below about the exit, which is the property under test.
+    with contextlib.suppress(TimeoutError):
+        asyncio.run(within(_stalls(), 0.05, "stalled"))
     assert exits == [75], (
         "a call that outlived its priced bound must end the container; returning or raising leaves "
         "it billing on the GPU against a reservation it already exceeded"
     )
+
+
+def test_the_bounded_call_reaps_work_when_its_own_frame_is_cancelled() -> None:
+    """The bound must close on the cancellation door too, not only the timeout door.
+
+    `asyncio.shield` is what lets the bound reap: it keeps the inner task alive so the wrapper can
+    cancel it deliberately. But shield cuts both ways -- when the OUTER frame is cancelled (a lane
+    torn down, a Modal timeout unwinding the caller) the `wait_for` raises `CancelledError`, not
+    `TimeoutError`, and the shielded task survives the frame that was supposed to bound it. Catching
+    only `TimeoutError` therefore reaped nothing on that route: the frame unwound, the task stayed
+    pinned in the engine, and the container kept billing against a reservation nobody was watching.
+
+    Also asserts the two conditions that keep the reap honest: a task that FINISHES during the reap
+    must not kill the container -- it stopped spending, and killing then destroys the artifact of
+    work that completed inside its reservation -- and the cancellation must re-raise so the caller
+    still observes it.
+    """
+    namespace = _bench_namespace(
+        "_within_call_bound",
+        asyncio=asyncio,
+        contextlib=contextlib,
+        os=os,
+        sys=sys,
+        drain_reap_seconds=lambda: 0.05,
+    )
+    within = namespace["_within_call_bound"]
+
+    exits: list[int] = []
+    namespace["os"] = types.SimpleNamespace(_exit=lambda code: exits.append(code))
+
+    # A task that ignores cancellation, exactly like a coroutine pinned in an uninterruptible
+    # engine call: cancelling it does not stop it spending.
+    async def _ignores_cancellation() -> str:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            await asyncio.sleep(30)
+        return "never"
+
+    async def _cancel_the_outer_frame() -> None:
+        outer = asyncio.ensure_future(within(_ignores_cancellation(), 60.0, "cancelled"))
+        await asyncio.sleep(0.05)
+        outer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await outer
+
+    asyncio.run(_cancel_the_outer_frame())
+    assert exits == [75], (
+        "a bounded call whose own frame is cancelled must still reap the work it started; "
+        "`shield` keeps that task alive, so leaving it running keeps billing the GPU after the "
+        "frame that authorized it is gone"
+    )
+
+    # A task that stops when asked has stopped spending. Killing the container then would destroy
+    # the artifact of work that completed inside its reservation.
+    exits.clear()
+    raised: list[str] = []
+
+    async def _stops_when_asked() -> str:
+        await asyncio.sleep(30)
+        return "never"
+
+    async def _cancel_a_cooperative_task() -> None:
+        outer = asyncio.ensure_future(within(_stops_when_asked(), 60.0, "cooperative"))
+        await asyncio.sleep(0.05)
+        outer.cancel()
+        try:
+            await outer
+        except asyncio.CancelledError:
+            raised.append("cancelled")
+
+    asyncio.run(_cancel_a_cooperative_task())
+    assert exits == [], (
+        "a task that stopped when cancelled is no longer spending; ending the container then "
+        "destroys the evidence of work that finished inside its reservation"
+    )
+    assert raised == ["cancelled"], (
+        "the bound accounts for the cancellation, it does not swallow it; the caller must still "
+        "observe that its frame was cancelled"
+    )
+
+
+def test_a_configuration_only_snapshot_cannot_answer_which_weights_ran() -> None:
+    """`config.json` alone must not qualify a snapshot as holding the model.
+
+    `_snapshots_holding` matches its role markers with `any(...)`, and `config.json` was a model
+    marker -- but it is the one file every metadata-only fetch pulls, including this probe's own
+    `AutoConfig.from_pretrained`. So a snapshot containing configuration and no weights entered the
+    model candidates. On the two UNPINNED repositories, a repo that advances after the weights
+    download and a later config or tokenizer fetch is enough to create one; if `refs/main` then
+    names it, it is accepted as the commit the running weights came from.
+
+    A capacity number is attributed to weights, so the model role must require a file that actually
+    carries them.
+    """
+    from flash.serving.bench.probe import _ROLE_MARKERS, _snapshots_holding
+
+    assert "config.json" not in _ROLE_MARKERS["model"], (
+        "`config.json` is present in every metadata-only snapshot, so accepting it as a model "
+        "marker lets a weightless directory answer which weights ran"
+    )
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        # The real shape: an older snapshot carrying weights, a newer one carrying only the
+        # configuration and tokenizer a later fetch pulled.
+        weights = root / "snapshots" / "aaaaaaaa"
+        weights.mkdir(parents=True)
+        (weights / "config.json").write_text("{}", encoding="utf-8")
+        (weights / "model.safetensors").write_text("weights", encoding="utf-8")
+
+        metadata_only = root / "snapshots" / "bbbbbbbb"
+        metadata_only.mkdir(parents=True)
+        (metadata_only / "config.json").write_text("{}", encoding="utf-8")
+        (metadata_only / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+        holding = _snapshots_holding(root, "model")
+        assert holding == ["aaaaaaaa"], (
+            f"only the snapshot carrying weights may answer for the model role; got {holding!r}, "
+            "which lets a configuration-only tree be published as the measured checkpoint"
+        )
+        # The tokenizer role is unchanged: it reads the tree that actually holds tokenizer files.
+        assert _snapshots_holding(root, "tokenizer") == ["bbbbbbbb"]
+
+
+def test_the_stream_accumulators_initial_state_is_digested() -> None:
+    """The defaults that decide validation must move the checksum.
+
+    `_absorb_event` and `_validate` are digested, but half of what they decide lives in the
+    accumulator's INITIAL state. `_validate` rejects on `cached_tokens_reported is not True` and on
+    `saw_final` being false, so seeding either differently -- or pre-populating a usage field --
+    changes which requests become errors, and the error rate is the numerator this campaign
+    publishes. With `_StreamOutcome` outside `_DRIVER_SOURCES`, two campaigns applying materially
+    different validation compared as compatible.
+    """
+    from flash.serving.bench import workload
+
+    assert "_StreamOutcome" in workload._DRIVER_SOURCES, (
+        "the accumulator's initial state decides which requests validate, so it must be digested "
+        "alongside the functions that read it"
+    )
+
+    # Not merely listed: the digest must actually change when a default changes.
+    driver_source = (REPO_ROOT / "flash" / "serving" / "bench" / "driver.py").read_text(
+        encoding="utf-8"
+    )
+    assert "self.saw_final = False" in driver_source
+
+    real_getsource = inspect.getsource
+
+    def _drift(obj: Any) -> str:
+        text = real_getsource(obj)
+        if getattr(obj, "__name__", "") == "_StreamOutcome":
+            text = text.replace("self.saw_final = False", "self.saw_final = True")
+        return text
+
+    before = workload.workload_checksum()
+    with mock.patch.object(inspect, "getsource", _drift):
+        after = workload.workload_checksum()
+    assert before != after, (
+        "changing the accumulator must move `workload_checksum()`; if it does not, a campaign with "
+        "different initial validation state can claim compatibility with this one"
+    )
+
+
+def test_the_local_identities_are_frozen_before_the_first_remote_call() -> None:
+    """Provenance must describe the sources the image uploaded, not the checkout hours later.
+
+    Modal uploads the local sources when the engine object is constructed; a sweep then runs for
+    hours. Recomputing `workload_checksum()` and the source digests when `run_bucket.remote()`
+    RETURNS records whatever the working tree says at that moment -- an edit, a branch switch, a
+    `git pull` during the paid run -- and attributes it to code the container is no longer running.
+    That is worse than no provenance: it is confidently wrong.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+
+    frozen_at = source.index("local_identity = {")
+    first_remote = source.index("_run_canary(base_model, engine, expected_gpu)")
+    assert frozen_at < first_remote, (
+        "the local identities must be captured before the first remote call, or they describe a "
+        "checkout that may have moved while the paid sweep ran"
+    )
+
+    # Every artifact spreads the frozen mapping; none recomputes.
+    assert source.count("**local_identity") == 4, (
+        "all four artifacts (canary, per-bucket, summary, failure) must carry the frozen "
+        "identities, or one of them records post-run local state"
+    )
+    body = source[source.index("local_identity = {") :]
+    assert body.count("workload_checksum()") == 1, (
+        "`workload_checksum()` must be evaluated once, into the frozen mapping; a second call site "
+        "inside the lane re-reads the checkout after remote work has already run"
+    )
+
+
+def test_the_benchmark_scheduler_has_a_recorded_content_identity() -> None:
+    """The loop that decides which cells run must be covered by some recorded identity.
+
+    `workload_checksum()` digests named objects from `flash.serving.bench` and
+    `_serving_source_identity()` digests the `flash` package. Neither can see `scripts/` -- yet
+    `_run_bucket` lives there and owns the concurrency ordering, the warm engine each cell
+    inherits, and the bucket, block and invocation forwarded into `run_cell`. Changing any of them
+    changes the prompts issued and the cells the curve contains while every other recorded identity
+    stays byte-identical.
+    """
+    namespace = _bench_namespace(
+        "_harness_source_identity",
+        Path=Path,
+        hashlib=hashlib,
+        __file__=str(BENCH_APP),
+    )
+    identity = namespace["_harness_source_identity"]()
+
+    assert identity.get("sha256") == hashlib.sha256(BENCH_APP.read_bytes()).hexdigest(), (
+        "the harness identity must digest the script's real content; a stale or hand-maintained "
+        "value moves only when someone remembers to move it"
+    )
+
+    # And it must actually be recorded, not merely computable.
+    source = BENCH_APP.read_text(encoding="utf-8")
+    assert '"harness_source": _harness_source_identity()' in source, (
+        "the scheduler's identity must reach the artifacts, or the curve cannot say which loop "
+        "produced its cells"
+    )
+
+
+def test_one_envelope_cannot_span_two_kernel_dispatch_stacks() -> None:
+    """Buckets that ran through different drivers must not be fused into one curve.
+
+    Each bucket is a separately bootable call, so a replaced container can land on a host carrying
+    a different NVIDIA driver mid-rollout. Same weights, same card model, different execution
+    stack. The per-bucket probes captured the distinction and the summary discarded it, keeping
+    only the canary's runtime packages and combining the curves regardless.
+    """
+    namespace = _bench_namespace("_require_one_dispatch_stack")
+    require = namespace["_require_one_dispatch_stack"]
+
+    same = [
+        ("canary", {"gpu": {"driver_version": "580.65.06"}}),
+        ("bucket 'short_interactive'", {"gpu": {"driver_version": "580.65.06"}}),
+    ]
+    assert require(same) == {"driver_version": "580.65.06"}
+
+    drifted = [
+        ("canary", {"gpu": {"driver_version": "580.65.06"}}),
+        ("bucket 'near_32k'", {"gpu": {"driver_version": "570.86.15"}}),
+    ]
+    with pytest.raises(RuntimeError, match="kernel-dispatch stacks"):
+        require(drifted)
 
 
 def test_the_serving_sources_the_image_uploads_are_recorded_in_every_artifact() -> None:
