@@ -1248,8 +1248,15 @@ def test_results_carry_the_engine_shape_that_produced_them() -> None:
     bucket_payload = bucket_payload[: bucket_payload.index("\ndef _write_artifact")]
     assert '"engine_catalog"' in bucket_payload, "per-bucket payload omits the engine shape"
 
-    main_body = source[source.index("def main(") :]
-    assert main_body.count('"engine_catalog"') >= 2, "canary and summary must both carry it"
+    # The envelope lives in `_Lane.write`, so EVERY artifact carries the engine shape and no
+    # individual write site can forget it. Assert it there, and that both lanes write through it.
+    lane_write = source[source.index("    def write(") :]
+    lane_write = lane_write[: lane_write.index("\n    def settle(")]
+    assert '"engine_catalog"' in lane_write, "the artifact envelope omits the engine shape"
+    for lane_fn in ("_run_canary_lane", "_run_sweep_lane"):
+        body = source[source.index(f"def {lane_fn}(") :]
+        body = body[: body.index("\n\n\n")]
+        assert "lane.write(" in body, f"{lane_fn} bypasses the envelope that carries the shape"
 
 
 def test_pynvml_is_actually_guaranteed_by_the_images_declared_dependencies() -> None:
@@ -1710,10 +1717,9 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     # one container. Every bucket call can therefore land on a cold replacement and pay another boot
     # plus its warmups, which bills whether or not the reservation admits it.
     replacements = (startup + canary) * 1
-    # `_run_canary` is now ONE remote call: `certify.remote()` probes and warms the SAME container,
-    # so there is no gap between two calls for a replacement to land in and no second canary boot to
-    # reserve. Reserving it anyway would refuse runs that cannot cost that much.
-    canary_replacement_boot = 0.0
+    # No separate canary replacement boot: `_run_canary` is ONE remote call (`certify.remote()`
+    # probes and warms the SAME container), so there is no gap between two calls for a replacement
+    # to land in. Reserving one anyway would refuse runs that cannot cost that much.
     # The canary's probe plus one per bucket: `_run_bucket` gates the container it measured on, and
     # each probe is bounded by `PROBE_TIMEOUT_SECONDS` rather than the class method timeout.
     probes = constants["PROBE_TIMEOUT_SECONDS"] * 2
@@ -1729,16 +1735,7 @@ def test_the_sweep_estimate_reserves_the_canary_and_every_drain() -> None:
     )
     # The boot is reserved at the ceiling Modal lets a stuck boot reach, not a typical observed one.
     assert estimate == pytest.approx(
-        startup
-        + canary_replacement_boot
-        + canary
-        + probes
-        + windows
-        + fitting
-        + drains
-        + replacements
-        + scaledown
-        + headroom
+        startup + canary + probes + windows + fitting + drains + replacements + scaledown + headroom
     )
 
 
@@ -2529,12 +2526,13 @@ def test_the_paid_entrypoint_settles_its_reservation() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == "main"
     )
+    # Settlement is centralized in `_Lane.settle`; the three lanes call it. Counting `lane.settle`
+    # across the module covers the canary lane and sweep lane helpers as well as the failure path.
+    del main
     settles = [
         node
-        for node in ast.walk(main)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "settle"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "lane.settle"
     ]
     # Three: the canary lane, the sweep lane, and the failure handler that settles a lane which
     # died mid-flight. A failed lane has already spent its boot and probe, so leaving it unsettled
@@ -3407,30 +3405,34 @@ def test_every_bucket_artifact_carries_its_own_workload_checksum() -> None:
     """
     source = BENCH_APP.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    main = next(
-        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "main"
+    sweep = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_sweep_lane"
     )
     bucket_writes = [
         node
-        for node in ast.walk(main)
+        for node in ast.walk(sweep)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "_write_artifact"
-        and any(
-            isinstance(arg, ast.Constant) is False and "sweep-" in ast.unparse(arg)
-            for arg in node.args
-        )
+        and ast.unparse(node.func) == "lane.write"
+        and any("sweep-" in ast.unparse(arg) for arg in node.args)
     ]
     assert bucket_writes, "no per-bucket artifact write found"
     for call in bucket_writes:
-        payload = ast.unparse(call.args[0])
-        # The identities are FROZEN into `local_identity` before the first remote call and spread
-        # here, so the checksum reaches the artifact through the mapping rather than a call at the
-        # write site. Recomputing it here is the defect, not the contract.
-        assert "**local_identity" in payload or "workload_checksum()" in payload, (
-            "a per-bucket artifact is persisted without its workload checksum"
+        assert ast.unparse(call.args[0]) == "payload", (
+            "the bucket artifact no longer carries the remote payload"
         )
-        assert "**payload" in payload, "the bucket artifact no longer carries the remote payload"
+    # The identities are FROZEN before the first remote call and spread by the envelope, so the
+    # checksum reaches every artifact through the mapping rather than a call at the write site.
+    # Recomputing it at the write site is the defect, not the contract.
+    write = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "write"
+    )
+    assert "**self.local_identity" in ast.unparse(write), (
+        "a per-bucket artifact is persisted without its workload checksum"
+    )
 
 
 def test_a_failed_paid_lane_settles_and_records_its_spend() -> None:
@@ -3451,15 +3453,15 @@ def test_a_failed_paid_lane_settles_and_records_its_spend() -> None:
     guarding = []
     for try_node in handlers:
         body = ast.unparse(try_node)
-        if "_run_canary" in body and "run_bucket" in body:
+        if "_run_canary" in body and "_run_sweep_lane" in body:
             guarding.append(try_node)
     assert guarding, "the wrapped region does not cover both the canary and the bucket calls"
 
     for try_node in guarding:
         for handler in try_node.handlers:
             text = ast.unparse(handler)
-            assert "ledger.settle" in text, "a failed lane does not settle its elapsed spend"
-            assert "_write_artifact" in text, "a failed lane writes no accounting artifact"
+            assert "lane.settle" in text, "a failed lane does not settle its elapsed spend"
+            assert "lane.write" in text, "a failed lane writes no accounting artifact"
             assert any(
                 isinstance(node, ast.Raise) and node.exc is None for node in ast.walk(handler)
             ), "the failure handler swallows the exception instead of re-raising it"
@@ -3925,13 +3927,23 @@ def test_every_lane_settles_the_scaledown_tail_it_keeps_billing() -> None:
     # Every settle site must go through it, including the failure path -- a lane that dies mid-sweep
     # has already spent, and that is exactly when accurate accounting matters most.
     tree = ast.parse(BENCH_APP.read_text(encoding="utf-8"))
-    settles = [
+    lane_settles = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("settle")
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "lane.settle"
     ]
-    assert len(settles) >= 3, "expected a settle on the canary, sweep and failure paths"
-    for settle in settles:
+    assert len(lane_settles) >= 3, "expected a settle on the canary, sweep and failure paths"
+    # Exactly ONE site reaches the ledger, and it applies the tail. Centralizing it is what makes
+    # the tail unforgettable: a lane cannot settle without going through this call.
+    ledger_settles = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("ledger.settle")
+    ]
+    assert len(ledger_settles) == 1, (
+        f"expected one ledger settle site carrying the tail; found {len(ledger_settles)}"
+    )
+    for settle in ledger_settles:
         assert any("_billable_lane_seconds" in ast.unparse(arg) for arg in settle.args), (
             f"a settle site reports raw call wall and under-reports its lane: {ast.unparse(settle)}"
         )
@@ -4618,18 +4630,18 @@ def test_the_lane_gates_checkpoint_identity_before_it_summarizes() -> None:
     fn = next(
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == "main"
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.name == "_run_sweep_lane"
     )
     calls = [
-        (node.func.id, node.lineno)
+        (ast.unparse(node.func), node.lineno)
         for node in ast.walk(fn)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in {"_require_one_checkpoint", "_write_artifact"}
+        and ast.unparse(node.func) in {"_require_one_checkpoint", "lane.write"}
     ]
     gate = [line for name, line in calls if name == "_require_one_checkpoint"]
     assert gate, "the lane never compares checkpoints across buckets"
-    writes = [line for name, line in calls if name == "_write_artifact"]
+    writes = [line for name, line in calls if name == "lane.write"]
     assert max(writes) > gate[0], "the drift gate runs after every artifact is already written"
 
 
@@ -5093,11 +5105,11 @@ def test_the_summary_carries_the_checkpoint_the_sweep_accepted() -> None:
     ]
     assert returns, "the gate discards the identity it accepted instead of returning it"
 
-    main_body = source[source.index("def main(") :]
-    assert "accepted_checkpoint = _require_one_checkpoint(" in main_body, (
+    sweep_body = source[source.index("def _run_sweep_lane(") :]
+    assert "accepted_checkpoint = _require_one_checkpoint(" in sweep_body, (
         "the accepted identity is not captured from the gate"
     )
-    summary = main_body[main_body.index('f"summary-') - 2000 : main_body.index('f"summary-')]
+    summary = sweep_body[sweep_body.index('f"summary-') - 2000 : sweep_body.index('f"summary-')]
     assert '"accepted_checkpoint": accepted_checkpoint' in summary, (
         "the summary payload omits the checkpoint the sweep accepted"
     )
@@ -5779,10 +5791,21 @@ def test_the_local_identities_are_frozen_before_the_first_remote_call() -> None:
         "checkout that may have moved while the paid sweep ran"
     )
 
-    # Every artifact spreads the frozen mapping; none recomputes.
-    assert source.count("**local_identity") == 4, (
-        "all four artifacts (canary, per-bucket, summary, failure) must carry the frozen "
-        "identities, or one of them records post-run local state"
+    # Every artifact spreads the frozen mapping; none recomputes. The envelope in `_Lane.write`
+    # applies it to all four artifacts (canary, per-bucket, summary, failure), so this asserts the
+    # single spread AND that no write bypasses it -- a stronger contract than four repeated
+    # spreads, where dropping one was invisible until that artifact was the only evidence left.
+    assert source.count("**self.local_identity") == 1, (
+        "the artifact envelope no longer spreads the frozen identities"
+    )
+    direct = [
+        line
+        for line in source.splitlines()
+        if "_write_artifact(" in line and "def _write_artifact" not in line
+    ]
+    assert len(direct) == 1, (
+        f"every artifact must be written through the envelope; found {len(direct)} direct calls, "
+        "one of which would record post-run local state"
     )
     body = source[source.index("local_identity = {") :]
     assert body.count("workload_checksum()") == 1, (

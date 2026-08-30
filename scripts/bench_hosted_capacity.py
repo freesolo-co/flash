@@ -1014,12 +1014,12 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     # handled, and entirely foreseeable path unfunded, so a sweep accepted under its ceiling could
     # bill past it once per selected bucket. Priced per call, since that is where the exposure is.
     replacements = (boot + canary) * len(selected)
-    # The canary is now ONE remote call (`certify.remote()` probes and warms the same container), so
-    # a sweep makes `len(selected) + 1` separately bootable calls rather than `+ 2`. The second boot
-    # this lane reserved was funding a replacement landing between the old `probe`/`warmup` pair;
-    # with no gap between them there is nothing left for a replacement to land in, and reserving it
-    # anyway would refuse runs that cannot cost that much.
-    canary_replacement_boot = 0.0
+    # No separate canary replacement boot is priced: the canary is ONE remote call
+    # (`certify.remote()` probes and warms the same container), so a sweep makes `len(selected) + 1`
+    # separately bootable calls rather than `+ 2`. The boot this lane once reserved was funding a
+    # replacement landing between the old `probe`/`warmup` pair; with no gap between them there is
+    # nothing left for a replacement to land in, and reserving it anyway would refuse runs that
+    # cannot cost that much.
     # The canary's probe, plus one per bucket: `_run_bucket` probes the container it actually
     # measured on. Each is bounded by `PROBE_TIMEOUT_SECONDS` rather than the class method timeout,
     # so this is the exposure the bound permits, not a guess at typical probe time.
@@ -1037,16 +1037,7 @@ def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
     # call, which is where each bound is issued.
     headroom = float(TIMEOUT_HEADROOM_SECONDS) * (len(selected) + 1)
     return (
-        boot
-        + canary_replacement_boot
-        + canary
-        + probes
-        + measured
-        + fitting
-        + drains
-        + replacements
-        + scaledown
-        + headroom
+        boot + canary + probes + measured + fitting + drains + replacements + scaledown + headroom
     )
 
 
@@ -1063,6 +1054,132 @@ def _billable_lane_seconds(elapsed: float) -> float:
     full window is charged even when Modal reclaims sooner.
     """
     return elapsed + float(SCALEDOWN_WINDOW_SECONDS)
+
+
+class _Lane:
+    """One model's paid lane: its frozen identity, its budget entry, and its artifact envelope.
+
+    Every artifact this lane writes answers the same four questions -- which model, which card,
+    which invocation, which engine shape -- plus the local identities FROZEN before the first
+    remote call. Those five elements were repeated at each of the four write sites, where a key
+    dropped from one payload is invisible until the artifact it was dropped from is the only
+    surviving evidence. Carrying them here means a write site names only what is distinctive
+    about it, and no site can forget the envelope.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_model: str,
+        mode: str,
+        expected_gpu: str,
+        provenance: dict[str, Any] | None,
+        invocation: str,
+        ledger: Any,
+        entry: Any,
+        local_identity: dict[str, Any],
+        started: float,
+    ) -> None:
+        self.base_model = base_model
+        self.mode = mode
+        self.expected_gpu = expected_gpu
+        self.provenance = provenance
+        self.invocation = invocation
+        self.ledger = ledger
+        self.entry = entry
+        self.local_identity = local_identity
+        self.started = started
+
+    def write(self, payload: dict[str, Any], name: str) -> Path:
+        """Write one artifact, wrapping it in the envelope every artifact must carry.
+
+        The payload's own keys are applied LAST so a lane-specific value -- the per-bucket
+        payload's own `base_model` and `engine_catalog`, read from the container that actually
+        measured -- wins over the envelope's local view of the same key.
+        """
+        return _write_artifact(
+            {
+                "base_model": self.base_model,
+                "gpu": self.expected_gpu,
+                "mode": self.mode,
+                "invocation": self.invocation,
+                "engine_catalog": self.provenance,
+                **self.local_identity,
+                **payload,
+            },
+            name,
+            invocation=self.invocation,
+        )
+
+    def settle(self, note: str) -> None:
+        """Replace the worst-case reservation with the wall this lane actually elapsed."""
+        self.ledger.settle(
+            self.entry, _billable_lane_seconds(time.monotonic() - self.started), note=note
+        )
+
+    def slug(self) -> str:
+        return self.base_model.replace("/", "_")
+
+
+def _run_canary_lane(lane: _Lane, gate: dict[str, Any]) -> None:
+    """Settle and publish the cheap gate that must pass before any sweep spends money."""
+    lane.settle("measured canary wall plus scaledown tail")
+    lane.write(
+        {"probe": gate["probe"], "warmup": gate["warmup"], "budget": lane.ledger.to_json()},
+        f"canary-{lane.slug()}.json",
+    )
+
+
+def _run_sweep_lane(
+    lane: _Lane, engine: Any, gate: dict[str, Any], selected: list, block: int
+) -> None:
+    """Sweep every selected bucket on the warmed engine, gate cross-bucket drift, then summarize."""
+    from flash.serving.bench.catalog import bench_engine_overrides_for
+    from flash.serving.bench.workload import concurrency_grid
+
+    overrides = bench_engine_overrides_for(lane.base_model)
+    grid = list(concurrency_grid(int(overrides.get("max_num_seqs", 8))))
+    # The invocation nonce keys every measured prompt HEADER. A retry at the same block would
+    # otherwise re-send byte-identical prompts, and inside Modal's 120s scaledown the previous
+    # container and its prefix cache are still alive: the driver would score those hits
+    # ERROR_CACHE_CONTAMINATED and throw away a paid rerun whose engine was healthy. The filler body
+    # is keyed separately and does not move, so the workload stays reproducible.
+    results = []
+    for name in [b.name for b in selected]:
+        payload = engine.run_bucket.remote(name, grid, block, lane.invocation)
+        results.append(payload)
+        # Written eagerly because a later bucket can fail, and then these are the only surviving
+        # evidence for a boot that was already paid for. The envelope rides along via `lane.write`,
+        # so a payload carrying measurements can never lose the contract that produced them.
+        lane.write(payload, f"sweep-{lane.slug()}-{name}-b{block}.json")
+    # BEFORE the summary, after every per-bucket artifact is safely on disk. Each bucket gated its
+    # own container's provenance, but nothing compared those containers to each other: a repo that
+    # advanced mid-sweep, or a replacement container, leaves buckets measured on different commits
+    # and the summary below would fuse their curves into one envelope.
+    gated = [("canary", gate["probe"])] + [
+        (f"bucket {p['bucket']!r}", p.get("provenance") or {}) for p in results
+    ]
+    accepted_checkpoint = _require_one_checkpoint(gated)
+    # Same aggregation hazard, different axis: the checkpoint gate proves every bucket measured the
+    # same WEIGHTS, this one proves they measured through the same kernel-dispatch stack.
+    accepted_dispatch_stack = _require_one_dispatch_stack(gated)
+    lane.settle("measured sweep wall plus scaledown tail")
+    lane.write(
+        {
+            "grid": grid,
+            "accepted_checkpoint": accepted_checkpoint,
+            # The driver every bucket agreed on, not just the canary's. Without it the summary
+            # named a runtime resolved once and silently spanned hosts that dispatched through
+            # different ones.
+            "accepted_dispatch_stack": accepted_dispatch_stack,
+            "runtime_packages": (gate["probe"].get("runtime_packages") or {}),
+            "buckets": [
+                {"bucket": payload["bucket"], "curve": payload["curve"]} for payload in results
+            ],
+            "budget": lane.ledger.to_json(),
+        },
+        f"summary-{lane.slug()}-b{block}.json",
+    )
 
 
 @app.local_entrypoint()
@@ -1084,7 +1201,7 @@ def main(
     """
     from flash.serving.bench.budget import BudgetLedger
     from flash.serving.bench.catalog import bench_catalog_summary
-    from flash.serving.bench.workload import BUCKETS, concurrency_grid, workload_checksum
+    from flash.serving.bench.workload import BUCKETS, workload_checksum
 
     # Checked before anything else: an unknown mode must not reach a remote call, because every one
     # of them allocates the model's GPU.
@@ -1150,6 +1267,17 @@ def main(
     # and a rerun would otherwise truncate it exactly as a sweep rerun did.
     invocation = uuid.uuid4().hex[:12]
     print(f"[bench] invocation nonce {invocation}", flush=True)
+    lane = _Lane(
+        base_model=base_model,
+        mode=mode,
+        expected_gpu=expected_gpu,
+        provenance=provenance,
+        invocation=invocation,
+        ledger=ledger,
+        entry=entry,
+        local_identity=local_identity,
+        started=lane_started,
+    )
     # Every line below is billable, so a failure here is a failure that has already SPENT. The
     # reservation and the elapsed wall exist only in this process; without this handler a lane
     # that dies mid-sweep leaves no accounting evidence for the boot, probe and cells it paid
@@ -1158,101 +1286,10 @@ def main(
         gate = _run_canary(base_model, engine, expected_gpu)
 
         if mode == "canary":
-            ledger.settle(
-                entry,
-                _billable_lane_seconds(time.monotonic() - lane_started),
-                note="measured canary wall plus scaledown tail",
-            )
-            _write_artifact(
-                {
-                    "base_model": base_model,
-                    "gpu": expected_gpu,
-                    "mode": "canary",
-                    "engine_catalog": provenance,
-                    "probe": gate["probe"],
-                    "warmup": gate["warmup"],
-                    **local_identity,
-                    "invocation": invocation,
-                    "budget": ledger.to_json(),
-                },
-                f"canary-{base_model.replace('/', '_')}.json",
-                invocation=invocation,
-            )
+            _run_canary_lane(lane, gate)
             return
 
-        overrides = bench_engine_overrides_for(base_model)
-        grid = list(concurrency_grid(int(overrides.get("max_num_seqs", 8))))
-        # The nonce allocated above keys every measured prompt HEADER. A retry at the same block would
-        # otherwise re-send byte-identical prompts, and inside Modal's 120s scaledown the previous
-        # container and its prefix cache are still alive: the driver would score those hits
-        # ERROR_CACHE_CONTAMINATED and throw away a paid rerun whose engine was healthy. The filler body
-        # is keyed separately and does not move, so the workload stays reproducible.
-        results = []
-        for name in [b.name for b in selected]:
-            payload = engine.run_bucket.remote(name, grid, block, invocation)
-            results.append(payload)
-            # The contract travels WITH each bucket, not only with the summary. These files are written
-            # eagerly because a later bucket can fail, and then they are the only surviving evidence for
-            # a boot that was already paid for. A payload carrying measurements but no checksum cannot
-            # say which prompt, driver and metric contract produced them, which is exactly the question
-            # a partial artifact exists to answer. `engine_catalog` rides along for the same reason.
-            _write_artifact(
-                {
-                    **payload,
-                    "base_model": base_model,
-                    "gpu": expected_gpu,
-                    "invocation": invocation,
-                    "engine_catalog": provenance,
-                    **local_identity,
-                },
-                f"sweep-{base_model.replace('/', '_')}-{name}-b{block}.json",
-                invocation=invocation,
-            )
-        # BEFORE the summary, after every per-bucket artifact is safely on disk. Each bucket gated
-        # its own container's provenance, but nothing compared those containers to each other: a
-        # repo that advanced mid-sweep, or a replacement container, leaves buckets measured on
-        # different commits and the summary below would fuse their curves into one envelope.
-        gated = [("canary", gate["probe"])] + [
-            (f"bucket {p['bucket']!r}", p.get("provenance") or {}) for p in results
-        ]
-        accepted_checkpoint = _require_one_checkpoint(gated)
-        # Same aggregation hazard, different axis: the checkpoint gate proves every bucket measured
-        # the same WEIGHTS, this one proves they measured through the same kernel-dispatch stack.
-        accepted_dispatch_stack = _require_one_dispatch_stack(gated)
-        ledger.settle(
-            entry,
-            _billable_lane_seconds(time.monotonic() - lane_started),
-            note="measured sweep wall plus scaledown tail",
-        )
-        _write_artifact(
-            {
-                "base_model": base_model,
-                "gpu": expected_gpu,
-                "mode": mode,
-                "grid": grid,
-                "invocation": invocation,
-                "engine_catalog": provenance,
-                "accepted_checkpoint": accepted_checkpoint,
-                # The driver every bucket agreed on, not just the canary's. Without it the summary
-                # named a runtime resolved once and silently spanned hosts that dispatched through
-                # different ones.
-                "accepted_dispatch_stack": accepted_dispatch_stack,
-                "runtime_packages": (gate["probe"].get("runtime_packages") or {}),
-                # The commits this sweep ACCEPTED, and the library versions it resolved. Neither is
-                # recoverable from `engine_catalog`: its `immutable_revisions` is empty for the two
-                # unpinned models, and the image installs from dependency ranges. The bucket
-                # artifacts carry both, but the summary is the file that presents the combined
-                # envelope -- without these it names a mutable repository and cannot say which
-                # weights or which runtime produced its curves once either moves.
-                **local_identity,
-                "buckets": [
-                    {"bucket": payload["bucket"], "curve": payload["curve"]} for payload in results
-                ],
-                "budget": ledger.to_json(),
-            },
-            f"summary-{base_model.replace('/', '_')}-b{block}.json",
-            invocation=invocation,
-        )
+        _run_sweep_lane(lane, engine, gate, selected, block)
     except BaseException as exc:
         # Settle FIRST, then write. Settling replaces the worst-case reservation with the wall
         # actually elapsed, so the artifact records what this lane really cost rather than what
@@ -1260,27 +1297,16 @@ def main(
         # timeout kills the lane exactly like an error does, and the GPU-seconds are just as
         # spent. The exception is re-raised unchanged -- this handler accounts, it never rescues.
         if entry.settled_usd is None:
-            ledger.settle(
-                entry,
-                _billable_lane_seconds(time.monotonic() - lane_started),
-                note="failed lane wall plus scaledown tail",
-            )
+            lane.settle("failed lane wall plus scaledown tail")
         with contextlib.suppress(Exception):
             # Suppressed: a failure to write the accounting record must not replace the
             # exception that explains why the lane died.
-            _write_artifact(
+            lane.write(
                 {
-                    "base_model": base_model,
-                    "gpu": expected_gpu,
-                    "mode": mode,
                     "outcome": "failed",
                     "failure": f"{type(exc).__name__}: {exc}",
-                    "invocation": invocation,
-                    "engine_catalog": provenance,
-                    **local_identity,
                     "budget": ledger.to_json(),
                 },
-                f"failed-{mode}-{base_model.replace('/', '_')}-b{block}.json",
-                invocation=invocation,
+                f"failed-{mode}-{lane.slug()}-b{block}.json",
             )
         raise
