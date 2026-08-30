@@ -8,6 +8,7 @@ import json
 import random
 import re
 import sys
+import tracemalloc
 from array import array
 from decimal import Decimal
 from itertools import pairwise
@@ -31,6 +32,7 @@ from flash.serve.request.tool_calls import (
     normalize_tools,
     tools_wire,
     validate_tool_history,
+    validate_tool_history_replay,
     validate_tool_stop_sequences,
 )
 from flash.serve.request.validation import detached_messages
@@ -4201,6 +4203,26 @@ def test_stop_overlap_scanning_does_not_grow_with_the_declared_marker_count() ->
     for overlapping in ("zzz<", ">zzz", f"{names[0]}>", "<tool_call>"):
         assert text_scan.overlaps_any(overlapping, markers), overlapping
 
+    # enumerating every run of the stop rather than only those a marker could share costs the
+    # square of its length. the complexity ceiling counts characters, so it admits a stop of
+    # millions of them, whose full run set is terabytes: the memory has to be bounded by the
+    # longest marker, not by the stop. measured rather than reasoned, because the allocation is
+    # inside a comprehension that no call count can see.
+    def peak_bytes(length: int) -> int:
+        tracemalloc.start()
+        try:
+            before = tracemalloc.get_traced_memory()[0]
+            validate_tool_stop_sequences(
+                ["z" * length], tools=tools, tool_choice="auto", error_type=OpenAIRequestError
+            )
+            return tracemalloc.get_traced_memory()[1] - before
+        finally:
+            tracemalloc.stop()
+
+    # a stop eight times longer would cost sixty-four times the memory if the runs were unbounded.
+    small, large = peak_bytes(1_000), peak_bytes(8_000)
+    assert large < 4 * max(small, 64 * 1024), (small, large)
+
 
 def test_nested_string_enums_may_carry_grammar_delimiters() -> None:
     """only a value the grammar writes between its own delimiters can be broken by carrying one.
@@ -4285,10 +4307,11 @@ def test_the_narrowed_closer_scan_finds_every_declared_name_and_no_other() -> No
     nested = "</parameter> <parameter=undeclared></parameter> <parameter=a>"
     assert find(nested, 0, frozenset({"a"})) == nested.index("</parameter> <parameter=a>")
 
-    # `normalize_tools` restricts property names to the opener charset, so regex syntax cannot
-    # reach the scan. literal comparison is asserted anyway, since the guarantee lives elsewhere.
+    # a name carrying regex syntax reaches the scan through a replay probe, whose names are the
+    # keys of a historical call rather than a validated declaration. it must be compared as literal
+    # text: matching its own spelling, and never matching a name it would match as a pattern.
     for hostile in ("a|b", "a.b", "(a)", "a*"):
-        assert find(f"</parameter> <parameter={hostile}>", 0, frozenset({hostile})) == -1, hostile
+        assert find(f"</parameter> <parameter={hostile}>", 0, frozenset({hostile})) == 0, hostile
         assert find("</parameter> <parameter=a>", 0, frozenset({hostile})) == -1, hostile
     for hostile in ("a.b", "(a)", "a*", "a|b"):
         with pytest.raises(OpenAIRequestError, match="key is invalid"):
@@ -4309,6 +4332,48 @@ def test_the_narrowed_closer_scan_finds_every_declared_name_and_no_other() -> No
                 ],
                 error_type=OpenAIRequestError,
             )
+
+
+def test_a_replay_probe_sees_openers_named_outside_the_declaration_charset() -> None:
+    """the closer scan's name run is the grammar's, not a public declaration's.
+
+    a replay probe derives its parameter names from the keys of a historical call, which never pass
+    `_identifier_name`. narrowing the scan to the charset a declaration may hold made an opener
+    named for such a key invisible, so a closer that genuinely hands off to it read as inert and a
+    replayable history was rejected as unreplayable.
+    """
+    arguments = {"good": "prefix</parameter>x", "bad.name": "b"}
+    history = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "hist", "arguments": json.dumps(arguments)},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
+    # no current declaration, so the probe's names come straight from the historical keys.
+    validate_tool_history_replay(history, None, error_type=OpenAIRequestError)
+
+    # the scan itself must find the boundary that hands off to the dotted name.
+    assert (
+        text_scan.find_viable_parameter_end(
+            "</parameter>\n<parameter=bad.name>", 0, frozenset(arguments)
+        )
+        == 0
+    )
+    # and must still reject a name no side declares, whatever characters it carries.
+    assert (
+        text_scan.find_viable_parameter_end(
+            "</parameter>\n<parameter=other.name>", 0, frozenset(arguments)
+        )
+        == -1
+    )
 
 
 def test_a_wide_catalog_costs_no_per_declaration_pattern_construction() -> None:
@@ -4519,27 +4584,38 @@ def test_undeclared_openers_do_not_each_open_a_parse_branch() -> None:
     )
 
     def passes(body: str) -> tuple[int, int]:
-        """(closer searches, parse branches) spent on a value with this body."""
+        """(regex engine entries, parse branches) spent on a value with this body."""
         text = (
             f"<tool_call><function=store><parameter=data>\n{body}\n"
             "</parameter></function></tool_call>"
         )
         searches, branches = [0], [0]
-        real_find = text_scan.find_viable_parameter_end
+        real_pattern = text_scan._NAMED_PARAMETER_END_RE
         real = tool_calls_module._parse_parameters
 
-        def counting_find(text: str, cursor: int, declared):
-            searches[0] += 1
-            return real_find(text, cursor, declared)
+        class _CountingPattern:
+            """counts entries into the engine, not calls to the helper wrapping it.
+
+            counting the helper hides the shape this test exists to catch: a scan that re-enters
+            the engine once per rejected opener calls the helper exactly once either way, so the
+            per-occurrence cost is invisible from outside it.
+            """
+
+            def finditer(self, text: str, position: int):
+                for match in real_pattern.finditer(text, position):
+                    searches[0] += 1
+                    yield match
+
+            def search(self, text: str, position: int):
+                searches[0] += 1
+                return real_pattern.search(text, position)
 
         def counting_parse(*args, **kwargs):
             branches[0] += 1
             return real(*args, **kwargs)
 
         with (
-            mock.patch.object(
-                tool_calls_module.text_scan, "find_viable_parameter_end", counting_find
-            ),
+            mock.patch.object(text_scan, "_NAMED_PARAMETER_END_RE", _CountingPattern()),
             mock.patch.object(tool_calls_module, "_parse_parameters", counting_parse),
         ):
             result = parse_qwen3_coder_output(text, tools, _work_limit=None)
@@ -4548,11 +4624,19 @@ def test_undeclared_openers_do_not_each_open_a_parse_branch() -> None:
         assert json.loads(result.calls[0].arguments)["data"] == body
         return searches[0], branches[0]
 
-    # neither pass may scale with how many times the value quotes an opener the schema never
-    # declared. a scan that returned each one as a candidate would cost a search and a rejected
-    # branch per occurrence, which is what made an 8 MiB argument take seconds.
+    # the recursive descent may not scale with how many times the value quotes an opener the schema
+    # never declared: treating each as a boundary spent a rejected branch per occurrence, which is
+    # what made an 8 MiB argument take seconds. the branch count is therefore flat.
     quoted = "</parameter><parameter=nope>"
-    assert passes(quoted) == passes(quoted * 1_000) == passes(quoted * 100_000), passes(quoted)
+    one, thousand, many = passes(quoted), passes(quoted * 1_000), passes(quoted * 100_000)
+    assert one[1] == thousand[1] == many[1] == 2, (one, thousand, many)
+
+    # the engine still visits each quoted pairing to reject it, so its entries do scale. that cost
+    # is one match against a fixed pattern rather than a python frame, and it is charged as the
+    # span it settles. asserting the entries are flat would be asserting something untrue, so what
+    # is pinned is that the visit stays a single pass: one entry per occurrence, not one restart of
+    # the scan per occurrence, which is what re-entering the engine on every rejection would cost.
+    assert (one[0], thousand[0], many[0]) == (1, 1_000, 100_000), (one, thousand, many)
 
 
 def test_opener_index_retains_only_declared_parameter_names() -> None:

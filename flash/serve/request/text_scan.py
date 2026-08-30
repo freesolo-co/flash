@@ -22,11 +22,13 @@ VIABLE_PARAMETER_END_RE = re.compile(
     rf"{re.escape(PARAMETER_END)}\s*(?:{re.escape(PARAMETER_START)}|{re.escape(FUNCTION_END)})"
 )
 # the same pairing, capturing the opener's name so the caller can reject one its schema never
-# declared. the name charset matches what a declaration may hold, so a name too long or carrying
-# any other character cannot be declared and correctly fails to pair here.
+# declared. the name run is anything the grammar itself can write between the opener and its `>`,
+# not the narrower set a public declaration may hold: a replay probe derives its parameter names
+# from the keys of a historical call, which reach this scan without passing that validation. the
+# run stops at `<` as well as `>` so a truncated opener cannot swallow the one that follows it.
 _NAMED_PARAMETER_END_RE = re.compile(
     rf"{re.escape(PARAMETER_END)}\s*"
-    rf"(?:{re.escape(PARAMETER_START)}([A-Za-z0-9_-]{{1,64}})>|{re.escape(FUNCTION_END)})"
+    rf"(?:{re.escape(PARAMETER_START)}([^<>]*)>|{re.escape(FUNCTION_END)})"
 )
 
 
@@ -42,12 +44,13 @@ def find_viable_parameter_end(text: str, cursor: int, declared: Container[str]) 
     carry hundreds of them: compiling that alternation costs more on one wide schema than every
     skip it saves, and the compilation is not work this parser can charge for.
     """
-    while (found := _NAMED_PARAMETER_END_RE.search(text, cursor)) is not None:
+    # one iteration rather than a search per rejection: the engine resumes from where it stopped,
+    # so a value quoting an undeclared opener a million times re-enters it once instead of a
+    # million times. no closer can begin inside a pairing just rejected, because the name charset
+    # excludes `<`, so continuing after it skips only spans that could not have started a match.
+    for found in _NAMED_PARAMETER_END_RE.finditer(text, cursor):
         if found[1] is None or found[1] in declared:
             return found.start()
-        # no closer can begin inside the pairing just rejected: the name charset excludes `<`, so
-        # resuming at its end skips only spans that could not have started a match anyway.
-        cursor = found.end()
     return -1
 
 
@@ -59,14 +62,22 @@ def overlaps_any(value: str, candidates: Iterable[str]) -> bool:
     slice allocations on the request path. the runs that can be shared depend only on ``value``,
     so they are enumerated once here and each candidate is then two native comparisons.
 
-    a suffix longer than the candidate cannot prefix it, so passing the whole tuple decides the
-    same predicate as bounding each pair by ``min(len(value), len(candidate))``.
+    only runs up to the longest candidate can be shared, and enumerating past that is what makes
+    the enumeration cost the square of the value's length: the complexity ceiling admits a stop of
+    millions of characters, whose full run set is terabytes. the grammar markers are tens of
+    characters, so the bound is what keeps this proportional to the declaration rather than to the
+    stop. a candidate longer than the value is still decided, by the containment test above.
     """
     if not value:
         # the empty string is a substring of everything, so any candidate at all overlaps it.
         return any(True for _ in candidates)
-    suffixes = tuple(value[-size:] for size in range(1, len(value)))
-    prefixes = tuple(value[:size] for size in range(1, len(value)))
+    candidates = tuple(candidates)
+    longest = max((len(candidate) for candidate in candidates), default=0)
+    # a shared run cannot exceed either side, and one as long as the value is containment, not
+    # overlap, so both are already decided without enumerating that size.
+    bound = min(len(value), longest)
+    suffixes = tuple(value[-size:] for size in range(1, bound))
+    prefixes = tuple(value[:size] for size in range(1, bound))
     for candidate in candidates:
         if value in candidate or candidate in value:
             return True
