@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 import os
 import shutil
 import uuid
@@ -20,6 +21,7 @@ from typing import Any
 # _RESERVED_CHAT_TEMPLATE_KWARGS (the apply_chat_template args a caller must never re-supply) and
 # the vllm build probes engine_boot uses.
 from flash.content.thinking import messages_for_chat_template
+from flash.serve.app.progress import boot_elapsed_seconds
 from flash.serve.contract.provenance import engine_adapter_name, record_key
 from flash.serving.src.engine.lora_entries import _LoraEntry, cached_lora_request, entries_for
 from flash.serving.src.engine.model_config import (
@@ -73,6 +75,9 @@ class _LoraEngineImpl:
         from flash.serving.src.store.settings import ADAPTER_CACHE_DIR, Settings
 
         self._replica_id = uuid.uuid4().hex
+        self._replica_in_flight_requests = 0
+        self._replica_first_request_pending = True
+        self._replica_boot_duration_seconds = None
         self.settings = Settings()
         self.registry = AdapterRegistry()
         self._adapter_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -116,6 +121,47 @@ class _LoraEngineImpl:
         self._liveness_task = asyncio.create_task(self._liveness_monitor())
         if cfg.PRELOAD_CACHED_LORAS:
             await self._preload_cached_loras()
+        try:
+            self._replica_boot_duration_seconds = boot_elapsed_seconds()
+        except Exception:
+            # capacity telemetry is observational and must never make a healthy replica fail.
+            self._replica_boot_duration_seconds = None
+
+    def _admit_generation(self) -> dict[str, Any]:
+        """record honest process-local demand at request admission."""
+
+        try:
+            if not hasattr(self, "_replica_in_flight_requests"):
+                return {}
+            requests = max(0, int(self._replica_in_flight_requests)) + 1
+            self._replica_in_flight_requests = requests
+            freshly_booted = bool(getattr(self, "_replica_first_request_pending", False))
+            self._replica_first_request_pending = False
+            snapshot: dict[str, Any] = {
+                "replica_in_flight_requests_at_admission": requests,
+                "replica_freshly_booted": freshly_booted,
+            }
+            boot_duration = getattr(self, "_replica_boot_duration_seconds", None)
+            if isinstance(boot_duration, (int, float)) and not isinstance(boot_duration, bool):
+                normalized_boot_duration = float(boot_duration)
+                if math.isfinite(normalized_boot_duration) and normalized_boot_duration >= 0:
+                    snapshot["replica_boot_duration_seconds"] = normalized_boot_duration
+            return snapshot
+        except Exception:
+            # capacity telemetry is observational and must never reject inference.
+            return {}
+
+    def _release_generation(self) -> None:
+        """release process-local demand without raising into inference cleanup."""
+
+        try:
+            if not hasattr(self, "_replica_in_flight_requests"):
+                return
+            requests = int(self._replica_in_flight_requests) - 1
+            self._replica_in_flight_requests = max(0, requests)
+        except Exception:
+            # a broken counter must not replace a successful generation with an error.
+            self._replica_in_flight_requests = 0
 
     def _engine_dead(self) -> bool:
         """Instance-bound view of :func:`_engine_is_dead` for the live engine."""
@@ -631,13 +677,18 @@ class _LoraEngineImpl:
     ) -> dict[str, Any]:
         from flash.serving.src.engine.generation import generate
 
-        return await generate(
-            self,
-            payload_dict,
-            record_dict,
-            expected_checkpoint,
-            generation_id,
-        )
+        capacity = self._admit_generation()
+        try:
+            return await generate(
+                self,
+                payload_dict,
+                record_dict,
+                expected_checkpoint,
+                generation_id,
+                capacity,
+            )
+        finally:
+            self._release_generation()
 
     async def _stream_generate(
         self,
@@ -648,20 +699,25 @@ class _LoraEngineImpl:
     ):
         from flash.serving.src.engine.generation import stream_generate
 
+        capacity = self._admit_generation()
         stream = stream_generate(
             self,
             payload_dict,
             record_dict,
             expected_checkpoint,
             generation_id,
+            capacity,
         )
         try:
             async for event in stream:
                 yield event
         finally:
-            close = getattr(stream, "aclose", None)
-            if close is not None:
-                await close()
+            try:
+                close = getattr(stream, "aclose", None)
+                if close is not None:
+                    await close()
+            finally:
+                self._release_generation()
 
     async def _unregister(
         self,

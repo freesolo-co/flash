@@ -336,17 +336,22 @@ from flash.serving.src.engine.model_config import (  # noqa: E402
 
 
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
-    """(max_inputs, target_inputs) sized to the model's REAL vLLM concurrency (``max_num_seqs``).
+    """return Modal input admission aligned with the engine's sequence capacity.
 
-    Modal's ``max_inputs`` is how many requests it packs onto ONE container before it must add
-    another. If it far exceeds the engine's ``max_num_seqs`` (e.g. the global 64 on the 35B, which
-    decodes only 8 at a time), Modal piles requests 9..64 INSIDE the container instead of autoscaling
-    — high latency and no scale-out until ~target_inputs are packed. So cap ``max_inputs`` near the
-    engine's capacity with a small boot buffer (2x, so a cold-booting replacement doesn't reject
-    bursts), bounded by the global ``MAX_INPUTS``; scale out at 3/4 of that. Models that leave
-    ``max_num_seqs`` at the vLLM default keep the global sizing."""
-    seqs = int(engine_overrides_for(base_model).get("max_num_seqs", MAX_INPUTS))
-    max_inputs = max(8, min(MAX_INPUTS, seqs * 2))
+    Modal counts requests while vLLM schedules sequences. The prior 2x buffer admitted 16 requests
+    onto every current 8-sequence engine, so normal ``n=1`` traffic queued half of them inside the
+    container and delayed scale-out until 12 inputs. OpenAI ``n`` can fan one input out to as many as
+    four sequences, but sizing every container for that rare worst case would leave normal traffic
+    underutilizing the GPU and cold-boot expensive replicas prematurely. Cap request admission at the
+    authored sequence capacity instead: current tiers admit 8 and scale out at 6. This deliberately
+    changes Modal's request knobs, not ``max_num_seqs``: raising the engine cap is not allocation-free,
+    and the 35B tier has a documented startup profiling OOM at higher sequence counts. Models without
+    an authored sequence cap retain the global sizing until their real capacity is explicit.
+    """
+    configured = engine_overrides_for(base_model).get("max_num_seqs")
+    if configured is None:
+        return MAX_INPUTS, TARGET_INPUTS
+    max_inputs = max(1, min(MAX_INPUTS, int(configured)))
     target_inputs = max(1, max_inputs * 3 // 4)
     return max_inputs, target_inputs
 
