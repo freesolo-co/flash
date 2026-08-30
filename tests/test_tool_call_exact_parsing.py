@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 import flash.serve.request.openai as openai_module
 import flash.serve.request.tool_calls as request_tool_calls_module
@@ -1224,6 +1225,65 @@ def test_replay_accepts_every_call_the_parser_emits_under_wide_declarations(
     assert request.messages[0]["tool_calls"][0]["function"]["name"] == "f"
 
 
+@pytest.mark.parametrize("declared", [10, 128, 300, 511])
+@pytest.mark.parametrize("occurrences", [1, 5, 50, 200])
+def test_replay_accepts_a_call_whose_argument_quotes_call_boundaries(
+    declared: int, occurrences: int
+) -> None:
+    # closure again, from the other direction: the candidate scan counts boundaries quoted inside
+    # this call's own argument, so generation grants declaration work for each of them. replay
+    # renders exactly one call, so a replay budget derived from the call count rather than from
+    # the text would be the narrower side and would reject what generation just emitted.
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "store",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "payload": {"type": "string"},
+                            **{f"p{index}": {"type": "string"} for index in range(declared - 1)},
+                        },
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+    value = "x" + "</function></tool_call><tool_call><function=store>" * occurrences + "y"
+    arguments = json.dumps({"payload": value})
+
+    request = parse_chat_request(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_quoted",
+                            "type": "function",
+                            "function": {"name": "store", "arguments": arguments},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_quoted", "content": "ok"},
+            ],
+            "tools": tools_wire(tools),
+            "tool_choice": "auto",
+        },
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    assert json.loads(request.messages[0]["tool_calls"][0]["function"]["arguments"]) == {
+        "payload": value
+    }
+
+
 def test_boundaries_quoted_inside_an_argument_do_not_trip_the_call_cap() -> None:
     # the candidate scan is context blind, so a boundary quoted inside a json string looks like a
     # call. the emitted-call ceiling must count real calls, not that estimate.
@@ -1289,9 +1349,9 @@ def test_genuine_call_runs_still_stop_at_the_emitted_call_ceiling(calls: int, em
     assert len(result.calls) == emitted
 
 
-def test_hosted_request_replays_history_without_inactive_declarations() -> None:
-    # the hosted envelope must reach the same verdict as the canonical path: a declaration that
-    # tool_choice has switched off cannot decide whether past calls replay.
+def _hosted_tool_request(tool_choice: str) -> OpenAIGenerateRequest:
+    # history whose replay verdict genuinely depends on the declaration: the argument carries
+    # structural delimiters that are ambiguous only when "b" is a declared sibling parameter.
     messages = [
         {
             "role": "assistant",
@@ -1300,37 +1360,50 @@ def test_hosted_request_replays_history_without_inactive_declarations() -> None:
                 {
                     "id": "call_fixed",
                     "type": "function",
-                    "function": {"name": "store", "arguments": '{"old": "x"}'},
+                    "function": {
+                        "name": "store",
+                        "arguments": '{"a": "</parameter><parameter=b>v"}',
+                    },
                 }
             ],
         },
         {"role": "tool", "tool_call_id": "call_fixed", "content": "ok"},
     ]
-    inactive = tools_wire(
+    declarations = tools_wire(
         (
             FunctionTool(
                 "store",
                 None,
                 {
                     "type": "object",
-                    "properties": {"new": {"type": "string"}},
-                    "required": ["new"],
+                    "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+                    "required": [],
                     "additionalProperties": False,
                 },
             ),
         )
     )
-
-    request = OpenAIGenerateRequest(
+    return OpenAIGenerateRequest(
         adapter_id="adapter",
         generation_id="generation",
         messages=messages,
-        tools=inactive,
-        tool_choice="none",
+        tools=declarations,
+        tool_choice=tool_choice,
         parallel_tool_calls=True,
     )
 
-    assert request.tool_choice == "none"
+
+def test_hosted_request_replays_history_without_inactive_declarations() -> None:
+    # the hosted envelope must reach the same verdict as the canonical path: a declaration that
+    # tool_choice has switched off cannot decide whether past calls replay.
+    assert _hosted_tool_request("none").tool_choice == "none"
+
+
+def test_hosted_request_applies_active_declarations_to_history_replay() -> None:
+    # the companion negative case: with the same declaration active, replay is ambiguous and must
+    # be rejected. without this, an envelope that ignored declarations entirely would still pass.
+    with pytest.raises(ValidationError, match="cannot be replayed exactly"):
+        _hosted_tool_request("auto")
 
 
 @pytest.mark.parametrize(

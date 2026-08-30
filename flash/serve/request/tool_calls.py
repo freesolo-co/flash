@@ -597,15 +597,15 @@ def _validate_template_roundtrip(
             raise ValueError(failure)
     text = "".join(blocks)
     replay_tools = _merged_replay_tools(probe)
-    # the replay budget must match what generation grants, including the per-call declaration
-    # scan. a narrower budget here would reject a turn the parser is willing to emit, breaking
-    # the closure this validation exists to enforce.
-    declared = max((len(tool.parameters["properties"]) for tool in replay_tools), default=0)
+    # replay must grant exactly what a generation parse of this same text would grant. restating
+    # the formula here only lets the two sides drift, and whichever side is narrower rejects a turn
+    # the other is willing to emit. the ceiling above already bounds this text, so replay opts out
+    # of the fixed cap and closure holds by construction rather than by keeping two formulas equal.
     result = parse_qwen3_coder_output(
         text,
         replay_tools,
         id_factory=lambda: "call_replay",
-        _work_limit=4 * len(text) + len(probe) * declared,
+        _work_limit=None,
     )
     if len(result.calls) != len(probe):
         raise ValueError(failure)
