@@ -884,10 +884,9 @@ class Provider(Protocol):
         lookup blip so allocate() can degrade to the others yet still tell 'no fit' from 'outage'."""
         ...
 
-    def submit_run(
+    def submit_attempt(
         self,
         spec: JobSpec,
-        seed: int,
         *,
         log: Any = None,
         on_handle: Any = None,
@@ -897,22 +896,23 @@ class Provider(Protocol):
         source_snapshot: dict | None = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
-        """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll to terminal.
+        """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll one attempt to terminal.
 
-        ``on_last_gpu``: no further GPU attempt follows, so capacity backstops may wait longer.
+        One run may execute several attempts, each on its own host or gpu class; this runs exactly
+        one of them. ``on_last_gpu``: no further gpu attempt follows, so capacity backstops may wait
+        longer.
         """
         ...
 
-    def poll(
+    def poll_attempt(
         self,
         handle: JobHandle,
         spec: JobSpec,
-        seed: int,
         *,
         log: Any = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
-        """Reattach to a persisted handle and poll it to a terminal state."""
+        """Reattach to one attempt's persisted handle and poll it to a terminal state."""
         ...
 
     def cancel(self, handle: JobHandle) -> None:

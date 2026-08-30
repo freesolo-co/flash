@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 import sys
 import time
 import uuid
@@ -130,11 +131,42 @@ def _reject_tools_with_structured_outputs(payload: OpenAIGenerateRequest, struct
         raise ValueError("tools cannot be combined with logprobs or structured outputs")
 
 
+def _optional_nonnegative_float(value: Any) -> float | None:
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return normalized if math.isfinite(normalized) and normalized >= 0 else None
+
+
+def _queue_wait_seconds(request_output: Any) -> float | None:
+    """return vLLM's measured queue interval when the output exposes one."""
+
+    try:
+        metrics = getattr(request_output, "metrics", None)
+        if metrics is None:
+            return None
+        direct = _optional_nonnegative_float(getattr(metrics, "time_in_queue", None))
+        if direct is not None:
+            return direct
+        arrival = _optional_nonnegative_float(getattr(metrics, "arrival_time", None))
+        scheduled = _optional_nonnegative_float(getattr(metrics, "first_scheduled_time", None))
+        if arrival is None or scheduled is None or scheduled < arrival:
+            return None
+        return scheduled - arrival
+    except Exception:
+        # telemetry is observational; an engine-version-specific metric must never break inference.
+        return None
+
+
 def _usage_fields(
     request_output: Any,
     completion_token_ids: list[int],
     *,
     start: float,
+    time_to_first_token_seconds: float | None,
+    queue_wait_seconds: float | None,
+    capacity: dict[str, Any],
     request_id: str,
     engine_replica_id: str,
     checkpoint: str,
@@ -151,6 +183,13 @@ def _usage_fields(
         "cached_tokens": _num_cached_tokens(request_output),
         "cached_tokens_reported": _cached_tokens_reported(request_output),
         "inference_time_seconds": time.time() - start,
+        **(
+            {"time_to_first_token_seconds": time_to_first_token_seconds}
+            if time_to_first_token_seconds is not None
+            else {}
+        ),
+        **({"queue_wait_seconds": queue_wait_seconds} if queue_wait_seconds is not None else {}),
+        **capacity,
         "request_id": request_id,
         "engine_replica_id": engine_replica_id,
         "checkpoint": checkpoint,
@@ -167,6 +206,7 @@ async def generate(
     record_dict: dict[str, Any] | None = None,
     expected_checkpoint: str | None = None,
     generation_id: str | None = None,
+    capacity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from vllm.sampling_params import RequestOutputKind
 
@@ -228,6 +268,13 @@ async def generate(
             final_output,
             completion_ids,
             start=start,
+            # under FINAL_ONLY the engine yields once, at completion, so there is no first-token
+            # boundary to observe here. reporting the completion interval as a time-to-first-token
+            # would be a second misleading duration next to inference_time_seconds. only the
+            # streaming path, which genuinely runs DELTA, reports this field.
+            time_to_first_token_seconds=None,
+            queue_wait_seconds=_queue_wait_seconds(final_output),
+            capacity=dict(capacity or {}),
             request_id=request_id,
             engine_replica_id=owner._replica_identifier(),
             checkpoint=active_checkpoint,
@@ -350,6 +397,7 @@ async def stream_generate(
     record_dict: dict[str, Any] | None = None,
     expected_checkpoint: str | None = None,
     generation_id: str | None = None,
+    capacity: dict[str, Any] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     from vllm.sampling_params import RequestOutputKind
 
@@ -369,6 +417,8 @@ async def stream_generate(
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
     start = time.time()
     prompt_input = await owner._prepare_prompt_input(payload, thinking)
+    # the new interval starts at engine submission, excluding prompt and image preparation.
+    first_output_started = time.perf_counter()
     output_stream = None
     completion_ids: list[int] = []
     choice_state: dict[int, _ChoiceState] = {
@@ -382,6 +432,9 @@ async def stream_generate(
     )
     usage_kwargs = {
         "start": start,
+        "time_to_first_token_seconds": None,
+        "queue_wait_seconds": None,
+        "capacity": dict(capacity or {}),
         "request_id": request_id,
         "engine_replica_id": owner._replica_identifier(),
         "checkpoint": active_checkpoint,
@@ -398,11 +451,14 @@ async def stream_generate(
                 reasoning_parser_kwargs=parser_kwargs,
             )
             first_output = await anext(output_stream)
+            time_to_first_token_seconds = max(0.0, time.perf_counter() - first_output_started)
         except StopAsyncIteration as exc:
             raise RuntimeError("vLLM returned no output") from exc
         except Exception:
             owner._self_heal_if_dead("stream_generate")
             raise
+        usage_kwargs["time_to_first_token_seconds"] = time_to_first_token_seconds
+        usage_kwargs["queue_wait_seconds"] = _queue_wait_seconds(first_output)
         first_ids = [
             int(token)
             for output in indexed_outputs(first_output, n=payload.n).values()

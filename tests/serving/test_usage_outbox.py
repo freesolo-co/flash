@@ -290,6 +290,55 @@ def test_empty_or_omitted_token_ids_preserve_resolved_scalar_counts(
     assert facts.cached_tokens <= facts.prompt_tokens
 
 
+def test_capacity_facts_use_top_level_optional_rpc_fields() -> None:
+    event = _usage_event()
+    event = replace(
+        event,
+        facts=replace(
+            event.facts,
+            time_to_first_token_seconds=0.75,
+            queue_wait_seconds=0.25,
+            replica_in_flight_requests_at_admission=3,
+            replica_boot_duration_seconds=91.5,
+            replica_freshly_booted=True,
+        ),
+    )
+
+    payload = event.rpc_payload()
+
+    assert payload["time_to_first_token_seconds"] == 0.75
+    assert payload["queue_wait_seconds"] == 0.25
+    assert payload["replica_in_flight_requests_at_admission"] == 3
+    assert payload["replica_boot_duration_seconds"] == 91.5
+    assert payload["replica_freshly_booted"] is True
+    assert "capacity" not in payload["attestation_evidence"]
+
+
+def test_invalid_or_missing_capacity_facts_are_omitted_without_raising() -> None:
+    facts = usage_facts(
+        {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "cached_tokens": 0,
+            "cached_tokens_reported": False,
+            "reasoning_tokens": 0,
+            "thinking": False,
+            "time_to_first_token_seconds": "not-a-number",
+            "queue_wait_seconds": -1,
+            "replica_in_flight_requests_at_admission": True,
+            "replica_boot_duration_seconds": float("inf"),
+            "replica_freshly_booted": "yes",
+        }
+    )
+    payload = replace(_usage_event(), facts=facts).rpc_payload()
+
+    assert "time_to_first_token_seconds" not in payload
+    assert "queue_wait_seconds" not in payload
+    assert "replica_in_flight_requests_at_admission" not in payload
+    assert "replica_boot_duration_seconds" not in payload
+    assert "replica_freshly_booted" not in payload
+
+
 def test_nonstream_capture_is_awaited_before_successful_response() -> None:
     record = _revision()
     pool = _Pool()

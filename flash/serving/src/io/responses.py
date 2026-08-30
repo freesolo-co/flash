@@ -32,6 +32,10 @@ def _inference_json_response(result: dict[str, Any], target: AdapterRecord) -> J
         "completion_token_ids",
         "engine_replica_id",
         "lora_request_adapter",
+        "queue_wait_seconds",
+        "replica_boot_duration_seconds",
+        "replica_freshly_booted",
+        "replica_in_flight_requests_at_admission",
         "prompt_token_ids",
     }
     public_result = {key: value for key, value in result.items() if key not in internal_fields}

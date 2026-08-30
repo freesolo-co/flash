@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import http.client
 import importlib.metadata
@@ -2877,11 +2878,11 @@ class _RecordingEnv:
     def __init__(self):
         self.recorded: list[str] = []
 
-    def new_rollout_state(self, _example):
+    def new_rollout_state(self, _example, prepared_prompt=None):
         # both keys, as the real adapter emits them: `prompt` is the frozen initial prefix and
         # `messages` starts as a copy of it that each turn appends to.
-        prompt = [{"role": "user", "content": "q"}]
-        return {"messages": [dict(message) for message in prompt], "prompt": prompt}
+        prompt = copy.deepcopy(prepared_prompt or [{"role": "user", "content": "q"}])
+        return {"messages": copy.deepcopy(prompt), "prompt": prompt}
 
     def record_model_turn(self, state, content):
         if not content.strip():
@@ -2975,10 +2976,11 @@ def test_opd_multiturn_start_preserves_reasoning_content_and_rejects_metadata():
     ]
 
     class _ReasoningEnv(_RecordingEnv):
-        def new_rollout_state(self, _example):
+        def new_rollout_state(self, _example, prepared_prompt=None):
+            frozen = copy.deepcopy(prepared_prompt or prompt)
             return {
-                "messages": [dict(message) for message in prompt],
-                "prompt": [dict(message) for message in prompt],
+                "messages": copy.deepcopy(frozen),
+                "prompt": frozen,
             }
 
     bridge = _multiturn_bridge(_ReasoningEnv(), student_messages=prompt)
@@ -3026,6 +3028,78 @@ def test_opd_multiturn_start_preserves_reasoning_content_and_rejects_metadata():
             image_count=0,
             image_digests=[],
         )
+
+
+def test_opd_multiturn_start_reuses_the_frozen_prompt_without_rerunning_preparation():
+    frozen = [{"role": "user", "content": "nonce-from-preparation-1"}]
+
+    class _NondeterministicEnv(_RecordingEnv):
+        def __init__(self):
+            super().__init__()
+            self.unprepared_starts = 0
+            self.prepared_starts = []
+            self.examples = []
+
+        def new_rollout_state(self, example, prepared_prompt=None):
+            self.examples.append(example)
+            if prepared_prompt is None:
+                self.unprepared_starts += 1
+                prompt = [
+                    {
+                        "role": "user",
+                        "content": f"nonce-from-preparation-{self.unprepared_starts + 1}",
+                    }
+                ]
+            else:
+                self.prepared_starts.append(copy.deepcopy(prepared_prompt))
+                prompt = copy.deepcopy(prepared_prompt)
+            return {"prompt": prompt, "messages": copy.deepcopy(prompt)}
+
+    env = _NondeterministicEnv()
+    bridge = _multiturn_bridge(env, student_messages=frozen)
+    example = bridge.prompts[0].example
+
+    bridge.start_multiturn(
+        index=0,
+        session_id="frozen-state",
+        prompt_ids=[10, 11],
+        raw_prompt=frozen,
+        image_count=0,
+        image_digests=[],
+    )
+
+    assert env.unprepared_starts == 0
+    assert env.examples == [example]
+    assert env.examples[0] is example
+    assert env.prepared_starts == [frozen]
+    assert bridge._sessions["frozen-state"]["state"]["prompt"] == frozen
+    assert bridge._sessions["frozen-state"]["messages"] == frozen
+
+
+def test_opd_multiturn_frozen_prompt_is_copied_into_each_stateful_session():
+    frozen = [{"role": "user", "content": "prepared"}]
+    env = _RecordingEnv()
+    bridge = _multiturn_bridge(env, student_messages=frozen)
+
+    for session_id in ("left", "right"):
+        bridge.start_multiturn(
+            index=0,
+            session_id=session_id,
+            prompt_ids=[10, 11],
+            raw_prompt=frozen,
+            image_count=0,
+            image_digests=[],
+        )
+
+    left = bridge._sessions["left"]["state"]
+    right = bridge._sessions["right"]["state"]
+    left["prompt"][0]["content"] = "mutated-left"
+    left["messages"].append({"role": "assistant", "content": "answer"})
+
+    assert right["prompt"] == frozen
+    assert right["messages"] == frozen
+    assert bridge.prompts[0].student_messages == frozen
+    assert bridge._sessions["right"]["messages"] == frozen
 
 
 def test_an_unusable_opd_turn_is_never_shown_to_the_environment():
@@ -7978,7 +8052,6 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
     assert spec.phase == "opd"
     alloc = build_worker_env(
         spec,
-        spec.seed,
         runtime_secrets=teacher_runtime,
     )["PYTORCH_CUDA_ALLOC_CONF"]
     assert "expandable_segments" not in alloc
@@ -7999,7 +8072,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
             "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
         }
     )
-    assert build_worker_env(sft, sft.seed)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert build_worker_env(sft)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
 
 
 def test_worker_fails_closed_on_tool_env(monkeypatch):
@@ -9254,17 +9327,22 @@ def test_dynamic_opd_media_snapshots_are_cumulative_ordered_and_immutable(monkey
 
 
 class _StructuredImageEnv(_RecordingEnv):
-    def __init__(self, initial_messages):
+    def __init__(self, initial_messages, *, use_prepared_prompt=True):
         super().__init__()
         self.initial_messages = initial_messages
+        self.use_prepared_prompt = use_prepared_prompt
+        self.prepared_prompts = []
         self.reply_contexts = []
 
-    def new_rollout_state(self, _example):
+    def new_rollout_state(self, _example, prepared_prompt=None):
         # `prompt` carries the frozen initial prefix and `messages` its mutable copy, matching what
         # the real adapter builds; the media checks read the prefix, not the growing transcript.
+        self.prepared_prompts.append(copy.deepcopy(prepared_prompt))
+        source = prepared_prompt if self.use_prepared_prompt else self.initial_messages
+        prompt = copy.deepcopy(source)
         return {
-            "messages": [dict(message) for message in self.initial_messages],
-            "prompt": self.initial_messages,
+            "messages": copy.deepcopy(prompt),
+            "prompt": prompt,
         }
 
     def env_reply(self, messages, _state):
@@ -9353,7 +9431,7 @@ def test_multiturn_start_authenticates_parquet_text_block_canonicalization():
 def test_multiturn_start_rejects_rehydrated_media_placement_drift_at_same_count():
     frozen = _image_prompt()
     drifted = _image_prompt(image_first=True)
-    env = _StructuredImageEnv(drifted)
+    env = _StructuredImageEnv(drifted, use_prepared_prompt=False)
     bridge, normalized = _structured_image_bridge(env, frozen)
 
     with pytest.raises(ValueError, match="changed after prompt freezing"):
@@ -9372,7 +9450,7 @@ def test_multiturn_start_rejects_same_structure_with_different_fresh_descriptor(
 
     frozen = _image_prompt()
     changed_source = _image_prompt(_OTHER_IMAGE_DATA_URI)
-    env = _StructuredImageEnv(changed_source)
+    env = _StructuredImageEnv(changed_source, use_prepared_prompt=False)
     bridge, normalized = _structured_image_bridge(env, frozen)
     fresh = normalize_prompt_images({}, changed_source, None)
     assert fresh.messages == normalized.messages
@@ -9422,6 +9500,7 @@ def test_valid_image_prompt_reaches_environment_with_media_placement_intact():
     )
 
     assert started["max_turns"] >= 1
+    assert env.prepared_prompts == [normalized.messages]
     assert bridge._sessions["valid"]["messages"][0] == normalized.messages[0]
     assert env.reply_contexts[0][0] == normalized.messages[0]
     assert env.reply_contexts[0][1] == {"role": "assistant", "content": "A"}

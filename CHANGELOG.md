@@ -30,6 +30,16 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- A Flash run is one seed and may execute several attempts. The provider seed argument threaded
+  beside `spec.seed` is gone, so the spec is the only seed channel and no caller can supply a
+  second one to disagree with it; `Provider.submit_run`/`poll` are now `submit_attempt`/
+  `poll_attempt`; and `runner/supervise/seed_submission.py` is `attempt_supervision.py`. Instance
+  labels drop the redundant seed field (`<run>-s<seed>-a<n>` becomes `<run>-a<n>`), and every
+  RunPod endpoint carries an explicit `-a<n>` ordinal including attempt zero, replacing the `r<n>`
+  retry suffix that made a retry ordinal an identity and left the base name ambiguous between a run
+  and its first attempt. Names that exceed the provider budget now raise rather than truncate,
+  since a clipped ordinal is one two attempts of a run can collide on.
+
 - Run-backed adapters now use only explicit permanent checkpoint identities, `<run_id>/final` and
   `<run_id>/step-N`. Bare run aliases, composite source-revision identities, activation, implicit
   checkpoint fallback, and public artifact provenance have been removed across hosted, managed, and

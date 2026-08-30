@@ -1,4 +1,4 @@
-"""Supervised seed submission and retry phases.
+"""Supervised attempt submission and retry phases.
 
 Split out of ``flash.runner.supervise.lifecycle`` to keep that module under the file-size limit.
 """
@@ -24,13 +24,12 @@ from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 @dataclass
 class _SubmitContext:
     spec: JobSpec
-    seed: int
     log: object
     runtime_secrets: dict[str, str] | None
     source_snapshot: dict
     reserved_claim: AttemptLaunchClaim | None = None
     last_handle: dict = field(default_factory=dict)
-    # tracks complete rN-suffixed retry handles that registry-less gc cannot reconstruct by name.
+    # tracks complete attempt-suffixed handles that registry-less gc cannot reconstruct by name.
     seen_endpoints: dict[str, dict] = field(default_factory=dict)
     last_detail: str | None = None
     current_claim: AttemptLaunchClaim | None = None
@@ -49,7 +48,7 @@ class _SubmitContext:
                 _record_cleanup_remote(self.spec.run_id, remote)
 
     def cancel(self):
-        """Reap this seed's tracked endpoints before unwinding on cancel."""
+        """Reap this run's tracked endpoints before unwinding on cancel."""
         from flash.runner.supervise.errors import _RunCancelled
 
         # a handle whose `running` write loses the terminal-stickiness race never lands in
@@ -82,7 +81,6 @@ class _SubmitContext:
 
 def _build_context(
     spec: JobSpec,
-    seed: int,
     log,
     runtime_secrets: dict[str, str] | None,
     source_snapshot: dict | None,
@@ -98,7 +96,6 @@ def _build_context(
         raise RuntimeError("reserved launch claim is invalid")
     return _SubmitContext(
         spec=spec,
-        seed=seed,
         log=log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
@@ -157,12 +154,12 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
         and not _record_cleanup_remote(ctx.spec.run_id, ctx.last_handle)
     ):
         raise RuntimeError(
-            f"seed {ctx.seed}: terminal worker's leaked endpoint cleanup target could not be persisted"
+            f"run {ctx.spec.run_id}: terminal worker's leaked endpoint cleanup target could not be persisted"
         )
     if worker_gone:
         if not _compare_and_clear_remote(ctx.spec.run_id, ctx.last_handle):
             raise RuntimeError(
-                f"seed {ctx.seed}: previous attempt's persisted remote changed before clear; "
+                f"run {ctx.spec.run_id}: previous attempt's persisted remote changed before clear; "
                 "aborting replacement to avoid double-provisioning"
             )
         message = (
@@ -191,7 +188,7 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
         flush=True,
     )
     raise RuntimeError(
-        f"seed {ctx.seed}: previous attempt's {ctx.last_handle.get('provider')} {resource_kind} "
+        f"run {ctx.spec.run_id}: previous attempt's {ctx.last_handle.get('provider')} {resource_kind} "
         f"{resource_id} teardown could not be confirmed; failing to avoid "
         "double-provisioning a second worker over a possibly-live resource"
     )
@@ -408,7 +405,6 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
         persisted = {
             **remote,
             "launch_claim_token": claim.token,
-            "seed": int(ctx.seed),
             "allocated_gpu": chosen.gpu,
             "allocated_gpu_count": int(getattr(chosen, "gpu_count", 1) or 1),
             "allocated_usable_vram_gb": _candidate_usable_vram_gb(chosen),
@@ -500,7 +496,7 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
             }
             if attempt_runtime_secrets:
                 submit_kwargs["runtime_secrets"] = attempt_runtime_secrets
-            return provider.submit_run(run_spec, ctx.seed, **submit_kwargs), False
+            return provider.submit_attempt(run_spec, **submit_kwargs), False
     except _TerminalHandleRace:
         raise
     except Exception as exc:
@@ -674,7 +670,7 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
         _retry_delay(ctx, plan.infra_retry_ordinal) if plan.retry and candidate_not_started else 0.0
     )
     print(
-        f"seed={ctx.seed} attempt={claim.attempt} failed ({result.failure}); {plan.action}"
+        f"attempt={claim.attempt} failed ({result.failure}); {plan.action}"
         f"\n--- failure detail ---\n{(result.detail or '')[:2000]}\n---",
         file=ctx.log,
         flush=True,
@@ -682,15 +678,14 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
     return None, plan.retry, retry_delay, False
 
 
-def submit_seed_supervised(
+def run_attempts_supervised(
     spec: JobSpec,
-    seed: int,
     log,
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     reserved_claim: AttemptLaunchClaim | None = None,
 ) -> dict:
-    """Run one seed with bounded auto-retry on infra-shaped failures."""
+    """Run one run's attempts with bounded auto-retry on infra-shaped failures."""
     ctx = None
     try:
         if spec.algorithm == "opd":
@@ -701,7 +696,6 @@ def submit_seed_supervised(
             preflight_validate_managed_teacher(spec)
         ctx = _build_context(
             spec,
-            seed,
             log,
             runtime_secrets,
             source_snapshot,
@@ -723,14 +717,14 @@ def submit_seed_supervised(
             if lost_ownership:
                 from flash.runner.supervise.errors import _LaunchOwnershipLost
 
-                raise _LaunchOwnershipLost(f"seed {seed} lost retry decision ownership")
+                raise _LaunchOwnershipLost(f"run {spec.run_id} lost retry decision ownership")
             if not retry:
                 break
             if retry_delay:
                 _lifecycle.time.sleep(retry_delay)
         _settle_terminal_remote(ctx)
         ctx.gc_seen_endpoints()
-        raise RuntimeError(f"seed {seed} failed after retries: {ctx.last_detail}")
+        raise RuntimeError(f"run {spec.run_id} failed after retries: {ctx.last_detail}")
     finally:
         claim = reserved_claim if ctx is None else ctx.current_claim or ctx.reserved_claim
         if claim is not None:

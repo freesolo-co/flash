@@ -633,12 +633,19 @@ class _StoppedUploader:
 
 
 class _FakeProc:
-    def __init__(self, lines, rc=0, timeout_once=False):
+    # the worker is launched as its own process-group leader, so a fake needs a pid to be
+    # addressable as a group. a real one is never signalled: the group teardown is stubbed out in
+    # the tests that reach it.
+    def __init__(self, lines, rc=0, timeout_once=False, pid=4242):
         self.stdout = iter(lines)
         self.returncode = rc
+        self.pid = pid
         self._timeout_once = timeout_once
         self._waits = 0
         self.killed = False
+
+    def poll(self):
+        return self.returncode
 
     def wait(self, timeout=None):
         self._waits += 1
@@ -651,11 +658,15 @@ class _FakeProc:
 
 
 class _RaisingWaitProc:
-    def __init__(self, error):
+    def __init__(self, error, pid=4243):
         self.args = ["worker"]
         self.stdout = iter(())
         self.returncode = None
+        self.pid = pid
         self.error = error
+
+    def poll(self):
+        return self.returncode
 
     def wait(self, timeout=None):
         raise self.error
@@ -1439,8 +1450,12 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
             self.args = ["worker"]
             self.stdout = iter(())
             self.returncode = None
+            self.pid = 4244
             self.wait_timeouts = []
             self.killed_at = None
+
+        def poll(self):
+            return self.returncode
 
         def wait(self, timeout=None):
             self.wait_timeouts.append(timeout)
@@ -1514,6 +1529,13 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
     monkeypatch.setattr(b, "fetch_code", lambda _payload: None)
     monkeypatch.setattr(b, "build_worker_env", lambda _payload: {})
     monkeypatch.setattr(b.subprocess, "Popen", lambda *_args, **_kwargs: worker)
+    # route the group teardown at the fake rather than a real killpg on its invented pid: the
+    # timing of the kill is what this measures, not the signalling mechanics.
+    monkeypatch.setattr(
+        b._bootstrap_processes,
+        "terminate_process_group",
+        lambda process, **_kwargs: process.kill(),
+    )
     monkeypatch.setattr(
         b,
         "_start_console_uploader",
@@ -1734,12 +1756,20 @@ def test_unreapable_uploader_with_interrupt_exits_before_marker(
     assert all(event[0] != "marker" for event in events)
 
 
-def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
+def test_run_mode_timeout_tears_down_the_whole_worker_group_and_raises(monkeypatch):
     _disable_periodic_console_upload(monkeypatch)
     monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *_args: True)
     monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
     proc = _FakeProc(["partial\n"], rc=0, timeout_once=True)
     monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
+    # never let a fake pid reach a real killpg; record the call instead.
+    torn_down = {}
+
+    def _terminate(process, *, process_group_id, **_kwargs):
+        torn_down["process"] = process
+        torn_down["group"] = process_group_id
+
+    monkeypatch.setattr(b._bootstrap_processes, "terminate_process_group", _terminate)
 
     payload = {
         "hf_repo": "o/r",
@@ -1751,7 +1781,177 @@ def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
     }
     with pytest.raises(TimeoutError, match="wall-clock cap"):
         b.run_mode(payload, {}, "grpo", deadline_ts=b.time.time() + 100)
-    assert proc.killed is True  # the child was killed on the deadline
+    # the whole group is torn down on the deadline, not just the leader pid: the worker's
+    # torchrun/vllm children hold the gpu and outlive a bare proc.kill().
+    assert torn_down["process"] is proc
+    assert torn_down["group"] == proc.pid
+
+
+def test_run_mode_timeout_reports_a_worker_group_that_survived_teardown(monkeypatch):
+    """A stranded gpu must not be filed as an ordinary capped run."""
+    _disable_periodic_console_upload(monkeypatch)
+    uploaded = {}
+
+    def _upload(_payload, _console, _mode, extra, *_args):
+        uploaded["extra"] = extra
+        return True
+
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", _upload)
+    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
+    proc = _FakeProc(["partial\n"], rc=0, timeout_once=True)
+    monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
+
+    def _terminate(_process, *, process_group_id, **_kwargs):
+        raise RuntimeError(f"process group {process_group_id} survived term and kill supervision")
+
+    monkeypatch.setattr(b._bootstrap_processes, "terminate_process_group", _terminate)
+
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+    }
+    with pytest.raises(TimeoutError, match="survived term and kill supervision"):
+        b.run_mode(payload, {}, "grpo", deadline_ts=b.time.time() + 100)
+    # the console tail still uploads and carries the survivor, rather than being skipped by the
+    # raise: without it there is no record of why the box is still occupied.
+    assert "survived term and kill supervision" in uploaded["extra"]
+
+
+def test_group_teardown_is_bounded_by_the_deadline_it_is_given():
+    """A SIGTERM-ignoring group must not spend time the caller reserved for what follows teardown.
+
+    ``terminate_process_group`` runs at the worker's cutoff, and its term-then-kill grace is 15s by
+    default while the bootstrap holds only 12s before ``upload_deadline_at``. Unbounded, teardown
+    overruns that window and the final console tail is skipped -- discarding the survivor line that
+    is the only record the gpu is still held. Bounding it against a deadline (rather than reserving
+    the worst case up front) keeps short wall budgets startable and preserves the escalation.
+    """
+    import flash.providers._lifecycle.bootstrapping.processes as processes
+
+    # a group that ignores every signal, so the waits run to their full allowance.
+    monkey_now = [1_000.0]
+    real_time = processes.time.time
+    try:
+        processes.time.time = lambda: monkey_now[0]
+        # only 0.4s left: the kill wait is funded first, then whatever remains goes to the term.
+        term_wait, kill_wait = processes._bounded_graces(10.0, 5.0, monkey_now[0] + 0.4)
+        assert kill_wait == pytest.approx(0.4), "the escalation that frees the gpu is funded first"
+        assert term_wait == pytest.approx(0.0)
+        assert term_wait + kill_wait <= 0.4, "the supervision must fit the window it was given"
+
+        # a comfortable budget still gets the full default graces, unchanged.
+        term_wait, kill_wait = processes._bounded_graces(10.0, 5.0, monkey_now[0] + 60.0)
+        assert (term_wait, kill_wait) == (10.0, 5.0)
+
+        # already past the deadline: no waiting at all, but the caller still sends the signals.
+        assert processes._bounded_graces(10.0, 5.0, monkey_now[0] - 1.0) == (0.0, 0.0)
+    finally:
+        processes.time.time = real_time
+
+    # and with no deadline the behaviour is the documented default.
+    assert processes._bounded_graces(10.0, 5.0, None) == (10.0, 5.0)
+
+
+def test_group_teardown_deadline_is_later_than_the_cutoff_that_triggers_teardown():
+    """Teardown cannot be bounded by the instant it starts, or the kill gets no time to land.
+
+    ``terminate_process_group`` runs when the worker deadline fires. Handing it that same instant
+    leaves zero remaining, so ``_bounded_graces`` yields (0, 0): SIGKILL is sent but never waited
+    on, ``_group_exists`` still sees the not-yet-reaped group, and an ordinary wall-clock timeout
+    is reported as a survivor holding the gpu. The teardown cap must therefore sit strictly after
+    the worker cutoff, while still leaving the final console tail -- which carries the survivor
+    line -- its own slice.
+    """
+    import flash.providers._lifecycle.bootstrapping.processes as processes
+
+    upload_deadline = 1_000.0
+    worker_cutoff = b._worker_execution_deadline(upload_deadline)
+    teardown_cap = b._group_teardown_deadline(upload_deadline)
+
+    assert teardown_cap > worker_cutoff, (
+        "teardown is bounded by the moment it begins, so the kill is never waited on and every "
+        "capped run reports a surviving process group"
+    )
+    # the slack is real time to reap a killed group, not a rounding artefact.
+    assert teardown_cap - worker_cutoff == pytest.approx(b._CONSOLE_UPLOAD_STOP_TIMEOUT_S)
+    # and it stops short of the tail that reports the survivor.
+    assert teardown_cap <= upload_deadline - b._CONSOLE_UPLOAD_FINAL_TIMEOUT_S
+
+    # standing at the cutoff -- where teardown actually begins -- that slack is what the
+    # supervision gets to spend. bounded by the cutoff instead, both waits would be zero.
+    real_time = processes.time.time
+    try:
+        processes.time.time = lambda: worker_cutoff
+        term_wait, kill_wait = processes._bounded_graces(10.0, 5.0, teardown_cap)
+        assert kill_wait > 0, "the escalation that frees the gpu must be given time to be reaped"
+        # the whole window is handed to the supervision -- none of it is lost to the split.
+        assert term_wait + kill_wait == pytest.approx(teardown_cap - worker_cutoff)
+        assert term_wait + kill_wait <= b._CONSOLE_UPLOAD_STOP_TIMEOUT_S
+        # bounded by the cutoff instead, both waits collapse and the kill is never awaited.
+        assert processes._bounded_graces(10.0, 5.0, worker_cutoff) == (0.0, 0.0)
+    finally:
+        processes.time.time = real_time
+
+
+def test_run_mode_hands_teardown_a_deadline_it_can_actually_use(monkeypatch):
+    """The cap ``run_mode`` passes to teardown must outlast the cutoff that triggered it."""
+    _disable_periodic_console_upload(monkeypatch)
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
+    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+
+    handed = {}
+
+    def terminate(process, *, process_group_id, deadline_at=None):
+        handed["deadline_at"] = deadline_at
+        handed["at"] = b.time.time()
+
+    monkeypatch.setattr(b._bootstrap_processes, "terminate_process_group", terminate)
+
+    class _NeverExits:
+        def __init__(self):
+            self.args = ["worker"]
+            self.stdout = iter(())
+            self.returncode = None
+            self.pid = 909
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(self.args, timeout)
+
+    monkeypatch.setattr(
+        b._bootstrap_processes,
+        "start_process_group",
+        lambda *a, **k: (_NeverExits(), 909),
+    )
+
+    deadline = b.time.time() + 100
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+    }
+    # the worker never exits, so the cap fires and the run ends as an ordinary timeout. that is
+    # the path under test: teardown runs, and what it was handed is what decides whether the kill
+    # is waited on or the run is misreported as a stranded gpu.
+    with pytest.raises(TimeoutError):
+        b.run_mode(payload, {}, "sft", deadline_ts=deadline)
+
+    upload_deadline, _reaping = b._upload_cleanup_deadlines(deadline)
+    assert handed["deadline_at"] == pytest.approx(b._group_teardown_deadline(upload_deadline))
+    # the cap must outlast the worker cutoff that triggered teardown. handing over the cutoff
+    # itself leaves zero remaining, so SIGKILL is sent but never waited on and an ordinary timeout
+    # is reported as a stranded gpu.
+    assert handed["deadline_at"] > b._worker_execution_deadline(upload_deadline)
+    assert handed["deadline_at"] > handed["at"], "teardown was handed an already-expired deadline"
 
 
 def test_run_mode_starts_no_subprocess_at_deadline(monkeypatch):

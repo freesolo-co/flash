@@ -1213,6 +1213,10 @@ class _MeteringPool(FakePool):
                 "completion_tokens": 3,
                 "cached_tokens_reported": False,
                 "inference_time_seconds": 0.25,
+                "queue_wait_seconds": 0.025,
+                "replica_in_flight_requests_at_admission": 2,
+                "replica_boot_duration_seconds": 30.0,
+                "replica_freshly_booted": True,
                 "engine_replica_id": "replica-7",
                 "checkpoint": checkpoint,
             },
@@ -1244,6 +1248,10 @@ def test_generate_response_strips_internal_cache_attribution():
 
     assert "cached_tokens_reported" not in body
     assert "engine_replica_id" not in body
+    assert "queue_wait_seconds" not in body
+    assert "replica_in_flight_requests_at_admission" not in body
+    assert "replica_boot_duration_seconds" not in body
+    assert "replica_freshly_booted" not in body
 
 
 class _CachedMeteringPool(FakePool):

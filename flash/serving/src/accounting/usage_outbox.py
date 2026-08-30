@@ -137,6 +137,11 @@ class UsageFacts:
     cached_tokens_reported: bool
     reasoning_tokens: int
     generation_duration_seconds: float | None
+    time_to_first_token_seconds: float | None
+    queue_wait_seconds: float | None
+    replica_in_flight_requests_at_admission: int | None
+    replica_boot_duration_seconds: float | None
+    replica_freshly_booted: bool | None
     engine_replica_id: str | None
 
 
@@ -187,6 +192,20 @@ class UsageEvent:
             "tokenizer_identity": self.tokenizer_identity,
             "tokenizer_version": self.tokenizer_version,
             "generation_duration_seconds": self.facts.generation_duration_seconds,
+            **{
+                key: value
+                for key, value in (
+                    ("time_to_first_token_seconds", self.facts.time_to_first_token_seconds),
+                    ("queue_wait_seconds", self.facts.queue_wait_seconds),
+                    (
+                        "replica_in_flight_requests_at_admission",
+                        self.facts.replica_in_flight_requests_at_admission,
+                    ),
+                    ("replica_boot_duration_seconds", self.facts.replica_boot_duration_seconds),
+                    ("replica_freshly_booted", self.facts.replica_freshly_booted),
+                )
+                if value is not None
+            },
             "engine_replica_id": self.facts.engine_replica_id,
             "serving_deployment_id": self.deployment_id,
             "serving_release": self.serving_release,

@@ -328,9 +328,9 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
         if self.max_turns <= 0:
             raise ValueError("flash OPD bridge multi-turn limit is invalid")
 
-    def _env_call(self, method: str, *args):
+    def _env_call(self, method: str, *args, **kwargs):
         with self.parent_work.busy():
-            return getattr(self.active_env, method)(*args)
+            return getattr(self.active_env, method)(*args, **kwargs)
 
     @staticmethod
     def _validate_session_id(session_id: str) -> str:
@@ -426,12 +426,26 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
                 existing["lease_deadline"] = now + self.session_lease_s
                 return {"max_turns": existing["turn_limit"]}
             with self._env_lock:
-                state = self._env_call("new_rollout_state", prompt.example)
-                initial_messages, fresh_descriptors = normalize_initial_prompt(
-                    prompt,
-                    state,
-                    self.processor,
+                state = self._env_call(
+                    "new_rollout_state",
+                    prompt.example,
+                    prepared_prompt=prompt.student_messages,
                 )
+                # the prepared prompt and its descriptors were frozen together before the child
+                # authenticated them. normalized image blocks intentionally carry no source, so an
+                # exact prepared state must reuse those frozen descriptors instead of rehydrating the
+                # prompt and rerunning environment preparation.
+                if state.get("prompt") == prompt.student_messages:
+                    initial_messages = validate_structured_messages(
+                        state["prompt"], source="environment initial prompt"
+                    )
+                    fresh_descriptors = tuple(prompt.image_descriptors)
+                else:
+                    initial_messages, fresh_descriptors = normalize_initial_prompt(
+                        prompt,
+                        state,
+                        self.processor,
+                    )
             if initial_messages != frozen_prompt or fresh_descriptors != prompt.image_descriptors:
                 raise ValueError(
                     "multi-turn environment initial prompt changed after prompt freezing"
