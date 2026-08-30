@@ -11,14 +11,17 @@ from decimal import Decimal, DecimalException
 from typing import Any
 
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES, TEXT_TYPES
+from flash.serve.request import text_scan
+from flash.serve.request.text_scan import TOOL_CALL_END, TOOL_CALL_START
 from flash.serve.request.text_scan import skip_whitespace as _skip_whitespace
 from flash.serve.request.text_scan import strings_overlap as _strings_overlap
 from flash.serve.request.tool_template import last_query_index, rendered_turn_prefix
 
+_FUNCTION_START, _FUNCTION_END = text_scan.FUNCTION_START, text_scan.FUNCTION_END
+_PARAMETER_START, _PARAMETER_END = text_scan.PARAMETER_START, text_scan.PARAMETER_END
+_VIABLE_PARAMETER_END_RE = text_scan.VIABLE_PARAMETER_END_RE
+
 TOOL_PARSER_QWEN3_CODER = "qwen3_coder"
-TOOL_CALL_START, TOOL_CALL_END = "<tool_call>", "</tool_call>"
-_FUNCTION_START, _FUNCTION_END = "<function=", "</function>"
-_PARAMETER_START, _PARAMETER_END = "<parameter=", "</parameter>"
 _REPLAY_CONTAINER_TYPE = "replay_container"
 _NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # built from chr() because a lone surrogate cannot be written as a source literal.
@@ -985,12 +988,11 @@ def _identifier_name(value: object, path: str, error_type: type[Exception]) -> s
 
 
 def _string_enum_conflicts_with_tool_grammar(value: str) -> bool:
-    cursor = 0
-    while True:
-        cursor = value.find(_PARAMETER_END, cursor)
-        if cursor < 0:
-            return False
-        following = _skip_whitespace(value, cursor + len(_PARAMETER_END))
-        if value.startswith((_PARAMETER_START, _FUNCTION_END), following):
-            return True
-        cursor += len(_PARAMETER_END)
+    """whether an enum value could close its own parameter and be read as grammar.
+
+    an enum value reaches the megabytes and this runs synchronously on the request path, so
+    stepping to every inert delimiter in python holds the event loop. only a delimiter followed,
+    after whitespace, by the next parameter or the function end can close a value, so the engine
+    finds one in a single native scan instead of one python iteration per occurrence.
+    """
+    return _VIABLE_PARAMETER_END_RE.search(value) is not None

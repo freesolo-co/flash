@@ -1,14 +1,25 @@
-"""native string scans shared by tool declaration validation and the generated-output parser.
+"""the tool-call grammar markers and the native string scans over them.
 
-both scans run on untrusted request and generation text that reaches the megabytes, so each one
-measures a run with a single native operation rather than stepping per character.
+declaration validation and the generated-output parser both read this grammar, and both run on
+untrusted text that reaches the megabytes, so each scan measures a run with a single native
+operation rather than stepping per character. the markers live here rather than beside either
+reader so the two can share them without importing each other.
 """
 
 from __future__ import annotations
 
 import re
 
+TOOL_CALL_START, TOOL_CALL_END = "<tool_call>", "</tool_call>"
+FUNCTION_START, FUNCTION_END = "<function=", "</function>"
+PARAMETER_START, PARAMETER_END = "<parameter=", "</parameter>"
 _LEADING_WHITESPACE_RE = re.compile(r"\s*")
+# a ``</parameter>`` that could actually close a value: only one followed, after whitespace, by the
+# next parameter or the function end can, and every other one is inert. searching for the pair lets
+# the engine skip the inert ones natively instead of stepping to each in python.
+VIABLE_PARAMETER_END_RE = re.compile(
+    rf"{re.escape(PARAMETER_END)}\s*(?:{re.escape(PARAMETER_START)}|{re.escape(FUNCTION_END)})"
+)
 
 
 def strings_overlap(left: str, right: str) -> bool:

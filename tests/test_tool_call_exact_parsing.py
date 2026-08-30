@@ -4271,3 +4271,92 @@ def test_opener_index_retains_only_declared_parameter_names() -> None:
     # and not one of the 50k undeclared openers was retained.
     assert "nope" not in captured, sorted(captured)
     assert set(captured) <= {"data"}, sorted(captured)
+
+
+def test_inert_enum_delimiters_are_not_stepped_one_at_a_time() -> None:
+    """an enum value full of delimiters that cannot close it must not cost one step each.
+
+    only a ``</parameter>`` followed, after whitespace, by the next parameter or the function end
+    can close a value. `normalize_tools` runs synchronously on the packaged and hosted request
+    paths, so stepping to every inert delimiter in a megabyte-scale enum holds the event loop.
+    """
+    from flash.serve.request.tool_calls import _string_enum_conflicts_with_tool_grammar
+
+    # a delimiter run that never becomes viable: each one is followed by an ordinary character.
+    inert = "</parameter>x" * 100_000
+    assert not _string_enum_conflicts_with_tool_grammar(inert)
+
+    # the same run is rejected as soon as one delimiter is actually followed by a parameter, so
+    # the fast path did not buy its speed by giving up the check.
+    assert _string_enum_conflicts_with_tool_grammar(inert + "</parameter><parameter=a>")
+    assert _string_enum_conflicts_with_tool_grammar(inert + "</parameter>  </function>")
+
+    # whitespace between the delimiter and the marker still counts, and a partial marker does not.
+    assert _string_enum_conflicts_with_tool_grammar("</parameter>\n\t<parameter=a>")
+    assert not _string_enum_conflicts_with_tool_grammar("</parameter>x<parameter=a>")
+    assert not _string_enum_conflicts_with_tool_grammar("</parameter>")
+
+    # a declaration carrying the inert run normalizes rather than being rejected or hanging.
+    normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "store",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"mode": {"type": "string", "enum": [inert]}},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ],
+        error_type=OpenAIRequestError,
+    )
+
+
+def test_streamed_candidate_accumulates_without_recopying_the_buffer() -> None:
+    """a buffered candidate must not be recopied once per delta.
+
+    a candidate is retained whole because a malformed later fragment falls back to the exact
+    text, so the buffer grows to the length of the call. concatenating onto a string per delta
+    copies the whole buffer each time, which costs work in the square of the candidate length.
+    """
+    tools = normalize_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "store",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"data": {"type": "string"}},
+                        "required": ["data"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+    )
+
+    parser = ToolCallStreamParser(tools)
+    parser.feed("<tool_call><function=store><parameter=data>\n")
+    chunk = "a" * 40
+    for _ in range(2_000):
+        parser.feed(chunk)
+
+    # timing this would be flaky, so the structure is asserted instead: each delta is retained as
+    # its own part rather than concatenated onto one growing string. a string buffer would show a
+    # single part holding everything, which is exactly the shape that copies per delta.
+    assert len(parser._parts) == 2_001, len(parser._parts)
+    assert sum(len(part) for part in parser._parts) == 44 + 2_000 * 40
+
+    # the joined text is still exact, so buffering by parts changed no observable content.
+    assert parser._pending == "<tool_call><function=store><parameter=data>\n" + chunk * 2_000
+
+    # and the retained text is still exact, so the fallback path is unaffected by the buffering.
+    parser = ToolCallStreamParser(tools)
+    emitted = "".join(parser.feed(part) for part in ("before <tool_", "call> not a call"))
+    assert emitted == "before "
+    assert parser.finish().content == "<tool_call> not a call"

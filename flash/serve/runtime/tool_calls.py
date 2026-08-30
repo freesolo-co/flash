@@ -10,15 +10,11 @@ from dataclasses import dataclass
 from decimal import DecimalException
 from typing import Any, NamedTuple
 
+from flash.serve.request import text_scan
+from flash.serve.request.text_scan import TOOL_CALL_END, TOOL_CALL_START
 from flash.serve.request.text_scan import skip_whitespace as _skip_whitespace
 from flash.serve.request.tool_calls import (
-    _FUNCTION_END,
-    _FUNCTION_START,
-    _PARAMETER_END,
-    _PARAMETER_START,
     _REPLAY_CONTAINER_TYPE,
-    TOOL_CALL_END,
-    TOOL_CALL_START,
     FunctionTool,
     _canonicalize_integer_values,
     _contains_unpaired_surrogate,
@@ -30,6 +26,9 @@ from flash.serve.request.tool_calls import (
 )
 from flash.serve.request.validation import MAX_MESSAGE_NODES
 
+_FUNCTION_START, _FUNCTION_END = text_scan.FUNCTION_START, text_scan.FUNCTION_END
+_PARAMETER_START, _PARAMETER_END = text_scan.PARAMETER_START, text_scan.PARAMETER_END
+_VIABLE_PARAMETER_END_RE = text_scan.VIABLE_PARAMETER_END_RE
 _CALL_BOUNDARY_RE = re.compile(r"</function>\s*</tool_call>\s*(<tool_call>)\s*<function=([^>]+)>")
 _PARAMETER_OPEN_RE = re.compile(r"<parameter=([A-Za-z0-9_-]{1,64})>")
 _WHITESPACE_RE = re.compile(r"\s*")
@@ -38,12 +37,6 @@ _WHITESPACE_RE = re.compile(r"\s*")
 # one way to match at each position and the engine cannot backtrack: an unterminated string fails
 # in one pass rather than retrying every split of the run.
 _STRING_BODY_RE = re.compile(r'(?:[^"\\]++|\\.)*+"', re.DOTALL)
-# a ``</parameter>`` that could actually end a value: only one followed, after whitespace, by the
-# next parameter or the function end can, and every other one is inert. searching for the pair
-# lets the engine skip the inert ones natively instead of stepping to each in python.
-_VIABLE_PARAMETER_END_RE = re.compile(
-    rf"{re.escape(_PARAMETER_END)}\s*(?:{re.escape(_PARAMETER_START)}|{re.escape(_FUNCTION_END)})"
-)
 # an inert closer and the whitespace run behind it. stepping weighed that run twice, once reaching
 # the next closer and once measuring the run itself, so a native skip that weighs the span once has
 # to add the runs back to exhaust at the same point.
@@ -115,31 +108,42 @@ class ToolCallStreamParser:
     ) -> None:
         self._tools = tuple(tools)
         self._id_factory = id_factory
-        self._pending = ""
+        # a candidate is buffered whole because a malformed later fragment has to fall back to the
+        # exact text, and a delta already emitted cannot be retracted. concatenating onto a string
+        # per delta would copy the whole buffer each time, so a candidate spanning the context
+        # window costs work in the square of its length. the parts are joined once at the end.
+        self._parts: list[str] = []
         self._candidate = False
+
+    @property
+    def _pending(self) -> str:
+        return "".join(self._parts)
 
     def feed(self, text: str) -> str:
         if not text:
             return ""
-        self._pending += text
+        # once a candidate is open every delta is retained to the end, so nothing scans the buffer
+        # again until `finish`. appending is what keeps that accumulation linear.
         if self._candidate:
+            self._parts.append(text)
             return ""
-        marker = self._pending.find(TOOL_CALL_START)
+        # before a candidate opens, everything but a partial marker suffix is emitted each time, so
+        # the buffer stays bounded by the marker length and joining it here stays cheap.
+        pending = self._pending + text
+        marker = pending.find(TOOL_CALL_START)
         if marker >= 0:
-            emitted = self._pending[:marker]
-            self._pending = self._pending[marker:]
+            self._parts = [pending[marker:]]
             self._candidate = True
-            return emitted
-        retain = _partial_marker_suffix(self._pending)
+            return pending[:marker]
+        retain = _partial_marker_suffix(pending)
         if retain:
-            emitted = self._pending[:-retain]
-            self._pending = self._pending[-retain:]
-        else:
-            emitted, self._pending = self._pending, ""
-        return emitted
+            self._parts = [pending[-retain:]]
+            return pending[:-retain]
+        self._parts = []
+        return pending
 
     def finish(self) -> ToolParseResult:
-        pending, self._pending = self._pending, ""
+        pending, self._parts = self._pending, []
         if not pending:
             return ToolParseResult(content=None, calls=())
         if not self._candidate:
