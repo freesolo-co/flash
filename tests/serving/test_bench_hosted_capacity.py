@@ -4584,7 +4584,9 @@ def test_the_provenance_gates_live_in_one_place_so_a_caller_cannot_skip_them() -
             if isinstance(n, ast.AsyncFunctionDef | ast.FunctionDef) and n.name == name
         )
         calls = {
-            c.func.id for c in ast.walk(node) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+            c.func.id
+            for c in ast.walk(node)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
         }
         assert "_gate_container_provenance" in calls, f"{name} does not use the shared gate"
         assert not {"_require_resolved_gdn_backend", "_require_resolved_checkpoint"} & calls, (
