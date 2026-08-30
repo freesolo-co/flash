@@ -1295,7 +1295,7 @@ def test_merged_self_derived_declarations_stay_within_the_schema_budget() -> Non
             "type": "function",
             "function": {
                 "name": "f",
-                "arguments": json.dumps({f"c{index}_p{field}": "v" for field in range(255)}),
+                "arguments": json.dumps({f"c{index}_p{field}": field for field in range(255)}),
             },
         }
         for index in range(204)
@@ -1308,20 +1308,8 @@ def test_merged_self_derived_declarations_stay_within_the_schema_budget() -> Non
         ),
     ]
 
-    # this history is rejected either way, so asserting only the outcome would pass without the
-    # cap. assert the boundary that rejects it: the union must never reach the parser as a
-    # declaration wider than a declared schema could ever be.
-    probe = [
-        (
-            request_tool_calls_module._historical_replay_tool("f", arguments),
-            arguments,
-            arguments,
-        )
-        for arguments in (json.loads(call["function"]["arguments"]) for call in calls)
-    ]
-    with pytest.raises(ValueError, match="cannot be replayed exactly"):
-        request_tool_calls_module._merged_replay_tools(probe)
-
+    # integer values render unambiguously, so this 52,020-property union is accepted without the
+    # cap and rejected with it. that makes the public request path enough to pin the behavior.
     with pytest.raises(OpenAIRequestError, match="cannot be replayed exactly"):
         parse_chat_request(
             {"messages": messages},
@@ -1330,26 +1318,40 @@ def test_merged_self_derived_declarations_stay_within_the_schema_budget() -> Non
         )
 
 
-def test_merged_self_derived_declarations_stay_under_the_property_ceiling() -> None:
+@pytest.mark.parametrize(
+    ("left", "right", "accepted"), [(255, 255, True), (255, 256, True), (256, 256, False)]
+)
+def test_merged_self_derived_declarations_stay_under_the_property_ceiling(
+    left: int, right: int, accepted: bool
+) -> None:
     # the union is capped at the same root-property budget a declared schema is normalized to, so
-    # a turn that stays under it still merges and one that crosses it does not.
-    def merge(calls: int, fields: int) -> tuple[Any, ...]:
-        probe = []
-        for index in range(calls):
-            arguments = {f"c{index}_p{field}": "v" for field in range(fields)}
-            probe.append(
-                (
-                    request_tool_calls_module._historical_replay_tool("f", arguments),
-                    arguments,
-                    arguments,
-                )
-            )
-        return request_tool_calls_module._merged_replay_tools(probe)
+    # a turn that stays under it still replays and one that crosses it does not. integer values
+    # render unambiguously, which is what lets a two-call turn walk the boundary through the public
+    # request path rather than reaching for the merge helper directly.
+    def call(index: int, fields: int) -> dict[str, Any]:
+        arguments = {f"c{index}_p{field}": field for field in range(fields)}
+        return {
+            "id": f"call_{index}",
+            "type": "function",
+            "function": {"name": "f", "arguments": json.dumps(arguments)},
+        }
 
-    assert len(merge(2, 255)[0].parameters["properties"]) == 510
-    assert len(merge(511, 1)[0].parameters["properties"]) == 511
-    with pytest.raises(ValueError, match="cannot be replayed exactly"):
-        merge(512, 1)
+    calls = [call(0, left), call(1, right)]
+    payload = {
+        "messages": [
+            {"role": "assistant", "content": None, "tool_calls": calls},
+            *({"role": "tool", "tool_call_id": item["id"], "content": "ok"} for item in calls),
+        ]
+    }
+
+    if not accepted:
+        with pytest.raises(OpenAIRequestError, match="cannot be replayed exactly"):
+            parse_chat_request(payload, require_model=False, allow_managed_selectors=True)
+        return
+
+    request = parse_chat_request(payload, require_model=False, allow_managed_selectors=True)
+
+    assert [item["function"]["name"] for item in request.messages[0]["tool_calls"]] == ["f", "f"]
 
 
 def test_boundaries_quoted_inside_an_argument_do_not_trip_the_call_cap() -> None:
