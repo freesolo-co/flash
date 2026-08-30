@@ -1353,6 +1353,40 @@ def test_merged_self_derived_declarations_stay_under_the_property_ceiling(
 
     assert [item["function"]["name"] for item in request.messages[0]["tool_calls"]] == ["f", "f"]
 
+    # the hosted envelope is a second entry into the same replay validation, so pin the ceiling
+    # there too rather than assuming one caller speaks for both.
+    hosted = OpenAIGenerateRequest(
+        adapter_id="adapter", generation_id="generation", messages=payload["messages"]
+    )
+
+    assert [item["function"]["name"] for item in hosted.messages[0]["tool_calls"]] == ["f", "f"]
+
+
+def test_hosted_envelope_enforces_the_replay_declaration_ceiling() -> None:
+    # the canonical path rejects a union above the schema budget; the hosted envelope must reach
+    # the same verdict, so a caller-specific uncapped route cannot appear unnoticed.
+    calls = [
+        {
+            "id": f"call_{index}",
+            "type": "function",
+            "function": {
+                "name": "f",
+                "arguments": json.dumps({f"c{index}_p{field}": field for field in range(256)}),
+            },
+        }
+        for index in range(2)
+    ]
+
+    with pytest.raises(ValidationError, match="cannot be replayed exactly"):
+        OpenAIGenerateRequest(
+            adapter_id="adapter",
+            generation_id="generation",
+            messages=[
+                {"role": "assistant", "content": None, "tool_calls": calls},
+                *({"role": "tool", "tool_call_id": item["id"], "content": "ok"} for item in calls),
+            ],
+        )
+
 
 def test_boundaries_quoted_inside_an_argument_do_not_trip_the_call_cap() -> None:
     # the candidate scan is context blind, so a boundary quoted inside a json string looks like a
