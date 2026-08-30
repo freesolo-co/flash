@@ -255,7 +255,7 @@ model = "Qwen/Qwen3.5-9B"   # see `flash models list`
 project = "PROJECT_UUID"  # required UUID from `flash projects create`
 algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-policy distillation)
 # thinking = true           # opt-in reasoning mode, for models that support it
-# seed = 42                 # reproducible per-run seed; omitted defaults to 42
+# seed = 42                 # the run's one seed; omitted defaults to 42
 
 [environment]
 id = "your-org/your-project/my-env"      # the id printed by `flash env push`
@@ -364,7 +364,9 @@ remove that failover, and cannot be combined with `providers`. An unknown name i
 time and the error lists the names your plane accepts. `[gpu] type` pins one exact active
 validated GPU class. Run artifacts are stored in a
 private environment-scoped repo with content-addressed Flash code snapshots. Set `seed` only at the
-top level. Compose or tweak configs without editing files: `--config extra.toml` (deep-merge) and
+top level: a run has exactly one seed, and if a host fails Flash executes another attempt of that
+same run rather than a new one, so every attempt trains on the seed you set here.
+Compose or tweak configs without editing files: `--config extra.toml` (deep-merge) and
 `--set key=value` (e.g. `--set train.epochs=3`). `--gpus N` is
 shorthand for `--set gpu.count=N`; both land in one override list, so repeats resolve left to
 right.

@@ -685,7 +685,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
             self.teardown = []
             self.events = []
 
-        def submit_run(self, _spec, _seed, *, attempt, on_handle, **_kwargs):
+        def submit_attempt(self, _spec, *, attempt, on_handle, **_kwargs):
             self.attempts.append(attempt)
             self.events.append(("submit", attempt))
             on_handle(_remote(attempt=attempt))
@@ -706,7 +706,7 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     provider = Provider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    metrics = lifecycle._submit_seed_supervised(spec, 42, io.StringIO())
+    metrics = lifecycle._run_attempts_supervised(spec, io.StringIO())
 
     assert metrics == {
         "train_tokens": 1,
@@ -758,12 +758,12 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
             self.runtime_secrets = []
             self.worker_envs = []
 
-        def submit_run(self, _spec, _seed, *, attempt, on_handle, **kwargs):
+        def submit_attempt(self, _spec, *, attempt, on_handle, **kwargs):
             from flash.providers._lifecycle.net.worker import build_worker_env
 
             secrets = kwargs.get("runtime_secrets")
             self.runtime_secrets.append(secrets)
-            self.worker_envs.append(build_worker_env(_spec, _seed, runtime_secrets=secrets))
+            self.worker_envs.append(build_worker_env(_spec, runtime_secrets=secrets))
             on_handle(_remote(attempt=attempt))
             if attempt == 0:
                 marker_path = opd_optimizer_start_marker_path(spec.run_id, 0)
@@ -797,9 +797,8 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
     provider = Provider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    metrics = lifecycle._submit_seed_supervised(
+    metrics = lifecycle._run_attempts_supervised(
         spec,
-        42,
         io.StringIO(),
         runtime_secrets={
             "WANDB_API_KEY": "real-secret",
@@ -854,7 +853,7 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
     events = []
 
     class Provider:
-        def poll(self, *_args, **_kwargs):
+        def poll_attempt(self, *_args, **_kwargs):
             return PollResult(False, failure="stalled", detail="worker stopped")
 
         def cancel(self, _handle):
@@ -973,7 +972,7 @@ def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypat
     # the fake private hf exposes no list_repo_files, so the resume-checkpoint presence check fails
     # closed: a proven mutation with no usable checkpoint keeps replacement blocked before allocation.
     with pytest.raises(RuntimeError, match="no complete resume checkpoint is available"):
-        lifecycle._submit_seed_supervised(spec, 42, io.StringIO())
+        lifecycle._run_attempts_supervised(spec, io.StringIO())
 
 
 # --- gate matrix: a proven mutation marker is safe to replace only when paired with a complete
@@ -1287,7 +1286,7 @@ def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width(
 ):
     """a pinned resume admits only candidates that execute at the checkpoint width."""
     from flash.providers.core.base import Allocation, Candidate
-    from flash.runner.supervise.seed_submission import _pinned_to_resume_width
+    from flash.runner.supervise.attempt_supervision import _pinned_to_resume_width
 
     candidates = (
         Candidate("runpod", "h100", 1.0, 80, 4, 2),
@@ -1327,11 +1326,11 @@ def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
     from flash.core.spec import JobSpec
     from flash.providers.core.base import Allocation, Candidate
     from flash.runner.lifecycle.attempts import AttemptLaunchClaim
-    from flash.runner.supervise.retry_decision import RetryState
-    from flash.runner.supervise.seed_submission import (
+    from flash.runner.supervise.attempt_supervision import (
         _build_candidate_plan,
         _pinned_to_resume_width,
     )
+    from flash.runner.supervise.retry_decision import RetryState
 
     rented_two_executes_one = Candidate("runpod", "h100", 1.0, 80, 2, 1)
     allocation = Allocation("runpod", "h100", 1.0, 80, (rented_two_executes_one,), gpu_count=2)
@@ -1383,7 +1382,7 @@ def test_retry_allocation_falls_back_for_unusable_executed_width(
 ):
     """absent and malformed executed widths fall back to the rented card count."""
     from flash.providers.core.base import Allocation, Candidate
-    from flash.runner.supervise.seed_submission import _pinned_to_resume_width
+    from flash.runner.supervise.attempt_supervision import _pinned_to_resume_width
 
     if executed_present:
         candidate = Candidate("runpod", "h100", 1.0, 80, 4, executed_gpu_count)

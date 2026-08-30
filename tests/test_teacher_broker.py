@@ -228,7 +228,7 @@ def test_48_hour_opd_wall_is_rejected_before_allocation(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="24 hours or less"):
-        lifecycle._submit_seed_supervised(spec, 42, io.StringIO())
+        lifecycle._run_attempts_supervised(spec, io.StringIO())
 
 
 def test_broker_accepts_every_catalog_teacher(monkeypatch):
@@ -1972,7 +1972,7 @@ def test_missing_broker_configuration_fails_before_allocation(monkeypatch, missi
     )
 
     with pytest.raises(RuntimeError):
-        lifecycle._submit_seed_supervised(spec, 42, io.StringIO())
+        lifecycle._run_attempts_supervised(spec, io.StringIO())
 
 
 def test_failed_submission_scope_revokes_attempt_capability(broker_db, monkeypatch):
@@ -2094,7 +2094,6 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
 
     lambda_payload = build_lambda_payload(
         spec,
-        42,
         0,
         runtime_secrets=runtime,
         source_snapshot=_SOURCE_SNAPSHOT,
@@ -2102,7 +2101,6 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
     )
     vast_payload = build_vast_payload(
         spec,
-        42,
         0,
         runtime_secrets=runtime,
         source_snapshot=_SOURCE_SNAPSHOT,
@@ -2125,9 +2123,8 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
         "poll_job",
         lambda *_args, **_kwargs: PollResult(True, metrics={}),
     )
-    runpod_job_execution.submit_run(
+    runpod_job_execution.submit_attempt(
         spec,
-        42,
         attempt=0,
         runtime_secrets=runtime,
         source_snapshot=_SOURCE_SNAPSHOT,
@@ -2150,7 +2147,7 @@ def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monke
         run_id="run-invalid-payload",
     )
     with pytest.raises(ValueError, match="managed teacher credential names"):
-        build_worker_env(invalid_spec, 42, runtime_secrets=runtime)
+        build_worker_env(invalid_spec, runtime_secrets=runtime)
 
 
 def test_capability_policy_is_run_bounded_and_rejects_excessive_shapes(monkeypatch):
