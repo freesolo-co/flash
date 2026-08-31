@@ -2,11 +2,50 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import os
 import threading
 import weakref
+from collections.abc import Iterator
 from typing import Self
+
+
+def _open_teacher_broker_lease() -> int:
+    """Open the lease guarding the configured teacher ledger."""
+    from flash.server.platform.db import db_path
+
+    path = f"{os.path.realpath(db_path())}.teacher-broker.lock"
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    return os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+
+
+@contextlib.contextmanager
+def _teacher_broker_lease(*, exclusive: bool) -> Iterator[None]:
+    """Exclude recovery from live requests while allowing brokers to serve concurrently."""
+    fd = _open_teacher_broker_lease()
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    locked = False
+    try:
+        fcntl.flock(fd, operation)
+        locked = True
+        yield
+    finally:
+        try:
+            if locked:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _teacher_recovery_lease() -> contextlib.AbstractContextManager[None]:
+    """Wait until no teacher request is live, then own ledger recovery exclusively."""
+    return _teacher_broker_lease(exclusive=True)
+
+
+def _teacher_serving_lease() -> contextlib.AbstractContextManager[None]:
+    """Represent one complete teacher request in the recovery locking protocol."""
+    return _teacher_broker_lease(exclusive=False)
 
 
 class _RunLock:

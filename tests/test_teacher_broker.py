@@ -21,6 +21,8 @@ from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 from flash.server.domain.teacher import broker as teacher_broker
 from flash.server.platform import db
 from tests._helpers.source_snapshot import valid_source_snapshot
+from tests._helpers.teacher_broker import _body, _issue, _limits, _response
+from tests._helpers.teacher_broker import broker_db as broker_db
 
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
@@ -35,78 +37,6 @@ def stub_worker_teacher_tokenizer(monkeypatch):
             return [EncodedTeacherToken(7, 0, len(text))]
 
     monkeypatch.setattr(worker_teacher, "load_teacher_tokenizer", lambda _model: Tokenizer())
-
-
-def _limits(**updates):
-    values = {
-        "max_requests": 4,
-        "max_score_items": 8,
-        "max_request_bytes": teacher_broker.MAX_REQUEST_BODY_BYTES,
-        "max_response_bytes": teacher_broker.MAX_RESPONSE_BODY_BYTES,
-        "max_concurrency": 2,
-        "max_upstream_attempts": 1,
-        "max_request_tokens": 128,
-        "max_total_tokens": 512,
-    }
-    values.update(updates)
-    return values
-
-
-@pytest.fixture
-def broker_db(monkeypatch, tmp_path):
-    path = tmp_path / "server.db"
-    monkeypatch.setattr(db, "DB_PATH", str(path))
-    owner = db.ensure_internal_key("test-owner-key")
-    db.record_run("run-1", owner["id"])
-    return path
-
-
-def _issue(*, now=None, expires_at=None, limits=None):
-    current = time.time() if now is None else float(now)
-    return db.issue_teacher_capability(
-        run_id="run-1",
-        attempt=2,
-        teacher_alias="glm-5.2",
-        provider=teacher_broker.PARASAIL_PROVIDER,
-        model="parasail-glm-52",
-        scoring_mode=teacher_broker.PARASAIL_SCORING_MODE,
-        expires_at=expires_at if expires_at is not None else current + 600,
-        limits=limits or _limits(),
-        now=current,
-    )
-
-
-def _body(*, prompt="questionanswer", model="parasail-glm-52", **extra):
-    value = {
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": 1,
-        "echo": True,
-        "logprobs": 1,
-        "prompt_logprobs": 1,
-        "return_token_ids": True,
-        "temperature": 0,
-        "top_p": 1,
-        "seed": 0,
-    }
-    value.update(extra)
-    return json.dumps(value, separators=(",", ":")).encode()
-
-
-def _response(*, token="questionanswer"):
-    return json.dumps(
-        {
-            "choices": [
-                {
-                    "index": 0,
-                    "prompt_token_ids": [7],
-                    "token_ids": [8],
-                    "prompt_logprobs": [{"7": {"logprob": -0.1, "decoded_token": token}}],
-                }
-            ],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-        }
-    ).encode()
 
 
 def _chat_body(*, model="parasail-glm-52", messages=None, **extra):
@@ -460,6 +390,35 @@ def test_stale_started_request_becomes_terminal_after_broker_recovery(broker_db)
     assert (row["state"], row["upstream_attempt_count"]) == ("outcome_unknown", 1)
     assert in_flight == 0
     assert db.teacher_capability_binding(token)["token_count"] == 128
+
+
+def test_broker_recovery_reconstructs_live_in_flight_accounting(broker_db):
+    token = _issue(limits=_limits(max_concurrency=4))
+    reservation = db.reserve_teacher_request(
+        token=token,
+        request_id="request-reconstructed-1",
+        request_fingerprint="a" * 64,
+        request_bytes=10,
+        score_items=1,
+        expected_run_id="run-1",
+        expected_attempt=2,
+    )
+    db.mark_teacher_request_started(
+        reservation["capability"]["id"],
+        "request-reconstructed-1",
+    )
+    connection = sqlite3.connect(broker_db)
+    connection.execute(
+        "CREATE TRIGGER preserve_live_request BEFORE UPDATE OF state ON teacher_score_requests "
+        "WHEN OLD.request_id = 'request-reconstructed-1' BEGIN SELECT RAISE(IGNORE); END"
+    )
+    connection.execute("UPDATE teacher_capabilities SET in_flight = 3")
+    connection.commit()
+    connection.close()
+
+    db.recover_teacher_request_ledger()
+
+    assert db.teacher_capability_binding(token)["in_flight"] == 1
 
 
 def test_closed_parasail_contract_rejects_extra_fields_model_changes_and_batches(broker_db):

@@ -852,7 +852,11 @@ def recover_teacher_request_ledger(*, now: float | None = None) -> dict[str, int
             "WHERE state = 'started'",
             (recovered_at, recovered_at),
         ).rowcount
-        conn.execute("UPDATE teacher_capabilities SET in_flight = 0")
+        conn.execute(
+            "UPDATE teacher_capabilities SET in_flight = COALESCE((SELECT COUNT(*) "
+            "FROM teacher_score_requests r WHERE r.capability_id = teacher_capabilities.id "
+            "AND r.state IN ('reserved', 'started')), 0)"
+        )
         conn.commit()
         return {"retryable": reserved, "outcome_unknown": started}
     except Exception:
