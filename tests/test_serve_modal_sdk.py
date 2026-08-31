@@ -681,7 +681,10 @@ def _assert_modal_wrapper_signals_parent(monkeypatch, exit_code: int) -> None:
 
     class _Exited:
         def wait(self, timeout: float | None = None) -> int:
-            assert timeout is not None
+            # the watcher waits without a deadline on purpose: it runs on a daemon thread whose
+            # only job is to outlive the child, so a deadline would either fire a spurious
+            # SIGTERM at a healthy container or reduce to this same call in a retry loop.
+            assert timeout is None, "the daemon watcher must not poll for the child"
             return exit_code
 
     watchers = _defer_modal_watcher(monkeypatch)
@@ -750,6 +753,8 @@ def test_wrapper_watcher_failure_retains_unreaped_child_and_original_cause(monke
     from flash.serve.provisioning.modal.planning import wrapper as _modal_wrapper
 
     class _UnreapedProcess:
+        pid = 5150
+
         def terminate(self) -> None:
             pass
 
@@ -772,7 +777,7 @@ def test_wrapper_watcher_failure_retains_unreaped_child_and_original_cause(monke
     with pytest.raises(launch.ChildReapUnconfirmed) as exc_info:
         launch_modal_server()
 
-    assert exc_info.value.process is process
+    assert exc_info.value.pid == process.pid
     assert exc_info.value.__cause__ is watcher_failure
 
 
@@ -803,7 +808,6 @@ def test_wrapper_real_subprocess_is_reaped_when_real_thread_start_fails(monkeypa
 
     monkeypatch.setattr(launch, "start_launcher_process", lambda: process)
     monkeypatch.setattr(launch, "_CHILD_STOP_TIMEOUT_SECONDS", 0.1)
-    monkeypatch.setattr(launch, "_CHILD_REAP_TIMEOUT_SECONDS", 0.1)
     monkeypatch.setattr(_modal_wrapper, "Thread", _BrokenThread)
     try:
         with pytest.raises(RuntimeError, match="real thread start sabotage"):

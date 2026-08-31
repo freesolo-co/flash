@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from os import getpid, kill
 from signal import SIGTERM
-from subprocess import TimeoutExpired
 from threading import Thread
-
-_CHILD_WATCH_POLL_SECONDS = 5.0
 
 
 def launch_modal_server() -> None:
@@ -44,13 +41,12 @@ def launch_modal_server() -> None:
     process = start_launcher_process()
 
     def stop_parent_when_child_exits() -> None:
-        while True:
-            try:
-                process.wait(timeout=_CHILD_WATCH_POLL_SECONDS)
-            except TimeoutExpired:
-                continue
-            kill(getpid(), SIGTERM)
-            return
+        # this wait is deliberately unbounded: the watcher's whole job is to outlive the child,
+        # and a deadline here would either fire a spurious SIGTERM at a healthy container or
+        # reduce to this same call written as a retry loop. it is safe only because it runs on
+        # a daemon thread, so it never delays the caller and never holds up interpreter exit.
+        process.wait()
+        kill(getpid(), SIGTERM)
 
     try:
         watcher = Thread(target=stop_parent_when_child_exits, daemon=True)

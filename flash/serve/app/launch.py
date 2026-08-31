@@ -34,7 +34,6 @@ _DEFAULT_HOST = "0.0.0.0"
 _DEFAULT_PORT = 8000
 _CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS = 5.0
 _CHILD_STOP_TIMEOUT_SECONDS = 5.0
-_CHILD_REAP_TIMEOUT_SECONDS = 5.0
 _BOOTSTRAP_PATH = "/app/serve_launch.py"
 _SAFE_CHILD_COPIED_ENV_NAMES = frozenset(
     {
@@ -112,10 +111,15 @@ class StartupTerminated(LaunchError):
 
 
 class ChildReapUnconfirmed(LaunchError):
-    """the packaged child still has to be treated as owned after shutdown deadlines."""
+    """the packaged child survived terminate and kill, so this process is not a clean pid 1.
 
-    def __init__(self, process: subprocess.Popen[Any]) -> None:
-        self.process = process
+    the pid is carried instead of the handle because nothing can adopt this child: both catchers
+    only re-raise, so no caller continues reaping. a handle would imply a transfer of ownership
+    that nothing performs, while the pid is what an operator needs to find the survivor.
+    """
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
         super().__init__(
             "launcher child reap could not be confirmed after terminate and kill deadlines"
         )
@@ -653,25 +657,38 @@ def _close_descriptors(descriptors: list[int]) -> None:
             os.close(fd)
 
 
-def _wait_for_child(process: subprocess.Popen[Any], timeout: float) -> bool:
+def _child_exited(process: subprocess.Popen[Any], timeout: float) -> bool:
+    """wait one bounded interval, reporting whether the child is confirmed gone.
+
+    only a timeout means the child is still running. treating every other failure as "still
+    running" would turn a keyboard interrupt or a waitpid error into a kill and then into a
+    false unconfirmed reap, so anything else propagates with its real type.
+    """
+
     try:
         process.wait(timeout=timeout)
-    except BaseException:
+    except subprocess.TimeoutExpired:
         return False
     return True
 
 
 def _terminate_and_reap(process: subprocess.Popen[Any]) -> None:
+    """stop the packaged child, never blocking this caller past the two shutdown deadlines.
+
+    a third wait after the kill would repeat the one above it with the same deadline and cannot
+    learn anything the second did not, so the contract is exactly two: one for the signal the
+    child may handle, one for the signal it cannot.
+    """
+
     with contextlib.suppress(Exception):
         process.terminate()
-    if _wait_for_child(process, _CHILD_STOP_TIMEOUT_SECONDS):
+    if _child_exited(process, _CHILD_STOP_TIMEOUT_SECONDS):
         return
     with contextlib.suppress(Exception):
         process.kill()
-    if _wait_for_child(process, _CHILD_STOP_TIMEOUT_SECONDS):
+    if _child_exited(process, _CHILD_STOP_TIMEOUT_SECONDS):
         return
-    if not _wait_for_child(process, _CHILD_REAP_TIMEOUT_SECONDS):
-        raise ChildReapUnconfirmed(process)
+    raise ChildReapUnconfirmed(process.pid)
 
 
 def start_launcher_process(

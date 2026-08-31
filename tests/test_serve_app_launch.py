@@ -1135,6 +1135,10 @@ class _FakeProcess:
     def terminate(self) -> None:
         self.terminated = True
 
+    @property
+    def pid(self) -> int:
+        return 4321
+
     def kill(self) -> None:
         self.killed = True
 
@@ -1156,22 +1160,70 @@ def test_terminate_and_reap_confirms_normal_shutdown() -> None:
     assert process.wait_calls == [launch._CHILD_STOP_TIMEOUT_SECONDS]
 
 
-def test_packaged_launcher_ownership_modules_have_no_unbounded_wait() -> None:
+def test_terminate_and_reap_propagates_a_wait_failure_instead_of_escalating() -> None:
+    """only a timeout means the child is still running.
+
+    treating every wait failure as "still running" turns an interrupt or a waitpid error into a
+    kill and then into a false unconfirmed reap, reporting a survivor that already exited.
+    """
+
+    class _InterruptedWait:
+        pid = 9182
+
+        def __init__(self) -> None:
+            self.terminated = False
+            self.killed = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise KeyboardInterrupt
+
+    process = _InterruptedWait()
+
+    with pytest.raises(KeyboardInterrupt):
+        launch._terminate_and_reap(process)
+
+    assert process.killed is False, "a non-timeout wait failure must not escalate to a kill"
+
+
+def test_packaged_launcher_ownership_modules_have_no_unbounded_caller_wait() -> None:
+    """no wait on a launcher caller's own thread may run without a deadline.
+
+    the modal watcher body is the one exemption and it is named explicitly: it exists to outlive
+    the child on a daemon thread, so a deadline there would only be this same wait rewritten as a
+    retry loop, which is unbounded in every sense except syntax. every other wait blocks a caller
+    and must carry a real deadline.
+    """
+
     root = Path(__file__).resolve().parents[1]
     ownership_modules = (
         root / "serve_launch.py",
         root / "flash/serve/app/launch.py",
         root / "flash/serve/provisioning/modal/planning/wrapper.py",
     )
+    exempt_daemon_watchers = {"stop_parent_when_child_exits"}
     waits: list[tuple[Path, ast.Call]] = []
     for path in ownership_modules:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        exempt_lines = {
+            node.lineno
+            for function in ast.walk(tree)
+            if isinstance(function, ast.FunctionDef) and function.name in exempt_daemon_watchers
+            for node in ast.walk(function)
+            if hasattr(node, "lineno")
+        }
         waits.extend(
             (path, node)
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr in {"join", "wait"}
+            and node.lineno not in exempt_lines
         )
 
     assert waits
@@ -1341,7 +1393,10 @@ def test_parent_helper_surfaces_unconfirmed_reap_without_releasing_child(
     ) as exc_info:
         launch.start_launcher_process(environment, popen_factory=lambda *_args, **_kwargs: process)
 
-    assert exc_info.value.process is process
+    assert exc_info.value.pid == process.pid
+    assert not hasattr(exc_info.value, "process"), (
+        "the survivor's handle must not be carried: every catcher only re-raises, so nothing adopts it"
+    )
     assert isinstance(exc_info.value.__cause__, launch.LaunchError)
     assert str(exc_info.value.__cause__) == "pipe failed"
     assert process.terminated is True
@@ -1349,7 +1404,6 @@ def test_parent_helper_surfaces_unconfirmed_reap_without_releasing_child(
     assert process.wait_calls == [
         launch._CHILD_STOP_TIMEOUT_SECONDS,
         launch._CHILD_STOP_TIMEOUT_SECONDS,
-        launch._CHILD_REAP_TIMEOUT_SECONDS,
     ]
     assert all(timeout is not None for timeout in process.wait_calls)
     assert INFERENCE_TOKEN not in str(exc_info.value)
