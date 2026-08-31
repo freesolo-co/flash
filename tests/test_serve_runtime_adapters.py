@@ -139,6 +139,46 @@ def test_add_requires_exact_true_and_retains_quarantine(
     assert engine.added[-1].lora_int_id == 7
 
 
+def test_indeterminate_state_is_never_read_as_loaded(adapter_dir: Path) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    entry = adapters_module._AdapterEntry(
+        spec=_spec(adapter_dir),
+        lora_request=_LoRARequest("adapter", 7, str(adapter_dir)),
+        state=adapters_module._AdapterState.INDETERMINATE,
+    )
+    manager._entries["adapter"] = entry
+
+    assert manager.registered_count == 1
+    assert manager.loaded_count == 0
+
+    async def acquire_indeterminate() -> None:
+        async with manager.acquire("adapter", "one"):
+            raise AssertionError("indeterminate engine ownership must block acquire")
+
+    with pytest.raises(AdapterError, match="ownership is indeterminate"):
+        asyncio.run(acquire_indeterminate())
+    assert engine.added == []
+
+
+def test_initial_indeterminate_load_uses_one_registry(adapter_dir: Path) -> None:
+    engine = _Engine()
+    engine.add_result = False
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    with pytest.raises(AdapterError, match="did not confirm lora registration"):
+        asyncio.run(manager.register(_spec(adapter_dir)))
+
+    assert set(manager._entries) == {"adapter"}
+    assert manager.registered_count == manager.loaded_count == 0
+    assert not hasattr(manager, "_quarantined")
+
+    engine.remove_result = False
+    with pytest.raises(AdapterError, match="did not confirm lora removal"):
+        asyncio.run(manager.unload("adapter", "one"))
+    assert manager.registered_count == manager.loaded_count == 0
+
+
 def test_replacement_waits_for_inflight_incarnation(adapter_dir: Path) -> None:
     engine = _Engine()
     manager = AdapterManager(engine, EngineConfig(model="model"))
