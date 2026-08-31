@@ -4754,6 +4754,70 @@ def test_a_warmup_request_is_bounded_against_a_hung_stream_close() -> None:
     )
 
 
+def test_a_request_that_delivers_during_the_reap_is_returned_not_discarded() -> None:
+    """A bounded cancellation must not throw away an outcome the container already paid for.
+
+    Cancellation races delivery. `run_request` catches its own failures and RETURNS a failed record
+    instead of raising, so a request that finishes between the bound expiring and the cancel landing
+    leaves a real `RequestRecord` in the task -- outcome decided, seconds already billed. Raising
+    over it fails the lane for a request that actually completed, and the warmup is the gate every
+    sweep runs behind, so one such race would refuse a healthy container.
+
+    Driven in a subprocess for the same reason as the bound test above: the fake clock a fast
+    in-process version needs would freeze the event loop's own timer.
+    """
+    program = textwrap.dedent(
+        """
+        import asyncio, sys
+        from flash.serving.bench import driver
+
+        # The enforced bound is the SUM of these two, so the request below must outlive 1.1s to
+        # reach the cancellation path at all -- a sleep shorter than the sum returns through the
+        # normal path and exercises nothing.
+        driver.REQUEST_TIMEOUT_SECONDS = 0.1
+        driver._DRAIN_REAP_SECONDS = 1.0
+
+        DELIVERED = {"ok": False, "marker": "delivered-during-the-reap"}
+
+        async def _slow(*a, **k):
+            # Outlives the 1.1s bound, then delivers inside the reap -- exactly the race. Swallowing
+            # the cancellation and returning is what `run_request` does: it converts its own
+            # failures into a failed record rather than propagating.
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                pass
+            return DELIVERED
+
+        driver.run_request = _slow
+        driver.os._exit = lambda code: sys.exit(7)
+
+        async def _main():
+            try:
+                got = await driver.run_request_within_bound(None, "m", [], 1, "uid")
+            except BaseException as exc:
+                print(f"raised {type(exc).__name__}", flush=True)
+                sys.exit(8)
+            print(f"returned {got!r}", flush=True)
+            sys.exit(0 if got is DELIVERED else 9)
+
+        asyncio.run(_main())
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        cwd=str(REPO_ROOT),
+    )
+    assert completed.returncode == 0, (
+        "a request that delivered during the bounded reap was discarded rather than returned; "
+        f"exit {completed.returncode}: {completed.stdout}{completed.stderr}"
+    )
+
+
 def test_the_warmup_reservation_funds_the_enforced_bound() -> None:
     """R17: reserving the nominal request timeout under-funds a path the code itself permits."""
     from flash.serving.bench import driver as driver_module

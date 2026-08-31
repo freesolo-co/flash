@@ -490,6 +490,14 @@ async def run_request_within_bound(*args: Any, **kwargs: Any) -> RequestRecord:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
             await asyncio.wait_for(asyncio.shield(task), timeout=_DRAIN_REAP_SECONDS)
+        # Cancellation races delivery. `run_request` catches its own failures and RETURNS a failed
+        # record rather than raising, so a request that finished between the bound expiring and the
+        # cancel landing has a real `RequestRecord` sitting in the task -- outcome already decided,
+        # already billed. Raising here would discard it and fail the lane over a request that
+        # completed, so return what the task actually produced whenever it produced one.
+        if task.done() and not task.cancelled():
+            with contextlib.suppress(BaseException):
+                return task.result()
         if not task.done():
             print(
                 f"[bench] a request outside a measured cell ignored cancellation past its "
