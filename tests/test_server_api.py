@@ -4986,6 +4986,113 @@ def test_status_report_shutdown_stops_retry_after_active_attempt(monkeypatch):
     runner_reporting._shutdown_status_reporter()
 
 
+def _clear_status_report_sequence_state():
+    runner_reporting._STATUS_REPORT_RETIRED.clear()
+    for values in (
+        runner_reporting._STATUS_REPORT_LAST_SENT,
+        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED,
+        runner_reporting._STATUS_REPORT_LAST_QUEUED,
+    ):
+        values.clear()
+
+
+def _drained_report(run_id, sequence, *, state="done"):
+    return SimpleNamespace(
+        run_id=run_id,
+        state=state,
+        updated_at=1.0,
+        report_sequence=sequence,
+        deployment={"state": "ready", "updated_at": 1.0},
+    )
+
+
+def test_status_report_sequence_state_is_bounded_by_retired_runs(monkeypatch):
+    # the three sequence dicts have no eviction of their own, so a long-lived server would keep
+    # three entries for every run it ever reported. drained runs retire into a bounded ring.
+    runner_reporting._shutdown_status_reporter()
+    runner_reporting._open_status_reporter()
+    _clear_status_report_sequence_state()
+    monkeypatch.setattr(runner_reporting, "_send_status_report", lambda _status: True)
+
+    cap = runner_reporting._MAX_RETIRED_STATUS_REPORT_RUNS
+    overflow = cap + 20
+    try:
+        for index in range(overflow):
+            runner_reporting._report_status(_drained_report(f"run-bounded-{index}", 1))
+        assert runner_reporting._wait_for_status_reports(30)
+
+        # every per-run structure that already self-cleaned still returns to zero
+        assert not runner_reporting._STATUS_REPORT_QUEUES
+        assert not runner_reporting._STATUS_REPORT_ACTIVE
+        assert not runner_reporting._STATUS_REPORT_WORKERS
+        # and the sequence dicts are now bounded rather than growing with every run
+        assert len(runner_reporting._STATUS_REPORT_RETIRED) == cap
+        assert len(runner_reporting._STATUS_REPORT_LAST_SENT) == cap
+        assert len(runner_reporting._STATUS_REPORT_LAST_ATTEMPTED) == cap
+        assert len(runner_reporting._STATUS_REPORT_LAST_QUEUED) == cap
+        # the oldest runs are the ones forgotten, and the newest are the ones kept
+        assert "run-bounded-0" not in runner_reporting._STATUS_REPORT_LAST_SENT
+        assert f"run-bounded-{overflow - 1}" in runner_reporting._STATUS_REPORT_LAST_SENT
+    finally:
+        _clear_status_report_sequence_state()
+        runner_reporting._shutdown_status_reporter()
+
+
+def test_retired_status_report_run_still_suppresses_duplicate_sequence(monkeypatch):
+    # eviction must not cost in-flight dedup: a retained run that re-reports the same sequence is
+    # still suppressed, which is why drained runs are retired into a ring rather than dropped.
+    runner_reporting._shutdown_status_reporter()
+    runner_reporting._open_status_reporter()
+    _clear_status_report_sequence_state()
+    delivered = []
+    monkeypatch.setattr(
+        runner_reporting, "_send_status_report", lambda status: delivered.append(status) or True
+    )
+
+    run_id = "run-retired-duplicate"
+    try:
+        runner_reporting._report_status(_drained_report(run_id, 1))
+        assert runner_reporting._wait_for_status_reports(5)
+        assert len(delivered) == 1
+        assert run_id in runner_reporting._STATUS_REPORT_RETIRED
+
+        runner_reporting._report_status(_drained_report(run_id, 1))
+        assert runner_reporting._wait_for_status_reports(5)
+        assert len(delivered) == 1
+
+        # a later deploy or reconcile report on the same terminal run still advances
+        runner_reporting._report_status(_drained_report(run_id, 2, state="deployed"))
+        assert runner_reporting._wait_for_status_reports(5)
+        assert [status.report_sequence for status in delivered] == [1, 2]
+    finally:
+        _clear_status_report_sequence_state()
+        runner_reporting._shutdown_status_reporter()
+
+
+def test_requeued_status_report_run_leaves_retirement(monkeypatch):
+    # a run that reports again is in flight, so it must not be an eviction candidate while queued.
+    runner_reporting._shutdown_status_reporter()
+    runner_reporting._open_status_reporter()
+    _clear_status_report_sequence_state()
+    monkeypatch.setattr(runner_reporting, "_send_status_report", lambda _status: True)
+
+    run_id = "run-retire-requeue"
+    try:
+        runner_reporting._report_status(_drained_report(run_id, 1))
+        assert runner_reporting._wait_for_status_reports(5)
+        assert run_id in runner_reporting._STATUS_REPORT_RETIRED
+
+        # fill the ring past capacity with other runs, then confirm the requeued run survived by
+        # re-reporting it before the flood and checking it is retired most recently afterwards.
+        runner_reporting._report_status(_drained_report(run_id, 2, state="deployed"))
+        assert runner_reporting._wait_for_status_reports(5)
+        retired = list(runner_reporting._STATUS_REPORT_RETIRED)
+        assert retired[-1] == run_id
+    finally:
+        _clear_status_report_sequence_state()
+        runner_reporting._shutdown_status_reporter()
+
+
 def test_deploy_rejects_verify_false_before_anything_registers(api, monkeypatch):
     # smoke verification is mandatory: an explicit opt-out is a 400 before queuing, and neither
     # serving registration nor alias activation is ever attempted.
