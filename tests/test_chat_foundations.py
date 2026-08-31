@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from types import MappingProxyType
 
 import pytest
 
@@ -21,8 +22,14 @@ from flash.serve.contract.provenance import (
     decode_freesolo_headers,
     validate_header_provenance,
 )
-from flash.serve.request.openai import DEFAULT_MAX_TOKENS, OpenAIRequestError, parse_chat_request
+from flash.serve.request.openai import (
+    DEFAULT_MAX_TOKENS,
+    OpenAIRequestError,
+    parse_chat_request,
+    reject_tool_capability,
+)
 from flash.serve.request.streaming import _complete_sse_frames
+from flash.serve.request.tool_calls import detached_template_messages
 from flash.serve.request.transport import OpenAIStreamResponse
 from flash.server.routes.serving_revisions import _authorized_chat_checkpoint
 
@@ -355,6 +362,642 @@ def test_header_provenance_validates_every_present_family() -> None:
 
     with pytest.raises(ValueError, match="mismatched checkpoint provenance"):
         validate_header_provenance({**matching, "X-Flash-Checkpoint-Id": "run-1/step-8"}, expected)
+
+
+def _function_tools() -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "look up weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "days": {"type": "integer"},
+                    },
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+
+def test_tool_controls_and_template_keys_are_strict() -> None:
+    request = parse_chat_request(
+        {
+            "messages": [{"role": "user", "content": "weather"}],
+            "tools": _function_tools(),
+            "chat_template_kwargs": {"tools": ["bypass"], "tool_choice": "required"},
+        },
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+    assert request.tool_choice == "auto"
+    assert request.parallel_tool_calls is True
+    assert request.chat_template_kwargs == {}
+    for update, match in (
+        ({"tool_choice": "required"}, "auto or none"),
+        ({"parallel_tool_calls": False}, "must be true"),
+    ):
+        with pytest.raises(OpenAIRequestError, match=match):
+            parse_chat_request(
+                {
+                    "messages": [{"role": "user", "content": "weather"}],
+                    "tools": _function_tools(),
+                    **update,
+                },
+                require_model=False,
+                allow_managed_selectors=True,
+            )
+
+
+def test_enum_member_complexity_is_a_request_error() -> None:
+    tools = _function_tools()
+    tools[0]["function"]["parameters"]["properties"]["days"]["enum"] = [
+        json.loads("[" * 600 + "0" + "]" * 600)
+    ]
+
+    with pytest.raises(OpenAIRequestError, match="enum value complexity"):
+        parse_chat_request(
+            {"messages": [{"role": "user", "content": "weather"}], "tools": tools},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+def test_tool_names_and_schema_container_keywords_are_exact() -> None:
+    valid = _function_tools()
+    valid[0]["function"]["name"] = "9-weather_tool"
+    request = parse_chat_request(
+        {"messages": [{"role": "user", "content": "weather"}], "tools": valid},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+    assert request.tools is not None
+    assert request.tools[0].name == "9-weather_tool"
+
+    for name in ("weather.lookup", "x" * 65):
+        invalid = _function_tools()
+        invalid[0]["function"]["name"] = name
+        with pytest.raises(OpenAIRequestError, match=r"function\.name is invalid"):
+            parse_chat_request(
+                {"messages": [{"role": "user", "content": "weather"}], "tools": invalid},
+                require_model=False,
+                allow_managed_selectors=True,
+            )
+
+    for name in ("city.name", "city>", "x" * 65):
+        invalid = _function_tools()
+        invalid[0]["function"]["parameters"]["properties"] = {name: {"type": "string"}}
+        invalid[0]["function"]["parameters"]["required"] = [name]
+        with pytest.raises(OpenAIRequestError, match=r"properties key is invalid"):
+            parse_chat_request(
+                {"messages": [{"role": "user", "content": "weather"}], "tools": invalid},
+                require_model=False,
+                allow_managed_selectors=True,
+            )
+
+    invalid_schema = _function_tools()
+    invalid_schema[0]["function"]["parameters"]["items"] = {"type": "string"}
+    with pytest.raises(OpenAIRequestError, match="object schema contains array-only keywords"):
+        parse_chat_request(
+            {
+                "messages": [{"role": "user", "content": "weather"}],
+                "tools": invalid_schema,
+            },
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+def test_tool_capability_rejection_uses_authoritative_thinking_and_parser() -> None:
+    tools = parse_chat_request(
+        {"messages": [{"role": "user", "content": "weather"}], "tools": _function_tools()},
+        require_model=False,
+        allow_managed_selectors=True,
+    ).tools
+    reject_tool_capability(
+        tools=tools,
+        tool_choice="auto",
+        thinking=False,
+        tool_parser="qwen3_coder",
+    )
+    reject_tool_capability(tools=tools, tool_choice="none", thinking=True, tool_parser=None)
+    with pytest.raises(OpenAIRequestError, match="thinking-enabled"):
+        reject_tool_capability(
+            tools=tools,
+            tool_choice="auto",
+            thinking=True,
+            tool_parser="qwen3_coder",
+        )
+    with pytest.raises(OpenAIRequestError, match="not qualified"):
+        reject_tool_capability(
+            tools=tools,
+            tool_choice="auto",
+            thinking=False,
+            tool_parser=None,
+        )
+
+
+def test_message_copy_complexity_is_controlled_and_caller_values_stay_detached() -> None:
+    nested: dict[str, object] = {}
+    for _ in range(1500):
+        nested = {"extra": nested}
+    messages = [{"role": "user", "content": "hello", "metadata": nested}]
+
+    with pytest.raises(OpenAIRequestError, match="messages exceed the supported complexity"):
+        parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+    assert messages[0]["metadata"] is nested
+    metadata = {"nested": {"value": 1}}
+    request = parse_chat_request(
+        {"messages": [{"role": "user", "content": "hello", "metadata": metadata}]},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+    metadata["nested"]["value"] = 2
+    assert request.messages[0]["metadata"] == {"nested": {"value": 1}}
+
+
+def test_canonical_message_mapping_proxy_is_detached() -> None:
+    metadata = {"value": 1}
+    request = parse_chat_request(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "hello",
+                    "metadata": MappingProxyType(metadata),
+                }
+            ]
+        },
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    metadata["value"] = 2
+    assert request.messages[0]["metadata"] == {"value": 1}
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["bad\ud800", [{"type": "text", "text": "bad\ud800"}]],
+    ids=["string", "text-block"],
+)
+def test_tool_result_content_rejects_unpaired_surrogates(content) -> None:
+    messages = _historical_tool_messages("{}")
+    messages[1]["content"] = content
+
+    with pytest.raises(
+        OpenAIRequestError, match="tool result content cannot contain an unpaired surrogate"
+    ):
+        parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+def test_tool_result_content_accepts_non_bmp_text() -> None:
+    for content in ("sunny ☀", [{"type": "text", "text": "sunny ☀"}]):
+        request = parse_chat_request(
+            {
+                "messages": [
+                    *_historical_tool_messages("{}")[:1],
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": content,
+                    },
+                ]
+            },
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+        assert request.messages[1]["content"] == content
+
+
+def test_tool_history_is_strict_and_does_not_mutate_caller_messages() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "name": "weather", "content": "sunny"},
+        {"role": "user", "content": "thanks"},
+    ]
+    original = json.loads(json.dumps(messages))
+    request = parse_chat_request(
+        {"messages": messages}, require_model=False, allow_managed_selectors=True
+    )
+    assert request.messages == original
+    assert messages == original
+    with pytest.raises(OpenAIRequestError, match="before all preceding tool calls were resolved"):
+        parse_chat_request(
+            {"messages": [messages[0], messages[2]]},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+    for message, match in (
+        (
+            {
+                "role": "user",
+                "content": "not an assistant",
+                "tool_calls": messages[0]["tool_calls"],
+            },
+            "tool_calls require the assistant role",
+        ),
+        (
+            {"role": "assistant", "content": "not a tool", "tool_call_id": "call_1"},
+            "tool_call_id requires the tool role",
+        ),
+    ):
+        with pytest.raises(OpenAIRequestError, match=match):
+            parse_chat_request(
+                {"messages": [message]},
+                require_model=False,
+                allow_managed_selectors=True,
+            )
+
+    invalid_history = json.loads(json.dumps(messages[0]))
+    invalid_history["tool_calls"][0]["function"]["name"] = "weather.lookup"
+    with pytest.raises(OpenAIRequestError, match="function name is invalid"):
+        parse_chat_request(
+            {"messages": [invalid_history]},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+    text_parts = parse_chat_request(
+        {
+            "messages": [
+                messages[0],
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": [
+                        {"type": "input_text", "text": "sun"},
+                        {"type": "text", "text": "ny"},
+                    ],
+                },
+            ]
+        },
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+    assert text_parts.messages[1]["content"] == [
+        {"type": "input_text", "text": "sun"},
+        {"type": "text", "text": "ny"},
+    ]
+
+
+def _historical_tool_messages(argument: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": argument},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"value":' + "[" * 600 + "0" + "]" * 600 + "}",
+        json.dumps({"values": [0] * 511}),
+    ],
+    ids=["depth", "aggregate-nodes"],
+)
+def test_historical_tool_argument_complexity_is_a_request_error(argument: str) -> None:
+    messages = _historical_tool_messages(argument)
+    original = json.loads(json.dumps(messages))
+
+    with pytest.raises(OpenAIRequestError, match="tool argument complexity"):
+        parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+    assert messages == original
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"value":' + "[" * 7 + "0" + "]" * 7 + "}",
+        json.dumps({"values": [0] * 510}),
+    ],
+    ids=["depth", "aggregate-nodes"],
+)
+def test_historical_tool_argument_complexity_boundary_succeeds(argument: str) -> None:
+    messages = _historical_tool_messages(argument)
+    original = json.loads(json.dumps(messages))
+
+    request = parse_chat_request(
+        {"messages": messages},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    assert request.messages == original
+    assert messages == original
+
+
+@pytest.mark.parametrize(
+    ("argument", "match"),
+    [
+        ('{"days":1e1000001}', "numeric exponent exceeds 1000000 magnitude limit"),
+        ('{"days":1e-1000001}', "numeric exponent exceeds 1000000 magnitude limit"),
+        ('{"days":1,"days":2}', "arguments must encode a JSON object"),
+        ('{"nested":{"days":1,"days":2}}', "arguments must encode a JSON object"),
+    ],
+    ids=["positive-exponent", "negative-exponent", "duplicate-root", "duplicate-nested"],
+)
+def test_malformed_numeric_or_duplicate_key_tool_history_is_a_request_error(
+    argument: str, match: str
+) -> None:
+    messages = _historical_tool_messages(argument)
+
+    with pytest.raises(OpenAIRequestError, match=match):
+        parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"direct":6.25e-1}',
+        '{"nested":{"value":2.5e1}}',
+        '{"values":[1e2,1.25e-2]}',
+    ],
+    ids=["direct", "nested", "list"],
+)
+def test_finite_exponent_tool_history_is_accepted(argument: str) -> None:
+    messages = _historical_tool_messages(argument)
+
+    request = parse_chat_request(
+        {"messages": messages},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    assert request.messages == messages
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"value":NaN}',
+        '{"value":Infinity}',
+        '{"value":-Infinity}',
+    ],
+    ids=["nan", "infinity", "negative-infinity"],
+)
+def test_nonfinite_tool_history_is_a_request_error(argument: str) -> None:
+    """a non-finite constant is not JSON and has no faithful rendering at all."""
+    with pytest.raises(OpenAIRequestError, match="arguments must encode a JSON object"):
+        parse_chat_request(
+            {"messages": _historical_tool_messages(argument)},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("argument", "rendered"),
+    [
+        ('{"value":1.' + "0" * 309 + "1e309}", "1" + "0" * 309 + ".1"),
+        ('{"value":1e-400}', "1e-400"),
+        ('{"value":9007199254740993.1}', "9007199254740993.1"),
+    ],
+    ids=["overflow", "nonzero-underflow", "lossy-nonintegral"],
+)
+def test_finite_number_no_native_value_carries_renders_exactly(
+    argument: str, rendered: str
+) -> None:
+    """a finite number keeps its exact text rather than rounding or being refused.
+
+    each of these overflows, underflows, or loses digits when forced through a python
+    float, which is why they used to be rejected. the template renders a scalar through
+    ``string``, so the exact literal reaches the model unchanged and the prior call the
+    model sees is the one it actually made.
+    """
+    normalized = parse_chat_request(
+        {"messages": _historical_tool_messages(argument)},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    detached = detached_template_messages(normalized.messages)
+    values = detached[0]["tool_calls"][0]["function"]["arguments"]
+    assert values["value"] == rendered
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        '{"direct":' + "9" * 1025 + "}",
+        '{"nested":{"value":' + "9" * 1025 + "}}",
+        '{"values":[' + "9" * 1025 + "]}",
+    ],
+    ids=["direct", "nested", "list"],
+)
+def test_oversized_integer_tool_history_is_a_request_error(argument: str) -> None:
+    with pytest.raises(OpenAIRequestError, match="1024-digit limit"):
+        parse_chat_request(
+            {"messages": _historical_tool_messages(argument)},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("argument", "rendered"),
+    [
+        ('{"direct":1e1024}', "1e+1024"),
+        ('{"nested":{"value":1e1024}}', '{"value": 1e+1024}'),
+        ('{"values":[1e1024,2]}', "[1e+1024, 2]"),
+        ('{"pair":{"a":1e1024,"b":2}}', '{"a": 1e+1024, "b": 2}'),
+        ('{"mixed":{"trailing":1.2300,"huge":1e1024}}', '{"trailing": 1.23, "huge": 1e+1024}'),
+        ('{"signed":{"zero":-0.0,"huge":1e1024}}', '{"zero": -0.0, "huge": 1e+1024}'),
+        ('{"enabled":true}', "true"),
+        ('{"disabled":false}', "false"),
+        ('{"value":null}', "null"),
+    ],
+    ids=[
+        "direct",
+        "nested",
+        "list",
+        "pair",
+        "mixed-native-leaf",
+        "mixed-signed-zero",
+        "scalar-true",
+        "scalar-false",
+        "scalar-null",
+    ],
+)
+def test_compact_exponent_tool_history_renders_without_expanding(
+    argument: str, rendered: str
+) -> None:
+    """a compact exponent survives as history because the template never expands it.
+
+    the grammar template sends a scalar through ``string`` and a container through
+    ``tojson``, neither of which needs the fixed expansion. expanding here would turn a
+    seven-character literal into a thousand-digit prompt and eventually trip python's own
+    integer-to-string limit, so the exact compact text is what the model must see.
+    """
+    normalized = parse_chat_request(
+        {"messages": _historical_tool_messages(argument)},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    detached = detached_template_messages(normalized.messages)
+    values = detached[0]["tool_calls"][0]["function"]["arguments"]
+    assert next(iter(values.values())) == rendered
+
+
+@pytest.mark.parametrize(
+    ("argument", "rendered"),
+    [
+        ('{"wrapped":{"enabled":true,"value":null}}', '{"enabled": true, "value": null}'),
+        ('{"listed":[true,false,null]}', "[true, false, null]"),
+    ],
+    ids=["nested", "listed"],
+)
+def test_contained_boolean_and_null_history_keeps_native_values(
+    argument: str, rendered: str
+) -> None:
+    """a bool or null inside a container stays native, because ``tojson`` spells it right.
+
+    only the scalar position needs pre-rendering: there the template uses ``string``, which
+    would emit python's ``True`` and ``None``. pre-rendering a container as well would hand
+    ``tojson`` a string and quote the whole structure, so the two positions differ.
+    """
+    normalized = parse_chat_request(
+        {"messages": _historical_tool_messages(argument)},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    detached = detached_template_messages(normalized.messages)
+    values = detached[0]["tool_calls"][0]["function"]["arguments"]
+    value = next(iter(values.values()))
+    assert not isinstance(value, str)
+    assert json.dumps(value, ensure_ascii=False) == rendered
+
+
+@pytest.mark.parametrize(
+    ("argument", "rendered"),
+    [
+        ('{"zero":-0.0}', "-0.0"),
+        ('{"nested":{"zero":-0.0}}', '{"zero": -0.0}'),
+        # the positive zero alongside it still collapses to an integer, which is what makes
+        # this pair show that only the sign, not the decimal point, is what gets preserved.
+        ('{"listed":[-0.0,0.0]}', "[-0.0, 0]"),
+    ],
+    ids=["scalar", "nested", "listed"],
+)
+def test_negative_zero_history_keeps_its_sign(argument: str, rendered: str) -> None:
+    """a negative zero must replay as ``-0.0``, not as ``0``.
+
+    ``-0.0`` is integral, so the decimal path used to hand it to ``int`` and drop the sign,
+    showing the model a different prior call than the one flash emitted. ``float`` carries
+    the sign and renders it back exactly, so signed zero takes that path instead. positive
+    zero has no sign to lose and stays an integer.
+    """
+    normalized = parse_chat_request(
+        {"messages": _historical_tool_messages(argument)},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    detached = detached_template_messages(normalized.messages)
+    values = detached[0]["tool_calls"][0]["function"]["arguments"]
+    value = next(iter(values.values()))
+    assert not isinstance(value, str)
+    assert json.dumps(value, ensure_ascii=False) == rendered
+
+
+def test_positive_zero_history_stays_an_integer() -> None:
+    """the control for ``test_negative_zero_history_keeps_its_sign``.
+
+    without this, widening the integral branch to send every zero through ``float`` would
+    pass the signed-zero test while silently changing ``0`` into ``0.0`` for everyone else.
+    """
+    normalized = parse_chat_request(
+        {"messages": _historical_tool_messages('{"zero":0.0}')},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    detached = detached_template_messages(normalized.messages)
+    value = next(iter(detached[0]["tool_calls"][0]["function"]["arguments"].values()))
+    assert value == 0
+    assert type(value) is int
+
+
+def test_integer_negative_zero_history_keeps_its_exact_lexeme() -> None:
+    normalized = parse_chat_request(
+        {"messages": _historical_tool_messages('{"zero":-0}')},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    detached = detached_template_messages(normalized.messages)
+    value = next(iter(detached[0]["tool_calls"][0]["function"]["arguments"].values()))
+    assert value == "-0"
+
+
+@pytest.mark.parametrize("argument", ['{"text":"\\ud800"}', '{"text":"\\udc00"}'])
+def test_unpaired_surrogate_in_tool_history_is_a_request_error(argument: str) -> None:
+    messages = _historical_tool_messages(argument)
+
+    with pytest.raises(OpenAIRequestError, match="arguments must encode a JSON object"):
+        parse_chat_request(
+            {"messages": messages},
+            require_model=False,
+            allow_managed_selectors=True,
+        )
+
+
+def test_valid_non_bmp_surrogate_pair_in_tool_history_is_accepted() -> None:
+    messages = _historical_tool_messages('{"text":"\\ud83d\\ude00"}')
+
+    request = parse_chat_request(
+        {"messages": messages},
+        require_model=False,
+        allow_managed_selectors=True,
+    )
+
+    assert request.messages == messages
 
 
 def test_authorized_checkpoint_requires_one_explicit_verified_target() -> None:

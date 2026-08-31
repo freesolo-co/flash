@@ -8,9 +8,15 @@ import io
 import json
 import re
 import warnings
+from collections.abc import Mapping
 from typing import Any
 
-from flash.serve.contract.protocol import reject_non_finite_json_constant
+from flash.serve.contract.protocol import (
+    IMAGE_TYPES,
+    TEXT_TYPES,
+    reject_non_finite_json_constant,
+)
+from flash.serve.request.tool_calls import validate_tool_history
 
 MAX_IMAGES = 4
 MAX_COMPRESSED_BYTES = 8 * 1024 * 1024
@@ -18,8 +24,8 @@ MAX_TOTAL_COMPRESSED_BYTES = 16 * 1024 * 1024
 MAX_DIMENSION = 8192
 MAX_TOTAL_DECODED_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_CHARS = len("data:image/webp;base64,") + 4 * ((MAX_COMPRESSED_BYTES + 2) // 3)
-IMAGE_TYPES = frozenset({"image_url", "input_image", "image"})
-TEXT_TYPES = frozenset({"text", "input_text"})
+MAX_MESSAGE_NODES = 4096
+MAX_MESSAGE_DEPTH = 256
 ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
 MIME_TO_FORMAT = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}
 DATA_URI_RE = re.compile(r"\Adata:(image/[^;,]+);base64,(.*)\Z", re.DOTALL)
@@ -67,6 +73,92 @@ ALLOWED_KEYS_HINT = (
 )
 
 ErrorType = type[Exception]
+_COPYABLE_MESSAGE_SCALARS = (bool, float, int, str, type(None))
+
+
+def detached_messages(
+    messages: Any,
+    *,
+    sequence_types: type | tuple[type, ...],
+    sequence_error: str,
+    error_type: ErrorType,
+) -> list[dict[str, Any]]:
+    if not isinstance(messages, sequence_types):
+        raise error_type(sequence_error)
+    detached: list[dict[str, Any]] = []
+    try:
+        iterator = iter(messages)
+    except Exception as exc:
+        raise error_type("messages contain an unsupported value") from exc
+    stack: list[tuple[Any, Any, int | None, bool]] = [(iterator, detached, None, True)]
+    active: set[int] = {id(messages)}
+    nodes = 1
+    while stack:
+        iterator, target, identity, top_level = stack[-1]
+        try:
+            entry = next(iterator)
+        except StopIteration:
+            stack.pop()
+            active.discard(identity)
+            continue
+        except Exception as exc:
+            raise error_type("messages contain an unsupported value") from exc
+        key = None
+        item = entry
+        if isinstance(target, dict):
+            try:
+                key, item = entry
+            except Exception as exc:
+                raise error_type("messages contain an unsupported value") from exc
+            if type(key) is not str:
+                raise error_type("messages contain an unsupported value")
+        nodes += 1
+        if nodes > MAX_MESSAGE_NODES:
+            raise error_type("messages exceed the supported complexity")
+        if top_level and not isinstance(item, Mapping):
+            raise error_type(f"message {len(target)} must be an object")
+        if isinstance(item, Mapping):
+            if len(stack) > MAX_MESSAGE_DEPTH:
+                raise error_type("messages exceed the supported complexity")
+            copied: dict[str, Any] = {}
+            _append_detached(target, key, copied)
+            nested = _message_items(item)
+        elif isinstance(item, list | tuple):
+            if len(stack) > MAX_MESSAGE_DEPTH:
+                raise error_type("messages exceed the supported complexity")
+            copied = []
+            _append_detached(target, key, copied)
+            nested = _message_values(item, error_type)
+        elif type(item) in _COPYABLE_MESSAGE_SCALARS:
+            _append_detached(target, key, item)
+            continue
+        else:
+            raise error_type("messages contain an unsupported value")
+        identity = id(item)
+        if identity in active:
+            raise error_type("messages must not contain recursive containers")
+        active.add(identity)
+        stack.append((nested, copied, identity, False))
+    return detached
+
+
+def _append_detached(target: Any, key: str | None, value: Any) -> None:
+    if isinstance(target, list):
+        target.append(value)
+    else:
+        target[key] = value
+
+
+def _message_items(value: Mapping[Any, Any]) -> Any:
+    for key in value:
+        yield key, value[key]
+
+
+def _message_values(value: list[Any] | tuple[Any, ...], error_type: ErrorType) -> Any:
+    try:
+        return iter(value)
+    except Exception as exc:
+        raise error_type("messages contain an unsupported value") from exc
 
 
 def has_image_blocks(messages: Any, *, sequence_types: type | tuple[type, ...]) -> bool:
@@ -113,7 +205,6 @@ def normalize_messages(
             normalized.append(dict(message))
             continue
         if content is None and role == "assistant" and "tool_calls" in message:
-            validate_tool_calls(message["tool_calls"], message_index, error_type=error_type)
             normalized.append(dict(message))
             continue
         if not isinstance(content, list):
@@ -133,19 +224,8 @@ def normalize_messages(
                 ),
             }
         )
+    validate_tool_history(normalized, error_type=error_type)
     return normalized, sources
-
-
-def validate_tool_calls(tool_calls: Any, message_index: int, *, error_type: ErrorType) -> None:
-    # validation stops at structure because template-specific requirements differ. an empty list
-    # leaves content null with nothing to render, so it is invalid for every template.
-    if not isinstance(tool_calls, list) or not tool_calls:
-        raise error_type(
-            f"message {message_index} tool_calls must be a nonempty list of call objects"
-        )
-    for call_index, call in enumerate(tool_calls):
-        if not isinstance(call, dict):
-            raise error_type(f"message {message_index} tool call {call_index} must be an object")
 
 
 def normalize_blocks(

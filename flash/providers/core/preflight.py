@@ -127,6 +127,13 @@ def require_operator_config() -> None:
     problems: list[str] = []
 
     configured = available_providers()
+    if "vast" in configured or "FLASH_VAST_RESULT_ORIGINS" in os.environ:
+        from flash.providers.vast.client.result import configured_result_origins
+
+        try:
+            configured_result_origins()
+        except ValueError as exc:
+            problems.append(f"  - {exc}")
     if not configured:
         problems.append(
             "  - no GPU provider is configured. Set at least ONE of:\n"

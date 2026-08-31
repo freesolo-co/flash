@@ -13,6 +13,11 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Added
 
+- OpenAI chat serving now implements and offline-validates strict function tool calling for the exact
+  Qwen3.5 packaged and hosted paths, including validated tool history, buffered and raw SSE
+  `tool_calls`, and managed forwarding. Flash parses schema-valid calls but does not execute them;
+  malformed automatic calls remain exact assistant text. Tool calling is not live-qualified pending
+  exact model testing.
 - OpenAI chat serving now preserves mirror sampling controls across packaged, hosted, and managed
   entry points: up to four indexed choices, signed seeds, frequency and presence penalties, and
   OpenAI token logprobs. Buffered and raw SSE responses retain independent choice terminals and

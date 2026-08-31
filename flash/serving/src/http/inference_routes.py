@@ -20,9 +20,11 @@ from flash.serve.request.openai import (
     OpenAIRequestError,
     parse_chat_request,
     reject_thinking_logprobs,
+    reject_tool_capability,
 )
 from flash.serving.src.accounting.usage import captured_now, new_request_identity
 from flash.serving.src.accounting.usage_outbox import UsageOutboxError
+from flash.serving.src.engine.model_config import tool_parser_for
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.io.multimodal import _prepare_generate_request
 from flash.serving.src.io.provenance import _checkpoint_provenance, _provenance_headers
@@ -152,6 +154,12 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
             effective_thinking = override
     try:
         reject_thinking_logprobs(thinking=effective_thinking, logprobs=normalized.logprobs)
+        reject_tool_capability(
+            tools=normalized.tools,
+            tool_choice=normalized.tool_choice,
+            thinking=effective_thinking,
+            tool_parser=tool_parser_for(target.base_model),
+        )
     except OpenAIRequestError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     generate_fields = openai_generate_fields(normalized, adapter_id)
