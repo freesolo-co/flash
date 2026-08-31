@@ -75,6 +75,58 @@ The packaged, hosted, and managed OpenAI entry points retain the shared strict s
 - `logprobs` is a strict boolean and `top_logprobs` is an integer from 0 through 20.
 - thinking-enabled adapters reject logprobs.
 
+Function tools are implemented and offline-validated only for the exact qualified Qwen3.5 packaged
+and hosted profile. This path is not live-qualified pending exact model testing. The parser identity
+is `qwen3_coder`; Qwen3.6 and unqualified engines reject tools after authorization and checkpoint
+resolution, before generation. Declarations must be closed function objects with unique nonempty
+names. Parameters use a bounded root-object JSON Schema profile with `properties`, `required`,
+`additionalProperties: false`, recursive scalar, object, and array types, descriptions, enums, and
+array `items`. Numeric enum members must be JSON integers; decimal and exponent numeric enum lexemes
+are rejected because Flash cannot preserve them exactly across every ingress and template boundary.
+Generated and historical JSON numeric literals support at most 1024 significand digits and exponent
+magnitude at most 1,000,000; generated candidates outside either bound remain exact text, while
+history outside either bound is rejected. A historical value within those bounds that no native
+template number carries faithfully, because it
+would overflow, underflow, or lose digits, is rendered as its exact compact text instead of being
+converted or rejected, and a container holding such a value is rendered exactly as a whole. A
+top-level boolean or null argument is likewise pre-rendered as `true`, `false`, or `null`, because the
+template spells a scalar with `string` and would otherwise show the model Python's `True` and `None`;
+inside a container those values stay native, since the template's `tojson` already spells them
+correctly. A response carries at most 408 tool calls, and a longer run of candidates stays exact text. That is
+the most any continuation could carry, not a promise that this batch replays. Replay cost depends on
+the follow-up request as a whole: the prior conversation shares the same message-complexity budget,
+and each result costs four nodes as a plain string, five with the optional `name`, and seven for a
+single text block plus three for each additional block. A long enough history leaves no room for
+even one call. Clients that intend to continue the tool lifecycle must therefore not assume any
+positive call count replays under every history: a follow-up that exceeds the budget is rejected
+with `messages exceed the supported complexity`. The budget counts structure rather than text, so
+the remedies are to send fewer messages or fewer content blocks, drop optional result `name` fields,
+use plain string results rather than text blocks, or request fewer calls; shortening the text inside
+a message does not help, because a string is one node however long it is. These local
+serving-contract bounds do not depend on Python's process-wide integer conversion limit. Unsupported
+keywords and `strict: true` are rejected.
+
+`tool_choice` defaults to `auto` and accepts only `auto` or `none`. `parallel_tool_calls` defaults to
+`true` and accepts only exact `true`; either control requires `tools`. Tools cannot be combined with
+thinking, logprobs, structured outputs, a non-text `response_format`, or image messages. Historical
+assistant calls require unique IDs, function type, valid names, and JSON-string object arguments.
+Each immediately following tool-result turn must resolve every declared call exactly once before a
+non-tool turn. External messages remain unchanged; only a detached template copy converts argument
+strings to objects.
+
+In `auto` mode, complete schema-valid Qwen3 Coder XML candidates become OpenAI `tool_calls` with
+independent call indexes and `finish_reason: "tool_calls"`. Parsed responses contain no raw Qwen
+tags. Ordinary text and malformed or incomplete candidates remain exact assistant text with the
+native finish reason. Candidate regions are buffered in raw SSE because argument deltas cannot be
+retracted safely. Native prompt, completion, cached, and reasoning token accounting remains
+authoritative and is never recomputed from serialized arguments. Flash parses calls but does not
+execute or resubmit them.
+
+The decoded convenience `chat_stream` iterator remains text-only and single-choice. It rejects
+`n != 1`, logprobs, and tools before opening transport; use buffered JSON or raw SSE for those
+features. Raw `/generate` and `/adapters/{id}/generate` remain tool-free. Buffered hosted responses
+and raw hosted SSE are authoritative; managed serving forwards them and never reparses tool calls.
+
 ## Public provenance
 
 Successful run-backed responses identify only the permanent checkpoint:

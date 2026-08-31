@@ -1153,6 +1153,7 @@ def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monk
         serving_chat,
         "effective_spec_from_status",
         lambda _status: SimpleNamespace(
+            model="Qwen/Qwen3.5-9B",
             train=SimpleNamespace(hf_repo="org/repo", stop_sequences=()),
             thinking=False,
         ),

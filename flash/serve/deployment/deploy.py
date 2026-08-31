@@ -589,6 +589,9 @@ def chat_sse(
     presence_penalty: float = 0.0,
     logprobs: bool = False,
     top_logprobs: int = 0,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
 ) -> transport.OpenAIStreamResponse:
     """open a raw openai stream while preserving status, headers, and sse bytes."""
 
@@ -613,6 +616,9 @@ def chat_sse(
         stop=stop,
         chat_template_kwargs=chat_template_kwargs,
         structured_outputs=structured_outputs,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
         stream_options=stream_options,
         frame_bytes=streaming_support._complete_sse_frames,
     )
@@ -633,9 +639,12 @@ def chat_stream(
     presence_penalty: float = 0.0,
     logprobs: bool = False,
     top_logprobs: int = 0,
+    tools: list[dict[str, Any]] | None = None,
 ) -> Iterator[str]:
     """yield one decoded choice while preserving eager open and cleanup semantics."""
 
+    if tools is not None:
+        raise ValueError("text-only chat_stream does not support tools")
     n = validate_choice_count(n)
     logprobs = validate_logprobs(logprobs)
     top_logprobs = validate_top_logprobs(top_logprobs)
@@ -695,6 +704,9 @@ def chat(
     presence_penalty: float = 0.0,
     logprobs: bool = False,
     top_logprobs: int = 0,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 
@@ -748,6 +760,9 @@ def chat(
         stop=stop,
         chat_template_kwargs=chat_template_kwargs,
         structured_outputs=structured_outputs,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
         timeout=timeout,
         before_raise=classify_unavailable,
         balance_payload=lambda payload, enabled: thinking_support._balance_thinking_payload(

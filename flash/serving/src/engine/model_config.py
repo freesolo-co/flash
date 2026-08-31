@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from flash.serve.request.tool_calls import qualified_tool_parser
 from flash.serving.src.engine.prequant_config import (
     fp8_serve_model_for as _prequant_serve_model_for,
 )
@@ -198,6 +199,13 @@ def engine_overrides_for(base_model: str) -> dict[str, Any]:
     if "serve_model_id" not in overrides:
         overrides["serve_model_id"] = serve_model_for(base_model)
     return overrides
+
+
+def tool_parser_for(base_model: str) -> str | None:
+    """return the qualified flash-owned output parser for one exact hosted base."""
+
+    _config_for(base_model)
+    return qualified_tool_parser(base_model)
 
 
 def reasoning_parser_for(base_model: str) -> str | None:
