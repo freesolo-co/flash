@@ -93,10 +93,11 @@ HOSTING_CACHE_MOUNT = "/vol/hosting-cache"
 # below — HF/internal key, backend + Supabase URLs — stays env-configured because it is per-deploy
 # credentials, not tuning.)
 TIMEOUT_SECONDS = 600
-# 2700s (45 min): the 35B bf16/H200 cold boot takes ~1010s of engine init alone (67 GiB load +
-# ~377s torch.compile + graph capture + warmup) on top of image pull, which blows past the old 1200s
-# ceiling — Modal SIGTERMs the container mid-warmup and it cold-cycles forever. A higher ceiling is
-# harmless for the fast tiers (they still boot in a minute; this is only a kill-if-stuck bound).
+# 2700s (45 min): the slowest MEASURED cold boot on the shipped B200 tiers is the 27B at 1821s
+# (a cold torch.compile cache alone costs ~354s of Dynamo), on top of image pull. The old 1200s
+# ceiling was already blown by the 35B's ~1010s of engine init — Modal SIGTERMs the container
+# mid-warmup and it cold-cycles forever. 2700s leaves ~880s of margin over the worst measurement,
+# and a higher ceiling is harmless for the fast tiers: this is only a kill-if-stuck bound.
 STARTUP_TIMEOUT_SECONDS = 2700
 # The router awaits the engine call, which on a cold base model includes vLLM startup, so its
 # timeout must cover startup + a request (else it's killed mid cold-start).
@@ -126,10 +127,14 @@ SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     # ~1010s cold boot (35B bf16, 67 GiB + ~377s torch.compile). Break-even AND a ~17-min
     # user-visible stall on a miss both argue for keeping the full window here.
     "H200": 1800,
-    # Blackwell. No cold-boot canary has run on either card yet, so both hold the H200's window as a
-    # placeholder: it is the longest we ship, and a too-long hold overpays for idle rather than
-    # cold-cycling a user request. Replace each with its measured boot time when the canary runs.
-    "B200": 1800,
+    # B200 now carries all three tiers. Measured cold boots (2026-08-30/31, this card): 9B 723s,
+    # 35B 488s, 27B 1821s. The 27B dominates because a cold torch.compile cache costs ~354s of
+    # Dynamo alone; warm-cache boots of the same tiers run 153-473s. Sized to the slowest MEASURED
+    # cold boot rather than the warm case, so a scale-out replacement is not cycled mid-boot.
+    "B200": 2100,
+    # B300 has no shipped tier. It also wedges intermittently serving above max_num_seqs (sm 10.3;
+    # B200 served 20/20 on the same workload), so it is not a deployment target yet -- the window
+    # stays a placeholder rather than a measurement.
     "B300": 1800,
 }
 # The tiers this app is allowed to run an engine on. `gpu` in the serving catalog is a plain string,
@@ -275,7 +280,7 @@ image = (
             # artifacts to VLLM_CACHE_ROOT/torch_compile_cache/<hash>/ (vllm/compilation/backends.py),
             # plus modelinfos/ and the GPU p2p cache. With MIN_CONTAINERS = 0 and a 30-minute
             # scaledown window that cost is paid on every cold start — it is the torch.compile +
-            # graph-capture portion of the ~1010s 35B engine init measured for STARTUP_TIMEOUT_SECONDS.
+            # graph-capture portion of the cold boots measured for STARTUP_TIMEOUT_SECONDS.
             # vLLM's own startup benchmark DEFINES a cold start this way (benchmarks/startup.py
             # cold_startup() points VLLM_CACHE_ROOT at a fresh mkdtemp), so leaving it unset on
             # ephemeral storage reproduces that worst case involuntarily.

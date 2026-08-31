@@ -163,8 +163,13 @@ def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app
     assert window_for("H200") == 1800
     # Every catalog tier resolves to a positive window, so no model falls back by accident.
     assert all(window_for(gpu_for(bm)) > 0 for bm in base_models())
-    # The Blackwell tiers hold the H200 window until a real cold-boot canary measures them.
-    assert window_for("B200") == window_for("B300") == 1800
+    # B200 now carries all three shipped tiers and its window is MEASURED, not inherited: the
+    # slowest cold boot on the card was the 27B at 1821s, so it holds longer than the H200 it
+    # replaced. B300 ships nothing and keeps the unmeasured placeholder.
+    assert window_for("B200") == 2100
+    assert window_for("B300") == 1800
+    # Every tier that actually serves holds at least as long as its slowest measured cold boot.
+    assert all(window_for(gpu_for(bm)) >= 2100 for bm in base_models())
 
 
 def test_unknown_gpu_tier_is_rejected_not_silently_defaulted(modal_app_module):
