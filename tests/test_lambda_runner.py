@@ -1394,7 +1394,7 @@ def test_submit_rejects_malformed_price_before_launch(monkeypatch, price):
     )
 
     with pytest.raises(MalformedProviderFieldError, match="price_cents_per_hour"):
-        _submit(jobs, _spec(), seed=0)
+        _submit(jobs, _spec())
 
     assert launched == []
 

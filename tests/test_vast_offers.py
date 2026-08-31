@@ -234,7 +234,7 @@ def test_submit_rejects_malformed_offer_before_create(monkeypatch, price):
     from flash.providers.core._decoding import MalformedProviderFieldError
 
     with pytest.raises(MalformedProviderFieldError, match="at least one well-formed row"):
-        vast.submit_run_vast(spec, seed=0, deadline_at=time.time() + 3600)
+        vast.submit_attempt_vast(spec, deadline_at=time.time() + 3600)
 
     assert created == []
 
