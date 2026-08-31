@@ -2001,7 +2001,7 @@ def _run_child_cudart_fix(tmp_path, extra_env=None):
     import subprocess
     import sys
 
-    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+    from flash.engine.worker.verl.install import _CHILD_CUDART_FIX
 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(tmp_path)
@@ -2089,7 +2089,7 @@ def test_child_cudart_neutralize_reports_unsafe_when_the_stub_is_left_shadowing(
     import os
     import sys
 
-    from flash.engine.worker.verl.capabilities import _neutralize_child_tilelang_cudart_stub
+    from flash.engine.worker.verl.install import _neutralize_child_tilelang_cudart_stub
 
     _fake_tilelang(tmp_path)
     # the script probes the real filesystem for a libcudart exporting cudaDeviceReset. an empty
@@ -2109,7 +2109,7 @@ def test_child_cudart_neutralize_reports_safe_when_there_is_no_tilelang(tmp_path
     """Nothing to shadow libcudart is a benign no-op, and must not withhold the stamp."""
     import sys
 
-    from flash.engine.worker.verl.capabilities import _neutralize_child_tilelang_cudart_stub
+    from flash.engine.worker.verl.install import _neutralize_child_tilelang_cudart_stub
 
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     monkeypatch.delenv("PYTHONHOME", raising=False)
@@ -2119,7 +2119,7 @@ def test_child_cudart_neutralize_reports_safe_when_there_is_no_tilelang(tmp_path
 
 def test_child_cudart_neutralize_reports_unsafe_when_the_interpreter_cannot_run(tmp_path):
     """An interpreter that never started did not repair anything either."""
-    from flash.engine.worker.verl.capabilities import _neutralize_child_tilelang_cudart_stub
+    from flash.engine.worker.verl.install import _neutralize_child_tilelang_cudart_stub
 
     assert _neutralize_child_tilelang_cudart_stub(str(tmp_path / "absent-python")) is False
 
@@ -2130,7 +2130,7 @@ def test_child_cudart_fix_does_not_import_flash():
     A `from flash...` import there raises ImportError, the repair never happens, and the child
     dies on vLLM import on a paid GPU -- the exact failure this fix exists to prevent.
     """
-    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+    from flash.engine.worker.verl.install import _CHILD_CUDART_FIX
 
     assert "import flash" not in _CHILD_CUDART_FIX
     assert "from flash" not in _CHILD_CUDART_FIX
@@ -2146,9 +2146,9 @@ def test_resolve_verl_python_repairs_a_venv_it_provisions():
     """
     import inspect
 
-    from flash.engine.worker.verl import capabilities
+    from flash.engine.worker.verl import install
 
-    src = inspect.getsource(capabilities.resolve_verl_python)
+    src = inspect.getsource(install.resolve_verl_python)
     assert "_neutralize_child_tilelang_cudart_stub(py)" in src, (
         "resolve_verl_python no longer repairs the venv it provisions, so vLLM can abort its "
         "import in the child after the gpu is already rented."
@@ -2217,7 +2217,7 @@ def test_worker_image_cudart_fix_is_extracted_not_duplicated():
     import sys
     import tempfile
 
-    from flash.engine.worker.verl.capabilities import _CHILD_CUDART_FIX
+    from flash.engine.worker.verl.install import _CHILD_CUDART_FIX
 
     root = pathlib.Path(__file__).resolve().parent.parent
     extractor = root / "docker" / "extract_cudart_fix.py"
@@ -2229,7 +2229,7 @@ def test_worker_image_cudart_fix_is_extracted_not_duplicated():
             [
                 sys.executable,
                 str(extractor),
-                str(root / "flash" / "engine" / "worker" / "verl" / "capabilities.py"),
+                str(root / "flash" / "engine" / "worker" / "verl" / "install.py"),
                 str(out),
             ],
             capture_output=True,

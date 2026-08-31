@@ -10,7 +10,6 @@ import math
 import os
 import shutil
 import time
-from dataclasses import dataclass
 from functools import reduce
 from math import gcd
 
@@ -21,154 +20,25 @@ import flash.engine.worker.model.adapter as _worker_adapter
 import flash.engine.worker.perf as _worker_perf
 import flash.engine.worker.runtime.rng as _worker_rng
 import flash.engine.worker.runtime.state as _worker_state
+import flash.engine.worker.train.sft.orchestration as _sft
 from flash.adapters.fused_experts import lora_target_parameters
 from flash.adapters.targets import resolve_lora_targeting
 from flash.core.catalog import get_model
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
 from flash.engine.support.verl_policy import _resolve_fsdp_generation
 from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
-from flash.engine.worker.train.entry import sft_train as _sft_train
+from flash.engine.worker.train.sft.orchestration import (
+    _SftCapabilities,
+    _SftChild,
+    _SftData,
+    _SftModelSetup,
+    _SftOptions,
+    _SftPaths,
+    _SftProgress,
+    _SftVerified,
+)
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 from flash.providers.core.base import rentable_gpu_counts
-
-RECIPE = _sft_train.RECIPE
-_MAX_ZERO_GRAD_STEPS = _sft_train._MAX_ZERO_GRAD_STEPS
-_SFT_LORAPLUS_RATIO = _sft_train._SFT_LORAPLUS_RATIO
-_LORAPLUS_READY_MARKER = _sft_train._LORAPLUS_READY_MARKER
-_VERL_OPTIMIZER_IMPL = _sft_train._VERL_OPTIMIZER_IMPL
-_VERL_OPTIMIZER_NAME = _sft_train._VERL_OPTIMIZER_NAME
-build_sft_overrides = _sft_train.build_sft_overrides
-# taken from the parent like every other name here, so the runner and `sft_train`'s own
-# `sft_data_loading`/`sft_configuring` wraps use one object rather than two imports of it.
-liveness_heartbeat = _sft_train.liveness_heartbeat
-render_sitecustomize_bootstrap = _sft_train.render_sitecustomize_bootstrap
-shim_marker_file = _sft_train.shim_marker_file
-verify_applied_shim_markers = _sft_train.verify_applied_shim_markers
-SHIM_FRAGMENT_FAILED_EXIT_CODE = _sft_train.SHIM_FRAGMENT_FAILED_EXIT_CODE
-sft_tokens_for_updates = _sft_train.sft_tokens_for_updates
-sft_under_ran = _sft_train.sft_under_ran
-validate_save_steps = _sft_train.validate_save_steps
-_render_sft_dataset_module = _sft_train._render_sft_dataset_module
-
-
-@dataclass(frozen=True)
-class _SftPaths:
-    workdir: str
-    data_dir: str
-    image_dir: str
-    local_dir: str
-    export_root: str
-
-
-@dataclass(frozen=True)
-class _SftOptions:
-    spec: object
-    env: object
-    started_at: float
-    gpu_probe: dict
-    model_id: str
-    model_revision: str
-    epochs: int
-    learning_rate: float
-    effective_batch: int
-    max_steps: int
-    save_at_steps: tuple[int, ...]
-    save_every: int
-    gpu_count: int
-    paths: _SftPaths
-
-
-@dataclass(frozen=True)
-class _SftData:
-    rows: list[dict]
-    multimodal: bool
-    processor: object | None
-    profile: object
-    max_length: int
-    realized_max_length: int
-    train_file: str
-
-
-@dataclass(frozen=True)
-class _SftModelSetup:
-    download_seconds: float
-    setup_seconds: float
-    lora_rank: int
-    lora_alpha: int
-    target_modules: object
-    exclude_modules: str | None
-    warmstart_adapter: str | None
-    fused_ce: bool
-    train_batch_size: int
-    micro_batch: int
-    update_horizon: int
-    loop_epochs: int
-    save_freq: int
-    gradient_checkpointing: bool
-    reentrant_gradient_checkpointing: bool
-
-
-@dataclass(frozen=True)
-class _SftCapabilities:
-    python_bin: str
-    caps: dict
-    gdn_hybrid: bool
-    gdn_module: str
-
-
-@dataclass(frozen=True)
-class _SftChild:
-    python_bin: str
-    loggers: list[str]
-    project_name: str
-    experiment_name: str
-    gdn_reset_arch: str | None
-    gdn_hybrid: bool
-    resume_step: int
-    watcher: object
-    child_env: dict[str, str]
-    command: list[str]
-    # ranks actually launched, which is the allocated card count only when the batch divides by it.
-    # reported so a reader comparing realized step time against the quote sees the executed width.
-    world_size: int
-    # the micro-batch verl RAN, which is `model.micro_batch` capped to one rank's share of the batch.
-    # carried because the result file reports it: recording the uncapped request would tell a reader
-    # reconstructing the token budget that each rank held twice the rows it did.
-    micro_batch: int
-    shim_markers: str
-    expected_shims: tuple[str, ...]
-
-
-@dataclass
-class _SftProgress:
-    values: dict[str, float | int | None]
-    zero_grad_steps: list[int]
-    observed_grad_norms: list[float]
-    loss_curve: list[float]
-    train_tokens: int
-    loraplus_applied: bool
-    wandb_link: dict[str, str | None]
-    # what the child plugin must prove applied; verified at the first optimizer step and again at
-    # child exit.
-    shim_markers: str = ""
-    expected_shims: tuple[str, ...] = ()
-    shims_verified: bool = False
-
-
-@dataclass(frozen=True)
-class _SftVerified:
-    actor_dir: str
-    final_step: int
-    train_tokens: int
-
-
-@dataclass(frozen=True)
-class _SftOutputs:
-    """What the paid child produced: where the adapter landed and what it cost to get there."""
-
-    adapter_dir: str
-    train_wall: float
-    device_peak_gpu_gb: float
 
 
 def _resolve_sft_options(spec) -> _SftOptions:
@@ -177,14 +47,14 @@ def _resolve_sft_options(spec) -> _SftOptions:
     # the child trainer is seeded through its shim, but the environment's dataset/completion calls
     # run HERE in the parent. without this the documented top-level seed no longer reproduces sft
     # targets for any env whose row construction uses python/numpy randomness.
-    _sft_train.seed_training_rngs(_worker_state.SEED)
+    _sft.seed_training_rngs(_worker_state.SEED)
     started_at = time.time()
     _worker_heartbeat.heartbeat("sft_start", gpu=_worker_perf.gpu_diagnostics(include_torch=False))
-    gpu_probe = _sft_train._probe_gpu_in_subprocess(
+    gpu_probe = _sft._probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
     )
-    model_id = spec.model if spec else RECIPE.hf_model_id
+    model_id = spec.model if spec else _sft.RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
     train_spec = spec.train if spec else None
 
@@ -213,9 +83,9 @@ def _resolve_sft_options(spec) -> _SftOptions:
         gpu_probe=gpu_probe,
         model_id=model_id,
         model_revision=model_revision,
-        epochs=int(train_opt("epochs", RECIPE.sft.num_epochs)),
-        learning_rate=float(train_opt("learning_rate", RECIPE.sft.learning_rate)),
-        effective_batch=int(train_opt("batch_size", RECIPE.sft.effective_batch)),
+        epochs=int(train_opt("epochs", _sft.RECIPE.sft.num_epochs)),
+        learning_rate=float(train_opt("learning_rate", _sft.RECIPE.sft.learning_rate)),
+        effective_batch=int(train_opt("batch_size", _sft.RECIPE.sft.effective_batch)),
         max_steps=int(train_opt("max_steps", 0) or 0),
         save_at_steps=tuple(getattr(train_spec, "save_at_steps", ()) or ()),
         save_every=int(train_opt("save_every", 50)),
@@ -231,7 +101,7 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
     # source snapshot off PYTHONPATH with no flash distribution installed, so a locally derived
     # version is the "0+unknown" fallback and would reject every profile the plane ever froze.
     producer_version = options.spec.workload_profile_producer_version
-    prepared_workload = _sft_train.prepare_sft_workload(
+    prepared_workload = _sft.prepare_sft_workload(
         options.spec,
         options.env,
         tokenizer_loader=lambda candidate, revision: _worker_hf.load_tokenizer(
@@ -270,7 +140,7 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
             "training continues on the environment-produced rows, and the accepted quote is unchanged"
         )
     profile = expected_profile
-    max_length = _sft_train._sft_profile_max_length(realized_profile)
+    max_length = _sft._sft_profile_max_length(realized_profile)
     dropped = realized_profile.dropped_examples
     selected_count = realized_profile.selected_examples
     retained_count = realized_profile.retained_examples
@@ -325,7 +195,7 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
         f"({masked_tokens / total_tokens_per_epoch:.0%}) prompt tokens"
     )
     train_file = os.path.join(options.paths.data_dir, "train.parquet")
-    _sft_train._write_sft_parquet(rows, train_file)
+    _sft._write_sft_parquet(rows, train_file)
     return _SftData(
         rows=rows,
         multimodal=prepared_workload.multimodal,
@@ -353,7 +223,7 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     # one-shot above, so `runs status` freezes on sft_model_load for the whole span and a healthy
     # cold cache is indistinguishable from a dead worker -- the exact ambiguity the stage was added
     # to resolve. same stage name, so the provider's setup-grace classification is unchanged.
-    with liveness_heartbeat("sft_model_load"):
+    with _sft.liveness_heartbeat("sft_model_load"):
         lora_config = _worker_adapter.make_lora(options.model_id)
         targeting = resolve_lora_targeting(
             options.model_id, algorithm="sft", multimodal=data.multimodal
@@ -362,23 +232,21 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
         target_modules = targeting.target_modules
         if isinstance(target_modules, set | frozenset):
             target_modules = sorted(target_modules)
-        warmstart_adapter = _sft_train._warmstart_adapter_path(
+        warmstart_adapter = _sft._warmstart_adapter_path(
             options.model_id,
             options.model_revision,
             lora_rank,
             int(lora_config.lora_alpha),
             targeting,
         )
-        vocab_size = _sft_train._resolve_sft_vocab_size(options.model_id, options.model_revision)
+        vocab_size = _sft._resolve_sft_vocab_size(options.model_id, options.model_revision)
         # hoisted into the span: on a PINNED revision this falls through to a live AutoConfig read
         # with no local_files_only, so it is the same cold-mount/hub stall as the reads above. it
         # only needs the model id, and everything between here and its old call site is arithmetic
         # on already-resolved values, so moving it up changes ordering but not results.
-        hidden, layers = _sft_train._model_arch_dims(
-            options.model_id, revision=options.model_revision
-        )
+        hidden, layers = _sft._model_arch_dims(options.model_id, revision=options.model_revision)
     fused_ce = sft_chunked_nll_enabled(options.model_id)
-    per_device_batch, _ = _sft_train._resolve_sft_grad_accum(
+    per_device_batch, _ = _sft._resolve_sft_grad_accum(
         options.effective_batch,
         seq_len=data.realized_max_length,
         vocab=vocab_size,
@@ -388,7 +256,7 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     micro_batch = max(1, min(per_device_batch, train_batch_size))
     steps_per_epoch = max(1, math.ceil(len(data.rows) / train_batch_size))
     update_horizon = data.profile.authoritative_steps
-    validate_save_steps(options.save_at_steps, update_horizon)
+    _sft.validate_save_steps(options.save_at_steps, update_horizon)
     loop_epochs = max(options.epochs, math.ceil(update_horizon / steps_per_epoch))
     save_freq = (
         reduce(gcd, options.save_at_steps)
@@ -401,7 +269,7 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     capability = tuple(raw_capability) if raw_capability else None
     info = MODELS.get(options.model_id)
     active_params_b = float(getattr(info, "active_params_b", 0.0) or 0.0) or None
-    gradient_checkpointing = _sft_train._resolve_sft_gradient_checkpointing(
+    gradient_checkpointing = _sft._resolve_sft_gradient_checkpointing(
         options.model_id,
         data.realized_max_length,
         allow_disable=True,
@@ -417,7 +285,7 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     )
     reentrant_gradient_checkpointing = bool(
         gradient_checkpointing
-        and _sft_train._resolve_sft_reentrant_gradient_checkpointing(options.model_id)
+        and _sft._resolve_sft_reentrant_gradient_checkpointing(options.model_id)
     )
     return _SftModelSetup(
         download_seconds=download_seconds,
@@ -549,7 +417,7 @@ def _resolve_sft_run_identity(
 ) -> tuple[list[str], str, str]:
     """The child's ``(loggers, project_name, experiment_name)``."""
     # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
-    loggers = _sft_train.resolve_verl_loggers(capabilities.caps)
+    loggers = _sft.resolve_verl_loggers(capabilities.caps)
     project_name = (
         options.spec.wandb.project if options.spec and options.spec.wandb else None
     ) or "flash"
@@ -570,7 +438,7 @@ def _write_sft_child_shims(
     """write the SFT plugin bundle, startup bootstrap, and non-secret plugin config."""
     # the bundle paths below are relative to flash/engine/worker/; this module now lives in
     # worker/train/entry/, so climb back out of train/entry rather than anchoring here.
-    parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(_sft_train.__file__)))
+    parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     copies = (
         ("train/core/child/runtime.py", "flash_verl_runtime.py"),
         ("train/sft/child/plugin.py", "flash_sft_plugin.py"),
@@ -578,18 +446,18 @@ def _write_sft_child_shims(
     )
     for source, target in copies:
         shutil.copy2(os.path.join(parent_dir, *source.split("/")), os.path.join(shim_dir, target))
-    shim_markers = shim_marker_file(shim_dir)
+    shim_markers = _sft.shim_marker_file(shim_dir)
     with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(render_sitecustomize_bootstrap())
+        file.write(_sft.render_sitecustomize_bootstrap())
     with open(custom_dataset_path, "w", encoding="utf-8") as file:
-        file.write(_render_sft_dataset_module())
+        file.write(_sft._render_sft_dataset_module())
     text_only = bool(getattr(model, "exclude_modules", None))
     plugin_config = json.dumps(
         {
             "marker_file": shim_markers,
             "seed": int(seed),
-            "loraplus_ratio": float(_SFT_LORAPLUS_RATIO),
-            "loraplus_ready_marker": _LORAPLUS_READY_MARKER,
+            "loraplus_ratio": float(_sft._SFT_LORAPLUS_RATIO),
+            "loraplus_ready_marker": _sft._LORAPLUS_READY_MARKER,
             "save_at_steps": list(options.save_at_steps),
             "total_steps": int(model.update_horizon),
             "reentrant_gradient_checkpointing": bool(model.reentrant_gradient_checkpointing),
@@ -619,7 +487,7 @@ def _prepare_sft_child(
     use_remove_padding: bool,
     gdn_reset_arch: str | None,
 ) -> _SftChild:
-    model_path = _sft_train._cached_model_path(options.model_id, options.model_revision)
+    model_path = _sft._cached_model_path(options.model_id, options.model_revision)
     loggers, project_name, experiment_name = _resolve_sft_run_identity(options, capabilities)
     shim_dir = os.path.join(options.paths.workdir, "shim")
     os.makedirs(shim_dir, exist_ok=True)
@@ -651,9 +519,9 @@ def _prepare_sft_child(
         "lora_adapter_path": model.warmstart_adapter,
         "ulysses_sp_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
         "lr": options.learning_rate,
-        "warmup_ratio": RECIPE.sft.warmup_frac,
-        "optimizer_impl": _VERL_OPTIMIZER_IMPL,
-        "optimizer_name": _VERL_OPTIMIZER_NAME,
+        "warmup_ratio": _sft.RECIPE.sft.warmup_frac,
+        "optimizer_impl": _sft._VERL_OPTIMIZER_IMPL,
+        "optimizer_name": _sft._VERL_OPTIMIZER_NAME,
         "optimizer_kwargs": None,
         "local_dir": options.paths.local_dir,
         "save_freq": model.save_freq,
@@ -666,22 +534,22 @@ def _prepare_sft_child(
         # liger produces a 0.0 lora grad norm under fsdp2 + peft + gradient checkpointing, versus
         # 7.02 off in a matched qwen3.5-9b test. fused linear ce remains provided by
         # use_fused_kernels with the impl_backend resolved below.
-        **_sft_train._sft_liger_config(),
+        **_sft._sft_liger_config(),
         "gradient_checkpointing": model.gradient_checkpointing
         and not model.reentrant_gradient_checkpointing,
         # the accepted quote's step count binds whether or not the user authored max_steps. the
         # plane profiles raw records without running environment.py, so an environment that expands
         # or replaces rows makes steps_per_epoch larger than the quote assumed; without an explicit
         # cap the loop would run a full realized epoch past the horizon the run was priced and
-        # wall-budgeted for. build_sft_overrides rejects setting both, so the horizon replaces the
+        # wall-budgeted for. _sft.build_sft_overrides rejects setting both, so the horizon replaces the
         # epoch count rather than joining it -- loop_epochs already covers the authored epochs.
         "total_training_steps": model.update_horizon,
         "total_epochs": None,
         "use_remove_padding": use_remove_padding,
         # resolved from the out-of-process capability probe, never by opening cuda in this parent.
-        "fused_ce_backend": _sft_train._resolve_sft_fused_ce_backend(capabilities.caps),
+        "fused_ce_backend": _sft._resolve_sft_fused_ce_backend(capabilities.caps),
     }
-    overrides = build_sft_overrides(config)
+    overrides = _sft.build_sft_overrides(config)
     shim_markers, expected_shims, plugin_config = _write_sft_child_shims(
         options,
         model,
@@ -698,12 +566,12 @@ def _prepare_sft_child(
     # shards by data and the width is bounded by the batch and the row count, so the two differ
     # whenever either fails to divide the allocation -- passing gpu_count here would discard a
     # checkpoint that matches the run about to start, and keep one that does not.
-    resume_step = _sft_train._restore_verl_resume(
+    resume_step = _sft._restore_verl_resume(
         options.paths.local_dir,
         world_size=world_size,
         expected_fsdp_generation=fsdp_generation,
     )
-    watcher = _sft_train._VerlCheckpointWatcher(
+    watcher = _sft._VerlCheckpointWatcher(
         local_dir=options.paths.local_dir,
         export_root=options.paths.export_root,
         python_bin=capabilities.python_bin,
@@ -716,12 +584,12 @@ def _prepare_sft_child(
     # the staged resume checkpoint is already a pending global_step_N on disk, so an unseeded
     # watcher re-merges it and re-uploads full state hf already has, holding the resume-upload
     # lock while the first genuinely new checkpoint waits behind it.
-    _sft_train._seed_resume_lifecycle(watcher, options.save_at_steps, resume_step)
+    _sft._seed_resume_lifecycle(watcher, options.save_at_steps, resume_step)
     if resume_step >= model.update_horizon:
         missing = watcher.lifecycle.missing_deployables(watcher.required_steps)
         if missing:
             raise RuntimeError(f"required saves were not durably published: {missing}")
-    child_env = _sft_train._build_verl_child_env(
+    child_env = _sft._build_verl_child_env(
         shim_dir=shim_dir,
         wandb_enabled="wandb" in loggers,
     )
@@ -766,11 +634,11 @@ def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, child: _SftChil
     zero_grad_steps: list[int] = []
     # every grad_norm this session observed, so a horizon too short to trip the consecutive-run
     # guard above can still be rejected at the end. a one-update run appends exactly one zero and
-    # never reaches _MAX_ZERO_GRAD_STEPS, which shipped the GRAD-001 failure the guard exists to
+    # never reaches _sft._MAX_ZERO_GRAD_STEPS, which shipped the GRAD-001 failure the guard exists to
     # stop: done, billed, and an adapter identical to the base weights.
     observed_grad_norms: list[float] = []
     train_tokens = (
-        sft_tokens_for_updates(
+        _sft.sft_tokens_for_updates(
             data.rows,
             examples_per_update=model.train_batch_size,
             updates=resume_step,
@@ -818,7 +686,7 @@ class _SftProgressCallbacks:
 
 
 def _invoke_sft_child(child: _SftChild, callbacks: _SftProgressCallbacks, on_line) -> int:
-    return _sft_train.run_verl_training(
+    return _sft.run_verl_training(
         child.command,
         env=child.child_env,
         on_step=callbacks.on_step,
@@ -834,19 +702,19 @@ def _consume_sft_marker_line(progress: _SftProgress, line: str) -> bool:
     asserts the lora+ shim landed before the first step, because a run that reaches an optimizer
     update without it is training plain lora at the lora+ learning rate.
     """
-    if _LORAPLUS_READY_MARKER in line:
+    if _sft._LORAPLUS_READY_MARKER in line:
         progress.loraplus_applied = True
-    link = _sft_train.parse_wandb_link(line)
+    link = _sft.parse_wandb_link(line)
     if link is not None:
         progress.wandb_link.update(link)
-    if _sft_train.verl_step_number(line) is None:
+    if _sft.verl_step_number(line) is None:
         return False
     # the marker set first: a skipped sitecustomize also loses the lora+ shim, and "no fragment
     # ran at all" is the root cause worth reporting over its lora+ symptom.
     if progress.expected_shims and not progress.shims_verified:
-        verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
+        _sft.verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
         progress.shims_verified = True
-    if _SFT_LORAPLUS_RATIO > 1 and not progress.loraplus_applied:
+    if _sft._SFT_LORAPLUS_RATIO > 1 and not progress.loraplus_applied:
         raise RuntimeError(
             "verl reached an optimizer step before the required lora+ shim succeeded"
         )
@@ -861,7 +729,7 @@ def _record_sft_step_metrics(
 ) -> None:
     """Fold one step's parsed metrics into the progress carrier, raising on a dead gradient.
 
-    Parsing stays in the caller's closure: `tests/test_sft_train.py` pins the three
+    Parsing stays in the caller's closure: `tests/test_sft.py` pins the three
     `parse_verl_metric` calls to `on_line` itself, and reads the values it hands over here.
     """
     values = progress.values
@@ -878,7 +746,7 @@ def _record_sft_step_metrics(
         # p.grad before optimizer.step() and scheduler advance, so lr cannot make the gradient zero.
         if grad_norm == 0.0:
             progress.zero_grad_steps.append(int(values["step"] or 0))
-            if len(progress.zero_grad_steps) >= _MAX_ZERO_GRAD_STEPS:
+            if len(progress.zero_grad_steps) >= _sft._MAX_ZERO_GRAD_STEPS:
                 raise RuntimeError(
                     "verl reported train/grad_norm=0.0 on "
                     f"{len(progress.zero_grad_steps)} steps: no gradient is reaching the "
@@ -898,7 +766,7 @@ def _finish_sft_child(
 ) -> tuple[float, float]:
     train_wall = time.time() - train_started_at
     device_peak_gpu_gb = gpu_sampler.stop_gb()
-    if return_code == SHIM_FRAGMENT_FAILED_EXIT_CODE:
+    if return_code == _sft.SHIM_FRAGMENT_FAILED_EXIT_CODE:
         # permanent, not retriable infra: the same interpreter fails the same fragment on retry.
         raise RuntimeError(
             f"verl SFT subprocess exited {return_code}: a required flash runtime patch failed to "
@@ -912,9 +780,9 @@ def _finish_sft_child(
     # step lines the parent never parsed. shims_verified starts True when the child is not
     # launched at all (resume already at the horizon), exactly like loraplus_applied above.
     if progress.expected_shims and not progress.shims_verified:
-        verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
+        _sft.verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
         progress.shims_verified = True
-    if _SFT_LORAPLUS_RATIO > 1 and not progress.loraplus_applied:
+    if _sft._SFT_LORAPLUS_RATIO > 1 and not progress.loraplus_applied:
         raise RuntimeError("required lora+ shim did not emit its success marker")
     return train_wall, device_peak_gpu_gb
 
@@ -926,8 +794,8 @@ def _verify_sft_run(
     progress: _SftProgress,
     resume_step: int,
 ) -> _SftVerified:
-    actor_dir, final_step = _sft_train.latest_global_step_dir(options.paths.local_dir)
-    if sft_under_ran(final_step, model.update_horizon):
+    actor_dir, final_step = _sft.latest_global_step_dir(options.paths.local_dir)
+    if _sft.sft_under_ran(final_step, model.update_horizon):
         raise RuntimeError(
             f"sft completed {final_step}/{model.update_horizon} requested optimizer updates"
         )
@@ -940,7 +808,7 @@ def _verify_sft_run(
             f"{len(progress.observed_grad_norms)} observed optimizer updates: no gradient is reaching "
             "the lora parameters, so this run would train nothing. see GRAD-001"
         )
-    train_tokens = sft_tokens_for_updates(
+    train_tokens = _sft.sft_tokens_for_updates(
         data.rows,
         examples_per_update=model.train_batch_size,
         updates=final_step,

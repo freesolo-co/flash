@@ -115,7 +115,7 @@ def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
 
 def _run_merger(cmd: list[str], env: dict[str, str]) -> None:
     """stream merger output and prefer direct disk evidence over a short-write marker."""
-    from flash.engine.worker.train.entry import backend_common
+    from flash.engine.worker.verl import process
 
     disk_line = ""
     short_write_line = ""
@@ -130,7 +130,7 @@ def _run_merger(cmd: list[str], env: dict[str, str]) -> None:
             short_write_line = line.strip()
 
     merger_env = {**env, "PYTHONUNBUFFERED": "1"}
-    return_code = backend_common._run_streaming_verl_subprocess(
+    return_code = process._run_streaming_verl_subprocess(
         cmd, env=merger_env, on_line=handle_line, errors="replace"
     )
     if return_code != 0:

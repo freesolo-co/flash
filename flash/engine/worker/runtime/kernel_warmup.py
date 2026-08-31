@@ -17,11 +17,11 @@ MEGA_CACHE_FILENAME = "mega_cache.bin"
 MEGA_CACHE_META_FILENAME = "mega_cache.json"
 
 # every env var that addresses the baked kernel cache, mapped to its subdirectory of the cache root.
-# Dockerfile.worker sets these image-wide to the same layout; this module re-forces them so a stale
+# dockerfile.worker sets these image-wide to the same layout; this module re-forces them so a stale
 # image or a prior run cannot defeat the redirect. it is also the allowlist the verl child inherits
-# (see sft_train._CHILD_ENV_EXACT) -- the child is the interpreter that actually trains, so a cache
-# only the parent can see is no cache at all. one definition, so a var added here cannot be added
-# without the child getting it too.
+# (see flash.engine.worker.train.sft.orchestration._CHILD_ENV_EXACT). the child is the interpreter
+# that actually trains, so a cache only the parent can see is no cache at all. one definition means
+# a var cannot be added here without the child getting it too.
 KERNEL_CACHE_ENV_SUBDIRS = {
     "TRITON_CACHE_DIR": "triton",
     "TORCHINDUCTOR_CACHE_DIR": "inductor",

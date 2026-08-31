@@ -17,30 +17,16 @@ import time
 import flash.engine.worker.io.hf as _worker_hf
 from flash.engine.worker.io.heartbeat import join_while_draining
 from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
-from flash.engine.worker.train.entry.backend_common import (
-    completed_checkpoint_step,
-    export_peft_adapter,
-    resolve_checkpoint_actor_dir,
-    stamp_adapter_dir_provenance,
-    undiscovered_checkpoint_dirs,
-)
 from flash.engine.worker.verl.checkpoints import (
     MergeDiskExhaustedError,
     MergeDiskHeadroomError,
+    completed_checkpoint_step,
+    export_peft_adapter,
+    resolve_checkpoint_actor_dir,
     resume_upload_unavailable,
+    stamp_adapter_dir_provenance,
+    undiscovered_checkpoint_dirs,
 )
-
-
-def _sft_train():
-    """The trainer module, imported lazily because it imports this one.
-
-    The watcher's export step is patched as `sft_train._export_checkpoint_adapter` by the sft tests,
-    so `_publish` has to resolve it through that module rather than as a global here -- a direct
-    call would bind this module's own function and run the real exporter under the patch.
-    """
-    from flash.engine.worker.train.entry import sft_train
-
-    return sft_train
 
 
 def _copy_processing_sidecars(actor_dir: str, adapter_dir: str) -> None:
@@ -270,7 +256,7 @@ class _VerlCheckpointWatcher:
         # the rl uploader republishes from its staged adapters on subsequent sweeps, and the opd
         # watcher hands `adapter_dir` to `_stage_retry_contract`. sft is done with it inside this call.
         try:
-            _sft_train()._export_checkpoint_adapter(
+            _export_checkpoint_adapter(
                 actor_dir,
                 adapter_dir,
                 model_id=self.model_id,

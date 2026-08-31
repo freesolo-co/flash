@@ -10,7 +10,6 @@ import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
 from flash.engine.worker.io import heartbeat
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
 from flash.engine.worker.teacher.client import TeacherClient
-from flash.engine.worker.train.entry import backend_common
 from flash.engine.worker.verl import diagnostics
 from flash.engine.worker.verl.parent_work import ParentWorkGauge
 
@@ -214,7 +213,9 @@ def test_teacher_score_many_calls_completion_callback_per_result():
 
 
 def test_authoritative_tail_classification_precedes_generic_silence():
-    backend_source = inspect.getsource(backend_common.run_verl_training)
+    from flash.engine.worker.verl import process
+
+    backend_source = inspect.getsource(process.run_verl_training)
     assert backend_source.index("raise_for_classified_verl_exit") < backend_source.index(
         "silence_watchdog.raise_if_failed"
     )
