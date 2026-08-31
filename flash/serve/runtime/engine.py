@@ -15,7 +15,6 @@ from flash.serve.request.runtime_support import reasoning_compatibility_guard
 from flash.serve.request.tool_calls import tools_active
 
 from .adapters import AdapterBinding, AdapterManager
-from .cancellation import GenerationOwner
 from .errors import (
     EngineDeadError,
     PromptError,
@@ -46,6 +45,89 @@ from .types import (
 )
 
 EngineDeathCallback = Callable[[RuntimeHealth], Awaitable[None] | None]
+_ABORT_TIMEOUT_SECONDS = 1.0
+_DRAIN_TIMEOUT_SECONDS = 1.0
+
+
+class _GenerationOwner:
+    def __init__(
+        self,
+        engine: Any,
+        request_id: str,
+        fatal: Callable[[str, str], Awaitable[None]],
+        detach: Callable[[asyncio.Future[Any]], None],
+    ) -> None:
+        self.request_id = request_id
+        self._engine = engine
+        self._fatal = fatal
+        self._detach = detach
+        self._active: set[asyncio.Future[Any]] = set()
+        self._cancel_lock = asyncio.Lock()
+        self._cancel_task: asyncio.Task[None] | None = None
+
+    async def wait(self, awaitable: Awaitable[Any]) -> Any:
+        task = asyncio.ensure_future(awaitable)
+        self._active.add(task)
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                self._active.discard(task)
+
+    async def cancel(self, stream: AsyncIterator[Any] | None, prompt: PreparedPrompt) -> None:
+        async with self._cancel_lock:
+            if self._cancel_task is None:
+                self._cancel_task = asyncio.create_task(self._cancel(stream, prompt))
+            task = self._cancel_task
+        await asyncio.shield(task)
+
+    async def _cancel(self, stream: AsyncIterator[Any] | None, prompt: PreparedPrompt) -> None:
+        abort_confirmed = await self._abort_once()
+        settlement = asyncio.create_task(self._settle(stream, prompt))
+        try:
+            await asyncio.wait_for(asyncio.shield(settlement), timeout=_DRAIN_TIMEOUT_SECONDS)
+        except TimeoutError:
+            self._detach(settlement)
+            reason = "generation cancellation did not settle"
+        else:
+            reason = None if abort_confirmed else "vllm abort could not be confirmed"
+        if reason is not None:
+            await self._fatal(self.request_id, reason)
+
+    async def _abort_once(self) -> bool:
+        abort = getattr(self._engine, "abort", None)
+        if abort is None:
+            return False
+        try:
+            result = abort(self.request_id)
+        except Exception:
+            return False
+        if not inspect.isawaitable(result):
+            return result is not False
+        task = asyncio.ensure_future(result)
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=_ABORT_TIMEOUT_SECONDS)
+        except TimeoutError:
+            self._detach(task)
+            return False
+        except Exception:
+            return False
+        return result is not False
+
+    async def _settle(self, stream: AsyncIterator[Any] | None, prompt: PreparedPrompt) -> None:
+        try:
+            if self._active:
+                await asyncio.gather(*tuple(self._active), return_exceptions=True)
+                self._active.clear()
+            if stream is not None:
+                with suppress(BaseException):
+                    async for _ in stream:
+                        pass
+                with suppress(BaseException):
+                    await VllmLoraRuntime._close_output_stream(stream)
+        finally:
+            with suppress(Exception):
+                prompt.close()
 
 
 @dataclass(slots=True)
@@ -299,8 +381,6 @@ class VllmLoraRuntime:
         self._death_notification_lock = asyncio.Lock()
         self._death_notified = False
         self._unhealthy_reason: str | None = None
-        self._owned_request_ids: set[str] = set()
-        self._unconfirmed_request_ids: set[str] = set()
         self._detached_tasks: set[asyncio.Future[Any]] = set()
         self._closed = False
 
@@ -334,12 +414,11 @@ class VllmLoraRuntime:
     async def generate(self, request: GenerationRequest) -> GenerationResult:
         """run one non-streaming generation with final-only vllm output."""
         await self._ensure_started()
-        owner = self._generation_owner(request.request_id)
+        request_id = uuid.uuid4().hex
+        owner = self._generation_owner(request_id)
         prompt: PreparedPrompt | None = None
-        cancelled = False
-        dispatched = False
-        released = False
         output_stream: AsyncIterator[Any] | None = None
+        lifecycle = "not_dispatched"
         try:
             async with self._binding(request) as binding:
                 adapter = binding.spec if binding is not None else None
@@ -353,37 +432,28 @@ class VllmLoraRuntime:
                 sampling = self._sampling_params(request, structured, streaming=False)
                 prompt = await self._prepare_prompt(request, thinking)
                 final_output = None
+                output_stream = self._generate_stream(
+                    prompt,
+                    sampling,
+                    request_id,
+                    lora_request,
+                    structured,
+                )
+                lifecycle = "active"
                 try:
-                    output_stream = self._generate_stream(
-                        prompt,
-                        sampling,
-                        request.request_id,
-                        lora_request,
-                        structured,
-                    )
-                    dispatched = True
                     async with _rejection_as_prompt_error():
                         while True:
                             try:
                                 final_output = await owner.wait(anext(output_stream))
                             except StopAsyncIteration:
-                                released = True
                                 break
-                except asyncio.CancelledError:
-                    cancelled = True
-                    released = await self._cancel_generation(owner, output_stream)
-                    raise
                 except Exception:
                     await self._notify_if_dead()
+                    await self._close_generation_resources(output_stream, prompt, owner=owner)
+                    lifecycle = "finished"
                     raise
-                finally:
-                    if not cancelled:
-                        try:
-                            await self._close_generation_resources(output_stream, prompt)
-                        finally:
-                            released = True
-                    elif released:
-                        await self._close_generation_resources(None, prompt)
+                await self._close_generation_resources(output_stream, prompt, owner=owner)
+                lifecycle = "finished"
             if final_output is None:
                 raise RuntimeNotReadyError("vllm returned no output")
             choices = tuple(
@@ -400,9 +470,8 @@ class VllmLoraRuntime:
                 )
             )
             cached_tokens, cached_reported = _cached_token_state(final_output)
-            released = True
             return GenerationResult(
-                request_id=request.request_id,
+                request_id=request_id,
                 adapter_id=request.adapter_id,
                 incarnation=adapter.incarnation if adapter is not None else None,
                 choices=choices,
@@ -412,25 +481,27 @@ class VllmLoraRuntime:
                 cached_tokens_reported=cached_reported,
                 thinking=thinking,
             )
+        except asyncio.CancelledError:
+            if lifecycle == "active":
+                lifecycle = "detached"
+                assert prompt is not None
+                await self._cancel_generation(owner, output_stream, prompt)
+            elif lifecycle == "not_dispatched" and prompt is not None:
+                await self._close_generation_resources(None, prompt)
+                lifecycle = "finished"
+            raise
         finally:
-            if not dispatched and not released:
-                try:
-                    if prompt is not None:
-                        await self._close_generation_resources(None, prompt)
-                finally:
-                    released = True
-            if released:
-                self._owned_request_ids.discard(request.request_id)
+            if lifecycle == "not_dispatched" and prompt is not None:
+                await self._close_generation_resources(None, prompt)
 
     async def stream(self, request: GenerationRequest) -> AsyncIterator[StreamEvent]:
         """yield ready, normalized delta, and terminal accounting events."""
         await self._ensure_started()
-        owner = self._generation_owner(request.request_id)
+        request_id = uuid.uuid4().hex
+        owner = self._generation_owner(request_id)
         prompt: PreparedPrompt | None = None
-        cancelled = False
-        dispatched = False
-        released = False
         output_stream: AsyncIterator[Any] | None = None
+        lifecycle = "not_dispatched"
         try:
             async with self._binding(request) as binding:
                 adapter = binding.spec if binding is not None else None
@@ -443,19 +514,19 @@ class VllmLoraRuntime:
                 self._reject_tools_with_structured_outputs(request, structured)
                 sampling = self._sampling_params(request, structured, streaming=True)
                 prompt = await self._prepare_prompt(request, thinking)
+                output_stream = self._generate_stream(
+                    prompt,
+                    sampling,
+                    request_id,
+                    lora_request,
+                    structured,
+                )
+                lifecycle = "active"
                 try:
-                    output_stream = self._generate_stream(
-                        prompt,
-                        sampling,
-                        request.request_id,
-                        lora_request,
-                        structured,
-                    )
-                    dispatched = True
                     async with _rejection_as_prompt_error():
                         first_output = await self._first_stream_output(output_stream, owner)
                     yield StreamReady(
-                        request_id=request.request_id,
+                        request_id=request_id,
                         runtime_id=self.runtime_id,
                         adapter_id=request.adapter_id,
                         incarnation=adapter.incarnation if adapter is not None else None,
@@ -477,40 +548,27 @@ class VllmLoraRuntime:
                             output = await owner.wait(anext(output_stream))
                         except StopAsyncIteration:
                             break
-                    finished = self._finished_event(
-                        request,
-                        adapter,
-                        thinking,
-                        request.request_id,
-                        state,
-                    )
-                    released = True
-                    yield finished
-                except (asyncio.CancelledError, GeneratorExit):
-                    cancelled = True
-                    if not released:
-                        released = await self._cancel_generation(owner, output_stream)
-                    raise
+                    finished = self._finished_event(request, adapter, thinking, request_id, state)
                 except Exception:
                     await self._notify_if_dead()
+                    await self._close_generation_resources(output_stream, prompt, owner=owner)
+                    lifecycle = "finished"
                     raise
-                finally:
-                    if not cancelled:
-                        try:
-                            await self._close_generation_resources(output_stream, prompt)
-                        finally:
-                            released = True
-                    elif released:
-                        await self._close_generation_resources(None, prompt)
+                await self._close_generation_resources(output_stream, prompt, owner=owner)
+                lifecycle = "finished"
+                yield finished
+        except (asyncio.CancelledError, GeneratorExit):
+            if lifecycle == "active":
+                lifecycle = "detached"
+                assert prompt is not None
+                await self._cancel_generation(owner, output_stream, prompt)
+            elif lifecycle == "not_dispatched" and prompt is not None:
+                await self._close_generation_resources(None, prompt)
+                lifecycle = "finished"
+            raise
         finally:
-            if not dispatched and not released:
-                try:
-                    if prompt is not None:
-                        await self._close_generation_resources(None, prompt)
-                finally:
-                    released = True
-            if released:
-                self._owned_request_ids.discard(request.request_id)
+            if lifecycle == "not_dispatched" and prompt is not None:
+                await self._close_generation_resources(None, prompt)
 
     def health(self) -> RuntimeHealth:
         """return process-local identity, state counts, and engine liveness."""
@@ -533,9 +591,6 @@ class VllmLoraRuntime:
             loaded_adapters=adapters.loaded_count if adapters is not None else 0,
             prompt_cache_entries=prompts.cache_entries if prompts is not None else 0,
             unhealthy_reason=self._unhealthy_reason,
-            owned_request_ids=tuple(
-                sorted(self._owned_request_ids | self._unconfirmed_request_ids)
-            ),
         )
 
     async def close(self) -> None:
@@ -767,7 +822,7 @@ class VllmLoraRuntime:
     async def _first_stream_output(
         self,
         output_stream: AsyncIterator[Any],
-        owner: GenerationOwner,
+        owner: _GenerationOwner,
     ) -> Any:
         try:
             return await owner.wait(anext(output_stream))
@@ -811,11 +866,21 @@ class VllmLoraRuntime:
         self,
         output_stream: AsyncIterator[Any] | None,
         prompt: PreparedPrompt,
+        *,
+        owner: _GenerationOwner | None = None,
     ) -> None:
         try:
-            await self._close_output_stream(output_stream)
-        finally:
+            cleanup = self._close_output_stream(output_stream)
+            if owner is None:
+                await cleanup
+            else:
+                await owner.wait(cleanup)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
             self._close_prompt(prompt)
+            raise
+        self._close_prompt(prompt)
 
     @staticmethod
     async def _close_output_stream(output_stream: AsyncIterator[Any] | None) -> None:
@@ -842,43 +907,42 @@ class VllmLoraRuntime:
             if not active_exception:
                 raise
 
-    def _generation_owner(self, request_id: str) -> GenerationOwner:
-        if request_id in self._owned_request_ids or request_id in self._unconfirmed_request_ids:
-            raise RuntimeNotReadyError("request id is already owned by this runtime")
+    def _generation_owner(self, request_id: str) -> _GenerationOwner:
         assert self._engine is not None
-        self._owned_request_ids.add(request_id)
-        return GenerationOwner(
+        return _GenerationOwner(
             self._engine,
             request_id,
-            mark_unhealthy=self._mark_cancellation_unhealthy,
-            detach=self._detach_request_task,
+            fatal=self._fatal_cancellation,
+            detach=self._detach_task,
         )
 
     async def _cancel_generation(
         self,
-        owner: GenerationOwner,
+        owner: _GenerationOwner,
         output_stream: AsyncIterator[Any] | None,
-    ) -> bool:
-        cleanup = asyncio.create_task(owner.cancel(output_stream))
+        prompt: PreparedPrompt,
+    ) -> None:
+        cleanup = asyncio.create_task(owner.cancel(output_stream, prompt))
         try:
-            result = await asyncio.shield(cleanup)
+            await asyncio.shield(cleanup)
         except asyncio.CancelledError:
-            self._mark_cancellation_unhealthy(
-                owner.request_id, "cancellation cleanup was interrupted"
-            )
-            self._detach_request_task(owner.request_id, cleanup)
-            return False
-        if not result.abort_confirmed:
-            self._unconfirmed_request_ids.add(owner.request_id)
-        return result.settled
+            self._detach_task(cleanup)
+            await self._fatal_cancellation(owner.request_id, "cancellation cleanup was interrupted")
 
-    def _mark_cancellation_unhealthy(self, request_id: str, reason: str) -> None:
-        self._unconfirmed_request_ids.add(request_id)
+    async def _fatal_cancellation(self, request_id: str, reason: str) -> None:
         if self._unhealthy_reason is None:
             self._unhealthy_reason = f"{reason}: {request_id}"
+        callback = self._on_engine_death
+        if callback is None:
+            return
+        try:
+            result = callback(self.health())
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            return
 
-    def _detach_request_task(self, request_id: str, task: asyncio.Future[Any]) -> None:
-        self._unconfirmed_request_ids.add(request_id)
+    def _detach_task(self, task: asyncio.Future[Any]) -> None:
         self._detached_tasks.add(task)
 
         def consume(done: asyncio.Future[Any]) -> None:

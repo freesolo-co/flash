@@ -39,6 +39,7 @@ RUNTIME_FILES = {
     "flash/serve/runtime/errors.py",
     "flash/serve/runtime/multimodal.py",
     "flash/serve/runtime/prompt.py",
+    "flash/serve/runtime/structured_outputs.py",
     "flash/serve/runtime/types.py",
 }
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import re
-import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -25,11 +24,8 @@ from flash.serve.request.validation import (
     has_image_blocks,
     normalize_messages,
 )
-from flash.serve.request.validation import (
-    normalize_structured_outputs as _normalize_structured_outputs,
-)
 
-from .errors import RuntimeConfigurationError, StructuredOutputsError
+from .errors import RuntimeConfigurationError
 from .sampling import (
     validate_choice_count,
     validate_logprobs,
@@ -38,6 +34,7 @@ from .sampling import (
     validate_seed,
     validate_top_logprobs,
 )
+from .structured_outputs import normalize_structured_outputs
 from .tool_calls import ParsedToolCall
 
 _REVISION_RE = re.compile(r"[0-9a-f]{40}")
@@ -61,15 +58,6 @@ _RESERVED_ENGINE_ARGS = frozenset(
         "enable_tower_connector_lora",
     }
 )
-
-
-def normalize_structured_outputs(value: Any) -> dict[str, Any] | None:
-    """return canonical structured-output kwargs, an explicit-off dict, or none."""
-    return _normalize_structured_outputs(
-        value,
-        error_type=StructuredOutputsError,
-        validate_decoded_dicts=False,
-    )
 
 
 class _FrozenList(tuple):
@@ -407,7 +395,6 @@ class GenerationRequest:
 
     adapter_id: str | None = None
     expected_incarnation: str | None = None
-    request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     prompt: str | None = None
     messages: Sequence[Mapping[str, Any]] | None = None
     max_tokens: int = 1024
@@ -428,7 +415,6 @@ class GenerationRequest:
     stop: Any = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "request_id", _nonempty(self.request_id, "request_id"))
         if self.adapter_id is not None:
             object.__setattr__(self, "adapter_id", _nonempty(self.adapter_id, "adapter_id"))
         if self.expected_incarnation is not None:
@@ -671,4 +657,3 @@ class RuntimeHealth:
     loaded_adapters: int
     prompt_cache_entries: int
     unhealthy_reason: str | None
-    owned_request_ids: tuple[str, ...]

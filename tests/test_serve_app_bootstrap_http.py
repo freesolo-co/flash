@@ -1591,6 +1591,60 @@ def test_engine_death_asks_the_running_server_to_exit(monkeypatch, capsys) -> No
     assert owner.close_calls == 1
 
 
+def test_fatal_runtime_shutdown_deadline_forces_process_exit(monkeypatch) -> None:
+    import uvicorn
+
+    owner = _ClosableOwner()
+    handlers: list[object] = []
+    exits: list[int] = []
+    timers: list[_Timer] = []
+
+    async def bootstrap(*_args, **kwargs):
+        handlers.append(kwargs.get("on_engine_death"))
+        return owner
+
+    class _Timer:
+        def __init__(self, interval, function, args) -> None:
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.daemon = False
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self) -> None:
+            self.function(*self.args)
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    class _Server:
+        def __init__(self, _config) -> None:
+            self.should_exit = False
+            self.capture_signals = None
+
+        async def serve(self) -> None:
+            await handlers[0](None)
+
+    monkeypatch.setattr(app_main, "_read_inference_token", lambda: AUTH_TOKEN)
+    monkeypatch.setattr(app_main, "bootstrap_serving", bootstrap)
+    monkeypatch.setattr(app_main, "create_app", lambda _owner, *, bearer_digest: object())
+    monkeypatch.setattr(app_main.threading, "Timer", _Timer)
+    monkeypatch.setattr(app_main.os, "_exit", exits.append)
+    monkeypatch.setattr(uvicorn, "Config", lambda *_a, **_k: object())
+    monkeypatch.setattr(uvicorn, "Server", _Server)
+    args = SimpleNamespace(cache_root="/cache", host="127.0.0.1", port=8000)
+
+    asyncio.run(app_main._serve(args, _manifest()))
+
+    assert exits == [1]
+    assert len(timers) == 1
+    assert timers[0].interval == app_main._HARD_SHUTDOWN_DEADLINE_SECONDS
+    assert timers[0].daemon is True
+    assert timers[0].cancelled is True
+    assert owner.close_calls == 1
+
+
 def test_missing_inference_token_prevents_runtime_bootstrap(monkeypatch) -> None:
     bootstrap_calls = 0
 

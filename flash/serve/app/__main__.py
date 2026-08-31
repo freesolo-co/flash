@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import os
 import signal
+import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 
@@ -16,6 +17,7 @@ from .materialize import read_artifact_token_fd
 from .progress import emit_boot_progress
 
 _INFERENCE_TOKEN_FD_ENV = "FLASH_INFERENCE_TOKEN_FD"
+_HARD_SHUTDOWN_DEADLINE_SECONDS = 10.0
 
 
 def _read_inference_token(fd: int | None = None) -> str:
@@ -46,25 +48,28 @@ async def _serve(
     finally:
         token = ""
     server: uvicorn.Server | None = None
+    shutdown_timer: threading.Timer | None = None
 
     async def _exit_on_engine_death(_health: object) -> None:
-        """stop serving once the vllm engine core dies.
+        """stop serving after an engine death or fatal cancellation failure."""
 
-        a dead engine core cannot be repaired in place. without this the http process stays bound
-        and answers 503 for every later request, so the provider never replaces the container.
-        asking uvicorn to exit drains in-flight requests and ends the process, which lets the
-        provider restart the container.
-        """
-
+        nonlocal shutdown_timer
         print(
-            "serving: vllm engine core is dead; shutting down so the provider replaces this "
-            "container",
+            "serving: runtime cannot safely continue; shutting down so the provider replaces "
+            "this container",
             flush=True,
         )
-        if server is not None:
-            server.should_exit = True
-        else:
+        if server is None:
             os._exit(1)
+        server.should_exit = True
+        if shutdown_timer is None:
+            shutdown_timer = threading.Timer(
+                _HARD_SHUTDOWN_DEADLINE_SECONDS,
+                os._exit,
+                args=(1,),
+            )
+            shutdown_timer.daemon = True
+            shutdown_timer.start()
 
     owner = await bootstrap_serving(
         manifest, args.cache_root, on_engine_death=_exit_on_engine_death
@@ -99,4 +104,8 @@ async def _serve(
         emit_boot_progress("port-bind-starting", host=args.host, port=args.port)
         await server.serve()
     finally:
-        await owner.close()
+        try:
+            await owner.close()
+        finally:
+            if shutdown_timer is not None:
+                shutdown_timer.cancel()
