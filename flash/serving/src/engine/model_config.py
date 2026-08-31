@@ -34,10 +34,10 @@ from flash.serving.src.engine.prequant_config import (
 # checkpoints published to the operator HF org.
 #
 # sizing rationale. preallocated lora buffers and loaded checkpoint weights dominate engine vram.
-# the active 9b uses 16 rank-128 slots on l40s, the active 27b uses 16 rank-64 slots on h100, and the
-# active 35b moe uses 6 rank-64 slots on h200.
-#   - Qwen3.6-35B-A3B (vision-language MoE; arch ``Qwen3_5MoeForConditionalGeneration``) -> H200
-#     (141 GiB) with the base bf16 weights, 6 x 64 LoRA at 32k. bf16 (not FP8) is the one path giving
+# all three active tiers serve on b200: the 9b uses 16 rank-128 slots, the 27b 16 rank-64 slots, and
+# the 35b moe 6 rank-64 slots.
+#   - Qwen3.6-35B-A3B (vision-language MoE; arch ``Qwen3_5MoeForConditionalGeneration``) -> B200
+#     (178 GiB) with the base bf16 weights, 6 x 64 LoRA at 32k. bf16 (not FP8) is the one path giving
 #     full-expert LoRA + CUDA graphs because the fused-MoE LoRA path won't compile on fp8e4nv. see the
 #     detailed 35B block below.
 #
@@ -49,11 +49,13 @@ SERVING_MODELS: list[dict[str, Any]] = [
     {
         "base_model": "Qwen/Qwen3.5-9B",
         "image_input_limit": 4,
-        "gpu": "L40S",
+        "gpu": "B200",
         "engine": {
-            # the L40S (48 GiB, Ada sm89) is the cheapest Modal card that fits rank-128 x 16 LoRA
-            # at 32k; L4 and 2xL4 OOMed in the real-GPU sweep. keep CUDA graphs on because eager is
-            # about 10x slower for this hybrid GatedDeltaNet model, and keep 0.90 for graph-capture headroom.
+            # measured on B200 (2026-08-31): 132.87 GiB of KV, 7,109,793 tokens, 217x concurrency at
+            # 32k with rank-128 x 16 LoRA. this tier previously ran on the L40S (48 GiB, Ada sm89),
+            # the cheapest card that fit the LoRA buffer; L4 and 2xL4 OOMed in the real-GPU sweep.
+            # keep CUDA graphs on because eager is about 10x slower for this hybrid GatedDeltaNet
+            # model, and keep 0.90 for graph-capture headroom.
             "gpu_memory_utilization": 0.90,
             "max_loras": 16,
             "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (cheap on the 9 GiB FP8 9B); 32k context.
@@ -63,22 +65,23 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "reasoning_parser": "qwen3",
         },
     },
-    # 35B-A3B MoE: bf16 on an H200 (141 GiB) is the one serving path that gives a flash adapter its
+    # 35B-A3B MoE: bf16 on a B200 (178 GiB) is the one serving path that gives a flash adapter its
     # full all-expert LoRA and CUDA graphs at speed. it gets rank 64 at 6 hot slots (6 x 64).
-    # why bf16/H200 and not the FP8 checkpoint used by every other tier:
+    # why bf16 and not the FP8 checkpoint used by every other tier:
     #   * FP8 on A100 materializes the FP8 experts back to bf16 in the fused-MoE LoRA path, leaving no
     #     room for CUDA-graph capture and forcing eager at about 4-10 tok/s.
     #   * FP8 on H200/B200 fails the fused-MoE LoRA kernel with "Unsupported lhs dtype fp8e4nv"; only
     #     the A100's Marlin kernel runs this MoE's full-expert LoRA.
-    #   * bf16 on H200 sidesteps the FP8 kernel. the real-GPU canary found that 8 x 64 LoRA plus 32k
-    #     overflows the 141 GiB card, with only about 19k context fitting. 6 x 64 plus 32k fits cleanly
-    #     with a 679,701-token KV cache, about 20x concurrency at 32k.
-    #   * cold boot is about 17 min (67 gibibytes of weights plus compile, graph capture, and warmup),
-    #     so it needs the raised startup_timeout in modal_app. inference or adapter registration starts it.
+    #   * bf16 sidesteps the FP8 kernel. on the 141 GiB H200 this tier used to run on, 8 x 64 LoRA
+    #     plus 32k overflowed the card (only about 19k context fit) and 6 x 64 measured about 20x
+    #     concurrency; the 178 GiB B200 measured 112x at the same 6 x 64 shape.
+    #   * cold boot measured 488s on the B200 (67 gibibytes of weights plus compile, graph capture
+    #     and warmup), so it needs the raised startup_timeout in modal_app. inference or adapter
+    #     registration starts it.
     {
         "base_model": "Qwen/Qwen3.6-35B-A3B",
         "image_input_limit": 4,
-        "gpu": "H200",
+        "gpu": "B200",
         "engine": {
             # Load the BASE bf16 weights, NOT the FP8 checkpoint — bf16 is what lets full-expert LoRA
             # + graphs coexist (see the block comment above). serve_model_id overrides the FP8 default
@@ -91,12 +94,13 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_loras": 6,
             "max_lora_rank": 64,
             "pin_loras": False,
-            # 32k context at 6 hot rank-64 LoRAs. the real-GPU canary produced a healthy 679,701-token
-            # KV cache, about 20x concurrency at 32k; 8 hot LoRAs overflowed and only fit about 19k.
+            # 32k context at 6 hot rank-64 LoRAs. measured on B200 (2026-08-30): 49.38 GiB of KV,
+            # 3,678,952 tokens, 112x concurrency at 32k -- the 178 GiB card leaves far more room than
+            # the 141 GiB H200 this tier previously ran on (which measured about 20x).
             "max_model_len": 32768,
             "max_num_batched_tokens": 4096,
-            # CUDA graphs ON — the whole point. On bf16/H200 the graph capture fits (~0.2-0.8 GiB) and
-            # is LoRA-specialized, so adapters serve under graphs too.
+            # CUDA graphs ON — the whole point. On bf16/B200 the graph capture fits (measured 0.38 GiB)
+            # and is LoRA-specialized, so adapters serve under graphs too.
             "enforce_eager": False,
             # Startup memory-profiling runs max_num_seqs sequences; cap low so the 248k-vocab logits +
             # all-expert MoE activations don't spike the profiling peak.
@@ -105,20 +109,20 @@ SERVING_MODELS: list[dict[str, Any]] = [
             # NB: the vision encoder is now LOADED (no language_model_only) — flash adapters adapt the
             # full multimodal tree, so their vision-tower LoRA keys must have real modules to bind to.
             # this adds the vision encoder's weights on top of the already weight-bound 6 x 64 LoRA buffer.
-            # the complete model and LoRA load is about 108 GiB on the 141 GiB H200.
+            # the complete model and LoRA load is about 108 GiB, on the 178 GiB B200.
         },
     },
-    # 27B dense on an H100 (80 GiB). the real-GPU canary measured the load at 44.25 GiB -- above the
-    # FP8 weight size alone, because the vision tower and the non-quantized tensors stay bf16 -- which
-    # still leaves 23.07 GiB of KV cache (350,981 tokens, 10.71x concurrency at 32k) after the 16
-    # rank-64 LoRA buffers and a 0.35 GiB graph capture. every repository here is pinned to an
-    # immutable revision so a served engine cannot silently follow an upstream retag; note the model
-    # pin names a commit in the -FP8 repo while the tokenizer/processor pins name one in the base
-    # repo, which are separate sha namespaces.
+    # 27B dense on a B200 (178 GiB). the load is 44.25 GiB -- above the FP8 weight size alone, because
+    # the vision tower and the non-quantized tensors stay bf16. measured on B200 (2026-08-30):
+    # 112.66 GiB of KV cache, 2,856,884 tokens, 87x concurrency at 32k, after the 16 rank-64 LoRA
+    # buffers and graph capture; the 80 GiB H100 this tier previously ran on measured 10.71x. every
+    # repository here is pinned to an immutable revision so a served engine cannot silently follow an
+    # upstream retag; note the model pin names a commit in the -FP8 repo while the tokenizer/processor
+    # pins name one in the base repo, which are separate sha namespaces.
     {
         "base_model": "Qwen/Qwen3.8-27B",
         "image_input_limit": 4,
-        "gpu": "H100",
+        "gpu": "B200",
         "engine": {
             "model_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
             "tokenizer_model": "Qwen/Qwen3.8-27B",

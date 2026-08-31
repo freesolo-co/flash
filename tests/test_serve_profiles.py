@@ -149,7 +149,20 @@ def test_profile_matches_the_catalog_serving_capacity(model_id: str) -> None:
     assert profile.gpu_memory_utilization == serving.gpu_memory_utilization
     assert profile.image_limit == serving.image_limit
     assert profile.served_model == serving.serve_model_id
-    assert profile.modal_gpu == serving.gpu
+    # SHAPE agrees with the catalog (above); the CARD deliberately does not. serving.gpu is the
+    # freesolo-owned hosted plane's card, modal_gpu is the card THIS customer-owned profile was
+    # live-qualified on. Pinned per model rather than asserted "different", so a profile silently
+    # drifting to some other unqualified card still fails here.
+    assert serving.gpu == "B200"  # every hosted tier
+    assert (
+        profile.modal_gpu
+        == {
+            "Qwen/Qwen3.5-9B": "L40S",
+            "Qwen/Qwen3.8-27B": "H100",
+            "Qwen/Qwen3.6-35B-A3B": "H200",
+        }[model_id]
+    )
+    assert profile.modal_live_qualified is True
 
 
 @pytest.mark.parametrize(
