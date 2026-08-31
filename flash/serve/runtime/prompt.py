@@ -12,6 +12,7 @@ from typing import Any
 from flash.content.reasoning_normalization import messages_for_chat_template
 from flash.serve.request.tool_calls import detached_template_messages, tools_active, tools_wire
 
+from ..request.validation import close_images
 from .errors import MultimodalRequestError, PromptError, ServingRuntimeError
 from .multimodal import has_image_blocks, normalize_text_messages, prepare_multimodal_request
 from .types import AdapterSpec, EngineConfig, GenerationRequest
@@ -45,10 +46,7 @@ class PreparedPrompt:
     images: tuple[Any, ...] = ()
 
     def close(self) -> None:
-        for image in self.images:
-            close = getattr(image, "close", None)
-            if close is not None:
-                close()
+        close_images(self.images)
 
 
 def safe_chat_template_kwargs(raw: Any) -> dict[str, Any]:

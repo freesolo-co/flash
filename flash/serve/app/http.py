@@ -7,7 +7,6 @@ import hashlib
 import hmac
 import json
 from collections.abc import Awaitable
-from contextlib import suppress
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -26,7 +25,7 @@ from flash.serve.runtime import (
 )
 
 from .bootstrap import ServingBootstrap
-from .chat_stream import close_iterator, stream_chat_body
+from .chat_stream import cancel_task, close_iterator, stream_chat_body
 from .openai import (
     OpenAIRequestError,
     nonstream_response,
@@ -275,27 +274,24 @@ async def _read_request_body(request: Request) -> bytes:
 async def _await_until_disconnect(request: Request, awaitable: Awaitable[Any]) -> Any:
     operation_task = asyncio.ensure_future(awaitable)
     disconnect_task = asyncio.create_task(_wait_for_disconnect(request))
+    operation_detached = False
     try:
         done, _ = await asyncio.wait(
             (operation_task, disconnect_task),
             return_when=asyncio.FIRST_COMPLETED,
         )
-        if operation_task in done:
-            return await operation_task
-        await disconnect_task
-        operation_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await operation_task
-        raise asyncio.CancelledError
+        if disconnect_task in done:
+            await disconnect_task
+            operation_detached = not await cancel_task(operation_task)
+            raise asyncio.CancelledError
+        return await operation_task
     finally:
-        if not operation_task.done():
-            operation_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await operation_task
-        if not disconnect_task.done():
-            disconnect_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await disconnect_task
+        try:
+            if not operation_task.done() and not operation_detached:
+                operation_detached = not await cancel_task(operation_task)
+        finally:
+            if not disconnect_task.done():
+                await cancel_task(disconnect_task)
 
 
 async def _wait_for_disconnect(request: Request) -> None:

@@ -484,10 +484,17 @@ def validate_dimensions(
 
 
 def close_images(images: list[Any] | tuple[Any, ...]) -> None:
+    # every image owns a decoded buffer, so one raising close() must not strand the rest. pillow
+    # raises from close() on a truncated or already-detached file, and this runs on the request
+    # teardown path, so the leak it would cause is per-request and unbounded.
     for image in images:
         close = getattr(image, "close", None)
-        if close is not None:
+        if close is None:
+            continue
+        try:
             close()
+        except Exception:
+            continue
 
 
 def decode_json(value: str) -> Any:

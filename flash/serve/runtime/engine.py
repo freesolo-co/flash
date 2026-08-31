@@ -45,6 +45,89 @@ from .types import (
 )
 
 EngineDeathCallback = Callable[[RuntimeHealth], Awaitable[None] | None]
+_ABORT_TIMEOUT_SECONDS = 1.0
+_DRAIN_TIMEOUT_SECONDS = 1.0
+
+
+class _GenerationOwner:
+    def __init__(
+        self,
+        engine: Any,
+        request_id: str,
+        fatal: Callable[[str, str], Awaitable[None]],
+        detach: Callable[[asyncio.Future[Any]], None],
+    ) -> None:
+        self.request_id = request_id
+        self._engine = engine
+        self._fatal = fatal
+        self._detach = detach
+        self._active: set[asyncio.Future[Any]] = set()
+        self._cancel_lock = asyncio.Lock()
+        self._cancel_task: asyncio.Task[None] | None = None
+
+    async def wait(self, awaitable: Awaitable[Any]) -> Any:
+        task = asyncio.ensure_future(awaitable)
+        self._active.add(task)
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                self._active.discard(task)
+
+    async def cancel(self, stream: AsyncIterator[Any] | None, prompt: PreparedPrompt) -> None:
+        async with self._cancel_lock:
+            if self._cancel_task is None:
+                self._cancel_task = asyncio.create_task(self._cancel(stream, prompt))
+            task = self._cancel_task
+        await asyncio.shield(task)
+
+    async def _cancel(self, stream: AsyncIterator[Any] | None, prompt: PreparedPrompt) -> None:
+        abort_confirmed = await self._abort_once()
+        settlement = asyncio.create_task(self._settle(stream, prompt))
+        try:
+            await asyncio.wait_for(asyncio.shield(settlement), timeout=_DRAIN_TIMEOUT_SECONDS)
+        except TimeoutError:
+            self._detach(settlement)
+            reason = "generation cancellation did not settle"
+        else:
+            reason = None if abort_confirmed else "vllm abort could not be confirmed"
+        if reason is not None:
+            await self._fatal(self.request_id, reason)
+
+    async def _abort_once(self) -> bool:
+        abort = getattr(self._engine, "abort", None)
+        if abort is None:
+            return False
+        try:
+            result = abort(self.request_id)
+        except Exception:
+            return False
+        if not inspect.isawaitable(result):
+            return result is not False
+        task = asyncio.ensure_future(result)
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=_ABORT_TIMEOUT_SECONDS)
+        except TimeoutError:
+            self._detach(task)
+            return False
+        except Exception:
+            return False
+        return result is not False
+
+    async def _settle(self, stream: AsyncIterator[Any] | None, prompt: PreparedPrompt) -> None:
+        try:
+            if self._active:
+                await asyncio.gather(*tuple(self._active), return_exceptions=True)
+                self._active.clear()
+            if stream is not None:
+                with suppress(BaseException):
+                    async for _ in stream:
+                        pass
+                with suppress(BaseException):
+                    await VllmLoraRuntime._close_output_stream(stream)
+        finally:
+            with suppress(Exception):
+                prompt.close()
 
 
 @dataclass(slots=True)
@@ -297,6 +380,8 @@ class VllmLoraRuntime:
         self._liveness_task: asyncio.Task[None] | None = None
         self._death_notification_lock = asyncio.Lock()
         self._death_notified = False
+        self._unhealthy_reason: str | None = None
+        self._detached_tasks: set[asyncio.Future[Any]] = set()
         self._closed = False
 
     async def start(self) -> None:
@@ -304,6 +389,8 @@ class VllmLoraRuntime:
         async with self._start_lock:
             if self._closed:
                 raise RuntimeNotReadyError("runtime is closed")
+            if self._unhealthy_reason is not None:
+                raise RuntimeNotReadyError("runtime is unhealthy after unconfirmed cancellation")
             if self._engine is not None:
                 if self._engine_is_dead():
                     await self._notify_engine_death()
@@ -328,112 +415,160 @@ class VllmLoraRuntime:
         """run one non-streaming generation with final-only vllm output."""
         await self._ensure_started()
         request_id = uuid.uuid4().hex
-        async with self._binding(request) as binding:
-            adapter = binding.spec if binding is not None else None
-            lora_request = binding.lora_request if binding is not None else None
-            thinking = resolve_thinking(request, adapter)
-            if thinking and request.logprobs:
-                raise PromptError("logprobs are not supported for thinking-enabled generation")
-            self._validate_tools(request, thinking)
-            structured = self._structured_state(request, adapter, thinking)
-            self._reject_tools_with_structured_outputs(request, structured)
-            sampling = self._sampling_params(request, structured, streaming=False)
-            prompt = await self._prepare_prompt(request, thinking)
-            final_output = None
-            try:
-                async with _rejection_as_prompt_error():
-                    async for output in self._generate_stream(
-                        prompt,
-                        sampling,
-                        request_id,
-                        lora_request,
-                        structured,
-                    ):
-                        final_output = output
-            except Exception:
-                await self._notify_if_dead()
-                raise
-            finally:
-                prompt.close()
-        if final_output is None:
-            raise RuntimeNotReadyError("vllm returned no output")
-        choices = tuple(
-            _generation_choice(
-                index,
-                output,
-                top_logprobs=request.top_logprobs,
-                tools=request.tools if tools_active(request.tools, request.tool_choice) else None,
+        owner = self._generation_owner(request_id)
+        prompt: PreparedPrompt | None = None
+        output_stream: AsyncIterator[Any] | None = None
+        lifecycle = "not_dispatched"
+        try:
+            async with self._binding(request) as binding:
+                adapter = binding.spec if binding is not None else None
+                lora_request = binding.lora_request if binding is not None else None
+                thinking = resolve_thinking(request, adapter)
+                if thinking and request.logprobs:
+                    raise PromptError("logprobs are not supported for thinking-enabled generation")
+                self._validate_tools(request, thinking)
+                structured = self._structured_state(request, adapter, thinking)
+                self._reject_tools_with_structured_outputs(request, structured)
+                sampling = self._sampling_params(request, structured, streaming=False)
+                prompt = await self._prepare_prompt(request, thinking)
+                final_output = None
+                output_stream = self._generate_stream(
+                    prompt,
+                    sampling,
+                    request_id,
+                    lora_request,
+                    structured,
+                )
+                lifecycle = "active"
+                try:
+                    async with _rejection_as_prompt_error():
+                        while True:
+                            try:
+                                final_output = await owner.wait(anext(output_stream))
+                            except StopAsyncIteration:
+                                break
+                except Exception:
+                    await self._notify_if_dead()
+                    await self._close_generation_resources(output_stream, prompt, owner=owner)
+                    lifecycle = "finished"
+                    raise
+                await self._close_generation_resources(output_stream, prompt, owner=owner)
+                lifecycle = "finished"
+            if final_output is None:
+                raise RuntimeNotReadyError("vllm returned no output")
+            choices = tuple(
+                _generation_choice(
+                    index,
+                    output,
+                    top_logprobs=request.top_logprobs,
+                    tools=request.tools
+                    if tools_active(request.tools, request.tool_choice)
+                    else None,
+                )
+                for index, output in sorted(
+                    complete_indexed_outputs(final_output, n=request.n).items()
+                )
             )
-            for index, output in sorted(complete_indexed_outputs(final_output, n=request.n).items())
-        )
-        cached_tokens, cached_reported = _cached_token_state(final_output)
-        return GenerationResult(
-            request_id=request_id,
-            adapter_id=request.adapter_id,
-            incarnation=adapter.incarnation if adapter is not None else None,
-            choices=choices,
-            prompt_tokens=_num_prompt_tokens(final_output),
-            completion_tokens=sum(len(choice.token_ids) for choice in choices),
-            cached_tokens=cached_tokens,
-            cached_tokens_reported=cached_reported,
-            thinking=thinking,
-        )
+            cached_tokens, cached_reported = _cached_token_state(final_output)
+            return GenerationResult(
+                request_id=request_id,
+                adapter_id=request.adapter_id,
+                incarnation=adapter.incarnation if adapter is not None else None,
+                choices=choices,
+                prompt_tokens=_num_prompt_tokens(final_output),
+                completion_tokens=sum(len(choice.token_ids) for choice in choices),
+                cached_tokens=cached_tokens,
+                cached_tokens_reported=cached_reported,
+                thinking=thinking,
+            )
+        except asyncio.CancelledError:
+            if lifecycle == "active":
+                lifecycle = "detached"
+                assert prompt is not None
+                await self._cancel_generation(owner, output_stream, prompt)
+            elif lifecycle == "not_dispatched" and prompt is not None:
+                await self._close_generation_resources(None, prompt)
+                lifecycle = "finished"
+            raise
+        finally:
+            if lifecycle == "not_dispatched" and prompt is not None:
+                await self._close_generation_resources(None, prompt)
 
     async def stream(self, request: GenerationRequest) -> AsyncIterator[StreamEvent]:
         """yield ready, normalized delta, and terminal accounting events."""
         await self._ensure_started()
         request_id = uuid.uuid4().hex
-        async with self._binding(request) as binding:
-            adapter = binding.spec if binding is not None else None
-            lora_request = binding.lora_request if binding is not None else None
-            thinking = resolve_thinking(request, adapter)
-            if thinking and request.logprobs:
-                raise PromptError("logprobs are not supported for thinking-enabled generation")
-            self._validate_tools(request, thinking)
-            structured = self._structured_state(request, adapter, thinking)
-            self._reject_tools_with_structured_outputs(request, structured)
-            sampling = self._sampling_params(request, structured, streaming=True)
-            prompt = await self._prepare_prompt(request, thinking)
-            output_stream = self._generate_stream(
-                prompt,
-                sampling,
-                request_id,
-                lora_request,
-                structured,
-            )
-            try:
-                async with _rejection_as_prompt_error():
-                    first_output = await self._first_stream_output(output_stream)
-                yield StreamReady(
-                    request_id=request_id,
-                    runtime_id=self.runtime_id,
-                    adapter_id=request.adapter_id,
-                    incarnation=adapter.incarnation if adapter is not None else None,
-                    thinking=thinking,
+        owner = self._generation_owner(request_id)
+        prompt: PreparedPrompt | None = None
+        output_stream: AsyncIterator[Any] | None = None
+        lifecycle = "not_dispatched"
+        try:
+            async with self._binding(request) as binding:
+                adapter = binding.spec if binding is not None else None
+                lora_request = binding.lora_request if binding is not None else None
+                thinking = resolve_thinking(request, adapter)
+                if thinking and request.logprobs:
+                    raise PromptError("logprobs are not supported for thinking-enabled generation")
+                self._validate_tools(request, thinking)
+                structured = self._structured_state(request, adapter, thinking)
+                self._reject_tools_with_structured_outputs(request, structured)
+                sampling = self._sampling_params(request, structured, streaming=True)
+                prompt = await self._prepare_prompt(request, thinking)
+                output_stream = self._generate_stream(
+                    prompt,
+                    sampling,
+                    request_id,
+                    lora_request,
+                    structured,
                 )
-                state = _StreamState.create(
-                    request.n,
-                    request.top_logprobs,
-                    request.tools if tools_active(request.tools, request.tool_choice) else None,
-                )
-                output = first_output
-                while True:
-                    for delta, terminal in state.consume(output):
-                        if delta is not None:
-                            yield delta
-                        if terminal is not None:
-                            yield terminal
-                    try:
-                        output = await anext(output_stream)
-                    except StopAsyncIteration:
-                        break
-                yield self._finished_event(request, adapter, thinking, request_id, state)
-            except Exception:
-                await self._notify_if_dead()
-                raise
-            finally:
-                await self._close_output_stream(output_stream)
-                prompt.close()
+                lifecycle = "active"
+                try:
+                    async with _rejection_as_prompt_error():
+                        first_output = await self._first_stream_output(output_stream, owner)
+                    yield StreamReady(
+                        request_id=request_id,
+                        runtime_id=self.runtime_id,
+                        adapter_id=request.adapter_id,
+                        incarnation=adapter.incarnation if adapter is not None else None,
+                        thinking=thinking,
+                    )
+                    state = _StreamState.create(
+                        request.n,
+                        request.top_logprobs,
+                        request.tools if tools_active(request.tools, request.tool_choice) else None,
+                    )
+                    output = first_output
+                    while True:
+                        for delta, terminal in state.consume(output):
+                            if delta is not None:
+                                yield delta
+                            if terminal is not None:
+                                yield terminal
+                        try:
+                            output = await owner.wait(anext(output_stream))
+                        except StopAsyncIteration:
+                            break
+                    finished = self._finished_event(request, adapter, thinking, request_id, state)
+                except Exception:
+                    await self._notify_if_dead()
+                    await self._close_generation_resources(output_stream, prompt, owner=owner)
+                    lifecycle = "finished"
+                    raise
+                await self._close_generation_resources(output_stream, prompt, owner=owner)
+                lifecycle = "finished"
+                yield finished
+        except (asyncio.CancelledError, GeneratorExit):
+            if lifecycle == "active":
+                lifecycle = "detached"
+                assert prompt is not None
+                await self._cancel_generation(owner, output_stream, prompt)
+            elif lifecycle == "not_dispatched" and prompt is not None:
+                await self._close_generation_resources(None, prompt)
+                lifecycle = "finished"
+            raise
+        finally:
+            if lifecycle == "not_dispatched" and prompt is not None:
+                await self._close_generation_resources(None, prompt)
 
     def health(self) -> RuntimeHealth:
         """return process-local identity, state counts, and engine liveness."""
@@ -441,7 +576,12 @@ class VllmLoraRuntime:
         adapters = self._adapters
         prompts = self._prompts
         return RuntimeHealth(
-            ok=self._engine is not None and not engine_dead and not self._closed,
+            ok=(
+                self._engine is not None
+                and not engine_dead
+                and not self._closed
+                and self._unhealthy_reason is None
+            ),
             started=self._engine is not None,
             engine_dead=engine_dead,
             runtime_id=self.runtime_id,
@@ -450,6 +590,7 @@ class VllmLoraRuntime:
             registered_adapters=adapters.registered_count if adapters is not None else 0,
             loaded_adapters=adapters.loaded_count if adapters is not None else 0,
             prompt_cache_entries=prompts.cache_entries if prompts is not None else 0,
+            unhealthy_reason=self._unhealthy_reason,
         )
 
     async def close(self) -> None:
@@ -550,6 +691,8 @@ class VllmLoraRuntime:
         return AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**kwargs))
 
     async def _ensure_started(self) -> None:
+        if self._unhealthy_reason is not None:
+            raise RuntimeNotReadyError("runtime is unhealthy after unconfirmed cancellation")
         await self.start()
         if self._engine_is_dead():
             await self._notify_engine_death()
@@ -676,9 +819,13 @@ class VllmLoraRuntime:
             reasoning_parser_kwargs=structured.parser_kwargs,
         )
 
-    async def _first_stream_output(self, output_stream: AsyncIterator[Any]) -> Any:
+    async def _first_stream_output(
+        self,
+        output_stream: AsyncIterator[Any],
+        owner: _GenerationOwner,
+    ) -> Any:
         try:
-            return await anext(output_stream)
+            return await owner.wait(anext(output_stream))
         except StopAsyncIteration as exc:
             raise RuntimeNotReadyError("vllm returned no output") from exc
 
@@ -715,8 +862,30 @@ class VllmLoraRuntime:
             thinking=thinking,
         )
 
+    async def _close_generation_resources(
+        self,
+        output_stream: AsyncIterator[Any] | None,
+        prompt: PreparedPrompt,
+        *,
+        owner: _GenerationOwner | None = None,
+    ) -> None:
+        try:
+            cleanup = self._close_output_stream(output_stream)
+            if owner is None:
+                await cleanup
+            else:
+                await owner.wait(cleanup)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            self._close_prompt(prompt)
+            raise
+        self._close_prompt(prompt)
+
     @staticmethod
-    async def _close_output_stream(output_stream: AsyncIterator[Any]) -> None:
+    async def _close_output_stream(output_stream: AsyncIterator[Any] | None) -> None:
+        if output_stream is None:
+            return
         close = getattr(output_stream, "aclose", None)
         if close is None:
             return
@@ -728,6 +897,60 @@ class VllmLoraRuntime:
         except Exception:
             if not active_exception:
                 raise
+
+    @staticmethod
+    def _close_prompt(prompt: PreparedPrompt) -> None:
+        active_exception = sys.exc_info()[0] is not None
+        try:
+            prompt.close()
+        except Exception:
+            if not active_exception:
+                raise
+
+    def _generation_owner(self, request_id: str) -> _GenerationOwner:
+        assert self._engine is not None
+        return _GenerationOwner(
+            self._engine,
+            request_id,
+            fatal=self._fatal_cancellation,
+            detach=self._detach_task,
+        )
+
+    async def _cancel_generation(
+        self,
+        owner: _GenerationOwner,
+        output_stream: AsyncIterator[Any] | None,
+        prompt: PreparedPrompt,
+    ) -> None:
+        cleanup = asyncio.create_task(owner.cancel(output_stream, prompt))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            self._detach_task(cleanup)
+            await self._fatal_cancellation(owner.request_id, "cancellation cleanup was interrupted")
+
+    async def _fatal_cancellation(self, request_id: str, reason: str) -> None:
+        if self._unhealthy_reason is None:
+            self._unhealthy_reason = f"{reason}: {request_id}"
+        callback = self._on_engine_death
+        if callback is None:
+            return
+        try:
+            result = callback(self.health())
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            return
+
+    def _detach_task(self, task: asyncio.Future[Any]) -> None:
+        self._detached_tasks.add(task)
+
+        def consume(done: asyncio.Future[Any]) -> None:
+            self._detached_tasks.discard(done)
+            with suppress(asyncio.CancelledError):
+                done.exception()
+
+        task.add_done_callback(consume)
 
     def _engine_is_dead(self) -> bool:
         return bool(self._engine is not None and getattr(self._engine, "errored", False))

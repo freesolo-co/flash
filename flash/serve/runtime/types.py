@@ -656,3 +656,4 @@ class RuntimeHealth:
     registered_adapters: int
     loaded_adapters: int
     prompt_cache_entries: int
+    unhealthy_reason: str | None
