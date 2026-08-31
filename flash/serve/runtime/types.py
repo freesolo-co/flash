@@ -10,7 +10,26 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal
 
-from .errors import RuntimeConfigurationError
+from flash.serve.request.tool_calls import (
+    FunctionTool,
+    normalize_tools,
+    tools_active,
+    tools_wire,
+    validate_tool_control_presence,
+    validate_tool_history_replay,
+    validate_tool_stop_sequences,
+)
+from flash.serve.request.validation import (
+    MAX_SOURCE_CHARS,
+    detached_messages,
+    has_image_blocks,
+    normalize_messages,
+)
+from flash.serve.request.validation import (
+    normalize_structured_outputs as _normalize_structured_outputs,
+)
+
+from .errors import RuntimeConfigurationError, StructuredOutputsError
 from .sampling import (
     validate_choice_count,
     validate_logprobs,
@@ -19,7 +38,7 @@ from .sampling import (
     validate_seed,
     validate_top_logprobs,
 )
-from .structured_outputs import normalize_structured_outputs
+from .tool_calls import ParsedToolCall
 
 _REVISION_RE = re.compile(r"[0-9a-f]{40}")
 _RESERVED_MODEL_LOAD_KWARGS = frozenset({"revision", "token", "trust_remote_code"})
@@ -35,11 +54,22 @@ _RESERVED_ENGINE_ARGS = frozenset(
         "max_lora_rank",
         "max_cpu_loras",
         "reasoning_parser",
+        "tool_parser",
+        "enable_auto_tool_choice",
         "limit_mm_per_prompt",
         "mm_processor_cache_gb",
         "enable_tower_connector_lora",
     }
 )
+
+
+def normalize_structured_outputs(value: Any) -> dict[str, Any] | None:
+    """return canonical structured-output kwargs, an explicit-off dict, or none."""
+    return _normalize_structured_outputs(
+        value,
+        error_type=StructuredOutputsError,
+        validate_decoded_dicts=False,
+    )
 
 
 class _FrozenList(tuple):
@@ -228,6 +258,7 @@ class EngineConfig:
     enable_tower_connector_lora: bool = False
     prompt_cache_size: int = 128
     reasoning_parser: str | None = None
+    tool_parser: str | None = None
     liveness_interval_seconds: float = 5.0
     engine_args: Mapping[str, Any] = field(default_factory=dict)
     tokenizer_kwargs: Mapping[str, Any] = field(default_factory=dict)
@@ -237,10 +268,18 @@ class EngineConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model", _nonempty(self.model, "model"))
-        for name in ("served_model", "tokenizer_model", "reasoning_parser", "hf_token"):
+        for name in (
+            "served_model",
+            "tokenizer_model",
+            "reasoning_parser",
+            "tool_parser",
+            "hf_token",
+        ):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _nonempty(value, name))
+        if self.tool_parser not in {None, "qwen3_coder"}:
+            raise RuntimeConfigurationError("tool_parser must be qwen3_coder or none")
         object.__setattr__(
             self,
             "trust_remote_code",
@@ -383,6 +422,9 @@ class GenerationRequest:
     thinking: bool | None = None
     chat_template_kwargs: Mapping[str, Any] = field(default_factory=dict)
     structured_outputs: Any = None
+    tools: Any = None
+    tool_choice: str | None = None
+    parallel_tool_calls: bool | None = None
     stop: Any = None
 
     def __post_init__(self) -> None:
@@ -410,9 +452,23 @@ class GenerationRequest:
         if self.messages is not None:
             if isinstance(self.messages, str) or not isinstance(self.messages, Sequence):
                 raise RuntimeConfigurationError("messages must be a sequence of mappings")
-            messages = tuple(dict(message) for message in self.messages)
+            messages = tuple(
+                detached_messages(
+                    self.messages,
+                    sequence_types=Sequence,
+                    sequence_error="messages must be a sequence of mappings",
+                    error_type=RuntimeConfigurationError,
+                )
+            )
             if not messages:
                 raise RuntimeConfigurationError("messages must not be empty")
+            normalize_messages(
+                messages,
+                sequence_types=tuple,
+                sequence_error="messages must be a sequence of mappings",
+                error_type=RuntimeConfigurationError,
+                max_source_chars=MAX_SOURCE_CHARS,
+            )
             object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "max_tokens", validate_generation_max_tokens(self.max_tokens))
         object.__setattr__(
@@ -454,8 +510,54 @@ class GenerationRequest:
         object.__setattr__(
             self, "structured_outputs", normalize_structured_outputs(self.structured_outputs)
         )
+        validate_tool_control_presence(
+            self.tools,
+            self.tool_choice,
+            self.parallel_tool_calls,
+            error_type=RuntimeConfigurationError,
+        )
+        if self.tools is not None:
+            raw_tools = self.tools
+            if (
+                isinstance(raw_tools, Sequence)
+                and not isinstance(raw_tools, str | bytes)
+                and all(type(tool) is FunctionTool for tool in raw_tools)
+            ):
+                raw_tools = tools_wire(tuple(raw_tools))
+            normalized_tools = normalize_tools(raw_tools, error_type=RuntimeConfigurationError)
+            object.__setattr__(self, "tools", normalized_tools)
+            replay_tools = (
+                normalized_tools if tools_active(normalized_tools, self.tool_choice) else None
+            )
+            validate_tool_history_replay(
+                self.messages or (), replay_tools, error_type=RuntimeConfigurationError
+            )
+            if self.tool_choice not in {"auto", "none"}:
+                raise RuntimeConfigurationError("tool_choice must be auto or none")
+            if self.parallel_tool_calls is not True:
+                raise RuntimeConfigurationError("parallel_tool_calls must be true")
+            if tools_active(normalized_tools, self.tool_choice):
+                if self.prompt is not None:
+                    raise RuntimeConfigurationError("tools require chat messages")
+                if has_image_blocks(self.messages, sequence_types=tuple):
+                    raise RuntimeConfigurationError("tools cannot be combined with image messages")
+                if self.logprobs or self.structured_outputs:
+                    raise RuntimeConfigurationError(
+                        "tools cannot be combined with logprobs or structured outputs"
+                    )
+        else:
+            validate_tool_history_replay(
+                self.messages or (), None, error_type=RuntimeConfigurationError
+            )
         # an empty sequence and none both mean "no stop sequences", so they normalize together.
-        object.__setattr__(self, "stop", _normalize_stop(self.stop, "stop"))
+        stop = _normalize_stop(self.stop, "stop")
+        validate_tool_stop_sequences(
+            stop,
+            tools=self.tools,
+            tool_choice=self.tool_choice,
+            error_type=RuntimeConfigurationError,
+        )
+        object.__setattr__(self, "stop", stop)
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,6 +569,7 @@ class GenerationChoice:
     finish_reason: str | None
     token_ids: tuple[int, ...]
     logprobs: list[dict[str, Any]] | None = None
+    tool_calls: tuple[ParsedToolCall, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,6 +614,7 @@ class StreamDelta:
     index: int
     text: str
     logprobs: list[dict[str, Any]] | None = None
+    tool_calls: tuple[ParsedToolCall, ...] = ()
     type: Literal["delta"] = field(default="delta", init=False)
 
 

@@ -34,6 +34,7 @@ from flash.serving.src.accounting.usage_outbox import (
     UsageEvent,
     UsageOutboxError,
 )
+from flash.serving.src.engine.model_config import base_models
 from flash.serving.src.http.inference_routes import _discard_prepared_stream
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
@@ -184,41 +185,30 @@ class _Store(OfflineUsageStore):
 
 
 def test_freesolo_prices_match_committed_catalog_fixed_point_contract() -> None:
+    # The charged per-token rate is the launch per-Mtok price divided by 1e6 with NO markup applied,
+    # so each value below is exactly its published rate shifted six places. Retired models are absent:
+    # the table is exactly the active hosted set.
     expected = {
-        "Qwen/Qwen3.5-0.8B": {
-            "prompt_token_usd": "0.000000012",
-            "cached_prompt_token_usd": "0.0000000024",
-            "completion_token_usd": "0.00000006",
-        },
-        "Qwen/Qwen3.5-2B": {
-            "prompt_token_usd": "0.000000024",
-            "cached_prompt_token_usd": "0.0000000048",
-            "completion_token_usd": "0.00000012",
-        },
-        "Qwen/Qwen3.5-4B": {
-            "prompt_token_usd": "0.000000036",
-            "cached_prompt_token_usd": "0.0000000072",
-            "completion_token_usd": "0.00000018",
-        },
         "Qwen/Qwen3.5-9B": {
-            "prompt_token_usd": "0.0000001368",
+            "prompt_token_usd": "0.000000095",
             "cached_prompt_token_usd": "0.0000000276",
-            "completion_token_usd": "0.000000228",
+            "completion_token_usd": "0.0000001425",
         },
-        "Qwen/Qwen3.6-27B": {
-            "prompt_token_usd": "0.00000051048",
-            "cached_prompt_token_usd": "0.000000168",
-            "completion_token_usd": "0.000003666",
+        "Qwen/Qwen3.8-27B": {
+            "prompt_token_usd": "0.0000003325",
+            "cached_prompt_token_usd": "0.00000003325",
+            "completion_token_usd": "0.0000024225",
         },
         "Qwen/Qwen3.6-35B-A3B": {
-            "prompt_token_usd": "0.0000002376",
-            "cached_prompt_token_usd": "0.0000000792",
-            "completion_token_usd": "0.000001518",
+            "prompt_token_usd": "0.000000095",
+            "cached_prompt_token_usd": "0.0000000475",
+            "completion_token_usd": "0.0000009025",
         },
     }
     decimal_string = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")
 
     assert set(_FREESOLO_USD_PER_MTOK) == set(expected)
+    assert set(_FREESOLO_USD_PER_MTOK) == set(base_models())
     for model, snapshot in expected.items():
         actual = freesolo_price(model).snapshot
         assert actual == snapshot
@@ -300,12 +290,61 @@ def test_empty_or_omitted_token_ids_preserve_resolved_scalar_counts(
     assert facts.cached_tokens <= facts.prompt_tokens
 
 
+def test_capacity_facts_use_top_level_optional_rpc_fields() -> None:
+    event = _usage_event()
+    event = replace(
+        event,
+        facts=replace(
+            event.facts,
+            time_to_first_token_seconds=0.75,
+            queue_wait_seconds=0.25,
+            replica_in_flight_requests_at_admission=3,
+            replica_boot_duration_seconds=91.5,
+            replica_freshly_booted=True,
+        ),
+    )
+
+    payload = event.rpc_payload()
+
+    assert payload["time_to_first_token_seconds"] == 0.75
+    assert payload["queue_wait_seconds"] == 0.25
+    assert payload["replica_in_flight_requests_at_admission"] == 3
+    assert payload["replica_boot_duration_seconds"] == 91.5
+    assert payload["replica_freshly_booted"] is True
+    assert "capacity" not in payload["attestation_evidence"]
+
+
+def test_invalid_or_missing_capacity_facts_are_omitted_without_raising() -> None:
+    facts = usage_facts(
+        {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "cached_tokens": 0,
+            "cached_tokens_reported": False,
+            "reasoning_tokens": 0,
+            "thinking": False,
+            "time_to_first_token_seconds": "not-a-number",
+            "queue_wait_seconds": -1,
+            "replica_in_flight_requests_at_admission": True,
+            "replica_boot_duration_seconds": float("inf"),
+            "replica_freshly_booted": "yes",
+        }
+    )
+    payload = replace(_usage_event(), facts=facts).rpc_payload()
+
+    assert "time_to_first_token_seconds" not in payload
+    assert "queue_wait_seconds" not in payload
+    assert "replica_in_flight_requests_at_admission" not in payload
+    assert "replica_boot_duration_seconds" not in payload
+    assert "replica_freshly_booted" not in payload
+
+
 def test_nonstream_capture_is_awaited_before_successful_response() -> None:
     record = _revision()
     pool = _Pool()
     store = _Store()
 
-    async def authorize(_token: str, _adapter_id: str) -> str:
+    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
         return "org-1"
 
     app = build_serving_app(
@@ -340,7 +379,7 @@ def test_stream_captures_in_progress_before_response_and_finalizes_same_id() -> 
     pool = _Pool()
     store = _Store()
 
-    async def authorize(_token: str, _adapter_id: str) -> str:
+    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
         return "org-1"
 
     app = build_serving_app(
@@ -422,7 +461,7 @@ def test_stream_finalization_preserves_first_event_attestation() -> None:
 def test_stream_capture_failure_before_headers_returns_controlled_503() -> None:
     record = _revision()
 
-    async def authorize(_token: str, _adapter_id: str) -> str:
+    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
         return "org-1"
 
     app = build_serving_app(
@@ -449,7 +488,7 @@ def test_thinking_request_is_rejected_before_engine_dispatch() -> None:
     record = _revision().model_copy(update={"thinking": True})
     pool = _Pool()
 
-    async def authorize(_token: str, _adapter_id: str) -> str:
+    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
         return "org-1"
 
     app = build_serving_app(
@@ -471,7 +510,7 @@ def test_thinking_request_is_rejected_before_engine_dispatch() -> None:
 def test_nonstream_capture_failure_returns_controlled_503() -> None:
     record = _revision()
 
-    async def authorize(_token: str, _adapter_id: str) -> str:
+    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
         return "org-1"
 
     app = build_serving_app(

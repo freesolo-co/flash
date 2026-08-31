@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from flash.serve.request.runtime_support import reasoning_compatibility_guard
+from flash.serve.request.tool_calls import tools_active
 
 from .adapters import AdapterBinding, AdapterManager
 from .cancellation import GenerationOwner
@@ -28,6 +29,7 @@ from .prompt import (
     resolve_thinking,
 )
 from .sampling import complete_indexed_outputs, indexed_outputs, normalize_token_logprobs
+from .tool_calls import ParsedToolCall, ToolCallStreamParser, parse_qwen3_coder_output
 from .types import (
     AdapterSpec,
     EngineConfig,
@@ -57,8 +59,10 @@ class _StructuredState:
 class _ChoiceStreamState:
     token_ids: list[int]
     logprobs: list[dict[str, Any]]
+    tool_parser: ToolCallStreamParser | None = None
     text: str = ""
     finish_reason: str | None = None
+    tool_calls: tuple[Any, ...] = ()
     terminal_emitted: bool = False
 
 
@@ -72,11 +76,18 @@ class _StreamState:
     cached_reported: bool = False
 
     @classmethod
-    def create(cls, n: int, top_logprobs: int) -> _StreamState:
+    def create(cls, n: int, top_logprobs: int, tools: Any = None) -> _StreamState:
         return cls(
             n=n,
             top_logprobs=top_logprobs,
-            choices={index: _ChoiceStreamState(token_ids=[], logprobs=[]) for index in range(n)},
+            choices={
+                index: _ChoiceStreamState(
+                    token_ids=[],
+                    logprobs=[],
+                    tool_parser=ToolCallStreamParser(tools) if tools is not None else None,
+                )
+                for index in range(n)
+            },
         )
 
     def consume(
@@ -101,26 +112,41 @@ class _StreamState:
             if chunk_logprobs is not None:
                 choice.logprobs.extend(chunk_logprobs)
             chunk_text = str(getattr(output, "text", "") or "")
-            choice.text += chunk_text
-            delta = (
-                StreamDelta(index=index, text=chunk_text, logprobs=chunk_logprobs)
-                if chunk_text or chunk_logprobs
-                else None
-            )
-            finish_reason = getattr(output, "finish_reason", None)
-            terminal = None
-            if finish_reason is not None:
-                if not isinstance(finish_reason, str) or not finish_reason:
-                    raise RuntimeNotReadyError("vllm returned an invalid finish reason")
-                choice.finish_reason = finish_reason
-                choice.terminal_emitted = True
-                terminal = StreamChoiceFinished(
-                    index=index,
-                    text=choice.text,
-                    finish_reason=finish_reason,
-                    token_ids=tuple(choice.token_ids),
+            visible = choice.tool_parser.feed(chunk_text) if choice.tool_parser else chunk_text
+            choice.text += visible
+            if visible or chunk_logprobs:
+                events.append(
+                    (StreamDelta(index=index, text=visible, logprobs=chunk_logprobs), None)
                 )
-            events.append((delta, terminal))
+            finish_reason = getattr(output, "finish_reason", None)
+            if finish_reason is None:
+                continue
+            if not isinstance(finish_reason, str) or not finish_reason:
+                raise RuntimeNotReadyError("vllm returned an invalid finish reason")
+            tool_calls: tuple[ParsedToolCall, ...] = ()
+            if choice.tool_parser is not None:
+                parsed = choice.tool_parser.finish()
+                if parsed.tools_called:
+                    tool_calls = parsed.calls
+                    finish_reason = "tool_calls"
+                    events.append((StreamDelta(index=index, text="", tool_calls=tool_calls), None))
+                elif parsed.content:
+                    choice.text += parsed.content
+                    events.append((StreamDelta(index=index, text=parsed.content), None))
+            choice.finish_reason = finish_reason
+            choice.tool_calls = tool_calls
+            choice.terminal_emitted = True
+            events.append(
+                (
+                    None,
+                    StreamChoiceFinished(
+                        index=index,
+                        text=choice.text,
+                        finish_reason=finish_reason,
+                        token_ids=tuple(choice.token_ids),
+                    ),
+                )
+            )
         return events
 
     def validate_complete(self) -> None:
@@ -130,14 +156,24 @@ class _StreamState:
             raise RuntimeNotReadyError("vllm ended with unterminated output choices")
 
 
-def _generation_choice(index: int, output: Any, *, top_logprobs: int) -> GenerationChoice:
+def _generation_choice(
+    index: int, output: Any, *, top_logprobs: int, tools: Any = None
+) -> GenerationChoice:
     token_ids = tuple(int(value) for value in (getattr(output, "token_ids", None) or []))
     finish_reason = getattr(output, "finish_reason", None)
     if not isinstance(finish_reason, str) or not finish_reason:
         raise RuntimeNotReadyError("vllm generation ended without a finish reason")
+    text = str(getattr(output, "text", "") or "")
+    tool_calls: tuple[ParsedToolCall, ...] = ()
+    if tools is not None:
+        parsed = parse_qwen3_coder_output(text, tools)
+        if parsed.tools_called:
+            text = parsed.content or ""
+            tool_calls = parsed.calls
+            finish_reason = "tool_calls"
     return GenerationChoice(
         index=index,
-        text=str(getattr(output, "text", "") or ""),
+        text=text,
         finish_reason=finish_reason,
         token_ids=token_ids,
         logprobs=normalize_token_logprobs(
@@ -145,6 +181,7 @@ def _generation_choice(index: int, output: Any, *, top_logprobs: int) -> Generat
             getattr(output, "logprobs", None),
             top_logprobs=top_logprobs,
         ),
+        tool_calls=tool_calls,
     )
 
 
@@ -310,7 +347,9 @@ class VllmLoraRuntime:
                 thinking = resolve_thinking(request, adapter)
                 if thinking and request.logprobs:
                     raise PromptError("logprobs are not supported for thinking-enabled generation")
+                self._validate_tools(request, thinking)
                 structured = self._structured_state(request, adapter, thinking)
+                self._reject_tools_with_structured_outputs(request, structured)
                 sampling = self._sampling_params(request, structured, streaming=False)
                 prompt = await self._prepare_prompt(request, thinking)
                 final_output = None
@@ -348,7 +387,14 @@ class VllmLoraRuntime:
             if final_output is None:
                 raise RuntimeNotReadyError("vllm returned no output")
             choices = tuple(
-                _generation_choice(index, output, top_logprobs=request.top_logprobs)
+                _generation_choice(
+                    index,
+                    output,
+                    top_logprobs=request.top_logprobs,
+                    tools=request.tools
+                    if tools_active(request.tools, request.tool_choice)
+                    else None,
+                )
                 for index, output in sorted(
                     complete_indexed_outputs(final_output, n=request.n).items()
                 )
@@ -392,7 +438,9 @@ class VllmLoraRuntime:
                 thinking = resolve_thinking(request, adapter)
                 if thinking and request.logprobs:
                     raise PromptError("logprobs are not supported for thinking-enabled generation")
+                self._validate_tools(request, thinking)
                 structured = self._structured_state(request, adapter, thinking)
+                self._reject_tools_with_structured_outputs(request, structured)
                 sampling = self._sampling_params(request, structured, streaming=True)
                 prompt = await self._prepare_prompt(request, thinking)
                 try:
@@ -413,7 +461,11 @@ class VllmLoraRuntime:
                         incarnation=adapter.incarnation if adapter is not None else None,
                         thinking=thinking,
                     )
-                    state = _StreamState.create(request.n, request.top_logprobs)
+                    state = _StreamState.create(
+                        request.n,
+                        request.top_logprobs,
+                        request.tools if tools_active(request.tools, request.tool_choice) else None,
+                    )
                     output = first_output
                     while True:
                         for delta, terminal in state.consume(output):
@@ -606,6 +658,22 @@ class VllmLoraRuntime:
         ) as binding:
             yield binding
 
+    def _validate_tools(self, request: GenerationRequest, thinking: bool | None) -> None:
+        if not tools_active(request.tools, request.tool_choice):
+            return
+        if thinking:
+            raise PromptError("tools are not supported for thinking-enabled generation")
+        if self.config.tool_parser != "qwen3_coder":
+            raise PromptError("this serving engine is not qualified for tool calling")
+
+    @staticmethod
+    def _reject_tools_with_structured_outputs(
+        request: GenerationRequest,
+        structured: _StructuredState,
+    ) -> None:
+        if tools_active(request.tools, request.tool_choice) and structured.params is not None:
+            raise PromptError("tools cannot be combined with logprobs or structured outputs")
+
     def _structured_state(
         self,
         request: GenerationRequest,
@@ -728,6 +796,7 @@ class VllmLoraRuntime:
                     finish_reason=choice.finish_reason,
                     token_ids=tuple(choice.token_ids),
                     logprobs=choice.logprobs or None,
+                    tool_calls=choice.tool_calls,
                 )
                 for index, choice in sorted(state.choices.items())
             ),

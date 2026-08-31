@@ -13,6 +13,11 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Added
 
+- OpenAI chat serving now implements and offline-validates strict function tool calling for the exact
+  Qwen3.5 packaged and hosted paths, including validated tool history, buffered and raw SSE
+  `tool_calls`, and managed forwarding. Flash parses schema-valid calls but does not execute them;
+  malformed automatic calls remain exact assistant text. Tool calling is not live-qualified pending
+  exact model testing.
 - OpenAI chat serving now preserves mirror sampling controls across packaged, hosted, and managed
   entry points: up to four indexed choices, signed seeds, frequency and presence penalties, and
   OpenAI token logprobs. Buffered and raw SSE responses retain independent choice terminals and
@@ -24,6 +29,16 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   and does nothing. `flash` is unchanged and remains correct on a base (client-only) install.
 
 ### Changed
+
+- A Flash run is one seed and may execute several attempts. The provider seed argument threaded
+  beside `spec.seed` is gone, so the spec is the only seed channel and no caller can supply a
+  second one to disagree with it; `Provider.submit_run`/`poll` are now `submit_attempt`/
+  `poll_attempt`; and `runner/supervise/seed_submission.py` is `attempt_supervision.py`. Instance
+  labels drop the redundant seed field (`<run>-s<seed>-a<n>` becomes `<run>-a<n>`), and every
+  RunPod endpoint carries an explicit `-a<n>` ordinal including attempt zero, replacing the `r<n>`
+  retry suffix that made a retry ordinal an identity and left the base name ambiguous between a run
+  and its first attempt. Names that exceed the provider budget now raise rather than truncate,
+  since a clipped ordinal is one two attempts of a run can collide on.
 
 - Run-backed adapters now use only explicit permanent checkpoint identities, `<run_id>/final` and
   `<run_id>/step-N`. Bare run aliases, composite source-revision identities, activation, implicit

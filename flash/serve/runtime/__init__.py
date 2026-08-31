@@ -15,7 +15,6 @@ from .errors import (
     StaleIncarnationError,
     StructuredOutputsError,
 )
-from .structured_outputs import normalize_structured_outputs
 from .types import (
     AdapterSpec,
     EngineConfig,
@@ -28,6 +27,7 @@ from .types import (
     StreamEvent,
     StreamFinished,
     StreamReady,
+    normalize_structured_outputs,
 )
 
 __all__ = [

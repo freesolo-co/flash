@@ -444,20 +444,23 @@ def test_worker_seed_prefers_jobspec_when_present():
 
 
 def test_provider_worker_env_emits_authoritative_spec_seed():
+    """The spec is the only seed channel, so no caller can supply a second one to disagree with."""
+    import inspect
+
     from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(model="model", seed=987)
-    assert build_worker_env(spec, 987)["SEED"] == "987"
-    with pytest.raises(ValueError, match=r"does not match JobSpec\.seed"):
-        build_worker_env(spec, 42)
+    assert build_worker_env(spec)["SEED"] == "987"
+    assert "seed" not in inspect.signature(build_worker_env).parameters
 
 
-def test_lifecycle_rejects_seed_mismatch_before_provider_work():
-    from flash.runner.supervise.lifecycle import _submit_seed_supervised
+def test_every_attempt_of_a_run_shares_the_one_authoritative_seed():
+    """A run owns one seed; an attempt is a fresh host for that same run, never a new identity."""
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(model="model", seed=987)
-    with pytest.raises(ValueError, match=r"does not match JobSpec\.seed"):
-        _submit_seed_supervised(spec, 42, SimpleNamespace())
+    seeds = {build_worker_env(spec)["SEED"] for _ in range(3)}
+    assert seeds == {"987"}
 
 
 def test_sft_under_ran_only_fails_a_genuine_under_run():
@@ -524,7 +527,7 @@ def test_runtime_secret_cannot_override_control_plane_seed():
     # a directly-constructed spec can declare a seed env secret (the toml schema rejects it, but
     # json/direct construction does not). the built worker env must still hold the canonical seed.
     spec = JobSpec(model="m", seed=987, environment=EnvironmentSpec(id="e", secrets=("SEED",)))
-    env = build_worker_env(spec, 987, runtime_secrets={"SEED": "7"})
+    env = build_worker_env(spec, runtime_secrets={"SEED": "7"})
     assert env["SEED"] == "987"
 
 
@@ -535,7 +538,6 @@ def test_provider_worker_env_carries_control_plane_resume_revision():
     spec = JobSpec(model="m", algorithm="opd", seed=987)
     env = build_worker_env(
         spec,
-        987,
         runtime_secrets={
             OPD_RESUME_REVISION_ENV: "a" * 40,
             "FLASH_PUBLIC_URL": "https://broker.example",

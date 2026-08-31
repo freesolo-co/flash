@@ -9,6 +9,9 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
+from flash.content.reasoning_normalization import messages_for_chat_template
+from flash.serve.request.tool_calls import detached_template_messages, tools_active, tools_wire
+
 from ..request.validation import close_images
 from .errors import MultimodalRequestError, PromptError, ServingRuntimeError
 from .multimodal import has_image_blocks, normalize_text_messages, prepare_multimodal_request
@@ -21,6 +24,9 @@ _RESERVED_CHAT_TEMPLATE_KWARGS = frozenset(
         "return_dict",
         "return_tensors",
         "return_assistant_tokens_mask",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
         "enable_thinking",
         "conversation",
         "documents",
@@ -67,6 +73,8 @@ def effective_chat_template_kwargs(
     kwargs = safe_chat_template_kwargs(request.chat_template_kwargs)
     if thinking is not None:
         kwargs["enable_thinking"] = thinking
+    if tools_active(request.tools, request.tool_choice):
+        kwargs["tools"] = tools_wire(request.tools)
     return kwargs
 
 
@@ -131,8 +139,9 @@ class PromptPreparer:
             # escape before `_rejection_as_prompt_error` and answer 503, telling the caller to
             # retry a request that must fail identically while the engine is perfectly healthy.
             try:
+                template_messages = messages_for_chat_template(detached_template_messages(messages))
                 token_ids = self._tokenizer.apply_chat_template(
-                    messages,
+                    template_messages,
                     tokenize=True,
                     add_generation_prompt=True,
                     return_dict=False,
@@ -207,6 +216,9 @@ class PromptPreparer:
                 # is about releasing decoded images, not classifying failures, so without this an
                 # unrenderable multimodal request escapes unclassified and answers 503 exactly as
                 # the text path used to.
+                template_messages = messages_for_chat_template(
+                    detached_template_messages(template_messages)
+                )
                 rendered = await asyncio.to_thread(
                     self._processor.apply_chat_template,
                     template_messages,

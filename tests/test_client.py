@@ -329,6 +329,52 @@ def test_prepare_chat_request_sends_exact_checkpoint_id() -> None:
     assert "adapter_revision" not in body
 
 
+def test_prepare_chat_request_defaults_tool_controls() -> None:
+    base_run_id, body = _prepare_chat_request(
+        "run-abc/final",
+        [{"role": "user", "content": "weather"}],
+        0.0,
+        32,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ],
+    )
+
+    assert base_run_id == "run-abc"
+    assert body["tool_choice"] == "auto"
+    assert body["parallel_tool_calls"] is True
+
+
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"tool_choice": "none"},
+        {"parallel_tool_calls": True},
+    ],
+    ids=["tool-choice", "parallel-tool-calls"],
+)
+def test_prepare_chat_request_rejects_tool_controls_without_tools(controls) -> None:
+    with pytest.raises(ClientError, match="tool controls require tools"):
+        _prepare_chat_request(
+            "run-abc/final",
+            [{"role": "user", "content": "weather"}],
+            0.0,
+            32,
+            **controls,
+        )
+
+
 def test_chat_omits_thinking_template_controls(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
