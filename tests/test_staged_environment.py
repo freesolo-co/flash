@@ -741,7 +741,9 @@ def test_attach_boundary_schedules_reconciliation_for_staged_transient(
     monkeypatch.setattr(
         "flash.providers.core.registry.get_provider",
         lambda _name: SimpleNamespace(
-            poll=lambda *_args, **_kwargs: PollResult(False, failure="stalled", detail="lost")
+            poll_attempt=lambda *_args, **_kwargs: PollResult(
+                False, failure="stalled", detail="lost"
+            )
         ),
     )
     monkeypatch.setattr(
@@ -837,7 +839,9 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
     monkeypatch.setattr(
         "flash.providers.core.registry.get_provider",
         lambda _name: SimpleNamespace(
-            poll=lambda *_args, **_kwargs: PollResult(False, failure="stalled", detail="lost")
+            poll_attempt=lambda *_args, **_kwargs: PollResult(
+                False, failure="stalled", detail="lost"
+            )
         ),
     )
     monkeypatch.setattr(supervise_lifecycle, "_runpod_completed_metrics", lambda *_a, **_k: None)

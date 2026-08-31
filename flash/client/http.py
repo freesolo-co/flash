@@ -33,6 +33,7 @@ from flash.client.streaming import (
 )
 from flash.core.spec import require_project_id
 from flash.serve.contract.urls import is_freesolo_hosted_url
+from flash.serve.request.tool_calls import validate_tool_control_presence
 
 
 class ClientError(RuntimeError):
@@ -213,9 +214,18 @@ def _prepare_chat_request(
     max_tokens: int,
     *,
     stream: bool = False,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
 ) -> tuple[str, dict[str, Any]]:
     base_run_id, checkpoint_id = _parse_chat_target(target)
     _validate_chat_messages(messages)
+    validate_tool_control_presence(
+        tools,
+        tool_choice,
+        parallel_tool_calls,
+        error_type=ClientError,
+    )
     body: dict[str, Any] = {
         "checkpoint_id": checkpoint_id,
         "messages": messages,
@@ -224,6 +234,10 @@ def _prepare_chat_request(
     }
     if stream:
         body["stream"] = True
+    if tools is not None:
+        body["tools"] = tools
+        body["tool_choice"] = "auto" if tool_choice is None else tool_choice
+        body["parallel_tool_calls"] = True if parallel_tool_calls is None else parallel_tool_calls
     return base_run_id, body
 
 
@@ -767,12 +781,19 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
         timeout: float | None = None,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> dict:
         base_run_id, body = _prepare_chat_request(
             run_id,
             messages,
             temperature,
             max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
         )
         return self._request(
             "POST",
@@ -787,7 +808,11 @@ class ApiClient:
         messages: list[dict],
         temperature: float = 0.0,
         max_tokens: int = 512,
+        *,
+        tools: list[dict[str, Any]] | None = None,
     ) -> Iterator[str]:
+        if tools is not None:
+            raise ValueError("decoded chat_stream does not support tools")
         base_run_id, body = _prepare_chat_request(
             run_id,
             messages,
