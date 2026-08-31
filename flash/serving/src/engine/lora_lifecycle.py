@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from flash.serve.contract.provenance import (
     CheckpointKey,
@@ -31,6 +31,12 @@ from flash.serving.src.engine.support import (
 )
 
 SourceIdent = tuple[str, str, str, str, str | None]
+
+
+class LoraEntryOwner(Protocol):
+    """The single attribute `entries_for` and `cached_lora_request` read off the engine."""
+
+    _lora_entries: dict[CheckpointKey, _LoraEntry]
 
 
 class AdapterCacheCapacityError(RuntimeError):
@@ -324,7 +330,7 @@ class _LoraEntry:
     tombstoned: bool = False
 
 
-def entries_for(owner: Any) -> dict[CheckpointKey, _LoraEntry]:
+def entries_for(owner: LoraEntryOwner) -> dict[CheckpointKey, _LoraEntry]:
     """lazily initialize entries for modal instances whose base initializer never ran."""
     entries = getattr(owner, "_lora_entries", None)
     if entries is None:
@@ -333,7 +339,7 @@ def entries_for(owner: Any) -> dict[CheckpointKey, _LoraEntry]:
     return entries
 
 
-def cached_lora_request(owner: Any, record: Any, path: Path) -> Any:
+def cached_lora_request(owner: LoraEntryOwner, record: Any, path: Path) -> Any:
     source_ident = _adapter_source_ident(record)
     adapter_key = record_key(record)
     adapter_name = engine_adapter_name(*adapter_key)
@@ -362,6 +368,34 @@ def cached_lora_request(owner: Any, record: Any, path: Path) -> Any:
 
 
 class LoraLifecycleMixin:
+    """Adapter reservation, materialization, and request lifecycle for one vLLM engine.
+
+    This is a mixin rather than a collaborator object because Modal binds the engine's
+    entrypoints (`_register`, `_unregister`) as methods at class-decoration time, so the
+    lifecycle has to live on the engine class itself.
+
+    That makes its dependencies on the host implicit, so they are declared here instead.
+    The host (`_LoraEngineImpl`) must establish all of the following in `_load()` before any
+    lifecycle method runs; the annotations below are contract, not assignment.
+    """
+
+    # supplied by the per-GPU Modal subclass
+    base_model: str
+    # built by the host's _load()
+    engine: Any
+    registry: Any
+    settings: Any
+    _replica_id: str
+    _adapter_cache_dir: Path
+    _source_cache: ReplicaSourceCache
+    _pin_loras: bool
+    _lora_entries: dict[CheckpointKey, _LoraEntry]
+    _adapter_locks: dict[CheckpointKey, asyncio.Lock]
+    _adapter_locks_guard: asyncio.Lock
+    _source_locks: dict[SourceIdent, asyncio.Lock]
+    _source_locks_guard: asyncio.Lock
+    _source_paths: dict[SourceIdent, Path]
+
     def _replica_identifier(self) -> str:
         replica_id = getattr(self, "_replica_id", None)
         if replica_id is None:
