@@ -2,7 +2,7 @@
 
 Modal fixes a class's GPU and concurrency at decoration time, so the serving app registers one
 ``LoraEngine`` ``@app.cls`` per distinct (GPU tier, max_inputs) key and dispatches each base model to
-its class (9b -> l40s, 35b -> h200). modal_app imports the ``modal`` sdk
+its class (all active tiers -> b200). modal_app imports the ``modal`` sdk
 at module top, which isn't installed offline, so we stub it just enough to import the module and
 reach the built engine classes.
 """
@@ -408,11 +408,10 @@ assert "flash.serving.src.io.multimodal" not in sys.modules
 
 def test_one_engine_class_per_distinct_engine_key(modal_app_module):
     """a loraengine class is built for each active gpu tier and concurrency key."""
-    assert set(modal_app_module.ENGINE_BY_KEY) == {
-        ("L40S", 8),
-        ("H100", 8),
-        ("H200", 8),
-    }
+    # all three active tiers serve on B200 with the same concurrency, so they legitimately share
+    # ONE engine class: the key is (gpu, max_inputs) and each model still gets its own container
+    # and its own engine args.
+    assert set(modal_app_module.ENGINE_BY_KEY) == {("B200", 8)}
 
 
 def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, monkeypatch):
@@ -439,28 +438,28 @@ def test_class_names_are_distinct_and_modal_safe(modal_app_module):
     assert modal_app_module._engine_class_name("A100-80GB", 16) == "LoraEngine_A100_80GB_c16"
 
 
-def test_9b_routes_to_l40s(modal_app_module):
-    """Rank-128 LoRA serving for 9B uses the L40S tier (8-seq -> (L40S, 8))."""
+def test_9b_routes_to_b200(modal_app_module):
+    """Rank-128 LoRA serving for 9B uses the B200 tier (8-seq -> (B200, 8))."""
     by_key = modal_app_module.ENGINE_BY_KEY
-    assert gpu_for("Qwen/Qwen3.5-9B") == "L40S"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.5-9B") is by_key[("L40S", 8)]
-    assert by_key[("L40S", 8)].__name__ == "LoraEngine_L40S_c8"
+    assert gpu_for("Qwen/Qwen3.5-9B") == "B200"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.5-9B") is by_key[("B200", 8)]
+    assert by_key[("B200", 8)].__name__ == "LoraEngine_B200_c8"
 
 
-def test_27b_routes_to_h100(modal_app_module):
-    """The dense 27B runs its FP8 checkpoint on the H100 tier (8-seq -> (H100, 8))."""
+def test_27b_routes_to_b200(modal_app_module):
+    """The dense 27B runs its FP8 checkpoint on the B200 tier (8-seq -> (B200, 8))."""
     by_key = modal_app_module.ENGINE_BY_KEY
-    assert gpu_for("Qwen/Qwen3.8-27B") == "H100"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B") is by_key[("H100", 8)]
-    assert by_key[("H100", 8)].pinned_gpu == "H100"
+    assert gpu_for("Qwen/Qwen3.8-27B") == "B200"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B") is by_key[("B200", 8)]
+    assert by_key[("B200", 8)].pinned_gpu == "B200"
 
 
-def test_35b_moe_routes_to_h200(modal_app_module):
-    """The 35B-A3B MoE runs bf16 on the H200 tier ((H200, 8))."""
+def test_35b_moe_routes_to_b200(modal_app_module):
+    """The 35B-A3B MoE runs bf16 on the B200 tier ((B200, 8))."""
     by_key = modal_app_module.ENGINE_BY_KEY
-    assert gpu_for("Qwen/Qwen3.6-35B-A3B") == "H200"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-35B-A3B") is by_key[("H200", 8)]
-    assert by_key[("H200", 8)].pinned_gpu == "H200"
+    assert gpu_for("Qwen/Qwen3.6-35B-A3B") == "B200"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-35B-A3B") is by_key[("B200", 8)]
+    assert by_key[("B200", 8)].pinned_gpu == "B200"
 
 
 def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module):
@@ -472,12 +471,12 @@ def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module)
 def test_tier_classes_inherit_the_shared_impl(modal_app_module):
     """Each tier class subclasses _LoraEngineImpl (so _load/_generate/etc resolve) and defines the
     public Modal entrypoints itself (so Modal collects them per class)."""
-    l40s = modal_app_module.ENGINE_BY_KEY[("L40S", 8)]
-    assert issubclass(l40s, modal_app_module._LoraEngineImpl)
+    b200 = modal_app_module.ENGINE_BY_KEY[("B200", 8)]
+    assert issubclass(b200, modal_app_module._LoraEngineImpl)
     for impl in ("_load", "_register", "_generate", "_stream_generate", "_unregister", "_health"):
-        assert hasattr(l40s, impl)
+        assert hasattr(b200, impl)
     for entry in ("load", "register", "generate", "stream_generate", "unregister", "health"):
-        assert entry in l40s.__dict__
+        assert entry in b200.__dict__
 
 
 def test_each_tier_class_records_its_pinned_gpu(modal_app_module):
@@ -487,8 +486,7 @@ def test_each_tier_class_records_its_pinned_gpu(modal_app_module):
     # Every class records the GPU half of its (gpu, max_inputs) key.
     for (gpu, _max_inputs), cls in by_key.items():
         assert cls.pinned_gpu == gpu
-    assert by_key[("L40S", 8)].pinned_gpu == "L40S"
-    assert by_key[("H200", 8)].pinned_gpu == "H200"
+    assert by_key[("B200", 8)].pinned_gpu == "B200"
 
 
 def test_tier_class_identity_is_fixed_before_decoration(modal_app_module):
@@ -522,7 +520,7 @@ def test_health_reports_pinned_gpu_over_derived_tier(modal_app_module):
         base_model = "Qwen/Qwen3.5-9B"
         registry = type("R", (), {"list_ready": lambda self: []})()
 
-    assert impl._health(_Bare())["configured_gpu"] == "L40S"
+    assert impl._health(_Bare())["configured_gpu"] == "B200"
 
 
 def test_health_reports_effective_max_model_len_override(modal_app_module):
@@ -784,7 +782,7 @@ def test_lora_pinning_only_when_hot_pool_covers_cpu_pool(modal_app_module, monke
 
 
 def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path):
-    """The 9B loads a pre-quantized FP8 checkpoint with FP8 KV and the L40S-validated 32k context."""
+    """The 9B loads a pre-quantized FP8 checkpoint with FP8 KV and the validated 32k context."""
     args = _capture_engine_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-9B")
     assert args.model == "Freesolo-Co/Qwen3.5-9B-FP8"  # owned pre-quant checkpoint
     assert args.quantization is None  # auto-detected from the checkpoint, not online-quantized
@@ -811,7 +809,7 @@ def test_qwen38_immutable_args_fail_closed_when_vllm_drops_revision_support():
 
 
 def test_load_bf16_base_with_full_experts_for_35b(modal_app_module, monkeypatch, tmp_path):
-    """The 35B MoE loads the BASE bf16 weights (not the FP8 checkpoint) on the H200 with CUDA graphs
+    """The 35B MoE loads the BASE bf16 weights (not the FP8 checkpoint) on the B200 with CUDA graphs
     and full all-expert LoRA — the only config where experts AND graphs coexist. quantization=None
     here means bf16 (explicit), not FP8 auto-detection."""
     args = _capture_engine_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.6-35B-A3B")
