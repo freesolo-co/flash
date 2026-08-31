@@ -12,10 +12,18 @@ from collections.abc import Callable
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.runtime.state as _worker_state
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.adapters.artifacts import attempt_scoped_artifact_name, has_loadable_adapter_weights
+from flash.adapters.artifacts import (
+    attempt_scoped_artifact_name,
+    has_loadable_adapter_weights,
+)
 from flash.engine.profiling.tokenizer import (  # noqa: F401
     load_tokenizer,
     model_revision_kwargs,
+)
+from flash.engine.worker.io.adapter_publication import (
+    AdapterPublicationError,
+    RequiredSaveError,
+    replace_adapter_folder,
 )
 
 # `gpu_diagnostics` has no call site here since prefetch moved to `.prefetch`, but it is kept
@@ -31,8 +39,20 @@ from flash.teacher.retry_contract import (
 )
 
 
-class RequiredSaveError(RuntimeError):
-    """permanent exact-save contract failure."""
+def _replace_adapter_folder(
+    local_dir: str,
+    repo_subpath: str,
+    *,
+    ignore_patterns: tuple[str, ...] = (),
+) -> str:
+    """Bind this worker's hub client and repository to an atomic adapter replacement."""
+    return replace_adapter_folder(
+        hf_api(),
+        _worker_state.HF_REPO,
+        local_dir,
+        repo_subpath,
+        ignore_patterns=ignore_patterns,
+    )
 
 
 def error_artifact_name(mode: str, attempt: int = 0) -> str:
@@ -148,6 +168,15 @@ def _hf_upload(do_upload, repo_subpath: str, required: bool, label: str) -> bool
             _require_hf_deadline_allowance()
             do_upload()
             return True
+        except RequiredSaveError:
+            raise
+        except AdapterPublicationError as e:
+            last_err = e
+            detail = sanitize_diagnostic(e, limit=500)
+            if not required:
+                print(f"{label} warn: {detail}")
+                return False
+            break
         except Exception as e:
             last_err = e
             detail = sanitize_diagnostic(e, limit=500)
@@ -203,14 +232,10 @@ def _resume_checkpoint_upload_slot(timeout_s: float | None = None):
 
 
 def hf_upload_folder(local_dir: str, repo_subpath: str, required: bool = False) -> bool:
-    """Upload a folder to the run's HF prefix. Returns True on success (see ``_hf_upload``)."""
+    """atomically replace an adapter folder under the run's HF prefix."""
+    target = f"{hf_prefix()}/{repo_subpath}"
     return _hf_upload(
-        lambda: hf_api().upload_folder(
-            folder_path=local_dir,
-            path_in_repo=f"{hf_prefix()}/{repo_subpath}",
-            repo_id=_worker_state.HF_REPO,
-            repo_type="dataset",
-        ),
+        lambda: _replace_adapter_folder(local_dir, target),
         repo_subpath,
         required,
         "hf_upload_folder",
@@ -377,16 +402,23 @@ def publish_deployable_checkpoint(
     for attempt in range(attempts):
         try:
             _require_hf_deadline_allowance()
-            hf_api().upload_folder(
-                folder_path=ckpt_dir,
-                path_in_repo=subfolder,
-                repo_id=_worker_state.HF_REPO,
-                repo_type="dataset",
-                ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
+            _replace_adapter_folder(
+                ckpt_dir,
+                subfolder,
+                ignore_patterns=_CHECKPOINT_TRAINER_STATE,
             )
             if _emit_heartbeat:
                 _worker_heartbeat.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
             return subfolder
+        except RequiredSaveError:
+            # a local contract violation: coexisting weight files, a malformed index, no complete
+            # weight representation. no amount of retrying changes the folder on disk, and calling
+            # it retriable infra would hand the run back to a resume that fails identically.
+            raise
+        except AdapterPublicationError as e:
+            last_error = e
+            print(f"[ckpt] deployable publish warn (step {step}):", e)
+            break
         except Exception as e:
             last_error = e
             print(f"[ckpt] deployable publish warn (step {step}):", e)
