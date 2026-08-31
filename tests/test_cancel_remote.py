@@ -297,6 +297,7 @@ def test_cancel_rejects_malformed_worker_but_cleans_raw_effective_identity(tmp_p
     with open(path, encoding="utf-8") as handle:
         stored = json.load(handle)
     stored["effective_preparation"]["worker_spec"]["gpu"]["max_retries"] = "5"
+    stored["remote"].pop("allocated_gpu")
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(stored, handle)
 

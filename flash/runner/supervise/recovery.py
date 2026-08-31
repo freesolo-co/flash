@@ -557,6 +557,17 @@ def _persisted_endpoint_cleanup_target(status) -> _PersistedEndpointCleanupTarge
     )
 
 
+def _fallback_cleanup_target_from_status(status):
+    """Use raw private identities, falling back to public only when the private key is absent."""
+    from flash.runner.lifecycle.state import _internal_spec_from_status
+
+    snapshot = getattr(status, "effective_preparation", None)
+    if not (isinstance(snapshot, dict) and "worker_spec" in snapshot):
+        with contextlib.suppress(Exception):
+            return _internal_spec_from_status(status)
+    return _persisted_endpoint_cleanup_target(status)
+
+
 def _gc_run_endpoints(spec: JobSpec | _PersistedEndpointCleanupTarget) -> None:
     """Best-effort teardown of every endpoint a run may have registered."""
     from flash.runner.accounting.reconciliation import (
