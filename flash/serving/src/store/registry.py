@@ -122,6 +122,15 @@ class AdapterRegistry:
                 self._local_idents.pop(checkpoint, None)
             return removed
 
+    def clear_local_path(self, record: AdapterRecord) -> None:
+        """forget one materialized source binding without touching durable routing state."""
+        if not record.is_checkpoint:
+            return
+        key = record_key(record)
+        with self._lock:
+            self._local_paths.pop(key, None)
+            self._local_idents.pop(key, None)
+
     def local_path_is_stale(self, record: AdapterRecord) -> bool:
         if not record.is_checkpoint:
             return False

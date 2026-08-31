@@ -8,7 +8,14 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 HOSTING_CACHE_DIR = Path("/vol/hosting-cache")
-ADAPTER_CACHE_DIR = HOSTING_CACHE_DIR / "adapters"
+HF_HUB_CACHE_DIR = HOSTING_CACHE_DIR / "hub"
+# adapter final directories stay replica-local so one replica can never observe or reclaim another
+# replica's materialization. immutable hub, weight, and compile caches remain on the shared hosting
+# volume through the environment configured by the modal app.
+ADAPTER_CACHE_DIR = Path("/tmp/flash-serving-adapters")
+# hard ceiling for replica-local adapter source directories. a load that cannot reserve its bytes
+# fails closed instead of evicting a source that is materializing, active, current, or vllm-loaded.
+ADAPTER_CACHE_MAX_BYTES = 32 * 1024 * 1024 * 1024
 
 # ── Hardcoded serving config (no knobs) ───────────────────────────────────────────────────────
 # An optimization either exists (baked in here) or it doesn't — there is nothing to tune at deploy

@@ -396,6 +396,12 @@ def _build_engine(
         async def load(self) -> None:
             await self._load()
 
+        @modal.exit()
+        async def exit(self) -> None:
+            # replica-local adapter directories live outside the shared volume, so this replica
+            # must delete its own materialization root before the container goes away.
+            await self._exit()
+
         @modal.method()
         async def register(
             self,
