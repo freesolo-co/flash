@@ -107,7 +107,6 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
 
         class Context:
             lookup = Lookup()
-            traffic_org_id = staticmethod(ServingContext.traffic_org_id)
 
             async def authorize_inference(self, *_args):
                 return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
