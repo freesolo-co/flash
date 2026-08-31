@@ -1739,7 +1739,7 @@ def test_text_teacher_batcher_enforces_max_batch_size_across_concurrent_requests
 
 def test_text_teacher_batcher_never_takes_more_than_max_batch_size():
     # the concurrent test above CANNOT observe the bound being exceeded: with a 0.1s flush window
-    # the pending queue never accumulates past the ceiling, so widening the slice in _take_batch
+    # the pending queue never accumulates past the ceiling, so widening the slice in _claim_batch
     # leaves it green (verified by mutation). this pins the slice directly against a pre-filled
     # queue -- no threads, no timer -- so the bound is falsifiable rather than merely unreached.
     batcher = _TextTeacherBatcher(object(), max_batch_size=4, flush_wait_s=0.01)
@@ -1750,7 +1750,7 @@ def test_text_teacher_batcher_never_takes_more_than_max_batch_size():
         for index in range(10)
     ]
 
-    batch = batcher._take_batch()
+    batch = batcher._claim_batch()
 
     assert batch is not None
     assert len(batch) == 4
@@ -2046,6 +2046,123 @@ def test_text_teacher_batcher_close_allows_inflight_scatter_within_bound():
         assert result.tokens == (
             TeacherToken(text="AB", logprob=-float(index + 1), start=0, end=2),
         )
+
+
+def test_text_teacher_batcher_close_cancels_before_dispatch_claim():
+    from flash.engine.worker.teacher.client import TeacherError
+
+    class NeverCalledTeacher:
+        def __init__(self):
+            self.called = threading.Event()
+
+        def score_many(self, items):
+            self.called.set()
+            return [
+                _teacher_score([TeacherToken(text="AB", logprob=-1.0, start=0, end=2)])
+                for _ in items
+            ]
+
+    class FlushWaitCondition(threading.Condition):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+
+        def wait(self, timeout=None):
+            if (
+                threading.current_thread().name == "flash-opd-text-teacher-batcher"
+                and timeout is not None
+            ):
+                self.entered.set()
+            return super().wait(timeout)
+
+    teacher = NeverCalledTeacher()
+    batcher = _TextTeacherBatcher(teacher, max_batch_size=8, flush_wait_s=30.0)
+    condition = FlushWaitCondition()
+    batcher._condition = condition
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(batcher.score, "prompt", "AB")
+    try:
+        assert condition.entered.wait(timeout=10.0)
+        # a real bound, not zero: a zero bound cancels the queue even when the consumer is wrongly
+        # handed the claim window, so it cannot tell the two policies apart.
+        batcher.close(timeout_s=5.0)
+        with pytest.raises(TeacherError) as error:
+            future.result(timeout=10.0)
+    finally:
+        if batcher._thread is not None:
+            batcher._thread.join(timeout=10.0)
+        batcher.close(timeout_s=0.1)
+        executor.shutdown(wait=True)
+
+    assert error.value.permanent
+    assert str(error.value) == "text teacher batcher shut down"
+    assert not teacher.called.is_set(), "shutdown billed an unclaimed teacher batch"
+
+
+def test_text_teacher_batcher_close_waits_for_claimed_dispatch_result():
+    class RecordingTeacher:
+        def __init__(self):
+            self.called = threading.Event()
+            self.release = threading.Event()
+
+        def score_many(self, items):
+            self.called.set()
+            assert self.release.wait(timeout=10.0)
+            return [
+                _teacher_score([TeacherToken(text="AB", logprob=-1.0, start=0, end=2)])
+                for _ in items
+            ]
+
+    teacher = RecordingTeacher()
+    batcher = _TextTeacherBatcher(teacher, max_batch_size=1, flush_wait_s=0.01)
+    claimed = threading.Event()
+    allow_dispatch = threading.Event()
+    close_done = threading.Event()
+    claim_batch = batcher._claim_batch
+
+    def claim_then_hold():
+        batch = claim_batch()
+        if batch is not None:
+            # the dispatch decision is final before this gate; close must retain the claimed batch.
+            claimed.set()
+            assert allow_dispatch.wait(timeout=10.0)
+        return batch
+
+    def close_batcher():
+        try:
+            batcher.close(timeout_s=5.0)
+        finally:
+            close_done.set()
+
+    batcher._claim_batch = claim_then_hold
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(batcher.score, "prompt", "AB")
+    close_thread = None
+    try:
+        assert claimed.wait(timeout=10.0)
+        close_thread = threading.Thread(target=close_batcher)
+        close_thread.start()
+        with batcher._condition:
+            assert batcher._condition.wait_for(lambda: batcher._closed, timeout=10.0)
+        assert not close_done.is_set(), "close returned before the claimed batch reached an outcome"
+        allow_dispatch.set()
+        assert teacher.called.wait(timeout=10.0)
+        assert not close_done.is_set(), "close returned while the claimed scorer was still running"
+        teacher.release.set()
+        result = future.result(timeout=10.0)
+        assert close_done.wait(timeout=10.0)
+        close_thread.join(timeout=10.0)
+        assert not close_thread.is_alive()
+    finally:
+        allow_dispatch.set()
+        teacher.release.set()
+        if close_thread is not None:
+            close_thread.join(timeout=10.0)
+        batcher.close(timeout_s=0.1)
+        executor.shutdown(wait=True)
+
+    assert teacher.called.is_set()
+    assert result.tokens == (TeacherToken(text="AB", logprob=-1.0, start=0, end=2),)
 
 
 def test_text_teacher_batcher_shutdown_cannot_strand_pending_bridge_waiter(monkeypatch):
