@@ -96,11 +96,15 @@ unhealthy stream or container stays visible instead of being absorbed into a cle
 Measured 2026-08-31, invocation `495dad60099e`, one container, one block. **1,914 requests
 attempted, 1,914 succeeded, 0 failed** across all 18 cells.
 
-Engine identity held constant across every cell and is asserted, not assumed: KV pool
-`760 blocks x 1056 tokens`, GDN prefill backend `triton` from vLLM's own resolver, model
-`Freesolo-Co/Qwen3.5-9B-FP8` @ `878d83ed`, tokenizer `Qwen/Qwen3.5-9B` @ `c2022362`, driver
-`580.95.05`. `triton` is the correct GDN path on sm89; the `warning_once` fallback that gate 5
-guards against is a Blackwell failure mode and does not apply to this card.
+Engine identity is asserted, not assumed. Every cell records `replica_ids`, and all 18 name the
+same single container (`41b37856...`), so the whole sweep measured one engine rather than a
+re-boot per cell. Each of the three bucket artifacts independently records the engine it booted:
+KV pool `760 blocks x 1056 tokens` (fp8), GDN prefill backend `triton` resolved by vLLM itself,
+model `Freesolo-Co/Qwen3.5-9B-FP8` @ `878d83ed`, tokenizer `Qwen/Qwen3.5-9B` @ `c2022362`, driver
+`580.95.05` read from NVML. All three agree.
+
+`triton` is the correct GDN path on sm89; the `warning_once` fallback that gate 5 guards against
+is a Blackwell failure mode and does not apply to this card.
 
 The 1056-token block size is not a tuning choice: vLLM raises the attention block size to keep
 the attention page at least as large as the mamba page, which is what sets the pool arithmetic.
