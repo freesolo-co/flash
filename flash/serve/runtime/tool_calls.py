@@ -348,13 +348,18 @@ def _index_parameter_openers(
     # historical call, so one key as long as the run makes every opener in it wide enough to copy.
     #
     # the widths a declaration does hold are few, and only they can copy an opener out to hash it.
-    # that is what keeps the copying proportional to the text rather than to its square: the
-    # openers ending at one delimiter have distinct widths, so it copies at most one name per
-    # declared width, and each of those names is at most as long as the distance it spans.
+    # the openers ending at one delimiter have distinct widths, so it copies at most one name per
+    # declared width, and each of those names is at most as long as the distance it spans. for a
+    # fixed declaration that is proportional to the text; across declarations it is not, because
+    # the number of distinct declared widths grows with the declaration itself. a replay probe
+    # declaring many keys of many lengths therefore costs the text times that width count, which
+    # a wide enough declaration makes materially superlinear in the input.
     #
     # the span is charged against the budget once, above, and the copies are not charged again.
-    # they cannot exceed it by more than the number of declared widths, and billing the same
-    # characters a second time exhausts calls that parse without the width check at all.
+    # so the work limit bounds the span, not the copying it admits: the copies exceed it by the
+    # number of declared widths, and that factor is what the limit does not contain. billing the
+    # same characters a second time is not the fix, because it exhausts calls that parse without
+    # the width check at all; scanning once per declared name instead only relocates the cost.
     positions: dict[str, array[int]] = {}
     widths = frozenset(len(name) for name in declared)
     cursor, name_end = text.find(_PARAMETER_START, start), -1
