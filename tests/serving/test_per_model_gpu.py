@@ -21,7 +21,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serving.src.engine.model_config import base_models, gpu_for
+from flash.serving.src.io.schemas import AdapterRecord, internal_adapter_payload
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
@@ -325,24 +327,27 @@ def test_router_secret_keeps_supabase_credentials(modal_app_module, monkeypatch)
 def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_path) -> None:
     from flash.serving.src.store.registry import AdapterRegistry
 
-    revision = "a" * 40
-    adapter_id = f"run-1@step-1.{revision}"
-    record_dict = {
+    run_id = "flash-1234567890-abcdef12"
+    adapter_id = f"{run_id}/step-1"
+    record_values = {
         "adapter_id": adapter_id,
         "repo_id": "org/private-adapter",
         "base_model": "Qwen/Qwen3.5-9B",
+        "subfolder": "checkpoints/step-1/adapter",
+        "repo_type": "dataset",
         "org_id": "org-1",
-        "checkpoint": "run-1/step-1",
+        "checkpoint": adapter_id,
         "private": True,
         "thinking": False,
         "status": "ready",
-        "metadata": {
-            "record_type": "revision",
-            "run_id": "run-1",
-            "checkpoint_step": 1,
-            "hf_revision": revision,
-        },
+        "run_id": run_id,
+        "checkpoint_step": 1,
+        "artifact_revision": "a" * 40,
+        "artifact_digest": "b" * 64,
+        "lora_rank": 32,
     }
+    record_values["artifact_fingerprint"] = immutable_binding_fingerprint(record_values)
+    record_dict = internal_adapter_payload(AdapterRecord.model_validate(record_values))
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine.base_model = record_dict["base_model"]
     engine.registry = AdapterRegistry()
@@ -368,7 +373,7 @@ def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_pat
 
     assert lora_request is resolved_request
     assert record.adapter_id == adapter_id
-    assert engine.registry.get(adapter_id) == record
+    assert engine.registry.get("org-1", adapter_id) == record
 
 
 def test_lora_engine_import_does_not_require_pillow() -> None:
@@ -404,8 +409,9 @@ assert "flash.serving.src.io.multimodal" not in sys.modules
 def test_one_engine_class_per_distinct_engine_key(modal_app_module):
     """a loraengine class is built for each active gpu tier and concurrency key."""
     assert set(modal_app_module.ENGINE_BY_KEY) == {
-        ("L40S", 16),
-        ("H200", 16),
+        ("L40S", 8),
+        ("H100", 8),
+        ("H200", 8),
     }
 
 
@@ -413,7 +419,7 @@ def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, m
     mod = modal_app_module
 
     monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {"max_num_seqs": 8})
-    assert mod._engine_concurrency("valid") == (16, 12)
+    assert mod._engine_concurrency("valid") == (8, 6)
 
     monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {})
     assert mod._engine_concurrency("defaulted") == (64, 48)
@@ -434,26 +440,27 @@ def test_class_names_are_distinct_and_modal_safe(modal_app_module):
 
 
 def test_9b_routes_to_l40s(modal_app_module):
-    """Rank-128 LoRA serving for 9B uses the L40S tier (8-seq -> (L40S, 16))."""
+    """Rank-128 LoRA serving for 9B uses the L40S tier (8-seq -> (L40S, 8))."""
     by_key = modal_app_module.ENGINE_BY_KEY
     assert gpu_for("Qwen/Qwen3.5-9B") == "L40S"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.5-9B") is by_key[("L40S", 16)]
-    assert by_key[("L40S", 16)].__name__ == "LoraEngine_L40S_c16"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.5-9B") is by_key[("L40S", 8)]
+    assert by_key[("L40S", 8)].__name__ == "LoraEngine_L40S_c8"
 
 
-def test_pending_qwen38_candidate_has_no_active_engine_dispatch(modal_app_module):
-    with pytest.raises(ValueError, match="Unsupported base model"):
-        gpu_for("Qwen/Qwen3.8-27B")
-    with pytest.raises(ValueError, match="Unsupported base model"):
-        modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B")
+def test_27b_routes_to_h100(modal_app_module):
+    """The dense 27B runs its FP8 checkpoint on the H100 tier (8-seq -> (H100, 8))."""
+    by_key = modal_app_module.ENGINE_BY_KEY
+    assert gpu_for("Qwen/Qwen3.8-27B") == "H100"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B") is by_key[("H100", 8)]
+    assert by_key[("H100", 8)].pinned_gpu == "H100"
 
 
 def test_35b_moe_routes_to_h200(modal_app_module):
-    """The 35B-A3B MoE runs bf16 on the H200 tier ((H200, 16))."""
+    """The 35B-A3B MoE runs bf16 on the H200 tier ((H200, 8))."""
     by_key = modal_app_module.ENGINE_BY_KEY
     assert gpu_for("Qwen/Qwen3.6-35B-A3B") == "H200"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-35B-A3B") is by_key[("H200", 16)]
-    assert by_key[("H200", 16)].pinned_gpu == "H200"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-35B-A3B") is by_key[("H200", 8)]
+    assert by_key[("H200", 8)].pinned_gpu == "H200"
 
 
 def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module):
@@ -465,7 +472,7 @@ def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module)
 def test_tier_classes_inherit_the_shared_impl(modal_app_module):
     """Each tier class subclasses _LoraEngineImpl (so _load/_generate/etc resolve) and defines the
     public Modal entrypoints itself (so Modal collects them per class)."""
-    l40s = modal_app_module.ENGINE_BY_KEY[("L40S", 16)]
+    l40s = modal_app_module.ENGINE_BY_KEY[("L40S", 8)]
     assert issubclass(l40s, modal_app_module._LoraEngineImpl)
     for impl in ("_load", "_register", "_generate", "_stream_generate", "_unregister", "_health"):
         assert hasattr(l40s, impl)
@@ -480,8 +487,8 @@ def test_each_tier_class_records_its_pinned_gpu(modal_app_module):
     # Every class records the GPU half of its (gpu, max_inputs) key.
     for (gpu, _max_inputs), cls in by_key.items():
         assert cls.pinned_gpu == gpu
-    assert by_key[("L40S", 16)].pinned_gpu == "L40S"
-    assert by_key[("H200", 16)].pinned_gpu == "H200"
+    assert by_key[("L40S", 8)].pinned_gpu == "L40S"
+    assert by_key[("H200", 8)].pinned_gpu == "H200"
 
 
 def test_tier_class_identity_is_fixed_before_decoration(modal_app_module):
@@ -642,17 +649,32 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
         {"messages": [{"role": "user", "content": "hello"}]},
         generation_id=generation_id,
     )
-    record = _Dump(
-        {"adapter_id": "run@step-1.sha"},
-        deployment_generation="generation-1",
-    )
+    checkpoint_id = "flash-1234567890-abcdef12/step-1"
+    record_values = {
+        "adapter_id": checkpoint_id,
+        "repo_id": "org/run",
+        "base_model": "Qwen/Qwen3.5-9B",
+        "subfolder": "checkpoints/step-1/adapter",
+        "repo_type": "dataset",
+        "org_id": "org-1",
+        "checkpoint": checkpoint_id,
+        "thinking": False,
+        "deployment_generation": "generation-1",
+        "run_id": "flash-1234567890-abcdef12",
+        "checkpoint_step": 1,
+        "artifact_revision": "a" * 40,
+        "artifact_digest": "b" * 64,
+        "lora_rank": 32,
+    }
+    record_values["artifact_fingerprint"] = immutable_binding_fingerprint(record_values)
+    record = AdapterRecord.model_validate(record_values)
 
     result = asyncio.run(
         pool.generate(
             "Qwen/Qwen3.5-9B",
             payload,
             record,
-            expected_checkpoint="step-1",
+            expected_checkpoint=checkpoint_id,
         )
     )
 
@@ -663,7 +685,7 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
                 "Qwen/Qwen3.5-9B",
                 payload,
                 record,
-                expected_checkpoint="step-1",
+                expected_checkpoint=checkpoint_id,
             )
         ]
 
@@ -677,26 +699,17 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.5-9B",
     ]
+    forwarded_record = internal_adapter_payload(record)
+    assert AdapterRecord.model_validate(forwarded_record) == record
     expected_inference_call = (
         {"messages": [{"role": "user", "content": "hello"}]},
-        {
-            "adapter_id": "run@step-1.sha",
-            "deployment_generation": "generation-1",
-        },
-        "step-1",
+        forwarded_record,
+        checkpoint_id,
         generation_id,
     )
     assert generate_calls == [expected_inference_call]
     assert stream_calls == [expected_inference_call]
-    assert register_calls == [
-        (
-            {
-                "adapter_id": "run@step-1.sha",
-                "deployment_generation": "generation-1",
-            },
-            "generation-1",
-        )
-    ]
+    assert register_calls == [(forwarded_record, "generation-1")]
 
 
 # ---- Functional: actually run _load() and capture the AsyncEngineArgs (vLLM/tokenizer stubbed) ----
@@ -785,14 +798,14 @@ def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path
     assert getattr(args, "max_num_batched_tokens", None) is None
 
 
-def test_qwen38_candidate_immutable_args_fail_closed_when_vllm_drops_revision_support():
+def test_qwen38_immutable_args_fail_closed_when_vllm_drops_revision_support():
     from flash.serving.src.engine import boot
-    from flash.serving.src.engine.model_config import _QWEN38_HOSTED_CANDIDATE
+    from flash.serving.src.engine.model_config import engine_overrides_for
 
     with pytest.raises(RuntimeError, match=r"cannot pin.*missing engine args"):
         boot._required_immutable_args(
             "Qwen/Qwen3.8-27B",
-            _QWEN38_HOSTED_CANDIDATE["engine"],
+            engine_overrides_for("Qwen/Qwen3.8-27B"),
             {"model"},
         )
 

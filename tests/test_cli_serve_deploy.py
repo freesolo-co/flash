@@ -172,8 +172,8 @@ def test_the_deploy_proceeds_once_a_token_is_present(
 def test_resolver_validation_failures_are_cli_errors_not_tracebacks(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # bad user input reaches validation below the resolver: a negative --checkpoint-step raises
-    # from format_adapter_revision and a nonimmutable revision raises from ResolvedAdapter, both
+    # bad user input reaches validation below the resolver: a negative --checkpoint-step and an
+    # invalid immutable checkpoint both raise from resolver-owned validation
     # as plain ValueError. catching only ResolveError let those escape as an unexpected-error
     # traceback after the artifact files had already been downloaded.
     _stub_environment(monkeypatch)
@@ -585,8 +585,9 @@ def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     """resolve against fixed hub facts so the command path is tested without the network."""
 
+    from flash.schema import format_checkpoint_ref
     from flash.serve.app import AdapterExecutionInput, ArtifactFile, aggregate_file_digest
-    from flash.serve.control import AdapterAliasIntent, ResolvedAdapter
+    from flash.serve.control import ResolvedAdapter
     from flash.serve.deployment.resolve import ResolvedDeploymentInputs
 
     artifact_revision = "c" * 40
@@ -594,7 +595,7 @@ def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
         ArtifactFile("adapter_config.json", 1308, "1" * 64),
         ArtifactFile("adapter_model.safetensors", 43346432, "2" * 64),
     )
-    revision = f"run1@final.{artifact_revision}"
+    checkpoint_id = format_checkpoint_ref("run1", None)
 
     def _fake_base_revision(model_id: str) -> str:
         return "d" * 40
@@ -602,8 +603,7 @@ def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     def _fake_resolve(**kwargs) -> ResolvedDeploymentInputs:
         adapter = ResolvedAdapter(
             run_id=kwargs["run_id"],
-            checkpoint="final",
-            adapter_revision=revision,
+            checkpoint_id=checkpoint_id,
             artifact_repo_id=kwargs["artifact_repo_id"],
             artifact_repo_type="dataset",
             artifact_revision=artifact_revision,
@@ -614,11 +614,10 @@ def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
             lora_rank=kwargs["lora_rank"],
             thinking_default=bool(kwargs.get("thinking_default", False)),
             structured_outputs_default_json=None,
-            alias_intent=AdapterAliasIntent(activate=True, expected_adapter_revision=None),
         )
         return ResolvedDeploymentInputs(
             adapter=adapter,
-            execution=AdapterExecutionInput(adapter_revision=revision, files=files),
+            execution=AdapterExecutionInput(checkpoint_id=checkpoint_id, files=files),
         )
 
     monkeypatch.setattr("flash.serve.deployment.resolve.resolve_adapter", _fake_resolve)
@@ -637,7 +636,11 @@ def _historical_identity(
 
     _stub_resolution(monkeypatch)
     current = serve_deploy._deployment_bundle(args)
-    engine = replace(current.spec.engine, served_model=retired_model, tokenizer_model=retired_model)
+    engine = replace(
+        current.spec.engine,
+        served_model=retired_model,
+        tokenizer_model=retired_model,
+    )
     adapters = tuple(
         replace(adapter, base_model=retired_model) for adapter in current.spec.adapters
     )
@@ -655,7 +658,7 @@ def _historical_identity(
         tokenizer_kwargs=current.manifest.tokenizer_kwargs,
         processor_kwargs=current.manifest.processor_kwargs,
         adapters=tuple(
-            AdapterExecutionInput(adapter_revision=entry.adapter_revision, files=entry.files)
+            AdapterExecutionInput(checkpoint_id=entry.checkpoint_id, files=entry.files)
             for entry in current.manifest.adapters
         ),
     )

@@ -93,7 +93,7 @@ def test_launcher_uses_cache_first_without_reading_artifact_token(
 
     def validate(manifest, cache_root):
         calls.append("validate")
-        return {manifest.adapters[0].adapter_revision: Path(cache_root) / "cached"}
+        return {manifest.adapters[0].checkpoint_id: Path(cache_root) / "cached"}
 
     def hydrate(*_args, **_kwargs):
         raise AssertionError("cache-first restart must not hydrate")

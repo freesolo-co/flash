@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import PurePosixPath
 from typing import Literal, TypeAlias
 
-from flash.serve.contract.protocol import ADAPTER_REVISION_PATTERN
+from flash.schema import parse_checkpoint_ref
 
 from ._canonical import canonical_json
 from ._urls import validate_modal_public_url
@@ -64,7 +64,6 @@ _DEPLOYMENT_ERROR_REASONS = frozenset(
     }
 )
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_ADAPTER_REVISION_RE = re.compile(ADAPTER_REVISION_PATTERN)
 _HEX_40_RE = re.compile(r"[0-9a-f]{40}")
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}")
 _IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
@@ -295,27 +294,11 @@ def validate_engine_identity(identity: EngineIdentity) -> None:
 
 
 @dataclass(frozen=True, slots=True)
-class AdapterAliasIntent:
-    """explicit compare-and-swap intent for the run's mutable alias."""
-
-    activate: bool
-    expected_adapter_revision: str | None
-
-    def __post_init__(self) -> None:
-        _require_bool(self.activate, "alias_intent.activate")
-        if not self.activate and self.expected_adapter_revision is not None:
-            raise ValueError("inactive alias intent cannot carry an expected revision")
-        if self.expected_adapter_revision is not None:
-            _require_nonempty(self.expected_adapter_revision, "alias expected revision")
-
-
-@dataclass(frozen=True, slots=True)
 class ResolvedAdapter:
-    """one authorized immutable adapter and its exact data-only artifact source."""
+    """one authorized permanent checkpoint and its private exact artifact source."""
 
     run_id: str
-    checkpoint: str
-    adapter_revision: str
+    checkpoint_id: str
     artifact_repo_id: str
     artifact_repo_type: RepoType
     artifact_revision: str
@@ -326,36 +309,25 @@ class ResolvedAdapter:
     lora_rank: int
     thinking_default: bool
     structured_outputs_default_json: str | None
-    alias_intent: AdapterAliasIntent
 
     def __post_init__(self) -> None:
         validate_resolved_adapter(self)
 
 
 def validate_resolved_adapter(adapter: ResolvedAdapter) -> None:
-    """validate one immutable adapter and its logical base provenance."""
+    """validate one immutable checkpoint and its logical base provenance."""
 
     if type(adapter) is not ResolvedAdapter:
         raise ValueError("adapters must contain exact ResolvedAdapter records")
     run_id = _require_identifier(adapter.run_id, "run_id")
-    revision = _require_nonempty(adapter.adapter_revision, "adapter_revision")
-    match = _ADAPTER_REVISION_RE.fullmatch(revision)
-    if match is None:
-        raise ValueError("adapter_revision must be a full immutable adapter revision")
-    if match.group("run_id") != run_id:
-        raise ValueError("adapter_revision does not belong to run_id")
-    checkpoint = "final" if match.group("step") is None else f"step-{match.group('step')}"
-    if adapter.checkpoint != checkpoint:
-        raise ValueError("checkpoint does not match adapter_revision")
+    parsed = parse_checkpoint_ref(adapter.checkpoint_id)
+    if parsed is None:
+        raise ValueError("checkpoint_id must be `<run_id>/final` or `<run_id>/step-N`")
+    if parsed[0] != run_id:
+        raise ValueError("checkpoint_id does not belong to run_id")
     _validate_repo_id(adapter.artifact_repo_id)
     _validate_repo_type(adapter.artifact_repo_type)
-    artifact_revision = _require_exact_digest(
-        adapter.artifact_revision,
-        "artifact_revision",
-        _HEX_40_RE,
-    )
-    if artifact_revision != match.group("hf_revision"):
-        raise ValueError("artifact_revision does not match adapter_revision")
+    _require_exact_digest(adapter.artifact_revision, "artifact_revision", _HEX_40_RE)
     _require_exact_digest(adapter.artifact_digest, "artifact_digest", _HEX_64_RE)
     _validate_subfolder(adapter.artifact_subfolder)
     _require_nonempty(adapter.base_model, "base_model")
@@ -363,14 +335,6 @@ def validate_resolved_adapter(adapter: ResolvedAdapter) -> None:
     _require_positive_int(adapter.lora_rank, "adapter lora_rank")
     _require_bool(adapter.thinking_default, "thinking_default")
     _validate_structured_default(adapter.structured_outputs_default_json)
-    if type(adapter.alias_intent) is not AdapterAliasIntent:
-        raise ValueError("alias_intent must be explicit")
-    adapter.alias_intent.__post_init__()
-    expected = adapter.alias_intent.expected_adapter_revision
-    if expected is not None:
-        expected_match = _ADAPTER_REVISION_RE.fullmatch(expected)
-        if expected_match is None or expected_match.group("run_id") != run_id:
-            raise ValueError("alias expected revision must be immutable and belong to the same run")
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,18 +399,13 @@ def _validate_deployment_components(
     if type(adapters) is not tuple or not adapters:
         raise ValueError("deployments require at least one adapter")
 
-    revisions: set[str] = set()
-    activating_runs: set[str] = set()
+    checkpoint_ids: set[str] = set()
     expected_base: tuple[str, str] | None = None
     for adapter in adapters:
         validate_resolved_adapter(adapter)
-        if adapter.adapter_revision in revisions:
-            raise ValueError("deployment contains a duplicate adapter revision")
-        revisions.add(adapter.adapter_revision)
-        if adapter.alias_intent.activate:
-            if adapter.run_id in activating_runs:
-                raise ValueError("deployment permits at most one active alias intent per run")
-            activating_runs.add(adapter.run_id)
+        if adapter.checkpoint_id in checkpoint_ids:
+            raise ValueError("deployment contains a duplicate checkpoint identity")
+        checkpoint_ids.add(adapter.checkpoint_id)
         if adapter.lora_rank > engine.max_lora_rank:
             raise ValueError("adapter lora_rank exceeds engine max_lora_rank")
         base = (adapter.base_model, adapter.base_model_revision)

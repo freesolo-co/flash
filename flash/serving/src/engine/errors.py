@@ -20,9 +20,6 @@ def value_error_http(router: AdapterRouter, adapter_id: str, exc: ValueError) ->
         )
     if message.startswith("Unknown adapter id"):
         return HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
-    current = router.get(adapter_id)
-    if current is None or current.status != "ready":
-        return HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
     return HTTPException(status.HTTP_400_BAD_REQUEST, message)
 
 

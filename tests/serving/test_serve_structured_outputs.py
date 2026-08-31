@@ -24,13 +24,16 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+from flash.serve.contract.provenance import engine_adapter_name
 from flash.serve.request.openai import parse_chat_request
+from flash.serving.src.engine import generation as engine_generation
 from flash.serving.src.engine.model_config import reasoning_parser_for
 from flash.serving.src.engine.support import _require_reasoning_api_compatibility
 from flash.serving.src.io.responses import openai_generate_fields
-from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest, internal_adapter_payload
 from flash.serving.src.io.streaming import openai_chat_stream
 from flash.serving.src.store.registry import AdapterRegistry
+from tests.serving.checkpoint_fixtures import checkpoint_record
 
 QWEN = "Qwen/Qwen3.5-9B"
 SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}}
@@ -185,6 +188,39 @@ class _CleanupEngine(_CaptureEngine):
         return self.output_stream
 
 
+class _ConcurrentCapacityEngine(_CaptureEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = 0
+        self.both_entered = asyncio.Event()
+
+    async def generate(
+        self,
+        prompt_input,
+        sampling_params,
+        request_id,
+        lora_request=None,
+        reasoning_ended=None,
+        reasoning_parser_kwargs=None,
+    ):
+        del prompt_input, request_id, lora_request
+        self.sampling_params.append(sampling_params)
+        self.reasoning_ended.append(reasoning_ended)
+        self.reasoning_parser_kwargs.append(reasoning_parser_kwargs)
+        self.entered += 1
+        if self.entered == 2:
+            self.both_entered.set()
+        await self.both_entered.wait()
+        yield types.SimpleNamespace(
+            outputs=[
+                types.SimpleNamespace(index=0, text="ok", finish_reason="stop", token_ids=[1])
+            ],
+            prompt_token_ids=[1],
+            num_cached_tokens=0,
+            metrics=types.SimpleNamespace(time_in_queue=0.125),
+        )
+
+
 def _engine(
     modal_app_module: Any,
     *,
@@ -217,13 +253,21 @@ def _engine(
     return eng
 
 
+def _forwarded_record(eng: Any, adapter_id: str) -> dict[str, Any]:
+    record = eng.registry.get(None, adapter_id)
+    assert record is not None
+    return internal_adapter_payload(record)
+
+
 def _generate(eng: Any, **payload_extra: Any) -> Any:
     """Run _generate and return the SamplingParams the (fake) vLLM engine received."""
     payload = {"adapter_id": "r1"}
     if "messages" not in payload_extra:
         payload["prompt"] = "hi"
     payload.update(payload_extra)
-    result = asyncio.run(eng._generate(payload))
+    record = eng.registry.get(None, payload["adapter_id"])
+    assert record is not None
+    result = asyncio.run(eng._generate(payload, internal_adapter_payload(record)))
     assert result["ok"] is True
     return eng.engine.sampling_params[-1]
 
@@ -245,7 +289,12 @@ def test_nonstream_generation_requires_a_real_finish_reason(modal_app_module) ->
     eng.engine = _NonterminalEngine()
 
     with pytest.raises(RuntimeError, match="ended without a finish reason"):
-        asyncio.run(eng._generate({"adapter_id": "r1", "prompt": "hi"}))
+        asyncio.run(
+            eng._generate(
+                {"adapter_id": "r1", "prompt": "hi"},
+                _forwarded_record(eng, "r1"),
+            )
+        )
 
 
 def test_reasoning_api_compatibility_check_fails_closed():
@@ -340,7 +389,6 @@ def test_reasoning_state_matches_effective_thinking_mode(modal_app_module):
     assert thinking.engine.reasoning_ended[-1] is False
     assert thinking.engine.reasoning_parser_kwargs[-1] == {
         "chat_template_kwargs": {
-            "tools": ["search"],
             "enable_thinking": True,
             "preserve_thinking": False,
         }
@@ -389,9 +437,13 @@ def test_concurrent_requests_do_not_leak_reasoning_or_grammar_state(modal_app_mo
                 {
                     "adapter_id": "r1",
                     "messages": [{"role": "user", "content": "hi"}],
-                }
+                },
+                _forwarded_record(eng, "r1"),
             ),
-            eng._generate({"adapter_id": "non-thinking", "prompt": "hi"}),
+            eng._generate(
+                {"adapter_id": "non-thinking", "prompt": "hi"},
+                _forwarded_record(eng, "non-thinking"),
+            ),
         )
 
     asyncio.run(run_both())
@@ -422,8 +474,16 @@ def test_thinking_constraint_rejects_empty_messages_before_vllm(
 
     async def run_request():
         if streaming:
-            return await anext(eng._stream_generate(payload))
-        return await eng._generate(payload)
+            return await anext(
+                eng._stream_generate(
+                    payload,
+                    _forwarded_record(eng, payload["adapter_id"]),
+                )
+            )
+        return await eng._generate(
+            payload,
+            _forwarded_record(eng, payload["adapter_id"]),
+        )
 
     with pytest.raises(ValueError, match="exactly one nonempty prompt or messages"):
         asyncio.run(run_request())
@@ -438,34 +498,25 @@ def test_thinking_constraint_requires_configured_parser(modal_app_module):
     assert eng.engine.sampling_params == []
 
 
-def test_stream_generate_attests_the_resolved_revision_before_deltas(modal_app_module):
+def test_stream_generate_attests_the_resolved_checkpoint_before_deltas(modal_app_module):
     eng = _engine(modal_app_module)
-    revision_id = "run-1@final." + "a" * 40
-    revision = AdapterRecord.model_validate(
-        {
-            "adapter_id": revision_id,
-            "repo_id": "org/run-1",
-            "org_id": "org-1",
-            "base_model": QWEN,
-            "checkpoint": "run-1",
-            "status": "ready",
-            "thinking": False,
-            "metadata": {
-                "record_type": "revision",
-                "run_id": "run-1",
-                "checkpoint_step": None,
-                "hf_revision": "a" * 40,
-            },
-        }
-    )
+    revision = checkpoint_record("run-1", QWEN)
+    checkpoint_id = revision.adapter_id
 
     async def resolved_lora(_adapter_id, _record_dict=None):
-        return types.SimpleNamespace(lora_name=revision_id), revision
+        return (
+            types.SimpleNamespace(lora_name=engine_adapter_name(revision.org_id, checkpoint_id)),
+            revision,
+        )
 
     eng._lora_request = resolved_lora
 
     async def first_event():
-        stream = eng._stream_generate({"adapter_id": revision_id, "prompt": "hi"})
+        stream = eng._stream_generate(
+            {"adapter_id": checkpoint_id, "prompt": "hi"},
+            internal_adapter_payload(revision),
+            expected_checkpoint=checkpoint_id,
+        )
         try:
             return await anext(stream)
         finally:
@@ -474,7 +525,53 @@ def test_stream_generate_attests_the_resolved_revision_before_deltas(modal_app_m
     ready = asyncio.run(first_event())
 
     assert ready["type"] == "ready"
-    assert ready["lora_request_adapter"] == revision_id
+    assert ready["lora_request_adapter"] == checkpoint_id
+    assert ready["checkpoint"] == checkpoint_id
+
+
+def test_queue_wait_prefers_real_metrics_and_omits_unavailable() -> None:
+    direct = types.SimpleNamespace(metrics=types.SimpleNamespace(time_in_queue=0.125))
+    derived = types.SimpleNamespace(
+        metrics=types.SimpleNamespace(
+            time_in_queue=None,
+            arrival_time=20.0,
+            first_scheduled_time=20.375,
+        )
+    )
+
+    assert engine_generation._queue_wait_seconds(direct) == 0.125
+    assert engine_generation._queue_wait_seconds(derived) == 0.375
+    assert engine_generation._queue_wait_seconds(types.SimpleNamespace()) is None
+
+
+def test_generation_reports_capacity_at_admission_and_releases_counter(modal_app_module):
+    from vllm.sampling_params import RequestOutputKind
+
+    eng = _engine(modal_app_module)
+    eng.engine = _ConcurrentCapacityEngine()
+    eng._replica_in_flight_requests = 0
+    eng._replica_first_request_pending = True
+    eng._replica_boot_duration_seconds = 12.5
+
+    async def run_both():
+        payload = {"adapter_id": "r1", "prompt": "hi"}
+        record = _forwarded_record(eng, "r1")
+        return await asyncio.gather(eng._generate(payload, record), eng._generate(payload, record))
+
+    results = asyncio.run(run_both())
+
+    assert [result["replica_in_flight_requests_at_admission"] for result in results] == [1, 2]
+    assert [result["replica_freshly_booted"] for result in results] == [True, False]
+    assert all(result["replica_boot_duration_seconds"] == 12.5 for result in results)
+    assert all(result["queue_wait_seconds"] == 0.125 for result in results)
+    # the buffered path reports no time-to-first-token: FINAL_ONLY yields once, at completion,
+    # so any such value would be the completion interval wearing a first-token name.
+    assert all("time_to_first_token_seconds" not in result for result in results)
+    # and it must still run FINAL_ONLY -- telemetry may not change how generation executes.
+    assert all(
+        params.output_kind == RequestOutputKind.FINAL_ONLY for params in eng.engine.sampling_params
+    )
+    assert eng._replica_in_flight_requests == 0
 
 
 def test_stream_generate_carries_structured_outputs(modal_app_module):
@@ -485,7 +582,10 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
 
     events = asyncio.run(
         _drain(
-            eng._stream_generate({"adapter_id": "r1", "prompt": "hi", "structured_outputs": SCHEMA})
+            eng._stream_generate(
+                {"adapter_id": "r1", "prompt": "hi", "structured_outputs": SCHEMA},
+                _forwarded_record(eng, "r1"),
+            )
         )
     )
     assert [event["type"] for event in events] == [
@@ -496,6 +596,7 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
     ]
     ready = events[0].copy()
     assert ready.pop("inference_time_seconds") >= 0
+    assert ready.pop("time_to_first_token_seconds") >= 0
     # the two ids are uuid4-derived, so they cannot be spelled literally. pin their shape here and
     # their VALUE on the delta below, against this event -- writing `ready["request_id"]` into this
     # dict would compare the value to itself and pin nothing at all.
@@ -517,6 +618,7 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
     }
     delta = events[1].copy()
     assert delta.pop("inference_time_seconds") >= 0
+    assert delta.pop("time_to_first_token_seconds") >= 0
     assert delta == {
         "type": "delta",
         "index": 0,
@@ -547,7 +649,13 @@ def _repeated_delta_events(modal_app_module):
     eng.engine = _RepeatedDeltaEngine()
 
     async def drain():
-        return [event async for event in eng._stream_generate({"adapter_id": "r1", "prompt": "hi"})]
+        return [
+            event
+            async for event in eng._stream_generate(
+                {"adapter_id": "r1", "prompt": "hi"},
+                _forwarded_record(eng, "r1"),
+            )
+        ]
 
     return eng, asyncio.run(drain())
 
@@ -636,9 +744,13 @@ def test_stream_close_after_ready_closes_inner_generator(modal_app_module):
     eng.engine = _CleanupEngine()
 
     async def prime_and_close():
-        stream = eng._stream_generate({"adapter_id": "r1", "prompt": "hi"})
+        stream = eng._stream_generate(
+            {"adapter_id": "r1", "prompt": "hi"},
+            _forwarded_record(eng, "r1"),
+        )
         ready = (await anext(stream)).copy()
         assert ready.pop("inference_time_seconds") >= 0
+        assert ready.pop("time_to_first_token_seconds") >= 0
         assert ready == {
             "type": "ready",
             "thinking": False,
@@ -667,7 +779,14 @@ def test_streaming_and_non_streaming_reasoning_state_match(modal_app_module):
     async def _drain(agen):
         return [event async for event in agen]
 
-    events = asyncio.run(_drain(eng._stream_generate({"adapter_id": "r1", "messages": messages})))
+    events = asyncio.run(
+        _drain(
+            eng._stream_generate(
+                {"adapter_id": "r1", "messages": messages},
+                _forwarded_record(eng, "r1"),
+            )
+        )
+    )
     assert events[0]["type"] == "ready"
     assert events[-1]["type"] == "final"
     assert eng.engine.reasoning_ended == [False, False]
@@ -700,8 +819,16 @@ def test_semantically_invalid_schema_raises_on_first_engine_advance(modal_app_mo
 
     async def run_request():
         if streaming:
-            return await anext(eng._stream_generate(payload))
-        return await eng._generate(payload)
+            return await anext(
+                eng._stream_generate(
+                    payload,
+                    _forwarded_record(eng, payload["adapter_id"]),
+                )
+            )
+        return await eng._generate(
+            payload,
+            _forwarded_record(eng, payload["adapter_id"]),
+        )
 
     with pytest.raises(ValueError, match="semantic validation failed"):
         asyncio.run(run_request())
@@ -726,14 +853,26 @@ def test_invalid_stored_spec_raises_value_error_before_ready(modal_app_module):
     )
     eng.registry.hydrate([bad])
 
-    with pytest.raises(ValueError, match="invalid structured outputs spec"):
-        asyncio.run(eng._generate({"adapter_id": "r1", "prompt": "hi"}))
+    with pytest.raises(ValueError, match="structured outputs spec must set exactly one constraint"):
+        asyncio.run(
+            eng._generate(
+                {"adapter_id": "r1", "prompt": "hi"},
+                _forwarded_record(eng, "r1"),
+            )
+        )
 
     async def _first(agen):
         return await anext(agen)
 
-    with pytest.raises(ValueError, match="invalid structured outputs spec"):
-        asyncio.run(_first(eng._stream_generate({"adapter_id": "r1", "prompt": "hi"})))
+    with pytest.raises(ValueError, match="structured outputs spec must set exactly one constraint"):
+        asyncio.run(
+            _first(
+                eng._stream_generate(
+                    {"adapter_id": "r1", "prompt": "hi"},
+                    _forwarded_record(eng, "r1"),
+                )
+            )
+        )
     assert eng.engine.sampling_params == []  # never reached vLLM
 
 
@@ -776,7 +915,12 @@ def test_stop_reaches_sampling_params_when_streaming(modal_app_module):
         return [event async for event in agen]
 
     events = asyncio.run(
-        _drain(eng._stream_generate({"adapter_id": "r1", "prompt": "hi", "stop": ["</s>"]}))
+        _drain(
+            eng._stream_generate(
+                {"adapter_id": "r1", "prompt": "hi", "stop": ["</s>"]},
+                _forwarded_record(eng, "r1"),
+            )
+        )
     )
     assert [event["type"] for event in events] == [
         "ready",

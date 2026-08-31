@@ -8,6 +8,7 @@ the direction it fails in: standalone must accept FEWER credentials than managed
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
@@ -637,7 +638,7 @@ def test_a_blank_github_token_is_not_shipped_to_the_worker(monkeypatch) -> None:
 
     monkeypatch.setenv("GITHUB_TOKEN", "  \t ")
     monkeypatch.setenv("HF_TOKEN", " hf_real ")
-    env = build_worker_env(spec, 0)
+    env = build_worker_env(spec)
     assert "GITHUB_TOKEN" not in env
     # the real token still travels, stripped: this is a blank-only rejection, not a blanket one.
     assert env["HF_TOKEN"] == "hf_real"
@@ -1071,6 +1072,109 @@ def test_standalone_deploy_needs_no_org_while_managed_fails_closed(monkeypatch) 
     assert ei.value.status_code == 409
     assert "owning organization" in str(ei.value.detail)
     serving._require_deploy_org("run-1", "org-1")  # managed with an org still deploys
+
+
+def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monkeypatch) -> None:
+    from flash.serve.deployment import deploy as serving_deploy
+    from flash.server.platform.internal_client import run_serving_org_id
+    from flash.server.routes import serving, serving_chat
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "http://serving.test")
+    status = SimpleNamespace(
+        run_id="run-standalone",
+        state="done",
+        spec={},
+        billing_context=None,
+        platform_context=None,
+        deployment={"state": "ready", "checkpoint_id": "run-standalone/final"},
+    )
+    assert auth.serving_org_id(None) == auth.STANDALONE_SERVING_ORG_ID
+    assert run_serving_org_id(status) == auth.STANDALONE_SERVING_ORG_ID
+
+    registrations: list[dict] = []
+    monkeypatch.setattr(serving_deploy, "_registered_adapter", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(serving_deploy, "resolve_artifact_revision", lambda _repo: "a" * 40)
+    monkeypatch.setattr(
+        serving_deploy.adapter_check,
+        "adapter_artifact_metadata",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            lora_rank=16,
+            artifact_digest="b" * 64,
+            targets_images=False,
+        ),
+    )
+    monkeypatch.setattr(serving_deploy, "_require_serving_capabilities", lambda **_kwargs: set())
+    monkeypatch.setattr(serving_deploy, "_wait_checkpoint_ready", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        serving_deploy.transport,
+        "serving_request",
+        lambda _method, _url, **kwargs: (
+            registrations.append(kwargs) or SimpleNamespace(status_code=200)
+        ),
+    )
+    deployment = serving_deploy.deploy_adapter(
+        "run-standalone",
+        "Qwen/Qwen3.5-9B",
+        "org/repo",
+        "sft/run-standalone",
+        org_id=None,
+        lora_rank=16,
+    )
+    assert deployment.checkpoint_id == "run-standalone/final"
+    assert registrations[0]["org_id"] == auth.STANDALONE_SERVING_ORG_ID
+    assert registrations[0]["json"]["org_id"] == auth.STANDALONE_SERVING_ORG_ID
+
+    monkeypatch.setattr(serving, "manageable_run", lambda *_args, **_kwargs: status)
+    monkeypatch.setattr(
+        serving._app,
+        "undeploy_adapter",
+        lambda checkpoint_id, *, org_id: {
+            "checkpoint_id": checkpoint_id,
+            "disabled_checkpoints": [checkpoint_id],
+            "serving_deregistered": True,
+            "org_id": org_id,
+        },
+    )
+    monkeypatch.setattr(serving, "mark_undeployed", lambda *_args: status)
+    monkeypatch.setattr(serving, "_report_persisted_transition", lambda *_args, **_kwargs: None)
+    undeployed = serving.undeploy(
+        "run-standalone",
+        "run-standalone/final",
+        {"id": 1, "auth_kind": "internal"},
+    )
+    assert undeployed["disabled_checkpoints"] == ["run-standalone/final"]
+
+    monkeypatch.setattr(serving_chat, "manageable_run", lambda *_args, **_kwargs: status)
+    monkeypatch.setattr(
+        serving_chat, "_verified_checkpoints", lambda _status: {"run-standalone/final"}
+    )
+    monkeypatch.setattr(
+        serving_chat,
+        "effective_spec_from_status",
+        lambda _status: SimpleNamespace(
+            model="Qwen/Qwen3.5-9B",
+            train=SimpleNamespace(hf_repo="org/repo", stop_sequences=()),
+            thinking=False,
+        ),
+    )
+    _request, _messages, _spec, _checkpoint, org_id = serving_chat._resolve_chat_request(
+        "run-standalone",
+        {
+            "checkpoint_id": "run-standalone/final",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        {"id": 1, "auth_kind": "internal"},
+        None,
+        None,
+    )
+    assert org_id == auth.STANDALONE_SERVING_ORG_ID
+
+
+def test_managed_serving_scope_never_synthesizes_an_org(monkeypatch) -> None:
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+    assert auth.serving_org_id(None) == ""
+    assert auth.serving_org_id("org-1") == "org-1"
 
 
 def test_standalone_deployment_listing_stays_exact_key_scoped(monkeypatch) -> None:

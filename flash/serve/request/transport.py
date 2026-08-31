@@ -23,8 +23,14 @@ from flash.serve.contract.urls import (
     serving_base_url,
     serving_control_url,
 )
+from flash.serve.request.tool_calls import (
+    FunctionTool,
+    tools_wire,
+    validate_tool_control_presence,
+)
 
 _INTERNAL_KEY_HEADER_NAME = "X-Freesolo-Internal-Key"
+_ORG_ID_HEADER_NAME = "X-Freesolo-Org-Id"
 _MAX_REDIRECTS = 100
 _RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
 _SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
@@ -52,19 +58,25 @@ def _configured_serving_origin() -> tuple[str, str, int | None] | None:
     return _url_origin(url)
 
 
-def _internal_key_header() -> dict[str, str]:
-    """Return the serving credential header when a key is configured."""
+def _internal_key_header(*, org_id: str | None = None) -> dict[str, str]:
+    """return serving credentials with an explicit tenant scope when required."""
+
     key = (os.environ.get("FREESOLO_INTERNAL_KEY") or "").strip()
-    return {_INTERNAL_KEY_HEADER_NAME: key} if key else {}
+    headers = {_INTERNAL_KEY_HEADER_NAME: key} if key else {}
+    normalized_org = (org_id or "").strip()
+    if normalized_org:
+        headers[_ORG_ID_HEADER_NAME] = normalized_org
+    return headers
 
 
 def _strip_internal_key_off_origin(request: httpx.Request) -> None:
-    """Drop the plane credential from requests that leave the serving origin."""
-    if _INTERNAL_KEY_HEADER_NAME not in request.headers:
-        return
+    """drop internal serving authority from requests that leave the serving origin."""
+
     origin = _configured_serving_origin()
-    if origin is None or _url_origin(request.url) != origin:
-        del request.headers[_INTERNAL_KEY_HEADER_NAME]
+    if origin is not None and _url_origin(request.url) == origin:
+        return
+    for name in (_INTERNAL_KEY_HEADER_NAME, _ORG_ID_HEADER_NAME):
+        request.headers.pop(name, None)
 
 
 def _new_serving_client(**kwargs) -> httpx.Client:
@@ -118,13 +130,14 @@ def serving_request(
     json: dict | None = None,
     ok_statuses: tuple[int, ...] = (),
     timeout_s: float | None = None,
+    org_id: str | None = None,
 ) -> httpx.Response:
     """Issue a serving request and translate transport failures."""
     import httpx
 
     timeout = 60.0 if timeout_s is None else min(60.0, max(0.0, float(timeout_s)))
     kwargs: dict = {
-        "headers": _internal_key_header(),
+        "headers": _internal_key_header(org_id=org_id),
         "timeout": timeout,
         "follow_redirects": True,
     }
@@ -169,10 +182,10 @@ def retryable_smoke_unavailable(
     response: httpx.Response,
     *,
     requested_model: str,
-    expected_adapter_revision: str,
+    expected_checkpoint_id: str,
     fallback_delay_seconds: float = _SMOKE_RETRY_FALLBACK_DELAY_SECONDS,
 ) -> serving_errors.RetryableServingUnavailable | None:
-    if response.status_code != 503:
+    if response.status_code not in {429, 503}:
         return None
     try:
         payload = response.json()
@@ -182,12 +195,26 @@ def retryable_smoke_unavailable(
         return None
     error = payload["error"]
     code = error.get("code")
+    exact_transient_server_error = (
+        response.status_code == 503 and code == "serving_capacity_unavailable"
+    )
+    if error.get("type") == "server_error" and exact_transient_server_error:
+        raw_delay = response.headers.get("Retry-After")
+        try:
+            retry_after_seconds = float(raw_delay)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(retry_after_seconds) or retry_after_seconds <= 0:
+            return None
+        return serving_errors.RetryableServingUnavailable(str(code), retry_after_seconds)
+    if response.status_code != 503:
+        return None
     if (
         error.get("type") != "adapter_unavailable"
         or error.get("retryable") is not True
         or code not in _RETRYABLE_SMOKE_503_CODES
         or error.get("requested_model") != requested_model
-        or error.get("adapter_revision") != expected_adapter_revision
+        or error.get("checkpoint_id") != expected_checkpoint_id
     ):
         return None
     raw_delay = response.headers.get("Retry-After") or error.get("retry_after_seconds")
@@ -218,10 +245,14 @@ def chat_request_body(
     stop: list[str] | None,
     chat_template_kwargs: dict[str, Any] | None,
     structured_outputs: dict[str, Any] | None,
+    tools: tuple[FunctionTool, ...] | list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
     stream_options: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """serialize the supported serving request fields exactly once."""
 
+    validate_tool_control_presence(tools, tool_choice, parallel_tool_calls)
     body: dict[str, Any] = {
         "model": run_id,
         "messages": messages,
@@ -244,6 +275,12 @@ def chat_request_body(
         body["stop"] = [str(value) for value in stop]
     if structured_outputs is not None:
         body["structured_outputs"] = structured_outputs
+    if tools is not None:
+        body["tools"] = (
+            tools_wire(tools) if all(type(tool) is FunctionTool for tool in tools) else tools
+        )
+        body["tool_choice"] = "auto" if tool_choice is None else tool_choice
+        body["parallel_tool_calls"] = True if parallel_tool_calls is None else parallel_tool_calls
     if stream_options is not None:
         body["stream_options"] = stream_options
     return body
@@ -355,6 +392,9 @@ def request_chat_sse(
     stop: list[str] | None,
     chat_template_kwargs: dict[str, Any] | None,
     structured_outputs: dict[str, Any] | None,
+    tools: tuple[FunctionTool, ...] | list[dict[str, Any]] | None,
+    tool_choice: str | None,
+    parallel_tool_calls: bool | None,
     stream_options: dict[str, bool] | None,
     frame_bytes: Callable[[Iterator[bytes]], Iterator[bytes]],
 ) -> OpenAIStreamResponse:
@@ -375,6 +415,9 @@ def request_chat_sse(
         stop=stop,
         chat_template_kwargs=chat_template_kwargs,
         structured_outputs=structured_outputs,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
         stream_options=stream_options,
     )
     return open_chat_stream(
@@ -463,6 +506,9 @@ def request_chat_json(
     stop: list[str] | None,
     chat_template_kwargs: dict[str, Any] | None,
     structured_outputs: dict[str, Any] | None,
+    tools: tuple[FunctionTool, ...] | list[dict[str, Any]] | None,
+    tool_choice: str | None,
+    parallel_tool_calls: bool | None,
     timeout: float,
     before_raise: Callable[[httpx.Response], None] | None,
     balance_payload: Callable[[Any, bool], None],
@@ -485,6 +531,9 @@ def request_chat_json(
         stop=stop,
         chat_template_kwargs=chat_template_kwargs,
         structured_outputs=structured_outputs,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
     )
     response = post_chat_json(
         client_context,
@@ -499,9 +548,7 @@ def request_chat_json(
     if expected_checkpoint and isinstance(payload, dict):
         response_headers = {key.lower(): value for key, value in response.headers.items()}
         payload["_freesolo_headers"] = {
-            "adapter_revision": response_headers.get("x-freesolo-adapter-revision"),
-            "checkpoint": response_headers.get("x-freesolo-checkpoint"),
-            "hf_revision": response_headers.get("x-freesolo-hf-revision"),
+            "checkpoint_id": response_headers.get("x-freesolo-checkpoint"),
         }
         payload["_freesolo_lora_request_adapter"] = response_headers.get(
             "x-freesolo-lora-request-adapter"

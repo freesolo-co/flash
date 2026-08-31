@@ -1,7 +1,7 @@
 """Daily realized-cost reconciliation for finished runs.
 
 Reports provider COGS with the operator key, best-effort and off-path. Attribution uses the last
-`RunStatus.remote`, so multi-resource retries may be undercounted.
+active or cleanup-confirmed provider handle, so multi-resource retries may be undercounted.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import urllib.request
 
 import flash.runner.accounting.costs as runner_costs
 import flash.runner.lifecycle.status as runner_status
+from flash._internal.http import _urlopen_no_redirect
 from flash.providers.core.realized import realized_cost_for_remote
 from flash.runner.lifecycle.state import TERMINAL_STATES, RunStatus
 from flash.server.platform.auth import freesolo_base_url
@@ -54,7 +55,7 @@ def _report(body: dict) -> bool:
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=_REPORT_TIMEOUT_S) as resp:
+        with _urlopen_no_redirect(req, timeout=_REPORT_TIMEOUT_S) as resp:
             resp.read()
         return True
     except OSError:
@@ -66,6 +67,12 @@ def _terminal_ts(status: RunStatus) -> float:
     if status.finished_at is None:
         raise ValueError(f"run {status.run_id} is missing finished_at")
     return float(status.finished_at)
+
+
+def _realized_cost_remote(status: RunStatus) -> dict:
+    """Return the exact provider identity retained for delayed COGS reconciliation."""
+    remote = status.realized_cost_remote or status.remote
+    return remote if isinstance(remote, dict) else {}
 
 
 def _due(status: RunStatus, now: float) -> bool:
@@ -81,7 +88,7 @@ def _due(status: RunStatus, now: float) -> bool:
     )  # from teardown, not a later updated_at bump (see _terminal_ts)
     if age < _SETTLE_SECONDS or age > _WINDOW_SECONDS:
         return False
-    return bool(status.remote)
+    return bool(_realized_cost_remote(status))
 
 
 def reconcile_run(status: RunStatus, *, now: float | None = None) -> bool:
@@ -89,7 +96,7 @@ def reconcile_run(status: RunStatus, *, now: float | None = None) -> bool:
     a positive realized cost was reported. A zero/None result leaves the run unreconciled so a
     later cycle (within the window) retries once the provider invoice settles."""
     now = time.time() if now is None else now
-    remote = status.remote or {}
+    remote = _realized_cost_remote(status)
     spec = status.spec or {}
     # runpod's billing query needs a lower bound even though its endpoint invoice is authoritative.
     # instance cost attribution independently requires a valid persisted started_ts and returns none

@@ -196,12 +196,12 @@ def _prepare_init_from_adapter_inner(
     )
     from flash.adapters.targets import require_modality_marker
     from flash.runner.results.checkpoints import CheckpointListingError, adapter_artifact_exists
-    from flash.schema import checkpoint_storage_ref, parse_checkpoint_ref
+    from flash.schema import checkpoint_storage_ref, format_checkpoint_ref, parse_checkpoint_ref
 
     parsed = parse_checkpoint_ref(ref)
     if parsed is None:
         raise ValueError(
-            "train.init_from_adapter must be `<run_id>` or `<run_id>/step-N` "
+            "train.init_from_adapter must be `<run_id>/final` or `<run_id>/step-N` "
             f"(a checkpoint listed by `flash runs checkpoint`); got {ref!r}"
         )
     src_run_id, step = parsed
@@ -257,7 +257,7 @@ def _prepare_init_from_adapter_inner(
     except CheckpointListingError as exc:
         raise ValueError(str(exc)) from exc
     if not exists:
-        target = f"{src_run_id}/step-{step}" if step is not None else src_run_id
+        target = format_checkpoint_ref(src_run_id, step)
         raise ValueError(
             f"train.init_from_adapter references {target!r}, but its complete adapter artifact "
             "was not found"

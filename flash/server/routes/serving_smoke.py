@@ -25,7 +25,6 @@ from flash.adapters.lora_rank import serving_completion_token_capacity
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.core.spec import JobSpec
 from flash.serve.contract.errors import (
-    AliasThinkingSilent,
     RetryableServingUnavailable,
     ServingError,
 )
@@ -276,30 +275,20 @@ def _strict_json_loads(value: str):
         raise ServingError(f"structured smoke output is not valid JSON: {exc}") from exc
 
 
-def _smoke_provenance(result: dict, adapter_revision: str, checkpoint: str) -> tuple[str, object]:
+def _smoke_provenance(result: dict, checkpoint_id: str, checkpoint: str) -> tuple[str, object]:
     choice = (result.get("choices") or [{}])[0]
     content = str((choice.get("message") or {}).get("content") or "")
     finish = choice.get("finish_reason")
     if not content.strip():
         raise ServingError(f"smoke generation returned no content (finish_reason={finish!r})")
     provenance = result.get("freesolo")
-    if not isinstance(provenance, dict):
-        raise ServingError("smoke response omitted immutable revision provenance")
-    if provenance.get("adapter_revision") != adapter_revision:
-        raise ServingError("smoke response returned the wrong adapter revision")
-    if provenance.get("checkpoint") != checkpoint:
-        raise ServingError("smoke response returned the wrong checkpoint")
-    hf_revision = adapter_revision.rsplit(".", 1)[-1]
-    if provenance.get("hf_revision") != hf_revision:
-        raise ServingError("smoke response returned the wrong Hub revision")
+    if not isinstance(provenance, dict) or provenance.get("checkpoint_id") != checkpoint_id:
+        raise ServingError("smoke response returned the wrong checkpoint identity")
     headers = result.get("_freesolo_headers")
-    expected_headers = {
-        "adapter_revision": adapter_revision,
-        "checkpoint": checkpoint,
-        "hf_revision": hf_revision,
-    }
-    if headers != expected_headers:
-        raise ServingError("smoke response returned mismatched provenance headers")
+    if headers != {"checkpoint_id": checkpoint_id}:
+        raise ServingError("smoke response returned mismatched checkpoint headers")
+    if checkpoint != checkpoint_id:
+        raise ServingError("smoke expected checkpoint is not canonical")
     return content, finish
 
 
@@ -337,7 +326,7 @@ def _lora_attestation_advertised(advertised: frozenset[str] | None) -> bool:
 
 
 def _smoke_lora_request_adapter(
-    result: dict, adapter_revision: str, *, attestation_advertised: bool
+    result: dict, checkpoint_id: str, *, attestation_advertised: bool
 ) -> str | None:
     """Check which LoRA answered the smoke, when the serving backend can actually say.
 
@@ -352,14 +341,14 @@ def _smoke_lora_request_adapter(
     """
     attested = result.get("_freesolo_lora_request_adapter")
     if not attestation_advertised:
-        if attested and attested != adapter_revision:
+        if attested and attested != checkpoint_id:
             # the backend volunteered an identity and it is the WRONG one. that is a genuine
             # mismatch regardless of what it advertises, so it still fails.
             raise ServingError("image deployment smoke returned the wrong LoRA request adapter")
         return str(attested) if attested else None
     if not attested:
         raise ServingError("image deployment smoke omitted LoRA request adapter attestation")
-    if attested != adapter_revision:
+    if attested != checkpoint_id:
         raise ServingError("image deployment smoke returned the wrong LoRA request adapter")
     return str(attested)
 
@@ -470,9 +459,9 @@ def _bounded_smoke_chat(
     serving_model: str,
     thinking: bool,
     expected_checkpoint: str,
+    org_id: str,
     messages: list[dict] | None = None,
     structured_outputs: dict | None = None,
-    expected_adapter_revision: str,
     max_tokens: int,
     stop_sequences: list[str] | None,
     deadline: float,
@@ -497,7 +486,7 @@ def _bounded_smoke_chat(
                     "max_tokens": max_tokens,
                     "thinking": thinking,
                     "expected_checkpoint": expected_checkpoint,
-                    "expected_adapter_revision": expected_adapter_revision,
+                    "org_id": org_id,
                     "timeout_s": timeout_s,
                     "retry_unavailable": True,
                     "stop": stop_sequences,
@@ -526,6 +515,7 @@ def _run_deployment_smoke(
     *,
     serving_model: str,
     expected_checkpoint: str,
+    org_id: str,
     # these facts were captured before the smoke; re-fetching inside the paid deadline can disagree
     # with the deployment that was actually registered or consume its verification budget.
     advertised_capabilities: frozenset[str] | None = None,
@@ -545,7 +535,7 @@ def _run_deployment_smoke(
         serving_model=serving_model,
         thinking=spec.thinking,
         expected_checkpoint=expected_checkpoint,
-        expected_adapter_revision=serving_model,
+        org_id=org_id,
         messages=image_messages if use_image_challenge else None,
         structured_outputs={} if use_image_challenge and constraint is not None else None,
         max_tokens=max_tokens,
@@ -560,9 +550,9 @@ def _run_deployment_smoke(
         expected_checkpoint=expected_checkpoint,
     )
     verify_turns = 1
-    attested_adapter_revision: str | None = None
+    attested_checkpoint_id: str | None = None
     if use_image_challenge:
-        attested_adapter_revision = _smoke_lora_request_adapter(
+        attested_checkpoint_id = _smoke_lora_request_adapter(
             result, serving_model, attestation_advertised=attestation_advertised
         )
         if answer.strip().upper() != expected_colour:
@@ -575,7 +565,7 @@ def _run_deployment_smoke(
                 serving_model=serving_model,
                 thinking=spec.thinking,
                 expected_checkpoint=expected_checkpoint,
-                expected_adapter_revision=serving_model,
+                org_id=org_id,
                 max_tokens=max_tokens,
                 stop_sequences=stop_sequences,
                 deadline=deadline,
@@ -611,62 +601,6 @@ def _run_deployment_smoke(
         "thinking_tag": "<think>" in content or "</think>" in content,
         "verify_sample": answer[:160],
     }
-    if attested_adapter_revision is not None:
-        smoke_result["verify_lora_request_adapter"] = attested_adapter_revision
+    if attested_checkpoint_id is not None:
+        smoke_result["verify_lora_request_adapter"] = attested_checkpoint_id
     return smoke_result
-
-
-def _alias_reasoning_content(result: dict, run_id: str, adapter_revision: str) -> str:
-    choices = result.get("choices")
-    choice = choices[0] if isinstance(choices, list) and choices else None
-    message = choice.get("message") if isinstance(choice, dict) else None
-    if not isinstance(message, dict):
-        raise ServingError("alias thinking verification returned a malformed chat message")
-    if "reasoning_content" not in message:
-        raise AliasThinkingSilent(
-            run_id,
-            adapter_revision,
-            detail=(
-                "the alias returned no direct reasoning_content field while the immutable revision "
-                "smoked with reasoning enabled"
-            ),
-        )
-    reasoning = message.get("reasoning_content")
-    if not isinstance(reasoning, str):
-        raise ServingError("alias thinking verification returned non-string reasoning_content")
-    return reasoning
-
-
-def _verify_alias_thinking(
-    run_id: str,
-    spec: JobSpec,
-    adapter_revision: str,
-    expected_checkpoint: str,
-    *,
-    budget_s: float = _SMOKE_BUDGET_SECONDS,
-) -> dict:
-    """Confirm the freshly activated alias serves the activated revision with reasoning metadata."""
-    started = time.monotonic()
-    deadline = started + budget_s
-    _, max_tokens, stop_sequences = _smoke_request_settings(spec)
-    result = _bounded_smoke_chat(
-        serving_model=run_id,
-        thinking=True,
-        expected_checkpoint=expected_checkpoint,
-        expected_adapter_revision=adapter_revision,
-        max_tokens=max_tokens,
-        stop_sequences=stop_sequences,
-        deadline=deadline,
-        budget_s=budget_s,
-        error_context=f"alias thinking verification could not reach {run_id}",
-    )
-
-    _smoke_provenance(result, adapter_revision, expected_checkpoint)
-    _alias_reasoning_content(result, run_id, adapter_revision)
-    if time.monotonic() > deadline:
-        raise _smoke_timeout_error(budget_s)
-    return {
-        "alias_thinking_tag": True,
-        "alias_thinking_verified_at": time.time(),
-        "alias_thinking_latency_s": time.monotonic() - started,
-    }

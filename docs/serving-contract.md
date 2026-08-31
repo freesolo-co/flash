@@ -1,229 +1,174 @@
 # The Flash serving contract
 
-`flash models deploy`, `chat`, and `undeploy` use an HTTP serving backend. `flash/serve/` owns the
-client, shared runtime, and customer-owned provider deployment. Freesolo's hosted backend
-(`flash/serving/`) is another implementation of this contract.
-A deployment serves one exact base model and its compatible LoRA adapters. A different base model
-requires a separate deployment. Use `flash serve deploy --provider modal` to provision one in your
-own Modal account, or implement these endpoints and run the conformance suite below.
+`flash models deploy`, `chat`, `evaluate`, and `undeploy` use an HTTP serving backend and one public
+identity for every run-backed adapter. `flash/serve/` owns the client, shared runtime, and
+customer-owned provider deployment. Freesolo's hosted backend (`flash/serving/`) is another
+implementation of this contract. A deployment serves one exact base model and its compatible LoRA
+adapters. A different base model requires a separate deployment. Use
+`flash serve deploy --provider modal` to provision one in your own Modal account.
 
 Customer-owned Modal is live-qualified for `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
 `Qwen/Qwen3.6-35B-A3B`. The 27B and 35B-A3B qualifications are bound to the exact certified serving
 image digest; another digest remains available for offline planning but cannot allocate Modal.
-Hosted Qwen3.8 27B remains inactive. Its customer-owned engine runs on
-`H100!` and serves the pinned `Qwen/Qwen3.8-27B-FP8` checkpoint while preserving
-`Qwen/Qwen3.8-27B` as the distinct logical base and tokenizer provenance. The 35B-A3B engine serves
-BF16 weights on one H200 with FP8 KV cache,
-a 32K context, eight sequences, a 4096 batched-token cap, and six rank-64 LoRA slots.
+Hosted Qwen3.8 27B is active on H100. Its customer-owned engine runs on `H100!` and serves the pinned
+`Qwen/Qwen3.8-27B-FP8` checkpoint while preserving `Qwen/Qwen3.8-27B` as the distinct logical base
+and tokenizer provenance. The 35B-A3B engine serves BF16 weights on one H200 with FP8 KV cache, a
+32K context, eight sequences, a 4096 batched-token cap, and six rank-64 LoRA slots.
 
 Customer-owned `flash serve` is Modal-only and requires the explicit provider argument. Historical
 customer-serving RunPod deployment identities are unsupported, with no migration, status, undeploy,
 or teardown shim. Managed RunPod training remains supported and unchanged. Retired Qwen3.6 27B is
 never translated into Qwen3.8 27B.
 
-## Identity model
+Run-backed adapters use only:
 
-A revision is immutable:
+- `<run_id>/final`
+- `<run_id>/step-N`
 
-- `<run_id>@step-<N>.<40-hex-hf-revision>`
-- `<run_id>@final.<40-hex-hf-revision>`
-  It permanently identifies one repository, repository type, subfolder, base model, checkpoint,
-  thinking mode, organization, structured-output policy, and provenance tuple.
-  The bare `<run_id>` is a mutable alias. Registration loads a revision; activation atomically moves
-  the alias. Chat uses the alias and must report the exact revision that answered.
+The grammar is exact. Bare run ids, omitted checkpoints, padded steps, whitespace, extra path segments, and old composite identities are rejected. A run id is grouping and authorization metadata only.
 
-## Authentication and health
+## Permanent checkpoint binding
 
-Every protected request carries a credential the backend compares with `hmac.compare_digest`,
-rejecting a mismatch with `401` or `403`. The client removes it on cross-origin redirects and keeps
-it on same-origin redirects.
-Which header carries it depends on who owns the deployment, because the two are trusted differently:
-
-- Customer-owned deployments (`flash serve deploy`) use `Authorization: Bearer <FLASH_SERVING_KEY>`.
-  The credential is scoped to that one deployment. `FREESOLO_INTERNAL_KEY` is a control-plane key
-  and must never be sent to a customer-owned endpoint, so these backends do not read it at all.
-- The Freesolo-hosted backend uses `X-Freesolo-Internal-Key`, which is meaningful only inside
-  Freesolo's own infrastructure.
-
-Run the conformance suite with the same credential the backend was deployed with.
-
-The suite checks the dynamic-registration contract on this page, so it applies to the
-Freesolo-hosted backend and custom backends that implement this registration surface. It does NOT
-apply to a `flash serve deploy` deployment: that
-app receives its adapters in an immutable manifest and registers them at boot, so it serves
-`/healthz`, `/v1/models`, and `/v1/chat/completions` and has no `/adapters` surface at all. Pointing
-the suite at one fails every registration, activation, and alias test against a perfectly healthy
-deployment. Verify a customer-owned deployment through those three endpoints instead.
-A custom dynamic-registration backend may intentionally be keyless; advertise that through
-`requires_key: false`.
-`GET /healthz` must answer without loading the model:
+`POST /adapters` registers one exact checkpoint:
 
 ```json
 {
-  "ok": true,
-  "base_models": ["Qwen/Qwen3.5-9B"],
-  "requires_key": true,
-  "capabilities": ["immutable_adapter_revisions", "alias_compare_and_swap"]
-}
-```
-
-`capabilities` must be a JSON array of strings. Required capabilities are:
-
-- `immutable_adapter_revisions`: one revision id always names the same artifact.
-- `alias_compare_and_swap`: activation atomically rejects stale expectations.
-  `revision_provenance` is preferred. Advertise
-  `thinking_structured_outputs_deferred_v1` only if a grammar is deferred until after thinking.
-  `requires_key: false` declares an open backend. If the field is true or absent, `flash serve status`
-  probes an unknown adapter id with the configured key. An accepted key returns `404`.
-
-## Registration and readiness
-
-`POST /adapters` registers a revision:
-
-```json
-{
-  "adapter_id": "run-abc@step-10.<40-hex>",
+  "adapter_id": "run-abc/step-10",
+  "checkpoint": "run-abc/step-10",
+  "run_id": "run-abc",
+  "checkpoint_step": 10,
   "repo_id": "acme/artifacts",
   "repo_type": "dataset",
   "subfolder": "sft/run-abc/adapter",
+  "artifact_revision": "<private-40-hex-source-commit>",
+  "artifact_digest": "<private-64-hex-content-digest>",
+  "artifact_fingerprint": "<private-64-hex-binding-fingerprint>",
   "base_model": "Qwen/Qwen3.5-9B",
-  "checkpoint": "run-abc/step-10",
+  "lora_rank": 16,
   "org_id": "org-id",
   "thinking": false,
-  "structured_outputs": { "regex": "[ab]+" },
-  "metadata": {
-    "record_type": "revision",
-    "run_id": "run-abc",
-    "checkpoint_step": 10,
-    "hf_revision": "<40-hex>"
+  "structured_outputs": null
+}
+```
+
+The registration schema is closed. Lifecycle fields are server-owned. The first registration binds the org-scoped checkpoint to its private source location, content identity, base model, LoRA shape, and serving defaults. An identical retry is idempotent. Any changed immutable fact returns `409`, and undeploy never frees the identity for reuse.
+
+Private artifact revision, digest, repository, and subfolder exist only for deterministic retrieval and cache integrity. They are not model identities and do not appear in public chat provenance, evaluation identities, analytics, or billing payloads.
+
+## Authentication and health
+
+Customer-owned deployments use `Authorization: Bearer <FLASH_SERVING_KEY>`. Freesolo-hosted serving uses `X-Freesolo-Internal-Key` for internal control operations and Freesolo API-key authorization for caller traffic. Credentials are compared without exposing them and are removed from cross-origin redirects.
+
+`GET /healthz` does not load a model. Dynamic hosted serving advertises permanent checkpoint identity support. Customer-owned deployments receive an immutable manifest at boot and expose no dynamic registration surface.
+
+## Readiness and routing
+
+Registration returns `200` or `202`. `GET /adapters/{checkpoint_id}` reports lifecycle for that exact binding. A checkpoint becomes routable only after its exact adapter load succeeds and the generation-fenced durable row is promoted to `ready`.
+
+Routing is direct. `POST /v1/chat/completions` requires the exact checkpoint id as `model`. There is no alias lookup, activation operation, current checkpoint, implicit final, first checkpoint, or sole-checkpoint fallback. Tenant authorization is checked against the checkpoint binding's owning organization before dispatch.
+
+The packaged, hosted, and managed OpenAI entry points retain the shared strict sampling grammar:
+
+- `n` is an exact integer from 1 through 4, and `n > 1` requires `temperature > 0`.
+- `seed` is null or a signed 64-bit integer, excluding `-1`.
+- frequency and presence penalties are finite values from -2 through 2.
+- `logprobs` is a strict boolean and `top_logprobs` is an integer from 0 through 20.
+- thinking-enabled adapters reject logprobs.
+
+Function tools are implemented and offline-validated only for the exact qualified Qwen3.5 packaged
+and hosted profile. This path is not live-qualified pending exact model testing. The parser identity
+is `qwen3_coder`; Qwen3.6 and unqualified engines reject tools after authorization and checkpoint
+resolution, before generation. Declarations must be closed function objects with unique nonempty
+names. Parameters use a bounded root-object JSON Schema profile with `properties`, `required`,
+`additionalProperties: false`, recursive scalar, object, and array types, descriptions, enums, and
+array `items`. Numeric enum members must be JSON integers; decimal and exponent numeric enum lexemes
+are rejected because Flash cannot preserve them exactly across every ingress and template boundary.
+Generated and historical JSON numeric literals support at most 1024 significand digits and exponent
+magnitude at most 1,000,000; generated candidates outside either bound remain exact text, while
+history outside either bound is rejected. A historical value within those bounds that no native
+template number carries faithfully, because it
+would overflow, underflow, or lose digits, is rendered as its exact compact text instead of being
+converted or rejected, and a container holding such a value is rendered exactly as a whole. A
+top-level boolean or null argument is likewise pre-rendered as `true`, `false`, or `null`, because the
+template spells a scalar with `string` and would otherwise show the model Python's `True` and `None`;
+inside a container those values stay native, since the template's `tojson` already spells them
+correctly. A response carries at most 408 tool calls, and a longer run of candidates stays exact text. That is
+the most any continuation could carry, not a promise that this batch replays. Replay cost depends on
+the follow-up request as a whole: the prior conversation shares the same message-complexity budget,
+and each result costs four nodes as a plain string, five with the optional `name`, and seven for a
+single text block plus three for each additional block. A long enough history leaves no room for
+even one call. Clients that intend to continue the tool lifecycle must therefore not assume any
+positive call count replays under every history: a follow-up that exceeds the budget is rejected
+with `messages exceed the supported complexity`. The budget counts structure rather than text, so
+the remedies are to send fewer messages or fewer content blocks, drop optional result `name` fields,
+use plain string results rather than text blocks, or request fewer calls; shortening the text inside
+a message does not help, because a string is one node however long it is. These local
+serving-contract bounds do not depend on Python's process-wide integer conversion limit. Unsupported
+keywords and `strict: true` are rejected.
+
+`tool_choice` defaults to `auto` and accepts only `auto` or `none`. `parallel_tool_calls` defaults to
+`true` and accepts only exact `true`; either control requires `tools`. Tools cannot be combined with
+thinking, logprobs, structured outputs, a non-text `response_format`, or image messages. Historical
+assistant calls require unique IDs, function type, valid names, and JSON-string object arguments.
+Each immediately following tool-result turn must resolve every declared call exactly once before a
+non-tool turn. External messages remain unchanged; only a detached template copy converts argument
+strings to objects.
+
+In `auto` mode, complete schema-valid Qwen3 Coder XML candidates become OpenAI `tool_calls` with
+independent call indexes and `finish_reason: "tool_calls"`. Parsed responses contain no raw Qwen
+tags. Ordinary text and malformed or incomplete candidates remain exact assistant text with the
+native finish reason. Candidate regions are buffered in raw SSE because argument deltas cannot be
+retracted safely. Native prompt, completion, cached, and reasoning token accounting remains
+authoritative and is never recomputed from serialized arguments. Flash parses calls but does not
+execute or resubmit them.
+
+The decoded convenience `chat_stream` iterator remains text-only and single-choice. It rejects
+`n != 1`, logprobs, and tools before opening transport; use buffered JSON or raw SSE for those
+features. Raw `/generate` and `/adapters/{id}/generate` remain tool-free. Buffered hosted responses
+and raw hosted SSE are authoritative; managed serving forwards them and never reparses tool calls.
+
+## Public provenance
+
+Successful run-backed responses identify only the permanent checkpoint:
+
+```json
+{
+  "freesolo": {
+    "checkpoint_id": "run-abc/step-10"
   }
 }
 ```
 
-Registration is a closed schema: an unknown top-level field is rejected with `422`. The backend
-owns `status` and `metadata.record_type`, so a client must omit them rather than send its own --
-sending `status` is itself an unknown field and fails the whole request. Metadata must agree with
-the revision id, and `hf_revision` must be a full commit sha.
-Return `200` or `202`. An identical retry must succeed, including while the first load is pending.
-Different identity under the same revision returns `409` or `422`.
-`GET /adapters/{id}` returns a bare record or `{"adapter": {...}}`. Echo every identity field. The
-client checks identity before lifecycle on every poll.
-Lifecycle states are:
+Hosted responses also send `X-Freesolo-Checkpoint`. Customer-owned responses expose `checkpoint_id` in `flash_provenance`. Stream and buffered responses must attest to the same checkpoint. Private source commits and digests are never returned.
 
-- `registered`: accepted and loading.
-- `ready`: loaded and usable.
-- `failed`: terminal; put the reason in `metadata.failure`.
-  A disabled status is terminal. Do not report `ready` until the adapter has loaded successfully.
-  Readiness uses a model-scaled 10 to 15 minute budget. Each request is capped at 60 seconds, transport
-  errors and 5xx responses are retried, and `Retry-After` is clamped to two seconds. Loading must
-  outlive the request that queued it.
-  `structured_outputs` registered here is the revision's default, and is part of its immutable
-  identity. Support `json`, `regex`, `choice`, and `json_object`, or reject unsupported forms
-  during registration. A chat request may still override the default for its own call; see
-  "Chat and provenance".
+## Undeploy and cleanup
 
-## Activation
-
-`POST /adapters/{revision_id}/activate` receives:
-
-```json
-{ "expected_adapter_revision": "run-abc@step-5.<40-hex>" }
-```
-
-`null` means the alias must not exist. Compare and write atomically; return `409` when the expectation
-is stale. On success return:
+`DELETE /adapters/{checkpoint_id}` disables exactly one checkpoint:
 
 ```json
 {
-  "adapter_id": "run-abc",
-  "target_adapter_revision": "run-abc@step-10.<40-hex>",
-  "previous_adapter_revision": null,
-  "checkpoint": "run-abc/step-10",
-  "updated_at": "2026-08-12T00:00:00Z"
-}
-```
-
-The alias record must contain `metadata.alias_of` for response-loss reconciliation.
-
-## Chat and provenance
-
-`POST /v1/chat/completions` is OpenAI-compatible. `model` is the run alias. Unknown, disabled, or
-unactivated aliases return `404` or `503`.
-The registered grammar is the default for every call to that revision. A request may override it
-per call with `structured_outputs`, or with the OpenAI-standard `response_format` accepted at this
-endpoint only; `{}` (equivalently `response_format: {"type": "text"}`) means explicitly
-unconstrained for that call and does not change what is registered. Requests may also include `stop` and `chat_template_kwargs.enable_thinking`.
-
-The packaged, hosted, and managed OpenAI entry points share one strict sampling grammar:
-
-- `n` is an exact integer from 1 through 4. `n > 1` requires `temperature > 0`; the server never
-  rewrites temperature or duplicates a greedy output.
-- `seed` is null or a signed 64-bit integer. Explicit `-1` is rejected because vLLM treats it as an
-  unset seed.
-- `frequency_penalty` and `presence_penalty` are finite numbers from -2 through 2.
-- `logprobs` is a strict boolean and `top_logprobs` is an exact integer from 0 through 20. A positive
-  `top_logprobs` requires `logprobs: true`.
-- Thinking-enabled adapters reject logprobs after the requested adapter or run has been authorized
-  and resolved. Tools, tool selection, and unrelated vLLM extensions remain unsupported.
-
-A buffered response contains one indexed `choices` entry per generated choice. Each choice keeps its
-own finish reason and, when requested, OpenAI token logprobs. Prompt and cached tokens count once per
-request; completion tokens are summed across all choices. Streaming may interleave choice indexes.
-Each choice has independent reasoning state and exactly one terminal entry, followed by one aggregate
-usage block when requested and one final `data: [DONE]`. Hosted serving durably settles the single
-request lifecycle before emitting successful terminals. Managed serving forwards the backend's raw
-SSE frames without flattening choices or rewriting provenance.
-
-The decoded convenience `chat_stream` iterator remains text-only and single-choice. It rejects
-`n != 1` and any logprob request before opening transport; use buffered JSON or raw SSE for those
-features.
-
-Every successful response reports the exact revision, checkpoint, and Hugging Face commit in:
-
-- body object `freesolo` with `adapter_revision`, `checkpoint`, and `hf_revision`;
-- headers `X-Freesolo-Adapter-Revision`, `X-Freesolo-Checkpoint`, and
-  `X-Freesolo-HF-Revision`.
-  Streaming uses `text/event-stream` with indexed `data:` JSON choice frames followed by
-  `data: [DONE]`. Preserve stop handling and provenance headers.
-  A cold adapter may return `503` with a top-level retryable `adapter_unavailable` /
-  `adapter_loading` error envelope and a `Retry-After` header.
-  The shared runtime supports bounded multimodal preparation. An image-capable profile declares
-  `image_limit`, loads a processor, and accepts image-bearing requests up to that limit; a text
-  profile declares no `image_limit` and returns `400` for them rather than answering without seeing
-  the image.
-
-## Undeploy
-
-`DELETE /adapters/{run_id}` disables the alias and all indexed revisions:
-
-```json
-{
+  "ok": true,
+  "checkpoint_id": "run-abc/step-10",
   "run_id": "run-abc",
-  "disabled_aliases": ["run-abc"],
-  "disabled_revisions": ["run-abc@step-10.<40-hex>"]
+  "disabled_checkpoints": ["run-abc/step-10"]
 }
 ```
 
-An unknown run returns `404`. After success, records are disabled or absent and chat no longer
-succeeds. The packaged serving app performs cold undeploy without starting the GPU, deletes only
-`adapters/<digest>` cache paths, and returns a retryable failure if cache cleanup must be retried.
-Warm residents are unloaded later using the exact revision incarnation.
+Sibling checkpoints remain independently ready and callable. Run-wide cleanup is a separately named internal administrative operation that first enumerates the run's exact checkpoint bindings.
 
-## Conformance
+## Customer-owned deployments
 
-Run against a dynamic-registration backend you own, because the suite registers, activates, chats,
-and deletes real state. A `flash serve deploy` deployment is not a valid target: it has no
-`/adapters` surface (see "Authentication and health" above).
+Manifest schema v2 keys adapters by checkpoint id. It keeps the private source commit, exact file table, and aggregate digest for hydration and cache verification, but publishes only checkpoint identities through `/v1/models` and chat provenance. Manifest and deployment identity v1 are rejected rather than translated.
 
-```bash
-uv run pytest tests/serving_conformance \
-  --serving-url "$FREESOLO_SERVING_URL" \
-  --conformance-repo acme/artifacts \
-  --conformance-subfolder sft/run-abc/adapter \
-  --conformance-base-model Qwen/Qwen3.5-9B \
-  --conformance-hf-revision 8f2c1b0e5d4a39c7b6e2f014a8d35c9b7e10426f
-```
+Modal deployments retain their existing provider topology, lifecycle fencing, direct authenticated HTTPS endpoint, capacity validation, and teardown behavior.
 
-Without `--serving-url`, live tests skip and offline oracle guards still run. Once a URL is supplied,
-all adapter arguments and a real 40-character commit sha are mandatory. The default readiness
-budget matches the shipped model-scaled client budget.
+## Cross-repository schema dependency
+
+Flash expects the coordinated Freesolo migration to provide:
+
+- `flash.hosted_lora_adapters` with explicit checkpoint and private binding columns;
+- `public.bind_hosted_checkpoint(...)` for atomic insert-or-identical-read semantics;
+- lifecycle-only mutable updates protected by immutable-field database enforcement;
+- accounting RPCs accepting `checkpoint_id` and private `artifact_fingerprint` without legacy identity fields.
+
+The old and new binaries are not compatible. Deploy them only through the documented maintenance-window cutover.

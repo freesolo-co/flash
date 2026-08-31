@@ -18,23 +18,17 @@ import flash.serve.contract.urls as serving_urls
 from flash._internal.logging import get_logger
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.envs.loading.loader import is_commit_sha
-from flash.schema import format_adapter_revision
+from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
 from flash.serve.contract.protocol import (
     PREFERRED_SERVING_CAPABILITIES,
     REQUIRED_SERVING_CAPABILITIES,
-    REVISION_PROVENANCE_CAPABILITY,
     THINKING_STRUCTURED_OUTPUTS_CAPABILITY,
     ServingHealthError,
     parse_serving_health,
 )
-from flash.serve.contract.responses import (
-    active_alias_target as _active_alias_target,
-)
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serve.contract.responses import (
     matches_revision_identity as _matches_revision_identity,
-)
-from flash.serve.contract.responses import (
-    validate_activation_response as _validate_activation_response,
 )
 from flash.serve.deployment import adapter_check, readiness
 from flash.serve.request import streaming as streaming_support
@@ -50,8 +44,6 @@ logger = get_logger(__name__)
 
 READBACK_DELAY_SECONDS = 0.5
 READBACK_MAX_DELAY_SECONDS = 2.0
-ACTIVATION_READBACK_ATTEMPTS = 3
-ACTIVATION_READBACK_DELAY_SECONDS = 2.0
 SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
 
 
@@ -63,7 +55,7 @@ class Deployment:
     openai_model: str
     endpoint_name: str
     openai_base_url: str
-    adapter_revision: str | None = None
+    checkpoint_id: str | None = None
     checkpoint_step: int | None = None
     verified_at: float | None = None
     state: str = "ready"
@@ -72,13 +64,13 @@ class Deployment:
         return asdict(self)
 
 
-def resolve_hf_revision(hf_repo: str) -> str:
+def resolve_artifact_revision(hf_repo: str) -> str:
     """Resolve the full immutable commit SHA for the uploaded adapter repository."""
     try:
         from huggingface_hub import HfApi
     except ImportError as exc:  # pragma: no cover
         raise serving_errors.ServingError(
-            "could not resolve adapter revision: huggingface_hub is not installed"
+            "could not resolve checkpoint: huggingface_hub is not installed"
         ) from exc
     try:
         revision = str(
@@ -93,7 +85,7 @@ def resolve_hf_revision(hf_repo: str) -> str:
         ).strip()
     except Exception as exc:
         raise serving_errors.ServingError(
-            f"could not resolve adapter revision for {hf_repo}: {exc}"
+            f"could not resolve checkpoint for {hf_repo}: {exc}"
         ) from exc
     if not is_commit_sha(revision):
         raise serving_errors.ServingError(f"could not resolve full Hub commit SHA for {hf_repo}")
@@ -107,17 +99,17 @@ def deployment_record(
     *,
     state: str = "ready",
     checkpoint_step: int | None = None,
-    adapter_revision: str | None = None,
 ) -> Deployment:
     subfolder = f"{adapter_prefix}/adapter"
     base = serving_urls.serving_base_url()
     openai_url = transport.serving_openai_base_url()
+    checkpoint_id = format_checkpoint_ref(run_id, checkpoint_step)
     return Deployment(
         run_id=run_id,
         model=model,
         adapter_hf_prefix=subfolder,
-        openai_model=run_id,
-        adapter_revision=adapter_revision,
+        openai_model=checkpoint_id,
+        checkpoint_id=checkpoint_id,
         checkpoint_step=checkpoint_step,
         endpoint_name=base,
         openai_base_url=openai_url,
@@ -125,7 +117,7 @@ def deployment_record(
     )
 
 
-def _call_before_activate(
+def _call_before_ready(
     callback: Callable[..., None],
     revision: str,
     checkpoint: str,
@@ -161,13 +153,12 @@ def deploy_adapter(
     structured_outputs: str = "",
     org_id: str | None = None,
     checkpoint_step: int | None = None,
-    expected_adapter_revision: str | None = None,
     # called with the immutable target plus keyword-only deployment facts already read here. handing
     # them down avoids re-fetching either health or adapter metadata from inside the paid smoke path.
     # keywords preserve two-argument callbacks that do not need those facts.
-    before_activate: Callable[..., None] | None = None,
+    before_ready: Callable[..., None] | None = None,
 ) -> Deployment:
-    """Register, verify, and atomically activate one immutable adapter revision.
+    """register, load, and verify one permanent checkpoint identity.
 
     Thinking adapters with structured outputs require serving to advertise deferred constraint
     support before the immutable revision is registered.
@@ -190,51 +181,62 @@ def deploy_adapter(
     if dry_run:
         return dep
 
-    hf_revision = resolve_hf_revision(hf_repo)
+    checkpoint_id = format_checkpoint_ref(run_id, checkpoint_step)
+    dep.checkpoint_id = checkpoint_id
+    from flash.server.platform.auth import serving_org_id
+
+    normalized_org_id = serving_org_id(org_id)
+    bound_record = (
+        _registered_adapter(normalized_org_id, checkpoint_id) if normalized_org_id else None
+    )
+    bound_revision = (
+        str(bound_record.get("artifact_revision") or "").strip().lower()
+        if isinstance(bound_record, dict)
+        else ""
+    )
+    artifact_revision = (
+        bound_revision if is_commit_sha(bound_revision) else resolve_artifact_revision(hf_repo)
+    )
     artifact_metadata = adapter_check.adapter_artifact_metadata(
-        hf_repo, subfolder, hf_revision=hf_revision
+        hf_repo, subfolder, artifact_revision=artifact_revision
     )
     adapter_check.validate_serving_lora_rank(
         model,
         artifact_metadata.lora_rank,
         rank_source="adapter artifact",
     )
-    revision = format_adapter_revision(run_id, checkpoint_step, hf_revision)
-    dep.adapter_revision = revision
-    checkpoint = f"{run_id}/step-{checkpoint_step}" if checkpoint_step is not None else run_id
     so_default = parse_structured_outputs(structured_outputs) if structured_outputs else None
     advertised = _require_serving_capabilities(
         thinking_structured_outputs=thinking and so_default is not None
     )
-    require_provenance = REVISION_PROVENANCE_CAPABILITY in advertised
 
     body = {
-        "adapter_id": revision,
+        "adapter_id": checkpoint_id,
         "repo_id": hf_repo,
         "base_model": model,
         "subfolder": subfolder,
         "repo_type": "dataset",
-        "checkpoint": checkpoint,
-        # NOTE: do NOT send a client-chosen "status" -- the serving backend sets the record status
-        # itself on registration and rejects an incoming "status" as an extra field (HTTP 422
-        # extra_forbidden). Sending it blocked every deploy against the deployed serving backend.
-        "metadata": {
-            "record_type": "revision",
-            "run_id": run_id,
-            "checkpoint_step": checkpoint_step,
-            "hf_revision": hf_revision,
-        },
+        "checkpoint": checkpoint_id,
+        "run_id": run_id,
+        "checkpoint_step": checkpoint_step,
+        "artifact_revision": artifact_revision,
+        "artifact_digest": artifact_metadata.artifact_digest,
+        "lora_rank": artifact_metadata.lora_rank,
         "thinking": bool(thinking),
     }
     if so_default is not None:
         body["structured_outputs"] = so_default
-    normalized_org_id = (org_id or "").strip()
-    if normalized_org_id:
-        body["org_id"] = normalized_org_id
+    if not normalized_org_id:
+        raise ValueError("org_id is required for hosted checkpoint deployment")
+    body["org_id"] = normalized_org_id
+    body["artifact_fingerprint"] = immutable_binding_fingerprint(body)
 
     try:
         registration = transport.serving_request(
-            "POST", f"{serving_urls.serving_base_url()}/adapters", json=body
+            "POST",
+            f"{serving_urls.serving_base_url()}/adapters",
+            json=body,
+            org_id=normalized_org_id,
         )
         if registration.status_code not in {200, 202}:
             raise serving_errors.ServingError(
@@ -244,42 +246,34 @@ def deploy_adapter(
         if exc.status_code is not None and exc.status_code < 500:
             raise
         try:
-            record = _registered_adapter(revision)
+            record = _registered_adapter(normalized_org_id, checkpoint_id)
         except serving_errors.ServingError as read_exc:
             raise exc from read_exc
-        if record is None or not _matches_revision_identity(
-            record, body, require_provenance=require_provenance
-        ):
+        if record is None or not _matches_revision_identity(record, body):
             raise exc
         logger.warning(
-            "adapter registration response was ambiguous; revision %s exists with matching identity",
-            revision,
+            "adapter registration response was ambiguous; checkpoint %s exists with matching identity",
+            checkpoint_id,
         )
 
-    _wait_revision_ready(
-        revision,
+    _wait_checkpoint_ready(
+        normalized_org_id,
+        checkpoint_id,
         subfolder,
         expected_identity=body,
-        require_provenance=require_provenance,
         budget_s=readiness.revision_ready_budget_seconds(model),
     )
-    if before_activate is not None:
-        _call_before_activate(
-            before_activate,
-            revision,
-            checkpoint,
+    if before_ready is not None:
+        _call_before_ready(
+            before_ready,
+            checkpoint_id,
+            checkpoint_id,
             frozenset(advertised),
             adapter_targets_images=artifact_metadata.targets_images,
         )
-    activation = _activate_revision(
-        run_id,
-        revision,
-        checkpoint,
-        expected_adapter_revision=expected_adapter_revision,
-    )
     dep.state = "ready"
-    dep.openai_model = str(activation.get("adapter_id") or run_id)
-    logger.info("activated adapter %s revision %s", run_id, revision)
+    dep.openai_model = checkpoint_id
+    logger.info("deployed checkpoint %s", checkpoint_id)
     return dep
 
 
@@ -288,7 +282,7 @@ def _adapter_url(adapter_id: str) -> str:
 
 
 def _registered_adapter_response(
-    adapter_id: str, *, timeout_s: float | None = None
+    org_id: str, adapter_id: str, *, timeout_s: float | None = None
 ) -> tuple[dict | None, httpx.Response]:
     """Read one authoritative adapter record and retain its polling headers."""
     resp = transport.serving_request(
@@ -296,6 +290,7 @@ def _registered_adapter_response(
         _adapter_url(adapter_id),
         ok_statuses=(404,),
         timeout_s=timeout_s,
+        org_id=org_id,
     )
     if resp.status_code == 404:
         return None, resp
@@ -315,22 +310,18 @@ def _registered_adapter_response(
     return record, resp
 
 
-def _registered_adapter(adapter_id: str, *, timeout_s: float | None = None) -> dict | None:
-    """Read one authoritative adapter record, including disabled records."""
-    record, _ = _registered_adapter_response(adapter_id, timeout_s=timeout_s)
+def _registered_adapter(
+    org_id: str, adapter_id: str, *, timeout_s: float | None = None
+) -> dict | None:
+    """read one tenant-scoped authoritative adapter record, including disabled records."""
+
+    record, _ = _registered_adapter_response(org_id, adapter_id, timeout_s=timeout_s)
     return record
 
 
 def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) -> set[str]:
-    # SAFETY-CRITICAL capabilities the deploy correctness contract genuinely depends on: immutable
-    # revisions (a revision id always maps to one artifact) and an atomic alias compare-and-swap
-    # (the alias flip can't race). These are hard-required.
+    # the hosted backend must advertise the permanent checkpoint identity contract.
     required = set(REQUIRED_SERVING_CAPABILITIES)
-    # PREFERRED (not required): `revision_provenance` only lets the serving backend echo back the
-    # run/checkpoint/hf_revision metadata, which is used ONLY on the rare 5xx-during-registration
-    # recovery path (`_matches_revision_identity`). Hard-requiring it blocked EVERY deploy org-wide
-    # whenever the serving build lagged on advertising it, even though the happy path never uses it.
-    # So its absence is a logged warning, not a deploy-blocking error.
     preferred = PREFERRED_SERVING_CAPABILITIES
     if thinking_structured_outputs:
         # Genuinely required for this run: thinking + structured outputs needs the serving backend's
@@ -356,6 +347,10 @@ def _require_serving_capabilities(*, thinking_structured_outputs: bool = False) 
         raise serving_errors.ServingError(
             f"serving_contract_unsupported: serving health check at {url} {detail}"
         ) from exc
+    if health.ok is False:
+        raise serving_errors.ServingError(
+            f"serving_contract_unsupported: serving health check at {url} reported ok=false"
+        )
     advertised = set(health.capabilities)
     missing = sorted(required - advertised)
     if missing:
@@ -388,12 +383,12 @@ def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
     return min(READBACK_DELAY_SECONDS * (2**attempt), READBACK_MAX_DELAY_SECONDS)
 
 
-def _wait_revision_ready(
+def _wait_checkpoint_ready(
+    org_id: str,
     revision: str,
     subfolder: str,
     *,
     expected_identity: dict | None = None,
-    require_provenance: bool = True,
     budget_s: float = readiness.REVISION_READY_MIN_BUDGET_SECONDS,
 ) -> dict:
     budget = max(0.0, float(budget_s))
@@ -420,7 +415,7 @@ def _wait_revision_ready(
                 break
         first_read = False
         try:
-            record, response = _registered_adapter_response(revision, timeout_s=remaining)
+            record, response = _registered_adapter_response(org_id, revision, timeout_s=remaining)
         except serving_errors.ServingError as exc:
             if exc.status_code is not None and exc.status_code < 500:
                 raise
@@ -439,10 +434,10 @@ def _wait_revision_ready(
             continue
         last_read_error = None
         if expected_identity is not None and not _matches_revision_identity(
-            record, expected_identity, require_provenance=require_provenance
+            record, expected_identity
         ):
             raise serving_errors.ServingError(
-                f"adapter revision {revision} resolved to a different immutable identity"
+                f"checkpoint {revision} resolved to a different immutable identity"
             )
         observed_record = True
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
@@ -456,7 +451,7 @@ def _wait_revision_ready(
         last_failure = str(failure) if failure else None
         if last_state == "failed" or record.get("status") == "disabled":
             raise serving_errors.ServingError(
-                f"serving failed to load adapter revision {revision}: {failure or 'unknown error'}"
+                f"serving failed to load checkpoint {revision}: {failure or 'unknown error'}"
             )
         if last_state == "ready":
             value = record.get("subfolder")
@@ -469,7 +464,7 @@ def _wait_revision_ready(
         # the more actionable half: reporting only the read error would send the reader to retry
         # against serving when serving already said the artifact itself is wrong.
         message = (
-            f"adapter revision {revision} readiness could not be confirmed after transient "
+            f"checkpoint {revision} readiness could not be confirmed after transient "
             f"serving errors: {last_read_error}"
         )
         if last_failure:
@@ -479,7 +474,7 @@ def _wait_revision_ready(
             )
         raise serving_errors.ServingError(message) from last_read_error
     # a TIMEOUT, not a rejection. the two are distinguishable in code (a rejected adapter raises
-    # "serving failed to load adapter revision" above) but the old message said only that the
+    # "serving failed to load checkpoint" above) but the old message said only that the
     # revision "remained 'registered'", which reads as a serving fault and sent readers to the wrong
     # subsystem. say which of the two happened, what the clock actually was, and that a retry is the
     # correct response to THIS one.
@@ -490,7 +485,7 @@ def _wait_revision_ready(
         # serving never returned a record: every completed poll 404ed. that is registration
         # visibility, not a slow load, and it points at a different failure than a stuck loader.
         # no lifecycle state was ever observed, so do not quote the initial one as if it were read.
-        details.append("serving never returned the revision record (every completed poll 404ed)")
+        details.append("serving never returned the checkpoint record (every completed poll 404ed)")
     if last_failure:
         details.append(f"loader reported: {last_failure}")
     # the advice depends on WHICH timeout this is. a loader that named a failure while leaving the
@@ -518,122 +513,40 @@ def _wait_revision_ready(
             "succeeds against the now-warm engine."
         )
     raise serving_errors.ServingError(
-        f"revision_ready_timeout: adapter revision {revision} did not become ready in time "
-        f"({'; '.join(details)}). the previous alias remains available and {remedy} this is NOT "
+        f"checkpoint_ready_timeout: checkpoint {revision} did not become ready in time "
+        f"({'; '.join(details)}). {remedy} this is NOT "
         "the same as serving rejecting the adapter, which fails the deployment with 'serving "
-        "failed to load adapter revision'."
+        "failed to load checkpoint'."
     )
 
 
-def adapter_alias_target(run_id: str) -> str | None:
-    """Read the authoritative immutable revision targeted by a mutable run alias."""
-    record = _registered_adapter(run_id)
-    if record is None or record.get("status") == "disabled":
-        return None
-    target = _active_alias_target(record)
-    if target is None:
-        raise serving_errors.ServingError(
-            f"serving alias {run_id} is not an immutable alias record; legacy aliases are unsupported"
-        )
-    return target
-
-
-def _activate_revision(
-    run_id: str,
-    revision: str,
-    checkpoint: str,
-    *,
-    expected_adapter_revision: str | None,
-) -> dict:
-    body = {"expected_adapter_revision": expected_adapter_revision}
-    try:
-        response = transport.serving_request(
-            "POST",
-            f"{_adapter_url(revision)}/activate",
-            json=body,
-        ).json()
-        return _validate_activation_response(
-            response,
-            run_id=run_id,
-            revision=revision,
-            checkpoint=checkpoint,
-            expected_adapter_revision=expected_adapter_revision,
-        )
-    except (serving_errors.ServingError, ValueError) as exc:
-        alias = None
-        read_error: serving_errors.ServingError | None = None
-        target = None
-        for attempt in range(ACTIVATION_READBACK_ATTEMPTS):
-            if attempt:
-                time.sleep(ACTIVATION_READBACK_DELAY_SECONDS)
-            try:
-                alias = _registered_adapter(run_id)
-                read_error = None
-            except serving_errors.ServingError as read_exc:
-                read_error = read_exc
-                continue
-            target = _active_alias_target(alias)
-            if target == revision:
-                return {
-                    "adapter_id": run_id,
-                    "target_adapter_revision": revision,
-                    "previous_adapter_revision": expected_adapter_revision,
-                    "checkpoint": checkpoint,
-                    "updated_at": alias.get("updated_at") if alias else None,
-                }
-            if target not in (None, expected_adapter_revision):
-                break
-        if read_error is not None:
-            raise serving_errors.ActivationOutcomeUnknown(run_id, revision) from read_error
-        if expected_adapter_revision is not None and target == expected_adapter_revision:
-            raise serving_errors.ServingError(
-                f"alias activation was not committed; {run_id} still targets {target!r}"
-            ) from exc
-        if target is None:
-            raise serving_errors.ActivationOutcomeUnknown(
-                run_id,
-                revision,
-                detail=(
-                    "alias activation outcome is ambiguous because authoritative readback exposed "
-                    "no target"
-                ),
-            ) from exc
-        raise serving_errors.ActivationOutcomeUnknown(
-            run_id,
-            revision,
-            detail=f"alias activation diverged because authoritative readback targets {target!r}",
-        ) from exc
-
-
-def undeploy_adapter(run_id: str) -> dict:
-    """Disable the run alias and all immutable revisions without engine eviction."""
+def undeploy_adapter(checkpoint_id: str, *, org_id: str) -> dict:
+    """disable one exact permanent checkpoint."""
     response = transport.serving_request(
         "DELETE",
-        _adapter_url(run_id),
+        _adapter_url(checkpoint_id),
         ok_statuses=(404,),
+        org_id=org_id,
     )
     if response.status_code == 404:
         return {
-            "run_id": run_id,
-            "disabled_aliases": [],
-            "disabled_revisions": [],
+            "checkpoint_id": checkpoint_id,
+            "disabled_checkpoints": [],
             "serving_deregistered": False,
         }
     try:
         payload = response.json()
     except ValueError as exc:
         raise serving_errors.ServingError("serving returned an invalid undeploy response") from exc
-    if not isinstance(payload, dict) or payload.get("run_id") != run_id:
+    if not isinstance(payload, dict) or payload.get("checkpoint_id") != checkpoint_id:
         raise serving_errors.ServingError("serving returned a mismatched undeploy response")
-    for field in ("disabled_aliases", "disabled_revisions"):
+    for field in ("disabled_checkpoints",):
         value = payload.setdefault(field, [])
         if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
             raise serving_errors.ServingError(
                 f"serving returned invalid {field} in undeploy response"
             )
-    payload["serving_deregistered"] = bool(
-        payload["disabled_aliases"] or payload["disabled_revisions"]
-    )
+    payload["serving_deregistered"] = bool(payload["disabled_checkpoints"])
     return payload
 
 
@@ -641,12 +554,12 @@ def _retryable_smoke_unavailable(
     response: httpx.Response,
     *,
     requested_model: str,
-    expected_adapter_revision: str,
+    expected_checkpoint_id: str,
 ) -> serving_errors.RetryableServingUnavailable | None:
     return transport.retryable_smoke_unavailable(
         response,
         requested_model=requested_model,
-        expected_adapter_revision=expected_adapter_revision,
+        expected_checkpoint_id=expected_checkpoint_id,
         fallback_delay_seconds=SMOKE_RETRY_FALLBACK_DELAY_SECONDS,
     )
 
@@ -660,6 +573,8 @@ def _openai_stream_content(lines: Iterator[str], *, thinking: bool) -> Iterator[
 def chat_sse(
     run_id: str,
     messages: list[dict],
+    *,
+    org_id: str,
     temperature: float = 0.0,
     max_tokens: int = 512,
     thinking: bool = False,
@@ -674,13 +589,18 @@ def chat_sse(
     presence_penalty: float = 0.0,
     logprobs: bool = False,
     top_logprobs: int = 0,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
 ) -> transport.OpenAIStreamResponse:
     """open a raw openai stream while preserving status, headers, and sse bytes."""
 
+    if parse_checkpoint_ref(run_id) is None:
+        raise ValueError("chat target must be `<run_id>/final` or `<run_id>/step-N`")
     return transport.request_chat_sse(
         transport._chat_http_client(),
         url=f"{transport.serving_openai_base_url()}/chat/completions",
-        headers=transport._internal_key_header(),
+        headers=transport._internal_key_header(org_id=org_id),
         run_id=run_id,
         messages=messages,
         temperature=temperature,
@@ -696,6 +616,9 @@ def chat_sse(
         stop=stop,
         chat_template_kwargs=chat_template_kwargs,
         structured_outputs=structured_outputs,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
         stream_options=stream_options,
         frame_bytes=streaming_support._complete_sse_frames,
     )
@@ -704,6 +627,8 @@ def chat_sse(
 def chat_stream(
     run_id: str,
     messages: list[dict],
+    *,
+    org_id: str,
     temperature: float = 0.0,
     max_tokens: int = 512,
     thinking: bool = False,
@@ -714,9 +639,12 @@ def chat_stream(
     presence_penalty: float = 0.0,
     logprobs: bool = False,
     top_logprobs: int = 0,
+    tools: list[dict[str, Any]] | None = None,
 ) -> Iterator[str]:
     """yield one decoded choice while preserving eager open and cleanup semantics."""
 
+    if tools is not None:
+        raise ValueError("text-only chat_stream does not support tools")
     n = validate_choice_count(n)
     logprobs = validate_logprobs(logprobs)
     top_logprobs = validate_top_logprobs(top_logprobs)
@@ -732,10 +660,12 @@ def chat_stream(
             find_delimiter=thinking_support._find_delimiter,
         )
 
+    if parse_checkpoint_ref(run_id) is None:
+        raise ValueError("chat target must be `<run_id>/final` or `<run_id>/step-N`")
     return transport.request_chat_stream(
         transport._chat_http_client(),
         url=f"{transport.serving_openai_base_url()}/chat/completions",
-        headers=transport._internal_key_header(),
+        headers=transport._internal_key_header(org_id=org_id),
         run_id=run_id,
         messages=messages,
         temperature=temperature,
@@ -756,11 +686,12 @@ def chat_stream(
 def chat(
     run_id: str,
     messages: list[dict],
+    *,
+    org_id: str,
     temperature: float = 0.0,
     max_tokens: int = 512,
     thinking: bool = False,
     expected_checkpoint: str | None = None,
-    expected_adapter_revision: str | None = None,
     timeout_s: float | None = None,
     retry_unavailable: bool = False,
     stop: list[str] | None = None,
@@ -773,17 +704,23 @@ def chat(
     presence_penalty: float = 0.0,
     logprobs: bool = False,
     top_logprobs: int = 0,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 
-    ``timeout_s`` overrides the default 30-minute request timeout. deployment smoke also enables
+    the target must be an explicit permanent checkpoint id. ``timeout_s`` overrides the default
+    30-minute request timeout. deployment smoke also enables
     recognized unavailable-envelope classification so its caller can retry within one deadline.
     ``stop`` carries the run's own stop sequences so a model trained to terminate on a delimiter
     rather than EOS finishes on ``stop`` instead of running to ``max_tokens``.
     """
     # follow_redirects: modal 303-redirects slow cold-start requests across many poll cycles
     # before the result is ready, bounded by the transport redirect limit on the serving origin.
-    headers = transport._internal_key_header()
+    if parse_checkpoint_ref(run_id) is None:
+        raise ValueError("chat target must be `<run_id>/final` or `<run_id>/step-N`")
+    headers = transport._internal_key_header(org_id=org_id)
     if expected_checkpoint:
         headers["X-Freesolo-Expected-Checkpoint"] = expected_checkpoint
     timeout = 30 * 60.0 if timeout_s is None else max(0.0, float(timeout_s))
@@ -799,7 +736,7 @@ def chat(
         retryable_error = _retryable_smoke_unavailable(
             response,
             requested_model=run_id,
-            expected_adapter_revision=expected_adapter_revision or run_id,
+            expected_checkpoint_id=expected_checkpoint or run_id,
         )
         if retryable_error is not None:
             raise retryable_error
@@ -823,6 +760,9 @@ def chat(
         stop=stop,
         chat_template_kwargs=chat_template_kwargs,
         structured_outputs=structured_outputs,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
         timeout=timeout,
         before_raise=classify_unavailable,
         balance_payload=lambda payload, enabled: thinking_support._balance_thinking_payload(

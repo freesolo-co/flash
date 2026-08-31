@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import sys
-import threading
 import time
 
 from flash._internal.channel import CLI_NAME
@@ -48,14 +47,6 @@ _DEPLOY_FINAL_READ_FRACTION = 0.9
 # an auth or authorization rejection answers the same way every time; polling through it just
 # spends the whole timeout to arrive at the identical error.
 _PERMANENT_POLL_STATUSES = frozenset({401, 403})
-# the pre-deploy alias read is advisory, so it must not spend the client's default 60s budget
-# deciding whether to print a warning: a stalled read would delay every real deploy behind a
-# line nobody asked for. short enough to stay unnoticed, long enough for a healthy plane.
-# it is spent three ways, because the client's own bounds are per-phase: as a socket timeout it
-# bounds one socket operation, and as a body deadline it bounds the body but is only consulted
-# once headers are parsed. a peer trickling headers just inside the socket timeout escapes both.
-# `_read_within` bounds the total in wall-clock time, which is the one that actually holds.
-_ALIAS_WARNING_READ_SECONDS = 5.0
 
 
 def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> dict:
@@ -170,9 +161,8 @@ def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
         # this runs on the way out of a wait that has already ended; a failed lookup just means we
         # fall back to the original "no longer active" message rather than failing the command.
         return None
-    # deployment_for is no help here: it resolves an exact revision, so asking it for the bare run
-    # id means "the final adapter" (step None) and it rejects the rolled-back step just as it
-    # rejected the requested one. match on the run id alone and let the caller judge identity.
+    # deployment_for resolves one exact checkpoint and cannot enumerate a run's siblings. match on
+    # run grouping metadata only, then let the caller judge the exact checkpoint identity.
     for entry in entries or ():
         listed = entry.get("deployment") or {}
         if base_run_id not in (listed.get("run_id"), entry.get("run_id")):
@@ -191,191 +181,6 @@ def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
 def _served_step_label(step: int | None) -> str:
     """Name a deployment's checkpoint the way the user addressed it: `step-N`, or `final`."""
     return "final" if step is None else f"step-{step}"
-
-
-def _read_within(budget: float, read):
-    """Run an advisory read, giving up on it entirely once ``budget`` seconds have passed.
-
-    The client's two bounds are both per-phase, not total: `timeout` restarts on every socket
-    operation and the body deadline is only checked once `urlopen` has finished parsing headers.
-    A peer that trickles the status line or headers just inside the socket timeout therefore
-    stalls for timeout x however many pauses it takes -- 12s against a 2s budget, measured -- and
-    the whole point of the bound is that the deploy the user actually asked for is waiting behind
-    it. Only wall-clock time outside the call bounds every phase at once.
-
-    A daemon thread rather than a cancellation: a blocked socket read cannot be interrupted from
-    outside, so the read is abandoned rather than stopped. That is sound only because this result
-    is discardable -- no warning is the documented outcome for a plane that cannot answer, so an
-    overrunning read degrades to silence. Daemon, so a stuck thread cannot keep the interpreter
-    alive after the deploy finishes.
-    """
-    result: list = []
-    worker = threading.Thread(
-        target=lambda: result.append(_read_or_none(read)),
-        daemon=True,
-    )
-    worker.start()
-    worker.join(budget)
-    return result[0] if result else None
-
-
-def _read_or_none(read):
-    """The advisory read's failure contract: a plane that cannot answer produces no warning.
-
-    Deliberately broader than `ApiError`/`ClientError`. The client translates urllib's HTTPError
-    and URLError, and documents that anything else propagates -- so a connection reset or a
-    truncated body mid-read surfaces as the bare `ConnectionResetError` / `IncompleteRead` that
-    urllib raised. Those are exactly the "plane cannot answer" case this exists to absorb, and on
-    the worker thread an escaping one reaches the thread hook and prints a traceback across a
-    deploy that is otherwise proceeding normally: a warning nobody asked for turning into noise
-    on a command that worked.
-    """
-    try:
-        return read()
-    except Exception:
-        # the deploy itself is the authority on whether it can proceed. failing it here -- or
-        # printing a traceback beside it -- would turn a warning nobody asked for into a fault in
-        # the command it decorates. BaseException still propagates, so KeyboardInterrupt is
-        # unaffected.
-        return None
-
-
-def _alias_move_warning(client, base_run_id: str, requested_step: int | None) -> str | None:
-    """Warn when deploying moves the shared `<run_id>` alias off a different checkpoint.
-
-    `deploy` registers under the bare run id whatever step it is given, so deploying a second
-    checkpoint of the same run does not stand up a second endpoint -- it repoints the one alias,
-    and everyone chatting bare `<run_id>` silently changes model. That makes "deploy another
-    checkpoint to compare" a destructive operation on the first, which reads as a serving fault
-    rather than the deploy that caused it.
-
-    Best-effort by construction: the read is advisory, so a plane that cannot answer must not
-    stop the deploy. Returns None when nothing is being displaced -- no deployment, the same
-    checkpoint again, or an unreadable current record.
-    """
-    current = _read_within(
-        _ALIAS_WARNING_READ_SECONDS,
-        # not `deployment_for`: its step filter hides exactly the record this asks about, a
-        # DIFFERENT checkpoint holding the alias.
-        lambda: client.deployed_checkpoint(
-            base_run_id,
-            timeout=_ALIAS_WARNING_READ_SECONDS,
-            body_deadline=_ALIAS_WARNING_READ_SECONDS,
-        ),
-    )
-    if current is None:
-        return None
-    # a `reconciling` record whose activation outcome was never recorded may ALREADY hold the
-    # alias. the plane permits replacing exactly that record rather than rejecting it as busy,
-    # and resolves the authoritative target through `_activation_predecessor` when it does
-    # (flash/server/routes/serving.py). reading it as "not serving" suppressed the warning in
-    # the very case the alias is most likely to move out from under someone.
-    unknown_activation = current.get("activation_outcome_unknown") is True
-    # `revocation_failed` is an undeploy whose BACKEND cleanup failed: local authority is revoked
-    # but the alias may still resolve to the old target, and `_validate_deploy_request` rejects
-    # only the busy set, so a deploy proceeds from here. reading it as "not serving" suppressed
-    # the warning in the case where cleanup already left the alias ambiguous.
-    revocation_failed = str(current.get("state") or "") == _REVOCATION_FAILED_STATE
-    ambiguous = unknown_activation or revocation_failed
-    if str(current.get("state") or "") not in _DEPLOYMENT_READY_STATES and not ambiguous:
-        # nothing is being served off the alias yet, so nothing is lost by moving it.
-        return None
-    cli = CLI_NAME
-    # `step-N` is not universally available: `ApiClient.chat` gates a step target behind
-    # `_require_chat_step_selector`, which refuses outright on a plane that does not advertise
-    # `chat_step_selector_v1`. the capability cannot be read here without spending a /v1/health on
-    # an advisory warning, and `_chat_step_selector_available` starts False, so a negative reading
-    # cannot tell "unsupported" from "not checked yet". state the condition instead of asserting
-    # the command works, and name the selector that works on every plane.
-    tail = (
-        f"so every client using bare `{base_run_id}` changes model. address a specific "
-        f"checkpoint with `{cli} models chat {base_run_id}/step-N` to compare them, or by "
-        "immutable adapter revision if this control plane does not support step selectors."
-    )
-    if revocation_failed:
-        # same reason as the unknown-activation arm: this record's `checkpoint_step` describes the
-        # deployment whose revocation failed, and whether the backend still answers on the alias
-        # is exactly what could not be determined. hedge rather than name a checkpoint.
-        return (
-            f"{base_run_id} has a deployment whose revocation did not complete, so whether it "
-            f"still serves off that shared model id cannot be determined from here; deploying "
-            f"{_served_step_label(requested_step)} may move it, "
-            f"{tail} run `{cli} models deployments` to see the current state first."
-        )
-    if unknown_activation:
-        # this record's `checkpoint_step` names the INCOMING attempt, not what the alias holds:
-        # the plane resolves the live target from `adapter_alias_target` / `previous_deployment`,
-        # and both are server-side (`public_deployment` strips the predecessor). naming a
-        # checkpoint here would report the wrong one -- worse than naming none -- so say only what
-        # this side can actually stand behind.
-        return (
-            f"{base_run_id} has a deployment whose activation never settled, so the checkpoint "
-            f"it currently serves cannot be determined from here; deploying "
-            f"{_served_step_label(requested_step)} may move that shared model id, "
-            f"{tail} run `{cli} models deployments` to see the current state first."
-        )
-    raw_step = current.get("checkpoint_step")
-    # `int()` does not just reject what it cannot read -- it silently COERCES. `true` becomes 1,
-    # `false` becomes 0, and `1.5` truncates to 1, none of them raising. a step this client cannot
-    # read as an exact whole number is an unreadable record, not checkpoint 1: reading it as a
-    # number either suppresses the warning (deploying step-1 against a `true`) or names a
-    # checkpoint that was never live. bool is checked first because it is a subclass of int.
-    if isinstance(raw_step, bool):
-        return None
-    if isinstance(raw_step, float) and not raw_step.is_integer():
-        return None
-    try:
-        served_step = None if raw_step is None else int(raw_step)
-    except (TypeError, ValueError, OverflowError):
-        # a proxy or older plane can answer 2xx with a step this client cannot read. that is an
-        # unreadable current record like any other, NOT a reason to fail the deploy: leaving the
-        # conversion unguarded let an advisory read traceback out of the command it decorates.
-        # all three arms are reachable from one JSON body: `json.loads` accepts the non-standard
-        # `Infinity`/`NaN` literals, and int() answers those with OverflowError and ValueError
-        # respectively -- so catching only the obvious two still crashed the deploy.
-        return None
-    if served_step == requested_step:
-        return None
-    reach_displaced = ""
-    # the record being displaced carries the one identifier that survives the alias move, so name
-    # it whenever it is there. `step-N` is not a substitute: it is rejected outright on a plane
-    # without `chat_step_selector_v1`, and after this deploy the listing shows only the NEW record
-    # -- `public_deployment` strips `previous_deployment` (flash/serve/contract/urls.py) -- so a revision
-    # not printed here is not recoverable from anywhere afterwards.
-    revision = str(current.get("adapter_revision") or "").strip()
-    if served_step is None:
-        # the displaced checkpoint is the FINAL adapter, and `_parse_chat_target` accepts only a
-        # bare run id, `RUN/step-N`, or a full immutable revision -- there is no `/final`
-        # selector. once the alias moves, `step-N` addresses the incoming checkpoint and the bare
-        # id is the thing that just changed, so the generic advice cannot reach the final adapter
-        # at all. its immutable revision can, and the record being displaced carries one.
-        reach_displaced = (
-            f" the displaced final adapter has no `/final` selector; reach it by its immutable "
-            f"revision `{revision}`."
-            if revision
-            # without a revision on the record there is nothing to hand the user, and deferring
-            # them to a later command would be worse than saying so: `client.deploy` fires as soon
-            # as this prints, and the deployments listing then shows only the NEW record --
-            # `public_deployment` strips `previous_deployment` (flash/serve/contract/urls.py), so the
-            # displaced revision is not in it. promising a selector that the next command cannot
-            # produce is the one outcome worse than admitting there is none.
-            else (
-                " the displaced final adapter has no `/final` selector and this plane did not "
-                "report its immutable revision, so it will not be addressable after this deploy; "
-                "undeploy and redeploy it to serve it again."
-            )
-        )
-    elif revision:
-        # a numbered checkpoint keeps its `step-N` selector, but only on a plane that advertises
-        # `chat_step_selector_v1`; where it does not, the qualified advice above leaves the user
-        # holding no identifier at all. this is that identifier, and this is the last moment it
-        # can be printed.
-        reach_displaced = f" the displaced checkpoint's immutable revision is `{revision}`."
-    return (
-        f"{base_run_id} currently serves {_served_step_label(served_step)}; deploying "
-        f"{_served_step_label(requested_step)} moves that shared model id onto the new "
-        f"checkpoint, {tail}{reach_displaced}"
-    )
 
 
 def _deployment_attempt_failed(requested: dict, final: dict) -> bool:
@@ -414,22 +219,11 @@ def cmd_deploy(args) -> int:
     if parsed is None:
         print(
             f"invalid run/checkpoint reference {args.run_id!r} "
-            "(expected <run_id> or <run_id>/step-N)",
+            "(expected <run_id>/final or <run_id>/step-N)",
             file=sys.stderr,
         )
         return 1
-    base_run_id, step = parsed
     client = client_from_config()
-    # before the POST: after it the alias has already moved, and a warning about a checkpoint that
-    # is no longer served reads as history rather than a decision the reader still has. a dry run
-    # registers nothing, so it displaces nothing and gets no warning.
-    if not args.dry_run:
-        alias_warning = _alias_move_warning(client, base_run_id, step)
-        if alias_warning:
-            print(
-                render.warn(alias_warning) if render.styled() else f"warning: {alias_warning}",
-                file=sys.stderr,
-            )
     dep = client.deploy(args.run_id, dry_run=args.dry_run)
     wait_seconds = getattr(args, "wait", None)
     # a dry run creates no deployment to poll for, so --wait has nothing to observe. test against
@@ -453,7 +247,7 @@ def cmd_deploy(args) -> int:
     if dep.get("state") != "dry_run":
         openai_base = str(dep.get("openai_base_url") or "")
         note = (
-            f"serving is billed per token only; use `{CLI_NAME} models undeploy {base_run_id}` "
+            f"serving is billed per token only; use `{CLI_NAME} models undeploy {args.run_id}` "
             "to deregister the adapter."
         )
         print(render.arrow(note) if render.styled() else f"note: {note}", file=sys.stderr)
@@ -825,7 +619,7 @@ def cmd_deployments(args) -> int:
         print(tables.deployments_table(rows))
         return 0
     print(
-        f"{'RUN ID':<30}  {'STEP':<6}  {'REVISION':<40}  {'STATE':<14}  "
+        f"{'RUN ID':<30}  {'STEP':<6}  {'CHECKPOINT ID':<40}  {'STATE':<14}  "
         f"{'VERIFIED AT':<20}  {'OPENAI MODEL':<30}  {'OPENAI BASE URL':<48}  DETAIL"
     )
     for row in rows:
@@ -837,27 +631,25 @@ def cmd_deployments(args) -> int:
         verified_text = (
             "-" if verified_at is None else (render._humanize_ts(verified_at) or str(verified_at))
         )
-        revision = str(deployment.get("adapter_revision") or "-")
+        checkpoint_id = str(deployment.get("checkpoint_id") or "-")
         state = str(deployment.get("state") or "-")
         openai_model = str(deployment.get("openai_model") or run_id)
         openai_base_url = str(deployment.get("openai_base_url") or "-")
         detail = str(deployment.get("error") or deployment.get("detail") or "")[:160]
         print(
-            f"{run_id:<30}  {step_text:<6}  {revision:<40}  {state:<14}  "
+            f"{run_id:<30}  {step_text:<6}  {checkpoint_id:<40}  {state:<14}  "
             f"{verified_text:<20}  {openai_model:<30}  {openai_base_url:<48}  {detail}"
         )
     return 0
 
 
 def cmd_chat(args) -> int:
-    from flash.schema import parse_adapter_revision, parse_checkpoint_ref
+    from flash.schema import parse_checkpoint_ref
 
-    revision = parse_adapter_revision(args.run_id)
-    parsed = parse_checkpoint_ref(args.run_id) if revision is None else None
-    if revision is None and parsed is None:
+    parsed = parse_checkpoint_ref(args.run_id)
+    if parsed is None:
         print(
-            f"invalid chat target {args.run_id!r} "
-            "(expected a bare <run_id>, <run_id>/step-N, or full immutable adapter revision)",
+            f"invalid chat target {args.run_id!r} (expected <run_id>/final or <run_id>/step-N)",
             file=sys.stderr,
         )
         return 1
