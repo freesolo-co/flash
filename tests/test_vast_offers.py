@@ -121,6 +121,124 @@ def test_usable_offers_filters_and_order(monkeypatch):
     assert by_id[17].gpu == "RTX 5090"
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("id", True, id="id-bool"),
+        pytest.param("id", 0, id="id-zero"),
+        pytest.param("id", 1.5, id="id-fraction"),
+        pytest.param("id", "1", id="id-string"),
+        pytest.param("id", "9" * 5000, id="id-digit-limit-string"),
+        pytest.param("machine_id", -1, id="machine-negative"),
+        pytest.param("machine_id", float("nan"), id="machine-nan"),
+        pytest.param("num_gpus", "1.0", id="count-decimal-string"),
+        pytest.param("num_gpus", float("inf"), id="count-infinity"),
+        pytest.param("gpu_ram", True, id="vram-bool"),
+        pytest.param("gpu_ram", float("nan"), id="vram-nan"),
+        pytest.param("gpu_ram", 10**10000, id="vram-huge-int"),
+        pytest.param("gpu_ram", -1, id="vram-negative"),
+        pytest.param("dph_total", "0.25", id="price-string"),
+        pytest.param("dph_total", "NaN", id="price-nan-string"),
+        pytest.param("dph_total", float("inf"), id="price-infinity"),
+        pytest.param("dph_total", 0, id="price-zero"),
+        pytest.param("dph_total", -1, id="price-negative"),
+        pytest.param("hosting_type", True, id="hosting-bool"),
+        pytest.param("hosting_type", 2, id="hosting-unknown"),
+        pytest.param("reliability2", -0.1, id="reliability-negative"),
+        pytest.param("reliability2", 1.1, id="reliability-too-large"),
+        pytest.param("cuda_max_good", -1, id="cuda-negative"),
+        pytest.param("disk_space", -1, id="disk-negative"),
+        pytest.param("inet_down", -1, id="network-negative"),
+    ],
+)
+@pytest.mark.parametrize("malformed_first", [False, True])
+def test_usable_offers_drops_malformed_numeric_sibling_in_any_order(
+    monkeypatch, field, value, malformed_first
+):
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    malformed = _offer(id=2)
+    malformed[field] = value
+    valid = _offer(id=1)
+    rows = [malformed, valid] if malformed_first else [valid, malformed]
+    monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: rows)
+
+    assert [offer.offer_id for offer in vast.usable_offers(24, 60)] == [1]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("gpu_name", None),
+        ("gpu_name", ""),
+        ("gpu_name", True),
+        ("verification", None),
+        ("verification", ""),
+        ("verification", 1),
+        ("geolocation", True),
+    ],
+)
+def test_usable_offers_drops_weak_identities_but_preserves_valid_sibling(monkeypatch, field, value):
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    monkeypatch.setattr(
+        vast_api,
+        "search_offers",
+        lambda *a, **k: [_offer(id=2, **{field: value}), _offer(id=1)],
+    )
+    assert [offer.offer_id for offer in vast.usable_offers(24, 60)] == [1]
+
+
+def test_usable_offers_classifies_all_malformed_rows_as_bad_response(monkeypatch):
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    monkeypatch.setattr(
+        vast_api,
+        "search_offers",
+        lambda *a, **k: [_offer(id=0), _offer(dph_total=float("nan"))],
+    )
+    from flash.providers.core._decoding import MalformedProviderFieldError
+
+    with pytest.raises(MalformedProviderFieldError, match="at least one well-formed row"):
+        vast.usable_offers(24, 60)
+
+
+@pytest.mark.parametrize(
+    "price",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(10**10000, id="huge-json-int"),
+        pytest.param("9" * 5000, id="digit-limit-string"),
+    ],
+)
+def test_submit_rejects_malformed_offer_before_create(monkeypatch, price):
+    import time
+
+    from flash.providers.vast import jobs as vast
+    from flash.providers.vast.client import api as vast_api
+
+    spec = _wall_capped_spec(600.0)
+    row = _offer(
+        gpu_name="H100 SXM",
+        gpu_ram=81920,
+        dph_total=price,
+        cuda_max_good=12.8,
+    )
+    monkeypatch.setattr(vast_api, "search_offers", lambda *a, **k: [row])
+    created = []
+    monkeypatch.setattr(vast_api, "create_instance", lambda *a, **k: created.append((a, k)) or 1)
+
+    from flash.providers.core._decoding import MalformedProviderFieldError
+
+    with pytest.raises(MalformedProviderFieldError, match="at least one well-formed row"):
+        vast.submit_attempt_vast(spec, deadline_at=time.time() + 3600)
+
+    assert created == []
+
+
 def test_usable_offers_always_datacenter_only(monkeypatch):
     """Community/marketplace hosts (hosting_type 0) are ALWAYS rejected — run secrets ship to the
     box, so even a verified community host (id=10) never makes the cut."""

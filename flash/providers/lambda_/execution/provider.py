@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from flash._internal.logging import get_logger
 from flash.providers._lifecycle.instances.instance import InstanceJobHandle
 from flash.providers._lifecycle.instances.provider import InstanceProvider
+from flash.providers.core._decoding import MalformedProviderFieldError
 from flash.providers.core.base import (
     AllocationConstraints,
     Candidate,
@@ -17,6 +19,38 @@ from flash.providers.core.base import (
     rentable_gpu_counts,
 )
 from flash.providers.core.sharding import combined_vram_gb
+
+logger = get_logger(__name__)
+
+
+def _carries_any_entry(catalog: object) -> bool:
+    """Whether the catalog is shaped like Lambda's own ``/instance-types`` map.
+
+    ``/instance-types`` lists every type Lambda sells regardless of stock -- availability is the
+    per-entry ``regions_with_capacity_available`` field, not omission -- so an empty or entry-less
+    response is a broken feed rather than an empty product line. This is what makes a MISSING key
+    trustworthy evidence that a shape is not sold: absence only means something once the catalog
+    around it is known to be a catalog.
+    """
+    return isinstance(catalog, dict) and any(isinstance(entry, dict) for entry in catalog.values())
+
+
+def _sku_holds_run(catalog: dict, sku: str, constraints: AllocationConstraints) -> bool:
+    """Whether one catalog SKU's fixed disk can hold the run.
+
+    Lambda ships storage WITH the instance type and takes no launch-time disk parameter, so renting
+    an undersized box pays for a machine that dies mid-setup. An unreported disk is left alone -- a
+    caller must not invent a refusal the catalog cannot prove.
+
+    A malformed catalog field raises ``MalformedProviderFieldError`` so the caller can contain it to
+    this one SKU instead of losing every sibling shape.
+    """
+    from flash.providers.lambda_.client.gpus import instance_type_disk_gb
+
+    sku_disk_gb = instance_type_disk_gb(catalog, sku)
+    return not (
+        constraints.disk_gb and sku_disk_gb is not None and sku_disk_gb < constraints.disk_gb
+    )
 
 
 class LambdaProvider(InstanceProvider):
@@ -130,9 +164,19 @@ class LambdaProvider(InstanceProvider):
         Lambda sells fixed card counts per class as distinct instance types, so each allowed count
         is probed against the live catalog and only the counts with real capacity are reported. The
         rate stays per-card (``usable_instances`` divides the per-instance price).
+
+        A malformed catalog field is contained to the SKU carrying it, exactly as a malformed Vast
+        row is dropped from the offer search: one bad field must not delete every valid sibling
+        shape and take the whole provider out of the allocation. A catalog carrying no entry at
+        all, or one where every decode attempt fails and none succeeds, is not a bad field but a
+        broken feed, and still fails the lookup retryably.
+
+        A shape simply absent from a well-formed catalog is the opposite: a complete answer that
+        Lambda does not sell it, which no retry can change. It is therefore excluded from the
+        broken-feed evidence entirely and left to fall through to ``UnsupportedGpuError``.
         """
         from flash.providers.lambda_.client import api as lambda_api
-        from flash.providers.lambda_.client.gpus import instance_type_disk_gb, instance_type_for
+        from flash.providers.lambda_.client.gpus import instance_type_for
         from flash.providers.lambda_.jobs import usable_instances
 
         out: list[Candidate] = []
@@ -140,6 +184,8 @@ class LambdaProvider(InstanceProvider):
         try:
             catalog = lambda_api.list_instance_types()
             structurally_fitting = False
+            malformed = 0
+            decoded = 0
             for g in self.gpu_classes():
                 if constraints.gpu_type and g.name != constraints.gpu_type:
                     continue
@@ -154,24 +200,38 @@ class LambdaProvider(InstanceProvider):
                         and combined_vram_gb(g.vram_gb, count) < constraints.required_vram_gb
                     ):
                         continue
-                    sku = instance_type_for(g.name, count, catalog)
-                    if sku not in catalog:
+                    try:
+                        sku = instance_type_for(g.name, count, catalog)
+                        if sku not in catalog:
+                            # Lambda does not sell this shape. A missing key is a COMPLETE answer
+                            # that needed no decoding, so it is evidence of neither health nor
+                            # breakage and belongs in neither tally.
+                            continue
+                        if not _sku_holds_run(catalog, sku, constraints):
+                            decoded += 1
+                            continue
+                        structurally_fitting = True
+                        live = usable_instances(g.name, gpu_count=count)
+                    except MalformedProviderFieldError as exc:
+                        # A decode failure is evidence about FEED HEALTH wherever in the shape it
+                        # happens -- resolving the multi-card name reads the catalog's own
+                        # ``gpu_count`` and VRAM fields, so a corrupt sibling entry aborts here
+                        # before the sku is ever in hand. Tallying it keeps the broken-feed gate
+                        # able to see it; not tallying it let a corrupt N-card entry read exactly
+                        # like a healthy catalog that does not sell the shape, and a retryable
+                        # outage surfaced as a terminal refusal.
+                        logger.warning("dropping malformed lambda catalog sku: %s", exc)
+                        malformed += 1
                         continue
-                    # A SKU whose fixed disk cannot hold the run is not capacity at all: renting it
-                    # would pay for a box that dies mid-setup. An unreported disk is left alone.
-                    sku_disk_gb = instance_type_disk_gb(catalog, sku)
-                    if (
-                        constraints.disk_gb
-                        and sku_disk_gb is not None
-                        and sku_disk_gb < constraints.disk_gb
-                    ):
-                        continue
-                    structurally_fitting = True
-                    live = usable_instances(g.name, gpu_count=count)
+                    decoded += 1
                     if live:
                         out.append(
                             Candidate("lambda", g.name, live[0].price_usd_hr, g.vram_gb, count)
                         )
+            if not _carries_any_entry(catalog) or (malformed and not decoded):
+                raise MalformedProviderFieldError(
+                    "lambda", "instance-types", "at least one well-formed sku"
+                )
             if constraints.required_vram_gb and not structurally_fitting:
                 requested = f" {constraints.gpu_type}" if constraints.gpu_type else ""
                 disk = f" with {constraints.disk_gb:g} GB of disk" if constraints.disk_gb else ""

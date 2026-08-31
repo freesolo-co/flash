@@ -1210,6 +1210,85 @@ def test_ambiguous_filesystem_create_adopts_single_exact_match(monkeypatch):
     assert listings["count"] == 2
 
 
+def test_instance_type_for_normalizes_digit_limit_failures():
+    from flash.providers.core._decoding import MalformedProviderFieldError
+    from flash.providers.lambda_.client.gpus import instance_type_for
+
+    huge_digits = "9" * 5000
+    with pytest.raises(MalformedProviderFieldError, match="gpu_count"):
+        instance_type_for(
+            "H100",
+            8,
+            {f"gpu_{huge_digits}x_h100_sxm5": {"instance_type": {}}},
+        )
+    with pytest.raises(MalformedProviderFieldError, match="gpu_description"):
+        instance_type_for(
+            "H100",
+            8,
+            {
+                "gpu_8x_h100_sxm5": {
+                    "instance_type": {"gpu_description": f"NVIDIA H100 {huge_digits} GB"}
+                }
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param({"instance_type": {"gpu_description": []}}, id="non-string-description"),
+        pytest.param({"instance_type": {"description": 80}}, id="non-string-alias"),
+        pytest.param({"instance_type": []}, id="non-object-instance-type"),
+        pytest.param([], id="non-object-entry"),
+    ],
+)
+def test_unreadable_memory_metadata_cannot_unlock_the_suffix_fallback(entry):
+    """A sole family match with UNREADABLE memory is not a match with no memory published.
+
+    The renamed-suffix fallback fires only when Lambda published no memory class for the one
+    candidate, because an unverified class is a different box at a different price. Reading an
+    unparseable description as "no memory published" answers that proof with a guess and rents on
+    it: the 8x A100 family alone spans a 40 GB box at $15.92/hr and an 80 GB box at $22.32/hr.
+    """
+    from flash.providers.core._decoding import MalformedProviderFieldError
+    from flash.providers.lambda_.client.gpus import instance_type_for
+
+    sole = "gpu_8x_h100_sxm5"
+    with pytest.raises(MalformedProviderFieldError, match=sole):
+        instance_type_for("H100", 8, {sole: entry})
+
+    # control: the SAME sole candidate with genuinely absent memory still takes the fallback, so the
+    # test above pins the malformed/absent split rather than the fallback simply being unreachable.
+    assert instance_type_for("H100", 8, {sole: {"instance_type": {}}}) == sole
+    assert instance_type_for("H100", 8, {sole: {"instance_type": None}}) == sole
+    assert instance_type_for("H100", 8, {sole: None}) == sole
+
+
+def test_a_corrupt_unrelated_family_cannot_abort_a_lookup_that_never_concerned_it():
+    """The family test gates the count decode, not the other way round.
+
+    Decoding a count raises, so evaluating it before the family comparison let one corrupt entry
+    from a family the caller never asked about abort the whole resolution. The A100 entry below is
+    exactly that: its count segment is unusable, and it has nothing to do with the H100 being
+    resolved beside it.
+    """
+    from flash.providers.core._decoding import MalformedProviderFieldError
+    from flash.providers.lambda_.client.gpus import instance_type_for
+
+    wanted = "gpu_8x_h100_sxm5"
+    catalog = {
+        "gpu_0x_a100_sxm4": {"instance_type": {"gpu_description": "A100 (40 GB SXM4)"}},
+        wanted: {"instance_type": {"gpu_description": "H100 (80 GB)"}},
+    }
+    assert instance_type_for("H100", 8, catalog) == wanted
+    # ordering is not a contract: the corrupt sibling must stay inert from either side.
+    assert instance_type_for("H100", 8, dict(reversed(catalog.items()))) == wanted
+    # a corrupt entry in the RESOLVED family is still fatal -- it could be the shape being named.
+    catalog["gpu_0x_h100_pcie"] = {"instance_type": {"gpu_description": "H100 (80 GB)"}}
+    with pytest.raises(MalformedProviderFieldError, match="gpu_0x_h100_pcie"):
+        instance_type_for("H100", 8, catalog)
+
+
 # ---------------------------------------------------------------------------
 # gpu.disk_gb: Lambda sells a FIXED disk per instance type (no launch-time parameter)
 # ---------------------------------------------------------------------------
@@ -1229,6 +1308,52 @@ def test_instance_type_disk_gb_reads_catalog_storage_or_reports_unknown():
     assert instance_type_disk_gb(None, "gpu_1x_a10") is None
 
 
+@pytest.mark.parametrize("value", [None, pytest.param("missing", id="absent")])
+def test_instance_type_disk_gb_maps_only_absent_or_null_to_unknown(value):
+    from flash.providers.lambda_.client.gpus import instance_type_disk_gb
+
+    specs = {} if value == "missing" else {"storage_gib": value}
+    catalog = {"gpu_1x_a10": {"instance_type": {"specs": specs}}}
+    assert instance_type_disk_gb(catalog, "gpu_1x_a10") is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        0,
+        -1,
+        True,
+        float("nan"),
+        float("inf"),
+        pytest.param(10**10000, id="huge-json-int"),
+        "512",
+        "NaN",
+        "1e2",
+        " 512",
+        {},
+        [],
+    ],
+)
+def test_instance_type_disk_gb_rejects_present_malformed_storage(value):
+    from flash.providers.core._decoding import MalformedProviderFieldError
+    from flash.providers.lambda_.client.gpus import instance_type_disk_gb
+
+    catalog = {"gpu_1x_a10": {"instance_type": {"specs": {"storage_gib": value}}}}
+    with pytest.raises(MalformedProviderFieldError, match="storage_gib"):
+        instance_type_disk_gb(catalog, "gpu_1x_a10")
+
+
+def test_instance_type_disk_gb_rejects_malformed_secondary_storage_alias():
+    from flash.providers.core._decoding import MalformedProviderFieldError
+    from flash.providers.lambda_.client.gpus import instance_type_disk_gb
+
+    catalog = {
+        "gpu_1x_a10": {"instance_type": {"specs": {"storage_gib": 512, "storage_gb": float("nan")}}}
+    }
+    with pytest.raises(MalformedProviderFieldError, match="storage_gb"):
+        instance_type_disk_gb(catalog, "gpu_1x_a10")
+
+
 def test_usable_instances_carries_the_sku_disk(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
@@ -1241,6 +1366,37 @@ def test_usable_instances_carries_the_sku_disk(monkeypatch):
     monkeypatch.setattr(lambda_api, "regions_with_capacity", lambda *a, **k: ["us-east-1"])
     monkeypatch.setattr("flash.providers.lambda_.client.pricing.hourly_rate", lambda *a, **k: 1.29)
     assert jobs.usable_instances("A10")[0].disk_gb == 512.0
+
+
+@pytest.mark.parametrize(
+    "price",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(10**10000, id="huge-json-int"),
+        pytest.param("9" * 5000, id="digit-limit-string"),
+    ],
+)
+def test_submit_rejects_malformed_price_before_launch(monkeypatch, price):
+    import flash.providers.lambda_.jobs as jobs
+    from flash.providers.core._decoding import MalformedProviderFieldError
+    from flash.providers.lambda_.client import api as lambda_api
+
+    catalog = {
+        "gpu_1x_a10": {
+            "instance_type": {"price_cents_per_hour": price},
+            "regions_with_capacity_available": [{"name": "us-east-1"}],
+        }
+    }
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: catalog)
+    launched = []
+    monkeypatch.setattr(
+        lambda_api, "launch_instance", lambda **kwargs: launched.append(kwargs) or "i-1"
+    )
+
+    with pytest.raises(MalformedProviderFieldError, match="price_cents_per_hour"):
+        _submit(jobs, _spec())
+
+    assert launched == []
 
 
 def test_launch_refuses_an_instance_type_below_the_run_disk_floor(monkeypatch):
@@ -1331,6 +1487,186 @@ def test_live_candidates_drop_skus_that_cannot_hold_the_run_disk(monkeypatch):
     assert [c.gpu for c in fits] == ["A10"]
     # the allocator must never hand the runner a Lambda class it could not rent for this run
     assert PROVIDER.live_candidates(24, AllocationConstraints(disk_gb=800, gpu_type="A10")) == []
+
+
+def test_live_candidates_contain_a_malformed_sku_to_that_sku(monkeypatch):
+    """One bad catalog field must not delete every VALID sibling shape.
+
+    The decoders raise on a present-but-malformed field on purpose (renting a box off a field you
+    could not read is how a run pays for the wrong machine). But ``live_candidates`` wraps the whole
+    class/count walk in one ``try`` whose tail converts any exception into a provider-wide
+    ``CapacityLookupError``, and the allocator answers that by dropping Lambda from the allocation
+    entirely -- so a single malformed A10 storage value used to cost every real H100 too. Vast
+    already drops the bad row and keeps the rest; Lambda gets the same containment.
+    """
+    import flash.providers.lambda_.jobs as jobs
+    from flash.providers.core.base import AllocationConstraints
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.execution.provider import PROVIDER
+
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instance_types",
+        lambda *a, **k: {
+            # storage_gib is present but not a positive number -> the decoder raises for THIS sku
+            "gpu_1x_a10": {"instance_type": {"specs": {"storage_gib": "512"}}},
+            "gpu_1x_h100_pcie": {"instance_type": {"specs": {"storage_gib": 1024}}},
+        },
+    )
+    monkeypatch.setattr(jobs, "usable_instances", lambda *a, **k: [_inst(disk_gb=1024.0)])
+
+    fits = PROVIDER.live_candidates(24, AllocationConstraints(disk_gb=200))
+    assert "H100" in [c.gpu for c in fits]
+    assert "A10" not in [c.gpu for c in fits]
+
+
+def test_live_candidates_fail_when_no_probed_sku_decodes(monkeypatch):
+    """Containment is per-sku, not a blanket mute: a catalog where NOTHING decodes is a broken feed.
+
+    Skipping every sku would report "lambda has no capacity", which the allocator cannot tell from a
+    real sell-out, so a wholly malformed feed must still surface as a lookup failure.
+    """
+    from flash.providers.core.base import AllocationConstraints, CapacityLookupError
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.execution.provider import PROVIDER
+
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instance_types",
+        lambda *a, **k: {"gpu_1x_a10": {"instance_type": {"specs": {"storage_gib": "512"}}}},
+    )
+
+    with pytest.raises(CapacityLookupError):
+        PROVIDER.live_candidates(24, AllocationConstraints(gpu_type="A10"))
+
+
+def test_broken_feed_beats_unsupported_gpu_when_a_fit_floor_is_set(monkeypatch):
+    """A shape the catalog never carried is not evidence the feed decodes.
+
+    ``allocate`` probes several card counts per class, and only the sold counts appear in the
+    catalog at all. Counting an ABSENT sku as a successful decode let a wholly malformed feed clear
+    the broken-feed gate on the unsold shapes, so with a fit floor set the walk fell through to
+    ``UnsupportedGpuError`` -- a TERMINAL config miss the allocator will not degrade past -- instead
+    of the retryable lookup failure that lets the run reach another provider.
+    """
+    from flash.providers.core.base import AllocationConstraints, CapacityLookupError
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.execution.provider import PROVIDER
+
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instance_types",
+        # the single sold sku is malformed; the 2x/4x/8x shapes probed alongside it are simply absent
+        lambda *a, **k: {"gpu_1x_a10": {"instance_type": {"specs": {"storage_gib": "512"}}}},
+    )
+
+    with pytest.raises(CapacityLookupError):
+        PROVIDER.live_candidates(
+            24,
+            AllocationConstraints(gpu_type="A10", required_vram_gb=24, max_gpu_count=8),
+        )
+
+
+def test_absent_shape_in_a_healthy_catalog_does_not_trip_the_broken_feed_gate(monkeypatch):
+    """A shape missing from a well-formed catalog is a complete answer, not missing evidence.
+
+    The broken-feed gate used to be fed by a sample that structurally EXCLUDED absent shapes: an
+    absent sku was probed but never counted as decoded, so a catalog that decodes perfectly and
+    simply does not sell the requested count left ``decoded == 0`` and raised a retryable
+    ``CapacityLookupError``. The allocator then retried forever for a shape Lambda does not sell.
+    """
+    from flash.providers.core.base import AllocationConstraints, UnsupportedGpuError
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.execution.provider import PROVIDER
+
+    # a healthy catalog for a DIFFERENT class: nothing the A10 walk probes is present in it, so
+    # every probed sku is absent and the gate has no decode evidence from the probed sample at all.
+    monkeypatch.setattr(
+        lambda_api,
+        "list_instance_types",
+        lambda *a, **k: {
+            "gpu_1x_h100_pcie": {
+                "instance_type": {
+                    "gpu_description": "H100 (80 GB)",
+                    "specs": {"storage_gib": 1024},
+                },
+                "regions_with_capacity_available": [],
+            }
+        },
+    )
+
+    with pytest.raises(UnsupportedGpuError, match=r"does not offer a rentable"):
+        PROVIDER.live_candidates(
+            24,
+            AllocationConstraints(gpu_type="A10", required_vram_gb=24, max_gpu_count=8),
+        )
+
+
+def test_a_corrupt_multi_card_entry_is_a_broken_feed_not_an_unsold_shape(monkeypatch):
+    """A decode that fails while RESOLVING the sku name is still feed-health evidence.
+
+    Naming a multi-card shape reads the catalog's own ``gpu_count`` and per-card VRAM fields, so a
+    corrupt N-card sibling raises before the sku is ever in hand. That failure used to be tallied
+    nowhere -- neither as a probe nor as a decode -- which made a corrupt 8x entry read EXACTLY like
+    the healthy catalog below that simply does not sell the shape. Lambda's feed being broken then
+    surfaced as a terminal ``UnsupportedGpuError`` the allocator will not degrade past, so the run
+    died on a config miss it does not have instead of reaching another provider.
+    """
+    from flash.providers.core.base import (
+        AllocationConstraints,
+        CapacityLookupError,
+        UnsupportedGpuError,
+    )
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.execution.provider import PROVIDER
+
+    healthy_1x = {
+        "gpu_1x_h100_pcie": {
+            "instance_type": {"gpu_description": "H100 (80 GB)", "specs": {"storage_gib": 1024}},
+            "regions_with_capacity_available": [],
+        }
+    }
+    # 497.6 GB is what eight 80 GB cards combine to, so the floor admits the 8-card shape and the
+    # walk actually reaches the corrupt entry. A floor above that skips every count and measures
+    # nothing.
+    constraints = AllocationConstraints(gpu_type="H100", required_vram_gb=400, max_gpu_count=8)
+
+    # control: the same catalog WITHOUT the corrupt sibling is a complete "not sold" answer.
+    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: dict(healthy_1x))
+    with pytest.raises(UnsupportedGpuError, match=r"does not offer a rentable"):
+        PROVIDER.live_candidates(80, constraints)
+
+    # `gpu_0x_` cannot be a real card count, and the VRAM string is unparseable: either field
+    # aborts the family match, and each must reach the broken-feed gate.
+    for corrupt in (
+        {"instance_type": {"gpu_description": "H100 (80 GB)"}},
+        {"instance_type": {"gpu_description": "H100 (0 GB)"}},
+    ):
+        catalog = dict(healthy_1x)
+        catalog["gpu_0x_h100_sxm5" if "80 GB" in str(corrupt) else "gpu_8x_h100_sxm5"] = corrupt
+        monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, _c=catalog, **k: _c)
+        with pytest.raises(CapacityLookupError):
+            PROVIDER.live_candidates(80, constraints)
+
+
+def test_an_entryless_catalog_is_a_broken_feed_not_an_empty_product_line(monkeypatch):
+    """Absence only means "not sold" once the catalog around it is known to be a catalog.
+
+    ``/instance-types`` lists every type Lambda sells regardless of stock, so a response carrying no
+    decodable entry is a broken feed. Reading a missing key as a complete "Lambda does not sell
+    this" would turn that outage into a TERMINAL ``UnsupportedGpuError`` the allocator will not
+    degrade past -- the run dies on a config miss it does not have instead of reaching another
+    provider.
+    """
+    from flash.providers.core.base import AllocationConstraints, CapacityLookupError
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.providers.lambda_.execution.provider import PROVIDER
+
+    constraints = AllocationConstraints(gpu_type="A10", required_vram_gb=24, max_gpu_count=8)
+    for catalog in ({}, {"gpu_1x_a10": "not-an-instance-type-object"}):
+        monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, _c=catalog, **k: _c)
+        with pytest.raises(CapacityLookupError):
+            PROVIDER.live_candidates(24, constraints)
 
 
 def test_launch_never_rents_an_undersized_sku_from_a_mixed_candidate_list(monkeypatch):

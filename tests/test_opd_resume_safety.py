@@ -1384,11 +1384,21 @@ def test_retry_allocation_falls_back_for_unusable_executed_width(
     from flash.providers.core.base import Allocation, Candidate
     from flash.runner.supervise.attempt_supervision import _pinned_to_resume_width
 
-    if executed_present:
+    valid_executed = executed_gpu_count is None or (
+        isinstance(executed_gpu_count, int)
+        and not isinstance(executed_gpu_count, bool)
+        and 0 < executed_gpu_count <= 4
+    )
+    if executed_present and valid_executed:
         candidate = Candidate("runpod", "h100", 1.0, 80, 4, executed_gpu_count)
     else:
         candidate = SimpleNamespace(
-            provider="runpod", gpu="h100", hourly_usd=1.0, vram_gb=80, gpu_count=4
+            provider="runpod",
+            gpu="h100",
+            hourly_usd=1.0,
+            vram_gb=80,
+            gpu_count=4,
+            **({"executed_gpu_count": executed_gpu_count} if executed_present else {}),
         )
     allocation = Allocation("runpod", "h100", 1.0, 80, (candidate,), gpu_count=4)
 

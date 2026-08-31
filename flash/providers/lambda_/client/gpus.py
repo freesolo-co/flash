@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import re
 
+from flash.providers.core._decoding import (
+    MISSING_PROVIDER_FIELD,
+    MalformedProviderFieldError,
+    decode_finite_number,
+)
 from flash.providers.core.base import UnsupportedGpuError, get_gpu_info, providers_for
 
 __all__ = ["instance_type_disk_gb", "instance_type_for"]
@@ -14,17 +19,57 @@ _COUNT_PREFIX = re.compile(r"^gpu_(\d+)x_")
 _VRAM_GB = re.compile(r"(\d+)\s*GB", re.IGNORECASE)
 
 
-def _catalog_vram_gb(entry: object) -> int | None:
-    """Per-card VRAM Lambda advertises for one catalog entry, when present."""
-    if not isinstance(entry, dict):
+def _catalog_positive_int(text: str, field: str) -> int:
+    try:
+        value = int(text)
+    except (OverflowError, ValueError) as exc:
+        raise MalformedProviderFieldError("lambda", field, "a positive integer") from exc
+    if value <= 0:
+        raise MalformedProviderFieldError("lambda", field, "a positive integer")
+    return value
+
+
+def _catalog_object(value: object, field: str) -> dict | None:
+    """One rung of a catalog walk: absent or null is unknown, any other shape is malformed."""
+    if value is MISSING_PROVIDER_FIELD or value is None:
         return None
-    instance = entry.get("instance_type")
-    if not isinstance(instance, dict):
+    if not isinstance(value, dict):
+        raise MalformedProviderFieldError("lambda", field, "an object or null")
+    return value
+
+
+def _catalog_child(parent: dict | None, key: str, field: str) -> dict | None:
+    """Descend one key, carrying an already-unknown parent through as unknown."""
+    if parent is None:
+        return None
+    return _catalog_object(parent.get(key, MISSING_PROVIDER_FIELD), field)
+
+
+def _catalog_vram_gb(entry: object, instance_type: str) -> int | None:
+    """Per-card VRAM Lambda advertises for one catalog entry.
+
+    None means the catalog states no memory for this entry, and nothing else. A present entry whose
+    shape or digits cannot be trusted raises instead: the caller reads None as PROOF that Lambda
+    published no memory class and falls back to a renamed suffix on the strength of it, so
+    unparseable metadata answering to the same None would rent an unverified memory class.
+    """
+    instance = _catalog_child(
+        _catalog_object(entry, instance_type),
+        "instance_type",
+        f"{instance_type}.instance_type",
+    )
+    if instance is None:
         return None
     for key in ("gpu_description", "description"):
-        match = _VRAM_GB.search(str(instance.get(key) or ""))
+        field = f"{instance_type}.{key}"
+        raw = instance.get(key, MISSING_PROVIDER_FIELD)
+        if raw is MISSING_PROVIDER_FIELD or raw is None:
+            continue
+        if not isinstance(raw, str):
+            raise MalformedProviderFieldError("lambda", field, "a string or null")
+        match = _VRAM_GB.search(raw)
         if match:
-            return int(match.group(1))
+            return _catalog_positive_int(match.group(1), field)
     return None
 
 
@@ -40,16 +85,23 @@ def instance_type_disk_gb(catalog, instance_type: str) -> float | None:
     """
     if not isinstance(catalog, dict):
         return None
-    entry = catalog.get(instance_type)
-    instance = entry.get("instance_type") if isinstance(entry, dict) else None
-    specs = instance.get("specs") if isinstance(instance, dict) else None
-    if not isinstance(specs, dict):
+    entry = _catalog_object(catalog.get(instance_type, MISSING_PROVIDER_FIELD), instance_type)
+    instance = _catalog_child(entry, "instance_type", f"{instance_type}.instance_type")
+    specs = _catalog_child(instance, "specs", f"{instance_type}.specs")
+    if specs is None:
         return None
+    decoded: list[float] = []
     for key in ("storage_gib", "storage_gb"):
-        storage = specs.get(key)
-        if not isinstance(storage, bool) and isinstance(storage, (int, float)) and storage > 0:
-            return float(storage)
-    return None
+        raw = specs.get(key, MISSING_PROVIDER_FIELD)
+        if raw is MISSING_PROVIDER_FIELD or raw is None:
+            continue
+        field = f"{instance_type}.{key}"
+        storage = decode_finite_number(raw, provider="lambda", field=field)
+        assert isinstance(storage, float)
+        if storage <= 0:
+            raise MalformedProviderFieldError("lambda", field, "a positive finite number")
+        decoded.append(storage)
+    return decoded[0] if decoded else None
 
 
 def instance_type_for(name: str, gpu_count: int = 1, catalog=None) -> str:
@@ -88,17 +140,19 @@ def instance_type_for(name: str, gpu_count: int = 1, catalog=None) -> str:
     family_matches = []
     for entry, entry_info in catalog.items():
         match = _COUNT_PREFIX.match(entry)
-        if (
-            match
-            and int(match.group(1)) == count
-            and _COUNT_PREFIX.sub("", entry, count=1).split("_")[0] == family
-        ):
-            family_matches.append((entry, _catalog_vram_gb(entry_info)))
+        # family first: decoding raises, so testing the count ahead of the family would let a corrupt
+        # entry from an UNRELATED family abort a lookup that never concerned it.
+        if not match or _COUNT_PREFIX.sub("", entry, count=1).split("_")[0] != family:
+            continue
+        if _catalog_positive_int(match.group(1), f"{entry}.gpu_count") == count:
+            family_matches.append((entry, _catalog_vram_gb(entry_info, entry)))
     memory_matches = sorted(entry for entry, vram_gb in family_matches if vram_gb == info.vram_gb)
     if memory_matches:
         return memory_matches[0]
     if len(family_matches) == 1 and family_matches[0][1] is None:
-        # Preserve the legacy suffix fallback only when the catalog gives no memory metadata. An
-        # explicit mismatch is a different managed class, not merely a renamed spelling.
+        # Preserve the suffix fallback only when the catalog PROVES it published no memory class for
+        # the sole candidate -- _catalog_vram_gb raises on unparseable metadata rather than
+        # answering None, so an unreadable description can no longer unlock this. An explicit
+        # mismatch is a different managed class, not merely a renamed spelling.
         return family_matches[0][0]
     return rewritten

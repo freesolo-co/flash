@@ -150,20 +150,70 @@ def test_all_regions_unions_sorts_and_dedups(monkeypatch):
     assert lambda_api.all_regions() == ["eu-central-1", "us-east-1", "us-west-2"]
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        0,
+        -1,
+        True,
+        float("nan"),
+        float("inf"),
+        pytest.param(10**10000, id="huge-json-int"),
+        "129",
+        "9" * 5000,
+        "NaN",
+        "1e2",
+        " 129",
+        {},
+        [],
+    ],
+)
+def test_instance_type_price_rejects_present_malformed_values(monkeypatch, value):
+    from flash.providers.core._decoding import MalformedProviderFieldError
+
+    lambda_api = _seed_types(
+        monkeypatch,
+        {"gpu_1x_a10": {"instance_type": {"price_cents_per_hour": value}}},
+    )
+    with pytest.raises(MalformedProviderFieldError, match="price_cents_per_hour"):
+        lambda_api.instance_type_price_usd_hr("gpu_1x_a10")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(10**10000, id="huge-json-int"),
+        pytest.param("9" * 5000, id="digit-limit-string"),
+    ],
+)
+def test_malformed_live_price_never_uses_static_fallback(monkeypatch, value):
+    from flash.providers.core._decoding import MalformedProviderFieldError
+    from flash.providers.lambda_.client import pricing
+
+    lambda_api = _seed_types(
+        monkeypatch,
+        {"gpu_1x_a10": {"instance_type": {"price_cents_per_hour": value}}},
+    )
+    monkeypatch.setattr(
+        lambda_api, "list_instance_types", lambda *a, **k: lambda_api._types_cache["data"]
+    )
+
+    with pytest.raises(MalformedProviderFieldError, match="price_cents_per_hour"):
+        pricing.hourly_rate("A10")
+
+
 def test_instance_type_price_usd_hr_variants(monkeypatch):
     lambda_api = _seed_types(
         monkeypatch,
         {
             "gpu_1x_a10": {"instance_type": {"price_cents_per_hour": 129}},
-            "gpu_free": {"instance_type": {"price_cents_per_hour": 0}},  # 0 -> falsy -> None
-            "gpu_noprice": {"instance_type": {}},  # no price key
-            "gpu_notype": {},  # no instance_type key
+            "gpu_null": {"instance_type": {"price_cents_per_hour": None}},
+            "gpu_noprice": {},
         },
     )
     assert lambda_api.instance_type_price_usd_hr("gpu_1x_a10") == 1.29
-    assert lambda_api.instance_type_price_usd_hr("gpu_free") is None
+    assert lambda_api.instance_type_price_usd_hr("gpu_null") is None
     assert lambda_api.instance_type_price_usd_hr("gpu_noprice") is None
-    assert lambda_api.instance_type_price_usd_hr("gpu_notype") is None
     assert lambda_api.instance_type_price_usd_hr("missing") is None
 
 
