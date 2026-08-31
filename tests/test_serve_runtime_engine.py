@@ -160,6 +160,10 @@ class _Engine:
         self.active: dict[str, Any] = {}
         self.shutdown_called = False
         self.seen_images: list[Any] = []
+        # set the moment `generate` is entered, so a test can wait for dispatch on a signal rather
+        # than by counting event-loop yields. how many yields the runtime spends before it reaches
+        # the engine is an asyncio implementation detail that differs between python versions.
+        self.generate_entered = asyncio.Event()
         type(self).latest = self
 
     @classmethod
@@ -216,6 +220,7 @@ class _Engine:
                 "reasoning_parser_kwargs": reasoning_parser_kwargs,
             }
         )
+        self.generate_entered.set()
         image = (prompt.get("multi_modal_data") or {}).get("image")
         if image is not None:
             self.seen_images.append(image)
@@ -1463,11 +1468,18 @@ def _set_short_cancellation_grace(monkeypatch) -> None:
 
 
 async def _wait_for_generate_call(engine: _Engine) -> None:
-    for _ in range(100):
-        if engine.generate_calls:
-            return
-        await asyncio.sleep(0)
-    raise AssertionError("generation did not reach the engine")
+    """block until the fake engine's `generate` has actually been entered.
+
+    the timeout only bounds a hang; it is not a scheduling budget. polling `generate_calls` across
+    a fixed number of `sleep(0)` yields instead would tie the test to how many times the runtime
+    happens to suspend on the way to the engine, which is not a stable number across python
+    versions: the same wait passed on 3.11 at 17 yields and failed on 3.12.
+    """
+
+    try:
+        await asyncio.wait_for(engine.generate_entered.wait(), timeout=5)
+    except TimeoutError:
+        raise AssertionError("generation did not reach the engine") from None
 
 
 def test_request_owns_exact_engine_id_and_normal_completion_does_not_abort() -> None:
