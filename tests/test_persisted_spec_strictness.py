@@ -97,11 +97,10 @@ def _set(payload: dict, path: str, value: object) -> dict:
         ("train.teacher_model", None),
         ("environment.params", None),
         ("workload_profile", []),
-        # `wandb` is deliberately absent: it is cosmetic run-naming metadata that no training,
-        # billing, or lifecycle decision reads, so a malformed persisted payload coerces to the
-        # default rather than killing a worker reattaching to a real run. the AUTHORING path still
-        # rejects it -- `test_invalid_wandb_section_rejected` covers that -- which is where a
-        # user's typo has to surface. every other field in this list IS read for a decision.
+        ("wandb", "tests"),
+        ("wandb", []),
+        ("wandb.project", 7),
+        ("wandb.run_name", False),
         ("environment.pip", "requests"),
         ("environment.secrets", ["TOKEN", 7]),
         ("train.stop_sequences", "END"),
@@ -134,6 +133,33 @@ def test_null_is_retained_only_for_optional_fields(path, value) -> None:
     section, _, field = path.partition(".")
     target = getattr(spec, section) if field else spec
     assert getattr(target, field or section) is None
+
+
+@pytest.mark.parametrize("section", ["train", "gpu", "environment"])
+def test_present_core_section_must_be_an_object(section) -> None:
+    with pytest.raises(TypeError, match=rf"{section} must be an object"):
+        JobSpec.from_dict(_set(_payload(), section, None))
+
+
+def test_absent_sections_use_documented_defaults() -> None:
+    payload = _payload()
+    for section in ("train", "gpu", "environment", "wandb"):
+        payload.pop(section)
+
+    spec = JobSpec.from_dict(payload)
+
+    assert spec.train == type(spec.train)()
+    assert spec.gpu == type(spec.gpu)()
+    assert spec.environment == type(spec.environment)()
+    assert spec.wandb == type(spec.wandb)()
+
+
+def test_model_revision_auto_requires_a_present_revision() -> None:
+    payload = _payload()
+    payload.update(model_revision="", model_revision_auto=True)
+
+    with pytest.raises(ValueError, match="model_revision_auto=True requires model_revision"):
+        JobSpec.from_dict(payload)
 
 
 def test_retained_sequence_and_numeric_alternatives_round_trip() -> None:

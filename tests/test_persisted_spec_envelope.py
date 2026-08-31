@@ -125,7 +125,7 @@ def test_present_worker_spec_never_falls_back_to_public(worker_spec) -> None:
         runner_status.effective_spec_from_status(status)
 
 
-def test_activation_requires_digest_even_for_plain_unprofiled_runs() -> None:
+def test_activation_requires_complete_envelope_even_for_plain_unprofiled_runs() -> None:
     spec = replace(
         _current_spec(),
         model_revision="",
@@ -134,16 +134,22 @@ def test_activation_requires_digest_even_for_plain_unprofiled_runs() -> None:
         workload_profile_input_digest="",
         workload_profile_producer_version="",
     )
+    worker = spec.to_internal_dict()
+    worker["train"]["hf_repo"] = "attacker/repo"
     status = runner_state.RunStatus(
         state="running",
         run_id=spec.run_id,
         spec=spec.to_dict(),
-        effective_preparation={
-            "version": PREPARATION_ENVELOPE_VERSION,
-            "worker_spec": spec.to_internal_dict(),
-        },
+        effective_preparation={"worker_spec": worker},
     )
 
+    with pytest.raises(ValueError, match="preparation envelope version is required"):
+        runner_status.effective_spec_from_status(status)
+
+    status.effective_preparation = {
+        "version": PREPARATION_ENVELOPE_VERSION,
+        "worker_spec": worker,
+    }
     with pytest.raises(ValueError, match="failed integrity validation"):
         runner_status.effective_spec_from_status(status)
 

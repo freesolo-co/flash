@@ -2131,6 +2131,7 @@ def test_cancellation_fences_teacher_capabilities_before_lifecycle_work(monkeypa
 
     events = []
     status = SimpleNamespace(
+        run_id="run-1",
         state="running",
         deployment=None,
         remote=None,

@@ -872,7 +872,10 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     from flash.runner.lifecycle.status import effective_spec_from_status, get_status
     from flash.runner.supervise.errors import _RunCancelled
     from flash.runner.supervise.lifecycle import _CompletedAttemptPending
-    from flash.runner.supervise.recovery import _gc_run_endpoints
+    from flash.runner.supervise.recovery import (
+        _gc_run_endpoints,
+        _persisted_endpoint_cleanup_target,
+    )
 
     cleanup_terminal = False
 
@@ -889,13 +892,12 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     if not status.remote and not confirmed_teardown:
         raise ValueError(f"run {run_id} has no persisted job handle; cannot reattach")
 
-    # start from the lossy public view so the except/finally handlers always have a spec, then
-    # upgrade to the authoritative worker spec (real run_id + managed fields) inside the try.
     try:
-        worker_spec = JobSpec.from_dict(status.spec)
+        JobSpec.from_dict(status.spec)
     except Exception as exc:
-        # this parse is above the try below, so a raise here escapes every handler.
         return _fail_unparseable_attach(run_id, status, exc, log_stream or sys.stderr)
+    cleanup_target = _persisted_endpoint_cleanup_target(status)
+    worker_spec = None
     persisted_remote = dict(status.remote or status.cleanup_confirmed_remote)
     next_attempt = 0
     source_snapshot = None
@@ -990,5 +992,5 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             cleanup_terminal = get_status(run_id).state in TERMINAL_STATES
         if cleanup_terminal:
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(worker_spec)
+                _gc_run_endpoints(worker_spec or cleanup_target)
     return status_for_return()

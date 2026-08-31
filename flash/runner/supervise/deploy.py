@@ -9,7 +9,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from flash.core.spec import JobSpec
 from flash.schema import parse_checkpoint_ref
 
 if TYPE_CHECKING:
@@ -532,9 +531,12 @@ def _prepare_cancellation(run_id: str) -> list[Exception]:
 
 def cancel_run(run_id: str) -> RunStatus:
     """Cancel training while preserving verified serving and durable cleanup targets."""
-    from flash.runner.lifecycle.state import TERMINAL_STATES
+    from flash.runner.lifecycle.state import TERMINAL_STATES, _internal_spec_from_status
     from flash.runner.lifecycle.status import _update, effective_spec_from_status, get_status
-    from flash.runner.supervise.recovery import _gc_run_endpoints
+    from flash.runner.supervise.recovery import (
+        _gc_run_endpoints,
+        _persisted_endpoint_cleanup_target,
+    )
     from flash.server.platform import db as server_db
     from flash.server.platform.locks import _deploy_lock
 
@@ -558,10 +560,11 @@ def cancel_run(run_id: str) -> RunStatus:
     effective_spec = None
     with contextlib.suppress(Exception):
         effective_spec = effective_spec_from_status(initial_status)
-    cleanup_spec = effective_spec
-    if cleanup_spec is None:
+    cleanup_target = effective_spec
+    if cleanup_target is None:
         with contextlib.suppress(Exception):
-            cleanup_spec = JobSpec.from_dict(initial_status.spec)
+            cleanup_target = _internal_spec_from_status(initial_status)
+    cleanup_target = cleanup_target or _persisted_endpoint_cleanup_target(initial_status)
     bill_cancel = (
         bool(initial_status.billing_context)
         and initial_status.state not in TERMINAL_STATES
@@ -613,9 +616,8 @@ def cancel_run(run_id: str) -> RunStatus:
             confirmed_cleanup_identities=confirmed_cleanup_identities,
             clear_exact_remote=_clear_exact_remote,
         )
-        if cleanup_spec is not None:
-            with contextlib.suppress(Exception):
-                _gc_run_endpoints(cleanup_spec)
+        with contextlib.suppress(Exception):
+            _gc_run_endpoints(cleanup_target)
 
         status = get_status(run_id)
         entered_deployed = entered_deployed or status.state == "deployed"

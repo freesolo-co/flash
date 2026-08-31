@@ -506,7 +506,7 @@ def test_from_dict_rejects_falsy_non_object_train(bad):
         JobSpec.from_dict({"train": bad})
 
 
-@pytest.mark.parametrize("payload", [{}, {"train": None}, {"train": {}}])
+@pytest.mark.parametrize("payload", [{}, {"train": {}}])
 def test_from_dict_defaults_missing_credit_assignment(payload):
     assert JobSpec.from_dict(payload).train.credit_assignment == "per_episode"
 

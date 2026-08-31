@@ -8,6 +8,7 @@ from dataclasses import MISSING
 from typing import Any
 
 PREPARATION_ENVELOPE_VERSION = 1
+_ABSENT = object()
 
 
 def validate_persisted_spec_envelope(snapshot: object) -> int:
@@ -38,14 +39,9 @@ def validated_section(
     name: str,
     allowed: set[str],
 ) -> dict[str, Any]:
-    """Read one nested persisted block and reject wrong types and unknown keys.
-
-    an ABSENT or null section reads as an empty block: null is how an omitted section has always
-    been serialized, so it is a known shape rather than corruption. every other non-object is
-    rejected -- a list or a bare string is not a section that was ever written by this writer.
-    """
-    section = data.get(name)
-    if section is None:
+    """Read one nested persisted block and reject wrong types and unknown keys."""
+    section = data.get(name, _ABSENT)
+    if section is _ABSENT:
         section = {}
     if not isinstance(section, dict):
         raise TypeError(f"{name} must be an object")
@@ -403,24 +399,11 @@ def _decode_wandb(data: dict[str, Any]) -> Any:
 
     from flash.core.spec import WandbSpec
 
-    # wandb is cosmetic run-naming metadata: nothing downstream reads it to make a training,
-    # billing, or lifecycle decision. a malformed persisted payload therefore coerces to the
-    # default instead of raising, so a worker reattaching to a real run cannot be killed by bad
-    # display metadata. the AUTHORING path stays strict -- `flash.schema` rejects the same shapes
-    # with a ConfigError, which is where a user's typo has to surface.
-    raw = data.get("wandb")
-    if not isinstance(raw, dict):
-        return WandbSpec()
-    unknown = sorted(set(raw) - {item.name for item in fields(WandbSpec)})
-    if unknown:
-        raise ValueError(f"wandb has unknown key(s): {', '.join(unknown)}")
-
-    def _label(value: Any) -> str | None:
-        if value is None:
-            return None
-        return str(value).strip() or None
-
-    return WandbSpec(project=_label(raw.get("project")), run_name=_label(raw.get("run_name")))
+    raw = validated_section(data, "wandb", {item.name for item in fields(WandbSpec)})
+    return WandbSpec(
+        project=persisted_str(raw.get("project"), name="wandb.project", optional=True),
+        run_name=persisted_str(raw.get("run_name"), name="wandb.run_name", optional=True),
+    )
 
 
 def decode_persisted_job_spec(data: dict[str, Any]) -> Any:
@@ -456,6 +439,8 @@ def decode_persisted_job_spec(data: dict[str, Any]) -> Any:
     model_revision_auto = persisted_bool(
         data.get("model_revision_auto", False), name="model_revision_auto"
     )
+    if model_revision_auto and not model_revision:
+        raise ValueError("model_revision_auto=True requires model_revision")
     if model_revision and not model_revision_auto:
         raise ValueError("model_revision requires model_revision_auto=True")
     spec = JobSpec(

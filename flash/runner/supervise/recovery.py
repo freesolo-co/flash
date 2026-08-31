@@ -13,7 +13,8 @@ from __future__ import annotations
 import contextlib
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 
 from flash.core.spec import JobSpec
 
@@ -512,7 +513,51 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
     )
 
 
-def _gc_run_endpoints(spec: JobSpec) -> None:
+@dataclass(frozen=True)
+class _CleanupGpuIdentity:
+    acceptable_types: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _PersistedEndpointCleanupTarget:
+    run_id: str
+    gpu: _CleanupGpuIdentity
+
+
+def _persisted_endpoint_cleanup_target(status) -> _PersistedEndpointCleanupTarget:
+    """Return only raw persisted identities needed for best-effort endpoint cleanup."""
+    gpu_types: list[str] = []
+
+    def add_types(value: object) -> None:
+        values: Iterable[object] = value if isinstance(value, (list, tuple)) else (value,)
+        for candidate in values:
+            if isinstance(candidate, str) and candidate and candidate not in gpu_types:
+                gpu_types.append(candidate)
+
+    for remote in (
+        getattr(status, "remote", None),
+        getattr(status, "cleanup_confirmed_remote", None),
+        getattr(status, "realized_cost_remote", None),
+    ):
+        if isinstance(remote, Mapping):
+            add_types(remote.get("allocated_gpu"))
+
+    snapshot = getattr(status, "effective_preparation", None)
+    if isinstance(snapshot, Mapping):
+        worker = snapshot.get("worker_spec")
+        if isinstance(worker, Mapping):
+            gpu = worker.get("gpu")
+            if isinstance(gpu, Mapping):
+                add_types(gpu.get("type"))
+                add_types(gpu.get("type_fallbacks"))
+
+    return _PersistedEndpointCleanupTarget(
+        run_id=status.run_id,
+        gpu=_CleanupGpuIdentity(tuple(gpu_types)),
+    )
+
+
+def _gc_run_endpoints(spec: JobSpec | _PersistedEndpointCleanupTarget) -> None:
     """Best-effort teardown of every endpoint a run may have registered."""
     from flash.runner.accounting.reconciliation import (
         _compare_and_confirm_remote_teardown,

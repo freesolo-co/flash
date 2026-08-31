@@ -3138,6 +3138,11 @@ def _spec(run_id):
     )
 
 
+def _effective_preparation(spec):
+    public = type(spec).from_dict(spec.to_dict())
+    return runner_submit._effective_preparation_snapshot(public, spec, None)
+
+
 def test_unstructured_prepare_does_not_import_serving_preflight(monkeypatch):
     import builtins
 
@@ -3332,7 +3337,7 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
                 state="done",
                 spec=source.to_dict(),
                 source_snapshot=_SOURCE_SNAPSHOT,
-                effective_preparation={"worker_spec": source.to_internal_dict()},
+                effective_preparation=_effective_preparation(source),
             )
         )
         monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: "a" * 40)
@@ -3413,7 +3418,7 @@ def test_submit_rejects_cross_org_init_ref(monkeypatch):
                 state="done",
                 spec=source.to_dict(),
                 source_snapshot=_SOURCE_SNAPSHOT,
-                effective_preparation={"worker_spec": source.to_internal_dict()},
+                effective_preparation=_effective_preparation(source),
                 billing_context={"org_id": "org-a"},
             )
         )
@@ -3454,7 +3459,7 @@ def test_submit_allows_missing_source_org_when_same_owner_key(monkeypatch):
                 state="done",
                 spec=source.to_dict(),
                 source_snapshot=_SOURCE_SNAPSHOT,
-                effective_preparation={"worker_spec": source.to_internal_dict()},
+                effective_preparation=_effective_preparation(source),
             )
         )
         import flash.adapters.lora_rank as rank_mod
@@ -3513,7 +3518,7 @@ def test_submit_dry_run_omits_public_warmstart_rank_and_resolves_alpha(monkeypat
                 state="done",
                 spec=source.to_dict(),
                 source_snapshot=_SOURCE_SNAPSHOT,
-                effective_preparation={"worker_spec": source.to_internal_dict()},
+                effective_preparation=_effective_preparation(source),
             )
         )
         import flash.adapters.lora_rank as rank_mod
@@ -3581,7 +3586,7 @@ def test_submit_rejects_final_checkpoint_from_unfinished_source_run(monkeypatch)
                 state="running",
                 spec=source.to_dict(),
                 source_snapshot=_SOURCE_SNAPSHOT,
-                effective_preparation={"worker_spec": source.to_internal_dict()},
+                effective_preparation=_effective_preparation(source),
             )
         )
         base = _spec("warm-run").to_dict()
@@ -3617,7 +3622,7 @@ def test_submit_rejects_final_checkpoint_without_adapter_artifact(monkeypatch):
                 state="done",
                 spec=source.to_dict(),
                 source_snapshot=_SOURCE_SNAPSHOT,
-                effective_preparation={"worker_spec": source.to_internal_dict()},
+                effective_preparation=_effective_preparation(source),
             )
         )
         monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: "a" * 40)
@@ -3658,7 +3663,7 @@ def test_submit_rejects_missing_source_org_without_same_owner_key(monkeypatch):
                 state="done",
                 spec=source.to_dict(),
                 source_snapshot=_SOURCE_SNAPSHOT,
-                effective_preparation={"worker_spec": source.to_internal_dict()},
+                effective_preparation=_effective_preparation(source),
             )
         )
         monkeypatch.setattr(db, "run_owner", lambda run_id: 8 if run_id == "source-run" else None)
@@ -3701,7 +3706,7 @@ def test_submit_rejects_missing_init_checkpoint_step(monkeypatch):
                 state="done",
                 spec=source.to_dict(),
                 source_snapshot=_SOURCE_SNAPSHOT,
-                effective_preparation={"worker_spec": source.to_internal_dict()},
+                effective_preparation=_effective_preparation(source),
                 billing_context={"org_id": "org-a"},
             )
         )
@@ -3749,7 +3754,7 @@ def test_submit_surfaces_checkpoint_listing_error_before_launch(monkeypatch):
                 state="done",
                 spec=source.to_dict(),
                 source_snapshot=_SOURCE_SNAPSHOT,
-                effective_preparation={"worker_spec": source.to_internal_dict()},
+                effective_preparation=_effective_preparation(source),
                 billing_context={"org_id": "org-a"},
             )
         )
@@ -4936,7 +4941,7 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
         monkeypatch.setattr(
             runner_recovery,
             "_gc_run_endpoints",
-            lambda spec: calls.append(("gc", spec.train.lora_rank)),
+            lambda target: calls.append(("gc", target.run_id)),
         )
         monkeypatch.setattr(
             runner_costs,
@@ -4953,7 +4958,7 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
         assert "cancel" in calls
         assert "destroy" in calls
         assert "undeploy" in calls
-        assert ("gc", 32) in calls
+        assert ("gc", public_spec.run_id) in calls
 
 
 def test_cancel_uses_rest_handle(monkeypatch):
