@@ -9,6 +9,11 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
+from flash.serving.src.stream_channel import _tasks
+from flash.serving.src.stream_channel._tasks import OrphanHandler
+from flash.serving.src.stream_channel._tasks import (
+    retain_background_task as _retain_background_task,
+)
 from flash.serving.src.stream_channel.protocol import (
     CALL_RESULT_SECONDS,
     CLEANUP_SECONDS,
@@ -25,38 +30,37 @@ from flash.serving.src.stream_channel.protocol import (
     StreamChannelError,
 )
 
-_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+# one process-wide retention set, shared with the engine side
+_BACKGROUND_TASKS = _tasks.BACKGROUND_TASKS
 
 
-def _consume_task_result(task: asyncio.Task[Any]) -> None:
-    with contextlib.suppress(asyncio.CancelledError, Exception):
-        task.exception()
+async def _stop_task(
+    task: asyncio.Task[Any],
+    *,
+    on_orphan: OrphanHandler | None = None,
+) -> None:
+    await _tasks.stop_task(task, CLEANUP_SECONDS, on_orphan=on_orphan)
 
 
-def _retain_background_task(task: asyncio.Task[Any]) -> None:
-    _BACKGROUND_TASKS.add(task)
-
-    def finish(completed: asyncio.Task[Any]) -> None:
-        _consume_task_result(completed)
-        _BACKGROUND_TASKS.discard(completed)
-
-    task.add_done_callback(finish)
-
-
-async def _stop_task(task: asyncio.Task[Any]) -> None:
-    if not task.done():
-        task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
-        if not done:
-            _retain_background_task(task)
-            return
-    _consume_task_result(task)
+async def _bounded_shield(
+    operation: Awaitable[Any],
+    deadline_seconds: float,
+    *,
+    on_orphan: OrphanHandler | None = None,
+) -> Any:
+    return await _tasks.bounded(
+        operation,
+        deadline_seconds,
+        CLEANUP_SECONDS,
+        on_orphan=on_orphan,
+    )
 
 
 async def _cancel_spawn_task_result(
     task: asyncio.Task[Any],
     cancel: Callable[[Any], Awaitable[None]],
 ) -> None:
+    """Dispose of a spawn that landed after we stopped waiting for it."""
     try:
         call = task.result()
     except (asyncio.CancelledError, Exception):
@@ -69,17 +73,14 @@ def _schedule_spawn_result_cancel(
     task: asyncio.Task[Any],
     cancel: Callable[[Any], Awaitable[None]],
 ) -> None:
-    cleanup = asyncio.create_task(_cancel_spawn_task_result(task, cancel))
-    _retain_background_task(cleanup)
+    _retain_background_task(asyncio.create_task(_cancel_spawn_task_result(task, cancel)))
 
 
-async def _bounded_shield(operation: Awaitable[Any], deadline_seconds: float) -> Any:
-    task = asyncio.ensure_future(operation)
-    try:
-        return await asyncio.wait_for(asyncio.shield(task), timeout=deadline_seconds)
-    except (TimeoutError, asyncio.CancelledError):
-        await _stop_task(task)
-        raise
+def _spawn_orphan_handler(cancel: Callable[[Any], Awaitable[None]]) -> OrphanHandler:
+    async def dispose(task: asyncio.Task[Any]) -> None:
+        await _cancel_spawn_task_result(task, cancel)
+
+    return dispose
 
 
 async def _dispatch_bounded(
@@ -87,6 +88,7 @@ async def _dispatch_bounded(
     dispatch_deadline_unix: float,
     phase: str,
 ) -> Any:
+    """Await one dispatch step within what is left of the dispatch deadline."""
     remaining = max(0.0, dispatch_deadline_unix - time.time())
     try:
         return await _bounded_shield(operation, remaining)
@@ -104,6 +106,7 @@ class _DispatchDeadlineContext:
         self._entered = False
 
     async def _exit_late_entry(self, task: asyncio.Task[Any]) -> None:
+        """Close a context that finished opening after we stopped waiting for it."""
         try:
             task.result()
         except (asyncio.CancelledError, Exception):
@@ -114,36 +117,21 @@ class _DispatchDeadlineContext:
                 CLEANUP_SECONDS,
             )
 
-    def _schedule_late_exit(self, task: asyncio.Task[Any]) -> None:
-        cleanup = asyncio.create_task(self._exit_late_entry(task))
-        _retain_background_task(cleanup)
-
-    async def _cancel_entry(self, task: asyncio.Task[Any]) -> None:
-        task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
-        if done:
-            await self._exit_late_entry(task)
-        else:
-            task.add_done_callback(self._schedule_late_exit)
-            _retain_background_task(task)
-
     async def __aenter__(self) -> Any:
-        task = asyncio.create_task(self._context.__aenter__())
         remaining = max(0.0, self._dispatch_deadline_unix - time.time())
         try:
-            done, _ = await asyncio.wait({task}, timeout=remaining)
-        except asyncio.CancelledError:
-            await self._cancel_entry(task)
-            raise
-        if done:
-            value = task.result()
-            self._entered = True
-            return value
-        await self._cancel_entry(task)
-        raise StreamChannelError(
-            ChannelErrorCode.DISPATCH_DEADLINE,
-            "dispatch deadline expired during channel setup",
-        )
+            value = await _bounded_shield(
+                self._context.__aenter__(),
+                remaining,
+                on_orphan=self._exit_late_entry,
+            )
+        except TimeoutError as exc:
+            raise StreamChannelError(
+                ChannelErrorCode.DISPATCH_DEADLINE,
+                "dispatch deadline expired during channel setup",
+            ) from exc
+        self._entered = True
+        return value
 
     async def __aexit__(self, *exc_info: object) -> Any:
         if not self._entered:
@@ -162,13 +150,7 @@ async def _cancel_or_retain_spawn(
     task: asyncio.Task[Any],
     cancel: Callable[[Any], Awaitable[None]],
 ) -> None:
-    task.cancel()
-    done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
-    if done:
-        await _cancel_spawn_task_result(task, cancel)
-        return
-    task.add_done_callback(lambda completed: _schedule_spawn_result_cancel(completed, cancel))
-    _retain_background_task(task)
+    await _stop_task(task, on_orphan=_spawn_orphan_handler(cancel))
 
 
 async def _spawn_cancellation_safe(
@@ -348,11 +330,8 @@ class CancellableStreamChannel:
             self._iterator = self._run()
         try:
             return await anext(self._iterator)
-        except (StopAsyncIteration, asyncio.CancelledError):
-            self._closed = True
-            self._iterator = None
-            raise
-        except Exception:
+        except BaseException:
+            # any exit from the generator ends this channel, including exhaustion
             self._closed = True
             self._iterator = None
             raise
