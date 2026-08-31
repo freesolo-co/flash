@@ -19,6 +19,7 @@ from flash.serving.src.http.adapter_routes import remove_adapter
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
+from flash.serving.src.http.router import build_serving_app as _metered_app
 from flash.serving.src.io.schemas import AdapterRecord
 from tests.serving.checkpoint_fixtures import (
     checkpoint_payload,
@@ -213,8 +214,8 @@ def test_healthz_reports_one_gpu_per_base_model(app_setup):
     ]
     assert body["base_models"] == [QWEN, QWEN_35B]  # sorted by model id
     assert body["gpus"] == 2  # two configured supported base-model engines
-    assert body["gpu_by_model"] == {QWEN: "L40S", QWEN_35B: "H200"}
-    assert body["gpu_tiers"] == ["H200", "L40S"]
+    assert body["gpu_by_model"] == {QWEN: "B200", QWEN_35B: "B200"}
+    assert body["gpu_tiers"] == ["B200"]  # sorted(set(...)): both tiers share the card
     assert "configuredGpu" not in body  # the single-GPU field is gone (per-model now)
     assert body["adapters"] == 3
 
@@ -230,6 +231,80 @@ def test_healthz_reports_configured_deployment_identity() -> None:
     body = client.get("/healthz").json()
     assert body["deployment_sha"] == "abc123"
     assert body["deployment_id"] == "456-2"
+
+
+class _UnhealthyUsageStore:
+    """A store whose delivery worker has stopped, so nothing new can be settled."""
+
+    enabled = True
+
+    def assert_healthy(self) -> None:
+        raise RuntimeError("usage_outbox_worker_stopped")
+
+    async def start(self) -> None:
+        return None
+
+    async def capture(self, event) -> None:
+        del event
+
+    async def finalize(self, event) -> None:
+        del event
+
+    async def fail(self, event, code: str) -> None:
+        del event, code
+
+    def relinquish(self, request_id: str) -> None:
+        del request_id
+
+    async def snapshot(self):
+        raise RuntimeError("usage_outbox_worker_stopped")
+
+    async def recover_stale_in_progress(self) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _metered_client(pool, router, store) -> TestClient:
+    return TestClient(
+        _metered_app(pool, router, usage_store=store, chat_authorizer=_allow),
+        headers={"Authorization": "Bearer t", "X-Freesolo-Org-Id": "org-1"},
+    )
+
+
+def test_healthz_fails_when_accounting_cannot_settle() -> None:
+    client = _metered_client(FakePool(), AdapterRouter([]), _UnhealthyUsageStore())
+
+    response = client.get("/healthz")
+
+    # a replica that cannot settle usage must leave rotation instead of taking chargeable traffic.
+    assert response.status_code == 503
+    body = response.json()
+    assert body["ok"] is False
+    assert body["accounting_ok"] is False
+
+
+def test_healthz_reports_accounting_ok_when_settlement_is_live() -> None:
+    client = _serve(FakePool(), AdapterRouter([]))
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json()["accounting_ok"] is True
+
+
+def test_generate_fails_closed_when_accounting_cannot_settle() -> None:
+    # a non-thinking adapter, so the thinking-settlement guard cannot mask the accounting gate.
+    router = AdapterRouter([checkpoint_record("qa", QWEN)])
+    pool = FakePool()
+    client = _metered_client(pool, router, _UnhealthyUsageStore())
+
+    response = client.post("/generate", json={"adapter_id": "qa/final", "prompt": "hi"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "durable serving accounting unavailable"}
+    assert pool.generated == []
 
 
 def test_healthz_reports_unsupported_hydrated_base_models_without_routing_them():
