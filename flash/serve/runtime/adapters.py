@@ -6,8 +6,9 @@ import asyncio
 import hashlib
 import inspect
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
@@ -33,11 +34,18 @@ class AdapterBinding:
     lora_request: Any
 
 
+class _AdapterState(Enum):
+    NOT_OWNED = auto()
+    OWNED = auto()
+    INDETERMINATE = auto()
+    QUARANTINED = auto()
+
+
 @dataclass(slots=True)
 class _AdapterEntry:
     spec: AdapterSpec
     lora_request: Any
-    loaded: bool
+    state: _AdapterState = _AdapterState.NOT_OWNED
 
 
 @dataclass(slots=True)
@@ -113,11 +121,11 @@ class AdapterManager:
 
     @property
     def registered_count(self) -> int:
-        return len(self._entries)
+        return sum(entry.state is not _AdapterState.QUARANTINED for entry in self._entries.values())
 
     @property
     def loaded_count(self) -> int:
-        return sum(entry.loaded for entry in self._entries.values())
+        return sum(entry.state is _AdapterState.OWNED for entry in self._entries.values())
 
     async def register(self, spec: AdapterSpec) -> bool:
         """load an exact incarnation, replacing the prior incarnation atomically per id."""
@@ -125,24 +133,30 @@ class AdapterManager:
         normalized = replace(spec, path=str(path))
         async with self._exclusive(normalized.adapter_id):
             current = self._entries.get(normalized.adapter_id)
+            if current is not None:
+                self._require_determinate_ownership(current)
             if current is not None and current.spec.incarnation == normalized.incarnation:
                 if current.spec != normalized:
                     raise AdapterConflictError(
                         "one adapter incarnation token cannot identify different runtime state"
                     )
-                if not current.loaded:
+                if current.state is _AdapterState.NOT_OWNED:
                     await self._load_entry(current)
                 return False
             int_id = await self._reserve_id(normalized.adapter_id, current)
-            if current is not None and current.loaded:
-                await self._remove_lora(current.lora_request.lora_int_id)
-                current.loaded = False
+            if current is not None and current.state is _AdapterState.OWNED:
+                await self._remove_lora(current)
             request = self._new_lora_request(normalized, int_id)
-            entry = _AdapterEntry(spec=normalized, lora_request=request, loaded=False)
+            entry = _AdapterEntry(spec=normalized, lora_request=request)
             try:
                 await self._load_entry(entry)
             except BaseException:
-                if current is None:
+                if current is not None and entry.state is _AdapterState.INDETERMINATE:
+                    current.state = _AdapterState.INDETERMINATE
+                elif current is None and entry.state is _AdapterState.INDETERMINATE:
+                    entry.state = _AdapterState.QUARANTINED
+                    self._entries[normalized.adapter_id] = entry
+                elif current is None:
                     await self._release_failed_reservation(normalized.adapter_id, int_id)
                 raise
             self._entries[normalized.adapter_id] = entry
@@ -165,7 +179,8 @@ class AdapterManager:
             if entry is None:
                 raise AdapterNotFoundError(f"adapter is not registered: {adapter_id}")
             self._require_incarnation(entry, expected_incarnation)
-            if not entry.loaded:
+            self._require_determinate_ownership(entry)
+            if entry.state is _AdapterState.NOT_OWNED:
                 await self._load_entry(entry)
             binding = AdapterBinding(spec=entry.spec, lora_request=entry.lora_request)
             gate.enter()
@@ -185,9 +200,9 @@ class AdapterManager:
             if entry is None:
                 return False
             self._require_incarnation(entry, expected_incarnation)
-            if entry.loaded:
-                await self._remove_lora(entry.lora_request.lora_int_id)
-            self._entries.pop(adapter_id, None)
+            if entry.state is not _AdapterState.NOT_OWNED:
+                await self._remove_lora(entry)
+            self._entries.pop(adapter_id)
             async with self._state_lock:
                 self._ids.pop(entry.lora_request.lora_int_id, None)
             return True
@@ -247,22 +262,52 @@ class AdapterManager:
         pin = getattr(self._engine, "pin_lora", None)
         if should_pin and pin is None:
             raise AdapterError("this vllm build does not expose pin_lora")
+        entry.state = _AdapterState.INDETERMINATE
+        added = await _maybe_await(self._engine.add_lora(entry.lora_request))
+        if added is not True:
+            raise AdapterError("vllm did not confirm lora registration")
         try:
-            await _maybe_await(self._engine.add_lora(entry.lora_request))
             if should_pin:
+                assert pin is not None
                 await _maybe_await(pin(entry.lora_request.lora_int_id))
         except BaseException:
-            entry.loaded = False
-            with suppress(Exception):
-                await self._remove_lora(entry.lora_request.lora_int_id)
+            await self._cleanup_failed_load(entry)
             raise
-        entry.loaded = True
+        entry.state = _AdapterState.OWNED
 
-    async def _remove_lora(self, int_id: int) -> None:
+    async def _cleanup_failed_load(self, entry: _AdapterEntry) -> None:
+        entry.state = _AdapterState.INDETERMINATE
+        try:
+            removed = await self._call_remove_lora(entry.lora_request.lora_int_id)
+        except Exception:
+            return
+        if removed is True:
+            entry.state = _AdapterState.NOT_OWNED
+
+    async def _remove_lora(self, entry: _AdapterEntry) -> None:
+        indeterminate = (
+            _AdapterState.QUARANTINED
+            if entry.state is _AdapterState.QUARANTINED
+            else _AdapterState.INDETERMINATE
+        )
+        entry.state = indeterminate
+        removed = await self._call_remove_lora(entry.lora_request.lora_int_id)
+        if removed is not True:
+            raise AdapterError("vllm did not confirm lora removal")
+        entry.state = _AdapterState.NOT_OWNED
+
+    async def _call_remove_lora(self, int_id: int) -> Any:
         remove = getattr(self._engine, "remove_lora", None)
         if remove is None:
             raise AdapterError("this vllm build does not expose remove_lora")
-        await _maybe_await(remove(int_id))
+        return await _maybe_await(remove(int_id))
+
+    @staticmethod
+    def _require_determinate_ownership(entry: _AdapterEntry) -> None:
+        if entry.state in {_AdapterState.INDETERMINATE, _AdapterState.QUARANTINED}:
+            raise AdapterError(
+                "vllm lora ownership is indeterminate; unload must confirm removal before reuse"
+            )
 
     @staticmethod
     def _require_incarnation(

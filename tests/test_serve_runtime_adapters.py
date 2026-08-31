@@ -11,6 +11,7 @@ import pytest
 
 from flash.serve.runtime import (
     AdapterConflictError,
+    AdapterError,
     AdapterSpec,
     EngineConfig,
     StaleIncarnationError,
@@ -31,22 +32,41 @@ class _Engine:
         self.added: list[_LoRARequest] = []
         self.pinned: list[int] = []
         self.removed: list[int] = []
+        self.add_result: object = True
+        self.remove_result: object = True
+        self.remove_results: list[object | BaseException] = []
+        self.remove_started: asyncio.Event | None = None
+        self.allow_remove: asyncio.Event | None = None
         self.fail_add_after_append = False
         self.fail_pin = False
+        self.fail_remove = False
 
-    async def add_lora(self, request: _LoRARequest) -> None:
+    async def add_lora(self, request: _LoRARequest) -> object:
         await asyncio.sleep(0)
         self.added.append(request)
         if self.fail_add_after_append:
             raise RuntimeError("add failed after partial registration")
+        return self.add_result
 
     async def pin_lora(self, int_id: int) -> None:
         if self.fail_pin:
             raise RuntimeError("pin failed")
         self.pinned.append(int_id)
 
-    async def remove_lora(self, int_id: int) -> None:
+    async def remove_lora(self, int_id: int) -> object:
         self.removed.append(int_id)
+        if self.remove_started is not None:
+            self.remove_started.set()
+        if self.allow_remove is not None:
+            await self.allow_remove.wait()
+        if self.fail_remove:
+            raise RuntimeError("remove failed")
+        if self.remove_results:
+            result = self.remove_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+        return self.remove_result
 
 
 @pytest.fixture(autouse=True)
@@ -85,6 +105,78 @@ def test_concurrent_registration_is_idempotent(adapter_dir: Path) -> None:
     assert len(engine.added) == 1
     assert engine.pinned == [engine.added[0].lora_int_id]
     assert manager.registered_count == manager.loaded_count == 1
+
+
+@pytest.mark.parametrize(
+    "add_result",
+    [False, None, [True, False], 1],
+    ids=["false", "none", "mixed-list", "non-bool"],
+)
+def test_add_requires_exact_true_and_retains_quarantine(
+    adapter_dir: Path,
+    monkeypatch,
+    add_result: object,
+) -> None:
+    monkeypatch.setattr(adapters_module, "lora_int_id", lambda _adapter_id: 7)
+    engine = _Engine()
+    engine.add_result = add_result
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    with pytest.raises(AdapterError, match="vllm did not confirm lora registration"):
+        asyncio.run(manager.register(_spec(adapter_dir, adapter_id="a")))
+
+    assert manager.registered_count == manager.loaded_count == 0
+    assert engine.pinned == []
+    assert engine.removed == []
+    engine.add_result = True
+    with pytest.raises(AdapterError, match="ownership is indeterminate"):
+        asyncio.run(manager.register(_spec(adapter_dir, "two", adapter_id="a")))
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="b")))
+    assert engine.added[-1].lora_int_id == 8
+
+    assert asyncio.run(manager.unload("a", "one")) is True
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="c")))
+    assert engine.added[-1].lora_int_id == 7
+
+
+def test_indeterminate_state_is_never_read_as_loaded(adapter_dir: Path) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    entry = adapters_module._AdapterEntry(
+        spec=_spec(adapter_dir),
+        lora_request=_LoRARequest("adapter", 7, str(adapter_dir)),
+        state=adapters_module._AdapterState.INDETERMINATE,
+    )
+    manager._entries["adapter"] = entry
+
+    assert manager.registered_count == 1
+    assert manager.loaded_count == 0
+
+    async def acquire_indeterminate() -> None:
+        async with manager.acquire("adapter", "one"):
+            raise AssertionError("indeterminate engine ownership must block acquire")
+
+    with pytest.raises(AdapterError, match="ownership is indeterminate"):
+        asyncio.run(acquire_indeterminate())
+    assert engine.added == []
+
+
+def test_initial_indeterminate_load_uses_one_registry(adapter_dir: Path) -> None:
+    engine = _Engine()
+    engine.add_result = False
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    with pytest.raises(AdapterError, match="did not confirm lora registration"):
+        asyncio.run(manager.register(_spec(adapter_dir)))
+
+    assert set(manager._entries) == {"adapter"}
+    assert manager.registered_count == manager.loaded_count == 0
+    assert not hasattr(manager, "_quarantined")
+
+    engine.remove_result = False
+    with pytest.raises(AdapterError, match="did not confirm lora removal"):
+        asyncio.run(manager.unload("adapter", "one"))
+    assert manager.registered_count == manager.loaded_count == 0
 
 
 def test_replacement_waits_for_inflight_incarnation(adapter_dir: Path) -> None:
@@ -182,6 +274,66 @@ def test_unload_waits_for_inflight_generations(adapter_dir: Path) -> None:
     assert engine.removed == [engine.added[0].lora_int_id]
 
 
+@pytest.mark.parametrize(
+    "remove_result",
+    [False, None, [True, False], "removed"],
+    ids=["false", "none", "mixed-list", "non-bool"],
+)
+def test_unload_requires_exact_true_and_retains_quarantine_and_id(
+    adapter_dir: Path,
+    monkeypatch,
+    remove_result: object,
+) -> None:
+    monkeypatch.setattr(adapters_module, "lora_int_id", lambda _adapter_id: 7)
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    asyncio.run(manager.register(_spec(adapter_dir)))
+    engine.remove_result = remove_result
+
+    with pytest.raises(AdapterError, match="vllm did not confirm lora removal"):
+        asyncio.run(manager.unload("adapter", "one"))
+
+    assert manager.registered_count == 1
+    assert manager.loaded_count == 0
+
+    async def acquire_quarantined() -> None:
+        async with manager.acquire("adapter", "one"):
+            raise AssertionError("indeterminate engine ownership must block acquire")
+
+    with pytest.raises(AdapterError, match="ownership is indeterminate"):
+        asyncio.run(acquire_quarantined())
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="other")))
+    assert engine.added[-1].lora_int_id == 8
+
+    engine.remove_result = True
+    assert asyncio.run(manager.unload("adapter", "one")) is True
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="reused")))
+    assert engine.added[-1].lora_int_id == 7
+
+
+def test_unload_remove_exception_retains_quarantine_and_id(
+    adapter_dir: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(adapters_module, "lora_int_id", lambda _adapter_id: 7)
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="a")))
+    engine.remove_results = [RuntimeError("remove failed")]
+
+    with pytest.raises(RuntimeError, match="remove failed"):
+        asyncio.run(manager.unload("a", "one"))
+
+    assert manager.registered_count == 1
+    assert manager.loaded_count == 0
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="b")))
+    assert engine.added[-1].lora_int_id == 8
+
+    assert asyncio.run(manager.unload("a", "one")) is True
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="c")))
+    assert engine.added[-1].lora_int_id == 7
+
+
 def test_same_incarnation_rejects_different_runtime_state(adapter_dir: Path) -> None:
     other = adapter_dir.parent / "other"
     other.mkdir()
@@ -217,28 +369,228 @@ def test_replacement_reuses_id_and_stale_operations_fail(adapter_dir: Path) -> N
     assert asyncio.run(manager.unload("adapter", "two")) is True
 
 
-def test_add_failure_rolls_back_new_lora_and_preserves_old_incarnation(
+@pytest.mark.parametrize(
+    "remove_result",
+    [False, None, [True, False], {"removed": True}],
+    ids=["false", "none", "mixed-list", "non-bool"],
+)
+def test_replacement_requires_exact_remove_true_before_new_incarnation(
+    adapter_dir: Path,
+    remove_result: object,
+) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    asyncio.run(manager.register(_spec(adapter_dir, "one")))
+    engine.remove_result = remove_result
+
+    with pytest.raises(AdapterError, match="vllm did not confirm lora removal"):
+        asyncio.run(manager.register(_spec(adapter_dir, "two")))
+
+    assert manager.registered_count == 1
+    assert manager.loaded_count == 0
+    assert [request.lora_name for request in engine.added] == ["adapter"]
+
+    async def acquire_old() -> None:
+        async with manager.acquire("adapter", "one"):
+            raise AssertionError("indeterminate engine ownership must block acquire")
+
+    with pytest.raises(AdapterError, match="ownership is indeterminate"):
+        asyncio.run(acquire_old())
+    with pytest.raises(AdapterError, match="ownership is indeterminate"):
+        asyncio.run(manager.register(_spec(adapter_dir, "two")))
+
+    engine.remove_result = True
+    assert asyncio.run(manager.unload("adapter", "one")) is True
+    assert asyncio.run(manager.register(_spec(adapter_dir, "two"))) is True
+
+
+def test_failed_replacement_quarantines_concurrent_acquire(adapter_dir: Path) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    async def exercise() -> None:
+        await manager.register(_spec(adapter_dir, "one"))
+        engine.remove_result = None
+        engine.remove_started = asyncio.Event()
+        engine.allow_remove = asyncio.Event()
+
+        replacement = asyncio.create_task(manager.register(_spec(adapter_dir, "two")))
+        await engine.remove_started.wait()
+
+        async def acquire_old() -> None:
+            async with manager.acquire("adapter", "one"):
+                raise AssertionError("indeterminate engine ownership must block acquire")
+
+        acquiring = asyncio.create_task(acquire_old())
+        await asyncio.sleep(0)
+        assert acquiring.done() is False
+
+        engine.allow_remove.set()
+        with pytest.raises(AdapterError, match="did not confirm lora removal"):
+            await replacement
+        with pytest.raises(AdapterError, match="ownership is indeterminate"):
+            await acquiring
+
+        assert len(engine.added) == 1
+        engine.remove_started = None
+        engine.allow_remove = None
+        engine.remove_result = True
+        assert await manager.unload("adapter", "one") is True
+
+    asyncio.run(exercise())
+
+
+def test_replacement_remove_exception_quarantines_old_incarnation(
     adapter_dir: Path,
 ) -> None:
     engine = _Engine()
     manager = AdapterManager(engine, EngineConfig(model="model"))
+    asyncio.run(manager.register(_spec(adapter_dir, "one")))
+    engine.fail_remove = True
 
-    async def exercise() -> int:
-        await manager.register(_spec(adapter_dir, "one"))
-        int_id = engine.added[0].lora_int_id
-        engine.fail_add_after_append = True
-        with pytest.raises(RuntimeError, match="add failed"):
-            await manager.register(_spec(adapter_dir, "two"))
-        assert manager.registered_count == 1
-        assert manager.loaded_count == 0
-        engine.fail_add_after_append = False
-        async with manager.acquire("adapter", "one") as binding:
-            assert binding.spec.incarnation == "one"
-        return int_id
+    with pytest.raises(RuntimeError, match="remove failed"):
+        asyncio.run(manager.register(_spec(adapter_dir, "two")))
 
-    int_id = asyncio.run(exercise())
+    assert manager.registered_count == 1
+    assert manager.loaded_count == 0
+    assert len(engine.added) == 1
+    engine.fail_remove = False
+    with pytest.raises(AdapterError, match="ownership is indeterminate"):
+        asyncio.run(manager.register(_spec(adapter_dir, "two")))
+    assert asyncio.run(manager.unload("adapter", "one")) is True
+
+
+@pytest.mark.parametrize(
+    "add_result",
+    [False, None, [True, False], {"added": True}],
+    ids=["false", "none", "mixed-list", "non-bool"],
+)
+def test_replacement_add_requires_exact_true_before_new_incarnation(
+    adapter_dir: Path,
+    monkeypatch,
+    add_result: object,
+) -> None:
+    monkeypatch.setattr(adapters_module, "lora_int_id", lambda _adapter_id: 7)
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="a")))
+    engine.add_result = add_result
+
+    with pytest.raises(AdapterError, match="vllm did not confirm lora registration"):
+        asyncio.run(manager.register(_spec(adapter_dir, "two", adapter_id="a")))
+
+    assert manager.registered_count == 1
+    assert manager.loaded_count == 0
+    assert len(engine.added) == 2
+    engine.add_result = True
+    with pytest.raises(AdapterError, match="ownership is indeterminate"):
+        asyncio.run(manager.register(_spec(adapter_dir, "three", adapter_id="a")))
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="b")))
+    assert engine.added[-1].lora_int_id == 8
+
+    assert asyncio.run(manager.unload("a", "one")) is True
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="c")))
+    assert engine.added[-1].lora_int_id == 7
+    assert engine.removed == [7, 7]
+
+
+def test_indeterminate_replacement_blocks_acquire_until_exact_removal(
+    adapter_dir: Path,
+) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    asyncio.run(manager.register(_spec(adapter_dir, "one")))
+    engine.fail_add_after_append = True
+
+    with pytest.raises(RuntimeError, match="add failed"):
+        asyncio.run(manager.register(_spec(adapter_dir, "two")))
+
+    async def acquire_old() -> None:
+        async with manager.acquire("adapter", "one"):
+            raise AssertionError("indeterminate engine ownership must block acquire")
+
+    engine.fail_add_after_append = False
+    with pytest.raises(AdapterError, match="ownership is indeterminate"):
+        asyncio.run(acquire_old())
+    assert len(engine.added) == 2
+
+    engine.remove_result = True
+    assert asyncio.run(manager.unload("adapter", "one")) is True
+
+
+def test_indeterminate_replacement_blocks_same_name_replacement(
+    adapter_dir: Path,
+) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    asyncio.run(manager.register(_spec(adapter_dir, "one")))
+    engine.fail_add_after_append = True
+
+    with pytest.raises(RuntimeError, match="add failed"):
+        asyncio.run(manager.register(_spec(adapter_dir, "two")))
+
+    engine.fail_add_after_append = False
+    with pytest.raises(AdapterError, match="ownership is indeterminate"):
+        asyncio.run(manager.register(_spec(adapter_dir, "three")))
+    assert len(engine.added) == 2
+
+    engine.remove_result = True
+    assert asyncio.run(manager.unload("adapter", "one")) is True
+    assert asyncio.run(manager.register(_spec(adapter_dir, "three"))) is True
+
+
+def test_initial_failure_blocks_same_name_retry_until_exact_removal(
+    adapter_dir: Path,
+) -> None:
+    engine = _Engine()
+    engine.fail_add_after_append = True
+    engine.remove_result = None
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    with pytest.raises(RuntimeError, match="add failed"):
+        asyncio.run(manager.register(_spec(adapter_dir, "one")))
+
+    engine.fail_add_after_append = False
+    with pytest.raises(AdapterError, match="ownership is indeterminate"):
+        asyncio.run(manager.register(_spec(adapter_dir, "two")))
+    assert len(engine.added) == 1
+
+    with pytest.raises(AdapterError, match="did not confirm lora removal"):
+        asyncio.run(manager.unload("adapter", "one"))
+    assert len(engine.added) == 1
+
+    engine.remove_result = True
+    assert asyncio.run(manager.unload("adapter", "one")) is True
+    assert asyncio.run(manager.register(_spec(adapter_dir, "two"))) is True
+    assert engine.added[0].lora_int_id == engine.added[1].lora_int_id
+
+
+def test_add_exception_quarantines_old_incarnation_until_exact_cleanup(
+    adapter_dir: Path,
+) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    asyncio.run(manager.register(_spec(adapter_dir, "one")))
+    int_id = engine.added[0].lora_int_id
+    engine.fail_add_after_append = True
+
+    with pytest.raises(RuntimeError, match="add failed"):
+        asyncio.run(manager.register(_spec(adapter_dir, "two")))
+
+    assert manager.registered_count == 1
+    assert manager.loaded_count == 0
+    assert engine.removed == [int_id]
+    assert len(engine.added) == 2
+
+    async def acquire_old() -> None:
+        async with manager.acquire("adapter", "one"):
+            raise AssertionError("indeterminate engine ownership must block acquire")
+
+    engine.fail_add_after_append = False
+    with pytest.raises(AdapterError, match="ownership is indeterminate"):
+        asyncio.run(acquire_old())
+    assert asyncio.run(manager.unload("adapter", "one")) is True
     assert engine.removed == [int_id, int_id]
-    assert [request.lora_name for request in engine.added] == ["adapter"] * 3
 
 
 def test_pin_failure_rolls_back_new_lora_and_preserves_old_incarnation(
@@ -250,6 +602,7 @@ def test_pin_failure_rolls_back_new_lora_and_preserves_old_incarnation(
     async def exercise() -> int:
         await manager.register(_spec(adapter_dir, "one"))
         int_id = engine.added[0].lora_int_id
+        engine.remove_results = [True, True]
         engine.fail_pin = True
         with pytest.raises(RuntimeError, match="pin failed"):
             await manager.register(_spec(adapter_dir, "two"))
@@ -263,6 +616,157 @@ def test_pin_failure_rolls_back_new_lora_and_preserves_old_incarnation(
     int_id = asyncio.run(exercise())
     assert engine.removed == [int_id, int_id]
     assert engine.pinned == [int_id, int_id]
+
+
+def test_replacement_pin_cleanup_false_requires_confirmed_unload_before_id_reuse(
+    adapter_dir: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(adapters_module, "lora_int_id", lambda _adapter_id: 7)
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="a")))
+    engine.remove_results = [True, False, False]
+    engine.fail_pin = True
+
+    with pytest.raises(RuntimeError, match="pin failed"):
+        asyncio.run(manager.register(_spec(adapter_dir, "two", adapter_id="a")))
+
+    assert manager.registered_count == 1
+    assert manager.loaded_count == 0
+    engine.fail_pin = False
+    with pytest.raises(AdapterError, match="did not confirm lora removal"):
+        asyncio.run(manager.unload("a", "one"))
+
+    assert manager.registered_count == 1
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="b")))
+    assert engine.added[-1].lora_int_id == 8
+
+    engine.remove_result = True
+    assert asyncio.run(manager.unload("a", "one")) is True
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="c")))
+    assert engine.added[-1].lora_int_id == 7
+    assert engine.removed == [7, 7, 7, 7]
+
+
+def test_replacement_pin_cleanup_error_requires_confirmed_unload_before_id_reuse(
+    adapter_dir: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(adapters_module, "lora_int_id", lambda _adapter_id: 7)
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="a")))
+    engine.remove_results = [True, RuntimeError("cleanup failed")]
+    engine.fail_pin = True
+
+    with pytest.raises(RuntimeError, match="pin failed"):
+        asyncio.run(manager.register(_spec(adapter_dir, "two", adapter_id="a")))
+
+    assert manager.registered_count == 1
+    assert manager.loaded_count == 0
+    engine.fail_pin = False
+    engine.fail_remove = True
+    with pytest.raises(RuntimeError, match="remove failed"):
+        asyncio.run(manager.unload("a", "one"))
+
+    assert manager.registered_count == 1
+    engine.fail_remove = False
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="b")))
+    assert engine.added[-1].lora_int_id == 8
+
+    engine.remove_result = True
+    assert asyncio.run(manager.unload("a", "one")) is True
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="c")))
+    assert engine.added[-1].lora_int_id == 7
+    assert engine.removed == [7, 7, 7, 7]
+
+
+def test_replacement_pin_confirmed_cleanup_releases_id_on_unload(
+    adapter_dir: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(adapters_module, "lora_int_id", lambda _adapter_id: 7)
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="a")))
+    engine.remove_results = [True, True]
+    engine.fail_pin = True
+
+    with pytest.raises(RuntimeError, match="pin failed"):
+        asyncio.run(manager.register(_spec(adapter_dir, "two", adapter_id="a")))
+
+    assert manager.registered_count == 1
+    assert manager.loaded_count == 0
+    engine.fail_pin = False
+    assert asyncio.run(manager.unload("a", "one")) is True
+    assert engine.removed == [7, 7]
+
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="b")))
+    assert engine.added[-1].lora_int_id == 7
+
+
+def test_failed_pin_cleanup_false_retains_id_ownership(
+    adapter_dir: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(adapters_module, "lora_int_id", lambda _adapter_id: 7)
+    engine = _Engine()
+    engine.fail_pin = True
+    engine.remove_result = False
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    with pytest.raises(RuntimeError, match="pin failed"):
+        asyncio.run(manager.register(_spec(adapter_dir, adapter_id="a")))
+
+    assert manager.registered_count == manager.loaded_count == 0
+    assert engine.removed == [7]
+    engine.fail_pin = False
+    engine.remove_result = None
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="b")))
+    assert engine.added[-1].lora_int_id == 8
+
+
+def test_failed_pin_cleanup_error_retains_id_ownership(
+    adapter_dir: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(adapters_module, "lora_int_id", lambda _adapter_id: 7)
+    engine = _Engine()
+    engine.fail_pin = True
+    engine.fail_remove = True
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    with pytest.raises(RuntimeError, match="pin failed"):
+        asyncio.run(manager.register(_spec(adapter_dir, adapter_id="a")))
+
+    assert manager.registered_count == manager.loaded_count == 0
+    assert engine.removed == [7]
+    engine.fail_pin = False
+    engine.fail_remove = False
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="b")))
+    assert engine.added[-1].lora_int_id == 8
+
+
+def test_failed_pin_confirmed_cleanup_releases_id(
+    adapter_dir: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(adapters_module, "lora_int_id", lambda _adapter_id: 7)
+    engine = _Engine()
+    engine.fail_pin = True
+    engine.remove_result = True
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    with pytest.raises(RuntimeError, match="pin failed"):
+        asyncio.run(manager.register(_spec(adapter_dir, adapter_id="a")))
+
+    assert manager.registered_count == manager.loaded_count == 0
+    assert engine.removed == [7]
+    engine.fail_pin = False
+    engine.remove_result = None
+    asyncio.run(manager.register(_spec(adapter_dir, adapter_id="b")))
+    assert engine.added[-1].lora_int_id == 7
 
 
 def test_collision_safe_ids_probe_without_cross_wiring(
@@ -299,6 +803,7 @@ def test_a_registration_left_unloaded_reloads_on_acquire_then_unloads(adapter_di
     asyncio.run(manager.register(_spec(adapter_dir, "one")))
     int_id = engine.added[0].lora_int_id
 
+    engine.remove_results = [True, True]
     engine.fail_pin = True
     with pytest.raises(RuntimeError):
         asyncio.run(manager.register(_spec(adapter_dir, "two")))

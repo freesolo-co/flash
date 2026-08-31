@@ -162,14 +162,16 @@ class _Engine:
         cls.args = args
         return cls()
 
-    async def add_lora(self, request: _LoRARequest) -> None:
+    async def add_lora(self, request: _LoRARequest) -> bool:
         self.added.append(request)
+        return True
 
     async def pin_lora(self, int_id: int) -> None:
         self.pinned.append(int_id)
 
-    async def remove_lora(self, int_id: int) -> None:
+    async def remove_lora(self, int_id: int) -> bool:
         self.removed.append(int_id)
+        return True
 
     async def shutdown(self) -> None:
         self.shutdown_called = True
