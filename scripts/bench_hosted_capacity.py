@@ -5,13 +5,14 @@ cannot run. The figures below are worst-case RESERVATIONS, deliberately far abov
 and each also clears the 80% submission stop ``reserve`` enforces -- see
 docs/serving-capacity-envelope.md):
     modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary \
-        --ceiling-usd 8
+        --ceiling-usd 20
     modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep \
-        --bucket short_interactive --ceiling-usd 19
+        --bucket short_interactive --ceiling-usd 59
 
-Each model is measured on ITS OWN production tier (L40S / H100 / H200), not on one shared card, so
-the envelope describes the capacity a customer actually gets rather than a hypothetical uniform
-fleet.
+Each model is measured on ITS OWN production tier, read from the catalog per model rather than
+hardcoded, so the envelope describes the capacity a customer actually gets rather than a
+hypothetical uniform fleet. dev #1376 put all three hosted models on B200; the ceilings above are
+that tier's reservations and rise or fall with whatever the catalog assigns.
 
 ISOLATION CONTRACT. This app is deliberately NOT ``flash/serving/app/modal_app.py``:
 

@@ -93,8 +93,9 @@ unhealthy stream or container stays visible instead of being absorbed into a cle
 
 ### Qwen/Qwen3.5-9B on L40S
 
-Measured 2026-08-31, invocation `495dad60099e`, one container, one block. **1,914 requests
-attempted, 1,914 succeeded, 0 failed** across all 18 cells.
+Measured 2026-08-31, invocation `495dad60099e`, one container, one block. **2,614 requests
+attempted, 2,614 succeeded, 0 failed** across all 18 cells (1,731 `short_interactive`, 726
+`medium_generation`, 157 `near_32k`).
 
 Engine identity is asserted, not assumed. Every cell records `replica_ids`, and all 18 name the
 same single container (`41b37856...`), so the whole sweep measured one engine rather than a
@@ -253,8 +254,8 @@ model/tokenizer/processor provenance, and 32768 configured context runs before a
 teardown is confirmed after each model:
 
 ```
-modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary --ceiling-usd 8
-modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep --bucket short_interactive --ceiling-usd 19
+modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary --ceiling-usd 20
+modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep --bucket short_interactive --ceiling-usd 59
 ```
 
 `--ceiling-usd` is required and has no default: both commands allocate a GPU, and a spend ceiling
@@ -310,11 +311,11 @@ which bills whether or not the reservation admitted it.
 
 A lane also has to clear its submission stop, not merely its ceiling: `reserve()` refuses at 80% of
 the ceiling so settlement lag and teardown stay funded. A lane consequently needs a ceiling around
-`1.25x` its own reservation -- $6.12 for the canary and $18.12 for the single-bucket
-`short_interactive` sweep -- and the `--ceiling-usd 8` and `--ceiling-usd 19` above clear those
-thresholds. A larger tier needs proportionally more: the same canary is $11.39 on the 35B's H200,
-so it needs a ceiling above $14.24, and that model's single-bucket sweep reserves $33.72 and needs
-one above $42.15.
+`1.25x` its own reservation -- on B200, $19.59 for the canary and $58.03 for the single-bucket
+`short_interactive` sweep -- and the `--ceiling-usd 20` and `--ceiling-usd 59` above clear those
+thresholds. These scale with the catalog's tier: the same canary reserves $6.12 on L40S and $14.23
+on H200, so a re-tiered catalog moves every figure here. A full three-bucket sweep is the number to
+watch: it reserves **$148.74 per model on B200**, against $46.44 on L40S.
 
 The boot dominates cost (~960s of ~1000s per cell in a prior campaign), so one boot runs a whole
 bucket's concurrency grid rather than one cell. `budget.py` reserves before allocation and raises

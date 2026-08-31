@@ -151,10 +151,15 @@ def test_bench_app_pins_one_container_per_tier() -> None:
 
 
 def test_bench_app_builds_one_class_per_production_tier() -> None:
-    """``@app.cls(gpu=...)`` fixes the GPU at decoration time, so three tiers need three classes.
+    """``@app.cls(gpu=...)`` fixes the GPU at decoration time, so each tier needs its own class.
 
     Importing the module would pull in ``modal`` and the whole serving stack, so the structure is
     asserted from the source: the factory must be called once per DISTINCT tier in the catalog.
+
+    The catalog's tier COUNT is dev's to choose, not this harness's. It has been three (one card
+    per model) and is currently one (#1376 moved every hosted model to B200). Asserting a minimum
+    of two pinned the harness to a catalog shape dev had already abandoned, so the invariant is
+    keyed to the distinct tiers themselves: whatever dev assigns, the app builds exactly that set.
     """
     source = BENCH_APP.read_text(encoding="utf-8")
     assert "_build_bench_engine" in source
@@ -162,7 +167,14 @@ def test_bench_app_builds_one_class_per_production_tier() -> None:
     # No single hardcoded GPU: the tier comes from the catalog, per model.
     assert "GPU_SPEC" not in source
     tiers = {bench_gpu_for(model) for model in BENCH_MODELS}
-    assert len(tiers) >= 2, "the catalog spans multiple tiers; one class cannot serve them"
+    assert tiers, "the catalog resolved no GPU tier at all"
+    # One class per distinct tier -- never one class spanning two, and never a stale extra.
+    built = set(re.findall(r"_build_bench_engine\(\s*[\"\']([A-Za-z0-9_.-]+)[\"\']", source))
+    if built:
+        assert built == tiers, f"app builds classes for {built}, catalog assigns {tiers}"
+    else:
+        # Built by comprehension over the catalog's own distinct tiers, which is stronger.
+        assert "_distinct_bench_gpus()" in source
 
 
 def test_bench_class_names_are_modal_safe_and_distinct() -> None:
