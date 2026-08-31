@@ -32,6 +32,7 @@ _DEFAULT_CACHE_ROOT = "/var/lib/flash-serving"
 _VLLM_CACHE_DIRNAME = "vllm"
 _DEFAULT_HOST = "0.0.0.0"
 _DEFAULT_PORT = 8000
+_CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS = 5.0
 _CHILD_STOP_TIMEOUT_SECONDS = 5.0
 _BOOTSTRAP_PATH = "/app/serve_launch.py"
 _SAFE_CHILD_COPIED_ENV_NAMES = frozenset(
@@ -107,6 +108,29 @@ class StartupTerminated(LaunchError):
     def __init__(self, exit_code: int) -> None:
         self.exit_code = exit_code
         super().__init__("serving startup was terminated")
+
+
+class ChildReapUnconfirmed(LaunchError):
+    """the packaged child survived terminate and kill, so this process is not a clean pid 1.
+
+    the pid is carried instead of the handle because nothing can adopt this child: both catchers
+    only re-raise, so no caller continues reaping. a handle would imply a transfer of ownership
+    that nothing performs, while the pid is what an operator needs to find the survivor.
+    """
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        super().__init__(
+            "launcher child reap could not be confirmed after terminate and kill deadlines"
+        )
+
+
+class CredentialWriterCleanupUnconfirmed(LaunchError):
+    """the secret writer remains explicitly owned after its bounded cleanup failed."""
+
+    def __init__(self, writer: threading.Thread) -> None:
+        self.writer = writer
+        super().__init__("credential writer cleanup could not be confirmed")
 
 
 class _PopenFactory(Protocol):
@@ -363,14 +387,34 @@ def _secret_descriptor(value: str):
             with contextlib.suppress(OSError):
                 os.close(write_fd)
 
-    writer = threading.Thread(target=populate, name="flash-secret-pipe", daemon=True)
-    writer.start()
+    writer: threading.Thread | None = None
+    operation_error: BaseException | None = None
     try:
+        writer = threading.Thread(target=populate, name="flash-secret-pipe", daemon=True)
+        writer.start()
         yield read_fd
+    except BaseException as exc:
+        operation_error = exc
+        raise
     finally:
         with contextlib.suppress(OSError):
             os.close(read_fd)
-        writer.join()
+        if writer is None or (writer.ident is None and not writer.is_alive()):
+            with contextlib.suppress(OSError):
+                os.close(write_fd)
+        else:
+            try:
+                writer.join(timeout=_CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS)
+            except BaseException as join_error:
+                cleanup_error = CredentialWriterCleanupUnconfirmed(writer)
+                if operation_error is not None:
+                    raise cleanup_error from operation_error
+                raise cleanup_error from join_error
+            if writer.is_alive():
+                cleanup_error = CredentialWriterCleanupUnconfirmed(writer)
+                if operation_error is not None:
+                    raise cleanup_error from operation_error
+                raise cleanup_error
     if errors:
         raise LaunchError("secret descriptor could not be populated") from errors[0]
 
@@ -613,23 +657,38 @@ def _close_descriptors(descriptors: list[int]) -> None:
             os.close(fd)
 
 
+def _child_exited(process: subprocess.Popen[Any], timeout: float) -> bool:
+    """wait one bounded interval, reporting whether the child is confirmed gone.
+
+    only a timeout means the child is still running. treating every other failure as "still
+    running" would turn a keyboard interrupt or a waitpid error into a kill and then into a
+    false unconfirmed reap, so anything else propagates with its real type.
+    """
+
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
 def _terminate_and_reap(process: subprocess.Popen[Any]) -> None:
+    """stop the packaged child, never blocking this caller past the two shutdown deadlines.
+
+    a third wait after the kill would repeat the one above it with the same deadline and cannot
+    learn anything the second did not, so the contract is exactly two: one for the signal the
+    child may handle, one for the signal it cannot.
+    """
+
     with contextlib.suppress(Exception):
         process.terminate()
-    try:
-        process.wait(timeout=_CHILD_STOP_TIMEOUT_SECONDS)
+    if _child_exited(process, _CHILD_STOP_TIMEOUT_SECONDS):
         return
-    except Exception:
-        pass
     with contextlib.suppress(Exception):
         process.kill()
-    try:
-        process.wait(timeout=_CHILD_STOP_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(Exception):
-            process.wait()
-    except Exception:
-        pass
+    if _child_exited(process, _CHILD_STOP_TIMEOUT_SECONDS):
+        return
+    raise ChildReapUnconfirmed(process.pid)
 
 
 def start_launcher_process(
@@ -673,9 +732,12 @@ def start_launcher_process(
         if artifact_token is not None:
             _write_all(write_fds[1], artifact_token)
         return process
-    except BaseException:
+    except BaseException as launch_error:
         if process is not None:
-            _terminate_and_reap(process)
+            try:
+                _terminate_and_reap(process)
+            except ChildReapUnconfirmed as reap_error:
+                raise reap_error from launch_error
         raise
     finally:
         _close_descriptors(read_fds)
