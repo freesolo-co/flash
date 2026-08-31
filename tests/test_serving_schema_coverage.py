@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
 
 import flash.server.routes.serving as serving
+import flash.server.routes.serving_smoke as serving_smoke
 from flash.serve.contract.errors import ServingError
 
 
@@ -108,11 +110,18 @@ def test_schema_error_sanitization_collapses_and_bounds_untrusted_text() -> None
         ({}, {"$ref": "https://schemas.invalid/missing.json"}, "reference"),
     ],
 )
-def test_json_schema_worker_reports_expected_outcomes(instance, schema, status) -> None:
+def test_json_schema_worker_reports_expected_outcomes(
+    instance, schema, status, monkeypatch
+) -> None:
     """The worker must classify normal schema outcomes and always close its connection."""
     connection = _Connection()
+    monkeypatch.setattr(
+        serving_smoke,
+        "_send_framed_ipc",
+        lambda _connection, value, **_kwargs: connection.sent.append(value),
+    )
 
-    serving._json_schema_validation_worker(connection, instance, schema)
+    serving._json_schema_validation_worker(connection, instance, schema, time.monotonic() + 1.0)
 
     assert connection.closed is True
     assert len(connection.sent) == 1
@@ -127,7 +136,12 @@ def test_json_schema_worker_safely_classifies_unexpected_failures(monkeypatch) -
         raise RuntimeError("validator exploded")
 
     monkeypatch.setattr(serving, "validator_for", boom)
-    serving._json_schema_validation_worker(connection, {}, {})
+    monkeypatch.setattr(
+        serving_smoke,
+        "_send_framed_ipc",
+        lambda _connection, value, **_kwargs: connection.sent.append(value),
+    )
+    serving._json_schema_validation_worker(connection, {}, {}, time.monotonic() + 1.0)
 
     assert connection.sent == [("error", "RuntimeError: validator exploded")]
     assert connection.closed is True
@@ -139,6 +153,15 @@ def _install_context(monkeypatch, *, outcome=None, eof=False, start_error=None):
     context = _Context(receive, process)
     monkeypatch.setattr(serving.multiprocessing, "get_context", lambda method: context)
     monkeypatch.setattr(serving.time, "monotonic", lambda: 10.0)
+
+    def receive_outcome(*_args, **_kwargs):
+        if eof:
+            raise ServingError("isolated JSON schema validation returned a truncated IPC frame")
+        if outcome is None:
+            raise serving_smoke._IpcDeadlineExceeded
+        return outcome
+
+    monkeypatch.setattr(serving_smoke, "_receive_framed_ipc", receive_outcome)
     return receive, context.send, process
 
 
@@ -174,7 +197,7 @@ def test_validate_json_schema_treats_child_eof_as_safe_failure(monkeypatch) -> N
     """A child that exits without an outcome must fail closed rather than validating the instance."""
     receive, send, _process = _install_context(monkeypatch, eof=True)
 
-    with pytest.raises(ServingError, match="wall-clock deadline"):
+    with pytest.raises(ServingError, match="truncated IPC frame"):
         serving._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
 
     assert receive.closed is True

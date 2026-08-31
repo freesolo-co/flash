@@ -162,6 +162,17 @@ def api(tmp_path, monkeypatch):
         "serve_chat",
         lambda **_k: {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]},
     )
+    import flash.server.routes.serving_smoke as serving_smoke
+
+    def inline_smoke_chat(chat_kwargs, *, deadline, budget_s):
+        if time.monotonic() >= deadline:
+            raise serving_smoke._smoke_timeout_error(budget_s)
+        result = serving_smoke._app.serve_chat(**chat_kwargs)
+        if time.monotonic() > deadline:
+            raise serving_smoke._smoke_timeout_error(budget_s)
+        return result
+
+    monkeypatch.setattr(serving_smoke, "_isolated_smoke_chat", inline_smoke_chat)
     # The new preflight requires the Lambda key above, which also makes
     # `configured_providers()` treat it as live -- so the startup lifespan's `recover_runs()`
     # and the orphan-sweep loop would dispatch real `sweep_orphans()` (Lambda list calls) and
@@ -3996,6 +4007,133 @@ def test_deploy_start_failure_persists_terminal_failure(api, monkeypatch):
     assert deployment["retryable"] is True
     assert "shutting down" in deployment["error"]
     assert [item.deployment["state"] for item in reported] == ["queued", "failed"]
+
+
+class _UnreapableChild:
+    """A child no rung of the ladder can end, so ownership must outlive the request."""
+
+    def __init__(self) -> None:
+        self.pid = 9876
+        self.close_calls = 0
+
+    def start(self) -> None:
+        return None
+
+    def join(self, *, timeout) -> None:
+        return None
+
+    def is_alive(self) -> bool:
+        return True
+
+    def terminate(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def test_deploy_keeps_a_live_smoke_child_owned_after_the_request_fails(api, monkeypatch):
+    """A smoke child that survives its reap stays owned, and the deployment records a failure.
+
+    Ownership does not travel on the exception any more, so the deployment failure path is the
+    ordinary one. What must hold is that the request cannot end with a live child that nothing
+    is tracking: the lifespan reaper still finds it in the live set.
+    """
+    import flash.server.asgi.app as app_mod
+    import flash.server.routes.serving_smoke as serving_smoke
+    from flash.serve.contract.errors import ServingError
+    from flash.server.platform import children
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner_status.get_status(run_id)
+    status.state = "done"
+    runner_state._save_status(status)
+    revision = f"{run_id}/final"
+
+    process = _UnreapableChild()
+
+    def leak_a_live_child(*_args, **_kwargs):
+        children.spawn_owned(process)
+        assert children.reap_owned(process) is False
+        raise ServingError("smoke failed with a live child")
+
+    def fake_deploy(**kwargs):
+        kwargs["before_ready"](revision, revision)
+        pytest.fail("a failing smoke must abort deployment")
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(serving_smoke, "_isolated_smoke_chat", leak_a_live_child)
+
+    try:
+        api.post(
+            f"/v1/runs/{run_id}/deploy",
+            json={"checkpoint_id": f"{run_id}/final"},
+            headers=_bearer(key),
+        )
+
+        assert process in children._LIVE_CHILDREN
+        assert process.close_calls == 0
+        deployment = runner_status.get_status(run_id).deployment
+        assert deployment["state"] == "failed"
+        assert "smoke failed with a live child" in deployment["error"]
+    finally:
+        children._release(process)
+
+
+def test_deploy_keeps_child_ownership_when_failure_recording_raises(api, monkeypatch):
+    """A raising persistence path cannot drop a live child, because it never owned it."""
+    import flash.server.asgi.app as app_mod
+    import flash.server.routes.serving_completion as serving_completion
+    import flash.server.routes.serving_smoke as serving_smoke
+    from flash.serve.contract.errors import ServingError
+    from flash.server.platform import children
+
+    key = _login()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    status = runner_status.get_status(run_id)
+    status.state = "done"
+    runner_state._save_status(status)
+    revision = f"{run_id}/final"
+
+    process = _UnreapableChild()
+
+    def leak_a_live_child(*_args, **_kwargs):
+        children.spawn_owned(process)
+        assert children.reap_owned(process) is False
+        raise ServingError("smoke failed with a live child")
+
+    def fake_deploy(**kwargs):
+        kwargs["before_ready"](revision, revision)
+        pytest.fail("a failing smoke must abort deployment")
+
+    monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
+    monkeypatch.setattr(serving_smoke, "_isolated_smoke_chat", leak_a_live_child)
+    monkeypatch.setattr(
+        serving_completion,
+        "_record_deployment_failure",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("storage unavailable")),
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="storage unavailable"):
+            api.post(
+                f"/v1/runs/{run_id}/deploy",
+                json={"checkpoint_id": f"{run_id}/final"},
+                headers=_bearer(key),
+            )
+
+        assert process in children._LIVE_CHILDREN
+        assert process.close_calls == 0
+    finally:
+        children._release(process)
 
 
 def test_sync_deploy_execution_error_keeps_specific_persisted_outcome(api, monkeypatch):

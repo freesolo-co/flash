@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import builtins
+import inspect
 import sys
+import threading
 import types
 
 import pytest
 
 import flash.server.asgi.app as app_mod
+from flash.server.platform import children
 
 
 def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> None:
@@ -51,6 +55,118 @@ def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> No
     ]
     with app_mod._DEPLOYMENT_JOBS_LOCK:
         assert not app_mod._DEPLOYMENT_JOBS
+
+
+class _OwnedProcess:
+    """A child that ignores join and terminate, so only the kill rung can end it."""
+
+    def __init__(self) -> None:
+        self.pid = 4321
+        self.alive = True
+        self.start_calls = 0
+        self.join_timeouts = []
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.close_calls = 0
+
+    def start(self):
+        self.start_calls += 1
+
+    def join(self, *, timeout):
+        self.join_timeouts.append(timeout)
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+    def kill(self):
+        self.kill_calls += 1
+        self.alive = False
+
+    def close(self):
+        self.close_calls += 1
+
+
+def test_a_child_still_running_when_the_lifespan_ends_is_reaped() -> None:
+    """A child owned at spawn and never reaped by its own thread is drained at shutdown.
+
+    The deployment smoke budget is far longer than the lifespan shutdown grace, and job threads
+    are daemons, so an in-progress child may never reach its own reap. Ownership therefore starts
+    at ``spawn_owned`` rather than at a failed reap: nothing has to go wrong for the child to be
+    registered, so the lifespan boundary can always find it.
+    """
+    process = _OwnedProcess()
+    children.spawn_owned(process)
+    try:
+        assert process.start_calls == 1
+        assert process in children._LIVE_CHILDREN
+
+        assert children.reap_live_children(1.0) is True
+
+        assert process.terminate_calls == 1
+        assert process.kill_calls == 1
+        assert process.close_calls == 1
+        assert process not in children._LIVE_CHILDREN
+    finally:
+        children._release(process)
+
+
+def test_live_children_are_drained_only_at_shutdown() -> None:
+    """Ownership is a shutdown backstop, never a background reaper.
+
+    ``reap_live_children`` terminates and kills anything still alive, so running it during the
+    lifespan would destroy healthy in-flight smokes seconds after they start: their budget is far
+    longer than the ladder's join. Every call must therefore sit in the lifespan's ``finally``.
+    """
+    tree = ast.parse(inspect.getsource(app_mod))
+    shutdown_calls = {
+        node
+        for handler in ast.walk(tree)
+        if isinstance(handler, ast.Try)
+        for statement in handler.finalbody
+        for node in ast.walk(statement)
+    }
+    # the drain is handed to `asyncio.to_thread`, so it is an attribute reference, not a call.
+    reaps = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "reap_live_children"
+    ]
+    assert reaps, "the shutdown drain disappeared"
+    assert all(node in shutdown_calls for node in reaps)
+
+
+def test_only_one_reaper_may_close_a_child() -> None:
+    """A confirmed exit hands the right to close to exactly one caller.
+
+    The owning thread and the shutdown drain can both reach the same exited child. Ownership is
+    released under the lock, so the loser is told no and the process is never closed twice.
+    """
+    process = _OwnedProcess()
+    children.spawn_owned(process)
+    try:
+        assert children.reap_owned(process) is True
+        assert children.reap_owned(process) is False
+    finally:
+        children._release(process)
+
+
+def test_run_deployment_job_only_clears_its_thread_registration() -> None:
+    """The job wrapper owns thread bookkeeping alone; child ownership is not routed through it."""
+    calls = []
+
+    def target(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise RuntimeError("deployment failed")
+
+    with pytest.raises(RuntimeError, match="deployment failed"):
+        app_mod._run_deployment_job(target, ("run-1",), {"final": True})
+
+    assert calls == [(("run-1",), {"final": True})]
+    with app_mod._DEPLOYMENT_JOBS_LOCK:
+        assert threading.current_thread() not in app_mod._DEPLOYMENT_JOBS
 
 
 def _run_loop_once(monkeypatch, loop, worker):

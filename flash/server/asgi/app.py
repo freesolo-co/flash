@@ -26,7 +26,7 @@ from flash.serve.deployment.deploy import (
     undeploy_adapter,
 )
 from flash.serve.deployment.export import export_adapter
-from flash.server.platform import db
+from flash.server.platform import children, db
 from flash.server.platform.locks import _DEPLOY_LOCKS, _deploy_lock
 from flash.server.platform.runtime import (
     _RECOVERABLE,
@@ -399,6 +399,10 @@ def create_app():
             with contextlib.suppress(Exception):
                 if not await asyncio.to_thread(_wait_for_deployment_jobs, 10.0):
                     _log.warning("deployment jobs still running at shutdown deadline")
+            with contextlib.suppress(Exception):
+                remaining = max(0.0, shutdown_deadline - time.monotonic())
+                if not await asyncio.to_thread(children.reap_live_children, remaining):
+                    _log.warning("live deployment children survived the shutdown deadline")
             with contextlib.suppress(Exception):
                 from flash.runner.lifecycle.reporting import _shutdown_status_reporter
 
