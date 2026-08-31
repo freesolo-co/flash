@@ -1,0 +1,1394 @@
+"""Isolated Modal app measuring the hosted per-model capacity envelope.
+
+Run (``--ceiling-usd`` is REQUIRED; ``main`` exits on the zero default, so a command without it
+cannot run. The figures below are worst-case RESERVATIONS, deliberately far above expected spend,
+and each also clears the 80% submission stop ``reserve`` enforces -- see
+docs/serving-capacity-envelope.md):
+    modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary \
+        --ceiling-usd 20
+    modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode sweep \
+        --bucket short_interactive --ceiling-usd 59
+
+Each model is measured on ITS OWN production tier, read from the catalog per model rather than
+hardcoded, so the envelope describes the capacity a customer actually gets rather than a
+hypothetical uniform fleet. dev #1376 put all three hosted models on B200; the ceilings above are
+that tier's reservations and rise or fall with whatever the catalog assigns.
+
+ISOLATION CONTRACT. This app is deliberately NOT ``flash/serving/app/modal_app.py``:
+
+* Its own ``APP_NAME``. That app hardcodes ``freesolo-lora-serving``, the live production deployment;
+  deploying it for a benchmark would replace production.
+* No router, no ASGI front door, no custom domain. The production router mandates a durable usage
+  outbox that settles billing against the real backend, so driving load through it would write
+  synthetic usage into production billing.
+* No Supabase, no backend URL, no internal key. Only ``HF_TOKEN`` is forwarded, and only because
+  downloading gated weights requires it.
+* ``max_containers=1`` and ``min_containers=0``. The envelope is per-card capacity, so autoscaling
+  must not silently add a second GPU mid-measurement and inflate the numbers.
+* Base models only. No adapter is ever registered.
+
+It DOES reuse the production engine, image, and generation path, so what is measured is the shipped
+serving stack rather than a benchmark-only reimplementation.
+"""
+
+# NO `from __future__ import annotations` here, deliberately. It makes every annotation a string, and
+# Modal's class-parameter validator resolves `base_model: str` through the real type object; under
+# postponed evaluation it receives the STRING "str" and dies with
+# `AttributeError: 'str' object has no attribute '__name__'` at decoration time. flash/serving/app/
+# modal_app.py omits the import for the same reason.
+
+import asyncio
+import contextlib
+import hashlib
+import json
+import os
+import sys
+import time
+import uuid
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import modal
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+# The image REWRITES installed vLLM files with this patch, so the kernel and LoRA code actually
+# executed is not the code any version string names. `runtime_packages` reports distribution
+# metadata, which the patch does not touch: two images built from different patch contents resolve
+# identical vLLM versions, identical checkpoints and an identical `workload_checksum`, while
+# measuring different execution. Hashing the patch is what makes those two runs distinguishable.
+MOE_LORA_PATCH = REPO_DIR / "docker" / "patch_vllm_moe_lora.py"
+
+# Distinct from APP_NAME in flash/serving/app/modal_app.py. If these ever collide, deploying the
+# benchmark would overwrite production serving.
+APP_NAME = "flash-bench-hosted-capacity"
+# Separate from the production HF cache volume so a benchmark run cannot evict production's warm
+# weights or compile artifacts.
+CACHE_VOLUME_NAME = "flash-bench-hosted-capacity-cache"
+CACHE_MOUNT = "/vol/bench-cache"
+
+# The 35B needs ~17 min of engine init before it serves a token; the ceiling bounds a stuck boot.
+STARTUP_TIMEOUT_SECONDS = 2700
+# A bucket runs its whole concurrency grid on one boot, so the container must outlive the sum of the
+# grid's cells AND their drains, not just the measured windows. The widest preregistered lane is
+# near_32k: 6 concurrency points x (600s window + 900s drain) = 9000s, and a 420s bucket still needs
+# 7920s. A 7200s ceiling terminated `run_bucket` before the most expensive bucket could persist its
+# artifact, so the run paid for the whole grid and published nothing. Derived below from the
+# preregistered bounds rather than typed, so widening a bucket cannot silently reintroduce the gap.
+TIMEOUT_HEADROOM_SECONDS = 900
+# The probe reads NVML, asks vLLM's resolver which GDN prefill backend it chose, and loads the
+# served config. All of that is post-boot and takes seconds -- but the METHOD timeout is the only
+# thing bounding it, and that timeout is sized for a whole concurrency grid. So a probe stalled in
+# `AutoConfig.from_pretrained` would bill hours against a lane that reserved nothing for it. Bounded
+# here, small, and reserved in both estimators, so the bound enforced matches the bound funded.
+PROBE_TIMEOUT_SECONDS = 300
+# Short: the container is torn down as soon as its lane finishes, and an idle benchmark card is pure
+# waste. Production's window is sized to amortize cold boots across real traffic; there is none here.
+SCALEDOWN_WINDOW_SECONDS = 120
+
+_HF_TOKEN = os.environ.get("HF_TOKEN", "")
+_secrets = [modal.Secret.from_dict({"HF_TOKEN": _HF_TOKEN})] if _HF_TOKEN else []
+
+image = (
+    modal.Image.from_registry(
+        # Digest-pinned, matching flash/serving/app/modal_app.py: the measured stack must be the
+        # shipped one, so the image is copied rather than independently chosen.
+        "nvidia/cuda:13.0.0-devel-ubuntu22.04@sha256:1470d2d7904fac4e5cb3bdfd4993305c46d3ee76deb0213eaaf248e5cf9c7400",
+        add_python="3.12",
+    )
+    .apt_install("build-essential", "git", "ninja-build")
+    .pip_install_from_pyproject(
+        str(REPO_DIR / "pyproject.toml"),
+        optional_dependencies=["serve-runtime", "serving"],
+    )
+    .add_local_file(
+        str(MOE_LORA_PATCH),
+        remote_path="/root/patch_vllm_moe_lora.py",
+        copy=True,
+    )
+    .run_commands(
+        "python /root/patch_vllm_moe_lora.py && "
+        "python /root/patch_vllm_moe_lora.py --verify && "
+        "rm /root/patch_vllm_moe_lora.py"
+    )
+    .env(
+        {
+            "HF_HOME": CACHE_MOUNT,
+            "HF_HUB_CACHE": f"{CACHE_MOUNT}/hub",
+            "TRANSFORMERS_CACHE": f"{CACHE_MOUNT}/transformers",
+            "VLLM_CACHE_ROOT": f"{CACHE_MOUNT}/vllm",
+            "HF_HUB_DISABLE_XET": "1",
+            "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "VLLM_MOE_USE_DEEP_GEMM": "0",
+            # Marks this container as the benchmark so any shared code path can refuse to treat it
+            # as a production serving replica.
+            "FLASH_BENCH_CAPACITY": "1",
+        }
+    )
+    .add_local_python_source("flash")
+)
+
+app = modal.App(APP_NAME, image=image)
+cache_volume = modal.Volume.from_name(CACHE_VOLUME_NAME, create_if_missing=True)
+
+from flash.serving.bench.catalog import (  # noqa: E402
+    BENCH_MODELS,
+    bench_engine_overrides_for,
+    bench_gpu_for,
+)
+from flash.serving.bench.driver import (  # noqa: E402
+    REQUEST_TIMEOUT_SECONDS,
+    drain_reap_seconds,
+    fitting_watchdog_grace_seconds,
+    prompt_fit_seconds_bound,
+    run_request_bound_seconds,
+)
+from flash.serving.bench.warmup import (  # noqa: E402
+    CANARY_WARMUP_REQUESTS,
+    run_warmup,
+    warmup_fit_seconds_bound,
+)
+from flash.serving.bench.workload import (  # noqa: E402
+    BUCKETS,
+    Bucket,
+    concurrency_grid,
+)
+from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
+
+# Wall time one warmup prompt fit is allowed, and what that fit can BILL. The bound and the warmup
+# count both live in the driver so `_execution_digest` reaches them; they are read here so the bound
+# reserved and the bound enforced cannot drift from the number actually issued.
+#
+# `_FUNDED_WARMUP_FIT_SECONDS` is NOT the bound the fit is nominally held to: the watchdog ends the
+# container at `bound + grace`, so the grace is time the lane permits itself to spend and must be
+# reserved with the bound. Reserving the nominal bound alone left every armed watchdog able to bill
+# past its own authorization.
+WARMUP_FIT_SECONDS_BOUND = warmup_fit_seconds_bound()
+_FUNDED_WARMUP_FIT_SECONDS = WARMUP_FIT_SECONDS_BOUND + fitting_watchdog_grace_seconds()
+
+
+def bucket_call_priced_seconds(bucket: Bucket, points: int) -> float:
+    """Everything ONE ``run_bucket`` call is priced for, at that call's own bucket and grid width.
+
+    The single source both the estimator and the enforcement read. `TIMEOUT_SECONDS` is one
+    class-wide number derived from the WIDEST bucket, so Modal permits a `short_interactive` call to
+    run 19439s while this function prices it at 13989s -- thousands of authorized-but-unreserved
+    GPU-seconds per call, in the one direction a budget must never err. Reserving that whole grant
+    instead would be worse: it funds slack the call's own bounds make unreachable, inflating a
+    canary from $4.89 to $12.06 and refusing runs that cannot cost that much.
+
+    So the call is bounded at what it is priced for, and the two numbers come from HERE rather than
+    being written twice. Widening a bucket or the grid moves the bound and the reservation together.
+    """
+    per_cell = (
+        bucket.max_seconds
+        + REQUEST_TIMEOUT_SECONDS
+        + drain_reap_seconds()
+        + prompt_fit_seconds_bound(bucket)
+        + fitting_watchdog_grace_seconds()
+    )
+    return (
+        per_cell * points
+        + (run_request_bound_seconds() + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
+        + PROBE_TIMEOUT_SECONDS
+    )
+
+
+def certify_call_priced_seconds() -> float:
+    """Everything ONE ``certify`` call is priced for: its probe plus its sequential warmups.
+
+    Same contract as `bucket_call_priced_seconds`, for the lane that has no bucket. The canary's
+    phases total ~5309s against a 19439s class timeout, so it carried the largest unreserved grant
+    of any call in the campaign.
+    """
+    return (
+        PROBE_TIMEOUT_SECONDS
+        + (run_request_bound_seconds() + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
+    )
+
+
+def _worst_case_bucket_seconds() -> float:
+    """Longest a single ``run_bucket`` call can legitimately take, from the preregistered bounds.
+
+    The widest grid across all bench models decides the ceiling, since one ``timeout`` covers every
+    tier's class. Priced per bucket and maximized, not by maximizing each term independently: the
+    widest bucket is the one that has to fit inside this timeout, and mixing one bucket's window
+    with another's fitting would describe a bucket that does not exist.
+
+    Every term lives in `bucket_call_priced_seconds`, which is also what each call is BOUNDED at, so
+    this ceiling and the per-call enforcement can no longer disagree about what a call may spend.
+    """
+    points = max(
+        len(concurrency_grid(int(bench_engine_overrides_for(base_model).get("max_num_seqs", 8))))
+        for base_model in BENCH_MODELS
+    )
+    return max(bucket_call_priced_seconds(bucket, points) for bucket in BUCKETS)
+
+
+# Derived, never typed: widening a bucket or the concurrency grid raises this automatically instead
+# of silently reintroducing a ceiling below the work the grid is allowed to do.
+TIMEOUT_SECONDS = int(_worst_case_bucket_seconds() + TIMEOUT_HEADROOM_SECONDS)
+
+
+class _BenchEngineImpl(_LoraEngineImpl):
+    """Production engine, with self-healing disabled.
+
+    ``_load`` is NOT overridden. The bench catalog delegates to ``model_config`` and returns
+    production's exact overrides, so a copied loader would only be a second implementation free to
+    drift from the one being measured -- which is precisely what it did: an earlier copy still used
+    the pre-rename ``dict[str, Lock]`` adapter-lock keys.
+
+    The inherited loader's adapter hydration is a no-op here rather than a failure: this app carries
+    no platform credentials, ``_load_adapters_for_base`` swallows the resulting error and returns an
+    empty list, and the cached-LoRA preload then iterates an empty registry. No adapter is registered
+    at any point, so nothing on the LoRA path is measured or needed.
+    """
+
+    def _self_heal_if_dead(self, _context: str) -> None:
+        """Never drain the container mid-measurement.
+
+        A dead engine must surface as failed requests in the evidence, because a self-heal here would
+        silently discard the very failures the error rate is meant to report.
+        """
+        return
+
+
+def _bench_class_name(gpu: str) -> str:
+    """Deterministic, Modal-safe class name for one tier -- 'H100!' -> 'BenchEngine_H100_'.
+
+    The GPU alone is the identity here (unlike production, which also keys on max_inputs) because
+    EVERY bench class is max_inputs=1: concurrency is generated inside the container.
+    """
+    return "BenchEngine_" + "".join(ch if ch.isalnum() else "_" for ch in gpu)
+
+
+def _build_bench_engine(gpu: str, class_name: str) -> Any:
+    """Register one Modal ``@app.cls`` bench engine pinned to ``gpu``.
+
+    Modal fixes a class's GPU at decoration time, so the three hosted tiers need three classes. As in
+    flash/serving/app/modal_app.py, class identity is fixed BEFORE the decorators run: ``modal.
+    concurrent`` returns a wrapper holding the user class separately, so renaming afterwards would
+    rename the wrapper and leave every tier registered under a ``<locals>`` qualname Modal rejects.
+    """
+
+    class _Engine(_BenchEngineImpl):
+        base_model: str = modal.parameter()
+
+        @modal.enter()
+        async def load(self) -> None:
+            await self._load()
+
+        @modal.method()
+        async def probe(self) -> dict[str, Any]:
+            """Hardware, kernel-path, and KV-cache provenance for this container."""
+            from flash.serving.bench.probe import probe_all
+
+            return probe_all(self.base_model, self)
+
+        @modal.method()
+        async def certify(self, requests: int = 5) -> dict[str, Any]:
+            """Probe AND warm up THIS container, in one remote invocation.
+
+            Two separate calls could not certify one container. `max_containers=1` caps simultaneous
+            replicas without pinning successive calls to one container, so Modal could replace the
+            container between them and the canary would combine container A's accepted provenance
+            with container B's generation health -- B free to hold an unresolved GDN backend or a
+            different card while its warmup passed.
+
+            The probe bound also only means something here. Bounding the SPAWNED call timed the cold
+            `@enter` model load too, and the 35B/H200 engine needs roughly 17 minutes to initialize:
+            a 300s bound would have cancelled its first probe every time. Inside the already-loaded
+            method, boot is governed by `startup_timeout` and the 300s covers only probe work.
+            """
+            return await _within_call_bound(
+                self._certify(requests),
+                certify_call_priced_seconds(),
+                "certify",
+            )
+
+        async def _certify(self, requests: int) -> dict[str, Any]:
+            provenance = await _probe_in_container_within_bound(self)
+            # Gate BEFORE warming. The gates used to run only in `_run_canary`, after this method
+            # returned both payloads, so a container on the wrong card or with an unresolved kernel
+            # path still paid for `requests` sequential warmups -- each able to spend its fitting
+            # allowance plus the full request bound -- before anything read the probe already in
+            # hand. Refusing here ends the call at the probe, which is the whole reason the probe
+            # runs first.
+            _gate_container_provenance(self, provenance, "canary")
+            warm = await run_warmup(self, requests)
+            return {"probe": provenance, "warmup": warm}
+
+        @modal.method()
+        async def warmup(self, requests: int = 5) -> dict[str, Any]:
+            """Sequential short requests so compile and graph capture finish before measuring.
+
+            Their timings are reported but never merged into the envelope: the first request after
+            boot pays one-time costs that would distort every percentile it entered.
+            """
+            return await run_warmup(self, requests)
+
+        @modal.method()
+        async def run_bucket(
+            self,
+            bucket_name: str,
+            concurrency_points: list[int],
+            block: int = 0,
+            invocation: str = "",
+        ) -> dict[str, Any]:
+            """Measure one bucket across its concurrency grid on this container."""
+            from flash.serving.bench.workload import BUCKETS_BY_NAME
+
+            return await _within_call_bound(
+                _run_bucket(self, bucket_name, concurrency_points, block, invocation),
+                bucket_call_priced_seconds(BUCKETS_BY_NAME[bucket_name], len(concurrency_points)),
+                f"run_bucket {bucket_name!r}",
+            )
+
+    _Engine.pinned_gpu = gpu
+    _Engine.__name__ = class_name
+    _Engine.__qualname__ = class_name
+    globals()[class_name] = _Engine
+    engine = app.cls(
+        gpu=gpu,
+        secrets=_secrets,
+        volumes={CACHE_MOUNT: cache_volume},
+        timeout=TIMEOUT_SECONDS,
+        startup_timeout=STARTUP_TIMEOUT_SECONDS,
+        scaledown_window=SCALEDOWN_WINDOW_SECONDS,
+        # Per-card capacity: autoscaling would add a second GPU mid-measurement and inflate it.
+        min_containers=0,
+        max_containers=1,
+        # Every Modal call lands on ONE container. Concurrency is generated inside the container by
+        # the driver, so Modal must never spread the offered load across replicas.
+    )(modal.concurrent(max_inputs=1, target_inputs=1)(_Engine))
+    globals()[class_name] = engine
+    return engine
+
+
+def _distinct_bench_gpus() -> list[str]:
+    """Distinct tiers across the bench catalog, order-stable."""
+    tiers: dict[str, None] = {}
+    for base_model in BENCH_MODELS:
+        tiers.setdefault(bench_gpu_for(base_model), None)
+    return list(tiers)
+
+
+ENGINE_BY_GPU: dict[str, Any] = {
+    gpu: _build_bench_engine(gpu, _bench_class_name(gpu)) for gpu in _distinct_bench_gpus()
+}
+
+
+def _engine_for(base_model: str) -> Any:
+    """The Modal bench class to run ``base_model`` on (its tier's class)."""
+    return ENGINE_BY_GPU[bench_gpu_for(base_model)]
+
+
+def _require_healthy_warmup(warm: Any, label: str) -> None:
+    """Raise unless every warmup record succeeded.
+
+    `run_request` converts exceptions, timeouts, malformed streams and cache-verification failures
+    into records with `ok=False` rather than raising, so a warmup call returns NORMALLY even when
+    the generation path is entirely broken. Without this check a warmup would wave through paid work
+    already known to be invalid -- and that is true of a replacement container's self-warmup just as
+    much as of the canary gate, so both paths share this one predicate.
+    """
+    records = warm.get("warmups") if isinstance(warm, dict) else None
+    if not isinstance(records, list) or not records:
+        raise RuntimeError(f"{label} warmup returned no records: {warm!r}")
+    failed = [record for record in records if not record.get("ok")]
+    if failed:
+        reasons = sorted({str(record.get("error")) for record in failed})
+        raise RuntimeError(
+            f"{label} warmup failed {len(failed)}/{len(records)} requests ({', '.join(reasons)}); "
+            "refusing to start paid work against a broken generation path"
+        )
+
+
+async def _ensure_warm(engine: Any) -> dict[str, Any] | None:
+    """Warm THIS container if it has not been warmed yet, and report whether it had to.
+
+    `max_containers=1` caps simultaneous replicas; it does NOT pin successive remote calls to one
+    container. Modal may replace or preempt the container between the canary and a bucket, so a
+    sweep whose gate passed on container A can measure its first cells on a freshly booted
+    container B -- paying compile and lazy-workspace costs inside the measured window while the
+    report says the warmup gate passed.
+
+    The flag lives on the container instance, so it is FALSE exactly when this process has not run
+    a warmup, which is the condition that matters. A returned dict means this container was cold
+    and warmed itself; None means it was already warm.
+    """
+    if getattr(engine, "_bench_warmed", False):
+        return None
+    warm = await run_warmup(engine, CANARY_WARMUP_REQUESTS)
+    # A cold replacement container is exactly where an unhealthy engine surfaces, so its warmup gets
+    # the same check the canary gate applies rather than being trusted because the canary passed on
+    # a DIFFERENT container.
+    _require_healthy_warmup(warm, "replacement-container")
+    return warm
+
+
+async def _run_bucket(
+    engine: Any,
+    bucket_name: str,
+    concurrency_points: list[int],
+    block: int,
+    invocation: str = "",
+) -> dict[str, Any]:
+    """One bucket's whole concurrency grid on one already-booted engine.
+
+    The boot dominates cost (~960s of ~1000s per cell in the prior campaign), so the grid runs
+    against a single engine rather than paying a boot per point.
+    """
+    from flash.serving.bench.catalog import bench_catalog_summary
+    from flash.serving.bench.driver import grid_should_halt, run_cell
+    from flash.serving.bench.metrics import summarize_curve
+    from flash.serving.bench.workload import BUCKETS_BY_NAME
+
+    bucket = BUCKETS_BY_NAME[bucket_name]
+    # Gate THIS container before opening its first cell, not the one the canary happened to land on.
+    # `max_containers=1` caps simultaneous replicas without pinning successive calls to one
+    # container, so the canary's probe describes a container this bucket may never have touched --
+    # and the provenance below is read only AFTER the whole grid, far too late to refuse anything.
+    # Probing here means an unresolved kernel path costs one bucket's boot instead of producing a
+    # publishable artifact whose numbers cannot be attributed to a kernel.
+    #
+    # BEFORE the warmup, not after. Warming a cold replacement runs CANARY_WARMUP_REQUESTS
+    # sequential requests, each able to spend its fitting allowance plus the full request timeout,
+    # so gating afterwards spent roughly an hour of paid GPU time on a container whose card or
+    # kernel path already made it unpublishable. The probe is comparatively cheap and answers the
+    # only question that can reject the container, so it goes first.
+    provenance = await _probe_in_container_within_bound(engine)
+    # Card identity too, not only the kernel path. A replacement container reporting a different
+    # accelerator would otherwise be measured and published under the catalog's expected label,
+    # which is the one attribution the whole campaign rests on, and the mismatch would sit in raw
+    # provenance, unread.
+    _gate_container_provenance(engine, provenance, f"bucket {bucket_name!r}")
+    # A replacement container measures cold otherwise; see `_ensure_warm`. Recorded in the payload
+    # so a reader can tell a bucket that inherited the canary's warm container from one that had to
+    # warm itself, rather than having to assume every bucket ran on the gated container.
+    cold_start_warmup = await _ensure_warm(engine)
+    cells = []
+    records = []
+    for concurrency in concurrency_points:
+        # Depth floors come from the bucket, so a near-32k cell is not asked for the same attempt
+        # count as a short turn.
+        result, cell_records = await run_cell(
+            engine,
+            engine.tokenizer,
+            engine.base_model,
+            bucket,
+            concurrency,
+            block,
+            invocation=invocation,
+        )
+        cells.append(result)
+        records.extend(cell_records)
+        print(
+            f"[bench] {engine.base_model} {bucket_name} c={concurrency} "
+            f"rps={result.successful_rps:.3f} tok/s={result.output_tokens_per_second:.1f} "
+            f"err={result.error_rate:.3f} bound={result.error_rate_upper_bound:.3f} "
+            f"resolved={result.error_bound_resolved} degraded={result.degraded}",
+            flush=True,
+        )
+        # Stop climbing once the engine is failing outright: further points would spend GPU time
+        # measuring progressively deeper failure, which the envelope does not need.
+        #
+        # The predicate lives in the driver, not inline here, so `_execution_digest` covers it. As
+        # an inline `result.succeeded_in_window == 0` it sat outside every digested source, and
+        # loosening it would have changed which cells the published curve contains -- a different
+        # ceiling, knee and saturation point -- under an unchanged `workload_checksum`.
+        if grid_should_halt(result):
+            print(
+                f"[bench] halting {bucket_name}: no steady-state successes at c={concurrency}",
+                flush=True,
+            )
+            break
+    return {
+        "base_model": engine.base_model,
+        "bucket": bucket_name,
+        "block": block,
+        # Recorded so a rerun's artifact is distinguishable from the run it replaced, and so the
+        # prompts it sent can be reconstructed exactly.
+        "invocation": invocation,
+        "cells": [cell.to_json() for cell in cells],
+        "curve": summarize_curve(cells),
+        "records": [record.to_json() for record in records],
+        # The SAME probe the gate above accepted. Re-probing here would report a container state
+        # nothing refused, which is how an unresolved backend reached a published artifact.
+        "provenance": provenance,
+        # Non-None when THIS container was cold and warmed itself, i.e. it is not the container the
+        # canary gated. None means it inherited the gated warm container.
+        "cold_start_warmup": cold_start_warmup,
+        # The resolved engine shape, so a cell's numbers stay interpretable after catalog drift.
+        "engine_catalog": next(
+            (row for row in bench_catalog_summary() if row["base_model"] == engine.base_model),
+            None,
+        ),
+    }
+
+
+def _harness_source_identity() -> dict[str, Any]:
+    """Content identity of THIS script, which `workload_checksum()` structurally cannot cover.
+
+    `workload_checksum()` digests named objects out of `flash.serving.bench`, and
+    `_serving_source_identity()` digests the `flash` package the image uploads. Neither can see
+    `scripts/`. But the scheduler lives here: `_run_bucket` owns the order concurrency points are
+    visited in, the warm engine they inherit, and the bucket, block and invocation it forwards into
+    `run_cell`. Reordering the grid, dropping the warmup, or passing a different block changes the
+    prompts issued and the cells the published curve contains -- a different ceiling, knee and
+    saturation point -- while every other recorded identity stays byte-identical.
+
+    Extracting `grid_should_halt` into the driver covered the stop predicate and nothing else. This
+    covers the loop that calls it.
+    """
+    path = Path(__file__).resolve()
+    return {
+        "script": path.name,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def _serving_source_identity() -> dict[str, Any]:
+    """Content identity of the `flash` package the image copies into the container.
+
+    `.add_local_python_source("flash")` ships the WHOLE package, but nothing recorded in an artifact
+    covered it. `workload_checksum()` digests a named list of bench functions and constants, and it
+    reads only from `flash.serving.bench`; `_serving_patch_identity()` digests the vLLM patch alone.
+    So an edit to `flash/serving/src/engine/generation.py`, `lora_engine.py` or the boot path changed
+    what every measured request executed while the patch digest, the workload checksum, the resolved
+    package versions and the checkpoint commits all stayed byte-identical -- two campaigns running
+    different serving code comparing as compatible, which is the failure the provenance block exists
+    to make impossible.
+
+    Digested by CONTENT, not by a version string or a git SHA. A hand-maintained constant is
+    self-attested: it moves when someone remembers to move it, which is the same class of defect. A
+    git SHA additionally reports nothing about uncommitted edits, and this harness is developed on a
+    working tree -- the tree that gets uploaded is the one that must be named.
+
+    Path and content are both fed in, so a rename with identical bytes moves the digest: the module
+    path decides what imports resolve to, and a moved file changes execution even when nothing
+    inside it changed.
+    """
+    root = REPO_DIR / "flash"
+    files = sorted(path for path in root.rglob("*.py") if "__pycache__" not in path.parts)
+    if not files:
+        # An empty tree means the upload would ship nothing and the run would fail on import
+        # anyway. Recording an empty digest instead would be an artifact asserting provenance for
+        # sources that were never there.
+        raise RuntimeError(f"no python sources under {root}; the image would upload an empty flash")
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(REPO_DIR)).encode())
+        digest.update(b"\x1f")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return {
+        "package": "flash",
+        "file_count": len(files),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _serving_patch_identity() -> dict[str, str]:
+    """Content identity of the vLLM patch baked into the measured image.
+
+    Read from the repository, not from the container: `run_commands` deletes the file after applying
+    it, so the container cannot report what it was built with. Both sides come from the same
+    checkout, and the image copies this exact file in, so the digest names what ran.
+
+    Raises rather than defaulting. A missing patch means the image build below would fail anyway,
+    and an artifact carrying an empty or absent identity is precisely the unfalsifiable provenance
+    this exists to prevent.
+    """
+    data = MOE_LORA_PATCH.read_bytes()
+    return {
+        "path": str(MOE_LORA_PATCH.relative_to(REPO_DIR)),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def _write_artifact(payload: dict[str, Any], name: str, *, invocation: str = "") -> Path:
+    """Write one artifact, scoped to its invocation so a retry cannot destroy the prior evidence.
+
+    `write_text` truncates, and the filenames key only on model, bucket and block -- all of which a
+    retry repeats. So a second run at the same block silently overwrote the first run's per-bucket
+    artifacts and its summary, which is the opposite of what the invocation nonce was added for:
+    the nonce exists to make retries distinguishable, and the evidence they produce is the part
+    worth distinguishing. Each invocation gets its own subdirectory.
+    """
+    out_dir = Path(os.environ.get("BENCH_OUT_DIR", "/tmp/flash-bench"))
+    if invocation:
+        out_dir = out_dir / invocation
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / name
+    if path.exists():
+        raise RuntimeError(
+            f"refusing to overwrite existing artifact {path}; a paid run already wrote it"
+        )
+    # Written to a sibling temp file and renamed, because the artifact IS the evidence: the remote
+    # bucket has already run and already been paid for by the time this executes, and a truncated
+    # JSON file cannot be distinguished later from a bucket that measured a short curve. `os.replace`
+    # is atomic within a directory, so a reader sees the whole artifact or no file at all. The
+    # descriptor is flushed and fsynced first -- a rename can otherwise land ahead of the bytes it
+    # names, leaving a zero-length file under the artifact's own name.
+    tmp = path.with_name(f"{path.name}.partial-{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    print(f"[bench] wrote {path}", flush=True)
+    return path
+
+
+async def _within_call_bound(coro: Any, bound_seconds: float, label: str) -> Any:
+    """Run one remote method under the bound its own phases were RESERVED at.
+
+    Modal enforces `TIMEOUT_SECONDS`, one class-wide number derived from the widest bucket. Every
+    narrower call therefore carried a grant far above its reservation -- 5450s for
+    `short_interactive`, 14130s for the canary -- billable before Modal would terminate it and
+    funded by nothing. Bounding here makes the enforcement match the estimator instead of raising
+    the reservation to cover slack these calls can never legitimately reach.
+
+    Ends the container rather than raising when the work outlives the bound. Same reasoning as
+    `_probe_in_container_within_bound`: a coroutine pinned in an uninterruptible engine call keeps
+    billing on the GPU through the scaledown window whatever this frame returns, so the only way it
+    stops spending against an already-exceeded reservation is for the process to end.
+
+    `CancelledError` is caught alongside the timeout because `shield` cuts both ways. It is what
+    lets this function reap deliberately -- but when the OUTER frame is cancelled (a lane torn
+    down, a Modal timeout unwinding the caller) `wait_for` raises `CancelledError`, not
+    `TimeoutError`, and the shielded task survives the frame that was meant to bound it. Catching
+    only the timeout reaped nothing on that route: the frame unwound and the work stayed pinned in
+    the engine, still spending. Same hole, entered by the other door.
+
+    The exit is guarded on `not task.done()` on purpose. A task that finished during the reap has
+    stopped spending, so killing the container then would destroy the artifact of work that
+    completed inside its reservation. In that case the cancellation is re-raised unchanged, so the
+    caller still observes it.
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=bound_seconds)
+    except (TimeoutError, asyncio.CancelledError):
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
+            await asyncio.wait_for(asyncio.shield(task), timeout=drain_reap_seconds())
+        if not task.done():
+            print(
+                f"[bench] FATAL: {label} ignored cancellation past its {bound_seconds:.0f}s priced bound; ending the "
+                "container so a call cannot bill past the reservation that authorized it",
+                flush=True,
+            )
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(75)
+        raise
+
+
+async def _probe_in_container_within_bound(engine: Any) -> dict[str, Any]:
+    """`probe_all` for the container we are ALREADY running inside, under the probe's own bound.
+
+    A spawned remote probe cannot serve here: `_run_bucket` executes
+    inside the container, so `probe_all` is an ordinary in-process call. But it is the same stall
+    risk with the same funding -- both estimators reserve `PROBE_TIMEOUT_SECONDS` per bucket, while
+    an unbounded call would run until the class-wide method timeout, blow past the bucket's
+    reservation, and take the whole paid artifact down with it when Modal terminates `run_bucket`.
+
+    Run in a worker thread so the bound is enforceable: `probe_all` is synchronous (NVML, the vLLM
+    resolver, `AutoConfig.from_pretrained`), and awaiting it directly would pin the event loop where
+    no timeout could fire. Timing out cannot stop that thread -- Python cannot interrupt a blocked C
+    call -- so the handler ends the process rather than raising, which is the only way a thread that
+    outlives its bound stops billing against the reservation it has already exceeded.
+    """
+    loop = asyncio.get_running_loop()
+    from flash.serving.bench.probe import probe_all
+
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, probe_all, engine.base_model, engine),
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except (TimeoutError, asyncio.CancelledError) as exc:
+        # Kill the CONTAINER, not just the wait. Timing out the future does not stop the worker
+        # thread: `probe_all` blocked in `AutoConfig.from_pretrained` or an NVML C call cannot be
+        # interrupted from Python, and raising here only fails the call -- the container survives
+        # its scaledown window with the stuck thread still on the GPU, still billing past the
+        # reservation this bound exists to enforce, and available to a retry that would inherit it.
+        # A spawned call would cancel with `terminate_containers=True` for exactly this; from
+        # inside the container the equivalent is to end the process. `os._exit` rather than
+        # `sys.exit`: an exception would be swallowed by the same event loop the stuck thread
+        # is already outliving.
+        #
+        # CANCELLATION lands here too, for the same reason and not merely for symmetry with
+        # `_within_call_bound`. `CancelledError` derives from `BaseException`, so a bare
+        # `except TimeoutError` lets it past: the asyncio future is cancelled while the executor
+        # thread and its resolver subprocess keep running, `_within_call_bound` then sees its task
+        # already cancelled and re-raises without terminating anything, and the retained container
+        # bills on -- inheritable by a later invocation. A thread Python cannot interrupt is
+        # unreapable whichever way the wait ended, so both endings must end the process.
+        reason = (
+            f"exceeded {PROBE_TIMEOUT_SECONDS}s"
+            if isinstance(exc, TimeoutError)
+            else "was cancelled"
+        )
+        print(
+            f"[bench] FATAL: in-container provenance probe {reason}; "
+            "terminating the container so a thread that cannot be interrupted stops billing",
+            flush=True,
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(70)
+
+
+def _gate_container_provenance(engine: Any, probe: dict[str, Any], where: str) -> None:
+    """Refuse this container unless its card, kernel path and checkpoints are publishable.
+
+    The three gates always travel together, and they exist to be applied BEFORE anything expensive
+    runs on the container they judge. Keeping them in one place is what stops a caller from
+    acquiring the probe and then spending on the container anyway: `certify` did exactly that,
+    probing first but warming unconditionally and leaving the refusal to its client-side caller, so
+    a container already known to be on the wrong card burned CANARY_WARMUP_REQUESTS sequential
+    warmups -- each able to spend its fitting allowance plus the full request bound -- before
+    anything looked at the probe it was holding.
+    """
+    from flash.serving.bench.catalog import bench_gpu_for
+    from flash.serving.bench.probe import gpu_matches
+
+    expected_gpu = bench_gpu_for(engine.base_model)
+    if not gpu_matches(probe, expected_gpu):
+        raise RuntimeError(
+            f"{where} container is {(probe.get('gpu') or {}).get('name')!r}, "
+            f"expected {expected_gpu}; refusing to attribute a measurement to the wrong card"
+        )
+    _require_resolved_gdn_backend(probe)
+    _require_resolved_checkpoint(probe, where)
+
+
+def _require_resolved_gdn_backend(probe: dict[str, Any]) -> None:
+    """Raise unless the probe established WHICH GDN prefill backend the engine chose.
+
+    The harness documents the kernel path as a publication gate, but the gate only checked card
+    identity and Cutlass integrity. `probe_gdn_backend` records `resolved=None` whenever the
+    resolver is absent, its signature moved, or the served config would not load -- and none of
+    those stop the engine from booting, serving, and billing. So a healthy warmup waved through a
+    sweep whose kernel path was never established, and the envelope would be published without the
+    one label that makes a Blackwell number interpretable.
+
+    Unknown is not a backend. Refuse here, where the cost is one canary, rather than after a paid
+    sweep whose numbers cannot be attributed to a kernel.
+    """
+    gdn = probe.get("gdn_prefill") or {}
+    if gdn.get("resolved"):
+        return
+    detail = str(gdn.get("reason") or "probe recorded no reason")
+    if gdn.get("resolver_signature_mismatch"):
+        detail = f"resolver signature mismatch: {detail}"
+    raise RuntimeError(
+        "GDN prefill backend is unresolved "
+        f"({detail}); refusing to start paid work whose kernel path cannot be labelled"
+    )
+
+
+def _require_resolved_checkpoint(probe: dict[str, Any], where: str) -> None:
+    """Raise unless the probe named the commit for the weights and the tokenizer it measured on.
+
+    `probe_resolved_revisions` is fail-soft by design: it records `commit=None` with a reason rather
+    than inventing a hash, because a fabricated commit is worse than none. That makes the REFUSAL
+    this caller's job, and until now nothing did it -- the GPU and GDN gates say which card and
+    kernel produced a number, not which weights. Two of the three hosted models pin nothing, so a
+    missing or unreadable cache ref would publish a curve identified only by a mutable repository
+    name; once that repository advances, the artifact can no longer say what it measured.
+
+    The `processor` role is deliberately NOT required. It resolves against the tokenizer repository
+    and is absent for text-only models, so demanding it would refuse containers whose provenance is
+    complete. Model and tokenizer are what a curve must be able to name.
+    """
+    resolved = probe.get("resolved_revisions") or {}
+    for role in ("model", "tokenizer"):
+        entry = resolved.get(role) or {}
+        # An AMBIGUOUS commit is refused as firmly as a missing one. The probe reports that source
+        # when several cached snapshots hold this role and the repository ref names none of them,
+        # so the commit it returns is a best guess at which tree was loaded. A guess that reaches
+        # the artifact is indistinguishable from a resolved commit downstream, which is the one
+        # failure this gate exists to prevent -- a curve that cannot truthfully name its weights.
+        if entry.get("source") == "snapshot-contents-ambiguous":
+            raise RuntimeError(
+                f"{where}: {role} checkpoint for {entry.get('repo')!r} could not be resolved to one "
+                f"snapshot (candidate {entry.get('commit')!r} is a guess); refusing to publish a "
+                "measurement whose weights cannot be named with certainty"
+            )
+        if entry.get("commit"):
+            continue
+        reason = str(entry.get("reason") or "probe recorded no reason")
+        repo = entry.get("repo") or "<unknown repository>"
+        raise RuntimeError(
+            f"{where}: {role} checkpoint for {repo!r} resolved to no commit ({reason}); refusing "
+            "to publish a measurement that cannot name the weights it ran on"
+        )
+
+
+def _checkpoint_identity(probe: dict[str, Any]) -> dict[str, str]:
+    """The model and tokenizer commits a probe resolved, as a comparable identity.
+
+    Only the two roles `_require_resolved_checkpoint` requires. `processor` resolves against the
+    tokenizer repository and is absent for text-only models, so including it would make two
+    identical containers compare unequal.
+    """
+    resolved = probe.get("resolved_revisions") or {}
+    return {
+        role: str(((resolved.get(role) or {}).get("commit")) or "")
+        for role in ("model", "tokenizer")
+    }
+
+
+def _require_one_identity(
+    payloads: list[tuple[str, dict[str, Any]]],
+    extract: Callable[[dict[str, Any]], dict[str, str]],
+    subject: str,
+) -> dict[str, str]:
+    """Refuse to publish one envelope over buckets that disagree on `extract`'s identity.
+
+    `max_containers=1` caps simultaneous replicas without pinning successive `.remote()` calls to
+    one container, so every axis below can differ between two buckets of the same sweep: a Hub repo
+    that advances mid-sweep, a preempted container replaced on a host carrying a different driver,
+    or a replacement that resolved a different kernel. Each payload gates ITSELF and passes, and the
+    summary then aggregates every curve as if one engine produced them -- a ceiling, knee and
+    saturation point computed across two of anything describes no engine that exists.
+
+    Refusing is the honest option rather than picking a winner: both halves are real measurements,
+    and which one the envelope should describe is not a question this harness can answer. The
+    artifacts are already written per bucket, so nothing paid for is lost -- what is refused is
+    presenting them as one curve.
+
+    Returns the one identity every payload agreed on, so the caller can publish what it ACCEPTED
+    rather than re-deriving it from state that may since have moved.
+    """
+    identities = [(where, extract(probe)) for where, probe in payloads]
+    if not identities:
+        return {}
+    _, first = identities[0]
+    for where, identity in identities[1:]:
+        if identity == first:
+            continue
+        raise RuntimeError(
+            f"{where} measured {subject} {identity} but the canary measured {first}; refusing to "
+            f"publish curves from different {subject}s as one capacity envelope"
+        )
+    return first
+
+
+def _dispatch_stack_identity(probe: dict[str, Any]) -> dict[str, str]:
+    """The kernel-dispatch stack a probe ran through, as a comparable identity.
+
+    `torch`/`vllm` versions come from the image and are identical by construction, so the driver is
+    the field that can actually differ between containers. The driver is what the kernels actually
+    dispatch through, so two buckets can measure the same weights on the same card model and still
+    be produced by different execution stacks.
+    """
+    return {"driver_version": str(((probe.get("gpu") or {}).get("driver_version")) or "")}
+
+
+def _gdn_backend_identity(probe: dict[str, Any]) -> dict[str, str]:
+    """The GDN prefill backend a probe resolved, as a comparable identity.
+
+    Publication-critical: FlashInfer and the Triton fallback are materially different speeds, so a
+    curve is uninterpretable without the label. `_require_resolved_gdn_backend` refuses an
+    unresolved backend per container, which is why this can compare the value directly.
+    """
+    return {"resolved": str(((probe.get("gdn_prefill") or {}).get("resolved")) or "")}
+
+
+def _kv_pool_identity(probe: dict[str, Any]) -> dict[str, str]:
+    """The KV pool a probe measured against, as a comparable identity.
+
+    Concurrency at a long context is bounded by this pool, not by `max_num_seqs` alone, so two
+    buckets that profiled different pools do not describe one engine. `near_32k` is the case that
+    matters: its whole claim is how many 32k requests fit, which IS the block count. A replacement
+    container sized differently would otherwise have its curve fused into the summary silently.
+
+    An absent pool raises rather than reading as `"unknown"`. Two probes that both failed to expose
+    `num_gpu_blocks` agree on nothing, and `"unknown" == "unknown"` is exactly the fusion this gate
+    exists to refuse -- it would publish `accepted_kv_pool: unknown` as a VERIFIED identity while
+    the buckets behind it could have been sized differently. An identity that cannot be read is not
+    an identity that matches; the sweep stops instead, with the per-bucket artifacts already
+    written.
+    """
+    kv = probe.get("kv_cache") or {}
+    blocks = kv.get("num_gpu_blocks")
+    block_size = kv.get("block_size")
+    if blocks is None or block_size is None:
+        raise RuntimeError(
+            "a probe exposed no KV pool (num_gpu_blocks="
+            f"{blocks!r}, block_size={block_size!r}); the pool bounds concurrency at long context, "
+            "so an unreadable one cannot be certified as matching any other"
+        )
+    return {"num_gpu_blocks": str(blocks), "block_size": str(block_size)}
+
+
+def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, Any]:
+    """Boot, verify the card and kernel path, and warm up. The cheap gate before any sweep."""
+    from flash.serving.bench.probe import gpu_matches
+
+    certified = engine.certify.remote(CANARY_WARMUP_REQUESTS)
+    probe = certified["probe"]
+    warm = certified["warmup"]
+    print(json.dumps(probe, indent=2), flush=True)
+    # `certify` already gated this container and would have raised before warming it, so reaching
+    # here means those gates passed. This check is NOT that one repeated: the container gates itself
+    # against `bench_gpu_for(self.base_model)`, its OWN idea of which card it should hold, so it
+    # cannot detect a container wired to a different model than the caller asked for. Comparing
+    # against the `expected_gpu` this lane was called with is the only place that mismatch surfaces.
+    if not gpu_matches(probe, expected_gpu):
+        raise RuntimeError(f"expected {expected_gpu}, got {(probe.get('gpu') or {}).get('name')!r}")
+    _require_resolved_gdn_backend(probe)
+    # Same gate the buckets apply. The canary is the cheap place to discover that the cache cannot
+    # name the weights: failing here costs one boot, while discovering it after a sweep means the
+    # whole paid artifact is unpublishable.
+    _require_resolved_checkpoint(probe, "canary")
+    cutlass = (probe.get("gdn_prefill") or {}).get("cutlass") or {}
+    if cutlass.get("checked") and not cutlass.get("intact"):
+        # A warning, not a failure: the campaign measures the shipped dev runtime as it is. The
+        # report carries this label so nobody reads the numbers as the FlashInfer fast path.
+        print(
+            "[bench] WARNING: cutlass cu13 install is NOT intact -> GDN prefill falls back to "
+            "Triton on Blackwell. Results describe the SLOW prefill path.",
+            flush=True,
+        )
+    print(json.dumps(warm, indent=2), flush=True)
+    # `run_request` converts exceptions, timeouts, malformed streams and cache-verification failures
+    # into records with ok=False rather than raising, so `warmup.remote` returns normally even when
+    # the generation path is entirely broken. Without this check the cheap gate would wave through an
+    # expensive sweep already known to be invalid.
+    _require_healthy_warmup(warm, "canary")
+    return {"probe": probe, "warmup": warm}
+
+
+# Conservative per-lane GPU-second estimates, used to reserve against the ceiling BEFORE any
+# allocation. Deliberately generous: a reservation that overestimates stops a lane early, while one
+# that underestimates lets a lane overspend, and only the second failure costs money.
+MODES = ("canary", "sweep")
+
+
+def _canary_gpu_seconds_estimate() -> float:
+    """Worst-case billed GPU-seconds for a canary lane.
+
+    A flat constant here was the same defect the sweep estimator had, in a lane the sweep fix did
+    not touch: the canary bills for a boot Modal allows to run to `STARTUP_TIMEOUT_SECONDS`, plus
+    `CANARY_WARMUP_REQUESTS` SEQUENTIAL warmups each of which the driver allows to run to
+    `REQUEST_TIMEOUT_SECONDS`. Reserving less accepts a ceiling the lane's own bounds permit it to
+    exceed, which is precisely what `BudgetLedger` exists to prevent.
+
+    The canary makes ONE remote call: `certify.remote()` probes and warms the same container, so a
+    replacement cannot split provenance from generation health. That also collapses the second boot
+    this lane used to reserve -- there is no longer a second call for a replacement to land on. The
+    probe runs INSIDE that call, after `@enter`, so it is billed on top of the boot rather than
+    overlapping it.
+    """
+    calls = 1
+    return (
+        float(STARTUP_TIMEOUT_SECONDS) * calls
+        # Same slack as the sweep: `certify.remote()` is held to `certify_call_priced_seconds()`,
+        # the phases below, and this covers the interval between that bound firing and the container
+        # ending. It is billable time the lane permits itself, so the lane reserves it.
+        + float(TIMEOUT_HEADROOM_SECONDS) * calls
+        + PROBE_TIMEOUT_SECONDS
+        # Each warmup pays its request timeout PLUS the fit that precedes it. The fit happens
+        # outside `run_request`, so pricing a warmup at the request timeout alone left an
+        # enforced-but-unfunded phase. The watchdog does not kill at `WARMUP_FIT_SECONDS_BOUND`, it
+        # kills at that bound PLUS its grace, so the grace is billable time the lane deliberately
+        # permits; reserving only the nominal bound leaves it funded by nothing. Priced per warmup
+        # because the watchdog is armed and disarmed around each one separately.
+        + (run_request_bound_seconds() + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
+        # The container survives its scaledown window after the last call returns, still allocated
+        # and still billing. A reservation that stops at the final return under-reserves every lane
+        # by that tail.
+        + float(SCALEDOWN_WINDOW_SECONDS)
+    )
+
+
+def _sweep_gpu_seconds_estimate(base_model: str, selected: list[Any]) -> float:
+    """Worst-case GPU-seconds for the selected buckets, from their own preregistered bounds.
+
+    Deliberately an UPPER bound. A reservation is a spending authorization, so it must be wrong in
+    the direction that refuses a run rather than the direction that overspends: every cell is priced
+    at its bucket's `max_seconds`, even though a cell that meets its floors early exits sooner.
+
+    EVERY bounded paid phase is reserved, not just the measured windows. A sweep bills for four
+    things, and pricing only the third would let an accepted run exceed its own ceiling:
+
+    1. the cold boot;
+    2. the canary, which always runs before the sweep and whose 5 warmup requests are SEQUENTIAL,
+       so worst case each one consumes its own `REQUEST_TIMEOUT_SECONDS`;
+    3. each cell's measured window, bounded by the bucket's `max_seconds`, PLUS the prompt
+       fitting that precedes it -- excluded from the window on purpose so tokenization cannot
+       distort the measurement, but still executed on the rented GPU and therefore billed;
+    4. each cell's DRAIN, which waits up to `REQUEST_TIMEOUT_SECONDS` for requests still in flight
+       when the window closed. This is the largest omission: at 900s per cell it can exceed the
+       measured time it follows, and it happens after every cell, not once per sweep.
+
+    The grid width comes from the engine's real `max_num_seqs`, so it tracks the catalog rather than
+    a hardcoded six.
+    """
+    overrides = bench_engine_overrides_for(base_model)
+    points = len(list(concurrency_grid(int(overrides.get("max_num_seqs", 8)))))
+    cells = points * len(selected)
+    measured = sum(float(bucket.max_seconds) * points for bucket in selected)
+    # Prompt fitting runs inside the container BEFORE each cell's window opens, so it is
+    # billed but appears in no `max_seconds`. Per cell, not per bucket: every concurrency
+    # point rebuilds its own pool.
+    # Each cell's pool arms its own watchdog, which terminates at bound + grace rather than at the
+    # bound, so the grace is reserved once per cell alongside the fitting it guards.
+    fitting = sum(
+        (prompt_fit_seconds_bound(bucket) + fitting_watchdog_grace_seconds()) * points
+        for bucket in selected
+    )
+    # A drain waits `REQUEST_TIMEOUT_SECONDS` in `asyncio.wait`, and a task that ignores
+    # cancellation then costs a further `drain_reap_seconds()` before the container is ended. Both
+    # are bounded and both are billed, so both are reserved; pricing only the first left the reap
+    # interval funded by nothing at every concurrency point.
+    drains = (REQUEST_TIMEOUT_SECONDS + drain_reap_seconds()) * cells
+    canary = (run_request_bound_seconds() + _FUNDED_WARMUP_FIT_SECONDS) * CANARY_WARMUP_REQUESTS
+    # The boot is reserved at the ceiling Modal actually allows a stuck boot to reach, not at a
+    # typical observed boot. Same reasoning as the canary lane.
+    boot = float(STARTUP_TIMEOUT_SECONDS)
+    # Every bucket is a SEPARATE remote call, and `max_containers=1` caps simultaneous replicas
+    # without pinning successive calls to one container -- which is exactly why `_ensure_warm`
+    # exists. So each call can land on a replacement container and bill another cold boot plus
+    # another sequential warmup. Reserving one boot for the whole campaign left that bounded,
+    # handled, and entirely foreseeable path unfunded, so a sweep accepted under its ceiling could
+    # bill past it once per selected bucket. Priced per call, since that is where the exposure is.
+    replacements = (boot + canary) * len(selected)
+    # No separate canary replacement boot is priced: the canary is ONE remote call
+    # (`certify.remote()` probes and warms the same container), so a sweep makes `len(selected) + 1`
+    # separately bootable calls rather than `+ 2`. The boot this lane once reserved was funding a
+    # replacement landing between the old `probe`/`warmup` pair; with no gap between them there is
+    # nothing left for a replacement to land in, and reserving it anyway would refuse runs that
+    # cannot cost that much.
+    # The canary's probe, plus one per bucket: `_run_bucket` probes the container it actually
+    # measured on. Each is bounded by `PROBE_TIMEOUT_SECONDS` rather than the class method timeout,
+    # so this is the exposure the bound permits, not a guess at typical probe time.
+    probes = PROBE_TIMEOUT_SECONDS * (len(selected) + 1)
+    # Every separately bootable call can leave a container alive for its scaledown window after the
+    # call returns, allocated and billing with no work in it. `len(selected) + 1` calls, each able
+    # to land on its own container, so the tail is priced per call rather than once per sweep.
+    scaledown = float(SCALEDOWN_WINDOW_SECONDS) * (len(selected) + 1)
+    # Scheduling and cleanup slack around each call's own bound. Every call is now held to
+    # `bucket_call_priced_seconds` / `certify_call_priced_seconds` -- the same terms priced above --
+    # rather than to the class-wide `TIMEOUT_SECONDS` derived from the WIDEST bucket. Before that
+    # bound existed, Modal permitted a `short_interactive` call to bill 5450s past everything
+    # reserved here, and the canary 14130s. `TIMEOUT_HEADROOM_SECONDS` covers the interval between
+    # a call's bound firing and its container actually ending; priced once per separately bootable
+    # call, which is where each bound is issued.
+    headroom = float(TIMEOUT_HEADROOM_SECONDS) * (len(selected) + 1)
+    return (
+        boot + canary + probes + measured + fitting + drains + replacements + scaledown + headroom
+    )
+
+
+def _billable_lane_seconds(elapsed: float) -> float:
+    """Local call wall plus the scaledown tail the container keeps billing after the call returns.
+
+    A settlement REPLACES the conservative reservation with a measured number, so anything it omits
+    silently becomes an understatement of what the campaign spent -- and the ledger is the only
+    record of that. `min_containers=0` does not release the GPU at the last return: the container
+    lives out its `scaledown_window` still allocated. Settling at the local call wall alone reported
+    a lane as cheaper than it was, in the one direction a budget must never err.
+
+    Conservative rather than exact: the harness has no post-hoc teardown timestamp to read, so the
+    full window is charged even when Modal reclaims sooner.
+    """
+    return elapsed + float(SCALEDOWN_WINDOW_SECONDS)
+
+
+class _Lane:
+    """One model's paid lane: its frozen identity, its budget entry, and its artifact envelope.
+
+    Every artifact this lane writes answers the same four questions -- which model, which card,
+    which invocation, which engine shape -- plus the local identities FROZEN before the first
+    remote call. Those five elements were repeated at each of the four write sites, where a key
+    dropped from one payload is invisible until the artifact it was dropped from is the only
+    surviving evidence. Carrying them here means a write site names only what is distinctive
+    about it, and no site can forget the envelope.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_model: str,
+        mode: str,
+        expected_gpu: str,
+        provenance: dict[str, Any] | None,
+        invocation: str,
+        ledger: Any,
+        entry: Any,
+        local_identity: dict[str, Any],
+        started: float,
+    ) -> None:
+        self.base_model = base_model
+        self.mode = mode
+        self.expected_gpu = expected_gpu
+        self.provenance = provenance
+        self.invocation = invocation
+        self.ledger = ledger
+        self.entry = entry
+        self.local_identity = local_identity
+        self.started = started
+
+    def write(self, payload: dict[str, Any], name: str) -> Path:
+        """Write one artifact, wrapping it in the envelope every artifact must carry.
+
+        The payload's own keys are applied LAST so a lane-specific value -- the per-bucket
+        payload's own `base_model` and `engine_catalog`, read from the container that actually
+        measured -- wins over the envelope's local view of the same key.
+        """
+        return _write_artifact(
+            {
+                "base_model": self.base_model,
+                "gpu": self.expected_gpu,
+                "mode": self.mode,
+                "invocation": self.invocation,
+                "engine_catalog": self.provenance,
+                **self.local_identity,
+                **payload,
+            },
+            name,
+            invocation=self.invocation,
+        )
+
+    def settle(self, note: str) -> None:
+        """Replace the worst-case reservation with the wall this lane actually elapsed."""
+        self.ledger.settle(
+            self.entry, _billable_lane_seconds(time.monotonic() - self.started), note=note
+        )
+
+    def slug(self) -> str:
+        return self.base_model.replace("/", "_")
+
+
+def _run_canary_lane(lane: _Lane, gate: dict[str, Any]) -> None:
+    """Settle and publish the cheap gate that must pass before any sweep spends money."""
+    lane.settle("measured canary wall plus scaledown tail")
+    lane.write(
+        {"probe": gate["probe"], "warmup": gate["warmup"], "budget": lane.ledger.to_json()},
+        f"canary-{lane.slug()}.json",
+    )
+
+
+def _run_sweep_lane(
+    lane: _Lane, engine: Any, gate: dict[str, Any], selected: list, block: int
+) -> None:
+    """Sweep every selected bucket on the warmed engine, gate cross-bucket drift, then summarize."""
+    from flash.serving.bench.catalog import bench_engine_overrides_for
+    from flash.serving.bench.workload import concurrency_grid
+
+    overrides = bench_engine_overrides_for(lane.base_model)
+    grid = list(concurrency_grid(int(overrides.get("max_num_seqs", 8))))
+    # The invocation nonce keys every measured prompt HEADER. A retry at the same block would
+    # otherwise re-send byte-identical prompts, and inside Modal's 120s scaledown the previous
+    # container and its prefix cache are still alive: the driver would score those hits
+    # ERROR_CACHE_CONTAMINATED and throw away a paid rerun whose engine was healthy. The filler body
+    # is keyed separately and does not move, so the workload stays reproducible.
+    results = []
+    for name in [b.name for b in selected]:
+        payload = engine.run_bucket.remote(name, grid, block, lane.invocation)
+        results.append(payload)
+        # Written eagerly because a later bucket can fail, and then these are the only surviving
+        # evidence for a boot that was already paid for. The envelope rides along via `lane.write`,
+        # so a payload carrying measurements can never lose the contract that produced them.
+        lane.write(payload, f"sweep-{lane.slug()}-{name}-b{block}.json")
+        # Checked HERE, against the canary, as soon as this bucket's artifact is on disk -- not
+        # after the whole sweep. Drift makes every remaining bucket unpublishable, so paying for
+        # them buys nothing: a sweep that drifts at the first bucket used to run the other two and
+        # refuse at the end, spending a full tier's GPU-hours to reach a failure already decided.
+        # The write above happens first, so stopping early still keeps the evidence it paid for.
+        _require_one_identity(
+            [("canary", gate["probe"]), (f"bucket {name!r}", payload.get("provenance") or {})],
+            _checkpoint_identity,
+            "checkpoint",
+        )
+    # BEFORE the summary, after every per-bucket artifact is safely on disk. Each bucket gated its
+    # own container's provenance, but nothing compared those containers to each other: a repo that
+    # advanced mid-sweep, or a replacement container, leaves buckets measured on different commits
+    # and the summary below would fuse their curves into one envelope. The per-bucket check above
+    # already stops a drifting sweep early; this re-gates the full set across all four axes, which
+    # is what the summary actually publishes.
+    gated = [("canary", gate["probe"])] + [
+        (f"bucket {p['bucket']!r}", p.get("provenance") or {}) for p in results
+    ]
+    accepted_checkpoint = _require_one_identity(gated, _checkpoint_identity, "checkpoint")
+    # Same aggregation hazard, three axes. The checkpoint gate proves every bucket measured the
+    # same WEIGHTS; the dispatch stack proves they measured through the same driver; the GDN
+    # backend proves they measured through the same prefill kernel, which is the difference
+    # between FlashInfer and the slower Triton fallback.
+    accepted_dispatch_stack = _require_one_identity(
+        gated, _dispatch_stack_identity, "kernel-dispatch stack"
+    )
+    accepted_gdn_backend = _require_one_identity(
+        gated, _gdn_backend_identity, "GDN prefill backend"
+    )
+    # Fourth axis, same hazard. The three above prove every bucket measured the same weights through
+    # the same driver and prefill kernel; this proves they measured against the same KV pool, which
+    # is what actually bounds achievable concurrency at a long context.
+    accepted_kv_pool = _require_one_identity(gated, _kv_pool_identity, "KV pool")
+    lane.settle("measured sweep wall plus scaledown tail")
+    lane.write(
+        {
+            "grid": grid,
+            "accepted_checkpoint": accepted_checkpoint,
+            # The driver every bucket agreed on, not just the canary's. Without it the summary
+            # named a runtime resolved once and silently spanned hosts that dispatched through
+            # different ones.
+            "accepted_dispatch_stack": accepted_dispatch_stack,
+            # The prefill kernel every bucket agreed on. Without it a summary archived apart from
+            # its sibling bucket files cannot say whether the reported curves ran on FlashInfer or
+            # the slower Triton fallback -- and the harness names that backend a publication gate.
+            "accepted_gdn_backend": accepted_gdn_backend,
+            # The KV pool every bucket agreed on. A near-32k concurrency number is a statement about
+            # how many long requests fit in this pool, so the summary has to name the pool it fit
+            # them into rather than leaving the reader to assume every bucket saw the same one.
+            "accepted_kv_pool": accepted_kv_pool,
+            "runtime_packages": (gate["probe"].get("runtime_packages") or {}),
+            "buckets": [
+                {"bucket": payload["bucket"], "curve": payload["curve"]} for payload in results
+            ],
+            "budget": lane.ledger.to_json(),
+        },
+        f"summary-{lane.slug()}-b{block}.json",
+    )
+
+
+@app.local_entrypoint()
+def main(
+    base_model: str = "Qwen/Qwen3.5-9B",
+    mode: str = "canary",
+    bucket: str = "",
+    block: int = 0,
+    ceiling_usd: float = 0.0,
+) -> None:
+    """Drive one model's benchmark lane on its own production tier.
+
+    ``canary`` boots the engine, verifies the card, reports the GDN prefill kernel, and runs a
+    handful of warmups. It is the cheap gate that must pass before any sweep spends money.
+
+    ``ceiling_usd`` is REQUIRED and has no usable default: every path below allocates a GPU, so the
+    budget is reserved here, before the first remote call, rather than advertised and never
+    consulted.
+    """
+    from flash.serving.bench.budget import BudgetLedger
+    from flash.serving.bench.catalog import bench_catalog_summary
+    from flash.serving.bench.workload import BUCKETS, workload_checksum
+
+    # Checked before anything else: an unknown mode must not reach a remote call, because every one
+    # of them allocates the model's GPU.
+    if mode not in MODES:
+        raise SystemExit(f"unknown --mode {mode!r}; expected one of {', '.join(MODES)}")
+    if ceiling_usd <= 0:
+        raise SystemExit(
+            "--ceiling-usd is required and must be positive: this entrypoint allocates a GPU, so "
+            "it refuses to run against an unauthorized budget"
+        )
+    # Submit-time, not on a rented GPU. `--bucket` is only indexed inside `run_bucket` on the
+    # remote side, so a typo used to pay for a full cold boot and warmup before failing with no
+    # measurement. Every argument that can be checked without a card is checked here.
+    selected = [b for b in BUCKETS if not bucket or b.name == bucket]
+    if bucket and not selected:
+        raise SystemExit(
+            f"unknown --bucket {bucket!r}; expected one of {', '.join(b.name for b in BUCKETS)}"
+        )
+
+    expected_gpu = bench_gpu_for(base_model)
+    ledger = BudgetLedger(ceiling_usd=ceiling_usd)
+    # Reserve the WORST CASE of the work actually selected, not a flat per-mode constant. A sweep
+    # without `--bucket` runs every bucket, and each bucket's grid can burn `max_seconds` at every
+    # concurrency point; a single 3600s reservation let a campaign whose own preregistered bounds
+    # permit far more be accepted under a ceiling it cannot honour. The ceiling is only real if the
+    # reservation covers the whole campaign before the first remote call.
+    estimate = (
+        _canary_gpu_seconds_estimate()
+        if mode == "canary"
+        else _sweep_gpu_seconds_estimate(base_model, selected)
+    )
+    # Raises BudgetExceeded rather than allocating. This is the line that makes the ceiling real.
+    entry = ledger.reserve(f"{mode}:{base_model}", estimate, expected_gpu)
+    # The reservation is the WORST CASE, deliberately generous. Publishing it as the cost would
+    # overstate every campaign by the margin that makes the ceiling safe, so the lane is settled
+    # against measured wall time before the artifact is written and `settled_usd` replaces the
+    # reservation in `committed_usd`. Billing starts at the first remote call, so the clock starts
+    # here rather than at process start, which would bill local argument checking.
+    lane_started = time.monotonic()
+
+    # FROZEN before the first remote call, not recomputed per artifact. Modal uploaded the image
+    # sources at `_engine_for(...)` below; a sweep then runs for hours. Recomputing these after
+    # `run_bucket.remote()` returns would record whatever the local checkout says THEN -- an edit,
+    # a branch switch, a `git pull` during the paid run -- and attribute it to code that is no
+    # longer what the container is executing. The values captured here are the ones that were true
+    # when the sources were uploaded, which is the only moment they describe the running container.
+    local_identity = {
+        "workload_checksum": workload_checksum(),
+        "serving_patch": _serving_patch_identity(),
+        "serving_source": _serving_source_identity(),
+        "harness_source": _harness_source_identity(),
+    }
+
+    catalog = {row["base_model"]: row for row in bench_catalog_summary()}
+    # The resolved engine shape travels WITH the numbers. Without it a published capacity figure
+    # cannot be tied to the checkpoint, context limit, sequence cap, or LoRA allocation that
+    # produced it, and catalog drift would silently reinterpret old results.
+    provenance = catalog.get(base_model)
+
+    engine = _engine_for(base_model)(base_model=base_model)
+    # One nonce per lane invocation, keying prompt headers AND the artifact directory. Allocated
+    # before the canary so the canary lane's artifact is invocation-scoped too: it is paid evidence
+    # and a rerun would otherwise truncate it exactly as a sweep rerun did.
+    invocation = uuid.uuid4().hex[:12]
+    print(f"[bench] invocation nonce {invocation}", flush=True)
+    lane = _Lane(
+        base_model=base_model,
+        mode=mode,
+        expected_gpu=expected_gpu,
+        provenance=provenance,
+        invocation=invocation,
+        ledger=ledger,
+        entry=entry,
+        local_identity=local_identity,
+        started=lane_started,
+    )
+    # Every line below is billable, so a failure here is a failure that has already SPENT. The
+    # reservation and the elapsed wall exist only in this process; without this handler a lane
+    # that dies mid-sweep leaves no accounting evidence for the boot, probe and cells it paid
+    # for, and the ledger would silently under-report the campaign's real committed spend.
+    try:
+        gate = _run_canary(base_model, engine, expected_gpu)
+
+        if mode == "canary":
+            _run_canary_lane(lane, gate)
+            return
+
+        _run_sweep_lane(lane, engine, gate, selected, block)
+    except BaseException as exc:
+        # Settle FIRST, then write. Settling replaces the worst-case reservation with the wall
+        # actually elapsed, so the artifact records what this lane really cost rather than what
+        # it was authorized to cost. `BaseException` on purpose: a KeyboardInterrupt or a Modal
+        # timeout kills the lane exactly like an error does, and the GPU-seconds are just as
+        # spent. The exception is re-raised unchanged -- this handler accounts, it never rescues.
+        if entry.settled_usd is None:
+            lane.settle("failed lane wall plus scaledown tail")
+        with contextlib.suppress(Exception):
+            # Suppressed: a failure to write the accounting record must not replace the
+            # exception that explains why the lane died.
+            lane.write(
+                {
+                    "outcome": "failed",
+                    "failure": f"{type(exc).__name__}: {exc}",
+                    "budget": ledger.to_json(),
+                },
+                f"failed-{mode}-{lane.slug()}-b{block}.json",
+            )
+        raise

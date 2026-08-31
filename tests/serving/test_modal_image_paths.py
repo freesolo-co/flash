@@ -171,8 +171,11 @@ def test_image_extras_cover_every_directly_imported_third_party_package() -> Non
         "dotenv": "python-dotenv",
     }
     # guaranteed by a hard dependency of something already named above, so they need no own bound:
-    # anyio is a required starlette dep (via fastapi); torch/PIL/pydantic ship with vllm.
-    transitive = {"anyio", "torch", "PIL", "pydantic"}
+    # anyio is a required starlette dep (via fastapi); torch/PIL/pydantic ship with vllm. pynvml is
+    # the `nvidia-ml-py` distribution, an unconditional (marker-free) dep of flashinfer-python,
+    # which vllm 0.23.0 requires unconditionally -- see uv.lock. The capacity probe uses it to read
+    # device identity from the driver WITHOUT creating a CUDA context in the parent process.
+    transitive = {"anyio", "torch", "PIL", "pydantic", "pynvml"}
 
     missing = {
         module
