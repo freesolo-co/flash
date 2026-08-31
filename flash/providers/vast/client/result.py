@@ -83,16 +83,28 @@ def fetch_result(url: object, *, timeout: float) -> bytes | None:
 
 
 def _read_bounded(response: object, deadline: float) -> bytes:
-    """Read up to the body cap, giving up when the peer drags the transfer past the deadline.
+    """Read up to the body cap, refusing a body the peer never finished sending.
+
+    Three separate things can go wrong while reading, and they need three separate answers.
 
     The transport timeout bounds inactivity between packets, not the transfer as a whole, so a peer
-    trickling one byte at a time stays under it indefinitely. ``read1`` is what makes rechecking the
-    absolute deadline an actual bound: ``read(amt)`` loops over as many socket receives as it takes
-    to fill ``amt`` or reach EOF, each receive getting a fresh inactivity timeout, so one call can
-    outlast any deadline checked around it. ``read1`` returns after a single receive, which puts the
-    transfer back under the loop's control.
+    trickling bytes under it drags the transfer out indefinitely. ``read1`` returns after a single
+    receive rather than looping until the request is filled, so rechecking the deadline between
+    calls bounds the transfer rather than only the gaps.
+
+    That bound is not exact: one ``read1`` still blocks until its own receive completes, so a
+    trickling peer overshoots the deadline by up to one transport timeout. Making it exact would
+    mean re-arming the socket timeout through ``response.fp.raw._sock`` before every read, and that
+    is undocumented internals of an object we do not own. The overshoot is bounded and the caller
+    passes the same value as both timeout and budget, so it is left as is.
+
+    ``read1`` also reports a short body as a clean EOF. ``read`` raised ``IncompleteRead`` for a
+    Content-Length the peer never delivered; ``read1`` returns the partial bytes and then ``b""``,
+    which is why the completeness check below is explicit. ``length`` is the stdlib's own count of
+    bytes still owed: ``0`` once a declared body is fully read, and ``None`` when the framing
+    declares no length, where a truncated chunked body already raises ``IncompleteRead``.
     """
-    chunks: list[bytes] = []
+    body = bytearray()
     remaining = _MAX_RESULT_BODY_BYTES + 1
     while remaining > 0:
         if time.monotonic() >= deadline:
@@ -100,12 +112,15 @@ def _read_bounded(response: object, deadline: float) -> bytes:
         chunk = response.read1(min(_READ_CHUNK_BYTES, remaining))
         if not chunk:
             break
-        chunks.append(chunk)
+        body += chunk
         remaining -= len(chunk)
-    body = b"".join(chunks)
     if len(body) > _MAX_RESULT_BODY_BYTES:
         raise VastResultError(f"Vast result body exceeds the {_MAX_RESULT_BODY_BYTES}-byte limit")
-    return body
+    if remaining > 0 and getattr(response, "length", None):
+        # stopping with bytes still owed means the peer closed mid-body. only reachable when the
+        # read loop ended on its own; a body at the cap stops early and legitimately leaves bytes.
+        raise VastResultError("Vast result retrieval returned a truncated body")
+    return bytes(body)
 
 
 def _admitted_url(url: object) -> str:

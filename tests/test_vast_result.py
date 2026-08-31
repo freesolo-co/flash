@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import http.server
 import io
+import socket
 import threading
 import time
 import urllib.error
@@ -23,17 +25,25 @@ class _Response:
     it has ``amt`` bytes, so a module that reaches for it is unbounded no matter what the deadline
     loop around it checks; withholding it turns that regression into an immediate AttributeError
     across the whole suite instead of a timing defect no fake can see.
+
+    ``length`` mirrors the stdlib: bytes still owed on a declared body, dropping to ``0`` once the
+    body is fully read. a fake that omitted it would let a truncated body read as complete, which
+    is the exact defect ``read1`` introduced.
     """
 
-    def __init__(self, body: bytes, status: int = 200):
+    def __init__(self, body: bytes, status: int = 200, *, owed_after: int = 0):
         self._stream = io.BytesIO(body)
         self._status = status
+        self._owed_after = owed_after
+        self.length = len(body) + owed_after
 
     def getcode(self):
         return self._status
 
     def read1(self, size=-1):
-        return self._stream.read(size)
+        chunk = self._stream.read(size)
+        self.length -= len(chunk)
+        return chunk
 
     def __enter__(self):
         return self
@@ -249,6 +259,10 @@ def test_a_body_over_the_cap_is_refused_without_buffering_the_rest(monkeypatch):
     reads = []
 
     class _Endless:
+        # an endless body declares no length, so hitting the cap is a size refusal and must not be
+        # reported as truncation.
+        length = None
+
         def getcode(self):
             return 200
 
@@ -308,6 +322,78 @@ def test_a_truncated_body_is_a_result_error(monkeypatch):
 
     with pytest.raises(vast_result.VastResultError):
         vast_result.fetch_result("https://s3.amazonaws.com/x", timeout=1.0)
+
+
+@contextlib.contextmanager
+def _one_shot_server(write_response):
+    """serve one request from a raw socket, so a test can stage a peer that hangs up mid-body.
+
+    ``http.server`` always frames a complete response, which is the one thing these tests need to
+    violate, so the response bytes are written by hand.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def serve():
+        try:
+            connection, _ = listener.accept()
+        except OSError:
+            return
+        with connection:
+            connection.recv(65536)
+            write_response(connection)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield listener.getsockname()[1]
+    finally:
+        listener.close()
+        thread.join(timeout=5.0)
+
+
+def test_a_body_the_peer_never_finished_sending_is_refused():
+    """a peer that declares a length and then closes early must not read as a complete log.
+
+    this needs a real socket. ``read1`` reports the short body as a clean EOF instead of raising
+    ``IncompleteRead`` the way ``read`` did, so nothing in the read loop distinguishes it from a
+    finished body; only the stdlib's own count of bytes still owed does. a fake that returns bytes
+    from a buffer cannot stage a peer that hangs up mid-body.
+    """
+    declared, sent = 300_000, 100_000
+
+    def hang_up_early(connection):
+        connection.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % declared
+        )
+        connection.sendall(b"a" * sent)
+
+    with _one_shot_server(hang_up_early) as port:
+        response = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=30.0)
+        with pytest.raises(vast_result.VastResultError) as exc_info:
+            vast_result._read_bounded(response, time.monotonic() + 30.0)
+
+    assert "truncated" in str(exc_info.value)
+
+
+def test_a_complete_body_survives_the_completeness_check():
+    """the truncation check must not refuse a body the peer did finish sending.
+
+    paired with the test above deliberately: a check that refuses everything would pass that one.
+    """
+    body = b"a" * 300_000
+
+    def send_all(connection):
+        connection.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body)
+        )
+        connection.sendall(body)
+
+    with _one_shot_server(send_all) as port:
+        response = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=30.0)
+        assert vast_result._read_bounded(response, time.monotonic() + 30.0) == body
 
 
 _TRICKLE_BYTES = 60
