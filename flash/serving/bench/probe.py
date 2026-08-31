@@ -92,11 +92,17 @@ def probe_gpu() -> dict[str, Any]:
             pynvml.nvmlShutdown()
 
     # Version strings are module attributes; reading them creates no context.
+    #
+    # `str(...)`, not the attribute itself. `torch.__version__` is a `TorchVersion` -- a str SUBCLASS
+    # defined in `torch.torch_version` -- so it pickles by reference to that module. This payload is
+    # returned across a Modal boundary to a local process that has no torch, where unpickling it
+    # raises `ModuleNotFoundError: torch` and the whole probe is lost AFTER the GPU has been paid
+    # for. A plain `str` carries the same characters with no module to import.
     try:
         import torch
 
-        result["torch_version"] = torch.__version__
-        result["cuda_version"] = torch.version.cuda
+        result["torch_version"] = str(torch.__version__)
+        result["cuda_version"] = str(torch.version.cuda) if torch.version.cuda else None
     except Exception:  # pragma: no cover - torch is present in the serving image
         pass
     return result
@@ -707,7 +713,39 @@ def probe_all(base_model: str, engine: Any | None = None) -> dict[str, Any]:
     }
     if engine is not None:
         payload["kv_cache"] = probe_engine_kv_cache(engine)
-    return payload
+    return _plain_types(payload)
+
+
+def _plain_types(value: Any) -> Any:
+    """Rebuild `value` out of types that exist without the serving image installed.
+
+    This payload crosses a Modal boundary into a LOCAL process that has no torch, no vllm and no
+    transformers. Anything typed by those packages pickles by reference to them, and the local
+    unpickle then dies with `ModuleNotFoundError` -- after the GPU has been allocated, booted and
+    billed. `torch.__version__` is exactly that: a `str` SUBCLASS from `torch.torch_version`, which
+    reads as an ordinary string everywhere it is used here and destroys the return anyway.
+
+    Each probe already coerces its own values, and that is where the real contract lives. This is
+    the boundary that makes the coercion unmissable: a field added later, or a config attribute that
+    quietly becomes an enum in the next vLLM bump, degrades to its `str` rather than costing a run.
+    Subclasses are normalized too -- `isinstance` is true for `TorchVersion`, so an identity pass
+    would let precisely the failing case through.
+    """
+    if isinstance(value, dict):
+        return {str(key): _plain_types(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_types(item) for item in value]
+    if value is None:
+        return None
+    if type(value) in (bool, int, float, str):
+        return value
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        return float(value)
+    return str(value)
 
 
 def gpu_matches(probe: dict[str, Any], expected: str) -> bool:

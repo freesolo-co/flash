@@ -3302,6 +3302,90 @@ def test_a_timed_out_in_container_probe_terminates_the_container() -> None:
     )
 
 
+def test_the_probe_payload_survives_a_local_process_without_the_serving_image() -> None:
+    """A probe value typed by torch loses the run it already paid for.
+
+    `probe_all` returns across a Modal boundary into a LOCAL process that has no torch, no vllm and
+    no transformers. `torch.__version__` is a `str` SUBCLASS defined in `torch.torch_version`, so it
+    pickles by reference to that module and the local unpickle dies with `ModuleNotFoundError:
+    torch` -- after the container has booted the engine, run the probe and billed for the GPU. The
+    canary on 2026-08-31 lost exactly that way: a healthy L40S boot with no verdict to show for it.
+
+    The failure is reproduced with a subclass whose defining module genuinely is not importable
+    here, which is the same shape as the real one rather than a stand-in for it.
+    """
+    import pickle
+
+    from flash.serving.bench import probe as probe_module
+
+    namespace: dict[str, Any] = {}
+    exec(compile("class Version(str):\n    pass\n", "absent_pkg/_version.py", "exec"), namespace)
+    version_type = namespace["Version"]
+    version_type.__module__ = "absent_pkg._version"
+    foreign = version_type("2.11.0+cu130")
+
+    # The premise: this value really is unpicklable outside the image that defines its type.
+    with pytest.raises(pickle.PicklingError, match=r"absent_pkg\.\_version"):
+        pickle.loads(pickle.dumps(foreign))
+
+    plain = probe_module._plain_types({"gpu": {"torch_version": foreign, "count": 1, "ok": True}})
+    assert pickle.loads(pickle.dumps(plain)) == {
+        "gpu": {"torch_version": "2.11.0+cu130", "count": 1, "ok": True}
+    }, "a foreign-typed probe value still crosses the boundary and loses the run"
+    assert type(plain["gpu"]["torch_version"]) is str, (
+        "the value is still its subclass: `isinstance` passes it while pickle still needs the module"
+    )
+    # Ints and bools must not be flattened to strings on the way through -- the summary compares
+    # block counts and reads flags, so coercing everything would trade one broken artifact for
+    # another.
+    assert type(plain["gpu"]["count"]) is int
+    assert type(plain["gpu"]["ok"]) is bool
+
+    # And the real probe must actually route through it, not merely define it.
+    source = Path(probe_module.__file__).read_text(encoding="utf-8")
+    probe_all_body = source[source.index("def probe_all(") : source.index("def _plain_types(")]
+    assert "return _plain_types(payload)" in probe_all_body, (
+        "probe_all returns its payload unguarded: a foreign-typed field added later loses a run"
+    )
+
+
+def test_a_cancelled_in_container_probe_terminates_the_container_too() -> None:
+    """Cancelling the wait is not catching it: `CancelledError` is not a `TimeoutError`.
+
+    `CancelledError` derives from `BaseException`, so a handler that names only `TimeoutError` lets
+    it straight past. The asyncio future is then cancelled while the executor thread and its
+    resolver subprocess keep running; `_within_call_bound` sees its task already cancelled and
+    re-raises without terminating anything; and the container survives its scaledown window with an
+    uninterruptible thread on the GPU, billing on and inheritable by a later invocation. A thread
+    Python cannot interrupt is unreapable whichever way the wait ended, so both endings must end the
+    process -- the same argument the timeout case already makes.
+    """
+    source = BENCH_APP.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    nodes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+    }
+    handler = next(
+        node
+        for node in ast.walk(nodes["_probe_in_container_within_bound"])
+        if isinstance(node, ast.ExceptHandler)
+    )
+    caught = {
+        ast.unparse(node)
+        for node in (handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type])
+    }
+    assert "asyncio.CancelledError" in caught, (
+        "a cancelled probe escapes the handler: the container keeps billing with an "
+        f"uninterruptible thread on the GPU (handler catches {sorted(caught)})"
+    )
+    # Catching it is only half the fix -- the handler must still end the process rather than fall
+    # through to a return, which would report a cancelled probe as a successful one.
+    src = ast.get_source_segment(source, nodes["_probe_in_container_within_bound"]) or ""
+    assert "os._exit" in src, "the cancelled probe returns past its bound without terminating"
+
+
 def test_the_canary_certifies_one_container_in_one_remote_call() -> None:
     """Provenance and generation health must describe the SAME container.
 
@@ -6005,6 +6089,78 @@ def test_the_summary_names_the_gdn_backend_that_produced_its_curves() -> None:
     summary = sweep_body[sweep_body.index('f"summary-') - 2500 : sweep_body.index('f"summary-')]
     assert '"accepted_gdn_backend": accepted_gdn_backend' in summary, (
         "the summary payload omits the GDN prefill backend the sweep accepted"
+    )
+
+
+def test_the_summary_refuses_buckets_that_measured_different_kv_pools() -> None:
+    """Concurrency at a long context is bounded by the KV pool, not by `max_num_seqs` alone.
+
+    `near_32k` is the case that makes this load-bearing: its whole claim is how many 32k requests
+    fit at once, and that IS the block count. A replacement container sized to a different pool --
+    a host with less free VRAM, a different fraction actually granted -- produces a genuinely
+    different ceiling, and each bucket gates ITSELF and passes. Without this axis the two curves
+    fuse into one envelope describing no engine that exists.
+    """
+    namespace = _bench_namespace("_require_one_identity", "_kv_pool_identity")
+    gate = namespace["_require_one_identity"]
+    kv_identity = namespace["_kv_pool_identity"]
+
+    def require(payloads: list[tuple[str, dict[str, Any]]]) -> dict[str, str]:
+        return gate(payloads, kv_identity, "KV pool")
+
+    same = [
+        ("canary", {"kv_cache": {"num_gpu_blocks": 12040, "block_size": 16}}),
+        ("bucket 'near_32k'", {"kv_cache": {"num_gpu_blocks": 12040, "block_size": 16}}),
+    ]
+    assert require(same) == {"num_gpu_blocks": "12040", "block_size": "16"}
+
+    drifted = [
+        ("canary", {"kv_cache": {"num_gpu_blocks": 12040, "block_size": 16}}),
+        ("bucket 'near_32k'", {"kv_cache": {"num_gpu_blocks": 8032, "block_size": 16}}),
+    ]
+    with pytest.raises(RuntimeError, match="KV pools"):
+        require(drifted)
+
+    # An absent field must read as unknown, never as a stand-in value. `probe_engine_kv_cache`
+    # omits each field independently, so a build can expose `block_size` while withholding the
+    # block count -- and a default that happened to equal the other bucket's real count would grant
+    # exactly the fusion this gate exists to refuse. Each axis is pinned separately because a
+    # single both-absent case is satisfied by whichever axis differs first.
+    for absent in ("num_gpu_blocks", "block_size"):
+        full = {"num_gpu_blocks": 12040, "block_size": 16}
+        assert (
+            kv_identity({"kv_cache": {k: v for k, v in full.items() if k != absent}})[absent]
+            == "unknown"
+        ), f"an absent {absent} is reported as a value the probe never read"
+        with pytest.raises(RuntimeError, match="KV pools"):
+            require(
+                [
+                    ("canary", {"kv_cache": full}),
+                    (
+                        "bucket 'near_32k'",
+                        {"kv_cache": {k: v for k, v in full.items() if k != absent}},
+                    ),
+                ]
+            )
+
+    # Two probes that both failed to expose a pool agree on NOTHING.
+    with pytest.raises(RuntimeError, match="KV pools"):
+        require(
+            [
+                ("canary", {"kv_cache": {"num_gpu_blocks": 12040, "block_size": 16}}),
+                ("bucket 'near_32k'", {}),
+            ]
+        )
+
+    # The gate must run in the sweep and reach the artifact, not merely exist as a helper.
+    source = BENCH_APP.read_text(encoding="utf-8")
+    sweep_body = source[source.index("def _run_sweep_lane(") :]
+    assert "accepted_kv_pool = _require_one_identity(" in sweep_body, (
+        "the sweep never establishes one KV pool across its buckets"
+    )
+    summary = sweep_body[sweep_body.index('f"summary-') - 2500 : sweep_body.index('f"summary-')]
+    assert '"accepted_kv_pool": accepted_kv_pool' in summary, (
+        "the summary payload omits the KV pool the sweep accepted"
     )
 
 

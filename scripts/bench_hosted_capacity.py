@@ -697,7 +697,7 @@ async def _probe_in_container_within_bound(engine: Any) -> dict[str, Any]:
             loop.run_in_executor(None, probe_all, engine.base_model, engine),
             timeout=PROBE_TIMEOUT_SECONDS,
         )
-    except TimeoutError:
+    except (TimeoutError, asyncio.CancelledError) as exc:
         # Kill the CONTAINER, not just the wait. Timing out the future does not stop the worker
         # thread: `probe_all` blocked in `AutoConfig.from_pretrained` or an NVML C call cannot be
         # interrupted from Python, and raising here only fails the call -- the container survives
@@ -707,8 +707,21 @@ async def _probe_in_container_within_bound(engine: Any) -> dict[str, Any]:
         # inside the container the equivalent is to end the process. `os._exit` rather than
         # `sys.exit`: an exception would be swallowed by the same event loop the stuck thread
         # is already outliving.
+        #
+        # CANCELLATION lands here too, for the same reason and not merely for symmetry with
+        # `_within_call_bound`. `CancelledError` derives from `BaseException`, so a bare
+        # `except TimeoutError` lets it past: the asyncio future is cancelled while the executor
+        # thread and its resolver subprocess keep running, `_within_call_bound` then sees its task
+        # already cancelled and re-raises without terminating anything, and the retained container
+        # bills on -- inheritable by a later invocation. A thread Python cannot interrupt is
+        # unreapable whichever way the wait ended, so both endings must end the process.
+        reason = (
+            f"exceeded {PROBE_TIMEOUT_SECONDS}s"
+            if isinstance(exc, TimeoutError)
+            else "was cancelled"
+        )
         print(
-            f"[bench] FATAL: in-container provenance probe exceeded {PROBE_TIMEOUT_SECONDS}s; "
+            f"[bench] FATAL: in-container provenance probe {reason}; "
             "terminating the container so a thread that cannot be interrupted stops billing",
             flush=True,
         )
@@ -873,6 +886,27 @@ def _gdn_backend_identity(probe: dict[str, Any]) -> dict[str, str]:
     unresolved backend per container, which is why this can compare the value directly.
     """
     return {"resolved": str(((probe.get("gdn_prefill") or {}).get("resolved")) or "")}
+
+
+def _kv_pool_identity(probe: dict[str, Any]) -> dict[str, str]:
+    """The KV pool a probe measured against, as a comparable identity.
+
+    Concurrency at a long context is bounded by this pool, not by `max_num_seqs` alone, so two
+    buckets that profiled different pools do not describe one engine. `near_32k` is the case that
+    matters: its whole claim is how many 32k requests fit, which IS the block count. A replacement
+    container sized differently would otherwise have its curve fused into the summary silently.
+
+    An absent pool reads as `"unknown"` rather than as an empty match. Two probes that both failed
+    to expose `num_gpu_blocks` agree on nothing, and letting empty compare equal to empty would
+    grant exactly the fusion this gate exists to refuse.
+    """
+    kv = probe.get("kv_cache") or {}
+    blocks = kv.get("num_gpu_blocks")
+    block_size = kv.get("block_size")
+    return {
+        "num_gpu_blocks": str(blocks) if blocks is not None else "unknown",
+        "block_size": str(block_size) if block_size is not None else "unknown",
+    }
 
 
 def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, Any]:
@@ -1164,6 +1198,10 @@ def _run_sweep_lane(
     accepted_gdn_backend = _require_one_identity(
         gated, _gdn_backend_identity, "GDN prefill backend"
     )
+    # Fourth axis, same hazard. The three above prove every bucket measured the same weights through
+    # the same driver and prefill kernel; this proves they measured against the same KV pool, which
+    # is what actually bounds achievable concurrency at a long context.
+    accepted_kv_pool = _require_one_identity(gated, _kv_pool_identity, "KV pool")
     lane.settle("measured sweep wall plus scaledown tail")
     lane.write(
         {
@@ -1177,6 +1215,10 @@ def _run_sweep_lane(
             # its sibling bucket files cannot say whether the reported curves ran on FlashInfer or
             # the slower Triton fallback -- and the harness names that backend a publication gate.
             "accepted_gdn_backend": accepted_gdn_backend,
+            # The KV pool every bucket agreed on. A near-32k concurrency number is a statement about
+            # how many long requests fit in this pool, so the summary has to name the pool it fit
+            # them into rather than leaving the reader to assume every bucket saw the same one.
+            "accepted_kv_pool": accepted_kv_pool,
             "runtime_packages": (gate["probe"].get("runtime_packages") or {}),
             "buckets": [
                 {"bucket": payload["bucket"], "curve": payload["curve"]} for payload in results
