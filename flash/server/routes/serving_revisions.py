@@ -7,8 +7,8 @@ import re
 from fastapi import HTTPException
 
 from flash.content.multimodal import messages_with_image_data_uris, normalize_prompt_images
-from flash.core.spec import JobSpec
 from flash.runner.lifecycle.state import adapter_prefix
+from flash.runner.lifecycle.status import effective_spec_from_status
 from flash.runner.results.checkpoints import checkpoint_adapter_prefix
 from flash.runner.results.verified_revisions import read_verified_checkpoints
 from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
@@ -68,8 +68,9 @@ def _authorized_chat_checkpoint(
 
 
 def _spec_is_unservable(status) -> bool:
+    """whether activation-sensitive serving would reject this run's persisted spec."""
     try:
-        JobSpec.from_dict(status.spec)
+        effective_spec_from_status(status)
     except Exception:
         return True
     return False

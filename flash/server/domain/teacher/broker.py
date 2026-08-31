@@ -347,6 +347,12 @@ def _require_current_attempt(capability: dict[str, Any]) -> None:
         raise TeacherBrokerError("run_not_active", status_code=401)
     if latest_reserved_attempt(capability["run_id"]) != capability["attempt"]:
         raise TeacherBrokerError("attempt_replaced", status_code=401)
+    # the STRUCTURAL loader: this authorizes a scoring call for a run ALREADY running, so the
+    # current serving catalog is not its business. `effective_spec_from_status` would additionally
+    # apply activation admission, and retiring a model or tightening the serving rank cap mid-run
+    # would turn every remaining scoring call into `run_scope_invalid`. the strictness this path
+    # needs -- a present but malformed worker spec never silently degrading to the public one --
+    # is already in `_internal_spec_from_status`.
     try:
         spec = _internal_spec_from_status(status)
     except (TypeError, ValueError) as exc:

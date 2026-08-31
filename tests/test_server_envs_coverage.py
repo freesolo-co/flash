@@ -594,6 +594,7 @@ def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
             run_id="r-settled",
             deployment={"state": "ready"},
             spec={"run_id": "r-settled", "model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
+            effective_preparation={},
         ),
     ]
     monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-settled"}])
@@ -629,6 +630,7 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
                 "algorithm": "opsd",
                 "project": project,
             },
+            effective_preparation={},
         ),
         # same ready state, a spec this build still parses: must be left serving, so the check
         # cannot be passing merely because it fails every ready record it sees.
@@ -642,6 +644,7 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
                 "algorithm": "sft",
                 "project": project,
             },
+            effective_preparation={},
         ),
     }
     monkeypatch.setattr(serving._app, "get_status", lambda run_id: statuses[run_id])
@@ -661,6 +664,62 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
         assert failed["state"] == "failed"
         # the reason names the actual cause, not the restart the busy branch reports.
         assert "no longer supported" in failed["error"]
+
+
+def test_recover_deployments_rejects_malformed_present_worker_specs(monkeypatch):
+    project = "11111111-1111-4111-8111-111111111111"
+    public_spec = {
+        "run_id": "placeholder",
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "sft",
+        "project": project,
+    }
+    preparations = {
+        "r-worker-null": {"worker_spec": None},
+        "r-worker-scalar": {"worker_spec": 7},
+        "r-worker-malformed": {
+            "worker_spec": {
+                **public_spec,
+                "run_id": "r-worker-malformed",
+                "train": {"epochs": "1"},
+            }
+        },
+        "r-worker-absent": {},
+    }
+    statuses = {
+        run_id: types.SimpleNamespace(
+            run_id=run_id,
+            state="done",
+            deployment={"state": "ready"},
+            spec={**public_spec, "run_id": run_id},
+            effective_preparation=effective_preparation,
+        )
+        for run_id, effective_preparation in preparations.items()
+    }
+    monkeypatch.setattr(
+        serving.db,
+        "all_runs",
+        lambda: [{"run_id": run_id} for run_id in preparations],
+    )
+    monkeypatch.setattr(serving._app, "get_status", lambda run_id: statuses[run_id])
+    marked: list[tuple[str, dict]] = []
+
+    def mark_failed(run_id, failed):
+        marked.append((run_id, failed))
+        return types.SimpleNamespace(run_id=run_id, state="done", deployment=failed)
+
+    monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
+    monkeypatch.setattr(runner_transitions, "mark_deployment_failed", mark_failed)
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda status: None)
+
+    assert serving_completion.recover_deployments() == 3
+    assert sorted(run_id for run_id, _failed in marked) == [
+        "r-worker-malformed",
+        "r-worker-null",
+        "r-worker-scalar",
+    ]
+    assert all(failed["state"] == "failed" for _run_id, failed in marked)
+    assert all("no longer supported" in failed["error"] for _run_id, failed in marked)
 
 
 def test_recover_deployments_reports_restored_ready_predecessor(monkeypatch):

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+from dataclasses import replace
 
 import pytest
 
@@ -269,6 +270,99 @@ def test_cancel_run_calls_terminate_and_marks_cancelled(tmp_path, monkeypatch):
         "must terminate the remote endpoint"
     )
     assert out.state == "cancelled"
+
+
+def test_cancel_rejects_malformed_worker_but_cleans_raw_effective_identity(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
+    from flash.core.spec import JobSpec
+    from flash.runner.supervise import lifecycle
+
+    public = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-9B",
+            "algorithm": "grpo",
+            "gpu": {"type": ["RTX 4090", "RTX 5090"]},
+            "run_id": "flash-malformed-private-cancel",
+        }
+    )
+    worker = replace(public, gpu=replace(public.gpu, type="RTX 5090", type_fallbacks=()))
+    status = provisioned_status(
+        worker,
+        state="running",
+        remote=_remote("endpoint-1", "job-1", 0),
+    )
+    status.spec = public.to_dict()
+    runner_state._save_status(status)
+    path = runner_state.runs_file_path(public.run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["effective_preparation"]["worker_spec"]["gpu"]["max_retries"] = "5"
+    stored["remote"].pop("allocated_gpu")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    with pytest.raises(TypeError, match=r"gpu\.max_retries must be an integer"):
+        runner_status.effective_spec_from_status(runner_status.get_status(public.run_id))
+
+    cleanup_targets = []
+    monkeypatch.setattr(lifecycle, "_strict_teardown_handle", lambda _handle, _run_id: True)
+    monkeypatch.setattr(
+        runner_recovery, "_gc_run_endpoints", lambda target: cleanup_targets.append(target)
+    )
+
+    cancelled = runner_deploy.cancel_run(public.run_id)
+
+    assert cancelled.state == "cancelled"
+    assert cancelled.remote is None
+    assert len(cleanup_targets) == 1
+    cleanup_target = cleanup_targets[0]
+    assert not isinstance(cleanup_target, JobSpec)
+    assert cleanup_target.run_id == public.run_id
+    assert cleanup_target.gpu.acceptable_types == ("RTX 5090",)
+
+
+def test_attach_failure_cleans_raw_effective_identity_without_public_substitution(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
+    from flash.core.spec import JobSpec
+
+    public = JobSpec.from_dict(
+        {
+            "model": "Qwen/Qwen3.5-9B",
+            "algorithm": "grpo",
+            "gpu": {"type": ["RTX 4090", "RTX 5090"]},
+            "run_id": "flash-malformed-private-attach",
+        }
+    )
+    worker = replace(public, gpu=replace(public.gpu, type="RTX 5090", type_fallbacks=()))
+    status = provisioned_status(
+        worker,
+        state="running",
+        remote=_remote("endpoint-attach", "job-attach", 0),
+    )
+    status.spec = public.to_dict()
+    save_provisioned_status(status)
+    path = runner_state.runs_file_path(public.run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["effective_preparation"]["worker_spec"]["gpu"]["max_retries"] = "5"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    cleanup_targets = []
+    monkeypatch.setattr(
+        runner_recovery, "_gc_run_endpoints", lambda target: cleanup_targets.append(target)
+    )
+
+    failed = runner_attach.attach_run(public.run_id)
+
+    assert failed.state == "failed"
+    assert len(cleanup_targets) == 1
+    cleanup_target = cleanup_targets[0]
+    assert not isinstance(cleanup_target, JobSpec)
+    assert cleanup_target.run_id == public.run_id
+    assert cleanup_target.gpu.acceptable_types == ("RTX 5090",)
 
 
 def test_cancel_tears_down_every_acceptable_class_of_an_ordered_pin(tmp_path, monkeypatch):

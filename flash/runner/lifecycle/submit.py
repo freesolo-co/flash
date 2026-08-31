@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core import catalog
@@ -251,6 +251,9 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
     preparation._validate_effective_spec(public_spec, worker_spec)
     effective_preparation = _effective_preparation_snapshot(
         public_spec, worker_spec, adapter_identity, stored_public=status.spec
+    )
+    status_ops.effective_spec_from_status(
+        replace(status, effective_preparation=effective_preparation)
     )
     return status_ops._update(
         worker_spec.run_id,

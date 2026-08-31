@@ -101,7 +101,7 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
         status = status_ops._runstatus_from_json(raw)
-        spec = state._internal_spec_from_status(status)
+        spec = status_ops.effective_spec_from_status(status)
         if spec.algorithm != "opd":
             raise RuntimeError("opd retry verification requires an opd run")
         try:

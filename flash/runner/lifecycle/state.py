@@ -70,22 +70,20 @@ def adapter_ref(spec: JobSpec) -> str | None:
 
 
 def _internal_spec_from_status(status: RunStatus) -> JobSpec:
-    """Reconstruct the run's complete internal job spec for the runner's lifecycle logic.
+    """Structurally decode the private worker spec, falling back only when its key is absent.
 
-    status.spec is the public representation and omits platform-managed fields (hf_repo,
-    max_wall_seconds, run_id, ...); their authoritative values are persisted verbatim in the
-    internal worker spec under effective_preparation (recorded for every provisioned run). Prefer
-    that carrier; fall back to the public spec for runs recorded before an effective worker spec
-    exists, where those fields carry their managed defaults.
+    This helper deliberately does not enforce current catalog eligibility, so passive inspection,
+    adapter display, checkpoint registration, cancellation, and cleanup can still observe retired
+    records. Activation-sensitive callers must use ``effective_spec_from_status`` instead.
     """
     snapshot = status.effective_preparation
-    raw_worker = snapshot.get("worker_spec") if isinstance(snapshot, dict) else None
-    if isinstance(raw_worker, dict):
-        try:
-            return JobSpec.from_dict(raw_worker)
-        except Exception:
-            pass
-    return JobSpec.from_dict(status.spec)
+    if snapshot is None:
+        return JobSpec.from_dict(status.spec)
+    if not isinstance(snapshot, dict):
+        raise ValueError("persisted effective preparation is malformed")
+    if "worker_spec" not in snapshot:
+        return JobSpec.from_dict(status.spec)
+    return JobSpec.from_dict(snapshot["worker_spec"])
 
 
 def _adapter_ref_for_status(status: RunStatus) -> str | None:
@@ -96,7 +94,10 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
     adapter exists, is platform-managed and read from the internal worker spec (see
     _internal_spec_from_status); run_id comes from the RunStatus itself.
     """
-    raw_worker = (status.effective_preparation or {}).get("worker_spec")
+    snapshot = status.effective_preparation
+    if not isinstance(snapshot, dict):
+        return None
+    raw_worker = snapshot.get("worker_spec")
     if not raw_worker:
         return None
     try:
@@ -341,7 +342,7 @@ def _save_status(
     with _status_guard(status.run_id):
         if _opd_retry_contract_version is not _PRIVATE_VALUE_UNSET:
             require_opd_retry_contract_version(_opd_retry_contract_version)
-            if JobSpec.from_dict(status.spec).algorithm != "opd":
+            if _internal_spec_from_status(status).algorithm != "opd":
                 raise ValueError("opd retry contract cannot be stored for a non-opd run")
         if not os.path.exists(runs_file_path(status.run_id, ".json")):
             # both defaults below are derived from the internal spec, so parse it once. a record

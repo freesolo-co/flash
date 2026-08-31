@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 import flash.runner.supervise.lifecycle as runner_lifecycle
 from flash.core.spec import EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
+from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 from flash.server.domain.teacher import broker as teacher_broker
 from flash.server.platform import db
 from tests._helpers.source_snapshot import valid_source_snapshot
@@ -1849,6 +1851,99 @@ def test_current_nonterminal_attempt_is_checked_on_every_admission(monkeypatch):
         teacher_broker._require_current_attempt(capability)
 
 
+def test_teacher_authorization_rejects_public_worker_disagreement(monkeypatch):
+    from flash.runner.lifecycle import preparation
+    from flash.runner.lifecycle.state import RunStatus
+
+    public = JobSpec(
+        model="Qwen/Qwen3.5-9B",
+        algorithm="opd",
+        train=TrainSpec(teacher_model="glm-5.2"),
+        run_id="run-mismatch",
+    )
+    worker = replace(public, algorithm="grpo")
+    status = RunStatus(
+        run_id=public.run_id,
+        state="running",
+        spec=public.to_dict(),
+        effective_preparation={
+            "worker_spec": worker.to_internal_dict(),
+            "preparation_digest": preparation._preparation_digest(public, worker, None),
+        },
+    )
+    capability = {
+        "run_id": public.run_id,
+        "attempt": 0,
+        "teacher_alias": "glm-5.2",
+        "provider": teacher_broker.PARASAIL_PROVIDER,
+        "model": "parasail-glm-52",
+        "scoring_mode": teacher_broker.PARASAIL_SCORING_MODE,
+    }
+    monkeypatch.setattr(runner_status, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(runner_attempts, "latest_reserved_attempt", lambda _run_id: 0)
+
+    with pytest.raises(teacher_broker.TeacherBrokerError, match="run_scope_invalid"):
+        teacher_broker._require_current_attempt(capability)
+
+
+def test_a_live_run_keeps_scoring_after_its_model_leaves_the_catalog(monkeypatch):
+    """Teacher authorization must not re-admit a run against the CURRENT serving catalog.
+
+    Authorization here answers "is this capability still the live attempt of this OPD run", which
+    the run's own persisted spec settles. Routing it through the activation-validating loader also
+    applies catalog admission (model retirement, thinking mode, serving rank cap), so retiring a
+    model or tightening the cap would turn every remaining scoring call of an ALREADY running job
+    into `run_scope_invalid` -- the run dies mid-flight while its provider instance keeps billing.
+    """
+    from flash.core import catalog as core_catalog
+    from flash.runner.lifecycle import preparation
+    from flash.runner.lifecycle import status as runner_status_mod
+    from flash.runner.lifecycle.state import RunStatus
+
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-9B",
+        algorithm="opd",
+        train=TrainSpec(teacher_model="glm-5.2"),
+        run_id="run-retired",
+    )
+    status = RunStatus(
+        run_id=spec.run_id,
+        state="running",
+        spec=spec.to_dict(),
+        effective_preparation={
+            "version": PREPARATION_ENVELOPE_VERSION,
+            "worker_spec": spec.to_internal_dict(),
+            "preparation_digest": preparation._preparation_digest(
+                spec, spec, None, stored_public=spec.to_dict()
+            ),
+        },
+    )
+    capability = {
+        "run_id": spec.run_id,
+        "attempt": 0,
+        "teacher_alias": "glm-5.2",
+        "provider": teacher_broker.PARASAIL_PROVIDER,
+        "model": "parasail-glm-52",
+        "scoring_mode": teacher_broker.PARASAIL_SCORING_MODE,
+    }
+    monkeypatch.setattr(runner_status, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(runner_attempts, "latest_reserved_attempt", lambda _run_id: 0)
+
+    # the model is gone from the catalog exactly as a retirement would leave it.
+    def _retired(model_id, algorithm):
+        raise ValueError(f"{model_id} is not available for {algorithm}")
+
+    monkeypatch.setattr(core_catalog, "validate_model_for_algorithm", _retired)
+    monkeypatch.setattr(runner_status_mod, "validate_model_for_algorithm", _retired)
+
+    # sanity: the activation loader DOES reject it, so this test is pinned by the call-site
+    # choice rather than by the patch failing to reach anything.
+    with pytest.raises(ValueError, match="not available"):
+        runner_status_mod.effective_spec_from_status(status)
+
+    teacher_broker._require_current_attempt(capability)
+
+
 def test_only_predispatch_failure_can_retry_same_logical_request(broker_db, monkeypatch):
     _service_ready(monkeypatch)
     token = _issue()
@@ -2036,6 +2131,7 @@ def test_cancellation_fences_teacher_capabilities_before_lifecycle_work(monkeypa
 
     events = []
     status = SimpleNamespace(
+        run_id="run-1",
         state="running",
         deployment=None,
         remote=None,

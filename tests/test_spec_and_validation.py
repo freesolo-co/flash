@@ -269,10 +269,13 @@ def test_job_spec_from_dict_credit_assignment_validates_worker_boundary() -> Non
     payload["train"].pop("credit_assignment", None)
     assert JobSpec.from_dict(payload).train.credit_assignment == "per_episode"
 
-    for invalid in (None, "", "  ", "per_step"):
+    for invalid in ("", "  ", "per_step"):
         payload["train"]["credit_assignment"] = invalid
         with pytest.raises(ValueError, match="credit_assignment must be one of"):
             JobSpec.from_dict(payload)
+    payload["train"]["credit_assignment"] = None
+    with pytest.raises(TypeError, match="credit_assignment must be a string"):
+        JobSpec.from_dict(payload)
 
 
 def test_job_spec_from_dict_rejects_nonpositive_save_every() -> None:
@@ -1800,23 +1803,21 @@ def test_model_revision_markers_accept_valid_bool_states(
 
 
 @pytest.mark.parametrize(
-    ("auto_raw", "force_raw", "expected"),
+    ("field_name", "value"),
     [
-        ("true", "false", (True, False)),
-        (1, 0, (True, False)),
-        ("true", "true", (True, True)),
+        ("model_revision_auto", "true"),
+        ("model_revision_auto", 1),
+        ("model_revision_force_pin", "false"),
+        ("model_revision_force_pin", 0),
     ],
 )
-def test_model_revision_marker_from_dict_coercion_and_roundtrip_are_unchanged(
-    auto_raw, force_raw, expected
-) -> None:
+def test_model_revision_marker_from_dict_rejects_coercion(field_name, value) -> None:
     payload = JobSpec(model_revision="a" * 40).to_internal_dict()
-    payload.update(model_revision_auto=auto_raw, model_revision_force_pin=force_raw)
+    payload["model_revision_auto"] = True
+    payload[field_name] = value
 
-    restored = JobSpec.from_dict(payload)
-
-    assert (restored.model_revision_auto, restored.model_revision_force_pin) == expected
-    assert JobSpec.from_dict(restored.to_internal_dict()) == restored
+    with pytest.raises(TypeError, match=rf"{field_name} must be a boolean"):
+        JobSpec.from_dict(payload)
 
 
 @pytest.mark.parametrize(
@@ -2302,37 +2303,6 @@ def test_an_unknown_top_level_key_is_still_rejected_on_read() -> None:
     # accept-anything hole in the persisted-spec reader.
     with pytest.raises(ValueError, match="unknown key"):
         JobSpec.from_dict({**JobSpec().to_internal_dict(), "not_a_real_key": 1})
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        # Falsey string forms (the bug a plain bool() has: any non-empty string is True).
-        ("false", False),
-        ("False", False),
-        ("0", False),
-        ("no", False),
-        ("off", False),
-        ("none", False),
-        ("", False),
-        ("  false  ", False),
-        # Truthy string forms.
-        ("true", True),
-        ("1", True),
-        ("yes", True),
-        ("anything-else", True),
-        # Already-typed values pass through bool().
-        (True, True),
-        (False, False),
-        (1, True),
-        (0, False),
-        (None, False),
-    ],
-)
-def test_coerce_bool(value, expected) -> None:
-    from flash.core.spec import coerce_bool
-
-    assert coerce_bool(value) is expected
 
 
 # ---------------------------------------------------------------------------

@@ -593,16 +593,18 @@ def test_identical_archives_for_different_git_shas_use_distinct_manifests_concur
     assert first.artifact_revision != second.artifact_revision
 
 
-def test_a_stripped_package_restages_from_the_same_pin_instead_of_running_unstaged(
-    tmp_path,
-) -> None:
+def test_a_stripped_package_is_refused_rather_than_running_unstaged(tmp_path) -> None:
     """Dropping the package from a snapshot must not silently produce an unstaged run.
 
     `_validate_effective_spec` cannot reject this shape: `to_internal_dict` omits the key when
     unset, so a stripped package is byte-identical to a run that has not staged yet -- the state of
-    every run between submit and allocation. The containment is at the consumer instead, and the
-    property that matters is that the recovered spec keeps the digest-bound `resolved_sha`, so a
-    restage rebuilds the SAME commit rather than resolving a newer one.
+    every run between submit and allocation. The preparation digest is what separates them, because
+    it was computed over the payload that still HAD the package.
+
+    That digest is now verified on every activation. It previously ran only when the snapshot
+    carried a workload profile or an auto-selected model revision, so a plain SFT run like this one
+    reached neither branch and the tamper was merely contained downstream. Refusing to activate is
+    strictly stronger than recovering a spec whose package silently vanished.
     """
 
     package, _manifest, _archive, _manifest_path, _archive_path = _staged_files(tmp_path)
@@ -622,9 +624,17 @@ def test_a_stripped_package_restages_from_the_same_pin_instead_of_running_unstag
         effective_preparation=tampered,
     )
 
-    recovered = runner_status.effective_spec_from_status(status)
-    assert recovered.environment.package is None
-    # the pin survives, so a restage cannot drift to a different commit than the one staged.
+    with pytest.raises(ValueError, match="failed integrity validation"):
+        runner_status.effective_spec_from_status(status)
+
+    # the UNtampered snapshot still activates, so the rejection is the tamper and not the shape.
+    intact = runner_state.RunStatus(
+        run_id=worker.run_id,
+        state="provisioning",
+        spec=public.to_dict(),
+        effective_preparation=snapshot,
+    )
+    recovered = runner_status.effective_spec_from_status(intact)
     assert recovered.environment.resolved_sha == worker.environment.resolved_sha
 
 

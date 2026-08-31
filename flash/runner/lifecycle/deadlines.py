@@ -30,6 +30,13 @@ def _canonical_run_deadline(raw: dict) -> tuple[RunStatus, float]:
     status = status_ops._runstatus_from_json(raw)
     # max_wall_seconds is platform-managed and stripped from the public status.spec, so source the
     # run-global wall budget from the internal worker spec (the same value submit recorded).
+    #
+    # the STRUCTURAL loader, not the activation-validating one: a remaining-wall check reads a
+    # budget that submit already fixed, it does not admit the run to anything. routing it through
+    # `effective_spec_from_status` would put the CURRENT catalog (model retirement, thinking mode,
+    # serving rank cap) on a live run's deadline arithmetic, so retiring a model would strand a
+    # run whose provider instance is still billing. `_internal_spec_from_status` still fail-closes
+    # on a present malformed worker half, which is the integrity property this path needs.
     spec = state._internal_spec_from_status(status)
     created_at = _require_valid_deadline(status.created_at)
     max_wall_seconds = _require_valid_deadline(spec.gpu.max_wall_seconds)

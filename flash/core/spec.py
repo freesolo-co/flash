@@ -21,23 +21,13 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 from uuid import UUID
 
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
-from flash.core.catalog import DEFAULT_MODEL, normalize_algorithm
-from flash.core.spec_persistence import (
-    opt_float,
-    opt_int,
-    str_tuple,
-    validated_persisted_providers,
-    validated_section,
-    volume_gb,
-)
+from flash.core.catalog import DEFAULT_MODEL
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
-
-_FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
 
 # default for old payloads and callers that do not select a per-run seed.
 FIXED_SEED = 42
@@ -53,20 +43,10 @@ CREDIT_ASSIGNMENTS: tuple[CreditAssignment, ...] = (
 
 
 def _coerce_credit_assignment(value: Any) -> CreditAssignment:
-    """coerce persisted credit assignment to a known explicit mode."""
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        for mode in CREDIT_ASSIGNMENTS:
-            if normalized == mode:
-                return mode
+    """Validate a persisted credit assignment without normalization."""
+    if value in CREDIT_ASSIGNMENTS:
+        return value
     raise ValueError(f"credit_assignment must be one of {CREDIT_ASSIGNMENTS}; got {value!r}")
-
-
-def coerce_bool(value: Any) -> bool:
-    """Parse a bool from loosely-typed sources; treats "false"/"0"/"no"/"off" as False."""
-    if isinstance(value, str):
-        return value.strip().lower() not in _FALSE_STRINGS
-    return bool(value)
 
 
 def require_project_id(value: Any) -> str:
@@ -82,20 +62,6 @@ def require_project_id(value: Any) -> str:
         return str(UUID(project_id))
     except ValueError as exc:
         raise ValueError("project must be a valid UUID") from exc
-
-
-def _coerce_wandb(value: Any) -> WandbSpec:
-    """Coerce to WandbSpec; non-dict input returns default."""
-    if not isinstance(value, dict):
-        return WandbSpec()
-
-    def _label(v: Any) -> str | None:
-        if v is None:
-            return None
-        s = str(v).strip()
-        return s or None
-
-    return WandbSpec(project=_label(value.get("project")), run_name=_label(value.get("run_name")))
 
 
 def _validated_gpu_type(value: Any, *, field_name: str) -> str:
@@ -116,8 +82,6 @@ def _validated_gpu_type(value: Any, *, field_name: str) -> str:
 
 def _validated_gpu_type_fallbacks(value: Any, *, head: str) -> tuple[str, ...]:
     """Canonicalize and deduplicate fallback classes in authored order."""
-    if value is None:
-        return ()
     if isinstance(value, str) or not isinstance(value, (list, tuple)):
         raise TypeError("gpu.type_fallbacks must be a list of strings")
     seen = {head} if head else set()
@@ -226,7 +190,8 @@ def parse_max_steps(value: Any) -> int | None:
     """parse the optional exact optimizer-update horizon without coercion.
 
     positive values are authoritative; absent or non-positive values canonicalize to none so every
-    parser, serializer, resolver, and save-step path shares one sentinel.
+    parser, serializer, resolver, and save-step path shares one sentinel. this is an authored-input
+    contract, so it stays lenient about the non-positive spelling and strict about the type.
     """
     if value is None:
         return None
@@ -698,141 +663,16 @@ class JobSpec:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
-        """Decode a current persisted or internal job spec.
+        """Decode a current persisted or internal job spec without scalar coercion.
 
         Authored configuration goes through ``flash.schema.spec_from_dict``. This parser accepts
-        platform-managed fields but rejects keys outside the current internal schema.
+        platform-managed fields, applies documented defaults only to absent keys, and rejects null
+        for non-optional fields and values whose persisted JSON type does not match the field type.
+        Current model-catalog eligibility is deliberately deferred to activation.
         """
-        if not isinstance(data, dict):
-            raise TypeError("job spec must be an object")
-        allowed_top_level = {item.name for item in fields(cls)}
-        unknown_top_level = sorted(set(data) - allowed_top_level)
-        if unknown_top_level:
-            raise ValueError(f"job spec has unknown key(s): {', '.join(unknown_top_level)}")
-        env = validated_section(
-            data, "environment", {item.name for item in fields(EnvironmentSpec)}
-        )
-        raw_package = env.get("package")
-        if raw_package is not None and not isinstance(raw_package, dict):
-            raise TypeError("environment.package must be an object")
-        if isinstance(raw_package, dict):
-            package_keys = {item.name for item in fields(EnvironmentPackageSpec)}
-            unknown_package = sorted(set(raw_package) - package_keys)
-            if unknown_package:
-                raise ValueError(
-                    "environment.package has unknown key(s): " + ", ".join(unknown_package)
-                )
-        package = (
-            EnvironmentPackageSpec(
-                artifact_revision=str(raw_package.get("artifact_revision") or ""),
-                archive_sha256=str(raw_package.get("archive_sha256") or ""),
-                manifest_sha256=str(raw_package.get("manifest_sha256") or ""),
-            )
-            if raw_package is not None
-            else None
-        )
-        train = validated_section(data, "train", {item.name for item in fields(TrainSpec)})
-        credit_assignment = (
-            _coerce_credit_assignment(train["credit_assignment"])
-            if "credit_assignment" in train
-            else DEFAULT_CREDIT_ASSIGNMENT
-        )
-        gpu = validated_section(data, "gpu", {item.name for item in fields(GpuSpec)})
-        gpu_type, gpu_type_fallbacks = _parse_persisted_gpu_types(gpu)
-        provider, providers = validated_persisted_providers(gpu, gpu_type, gpu_type_fallbacks)
-        project_raw = data.get("project", "")
-        if not isinstance(project_raw, str):
-            raise TypeError("project must be a string")
-        project = require_project_id(project_raw) if project_raw.strip() else ""
-        model_revision = _model_revision(data.get("model_revision", cls.model_revision))
-        model_revision_auto = coerce_bool(data.get("model_revision_auto", False))
-        if model_revision and not model_revision_auto:
-            raise ValueError("model_revision requires model_revision_auto=True")
-        algorithm = normalize_algorithm(data.get("algorithm", cls.algorithm))
-        if algorithm in {"grpo", "opd"} and train.get("batch_size") is not None:
-            raise ValueError(
-                f"train.batch_size does not apply to {algorithm}; use train.prompts_per_step"
-            )
-        if algorithm == "grpo":
-            for name, value in (
-                ("prompts_per_step", train.get("prompts_per_step")),
-                ("group_size", train.get("group_size")),
-            ):
-                if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
-                    raise TypeError(f"train.{name} must be an integer or omitted for GRPO")
-        return cls(
-            model=data.get("model", cls.model),
-            model_revision=model_revision,
-            algorithm=algorithm,
-            environment=EnvironmentSpec(
-                id=env.get("id", ""),
-                params=dict(env.get("params") or {}),
-                pip=tuple(str(p) for p in env.get("pip") or ()),
-                secrets=str_tuple(env.get("secrets")),
-                resolved_sha=str(env.get("resolved_sha") or ""),
-                package=package,
-            ),
-            train=TrainSpec(
-                epochs=opt_int(train.get("epochs")),
-                lora_rank=int(train.get("lora_rank", 32)),
-                # round-trip a stored alpha (authored value, internal carrier, or a warm-start's
-                # inherited parent alpha); fall back to 2 x rank when absent.
-                lora_alpha=(
-                    int(train["lora_alpha"])
-                    if "lora_alpha" in train
-                    else 2 * int(train.get("lora_rank", 32))
-                ),
-                init_from_adapter=str(train.get("init_from_adapter") or ""),
-                init_from_adapter_revision=str(train.get("init_from_adapter_revision") or ""),
-                hf_repo=str(train.get("hf_repo") or ""),
-                learning_rate=opt_float(train.get("learning_rate")),
-                batch_size=opt_int(train.get("batch_size")),
-                prompts_per_step=opt_int(train.get("prompts_per_step")),
-                max_context_tokens=opt_int(train.get("max_context_tokens")),
-                save_every=opt_int(train.get("save_every")),
-                max_steps=parse_max_steps(train.get("max_steps")),
-                save_at_steps=train.get("save_at_steps"),
-                max_examples=opt_int(train.get("max_examples")),
-                group_size=opt_int(train.get("group_size")),
-                temperature=opt_float(train.get("temperature")),
-                max_completion_tokens=opt_int(train.get("max_completion_tokens")),
-                kl_penalty_coef=opt_float(train.get("kl_penalty_coef")),
-                entropy_quantile=opt_float(train.get("entropy_quantile")),
-                thinking_length_penalty_coef=opt_float(train.get("thinking_length_penalty_coef")),
-                teacher_model=str(train.get("teacher_model") or ""),
-                stop_sequences=str_tuple(train.get("stop_sequences")),
-                structured_outputs=str(train.get("structured_outputs") or ""),
-                credit_assignment=credit_assignment,
-            ),
-            gpu=GpuSpec(
-                type=gpu_type,
-                provider=provider,
-                providers=providers,
-                disk_gb=int(gpu.get("disk_gb", 60)),
-                max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
-                max_retries=int(gpu.get("max_retries", 5)),
-                # network_volume/network_volume_gb round-trip so the runner-assigned weight cache
-                # survives the to_dict()->from_dict() hops in _with_model_disk / _spec_with_gpu /
-                # _assign_managed_hf_repo before deploy.
-                network_volume=gpu.get("network_volume"),
-                network_volume_gb=volume_gb(gpu.get("network_volume_gb")),
-                count=gpu.get("count", 1),
-                type_fallbacks=gpu_type_fallbacks,
-            ),
-            run_id=data.get("run_id", "local"),
-            thinking=coerce_bool(data.get("thinking", False)),
-            wandb=_coerce_wandb(data.get("wandb")),
-            seed=parse_seed(data.get("seed", FIXED_SEED)),
-            model_revision_auto=model_revision_auto,
-            model_revision_force_pin=coerce_bool(data.get("model_revision_force_pin", False)),
-            gpu_count_auto=coerce_bool(data.get("gpu_count_auto", False)),
-            workload_profile_input_digest=str(data.get("workload_profile_input_digest") or ""),
-            workload_profile_producer_version=str(
-                data.get("workload_profile_producer_version") or ""
-            ),
-            workload_profile=dict(data.get("workload_profile") or {}),
-            project=project,
-        )
+        from flash.core.spec_persistence import decode_persisted_job_spec
+
+        return decode_persisted_job_spec(data)
 
     @classmethod
     def from_json(cls, raw: str) -> JobSpec:

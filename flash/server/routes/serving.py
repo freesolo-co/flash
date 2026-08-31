@@ -236,7 +236,7 @@ def _validate_deploy_request(
     """
     try:
         effective_spec = effective_spec_from_status(status)
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     # smoke verification is mandatory for every real checkpoint deployment. reject an opt-out
     # before anything is queued or registered (dry runs never register or activate, so
@@ -375,7 +375,7 @@ def deploy(
 
         job_kwargs = {
             "run_id": run_id,
-            "spec_dict": status.spec,
+            "spec_dict": effective_spec.to_internal_dict(),
             "is_checkpoint": is_checkpoint,
             "deploy_kwargs": deploy_kwargs,
             "deployment": dep_dict,
@@ -526,7 +526,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         status = owned_run(run_id, key)
         try:
             effective_spec = effective_spec_from_status(status)
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not effective_spec.train.hf_repo:
             raise HTTPException(

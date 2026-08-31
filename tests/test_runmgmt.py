@@ -2997,6 +2997,45 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
     )
 
 
+def test_attach_private_decode_failure_fails_without_public_projection_charge(
+    monkeypatch, tmp_path
+):
+    import io
+
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(
+        run_id="attach-malformed-private",
+        model="Qwen/Qwen3.5-9B",
+        algorithm="grpo",
+    )
+    remote = _vast_remote(allocated_gpu="RTX 4090", allocated_gpu_count=1)
+    status = provisioned_status(
+        spec,
+        state="running",
+        remote=remote,
+        estimated_cost_usd=9.99,
+        billing_context={"org_id": "org-1"},
+    )
+    runner_state._save_status(status, _next_attempt=1)
+    path = runner_state.runs_file_path(spec.run_id, ".json")
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    stored["effective_preparation"]["worker_spec"]["gpu"]["max_wall_seconds"] = "3600"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
+    result = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
+
+    assert result.state == "failed"
+    assert result.cost_usd == 0.0
+    assert result.billing_state is None
+    assert result.billing_charge is None
+    assert "max_wall_seconds must be an integer" in (result.error or "")
+
+
 def test_attach_poll_success_carries_the_whole_allocation_stamp(monkeypatch):
     # the OTHER attach exit: a provider poll that returns ok. the wall-deadline route above carries
     # all three fields through `_carry_allocation_stamp`, but this one restored only gpu and count
