@@ -91,32 +91,105 @@ unhealthy stream or container stays visible instead of being absorbed into a cle
 
 ## Results
 
-**Not yet measured.** The harness is complete and validated allocation-free; no GPU has been
-allocated, because doing so requires a separate explicit authorization (Modal source-upload
-permission and a finite numeric budget) that has not been given. The quote is ~$8 for a full pass
-and ~$20 including canaries and one failed boot:
+### Qwen/Qwen3.5-9B on L40S
 
-| model | GPU-s | cost |
-| --- | --- | --- |
-| 9B / L40S | 2280 | $1.24 |
-| 27B / H100 | 2560 | $2.81 |
-| 35B / H200 | 3170 | $4.00 |
+Measured 2026-08-31, invocation `495dad60099e`, one container, one block. **1,914 requests
+attempted, 1,914 succeeded, 0 failed** across all 18 cells.
 
-`test_the_planned_sweep_costs_what_the_plan_quoted` pins those numbers against the pricing code, so
-the quote presented for authorization is reproducible from the code that would spend.
+Engine identity held constant across every cell and is asserted, not assumed: KV pool
+`760 blocks x 1056 tokens`, GDN prefill backend `triton` from vLLM's own resolver, model
+`Freesolo-Co/Qwen3.5-9B-FP8` @ `878d83ed`, tokenizer `Qwen/Qwen3.5-9B` @ `c2022362`, driver
+`580.95.05`. `triton` is the correct GDN path on sm89; the `warning_once` fallback that gate 5
+guards against is a Blackwell failure mode and does not apply to this card.
 
-Those are EXPECTED costs: cells that meet their floors early exit early, and a boot that works takes
-nothing like its permitted ceiling. The `--ceiling-usd` figures under "Running it" are a different
-quantity and are deliberately much larger, because a reservation must be wrong in the direction that
-refuses a run rather than the direction that overspends. Every cell is priced at its bucket's
-`max_seconds`, every request at `REQUEST_TIMEOUT_SECONDS`, and the boot at the full
-`STARTUP_TIMEOUT_SECONDS` a stuck boot is allowed to bill. Authorizing the expected ~$8 while
-passing a ceiling that only covers ~$8 would refuse the run before it allocated; authorize against
-the reservation and expect to be billed the smaller number.
+The 1056-token block size is not a tuning choice: vLLM raises the attention block size to keep
+the attention page at least as large as the mamba page, which is what sets the pool arithmetic.
 
-When the sweep runs, the tables land here — one per model, one row per bucket and concurrency
-point, plus the derived curve (`throughput_ceiling_tokens_per_second`, `knee_concurrency`,
-`saturation_concurrency`).
+#### `short_interactive` (512 in / 128 out)
+
+| concurrency | attempted | ok | failed | rps | output tok/s | TTFT p50 | TTFT p95 | latency p50 | latency p95 | latency p99 | error rate | error bound (95% upper) | bound resolved |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| 1 | 202 | 202 | 0 | 0.479 | 61.3 | 0.062s | 0.063s | 2.080s | 2.082s | 2.083s | 0.000 | 0.013 | no |
+| 2 | 301 | 301 | 0 | 0.926 | 118.6 | 0.124s | 0.131s | 2.152s | 2.156s | 2.157s | 0.000 | 0.009 | yes |
+| 4 | 301 | 301 | 0 | 1.785 | 228.5 | 0.157s | 0.160s | 2.236s | 2.239s | 2.526s | 0.000 | 0.009 | yes |
+| 8 | 305 | 305 | 0 | 3.184 | 407.6 | 0.232s | 0.264s | 2.478s | 2.485s | 2.527s | 0.000 | 0.009 | yes |
+| 12 | 309 | 309 | 0 | 3.209 | 410.8 | 0.336s | 2.558s | 2.622s | 4.858s | 4.928s | 0.000 | 0.009 | yes |
+| 16 | 313 | 313 | 0 | 3.210 | 410.9 | 2.615s | 2.662s | 4.913s | 4.928s | 5.058s | 0.000 | 0.009 | yes |
+
+Curve: ceiling **410.9 tok/s** at concurrency 16, knee at **8**, saturation at **12**.
+
+#### `medium_generation` (8192 in / 256 out)
+
+| concurrency | attempted | ok | failed | rps | output tok/s | TTFT p50 | TTFT p95 | latency p50 | latency p95 | latency p99 | error rate | error bound (95% upper) | bound resolved |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| 1 | 89 | 89 | 0 | 0.210 | 53.6 | 0.634s | 0.651s | 4.738s | 4.944s | 5.087s | 0.000 | 0.030 | no |
+| 2 | 121 | 121 | 0 | 0.372 | 95.3 | 0.844s | 0.903s | 5.363s | 5.397s | 5.406s | 0.000 | 0.022 | no |
+| 4 | 123 | 123 | 0 | 0.604 | 154.7 | 0.989s | 1.040s | 6.558s | 6.647s | 7.415s | 0.000 | 0.022 | no |
+| 8 | 127 | 127 | 0 | 0.868 | 222.3 | 1.009s | 1.383s | 8.915s | 9.179s | 12.136s | 0.000 | 0.021 | no |
+| 12 | 131 | 131 | 0 | 0.871 | 223.0 | 3.507s | 7.328s | 11.714s | 15.547s | 18.583s | 0.000 | 0.020 | no |
+| 16 | 135 | 135 | 0 | 0.866 | 221.8 | 9.807s | 10.229s | 17.913s | 18.208s | 21.184s | 0.000 | 0.020 | no |
+
+Curve: ceiling **223.0 tok/s** at concurrency 12, knee at **8**, saturation at **12**.
+
+#### `near_32k` (31744 in / 512 out)
+
+| concurrency | attempted | ok | failed | rps | output tok/s | TTFT p50 | TTFT p95 | latency p50 | latency p95 | latency p99 | error rate | error bound (95% upper) | bound resolved |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| 1 | 20 | 20 | 0 | 0.087 | 44.6 | 2.954s | 2.989s | 11.477s | 11.513s | 11.531s | 0.000 | 0.119 | no |
+| 2 | 21 | 21 | 0 | 0.138 | 70.4 | 3.339s | 3.736s | 14.332s | 14.484s | 15.973s | 0.000 | 0.114 | no |
+| 4 | 23 | 23 | 0 | 0.187 | 94.7 | 3.664s | 8.796s | 19.835s | 24.830s | 26.980s | 0.000 | 0.105 | no |
+| 8 | 27 | 27 | 0 | 0.199 | 101.7 | 3.787s | 20.605s | 30.946s | 47.729s | 50.006s | 0.000 | 0.091 | no |
+| 12 | 31 | 31 | 0 | 0.199 | 101.7 | 18.812s | 39.299s | 46.336s | 66.835s | 69.110s | 0.000 | 0.080 | no |
+| 16 | 35 | 35 | 0 | 0.195 | 99.7 | 34.547s | 51.735s | 63.256s | 80.238s | 82.647s | 0.000 | 0.072 | no |
+
+Curve: ceiling **101.7 tok/s** at concurrency 8, knee at **8**, saturation at **8**.
+
+#### Reading the 9B curve
+
+The **knee is at concurrency 8 in all three buckets** -- exactly the engine's `max_num_seqs = 8`.
+That is the number to operate at. Past it the added wait moves into TTFT rather than buying
+throughput: from c=8 to c=16 `short_interactive` gains 0.8% throughput (407.6 to 410.9 tok/s) while TTFT p50
+grows 11x (0.232s to 2.615s). Those requests are waiting for an
+admission slot, not for a busier GPU.
+
+The curve's `saturation` marker sits one grid point later (12 for `short_interactive` and
+`medium_generation`, 8 for `near_32k`) because it marks where throughput stops improving at all,
+while the knee marks where it stops improving *proportionally*. The knee is the operating point;
+the gap between them is latency bought at no throughput gain.
+
+**Operating point: concurrency 8.** Beyond it you buy latency, not throughput.
+
+Every cell carries `p99_descriptive_only`, because no cell reaches the 400 samples a p99 needs;
+the p99 column describes the sample and is not a guarantee. The error bound resolves only where
+`bound resolved` says yes: `medium_generation` and `near_32k` ran 20-135 attempts against the
+~268 a 1% Wilson bound requires, so they publish an unresolved bound rather than a false one.
+
+### Cost
+
+| lane | GPU | reserved | settled | GPU-seconds |
+| --- | --- | ---: | ---: | ---: |
+| canary 9B | L40S | $4.89 | $0.2019 | 372 |
+| sweep 9B (3 buckets) | L40S | $37.15 | $2.4620 | 4543 |
+| canary 27B | H100 | $9.91 | $1.5613 | - |
+
+Settled cost is ~6% of the reservation. That gap is the design working as intended: a
+reservation is a spending authorization priced at every bucket's `max_seconds`, every request at
+`REQUEST_TIMEOUT_SECONDS`, and the boot at the full `STARTUP_TIMEOUT_SECONDS` a stuck boot may
+bill, so it must be wrong in the direction that refuses a run rather than the direction that
+overspends.
+
+One operational note for whoever runs this next: the ledger holds back a **submission stop at
+80% of the ceiling** for delayed charges and teardown, so a reservation must clear the *stop*,
+not the ceiling. Pass `--ceiling-usd` at roughly 1.25x the reservation or the lane is refused
+before it allocates.
+
+### Remaining models
+
+**Not yet measured.** 27B/H100 is sweeping; 35B/H200 follows. Their tables land here in the
+same shape, and each tier passes its own canary -- real card identity, immutable model,
+tokenizer and processor revisions, 32768 configured context, a GDN backend named by vLLM's own
+resolver, finite non-empty output with a terminal finish reason, and confirmed teardown --
+before its sweep is allowed to spend.
 
 ## What the envelope will not claim
 
