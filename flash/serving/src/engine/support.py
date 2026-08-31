@@ -10,15 +10,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+from flash.adapters.artifacts import directory_holds_loadable_adapter_weights
 from flash.schema import parse_checkpoint_ref
 from flash.serve.request.runtime_support import (
     argument_names,
-    is_adapter_tensor_file,
     reasoning_compatibility_guard,
 )
 
 _async_engine_arg_names = argument_names
-_is_adapter_tensor_file = is_adapter_tensor_file
 _require_reasoning_api_compatibility = reasoning_compatibility_guard(
     RuntimeError, "vLLM reasoning API is incompatible; missing "
 )
@@ -110,13 +109,8 @@ def _adapter_cache_path(root: Path, subfolder: str | None) -> Path:
 
 
 def _adapter_cache_ready(path: Path) -> bool:
-    if not (path / "adapter_config.json").is_file():
-        return False
     try:
-        return any(
-            child.is_file() and _is_adapter_tensor_file(child) and child.stat().st_size > 0
-            for child in path.iterdir()
-        )
+        return directory_holds_loadable_adapter_weights(path)
     except OSError:
         return False
 

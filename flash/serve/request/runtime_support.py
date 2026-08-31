@@ -3,7 +3,6 @@
 import dataclasses
 import inspect
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 
@@ -41,10 +40,3 @@ def reasoning_compatibility_guard(
             raise error_factory(message + ", ".join(missing))
 
     return require
-
-
-def is_adapter_tensor_file(path: Path) -> bool:
-    name = path.name
-    return name in {"adapter_model.safetensors", "adapter_model.bin"} or (
-        name.startswith("adapter_model-") and name.endswith((".safetensors", ".bin"))
-    )
