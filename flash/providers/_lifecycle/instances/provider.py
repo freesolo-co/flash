@@ -11,8 +11,8 @@ and define the hooks below" — no need to re-derive the poll/submit/gc plumbing
 
 top-level project imports are confined to shared ``_instance`` and ``base``. ``_hf_artifacts``,
 ``contextlib``, and substrate-specific modules are imported lazily inside methods. hooks therefore
-resolve their targets at call time for monkeypatch seams such as ``vast.jobs.submit_run_vast`` and
-``lambda_api.terminate_instances``.
+resolve their targets at call time for monkeypatch seams such as
+``vast.jobs.submit_attempt_vast`` and ``lambda_api.terminate_instances``.
 """
 
 from __future__ import annotations
@@ -57,10 +57,9 @@ class InstanceProvider(abc.ABC):
     def _hourly_rate(self, gpu: str) -> float: ...
 
     @abc.abstractmethod
-    def _submit_run(
+    def _submit_attempt(
         self,
         spec,
-        seed: int,
         *,
         log: Any,
         on_handle: Any,
@@ -75,7 +74,6 @@ class InstanceProvider(abc.ABC):
         self,
         handle: JobHandle,
         spec,
-        seed: int,
         *,
         log: Any,
         heartbeat_reader: Any,
@@ -84,7 +82,7 @@ class InstanceProvider(abc.ABC):
 
     @abc.abstractmethod
     def _teardown_reattached(self, handle: JobHandle, spec) -> None:
-        """Destroy an instance recovered via ``poll`` (attach has no submit teardown to lean on)."""
+        """Destroy an instance recovered via ``poll_attempt`` (attach has no submit teardown)."""
 
     @abc.abstractmethod
     def _gc(self, run_id: str) -> None: ...
@@ -112,10 +110,9 @@ class InstanceProvider(abc.ABC):
     def hourly_rate(self, gpu: str) -> float:
         return self._hourly_rate(gpu)
 
-    def submit_run(
+    def submit_attempt(
         self,
         spec,
-        seed: int,
         *,
         log: Any = None,
         on_handle: Any = None,
@@ -125,13 +122,9 @@ class InstanceProvider(abc.ABC):
         source_snapshot: dict | None = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
-        from flash.core.spec import require_matching_seed
-
-        seed = require_matching_seed(spec, seed)
         # ``on_last_gpu`` is unused: the instance providers use a uniform per-gpu wait (kept for interface parity).
-        return self._submit_run(
+        return self._submit_attempt(
             spec,
-            seed,
             log=log,
             on_handle=on_handle,
             attempt=attempt,
@@ -140,21 +133,18 @@ class InstanceProvider(abc.ABC):
             deadline_at=_deadline_at,
         )
 
-    def poll(
+    def poll_attempt(
         self,
         handle: JobHandle,
         spec,
-        seed: int,
         *,
         log: Any = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
         import contextlib
 
-        from flash.core.spec import require_matching_seed
         from flash.providers.artifacts.hf import heartbeat_reader_for
 
-        seed = require_matching_seed(spec, seed)
         reader = heartbeat_reader_for(spec, deadline_at=_deadline_at)
         h = self._handle_cls.from_dict(handle.to_dict())
         if log is not None:
@@ -163,7 +153,6 @@ class InstanceProvider(abc.ABC):
             return self._poll_job(
                 h,
                 spec,
-                seed,
                 log=log,
                 heartbeat_reader=reader,
                 deadline_at=_deadline_at,

@@ -124,21 +124,67 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     assert modal_app_module.app.function.call_args.kwargs["min_containers"] == 1
 
 
+def test_no_gpu_engine_is_capped_and_each_keeps_one_buffer(modal_app_module):
+    # `base_model` is a modal.parameter(), so Modal gives each distinct value its own container pool
+    # with its own autoscaling accounting. A fixed cap therefore ceilings a SINGLE model's capacity
+    # rather than bounding total spend -- sustained load on one model cannot borrow headroom from an
+    # idle one, so the cap converts demand into queueing on the hot tier. Spend is bounded by workspace
+    # quotas and billing alerts instead. Asserted on the kwargs modal is actually CALLED with, because
+    # a module constant that never reaches `app.cls` governs nothing.
+    assert modal_app_module.MAX_CONTAINERS is None
+    assert modal_app_module.BUFFER_CONTAINERS == 1
+
+    cls_calls = [call.kwargs for call in modal_app_module.app.cls.call_args_list]
+    assert len(cls_calls) == len(modal_app_module.ENGINE_BY_KEY)
+    assert all(kwargs["max_containers"] is None for kwargs in cls_calls)
+    # One spare warm container per engine absorbs a burst past TARGET_INPUTS without a cold boot.
+    # `buffer_containers` only provisions while the Function is ACTIVE, so this preserves scale-to-zero
+    # (MIN_CONTAINERS stays 0) rather than paying for an idle gpu.
+    assert all(kwargs["buffer_containers"] == 1 for kwargs in cls_calls)
+    assert all(kwargs["min_containers"] == 0 for kwargs in cls_calls)
+
+    # The cpu router is likewise uncapped: it is the front door that triggers cold engines, and
+    # capping it would throttle every model at once rather than bounding gpu spend per model. It
+    # carries the same buffer, so a burst does not queue behind the front door it just cleared.
+    router_kwargs = modal_app_module.app.function.call_args.kwargs
+    assert "max_containers" not in router_kwargs
+    assert router_kwargs["buffer_containers"] == 1
+
+
 def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app_module):
     # The whole point of the table: an idle container bills at the full gpu rate, so a cheap
     # fast-booting tier must not hold a card as long as the 35B's ~1010s-boot H200 does.
     from flash.serving.src.engine.model_config import base_models, gpu_for
 
     window_for = modal_app_module.scaledown_window_for
-    default = modal_app_module.DEFAULT_SCALEDOWN_WINDOW_SECONDS
 
     assert window_for("L4") < window_for("L40S") < window_for("H100") < window_for("H200")
     # The H200 keeps the full legacy hold (boot is ~17 min; a miss stalls the user that long).
-    assert window_for("H200") == default == 1800
+    assert window_for("H200") == 1800
     # Every catalog tier resolves to a positive window, so no model falls back by accident.
     assert all(window_for(gpu_for(bm)) > 0 for bm in base_models())
-    # An unknown tier falls back to the safe (longest) default rather than releasing early.
-    assert window_for("B200") == default
+    # The Blackwell tiers hold the H200 window until a real cold-boot canary measures them.
+    assert window_for("B200") == window_for("B300") == 1800
+
+
+def test_unknown_gpu_tier_is_rejected_not_silently_defaulted(modal_app_module):
+    # `gpu` in the serving catalog is a plain string. A typo or an unvalidated new card used to fall
+    # through `dict.get` to the default window and DEPLOY, billing that card's real hourly rate on a
+    # tier nobody qualified. Every one of these once returned 1800 silently.
+    from flash.serving.src.engine.model_config import base_models, gpu_for
+
+    window_for = modal_app_module.scaledown_window_for
+
+    for bogus in ("b200", "B2OO", "H2OO", "A100", "TOTALLY_FAKE", ""):
+        with pytest.raises(ValueError, match="Unsupported serving GPU tier"):
+            window_for(bogus)
+
+    # The gate is membership in the shipped table, so the two stay in sync by construction.
+    assert frozenset(modal_app_module.SCALEDOWN_WINDOW_SECONDS_BY_GPU) == (
+        modal_app_module.SUPPORTED_GPUS
+    )
+    # Every tier a cataloged model actually routes to must be supported.
+    assert {gpu_for(bm) for bm in base_models()} <= modal_app_module.SUPPORTED_GPUS
 
 
 def test_modal_concurrency_is_per_engine_key(modal_app_module):
@@ -333,6 +379,50 @@ def test_lora_engine_cache_key_uses_adapter_thinking_default(modal_app_module):
         "prompt_token_ids": [2]
     }
     assert calls == [True, False]
+
+
+def test_hosted_prompt_cache_key_utf8_encodes_accepted_tool_declarations(modal_app_module):
+    engine = object.__new__(modal_app_module._LoraEngineImpl)
+    engine._prompt_cache_size = 1
+
+    class _Payload:
+        messages: ClassVar[list[dict[str, str]]] = [{"role": "user", "content": "weather"}]
+        prompt = None
+        chat_template_kwargs: ClassVar[dict[str, object]] = {}
+        tool_choice = "auto"
+        tools: ClassVar[list[dict[str, object]]] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "description": "prévisions météo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "object",
+                                "properties": {
+                                    "forecast_🌦": {
+                                        "type": "string",
+                                        "description": "réponse détaillée",
+                                        "enum": ["ensoleillé", "nuageux ☁"],
+                                    }
+                                },
+                                "required": ["forecast_🌦"],
+                                "additionalProperties": False,
+                            }
+                        },
+                        "required": ["location"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+
+    key = engine._prompt_cache_key(_Payload(), thinking_default=False)
+
+    assert key is not None
+    assert key == engine._prompt_cache_key(_Payload(), thinking_default=False)
 
 
 def test_lora_engine_requires_trained_thinking_default(modal_app_module):

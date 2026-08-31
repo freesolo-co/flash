@@ -15,6 +15,7 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from flash._internal.channel import CLI_NAME
+from flash._internal.http import _urlopen_no_redirect
 from flash._internal.openai_sse import (
     DeltaEvent,
     ErrorEvent,
@@ -32,6 +33,7 @@ from flash.client.streaming import (
 )
 from flash.core.spec import require_project_id
 from flash.serve.contract.urls import is_freesolo_hosted_url
+from flash.serve.request.tool_calls import validate_tool_control_presence
 
 
 class ClientError(RuntimeError):
@@ -212,9 +214,18 @@ def _prepare_chat_request(
     max_tokens: int,
     *,
     stream: bool = False,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
 ) -> tuple[str, dict[str, Any]]:
     base_run_id, checkpoint_id = _parse_chat_target(target)
     _validate_chat_messages(messages)
+    validate_tool_control_presence(
+        tools,
+        tool_choice,
+        parallel_tool_calls,
+        error_type=ClientError,
+    )
     body: dict[str, Any] = {
         "checkpoint_id": checkpoint_id,
         "messages": messages,
@@ -223,6 +234,10 @@ def _prepare_chat_request(
     }
     if stream:
         body["stream"] = True
+    if tools is not None:
+        body["tools"] = tools
+        body["tool_choice"] = "auto" if tool_choice is None else tool_choice
+        body["parallel_tool_calls"] = True if parallel_tool_calls is None else parallel_tool_calls
     return base_run_id, body
 
 
@@ -408,7 +423,7 @@ class ApiClient:
         deadline = time.monotonic() + body_deadline if body_deadline is not None else None
         with (
             self._translate_http_errors(),
-            urllib.request.urlopen(
+            _urlopen_no_redirect(
                 req, timeout=_capped_timeout(timeout or self.timeout, deadline)
             ) as resp,
         ):
@@ -435,7 +450,7 @@ class ApiClient:
         )
         with (
             self._translate_http_errors(),
-            urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp,
+            _urlopen_no_redirect(req, timeout=timeout or self.timeout) as resp,
         ):
             if max_bytes is not None:
                 return _read_capped_response(resp, max_bytes)
@@ -766,12 +781,19 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
         timeout: float | None = None,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> dict:
         base_run_id, body = _prepare_chat_request(
             run_id,
             messages,
             temperature,
             max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
         )
         return self._request(
             "POST",
@@ -786,7 +808,11 @@ class ApiClient:
         messages: list[dict],
         temperature: float = 0.0,
         max_tokens: int = 512,
+        *,
+        tools: list[dict[str, Any]] | None = None,
     ) -> Iterator[str]:
+        if tools is not None:
+            raise ValueError("decoded chat_stream does not support tools")
         base_run_id, body = _prepare_chat_request(
             run_id,
             messages,
@@ -804,7 +830,7 @@ class ApiClient:
         decoder = codecs.getincrementaldecoder("utf-8")()
         with (
             self._translate_http_errors(),
-            urllib.request.urlopen(req, timeout=30 * 60) as resp,
+            _urlopen_no_redirect(req, timeout=30 * 60) as resp,
         ):
             content_type = resp.headers.get("Content-Type", "")
             media_type = content_type.partition(";")[0].strip().lower()

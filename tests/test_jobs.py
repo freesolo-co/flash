@@ -72,14 +72,17 @@ def _runpod_handle_dict(
     attempt=0,
     started_ts=1.0,
 ):
-    return _runpod_handle(
-        jobs,
-        endpoint_id=endpoint_id,
-        endpoint_name=endpoint_name,
-        job_id=job_id,
-        attempt=attempt,
-        started_ts=started_ts,
-    ).to_dict()
+    return {
+        **_runpod_handle(
+            jobs,
+            endpoint_id=endpoint_id,
+            endpoint_name=endpoint_name,
+            job_id=job_id,
+            attempt=attempt,
+            started_ts=started_ts,
+        ).to_dict(),
+        "launch_claim_token": f"claim-{attempt}",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -807,7 +810,7 @@ def test_poll_job_in_queue_capacity_stall(monkeypatch):
     # a provider-side guess contradicts that line whenever the budget is exhausted.
     assert "no RunPod capacity" in res.detail
     assert "retrying" not in res.detail
-    assert "GPU-class escalation may follow" in res.detail
+    assert "GPU-class escalation" not in res.detail
 
 
 def test_no_capacity_detail_never_predicts_the_retry_disposition(monkeypatch):
@@ -1719,7 +1722,7 @@ def test_reattach_poll_reproduces_the_multi_card_capacity_grace(monkeypatch):
             "attempt": 1,
         }
     )
-    PROVIDER.poll(handle, spec, spec.seed)
+    PROVIDER.poll_attempt(handle, spec)
     assert captured["queue_grace_s"] == 1800.0
     assert captured["throttled_grace_s"] == 1800.0
 
@@ -1754,23 +1757,21 @@ def test_reattach_poll_reproduces_persisted_on_last_gpu(monkeypatch):
         "started_ts": 1.0,
     }
 
-    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True, "attempt": 2}), spec, spec.seed)
+    PROVIDER.poll_attempt(JobHandle.from_dict({**base, "on_last_gpu": True, "attempt": 2}), spec)
     assert captured["queue_grace_s"] == 900.0
     assert captured["throttled_grace_s"] == 900.0
     assert captured["current_attempt"] == 2
 
     captured.clear()
-    PROVIDER.poll(
-        JobHandle.from_dict({**base, "on_last_gpu": False, "attempt": 0}), spec, spec.seed
-    )
+    PROVIDER.poll_attempt(JobHandle.from_dict({**base, "on_last_gpu": False, "attempt": 0}), spec)
     assert captured["queue_grace_s"] == 300.0
     assert captured["current_attempt"] == 0
 
     with pytest.raises(ValueError, match="attempt identity is invalid"):
-        PROVIDER.poll(JobHandle.from_dict(base), spec, spec.seed)
+        PROVIDER.poll_attempt(JobHandle.from_dict(base), spec)
 
 
-def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
+def test_submit_attempt_payload_carries_structured_source_snapshot(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import job_execution, jobs
@@ -1798,9 +1799,8 @@ def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
     monkeypatch.setattr(polling, "poll_job", lambda *a, **k: jobs.PollResult(True, metrics={}))
 
     source_snapshot = valid_source_snapshot()
-    assert job_execution.submit_run(
+    assert job_execution.submit_attempt(
         spec,
-        seed=spec.seed,
         source_snapshot=source_snapshot,
         deadline_at=10_000_000_000.0,
     ).ok
@@ -1809,7 +1809,7 @@ def test_submit_run_payload_carries_structured_source_snapshot(monkeypatch):
     assert "code_prefix" not in submitted["payload"]
 
 
-def test_submit_run_rejects_malformed_source_before_deploy(monkeypatch):
+def test_submit_attempt_rejects_malformed_source_before_deploy(monkeypatch):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.runpod.execution import job_execution
     from flash.snapshot.archive import SourceSnapshotError
@@ -1831,16 +1831,15 @@ def test_submit_run_rejects_malformed_source_before_deploy(monkeypatch):
     malformed["archive_path"] = "source/wrong/flash-source.zip"
 
     with pytest.raises(SourceSnapshotError, match="archive path"):
-        job_execution.submit_run(
+        job_execution.submit_attempt(
             spec,
-            seed=spec.seed,
             source_snapshot=malformed,
             deadline_at=10_000_000_000.0,
         )
     assert deploy_calls == []
 
 
-def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkeypatch):
+def test_submit_attempt_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkeypatch):
     # The submitting process must apply the scaled budget too, not just a recovering one -- this is
     # the path that burned the queue time in the first place. The count is read off the effective
     # spec this attempt is launching, which allocation may have resolved to FEWER cards than the
@@ -1871,9 +1870,8 @@ def test_submit_run_polls_a_multi_card_shape_on_the_scaled_capacity_grace(monkey
             train=TrainSpec(epochs=1, hf_repo="org/repo"),
             gpu=GpuSpec(type="H200", count=count),
         )
-        assert job_execution.submit_run(
+        assert job_execution.submit_attempt(
             spec,
-            seed=spec.seed,
             on_last_gpu=True,
             source_snapshot=_SOURCE_SNAPSHOT,
             deadline_at=10_000_000_000.0,
@@ -1918,9 +1916,8 @@ def test_runpod_submit_failure_is_retryable_only_after_confirmed_endpoint_deleti
     )
 
     with pytest.raises(RuntimeError) as caught:
-        job_execution.submit_run(
+        job_execution.submit_attempt(
             spec,
-            spec.seed,
             attempt=4,
             on_handle=handles.append,
             source_snapshot=_SOURCE_SNAPSHOT,
@@ -1967,9 +1964,8 @@ def test_runpod_submit_failure_persists_endpoint_only_cleanup_handle(monkeypatch
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
 
     with pytest.raises(UnreconciledCreateError, match="could not be reconciled"):
-        job_execution.submit_run(
+        job_execution.submit_attempt(
             spec,
-            spec.seed,
             attempt=4,
             on_handle=handles.append,
             source_snapshot=_SOURCE_SNAPSHOT,
@@ -2069,9 +2065,8 @@ def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypat
 
     monkeypatch.setattr(polling, "poll_job", fake_poll)
     provider = RunpodProvider()
-    assert provider.submit_run(
+    assert provider.submit_attempt(
         spec,
-        seed=spec.seed,
         source_snapshot=_SOURCE_SNAPSHOT,
         _deadline_at=deadline_at,
     ).ok
@@ -2083,7 +2078,7 @@ def test_runpod_initial_and_reattached_poll_use_same_absolute_deadline(monkeypat
             job_id="job-1",
         )
     )
-    assert provider.poll(handle, spec, seed=spec.seed, _deadline_at=deadline_at).ok
+    assert provider.poll_attempt(handle, spec, _deadline_at=deadline_at).ok
 
     assert captured == [deadline_at, deadline_at]
 
@@ -2122,9 +2117,7 @@ def test_runpod_endpoint_time_consumption_blocks_queue_job_creation(monkeypatch)
     )
 
     with pytest.raises(RuntimeError, match="60-second minimum provider allowance"):
-        job_execution.submit_run(
-            spec, seed=spec.seed, source_snapshot=_SOURCE_SNAPSHOT, deadline_at=200.0
-        )
+        job_execution.submit_attempt(spec, source_snapshot=_SOURCE_SNAPSHOT, deadline_at=200.0)
 
     assert submitted == []
     assert deleted == ["ep"]
@@ -2327,7 +2320,7 @@ def test_reattach_normalizes_persisted_attempt_once_for_failure_reader_and_poll(
             "started_ts": 12_345.0,
         },
     )
-    RunpodProvider().poll(handle, spec, spec.seed)
+    RunpodProvider().poll_attempt(handle, spec)
     assert captured["current_attempt"] == 2
     assert captured["failure_attempt"] == 2
     assert captured["handle"].attempt == 2
@@ -2344,7 +2337,7 @@ def test_reattach_normalizes_persisted_attempt_once_for_failure_reader_and_poll(
         },
     )
     with pytest.raises(ValueError, match="attempt identity is invalid"):
-        RunpodProvider().poll(handle, spec, spec.seed)
+        RunpodProvider().poll_attempt(handle, spec)
 
 
 @pytest.mark.parametrize("raw_attempt", ["", "x", None, True, -1, 1.5])
@@ -2375,7 +2368,7 @@ def test_reattach_rejects_explicit_malformed_persisted_attempt(monkeypatch, raw_
     )
 
     with pytest.raises(ValueError, match="attempt identity is invalid"):
-        RunpodProvider().poll(handle, spec, spec.seed)
+        RunpodProvider().poll_attempt(handle, spec)
 
 
 def test_reattach_rejects_endpoint_only_handle(monkeypatch):
@@ -2404,7 +2397,7 @@ def test_reattach_rejects_endpoint_only_handle(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="endpoint-only"):
-        RunpodProvider().poll(handle, spec, spec.seed)
+        RunpodProvider().poll_attempt(handle, spec)
 
 
 def test_poll_job_setup_heartbeat_does_not_tighten(monkeypatch):
@@ -3218,7 +3211,7 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_du
         class Provider:
             supports_weight_cache = False
 
-            def submit_run(self, spec, seed, log=None, on_handle=None, attempt=0, **_):
+            def submit_attempt(self, spec, log=None, on_handle=None, attempt=0, **_):
                 calls["n"] += 1
                 if on_handle:
                     on_handle(
@@ -3257,16 +3250,14 @@ def test_supervisor_adopts_runpod_completion_before_retry(monkeypatch, cancel_du
 
         if cancel_during_status:
             with pytest.raises(runner_errors._RunCancelled):
-                lifecycle._submit_seed_supervised(
+                lifecycle._run_attempts_supervised(
                     spec,
-                    spec.seed,
                     io.StringIO(),
                     source_snapshot=_SOURCE_SNAPSHOT,
                 )
         else:
-            metrics = lifecycle._submit_seed_supervised(
+            metrics = lifecycle._run_attempts_supervised(
                 spec,
-                spec.seed,
                 io.StringIO(),
                 source_snapshot=_SOURCE_SNAPSHOT,
             )
@@ -3284,7 +3275,7 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         calls = {"n": 0}
         source_snapshots: list[dict | None] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, source_snapshot=None, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, source_snapshot=None, **_):
             calls["n"] += 1
             source_snapshots.append(source_snapshot)
             if on_handle:
@@ -3303,7 +3294,7 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         runner_submit.submit_job(_spec("retry-ok"), dry_run=False, background=False)
         st = runner_status.get_status("retry-ok")
@@ -3311,7 +3302,7 @@ def test_supervisor_retries_on_stall_then_succeeds(monkeypatch):
         assert calls["n"] == 2
         assert source_snapshots == [_SOURCE_SNAPSHOT, _SOURCE_SNAPSHOT]
         assert st.remote is None
-        assert st.realized_cost_remote["job_id"] == "j2"
+        assert st.cleanup_confirmed_remote["job_id"] == "j2"
 
 
 def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch):
@@ -3380,7 +3371,7 @@ def test_submit_keeps_public_short_init_ref_but_launches_storage_ref(monkeypatch
             launched["lora_alpha"] = spec.train.lora_alpha
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: _adapter_config())
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
@@ -3831,6 +3822,7 @@ def test_attach_polls_live_warmstart_handle_without_source_revalidation(monkeypa
                     "key_fingerprint": _RUNPOD_FINGERPRINT,
                     "job_id": "job",
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                 },
                 source_snapshot=_SOURCE_SNAPSHOT,
@@ -3852,7 +3844,7 @@ def test_attach_polls_live_warmstart_handle_without_source_revalidation(monkeypa
         polled = {}
 
         class Provider:
-            def poll(self, handle, spec, seed, **kwargs):
+            def poll_attempt(self, handle, spec, **kwargs):
                 polled.update(
                     init_from_adapter=spec.train.init_from_adapter,
                     revision=spec.train.init_from_adapter_revision,
@@ -3926,7 +3918,11 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
                     "key_fingerprint": _RUNPOD_FINGERPRINT,
                     "job_id": "job",
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
+                    "allocated_gpu": "RTX 4090",
+                    "allocated_gpu_count": 1,
+                    "allocated_usable_vram_gb": 24.0,
                 },
                 source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={
@@ -3937,7 +3933,8 @@ def test_attach_reuses_verified_effective_snapshot_before_recovery_launch(monkey
                         public_spec, worker_spec, identity.to_dict()
                     ),
                 },
-            )
+            ),
+            _next_attempt=1,
         )
         monkeypatch.setattr(
             rank_mod, "load_hf_adapter_config", lambda *a, **k: _adapter_config(rank=64)
@@ -4015,7 +4012,11 @@ def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
                     "key_fingerprint": _RUNPOD_FINGERPRINT,
                     "job_id": "job",
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
+                    "allocated_gpu": "RTX 4090",
+                    "allocated_gpu_count": 1,
+                    "allocated_usable_vram_gb": 24.0,
                 },
                 source_snapshot=_SOURCE_SNAPSHOT,
                 effective_preparation={
@@ -4026,7 +4027,8 @@ def test_attach_revalidates_source_before_handleless_resubmission(monkeypatch):
                         public_spec, worker_spec, original_identity
                     ),
                 },
-            )
+            ),
+            _next_attempt=1,
         )
         monkeypatch.setattr(rank_mod, "load_hf_adapter_config", lambda *a, **k: _adapter_config())
         monkeypatch.setattr(
@@ -4081,6 +4083,7 @@ def test_attach_legacy_warmstart_without_snapshot_fails_closed(monkeypatch):
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "job",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
         }
         runner_state._save_status(
@@ -4116,6 +4119,7 @@ def test_attach_setup_failure_does_not_overwrite_concurrent_cancel(monkeypatch):
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "job",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
         }
         runner_state._save_status(
@@ -4146,7 +4150,7 @@ def test_attach_setup_failure_does_not_overwrite_concurrent_cancel(monkeypatch):
         assert status.remote is None
         assert runner_status._load_status_json("cancelled-attach")[
             runner_state._CLEANUP_REMOTES_KEY
-        ] == [remote]
+        ] == [{key: value for key, value in remote.items() if key != "launch_claim_token"}]
 
 
 def test_attach_setup_failure_does_not_steal_precommit_cancel(monkeypatch):
@@ -4162,6 +4166,7 @@ def test_attach_setup_failure_does_not_steal_precommit_cancel(monkeypatch):
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "job",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
         }
         runner_state._save_status(
@@ -4217,7 +4222,7 @@ def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
             lambda eid, _fingerprint, **_kw: deleted.append(eid) or True,
         )
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             runner_status._update(spec.run_id, "cancelled")  # cancel lands during provisioning
             if on_handle:  # endpoint comes up anyway; its "running" write is rejected (terminal)
                 on_handle(
@@ -4233,7 +4238,7 @@ def test_cancel_during_attempt_reaps_walked_endpoint(monkeypatch):
                 )
             return jobs.PollResult(True, metrics={"cost_usd": 0.1})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         runner_submit.submit_job(_spec("cancel-reap"), dry_run=False, background=False)
@@ -4255,7 +4260,7 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             if on_handle:
                 on_handle(
@@ -4273,7 +4278,7 @@ def test_supervisor_retries_runpod_cancelled_then_succeeds(monkeypatch):
                 return jobs.PollResult(False, failure="job_preempted", detail="[CANCELLED] None")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         runner_submit.submit_job(_spec("cancel-retry"), dry_run=False, background=False)
         assert runner_status.get_status("cancel-retry").state == "done"
@@ -4288,47 +4293,18 @@ def test_supervisor_does_not_retry_worker_code_errors(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             return jobs.PollResult(
                 False, failure="job_failed", detail="Remote execution failed: ValueError"
             )
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         with pytest.raises(RuntimeError):
             runner_submit.submit_job(_spec("fail-fast"), dry_run=False, background=False)
         assert calls["n"] == 1
         assert runner_status.get_status("fail-fast").state == "failed"
-
-
-def test_supervisor_infra_failure_retries_up_to_floor(monkeypatch):
-    """A STREAK of infra-shaped failures (broken/busy GPU -> stalled/job_preempted) walks past up to
-    INFRA_RETRY_FLOOR hosts even though the spec's max_retries is only 2 — so a run of bad GPUs finds a
-    healthy host instead of dying on the small default budget. (Genuine worker errors still fail fast:
-    test_supervisor_does_not_retry_worker_code_errors.)"""
-    from flash.runner.supervise.lifecycle import INFRA_RETRY_FLOOR
-
-    with tempfile.TemporaryDirectory() as tmp:
-        _fresh_orchestrator(tmp, monkeypatch)
-        import flash.providers.runpod.execution.jobs as jobs
-        import flash.providers.runpod.serverless.endpoints as flash_train
-
-        calls = {"n": 0}
-
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
-            calls["n"] += 1
-            return jobs.PollResult(False, failure="stalled", detail="GPU never became ready")
-
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
-        with pytest.raises(RuntimeError):
-            runner_submit.submit_job(
-                _spec("infra-floor"), dry_run=False, background=False
-            )  # max_retries=2
-        # floor=5 -> 6 attempts (walk 0..5), NOT the 3 the raw max_retries=2 would give.
-        assert calls["n"] == INFRA_RETRY_FLOOR + 1
-        assert runner_status.get_status("infra-floor").state == "failed"
 
 
 def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
@@ -4342,11 +4318,11 @@ def test_supervisor_infra_floor_respects_explicit_zero_retries(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             return jobs.PollResult(False, failure="stalled", detail="frozen")
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         spec = JobSpec(
             run_id="no-retry",
@@ -4372,11 +4348,11 @@ def test_shared_cache_zero_retry_budget_submits_exactly_once(monkeypatch, failur
 
         submissions = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
             submissions.append((attempt, spec.gpu.network_volume, on_last_gpu))
             return jobs.PollResult(False, failure=failure, detail="cache-constrained failure")
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         spec = JobSpec(
             run_id=f"cache-zero-{failure}",
@@ -4406,7 +4382,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
 
         gpus_seen: list[str] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle(
@@ -4424,7 +4400,7 @@ def test_supervisor_walks_to_next_gpu_class_on_infra_retry(monkeypatch):
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4501,7 +4477,7 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
         )
         gpus_seen: list[str] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle(
@@ -4519,7 +4495,7 @@ def test_supervisor_oom_walks_only_to_strictly_larger_gpu(monkeypatch):
                 return jobs.PollResult(False, failure="oom", detail="vLLM free-memory preflight")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         import types
@@ -4568,13 +4544,13 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
 
         calls = {"n": 0}
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             calls["n"] += 1
             return jobs.PollResult(
                 False, failure="job_failed", detail="ValueError: bad reward fn (no infra marker)"
             )
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4590,9 +4566,8 @@ def test_supervisor_job_failed_without_marker_does_not_retry(monkeypatch):
         assert runner_status.get_status("code-crash").state == "failed"
 
 
-def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch):
-    # after every distinct candidate is tried, retries wrap to the cheapest candidate rather than
-    # clamping on the priciest or indexing past the list.
+def test_supervisor_marks_on_last_gpu_on_the_largest_survivor(monkeypatch):
+    # on_last_gpu stays false for the cached attempt while its exact cacheless fallback remains.
     import dataclasses
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -4603,79 +4578,13 @@ def test_supervisor_gpu_walk_exhausts_classes_then_retries_cheapest(monkeypatch)
         import flash.providers.runpod.serverless.endpoints as flash_train
         from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
-        # Need 80 GB; the validated 80 GB+ RunPod pool is A100 PCIe ($1.39), A100 SXM ($1.49), RTX
-        # Pro 6000 Server ($2.09), H100 ($3.29). Trim the ranked candidates to the two cheapest so
-        # exactly TWO candidates remain for a clean walk+clamp assertion.
+        # keep two candidates with different usable vram so the floor permits exactly one retry.
         monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 80)
         real_allocate = allocator.allocate
 
         def two_candidate_allocate(*a, **k):
             alloc = real_allocate(*a, **k)
-            keep = tuple(c for c in alloc.candidates if c.gpu in ("A100 PCIe", "A100 SXM"))
-            best = keep[0]
-            return dataclasses.replace(
-                alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep
-            )
-
-        monkeypatch.setattr(allocator, "allocate", two_candidate_allocate)
-        gpus_seen: list[str] = []
-
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
-            gpus_seen.append(spec.gpu.type)
-            if on_handle:
-                on_handle(
-                    {
-                        "provider": "runpod",
-                        "endpoint_id": "ep",
-                        "endpoint_name": "n",
-                        "key_fingerprint": _RUNPOD_FINGERPRINT,
-                        "job_id": f"j{attempt}",
-                        "attempt": attempt,
-                        "started_ts": 1.0,
-                    }
-                )
-            if attempt < 2:
-                return jobs.PollResult(False, failure="stalled", detail="frozen")
-            return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
-
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
-        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
-
-        spec = JobSpec(
-            run_id="clamp",
-            model="Qwen/Qwen3.5-9B",
-            algorithm="grpo",
-            train=TrainSpec(epochs=1, max_examples=1),
-            gpu=GpuSpec(type="", max_retries=2),
-        )
-        runner_submit.submit_job(spec, dry_run=False, background=False)
-
-        assert runner_status.get_status("clamp").state == "done"
-        # Walk advances through both classes, then re-rolls the cheapest (never out of range).
-        assert gpus_seen == ["A100 PCIe", "A100 SXM", "A100 PCIe"]
-
-
-def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
-    # on_last_gpu must reach the provider so the no-capacity backstops know whether there is a
-    # next-best class to fall to: False while the walk still has somewhere to go (attempt 0 on the
-    # cheaper of two classes), True once it lands on (and clamps to) the last candidate.
-    import dataclasses
-
-    with tempfile.TemporaryDirectory() as tmp:
-        _fresh_orchestrator(tmp, monkeypatch)
-        _confirm_runpod_retry_teardown(monkeypatch)
-        import flash.providers.core.allocator as allocator
-        import flash.providers.runpod.execution.jobs as jobs
-        import flash.providers.runpod.serverless.endpoints as flash_train
-        from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-
-        # Same trim as the clamp test: exactly two 80 GB candidates so the walk has one step.
-        monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 80)
-        real_allocate = allocator.allocate
-
-        def two_candidate_allocate(*a, **k):
-            alloc = real_allocate(*a, **k)
-            keep = tuple(c for c in alloc.candidates if c.gpu in ("A100 PCIe", "A100 SXM"))
+            keep = tuple(c for c in alloc.candidates if c.gpu in ("A100 PCIe", "RTX Pro 6000"))
             best = keep[0]
             return dataclasses.replace(
                 alloc, gpu=best.gpu, hourly_usd=best.hourly_usd, candidates=keep
@@ -4684,7 +4593,7 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
         monkeypatch.setattr(allocator, "allocate", two_candidate_allocate)
         last_flags: list[bool] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, on_last_gpu=False, **_):
             last_flags.append(on_last_gpu)
             if on_handle:
                 on_handle(
@@ -4698,11 +4607,11 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
                         "started_ts": 1.0,
                     }
                 )
-            if attempt < 2:
+            if attempt == 0:
                 return jobs.PollResult(False, failure="stalled", detail="frozen")
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4715,13 +4624,11 @@ def test_supervisor_marks_on_last_gpu_only_at_end_of_walk(monkeypatch):
         runner_submit.submit_job(spec, dry_run=False, background=False)
 
         assert runner_status.get_status("lastgpu").state == "done"
-        # attempt 0: cheaper class, a next-best still exists -> False; attempts 1 & 2: on the last
-        # candidate (and clamped onto it) -> True.
-        assert last_flags == [False, True, True]
-        # the winning attempt retains on_last_gpu in its billing identity after confirmed teardown.
+        assert last_flags == [False, False]
+        # the cached attempt keeps ordinary queue grace because its exact cacheless fallback remains.
         status = runner_status.get_status("lastgpu")
         assert status.remote is None
-        assert status.realized_cost_remote.get("on_last_gpu") is True
+        assert status.cleanup_confirmed_remote.get("on_last_gpu") is False
 
 
 def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
@@ -4751,7 +4658,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
 
         gpus_seen: list[str] = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             gpus_seen.append(spec.gpu.type)
             if on_handle:
                 on_handle(
@@ -4767,7 +4674,7 @@ def test_supervisor_allocation_failure_does_not_skip_cheapest(monkeypatch):
                 )
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4816,11 +4723,11 @@ def test_selected_provider_never_refreshes_the_accepted_cost_quote(monkeypatch):
         monkeypatch.setattr("flash.cost.spec.estimate_for_spec", fixed_estimate)
         submitted = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_kwargs):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_kwargs):
             submitted.append((spec.gpu.type, attempt))
             return jobs.PollResult(True, metrics={"cost_usd": 0.1, "trained_eval_acc": 0.9})
 
-        monkeypatch.setattr(job_execution, "submit_run", fake_submit)
+        monkeypatch.setattr(job_execution, "submit_attempt", fake_submit)
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         spec = JobSpec(
@@ -4861,6 +4768,7 @@ def test_attach_costs_recovered_run_with_walked_gpu(monkeypatch):
                 "allocated_gpu": "RTX 5090",
                 "on_last_gpu": True,
                 "attempt": 2,
+                "launch_claim_token": "claim-2",
                 "started_ts": 1.0,
             },
         )
@@ -4997,6 +4905,7 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
                     "key_fingerprint": _RUNPOD_FINGERPRINT,
                     "job_id": "job-1",
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                 },
                 deployment={
@@ -5063,6 +4972,7 @@ def test_cancel_uses_rest_handle(monkeypatch):
                 "key_fingerprint": _RUNPOD_FINGERPRINT,
                 "job_id": "jX",
                 "attempt": 0,
+                "launch_claim_token": "claim-0",
                 "started_ts": 1.0,
             },
         )
@@ -5108,7 +5018,11 @@ def test_attach_completes_run(monkeypatch):
                 "job_id": "jA",
                 "on_last_gpu": False,
                 "attempt": 0,
+                "launch_claim_token": "claim-0",
                 "started_ts": 1.0,
+                "allocated_gpu": "RTX 4090",
+                "allocated_gpu_count": 1,
+                "allocated_usable_vram_gb": 24.0,
             },
         )
         runner_state._save_status(status)
@@ -5146,6 +5060,7 @@ def test_attach_cleanup_survives_unreadable_final_status(monkeypatch):
                     "key_fingerprint": _RUNPOD_FINGERPRINT,
                     "job_id": "j-finally",
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                 },
             )
@@ -5202,6 +5117,7 @@ def test_attach_confirmed_cancel_survives_unreadable_cleanup_status(monkeypatch)
                     "key_fingerprint": _RUNPOD_FINGERPRINT,
                     "job_id": "j-cancel",
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                 },
             )
@@ -5257,7 +5173,11 @@ def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monk
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "j-stale",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
+            "allocated_gpu": "RTX 4090",
+            "allocated_gpu_count": 1,
+            "allocated_usable_vram_gb": 24.0,
         }
         live_remote = {
             "provider": "runpod",
@@ -5274,7 +5194,7 @@ def test_attach_duplicate_supervisor_unreadable_status_preserves_live_owner(monk
             remote=stale_remote,
         )
         status.source_snapshot = _SOURCE_SNAPSHOT
-        runner_state._save_status(status)
+        runner_state._save_status(status, _next_attempt=1)
         monkeypatch.setattr(
             polling,
             "poll_job",
@@ -5341,6 +5261,7 @@ def test_attach_unparseable_spec_fails_closed_and_tears_down(monkeypatch):
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "jBad",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
         }
         from dataclasses import replace
@@ -5402,11 +5323,15 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
                 "job_id": "jA",
                 "on_last_gpu": False,
                 "attempt": 0,
+                "launch_claim_token": "claim-0",
                 "started_ts": 1.0,
+                "allocated_gpu": "RTX 4090",
+                "allocated_gpu_count": 1,
+                "allocated_usable_vram_gb": 24.0,
             },
         )
         status.source_snapshot = _SOURCE_SNAPSHOT
-        runner_state._save_status(status)
+        runner_state._save_status(status, _next_attempt=1)
         # Poll reports a dead/abandoned job (the common redeploy-window outcome).
         monkeypatch.setattr(
             polling,
@@ -5423,8 +5348,9 @@ def test_attach_resumes_from_checkpoint_on_poll_failure(monkeypatch):
             prior_cost,
             runtime_secrets=None,
             source_snapshot=None,
-            attempt_start,
+            reserved_claim=None,
         ):
+            assert reserved_claim is not None
             seen["remote"] = runner_status.get_status(spec.run_id).remote
             seen["source_snapshot"] = source_snapshot
             runner_status._update(spec.run_id, "done", cost_usd=prior_cost)
@@ -5462,9 +5388,14 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
                     "job_id": "jA",
                     "on_last_gpu": True,
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
+                    "allocated_gpu": "RTX 4090",
+                    "allocated_gpu_count": 1,
+                    "allocated_usable_vram_gb": 24.0,
                 },
-            )
+            ),
+            _next_attempt=1,
         )
         monkeypatch.setattr(
             polling,
@@ -5484,7 +5415,6 @@ def test_attach_one_shot_failure_does_not_submit_attempt_one(monkeypatch):
         assert training_calls == []
         assert status.remote is None
         assert status.cleanup_confirmed_remote["endpoint_id"] == "epA"
-        assert status.realized_cost_remote["endpoint_id"] == "epA"
 
 
 def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
@@ -5506,11 +5436,15 @@ def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
                 "job_id": "jA",
                 "on_last_gpu": False,
                 "attempt": 0,
+                "launch_claim_token": "claim-0",
                 "started_ts": 1.0,
+                "allocated_gpu": "RTX 4090",
+                "allocated_gpu_count": 1,
+                "allocated_usable_vram_gb": 24.0,
             },
         )
         status.source_snapshot = _SOURCE_SNAPSHOT
-        runner_state._save_status(status)
+        runner_state._save_status(status, _next_attempt=1)
         monkeypatch.setattr(
             polling,
             "poll_job",
@@ -5526,11 +5460,11 @@ def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
             prior_cost,
             runtime_secrets=None,
             source_snapshot=None,
-            attempt_start,
+            reserved_claim=None,
         ):
+            assert reserved_claim is not None
             seen["prior_cost"] = prior_cost
             seen["source_snapshot"] = source_snapshot
-            seen["attempt_start"] = attempt_start
             runner_status._update(spec.run_id, "done", cost_usd=prior_cost)
 
         monkeypatch.setattr(runner_lifecycle, "_run_training", fake_training)
@@ -5541,96 +5475,52 @@ def test_attach_resume_reuses_persisted_source_snapshot(monkeypatch):
         assert seen == {
             "prior_cost": 0.25,
             "source_snapshot": _SOURCE_SNAPSHOT,
-            "attempt_start": 1,
         }
 
 
-def test_attach_resume_that_fails_again_marks_run_failed(monkeypatch):
-    # The resume delegates the genuine-vs-infra decision to the training submit (unchanged): a run
-    # that is truly broken reproduces the failure on the resumed attempt, _run_training fails it, and
-    # attach surfaces that terminal `failed` — so a broken run still terminates (nothing hangs).
+def test_attach_worker_error_fails_without_replacement(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         _confirm_runpod_retry_teardown(monkeypatch)
         import flash.providers.runpod.execution.jobs as jobs
-        import flash.providers.runpod.serverless.endpoints as flash_train
 
-        status = provisioned_status(
-            _spec("g1"),
-            state="running",
-            remote={
-                "provider": "runpod",
-                "endpoint_id": "epA",
-                "endpoint_name": "n",
-                "key_fingerprint": _RUNPOD_FINGERPRINT,
-                "job_id": "jA",
-                "on_last_gpu": False,
-                "attempt": 0,
-                "started_ts": 1.0,
-            },
-        )
+        remote = {
+            "provider": "runpod",
+            "endpoint_id": "epA",
+            "endpoint_name": "n",
+            "key_fingerprint": _RUNPOD_FINGERPRINT,
+            "job_id": "jA",
+            "on_last_gpu": False,
+            "attempt": 0,
+            "launch_claim_token": "claim-0",
+            "started_ts": 1.0,
+            "allocated_gpu": "RTX 4090",
+            "allocated_gpu_count": 1,
+            "allocated_usable_vram_gb": 24.0,
+        }
+        status = provisioned_status(_spec("g1"), state="running", remote=remote)
         status.source_snapshot = _SOURCE_SNAPSHOT
-        runner_state._save_status(status)
+        runner_state._save_status(status, _next_attempt=1)
         monkeypatch.setattr(
             polling,
             "poll_job",
             lambda *a, **k: jobs.PollResult(
-                False, failure="worker_error", detail="Traceback ...\nRuntimeError: bad reward fn"
+                False, failure="worker_error", detail="RuntimeError: bad reward fn"
             ),
         )
-        monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
         monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
-        resumed = {"called": False}
-        replacement_remote = {
-            "provider": "runpod",
-            "endpoint_id": "epB",
-            "endpoint_name": "replacement",
-            "key_fingerprint": _RUNPOD_FINGERPRINT,
-            "job_id": "jB",
-            "on_last_gpu": False,
-            "attempt": 1,
-            "started_ts": 2.0,
-        }
-
-        def fake_training(
-            spec,
-            log,
-            *,
-            prior_cost,
-            runtime_secrets=None,
-            source_snapshot=None,
-            attempt_start,
-        ):
-            assert source_snapshot == _SOURCE_SNAPSHOT
-            # the training submit re-runs the run; a genuinely broken run fails there (matches
-            # _submit_seed_supervised raising after a non-infra failure with no retries left).
-            resumed["called"] = True
-            resumed["attempt_start"] = attempt_start
-            runner_status._update(spec.run_id, "running", remote=replacement_remote)
-            raise RuntimeError("run failed after retries: worker_error: bad reward fn")
-
-        monkeypatch.setattr(runner_lifecycle, "_run_training", fake_training)
-
-        st = runner_attach.attach_run("g1", log_stream=sys.stderr)
-
-        assert resumed["called"] is True, (
-            "attach must attempt a checkpoint resume on any non-ok poll"
+        monkeypatch.setattr(
+            runner_lifecycle,
+            "_run_training",
+            lambda *_a, **_k: pytest.fail("worker error must not allocate a replacement"),
         )
-        assert st.state == "failed", "a resume that fails again must terminate the run"
-        assert st.remote == replacement_remote
-        assert "bad reward fn" in (st.error or "")
-        assert runner_status._load_status_json("g1")[runner_state._CLEANUP_REMOTES_KEY] == [
-            {key: value for key, value in replacement_remote.items() if key != "on_last_gpu"},
-            {
-                "provider": "runpod",
-                "endpoint_id": "epA",
-                "endpoint_name": "n",
-                "key_fingerprint": _RUNPOD_FINGERPRINT,
-                "job_id": "jA",
-                "attempt": 0,
-                "started_ts": 1.0,
-            },
-        ]
+
+        status = runner_attach.attach_run("g1", log_stream=sys.stderr)
+
+        assert status.state == "failed"
+        assert status.remote is None
+        assert status.cleanup_confirmed_remote == remote
+        assert "bad reward fn" in (status.error or "")
 
 
 @pytest.mark.parametrize(
@@ -5656,14 +5546,19 @@ def test_attach_does_not_resume_over_unconfirmed_runpod_teardown(
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "job-old",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
+            "allocated_gpu": "RTX 4090",
+            "allocated_gpu_count": 1,
+            "allocated_usable_vram_gb": 24.0,
         }
         runner_state._save_status(
             provisioned_status(
                 _spec("runpod-unconfirmed"),
                 state="running",
                 remote=remote,
-            )
+            ),
+            _next_attempt=1,
         )
         monkeypatch.setattr(
             polling,
@@ -5731,7 +5626,11 @@ def test_attach_preserves_newer_remote_before_compare_and_clear(monkeypatch):
             "key_fingerprint": _RUNPOD_FINGERPRINT,
             "job_id": "job-old",
             "attempt": 0,
+            "launch_claim_token": "claim-0",
             "started_ts": 1.0,
+            "allocated_gpu": "RTX 4090",
+            "allocated_gpu_count": 1,
+            "allocated_usable_vram_gb": 24.0,
         }
         newer_remote = {
             "provider": "runpod",
@@ -5747,7 +5646,8 @@ def test_attach_preserves_newer_remote_before_compare_and_clear(monkeypatch):
                 _spec("attach-newer-remote"),
                 state="running",
                 remote=old_remote,
-            )
+            ),
+            _next_attempt=1,
         )
         monkeypatch.setattr(
             polling,
@@ -5807,14 +5707,19 @@ def test_attach_does_not_resume_over_unconfirmed_vast_teardown(monkeypatch, rema
                     "gpu": "RTX 4090",
                     "hourly_usd": 0.5,
                     "attempt": 0,
+                    "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
+                    "allocated_gpu": "RTX 4090",
+                    "allocated_gpu_count": 1,
+                    "allocated_usable_vram_gb": 24.0,
                 },
-            )
+            ),
+            _next_attempt=1,
         )
         monkeypatch.setattr(flash_train, "terminate_endpoint", lambda *a, **k: [])
 
         class _RaisingVast:
-            def poll(self, handle, spec, seed, *, log=None, _deadline_at=None):
+            def poll_attempt(self, handle, spec, *, log=None, _deadline_at=None):
                 assert _deadline_at == pytest.approx(
                     runner_status.get_status("v1").created_at + _spec("v1").gpu.max_wall_seconds
                 )
@@ -5878,6 +5783,7 @@ def _vast_recovery_remote(instance_id=101, attempt=0):
         "gpu": "RTX 4090",
         "hourly_usd": 0.5,
         "attempt": attempt,
+        "launch_claim_token": f"claim-{attempt}",
         "started_ts": 100.0,
     }
 
@@ -5985,11 +5891,27 @@ def test_attach_reconciliation_cleans_endpoint_after_background_completion(monke
 def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
+        from dataclasses import replace
+
         import flash.runner.supervise.attach as attach_mod
         from flash.providers.core import registry as providers
+        from flash.runner.supervise.retry_decision import (
+            PersistedRetryDecision,
+            RetryPlan,
+            RetryState,
+        )
 
         remote = _vast_recovery_remote()
         spec = _spec("vast-reconcile-clear")
+        retry_state = replace(
+            RetryState.initial_for_spec(spec),
+            infra_used=1,
+            last_decision=PersistedRetryDecision(
+                0,
+                "stalled",
+                RetryPlan(True, "retrying", infra_retry_ordinal=1),
+            ),
+        )
         runner_state._save_status(
             runner_state.RunStatus(
                 run_id=spec.run_id,
@@ -5997,7 +5919,9 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
                 spec=spec.to_dict(),
                 remote=remote,
                 source_snapshot=_SOURCE_SNAPSHOT,
-            )
+            ),
+            _next_attempt=1,
+            _retry_state=retry_state.to_snapshot(),
         )
 
         class Provider:
@@ -6010,11 +5934,13 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
         monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
         monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
         resumed = []
-        monkeypatch.setattr(
-            runner_lifecycle,
-            "_run_training",
-            lambda *args, **kwargs: resumed.append(kwargs["attempt_start"]),
-        )
+
+        def resume_training(*_args, **kwargs):
+            assert kwargs["reserved_claim"].attempt == 1
+            resumed.append(1)
+            runner_status._update(spec.run_id, "running")
+
+        monkeypatch.setattr(runner_lifecycle, "_run_training", resume_training)
 
         attach_mod._reconcile_attached_remote(
             spec.run_id,
@@ -6078,7 +6004,7 @@ def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
         assert status.state == "failed"
         assert status.remote == remote
         assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
-            remote
+            {key: value for key, value in remote.items() if key != "launch_claim_token"}
         ]
 
 
@@ -6123,7 +6049,7 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
         assert status.remote == remote
         assert status.error is None
         assert runner_status._load_status_json(spec.run_id)[runner_state._CLEANUP_REMOTES_KEY] == [
-            remote
+            {key: value for key, value in remote.items() if key != "launch_claim_token"}
         ]
 
 
@@ -7250,29 +7176,14 @@ def _poll_in_queue_forever(monkeypatch, **poll_kwargs):
     )
 
 
-def test_capacity_detail_does_not_promise_a_next_best_gpu_on_the_last_class(monkeypatch):
-    """LS-008/AT-013: do not promise a next-best GPU on the last class.
+def test_capacity_detail_contains_no_retry_policy(monkeypatch):
+    """The provider reports capacity evidence while the supervisor owns retry policy."""
+    result = _poll_in_queue_forever(monkeypatch)
 
-    ``on_last_gpu`` does not identify a reused class; only the supervisor owns that candidate list.
-    """
-    res = _poll_in_queue_forever(monkeypatch, on_last_gpu=True)
-    assert res.failure == "no_capacity"
-    assert "next-best" not in res.detail, res.detail
-    assert "no further GPU-class escalation follows" in res.detail, res.detail
-    assert "same class" not in res.detail, res.detail
-
-
-def test_capacity_detail_claims_neither_a_retry_nor_class_exhaustion(monkeypatch):
-    """Claim neither retry nor class exhaustion from ``on_last_gpu``.
-
-    It can mean no untried class remains or the retry budget is spent; only the supervisor knows.
-    """
-    res = _poll_in_queue_forever(monkeypatch, on_last_gpu=True)
-    assert res.failure == "no_capacity"
-    # not a retry promise: this detail is also emitted on the attempt that ends the run.
-    assert "retrying" not in res.detail, res.detail
-    # not a class-exhaustion claim: untried classes can remain when the budget is what ran out.
-    assert "untried" not in res.detail, res.detail
+    assert result.failure == "no_capacity"
+    assert "next-best" not in result.detail
+    assert "retrying" not in result.detail
+    assert "GPU-class escalation" not in result.detail
 
 
 def test_reattach_keeps_the_stall_grace_but_not_the_capacity_wording(monkeypatch):
@@ -7310,7 +7221,7 @@ def test_reattach_keeps_the_stall_grace_but_not_the_capacity_wording(monkeypatch
         "attempt": 2,
     }
 
-    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": True}), spec, spec.seed)
+    PROVIDER.poll_attempt(JobHandle.from_dict({**base, "on_last_gpu": True}), spec)
     # the capacity wording is left at poll_job's neutral default: escalation may follow, because
     # after recovery it genuinely can.
     assert "on_last_gpu" not in captured, captured
@@ -7319,19 +7230,6 @@ def test_reattach_keeps_the_stall_grace_but_not_the_capacity_wording(monkeypatch
     assert captured["throttled_grace_s"] == 900.0, captured
 
     captured.clear()
-    PROVIDER.poll(JobHandle.from_dict({**base, "on_last_gpu": False}), spec, spec.seed)
+    PROVIDER.poll_attempt(JobHandle.from_dict({**base, "on_last_gpu": False}), spec)
     assert "on_last_gpu" not in captured, captured
     assert captured["queue_grace_s"] == 300.0, captured
-
-
-def test_capacity_detail_promises_no_retry_when_a_next_class_exists(monkeypatch):
-    """Keep the default capacity detail neutral about retries and class walks.
-
-    A cache-drop retry may reselect the same class; see
-    ``test_cache_drop_retry_names_the_same_class_it_reselects``.
-    """
-    res = _poll_in_queue_forever(monkeypatch)
-    assert res.failure == "no_capacity"
-    assert "GPU-class escalation may follow" in res.detail, res.detail
-    assert "retrying" not in res.detail, res.detail
-    assert "next-best" not in res.detail, res.detail

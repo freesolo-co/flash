@@ -19,6 +19,7 @@ from flash.serving.src.http.adapter_routes import remove_adapter
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
+from flash.serving.src.http.router import build_serving_app as _metered_app
 from flash.serving.src.io.schemas import AdapterRecord
 from tests.serving.checkpoint_fixtures import (
     checkpoint_payload,
@@ -28,7 +29,7 @@ from tests.serving.checkpoint_fixtures import (
 from tests.serving.conftest import attest
 
 
-async def _allow(_token: str, _adapter_id: str) -> str:
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
     """Permissive attributed authorizer for routing tests."""
     return "org-1"
 
@@ -232,6 +233,80 @@ def test_healthz_reports_configured_deployment_identity() -> None:
     assert body["deployment_id"] == "456-2"
 
 
+class _UnhealthyUsageStore:
+    """A store whose delivery worker has stopped, so nothing new can be settled."""
+
+    enabled = True
+
+    def assert_healthy(self) -> None:
+        raise RuntimeError("usage_outbox_worker_stopped")
+
+    async def start(self) -> None:
+        return None
+
+    async def capture(self, event) -> None:
+        del event
+
+    async def finalize(self, event) -> None:
+        del event
+
+    async def fail(self, event, code: str) -> None:
+        del event, code
+
+    def relinquish(self, request_id: str) -> None:
+        del request_id
+
+    async def snapshot(self):
+        raise RuntimeError("usage_outbox_worker_stopped")
+
+    async def recover_stale_in_progress(self) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _metered_client(pool, router, store) -> TestClient:
+    return TestClient(
+        _metered_app(pool, router, usage_store=store, chat_authorizer=_allow),
+        headers={"Authorization": "Bearer t", "X-Freesolo-Org-Id": "org-1"},
+    )
+
+
+def test_healthz_fails_when_accounting_cannot_settle() -> None:
+    client = _metered_client(FakePool(), AdapterRouter([]), _UnhealthyUsageStore())
+
+    response = client.get("/healthz")
+
+    # a replica that cannot settle usage must leave rotation instead of taking chargeable traffic.
+    assert response.status_code == 503
+    body = response.json()
+    assert body["ok"] is False
+    assert body["accounting_ok"] is False
+
+
+def test_healthz_reports_accounting_ok_when_settlement_is_live() -> None:
+    client = _serve(FakePool(), AdapterRouter([]))
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json()["accounting_ok"] is True
+
+
+def test_generate_fails_closed_when_accounting_cannot_settle() -> None:
+    # a non-thinking adapter, so the thinking-settlement guard cannot mask the accounting gate.
+    router = AdapterRouter([checkpoint_record("qa", QWEN)])
+    pool = FakePool()
+    client = _metered_client(pool, router, _UnhealthyUsageStore())
+
+    response = client.post("/generate", json={"adapter_id": "qa/final", "prompt": "hi"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "durable serving accounting unavailable"}
+    assert pool.generated == []
+
+
 def test_healthz_reports_unsupported_hydrated_base_models_without_routing_them():
     legacy = checkpoint_record("legacy", "unsupported/model", thinking=True)
     router = AdapterRouter([legacy])
@@ -386,6 +461,40 @@ def test_thinking_logprobs_policy_runs_after_adapter_resolution(app_setup):
     assert "thinking-enabled" in response.json()["detail"]
     assert resolved == [_revision_id("qa")]
     assert pool.generated == []
+
+
+def test_tool_choice_none_is_inactive_on_unqualified_thinking_route() -> None:
+    record = _rec("unqualified", QWEN_35B)
+    pool = FakePool()
+    client = _serve(pool, AdapterRouter([record]))
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": _revision_id("unqualified"),
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+            "tool_choice": "none",
+            "parallel_tool_calls": True,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert pool.generated == [(QWEN_35B, _revision_id("unqualified"))]
 
 
 def test_base_model_false_thinking_override_allows_logprobs() -> None:
@@ -695,7 +804,18 @@ def test_raw_generate_responses_exclude_internal_fields(app_setup, path, payload
 
 
 @pytest.mark.parametrize(
-    "field", ["n", "seed", "frequency_penalty", "presence_penalty", "logprobs", "top_logprobs"]
+    "field",
+    [
+        "n",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+        "logprobs",
+        "top_logprobs",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+    ],
 )
 @pytest.mark.parametrize(
     ("path", "payload"),
@@ -894,7 +1014,7 @@ def test_openai_chat_stream_sets_anti_buffering_headers(app_setup):
 def test_openai_chat_rejects_non_boolean_stream_after_authorization(stream):
     authorizations: list[str] = []
 
-    async def _authorize(_token: str, adapter_id: str) -> str:
+    async def _authorize(_token: str, adapter_id: str, _scope: dict | None = None) -> str:
         authorizations.append(adapter_id)
         return "org-1"
 
@@ -1168,6 +1288,10 @@ class _MeteringPool(FakePool):
                 "completion_tokens": 3,
                 "cached_tokens_reported": False,
                 "inference_time_seconds": 0.25,
+                "queue_wait_seconds": 0.025,
+                "replica_in_flight_requests_at_admission": 2,
+                "replica_boot_duration_seconds": 30.0,
+                "replica_freshly_booted": True,
                 "engine_replica_id": "replica-7",
                 "checkpoint": checkpoint,
             },
@@ -1199,6 +1323,10 @@ def test_generate_response_strips_internal_cache_attribution():
 
     assert "cached_tokens_reported" not in body
     assert "engine_replica_id" not in body
+    assert "queue_wait_seconds" not in body
+    assert "replica_in_flight_requests_at_admission" not in body
+    assert "replica_boot_duration_seconds" not in body
+    assert "replica_freshly_booted" not in body
 
 
 class _CachedMeteringPool(FakePool):

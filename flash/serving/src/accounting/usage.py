@@ -24,25 +24,33 @@ from flash.serving.src.accounting.usage_outbox import (
 from flash.serving.src.io.schemas import AdapterRecord
 
 FREESOLO_PRICING_SOURCE = "freesolo_backend_catalog"
-FREESOLO_PRICING_VERSION = "2026-08-24.1"
+FREESOLO_PRICING_VERSION = "2026-08-27.1"
+# (prompt, completion, cached prompt) usd per million tokens, one entry per active hosted model.
+# these are the charged customer rates, set 5% below the lowest healthy comparable openrouter fp8
+# listing for each model and token category. they are NOT cost-plus: no markup is applied, and they
+# currently sit below the recorded cost basis, so do not reintroduce a multiplier here until measured
+# b200 economics establish a lower truthful cost basis.
 _FREESOLO_USD_PER_MTOK: dict[str, tuple[str, str, str]] = {
-    "Qwen/Qwen3.5-0.8B": ("0.01", "0.05", "0.002"),
-    "Qwen/Qwen3.5-2B": ("0.02", "0.10", "0.004"),
-    "Qwen/Qwen3.5-4B": ("0.03", "0.15", "0.006"),
-    "Qwen/Qwen3.5-9B": ("0.114", "0.19", "0.023"),
-    "Qwen/Qwen3.6-27B": ("0.4254", "3.055", "0.14"),
-    "Qwen/Qwen3.6-35B-A3B": ("0.198", "1.265", "0.066"),
+    "Qwen/Qwen3.5-9B": ("0.095", "0.1425", "0.0276"),
+    "Qwen/Qwen3.8-27B": ("0.3325", "2.4225", "0.03325"),
+    "Qwen/Qwen3.6-35B-A3B": ("0.095", "0.9025", "0.0475"),
 }
-_FREESOLO_MARKUP = Decimal("1.2")
 _USD_PER_MTOK_DIVISOR = Decimal("1000000")
 
 
 @dataclass(frozen=True)
 class AuthorizedTraffic:
     principal: ServingTrafficPrincipal
-    openrouter_request_id: str | None = None
-    openrouter_generation_id: str | None = None
-    upstream_id: str | None = None
+
+
+@dataclass(frozen=True)
+class TrustedInternalAuthorization:
+    """A trusted server-to-server caller that has not yet been attributed to an organization."""
+
+    org_id: str | None = None
+
+
+InferenceAuthorization = AuthorizedTraffic | TrustedInternalAuthorization
 
 
 @dataclass(frozen=True)
@@ -103,7 +111,6 @@ def new_request_identity(
     request: Request,
     *,
     openai_completion_id: str | None = None,
-    traffic: AuthorizedTraffic | None = None,
 ) -> RequestIdentity:
     request_id = new_generation_id()
     supplied_correlation = _bounded_header(request, "X-Correlation-ID")
@@ -112,9 +119,6 @@ def new_request_identity(
         request_id=request_id,
         correlation_id=correlation_id,
         openai_completion_id=openai_completion_id,
-        openrouter_request_id=traffic.openrouter_request_id if traffic else None,
-        openrouter_generation_id=traffic.openrouter_generation_id if traffic else None,
-        upstream_id=traffic.upstream_id if traffic else None,
     )
 
 
@@ -130,29 +134,13 @@ def build_usage_session(
     serving_release: str,
     captured_at: datetime,
 ) -> UsageSession:
-    public_model_id = (
-        principal.publicModelId if principal.kind == "openrouter" else requested.adapter_id
-    )
     immutable_target = ImmutableTarget(
-        public_model_id=public_model_id,
+        public_model_id=requested.adapter_id,
         base_model=target.base_model,
         checkpoint_id=target.adapter_id if target.is_checkpoint else None,
         artifact_fingerprint=target.artifact_fingerprint,
     )
-    price = (
-        CapturedPrice(
-            source="openrouter_admission",
-            version=principal.providerCatalogDigest,
-            snapshot=principal.acceptedPriceSnapshot.model_dump(mode="json"),
-        )
-        if principal.kind == "openrouter"
-        else freesolo_price(target.base_model)
-    )
-    if principal.kind == "trusted_internal" and target.org_id is not None:
-        principal = TrustedInternalTrafficPrincipal(
-            orgId=target.org_id,
-            billingAttributionExplicit=True,
-        )
+    price = freesolo_price(target.base_model)
     return UsageSession(
         store=store,
         identity=identity,
@@ -173,7 +161,7 @@ def freesolo_price(base_model: str) -> CapturedPrice:
         raise ValueError(f"no durable serving price for base model {base_model!r}") from exc
 
     def per_token(rate: str) -> str:
-        return format(Decimal(rate) * _FREESOLO_MARKUP / _USD_PER_MTOK_DIVISOR, "f")
+        return format(Decimal(rate) / _USD_PER_MTOK_DIVISOR, "f")
 
     return CapturedPrice(
         source=FREESOLO_PRICING_SOURCE,
@@ -190,11 +178,8 @@ def principal_for_external_org(org_id: str) -> FreesoloOrgTrafficPrincipal:
     return FreesoloOrgTrafficPrincipal(orgId=org_id)
 
 
-def principal_for_trusted_internal(org_id: str | None = None) -> TrustedInternalTrafficPrincipal:
-    return TrustedInternalTrafficPrincipal(
-        orgId=org_id,
-        billingAttributionExplicit=org_id is not None,
-    )
+def principal_for_trusted_internal(org_id: str) -> TrustedInternalTrafficPrincipal:
+    return TrustedInternalTrafficPrincipal(orgId=org_id)
 
 
 def captured_now() -> datetime:

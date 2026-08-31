@@ -16,6 +16,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
 from flash.serving.src.accounting.usage_outbox import OfflineUsageStore, UsageStore
@@ -56,7 +57,7 @@ def build_serving_app(
     lookup_record: Callable[[str, str], AdapterRecord | None] | None = None,
     reload_interval_seconds: float = 30.0,
     usage_store: UsageStore,
-    chat_authorizer: Callable[[str, str], Awaitable["str | None"]] | None = None,
+    chat_authorizer: Callable[[str, str, dict[str, str]], Awaitable["str | None"]] | None = None,
 ):
     """Front-door FastAPI app. ``reload_records`` re-reads persisted ready adapters so a router
     that missed a (un)registration on another container still resolves it: reload once on a miss
@@ -104,13 +105,22 @@ def build_serving_app(
     api.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_CHAT_REQUEST_BYTES)
 
     @api.get("/healthz", tags=["system"])
-    async def healthz() -> dict[str, Any]:
-        return health_body(
+    async def healthz() -> Any:
+        body = health_body(
             router,
             deployment_sha=deployment_sha,
             deployment_id=deployment_id,
             capabilities=list(_CAPABILITIES),
         )
+        # a replica that cannot settle usage must not stay in rotation taking chargeable traffic.
+        try:
+            usage_store.assert_healthy()
+        except Exception:
+            body["ok"] = False
+            body["accounting_ok"] = False
+            return JSONResponse(status_code=503, content=body)
+        body["accounting_ok"] = True
+        return body
 
     api.include_router(adapter_router)
     api.include_router(inference_router)

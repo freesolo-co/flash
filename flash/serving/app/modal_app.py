@@ -116,7 +116,6 @@ ROUTER_TIMEOUT_SECONDS = STARTUP_TIMEOUT_SECONDS + TIMEOUT_SECONDS
 # The H200 keeps a LONGER hold than break-even alone would suggest: the 35B's boot is ~1010s of
 # engine init (67 GiB of weights + ~377s torch.compile + graph capture), so a miss is a ~17-minute
 # user-visible stall. Cost and latency point the same way there, and the window stays at 1800s.
-DEFAULT_SCALEDOWN_WINDOW_SECONDS = 1800
 SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     # ~60s cold boot (small FP8 checkpoints, cached compile artifacts on the shared volume).
     "L4": 300,
@@ -127,19 +126,48 @@ SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     # ~1010s cold boot (35B bf16, 67 GiB + ~377s torch.compile). Break-even AND a ~17-min
     # user-visible stall on a miss both argue for keeping the full window here.
     "H200": 1800,
+    # Blackwell. No cold-boot canary has run on either card yet, so both hold the H200's window as a
+    # placeholder: it is the longest we ship, and a too-long hold overpays for idle rather than
+    # cold-cycling a user request. Replace each with its measured boot time when the canary runs.
+    "B200": 1800,
+    "B300": 1800,
 }
+# The tiers this app is allowed to run an engine on. `gpu` in the serving catalog is a plain string,
+# so a typo ("b200", "B2OO") or an unvalidated new card used to fall through `dict.get` to a default
+# window and deploy anyway, at that card's real hourly rate. Membership here is the one gate.
+SUPPORTED_GPUS: frozenset[str] = frozenset(SCALEDOWN_WINDOW_SECONDS_BY_GPU)
 
 
 def scaledown_window_for(gpu: str) -> int:
-    """Idle seconds before ``gpu``'s engine containers scale down (see the table above)."""
-    return SCALEDOWN_WINDOW_SECONDS_BY_GPU.get(gpu, DEFAULT_SCALEDOWN_WINDOW_SECONDS)
+    """Idle seconds before ``gpu``'s engine containers scale down (see the table above).
+
+    Raises ``ValueError`` for a tier this app has no window for, rather than silently applying a
+    default to an unrecognized card.
+    """
+    try:
+        return SCALEDOWN_WINDOW_SECONDS_BY_GPU[gpu]
+    except KeyError:
+        supported = ", ".join(sorted(SUPPORTED_GPUS))
+        raise ValueError(
+            f"Unsupported serving GPU tier {gpu!r}; supported tiers: {supported}. "
+            "Add the tier to SCALEDOWN_WINDOW_SECONDS_BY_GPU with its measured cold-boot window."
+        ) from None
 
 
 # gpu model engines scale to zero. inference and adapter registration remote calls start the matching
 # parameter-bound engine on demand.
 MIN_CONTAINERS = 0
-# no autoscaling cap per base-model engine; modal adds capacity as concurrency demands.
+# No autoscaling cap per base-model engine; modal adds capacity as concurrency demands. A fixed cap
+# here is a hard ceiling on a SINGLE model's capacity: `base_model` is a modal.parameter() and Modal
+# gives each value its own container pool, so sustained load on one model cannot borrow headroom from
+# an idle one. Bound spend with workspace quotas and billing alerts, which do not silently convert
+# demand into queueing on the hot tier.
 MAX_CONTAINERS = None
+# One spare warm container for each autoscaling pool -- every base-model engine AND the cpu router --
+# so a burst past `TARGET_INPUTS` does not pay a full cold boot (420s on L40S, 900s on H100, 1010s on
+# H200) before it can be served. Modal only provisions the buffer while a Function is ACTIVE, so this
+# does not defeat `MIN_CONTAINERS = 0`: idle engines still scale to zero and bill nothing.
+BUFFER_CONTAINERS = 1
 # Concurrent requests packed onto one base-model GPU before Modal autoscales a new (costly) one.
 # A real-GPU sweep (scripts/gpu_canary.py::sweep_concurrency on A10G/Qwen2.5-1.5B) showed vLLM
 # throughput scaling near-linearly with no saturation through 128 concurrent, while TTFT stayed
@@ -308,17 +336,22 @@ from flash.serving.src.engine.model_config import (  # noqa: E402
 
 
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
-    """(max_inputs, target_inputs) sized to the model's REAL vLLM concurrency (``max_num_seqs``).
+    """return Modal input admission aligned with the engine's sequence capacity.
 
-    Modal's ``max_inputs`` is how many requests it packs onto ONE container before it must add
-    another. If it far exceeds the engine's ``max_num_seqs`` (e.g. the global 64 on the 35B, which
-    decodes only 8 at a time), Modal piles requests 9..64 INSIDE the container instead of autoscaling
-    — high latency and no scale-out until ~target_inputs are packed. So cap ``max_inputs`` near the
-    engine's capacity with a small boot buffer (2x, so a cold-booting replacement doesn't reject
-    bursts), bounded by the global ``MAX_INPUTS``; scale out at 3/4 of that. Models that leave
-    ``max_num_seqs`` at the vLLM default keep the global sizing."""
-    seqs = int(engine_overrides_for(base_model).get("max_num_seqs", MAX_INPUTS))
-    max_inputs = max(8, min(MAX_INPUTS, seqs * 2))
+    Modal counts requests while vLLM schedules sequences. The prior 2x buffer admitted 16 requests
+    onto every current 8-sequence engine, so normal ``n=1`` traffic queued half of them inside the
+    container and delayed scale-out until 12 inputs. OpenAI ``n`` can fan one input out to as many as
+    four sequences, but sizing every container for that rare worst case would leave normal traffic
+    underutilizing the GPU and cold-boot expensive replicas prematurely. Cap request admission at the
+    authored sequence capacity instead: current tiers admit 8 and scale out at 6. This deliberately
+    changes Modal's request knobs, not ``max_num_seqs``: raising the engine cap is not allocation-free,
+    and the 35B tier has a documented startup profiling OOM at higher sequence counts. Models without
+    an authored sequence cap retain the global sizing until their real capacity is explicit.
+    """
+    configured = engine_overrides_for(base_model).get("max_num_seqs")
+    if configured is None:
+        return MAX_INPUTS, TARGET_INPUTS
+    max_inputs = max(1, min(MAX_INPUTS, int(configured)))
     target_inputs = max(1, max_inputs * 3 // 4)
     return max_inputs, target_inputs
 
@@ -430,6 +463,7 @@ def _build_engine(
         timeout=TIMEOUT_SECONDS,
         min_containers=MIN_CONTAINERS,
         max_containers=MAX_CONTAINERS,
+        buffer_containers=BUFFER_CONTAINERS,
     )(modal.concurrent(max_inputs=max_inputs, target_inputs=target_inputs)(_Engine))
     # Rebind the module name to the decorated handle, matching the normal ``@app.cls class X`` pattern
     # where the module attribute ends up referring to the decorated class.
@@ -558,6 +592,66 @@ _AUTH_CACHE_TTL_SECONDS = 60.0
 _AUTH_CACHE_MAX_ENTRIES = 4096
 
 
+def _authorize_response_org(resp: Any) -> "str | None":
+    """Translate the backend's authorize response into a billing org, or raise.
+
+    Extracted from _build_chat_authorizer only to keep that closure under the repo's
+    function-size limit; it reads nothing but the response, so hoisting it changes no
+    behaviour and makes each status mapping testable on its own.
+    """
+    from fastapi import HTTPException, status
+
+    if resp.status_code == 200:
+        # Return the authorized billing org so the router can meter a base-model serve to the
+        # caller (a base model has no adapter owner). A malformed response cannot authorize an
+        # external request because that would let base-model usage escape billing.
+        try:
+            org_id = resp.json().get("orgId")
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "serving auth backend returned malformed response",
+            ) from exc
+        if not isinstance(org_id, str) or not org_id:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "serving auth backend returned malformed response",
+            )
+        return org_id
+    if resp.status_code == 401:
+        # The backend returns 401 for BOTH an invalid *user* key (our authorize route, body
+        # code "invalid_api_key") AND a rejected serving *machine* bearer (require_internal_token,
+        # decided before the user key is even read). Only the former is the caller's fault; the
+        # latter is a serving misconfiguration we must not report as the user's bad key.
+        code = ""
+        try:
+            detail = resp.json().get("detail")
+            if isinstance(detail, dict):
+                code = detail.get("code") or ""
+        except Exception:  # a non-JSON 401 is an internal-auth failure (below)
+            code = ""
+        if code == "invalid_api_key":
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid Freesolo API key")
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth is misconfigured")
+    # Org has no budget to serve (zero balance and no card+auto-topup). The backend gates this
+    # before generation so a broke org can't serve for free; surface it as a clean 402 rather
+    # than letting it fall through to the retryable 503 below.
+    if resp.status_code == 402:
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED,
+            "insufficient balance: top up or enable auto-topup to serve this model",
+        )
+    # Unknown adapter (404) and org mismatch (403) both collapse to 403 so we don't leak
+    # which adapters exist to an unauthorized caller.
+    if resp.status_code in (403, 404):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "API key is not authorized for this adapter")
+    # Any backend 5xx (500/502/503/504) or other unexpected status is a transient auth-lookup
+    # infra failure (Supabase down, backend overloaded). Surface it as a RETRYABLE 503, never a
+    # 502: a client/load-balancer must be free to retry rather than treat it as a permanent
+    # upstream error. The cache+single-flight above is what makes this failure rare under load.
+    raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unavailable")
+
+
 def _build_chat_authorizer(settings: Any) -> Any:
     """Build the serving->backend chat authorizer, or None when not configured.
 
@@ -591,70 +685,30 @@ def _build_chat_authorizer(settings: Any) -> Any:
 
     # (api_key_sha256, adapter_id) -> (expires_at_monotonic, org_id); populated only on a successful
     # authorization. Per-router-container in-memory (each container reduces its own backend load).
-    _cache: dict[tuple[str, str], tuple[float, str | None]] = {}
+    _cache: dict[tuple[str, str, str], tuple[float, str | None]] = {}
     # In-flight single-flight tasks so concurrent identical misses share ONE backend call.
-    _inflight: dict[tuple[str, str], asyncio.Task[str | None]] = {}
+    _inflight: dict[tuple[str, str, str], asyncio.Task[str | None]] = {}
 
-    async def _authorize_backend(api_key: str, adapter_id: str) -> "str | None":
+    async def _authorize_backend(
+        api_key: str, adapter_id: str, scope: "dict[str, str]"
+    ) -> "str | None":
         try:
-            resp = await _client.post(url, json={"apiKey": api_key, "modelId": adapter_id})
+            resp = await _client.post(
+                url,
+                json={"apiKey": api_key, "modelId": adapter_id},
+                # A training container authenticates with the platform internal key rather
+                # than a customer key, so the backend cannot resolve it via
+                # authenticate_api_key. It identifies the calling job from these headers and
+                # re-checks them against the live job row. Dropping them here is
+                # indistinguishable, to the backend, from a request that never had them: it
+                # refuses with missing_training_context and catalog sampling fails closed.
+                headers=scope or None,
+            )
         except Exception as exc:  # backend unreachable -> fail closed, never serve unauthorized
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unreachable"
             ) from exc
-        if resp.status_code == 200:
-            # Return the authorized billing org so the router can meter a base-model serve to the
-            # caller (a base model has no adapter owner). A malformed response cannot authorize an
-            # external request because that would let base-model usage escape billing.
-            try:
-                org_id = resp.json().get("orgId")
-            except Exception as exc:
-                raise HTTPException(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "serving auth backend returned malformed response",
-                ) from exc
-            if not isinstance(org_id, str) or not org_id:
-                raise HTTPException(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "serving auth backend returned malformed response",
-                )
-            return org_id
-        if resp.status_code == 401:
-            # The backend returns 401 for BOTH an invalid *user* key (our authorize route, body
-            # code "invalid_api_key") AND a rejected serving *machine* bearer (require_internal_token,
-            # decided before the user key is even read). Only the former is the caller's fault; the
-            # latter is a serving misconfiguration we must not report as the user's bad key.
-            code = ""
-            try:
-                detail = resp.json().get("detail")
-                if isinstance(detail, dict):
-                    code = detail.get("code") or ""
-            except Exception:  # a non-JSON 401 is an internal-auth failure (below)
-                code = ""
-            if code == "invalid_api_key":
-                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid Freesolo API key")
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth is misconfigured"
-            )
-        # Org has no budget to serve (zero balance and no card+auto-topup). The backend gates this
-        # before generation so a broke org can't serve for free; surface it as a clean 402 rather
-        # than letting it fall through to the retryable 503 below.
-        if resp.status_code == 402:
-            raise HTTPException(
-                status.HTTP_402_PAYMENT_REQUIRED,
-                "insufficient balance: top up or enable auto-topup to serve this model",
-            )
-        # Unknown adapter (404) and org mismatch (403) both collapse to 403 so we don't leak
-        # which adapters exist to an unauthorized caller.
-        if resp.status_code in (403, 404):
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN, "API key is not authorized for this adapter"
-            )
-        # Any backend 5xx (500/502/503/504) or other unexpected status is a transient auth-lookup
-        # infra failure (Supabase down, backend overloaded). Surface it as a RETRYABLE 503, never a
-        # 502: a client/load-balancer must be free to retry rather than treat it as a permanent
-        # upstream error. The cache+single-flight above is what makes this failure rare under load.
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unavailable")
+        return _authorize_response_org(resp)
 
     def _prune(now: float) -> None:
         for expired in [k for k, (exp, _) in _cache.items() if exp <= now]:
@@ -665,10 +719,10 @@ def _build_chat_authorizer(settings: Any) -> Any:
                 _cache.pop(k, None)
 
     async def _authorize_and_cache(
-        ck: tuple[str, str], api_key: str, adapter_id: str
+        ck: tuple[str, str, str], api_key: str, adapter_id: str, scope: "dict[str, str]"
     ) -> "str | None":
         try:
-            org = await _authorize_backend(api_key, adapter_id)
+            org = await _authorize_backend(api_key, adapter_id, scope)
         finally:
             # Drop the single-flight slot regardless of outcome so a failed lookup re-checks next
             # time (failures are never cached) and a success can be re-driven once the cache expires.
@@ -679,9 +733,19 @@ def _build_chat_authorizer(settings: Any) -> Any:
         _prune(now)
         return org
 
-    async def authorize(api_key: str, adapter_id: str) -> "str | None":
+    async def authorize(
+        api_key: str, adapter_id: str, scope: "dict[str, str] | None" = None
+    ) -> "str | None":
         # do not retain raw user credentials as live dict keys beyond the request that supplied them.
-        ck = (hashlib.sha256(api_key.encode("utf-8")).hexdigest(), adapter_id)
+        scope = scope or {}
+        # The scope is part of the key, not just the payload. Every training container presents
+        # the SAME platform internal key, so keying on (key, model) alone would let one job's
+        # cached authorization answer another job's request -- and the cached value is the
+        # billing org, so the second job's usage would be metered to the first job's tenant.
+        scope_digest = hashlib.sha256(
+            "\x00".join(f"{k}={scope[k]}" for k in sorted(scope)).encode("utf-8")
+        ).hexdigest()
+        ck = (hashlib.sha256(api_key.encode("utf-8")).hexdigest(), adapter_id, scope_digest)
         cached = _cache.get(ck)
         now = time.monotonic()
         if cached is not None:
@@ -690,7 +754,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
             _cache.pop(ck, None)
         task = _inflight.get(ck)
         if task is None:
-            task = asyncio.ensure_future(_authorize_and_cache(ck, api_key, adapter_id))
+            task = asyncio.ensure_future(_authorize_and_cache(ck, api_key, adapter_id, scope))
             # Retrieve the task's outcome even if every awaiter is cancelled (all identical clients
             # disconnect), so an orphaned single-flight failure doesn't warn "exception never retrieved".
             task.add_done_callback(lambda t: t.cancelled() or t.exception())
@@ -729,6 +793,7 @@ def _base_model_records() -> list:
 @app.function(
     secrets=runtime_secrets,
     min_containers=1,  # one warm CPU front door (hardcoded; no deploy-time knob)
+    buffer_containers=BUFFER_CONTAINERS,  # scales out with the engines; see BUFFER_CONTAINERS
     timeout=ROUTER_TIMEOUT_SECONDS,  # must cover engine cold start (see ROUTER_TIMEOUT_SECONDS)
 )
 @modal.concurrent(max_inputs=MAX_INPUTS, target_inputs=TARGET_INPUTS)

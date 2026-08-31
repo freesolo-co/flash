@@ -1,7 +1,7 @@
 """complete immutable serving inputs for customer-owned modal deployments.
 
 ``provision_modal_deployment`` takes a ``DeploymentBundle``, which requires an exact
-``EngineIdentity`` (27 fields), an exact ``ModalPlacement``, and a digest-qualified
+``EngineIdentity`` (26 fields), an exact ``ModalPlacement``, and a digest-qualified
 ``ServingImage``. This module is that producer.
 
 Every value here is immutable serving identity: it feeds ``engine_id``, which is the sha-256 of

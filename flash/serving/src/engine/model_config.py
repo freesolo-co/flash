@@ -3,15 +3,16 @@
 The serving app runs one vLLM GPU engine per base model, each on the Modal GPU class set by its
 catalog ``gpu`` (see below). Adapters and routing key off the logical ``base_model``; the engine
 loads its configured checkpoint at that checkpoint's own dtype. The active dense 9B uses Freesolo
-compressed-tensors FP8. Qwen3.8-27B retains pinned candidate metadata but is excluded from active
-lookups until its exact canary passes. The active 35B-A3B MoE serves base bf16 weights because its
-fused-MoE LoRA path will not compile on FP8, as detailed below.
+compressed-tensors FP8 and the active dense 27B uses the official Qwen FP8 checkpoint. The active
+35B-A3B MoE serves base bf16 weights because its fused-MoE LoRA path will not compile on FP8, as
+detailed below.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from flash.serve.request.tool_calls import qualified_tool_parser
 from flash.serving.src.engine.prequant_config import (
     fp8_serve_model_for as _prequant_serve_model_for,
 )
@@ -27,15 +28,14 @@ from flash.serving.src.engine.prequant_config import (
 # `engine` (optional): per-model vLLM engine-arg overrides (LoRA buffer shape, scheduler/memory caps,
 # language_model_only, …). The engine's LOADED checkpoint is NOT in here — it is resolved centrally by
 # ``serve_model_for`` from ``src.prequant_config`` and injected into the overrides as ``serve_model_id``.
-# active models resolve through prequant_config unless an exact validated override is present. the
-# pending 27b candidate carries its own immutable checkpoint pin without entering active resolution.
+# active models resolve through prequant_config unless an exact validated override is present.
 # ⚠ serve_model_id is pointed only at checkpoints VERIFIED to exist (a missing repo 404-crash-loops
 # the engine — the reason this mechanism was removed once); the owned repos are VL-preserving FP8
 # checkpoints published to the operator HF org.
 #
 # sizing rationale. preallocated lora buffers and loaded checkpoint weights dominate engine vram.
-# the active 9b uses 16 rank-128 slots on l40s and the active 35b moe uses 6 rank-64 slots on h200.
-# the pending 27b candidate retains its proposed h100 shape only for the exact canary.
+# the active 9b uses 16 rank-128 slots on l40s, the active 27b uses 16 rank-64 slots on h100, and the
+# active 35b moe uses 6 rank-64 slots on h200.
 #   - Qwen3.6-35B-A3B (vision-language MoE; arch ``Qwen3_5MoeForConditionalGeneration``) -> H200
 #     (141 GiB) with the base bf16 weights, 6 x 64 LoRA at 32k. bf16 (not FP8) is the one path giving
 #     full-expert LoRA + CUDA graphs because the fused-MoE LoRA path won't compile on fp8e4nv. see the
@@ -108,31 +108,34 @@ SERVING_MODELS: list[dict[str, Any]] = [
             # the complete model and LoRA load is about 108 GiB on the 141 GiB H200.
         },
     },
+    # 27B dense on an H100 (80 GiB). the real-GPU canary measured the load at 44.25 GiB -- above the
+    # FP8 weight size alone, because the vision tower and the non-quantized tensors stay bf16 -- which
+    # still leaves 23.07 GiB of KV cache (350,981 tokens, 10.71x concurrency at 32k) after the 16
+    # rank-64 LoRA buffers and a 0.35 GiB graph capture. every repository here is pinned to an
+    # immutable revision so a served engine cannot silently follow an upstream retag; note the model
+    # pin names a commit in the -FP8 repo while the tokenizer/processor pins name one in the base
+    # repo, which are separate sha namespaces.
+    {
+        "base_model": "Qwen/Qwen3.8-27B",
+        "image_input_limit": 4,
+        "gpu": "H100",
+        "engine": {
+            "model_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+            "tokenizer_model": "Qwen/Qwen3.8-27B",
+            "tokenizer_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+            "processor_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+            "gpu_memory_utilization": 0.90,
+            "max_loras": 16,
+            "max_lora_rank": 64,
+            "max_model_len": 32768,
+            "max_num_seqs": 8,
+            "enforce_eager": False,
+            "reasoning_parser": "qwen3",
+        },
+    },
 ]
 
 _BY_MODEL: dict[str, dict[str, Any]] = {m["base_model"]: m for m in SERVING_MODELS}
-
-# inert descriptor for the exact pending canary. activation means moving this descriptor into
-# SERVING_MODELS, not consulting a second runtime allowlist.
-_QWEN38_HOSTED_CANDIDATE: dict[str, Any] = {
-    "base_model": "Qwen/Qwen3.8-27B",
-    "image_input_limit": 4,
-    "gpu": "H100",
-    "engine": {
-        "serve_model_id": "Qwen/Qwen3.8-27B-FP8",
-        "model_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
-        "tokenizer_model": "Qwen/Qwen3.8-27B",
-        "tokenizer_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
-        "processor_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
-        "gpu_memory_utilization": 0.90,
-        "max_loras": 16,
-        "max_lora_rank": 64,
-        "max_model_len": 32768,
-        "max_num_seqs": 8,
-        "enforce_eager": False,
-        "reasoning_parser": "qwen3",
-    },
-}
 
 
 def base_models() -> list[str]:
@@ -196,6 +199,13 @@ def engine_overrides_for(base_model: str) -> dict[str, Any]:
     if "serve_model_id" not in overrides:
         overrides["serve_model_id"] = serve_model_for(base_model)
     return overrides
+
+
+def tool_parser_for(base_model: str) -> str | None:
+    """return the qualified flash-owned output parser for one exact hosted base."""
+
+    _config_for(base_model)
+    return qualified_tool_parser(base_model)
 
 
 def reasoning_parser_for(base_model: str) -> str | None:

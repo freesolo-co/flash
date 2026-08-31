@@ -7,9 +7,10 @@ import contextlib
 import inspect
 import queue as stdlib_queue
 import time
-from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any, Protocol, TypeVar
 
+from flash.serving.src.stream_channel import _tasks
 from flash.serving.src.stream_channel.protocol import (
     CLEANUP_SECONDS,
     CONTROL_PARTITION,
@@ -27,59 +28,48 @@ from flash.serving.src.stream_channel.protocol import (
 _T = TypeVar("_T")
 
 
+class StreamGenerateOwner(Protocol):
+    """The engine surface `stream_generate_call` drives on the replica."""
+
+    engine: Any
+
+    def _replica_identifier(self) -> str: ...
+
+    def _stream_generate(
+        self,
+        payload_dict: dict[str, Any],
+        record_dict: dict[str, Any] | None = None,
+        expected_checkpoint: str | None = None,
+        generation_id: str | None = None,
+        *,
+        pre_generate_check: Callable[[], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]: ...
+
+
 class _UnsettledGuardedOperation(Exception):
     def __init__(self, cause: BaseException) -> None:
         self.cause = cause
         super().__init__(str(cause))
 
 
-_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
-
-
-def _consume_task_result(task: asyncio.Task[Any]) -> None:
-    with contextlib.suppress(asyncio.CancelledError, Exception):
-        task.exception()
-
-
-def _retain_background_task(task: asyncio.Task[Any]) -> None:
-    _BACKGROUND_TASKS.add(task)
-
-    def finish(completed: asyncio.Task[Any]) -> None:
-        _consume_task_result(completed)
-        _BACKGROUND_TASKS.discard(completed)
-
-    task.add_done_callback(finish)
+# one process-wide retention set, shared with the router side
+_BACKGROUND_TASKS = _tasks.BACKGROUND_TASKS
 
 
 async def _join_task(task: asyncio.Task[Any]) -> None:
-    if not task.done():
-        done, _ = await asyncio.wait({task}, timeout=CLEANUP_SECONDS)
-        if not done:
-            _retain_background_task(task)
-            return
-    _consume_task_result(task)
+    await _tasks.join_task(task, CLEANUP_SECONDS)
 
 
 async def _stop_task(task: asyncio.Task[Any]) -> None:
-    if not task.done():
-        task.cancel()
-    await _join_task(task)
+    await _tasks.stop_task(task, CLEANUP_SECONDS)
 
 
-async def _bounded_operation(
-    operation: Awaitable[_T],
-    timeout_seconds: float,
-) -> _T:
-    task = asyncio.ensure_future(operation)
-    try:
-        done, _ = await asyncio.wait({task}, timeout=timeout_seconds)
-    except asyncio.CancelledError:
-        await _stop_task(task)
-        raise
-    if not done:
-        await _stop_task(task)
-        raise TimeoutError
-    return await task
+async def _bounded_operation(operation: Awaitable[_T], timeout_seconds: float) -> _T:
+    return await _tasks.bounded(operation, timeout_seconds, CLEANUP_SECONDS)
+
+
+async def _finish_cleanup(operation: Awaitable[Any]) -> asyncio.CancelledError | None:
+    return await _tasks.finish_cleanup(operation, CLEANUP_SECONDS)
 
 
 class _LeaseWatch:
@@ -246,7 +236,7 @@ async def _close_stream(stream: Any) -> None:
         await result
 
 
-async def _abort_generation(owner: Any, generation_id: str) -> None:
+async def _abort_generation(owner: StreamGenerateOwner, generation_id: str) -> None:
     result = owner.engine.abort(generation_id)
     if inspect.isawaitable(result):
         await result
@@ -260,29 +250,8 @@ async def _put_data(queue: Any, envelope: DataEnvelope) -> None:
     )
 
 
-async def _finish_cleanup(operation: Awaitable[Any]) -> asyncio.CancelledError | None:
-    task = asyncio.ensure_future(operation)
-    cancellation: asyncio.CancelledError | None = None
-    try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=CLEANUP_SECONDS)
-    except asyncio.CancelledError as exc:
-        cancellation = exc
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=CLEANUP_SECONDS)
-        except (TimeoutError, asyncio.CancelledError):
-            task.cancel()
-        except Exception:
-            pass
-    except TimeoutError:
-        task.cancel()
-    except Exception:
-        pass
-    await _stop_task(task)
-    return cancellation
-
-
 async def stream_generate_call(
-    owner: Any,
+    owner: StreamGenerateOwner,
     payload_dict: dict[str, Any],
     record_dict: dict[str, Any] | None,
     expected_checkpoint: str | None,

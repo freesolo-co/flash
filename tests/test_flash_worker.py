@@ -51,7 +51,7 @@ def test_build_worker_env_does_not_forward_removed_tuning_knobs(monkeypatch):
     for k, v in knobs.items():
         monkeypatch.setenv(k, v)
 
-    env = build_worker_env(_spec(), 0)
+    env = build_worker_env(_spec())
     for k in knobs:
         assert k not in env, f"{k} should not be forwarded to worker"
     # fragmentation-safe allocator default is always set
@@ -64,7 +64,7 @@ def test_build_worker_env_ignores_alloc_conf_override(monkeypatch):
     from flash.providers._lifecycle.net.worker import build_worker_env
 
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:999")
-    env = build_worker_env(_spec(), 0)  # grpo -> sleep-safe non-expandable
+    env = build_worker_env(_spec())  # grpo -> sleep-safe non-expandable
     assert env["PYTORCH_CUDA_ALLOC_CONF"] != "max_split_size_mb:999"
     assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
 
@@ -92,7 +92,6 @@ def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
     )
     env = build_worker_env(
         opd_spec,
-        0,
         runtime_secrets={
             "FLASH_PUBLIC_URL": "https://broker.example",
             "FLASH_TEACHER_CAPABILITY": "capability-test-value",
@@ -101,7 +100,7 @@ def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
     assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
     assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
     # GRPO still ships the sleep-safe non-expandable conf.
-    grpo_env = build_worker_env(_spec(), 0)
+    grpo_env = build_worker_env(_spec())
     assert "expandable_segments" not in grpo_env["PYTORCH_CUDA_ALLOC_CONF"]
 
 
@@ -115,7 +114,7 @@ def test_build_worker_env_does_not_forward_judge_creds(monkeypatch):
 
     for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "FLASH_JUDGE_MODEL"):
         monkeypatch.setenv(key, "control-plane-should-not-forward")
-    env = build_worker_env(_spec(), 0)
+    env = build_worker_env(_spec())
     for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "FLASH_JUDGE_MODEL"):
         assert key not in env
 
@@ -125,7 +124,7 @@ def test_build_worker_env_forwards_github_only_for_private_vcs_pip(monkeypatch):
 
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-secret")
     monkeypatch.setenv("GIT_ASKPASS", "/tmp/operator-askpass")
-    env = build_worker_env(_spec(), 0)
+    env = build_worker_env(_spec())
     assert env["GITHUB_TOKEN"] == "ghp-secret"
     assert "GIT_ASKPASS" not in env
 
@@ -144,7 +143,6 @@ def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monke
     )
     env = build_worker_env(
         opd_spec,
-        0,
         runtime_secrets={
             "FLASH_PUBLIC_URL": "https://broker.example",
             "FLASH_TEACHER_CAPABILITY": "capability-test-value",
@@ -153,7 +151,7 @@ def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monke
     assert env["FLASH_PUBLIC_URL"] == "https://broker.example"
     assert env["FLASH_TEACHER_CAPABILITY"] == "capability-test-value"
     assert "PARASAIL_API_KEY" not in env
-    grpo = build_worker_env(_spec(), 0)
+    grpo = build_worker_env(_spec())
     assert "FLASH_PUBLIC_URL" not in grpo
     assert "FLASH_TEACHER_CAPABILITY" not in grpo
 
@@ -172,7 +170,6 @@ def test_build_worker_env_does_not_accept_legacy_teacher_broker_url():
     with pytest.raises(RuntimeError, match="control-panel teacher transport is missing"):
         build_worker_env(
             opd_spec,
-            0,
             runtime_secrets={
                 "FLASH_TEACHER_BROKER_URL": "https://broker.example",
                 "FLASH_TEACHER_CAPABILITY": "capability-test-value",
@@ -194,7 +191,6 @@ def test_build_worker_env_rejects_managed_teacher_byo_names():
     with pytest.raises(ValueError, match="managed teacher credential names"):
         build_worker_env(
             opd_spec,
-            0,
             runtime_secrets={
                 "PARASAIL_API_KEY": "byo-parasail-key",
                 "FLASH_PUBLIC_URL": "https://broker.example",
@@ -212,10 +208,10 @@ def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(mon
     from flash.providers._lifecycle.net.worker import build_worker_env
 
     monkeypatch.setenv("WANDB_API_KEY", "platform-should-not-forward")
-    env = build_worker_env(_spec(), 0)
+    env = build_worker_env(_spec())
     assert "WANDB_API_KEY" not in env
 
-    env = build_worker_env(_spec(), 0, runtime_secrets={"WANDB_API_KEY": "user-wb"})
+    env = build_worker_env(_spec(), runtime_secrets={"WANDB_API_KEY": "user-wb"})
     assert env["WANDB_API_KEY"] == "user-wb"
 
 
@@ -233,7 +229,6 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
 
     env = build_worker_env(
         spec,
-        0,
         runtime_secrets={
             "SERPAPI_API_KEY": "serp-user",
             "UNDECLARED_API_KEY": "must-not-forward",
@@ -266,14 +261,14 @@ def test_build_worker_env_lists_declared_secret_names_for_the_redactors(monkeypa
     )
     supplied = {name: f"synthetic-{name.lower()}" for name in declared}
     supplied["WANDB_API_KEY"] = "synthetic-wandb-key"
-    env = build_worker_env(spec, 0, runtime_secrets=supplied)
+    env = build_worker_env(spec, runtime_secrets=supplied)
 
     listed = set(env[SECRET_ENV_KEYS_ENV].split(","))
     assert listed == {*declared, "WANDB_API_KEY"}
     for name in listed:
         assert name in env
     # a run with no applied secrets carries no list at all.
-    assert SECRET_ENV_KEYS_ENV not in build_worker_env(_spec(), 0)
+    assert SECRET_ENV_KEYS_ENV not in build_worker_env(_spec())
 
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -324,7 +319,7 @@ def test_grpo_worker_env_keeps_native_thread_policy_managed():
         algorithm="grpo",
         environment=EnvironmentSpec(id="owner/project/env", secrets=("OMP_NUM_THREADS",)),
     )
-    env = build_worker_env(spec, spec.seed, runtime_secrets={"OMP_NUM_THREADS": "999"})
+    env = build_worker_env(spec, runtime_secrets={"OMP_NUM_THREADS": "999"})
 
     assert env["OMP_NUM_THREADS"] == GRPO_NATIVE_THREAD_ENV["OMP_NUM_THREADS"]
     assert "OMP_NUM_THREADS" not in set(env.get(SECRET_ENV_KEYS_ENV, "").split(","))
@@ -340,7 +335,7 @@ def test_sft_worker_env_forwards_declared_native_thread_secret():
         algorithm="sft",
         environment=EnvironmentSpec(id="owner/project/env", secrets=("OMP_NUM_THREADS",)),
     )
-    env = build_worker_env(spec, spec.seed, runtime_secrets={"OMP_NUM_THREADS": "7"})
+    env = build_worker_env(spec, runtime_secrets={"OMP_NUM_THREADS": "7"})
 
     assert env["OMP_NUM_THREADS"] == "7"
     assert "OMP_NUM_THREADS" in set(env[SECRET_ENV_KEYS_ENV].split(","))
@@ -369,7 +364,7 @@ def test_declared_secret_names_cannot_contain_the_metadata_delimiter():
         seed=0,
     )
     with pytest.raises(RuntimeError, match="delimiter"):
-        build_worker_env(spec, 0, runtime_secrets={"FOO,BAR": "leaky"})
+        build_worker_env(spec, runtime_secrets={"FOO,BAR": "leaky"})
 
 
 def test_the_handlers_inline_redactor_covers_multiline_secret_components():
@@ -613,7 +608,7 @@ def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
 
     # the flag is gone — setting it in the control-plane env does not reach the worker
     monkeypatch.setenv("FLASH_UPLOAD_CONSOLE", "1")
-    assert "FLASH_UPLOAD_CONSOLE" not in build_worker_env(_spec(), 0)
+    assert "FLASH_UPLOAD_CONSOLE" not in build_worker_env(_spec())
 
     # both worker run_mode paths upload unconditionally (no flag, no gating var)
     for src in (
@@ -649,7 +644,7 @@ def test_removed_keys_cannot_reach_the_worker_through_environment_secrets():
         "FLASH_TRITON_LORA": "1",
         "MY_TOKEN": "keep-me",
     }
-    env = build_worker_env(spec, 0, runtime_secrets=supplied)
+    env = build_worker_env(spec, runtime_secrets=supplied)
 
     # assert on the values this call supplied, not on key presence: some removed names (e.g.
     # PYTORCH_ALLOC_CONF) are legitimately set by flash itself downstream, so "key absent from env"
@@ -677,10 +672,10 @@ def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="myorg/runs"),
         seed=0,
     )
-    assert build_worker_env(per_run, 0)["HF_REPO"] == "myorg/runs"
+    assert build_worker_env(per_run)["HF_REPO"] == "myorg/runs"
     # still the per-run value even with no operator HF_REPO at all
     monkeypatch.delenv("HF_REPO", raising=False)
-    assert build_worker_env(per_run, 0)["HF_REPO"] == "myorg/runs"
+    assert build_worker_env(per_run)["HF_REPO"] == "myorg/runs"
 
 
 def test_alloc_conf_rl_is_non_expandable(monkeypatch):
@@ -692,7 +687,7 @@ def test_alloc_conf_rl_is_non_expandable(monkeypatch):
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    env = build_worker_env(_spec(), 0)  # grpo
+    env = build_worker_env(_spec())  # grpo
     assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
     assert env["PYTORCH_ALLOC_CONF"] == env["PYTORCH_CUDA_ALLOC_CONF"]
     # no launcher->worker FLASH_ALLOC_AUTO signal anymore (the worker gates on PHASE == "rl")
@@ -711,7 +706,7 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
         train=TrainSpec(epochs=1, max_examples=2),
         seed=0,
     )
-    env = build_worker_env(spec, 0)
+    env = build_worker_env(spec)
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
 

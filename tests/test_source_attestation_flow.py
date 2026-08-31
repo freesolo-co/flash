@@ -149,9 +149,7 @@ def test_recovery_completion_requires_attestation_before_done(monkeypatch, tmp_p
     assert completed.source_verified_attempt == 2
 
 
-def test_attach_freezes_top_level_descriptor_and_discards_legacy_prefix(
-    monkeypatch, tmp_path
-) -> None:
+def test_attach_freezes_top_level_descriptor(monkeypatch, tmp_path) -> None:
     from flash.core.spec import JobSpec
     from flash.runner.supervise.attach import _build_attach_context
 
@@ -172,7 +170,7 @@ def test_attach_freezes_top_level_descriptor_and_discards_legacy_prefix(
         "job_id": "job",
         "attempt": 2,
         "started_ts": 100.0,
-        "code_prefix": "code/legacy/flash",
+        "launch_claim_token": "token-2",
     }
     runner_state._save_status(
         runner_state.RunStatus(
@@ -186,7 +184,10 @@ def test_attach_freezes_top_level_descriptor_and_discards_legacy_prefix(
 
     context = _build_attach_context(spec, remote)
     assert context.source_snapshot == SOURCE_SNAPSHOT
-    assert "code_prefix" not in context.handle.to_dict()
+    assert context.recovered_attempt == 2
+    assert context.launch_claim_token == "token-2"
+    # the launch token authorizes the attempt and must not ride into the polled provider handle.
+    assert "launch_claim_token" not in context.handle.to_dict()
 
 
 def test_descriptorless_replacement_is_blocked() -> None:

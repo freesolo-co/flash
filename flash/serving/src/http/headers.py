@@ -24,6 +24,12 @@ def internal_org_id(request: Request) -> str:
     return org_id
 
 
+def optional_internal_org_id(request: Request) -> str | None:
+    """read the tenant scope an internal caller supplied, without requiring one."""
+
+    return (request.headers.get("X-Freesolo-Org-Id") or "").strip() or None
+
+
 def assert_internal(request: Request, internal_key: str | None) -> None:
     if not internal_key:
         # No internal key configured -> the control plane can't be authenticated. Fail closed
@@ -48,6 +54,34 @@ def is_trusted_internal(request: Request, trusted_keys: tuple[str, ...]) -> bool
     # C419 (prefer a generator) is exactly the rewrite the comment above forbids: a
     # generator short-circuits, which is the timing leak. The list is load-bearing.
     return any([hmac.compare_digest(presented, k) for k in trusted_keys])  # noqa: C419
+
+
+# The job-scope headers a training container sends with a catalog-base sample. The backend
+# re-checks all five against the live training job row before authorizing, so they have to
+# survive the hop through this service -- it forwards the caller's key but is otherwise the
+# only thing standing between the container and /api/serving/authorize.
+TRAINING_SCOPE_HEADERS = (
+    "x-freesolo-org-id",
+    "x-freesolo-training-job-id",
+    "x-freesolo-project-id",
+    "x-freesolo-worker-id",
+    "x-freesolo-training-job-attempt",
+)
+
+
+def training_scope_headers(request: Request) -> dict[str, str]:
+    """The training job-scope headers present on this request, lowercased.
+
+    Absent headers are omitted rather than sent empty: a normal customer chat request
+    carries none of these, and forwarding five blanks would make every such request look
+    like a malformed training call to the backend.
+    """
+    found = {}
+    for name in TRAINING_SCOPE_HEADERS:
+        value = (request.headers.get(name) or "").strip()
+        if value:
+            found[name] = value
+    return found
 
 
 def _bearer_token(request: Request) -> str | None:

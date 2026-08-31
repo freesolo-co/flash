@@ -136,7 +136,7 @@ def test_public_rows_prune_unset_serving_capacity_fields():
     }
 
 
-def test_serving_repos_cover_public_catalog_without_hosted_activation() -> None:
+def test_serving_repos_cover_public_catalog_and_hosted_activation() -> None:
     assert SERVING_MODEL_REPOS == {
         "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
         "Qwen/Qwen3.8-27B": "Qwen/Qwen3.8-27B-FP8",
@@ -145,7 +145,7 @@ def test_serving_repos_cover_public_catalog_without_hosted_activation() -> None:
     assert MODELS["Qwen/Qwen3.8-27B"].serving is not None
     from flash.serving.src.engine.model_config import SERVING_MODELS
 
-    assert "Qwen/Qwen3.8-27B" not in {entry["base_model"] for entry in SERVING_MODELS}
+    assert "Qwen/Qwen3.8-27B" in {entry["base_model"] for entry in SERVING_MODELS}
 
 
 def test_qwen38_27b_fixture_binds_checkpoint_metadata() -> None:

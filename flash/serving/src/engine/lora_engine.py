@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import os
 import uuid
 from collections import OrderedDict
@@ -19,7 +20,14 @@ from typing import Any
 # _RESERVED_CHAT_TEMPLATE_KWARGS (the apply_chat_template args a caller must never re-supply) and
 # the vllm build probes engine_boot uses.
 from flash.content.thinking import messages_for_chat_template
+from flash.serve.app.progress import boot_elapsed_seconds
 from flash.serve.contract.provenance import CheckpointKey, engine_adapter_name, record_key
+from flash.serve.request.tool_calls import (
+    detached_template_messages,
+    normalize_tools,
+    tools_active,
+    tools_wire,
+)
 from flash.serving.src.engine.lora_lifecycle import (
     LoraLifecycleMixin,
     ReplicaSourceCache,
@@ -32,6 +40,7 @@ from flash.serving.src.engine.model_config import (
     immutable_serving_revisions,
     supports_image_input,
     tokenizer_model_for,
+    tool_parser_for,
 )
 from flash.serving.src.engine.support import (
     _engine_is_dead,
@@ -78,6 +87,9 @@ class _LoraEngineImpl(LoraLifecycleMixin):
 
         self._replica_id = uuid.uuid4().hex
         self._adapter_cache_dir = _replica_adapter_cache_dir(ADAPTER_CACHE_DIR, self._replica_id)
+        self._replica_in_flight_requests = 0
+        self._replica_first_request_pending = True
+        self._replica_boot_duration_seconds = None
         self.settings = Settings()
         self.registry = AdapterRegistry()
         self._adapter_locks: dict[CheckpointKey, asyncio.Lock] = {}
@@ -103,6 +115,7 @@ class _LoraEngineImpl(LoraLifecycleMixin):
         )
         self._pin_loras = pin_loras_default(overrides, cfg)
         self.reasoning_parser = kwargs.get("reasoning_parser")
+        self.tool_parser = tool_parser_for(self.base_model)
         self.engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**kwargs))
         # No in-engine kernel-patching hook runs here (2026-07-05 35B outage post-mortem): under
         # vLLM V1 the model executes in a SEPARATE EngineCore process, so patching this process's
@@ -125,6 +138,47 @@ class _LoraEngineImpl(LoraLifecycleMixin):
         self._liveness_task = asyncio.create_task(self._liveness_monitor())
         if cfg.PRELOAD_CACHED_LORAS:
             await self._preload_cached_loras()
+        try:
+            self._replica_boot_duration_seconds = boot_elapsed_seconds()
+        except Exception:
+            # capacity telemetry is observational and must never make a healthy replica fail.
+            self._replica_boot_duration_seconds = None
+
+    def _admit_generation(self) -> dict[str, Any]:
+        """record honest process-local demand at request admission."""
+
+        try:
+            if not hasattr(self, "_replica_in_flight_requests"):
+                return {}
+            requests = max(0, int(self._replica_in_flight_requests)) + 1
+            self._replica_in_flight_requests = requests
+            freshly_booted = bool(getattr(self, "_replica_first_request_pending", False))
+            self._replica_first_request_pending = False
+            snapshot: dict[str, Any] = {
+                "replica_in_flight_requests_at_admission": requests,
+                "replica_freshly_booted": freshly_booted,
+            }
+            boot_duration = getattr(self, "_replica_boot_duration_seconds", None)
+            if isinstance(boot_duration, (int, float)) and not isinstance(boot_duration, bool):
+                normalized_boot_duration = float(boot_duration)
+                if math.isfinite(normalized_boot_duration) and normalized_boot_duration >= 0:
+                    snapshot["replica_boot_duration_seconds"] = normalized_boot_duration
+            return snapshot
+        except Exception:
+            # capacity telemetry is observational and must never reject inference.
+            return {}
+
+    def _release_generation(self) -> None:
+        """release process-local demand without raising into inference cleanup."""
+
+        try:
+            if not hasattr(self, "_replica_in_flight_requests"):
+                return
+            requests = int(self._replica_in_flight_requests) - 1
+            self._replica_in_flight_requests = max(0, requests)
+        except Exception:
+            # a broken counter must not replace a successful generation with an error.
+            self._replica_in_flight_requests = 0
 
     def _engine_dead(self) -> bool:
         """Instance-bound view of :func:`_engine_is_dead` for the live engine."""
@@ -228,11 +282,14 @@ class _LoraEngineImpl(LoraLifecycleMixin):
         ctk = _safe_chat_template_kwargs(getattr(payload, "chat_template_kwargs", None))
         if not isinstance(thinking_default, bool):
             raise ValueError("adapter thinking default is required")
-        return {
+        effective = {
             **ctk,
             "enable_thinking": thinking_default,
             "preserve_thinking": False,
         }
+        if tools_active(getattr(payload, "tools", None), getattr(payload, "tool_choice", None)):
+            effective["tools"] = tools_wire(normalize_tools(payload.tools))
+        return effective
 
     def _prompt_cache_key(
         self, payload: Any, thinking_default: bool | None = None
@@ -310,13 +367,16 @@ class _LoraEngineImpl(LoraLifecycleMixin):
             # trained ``thinking`` value so every caller renders in the mode this LoRA was trained
             # with. Reserved/return-shape kwargs are dropped before rendering to avoid 500s.
             ctk = self._effective_chat_template_kwargs(payload, thinking_default)
-            prompt_token_ids = self.tokenizer.apply_chat_template(
-                messages_for_chat_template(payload.messages),
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=False,
-                **ctk,
-            )
+            try:
+                prompt_token_ids = self.tokenizer.apply_chat_template(
+                    messages_for_chat_template(detached_template_messages(payload.messages)),
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_dict=False,
+                    **ctk,
+                )
+            except Exception as exc:
+                raise ValueError(f"chat template rejected the request messages: {exc}") from exc
             return list(prompt_token_ids)
         if payload.prompt:
             prompt_token_ids = self.tokenizer.encode(payload.prompt, add_special_tokens=False)
@@ -354,7 +414,7 @@ class _LoraEngineImpl(LoraLifecycleMixin):
             # over the message list, and its sibling image decode above already runs off-loop.
             rendered = await asyncio.to_thread(
                 lambda: processor.apply_chat_template(
-                    messages_for_chat_template(template_messages),
+                    messages_for_chat_template(detached_template_messages(template_messages)),
                     tokenize=False,
                     add_generation_prompt=True,
                     **ctk,
@@ -408,13 +468,18 @@ class _LoraEngineImpl(LoraLifecycleMixin):
     ) -> dict[str, Any]:
         from flash.serving.src.engine.generation import generate
 
-        return await generate(
-            self,
-            payload_dict,
-            record_dict,
-            expected_checkpoint,
-            generation_id,
-        )
+        capacity = self._admit_generation()
+        try:
+            return await generate(
+                self,
+                payload_dict,
+                record_dict,
+                expected_checkpoint,
+                generation_id,
+                capacity,
+            )
+        finally:
+            self._release_generation()
 
     async def _stream_generate(
         self,
@@ -425,20 +490,25 @@ class _LoraEngineImpl(LoraLifecycleMixin):
     ):
         from flash.serving.src.engine.generation import stream_generate
 
+        capacity = self._admit_generation()
         stream = stream_generate(
             self,
             payload_dict,
             record_dict,
             expected_checkpoint,
             generation_id,
+            capacity,
         )
         try:
             async for event in stream:
                 yield event
         finally:
-            close = getattr(stream, "aclose", None)
-            if close is not None:
-                await close()
+            try:
+                close = getattr(stream, "aclose", None)
+                if close is not None:
+                    await close()
+            finally:
+                self._release_generation()
 
     def _health(self) -> dict[str, Any]:
         cuda_available: bool | None = None

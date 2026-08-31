@@ -95,7 +95,7 @@ def _tool_history_messages(*, with_image: bool) -> list[dict[str, Any]]:
                     "type": "function",
                     "function": {
                         "name": "calculator",
-                        "arguments": {"expression": "2+2"},
+                        "arguments": '{"expression":"2+2"}',
                     },
                 }
             ],
@@ -746,7 +746,7 @@ class _Pool:
         return None
 
 
-async def _allow(_token: str, _adapter_id: str) -> str:
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
     return "org-1"
 
 
@@ -1111,7 +1111,20 @@ def test_malformed_tool_calls_are_rejected_before_the_chat_template(tool_calls: 
 
 
 def test_a_usable_tool_call_history_still_passes() -> None:
-    messages = [{"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "f"}}]}]
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
     assert normalize_chat_messages(messages, supports_images=False, image_limit=4) == messages
 
 

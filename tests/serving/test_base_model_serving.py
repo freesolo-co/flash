@@ -86,7 +86,7 @@ class FakeAuthorizer:
         self.calls = []
         self._org = org
 
-    async def __call__(self, token, adapter_id):
+    async def __call__(self, token, adapter_id, scope=None):
         self.calls.append((token, adapter_id))
         return self._org
 
@@ -169,14 +169,31 @@ def test_explicit_base_model_thinking_remains_rejected_before_settlement() -> No
     assert store.finalized == []
 
 
-def test_base_model_via_internal_key_is_durably_unattributed() -> None:
+def test_unattributable_internal_base_model_request_fails_closed() -> None:
     client, store = _build([_base_rec()], authorizer=FakeAuthorizer())
+
     resp = _chat(client, QWEN, **{"X-Freesolo-Internal-Key": INTERNAL_KEY})
+
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "serving request lacks required organization attribution"}
+    assert store.finalized == []
+
+
+def test_internal_base_model_request_is_attributed_by_the_org_header() -> None:
+    client, store = _build([_base_rec()], authorizer=FakeAuthorizer())
+
+    resp = _chat(
+        client,
+        QWEN,
+        **{"X-Freesolo-Internal-Key": INTERNAL_KEY, "X-Freesolo-Org-Id": "org-A"},
+    )
+
     assert resp.status_code == 200
     assert len(store.finalized) == 1
     event = store.finalized[0]
     assert event.principal.kind == "trusted_internal"
-    assert event.principal.orgId is None
+    assert event.principal.orgId == "org-A"
+    assert event.principal.billingAttributionExplicit is True
     assert event.target.public_model_id == QWEN
 
 
@@ -203,6 +220,17 @@ def test_internal_lora_is_explicitly_attributed_to_immutable_owner() -> None:
 
 def test_external_authorizer_none_fails_closed_before_dispatch() -> None:
     client, store = _build([_base_rec()], authorizer=FakeAuthorizer(org=None))
+
+    response = _chat(client, QWEN, Authorization="Bearer k")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "serving auth did not return an attributable principal"}
+    assert store.finalized == []
+
+
+def test_external_authorizer_blank_org_fails_closed_before_dispatch() -> None:
+    # a whitespace-only org would otherwise reach the principal model and raise a 500 there.
+    client, store = _build([_base_rec()], authorizer=FakeAuthorizer(org="   "))
 
     response = _chat(client, QWEN, Authorization="Bearer k")
 
