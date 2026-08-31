@@ -116,7 +116,6 @@ ROUTER_TIMEOUT_SECONDS = STARTUP_TIMEOUT_SECONDS + TIMEOUT_SECONDS
 # The H200 keeps a LONGER hold than break-even alone would suggest: the 35B's boot is ~1010s of
 # engine init (67 GiB of weights + ~377s torch.compile + graph capture), so a miss is a ~17-minute
 # user-visible stall. Cost and latency point the same way there, and the window stays at 1800s.
-DEFAULT_SCALEDOWN_WINDOW_SECONDS = 1800
 SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     # ~60s cold boot (small FP8 checkpoints, cached compile artifacts on the shared volume).
     "L4": 300,
@@ -127,12 +126,32 @@ SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     # ~1010s cold boot (35B bf16, 67 GiB + ~377s torch.compile). Break-even AND a ~17-min
     # user-visible stall on a miss both argue for keeping the full window here.
     "H200": 1800,
+    # Blackwell. No cold-boot canary has run on either card yet, so both hold the H200's window as a
+    # placeholder: it is the longest we ship, and a too-long hold overpays for idle rather than
+    # cold-cycling a user request. Replace each with its measured boot time when the canary runs.
+    "B200": 1800,
+    "B300": 1800,
 }
+# The tiers this app is allowed to run an engine on. `gpu` in the serving catalog is a plain string,
+# so a typo ("b200", "B2OO") or an unvalidated new card used to fall through `dict.get` to a default
+# window and deploy anyway, at that card's real hourly rate. Membership here is the one gate.
+SUPPORTED_GPUS: frozenset[str] = frozenset(SCALEDOWN_WINDOW_SECONDS_BY_GPU)
 
 
 def scaledown_window_for(gpu: str) -> int:
-    """Idle seconds before ``gpu``'s engine containers scale down (see the table above)."""
-    return SCALEDOWN_WINDOW_SECONDS_BY_GPU.get(gpu, DEFAULT_SCALEDOWN_WINDOW_SECONDS)
+    """Idle seconds before ``gpu``'s engine containers scale down (see the table above).
+
+    Raises ``ValueError`` for a tier this app has no window for, rather than silently applying a
+    default to an unrecognized card.
+    """
+    try:
+        return SCALEDOWN_WINDOW_SECONDS_BY_GPU[gpu]
+    except KeyError:
+        supported = ", ".join(sorted(SUPPORTED_GPUS))
+        raise ValueError(
+            f"Unsupported serving GPU tier {gpu!r}; supported tiers: {supported}. "
+            "Add the tier to SCALEDOWN_WINDOW_SECONDS_BY_GPU with its measured cold-boot window."
+        ) from None
 
 
 # gpu model engines scale to zero. inference and adapter registration remote calls start the matching
@@ -317,17 +336,22 @@ from flash.serving.src.engine.model_config import (  # noqa: E402
 
 
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
-    """(max_inputs, target_inputs) sized to the model's REAL vLLM concurrency (``max_num_seqs``).
+    """return Modal input admission aligned with the engine's sequence capacity.
 
-    Modal's ``max_inputs`` is how many requests it packs onto ONE container before it must add
-    another. If it far exceeds the engine's ``max_num_seqs`` (e.g. the global 64 on the 35B, which
-    decodes only 8 at a time), Modal piles requests 9..64 INSIDE the container instead of autoscaling
-    — high latency and no scale-out until ~target_inputs are packed. So cap ``max_inputs`` near the
-    engine's capacity with a small boot buffer (2x, so a cold-booting replacement doesn't reject
-    bursts), bounded by the global ``MAX_INPUTS``; scale out at 3/4 of that. Models that leave
-    ``max_num_seqs`` at the vLLM default keep the global sizing."""
-    seqs = int(engine_overrides_for(base_model).get("max_num_seqs", MAX_INPUTS))
-    max_inputs = max(8, min(MAX_INPUTS, seqs * 2))
+    Modal counts requests while vLLM schedules sequences. The prior 2x buffer admitted 16 requests
+    onto every current 8-sequence engine, so normal ``n=1`` traffic queued half of them inside the
+    container and delayed scale-out until 12 inputs. OpenAI ``n`` can fan one input out to as many as
+    four sequences, but sizing every container for that rare worst case would leave normal traffic
+    underutilizing the GPU and cold-boot expensive replicas prematurely. Cap request admission at the
+    authored sequence capacity instead: current tiers admit 8 and scale out at 6. This deliberately
+    changes Modal's request knobs, not ``max_num_seqs``: raising the engine cap is not allocation-free,
+    and the 35B tier has a documented startup profiling OOM at higher sequence counts. Models without
+    an authored sequence cap retain the global sizing until their real capacity is explicit.
+    """
+    configured = engine_overrides_for(base_model).get("max_num_seqs")
+    if configured is None:
+        return MAX_INPUTS, TARGET_INPUTS
+    max_inputs = max(1, min(MAX_INPUTS, int(configured)))
     target_inputs = max(1, max_inputs * 3 // 4)
     return max_inputs, target_inputs
 

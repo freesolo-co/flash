@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
 import flash.serve.request.transport as transport
@@ -7,6 +8,23 @@ from flash.serve.contract.errors import RetryableServingUnavailable
 from tests._helpers.chat_transport import StreamClient, StreamContext, StreamResponse
 
 ORG_ID = "org-1"
+
+
+def _tools():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
 
 
 @pytest.fixture(autouse=True)
@@ -146,6 +164,60 @@ def test_chat_fails_closed_for_unrecognized_smoke_503(monkeypatch, error):
         )
 
 
+def test_smoke_classifier_retries_exact_pre_header_capacity_envelope():
+    response = httpx.Response(
+        503,
+        headers={"Retry-After": "1.25"},
+        json={"error": {"type": "server_error", "code": "serving_capacity_unavailable"}},
+    )
+
+    retryable = transport.retryable_smoke_unavailable(
+        response,
+        requested_model="run-1",
+        expected_checkpoint_id="run-1/final",
+    )
+
+    assert retryable is not None
+    assert retryable.code == "serving_capacity_unavailable"
+    assert retryable.retry_after_seconds == 1.25
+
+
+def test_smoke_classifier_does_not_retry_arbitrary_429():
+    response = httpx.Response(
+        429,
+        headers={"Retry-After": "1.25"},
+        json={"error": {"type": "server_error", "code": "rate_limit_exceeded"}},
+    )
+
+    assert (
+        transport.retryable_smoke_unavailable(
+            response,
+            requested_model="run-1",
+            expected_checkpoint_id="run-1/final",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("retry_after", [None, "", "0", "nan", "inf", "invalid"])
+def test_smoke_classifier_rejects_malformed_traffic_retry_headers(retry_after):
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    response = httpx.Response(
+        503,
+        headers=headers,
+        json={"error": {"type": "server_error", "code": "serving_capacity_unavailable"}},
+    )
+
+    assert (
+        transport.retryable_smoke_unavailable(
+            response,
+            requested_model="run-1",
+            expected_checkpoint_id="run-1/final",
+        )
+        is None
+    )
+
+
 def test_chat_posts_to_freesolo_serving(monkeypatch):
     """A terminal /v1 override produces one OpenAI path for direct chat."""
     import flash.serve.deployment.deploy as d
@@ -213,6 +285,34 @@ def test_chat_posts_to_freesolo_serving(monkeypatch):
     assert seen["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
 
 
+@pytest.mark.parametrize("helper_name", ["chat", "chat_sse"])
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"tool_choice": "none"},
+        {"parallel_tool_calls": True},
+    ],
+    ids=["tool-choice", "parallel-tool-calls"],
+)
+def test_public_chat_helpers_reject_tool_controls_without_tools(
+    monkeypatch, helper_name: str, controls: dict[str, object]
+) -> None:
+    import flash.serve.deployment.deploy as d
+
+    class Client:
+        def post(self, *_args, **_kwargs):
+            pytest.fail("invalid tool controls must not reach buffered transport")
+
+        def stream(self, *_args, **_kwargs):
+            pytest.fail("invalid tool controls must not reach streaming transport")
+
+    monkeypatch.setattr(transport, "_chat_http_client", Client)
+    helper = getattr(d, helper_name)
+
+    with pytest.raises(ValueError, match="tool controls require tools"):
+        helper("run-1/final", [{"role": "user", "content": "hi"}], org_id=ORG_ID, **controls)
+
+
 def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkeypatch):
     import flash.serve.deployment.deploy as d
 
@@ -237,17 +337,21 @@ def test_chat_preserves_explicit_empty_structured_override_and_omits_none(monkey
     messages = [{"role": "user", "content": "hello"}]
     d.chat("run-1/final", messages, org_id=ORG_ID, structured_outputs={})
     d.chat("run-1/final", messages, org_id=ORG_ID)
+    d.chat("run-1/final", messages, org_id=ORG_ID, tools=_tools())
 
     first_url, first = requests[0]
     second_url, second = requests[1]
-    assert first_url == second_url == "https://serve.example/v1/chat/completions"
+    third_url, third = requests[2]
+    assert first_url == second_url == third_url == "https://serve.example/v1/chat/completions"
     assert first["json"]["structured_outputs"] == {}
     assert "structured_outputs" not in second["json"]
+    assert third["json"]["tool_choice"] == "auto"
+    assert third["json"]["parallel_tool_calls"] is True
     assert first["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
     assert second["headers"]["X-Freesolo-Internal-Key"] == "secret-internal"
 
 
-def test_chat_sse_preserves_raw_frames_and_forwards_supported_fields(monkeypatch):
+def test_chat_sse_preserves_pre_tool_positional_order(monkeypatch):
     import flash.serve.deployment.deploy as d
 
     seen = {}
@@ -278,6 +382,12 @@ def test_chat_sse_preserves_raw_frames_and_forwards_supported_fields(monkeypatch
         chat_template_kwargs={"enable_thinking": False, "custom": 1},
         structured_outputs={"json_object": True},
         stream_options={"include_usage": True},
+        n=2,
+        seed=42,
+        frequency_penalty=-0.5,
+        presence_penalty=0.75,
+        logprobs=True,
+        top_logprobs=3,
     )
 
     frames = list(response.iter_bytes())
@@ -294,18 +404,41 @@ def test_chat_sse_preserves_raw_frames_and_forwards_supported_fields(monkeypatch
         "max_tokens": 9,
         "temperature": 0.2,
         "top_p": 0.7,
-        "n": 1,
-        "seed": None,
-        "frequency_penalty": 0.0,
-        "presence_penalty": 0.0,
-        "logprobs": False,
-        "top_logprobs": 0,
+        "n": 2,
+        "seed": 42,
+        "frequency_penalty": -0.5,
+        "presence_penalty": 0.75,
+        "logprobs": True,
+        "top_logprobs": 3,
         "chat_template_kwargs": {"enable_thinking": False, "custom": 1},
         "stream": True,
         "stop": ["end"],
         "structured_outputs": {"json_object": True},
         "stream_options": {"include_usage": True},
     }
+    assert len(exits) == 1
+
+
+def test_chat_sse_defaults_tool_controls(monkeypatch):
+    import flash.serve.deployment.deploy as d
+
+    seen = {}
+    exits = []
+    upstream = StreamResponse(byte_chunks=(b"data: [DONE]\n\n",))
+    client = StreamClient(StreamContext(upstream, exits), seen)
+    monkeypatch.setattr(transport, "_chat_http_client", lambda: client)
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serve.example/v1")
+
+    response = d.chat_sse(
+        "run-1/final",
+        [{"role": "user", "content": "weather"}],
+        org_id=ORG_ID,
+        tools=_tools(),
+    )
+
+    assert list(response.iter_bytes()) == [b"data: [DONE]\n\n"]
+    assert seen["json"]["tool_choice"] == "auto"
+    assert seen["json"]["parallel_tool_calls"] is True
     assert len(exits) == 1
 
 

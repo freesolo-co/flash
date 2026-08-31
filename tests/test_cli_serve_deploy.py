@@ -636,7 +636,11 @@ def _historical_identity(
 
     _stub_resolution(monkeypatch)
     current = serve_deploy._deployment_bundle(args)
-    engine = replace(current.spec.engine, served_model=retired_model, tokenizer_model=retired_model)
+    engine = replace(
+        current.spec.engine,
+        served_model=retired_model,
+        tokenizer_model=retired_model,
+    )
     adapters = tuple(
         replace(adapter, base_model=retired_model) for adapter in current.spec.adapters
     )

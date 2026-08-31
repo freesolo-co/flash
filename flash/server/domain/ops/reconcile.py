@@ -13,6 +13,7 @@ import urllib.request
 
 import flash.runner.accounting.costs as runner_costs
 import flash.runner.lifecycle.status as runner_status
+from flash._internal.http import _urlopen_no_redirect
 from flash.providers.core.realized import realized_cost_for_remote
 from flash.runner.lifecycle.state import TERMINAL_STATES, RunStatus
 from flash.server.platform.auth import freesolo_base_url
@@ -54,7 +55,7 @@ def _report(body: dict) -> bool:
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=_REPORT_TIMEOUT_S) as resp:
+        with _urlopen_no_redirect(req, timeout=_REPORT_TIMEOUT_S) as resp:
             resp.read()
         return True
     except OSError:

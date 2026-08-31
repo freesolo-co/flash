@@ -401,7 +401,7 @@ def test_build_worker_env():
         train=TrainSpec(epochs=1, max_examples=8),
         seed=0,
     )
-    env = build_worker_env(spec, 0)
+    env = build_worker_env(spec)
     assert env["RUN_ID"] == "r1"
     assert env["BENCH_HF_MODEL"] == "Qwen/Qwen3.5-9B"
     assert "RL_STEPS" not in env

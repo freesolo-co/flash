@@ -26,6 +26,7 @@ from pydantic import ValidationError
 
 from flash.serve.contract.provenance import engine_adapter_name
 from flash.serve.request.openai import parse_chat_request
+from flash.serving.src.engine import generation as engine_generation
 from flash.serving.src.engine.model_config import reasoning_parser_for
 from flash.serving.src.engine.support import _require_reasoning_api_compatibility
 from flash.serving.src.io.responses import openai_generate_fields
@@ -185,6 +186,39 @@ class _CleanupEngine(_CaptureEngine):
 
         self.output_stream = output_stream()
         return self.output_stream
+
+
+class _ConcurrentCapacityEngine(_CaptureEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = 0
+        self.both_entered = asyncio.Event()
+
+    async def generate(
+        self,
+        prompt_input,
+        sampling_params,
+        request_id,
+        lora_request=None,
+        reasoning_ended=None,
+        reasoning_parser_kwargs=None,
+    ):
+        del prompt_input, request_id, lora_request
+        self.sampling_params.append(sampling_params)
+        self.reasoning_ended.append(reasoning_ended)
+        self.reasoning_parser_kwargs.append(reasoning_parser_kwargs)
+        self.entered += 1
+        if self.entered == 2:
+            self.both_entered.set()
+        await self.both_entered.wait()
+        yield types.SimpleNamespace(
+            outputs=[
+                types.SimpleNamespace(index=0, text="ok", finish_reason="stop", token_ids=[1])
+            ],
+            prompt_token_ids=[1],
+            num_cached_tokens=0,
+            metrics=types.SimpleNamespace(time_in_queue=0.125),
+        )
 
 
 def _engine(
@@ -355,7 +389,6 @@ def test_reasoning_state_matches_effective_thinking_mode(modal_app_module):
     assert thinking.engine.reasoning_ended[-1] is False
     assert thinking.engine.reasoning_parser_kwargs[-1] == {
         "chat_template_kwargs": {
-            "tools": ["search"],
             "enable_thinking": True,
             "preserve_thinking": False,
         }
@@ -496,6 +529,51 @@ def test_stream_generate_attests_the_resolved_checkpoint_before_deltas(modal_app
     assert ready["checkpoint"] == checkpoint_id
 
 
+def test_queue_wait_prefers_real_metrics_and_omits_unavailable() -> None:
+    direct = types.SimpleNamespace(metrics=types.SimpleNamespace(time_in_queue=0.125))
+    derived = types.SimpleNamespace(
+        metrics=types.SimpleNamespace(
+            time_in_queue=None,
+            arrival_time=20.0,
+            first_scheduled_time=20.375,
+        )
+    )
+
+    assert engine_generation._queue_wait_seconds(direct) == 0.125
+    assert engine_generation._queue_wait_seconds(derived) == 0.375
+    assert engine_generation._queue_wait_seconds(types.SimpleNamespace()) is None
+
+
+def test_generation_reports_capacity_at_admission_and_releases_counter(modal_app_module):
+    from vllm.sampling_params import RequestOutputKind
+
+    eng = _engine(modal_app_module)
+    eng.engine = _ConcurrentCapacityEngine()
+    eng._replica_in_flight_requests = 0
+    eng._replica_first_request_pending = True
+    eng._replica_boot_duration_seconds = 12.5
+
+    async def run_both():
+        payload = {"adapter_id": "r1", "prompt": "hi"}
+        record = _forwarded_record(eng, "r1")
+        return await asyncio.gather(eng._generate(payload, record), eng._generate(payload, record))
+
+    results = asyncio.run(run_both())
+
+    assert [result["replica_in_flight_requests_at_admission"] for result in results] == [1, 2]
+    assert [result["replica_freshly_booted"] for result in results] == [True, False]
+    assert all(result["replica_boot_duration_seconds"] == 12.5 for result in results)
+    assert all(result["queue_wait_seconds"] == 0.125 for result in results)
+    # the buffered path reports no time-to-first-token: FINAL_ONLY yields once, at completion,
+    # so any such value would be the completion interval wearing a first-token name.
+    assert all("time_to_first_token_seconds" not in result for result in results)
+    # and it must still run FINAL_ONLY -- telemetry may not change how generation executes.
+    assert all(
+        params.output_kind == RequestOutputKind.FINAL_ONLY for params in eng.engine.sampling_params
+    )
+    assert eng._replica_in_flight_requests == 0
+
+
 def test_stream_generate_carries_structured_outputs(modal_app_module):
     eng = _engine(modal_app_module)
 
@@ -518,6 +596,7 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
     ]
     ready = events[0].copy()
     assert ready.pop("inference_time_seconds") >= 0
+    assert ready.pop("time_to_first_token_seconds") >= 0
     # the two ids are uuid4-derived, so they cannot be spelled literally. pin their shape here and
     # their VALUE on the delta below, against this event -- writing `ready["request_id"]` into this
     # dict would compare the value to itself and pin nothing at all.
@@ -539,6 +618,7 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
     }
     delta = events[1].copy()
     assert delta.pop("inference_time_seconds") >= 0
+    assert delta.pop("time_to_first_token_seconds") >= 0
     assert delta == {
         "type": "delta",
         "index": 0,
@@ -670,6 +750,7 @@ def test_stream_close_after_ready_closes_inner_generator(modal_app_module):
         )
         ready = (await anext(stream)).copy()
         assert ready.pop("inference_time_seconds") >= 0
+        assert ready.pop("time_to_first_token_seconds") >= 0
         assert ready == {
             "type": "ready",
             "thinking": False,

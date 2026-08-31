@@ -463,6 +463,40 @@ def test_thinking_logprobs_policy_runs_after_adapter_resolution(app_setup):
     assert pool.generated == []
 
 
+def test_tool_choice_none_is_inactive_on_unqualified_thinking_route() -> None:
+    record = _rec("unqualified", QWEN_35B)
+    pool = FakePool()
+    client = _serve(pool, AdapterRouter([record]))
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": _revision_id("unqualified"),
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+            "tool_choice": "none",
+            "parallel_tool_calls": True,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert pool.generated == [(QWEN_35B, _revision_id("unqualified"))]
+
+
 def test_base_model_false_thinking_override_allows_logprobs() -> None:
     record = AdapterRecord(
         adapter_id=QWEN,
@@ -770,7 +804,18 @@ def test_raw_generate_responses_exclude_internal_fields(app_setup, path, payload
 
 
 @pytest.mark.parametrize(
-    "field", ["n", "seed", "frequency_penalty", "presence_penalty", "logprobs", "top_logprobs"]
+    "field",
+    [
+        "n",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+        "logprobs",
+        "top_logprobs",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+    ],
 )
 @pytest.mark.parametrize(
     ("path", "payload"),
@@ -1243,6 +1288,10 @@ class _MeteringPool(FakePool):
                 "completion_tokens": 3,
                 "cached_tokens_reported": False,
                 "inference_time_seconds": 0.25,
+                "queue_wait_seconds": 0.025,
+                "replica_in_flight_requests_at_admission": 2,
+                "replica_boot_duration_seconds": 30.0,
+                "replica_freshly_booted": True,
                 "engine_replica_id": "replica-7",
                 "checkpoint": checkpoint,
             },
@@ -1274,6 +1323,10 @@ def test_generate_response_strips_internal_cache_attribution():
 
     assert "cached_tokens_reported" not in body
     assert "engine_replica_id" not in body
+    assert "queue_wait_seconds" not in body
+    assert "replica_in_flight_requests_at_admission" not in body
+    assert "replica_boot_duration_seconds" not in body
+    assert "replica_freshly_booted" not in body
 
 
 class _CachedMeteringPool(FakePool):

@@ -884,10 +884,9 @@ class Provider(Protocol):
         lookup blip so allocate() can degrade to the others yet still tell 'no fit' from 'outage'."""
         ...
 
-    def submit_run(
+    def submit_attempt(
         self,
         spec: JobSpec,
-        seed: int,
         *,
         log: Any = None,
         on_handle: Any = None,
@@ -897,22 +896,23 @@ class Provider(Protocol):
         source_snapshot: dict | None = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
-        """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll to terminal.
+        """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll one attempt to terminal.
 
-        ``on_last_gpu``: no further GPU attempt follows, so capacity backstops may wait longer.
+        One run may execute several attempts, each on its own host or gpu class; this runs exactly
+        one of them. ``on_last_gpu``: no further gpu attempt follows, so capacity backstops may wait
+        longer.
         """
         ...
 
-    def poll(
+    def poll_attempt(
         self,
         handle: JobHandle,
         spec: JobSpec,
-        seed: int,
         *,
         log: Any = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
-        """Reattach to a persisted handle and poll it to a terminal state."""
+        """Reattach to one attempt's persisted handle and poll it to a terminal state."""
         ...
 
     def cancel(self, handle: JobHandle) -> None:
@@ -929,9 +929,8 @@ class Provider(Protocol):
 
     # NOTE: ``supports_weight_cache: bool`` is an OPTIONAL capability attr (read via
     # ``getattr(prov, "supports_weight_cache", False)``, off this Protocol for the same isinstance
-    # reason as below): True only for the provider that offers the shared weight-cache network volume
-    # (RunPod). The runner gates its one-shot cache-less retry fallback on it; every other provider
-    # defaults False.
+    # reason as below): True for providers that attach the managed shared weight cache. The runner
+    # gates its one-shot cache-less retry fallback on it; every other provider defaults False.
 
     # ``run_instances_remaining(run_id)`` is optional and must stay off this runtime-checkable
     # protocol. callers use getattr in server/_runtime.py. ``[]`` confirms clear; non-empty means a

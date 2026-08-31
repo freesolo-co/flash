@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "name": "fake five-phase hosted inference",
+  "endpoint": "https://example.invalid",
+  "expected_deployment": {
+    "sha": "94210a3",
+    "deployment_id": "fake-deployment-1"
+  },
+  "credential_env": "FAKE_SERVING_TOKEN",
+  "required_capabilities": ["permanent_checkpoint_identity"],
+  "discovery": {
+    "enabled": true,
+    "include": ["model-a", "model-b", "model-c"],
+    "exclude": ["model-b"],
+    "require": ["model-a"]
+  },
+  "targets": [],
+  "profiles": [
+    {
+      "name": "short",
+      "weight": 1.0,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Return one short sentence."
+        }
+      ],
+      "max_tokens": 16,
+      "temperature": 0.0,
+      "top_p": 0.95
+    }
+  ],
+  "client": {
+    "connect_timeout_seconds": 5.0,
+    "read_timeout_seconds": 30.0,
+    "write_timeout_seconds": 10.0,
+    "pool_timeout_seconds": 5.0,
+    "max_in_flight": 8,
+    "max_scheduling_lag_ms": 100.0
+  },
+  "seed": 17,
+  "fake": true,
+  "phases": [
+    {
+      "name": "cold",
+      "kind": "cold_burst",
+      "requests": 4,
+      "burst_window_seconds": 0.2,
+      "cold_intent": "cold_scale_out"
+    },
+    {
+      "name": "warm",
+      "kind": "warm",
+      "requests": 4,
+      "concurrency": 2
+    },
+    {
+      "name": "sustained",
+      "kind": "sustained",
+      "duration_seconds": 2.0,
+      "rate_rps": 2.0
+    },
+    {
+      "name": "mixed",
+      "kind": "mixed",
+      "duration_seconds": 2.0,
+      "rate_rps": 3.0
+    },
+    {
+      "name": "overload",
+      "kind": "overload",
+      "expects_capacity_contract": false,
+      "stages": [
+        {
+          "duration_seconds": 1.0,
+          "rate_rps": 4.0
+        },
+        {
+          "duration_seconds": 1.0,
+          "rate_rps": 8.0
+        }
+      ]
+    }
+  ]
+}

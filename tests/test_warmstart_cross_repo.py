@@ -1364,7 +1364,7 @@ def test_persisting_a_pre_alpha_run_does_not_rewrite_its_digest_out_of_reach(mon
     """Rewriting the snapshot must replay the same `lora_alpha` omission recovery replays.
 
     `_persist_effective_worker_spec` runs on the ATTACH and RESUBMIT paths (`supervise/attach.py`,
-    `supervise/seed_submission.py`), rebuilding `public_spec` from `status.spec` -- whose
+    `supervise/attempt_supervision.py`), rebuilding `public_spec` from `status.spec` -- whose
     `to_dict()` re-materializes an alpha the stored record never had -- and it never updates
     `status.spec` to match. So a pre-1.1.35 run that recovers once is retired on its NEXT attach:
     `server/platform/runtime.py` marks it `unrecoverable` when `reallocation_spec_from_status`
