@@ -408,10 +408,11 @@ assert "flash.serving.src.io.multimodal" not in sys.modules
 
 def test_one_engine_class_per_distinct_engine_key(modal_app_module):
     """a loraengine class is built for each active gpu tier and concurrency key."""
-    # all three active tiers serve on B200 with the same concurrency, so they legitimately share
-    # ONE engine class: the key is (gpu, max_inputs) and each model still gets its own container
-    # and its own engine args.
-    assert set(modal_app_module.ENGINE_BY_KEY) == {("B200", 8)}
+    # all three tiers serve on B200 and all three measured the same knee (32), so they legitimately
+    # share ONE engine class: the key is (gpu, max_inputs), max_inputs DERIVES from each model's
+    # max_num_seqs, and each model still gets its own container and its own engine args. modal fixes
+    # concurrency per class, so a tier that later measures a different depth becomes its own class.
+    assert set(modal_app_module.ENGINE_BY_KEY) == {("B200", 32)}
 
 
 def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, monkeypatch):
@@ -439,27 +440,27 @@ def test_class_names_are_distinct_and_modal_safe(modal_app_module):
 
 
 def test_9b_routes_to_b200(modal_app_module):
-    """Rank-128 LoRA serving for 9B uses the B200 tier (8-seq -> (B200, 8))."""
+    """Rank-128 LoRA serving for 9B uses the B200 tier at its measured cap (32-seq -> (B200, 32))."""
     by_key = modal_app_module.ENGINE_BY_KEY
     assert gpu_for("Qwen/Qwen3.5-9B") == "B200"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.5-9B") is by_key[("B200", 8)]
-    assert by_key[("B200", 8)].__name__ == "LoraEngine_B200_c8"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.5-9B") is by_key[("B200", 32)]
+    assert by_key[("B200", 32)].__name__ == "LoraEngine_B200_c32"
 
 
 def test_27b_routes_to_b200(modal_app_module):
-    """The dense 27B runs its FP8 checkpoint on the B200 tier (8-seq -> (B200, 8))."""
+    """The dense 27B runs its FP8 checkpoint on the B200 tier at its measured cap (32 -> (B200, 32))."""
     by_key = modal_app_module.ENGINE_BY_KEY
     assert gpu_for("Qwen/Qwen3.8-27B") == "B200"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B") is by_key[("B200", 8)]
-    assert by_key[("B200", 8)].pinned_gpu == "B200"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.8-27B") is by_key[("B200", 32)]
+    assert by_key[("B200", 32)].pinned_gpu == "B200"
 
 
 def test_35b_moe_routes_to_b200(modal_app_module):
-    """The 35B-A3B MoE runs bf16 on the B200 tier ((B200, 8))."""
+    """The 35B-A3B MoE runs bf16 on the B200 tier at its measured cap (32 -> (B200, 32))."""
     by_key = modal_app_module.ENGINE_BY_KEY
     assert gpu_for("Qwen/Qwen3.6-35B-A3B") == "B200"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-35B-A3B") is by_key[("B200", 8)]
-    assert by_key[("B200", 8)].pinned_gpu == "B200"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.6-35B-A3B") is by_key[("B200", 32)]
+    assert by_key[("B200", 32)].pinned_gpu == "B200"
 
 
 def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module):
@@ -471,7 +472,7 @@ def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module)
 def test_tier_classes_inherit_the_shared_impl(modal_app_module):
     """Each tier class subclasses _LoraEngineImpl (so _load/_generate/etc resolve) and defines the
     public Modal entrypoints itself (so Modal collects them per class)."""
-    b200 = modal_app_module.ENGINE_BY_KEY[("B200", 8)]
+    b200 = modal_app_module.ENGINE_BY_KEY[("B200", 32)]
     assert issubclass(b200, modal_app_module._LoraEngineImpl)
     for impl in ("_load", "_register", "_generate", "_stream_generate", "_unregister", "_health"):
         assert hasattr(b200, impl)
@@ -486,7 +487,7 @@ def test_each_tier_class_records_its_pinned_gpu(modal_app_module):
     # Every class records the GPU half of its (gpu, max_inputs) key.
     for (gpu, _max_inputs), cls in by_key.items():
         assert cls.pinned_gpu == gpu
-    assert by_key[("B200", 8)].pinned_gpu == "B200"
+    assert by_key[("B200", 32)].pinned_gpu == "B200"
 
 
 def test_tier_class_identity_is_fixed_before_decoration(modal_app_module):
@@ -790,7 +791,7 @@ def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path
     assert args.max_loras == 16
     assert args.max_lora_rank == 128
     assert args.max_model_len == 32768
-    assert args.max_num_seqs == 8
+    assert args.max_num_seqs == 32  # measured B200 knee; see SERVING_MODELS
     assert args.gpu_memory_utilization == 0.90  # 0.90 leaves CUDA-graph capture headroom (was 0.98)
     assert args.enforce_eager is False  # CUDA graphs ON: ~10x faster decode on the hybrid GDN model
     assert getattr(args, "max_num_batched_tokens", None) is None
@@ -823,7 +824,7 @@ def test_load_bf16_base_with_full_experts_for_35b(modal_app_module, monkeypatch,
     assert args.max_num_batched_tokens == 4096
     assert args.gpu_memory_utilization == 0.90
     assert args.enforce_eager is False  # CUDA graphs ON
-    assert args.max_num_seqs == 8
+    assert args.max_num_seqs == 32  # measured B200 knee; see SERVING_MODELS
     # language_model_only is NOT enabled: the full VL model (vision encoder included) is loaded so
     # flash adapters' vision-tower LoRA keys have real modules to bind to.
     assert not args.language_model_only

@@ -241,9 +241,14 @@ _PROFILES: dict[str, ServingProfile] = {
     ),
 }
 
+# NB: max_num_seqs is deliberately absent. It is per-card TUNING, not advertised shape: the hosted
+# value is the measured B200 knee (32 on the 9B/27B), while these profiles are live-qualified on
+# L40S/H100/H200, where that number is unmeasured -- and an L40S is a 48 GiB card. Forcing a
+# customer profile to admit the hosted card's sequence count would push an unvalidated batch onto
+# smaller hardware. Same split as modal_gpu below: the card and how deeply it is packed travel
+# together, and neither is a promise the catalog makes to a caller.
 _CATALOG_CHECKED_FIELDS = (
     "max_model_len",
-    "max_num_seqs",
     "max_num_batched_tokens",
     "max_loras",
     "max_cpu_loras",

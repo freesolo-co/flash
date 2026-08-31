@@ -51,7 +51,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
         "image_input_limit": 4,
         "gpu": "B200",
         "engine": {
-            # measured on B200 (2026-08-31): 132.87 GiB of KV, 7,109,793 tokens, 217x concurrency at
+            # measured on B200 (2026-08-31): 132.87 GiB of KV, 8,713,056 tokens, 217x concurrency at
             # 32k with rank-128 x 16 LoRA. this tier previously ran on the L40S (48 GiB, Ada sm89),
             # the cheapest card that fit the LoRA buffer; L4 and 2xL4 OOMed in the real-GPU sweep.
             # keep CUDA graphs on because eager is about 10x slower for this hybrid GatedDeltaNet
@@ -60,7 +60,15 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_loras": 16,
             "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (cheap on the 9 GiB FP8 9B); 32k context.
             "max_model_len": 32768,
-            "max_num_seqs": 8,
+            # 32, not the 8 inherited from the L40S, which left most of the B200 idle. a real sweep
+            # (2026-08-31, one boot per value) measured container throughput at each cap's OWN
+            # capacity: 2165 t/s at 8, 3307 at 16, 4793 at 32 -- 2.2x -- with p50 TTFT flat
+            # (0.054s -> 0.175s). 32 is the KNEE, not merely the largest tried: headroom above the
+            # cap collapses from +16.9% at 16 to +2.2% at 32, so 64 would buy ~nothing. no memory
+            # cost (kv pool moves 0.07% across the range, free vram flat at ~18.4 GiB). the one
+            # cost is the first boot after the change: max_num_seqs is part of the vllm compile
+            # cache key, so it recompiles once (169s -> 254s cache-warm on this tier).
+            "max_num_seqs": 32,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },
@@ -95,16 +103,23 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_lora_rank": 64,
             "pin_loras": False,
             # 32k context at 6 hot rank-64 LoRAs. measured on B200 (2026-08-30): 49.38 GiB of KV,
-            # 3,678,952 tokens, 112x concurrency at 32k -- the 178 GiB card leaves far more room than
+            # 5,177,120 tokens, 112x concurrency at 32k -- the 178 GiB card leaves far more room than
             # the 141 GiB H200 this tier previously ran on (which measured about 20x).
             "max_model_len": 32768,
             "max_num_batched_tokens": 4096,
             # CUDA graphs ON — the whole point. On bf16/B200 the graph capture fits (measured 0.38 GiB)
             # and is LoRA-specialized, so adapters serve under graphs too.
             "enforce_eager": False,
-            # Startup memory-profiling runs max_num_seqs sequences; cap low so the 248k-vocab logits +
-            # all-expert MoE activations don't spike the profiling peak.
-            "max_num_seqs": 8,
+            # Startup memory-profiling runs max_num_seqs sequences, so this was held at 8 out of
+            # concern that the 248k-vocab logits + all-expert MoE activations would spike the
+            # profiling peak. Measured on B200 (2026-08-31) that concern does not bind here: booting
+            # and loading at 32 showed no OOM or preemption, free vram moved 18.11 -> 17.77 GiB and
+            # the kv pool 0.24% across 8/16/32. Container throughput at each cap's OWN capacity was
+            # 721 t/s at 8, 1200 at 16, 3196 at 32 -- 4.4x, with the 16->32 step (+166.3%) the
+            # largest in the sweep -- and p50 TTFT IMPROVES at 32 (0.553s -> 0.463s), because past
+            # the cap requests queue instead of running. 32 is the ceiling regardless: the earlier
+            # B200/B300 sweep saw a 4x regression and a hang at 64.
+            "max_num_seqs": 32,
             "reasoning_parser": "qwen3",
             # NB: the vision encoder is now LOADED (no language_model_only) — flash adapters adapt the
             # full multimodal tree, so their vision-tower LoRA keys must have real modules to bind to.
@@ -114,7 +129,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
     },
     # 27B dense on a B200 (178 GiB). the load is 44.25 GiB -- above the FP8 weight size alone, because
     # the vision tower and the non-quantized tensors stay bf16. measured on B200 (2026-08-30):
-    # 112.66 GiB of KV cache, 2,856,884 tokens, 87x concurrency at 32k, after the 16 rank-64 LoRA
+    # 112.66 GiB of KV cache, 3,691,072 tokens, 87x concurrency at 32k, after the 16 rank-64 LoRA
     # buffers and graph capture; the 80 GiB H100 this tier previously ran on measured 10.71x. every
     # repository here is pinned to an immutable revision so a served engine cannot silently follow an
     # upstream retag; note the model pin names a commit in the -FP8 repo while the tokenizer/processor
@@ -132,7 +147,16 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_loras": 16,
             "max_lora_rank": 64,
             "max_model_len": 32768,
-            "max_num_seqs": 8,
+            # 32, not the 8 inherited from the H100. measured on B200 (2026-08-31), container
+            # throughput at each cap's OWN capacity: 721 t/s at 8, 1110 at 16, 1899 at 32 -- 2.6x.
+            # the 16->32 step (+71.1%) is the largest in the sweep, so low headroom above a lower
+            # cap does NOT mean the next cap is unhelpful: past the cap requests queue instead of
+            # running. costs no memory: the kv pool moves 0.13% across the range and free vram
+            # stays flat at ~18.2 GiB. changing this value invalidates the vllm compile cache
+            # (max_num_seqs is part of its key), so the FIRST boot after this change pays a
+            # one-time torch.compile -- 430s of the 948s cold boot measured at 32, against 202s
+            # for the cache-warm boot at 16. both are far inside STARTUP_TIMEOUT_SECONDS (2700s).
+            "max_num_seqs": 32,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },
