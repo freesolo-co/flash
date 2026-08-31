@@ -13,8 +13,9 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
-from flash.serving.src.io.schemas import AdapterRecord
+from flash.serving.src.io.schemas import AdapterRecord, internal_adapter_payload
 from tests.serving.conftest import RecordingUsageStore, attest
 
 QWEN = "Qwen/Qwen3.5-9B"
@@ -22,40 +23,22 @@ INTERNAL_KEY = "fs-internal"
 
 
 def _lora_rec(run_id: str = "qa") -> AdapterRecord:
-    sha = "a" * 40
-    return AdapterRecord.model_validate(
-        {
-            "adapter_id": f"{run_id}@final.{sha}",
-            "repo_id": f"org/{run_id}",
-            "base_model": QWEN,
-            "org_id": "org-A",
-            "checkpoint": run_id,
-            "status": "ready",
-            "thinking": False,
-            "metadata": {
-                "record_type": "revision",
-                "run_id": run_id,
-                "checkpoint_step": None,
-                "hf_revision": sha,
-            },
-        }
-    )
-
-
-def _lora_alias(revision: AdapterRecord) -> AdapterRecord:
-    run_id = revision.run_id
-    assert run_id is not None
-    return revision.model_copy(
-        update={
-            "adapter_id": run_id,
-            "checkpoint": None,
-            "metadata": {
-                "record_type": "alias",
-                "run_id": run_id,
-                "alias_of": revision.adapter_id,
-            },
-        }
-    )
+    values = {
+        "adapter_id": f"{run_id}/final",
+        "repo_id": f"org/{run_id}",
+        "base_model": QWEN,
+        "org_id": "org-A",
+        "checkpoint": f"{run_id}/final",
+        "status": "ready",
+        "thinking": False,
+        "run_id": run_id,
+        "checkpoint_step": None,
+        "artifact_revision": "a" * 40,
+        "artifact_digest": "b" * 64,
+        "lora_rank": 16,
+    }
+    values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
+    return AdapterRecord.model_validate(values)
 
 
 def _base_rec(base_model: str = QWEN) -> AdapterRecord:
@@ -82,7 +65,7 @@ class FakePool:
                 "cached_tokens_reported": False,
                 "reasoning_tokens": 0,
                 "request_id": payload.generation_id,
-                "checkpoint": "",
+                "checkpoint": record.adapter_id if record.is_checkpoint else "",
             },
         )
 
@@ -103,7 +86,7 @@ class FakeAuthorizer:
         self.calls = []
         self._org = org
 
-    async def __call__(self, token, adapter_id):
+    async def __call__(self, token, adapter_id, scope=None):
         self.calls.append((token, adapter_id))
         return self._org
 
@@ -144,7 +127,7 @@ def test_base_model_serve_records_the_authorized_org_principal() -> None:
     event = store.finalized[0]
     assert event.principal.kind == "freesolo_org"
     assert event.principal.orgId == "caller-org"
-    assert event.target.requested_adapter_id == QWEN
+    assert event.target.public_model_id == QWEN
     assert event.target.base_model == QWEN
 
 
@@ -186,22 +169,46 @@ def test_explicit_base_model_thinking_remains_rejected_before_settlement() -> No
     assert store.finalized == []
 
 
-def test_base_model_via_internal_key_is_durably_unattributed() -> None:
+def test_unattributable_internal_base_model_request_fails_closed() -> None:
     client, store = _build([_base_rec()], authorizer=FakeAuthorizer())
+
     resp = _chat(client, QWEN, **{"X-Freesolo-Internal-Key": INTERNAL_KEY})
+
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "serving request lacks required organization attribution"}
+    assert store.finalized == []
+
+
+def test_internal_base_model_request_is_attributed_by_the_org_header() -> None:
+    client, store = _build([_base_rec()], authorizer=FakeAuthorizer())
+
+    resp = _chat(
+        client,
+        QWEN,
+        **{"X-Freesolo-Internal-Key": INTERNAL_KEY, "X-Freesolo-Org-Id": "org-A"},
+    )
+
     assert resp.status_code == 200
     assert len(store.finalized) == 1
     event = store.finalized[0]
     assert event.principal.kind == "trusted_internal"
-    assert event.principal.orgId is None
-    assert event.target.requested_adapter_id == QWEN
+    assert event.principal.orgId == "org-A"
+    assert event.principal.billingAttributionExplicit is True
+    assert event.target.public_model_id == QWEN
 
 
 def test_internal_lora_is_explicitly_attributed_to_immutable_owner() -> None:
     revision = _lora_rec("qa")
-    client, store = _build([revision, _lora_alias(revision)], authorizer=FakeAuthorizer())
+    client, store = _build([revision], authorizer=FakeAuthorizer())
 
-    response = _chat(client, "qa", **{"X-Freesolo-Internal-Key": INTERNAL_KEY})
+    response = _chat(
+        client,
+        "qa/final",
+        **{
+            "X-Freesolo-Internal-Key": INTERNAL_KEY,
+            "X-Freesolo-Org-Id": "org-A",
+        },
+    )
 
     assert response.status_code == 200
     assert len(store.finalized) == 1
@@ -221,16 +228,27 @@ def test_external_authorizer_none_fails_closed_before_dispatch() -> None:
     assert store.finalized == []
 
 
+def test_external_authorizer_blank_org_fails_closed_before_dispatch() -> None:
+    # a whitespace-only org would otherwise reach the principal model and raise a 500 there.
+    client, store = _build([_base_rec()], authorizer=FakeAuthorizer(org="   "))
+
+    response = _chat(client, QWEN, Authorization="Bearer k")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "serving auth did not return an attributable principal"}
+    assert store.finalized == []
+
+
 def test_lora_adapter_still_requires_a_key_and_records_requested_identity() -> None:
-    auth = FakeAuthorizer()
     revision = _lora_rec("qa")
-    client, store = _build([revision, _lora_alias(revision)], authorizer=auth)
-    assert _chat(client, "qa").status_code == 401
-    assert _chat(client, "qa", Authorization="Bearer k").status_code == 200
-    assert auth.calls == [("k", "qa")]
+    auth = FakeAuthorizer(org="org-A")
+    client, store = _build([revision], authorizer=auth)
+    assert _chat(client, "qa/final").status_code == 401
+    assert _chat(client, "qa/final", Authorization="Bearer k").status_code == 200
+    assert auth.calls == [("k", "qa/final")]
     assert len(store.finalized) == 1
-    assert store.finalized[0].target.requested_adapter_id == "qa"
-    assert store.finalized[0].principal.orgId == "caller-org"
+    assert store.finalized[0].target.public_model_id == "qa/final"
+    assert store.finalized[0].principal.orgId == "org-A"
 
 
 def test_adapter_record_defaults_serve_base_model_false() -> None:
@@ -289,6 +307,8 @@ def test_lora_request_returns_no_lora_for_base_model(modal_app_module):
 
     engine._ensure_adapter_local_locked = _boom  # type: ignore[assignment]
 
-    lora_request, record = asyncio.run(engine._lora_request(QWEN))
+    lora_request, record = asyncio.run(
+        engine._lora_request(QWEN, internal_adapter_payload(_base_rec()))
+    )
     assert lora_request is None
     assert record.serve_base_model is True

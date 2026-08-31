@@ -12,7 +12,13 @@ from contextlib import suppress
 from logging import Logger
 from typing import Any
 
-from flash.server.platform.auth import INTERNAL_KEY_ENV, freesolo_base_url, standalone
+from flash._internal.http import _urlopen_no_redirect
+from flash.server.platform.auth import (
+    INTERNAL_KEY_ENV,
+    freesolo_base_url,
+    serving_org_id,
+    standalone,
+)
 
 DEFAULT_TIMEOUT_S = 10.0
 
@@ -53,6 +59,12 @@ def run_org_id(status: Any) -> str:
             if org:
                 return org
     return ""
+
+
+def run_serving_org_id(status: Any) -> str:
+    """return the managed run org or the stable standalone serving scope."""
+
+    return serving_org_id(run_org_id(status))
 
 
 def build_internal_request(
@@ -120,7 +132,7 @@ def request_internal_json(
     method: str,
     subject: str,
     logger: Logger,
-    urlopen: UrlOpen = urllib.request.urlopen,
+    urlopen: UrlOpen | None = None,
     raise_for: AbstractSet[int] | None = None,
     expected: AbstractSet[int] | None = None,
 ) -> bool:
@@ -139,7 +151,7 @@ def request_internal_json(
         return False
     req = build_internal_request(path, body, token=key, method=method)
     try:
-        with urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
+        with _urlopen_no_redirect(req, timeout=DEFAULT_TIMEOUT_S, urlopen=urlopen) as resp:
             return 200 <= resp.status < 300
     except urllib.error.HTTPError as exc:
         detail = error_detail(exc)
@@ -160,7 +172,7 @@ def post_internal_json(
     *,
     subject: str,
     logger: Logger,
-    urlopen: UrlOpen = urllib.request.urlopen,
+    urlopen: UrlOpen | None = None,
     raise_for: AbstractSet[int] | None = None,
     expected: AbstractSet[int] | None = None,
 ) -> bool:
@@ -182,7 +194,7 @@ def delete_internal_json(
     *,
     subject: str,
     logger: Logger,
-    urlopen: UrlOpen = urllib.request.urlopen,
+    urlopen: UrlOpen | None = None,
 ) -> bool:
     return request_internal_json(
         path,

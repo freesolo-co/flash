@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 from flash.serve.app.openai import split_reasoning
 from flash.serve.request.openai import NormalizedChatRequest
-from flash.serving.src.io.provenance import _provenance_headers, _revision_provenance
+from flash.serving.src.io.provenance import _checkpoint_provenance, _provenance_headers
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.io.structured_outputs import StructuredOutputsError
 
@@ -26,12 +26,16 @@ _THINK_CLOSE = "</think>"
 def _inference_json_response(result: dict[str, Any], target: AdapterRecord) -> JSONResponse:
     # attach revision provenance while keeping engine-process attribution internal to metering.
     active_checkpoint = result.get("checkpoint")
-    provenance = _revision_provenance(target, active_checkpoint)
+    provenance = _checkpoint_provenance(target, active_checkpoint)
     internal_fields = {
         "cached_tokens_reported",
         "completion_token_ids",
         "engine_replica_id",
         "lora_request_adapter",
+        "queue_wait_seconds",
+        "replica_boot_duration_seconds",
+        "replica_freshly_booted",
+        "replica_in_flight_requests_at_admission",
         "prompt_token_ids",
     }
     public_result = {key: value for key, value in result.items() if key not in internal_fields}
@@ -212,7 +216,13 @@ def openai_chat_completion(
         reasoning, content = split_reasoning(
             str(choice["text"]), thinking=bool(generation.get("thinking"))
         )
-        message: dict[str, Any] = {"role": "assistant", "content": content}
+        tool_calls = choice.get("tool_calls") or []
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": content if content else None if tool_calls else content,
+        }
+        if tool_calls:
+            message["tool_calls"] = tool_calls
         if reasoning is not None:
             message["reasoning_content"] = reasoning
         choice_logprobs = choice.get("logprobs")
@@ -260,4 +270,7 @@ def openai_generate_fields(request: NormalizedChatRequest, adapter_id: str) -> d
         "chat_template_kwargs": request.chat_template_kwargs,
         "stop": list(request.stop) or None,
         "structured_outputs": request.structured_outputs,
+        "tools": None if request.tools is None else [tool.wire() for tool in request.tools],
+        "tool_choice": request.tool_choice,
+        "parallel_tool_calls": request.parallel_tool_calls,
     }

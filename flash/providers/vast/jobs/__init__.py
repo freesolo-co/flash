@@ -162,7 +162,7 @@ def _adopt_instance_by_label(
     *,
     deadline_at: float | None = None,
 ) -> dict | None:
-    """Best-effort instance DICT carrying this EXACT (per run/seed/attempt) label, or ``None``. Reclaims
+    """Best-effort instance DICT carrying this EXACT (per run/attempt) label, or ``None``. Reclaims
     a contract a possibly-successful-but-unconfirmed create left behind so the walk adopts it instead of
     renting a duplicate; the full dict (not just the id) lets the caller stamp the real launch time. Any
     lookup failure -> ``None`` (caller falls back; the orphan sweep is the backstop)."""
@@ -276,7 +276,6 @@ def _reconcile_ambiguous_create(
 
 def deploy_and_submit(
     spec,
-    seed: int,
     offers: list[VastOffer],
     attempt: int = 0,
     log=None,
@@ -297,13 +296,12 @@ def deploy_and_submit(
         raise vast_api.VastApiError("no usable vast offers (verified datacenter pool empty)")
     payload = build_payload(
         spec,
-        seed,
         attempt,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
         **deadline_kwargs(build_payload, absolute_deadline),
     )
-    label = instance_label(spec.run_id, seed, attempt)
+    label = instance_label(spec.run_id, attempt)
     onstart = build_onstart(payload)
 
     tried: list[VastOffer] = []
@@ -389,7 +387,7 @@ def deploy_and_submit(
                     say(
                         f"rented vast instance {instance_id}: {offer.gpu} ${offer.dph_total:.2f}/hr "
                         f"(offer {offer.offer_id}, {offer.geolocation}, reliability "
-                        f"{offer.reliability:.3f}) attempt={attempt} seed={seed}"
+                        f"{offer.reliability:.3f}) attempt={attempt}"
                     )
                 return VastJobHandle(
                     instance_id=instance_id,
@@ -455,7 +453,6 @@ def _failure_detail(
 def poll_vast_job(
     handle: VastJobHandle,
     spec,
-    seed: int,
     log=None,
     interval_s: float = 15.0,
     heartbeat_reader=None,
@@ -571,9 +568,8 @@ def poll_vast_job(
     )
 
 
-def submit_run_vast(
+def submit_attempt_vast(
     spec,
-    seed: int,
     log=None,
     on_handle=None,
     attempt: int = 0,
@@ -581,7 +577,7 @@ def submit_run_vast(
     source_snapshot: dict | None = None,
     deadline_at: float | None = None,
 ) -> PollResult:
-    """Vast equivalent of ``lambdalabs.jobs.submit_run_lambda``: rent, persist, poll, destroy.
+    """Vast equivalent of ``lambdalabs.jobs.submit_attempt_lambda``: rent, persist, poll, destroy.
 
     The ``finally`` destroy is the cost-safety primary: every exit path — success, failure, stall,
     exception, KeyboardInterrupt — tears the paid instance down.
@@ -591,7 +587,7 @@ def submit_run_vast(
     # caller bug — name it clearly.
     if spec.gpu.type not in GPU_INFO:
         raise vast_api.VastApiError(
-            f"submit_run_vast needs a concrete gpu class, got {spec.gpu.type!r}"
+            f"submit_attempt_vast needs a concrete gpu class, got {spec.gpu.type!r}"
         )
     from flash.core.spec import gpu_count_of
 
@@ -657,7 +653,6 @@ def submit_run_vast(
     try:
         handle = deploy_and_submit(
             spec,
-            seed,
             offers,
             attempt=attempt,
             log=log,
@@ -674,7 +669,6 @@ def submit_run_vast(
         result = poll_vast_job(
             handle,
             spec,
-            seed,
             log=log,
             heartbeat_reader=reader,
             **deadline_kwargs(poll_vast_job, absolute_deadline),
@@ -696,7 +690,7 @@ def submit_run_vast(
             try:
                 confirmed = _best_effort_destroy(
                     handle.instance_id,
-                    context="submit_run_vast teardown",
+                    context="submit_attempt_vast teardown",
                 )
             except BaseException as exc:
                 cleanup_exc = exc

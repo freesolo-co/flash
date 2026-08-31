@@ -22,9 +22,11 @@ Two credentials and at least one GPU account:
 
 Everything else is optional.
 
-The active training catalog is Qwen3.5 9B, Qwen3.8 27B, and Qwen3.6 35B-A3B. Customer-owned
-serving through `flash serve deploy` remains Qwen3.5 9B-only; the hosted 27B profile is not a
-customer-provider placement contract.
+The active training catalog is Qwen3.5 9B, Qwen3.8 27B, and Qwen3.6 35B-A3B. Hosted Qwen3.8
+27B remains inactive. Customer-owned Modal supports all three models; 27B and 35B-A3B are bound to
+the certified serving image digest. Customer-owned `flash serve` requires explicit
+`--provider modal`. Customer-serving RunPod commands and identities are unsupported, with no
+migration or teardown shim. Managed RunPod training remains supported and unchanged.
 
 ## Quickstart
 
@@ -233,6 +235,12 @@ placeholder value to set for the ones you skip.
 | Lambda   | `LAMBDA_API_KEY` |                                                                 |
 | Vast     | `VAST_API_KEY`   |                                                                 |
 
+Vast log retrieval accepts signed result URLs only from exact HTTPS origins in
+`FLASH_VAST_RESULT_ORIGINS`. The variable is control-plane-only and comma-separated. Leaving it
+unset or blank allows only `https://s3.amazonaws.com`; setting it replaces that default. Origins
+must be canonical HTTPS origins without credentials, explicit ports, paths, queries, fragments,
+wildcards, spaces, or control characters.
+
 The allocator ranks candidate GPU classes only on the substrates you configured, so a
 plane with just `VAST_API_KEY` set allocates on Vast and never proposes a class it cannot
 provision. Startup fails only when **all three** are missing.
@@ -363,10 +371,23 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 
 ## Serving
 
-`flash serve deploy` provisions serving in **your own** Modal or RunPod account, running the
-published worker image against one base model and one run's adapter. Training and export remain
-independent of serving. Catalog serving checkpoint repositories are informational only and are never
-resolved by the training path.
+`flash serve deploy` provisions serving in **your own** Modal account, running the published worker
+image against one exact base model and that model's compatible adapters. A separate deployment is
+required for each base model. Training and export remain independent of serving. The required
+provider argument has the sole accepted value `--provider modal`.
+Catalog serving checkpoint repositories are informational only and are never resolved by the
+training path.
+
+Customer-owned Modal is live-qualified for Qwen3.5 9B, Qwen3.8 27B, and Qwen3.6 35B-A3B. The 27B
+and 35B-A3B qualifications are bound to the certified serving image digest. The 27B engine runs on
+`H100!` and serves the pinned `Qwen/Qwen3.8-27B-FP8` checkpoint while retaining
+`Qwen/Qwen3.8-27B` as its logical base and tokenizer provenance. The 35B-A3B engine serves the BF16
+model on one H200 with FP8 KV cache, a 32K context, eight sequences, a 4096 batched-token cap, and
+six rank-64 LoRA slots.
+Customer-serving RunPod lifecycle commands and deployment identities are unsupported. There is no
+migration, status, undeploy, or teardown shim for an old RunPod identity. This does not affect the
+managed RunPod training provider, serverless workers, artifact caching, or `RUNPOD_API_KEY` used by
+the training control plane.
 
 ```bash
 # the `server` extra, not the bare install: `serve deploy` resolves the adapter through
@@ -392,31 +413,9 @@ flash serve deploy \
   --modal-region us-east
 ```
 
-The three `--modal-*` placement flags are required for `--provider modal` even though `--help`
-lists them as optional: they are optional to _argparse_ because RunPod takes its own pair instead,
-and `placement_for` is what requires exactly one provider's set. Omitting them exits with
-`modal placement requires environment, region, workspace_name`.
-
-For RunPod, export `RUNPOD_API_KEY` instead and swap the placement flags rather than adding to
-them -- `placement_for` rejects the other provider's inputs instead of ignoring them, so keeping
-`--modal-*` alongside `--provider runpod` fails before anything is created:
-
-```bash
-flash serve deploy \
-  --provider runpod \
-  --model Qwen/Qwen3.5-9B \
-  --run <run-id> \
-  --deployment-id my-9b-serving \
-  --image ghcr.io/freesolo-co/freesolo-flash-serve@sha256:<digest> \
-  --artifact-repo <hub-repo> \
-  --artifact-subfolder <path-within-repo> \
-  --lora-rank 32 \
-  --runpod-account <your-account-id> \
-  --runpod-data-center <data-center-id>
-```
-
-Both `--runpod-*` flags are required and must be nonempty, for the same reason the `--modal-*`
-trio is: `--help` lists them as optional only because each provider takes its own set.
+The three `--modal-*` placement flags are required for `--provider modal`. Omitting them exits with
+`modal placement requires environment, region, workspace_name`. Passing `--provider runpod` is
+rejected by argument parsing before Hub resolution, credential reads, or provider access.
 
 Provider credentials are read from the process environment for the duration of a single call and are
 never written to the deployment record, logs, or command arguments — so any later resize or teardown

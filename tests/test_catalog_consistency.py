@@ -67,23 +67,41 @@ def test_serving_capacity_matches_validated_matrix():
     # freesolo tree; compare both repos in the pinned freesolo-co/tests checkout.
     expected = {
         "Qwen/Qwen3.5-9B": {
-            "gpu": "L40S",
+            "gpu": "B200",
             "serve_model_id": "Freesolo-Co/Qwen3.5-9B-FP8",
             "max_loras": 16,
+            "max_cpu_loras": 16,
             "max_lora_rank": 128,
             "max_model_len": 32768,
             "max_num_seqs": 8,
+            "tensor_parallel_size": 1,
             "gpu_memory_utilization": 0.90,
+            "image_limit": 4,
+        },
+        "Qwen/Qwen3.8-27B": {
+            "gpu": "B200",
+            "serve_model_id": "Qwen/Qwen3.8-27B-FP8",
+            "max_loras": 16,
+            "max_cpu_loras": 16,
+            "max_lora_rank": 64,
+            "max_model_len": 32768,
+            "max_num_seqs": 8,
+            "tensor_parallel_size": 1,
+            "gpu_memory_utilization": 0.90,
+            "image_limit": 4,
         },
         "Qwen/Qwen3.6-35B-A3B": {
-            "gpu": "H200",
+            "gpu": "B200",
             "serve_model_id": "Qwen/Qwen3.6-35B-A3B",
             "max_loras": 6,
+            "max_cpu_loras": 6,
             "max_lora_rank": 64,
             "max_model_len": 32768,
             "max_num_seqs": 8,
             "max_num_batched_tokens": 4096,
+            "tensor_parallel_size": 1,
             "gpu_memory_utilization": 0.90,
+            "image_limit": 4,
         },
     }
     for model_id, values in expected.items():
@@ -95,7 +113,7 @@ def test_serving_capacity_matches_validated_matrix():
 
 def test_public_rows_include_serving_capacity():
     row = get_model("Qwen/Qwen3.5-9B").to_dict()
-    assert row["serving"]["gpu"] == "L40S"
+    assert row["serving"]["gpu"] == "B200"
     assert row["serving"]["max_loras"] == 16
     assert row["serving"]["max_lora_rank"] == 128
     assert row["serving"]["serve_model_id"] == "Freesolo-Co/Qwen3.5-9B-FP8"
@@ -105,23 +123,29 @@ def test_public_rows_prune_unset_serving_capacity_fields():
     row = get_model("Qwen/Qwen3.5-9B").to_dict()
     # serve_model_id survives while zero-valued optional capacity fields are pruned.
     assert row["serving"] == {
-        "gpu": "L40S",
+        "gpu": "B200",
         "serve_model_id": "Freesolo-Co/Qwen3.5-9B-FP8",
         "max_loras": 16,
+        "max_cpu_loras": 16,
         "max_lora_rank": 128,
         "max_model_len": 32768,
         "max_num_seqs": 8,
+        "tensor_parallel_size": 1,
         "gpu_memory_utilization": 0.90,
+        "image_limit": 4,
     }
 
 
-def test_serving_repos_match_current_active_serving_matrix() -> None:
+def test_serving_repos_cover_public_catalog_and_hosted_activation() -> None:
     assert SERVING_MODEL_REPOS == {
         "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
+        "Qwen/Qwen3.8-27B": "Qwen/Qwen3.8-27B-FP8",
         "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B",
     }
-    assert MODELS["Qwen/Qwen3.8-27B"].serving is None
-    assert "serving" not in MODELS["Qwen/Qwen3.8-27B"].to_dict()
+    assert MODELS["Qwen/Qwen3.8-27B"].serving is not None
+    from flash.serving.src.engine.model_config import SERVING_MODELS
+
+    assert "Qwen/Qwen3.8-27B" in {entry["base_model"] for entry in SERVING_MODELS}
 
 
 def test_qwen38_27b_fixture_binds_checkpoint_metadata() -> None:

@@ -17,6 +17,7 @@ import flash.engine.worker.runtime.kernel_warmup as kernel_warmup
 import flash.engine.worker.train.entry.backend_common as backend_common
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import gpu_count_of
+from flash.engine.support.huggingface import hub_error_transience
 from flash.engine.worker.runtime import state
 from flash.envs.loading.staged import (
     StagedEnvironmentTransientError,
@@ -67,6 +68,7 @@ def _run_worker_mode() -> None:
     # Idempotency: check DONE before any env-mutating pip install (fla fast path).
     if state.HF_REPO:
         from huggingface_hub import hf_hub_download
+        from huggingface_hub.errors import RemoteEntryNotFoundError
 
         try:
             hf_hub_download(
@@ -76,8 +78,15 @@ def _run_worker_mode() -> None:
                 token=os.environ.get("HF_TOKEN"),
             )
             done = True
-        except Exception:
-            done = False
+        except Exception as exc:
+            if type(exc) is RemoteEntryNotFoundError:
+                done = False
+            elif hub_error_transience(exc) is True:
+                raise worker_perf.RetriableInfraError(
+                    f"DONE marker read failed transiently ({type(exc).__name__})"
+                ) from exc
+            else:
+                raise
         remaining = state._remaining_worker_wall_seconds()
         if remaining is not None and remaining <= 0:
             raise RuntimeError("worker run wall deadline exceeded")

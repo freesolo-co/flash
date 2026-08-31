@@ -13,6 +13,11 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Added
 
+- OpenAI chat serving now implements and offline-validates strict function tool calling for the exact
+  Qwen3.5 packaged and hosted paths, including validated tool history, buffered and raw SSE
+  `tool_calls`, and managed forwarding. Flash parses schema-valid calls but does not execute them;
+  malformed automatic calls remain exact assistant text. Tool calling is not live-qualified pending
+  exact model testing.
 - OpenAI chat serving now preserves mirror sampling controls across packaged, hosted, and managed
   entry points: up to four indexed choices, signed seeds, frequency and presence penalties, and
   OpenAI token logprobs. Buffered and raw SSE responses retain independent choice terminals and
@@ -25,13 +30,38 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
-- Active training and hosted serving now expose exactly `Qwen/Qwen3.5-9B`,
-  `Qwen/Qwen3.8-27B`, and `Qwen/Qwen3.6-35B-A3B`. Qwen3.8 uses the immutable BF16 revision
+- A Flash run is one seed and may execute several attempts. The provider seed argument threaded
+  beside `spec.seed` is gone, so the spec is the only seed channel and no caller can supply a
+  second one to disagree with it; `Provider.submit_run`/`poll` are now `submit_attempt`/
+  `poll_attempt`; and `runner/supervise/seed_submission.py` is `attempt_supervision.py`. Instance
+  labels drop the redundant seed field (`<run>-s<seed>-a<n>` becomes `<run>-a<n>`), and every
+  RunPod endpoint carries an explicit `-a<n>` ordinal including attempt zero, replacing the `r<n>`
+  retry suffix that made a retry ordinal an identity and left the base name ambiguous between a run
+  and its first attempt. Names that exceed the provider budget now raise rather than truncate,
+  since a clipped ordinal is one two attempts of a run can collide on.
+
+- Run-backed adapters now use only explicit permanent checkpoint identities, `<run_id>/final` and
+  `<run_id>/step-N`. Bare run aliases, composite source-revision identities, activation, implicit
+  checkpoint fallback, and public artifact provenance have been removed across hosted, managed, and
+  customer-owned serving. Checkpoint bindings are write-once, exact undeploy preserves siblings,
+  and customer-owned manifests use schema v2.
+- Active training now exposes exactly `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
+  `Qwen/Qwen3.6-35B-A3B`. Hosted serving remains active for 9B and 35B-A3B; hosted Qwen3.8 27B
+  remains inactive. Qwen3.8 uses the immutable BF16 revision
   `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` and official native block-FP8 serving revision
-  `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`. The Qwen3.5 0.8B, 2B, and 4B tiers and
+  `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`, with the logical base and tokenizer provenance kept
+  distinct from the served checkpoint. The Qwen3.5 0.8B, 2B, and 4B tiers and
   `Qwen/Qwen3.6-27B` cannot activate, while historical status, accepted billing retry,
   cancellation, cleanup, hosted revocation, and exact identity-based undeploy remain available.
-  Qwen3.6 27B adapters are not compatible with Qwen3.8. Customer-owned serving remains 9B-only.
+  Qwen3.6 27B adapters are not compatible with Qwen3.8.
+- Customer-owned serving is now Modal-only and requires explicit `--provider modal`. Modal remains
+  live-qualified for all three active models. The 27B and 35B-A3B qualifications stay bound to the
+  exact certified serving image digest. Each deployment still serves one exact base model. The 27B
+  engine keeps its `H100!` placement and distinct served checkpoint and tokenizer provenance. The
+  35B-A3B engine keeps its H200, BF16, FP8 KV, 32K context, eight-sequence, 4096 batched-token, and
+  six rank-64 LoRA-slot contract. Customer-serving RunPod commands, profiles, identities, and
+  lifecycle code are removed without a compatibility or teardown shim. Managed RunPod training,
+  serverless workers, dependencies, provider routing, artifacts, and caching are unchanged.
 - `[train] init_from_adapter` now works for every source/target algorithm pair. SFT was rejected as
   a warm-start target, so an adapter could be continued only by GRPO or OPD; that restriction
   described the retired trl SFT backend, and the verl backend that replaced it loads a warm-start

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -123,21 +124,72 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     assert modal_app_module.app.function.call_args.kwargs["min_containers"] == 1
 
 
+def test_no_gpu_engine_is_capped_and_each_keeps_one_buffer(modal_app_module):
+    # `base_model` is a modal.parameter(), so Modal gives each distinct value its own container pool
+    # with its own autoscaling accounting. A fixed cap therefore ceilings a SINGLE model's capacity
+    # rather than bounding total spend -- sustained load on one model cannot borrow headroom from an
+    # idle one, so the cap converts demand into queueing on the hot tier. Spend is bounded by workspace
+    # quotas and billing alerts instead. Asserted on the kwargs modal is actually CALLED with, because
+    # a module constant that never reaches `app.cls` governs nothing.
+    assert modal_app_module.MAX_CONTAINERS is None
+    assert modal_app_module.BUFFER_CONTAINERS == 1
+
+    cls_calls = [call.kwargs for call in modal_app_module.app.cls.call_args_list]
+    assert len(cls_calls) == len(modal_app_module.ENGINE_BY_KEY)
+    assert all(kwargs["max_containers"] is None for kwargs in cls_calls)
+    # One spare warm container per engine absorbs a burst past TARGET_INPUTS without a cold boot.
+    # `buffer_containers` only provisions while the Function is ACTIVE, so this preserves scale-to-zero
+    # (MIN_CONTAINERS stays 0) rather than paying for an idle gpu.
+    assert all(kwargs["buffer_containers"] == 1 for kwargs in cls_calls)
+    assert all(kwargs["min_containers"] == 0 for kwargs in cls_calls)
+
+    # The cpu router is likewise uncapped: it is the front door that triggers cold engines, and
+    # capping it would throttle every model at once rather than bounding gpu spend per model. It
+    # carries the same buffer, so a burst does not queue behind the front door it just cleared.
+    router_kwargs = modal_app_module.app.function.call_args.kwargs
+    assert "max_containers" not in router_kwargs
+    assert router_kwargs["buffer_containers"] == 1
+
+
 def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app_module):
     # The whole point of the table: an idle container bills at the full gpu rate, so a cheap
     # fast-booting tier must not hold a card as long as the 35B's ~1010s-boot H200 does.
     from flash.serving.src.engine.model_config import base_models, gpu_for
 
     window_for = modal_app_module.scaledown_window_for
-    default = modal_app_module.DEFAULT_SCALEDOWN_WINDOW_SECONDS
 
     assert window_for("L4") < window_for("L40S") < window_for("H100") < window_for("H200")
     # The H200 keeps the full legacy hold (boot is ~17 min; a miss stalls the user that long).
-    assert window_for("H200") == default == 1800
+    assert window_for("H200") == 1800
     # Every catalog tier resolves to a positive window, so no model falls back by accident.
     assert all(window_for(gpu_for(bm)) > 0 for bm in base_models())
-    # An unknown tier falls back to the safe (longest) default rather than releasing early.
-    assert window_for("B200") == default
+    # B200 now carries all three shipped tiers and its window is MEASURED, not inherited: the
+    # slowest cold boot on the card was the 27B at 1821s, so it holds longer than the H200 it
+    # replaced. B300 ships nothing and keeps the unmeasured placeholder.
+    assert window_for("B200") == 2100
+    assert window_for("B300") == 1800
+    # Every tier that actually serves holds at least as long as its slowest measured cold boot.
+    assert all(window_for(gpu_for(bm)) >= 2100 for bm in base_models())
+
+
+def test_unknown_gpu_tier_is_rejected_not_silently_defaulted(modal_app_module):
+    # `gpu` in the serving catalog is a plain string. A typo or an unvalidated new card used to fall
+    # through `dict.get` to the default window and DEPLOY, billing that card's real hourly rate on a
+    # tier nobody qualified. Every one of these once returned 1800 silently.
+    from flash.serving.src.engine.model_config import base_models, gpu_for
+
+    window_for = modal_app_module.scaledown_window_for
+
+    for bogus in ("b200", "B2OO", "H2OO", "A100", "TOTALLY_FAKE", ""):
+        with pytest.raises(ValueError, match="Unsupported serving GPU tier"):
+            window_for(bogus)
+
+    # The gate is membership in the shipped table, so the two stay in sync by construction.
+    assert frozenset(modal_app_module.SCALEDOWN_WINDOW_SECONDS_BY_GPU) == (
+        modal_app_module.SUPPORTED_GPUS
+    )
+    # Every tier a cataloged model actually routes to must be supported.
+    assert {gpu_for(bm) for bm in base_models()} <= modal_app_module.SUPPORTED_GPUS
 
 
 def test_modal_concurrency_is_per_engine_key(modal_app_module):
@@ -332,6 +384,50 @@ def test_lora_engine_cache_key_uses_adapter_thinking_default(modal_app_module):
         "prompt_token_ids": [2]
     }
     assert calls == [True, False]
+
+
+def test_hosted_prompt_cache_key_utf8_encodes_accepted_tool_declarations(modal_app_module):
+    engine = object.__new__(modal_app_module._LoraEngineImpl)
+    engine._prompt_cache_size = 1
+
+    class _Payload:
+        messages: ClassVar[list[dict[str, str]]] = [{"role": "user", "content": "weather"}]
+        prompt = None
+        chat_template_kwargs: ClassVar[dict[str, object]] = {}
+        tool_choice = "auto"
+        tools: ClassVar[list[dict[str, object]]] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "description": "prévisions météo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "object",
+                                "properties": {
+                                    "forecast_🌦": {
+                                        "type": "string",
+                                        "description": "réponse détaillée",
+                                        "enum": ["ensoleillé", "nuageux ☁"],
+                                    }
+                                },
+                                "required": ["forecast_🌦"],
+                                "additionalProperties": False,
+                            }
+                        },
+                        "required": ["location"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+
+    key = engine._prompt_cache_key(_Payload(), thinking_default=False)
+
+    assert key is not None
+    assert key == engine._prompt_cache_key(_Payload(), thinking_default=False)
 
 
 def test_lora_engine_requires_trained_thinking_default(modal_app_module):
@@ -587,7 +683,7 @@ def test_load_adapters_for_base_filters_records(modal_app_module, monkeypatch):
         def __init__(self, base_model: str) -> None:
             self.base_model = base_model
             self.status = "ready"
-            self.is_revision = True
+            self.is_checkpoint = True
 
     records = [_Record("Qwen/Qwen3.8-27B"), _Record("Qwen/Qwen3.5-9B")]
     monkeypatch.setattr(
@@ -607,20 +703,45 @@ def test_load_adapters_for_base_skips_hydration_failures(modal_app_module, monke
     assert "adapter hydration skipped" in capsys.readouterr().out
 
 
+def _checkpoint_record(
+    run_id: str,
+    repo_id: str,
+    *,
+    subfolder: str | None = None,
+) -> dict[str, Any]:
+    checkpoint_id = f"{run_id}/final"
+    return {
+        "adapter_id": checkpoint_id,
+        "repo_id": repo_id,
+        "org_id": "org-1",
+        "base_model": "Qwen/Qwen3.5-9B",
+        "checkpoint": checkpoint_id,
+        "run_id": run_id,
+        "checkpoint_step": None,
+        "artifact_revision": hashlib.sha1(run_id.encode()).hexdigest(),
+        "artifact_digest": hashlib.sha256(f"{run_id}-artifact".encode()).hexdigest(),
+        "artifact_fingerprint": hashlib.sha256(f"{run_id}-binding".encode()).hexdigest(),
+        "lora_rank": 16,
+        "subfolder": subfolder,
+        "repo_type": "dataset",
+        "thinking": True,
+    }
+
+
 def test_adapter_source_cache_dir_ignores_adapter_id(modal_app_module):
     from flash.serving.src.io.schemas import AdapterRecord
 
     first = AdapterRecord.model_validate(
+        _checkpoint_record("a", "org/run", subfolder="sft/run/seed0/adapter")
+    )
+    second = AdapterRecord.model_validate(
         {
-            "adapter_id": "a",
-            "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-9B",
-            "subfolder": "sft/run/seed0/adapter",
-            "repo_type": "dataset",
-            "thinking": True,
+            **_checkpoint_record("b", "org/run", subfolder="sft/run/seed0/adapter"),
+            "artifact_revision": first.artifact_revision,
+            "artifact_digest": first.artifact_digest,
+            "artifact_fingerprint": first.artifact_fingerprint,
         }
     )
-    second = first.model_copy(update={"adapter_id": "b"})
     changed = first.model_copy(update={"subfolder": "sft/other/seed0/adapter"})
 
     root = Path("/cache/adapters")
@@ -672,22 +793,22 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
     engine.settings = type("_Settings", (), {"hf_api_key": "hf_secret"})()
 
     first = AdapterRecord.model_validate(
+        _checkpoint_record("a", "org/run", subfolder="sft/run/seed0/adapter")
+    )
+    second = AdapterRecord.model_validate(
         {
-            "adapter_id": "a",
-            "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-9B",
-            "subfolder": "sft/run/seed0/adapter",
-            "repo_type": "dataset",
-            "thinking": True,
+            **_checkpoint_record("b", "org/run", subfolder="sft/run/seed0/adapter"),
+            "artifact_revision": first.artifact_revision,
+            "artifact_digest": first.artifact_digest,
+            "artifact_fingerprint": first.artifact_fingerprint,
         }
     )
-    second = first.model_copy(update={"adapter_id": "b"})
 
     first_path = asyncio.run(engine._ensure_adapter_local_locked(first))
     second_path = asyncio.run(engine._ensure_adapter_local_locked(second))
 
     assert first_path == second_path
-    assert engine.registry.paths == {"a": first_path, "b": first_path}
+    assert engine.registry.paths == {first.adapter_id: first_path, second.adapter_id: first_path}
     assert len(calls) == 1
     assert calls[0]["repo_id"] == "org/run"
     assert calls[0]["repo_type"] == "dataset"
@@ -722,14 +843,7 @@ def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monke
     monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     record = AdapterRecord.model_validate(
-        {
-            "adapter_id": "a",
-            "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-9B",
-            "subfolder": "sft/run/seed0/adapter",
-            "repo_type": "dataset",
-            "thinking": True,
-        }
+        _checkpoint_record("a", "org/run", subfolder="sft/run/seed0/adapter")
     )
     cached_path = engine_support._adapter_source_cache_dir(tmp_path / "adapters", record)
     cached_path = cached_path / "sft/run/seed0/adapter"
@@ -747,7 +861,7 @@ def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monke
     path = asyncio.run(engine._ensure_adapter_local_locked(record))
 
     assert path == cached_path
-    assert engine.registry.paths == {"a": cached_path}
+    assert engine.registry.paths == {record.adapter_id: cached_path}
 
 
 def test_ensure_adapter_local_redownloads_partial_volume_cache(
@@ -771,14 +885,7 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
             self.paths[record.adapter_id] = path
 
     record = AdapterRecord.model_validate(
-        {
-            "adapter_id": "a",
-            "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-9B",
-            "subfolder": "sft/run/seed0/adapter",
-            "repo_type": "dataset",
-            "thinking": True,
-        }
+        _checkpoint_record("a", "org/run", subfolder="sft/run/seed0/adapter")
     )
     partial_path = engine_support._adapter_source_cache_dir(tmp_path / "adapters", record)
     partial_adapter_path = partial_path / "sft/run/seed0/adapter"
@@ -810,7 +917,7 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
     assert path == partial_adapter_path
     assert len(calls) == 1
     assert (path / "adapter_model.safetensors").read_bytes() == b"weights"
-    assert engine.registry.paths == {"a": partial_adapter_path}
+    assert engine.registry.paths == {record.adapter_id: partial_adapter_path}
 
 
 def test_preload_cached_loras_adds_only_volume_cached_adapters(
@@ -818,20 +925,16 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
 ):
     import asyncio
 
+    from flash.serve.contract.provenance import engine_adapter_name
     from flash.serving.src.io.schemas import AdapterRecord
     from flash.serving.src.store.registry import AdapterRegistry, lora_int_id
 
     cached = AdapterRecord.model_validate(
-        {
-            "adapter_id": "cached",
-            "repo_id": "org/cached",
-            "base_model": "Qwen/Qwen3.5-9B",
-            "subfolder": "sft/cached/seed0/adapter",
-            "repo_type": "dataset",
-            "thinking": True,
-        }
+        _checkpoint_record("cached", "org/cached", subfolder="sft/cached/seed0/adapter")
     )
-    missing = cached.model_copy(update={"adapter_id": "missing", "repo_id": "org/missing"})
+    missing = AdapterRecord.model_validate(
+        _checkpoint_record("missing", "org/missing", subfolder="sft/missing/seed0/adapter")
+    )
     cache_path = engine_support._adapter_source_cache_dir(tmp_path / "adapters", cached)
     cache_path = cache_path / "sft/cached/seed0/adapter"
     cache_path.mkdir(parents=True)
@@ -865,8 +968,9 @@ def test_preload_cached_loras_adds_only_volume_cached_adapters(
 
     asyncio.run(engine._preload_cached_loras())
 
-    assert [request.lora_name for request in engine.engine.added] == ["cached"]
-    assert engine.engine.pinned == [lora_int_id("cached")]
+    adapter_name = engine_adapter_name(cached.org_id, cached.adapter_id)
+    assert [request.lora_name for request in engine.engine.added] == [adapter_name]
+    assert engine.engine.pinned == [lora_int_id(adapter_name)]
     assert registry.local_path(cached) == cache_path
     assert registry.local_path(missing) is None
 
@@ -881,14 +985,7 @@ def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkey
     monkeypatch.setattr(registry_mod, "lora_int_id", lambda adapter_id: 42)
 
     def _rec(adapter_id: str, repo: str) -> AdapterRecord:
-        return AdapterRecord.model_validate(
-            {
-                "adapter_id": adapter_id,
-                "repo_id": repo,
-                "base_model": "Qwen/Qwen3.5-9B",
-                "thinking": True,
-            }
-        )
+        return AdapterRecord.model_validate(_checkpoint_record(adapter_id, repo))
 
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     assert not hasattr(engine, "_lora_entries")
@@ -902,8 +999,9 @@ def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkey
     assert req_a.lora_int_id != req_b.lora_int_id
     # re-resolving an already-cached adapter returns the same request and id.
     assert engine._cached_lora_request_locked(record_a, tmp_path / "a") is req_a
-    entry_a = engine._lora_entries["a"]
-    engine._lora_entries["a"] = _LoraEntry(entry_a.source_ident, req_a, "unconfirmed")
+    key_a = (record_a.org_id, record_a.adapter_id)
+    entry_a = engine._lora_entries[key_a]
+    engine._lora_entries[key_a] = _LoraEntry(entry_a.source_ident, req_a, "unconfirmed")
     req_c = engine._cached_lora_request_locked(_rec("c", "org/c"), tmp_path / "c")
     assert req_c.lora_int_id == 44
 

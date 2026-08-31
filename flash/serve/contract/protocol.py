@@ -5,9 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-IMMUTABLE_ADAPTER_REVISIONS_CAPABILITY = "immutable_adapter_revisions"
-ALIAS_COMPARE_AND_SWAP_CAPABILITY = "alias_compare_and_swap"
-REVISION_PROVENANCE_CAPABILITY = "revision_provenance"
+PERMANENT_CHECKPOINT_IDENTITY_CAPABILITY = "permanent_checkpoint_identity"
 THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 # the serving backend echoes back WHICH LoRA answered a request. like revision provenance
 # this is produced by the serving image, not by the run, so a client cannot make it appear
@@ -15,19 +13,15 @@ THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v
 LORA_REQUEST_ATTESTATION_CAPABILITY = "lora_request_attestation"
 # 16 mib of compressed images expands below 22 mib in base64, leaving over 2 mib for json and text.
 MAX_CHAT_REQUEST_BYTES = 24 * 1024 * 1024
+# every spelling of a text and an image content block. request validation, tool-history detachment
+# and template rendering each classify blocks, so the sets live here rather than in any of them
+# importing another.
+TEXT_TYPES = frozenset({"text", "input_text"})
+IMAGE_TYPES = frozenset({"image_url", "input_image", "image"})
 
-REQUIRED_SERVING_CAPABILITIES = frozenset(
-    {
-        IMMUTABLE_ADAPTER_REVISIONS_CAPABILITY,
-        ALIAS_COMPARE_AND_SWAP_CAPABILITY,
-    }
-)
-PREFERRED_SERVING_CAPABILITIES = frozenset({REVISION_PROVENANCE_CAPABILITY})
-ADAPTER_REVISION_PATTERN = (
-    r"(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})@"
-    r"(?:final|step-(?P<step>0|[1-9]\d{0,17}))\."
-    r"(?P<hf_revision>[0-9a-f]{40})"
-)
+REQUIRED_SERVING_CAPABILITIES = frozenset({PERMANENT_CHECKPOINT_IDENTITY_CAPABILITY})
+PREFERRED_SERVING_CAPABILITIES: frozenset[str] = frozenset()
+
 
 ServingHealthErrorCode = Literal[
     "non_object",

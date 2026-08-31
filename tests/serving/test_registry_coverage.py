@@ -1,32 +1,10 @@
-"""Registry edge coverage pins naive timestamps, unknown tombstones, and alias path handling.
-
-The tests use in-memory records only and never download adapter artifacts.
-"""
+"""Registry edge coverage pins naive timestamps and tenant-scoped tombstones."""
 
 from __future__ import annotations
 
 from datetime import UTC
-from pathlib import Path
 
-from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.store.registry import AdapterRegistry, _parse_iso
-
-
-def _alias() -> AdapterRecord:
-    return AdapterRecord.model_validate(
-        {
-            "adapter_id": "run",
-            "repo_id": "org/run",
-            "base_model": "Qwen/Qwen3.5-9B",
-            "org_id": "org-1",
-            "thinking": False,
-            "metadata": {
-                "record_type": "alias",
-                "run_id": "run",
-                "alias_of": "run@final." + "a" * 40,
-            },
-        }
-    )
 
 
 def test_parse_iso_assigns_utc_to_naive_timestamp() -> None:
@@ -40,26 +18,10 @@ def test_parse_iso_assigns_utc_to_naive_timestamp() -> None:
 def test_remove_unknown_id_creates_and_preserves_tombstone() -> None:
     registry = AdapterRegistry()
 
-    assert registry.remove("missing") is None
-    first = registry._tombstones["missing"]
+    key = ("org-1", "missing/final")
+    assert registry.remove(*key) is None
+    first = registry._tombstones[key]
     assert first is not None
 
-    assert registry.remove("missing") is None
-    assert registry._tombstones["missing"] == first
-
-
-def test_alias_local_path_is_never_stale() -> None:
-    registry = AdapterRegistry()
-    cached_record = AdapterRecord.model_validate(
-        {
-            "adapter_id": "run",
-            "repo_id": "org/old-run",
-            "base_model": "Qwen/Qwen3.5-9B",
-            "org_id": "org-1",
-            "thinking": False,
-            "metadata": {"hf_revision": "b" * 40},
-        }
-    )
-    registry.set_local_path(cached_record, Path("/tmp/old-run"))
-
-    assert registry.local_path_is_stale(_alias()) is False
+    assert registry.remove(*key) is None
+    assert registry._tombstones[key] == first

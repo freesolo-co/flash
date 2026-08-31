@@ -75,6 +75,7 @@ _DEFAULT_VOCAB_SIZE = 248_320
 class ServingCapacity:
     gpu: str
     max_loras: int
+    max_cpu_loras: int
     max_lora_rank: int
     max_model_len: int
     serve_model_id: str = ""
@@ -82,6 +83,7 @@ class ServingCapacity:
     max_num_batched_tokens: int = 0
     tensor_parallel_size: int = 0
     gpu_memory_utilization: float = 0.0
+    image_limit: int = 0
 
 
 @dataclass(frozen=True)
@@ -196,6 +198,7 @@ class ModelInfo:
                 "max_num_batched_tokens",
                 "tensor_parallel_size",
                 "gpu_memory_utilization",
+                "image_limit",
             ):
                 if serving.get(key) in ("", 0, 0.0, None):
                     serving.pop(key, None)
@@ -204,10 +207,11 @@ class ModelInfo:
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 
-# the checkpoint each active hosted base model's serving engine loads. qwen3.8-27b remains a
-# training model and a pinned hosted candidate, but does not enter this active map before its canary.
+# the checkpoint each public catalog model loads for customer-owned serving. hosted activation is
+# a separate allowlist in flash.serving.src.engine.model_config.
 SERVING_MODEL_REPOS: dict[str, str] = {
     "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
+    "Qwen/Qwen3.8-27B": "Qwen/Qwen3.8-27B-FP8",
     "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B",
 }
 
@@ -254,13 +258,16 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="A100 PCIe",
         serving=ServingCapacity(
-            gpu="L40S",
+            gpu="B200",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-9B"],
             max_loras=16,
+            max_cpu_loras=16,
             max_lora_rank=128,
             max_model_len=32768,
             max_num_seqs=8,
+            tensor_parallel_size=1,
             gpu_memory_utilization=0.90,
+            image_limit=4,
         ),
         thinking="hybrid",
         notes="bf16 LoRA. ~19 GB of weights; SFT fits a 48 GB card, while colocated GRPO "
@@ -310,10 +317,22 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="A100 PCIe",
         min_disk_gb=160,
+        serving=ServingCapacity(
+            gpu="B200",
+            serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.8-27B"],
+            max_loras=16,
+            max_cpu_loras=16,
+            max_lora_rank=64,
+            max_model_len=32768,
+            max_num_seqs=8,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.90,
+            image_limit=4,
+        ),
         thinking="hybrid",
         notes="Dense 27.781427952B multimodal VL checkpoint with image-capable bf16 LoRA training. "
         "SFT fits the 80GB A100 (~55.6GB weights); colocated GRPO needs the B200 (trainer + vLLM "
-        "rollout = two copies). Hosted serving remains pending the exact official FP8 H100 canary.",
+        "rollout = two copies). Hosted serving runs the official FP8 checkpoint on the B200.",
     ),
     "Qwen/Qwen3.6-35B-A3B": ModelInfo(
         id="Qwen/Qwen3.6-35B-A3B",
@@ -374,16 +393,19 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="H200",
         serving=ServingCapacity(
-            gpu="H200",
+            gpu="B200",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"],
-            # bf16 on h200 is the validated full-expert lora path. six hot rank-64 adapters plus 32k
-            # fit with cuda graphs and a 679,701-token kv cache; eight hot adapters overflow the card.
+            # bf16 is the validated full-expert lora path. six hot rank-64 adapters plus 32k fit
+            # with cuda graphs; the b200 measured 49.38 GiB of kv (3,678,952 tokens) for this shape.
             max_loras=6,
+            max_cpu_loras=6,
             max_lora_rank=64,
             max_model_len=32768,
             max_num_seqs=8,
             max_num_batched_tokens=4096,
+            tensor_parallel_size=1,
             gpu_memory_utilization=0.90,
+            image_limit=4,
         ),
         thinking="hybrid",
         min_disk_gb=200,

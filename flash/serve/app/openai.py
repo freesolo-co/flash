@@ -11,6 +11,7 @@ from flash.serve.request.openai import (  # noqa: F401
     OpenAIRequestError,
     parse_stream_options,
     reject_thinking_logprobs,
+    reject_tool_capability,
 )
 from flash.serve.request.openai import (
     parse_chat_request as parse_normalized_chat_request,
@@ -33,7 +34,9 @@ class OpenAIChatRequest:
     generation: GenerationRequest
 
 
-def parse_chat_request(payload: object, resolved: PublishedAdapter) -> OpenAIChatRequest:
+def parse_chat_request(
+    payload: object, resolved: PublishedAdapter, *, tool_parser: str | None = None
+) -> OpenAIChatRequest:
     """bind the canonical request grammar to an exact immutable adapter."""
 
     request = parse_normalized_chat_request(
@@ -47,8 +50,14 @@ def parse_chat_request(payload: object, resolved: PublishedAdapter) -> OpenAICha
         thinking=resolved.adapter.thinking_default,
         logprobs=request.logprobs,
     )
+    reject_tool_capability(
+        tools=request.tools,
+        tool_choice=request.tool_choice,
+        thinking=resolved.adapter.thinking_default,
+        tool_parser=tool_parser,
+    )
     generation = GenerationRequest(
-        adapter_id=resolved.adapter.adapter_revision,
+        adapter_id=resolved.adapter.checkpoint_id,
         expected_incarnation=resolved.adapter.aggregate_sha256,
         messages=request.messages,
         max_tokens=request.max_tokens,
@@ -64,6 +73,9 @@ def parse_chat_request(payload: object, resolved: PublishedAdapter) -> OpenAICha
         stop=request.stop,
         chat_template_kwargs=request.chat_template_kwargs,
         structured_outputs=request.structured_outputs,
+        tools=request.tools,
+        tool_choice=request.tool_choice,
+        parallel_tool_calls=request.parallel_tool_calls,
     )
     return OpenAIChatRequest(
         stream=request.stream,
@@ -175,11 +187,7 @@ def provenance_payload(
         "tokenizer_model": manifest.engine.tokenizer_model,
         "tokenizer_revision": manifest.engine.tokenizer_revision,
         "requested_model": resolved.requested_model,
-        "adapter_revision": adapter.adapter_revision,
-        "checkpoint": adapter.checkpoint,
-        "source_revision": adapter.source_revision,
-        "source_subfolder": adapter.source_subfolder,
-        "aggregate_sha256": adapter.aggregate_sha256,
+        "checkpoint_id": adapter.checkpoint_id,
     }
 
 
@@ -191,7 +199,12 @@ def nonstream_response(
     choices = []
     for choice in result.choices:
         reasoning, content = split_reasoning(choice.text, thinking=bool(result.thinking))
-        message: dict[str, Any] = {"role": "assistant", "content": content}
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": content if content else None if choice.tool_calls else content,
+        }
+        if choice.tool_calls:
+            message["tool_calls"] = [call.wire() for call in choice.tool_calls]
         if reasoning is not None:
             message["reasoning_content"] = reasoning
         choices.append(

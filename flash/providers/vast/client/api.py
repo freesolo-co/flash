@@ -12,7 +12,6 @@ import json
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 from typing import Any
 
 from flash._internal.logging import get_logger
@@ -22,6 +21,7 @@ from flash.providers._lifecycle.net.deadline import (
     require_deadline_at,
 )
 from flash.providers._lifecycle.net.http import RestClient, is_not_found
+from flash.providers.vast.client.result import VastResultError, fetch_result
 
 logger = get_logger(__name__)
 
@@ -404,13 +404,13 @@ def instance_logs(instance_id: int, *, deadline_at: float | None = None) -> str 
             if remaining <= 0:
                 break
             try:
-                with urllib.request.urlopen(url, timeout=min(15.0, remaining)) as resp:
-                    body = resp.read().decode(errors="replace")
+                result = fetch_result(url, timeout=min(15.0, remaining))
+            except VastResultError:
+                return None
+            if result is not None:
+                body = result.decode(errors="replace")
                 if body.strip():
                     return body
-            except urllib.error.HTTPError as e:
-                if e.code != 404:  # 404 = not materialized yet
-                    return None
             sleep_for = min(2.0, remaining_seconds(poll_deadline))
             if sleep_for <= 0:
                 break

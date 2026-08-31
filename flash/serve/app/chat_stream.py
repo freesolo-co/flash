@@ -57,6 +57,21 @@ async def stream_chat_body(
             if type(event) is StreamDelta and finished is None:
                 if event.index in terminals or event.index not in splitters:
                     raise RuntimeError("invalid stream choice delta")
+                if event.tool_calls:
+                    yield sse_data(
+                        stream_chunk(
+                            request_id=ready.request_id,
+                            model=resolved.requested_model,
+                            index=event.index,
+                            delta={
+                                "tool_calls": [
+                                    call.wire(index=call_index)
+                                    for call_index, call in enumerate(event.tool_calls)
+                                ]
+                            },
+                        )
+                    )
+                    continue
                 rendered = splitters[event.index].feed(event.text)
                 if event.logprobs is not None and len(rendered) > 1:
                     raise RuntimeError("a logprob delta crossed the reasoning boundary")
@@ -87,7 +102,7 @@ async def stream_chat_body(
         if (
             finished.request_id != ready.request_id
             or finished.runtime_id != ready.runtime_id
-            or finished.adapter_id != resolved.adapter.adapter_revision
+            or finished.adapter_id != resolved.adapter.checkpoint_id
             or finished.incarnation != resolved.adapter.aggregate_sha256
             or finished.thinking != ready.thinking
         ):

@@ -474,7 +474,6 @@ def _fast_serving_readback(monkeypatch):
     import flash.serve.deployment.deploy as _deploy
 
     monkeypatch.setattr(_deploy, "READBACK_DELAY_SECONDS", 0.0)
-    monkeypatch.setattr(_deploy, "ACTIVATION_READBACK_DELAY_SECONDS", 0.0)
     monkeypatch.setattr(_deploy, "SMOKE_RETRY_FALLBACK_DELAY_SECONDS", 0.0)
 
 

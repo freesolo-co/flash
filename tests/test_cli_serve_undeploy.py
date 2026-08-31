@@ -25,12 +25,12 @@ def _parse(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _args(provider: str = "modal") -> argparse.Namespace:
+def _args() -> argparse.Namespace:
     base = [
         "serve",
         "undeploy",
         "--provider",
-        provider,
+        "modal",
         "--model",
         MODEL,
         "--run",
@@ -46,51 +46,31 @@ def _args(provider: str = "modal") -> argparse.Namespace:
         "--lora-rank",
         "32",
     ]
-    if provider == "modal":
-        base.extend(
-            [
-                "--modal-workspace",
-                "workspace",
-                "--modal-environment",
-                "dev",
-                "--modal-region",
-                "us-east",
-                "--modal-app-id",
-                "ap-" + "1" * 22,
-                "--modal-volume-id",
-                "vo-" + "1" * 22,
-                "--modal-inference-secret-id",
-                "st-" + "1" * 22,
-            ]
-        )
-    else:
-        base.extend(
-            [
-                "--runpod-account",
-                "account1",
-                "--runpod-data-center",
-                "US-KS-2",
-                "--runpod-pod-id",
-                "pod1234567890",
-                "--runpod-network-volume-id",
-                "vol1234567890",
-                "--runpod-template-id",
-                "tpl1234567890",
-                "--runpod-inference-secret-id",
-                "sec1234567890",
-            ]
-        )
+    base.extend(
+        [
+            "--modal-workspace",
+            "workspace",
+            "--modal-environment",
+            "dev",
+            "--modal-region",
+            "us-east",
+            "--modal-app-id",
+            "ap-" + "1" * 22,
+            "--modal-volume-id",
+            "vo-" + "1" * 22,
+            "--modal-inference-secret-id",
+            "st-" + "1" * 22,
+        ]
+    )
     return _parse(base)
 
 
-def _stub_credentials(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str, str]:
+def _stub_credentials(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str]:
     token_id = "modal-token-id-do-not-print"
     token_secret = "modal-token-secret-do-not-print"
-    api_key = "runpod-api-key-do-not-print"
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_ID_ENV, token_id)
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_SECRET_ENV, token_secret)
-    monkeypatch.setenv(serve_deploy.RUNPOD_API_KEY_ENV, api_key)
-    return token_id, token_secret, api_key
+    return token_id, token_secret
 
 
 def _result(bundle, status: str, error_code: str | None = None) -> DeploymentResult:
@@ -105,10 +85,8 @@ def _deployment_identity(monkeypatch: pytest.MonkeyPatch, args: argparse.Namespa
     return encode_deployment_identity(bundle)
 
 
-def _args_with_identity(
-    monkeypatch: pytest.MonkeyPatch, provider: str = "modal"
-) -> argparse.Namespace:
-    args = _args(provider)
+def _args_with_identity(monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace:
+    args = _args()
     args.deployment_identity = _deployment_identity(monkeypatch, args)
     return args
 
@@ -131,7 +109,7 @@ def _fail_hub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_undeploy_uses_immutable_identity_for_removed_model(
     monkeypatch: pytest.MonkeyPatch, retired_model: str
 ) -> None:
-    args = _args("modal")
+    args = _args()
     args.deployment_identity = _historical_identity(monkeypatch, args, retired_model)
     args.model = retired_model
     _stub_credentials(monkeypatch)
@@ -148,44 +126,6 @@ def test_undeploy_uses_immutable_identity_for_removed_model(
 
     assert cmd_serve_undeploy(args) == 0
     assert seen == [retired_model]
-
-
-@pytest.mark.parametrize(
-    ("provider", "handle_field", "expected_id"),
-    [
-        ("modal", "app_id", "ap-" + "1" * 22),
-        ("runpod", "pod_id", "pod1234567890"),
-    ],
-)
-def test_undeploy_uses_supplied_identity_when_hub_resolution_fails(
-    monkeypatch: pytest.MonkeyPatch,
-    provider: str,
-    handle_field: str,
-    expected_id: str,
-) -> None:
-    calls: list[str] = []
-    args = _args(provider)
-    args.deployment_identity = _deployment_identity(monkeypatch, args)
-    _fail_hub_resolution(monkeypatch)
-    _stub_credentials(monkeypatch)
-
-    def _teardown(bundle, handle, credentials, *, deadline_at, **_kwargs):
-        calls.append(getattr(handle, handle_field))
-        return _result(bundle, "absent")
-
-    # modal's entry sits under execution/, runpod's directly under the package.
-    entry = (
-        "flash.serve.provisioning.modal.execution.operations"
-        if provider == "modal"
-        else "flash.serve.provisioning.runpod.operations"
-    )
-    monkeypatch.setattr(
-        f"{entry}.teardown_{provider}_deployment",
-        _teardown,
-    )
-
-    assert cmd_serve_undeploy(args) == 0
-    assert calls == [expected_id]
 
 
 def test_undeploy_uses_deploy_time_names_after_the_model_tip_advances(
@@ -317,7 +257,7 @@ def test_undeploy_rejects_mismatched_handle_input_without_a_traceback(
 def test_modal_undeploy_without_provider_ids_routes_to_identity_reclaim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    args = _args_with_identity(monkeypatch, "modal")
+    args = _args_with_identity(monkeypatch)
     args.modal_app_id = ""
     args.modal_volume_id = ""
     args.modal_inference_secret_id = ""
@@ -340,7 +280,7 @@ def test_modal_undeploy_without_provider_ids_routes_to_identity_reclaim(
 def test_modal_undeploy_rejects_partial_provider_ids(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    args = _args_with_identity(monkeypatch, "modal")
+    args = _args_with_identity(monkeypatch)
     args.modal_app_id = ""
     _stub_credentials(monkeypatch)
 
@@ -354,73 +294,6 @@ def test_modal_undeploy_rejects_partial_provider_ids(
 
     assert cmd_serve_undeploy(args) == 1
     assert "modal provider ids must be supplied together or omitted" in capsys.readouterr().err
-
-
-def test_runpod_undeploy_without_provider_ids_routes_to_identity_reclaim(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    args = _args_with_identity(monkeypatch, "runpod")
-    args.runpod_pod_id = ""
-    args.runpod_network_volume_id = ""
-    args.runpod_template_id = ""
-    args.runpod_inference_secret_id = ""
-    _stub_credentials(monkeypatch)
-    handles = []
-
-    def _reclaim(bundle, handle, credentials, *, deadline_at, **_kwargs):
-        handles.append(handle)
-        return _result(bundle, "absent")
-
-    monkeypatch.setattr(
-        "flash.serve.provisioning.runpod.operations.teardown_runpod_deployment", _reclaim
-    )
-
-    assert cmd_serve_undeploy(args) == 0
-    assert handles == [None]
-
-
-def test_runpod_undeploy_rejects_partial_provider_ids(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    args = _args_with_identity(monkeypatch, "runpod")
-    args.runpod_pod_id = ""
-    _stub_credentials(monkeypatch)
-
-    def _explode(*_args, **_kwargs):
-        raise AssertionError("teardown ran with a partial provider handle")
-
-    monkeypatch.setattr(
-        "flash.serve.provisioning.runpod.operations.teardown_runpod_deployment", _explode
-    )
-
-    assert cmd_serve_undeploy(args) == 1
-    assert "runpod provider ids must be supplied together or omitted" in capsys.readouterr().err
-
-
-def test_undeploy_routes_to_the_named_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str]] = []
-
-    def _modal(bundle, handle, credentials, *, deadline_at, **_kwargs):
-        calls.append(("modal", handle.app_id))
-        return _result(bundle, "absent")
-
-    def _runpod(bundle, handle, credentials, *, deadline_at, **_kwargs):
-        calls.append(("runpod", handle.pod_id))
-        return _result(bundle, "absent")
-
-    _stub_credentials(monkeypatch)
-    modal_args = _args_with_identity(monkeypatch, "modal")
-    runpod_args = _args_with_identity(monkeypatch, "runpod")
-    monkeypatch.setattr(
-        "flash.serve.provisioning.modal.execution.operations.teardown_modal_deployment", _modal
-    )
-    monkeypatch.setattr(
-        "flash.serve.provisioning.runpod.operations.teardown_runpod_deployment", _runpod
-    )
-
-    assert cmd_serve_undeploy(modal_args) == 0
-    assert cmd_serve_undeploy(runpod_args) == 0
-    assert calls == [("modal", "ap-" + "1" * 22), ("runpod", "pod1234567890")]
 
 
 @pytest.mark.parametrize(
@@ -519,3 +392,42 @@ def test_parser_wires_serve_undeploy_without_credential_flags() -> None:
     help_text += undeploy.format_help()
     for forbidden in ("--token", "--api-key", "--password", "--credential"):
         assert forbidden not in help_text
+
+
+def test_undeploy_uses_supplied_identity_when_hub_resolution_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    args = _args()
+    args.deployment_identity = _deployment_identity(monkeypatch, args)
+    _fail_hub_resolution(monkeypatch)
+    _stub_credentials(monkeypatch)
+
+    def _teardown(bundle, handle, credentials, *, deadline_at, **_kwargs):
+        calls.append(handle.app_id)
+        return _result(bundle, "absent")
+
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.operations.teardown_modal_deployment",
+        _teardown,
+    )
+
+    assert cmd_serve_undeploy(args) == 0
+    assert calls == ["ap-" + "1" * 22]
+
+
+def test_undeploy_routes_to_modal(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def _modal(bundle, handle, credentials, *, deadline_at, **_kwargs):
+        calls.append(handle.app_id)
+        return _result(bundle, "absent")
+
+    _stub_credentials(monkeypatch)
+    args = _args_with_identity(monkeypatch)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.operations.teardown_modal_deployment", _modal
+    )
+
+    assert cmd_serve_undeploy(args) == 0
+    assert calls == ["ap-" + "1" * 22]

@@ -236,7 +236,7 @@ async def _produce_openai_chat_stream(
         await stream_output.emit(
             _assistant_role_chunk(completion_id, created, adapter_id, choice_count)
         )
-        while True:
+        while final is None:
             try:
                 event = await _next_event_or_disconnect(guarded_events, disconnect_wait)
             except StopAsyncIteration:
@@ -268,7 +268,7 @@ async def _produce_openai_chat_stream(
                     terminal_persisted = True
                 await stream_output.terminal(stream_output.error(event["message"], event["code"]))
                 return
-            elif kind != "ready":
+            elif kind not in {"ready", "usage_progress"}:
                 raise RuntimeError("invalid engine stream event")
         if disconnected.is_set() and final is None:
             if latest_usage:
@@ -334,6 +334,15 @@ async def _emit_delta(
     index = _event_index(event, len(splitters))
     if index in terminals:
         raise RuntimeError("choice delta followed its terminal")
+    tool_calls = event.get("tool_calls")
+    if tool_calls:
+        deltas = []
+        for call_index, call in enumerate(tool_calls):
+            delta = dict(call)
+            delta["index"] = call_index
+            deltas.append(delta)
+        await stream_output.emit(stream_output.delta({"tool_calls": deltas}, index=index))
+        return
     rendered = splitters[index].feed(str(event.get("text") or ""))
     logprobs = event.get("logprobs")
     if logprobs is not None and len(rendered) > 1:

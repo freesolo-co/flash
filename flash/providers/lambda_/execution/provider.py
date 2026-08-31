@@ -57,6 +57,7 @@ class LambdaProvider(InstanceProvider):
     """``base.Provider`` for the Lambda Cloud substrate."""
 
     name = "lambda"
+    supports_weight_cache = True
     _gpu_identity_attr = "lambda_name"
 
     @property
@@ -80,10 +81,9 @@ class LambdaProvider(InstanceProvider):
 
         return hourly_rate(gpu)
 
-    def _submit_run(
+    def _submit_attempt(
         self,
         spec,
-        seed: int,
         *,
         log: Any,
         on_handle: Any,
@@ -92,11 +92,10 @@ class LambdaProvider(InstanceProvider):
         source_snapshot: dict | None,
         deadline_at: float | None,
     ) -> PollResult:
-        from flash.providers.lambda_.jobs import submit_run_lambda
+        from flash.providers.lambda_.jobs import submit_attempt_lambda
 
-        return submit_run_lambda(
+        return submit_attempt_lambda(
             spec,
-            seed,
             log=log,
             on_handle=on_handle,
             attempt=attempt,
@@ -109,7 +108,6 @@ class LambdaProvider(InstanceProvider):
         self,
         handle: JobHandle,
         spec,
-        seed: int,
         *,
         log: Any,
         heartbeat_reader: Any,
@@ -120,7 +118,6 @@ class LambdaProvider(InstanceProvider):
         return poll_lambda_job(
             handle,
             spec,
-            seed,
             log=log,
             heartbeat_reader=heartbeat_reader,
             deadline_at=deadline_at,
