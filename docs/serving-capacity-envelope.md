@@ -192,7 +192,7 @@ before it allocates.
 
 **Not yet measured.** 27B/H100 is sweeping; 35B/H200 follows. Their tables land here in the
 same shape, and each tier passes its own canary -- real card identity, immutable model,
-tokenizer and processor revisions, 32768 configured context, a GDN backend named by vLLM's own
+tokenizer revisions, 32768 configured context, a GDN backend named by vLLM's own
 resolver, finite non-empty output with a terminal finish reason, and confirmed teardown --
 before its sweep is allowed to spend.
 
@@ -250,7 +250,7 @@ uv run ruff check flash/serving/bench scripts/bench_hosted_capacity.py
 ```
 
 Paid, only under explicit authorization — a per-model canary asserting GPU identity, exact
-model/tokenizer/processor provenance, and 32768 configured context runs before any sweep, and
+exact model and tokenizer provenance, and 32768 configured context runs before any sweep, and
 teardown is confirmed after each model:
 
 ```

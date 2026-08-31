@@ -6133,36 +6133,32 @@ def test_the_summary_refuses_buckets_that_measured_different_kv_pools() -> None:
     with pytest.raises(RuntimeError, match="KV pools"):
         require(drifted)
 
-    # An absent field must read as unknown, never as a stand-in value. `probe_engine_kv_cache`
-    # omits each field independently, so a build can expose `block_size` while withholding the
-    # block count -- and a default that happened to equal the other bucket's real count would grant
-    # exactly the fusion this gate exists to refuse. Each axis is pinned separately because a
-    # single both-absent case is satisfied by whichever axis differs first.
+    # An unreadable pool must REFUSE, never resolve to a comparable stand-in. `probe_engine_kv_cache`
+    # omits each field independently, so a build can expose `block_size` while withholding the block
+    # count. Reporting the missing axis as `"unknown"` made it comparable, and two probes that each
+    # withheld it then compared EQUAL -- publishing `accepted_kv_pool: unknown` as a verified
+    # identity over buckets that could have been sized differently. Each axis is pinned separately
+    # because a single both-absent case is satisfied by whichever axis raises first.
     for absent in ("num_gpu_blocks", "block_size"):
         full = {"num_gpu_blocks": 12040, "block_size": 16}
-        assert (
-            kv_identity({"kv_cache": {k: v for k, v in full.items() if k != absent}})[absent]
-            == "unknown"
-        ), f"an absent {absent} is reported as a value the probe never read"
-        with pytest.raises(RuntimeError, match="KV pools"):
-            require(
-                [
-                    ("canary", {"kv_cache": full}),
-                    (
-                        "bucket 'near_32k'",
-                        {"kv_cache": {k: v for k, v in full.items() if k != absent}},
-                    ),
-                ]
-            )
+        partial = {"kv_cache": {k: v for k, v in full.items() if k != absent}}
+        with pytest.raises(RuntimeError, match="no KV pool"):
+            kv_identity(partial)
+        with pytest.raises(RuntimeError, match="no KV pool"):
+            require([("canary", {"kv_cache": full}), ("bucket 'near_32k'", partial)])
 
-    # Two probes that both failed to expose a pool agree on NOTHING.
-    with pytest.raises(RuntimeError, match="KV pools"):
+    # Two probes that both failed to expose a pool agree on NOTHING. This is the case the
+    # `"unknown"` spelling silently PASSED: identical placeholders on both sides compare equal, so
+    # the gate certified a pool nobody ever read. Both orderings, and the both-absent pair.
+    with pytest.raises(RuntimeError, match="no KV pool"):
         require(
             [
                 ("canary", {"kv_cache": {"num_gpu_blocks": 12040, "block_size": 16}}),
                 ("bucket 'near_32k'", {}),
             ]
         )
+    with pytest.raises(RuntimeError, match="no KV pool"):
+        require([("canary", {}), ("bucket 'near_32k'", {"kv_cache": {}})])
 
     # The gate must run in the sweep and reach the artifact, not merely exist as a helper.
     source = BENCH_APP.read_text(encoding="utf-8")

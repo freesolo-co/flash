@@ -897,17 +897,23 @@ def _kv_pool_identity(probe: dict[str, Any]) -> dict[str, str]:
     matters: its whole claim is how many 32k requests fit, which IS the block count. A replacement
     container sized differently would otherwise have its curve fused into the summary silently.
 
-    An absent pool reads as `"unknown"` rather than as an empty match. Two probes that both failed
-    to expose `num_gpu_blocks` agree on nothing, and letting empty compare equal to empty would
-    grant exactly the fusion this gate exists to refuse.
+    An absent pool raises rather than reading as `"unknown"`. Two probes that both failed to expose
+    `num_gpu_blocks` agree on nothing, and `"unknown" == "unknown"` is exactly the fusion this gate
+    exists to refuse -- it would publish `accepted_kv_pool: unknown` as a VERIFIED identity while
+    the buckets behind it could have been sized differently. An identity that cannot be read is not
+    an identity that matches; the sweep stops instead, with the per-bucket artifacts already
+    written.
     """
     kv = probe.get("kv_cache") or {}
     blocks = kv.get("num_gpu_blocks")
     block_size = kv.get("block_size")
-    return {
-        "num_gpu_blocks": str(blocks) if blocks is not None else "unknown",
-        "block_size": str(block_size) if block_size is not None else "unknown",
-    }
+    if blocks is None or block_size is None:
+        raise RuntimeError(
+            "a probe exposed no KV pool (num_gpu_blocks="
+            f"{blocks!r}, block_size={block_size!r}); the pool bounds concurrency at long context, "
+            "so an unreadable one cannot be certified as matching any other"
+        )
+    return {"num_gpu_blocks": str(blocks), "block_size": str(block_size)}
 
 
 def _run_canary(base_model: str, engine: Any, expected_gpu: str) -> dict[str, Any]:
@@ -1181,10 +1187,22 @@ def _run_sweep_lane(
         # evidence for a boot that was already paid for. The envelope rides along via `lane.write`,
         # so a payload carrying measurements can never lose the contract that produced them.
         lane.write(payload, f"sweep-{lane.slug()}-{name}-b{block}.json")
+        # Checked HERE, against the canary, as soon as this bucket's artifact is on disk -- not
+        # after the whole sweep. Drift makes every remaining bucket unpublishable, so paying for
+        # them buys nothing: a sweep that drifts at the first bucket used to run the other two and
+        # refuse at the end, spending a full tier's GPU-hours to reach a failure already decided.
+        # The write above happens first, so stopping early still keeps the evidence it paid for.
+        _require_one_identity(
+            [("canary", gate["probe"]), (f"bucket {name!r}", payload.get("provenance") or {})],
+            _checkpoint_identity,
+            "checkpoint",
+        )
     # BEFORE the summary, after every per-bucket artifact is safely on disk. Each bucket gated its
     # own container's provenance, but nothing compared those containers to each other: a repo that
     # advanced mid-sweep, or a replacement container, leaves buckets measured on different commits
-    # and the summary below would fuse their curves into one envelope.
+    # and the summary below would fuse their curves into one envelope. The per-bucket check above
+    # already stops a drifting sweep early; this re-gates the full set across all four axes, which
+    # is what the summary actually publishes.
     gated = [("canary", gate["probe"])] + [
         (f"bucket {p['bucket']!r}", p.get("provenance") or {}) for p in results
     ]
