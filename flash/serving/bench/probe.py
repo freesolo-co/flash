@@ -26,6 +26,7 @@ import inspect
 import json
 import subprocess
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -262,9 +263,10 @@ def _gdn_resolver_kwargs(resolver: Any, base_model: str) -> dict[str, Any]:
     """Bind only the parameters this build's resolver actually declares.
 
     Signature-driven rather than hardcoded, because the resolver is vLLM-internal and its parameters
-    move between builds; a fixed argument list would break on the next bump exactly as the zero-arg
-    call broke on this one. A REQUIRED parameter that the config cannot supply raises, and the caller
-    records that as a signature mismatch rather than as an unknown backend.
+    move between builds. vLLM 0.23.0 takes one ``vllm_config`` object rather than raw head dimensions,
+    so build the smallest duck-typed view of the real engine config that its resolver reads. The head
+    dimension still comes from the served checkpoint; supplying a guessed value would make the probe
+    answer its own question.
     """
     signature = inspect.signature(resolver)
     available = _gdn_config_values(base_model)
@@ -272,7 +274,24 @@ def _gdn_resolver_kwargs(resolver: Any, base_model: str) -> dict[str, Any]:
     for name, parameter in signature.parameters.items():
         if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
             continue
-        if name in available:
+        if name == "vllm_config":
+            # Never default the head dim. On SM10.x the resolver grants FlashInfer only when
+            # `linear_key_head_dim == 128`, so a missing value silently answers "triton" -- the
+            # exact Blackwell fallback this probe exists to detect, reported as if it were the
+            # engine's own decision. An absent dimension is a failed config read, not a backend.
+            if "linear_key_head_dim" not in available:
+                raise TypeError(
+                    "resolver requires 'vllm_config.model_config.hf_text_config."
+                    "linear_key_head_dim', which this model config does not supply"
+                )
+            hf_text_config = types.SimpleNamespace(
+                linear_key_head_dim=available["linear_key_head_dim"]
+            )
+            kwargs[name] = types.SimpleNamespace(
+                additional_config=None,
+                model_config=types.SimpleNamespace(hf_text_config=hf_text_config),
+            )
+        elif name in available:
             kwargs[name] = available[name]
         elif parameter.default is parameter.empty:
             raise TypeError(f"resolver requires {name!r}, which this model config does not supply")
@@ -288,7 +307,11 @@ def _gdn_backend_in_process(base_model: str) -> dict[str, Any]:
 
     `probe_gdn_backend` explains why this must not run in the engine's own process.
     """
-    result: dict[str, Any] = {"base_model": base_model, "resolved": None}
+    result: dict[str, Any] = {
+        "base_model": base_model,
+        "resolved": None,
+        "source": "resolver",
+    }
     try:
         from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
     except Exception as exc:
@@ -381,6 +404,7 @@ def probe_gdn_backend(base_model: str, *, timeout: float = 120.0) -> dict[str, A
             "base_model": base_model,
             "resolved": None,
             "reason": f"resolver subprocess exceeded {timeout}s",
+            "source": "resolver",
             "subprocess_isolated": True,
         }
     except Exception as exc:
@@ -388,6 +412,7 @@ def probe_gdn_backend(base_model: str, *, timeout: float = 120.0) -> dict[str, A
             "base_model": base_model,
             "resolved": None,
             "reason": f"resolver subprocess failed to start: {type(exc).__name__}: {exc}",
+            "source": "resolver",
             "subprocess_isolated": True,
         }
 
@@ -396,6 +421,7 @@ def probe_gdn_backend(base_model: str, *, timeout: float = 120.0) -> dict[str, A
             "base_model": base_model,
             "resolved": None,
             "reason": f"resolver subprocess exited {completed.returncode}: {completed.stderr[-400:]}",
+            "source": "resolver",
             "subprocess_isolated": True,
         }
     try:
@@ -405,8 +431,10 @@ def probe_gdn_backend(base_model: str, *, timeout: float = 120.0) -> dict[str, A
             "base_model": base_model,
             "resolved": None,
             "reason": f"resolver subprocess returned unparseable output: {exc}",
+            "source": "resolver",
             "subprocess_isolated": True,
         }
+    result.setdefault("source", "resolver")
     result["subprocess_isolated"] = True
     return result
 
@@ -668,13 +696,14 @@ def probe_all(base_model: str, engine: Any | None = None) -> dict[str, Any]:
     # load can rewrite underneath it. `_gdn_config_values` is pinned to the local cache so it cannot
     # do that, but the order is the second, independent guarantee: provenance is captured before any
     # later-added probe gets the chance to refresh a ref and silently re-date the measurement.
+    resolved_revisions = probe_resolved_revisions(base_model, getattr(engine, "tokenizer", None))
+    gdn_prefill = probe_gdn_backend(base_model)
+
     payload: dict[str, Any] = {
-        "resolved_revisions": probe_resolved_revisions(
-            base_model, getattr(engine, "tokenizer", None)
-        ),
+        "resolved_revisions": resolved_revisions,
         "runtime_packages": probe_runtime_packages(),
         "gpu": probe_gpu(),
-        "gdn_prefill": probe_gdn_backend(base_model),
+        "gdn_prefill": gdn_prefill,
     }
     if engine is not None:
         payload["kv_cache"] = probe_engine_kv_cache(engine)

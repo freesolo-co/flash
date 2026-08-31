@@ -2453,49 +2453,77 @@ def _fake_gdn_modules(leaf: Any) -> dict[str, Any]:
     return modules
 
 
-def test_gdn_probe_reports_a_signature_mismatch_rather_than_an_unknown_backend() -> None:
-    """A mis-called resolver must not read as "this build cannot be probed".
+def test_gdn_probe_calls_the_vllm_config_resolver_with_served_geometry() -> None:
+    """The pinned vLLM resolver takes one config object, not raw head dimensions."""
+    seen: dict[str, Any] = {}
 
-    The resolver takes build-dependent arguments, so a bare ``resolver()`` raises TypeError on
-    exactly the builds that HAVE it. That was swallowed into ``reason`` and the probe returned
-    ``resolved=None`` -- indistinguishable from a build with no resolver, so the canary could not
-    tell a broken probe from an absent one, and the Blackwell Triton fallback stayed invisible.
-    """
-    calls: dict[str, Any] = {}
-
-    def _resolver(linear_key_head_dim: int) -> str:
-        calls["linear_key_head_dim"] = linear_key_head_dim
-        return "flashinfer"
+    def _resolver(vllm_config: Any) -> tuple[str, str]:
+        seen["additional_config"] = vllm_config.additional_config
+        seen["head_dim"] = vllm_config.model_config.hf_text_config.linear_key_head_dim
+        return "auto", "cutedsl"
 
     from flash.serving.bench.probe import _gdn_backend_in_process
 
     module = mock.Mock()
     module._resolve_gdn_prefill_backend = _resolver
-
     with (
         mock.patch.dict("sys.modules", _fake_gdn_modules(module)),
         mock.patch(
             "flash.serving.bench.probe._gdn_config_values",
-            return_value={"linear_key_head_dim": 128},
+            return_value={"linear_key_head_dim": 96},
         ),
         mock.patch(
             "flash.serving.bench.probe.probe_cutlass_integrity",
             return_value={"checked": False},
         ),
     ):
-        # The in-process helper, because `sys.modules` patches cannot cross into a child process.
-        # This exercises the resolver contract; the isolation itself is asserted separately.
         result = _gdn_backend_in_process("Qwen/Qwen3.5-9B")
 
-    assert calls == {"linear_key_head_dim": 128}, "the resolver was not called with its parameters"
-    assert result["resolved"] == "flashinfer"
+    assert seen == {"additional_config": None, "head_dim": 96}
+    assert result["resolved"] == "cutedsl"
+    assert result["resolved_raw"] == ["auto", "cutedsl"]
+    assert result["source"] == "resolver"
     assert not result.get("resolver_signature_mismatch")
 
-    # A resolver whose required parameter the config cannot supply is a SIGNATURE problem, and must
-    # be labelled as one rather than reported as an unresolved backend.
+
+def test_gdn_probe_still_binds_raw_head_dimension_resolvers() -> None:
+    """Signature-driven binding remains valid for builds that declare raw geometry parameters."""
+    seen: list[int] = []
+
+    def _resolver(linear_key_head_dim: int) -> str:
+        seen.append(linear_key_head_dim)
+        return "flashinfer"
+
+    from flash.serving.bench.probe import _gdn_backend_in_process
+
+    module = mock.Mock()
+    module._resolve_gdn_prefill_backend = _resolver
+    with (
+        mock.patch.dict("sys.modules", _fake_gdn_modules(module)),
+        mock.patch(
+            "flash.serving.bench.probe._gdn_config_values",
+            return_value={"linear_key_head_dim": 80},
+        ),
+        mock.patch(
+            "flash.serving.bench.probe.probe_cutlass_integrity",
+            return_value={"checked": False},
+        ),
+    ):
+        result = _gdn_backend_in_process("Qwen/Qwen3.5-9B")
+
+    assert seen == [80]
+    assert result["resolved"] == "flashinfer"
+
+
+def test_gdn_probe_records_an_unknown_required_parameter_as_a_signature_mismatch() -> None:
+    """An unsupported required parameter remains distinct from an unknown backend decision."""
+
     def _needs_unknown(some_new_parameter: int) -> str:  # pragma: no cover - never called
         return "flashinfer"
 
+    from flash.serving.bench.probe import _gdn_backend_in_process
+
+    module = mock.Mock()
     module._resolve_gdn_prefill_backend = _needs_unknown
     with (
         mock.patch.dict("sys.modules", _fake_gdn_modules(module)),
@@ -2505,11 +2533,70 @@ def test_gdn_probe_reports_a_signature_mismatch_rather_than_an_unknown_backend()
             return_value={"checked": False},
         ),
     ):
-        mismatch = _gdn_backend_in_process("Qwen/Qwen3.5-9B")
+        result = _gdn_backend_in_process("Qwen/Qwen3.5-9B")
 
-    assert mismatch["resolved"] is None
-    assert mismatch["resolver_signature_mismatch"] is True
-    assert "signature unsupported" in mismatch["reason"]
+    assert result["resolved"] is None
+    assert result["resolver_signature_mismatch"] is True
+    assert "signature unsupported" in result["reason"]
+    assert "some_new_parameter" in result["reason"]
+
+
+def test_resolver_binding_refuses_a_config_with_no_gdn_head_dimension() -> None:
+    """A missing head dim must fail, not default.
+
+    On SM10.x the resolver grants FlashInfer only when ``linear_key_head_dim == 128``. Passing
+    ``None`` therefore returns "triton" -- indistinguishable from the real Blackwell fallback this
+    probe exists to catch, but manufactured by the probe itself. The failed config read has to
+    surface as a signature mismatch so the gate refuses the run.
+    """
+    from flash.serving.bench.probe import _gdn_backend_in_process
+
+    def _needs_vllm_config(vllm_config: Any) -> tuple[str, str]:
+        raise AssertionError("resolver must not be called without a real head dimension")
+
+    module = mock.Mock()
+    module._resolve_gdn_prefill_backend = _needs_vllm_config
+    with (
+        mock.patch.dict("sys.modules", _fake_gdn_modules(module)),
+        mock.patch("flash.serving.bench.probe._gdn_config_values", return_value={}),
+        mock.patch(
+            "flash.serving.bench.probe.probe_cutlass_integrity",
+            return_value={"checked": False},
+        ),
+    ):
+        result = _gdn_backend_in_process("Qwen/Qwen3.5-9B")
+
+    assert result["resolved"] is None
+    assert result["resolver_signature_mismatch"] is True
+    assert "linear_key_head_dim" in result["reason"]
+
+
+def test_probe_all_reads_the_gdn_backend_from_the_isolated_resolver() -> None:
+    """The engine object is not a GDN evidence source.
+
+    vLLM V1 executes the model in a separate EngineCore process (see the 2026-07-05 post-mortem in
+    ``lora_engine.py``), so no layer carrying ``gdn_prefill_backend`` is reachable from this
+    process. The subprocess resolver is the only path that can answer, and it must be consulted
+    even when a live engine is passed.
+    """
+    from flash.serving.bench import probe as probe_module
+
+    engine = types.SimpleNamespace(engine=types.SimpleNamespace())
+    resolver_result = {"resolved": "cutedsl", "source": "resolver"}
+    with (
+        mock.patch.object(probe_module, "probe_resolved_revisions", return_value={}),
+        mock.patch.object(probe_module, "probe_runtime_packages", return_value={}),
+        mock.patch.object(probe_module, "probe_gpu", return_value={}),
+        mock.patch.object(
+            probe_module, "probe_gdn_backend", return_value=resolver_result.copy()
+        ) as resolver_probe,
+        mock.patch.object(probe_module, "probe_engine_kv_cache", return_value={}),
+    ):
+        result = probe_module.probe_all("Qwen/Qwen3.6-35B-A3B", engine)
+
+    resolver_probe.assert_called_once_with("Qwen/Qwen3.6-35B-A3B")
+    assert result["gdn_prefill"]["resolved"] == "cutedsl"
+    assert result["gdn_prefill"]["source"] == "resolver"
 
 
 def test_the_paid_entrypoint_settles_its_reservation() -> None:
