@@ -174,13 +174,15 @@ MAX_CONTAINERS = None
 # does not defeat `MIN_CONTAINERS = 0`: idle engines still scale to zero and bill nothing.
 BUFFER_CONTAINERS = 1
 # Concurrent requests packed onto one base-model GPU before Modal autoscales a new (costly) one.
-# A real-GPU sweep (scripts/gpu_canary.py::sweep_concurrency on A10G/Qwen2.5-1.5B) showed vLLM
-# throughput scaling near-linearly with no saturation through 128 concurrent, while TTFT stayed
-# <60 ms — so the old default of 32 left ~2x of each GPU idle. 64 packs ~2.3x the throughput per
-# GPU for ~+14% per-request latency (now blunted by the fp8 KV cache, which is on for every base —
-# see settings.KV_CACHE_DTYPE), roughly halving GPU count for the same load.
-# Per-engine concurrency is sized by _engine_concurrency from each model's max_num_seqs; these are
-# the router/global ceiling. TARGET_INPUTS auto-derives to 48 (= 64*3//4).
+# This is only a CEILING and a fallback: _engine_concurrency sizes each engine from its own
+# authored max_num_seqs (min(MAX_INPUTS, configured)), and every active tier authors one, so 64
+# binds nothing today. It applies to a model whose sequence capacity is not yet explicit.
+# 64 is kept as a ceiling rather than measured up to: the per-tier B200 sweep (2026-08-31) found
+# the throughput knee at 32 on both the 9B and the 27B, with headroom above the cap already
+# collapsed to +2.2% and +3.1%, so no current tier has a reason to ask for more. (The number's
+# original justification cited scripts/gpu_canary.py on A10G/Qwen2.5-1.5B — a different card and
+# a model smaller than the smallest hosted tier; that script no longer exists on dev.)
+# TARGET_INPUTS auto-derives to 48 (= 64*3//4).
 MAX_INPUTS = 64
 TARGET_INPUTS = max(1, MAX_INPUTS * 3 // 4)
 
@@ -348,10 +350,9 @@ def _engine_concurrency(base_model: str) -> tuple[int, int]:
     container and delayed scale-out until 12 inputs. OpenAI ``n`` can fan one input out to as many as
     four sequences, but sizing every container for that rare worst case would leave normal traffic
     underutilizing the GPU and cold-boot expensive replicas prematurely. Cap request admission at the
-    authored sequence capacity instead: current tiers admit 8 and scale out at 6. This deliberately
-    changes Modal's request knobs, not ``max_num_seqs``: raising the engine cap is not allocation-free,
-    and the 35B tier has a documented startup profiling OOM at higher sequence counts. Models without
-    an authored sequence cap retain the global sizing until their real capacity is explicit.
+    authored sequence capacity instead, so admission tracks whatever each tier was measured to hold:
+    every current tier measured the same knee, so all three admit 32 and scale out at 24. Models
+    without an authored sequence cap retain the global sizing until their real capacity is explicit.
     """
     configured = engine_overrides_for(base_model).get("max_num_seqs")
     if configured is None:

@@ -120,7 +120,9 @@ def test_9b_has_b200_rank128_serving_overrides() -> None:
     assert ov["max_loras"] == 16
     assert ov["max_lora_rank"] == 128
     assert ov["max_model_len"] == 32768
-    assert ov["max_num_seqs"] == 8
+    # 32: measured knee on B200 (2.2x container throughput over the inherited 8, with headroom
+    # above the cap collapsing to +2.2%). each tier is sized independently, so this is per model.
+    assert ov["max_num_seqs"] == 32
     # the 9B serves on B200: 132.87 GiB of KV and 217x concurrency at 32k with rank-128 x 16.
     assert gpu_for("Qwen/Qwen3.5-9B") == "B200"
     assert ov["gpu_memory_utilization"] == 0.90
@@ -147,7 +149,7 @@ def test_qwen38_27b_is_active_on_b200_with_pinned_immutable_revisions() -> None:
     assert ov["max_loras"] == 16
     assert ov["max_lora_rank"] == 64
     assert ov["max_model_len"] == 32768
-    assert ov["max_num_seqs"] == 8
+    assert ov["max_num_seqs"] == 32  # measured B200 knee; see SERVING_MODELS
     assert ov["gpu_memory_utilization"] == 0.90
     assert ov["enforce_eager"] is False
     assert ov["reasoning_parser"] == "qwen3"
@@ -171,7 +173,7 @@ def test_35b_has_b200_bf16_rank64_six_loras_overrides() -> None:
     assert ov["max_loras"] == 6
     assert ov["max_lora_rank"] == 64
     assert ov["max_model_len"] == 32768
-    assert ov["max_num_seqs"] == 8
+    assert ov["max_num_seqs"] == 32  # measured B200 knee; see SERVING_MODELS
     assert ov["max_num_batched_tokens"] == 4096
     assert (
         ov["gpu_memory_utilization"] == 0.90

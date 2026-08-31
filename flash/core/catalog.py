@@ -264,7 +264,9 @@ MODELS: dict[str, ModelInfo] = {
             max_cpu_loras=16,
             max_lora_rank=128,
             max_model_len=32768,
-            max_num_seqs=8,
+            # raised from 8 on measured B200 evidence: 2.2x container throughput at flat p50 TTFT.
+            # see SERVING_MODELS in flash/serving/src/engine/model_config.py for the sweep.
+            max_num_seqs=32,
             tensor_parallel_size=1,
             gpu_memory_utilization=0.90,
             image_limit=4,
@@ -324,7 +326,8 @@ MODELS: dict[str, ModelInfo] = {
             max_cpu_loras=16,
             max_lora_rank=64,
             max_model_len=32768,
-            max_num_seqs=8,
+            # raised from 8 on measured B200 evidence: 2.6x container throughput. see SERVING_MODELS.
+            max_num_seqs=32,
             tensor_parallel_size=1,
             gpu_memory_utilization=0.90,
             image_limit=4,
@@ -401,7 +404,9 @@ MODELS: dict[str, ModelInfo] = {
             max_cpu_loras=6,
             max_lora_rank=64,
             max_model_len=32768,
-            max_num_seqs=8,
+            # raised from 8 on measured B200 evidence: 4.4x container throughput, no memory
+            # pressure at 32. see SERVING_MODELS in flash/serving/src/engine/model_config.py.
+            max_num_seqs=32,
             max_num_batched_tokens=4096,
             tensor_parallel_size=1,
             gpu_memory_utilization=0.90,

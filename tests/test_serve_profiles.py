@@ -140,7 +140,6 @@ def test_profile_matches_the_catalog_serving_capacity(model_id: str) -> None:
     assert serving is not None
 
     assert profile.max_model_len == serving.max_model_len
-    assert profile.max_num_seqs == serving.max_num_seqs
     assert profile.max_num_batched_tokens == (serving.max_num_batched_tokens or None)
     assert profile.max_loras == serving.max_loras
     assert profile.max_cpu_loras == serving.max_cpu_loras
@@ -163,6 +162,19 @@ def test_profile_matches_the_catalog_serving_capacity(model_id: str) -> None:
         }[model_id]
     )
     assert profile.modal_live_qualified is True
+    # max_num_seqs travels with the card, so it is pinned here rather than compared: the hosted
+    # tiers carry their measured B200 knee while these profiles keep the value qualified on their
+    # own smaller cards. Pinned per model (not asserted "different") so a profile silently drifting
+    # to some other untested depth still fails here.
+    assert profile.max_num_seqs == 8
+    assert (
+        serving.max_num_seqs
+        == {
+            "Qwen/Qwen3.5-9B": 32,
+            "Qwen/Qwen3.8-27B": 32,
+            "Qwen/Qwen3.6-35B-A3B": 32,
+        }[model_id]
+    )
 
 
 @pytest.mark.parametrize(
@@ -170,7 +182,6 @@ def test_profile_matches_the_catalog_serving_capacity(model_id: str) -> None:
     [
         ("max_model_len", 65536),
         ("max_lora_rank", 64),
-        ("max_num_seqs", 4),
         ("max_num_batched_tokens", 2048),
         ("max_cpu_loras", 32),
         ("tensor_parallel_size", 2),
