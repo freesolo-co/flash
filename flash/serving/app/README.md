@@ -73,6 +73,45 @@ Required production wiring is `HF_TOKEN`, `FREESOLO_INTERNAL_KEY`,
 `PLATFORM_BACKEND_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, a nonblank
 `FREESOLO_DEPLOYMENT_ID`, and `SERVING_CUSTOM_DOMAIN=serve.freesolo.co`.
 
+#### Promotion gate
+
+`modal deploy` replaces the live app in place, and a `/healthz` poll only reads back the identity
+the deploy step just injected. That proves a router process booted; it does not prove a GPU engine
+started, that a generation ran, that streaming works, or that usage settled. So after readiness the
+workflow runs `python -m flash.serving.promotion.gate`, which must prove all three in order:
+
+1. the live router reports `ok`, this exact `deployment_sha`, this run's attempt id, and at least
+   one engine;
+2. an authenticated `stream=true` request carrying `X-Correlation-ID: fspromo-<run>-<attempt>`
+   returns SSE with at least one non-empty content delta, a terminal finish reason, terminal usage
+   with non-zero completion tokens, and `data: [DONE]`;
+3. this release's durable delivery loop is running rather than wedged: no expired lease, and no
+   undelivered row older than the stall threshold.
+
+Exact-head binding comes from steps 1 and 2 together. The router proves its identity, and then that
+same router serves a real generation; engines receive only `HF_TOKEN` and cannot report a release
+sha, and `engine_replica_id` is stripped from public bodies, so the response itself cannot carry it.
+
+Step 3 is deliberately weaker than "the canary's own usage row settled". The only durable accounting
+surface the router exposes is `serving_usage_backlog_snapshot`, which aggregates every generation in
+flight and has no per-correlation read. Asserting a drained backlog there would be **fail-open** (a
+burst of unrelated traffic can drain the counters to zero while the canary's own row is stuck) and
+flaky besides (live traffic keeps them nonzero on a perfectly healthy release). Expired leases and
+undelivered age are the parts of that snapshot that mean the same thing regardless of whose rows are
+in it. Proving per-request settlement would need a read-by-correlation-id RPC, which does not exist
+today; the canary still sends `X-Correlation-ID` so the row is identifiable by an operator.
+
+If any step after the deploy fails, the workflow redeploys the sha the live app reported _before_
+this deploy and re-reads `/healthz` to confirm the restored release under a distinct `-rollback`
+attempt id. The job still exits non-zero: a restored predecessor means production is serving, not
+that this commit shipped.
+
+There is **no ingress fence**. Traffic is not gated during the canary window, so a small amount of
+live traffic can reach a release that is about to be rolled back. Closing that window needs a
+runtime admission gate and a race-free drain (a request admitted just before closure creates no
+durable row before GPU dispatch, so a zero-backlog check cannot see it), which is deliberately not
+part of this mechanism.
+
 ### Development
 
 Development uses the dedicated Modal environment `dev`, development Supabase,
