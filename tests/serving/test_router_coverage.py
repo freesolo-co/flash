@@ -11,6 +11,7 @@ Targets branches the existing suites miss:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 
 import pytest
 from fastapi.testclient import TestClient
@@ -29,17 +30,28 @@ from flash.serving.src.io.structured_outputs import StructuredOutputsError
 QWEN = "Qwen/Qwen3.5-9B"
 
 
-async def _allow(_token: str, _adapter_id: str) -> str:
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
     return "org-1"
 
 
 def _rec(adapter_id: str, base_model: str = QWEN, **overrides) -> AdapterRecord:
+    run_id = adapter_id.split("/", 1)[0]
+    checkpoint_id = adapter_id if "/" in adapter_id else f"{run_id}/final"
+    checkpoint = checkpoint_id.split("/", 1)[1]
     data = {
-        "adapter_id": adapter_id,
-        "repo_id": f"org/{adapter_id}",
+        "adapter_id": checkpoint_id,
+        "repo_id": f"org/{run_id}",
+        "org_id": "org-1",
         "base_model": base_model,
         "status": "ready",
         "thinking": True,
+        "checkpoint": checkpoint_id,
+        "run_id": run_id,
+        "checkpoint_step": None if checkpoint == "final" else int(checkpoint.removeprefix("step-")),
+        "artifact_revision": hashlib.sha1(run_id.encode()).hexdigest(),
+        "artifact_digest": hashlib.sha256(f"{run_id}-artifact".encode()).hexdigest(),
+        "artifact_fingerprint": hashlib.sha256(f"{run_id}-binding".encode()).hexdigest(),
+        "lora_rank": 16,
     }
     data.update(overrides)
     return AdapterRecord.model_validate(data)
@@ -122,16 +134,16 @@ def test_openai_structured_output_fields_are_mutually_exclusive():
 
 def test_inference_requires_a_bearer_api_key():
     """No Authorization header, or a non-bearer scheme, is a 401 before the engine is reached."""
-    router = AdapterRouter([_rec("qa")])
+    router = AdapterRouter([_rec("qa/final")])
     client = TestClient(build_serving_app(FakePool(), router, chat_authorizer=_allow))
 
-    no_header = client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"})
+    no_header = client.post("/generate", json={"adapter_id": "qa/final", "prompt": "hi"})
     assert no_header.status_code == 401
     assert "Missing Freesolo API key" in no_header.json()["detail"]
 
     non_bearer = client.post(
         "/generate",
-        json={"adapter_id": "qa", "prompt": "hi"},
+        json={"adapter_id": "qa/final", "prompt": "hi"},
         headers={"Authorization": "Basic Zm9vOmJhcg=="},
     )
     assert non_bearer.status_code == 401  # scheme != bearer -> token treated as absent
@@ -139,11 +151,11 @@ def test_inference_requires_a_bearer_api_key():
 
 def test_inference_fails_closed_when_no_authorizer_is_wired():
     """A bearer key with no chat_authorizer configured must fail closed (503), not serve open."""
-    router = AdapterRouter([_rec("qa")])
+    router = AdapterRouter([_rec("qa/final")])
     client = TestClient(build_serving_app(FakePool(), router, chat_authorizer=None))
     resp = client.post(
         "/generate",
-        json={"adapter_id": "qa", "prompt": "hi"},
+        json={"adapter_id": "qa/final", "prompt": "hi"},
         headers={"Authorization": "Bearer k"},
     )
     assert resp.status_code == 503
@@ -152,7 +164,7 @@ def test_inference_fails_closed_when_no_authorizer_is_wired():
 
 def test_chat_completions_rejects_a_missing_or_blank_model():
     """`model` must be a non-empty adapter id; anything else is a clean 400 (before auth/routing)."""
-    router = AdapterRouter([_rec("qa")])
+    router = AdapterRouter([_rec("qa/final")])
     client = TestClient(
         build_serving_app(FakePool(), router, chat_authorizer=_allow),
         headers={"Authorization": "Bearer k"},
@@ -219,7 +231,7 @@ def test_exceptional_lifespan_exit_closes_usage_and_authorizer():
 
     app = build_durable_serving_app(
         FakePool(),
-        AdapterRouter([_rec("qa")]),
+        AdapterRouter([_rec("qa/final")]),
         usage_store=Store(),
         chat_authorizer=Authorizer(),
     )
@@ -256,7 +268,7 @@ def test_shutdown_propagates_usage_store_close_failure():
     authorizer = Authorizer()
     app = build_durable_serving_app(
         FakePool(),
-        AdapterRouter([_rec("qa")]),
+        AdapterRouter([_rec("qa/final")]),
         usage_store=Store(),
         chat_authorizer=authorizer,
     )
@@ -285,7 +297,7 @@ def test_shutdown_swallows_authorizer_aclose_errors():
     authorizer = Authorizer()
     app = build_durable_serving_app(
         FakePool(),
-        AdapterRouter([_rec("qa")]),
+        AdapterRouter([_rec("qa/final")]),
         usage_store=OfflineUsageStore(),
         chat_authorizer=authorizer,
     )

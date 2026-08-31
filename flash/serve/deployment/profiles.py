@@ -1,7 +1,7 @@
 """complete immutable serving inputs for customer-owned modal deployments.
 
 ``provision_modal_deployment`` takes a ``DeploymentBundle``, which requires an exact
-``EngineIdentity`` (27 fields), an exact ``ModalPlacement``, and a digest-qualified
+``EngineIdentity`` (26 fields), an exact ``ModalPlacement``, and a digest-qualified
 ``ServingImage``. This module is that producer.
 
 Every value here is immutable serving identity: it feeds ``engine_id``, which is the sha-256 of
@@ -385,9 +385,15 @@ def _require_catalog_agreement(profile: ServingProfile) -> None:
                 f"{profile.model_id} serving profile {name}={actual!r} disagrees with the "
                 f"catalog capacity {expected!r}"
             )
+    # NB: modal_gpu is deliberately NOT checked against serving.gpu. They describe different
+    # planes: serving.gpu is the card the freesolo-owned hosted plane runs on, while modal_gpu is
+    # the card THIS customer-owned profile was live-qualified on (modal_live_qualified). The hosted
+    # plane moved to B200; the customer profiles stay on their qualified cards until a customer-owned
+    # B200 qualification runs. Engine SHAPE still has to agree -- see _CATALOG_CHECKED_FIELDS, which
+    # is what stops a profile serving a longer context or higher lora rank than the catalog
+    # advertises. The card is placement, not shape.
     for label, expected, actual in (
         ("served_model", serving.serve_model_id, profile.served_model),
-        ("modal gpu", serving.gpu, profile.modal_gpu),
     ):
         if expected != actual:
             raise ProfileError(

@@ -82,7 +82,7 @@ def _authorizer(modal_app_module, monkeypatch, response: Any):
         def __init__(self, *_a: Any, **_k: Any) -> None:
             pass
 
-        async def post(self, _url: str, json: Any) -> _FakeResp:
+        async def post(self, _url: str, json: Any, headers: Any = None) -> _FakeResp:
             if isinstance(response, Exception):
                 raise response
             return response
@@ -194,7 +194,7 @@ def _counting_client(monkeypatch, responder, *, delay: float = 0.0):
         def __init__(self, *_a: Any, **_k: Any) -> None:
             pass
 
-        async def post(self, _url: str, json: Any) -> _FakeResp:
+        async def post(self, _url: str, json: Any, headers: Any = None) -> _FakeResp:
             calls["n"] += 1
             n = calls["n"]
             if delay:
@@ -313,7 +313,10 @@ def test_malformed_200_fails_closed_without_dispatch_or_cache(
         assert pool.generate_calls == 0
 
         allowed = _chat(client, Authorization="Bearer fs-user-key")
-        internal = _chat(client, **{"X-Freesolo-Internal-Key": _INTERNAL_KEY})
+        internal = _chat(
+            client,
+            **{"X-Freesolo-Internal-Key": _INTERNAL_KEY, "X-Freesolo-Org-Id": "org-2"},
+        )
 
     assert allowed.status_code == 200
     assert internal.status_code == 200
@@ -322,7 +325,7 @@ def test_malformed_200_fails_closed_without_dispatch_or_cache(
     assert len(store.finalized) == 2
     assert store.finalized[0].principal.orgId == "org-1"
     assert store.finalized[1].principal.kind == "trusted_internal"
-    assert store.finalized[1].principal.orgId is None
+    assert store.finalized[1].principal.orgId == "org-2"
 
 
 def test_cancelled_waiter_does_not_cancel_shared_authorization(modal_app_module, monkeypatch):
@@ -413,6 +416,9 @@ def test_failed_authorization_is_not_cached(modal_app_module, monkeypatch):
     assert calls["n"] == 2
 
 
+_EMPTY_SCOPE_DIGEST = hashlib.sha256(b"").hexdigest()
+
+
 def test_expired_key_is_evicted_before_reauthorization(modal_app_module, monkeypatch):
     import asyncio
     import inspect
@@ -426,7 +432,11 @@ def test_expired_key_is_evicted_before_reauthorization(modal_app_module, monkeyp
     authorize = _new_authorizer(modal_app_module)
     cache = inspect.getclosurevars(authorize).nonlocals["_cache"]
     request_key = ("synthetic-expired-key", "adapter-1")
-    cache_key = (hashlib.sha256(request_key[0].encode("utf-8")).hexdigest(), request_key[1])
+    cache_key = (
+        hashlib.sha256(request_key[0].encode("utf-8")).hexdigest(),
+        request_key[1],
+        _EMPTY_SCOPE_DIGEST,
+    )
 
     async def run() -> None:
         await authorize(*request_key)
@@ -455,10 +465,12 @@ def test_prune_removes_expired_keys_below_capacity(modal_app_module, monkeypatch
     expired_key = (
         hashlib.sha256(expired_request[0].encode("utf-8")).hexdigest(),
         expired_request[1],
+        _EMPTY_SCOPE_DIGEST,
     )
     current_key = (
         hashlib.sha256(current_request[0].encode("utf-8")).hexdigest(),
         current_request[1],
+        _EMPTY_SCOPE_DIGEST,
     )
 
     async def run() -> None:

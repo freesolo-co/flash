@@ -177,7 +177,7 @@ def attributed_gpu_type(status: Any) -> str:
     def field(name: str) -> Any:
         return status.get(name) if isinstance(status, dict) else getattr(status, name, None)
 
-    remote = field("remote")
+    remote = field("remote") or field("realized_cost_remote")
     allocated = remote.get("allocated_gpu") if isinstance(remote, dict) else None
     if isinstance(allocated, str) and allocated:
         return allocated
@@ -266,18 +266,6 @@ CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
 # is a constant rather than a resolution: no job-spec field can select anything else. recorded on
 # effective_preparation so a stored run says which trainer produced it.
 TRAINER_BACKEND = "verl"
-
-
-def require_matching_seed(spec: JobSpec, seed: Any) -> int:
-    """Require the retained provider seed argument to match the authoritative JobSpec seed."""
-    provided = parse_seed(seed)
-    canonical = parse_seed(spec.seed)
-    if provided != canonical:
-        raise ValueError(
-            f"provider seed {provided} does not match JobSpec.seed {canonical}; "
-            "use spec.seed as the provider seed"
-        )
-    return canonical
 
 
 def _model_revision(value: Any) -> str:

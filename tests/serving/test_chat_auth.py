@@ -14,47 +14,19 @@ from fastapi.testclient import TestClient
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
+from tests.serving.checkpoint_fixtures import checkpoint_record
 from tests.serving.conftest import attest
 
 QWEN = "Qwen/Qwen3.5-9B"
 INTERNAL_KEY = "fs-internal"
 
 
-def _rec(run_id: str, *, org_id: str | None = "org-A") -> AdapterRecord:
-    sha = "a" * 40
-    return AdapterRecord.model_validate(
-        {
-            "adapter_id": f"{run_id}@final.{sha}",
-            "repo_id": f"org/{run_id}",
-            "base_model": QWEN,
-            "org_id": org_id,
-            "checkpoint": run_id,
-            "status": "ready",
-            "thinking": True,
-            "metadata": {
-                "record_type": "revision",
-                "run_id": run_id,
-                "checkpoint_step": None,
-                "hf_revision": sha,
-            },
-        }
-    )
+def _rec(run_id: str, *, org_id: str = "org-A") -> AdapterRecord:
+    return checkpoint_record(run_id, QWEN, org_id=org_id, thinking=True)
 
 
-def _alias(revision: AdapterRecord) -> AdapterRecord:
-    run_id = revision.run_id
-    assert run_id is not None
-    return revision.model_copy(
-        update={
-            "adapter_id": run_id,
-            "checkpoint": None,
-            "metadata": {
-                "record_type": "alias",
-                "run_id": run_id,
-                "alias_of": revision.adapter_id,
-            },
-        }
-    )
+def _id(run_id: str = "qa") -> str:
+    return f"{run_id}/final"
 
 
 class FakePool:
@@ -95,6 +67,7 @@ class FakePool:
     async def unregister(
         self,
         base_model: str,
+        org_id: str,
         adapter_id: str,
         expected_generation: str | None = None,
     ) -> None:  # pragma: no cover
@@ -108,7 +81,7 @@ class FakeAuthorizer:
         self.calls: list[tuple[str, str]] = []
         self._raises = raises
 
-    async def __call__(self, token: str, adapter_id: str) -> str:
+    async def __call__(self, token: str, adapter_id: str, scope: dict | None = None) -> str:
         self.calls.append((token, adapter_id))
         if self._raises is not None:
             raise self._raises
@@ -117,7 +90,7 @@ class FakeAuthorizer:
 
 def _client(*, authorizer=None) -> TestClient:
     revision = _rec("qa")
-    router = AdapterRouter([revision, _alias(revision)])
+    router = AdapterRouter([revision])
     app = build_serving_app(
         FakePool(),
         router,
@@ -130,7 +103,7 @@ def _client(*, authorizer=None) -> TestClient:
 def _chat(client: TestClient, **headers: str):
     return client.post(
         "/v1/chat/completions",
-        json={"model": "qa", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": _id(), "messages": [{"role": "user", "content": "hi"}]},
         headers=headers,
     )
 
@@ -146,7 +119,7 @@ def test_valid_key_owning_adapter_passes() -> None:
     auth = FakeAuthorizer()
     resp = _chat(_client(authorizer=auth), Authorization="Bearer fs-user-key")
     assert resp.status_code == 200
-    assert auth.calls == [("fs-user-key", "qa")]  # token + adapter forwarded to the backend
+    assert auth.calls == [("fs-user-key", _id())]  # token + adapter forwarded to the backend
 
 
 def test_denied_key_propagates_403() -> None:
@@ -159,7 +132,10 @@ def test_internal_key_bypasses_user_auth() -> None:
     # trusted server-to-server callers (the backend /api/sample proxy, the flash control plane)
     # present the shared internal key -> bypass, no user key needed.
     auth = FakeAuthorizer()
-    resp = _chat(_client(authorizer=auth), **{"X-Freesolo-Internal-Key": INTERNAL_KEY})
+    resp = _chat(
+        _client(authorizer=auth),
+        **{"X-Freesolo-Internal-Key": INTERNAL_KEY, "X-Freesolo-Org-Id": "org-A"},
+    )
     assert resp.status_code == 200
     assert auth.calls == []  # trusted caller is not sent through the user-key authorizer
 
@@ -178,28 +154,29 @@ def test_adapter_listing_is_gated_and_never_exposes_org_id() -> None:
     # mapping to anon callers). Even for authorized callers the org id must never be serialized
     # (defense in depth), though the record still carries it internally for the auth check.
     revision = _rec("qa", org_id="org-secret")
-    router = AdapterRouter([revision, _alias(revision)])
+    router = AdapterRouter([revision])
     client = TestClient(build_serving_app(FakePool(), router, internal_key=INTERNAL_KEY))
     assert client.get("/adapters").status_code == 401
-    adapters = client.get("/adapters", headers={"X-Freesolo-Internal-Key": INTERNAL_KEY}).json()[
-        "adapters"
-    ]
+    adapters = client.get(
+        "/adapters",
+        headers={"X-Freesolo-Internal-Key": INTERNAL_KEY, "X-Freesolo-Org-Id": "org-secret"},
+    ).json()["adapters"]
     assert adapters
     assert all("org_id" not in a and "org_id" not in a for a in adapters)
-    assert router.get("qa").org_id == "org-secret"
+    assert router.get(_id(), org_id="org-secret").org_id == "org-secret"
 
 
 def test_generate_endpoint_is_also_enforced() -> None:
     auth = FakeAuthorizer()
     client = _client(authorizer=auth)
-    assert client.post("/generate", json={"adapter_id": "qa", "prompt": "hi"}).status_code == 401
+    assert client.post("/generate", json={"adapter_id": _id(), "prompt": "hi"}).status_code == 401
     ok = client.post(
         "/generate",
-        json={"adapter_id": "qa", "prompt": "hi"},
+        json={"adapter_id": _id(), "prompt": "hi"},
         headers={"Authorization": "Bearer fs-user-key"},
     )
     assert ok.status_code == 200
-    assert auth.calls == [("fs-user-key", "qa")]
+    assert auth.calls == [("fs-user-key", _id())]
 
 
 def test_chat_auth_precedes_stream_validation() -> None:
@@ -207,7 +184,7 @@ def test_chat_auth_precedes_stream_validation() -> None:
     response = _client(authorizer=auth).post(
         "/v1/chat/completions",
         json={
-            "model": "qa",
+            "model": _id(),
             "messages": [{"role": "user", "content": "hi"}],
             "stream": "not-a-boolean",
         },
@@ -221,7 +198,7 @@ def test_per_adapter_auth_precedes_payload_validation() -> None:
     """a valid path id is authenticated before a malformed request body is validated."""
     auth = FakeAuthorizer()
     response = _client(authorizer=auth).post(
-        "/adapters/qa/generate",
+        f"/adapters/{_id()}/generate",
         json={"prompt": "hi", "top_p": "not-a-number"},
     )
 
@@ -253,11 +230,11 @@ def test_generate_authorizes_against_the_normalized_adapter_id() -> None:
     client = _client(authorizer=auth)
     ok = client.post(
         "/generate",
-        json={"adapter_id": "  qa  ", "prompt": "hi"},
+        json={"adapter_id": f"  {_id()}  ", "prompt": "hi"},
         headers={"Authorization": "Bearer fs-user-key"},
     )
     assert ok.status_code == 200
-    assert auth.calls == [("fs-user-key", "qa")]
+    assert auth.calls == [("fs-user-key", _id())]
 
 
 if __name__ == "__main__":  # pragma: no cover

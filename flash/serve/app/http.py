@@ -14,6 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES, reject_non_finite_json_constant
+from flash.serve.request.tool_calls import qualified_tool_parser
 from flash.serve.runtime import (
     AdapterNotFoundError,
     EngineDeadError,
@@ -137,7 +138,11 @@ def create_app(
         if resolved is None:
             return _error(404, "model_not_found", "requested model is not deployed")
         try:
-            parsed = parse_chat_request(payload, resolved)
+            parsed = parse_chat_request(
+                payload,
+                resolved,
+                tool_parser=qualified_tool_parser(state.bootstrap.manifest.logical_base_model),
+            )
         except (OpenAIRequestError, PromptError, RuntimeConfigurationError, ValueError):
             return _error(422, "invalid_request", "request validation failed")
         provenance = provenance_payload(state.bootstrap.manifest, resolved)
@@ -159,7 +164,7 @@ def create_app(
             except Exception:
                 return _error(503, "service_unavailable", "generation service is unavailable")
             if (
-                result.adapter_id != resolved.adapter.adapter_revision
+                result.adapter_id != resolved.adapter.checkpoint_id
                 or result.incarnation != resolved.adapter.aggregate_sha256
                 or result.thinking != resolved.adapter.thinking_default
                 or result.finish_reason is None
@@ -187,7 +192,7 @@ def create_app(
             return _error(503, "service_unavailable", "generation service is unavailable")
         if (
             type(first) is not StreamReady
-            or first.adapter_id != resolved.adapter.adapter_revision
+            or first.adapter_id != resolved.adapter.checkpoint_id
             or first.incarnation != resolved.adapter.aggregate_sha256
             or first.thinking != resolved.adapter.thinking_default
         ):
@@ -201,7 +206,15 @@ def create_app(
             choice_count=parsed.generation.n,
             include_usage=parsed.include_usage,
         )
-        return StreamingResponse(body, media_type="text/event-stream", headers=headers)
+        return StreamingResponse(
+            body,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                **headers,
+            },
+        )
 
     return app
 

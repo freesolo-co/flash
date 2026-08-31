@@ -19,6 +19,8 @@ from flash.serve.runtime import (
     GenerationRequest,
     PromptError,
     RuntimeNotReadyError,
+    StaleIncarnationError,
+    StreamChoiceFinished,
     StreamDelta,
     StreamFinished,
     StreamReady,
@@ -27,6 +29,20 @@ from flash.serve.runtime import (
 from flash.serve.runtime import engine as engine_module
 
 SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}}
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": False,
+            },
+        },
+    }
+]
 MODEL_REVISION = "a" * 40
 TOKENIZER_REVISION = "b" * 40
 
@@ -40,13 +56,15 @@ class _Tokenizer:
         self.eos_token = "<eos>"
         self.eos_token_id = 9
         self.template_calls: list[dict[str, Any]] = []
+        self.template_messages: list[Any] = []
 
     @classmethod
     def from_pretrained(cls, model: str, **kwargs: Any):
         cls.calls.append((model, kwargs))
         return cls()
 
-    def apply_chat_template(self, _messages, **kwargs: Any):
+    def apply_chat_template(self, messages, **kwargs: Any):
+        self.template_messages.append(messages)
         self.template_calls.append(kwargs)
         return [10, 11, 12]
 
@@ -107,7 +125,10 @@ class _Logprob:
 
 
 class _SamplingParams:
+    created: ClassVar[int] = 0
+
     def __init__(self, **kwargs: Any) -> None:
+        type(self).created += 1
         self.kwargs = kwargs
 
 
@@ -202,6 +223,7 @@ def _no_hub_credential(monkeypatch):
 def _fake_modules(monkeypatch):
     _Tokenizer.calls = []
     _Processor.calls = []
+    _SamplingParams.created = 0
     _Engine.latest = None
     _Engine.args = None
 
@@ -570,6 +592,140 @@ def test_nonstream_generation_binds_thinking_structured_outputs_and_accounting(
     asyncio.run(runtime.close())
 
 
+@pytest.mark.parametrize("streaming", [False, True], ids=["buffered", "streaming"])
+def test_effective_structured_default_rejects_automatic_tools_after_adapter_resolution(
+    adapter_dir: Path,
+    streaming: bool,
+) -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model", tool_parser="qwen3_coder"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    asyncio.run(
+        runtime.register_adapter(
+            AdapterSpec(
+                adapter_id="adapter",
+                path=str(adapter_dir),
+                incarnation="incarnation-1",
+                structured_outputs=SCHEMA,
+            )
+        )
+    )
+
+    def invoke(expected_incarnation: str, structured_outputs=None) -> None:
+        request = GenerationRequest(
+            adapter_id="adapter",
+            expected_incarnation=expected_incarnation,
+            messages=[{"role": "user", "content": "weather"}],
+            structured_outputs=structured_outputs,
+            tools=TOOLS,
+            tool_choice="auto",
+            parallel_tool_calls=True,
+        )
+        if streaming:
+
+            async def first_event() -> None:
+                await anext(runtime.stream(request))
+
+            asyncio.run(first_event())
+        else:
+            asyncio.run(runtime.generate(request))
+
+    with pytest.raises(StaleIncarnationError):
+        invoke("stale-incarnation")
+    with pytest.raises(
+        PromptError,
+        match="tools cannot be combined with logprobs or structured outputs",
+    ):
+        invoke("incarnation-1")
+    assert _SamplingParams.created == 0
+    assert engine.generate_calls == []
+    assert runtime._tokenizer.template_calls == []
+
+    engine.responses.append([_output("plain text", [1])])
+    invoke("incarnation-1", {})
+    assert _SamplingParams.created == 1
+    assert len(engine.generate_calls) == 1
+    asyncio.run(runtime.close())
+
+
+def test_inactive_tools_allow_unqualified_thinking_generation(adapter_dir: Path) -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    asyncio.run(
+        runtime.register_adapter(
+            AdapterSpec(
+                adapter_id="adapter",
+                path=str(adapter_dir),
+                incarnation="incarnation-1",
+                thinking=True,
+            )
+        )
+    )
+    engine.responses.append([_output("plain text", [1])])
+
+    result = asyncio.run(
+        runtime.generate(
+            GenerationRequest(
+                adapter_id="adapter",
+                expected_incarnation="incarnation-1",
+                messages=[{"role": "user", "content": "weather"}],
+                tools=TOOLS,
+                tool_choice="none",
+                parallel_tool_calls=True,
+            )
+        )
+    )
+
+    assert result.thinking is True
+    assert "tools" not in runtime._tokenizer.template_calls[0]
+    asyncio.run(runtime.close())
+
+
+def test_inactive_tools_allow_effective_structured_default_and_logprobs(
+    adapter_dir: Path,
+) -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    asyncio.run(
+        runtime.register_adapter(
+            AdapterSpec(
+                adapter_id="adapter",
+                path=str(adapter_dir),
+                incarnation="incarnation-1",
+                structured_outputs=SCHEMA,
+            )
+        )
+    )
+    candidates = {1: _Logprob(-0.1, "a")}
+    engine.responses.append([_output("a", [1], logprobs=[candidates])])
+
+    asyncio.run(
+        runtime.generate(
+            GenerationRequest(
+                adapter_id="adapter",
+                expected_incarnation="incarnation-1",
+                messages=[{"role": "user", "content": "weather"}],
+                tools=TOOLS,
+                tool_choice="none",
+                parallel_tool_calls=True,
+                logprobs=True,
+                top_logprobs=1,
+            )
+        )
+    )
+
+    sampling = engine.generate_calls[0]["sampling"].kwargs
+    assert sampling["structured_outputs"].kwargs == {"json": SCHEMA}
+    assert sampling["logprobs"] == 1
+    assert "tools" not in runtime._tokenizer.template_calls[0]
+    asyncio.run(runtime.close())
+
+
 def test_adapterless_structured_generation_binds_default_thinking_false() -> None:
     runtime = VllmLoraRuntime(EngineConfig(model="model", reasoning_parser="qwen3"))
     asyncio.run(runtime.start())
@@ -652,6 +808,107 @@ def test_stream_trusts_pinned_delta_output_and_counts_chunks() -> None:
     assert final.cached_tokens == 0
     assert final.cached_tokens_reported is False
     assert engine.generate_calls[0]["sampling"].kwargs["output_kind"] == "delta"
+    asyncio.run(runtime.close())
+
+
+def test_stream_tool_parsers_isolate_interleaved_choices() -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model", tool_parser="qwen3_coder"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+
+    def interleaved(index: int, text: str, token_id: int, finish_reason: str | None):
+        return SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    index=index,
+                    text=text,
+                    token_ids=[token_id],
+                    finish_reason=finish_reason,
+                    logprobs=None,
+                )
+            ],
+            prompt_token_ids=[1, 2, 3],
+            num_cached_tokens=0,
+        )
+
+    engine.responses.append(
+        [
+            interleaved(1, "<tool_call><function=weather><parameter=city>To", 31, None),
+            interleaved(0, "<tool_call><function=weather><parameter=city>Par", 30, None),
+            interleaved(1, "kyo</parameter></function></tool_call>", 33, "stop"),
+            interleaved(0, "is</parameter></function></tool_call>", 32, "stop"),
+        ]
+    )
+    request = GenerationRequest(
+        messages=[{"role": "user", "content": "weather"}],
+        n=2,
+        temperature=0.5,
+        tools=TOOLS,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    )
+
+    async def collect():
+        return [event async for event in runtime.stream(request)]
+
+    events = asyncio.run(collect())
+    tool_deltas = [event for event in events if isinstance(event, StreamDelta) and event.tool_calls]
+    final = events[-1]
+
+    assert isinstance(final, StreamFinished)
+    assert [(event.index, event.tool_calls[0].arguments) for event in tool_deltas] == [
+        (1, '{"city":"Tokyo"}'),
+        (0, '{"city":"Paris"}'),
+    ]
+    assert [choice.tool_calls[0].arguments for choice in final.choices] == [
+        '{"city":"Paris"}',
+        '{"city":"Tokyo"}',
+    ]
+    assert all("<tool_call>" not in event.text for event in events if hasattr(event, "text"))
+    asyncio.run(runtime.close())
+
+
+def test_stream_tool_choices_hide_raw_xml_in_terminals_and_final_choices() -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model", tool_parser="qwen3_coder"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    engine.responses.append(
+        [
+            _output(
+                "I will check. <tool_call>\n<function=weather>\n",
+                [1, 2],
+                finish_reason=None,
+            ),
+            _output(
+                "<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+                [3, 4],
+            ),
+        ]
+    )
+    request = GenerationRequest(
+        messages=[{"role": "user", "content": "weather"}],
+        tools=TOOLS,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+    )
+
+    async def collect():
+        return [event async for event in runtime.stream(request)]
+
+    events = asyncio.run(collect())
+    terminal = next(event for event in events if isinstance(event, StreamChoiceFinished))
+    final = events[-1]
+    assert isinstance(final, StreamFinished)
+    assert terminal.text == "I will check. "
+    assert terminal.token_ids == (1, 2, 3, 4)
+    assert terminal.finish_reason == "tool_calls"
+    assert final.choices[0].text == "I will check. "
+    assert final.choices[0].token_ids == (1, 2, 3, 4)
+    assert final.choices[0].tool_calls[0].name == "weather"
+    assert final.choices[0].tool_calls[0].arguments == '{"city":"Paris"}'
+    assert all("<tool_call>" not in event.text for event in events if hasattr(event, "text"))
     asyncio.run(runtime.close())
 
 
@@ -816,6 +1073,74 @@ def test_engine_failure_is_not_reclassified_as_a_prompt_error() -> None:
     with pytest.raises(TypeError, match="engine-side defect"):
         asyncio.run(runtime.generate(GenerationRequest(prompt="hello")))
     assert isinstance(engine.responses, list)
+    asyncio.run(runtime.close())
+
+
+def test_multimodal_template_detaches_and_decodes_historical_tool_arguments(monkeypatch) -> None:
+    closed: list[bool] = []
+
+    class _Image:
+        def close(self) -> None:
+            closed.append(True)
+
+    image = _Image()
+
+    def prepare(messages, **_kwargs):
+        return list(messages), [image]
+
+    monkeypatch.setattr("flash.serve.runtime.prompt.prepare_multimodal_request", prepare)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                {"type": "text", "text": "check the weather"},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "arguments": '{"large":9007199254740993.0,"tiny":1e-40}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": [
+                {"type": "input_text", "text": "sun"},
+                {"type": "text", "text": "ny"},
+            ],
+            "tool_call_id": "call_1",
+            "name": "weather",
+        },
+    ]
+    runtime = VllmLoraRuntime(EngineConfig(model="model", image_limit=1))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    engine.responses.append([_output("ok", [1])])
+
+    result = asyncio.run(runtime.generate(GenerationRequest(messages=messages)))
+
+    assert result.text == "ok"
+    processor = runtime._processor
+    template_messages = processor.template_calls[0][0]
+    arguments = template_messages[1]["tool_calls"][0]["function"]["arguments"]
+    assert arguments["large"] == 9007199254740993
+    assert arguments["tiny"] == 1e-40
+    assert template_messages[2]["content"] == "sunny"
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == (
+        '{"large":9007199254740993.0,"tiny":1e-40}'
+    )
+    assert isinstance(messages[2]["content"], list)
+    assert closed == [True]
     asyncio.run(runtime.close())
 
 

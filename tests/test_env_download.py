@@ -92,7 +92,7 @@ def test_github_download_once_packages_slug_directory(tmp_path, monkeypatch):
     _git(seed, "remote", "add", "origin", str(remote))
     _git(seed, "push", "origin", "main")
 
-    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
 
     package = envs._github_download_once(
         repo="ignored/repo", token="tok", publish_root="ns/project/env"

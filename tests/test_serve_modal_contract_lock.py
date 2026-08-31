@@ -18,8 +18,8 @@ from flash.cli.parsing.serve_parser import _add_serve_commands
 from flash.serve.provisioning.modal.planning.plan import build_modal_create_plan
 from tests.test_cli_serve_deploy import _args, _stub_resolution
 
-_MODAL_SPEC_ID = "1752cb1cad7dd022896af2933527cac0d885d9bdb54baaa86752b031bec6fe2d"
-_MODAL_IDENTITY_SHA256 = "e37934bd72c8b393d0d06e7486a9000ecc58423bfe7f14f12e4069d8e3f444b7"
+_MODAL_SPEC_ID = "6ae4d74ee15c1dfc05f352afbcd99eb100265e54b93e606faa014173644c6805"
+_MODAL_IDENTITY_SHA256 = "98a7731a6eae01963a4c3b7e9f413c80021ff1d911aa38c7a633dea0733cda8d"
 _MODAL_NAMES = {
     "app_or_pod": "flash-app-zptooedz4yfjaqhxks5etacu23bkqi2b",
     "volume": "flash-volume-u7ve3ykgp7eboeqytu4rljdbnqrzkezm",
@@ -32,9 +32,9 @@ _MODAL_TAGS = (
     ("flash-engine", "G_VoYu0hpBNT3-DbeaCzKwHKn6MbEgvDGiTvPhoF7Jw"),
     ("flash-generation", "1"),
     ("flash-image", "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo"),
-    ("flash-manifest", "Vqo_sUJaadpnyyQJh0wkrOKPrpMbQOdsQ0pG0sBlOkM"),
+    ("flash-manifest", "WJXGrlHLrQ3Ju0x4Ufa3bor-FwsbvDvcYJHUOYFZWRQ"),
     ("flash-phase", "finalized"),
-    ("flash-spec", "F1LLHK190CKJavKTNSfKwNiF2b21S6qoZ1KwMb7G_i0"),
+    ("flash-spec", "auTXTuFcHfwF81KvvNmesQAmXlS5PmBvqgFBc2RMaAU"),
     ("flash-topology", "Ypl_b2aBI81W-dGw6BbFxchnVretqCLS7MsxDUJThL8"),
 )
 
@@ -85,7 +85,7 @@ def _decode_raw(identity: str) -> dict[str, object]:
     return json.loads(raw)
 
 
-def test_modal_schema_v1_identity_spec_and_plan_are_byte_stable(
+def test_modal_schema_v2_identity_spec_and_plan_are_byte_stable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _stub_resolution(monkeypatch)
@@ -99,7 +99,7 @@ def test_modal_schema_v1_identity_spec_and_plan_are_byte_stable(
     assert hashlib.sha256(identity.encode("ascii")).hexdigest() == _MODAL_IDENTITY_SHA256
     assert encode_deployment_identity(decoded) == identity
     assert payload["schema"] == "flash.cli.serving.deployment-identity"
-    assert payload["version"] == 1
+    assert payload["version"] == 2
     assert payload["provider"] == "modal"
     assert list(payload["placement"]) == [
         "environment",
@@ -163,5 +163,5 @@ def test_historical_runpod_identity_is_rejected_without_a_compatibility_decoder(
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     identity = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
-    with pytest.raises(ValueError, match="provider must be modal"):
+    with pytest.raises(ValueError, match="schema is not supported"):
         decode_deployment_identity(identity)

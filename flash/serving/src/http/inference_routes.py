@@ -8,7 +8,6 @@ key unless the caller presents the shared internal key.
 """
 
 import asyncio
-import re
 import time
 import uuid
 from collections.abc import Awaitable
@@ -21,12 +20,19 @@ from flash.serve.request.openai import (
     OpenAIRequestError,
     parse_chat_request,
     reject_thinking_logprobs,
+    reject_tool_capability,
 )
-from flash.serving.src.accounting.usage import captured_now, new_request_identity
+from flash.serving.src.accounting.usage import (
+    AuthorizedTraffic,
+    InferenceAuthorization,
+    captured_now,
+    new_request_identity,
+)
 from flash.serving.src.accounting.usage_outbox import UsageOutboxError
-from flash.serving.src.http.context import ServingContext
+from flash.serving.src.engine.model_config import tool_parser_for
+from flash.serving.src.http.context import ServingContext, require_attributed_traffic
 from flash.serving.src.io.multimodal import _prepare_generate_request
-from flash.serving.src.io.provenance import _provenance_headers, _revision_provenance
+from flash.serving.src.io.provenance import _checkpoint_provenance, _provenance_headers
 from flash.serving.src.io.requests import (
     _expected_checkpoint,
     _parse_generate,
@@ -40,21 +46,20 @@ from flash.serving.src.io.responses import (
 from flash.serving.src.io.schemas import GenerateRequest
 from flash.serving.src.io.streaming import _close_async_iterator
 
-_FLASH_CHECKPOINT_MODEL_RE = re.compile(
-    r"(?P<run_id>flash-[0-9]{1,20}-[0-9a-f]{8})/step-[0-9]{1,18}"
-)
-
 inference_router = APIRouter()
 
 
 @inference_router.post("/generate", tags=["inference"])
 async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
     context = ServingContext.of(request)
-    traffic = await context.authorize_inference(request, payload.adapter_id)
-    requested, target = await context.lookup.resolve(payload.adapter_id)
+    authorization = await context.authorize_inference(request, payload.adapter_id)
+    requested, target = await context.lookup.resolve(
+        payload.adapter_id, org_id=_authorization_org_id(authorization)
+    )
+    traffic = require_attributed_traffic(authorization, target)
     context.reject_unsettleable_thinking(payload, target)
     await _prepare_generate_request(payload, target)
-    identity = new_request_identity(request, traffic=traffic)
+    identity = new_request_identity(request)
     admitted_at = captured_now()
     try:
         result = await _await_until_disconnect(
@@ -76,18 +81,21 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
     return _inference_json_response(result, target)
 
 
-@inference_router.post("/adapters/{adapter_id}/generate", tags=["inference"])
+@inference_router.post("/adapters/{adapter_id:path}/generate", tags=["inference"])
 async def generate_for_adapter(
     adapter_id: str, payload: dict[str, Any], request: Request
 ) -> JSONResponse:
     context = ServingContext.of(request)
     normalized_adapter_id = _path_adapter_id(adapter_id)
-    traffic = await context.authorize_inference(request, normalized_adapter_id)
-    req = _parse_generate({**payload, "adapter_id": adapter_id})
-    requested, target = await context.lookup.resolve(req.adapter_id)
+    authorization = await context.authorize_inference(request, normalized_adapter_id)
+    req = _parse_generate({**payload, "adapter_id": normalized_adapter_id})
+    requested, target = await context.lookup.resolve(
+        req.adapter_id, org_id=_authorization_org_id(authorization)
+    )
+    traffic = require_attributed_traffic(authorization, target)
     context.reject_unsettleable_thinking(req, target)
     await _prepare_generate_request(req, target)
-    identity = new_request_identity(request, traffic=traffic)
+    identity = new_request_identity(request)
     admitted_at = captured_now()
     try:
         result = await _await_until_disconnect(
@@ -109,6 +117,14 @@ async def generate_for_adapter(
     return _inference_json_response(result, target)
 
 
+def _authorization_org_id(authorization: InferenceAuthorization) -> str | None:
+    # tenant scope for the lookup itself. an external key is already bound to its org; a trusted
+    # internal caller scopes by the org header when it supplied one.
+    if isinstance(authorization, AuthorizedTraffic):
+        return authorization.principal.orgId
+    return authorization.org_id
+
+
 def _path_adapter_id(adapter_id: str) -> str:
     """return the stripped path adapter id, rejecting a blank one before the authorizer runs."""
     stripped = adapter_id.strip()
@@ -125,23 +141,11 @@ def _openai_adapter_id(payload: dict[str, Any]) -> str:
     return adapter_id.strip()
 
 
-def _validate_openai_model_id(adapter_id: str) -> None:
-    """reject checkpoint identifiers after the caller has been authorized."""
-    match = _FLASH_CHECKPOINT_MODEL_RE.fullmatch(adapter_id)
-    if match is not None:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "This is a checkpoint identifier, not a serving model identifier. "
-            f"Deploy it first or use model {match.group('run_id')}.",
-        )
-
-
 @inference_router.post("/v1/chat/completions", tags=["openai"])
 async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     context = ServingContext.of(request)
     adapter_id = _openai_adapter_id(payload)
-    traffic = await context.authorize_inference(request, adapter_id)
-    _validate_openai_model_id(adapter_id)
+    authorization = await context.authorize_inference(request, adapter_id)
     try:
         normalized = parse_chat_request(
             payload,
@@ -155,7 +159,10 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
             else status.HTTP_422_UNPROCESSABLE_ENTITY
         )
         raise HTTPException(request_status, str(exc)) from exc
-    requested, target = await context.lookup.resolve(adapter_id)
+    requested, target = await context.lookup.resolve(
+        adapter_id, org_id=_authorization_org_id(authorization)
+    )
+    traffic = require_attributed_traffic(authorization, target)
     effective_thinking = target.thinking
     if target.serve_base_model:
         override = normalized.chat_template_kwargs.get("enable_thinking")
@@ -163,6 +170,12 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
             effective_thinking = override
     try:
         reject_thinking_logprobs(thinking=effective_thinking, logprobs=normalized.logprobs)
+        reject_tool_capability(
+            tools=normalized.tools,
+            tool_choice=normalized.tool_choice,
+            thinking=effective_thinking,
+            tool_parser=tool_parser_for(target.base_model),
+        )
     except OpenAIRequestError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     generate_fields = openai_generate_fields(normalized, adapter_id)
@@ -176,7 +189,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     include_usage = normalized.include_usage
     await _prepare_generate_request(req, target)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-    identity = new_request_identity(request, openai_completion_id=completion_id, traffic=traffic)
+    identity = new_request_identity(request, openai_completion_id=completion_id)
     admitted_at = captured_now()
     created = int(time.time())
     if stream:
@@ -216,7 +229,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     # off the body so it does not leak into the OpenAI-shaped response.
     lora_request_adapter = generation.pop("lora_request_adapter", None)
     active_checkpoint = generation.get("checkpoint")
-    provenance = _revision_provenance(target, active_checkpoint)
+    provenance = _checkpoint_provenance(target, active_checkpoint)
     response = openai_chat_completion(
         completion_id=completion_id,
         created=created,
@@ -225,7 +238,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         provenance=provenance,
     )
     response_headers = _provenance_headers(provenance, active_checkpoint)
-    if target.is_revision:
+    if target.is_checkpoint:
         response_headers["X-Freesolo-LoRA-Request-Adapter"] = lora_request_adapter
     return JSONResponse(response, headers=response_headers)
 

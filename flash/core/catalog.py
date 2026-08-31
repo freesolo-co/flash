@@ -208,7 +208,7 @@ class ModelInfo:
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 
 # the checkpoint each public catalog model loads for customer-owned serving. hosted activation is
-# a separate allowlist in flash.serving.src.engine.model_config, where qwen3.8-27b remains inactive.
+# a separate allowlist in flash.serving.src.engine.model_config.
 SERVING_MODEL_REPOS: dict[str, str] = {
     "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
     "Qwen/Qwen3.8-27B": "Qwen/Qwen3.8-27B-FP8",
@@ -258,7 +258,7 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="A100 PCIe",
         serving=ServingCapacity(
-            gpu="L40S",
+            gpu="B200",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-9B"],
             max_loras=16,
             max_cpu_loras=16,
@@ -318,7 +318,7 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="A100 PCIe",
         min_disk_gb=160,
         serving=ServingCapacity(
-            gpu="H100",
+            gpu="B200",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.8-27B"],
             max_loras=16,
             max_cpu_loras=16,
@@ -332,7 +332,7 @@ MODELS: dict[str, ModelInfo] = {
         thinking="hybrid",
         notes="Dense 27.781427952B multimodal VL checkpoint with image-capable bf16 LoRA training. "
         "SFT fits the 80GB A100 (~55.6GB weights); colocated GRPO needs the B200 (trainer + vLLM "
-        "rollout = two copies). Hosted serving remains pending the exact official FP8 H100 canary.",
+        "rollout = two copies). Hosted serving runs the official FP8 checkpoint on the B200.",
     ),
     "Qwen/Qwen3.6-35B-A3B": ModelInfo(
         id="Qwen/Qwen3.6-35B-A3B",
@@ -393,10 +393,10 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="H200",
         serving=ServingCapacity(
-            gpu="H200",
+            gpu="B200",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"],
-            # bf16 on h200 is the validated full-expert lora path. six hot rank-64 adapters plus 32k
-            # fit with cuda graphs and a 679,701-token kv cache; eight hot adapters overflow the card.
+            # bf16 is the validated full-expert lora path. six hot rank-64 adapters plus 32k fit
+            # with cuda graphs; the b200 measured 49.38 GiB of kv (3,678,952 tokens) for this shape.
             max_loras=6,
             max_cpu_loras=6,
             max_lora_rank=64,
