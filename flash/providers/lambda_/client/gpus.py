@@ -29,17 +29,47 @@ def _catalog_positive_int(text: str, field: str) -> int:
     return value
 
 
-def _catalog_vram_gb(entry: object) -> int | None:
-    """Per-card VRAM Lambda advertises for one catalog entry, when present."""
-    if not isinstance(entry, dict):
+def _catalog_object(value: object, field: str) -> dict | None:
+    """One rung of a catalog walk: absent or null is unknown, any other shape is malformed."""
+    if value is MISSING_PROVIDER_FIELD or value is None:
         return None
-    instance = entry.get("instance_type")
-    if not isinstance(instance, dict):
+    if not isinstance(value, dict):
+        raise MalformedProviderFieldError("lambda", field, "an object or null")
+    return value
+
+
+def _catalog_child(parent: dict | None, key: str, field: str) -> dict | None:
+    """Descend one key, carrying an already-unknown parent through as unknown."""
+    if parent is None:
+        return None
+    return _catalog_object(parent.get(key, MISSING_PROVIDER_FIELD), field)
+
+
+def _catalog_vram_gb(entry: object, instance_type: str) -> int | None:
+    """Per-card VRAM Lambda advertises for one catalog entry.
+
+    None means the catalog states no memory for this entry, and nothing else. A present entry whose
+    shape or digits cannot be trusted raises instead: the caller reads None as PROOF that Lambda
+    published no memory class and falls back to a renamed suffix on the strength of it, so
+    unparseable metadata answering to the same None would rent an unverified memory class.
+    """
+    instance = _catalog_child(
+        _catalog_object(entry, instance_type),
+        "instance_type",
+        f"{instance_type}.instance_type",
+    )
+    if instance is None:
         return None
     for key in ("gpu_description", "description"):
-        match = _VRAM_GB.search(str(instance.get(key) or ""))
+        field = f"{instance_type}.{key}"
+        raw = instance.get(key, MISSING_PROVIDER_FIELD)
+        if raw is MISSING_PROVIDER_FIELD or raw is None:
+            continue
+        if not isinstance(raw, str):
+            raise MalformedProviderFieldError("lambda", field, "a string or null")
+        match = _VRAM_GB.search(raw)
         if match:
-            return _catalog_positive_int(match.group(1), key)
+            return _catalog_positive_int(match.group(1), field)
     return None
 
 
@@ -55,23 +85,11 @@ def instance_type_disk_gb(catalog, instance_type: str) -> float | None:
     """
     if not isinstance(catalog, dict):
         return None
-    entry = catalog.get(instance_type, MISSING_PROVIDER_FIELD)
-    if entry is MISSING_PROVIDER_FIELD or entry is None:
+    entry = _catalog_object(catalog.get(instance_type, MISSING_PROVIDER_FIELD), instance_type)
+    instance = _catalog_child(entry, "instance_type", f"{instance_type}.instance_type")
+    specs = _catalog_child(instance, "specs", f"{instance_type}.specs")
+    if specs is None:
         return None
-    if not isinstance(entry, dict):
-        raise MalformedProviderFieldError("lambda", instance_type, "an instance-type object")
-    instance = entry.get("instance_type", MISSING_PROVIDER_FIELD)
-    if instance is MISSING_PROVIDER_FIELD or instance is None:
-        return None
-    if not isinstance(instance, dict):
-        raise MalformedProviderFieldError(
-            "lambda", f"{instance_type}.instance_type", "an object or null"
-        )
-    specs = instance.get("specs", MISSING_PROVIDER_FIELD)
-    if specs is MISSING_PROVIDER_FIELD or specs is None:
-        return None
-    if not isinstance(specs, dict):
-        raise MalformedProviderFieldError("lambda", f"{instance_type}.specs", "an object or null")
     decoded: list[float] = []
     for key in ("storage_gib", "storage_gb"):
         raw = specs.get(key, MISSING_PROVIDER_FIELD)
@@ -122,17 +140,19 @@ def instance_type_for(name: str, gpu_count: int = 1, catalog=None) -> str:
     family_matches = []
     for entry, entry_info in catalog.items():
         match = _COUNT_PREFIX.match(entry)
-        if (
-            match
-            and _catalog_positive_int(match.group(1), f"{entry}.gpu_count") == count
-            and _COUNT_PREFIX.sub("", entry, count=1).split("_")[0] == family
-        ):
-            family_matches.append((entry, _catalog_vram_gb(entry_info)))
+        # family first: decoding raises, so testing the count ahead of the family would let a corrupt
+        # entry from an UNRELATED family abort a lookup that never concerned it.
+        if not match or _COUNT_PREFIX.sub("", entry, count=1).split("_")[0] != family:
+            continue
+        if _catalog_positive_int(match.group(1), f"{entry}.gpu_count") == count:
+            family_matches.append((entry, _catalog_vram_gb(entry_info, entry)))
     memory_matches = sorted(entry for entry, vram_gb in family_matches if vram_gb == info.vram_gb)
     if memory_matches:
         return memory_matches[0]
     if len(family_matches) == 1 and family_matches[0][1] is None:
-        # Preserve the legacy suffix fallback only when the catalog gives no memory metadata. An
-        # explicit mismatch is a different managed class, not merely a renamed spelling.
+        # Preserve the suffix fallback only when the catalog PROVES it published no memory class for
+        # the sole candidate -- _catalog_vram_gb raises on unparseable metadata rather than
+        # answering None, so an unreadable description can no longer unlock this. An explicit
+        # mismatch is a different managed class, not merely a renamed spelling.
         return family_matches[0][0]
     return rewritten

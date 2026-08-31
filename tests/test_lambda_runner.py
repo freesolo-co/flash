@@ -1234,6 +1234,62 @@ def test_instance_type_for_normalizes_digit_limit_failures():
         )
 
 
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param({"instance_type": {"gpu_description": []}}, id="non-string-description"),
+        pytest.param({"instance_type": {"description": 80}}, id="non-string-alias"),
+        pytest.param({"instance_type": []}, id="non-object-instance-type"),
+        pytest.param([], id="non-object-entry"),
+    ],
+)
+def test_unreadable_memory_metadata_cannot_unlock_the_suffix_fallback(entry):
+    """A sole family match with UNREADABLE memory is not a match with no memory published.
+
+    The renamed-suffix fallback fires only when Lambda published no memory class for the one
+    candidate, because an unverified class is a different box at a different price. Reading an
+    unparseable description as "no memory published" answers that proof with a guess and rents on
+    it: the 8x A100 family alone spans a 40 GB box at $15.92/hr and an 80 GB box at $22.32/hr.
+    """
+    from flash.providers.core._decoding import MalformedProviderFieldError
+    from flash.providers.lambda_.client.gpus import instance_type_for
+
+    sole = "gpu_8x_h100_sxm5"
+    with pytest.raises(MalformedProviderFieldError, match=sole):
+        instance_type_for("H100", 8, {sole: entry})
+
+    # control: the SAME sole candidate with genuinely absent memory still takes the fallback, so the
+    # test above pins the malformed/absent split rather than the fallback simply being unreachable.
+    assert instance_type_for("H100", 8, {sole: {"instance_type": {}}}) == sole
+    assert instance_type_for("H100", 8, {sole: {"instance_type": None}}) == sole
+    assert instance_type_for("H100", 8, {sole: None}) == sole
+
+
+def test_a_corrupt_unrelated_family_cannot_abort_a_lookup_that_never_concerned_it():
+    """The family test gates the count decode, not the other way round.
+
+    Decoding a count raises, so evaluating it before the family comparison let one corrupt entry
+    from a family the caller never asked about abort the whole resolution. The A100 entry below is
+    exactly that: its count segment is unusable, and it has nothing to do with the H100 being
+    resolved beside it.
+    """
+    from flash.providers.core._decoding import MalformedProviderFieldError
+    from flash.providers.lambda_.client.gpus import instance_type_for
+
+    wanted = "gpu_8x_h100_sxm5"
+    catalog = {
+        "gpu_0x_a100_sxm4": {"instance_type": {"gpu_description": "A100 (40 GB SXM4)"}},
+        wanted: {"instance_type": {"gpu_description": "H100 (80 GB)"}},
+    }
+    assert instance_type_for("H100", 8, catalog) == wanted
+    # ordering is not a contract: the corrupt sibling must stay inert from either side.
+    assert instance_type_for("H100", 8, dict(reversed(catalog.items()))) == wanted
+    # a corrupt entry in the RESOLVED family is still fatal -- it could be the shape being named.
+    catalog["gpu_0x_h100_pcie"] = {"instance_type": {"gpu_description": "H100 (80 GB)"}}
+    with pytest.raises(MalformedProviderFieldError, match="gpu_0x_h100_pcie"):
+        instance_type_for("H100", 8, catalog)
+
+
 # ---------------------------------------------------------------------------
 # gpu.disk_gb: Lambda sells a FIXED disk per instance type (no launch-time parameter)
 # ---------------------------------------------------------------------------
