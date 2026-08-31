@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import http.client
+import http.server
 import io
-import types
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -15,6 +17,14 @@ from flash.providers.vast.client import result as vast_result
 
 
 class _Response:
+    """a response exposing only ``read1``, the one bounded-read call the module is allowed to make.
+
+    every fake here withholds ``read`` deliberately. ``read(amt)`` loops over socket receives until
+    it has ``amt`` bytes, so a module that reaches for it is unbounded no matter what the deadline
+    loop around it checks; withholding it turns that regression into an immediate AttributeError
+    across the whole suite instead of a timing defect no fake can see.
+    """
+
     def __init__(self, body: bytes, status: int = 200):
         self._stream = io.BytesIO(body)
         self._status = status
@@ -22,7 +32,7 @@ class _Response:
     def getcode(self):
         return self._status
 
-    def read(self, size=-1):
+    def read1(self, size=-1):
         return self._stream.read(size)
 
     def __enter__(self):
@@ -242,7 +252,7 @@ def test_a_body_over_the_cap_is_refused_without_buffering_the_rest(monkeypatch):
         def getcode(self):
             return 200
 
-        def read(self, size=-1):
+        def read1(self, size=-1):
             reads.append(size)
             return b"a" * size
 
@@ -285,7 +295,7 @@ def test_a_truncated_body_is_a_result_error(monkeypatch):
         def getcode(self):
             return 200
 
-        def read(self, size=-1):
+        def read1(self, size=-1):
             raise http.client.IncompleteRead(b"half")
 
         def __enter__(self):
@@ -300,31 +310,51 @@ def test_a_truncated_body_is_a_result_error(monkeypatch):
         vast_result.fetch_result("https://s3.amazonaws.com/x", timeout=1.0)
 
 
-def test_a_trickling_peer_cannot_outlast_the_deadline(monkeypatch):
-    """the transport timeout bounds inactivity between packets, not the transfer. a peer that keeps
-    sending just under it must still be cut off at the caller's deadline."""
-    monkeypatch.delenv(vast_result.RESULT_ORIGINS_ENV, raising=False)
-    clock = {"now": 0.0}
-    # swap the module's own reference rather than patching the shared stdlib clock, which pytest
-    # and every other importer are also reading.
-    monkeypatch.setattr(vast_result, "time", types.SimpleNamespace(monotonic=lambda: clock["now"]))
+_TRICKLE_BYTES = 60
+_TRICKLE_INTERVAL = 0.05
+_TRICKLE_DEADLINE = 0.25
 
-    class _Trickle:
-        def getcode(self):
-            return 200
 
-        def read(self, size=-1):
-            clock["now"] += 0.4  # answers every read, always under the transport timeout.
-            return b"a"
+class _TricklingHandler(http.server.BaseHTTPRequestHandler):
+    """answer with a complete, well-formed body delivered one byte at a time."""
 
-        def __enter__(self):
-            return self
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", str(_TRICKLE_BYTES))
+        self.end_headers()
+        for _ in range(_TRICKLE_BYTES):
+            self.wfile.write(b"a")
+            self.wfile.flush()
+            time.sleep(_TRICKLE_INTERVAL)
 
-        def __exit__(self, *_exc):
-            return False
+    def log_message(self, *_args):
+        return
 
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Trickle())
 
-    with pytest.raises(vast_result.VastResultError) as exc_info:
-        vast_result.fetch_result("https://s3.amazonaws.com/x", timeout=1.0)
+@pytest.mark.wallclock
+def test_a_trickling_peer_cannot_outlast_the_deadline():
+    """the deadline has to bound the transfer, not just the gaps between reads.
+
+    a fake cannot prove this. the defect lives inside a real ``HTTPResponse``: ``read(amt)`` loops
+    over socket receives until it has ``amt`` bytes or hits EOF, each receive getting a fresh
+    inactivity timeout, so a peer trickling under that timeout keeps one call blocked for the whole
+    transfer while the deadline check sits outside it, unreached. only a real socket serving real
+    bytes slowly reproduces that, so this test asserts on elapsed time against a real server: with
+    ``read`` it takes the full 3s transfer, with ``read1`` it stops at the deadline.
+    """
+    server = http.server.HTTPServer(("127.0.0.1", 0), _TricklingHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        # the transport timeout is deliberately far above the whole transfer: the point is that no
+        # receive ever times out, so the caller's deadline is the only thing that can end this.
+        response = urllib.request.urlopen(f"http://127.0.0.1:{server.server_port}/", timeout=30.0)
+        started = time.monotonic()
+        with pytest.raises(vast_result.VastResultError) as exc_info:
+            vast_result._read_bounded(response, started + _TRICKLE_DEADLINE)
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+
     assert "deadline" in str(exc_info.value)
+    # the untimed read returns only once the peer has sent all 60 bytes, three seconds in.
+    assert elapsed < _TRICKLE_BYTES * _TRICKLE_INTERVAL / 2

@@ -86,15 +86,18 @@ def _read_bounded(response: object, deadline: float) -> bytes:
     """Read up to the body cap, giving up when the peer drags the transfer past the deadline.
 
     The transport timeout bounds inactivity between packets, not the transfer as a whole, so a peer
-    trickling one byte at a time stays under it indefinitely. Reading in chunks and rechecking the
-    absolute deadline is what turns that into a bounded call.
+    trickling one byte at a time stays under it indefinitely. ``read1`` is what makes rechecking the
+    absolute deadline an actual bound: ``read(amt)`` loops over as many socket receives as it takes
+    to fill ``amt`` or reach EOF, each receive getting a fresh inactivity timeout, so one call can
+    outlast any deadline checked around it. ``read1`` returns after a single receive, which puts the
+    transfer back under the loop's control.
     """
     chunks: list[bytes] = []
     remaining = _MAX_RESULT_BODY_BYTES + 1
     while remaining > 0:
         if time.monotonic() >= deadline:
             raise VastResultError("Vast result retrieval exceeded its deadline")
-        chunk = response.read(min(_READ_CHUNK_BYTES, remaining))
+        chunk = response.read1(min(_READ_CHUNK_BYTES, remaining))
         if not chunk:
             break
         chunks.append(chunk)
