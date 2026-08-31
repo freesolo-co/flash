@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import http.client
 import io
+import types
 import urllib.error
 import urllib.request
 
@@ -13,8 +15,12 @@ from flash.providers.vast.client import result as vast_result
 
 
 class _Response:
-    def __init__(self, body: bytes):
+    def __init__(self, body: bytes, status: int = 200):
         self._stream = io.BytesIO(body)
+        self._status = status
+
+    def getcode(self):
+        return self._status
 
     def read(self, size=-1):
         return self._stream.read(size)
@@ -227,12 +233,15 @@ def test_a_body_at_the_cap_is_returned(monkeypatch):
 
 
 def test_a_body_over_the_cap_is_refused_without_buffering_the_rest(monkeypatch):
-    """the read is capped at one byte past the limit, so an endless response cannot exhaust the
-    control plane before the size is known."""
+    """reads stop one byte past the limit, so an endless response cannot exhaust the control plane
+    before the size is known."""
     monkeypatch.delenv(vast_result.RESULT_ORIGINS_ENV, raising=False)
     reads = []
 
     class _Endless:
+        def getcode(self):
+            return 200
+
         def read(self, size=-1):
             reads.append(size)
             return b"a" * size
@@ -248,4 +257,74 @@ def test_a_body_over_the_cap_is_refused_without_buffering_the_rest(monkeypatch):
     with pytest.raises(vast_result.VastResultError) as exc_info:
         vast_result.fetch_result("https://s3.amazonaws.com/x", timeout=1.0)
     assert str(vast_result._MAX_RESULT_BODY_BYTES) in str(exc_info.value)
-    assert reads == [vast_result._MAX_RESULT_BODY_BYTES + 1]
+    # never asks for more than one chunk at a time, and stops the moment the cap is exceeded.
+    assert sum(reads) == vast_result._MAX_RESULT_BODY_BYTES + 1
+    assert max(reads) <= vast_result._READ_CHUNK_BYTES
+
+
+@pytest.mark.parametrize("code", [201, 202, 204, 206])
+def test_a_non_200_success_status_is_not_a_materialized_log(monkeypatch, code):
+    """urllib raises only for non-2xx, so a fragment or an acknowledgement arrives looking like
+    success. accepting one would hand a partial body to the caller as a complete log."""
+    monkeypatch.delenv(vast_result.RESULT_ORIGINS_ENV, raising=False)
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda *_a, **_k: _Response(b"partial", status=code)
+    )
+
+    with pytest.raises(vast_result.VastResultError) as exc_info:
+        vast_result.fetch_result("https://s3.amazonaws.com/x", timeout=1.0)
+    assert str(code) in str(exc_info.value)
+
+
+def test_a_truncated_body_is_a_result_error(monkeypatch):
+    """http.client.HTTPException is not an OSError, so a framing failure would otherwise escape the
+    documented VastResultError boundary."""
+    monkeypatch.delenv(vast_result.RESULT_ORIGINS_ENV, raising=False)
+
+    class _Truncated:
+        def getcode(self):
+            return 200
+
+        def read(self, size=-1):
+            raise http.client.IncompleteRead(b"half")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Truncated())
+
+    with pytest.raises(vast_result.VastResultError):
+        vast_result.fetch_result("https://s3.amazonaws.com/x", timeout=1.0)
+
+
+def test_a_trickling_peer_cannot_outlast_the_deadline(monkeypatch):
+    """the transport timeout bounds inactivity between packets, not the transfer. a peer that keeps
+    sending just under it must still be cut off at the caller's deadline."""
+    monkeypatch.delenv(vast_result.RESULT_ORIGINS_ENV, raising=False)
+    clock = {"now": 0.0}
+    # swap the module's own reference rather than patching the shared stdlib clock, which pytest
+    # and every other importer are also reading.
+    monkeypatch.setattr(vast_result, "time", types.SimpleNamespace(monotonic=lambda: clock["now"]))
+
+    class _Trickle:
+        def getcode(self):
+            return 200
+
+        def read(self, size=-1):
+            clock["now"] += 0.4  # answers every read, always under the transport timeout.
+            return b"a"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Trickle())
+
+    with pytest.raises(vast_result.VastResultError) as exc_info:
+        vast_result.fetch_result("https://s3.amazonaws.com/x", timeout=1.0)
+    assert "deadline" in str(exc_info.value)

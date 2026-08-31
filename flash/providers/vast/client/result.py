@@ -9,7 +9,9 @@ response cannot exhaust the control plane.
 
 from __future__ import annotations
 
+import http.client
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +21,7 @@ from flash._internal.http import _urlopen_no_redirect
 RESULT_ORIGINS_ENV = "FLASH_VAST_RESULT_ORIGINS"
 _DEFAULT_RESULT_ORIGINS = ("https://s3.amazonaws.com",)
 _MAX_RESULT_BODY_BYTES = 1_048_576
+_READ_CHUNK_BYTES = 65_536
 
 _CONFIG_RULE = (
     "must be a comma-separated list of exact canonical HTTPS origins without credentials, "
@@ -52,22 +55,51 @@ def configured_result_origins() -> tuple[str, ...]:
 def fetch_result(url: object, *, timeout: float) -> bytes | None:
     """Fetch one signed result URL, returning ``None`` while the result is not yet materialized.
 
-    Raises ``VastResultError`` for a refused origin, a redirect, any other non-200 status, a
-    transport failure, or a body over the cap. Vast answers 404 until the log is written, which is
-    the one status the caller polls through rather than gives up on.
+    Raises ``VastResultError`` for a refused origin, a redirect, any status other than 200, a
+    transport failure, a body over the cap, or a peer that keeps the body open past ``timeout``.
+    Vast answers 404 until the log is written, which is the one status the caller polls through
+    rather than gives up on.
     """
     request = urllib.request.Request(_admitted_url(url), method="GET")
+    deadline = time.monotonic() + timeout
     try:
         with _urlopen_no_redirect(request, timeout=timeout) as response:
-            # one byte over the cap is enough to detect the overflow without buffering the rest.
-            body = response.read(_MAX_RESULT_BODY_BYTES + 1)
+            status = response.getcode()
+            if status != 200:
+                # every other 2xx describes something that is not a complete materialized log:
+                # 206 is a fragment, 202 is an acknowledgement, 204 has no body at all. urllib
+                # raises only for non-2xx, so these arrive here looking like success.
+                raise VastResultError(f"Vast result retrieval returned HTTP {status}")
+            body = _read_bounded(response, deadline)
     except urllib.error.HTTPError as exc:
         exc.close()
         if exc.code == 404:
             return None
         raise VastResultError(f"Vast result retrieval returned HTTP {exc.code}") from None
-    except OSError:
+    except (OSError, http.client.HTTPException):
+        # a truncated or malformed body raises HTTPException, which is not an OSError.
         raise VastResultError("Vast result retrieval failed") from None
+    return body
+
+
+def _read_bounded(response: object, deadline: float) -> bytes:
+    """Read up to the body cap, giving up when the peer drags the transfer past the deadline.
+
+    The transport timeout bounds inactivity between packets, not the transfer as a whole, so a peer
+    trickling one byte at a time stays under it indefinitely. Reading in chunks and rechecking the
+    absolute deadline is what turns that into a bounded call.
+    """
+    chunks: list[bytes] = []
+    remaining = _MAX_RESULT_BODY_BYTES + 1
+    while remaining > 0:
+        if time.monotonic() >= deadline:
+            raise VastResultError("Vast result retrieval exceeded its deadline")
+        chunk = response.read(min(_READ_CHUNK_BYTES, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    body = b"".join(chunks)
     if len(body) > _MAX_RESULT_BODY_BYTES:
         raise VastResultError(f"Vast result body exceeds the {_MAX_RESULT_BODY_BYTES}-byte limit")
     return body
