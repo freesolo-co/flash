@@ -193,8 +193,11 @@ before it allocates.
 **Not yet measured.** 27B/H100 is sweeping; 35B/H200 follows. Their tables land here in the
 same shape, and each tier passes its own canary -- real card identity, immutable model,
 tokenizer revisions, 32768 configured context, a GDN backend named by vLLM's own
-resolver, finite non-empty output with a terminal finish reason, and confirmed teardown --
-before its sweep is allowed to spend.
+resolver, and finite non-empty output with a terminal finish reason -- before its sweep is
+allowed to spend. Teardown is *charged*, not confirmed: the harness has no post-hoc reclamation
+timestamp to read, so every lane settles the full `scaledown_window` on top of its measured call
+wall and errs toward overstating spend. Confirming a container is actually gone is a separate
+`modal app list` check, run by hand after each model.
 
 ## What the envelope will not claim
 
@@ -250,8 +253,9 @@ uv run ruff check flash/serving/bench scripts/bench_hosted_capacity.py
 ```
 
 Paid, only under explicit authorization — a per-model canary asserting GPU identity, exact
-exact model and tokenizer provenance, and 32768 configured context runs before any sweep, and
-teardown is confirmed after each model:
+model and tokenizer provenance, and 32768 configured context runs before any sweep. The lane
+settles the full scaledown window as billed rather than reading a reclamation timestamp, so
+confirm the container is actually gone with `modal app list` after each model:
 
 ```
 modal run scripts/bench_hosted_capacity.py --base-model Qwen/Qwen3.5-9B --mode canary --ceiling-usd 20

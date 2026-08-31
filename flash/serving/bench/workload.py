@@ -438,7 +438,15 @@ _DRIVER_SOURCES: tuple[str, ...] = (
 # Its own tuple because it lives in `bench.warmup`, a sibling of `driver`: the warmup imports FROM
 # the driver, so re-exporting it back through the driver would be a cycle. What the digest needs is
 # only that the source is reachable, not which module holds it.
-_WARMUP_SOURCES: tuple[str, ...] = ("run_warmup",)
+_WARMUP_SOURCES: tuple[str, ...] = (
+    "run_warmup",
+    # `run_warmup` DELEGATES every generation to this bound, so digesting only the caller captures
+    # the helper's NAME and none of its behavior. Its timeout and its cancellation routing decide
+    # whether a cleanup-stalled warmup is scored delivered, retried, or ends the container -- which
+    # is exactly which startup cost the curve excludes -- and changing either would otherwise leave
+    # every digest byte-identical.
+    "run_request_within_bound",
+)
 _WARMUP_CONSTANTS: tuple[str, ...] = (
     # How many warmups precede a measured cell. `run_warmup` is digested, but its source only names
     # the count its caller passes, so going from five warmups to one would leave every source digest

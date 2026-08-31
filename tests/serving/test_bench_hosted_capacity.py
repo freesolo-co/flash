@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import builtins
 import contextlib
 import dataclasses
 import hashlib
@@ -3506,6 +3507,71 @@ def test_a_retry_cannot_destroy_the_prior_invocations_artifacts(tmp_path) -> Non
         # Even within one invocation, a repeated name must refuse rather than truncate.
         with pytest.raises(RuntimeError, match="refusing to overwrite"):
             write({"run": 3}, "summary-model-b0.json", invocation="aaaaaaaaaaaa")
+    finally:
+        os.environ.pop("BENCH_OUT_DIR", None)
+
+
+def test_a_failed_write_leaves_no_artifact_under_the_real_name(tmp_path) -> None:
+    """A paid artifact must appear whole or not at all.
+
+    The remote bucket has already run and already been billed by the time the write executes, so a
+    truncated JSON file under the artifact's own name is indistinguishable later from a bucket that
+    measured a short curve -- and the artifact is the only surviving evidence of what was paid for.
+    The failure is injected DURING the write, not in serialization: `json.dumps` runs to completion
+    before any file is opened, so a dumps failure never created a file even on the old path and
+    proves nothing. A sink that dies part way through does -- an interrupted write leaves bytes on
+    disk that no longer parse. Under the atomic write those bytes are in a temp file that is removed
+    and never renamed, so the real name stays absent.
+    """
+    namespace = _bench_namespace(
+        "_write_artifact", os=os, json=json, Path=Path, contextlib=contextlib
+    )
+    write = namespace["_write_artifact"]
+
+    real_open = builtins.open
+
+    class _DiesMidWrite:
+        """Writes the first chunk, then fails the way a full disk or a signal would."""
+
+        def __init__(self, handle):
+            self._handle = handle
+            self._wrote = False
+
+        def write(self, data):
+            # The payload is one `json.dumps` string, so this is called ONCE: land half the bytes
+            # on disk, then fail. That is the shape an interrupted write actually has.
+            self._handle.write(data[: max(1, len(data) // 2)])
+            self._handle.flush()
+            self._wrote = True
+            raise OSError(28, "No space left on device")
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self._handle.__exit__(*exc)
+
+    def _failing_open(*args, **kwargs):
+        return _DiesMidWrite(real_open(*args, **kwargs))
+
+    payload = {"rows": ["x" * 100] * 5000}
+    os.environ["BENCH_OUT_DIR"] = str(tmp_path)
+    try:
+        namespace["open"] = _failing_open
+        with pytest.raises(OSError, match="No space left on device"):
+            write(payload, "summary-model-b0.json", invocation="aaaaaaaaaaaa")
+        namespace["open"] = real_open
+        out_dir = tmp_path / "aaaaaaaaaaaa"
+        leftovers = sorted(p.name for p in out_dir.iterdir()) if out_dir.exists() else []
+        assert leftovers == [], f"a failed write left files behind: {leftovers}"
+
+        # And the happy path still lands the whole payload under the real name.
+        path = write({"run": 1}, "summary-model-b0.json", invocation="aaaaaaaaaaaa")
+        assert json.loads(path.read_text())["run"] == 1
+        assert sorted(p.name for p in path.parent.iterdir()) == ["summary-model-b0.json"]
     finally:
         os.environ.pop("BENCH_OUT_DIR", None)
 

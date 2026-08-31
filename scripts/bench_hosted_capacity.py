@@ -625,7 +625,23 @@ def _write_artifact(payload: dict[str, Any], name: str, *, invocation: str = "")
         raise RuntimeError(
             f"refusing to overwrite existing artifact {path}; a paid run already wrote it"
         )
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    # Written to a sibling temp file and renamed, because the artifact IS the evidence: the remote
+    # bucket has already run and already been paid for by the time this executes, and a truncated
+    # JSON file cannot be distinguished later from a bucket that measured a short curve. `os.replace`
+    # is atomic within a directory, so a reader sees the whole artifact or no file at all. The
+    # descriptor is flushed and fsynced first -- a rename can otherwise land ahead of the bytes it
+    # names, leaving a zero-length file under the artifact's own name.
+    tmp = path.with_name(f"{path.name}.partial-{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
     print(f"[bench] wrote {path}", flush=True)
     return path
 
