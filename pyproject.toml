@@ -60,7 +60,7 @@ server = [
     "fastapi>=0.136,<1",
     "uvicorn>=0.52,<1",
     # customer-owned modal lifecycle mutations execute in the control plane.
-    "modal==1.5.4",
+    "modal==1.5.5",
     "runpod-flash>=1.19,<2",
     "httpx>=0.27",
     "jsonschema>=4.23",
@@ -98,7 +98,7 @@ serving = [
     # this one is what the serving image installs ALONE -- so a range here lets the container
     # resolve a different modal than the control plane was validated against, on a rebuild that
     # changed nothing else. one policy per package.
-    "modal==1.5.4",
+    "modal==1.5.5",
     "orjson>=3.10.0",
     # `src/multimodal.py` decodes and normalizes inbound images at module scope. the `gpu` extra
     # gets Pillow transitively via vllm, but this extra deliberately excludes vllm, so it has to
