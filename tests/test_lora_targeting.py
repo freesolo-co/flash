@@ -456,7 +456,7 @@ def test_sft_grpo_and_opd_plugins_install_text_targeting_only_for_text_jobs(tmp_
     shim_dir = tmp_path / "sft-text-shim"
     shim_dir.mkdir()
     _marker, expected, raw_sft = sft_train_runner._write_sft_child_shims(
-        SimpleNamespace(model_id="Qwen/Qwen3.5-9B", save_at_steps=()),
+        SimpleNamespace(model_id="Qwen/Qwen3.5-9B", save_at_steps=(), loraplus_ratio=16.0),
         SimpleNamespace(
             update_horizon=1,
             reentrant_gradient_checkpointing=False,
@@ -474,7 +474,7 @@ def test_sft_grpo_and_opd_plugins_install_text_targeting_only_for_text_jobs(tmp_
     multimodal_dir = tmp_path / "sft-multimodal-shim"
     multimodal_dir.mkdir()
     _marker, expected, raw_sft = sft_train_runner._write_sft_child_shims(
-        SimpleNamespace(model_id="Qwen/Qwen3.5-9B", save_at_steps=()),
+        SimpleNamespace(model_id="Qwen/Qwen3.5-9B", save_at_steps=(), loraplus_ratio=16.0),
         SimpleNamespace(
             update_horizon=1,
             reentrant_gradient_checkpointing=False,

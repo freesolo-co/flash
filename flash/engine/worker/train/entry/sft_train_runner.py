@@ -33,7 +33,6 @@ from flash.providers.core.base import rentable_gpu_counts
 
 RECIPE = _sft_train.RECIPE
 _MAX_ZERO_GRAD_STEPS = _sft_train._MAX_ZERO_GRAD_STEPS
-_SFT_LORAPLUS_RATIO = _sft_train._SFT_LORAPLUS_RATIO
 _LORAPLUS_READY_MARKER = _sft_train._LORAPLUS_READY_MARKER
 _VERL_OPTIMIZER_IMPL = _sft_train._VERL_OPTIMIZER_IMPL
 _VERL_OPTIMIZER_NAME = _sft_train._VERL_OPTIMIZER_NAME
@@ -70,6 +69,7 @@ class _SftOptions:
     model_revision: str
     epochs: int
     learning_rate: float
+    loraplus_ratio: float
     effective_batch: int
     max_steps: int
     save_at_steps: tuple[int, ...]
@@ -147,6 +147,7 @@ class _SftProgress:
     loss_curve: list[float]
     train_tokens: int
     loraplus_applied: bool
+    loraplus_ratio: float
     wandb_link: dict[str, str | None]
     # what the child plugin must prove applied; verified at the first optimizer step and again at
     # child exit.
@@ -215,6 +216,7 @@ def _resolve_sft_options(spec) -> _SftOptions:
         model_revision=model_revision,
         epochs=int(train_opt("epochs", RECIPE.sft.num_epochs)),
         learning_rate=float(train_opt("learning_rate", RECIPE.sft.learning_rate)),
+        loraplus_ratio=float(train_opt("loraplus_ratio", RECIPE.sft.loraplus_ratio)),
         effective_batch=int(train_opt("batch_size", RECIPE.sft.effective_batch)),
         max_steps=int(train_opt("max_steps", 0) or 0),
         save_at_steps=tuple(getattr(train_spec, "save_at_steps", ()) or ()),
@@ -588,7 +590,7 @@ def _write_sft_child_shims(
         {
             "marker_file": shim_markers,
             "seed": int(seed),
-            "loraplus_ratio": float(_SFT_LORAPLUS_RATIO),
+            "loraplus_ratio": options.loraplus_ratio,
             "loraplus_ready_marker": _LORAPLUS_READY_MARKER,
             "save_at_steps": list(options.save_at_steps),
             "total_steps": int(model.update_horizon),
@@ -758,7 +760,9 @@ def _prepare_sft_child(
     )
 
 
-def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, child: _SftChild) -> _SftProgress:
+def _prepare_sft_progress(
+    options: _SftOptions, data: _SftData, model: _SftModelSetup, child: _SftChild
+) -> _SftProgress:
     resume_step = child.resume_step
     progress = {"step": resume_step, "loss": None, "grad_norm": None, "lr": None}
     # consecutive steps seen with grad_norm == 0.0 at a nonzero lr. one step can legitimately be
@@ -786,6 +790,7 @@ def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, child: _SftChil
         loss_curve=[],
         train_tokens=train_tokens,
         loraplus_applied=resume_step >= model.update_horizon,
+        loraplus_ratio=options.loraplus_ratio,
         wandb_link={},
         shim_markers=child.shim_markers,
         expected_shims=child.expected_shims,
@@ -846,7 +851,7 @@ def _consume_sft_marker_line(progress: _SftProgress, line: str) -> bool:
     if progress.expected_shims and not progress.shims_verified:
         verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
         progress.shims_verified = True
-    if _SFT_LORAPLUS_RATIO > 1 and not progress.loraplus_applied:
+    if progress.loraplus_ratio > 1 and not progress.loraplus_applied:
         raise RuntimeError(
             "verl reached an optimizer step before the required lora+ shim succeeded"
         )
@@ -914,7 +919,7 @@ def _finish_sft_child(
     if progress.expected_shims and not progress.shims_verified:
         verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
         progress.shims_verified = True
-    if _SFT_LORAPLUS_RATIO > 1 and not progress.loraplus_applied:
+    if progress.loraplus_ratio > 1 and not progress.loraplus_applied:
         raise RuntimeError("required lora+ shim did not emit its success marker")
     return train_wall, device_peak_gpu_gb
 

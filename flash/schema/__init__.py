@@ -297,6 +297,8 @@ def validate_train_keys_for_algorithm(train_raw: Mapping[str, Any], algorithm: s
     every spec fail to reparse its own output and break resubmit, warm-start and server reparse.
     A null is the absence of an authored value, which is exactly what the user is being asked for.
     """
+    if train_raw.get("loraplus_ratio") is not None and algorithm != "sft":
+        raise ConfigError("train.loraplus_ratio only applies to sft")
     for key, allowed in _ALGORITHM_ONLY_TRAIN_KEYS.items():
         if train_raw.get(key) is None or algorithm in allowed:
             continue
@@ -686,6 +688,7 @@ def spec_from_dict(
             init_from_adapter=init_from_adapter,
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
+            loraplus_ratio=_train_float(train_raw, "loraplus_ratio", minimum=1.0),
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
             prompts_per_step=_train_int(train_raw, "prompts_per_step", minimum=1),
             max_context_tokens=_train_int(train_raw, "max_context_tokens", minimum=1),

@@ -170,6 +170,7 @@ class SFTConfig:
     max_seq_len: int = 1024
     max_seq_len_thinking: int = 2048
     learning_rate: float = 1e-4
+    loraplus_ratio: float = 16.0
     warmup_frac: float = 0.03
     effective_batch: int = 32
     num_epochs: int = 2
