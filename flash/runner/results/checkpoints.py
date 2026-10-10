@@ -16,7 +16,7 @@ import re
 
 from flash.adapters.artifacts import has_loadable_adapter_weights
 from flash.core.spec import JobSpec
-from flash.runner import adapter_prefix
+from flash.runner.lifecycle.state import adapter_prefix
 
 
 class CheckpointListingError(RuntimeError):

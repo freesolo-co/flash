@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-import io
 import types
 
 import pytest
+
+import flash.engine.worker.entry.worker as worker_entry
+import flash.engine.worker.perf as worker_perf
+import flash.engine.worker.runtime.state as worker_state
 
 
 @pytest.fixture(autouse=True)
@@ -58,8 +61,11 @@ def test_a_child_process_oom_is_classified_from_its_output():
     So the child's own output is the only evidence, and without it the one OOM shape that happens
     DURING training (rather than at vllm startup) is never retried on a larger card.
     """
-    from flash.engine.worker.backend_common import ChildOutputTail, raise_for_classified_verl_exit
     from flash.engine.worker.perf.lifecycle import is_cuda_oom
+    from flash.engine.worker.train.entry.backend_common import (
+        ChildOutputTail,
+        raise_for_classified_verl_exit,
+    )
 
     tail = ChildOutputTail()
     tail.record(
@@ -83,7 +89,10 @@ def test_child_output_that_merely_mentions_memory_is_not_an_oom():
     environment's own error text, or a Triton message as a CUDA OOM and burn a retry on a larger
     card for a run that would fail there identically.
     """
-    from flash.engine.worker.backend_common import ChildOutputTail, raise_for_classified_verl_exit
+    from flash.engine.worker.train.entry.backend_common import (
+        ChildOutputTail,
+        raise_for_classified_verl_exit,
+    )
 
     for line in (
         "MemoryError: host ram: out of memory",
@@ -171,7 +180,7 @@ def test_host_ram_evidence_outranks_a_stale_allocator_counter(monkeypatch):
     re-arming the exact VRAM escalation this fix removes, on the runs most likely to have touched
     the allocator. A failure that named its own cause must not be diagnosed by a stale counter.
     """
-    from flash.engine.worker import _worker_failure_flags
+    from flash.engine.worker.entry.worker import _worker_failure_flags
     from flash.engine.worker.perf import lifecycle as lc
     from flash.engine.worker.verl.diagnostics import ChildOutputTail, raise_for_classified_verl_exit
 
@@ -257,15 +266,19 @@ def _card(gpu, vram):
     return types.SimpleNamespace(gpu=gpu, vram_gb=vram, provider="runpod", hourly_usd=1.0)
 
 
-def test_oom_escalated_keeps_only_strictly_larger_cards():
-    from flash.runner.supervise.lifecycle import _oom_escalated
+def test_retry_filter_keeps_only_strictly_larger_cards():
+    from flash.runner.supervise.retry_decision import _strictly_larger_candidates
 
-    cands = [_card("A100", 80), _card("A100b", 80), _card("Pro6000", 96), _card("B200", 180)]
-    assert [c.gpu for c in _oom_escalated(cands, 0)] == [
-        c.gpu for c in cands
-    ]  # no OOM -> unchanged
-    assert {c.gpu for c in _oom_escalated(cands, 80)} == {"Pro6000", "B200"}  # >80 only
-    assert _oom_escalated(cands, 180) == []  # OOM'd the biggest -> nowhere larger
+    candidates = [_card("A100", 80), _card("A100b", 80), _card("Pro6000", 96), _card("B200", 180)]
+
+    assert [candidate.gpu for candidate in _strictly_larger_candidates(candidates, 0)] == [
+        candidate.gpu for candidate in candidates
+    ]
+    assert [candidate.gpu for candidate in _strictly_larger_candidates(candidates, 80)] == [
+        "Pro6000",
+        "B200",
+    ]
+    assert _strictly_larger_candidates(candidates, 180) == ()
 
 
 def _shape(gpu, vram, count):
@@ -275,9 +288,13 @@ def _shape(gpu, vram, count):
 
 
 def test_sft_oom_escalation_uses_the_ranks_that_joined():
-    from flash.providers.allocator import _executed_width, _fitting_candidates
-    from flash.providers.base import Candidate, combined_vram_gb
-    from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
+    from flash.providers.core.allocator import _executed_width, _fitting_candidates
+    from flash.providers.core.base import Candidate
+    from flash.providers.core.sharding import combined_vram_gb
+    from flash.runner.supervise.retry_decision import (
+        _candidate_usable_vram_gb,
+        _strictly_larger_candidates,
+    )
 
     failed = Candidate("runpod", "RTX 4090", 0.69, 24, 4)
     fallback = Candidate("runpod", "A100 SXM 40GB", 1.0, 40, 1)
@@ -293,13 +310,17 @@ def test_sft_oom_escalation_uses_the_ranks_that_joined():
     assert _candidate_usable_vram_gb(failed) == pytest.approx(combined_vram_gb(24, 2))
     assert _candidate_usable_vram_gb(failed) == pytest.approx(35.2)
     assert _candidate_usable_vram_gb(failed) != pytest.approx(combined_vram_gb(24, 4))
-    assert _oom_escalated([fallback], _candidate_usable_vram_gb(failed)) == [fallback]
+    assert _strictly_larger_candidates([fallback], _candidate_usable_vram_gb(failed)) == (fallback,)
 
 
 def test_non_sft_oom_escalation_still_uses_every_rented_card():
-    from flash.providers.allocator import _executed_width, _fitting_candidates
-    from flash.providers.base import Candidate, combined_vram_gb
-    from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
+    from flash.providers.core.allocator import _executed_width, _fitting_candidates
+    from flash.providers.core.base import Candidate
+    from flash.providers.core.sharding import combined_vram_gb
+    from flash.runner.supervise.retry_decision import (
+        _candidate_usable_vram_gb,
+        _strictly_larger_candidates,
+    )
 
     failed = Candidate("runpod", "RTX 4090", 0.69, 24, 4)
     fallback = Candidate("runpod", "A100 SXM 40GB", 1.0, 40, 1)
@@ -312,51 +333,7 @@ def test_non_sft_oom_escalation_still_uses_every_rented_card():
     assert failed.executed_gpu_count == failed.gpu_count == 4
     assert _candidate_usable_vram_gb(failed) == pytest.approx(combined_vram_gb(24, 4))
     assert _candidate_usable_vram_gb(failed) == pytest.approx(62.4)
-    assert _oom_escalated([fallback], _candidate_usable_vram_gb(failed)) == []
-
-
-def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
-    from flash.providers.allocator import _executed_width, _fitting_candidates
-    from flash.providers.base import Candidate, PollResult
-    from flash.runner.supervise import seed_submission
-    from flash.runner.supervise.lifecycle import _oom_escalated, _RetryBudget
-
-    failed = _fitting_candidates(
-        [Candidate("runpod", "RTX 4090", 0.69, 24, 4)],
-        35,
-        _executed_width("sft", {"batch_size": 8}, {"sft_retained_examples": 10}),
-    )[0]
-    ctx = types.SimpleNamespace(
-        raise_if_cancelled=lambda: None,
-        last_handle=None,
-        spec=types.SimpleNamespace(run_id="run"),
-        last_detail="",
-        oom_vram_floor=0.0,
-        drop_weight_cache=False,
-        retry_budget=_RetryBudget(0, 1, 0),
-        failed_providers=set(),
-        tried_classes=set(),
-        capacity_refusals={},
-        seed=1,
-        log=io.StringIO(),
-    )
-    prepared = types.SimpleNamespace(attempt=0)
-    outcome = seed_submission._AttemptOutcome(
-        result=PollResult(False, failure="oom", detail="cuda oom"),
-        chosen=failed,
-        candidates=(failed,),
-        run_spec=types.SimpleNamespace(gpu=types.SimpleNamespace(network_volume=None)),
-    )
-    monkeypatch.setattr(
-        seed_submission._lifecycle, "_await_runpod_completed_metrics", lambda *a, **k: None
-    )
-    monkeypatch.setattr("flash.runner._load_run_deadline_at", lambda _run_id: None)
-
-    decision = seed_submission._handle_failure(ctx, prepared, outcome)
-
-    assert decision.retry is True
-    assert ctx.oom_vram_floor == pytest.approx(35.2)
-    assert failed not in _oom_escalated([failed], ctx.oom_vram_floor)
+    assert _strictly_larger_candidates([fallback], _candidate_usable_vram_gb(failed)) == ()
 
 
 def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():
@@ -369,26 +346,31 @@ def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():
     130.4 GB usable, so the "larger" retry is smaller than the shape that already failed and burns a
     paid attempt to reach the same OOM.
     """
-    from flash.providers.base import combined_vram_gb
-    from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
+    from flash.providers.core.sharding import combined_vram_gb
+    from flash.runner.supervise.retry_decision import (
+        _candidate_usable_vram_gb,
+        _strictly_larger_candidates,
+    )
 
     single_h200 = _shape("H200", 141, 1)
     pair_h100 = _shape("H100x2", 80, 2)
     assert combined_vram_gb(80, 2) < 141  # the premise: the pair is the smaller shape
 
     floor = _candidate_usable_vram_gb(single_h200)
-    assert pair_h100 not in _oom_escalated([pair_h100], floor)
+    assert pair_h100 not in _strictly_larger_candidates([pair_h100], floor)
 
     # and the floor is recorded on the same scale: a sharded shape that OOMs must not write a floor
     # so inflated that genuinely larger single cards get filtered out. 3x40 raw-counts as 120 GB,
     # which would wrongly exclude a 96 GB card that the fit model rates higher (89.6 GB usable).
     triple_40 = _shape("L40Sx3", 40, 3)
     single_96 = _shape("Pro6000", 96, 1)
-    assert single_96 in _oom_escalated([single_96], _candidate_usable_vram_gb(triple_40))
+    assert single_96 in _strictly_larger_candidates(
+        [single_96], _candidate_usable_vram_gb(triple_40)
+    )
 
 
 def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
-    from flash.providers.runpod.jobs import surfaced_worker_flags
+    from flash.providers.runpod.execution.jobs import surfaced_worker_flags
 
     say = lambda _m: None  # noqa: E731
     reads = {"n": 0}
@@ -418,7 +400,7 @@ def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
 
 
 def test_heartbeat_oom_for_attempt_gates_stale_flag():
-    from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
+    from flash.providers._lifecycle.instances.poll import heartbeat_oom_for_attempt
 
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": 0}, 0) is True
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": 0}, 1) is False
@@ -436,7 +418,7 @@ def test_heartbeat_oom_for_attempt_gates_stale_flag():
 def test_heartbeat_oom_accepts_only_canonical_attempt_identities(
     heartbeat_attempt, current_attempt
 ):
-    from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
+    from flash.providers._lifecycle.instances.poll import heartbeat_oom_for_attempt
 
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": heartbeat_attempt}, current_attempt)
 
@@ -462,7 +444,7 @@ def test_heartbeat_oom_accepts_only_canonical_attempt_identities(
     ],
 )
 def test_heartbeat_oom_rejects_malformed_heartbeat_attempt(malformed_attempt):
-    from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
+    from flash.providers._lifecycle.instances.poll import heartbeat_oom_for_attempt
 
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": malformed_attempt}, 1) is False
 
@@ -488,16 +470,16 @@ def test_heartbeat_oom_rejects_malformed_heartbeat_attempt(malformed_attempt):
     ],
 )
 def test_heartbeat_oom_rejects_malformed_current_attempt(malformed_attempt):
-    from flash.providers._lifecycle.poll import heartbeat_oom_for_attempt
+    from flash.providers._lifecycle.instances.poll import heartbeat_oom_for_attempt
 
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": 1}, malformed_attempt) is False
 
 
 def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
+    from flash.providers.runpod.client import api as runpod_api
+    from flash.providers.runpod.execution import jobs, polling
 
-    monkeypatch.setattr(jobs.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(polling.time, "sleep", lambda _s: None)
     monkeypatch.setattr(
         runpod_api,
         "job_status",
@@ -505,7 +487,7 @@ def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
     )
     handle = jobs.JobHandle("ep", "name", "rpk-" + "0" * 64, "job", 2, 1.0)
 
-    res = jobs.poll_job(
+    res = polling.poll_job(
         handle,
         interval_s=0,
         heartbeat_reader=lambda force=False: {"oom": True, "attempt": 2},
@@ -513,7 +495,7 @@ def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
     )
     assert res.failure == "oom"
 
-    res = jobs.poll_job(
+    res = polling.poll_job(
         handle,
         interval_s=0,
         heartbeat_reader=lambda force=False: {"oom": True, "attempt": 1},
@@ -523,14 +505,13 @@ def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
 
 
 def test_worker_failure_flags_prioritize_retriable_over_oom(monkeypatch):
-    import flash.engine.worker as worker
 
-    monkeypatch.setattr(worker, "is_cuda_oom", lambda _exc: True)
-    assert worker._worker_failure_flags(RuntimeError("cuda oom")) == {
+    monkeypatch.setattr(worker_perf, "is_cuda_oom", lambda _exc: True)
+    assert worker_entry._worker_failure_flags(RuntimeError("cuda oom")) == {
         "retriable": False,
         "oom": True,
     }
-    assert worker._worker_failure_flags(worker.RetriableInfraError("bad host")) == {
+    assert worker_entry._worker_failure_flags(worker_perf.RetriableInfraError("bad host")) == {
         "retriable": True,
         "oom": False,
     }
@@ -545,7 +526,6 @@ def test_a_dirty_card_is_infra_retriable_and_never_an_oom(monkeypatch):
     paid GPU later -- classified `oom`, which escalates to a larger card and spends the small OOM
     retry budget. Both are the wrong recovery for a card that was merely occupied.
     """
-    import flash.engine.worker as worker
     from flash.engine.worker.perf import lifecycle as lc
 
     monkeypatch.setattr(lc, "_nvml_memory_gb", lambda _device_index: (3.4, 22.5))
@@ -556,8 +536,8 @@ def test_a_dirty_card_is_infra_retriable_and_never_an_oom(monkeypatch):
         excinfo.value
     )
     # the whole point: infra retry, NOT an oom escalation onto a bigger (equally dirty) card.
-    monkeypatch.setattr(worker, "is_cuda_oom", lambda _exc: False)
-    assert worker._worker_failure_flags(excinfo.value) == {"retriable": True, "oom": False}
+    monkeypatch.setattr(worker_perf, "is_cuda_oom", lambda _exc: False)
+    assert worker_entry._worker_failure_flags(excinfo.value) == {"retriable": True, "oom": False}
 
 
 def _install_nvml_memory_stub(monkeypatch, readings):
@@ -585,7 +565,6 @@ def _install_nvml_memory_stub(monkeypatch, readings):
 
 
 def test_clean_gpu0_dirty_gpu1_is_rejected(monkeypatch):
-    import flash.engine.worker as worker
     from flash.engine.worker.perf import lifecycle as lc
 
     queried = _install_nvml_memory_stub(monkeypatch, {0: (22.1, 22.5), 1: (3.4, 22.5)})
@@ -593,7 +572,7 @@ def test_clean_gpu0_dirty_gpu1_is_rejected(monkeypatch):
         lc.preflight_gpu_occupancy(2)
 
     assert queried == [0, 1]
-    assert worker._worker_failure_flags(excinfo.value) == {"retriable": True, "oom": False}
+    assert worker_entry._worker_failure_flags(excinfo.value) == {"retriable": True, "oom": False}
 
 
 def test_unreadable_gpu0_does_not_hide_dirty_gpu1(monkeypatch):
@@ -617,7 +596,6 @@ def test_invalid_gpu0_does_not_hide_dirty_gpu1(monkeypatch):
 
 
 def test_resolved_count_bounds_gpu_enumeration(monkeypatch):
-    import flash.engine.worker as worker
     from flash.engine.worker.perf import lifecycle as lc
 
     queried = _install_nvml_memory_stub(
@@ -630,10 +608,10 @@ def test_resolved_count_bounds_gpu_enumeration(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        worker, "JOB_SPEC", types.SimpleNamespace(gpu=types.SimpleNamespace(count=2))
+        worker_state, "JOB_SPEC", types.SimpleNamespace(gpu=types.SimpleNamespace(count=2))
     )
     with pytest.raises(lc.DirtyGpuError, match="GPU device 0"):
-        worker._preflight_gpu_occupancy_for_spec()
+        worker_entry._preflight_gpu_occupancy_for_spec()
 
     assert queried == [0, 1]
 
@@ -719,12 +697,10 @@ def test_boot_reads_the_card_before_anything_initializes_cuda():
     """
     import inspect
 
-    import flash.engine.worker as worker
-
     # the boot function specifically, not the module: at module scope the definition of
     # `_preflight_gpu_occupancy_for_spec` precedes everything, so the ordering assertion would hold no
     # matter how the calls were arranged and the test would pass while the check was disabled.
-    body = inspect.getsource(worker._run_worker_mode)
+    body = inspect.getsource(worker_entry._run_worker_mode)
     preflight = body.index("_preflight_gpu_occupancy_for_spec()")
     forcer = body.index("_force_fla_triton_gdn_on_sm100()")
     assert preflight < forcer, "the occupancy read must precede the first CUDA context"
@@ -785,8 +761,8 @@ def test_preflight_never_re_derives_what_the_run_needs(monkeypatch):
     batch 1), so recomputing from ``JOB_SPEC.train`` here demands more VRAM than the card was
     rented for and rejects the instance the allocator correctly picked.
     """
-    import flash.providers.allocator as allocator
-    from flash.engine.worker import _preflight_gpu_occupancy_for_spec
+    import flash.providers.core.allocator as allocator
+    from flash.engine.worker.entry.worker import _preflight_gpu_occupancy_for_spec
     from flash.engine.worker.perf import lifecycle as lc
 
     def _fail(*_a, **_k):

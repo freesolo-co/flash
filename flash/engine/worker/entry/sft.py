@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import random
 
+import flash.engine.worker.io.hf as _worker_hf
 from flash.engine.worker.model.chatml_mask import assistant_only_mask
 from flash.engine.worker.model.packing import (
     completion_mask_from_ids,
@@ -17,7 +18,6 @@ from flash.engine.worker.model.packing import (
     tokenize_for_packing,
     untruncated_lengths_for_packing,
 )
-from flash.engine.worker.runtime.pkg_proxy import W as _w
 
 
 def has_real_target(input_ids, loss_mask, special_ids: set[int]) -> bool:
@@ -100,7 +100,7 @@ def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:
         cfg = AutoConfig.from_pretrained(
             model_id,
             trust_remote_code=True,
-            **_w.model_revision_kwargs(revision),
+            **_worker_hf.model_revision_kwargs(revision),
         )
         tc = getattr(cfg, "text_config", None) or cfg
         layers = int(
@@ -199,6 +199,6 @@ def _reject_image_completion(
 
 def run_sft():
     """Run SFT. verl is the only backend; this module keeps the dataset helpers it shares."""
-    from flash.engine.worker.sft_train import run_sft_train
+    from flash.engine.worker.train.entry.sft_train import run_sft_train
 
     run_sft_train()

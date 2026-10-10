@@ -16,8 +16,8 @@ from flash.cost.analytical import (
     setup_seconds,
 )
 
-SMALL = "Qwen/Qwen3.5-0.8B"
-MID = "Qwen/Qwen3.5-4B"
+SMALL = "Qwen/Qwen3.5-9B"
+MID = "Qwen/Qwen3.5-9B"
 BIG = "Qwen/Qwen3.5-9B"
 
 
@@ -60,9 +60,9 @@ def test_grpo_costs_more_than_sft():
 
 
 def test_bigger_model_costs_more_per_step():
-    gpu = "RTX 5090"
-    small = seconds_per_step(RunConfig(SMALL, "sft", 1), gpu)
-    big = seconds_per_step(RunConfig(BIG, "sft", 1), gpu)
+    gpu = "H100"
+    small = seconds_per_step(RunConfig("Qwen/Qwen3.5-9B", "sft", 1), gpu)
+    big = seconds_per_step(RunConfig("Qwen/Qwen3.8-27B", "sft", 1), gpu)
     assert big > small
 
 
@@ -75,7 +75,7 @@ def test_grpo_requires_at_least_as_much_vram_as_sft():
 
 def test_omitted_sft_batch_sizes_like_the_real_allocator():
     # An omitted SFT batch sizes VRAM like the allocator (micro-batch 4), not the recipe batch (32).
-    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "sft", 100)  # batch_size omitted
     _, need, *_ = _offline_gpu_shape(cfg)
@@ -87,7 +87,7 @@ def test_omitted_sft_batch_sizes_like_the_real_allocator():
 def test_explicit_sft_batch_is_still_forwarded_for_sizing():
     # An EXPLICIT batch_size is honored for VRAM sizing (and matches the allocator at that
     # batch), so a deliberately large batch still routes to the right card.
-    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "sft", 100, batch_size=32)
     _, need, *_ = _offline_gpu_shape(cfg)
@@ -105,9 +105,11 @@ def test_grpo_colocate_routes_4b_to_a_bigger_card_than_sft():
 
 
 def test_setup_grpo_exceeds_sft_and_scales_with_model_size():
-    # GRPO pays an extra vLLM-init cost; bigger models download longer.
+    # grpo pays an extra vllm-init cost; bigger models download longer.
     assert setup_seconds(RunConfig(MID, "grpo", 1)) > setup_seconds(RunConfig(MID, "sft", 1))
-    assert setup_seconds(RunConfig(BIG, "sft", 1)) > setup_seconds(RunConfig(SMALL, "sft", 1))
+    assert setup_seconds(RunConfig("Qwen/Qwen3.8-27B", "sft", 1)) > setup_seconds(
+        RunConfig("Qwen/Qwen3.5-9B", "sft", 1)
+    )
 
 
 def test_setup_opd_includes_vllm_init():
@@ -117,18 +119,29 @@ def test_setup_opd_includes_vllm_init():
     )
 
 
-def test_cold_start_calibrated_to_real_short_sft_run():
-    # Calibration anchor: a real fresh-worker run (0.8B SFT, 391 examples -> 26 priced steps at
-    # the recipe batch) was cold-start-dominated (a fresh worker spent ~12.5 min in model load).
-    # Static pricing picks the cheapest fitting class; the cheapest managed card is the 24 GB
-    # RTX 4090 ($0.69). 26 = ceil(391 / 32) * 2 epochs.
-    e = estimate_cost(RunConfig(SMALL, "sft", 26))
+def test_cold_start_calibrated_to_real_short_sft_run(monkeypatch):
+    # the historical 0.9b calibration is a generic size anchor, not an executable catalog model.
+    from flash.core.catalog import MODELS, ModelInfo
+
+    model_id = "test/cold-start-anchor"
+    monkeypatch.setitem(
+        MODELS,
+        model_id,
+        ModelInfo(
+            id=model_id,
+            display_name="synthetic 0.9b calibration anchor",
+            params="0.9B",
+            params_b=0.9,
+            algos=("sft",),
+            min_vram_gb=12,
+        ),
+    )
+    e = estimate_cost(RunConfig(model_id, "sft", 26))
     assert e.gpu == "RTX 4090"
     assert e.gpu_hourly_usd == pytest.approx(0.69, abs=1e-3)
     assert e.total_usd == pytest.approx(e.billable_hours * e.gpu_hourly_usd)
     assert e.total_usd < e.wall_clock_hours * e.gpu_hourly_usd
-    # Model load (not boot/deps) is the dominant cold-start term for a short job.
-    assert e.setup_seconds > e.train_seconds  # cold start dominates this short run
+    assert e.setup_seconds > e.train_seconds
 
 
 def test_cold_start_negligible_for_long_runs():
@@ -197,7 +210,7 @@ def test_35b_moe_long_context_grpo_sized_past_the_resident_wall():
     # the 35b moe is resident-only for grpo because vllm sleep hangs its wake. 205 gb separates
     # moderate from long contexts using the resident peak, preventing admission into the broken sleep
     # path; it is intentionally not a card size.
-    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb as alloc_required_vram_gb
 
     moe = "Qwen/Qwen3.6-35B-A3B"
     # default + moderate context stay under the wall.
@@ -231,7 +244,7 @@ def test_omitted_grpo_context_sizes_like_the_real_allocator():
     # An omitted GRPO context mirrors the worker's max(1024, max_prompt_len + completion), not
     # bare max_prompt_len -- else the estimate under-sizes VRAM by the completion budget.
     from flash.engine.plan.recipe import RECIPE
-    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "grpo", 100)  # max_context_tokens / seq_len omitted
     worker_len = max(1024, RECIPE.rl.max_prompt_len + RECIPE.rl.max_completion_len)
@@ -260,7 +273,7 @@ def test_omitted_grpo_context_mirrors_worker_with_thinking():
 def test_explicit_grpo_context_still_wins():
     # An explicitly pinned seq_len (engine length) is honored verbatim, not overridden by the
     # worker-mirrored default, and matches the allocator at that same pinned context.
-    from flash.providers.allocator import required_vram_gb as alloc_required_vram_gb
+    from flash.providers.core.allocator import required_vram_gb as alloc_required_vram_gb
 
     cfg = RunConfig(MID, "grpo", 100, seq_len=8192)
     assert cfg.normalized().seq_len == 8192
@@ -359,10 +372,26 @@ def test_revision_pinned_sizing_flows_into_setup_and_required_save(monkeypatch, 
     import json
     from types import SimpleNamespace
 
+    from flash.core.catalog import MODELS, ModelInfo
     from flash.cost.analytical import required_save_overhead_seconds
     from flash.cost.facts import download_weight_gb, total_params_b
 
-    # a pinned commit the Hub reports at 0.87B, within the 5% catalog-drift gate (catalog is 0.9B).
+    model_id = "test/revision-sized-model"
+    monkeypatch.setitem(
+        MODELS,
+        model_id,
+        ModelInfo(
+            id=model_id,
+            display_name="synthetic revision-sized model",
+            params="0.9B",
+            params_b=0.9,
+            algos=("sft",),
+            min_vram_gb=12,
+            vocab_size=248_320,
+        ),
+    )
+
+    # a pinned commit the hub reports at 0.87b, within the 5% catalog-drift gate (catalog is 0.9b).
     # vocab must equal the catalog to clear the fail-closed validation for a cataloged model.
     config = tmp_path / "config.json"
     config.write_text(json.dumps({"vocab_size": 248320}))
@@ -379,14 +408,14 @@ def test_revision_pinned_sizing_flows_into_setup_and_required_save(monkeypatch, 
 
     rev = "d" * 40
     # the facts accessors resolve the pinned commit's size, distinct from the catalog default.
-    assert total_params_b(SMALL, rev) == pytest.approx(0.87)
-    assert total_params_b(SMALL) == pytest.approx(0.9)
-    assert download_weight_gb(SMALL, rev) == pytest.approx(1.74)
+    assert total_params_b(model_id, rev) == pytest.approx(0.87)
+    assert total_params_b(model_id) == pytest.approx(0.9)
+    assert download_weight_gb(model_id, rev) == pytest.approx(1.74)
 
     # both cold-start setup (download term) and required-save (serialize term) track the smaller pinned
     # weights, so the 0.87B revision quotes strictly cheaper than the 0.9B catalog default.
-    pinned = RunConfig(SMALL, "sft", 100, model_revision=rev, save_at_steps=(100,))
-    default = RunConfig(SMALL, "sft", 100, save_at_steps=(100,))
+    pinned = RunConfig(model_id, "sft", 100, model_revision=rev, save_at_steps=(100,))
+    default = RunConfig(model_id, "sft", 100, save_at_steps=(100,))
     assert setup_seconds(pinned) < setup_seconds(default)
     assert required_save_overhead_seconds(pinned) < required_save_overhead_seconds(default)
 
@@ -407,11 +436,11 @@ def test_offline_quote_and_allocator_agree_on_the_executed_sft_width():
 
     from flash.cost.analytical import _offline_gpu_shape, executed_gpu_count
     from flash.cost.types import RunConfig
-    from flash.providers.allocator import _fits
-    from flash.providers.base import GPU_INFO, Candidate
+    from flash.providers.core.allocator import _fits
+    from flash.providers.core.base import GPU_INFO, Candidate
 
     def quoted_shape_is_allocatable(**kwargs):
-        config = RunConfig("Qwen/Qwen3.6-27B", "sft", 10, **kwargs)
+        config = RunConfig("Qwen/Qwen3.8-27B", "sft", 10, **kwargs)
         gpu, need, count, _provider, rate = _offline_gpu_shape(config)
         candidate = Candidate(
             provider="runpod",
@@ -430,9 +459,9 @@ def test_offline_quote_and_allocator_agree_on_the_executed_sft_width():
     assert quoted_shape_is_allocatable(seq_len=4096, batch_size=8, sft_retained_examples=64)
 
     # the shared helper is the reason they cannot drift: sft narrows, everything else does not.
-    grpo = RunConfig("Qwen/Qwen3.6-27B", "grpo", 10, batch_size=8, sft_retained_examples=10)
+    grpo = RunConfig("Qwen/Qwen3.8-27B", "grpo", 10, batch_size=8, sft_retained_examples=10)
     assert executed_gpu_count(grpo, 4) == 4
     sft_rows_bound = RunConfig(
-        "Qwen/Qwen3.6-27B", "sft", 10, batch_size=8, sft_retained_examples=10
+        "Qwen/Qwen3.8-27B", "sft", 10, batch_size=8, sft_retained_examples=10
     )
     assert executed_gpu_count(sft_rows_bound, 4) == 2

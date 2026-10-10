@@ -13,8 +13,6 @@ from flash.server.platform.deps import require_key
 
 router = APIRouter()
 
-_CONTROL_PLANE_CAPABILITIES = ("chat_step_selector_v1",)
-
 
 # NOTE: must stay `async def`. Sync (`def`) route handlers share one CapacityLimiter (default 40
 # tokens); when slow sync handlers (chat->Modal, auth/billing/HF calls) saturate it under upstream
@@ -26,7 +24,7 @@ async def health():
         "ok": True,
         "service": "flash",
         "version": __version__,
-        "capabilities": list(_CONTROL_PLANE_CAPABILITIES),
+        "capabilities": [],
     }
 
 

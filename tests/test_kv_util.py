@@ -58,7 +58,7 @@ def test_scales_with_generation_group():
 
 
 def test_grpo_sleep_preflight_matches_worker_kv_budget_and_group_size():
-    info = MODELS["Qwen/Qwen3.5-4B"]
+    info = MODELS["Qwen/Qwen3.5-9B"]
     seq_len = 8192
     rank = 32
     weights = info.params_b * 2.0
@@ -153,8 +153,8 @@ def test_lora_is_added_beside_the_requested_kv_pool_when_the_engine_fits(
 def test_lora_reduces_kv_only_when_the_explicit_engine_cap_binds():
     from flash.engine.plan.vram import _lora_weight_memory_gb
 
-    info = MODELS["Qwen/Qwen3.5-4B"]
-    card_gb = 32.0
+    info = MODELS["Qwen/Qwen3.5-9B"]
+    card_gb = 48.0
     adapter_gb = _lora_weight_memory_gb(128, info)
     requested_kv_gb = 12.0
     util = colocate_kv_util(
@@ -167,10 +167,10 @@ def test_lora_reduces_kv_only_when_the_explicit_engine_cap_binds():
         lora_rank=128,
     )
 
-    assert adapter_gb == pytest.approx(0.62390272)
+    assert adapter_gb == pytest.approx(0.820240384)
     assert util == 0.45
     fitted_kv_gb = util * card_gb - info.params_b * 2.0 - adapter_gb
-    assert fitted_kv_gb == pytest.approx(0.45 * card_gb - 9.4 - adapter_gb)
+    assert fitted_kv_gb == pytest.approx(0.45 * card_gb - info.params_b * 2.0 - adapter_gb)
     assert 0.0 < fitted_kv_gb < requested_kv_gb
 
 

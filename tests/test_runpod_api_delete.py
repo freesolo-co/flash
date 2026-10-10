@@ -23,7 +23,7 @@ def _http_error(code: int, body: bytes = b""):
 
 
 def _patch_urlopen(monkeypatch, error):
-    from flash.providers._lifecycle import http as _http
+    from flash.providers._lifecycle.net import http as _http
 
     def fake_urlopen(req, timeout=None):
         raise error
@@ -33,7 +33,7 @@ def _patch_urlopen(monkeypatch, error):
 
 
 def test_delete_endpoint_404_reports_success(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     _patch_urlopen(monkeypatch, _http_error(404, b'{"error": "endpoint does not exist"}'))
     # already gone == desired end state reached == clean teardown.
@@ -41,7 +41,7 @@ def test_delete_endpoint_404_reports_success(monkeypatch):
 
 
 def test_delete_endpoint_empty_success_response_reports_success(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     monkeypatch.setattr(
         runpod_api._CLIENT,
@@ -53,14 +53,14 @@ def test_delete_endpoint_empty_success_response_reports_success(monkeypatch):
 
 
 def test_delete_endpoint_other_error_reports_failure(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     _patch_urlopen(monkeypatch, _http_error(403, b'{"error": "forbidden"}'))
     assert runpod_api.delete_endpoint_for_key("ep-denied", "rk-test") is False
 
 
 def test_delete_endpoint_5xx_exhausted_reports_failure(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     # 5xx retries then raises "failed after n attempts" (no __cause__ httperror, no 404 text).
     _patch_urlopen(monkeypatch, _http_error(500, b"boom"))
@@ -69,14 +69,14 @@ def test_delete_endpoint_5xx_exhausted_reports_failure(monkeypatch):
 
 def test_delete_endpoint_403_with_not_found_text_reports_failure(monkeypatch):
     """A 403 whose body says "does not exist" is still a 403 — must NOT be swallowed."""
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     _patch_urlopen(monkeypatch, _http_error(403, b'{"error": "endpoint does not exist"}'))
     assert runpod_api.delete_endpoint_for_key("ep-denied", "rk-test") is False
 
 
 def test_exact_endpoint_lookup_accepts_only_explicit_owner_404(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     key = "rk-owner-secret"
     monkeypatch.setattr(runpod_api._keys, "keys", lambda: [key])
@@ -101,7 +101,7 @@ def test_exact_endpoint_lookup_accepts_only_explicit_owner_404(monkeypatch):
     ids=["endpoint-present", "empty-response", "malformed-response"],
 )
 def test_exact_endpoint_lookup_rejects_every_success_response(monkeypatch, response):
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     key = "rk-owner-secret"
     calls = []
@@ -135,7 +135,7 @@ def test_exact_endpoint_lookup_rejects_every_success_response(monkeypatch, respo
     ids=["non-404", "network-error"],
 )
 def test_exact_endpoint_lookup_rejects_errors_without_leaking_details(monkeypatch, error):
-    from flash.providers.runpod import api as runpod_api
+    from flash.providers.runpod.client import api as runpod_api
 
     key = "rk-owner-secret"
     monkeypatch.setattr(runpod_api._keys, "keys", lambda: [key])

@@ -14,10 +14,16 @@ import types
 
 import pytest
 
-import flash.cli as cli
-from flash.cli.commands import traces as cli_traces
+import flash.cli.parsing.main as cli
+from flash.cli.commands.ops import account as account_commands
+from flash.cli.commands.ops import deploy as deploy_commands
+from flash.cli.commands.ops import log_follow
+from flash.cli.commands.ops import runs as run_commands
+from flash.cli.commands.ops import traces as cli_traces
+from flash.cli.commands.ops import train as train_commands
+from flash.cli.ui import cost as cost_ui
 from flash.client.config import DEFAULT_API_URL
-from flash.providers._lifecycle.poll import _format_heartbeat
+from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
 
 def test_format_heartbeat_appends_named_reward_metrics() -> None:
@@ -54,7 +60,7 @@ class _FakeClient:
     def models(self, include_experimental: bool = False) -> list[dict]:
         rows = [
             {
-                "id": "Qwen/Qwen3.5-0.8B",
+                "id": "Qwen/Qwen3.5-9B",
                 "display_name": "Qwen3 0.6B",
                 "params": "0.6B dense",
                 "algos": ["sft", "grpo"],
@@ -78,7 +84,7 @@ class _FakeClient:
                 "updated_at": 1700000000.0,
                 "spec": {
                     "project": "11111111-1111-4111-8111-111111111111",
-                    "model": "Qwen/Qwen3.5-0.8B",
+                    "model": "Qwen/Qwen3.5-9B",
                     "algorithm": "sft",
                 },
             }
@@ -90,7 +96,7 @@ class _FakeClient:
             "state": "done",
             "cost_usd": 0.25,
             "error": None,
-            "spec": {"model": "Qwen/Qwen3.5-0.8B"},
+            "spec": {"model": "Qwen/Qwen3.5-9B"},
         }
 
     def get_logs(self, run_id: str, offset: int = 0) -> dict:
@@ -198,7 +204,7 @@ def project_api(monkeypatch):
         "flash.client.config.load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
     )
     monkeypatch.setattr(
-        cli.commands, "load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
+        account_commands, "load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
     )
     monkeypatch.setattr(
         "flash.client.get_project", lambda project_id, api_key: {"id": project_id, "name": "Test"}
@@ -212,7 +218,10 @@ def project_api(monkeypatch):
 @pytest.fixture
 def fake_client(monkeypatch) -> _FakeClient:
     client = _FakeClient()
-    monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: client)
+    monkeypatch.setattr(account_commands, "client_from_config", lambda *a, **k: client)
+    monkeypatch.setattr(run_commands, "client_from_config", lambda *a, **k: client)
+    monkeypatch.setattr(deploy_commands, "client_from_config", lambda *a, **k: client)
+    monkeypatch.setattr(train_commands, "client_from_config", lambda *a, **k: client)
     return client
 
 
@@ -234,7 +243,7 @@ def test_project_create_prints_only_returned_id_in_plain_mode(monkeypatch, capsy
     # a Freesolo-hosted api_url: `projects create` only calls the backend on the HOSTED path
     # (a self-hosted plane mints the id locally, see the standalone tests below).
     monkeypatch.setattr(
-        cli.commands, "load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
+        account_commands, "load_credentials", lambda: ("https://flash.freesolo.co", "fslo-test")
     )
 
     def create(name, description, api_key):
@@ -294,7 +303,7 @@ def _self_hosted(monkeypatch) -> None:
     path set the var themselves after calling this.
     """
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: _SELF_HOSTED)
-    monkeypatch.setattr(cli.commands, "load_credentials", lambda: _SELF_HOSTED)
+    monkeypatch.setattr(account_commands, "load_credentials", lambda: _SELF_HOSTED)
     monkeypatch.setattr(cli_traces, "load_credentials", lambda: _SELF_HOSTED)
     monkeypatch.delenv("FREESOLO_BASE_URL", raising=False)
 
@@ -312,7 +321,7 @@ def test_projects_create_mints_a_local_id_on_a_self_hosted_plane(monkeypatch, ca
     assert _run(["projects", "create", "My project"]) == 0
     minted = capsys.readouterr().out.strip()
 
-    from flash.server.domain.projects import require_project_access
+    from flash.server.domain.registry.projects import require_project_access
 
     monkeypatch.setenv("FLASH_STANDALONE", "1")
     assert (
@@ -379,7 +388,7 @@ def test_hosted_plane_still_refuses_when_logged_out(monkeypatch, capsys) -> None
     # state and keep an impossible branch alive in the guard.
     logged_out = (DEFAULT_API_URL, None)
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: logged_out)
-    monkeypatch.setattr(cli.commands, "load_credentials", lambda: logged_out)
+    monkeypatch.setattr(account_commands, "load_credentials", lambda: logged_out)
     monkeypatch.delenv("FREESOLO_BASE_URL", raising=False)
 
     def _unreachable(*a, **k):
@@ -389,9 +398,9 @@ def test_hosted_plane_still_refuses_when_logged_out(monkeypatch, capsys) -> None
     monkeypatch.setattr("flash.client.list_projects", _unreachable)
 
     assert _run(["projects", "create", "no key"]) == 1
-    assert f"{cli.commands.CLI_NAME} login" in capsys.readouterr().err
+    assert f"{cli.CLI_NAME} login" in capsys.readouterr().err
     assert _run(["projects", "list"]) == 1
-    assert f"{cli.commands.CLI_NAME} login" in capsys.readouterr().err
+    assert f"{cli.CLI_NAME} login" in capsys.readouterr().err
 
 
 def test_configured_backend_keeps_the_hosted_path_on_a_self_hosted_plane(
@@ -481,7 +490,7 @@ def test_blank_backend_url_does_not_count_as_configured(monkeypatch, capsys) -> 
 def test_train_cost_requires_explicit_project(tmp_path, capsys) -> None:
     config = tmp_path / "run.toml"
     config.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
         'id = "acme/example-project/example"\n'
@@ -498,7 +507,7 @@ def test_train_cost_requires_explicit_project(tmp_path, capsys) -> None:
 def test_env_setup_maps_inaccessible_project_to_client_error(monkeypatch) -> None:
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
     from flash.client import ApiError, ClientError
 
     # pinned to a HOSTED url and a key: ownership is only resolved against the backend when the
@@ -527,12 +536,12 @@ def test_env_setup_resolves_the_project_locally_on_a_self_hosted_plane(monkeypat
     Resolving it against ``api.freesolo.co`` sent the operator's plane-root key to a service with
     no relationship to it, which answered 401 -- so `flash env setup`, the first command in the
     SELF_HOSTING.md quickstart, died before writing a file. The plane exposes no project routes at
-    all, so there is nothing else to ask; ``flash/server/domain/projects.py`` performs exactly this
+    all, so there is nothing else to ask; ``flash/server/domain/registry/projects.py`` performs exactly this
     shape-only check under ``standalone()`` when the same run is later submitted.
     """
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     monkeypatch.setattr(
         "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
@@ -559,7 +568,7 @@ def _scaffold(monkeypatch, tmp_path, api_url: str | None, *, turn_mode: str | No
     """Run `flash env setup` in tmp_path against a plane at api_url; return the written files."""
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     monkeypatch.setattr(
         env_setup,
@@ -593,8 +602,8 @@ def test_env_setup_scaffolds_the_github_form_on_a_self_hosted_plane(monkeypatch,
     """
     import tomllib
 
-    from flash.cli.commands.env import setup as setup_mod
-    from flash.envs.loader import _parse_github_environment_ref
+    from flash.cli.commands.env.ops import setup as setup_mod
+    from flash.envs.loading.loader import _parse_github_environment_ref
 
     written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
 
@@ -640,7 +649,7 @@ def test_env_setup_keeps_the_push_workflow_on_the_managed_plane(monkeypatch, tmp
 
     An unset api_url is the managed plane too: it means the built-in default.
     """
-    from flash.cli.commands.env import setup as setup_mod
+    from flash.cli.commands.env.ops import setup as setup_mod
 
     placeholders = set(setup_mod._HOSTED_GUIDANCE) | set(setup_mod._SELF_HOSTED_GUIDANCE)
     for index, api_url in enumerate(("https://flash.freesolo.co", None)):
@@ -767,7 +776,7 @@ def test_env_setup_survives_a_retained_starter_it_cannot_decode(
     """
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     _scaffold(monkeypatch, tmp_path, "https://flash.freesolo.co")
     capsys.readouterr()
@@ -829,7 +838,7 @@ def test_env_setup_does_not_let_an_unreadable_env_override_the_turn_flag(
     from argparse import Namespace
     from pathlib import Path
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     starter = tmp_path / "environment.py"
     starter.write_bytes(b"# -*- coding: latin-1 -*-\nclass E(EnvironmentMultiTurn):  # caf\xe9\n")
@@ -881,14 +890,14 @@ def test_training_guide_says_a_private_env_repo_needs_a_plane_side_token(
 ) -> None:
     """The scaffold tells a self-hoster to point at their own repo without naming the token it needs.
 
-    `_github_token` (flash/envs/loader.py) reads `GITHUB_TOKEN` from the resolving process's own
+    `_github_token` (flash/envs/loading/loader.py) reads `GITHUB_TOKEN` from the resolving process's own
     environment and there is no spec or client field that carries one, so a private repo resolves as
     missing no matter what the operator has exported locally. The guide has to name where the token
     belongs, since the failure surfaces as an unreadable ref rather than an auth error.
     """
     import inspect
 
-    from flash.envs import loader
+    from flash.envs.loading import loader
 
     # the premise: the token comes from the plane's process env, not from anything the client sends
     source = inspect.getsource(loader._github_token)
@@ -909,7 +918,7 @@ def test_training_guide_says_env_eval_rejects_a_github_id(monkeypatch, tmp_path)
     """
     import inspect
 
-    from flash.cli.commands.env import eval as env_eval
+    from flash.cli.commands.env.testing import eval as env_eval
 
     # the premise: the gate is a managed-slug check, not a soft preference
     source = inspect.getsource(env_eval._resolve_evaluation_environment)
@@ -938,7 +947,7 @@ def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatc
     """Skipping the ownership lookup must not skip the shape check that stands in for it."""
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     monkeypatch.setattr(
         "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
@@ -955,7 +964,7 @@ def test_env_setup_still_rejects_a_malformed_project_when_self_hosted(monkeypatc
 def test_env_setup_self_hosted_interactive_requires_an_explicit_project(monkeypatch) -> None:
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
     from flash.client import ClientError
 
     monkeypatch.delenv("FREESOLO_BASE_URL", raising=False)
@@ -988,7 +997,7 @@ def test_env_setup_interactive_lists_projects_from_an_operator_backend(monkeypat
     """
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     project_id = "11111111-1111-4111-8111-111111111111"
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://identity.operator.example")
@@ -1052,7 +1061,7 @@ def test_supplied_project_is_ownership_checked_against_an_operator_backend(monke
 def test_env_setup_hosted_interactive_still_selects_a_project(monkeypatch) -> None:
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     project_id = "11111111-1111-4111-8111-111111111111"
     api_url = "https://flash.freesolo.co"
@@ -1082,7 +1091,7 @@ def test_env_setup_hosted_interactive_still_selects_a_project(monkeypatch) -> No
 def test_env_setup_interactive_retains_the_selected_project_name(monkeypatch, tmp_path) -> None:
     from argparse import Namespace
 
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     project_id = "11111111-1111-4111-8111-111111111111"
     project_name = "Interactive Project"
@@ -1141,13 +1150,13 @@ def test_login_shows_who_you_are(monkeypatch, capsys) -> None:
     # Verify + store are stubbed; login should still surface the identity card itself so the
     # user sees who they are without a separate `flash whoami`. The card is built from the
     # just-verified key via ApiClient, so stub that (not client_from_config).
-    monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "verify_freesolo_key", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "save_credentials", lambda *a, **k: None)
     # `kind` mirrors the real /v1/me, which always sends it alongside key_prefix (server/routes/
     # meta.py); only `email` is conditional. Login now checks for that shape before trusting a
     # plane's answer, so a fixture missing it would be asserting on a response no server can send.
     monkeypatch.setattr(
-        cli.commands,
+        account_commands,
         "ApiClient",
         lambda *a, **k: type(
             "_C",
@@ -1174,7 +1183,7 @@ def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> Non
     def _reject(api_key, base_url=None):
         raise ClientError("freesolo rejected this API key")
 
-    monkeypatch.setattr(cli.commands, "verify_freesolo_key", _reject)
+    monkeypatch.setattr(account_commands, "verify_freesolo_key", _reject)
     assert _run(["login", "--api-key", "bad-key"]) == 1
     err = capsys.readouterr().err
     assert "login failed" in err
@@ -1184,9 +1193,9 @@ def test_login_failure_is_friendly_and_asks_to_retry(monkeypatch, capsys) -> Non
 
 
 def test_login_api_key_argument_warns_but_environment_route_does_not(monkeypatch, capsys) -> None:
-    monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "verify_freesolo_key", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "_identity_or_none", lambda *a, **k: None)
 
     assert _run(["login", "--api-key", "fs_secret"]) == 0
     err = capsys.readouterr().err
@@ -1224,10 +1233,10 @@ def test_models_table(fake_client, capsys) -> None:
     assert _run(["models", "list"]) == 0
     out = capsys.readouterr().out
     # every catalog model is listed (no experimental/hidden tier)
-    assert "Qwen/Qwen3.5-0.8B" in out
     assert "Qwen/Qwen3.5-9B" in out
-    assert "Qwen/Qwen3.6-27B" in out
-    assert "Qwen/Qwen3.5-2B" in out
+    assert "Qwen/Qwen3.5-9B" in out
+    assert "Qwen/Qwen3.8-27B" in out
+    assert "Qwen/Qwen3.5-9B" in out
     # only bare model ids, none of the extra per-model detail columns
     assert "2.3B" not in out
     assert "dense" not in out
@@ -1252,7 +1261,7 @@ def test_gpus_tip_explains_automatic_default_and_type_pin(fake_client, capsys) -
 def _train_config(tmp_path, *, extra_train: str = ""):
     path = tmp_path / "train.toml"
     path.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "owner/project/env"\n'
@@ -1288,8 +1297,9 @@ def _train_config(tmp_path, *, extra_train: str = ""):
     ],
 )
 def test_train_dry_run_keeps_compatibility_on_stderr(
-    fake_client, tmp_path, capsys, compatibility, expected
+    fake_client, tmp_path, capsys, monkeypatch, compatibility, expected
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     if compatibility is None:
         original_create_run = fake_client.create_run
 
@@ -1373,7 +1383,7 @@ def test_train_dry_run_keeps_inline_records_off_the_published_environment_note(
     monkeypatch.setattr(fake_client, "create_run", create_run_with_profile)
     config = tmp_path / "inline.toml"
     config.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "owner/project/env"\n'
@@ -1399,7 +1409,7 @@ def test_inline_records_are_not_labelled_a_published_copy_in_cost_rows(monkeypat
     """
     from types import SimpleNamespace
 
-    from flash.cli.commands import train_cost
+    from flash.cli.commands.ops import train
 
     monkeypatch.setenv("FLASH_STYLE", "0")
     profile = {
@@ -1410,11 +1420,11 @@ def test_inline_records_are_not_labelled_a_published_copy_in_cost_rows(monkeypat
         "selected_examples": 9,
     }
     spec = SimpleNamespace(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         environment=SimpleNamespace(params={"records": [{"input": "x"}]}),
     )
 
-    rows = dict(train_cost._sft_cost_rows(spec, profile))
+    rows = dict(train._sft_cost_rows(spec, profile))
 
     assert "inline records" in rows["examples"]
     assert "published copy" not in rows["examples"]
@@ -1426,7 +1436,7 @@ def test_published_rows_keep_their_published_labels(monkeypatch) -> None:
     """The inline branch must not relabel an ordinary published quote."""
     from types import SimpleNamespace
 
-    from flash.cli.commands import train_cost
+    from flash.cli.commands.ops import train
 
     monkeypatch.setenv("FLASH_STYLE", "0")
     profile = {
@@ -1436,9 +1446,9 @@ def test_published_rows_keep_their_published_labels(monkeypatch) -> None:
         "retained_examples": 8,
         "selected_examples": 9,
     }
-    spec = SimpleNamespace(model="Qwen/Qwen3.5-4B", environment=SimpleNamespace(params={}))
+    spec = SimpleNamespace(model="Qwen/Qwen3.5-9B", environment=SimpleNamespace(params={}))
 
-    rows = dict(train_cost._sft_cost_rows(spec, profile))
+    rows = dict(train._sft_cost_rows(spec, profile))
 
     assert "source rows in published copy" in rows["examples"]
     assert rows["env"] == "published environment owner/project/env"
@@ -1448,9 +1458,10 @@ def test_published_rows_keep_their_published_labels(monkeypatch) -> None:
 def test_train_dry_run_sends_declared_runtime_secrets(
     fake_client, tmp_path, capsys, monkeypatch
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     config = tmp_path / "train.toml"
     config.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "sft"\n'
         '[environment]\nid = "owner/project/env"\nsecrets = ["SERPAPI_API_KEY"]\n'
@@ -1540,7 +1551,7 @@ def test_status_runs_and_log_command(fake_client, capsys, monkeypatch) -> None:
         # scoped: this iterator holds exactly the two statuses this one assertion consumes, so
         # letting it stay installed would starve every later command of a status it needs.
         patched.setattr(fake_client, "get_run", lambda _run_id: next(statuses))
-        patched.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+        patched.setattr(run_commands.time, "sleep", lambda _seconds: None)
         assert _run(["runs", "status", "flash-1", "--follow", "--json"]) == 0
         assert [json.loads(line)["state"] for line in capsys.readouterr().out.splitlines()] == [
             "running",
@@ -1769,7 +1780,7 @@ def test_ctrl_c_while_following_says_the_run_is_still_billing(
     """
     config = tmp_path / "sft.toml"
     config.write_text(
-        "model = 'Qwen/Qwen3.5-0.8B'\nalgorithm = 'sft'\n"
+        "model = 'Qwen/Qwen3.5-9B'\nalgorithm = 'sft'\n"
         "project = '11111111-1111-4111-8111-111111111111'\n"
         "[environment]\nid = 'github:owner/repo@main:env/environment.py'\n"
         "[train]\nepochs = 1\nmax_examples = 8\n"
@@ -1785,8 +1796,8 @@ def test_ctrl_c_while_following_says_the_run_is_still_billing(
     assert _run([str(config) if a == "CONFIG" else a for a in argv]) == 130
     err = capsys.readouterr().err
     assert "still going and still billing" in err
-    assert f"{cli.commands.CLI_NAME} runs cancel flash-1" in err
-    assert f"{cli.commands.CLI_NAME} runs log flash-1 --follow" in err
+    assert f"{cli.CLI_NAME} runs cancel flash-1" in err
+    assert f"{cli.CLI_NAME} runs log flash-1 --follow" in err
     # the run was never cancelled on the user's behalf -- detaching is not stopping.
     assert not any(c[0] == "cancel" for c in fake_client.calls)
 
@@ -1797,7 +1808,7 @@ def test_train_submit_note_warns_that_ctrl_c_keeps_billing(
     """The hand-off note has to carry the same warning, before anyone reaches for ctrl-c."""
     config = tmp_path / "sft.toml"
     config.write_text(
-        "model = 'Qwen/Qwen3.5-0.8B'\nalgorithm = 'sft'\n"
+        "model = 'Qwen/Qwen3.5-9B'\nalgorithm = 'sft'\n"
         "project = '11111111-1111-4111-8111-111111111111'\n"
         "[environment]\nid = 'github:owner/repo@main:env/environment.py'\n"
         "[train]\nepochs = 1\nmax_examples = 8\n"
@@ -1812,7 +1823,7 @@ def test_train_submit_note_warns_that_ctrl_c_keeps_billing(
     assert _run(["train", str(config)]) == 0
     err = capsys.readouterr().err
     assert "keeps billing" in err
-    assert f"{cli.commands.CLI_NAME} runs cancel flash-1" in err
+    assert f"{cli.CLI_NAME} runs cancel flash-1" in err
 
 
 def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> None:
@@ -1848,10 +1859,10 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
             return next(self.statuses)
 
     stderr = _TTYBuffer()
-    monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.sys, "stderr", stderr)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any, _ = cli.commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
+    state, printed_any, _ = run_commands._poll_logs(_WaitingClient(), "flash-spin", interval=0.2)
 
     assert state == "done"
     assert printed_any is True
@@ -1870,9 +1881,9 @@ def test_poll_logs_returns_the_live_attempt_from_the_terminal_status(capsys) -> 
         def get_run(self, run_id: str) -> dict:
             return {"run_id": run_id, "state": "done", "remote": {"attempt": 1}}
 
-    result = cli.commands._poll_logs(_AttemptClient(), "flash-attempt", interval=0)
+    result = run_commands._poll_logs(_AttemptClient(), "flash-attempt", interval=0)
 
-    assert result == cli.commands._LogPollResult("done", False, 1)
+    assert result == run_commands._LogPollResult("done", False, 1)
     assert result.live_attempt == 1
     assert capsys.readouterr().out == ""
 
@@ -1910,10 +1921,10 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
             return next(self.statuses)
 
     stderr = _TTYBuffer()
-    monkeypatch.setattr(cli.commands.sys, "stderr", stderr)
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.sys, "stderr", stderr)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any, _ = cli.commands._poll_logs(_LaggingLogClient(), "flash-lag", interval=0.2)
+    state, printed_any, _ = run_commands._poll_logs(_LaggingLogClient(), "flash-lag", interval=0.2)
 
     assert state == "done"
     assert printed_any is False
@@ -1984,9 +1995,9 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
         def get_run(self, run_id: str) -> dict:
             return next(self.statuses)
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    state, printed_any, _ = cli.commands._poll_logs(_MetricClient(), "flash-metrics", interval=0.2)
+    state, printed_any, _ = run_commands._poll_logs(_MetricClient(), "flash-metrics", interval=0.2)
 
     assert state == "done"
     assert printed_any is False
@@ -2006,7 +2017,7 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
 
 
 def test_log_follow_metric_dedup_is_attempt_aware() -> None:
-    from flash.cli.commands import _log_follow_metric_rows
+    from flash.cli.commands.ops.log_follow import _log_follow_metric_rows
 
     seen = set()
     attempt_one = {
@@ -2038,9 +2049,9 @@ def test_cancel_surfaces_surviving_checkpoints(fake_client, capsys) -> None:
     out, err = capsys.readouterr()
     assert _json.loads(out)["state"] == "cancelled"  # stdout stays pure JSON in the plain path
     assert "2 deployable checkpoint(s) survive this cancel" in err
-    assert f"{cli.commands.CLI_NAME} runs checkpoint flash-1" in err
+    assert f"{cli.CLI_NAME} runs checkpoint flash-1" in err
     assert (
-        f"{cli.commands.CLI_NAME} models deploy flash-1/step-40" in err
+        f"{cli.CLI_NAME} models deploy flash-1/step-40" in err
     )  # points at the newest surviving step
 
 
@@ -2070,9 +2081,7 @@ def test_cancel_hint_survives_malformed_checkpoint_shape(fake_client, capsys, mo
     out, err = capsys.readouterr()
     assert '"state": "cancelled"' in out
     assert "3 deployable checkpoint(s) survive this cancel" in err
-    assert (
-        f"{cli.commands.CLI_NAME} models deploy flash-1/step-7" in err
-    )  # max of the RECOVERABLE steps
+    assert f"{cli.CLI_NAME} models deploy flash-1/step-7" in err  # max of the RECOVERABLE steps
 
     monkeypatch.setattr(fake_client, "checkpoints", lambda run_id: [{"no_step": 1}])
     assert _run(["runs", "cancel", "flash-1"]) == 0
@@ -2085,24 +2094,24 @@ def test_cancel_deploy_undeploy_deployments(fake_client, capsys) -> None:
     assert _run(["runs", "cancel", "flash-1"]) == 0
     assert ("cancel", "flash-1") in fake_client.calls
 
-    assert _run(["models", "deploy", "flash-1"]) == 0
-    assert ("deploy", "flash-1", {"dry_run": False}) in fake_client.calls
+    assert _run(["models", "deploy", "flash-1/final"]) == 0
+    assert ("deploy", "flash-1/final", {"dry_run": False}) in fake_client.calls
 
     assert _run(["models", "deploy", "flash-1/step-40"]) == 0
     assert ("deploy", "flash-1/step-40", {"dry_run": False}) in fake_client.calls
     err = capsys.readouterr().err
-    assert "flash models undeploy flash-1`" in err
-    assert "flash models undeploy flash-1/step-40`" not in err
+    assert "flash models undeploy flash-1/final`" in err
+    assert "flash models undeploy flash-1/step-40`" in err
 
     assert _run(["models", "deployments"]) == 0
     deployments_out = capsys.readouterr().out
     assert "flash-1" in deployments_out
-    assert "REVISION" in deployments_out
+    assert "CHECKPOINT ID" in deployments_out
     assert "OPENAI BASE URL" in deployments_out
     assert "https://serve.example/v1" in deployments_out
 
-    assert _run(["models", "undeploy", "flash-1"]) == 0
-    assert ("undeploy", "flash-1") in fake_client.calls
+    assert _run(["models", "undeploy", "flash-1/final"]) == 0
+    assert ("undeploy", "flash-1/final") in fake_client.calls
 
 
 def test_deployments_json_passes_server_rows_through(fake_client, capsys) -> None:
@@ -2140,7 +2149,7 @@ def test_deployments_without_base_url_renders_placeholder(fake_client, monkeypat
 
 
 def test_chat_sends_message_and_prints_reply(fake_client, capsys) -> None:
-    assert _run(["models", "chat", "flash-1", "-m", "What is 6*7?"]) == 0
+    assert _run(["models", "chat", "flash-1/final", "-m", "What is 6*7?"]) == 0
     assert "42" in capsys.readouterr().out
     assert fake_client.calls[-1][0] == "chat_stream"
 
@@ -2153,10 +2162,10 @@ def test_chat_checkpoint_ref_is_forwarded_unchanged(fake_client) -> None:
     assert fake_client.calls[-1][1] == target
 
 
-def test_chat_stream_caches_a_successful_checkpoint_capability_check(monkeypatch) -> None:
-    # env eval opens one stream per case. repeating the health preflight makes a large suite pay
-    # hundreds of extra requests and lets one transient health failure replace a model measurement.
-    from flash.client import ApiClient, ClientError
+def test_chat_stream_uses_permanent_checkpoint_without_legacy_capability_preflight(
+    monkeypatch,
+) -> None:
+    from flash.client import ApiClient
 
     class Response:
         def __init__(self):
@@ -2172,49 +2181,34 @@ def test_chat_stream_caches_a_successful_checkpoint_capability_check(monkeypatch
             return b'{"choices":[{"message":{"content":"ok"}}]}'
 
     client = ApiClient("https://flash.test")
-    successful_health_calls = 0
+    health_calls = 0
 
-    def successful_health():
-        nonlocal successful_health_calls
-        successful_health_calls += 1
-        return {"capabilities": ["chat_step_selector_v1"]}
+    def health():
+        nonlocal health_calls
+        health_calls += 1
+        return {"capabilities": []}
 
-    monkeypatch.setattr(client, "health", successful_health)
+    monkeypatch.setattr(client, "health", health)
     monkeypatch.setattr(
         "flash.client.http.urllib.request.urlopen", lambda *args, **kwargs: Response()
     )
 
-    for _ in range(2):
-        assert list(client.chat_stream("flash-1/step-3", [])) == ["ok"]
-
-    assert successful_health_calls == 1
-
-    failing_client = ApiClient("https://flash.test")
-    failing_health_calls = 0
-
-    def failing_health():
-        nonlocal failing_health_calls
-        failing_health_calls += 1
-        return {"capabilities": []}
-
-    monkeypatch.setattr(failing_client, "health", failing_health)
-    for _ in range(2):
-        with pytest.raises(ClientError, match="chat_step_selector_v1"):
-            list(failing_client.chat_stream("flash-1/step-3", []))
-
-    assert failing_health_calls == 2
+    assert list(client.chat_stream("flash-1/step-3", [])) == ["ok"]
+    assert health_calls == 0
 
 
-def test_chat_accepts_full_immutable_revision(fake_client) -> None:
-    revision = "flash-1@step-40." + "a" * 40
-    assert _run(["models", "chat", revision, "-m", "What is 6*7?"]) == 0
+def test_chat_accepts_permanent_checkpoint(fake_client) -> None:
+    checkpoint_id = "flash-1/step-40"
+    assert _run(["models", "chat", checkpoint_id, "-m", "What is 6*7?"]) == 0
     assert fake_client.calls[-1][0] == "chat_stream"
-    assert fake_client.calls[-1][1] == revision
+    assert fake_client.calls[-1][1] == checkpoint_id
 
 
 def test_chat_system_flag_prepends_system_message(fake_client) -> None:
     """--system gives evals training-prompt parity without calling the HTTP API directly."""
-    assert _run(["models", "chat", "flash-1", "-m", "What is 6*7?", "--system", "be brief"]) == 0
+    assert (
+        _run(["models", "chat", "flash-1/final", "-m", "What is 6*7?", "--system", "be brief"]) == 0
+    )
     _, _, messages = fake_client.calls[-1]
     assert messages == [
         {"role": "system", "content": "be brief"},
@@ -2223,7 +2217,7 @@ def test_chat_system_flag_prepends_system_message(fake_client) -> None:
 
 
 def test_chat_without_system_flag_sends_user_message_only(fake_client) -> None:
-    assert _run(["models", "chat", "flash-1", "-m", "What is 6*7?"]) == 0
+    assert _run(["models", "chat", "flash-1/final", "-m", "What is 6*7?"]) == 0
     _, _, messages = fake_client.calls[-1]
     assert messages == [{"role": "user", "content": "What is 6*7?"}]
 
@@ -2231,7 +2225,7 @@ def test_chat_without_system_flag_sends_user_message_only(fake_client) -> None:
 @pytest.mark.parametrize("flag", ["--enable-thinking", "--disable-thinking"])
 def test_chat_does_not_expose_thinking_override_flags(fake_client, flag) -> None:
     with pytest.raises(SystemExit) as excinfo:
-        _run(["models", "chat", "flash-1", "-m", "What is 6*7?", flag])
+        _run(["models", "chat", "flash-1/final", "-m", "What is 6*7?", flag])
     assert excinfo.value.code == 2
 
 
@@ -2261,7 +2255,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
         def grade(self, response, example):
             return True
 
-    from flash.envs.evaluations import load_evaluation_suites
+    from flash.envs.meta.evaluations import load_evaluation_suites
 
     starter_suite = load_evaluation_suites(tmp_path, environment=StarterEnvironment())[0]
     starter_case = starter_suite.cases()[0]
@@ -2329,7 +2323,9 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert 'project = "11111111-1111-4111-8111-111111111111"' in training_text
     assert "flash runs checkpoint <run-id>" in training_text
     assert "flash models deployments" in training_text
-    assert "flash models export --adapter-id <run-id> --repository <you>/<repo>" in training_text
+    assert (
+        "flash models export --adapter-id <run-id>/final --repository <you>/<repo>" in training_text
+    )
     assert (
         "flash env push --project 11111111-1111-4111-8111-111111111111 --name my-env ."
         in training_text
@@ -2463,7 +2459,7 @@ def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path
     evaluations_text = (tmp_path / "evaluations.py").read_text()
     assert "load_evaluations(environment=None)" in evaluations_text
     # the multi-turn scaffold gets its own suite. `reward(response, example)` with no episode state
-    # sends `_score_one` down the single-turn branch (flash/envs/adapter.py:237-243), which grades an
+    # sends `_score_one` down the single-turn branch (flash/envs/loading/adapter.py:237-243), which grades an
     # EMPTY transcript -- the arithmetic suite scored this guess-the-number env 1.0 on "12".
     assert "self.environment.reward(response, example)" not in evaluations_text
     assert "`score(self, case, response, state)`" in evaluations_text
@@ -2548,15 +2544,15 @@ def test_env_setup_reasoning_conflict_names_every_stale_config(
 
 
 def test_existing_reasoning_ignores_thinking_text_in_comments(tmp_path) -> None:
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     sft = tmp_path / "sft.toml"
     rl = tmp_path / "rl.toml"
     sft.write_text(
-        'model = "Qwen/Qwen3.5-4B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         "# reasoning is on (thinking = true): gold outputs need think tags\n"
     )
-    rl.write_text('model = "Qwen/Qwen3.5-4B"\n')
+    rl.write_text('model = "Qwen/Qwen3.5-9B"\n')
 
     assert env_setup._existing_reasoning((sft, rl)) is False
 
@@ -2731,8 +2727,8 @@ def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_pa
     )
     assert (tmp_path / "evaluations.py").is_file()
 
-    from flash.envs.evaluations import load_evaluation_suites
-    from flash.envs.loader import load_freesolo_environment
+    from flash.envs.loading.loader import load_freesolo_environment
+    from flash.envs.meta.evaluations import load_evaluation_suites
 
     environment = load_freesolo_environment(str(tmp_path / "environment.py"))
     suite = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0]
@@ -2752,7 +2748,7 @@ def test_env_setup_multi_turn_scaffolds_runnable_evaluations(monkeypatch, tmp_pa
     # the environment is multi-turn but this suite grades one reply, so it must NOT opt into
     # episode play. driving it would score the last turn instead of the opening action, and these
     # cases carry no `output` for `step_episode` to advance from, so the case would error out.
-    from flash.cli.commands.env.episode import _grades_episodes
+    from flash.cli.commands.env.testing.episode import _grades_episodes
 
     assert environment.multi_turn is True
     assert _grades_episodes(suite) is False
@@ -2771,8 +2767,8 @@ def test_env_setup_multi_turn_eval_case_does_not_duplicate_the_episode_prompt(
         == 0
     )
 
-    from flash.envs.evaluations import load_evaluation_suites
-    from flash.envs.loader import load_freesolo_environment
+    from flash.envs.loading.loader import load_freesolo_environment
+    from flash.envs.meta.evaluations import load_evaluation_suites
 
     environment = load_freesolo_environment(str(tmp_path / "environment.py"))
     case = load_evaluation_suites(tmp_path / "environment.py", environment=environment)[0].cases()[
@@ -2806,7 +2802,7 @@ def test_starter_evaluator_fails_a_near_miss_the_environment_rejects(monkeypatch
     monkeypatch.chdir(tmp_path)
     assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
 
-    from flash.envs.evaluations import load_evaluation_suites
+    from flash.envs.meta.evaluations import load_evaluation_suites
 
     class ShapedEnvironment:
         """Pays partial credit for a wrong answer, exactly as the multi-turn starter does."""
@@ -2914,7 +2910,7 @@ def test_env_setup_uses_project_id_when_canonical_name_is_unusable(
 
 
 def test_env_setup_rejects_blank_folder_name_before_writes(monkeypatch, tmp_path, capsys) -> None:
-    from flash.cli.commands.env import setup as env_setup
+    from flash.cli.commands.env.ops import setup as env_setup
 
     class _BlankCwd:
         name = "   "
@@ -2939,7 +2935,7 @@ def test_env_setup_rejects_projectless_or_conflicting_existing_configs(
     monkeypatch.chdir(tmp_path)
     configs = tmp_path / "configs"
     configs.mkdir()
-    (configs / "sft.toml").write_text('model = "Qwen/Qwen3.5-4B"\n')
+    (configs / "sft.toml").write_text('model = "Qwen/Qwen3.5-9B"\n')
     assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 1
     assert "has no valid top-level project UUID" in capsys.readouterr().err
     assert not (tmp_path / "environment.py").exists()
@@ -2973,7 +2969,7 @@ def test_unknown_run_errors_surface_as_nonzero_exit(monkeypatch, capsys) -> None
         def get_run(self, run_id: str) -> dict:
             raise ApiError(404, "unknown run")
 
-    monkeypatch.setattr(cli.commands, "client_from_config", lambda *a, **k: _Erroring())
+    monkeypatch.setattr(run_commands, "client_from_config", lambda *a, **k: _Erroring())
     assert _run(["runs", "status", "nope"]) != 0
     assert "unknown run" in capsys.readouterr().err
 
@@ -2988,10 +2984,10 @@ def test_submit_payload_carries_authored_pip_and_the_worker_appends_it(
     """
     from flash.client.specs import spec_payload
     from flash.core.spec import EnvironmentSpec, JobSpec
-    from flash.envs.base import worker_pip_with_extras
+    from flash.envs.loading.base import worker_pip_with_extras
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         project="11111111-1111-4111-8111-111111111111",
         environment=EnvironmentSpec(id="owner/project/env", pip=("pymongo>=4.6",)),
     )
@@ -3000,14 +2996,14 @@ def test_submit_payload_carries_authored_pip_and_the_worker_appends_it(
     assert tuple(spec_payload(spec)["environment"]["pip"]) == ("pymongo>=4.6",)
     # and the submit paths install it after the worker requirement, not instead of it.
     assert worker_pip_with_extras(spec.environment.id, spec.environment.pip) == [
-        "freesolo>=0.4.1",
+        "freesolo>=0.4.2",
         "pymongo>=4.6",
     ]
 
 
 def test_export_uses_api_key_flag_and_forwards_args(fake_client, capsys, monkeypatch) -> None:
     # The --api-key flag is the destination HF token; checkpoint refs and --public are forwarded.
-    from flash.cli.commands import deploy as cli_deploy
+    from flash.cli.commands.ops import deploy as cli_deploy
 
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.setattr(cli_deploy, "_hf_identity_and_write_access", lambda *_: "me")
@@ -3039,7 +3035,7 @@ def test_export_reads_hf_token_from_env_and_defaults_private(
     fake_client, monkeypatch, capsys
 ) -> None:
     # No --api-key: the token resolves from HF_TOKEN, and the repo defaults to private.
-    from flash.cli.commands import deploy as cli_deploy
+    from flash.cli.commands.ops import deploy as cli_deploy
 
     monkeypatch.setenv("HF_TOKEN", "hf_env")
     monkeypatch.setattr(cli_deploy, "_hf_identity_and_write_access", lambda *_: "me")
@@ -3739,8 +3735,8 @@ def test_export_without_huggingface_hub_skips_preflight(fake_client, monkeypatch
 
 
 def test_deploy_enqueues_server_side_verification(fake_client, capsys) -> None:
-    assert _run(["models", "deploy", "flash-1"]) == 0
-    assert ("deploy", "flash-1", {"dry_run": False}) in fake_client.calls
+    assert _run(["models", "deploy", "flash-1/final"]) == 0
+    assert ("deploy", "flash-1/final", {"dry_run": False}) in fake_client.calls
     assert not any(c[0] == "chat" for c in fake_client.calls)
     err = capsys.readouterr().err
     assert "flash models deployments" in err
@@ -3755,7 +3751,7 @@ def test_deploy_checkpoint_enqueues_base_run_deployment(fake_client) -> None:
 
 def test_deploy_no_verify_flag_is_removed(fake_client) -> None:
     with pytest.raises(SystemExit) as excinfo:
-        _run(["models", "deploy", "flash-1", "--no-verify"])
+        _run(["models", "deploy", "flash-1/final", "--no-verify"])
     assert excinfo.value.code == 2
     assert not any(call[0] == "deploy" for call in fake_client.calls)
 
@@ -3767,7 +3763,7 @@ def test_deploy_dry_run_skips_active_deployment_note(fake_client, monkeypatch, c
         lambda run_id, **_: {"run_id": run_id, "state": "dry_run"},
         raising=False,
     )
-    assert _run(["models", "deploy", "flash-1", "--dry-run"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--dry-run"]) == 0
     assert not any(c[0] == "chat" for c in fake_client.calls)
     assert "flash models deployments" not in capsys.readouterr().err
 
@@ -3784,7 +3780,7 @@ def test_deploy_failed_state_exits_nonzero(fake_client, monkeypatch, capsys) -> 
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1"]) == 1
+    assert _run(["models", "deploy", "flash-1/final"]) == 1
     err = capsys.readouterr().err
     assert "deployment failed: smoke generation failed" in err
     assert "once it is ready" not in err
@@ -3798,14 +3794,14 @@ def _queued_deploy(monkeypatch, fake_client) -> None:
         lambda run_id, **_: {"run_id": run_id, "state": "queued"},
         raising=False,
     )
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _s: None)
 
 
 def test_deploy_without_wait_returns_while_still_queued(fake_client, monkeypatch, capsys) -> None:
     """No --wait keeps the old behaviour: return immediately, do not poll."""
     _queued_deploy(monkeypatch, fake_client)
 
-    assert _run(["models", "deploy", "flash-1"]) == 0
+    assert _run(["models", "deploy", "flash-1/final"]) == 0
     assert not any(c[0] == "deployment_for" for c in fake_client.calls)
     assert "deployment state is 'queued'" in capsys.readouterr().err
 
@@ -3823,7 +3819,7 @@ def test_deploy_wait_polls_until_the_revision_is_servable(fake_client, monkeypat
         fake_client, "deployment_for", lambda run_id, timeout=None: next(states), raising=False
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 0
     out, err = capsys.readouterr()
     assert "ready" in out
     assert "queued" not in err
@@ -3839,7 +3835,7 @@ def test_deploy_wait_stops_on_a_failed_revision(fake_client, monkeypatch, capsys
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     assert "deployment failed: smoke generation failed" in capsys.readouterr().err
 
 
@@ -3857,7 +3853,7 @@ def test_deploy_wait_gives_up_at_the_timeout_without_claiming_success(
     # exit 1, not 0: --wait's contract is "the revision is servable when i return", and a timeout
     # is precisely the case where it is not. exiting 0 here is what lets
     # `deploy --wait && evaluate` proceed against a revision that never became servable.
-    assert _run(["models", "deploy", "flash-1", "--wait", "0.01"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "0.01"]) == 1
     err = capsys.readouterr().err
     assert "still 'smoke_testing' after 0.01s" in err
     assert "flash models deployments" in err
@@ -3873,7 +3869,7 @@ def test_deploy_wait_ends_when_the_deployment_stops_being_listed(
     )
 
     # the last record seen was still queued, so the requested revision never became servable.
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     assert "no longer an active deployment" in capsys.readouterr().err
 
 
@@ -3927,14 +3923,11 @@ def test_deploy_wait_reports_a_rollback_to_a_different_checkpoint_step(
 def test_deploy_wait_reports_a_rollback_from_the_final_adapter(
     fake_client, monkeypatch, capsys
 ) -> None:
-    """A bare run id is a revision too, and its failed redeploy rolls back like any other.
+    """A failed final-checkpoint redeploy reports the restored sibling and its error.
 
-    `deploy flash-1` asks for the final adapter, which `parse_checkpoint_ref` reports as step
-    `None`. A run already serving `step-20` whose final-adapter redeploy fails is restored to
-    step-20 by `mark_deployment_failed`, and `deployment_for` rejects the restored record because
-    its non-null step does not match the requested final adapter -- so the bare-run form reads as
-    absent exactly like the `/step-N` form does. Exempting it from the rollback lookup reported the
-    run as vanished and dropped `last_deploy_error`.
+    `deploy flash-1/final` asks for the permanent final checkpoint. A run already serving
+    `step-20` whose final-checkpoint redeploy fails is restored to step-20, and the exact final
+    checkpoint lookup reads as absent. The rollback lookup must retain `last_deploy_error`.
     """
     _queued_deploy(monkeypatch, fake_client)
     monkeypatch.setattr(
@@ -3964,7 +3957,7 @@ def test_deploy_wait_reports_a_rollback_from_the_final_adapter(
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "5"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "5"]) == 1
     err = capsys.readouterr().err
     assert "adapter merge failed" in err, err
     assert "previously deployed revision is still serving" in err, err
@@ -3980,9 +3973,9 @@ def test_deploy_wait_rollback_lookup_stays_inside_the_deadline(fake_client, monk
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
 
     def _poll(run_id, timeout=None):
@@ -4003,7 +3996,9 @@ def test_deploy_wait_rollback_lookup_stays_inside_the_deadline(fake_client, monk
     for start, bound in reads:
         assert bound is not None, reads
         # the expired case is allowed the zero-wait one-shot bound and nothing wider.
-        assert bound <= max(5.0 - start, cli.commands._DEPLOY_ZERO_WAIT_READ_SECONDS) + 0.001, reads
+        assert bound <= max(5.0 - start, deploy_commands._DEPLOY_ZERO_WAIT_READ_SECONDS) + 0.001, (
+            reads
+        )
 
 
 def test_deploy_wait_rollback_lookup_gets_a_usable_bound_near_the_deadline(
@@ -4019,9 +4014,9 @@ def test_deploy_wait_rollback_lookup_gets_a_usable_bound_near_the_deadline(
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
     # stop a hair inside the deadline: positive remainder, far too little to complete a read.
     monkeypatch.setattr(
@@ -4039,8 +4034,8 @@ def test_deploy_wait_rollback_lookup_gets_a_usable_bound_near_the_deadline(
 
     def _listing(timeout=None):
         # a real client cannot answer inside a bound this small; it raises at it.
-        if timeout is not None and timeout < cli.commands._DEPLOY_ZERO_WAIT_READ_SECONDS:
-            raise cli.commands.ClientError("read timed out")
+        if timeout is not None and timeout < deploy_commands._DEPLOY_ZERO_WAIT_READ_SECONDS:
+            raise deploy_commands.ClientError("read timed out")
         return [{"run_id": "flash-1", "deployment": rolled_back}]
 
     monkeypatch.setattr(fake_client, "deployments", _listing, raising=False)
@@ -4089,7 +4084,7 @@ def test_deploy_wait_survives_a_transient_control_plane_error(
 ) -> None:
     """One failed poll must not fail a deploy that is progressing fine."""
     _queued_deploy(monkeypatch, fake_client)
-    results = iter([cli.commands.ClientError("503"), {"state": "ready"}])
+    results = iter([deploy_commands.ClientError("503"), {"state": "ready"}])
 
     def _next(run_id, timeout=None):
         value = next(results)
@@ -4099,7 +4094,7 @@ def test_deploy_wait_survives_a_transient_control_plane_error(
 
     monkeypatch.setattr(fake_client, "deployment_for", _next, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 0
     assert "ready" in capsys.readouterr().out
 
 
@@ -4120,7 +4115,7 @@ def test_deploy_wait_zero_polls_once_instead_of_being_treated_as_no_wait(
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "0"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "0"]) == 1
     assert "waiting up to 0s" in capsys.readouterr().err
 
 
@@ -4141,7 +4136,7 @@ def test_deploy_wait_rejects_a_restored_previous_revision(fake_client, monkeypat
         },
         raising=False,
     )
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _s: None)
     monkeypatch.setattr(
         fake_client,
         "deployment_for",
@@ -4153,7 +4148,7 @@ def test_deploy_wait_rejects_a_restored_previous_revision(fake_client, monkeypat
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     err = capsys.readouterr().err
     assert "did not become servable" in err
     assert "adapter load failed" in err
@@ -4177,7 +4172,7 @@ def test_deploy_wait_accepts_a_ready_revision_carrying_a_stale_error(
         },
         raising=False,
     )
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _s: None)
     monkeypatch.setattr(
         fake_client,
         "deployment_for",
@@ -4189,7 +4184,7 @@ def test_deploy_wait_accepts_a_ready_revision_carrying_a_stale_error(
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 0
 
 
 def test_deploy_wait_bounds_each_poll_by_the_remaining_time(
@@ -4209,7 +4204,7 @@ def test_deploy_wait_bounds_each_poll_by_the_remaining_time(
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "5"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "5"]) == 0
     assert seen == [pytest.approx(5.0, abs=0.5)]
 
 
@@ -4229,8 +4224,8 @@ def test_deploy_wait_zero_actually_reads_the_current_state(fake_client, monkeypa
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "0"]) == 0
-    assert polls == ["flash-1"], polls
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "0"]) == 0
+    assert polls == ["flash-1/final"], polls
 
 
 def test_deploy_wait_does_not_start_a_read_after_the_deadline_expires(
@@ -4250,10 +4245,10 @@ def test_deploy_wait_does_not_start_a_read_after_the_deadline_expires(
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     # the sleep is what burns the budget, exactly as a real one would.
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
     reads: list[tuple[float, float | None]] = []
 
@@ -4263,7 +4258,7 @@ def test_deploy_wait_does_not_start_a_read_after_the_deadline_expires(
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "0.1"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "0.1"]) == 1
     assert reads, "the wait issued no read at all"
     # a read starting at `start` and bounded by `bound` occupies the plane until start+bound, so
     # that sum is what has to stay within the advertised wait. this is the assertion the 1.0s floor
@@ -4291,7 +4286,7 @@ def test_deploy_wait_fails_closed_on_a_terminal_state_that_is_not_ready(
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     err = capsys.readouterr().err
     assert "not\nservable" in err or "not servable" in err, err
     assert "once it is ready" not in err, err
@@ -4316,7 +4311,7 @@ def test_deploy_wait_rejects_a_superseding_deploy_that_carries_no_error(
         },
         raising=False,
     )
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _s: None)
     monkeypatch.setattr(
         fake_client,
         "deployment_for",
@@ -4328,7 +4323,7 @@ def test_deploy_wait_rejects_a_superseding_deploy_that_carries_no_error(
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     assert "once it is ready" not in capsys.readouterr().err
 
 
@@ -4343,9 +4338,9 @@ def test_deploy_wait_observes_readiness_inside_a_short_window(fake_client, monke
     # a non-advancing sleep is an infinite poll, which is a broken test rather than a caught defect.
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
 
     def _poll(run_id, timeout=None):
@@ -4354,7 +4349,7 @@ def test_deploy_wait_observes_readiness_inside_a_short_window(fake_client, monke
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "5"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "5"]) == 0
 
 
 def test_deploy_wait_observes_readiness_inside_the_final_window(fake_client, monkeypatch) -> None:
@@ -4367,9 +4362,9 @@ def test_deploy_wait_observes_readiness_inside_the_final_window(fake_client, mon
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
 
     def _poll(run_id, timeout=None):
@@ -4378,7 +4373,7 @@ def test_deploy_wait_observes_readiness_inside_the_final_window(fake_client, mon
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "1"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "1"]) == 0
 
 
 def test_deploy_wait_watches_the_final_window_to_its_deadline(fake_client, monkeypatch) -> None:
@@ -4391,9 +4386,9 @@ def test_deploy_wait_watches_the_final_window_to_its_deadline(fake_client, monke
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
 
     def _poll(run_id, timeout=None):
@@ -4402,7 +4397,7 @@ def test_deploy_wait_watches_the_final_window_to_its_deadline(fake_client, monke
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "1"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "1"]) == 0
 
 
 def test_deploy_wait_final_window_does_not_poll_unboundedly(fake_client, monkeypatch) -> None:
@@ -4415,9 +4410,9 @@ def test_deploy_wait_final_window_does_not_poll_unboundedly(fake_client, monkeyp
     """
     _queued_deploy(monkeypatch, fake_client)
     clock = {"t": 0.0}
-    monkeypatch.setattr(cli.commands.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(
-        cli.commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+        run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
     reads = []
 
@@ -4428,7 +4423,7 @@ def test_deploy_wait_final_window_does_not_poll_unboundedly(fake_client, monkeyp
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "1"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "1"]) == 1
     # the up-front read plus the one the split funds. a fractional reserve makes this grow without
     # bound; asserting the exact count is what keeps the split from silently becoming that.
     assert len(reads) == 2, reads
@@ -4449,7 +4444,7 @@ def test_deploy_wait_zero_does_not_block_past_its_own_bound(fake_client, monkeyp
 
     monkeypatch.setattr(fake_client, "deployment_for", _poll, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait", "0"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait", "0"]) == 0
     assert seen == [pytest.approx(1.0, abs=0.001)], seen
 
 
@@ -4474,7 +4469,7 @@ def test_deploy_wait_rejects_a_synchronous_failure_that_returns_the_restored_rev
         fake_client, "deployment_for", lambda run_id, timeout=None: dict(settled), raising=False
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     err = capsys.readouterr().err
     assert "did not become servable" in err, err
     assert "adapter load failed" in err, err
@@ -4488,15 +4483,15 @@ def test_deploy_wait_accepts_a_synchronous_success(fake_client, monkeypatch) -> 
         fake_client, "deployment_for", lambda run_id, timeout=None: dict(settled), raising=False
     )
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 0
 
 
 def test_deploy_notes_name_this_channels_executable(fake_client, monkeypatch, capsys) -> None:
     """The dev channel installs `flash-dev`; a hardcoded `flash ...` hint is not runnable there."""
-    monkeypatch.setattr(cli.commands, "CLI_NAME", "flash-dev")
+    monkeypatch.setattr(deploy_commands, "CLI_NAME", "flash-dev")
     _queued_deploy(monkeypatch, fake_client)
 
-    assert _run(["models", "deploy", "flash-1"]) == 0
+    assert _run(["models", "deploy", "flash-1/final"]) == 0
     err = capsys.readouterr().err
     assert "flash-dev models deployments" in err, err
     assert "`flash models" not in err, err
@@ -4513,11 +4508,11 @@ def test_deploy_wait_stops_retrying_a_rejected_key(fake_client, monkeypatch, cap
 
     def _denied(run_id, timeout=None):
         calls.append(1)
-        raise cli.commands.ApiError(403, "forbidden")
+        raise deploy_commands.ApiError(403, "forbidden")
 
     monkeypatch.setattr(fake_client, "deployment_for", _denied, raising=False)
 
-    assert _run(["models", "deploy", "flash-1", "--wait"]) == 1
+    assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 1
     assert len(calls) == 1
     assert "cannot check flash-1" in capsys.readouterr().err
 
@@ -4531,7 +4526,7 @@ def test_deploy_wait_rejects_a_timeout_that_would_never_expire(fake_client, valu
     leading-dash value reaches the validator instead of being read as another option.
     """
     with pytest.raises(SystemExit) as excinfo:
-        _run(["models", "deploy", "flash-1", f"--wait={value}"])
+        _run(["models", "deploy", "flash-1/final", f"--wait={value}"])
     assert excinfo.value.code == 2
     assert "--wait" in capsys.readouterr().err
 
@@ -4559,7 +4554,7 @@ def test_deploy_wait_skips_polling_for_a_dry_run(fake_client, monkeypatch, capsy
         raising=False,
     )
 
-    assert _run(["models", "deploy", "flash-1", "--dry-run", "--wait"]) == 0
+    assert _run(["models", "deploy", "flash-1/final", "--dry-run", "--wait"]) == 0
     assert not any(c[0] == "deployment_for" for c in fake_client.calls)
     assert "ctrl-c stops waiting" not in capsys.readouterr().err
 
@@ -4569,7 +4564,7 @@ def test_log_follow_progress_includes_heartbeat_age() -> None:
     "alive, throttled" instead of a frozen line."""
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     status = {
         "state": "running",
@@ -4598,7 +4593,7 @@ def test_log_follow_progress_names_the_attempt_after_a_relaunch() -> None:
     follow line must name the attempt or the rewind reads as lost progress with no cause."""
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     # attempts are 0-based, so a first attempt must stay unannotated.
     first = {
@@ -4672,7 +4667,7 @@ def test_log_follow_progress_does_not_trust_a_ping_left_by_a_cleared_remote(
     """
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     _, progress = _log_follow_progress(
         {
@@ -4705,7 +4700,7 @@ def test_log_follow_progress_names_the_attempt_before_the_first_heartbeat() -> N
     the line print a bare `running` for the whole cold start -- silent through exactly the window
     the attempt counter exists to explain, and the window a user is most likely to be watching.
     """
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     state, progress = _log_follow_progress(
         {"state": "running", "remote": {"attempt": 1}, "last_heartbeat": None},
@@ -4737,7 +4732,7 @@ def test_log_follow_progress_marks_a_stale_heartbeats_fields() -> None:
     """
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     _, progress = _log_follow_progress(
         {
@@ -4787,7 +4782,7 @@ def test_log_follow_progress_marks_a_stale_heartbeats_fields() -> None:
 def test_log_follow_progress_explains_rl_warmup(stage: str) -> None:
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     status = {"state": "running", "last_heartbeat": {"stage": stage, "ts": _time.time()}}
     _, progress = _log_follow_progress(status, "unknown")
@@ -4807,7 +4802,7 @@ def test_log_follow_progress_explains_rl_warmup(stage: str) -> None:
 def test_log_follow_progress_omits_warmup_claim_for_stale_heartbeat(stage: str) -> None:
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     status = {
         "state": "running",
@@ -4825,7 +4820,7 @@ def test_log_follow_progress_omits_warmup_claim_for_stale_heartbeat(stage: str) 
 def test_log_follow_progress_omits_warmup_claim_for_prior_attempt_heartbeat(stage: str) -> None:
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     # remote is on attempt 1 while last_heartbeat is the previous attempt's fresh setup ping: the
     # warmup reassurance must not fire against a superseded attempt before the new worker publishes.
@@ -4845,7 +4840,7 @@ def test_log_follow_progress_omits_warmup_claim_for_prior_attempt_heartbeat(stag
 def test_log_follow_progress_explains_warmup_when_heartbeat_matches_attempt(stage: str) -> None:
     import time as _time
 
-    from flash.cli.commands import _log_follow_progress
+    from flash.cli.commands.ops.runs import _log_follow_progress
 
     status = {
         "state": "running",
@@ -4874,7 +4869,7 @@ def test_runs_listing_flags_a_live_cost_as_an_estimate(fake_client, monkeypatch,
                 "cost_usd": 0.0,
                 "estimated_cost_usd": 2.5,
                 "updated_at": 1700000000.0,
-                "spec": {"model": "Qwen/Qwen3.5-0.8B", "algorithm": "grpo"},
+                "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"},
             }
         ],
     )
@@ -4893,14 +4888,14 @@ def test_runs_listing_shows_the_settled_charge_unflagged(fake_client, monkeypatc
 
 
 def test_log_follow_progress_reports_the_quote_while_live() -> None:
-    _state, progress = cli.commands._log_follow_progress(
+    _state, progress = run_commands._log_follow_progress(
         {"state": "running", "cost_usd": 0.0, "estimated_cost_usd": 2.5}, "running"
     )
     assert "cost=~$2.5000" in progress
 
 
 def test_log_follow_progress_reports_the_settled_charge_when_done() -> None:
-    _state, progress = cli.commands._log_follow_progress(
+    _state, progress = run_commands._log_follow_progress(
         {"state": "done", "cost_usd": 1.25, "estimated_cost_usd": 2.5}, "done"
     )
     assert "cost=$1.2500" in progress
@@ -4909,7 +4904,7 @@ def test_log_follow_progress_reports_the_settled_charge_when_done() -> None:
 
 def test_log_follow_progress_omits_cost_when_there_is_nothing_to_show() -> None:
     # no quote and no measured spend: don't print a misleading "cost=$0.0000".
-    _state, progress = cli.commands._log_follow_progress({"state": "queued"}, "queued")
+    _state, progress = run_commands._log_follow_progress({"state": "queued"}, "queued")
     assert "cost=" not in progress
 
 
@@ -4920,8 +4915,8 @@ def test_log_follow_progress_shows_a_settled_zero_like_the_other_surfaces() -> N
     (0.0, False) there. Suppressing it only in follow made the same finished run read as costed in
     one place and uncosted in another, which is the inconsistency, not the zero.
     """
-    for state in sorted(cli.render.SETTLED_COST_STATES):
-        _state, progress = cli.commands._log_follow_progress(
+    for state in sorted(cost_ui.SETTLED_COST_STATES):
+        _state, progress = run_commands._log_follow_progress(
             {"state": state, "cost_usd": 0.0}, state
         )
         assert "cost=$0.0000" in progress, state
@@ -4950,13 +4945,13 @@ def test_login_warns_before_sending_the_key_over_plaintext_http(monkeypatch, cap
         warned_before_request["stderr"] = capsys.readouterr().err
         return {"email": "operator@example.com"}
 
-    monkeypatch.setattr(cli.commands, "_verify_key_against_plane", _verify)
-    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "_verify_key_against_plane", _verify)
+    monkeypatch.setattr(account_commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "_identity_or_none", lambda *a, **k: None)
     monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
 
     args = types.SimpleNamespace(api_url=api_url, api_key="operator-key", debug=False)
-    assert cli.commands.cmd_login(args) == 0
+    assert account_commands.cmd_login(args) == 0
     assert "plaintext HTTP" in warned_before_request["stderr"]
 
 
@@ -4971,15 +4966,15 @@ def test_login_warns_before_sending_the_key_over_plaintext_http(monkeypatch, cap
 def test_login_stays_quiet_for_loopback_and_tls(monkeypatch, capsys, api_url):
     """Local development over http is the one safe plaintext case, and https is the fix."""
     monkeypatch.setattr(
-        cli.commands, "_verify_key_against_plane", lambda *a, **k: {"email": "op@example.com"}
+        account_commands, "_verify_key_against_plane", lambda *a, **k: {"email": "op@example.com"}
     )
-    monkeypatch.setattr(cli.commands, "verify_freesolo_key", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "verify_freesolo_key", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "_identity_or_none", lambda *a, **k: None)
     monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
 
     args = types.SimpleNamespace(api_url=api_url, api_key="operator-key", debug=False)
-    assert cli.commands.cmd_login(args) == 0
+    assert account_commands.cmd_login(args) == 0
     assert "plaintext HTTP" not in capsys.readouterr().err
 
 
@@ -4995,10 +4990,10 @@ def test_login_warns_about_a_plaintext_freesolo_url_behind_an_https_plane(monkey
     def _verify(api_key, *, base_url):
         warned_before_request["stderr"] = capsys.readouterr().err
 
-    monkeypatch.setattr(cli.commands, "verify_freesolo_key", _verify)
-    monkeypatch.setattr(cli.commands, "_verifies_against_freesolo", lambda *a, **k: True)
-    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "verify_freesolo_key", _verify)
+    monkeypatch.setattr(account_commands, "_verifies_against_freesolo", lambda *a, **k: True)
+    monkeypatch.setattr(account_commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "_identity_or_none", lambda *a, **k: None)
     monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
 
     args = types.SimpleNamespace(
@@ -5007,7 +5002,7 @@ def test_login_warns_about_a_plaintext_freesolo_url_behind_an_https_plane(monkey
         api_key="operator-key",
         debug=False,
     )
-    assert cli.commands.cmd_login(args) == 0
+    assert account_commands.cmd_login(args) == 0
     stderr = warned_before_request["stderr"]
     assert "plaintext HTTP" in stderr, stderr
     # it names the offending url, not the https plane that is already fine.
@@ -5017,7 +5012,7 @@ def test_login_warns_about_a_plaintext_freesolo_url_behind_an_https_plane(monkey
 
 def test_login_does_not_warn_twice_for_one_url():
     """A plane that is also its own identity backend is one destination, so it warns once."""
-    warnings = cli.commands._plaintext_login_warnings(
+    warnings = account_commands._plaintext_login_warnings(
         "http://plane.example:8080", "http://plane.example:8080"
     )
     assert len(warnings) == 1, warnings
@@ -5035,9 +5030,9 @@ def test_login_warns_about_a_plaintext_freesolo_base_url_from_the_environment(mo
     def _verify(api_key, *, base_url):
         warned_before_request["stderr"] = capsys.readouterr().err
 
-    monkeypatch.setattr(cli.commands, "verify_freesolo_key", _verify)
-    monkeypatch.setattr(cli.commands, "save_credentials", lambda *a, **k: None)
-    monkeypatch.setattr(cli.commands, "_identity_or_none", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "verify_freesolo_key", _verify)
+    monkeypatch.setattr(account_commands, "save_credentials", lambda *a, **k: None)
+    monkeypatch.setattr(account_commands, "_identity_or_none", lambda *a, **k: None)
     monkeypatch.delenv("FREESOLO_API_KEY", raising=False)
     monkeypatch.setenv("FREESOLO_BASE_URL", "http://identity.internal.test")
 
@@ -5045,7 +5040,7 @@ def test_login_warns_about_a_plaintext_freesolo_base_url_from_the_environment(mo
     args = types.SimpleNamespace(
         api_url="https://api.freesolo.co", api_key="operator-key", debug=False
     )
-    assert cli.commands.cmd_login(args) == 0
+    assert account_commands.cmd_login(args) == 0
     stderr = warned_before_request["stderr"]
     assert "plaintext HTTP" in stderr, stderr
     assert "identity.internal.test" in stderr
@@ -5059,7 +5054,7 @@ def test_login_ignores_the_identity_url_when_the_key_never_goes_there(monkeypatc
     """
     monkeypatch.setenv("FREESOLO_BASE_URL", "http://identity.internal.test")
 
-    warnings = cli.commands._plaintext_login_warnings("https://plane.example", None)
+    warnings = account_commands._plaintext_login_warnings("https://plane.example", None)
     assert warnings == [], warnings
 
 
@@ -5123,7 +5118,7 @@ def test_displayable_url_keeps_ipv6_brackets_and_rejects_bad_ports():
     ``2001:db8::1:8443`` -- an address the reader cannot split back into host and port. A URL
     printed in an error is meant to be copied, so it has to survive the round trip.
     """
-    from flash.serve.urls import displayable_url
+    from flash.serve.contract.urls import displayable_url
 
     assert displayable_url("https://[2001:db8::1]:8443") == "https://[2001:db8::1]:8443"
     assert displayable_url("https://[2001:db8::1]") == "https://[2001:db8::1]"
@@ -5205,16 +5200,16 @@ def test_follow_survives_a_transient_502_instead_of_reporting_a_failed_submit(
         def get_logs(self, run_id: str, offset: int = 0) -> dict:
             self.log_calls += 1
             if self.log_calls == 1:
-                raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+                raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
             return {"run_id": run_id, "logs": "trained\n", "offset": 8, "state": "done"}
 
         def get_run(self, run_id: str) -> dict:
             return {"run_id": run_id, "state": "done"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
     client = _FlakyClient()
 
-    assert cli.commands._follow_run(client, "flash-502") == 0
+    assert run_commands._follow_run(client, "flash-502") == 0
 
     captured = capsys.readouterr()
     assert "trained" in captured.out
@@ -5245,13 +5240,13 @@ def test_follow_does_not_reprint_the_log_page_it_retried(monkeypatch, capsys) ->
         def get_run(self, run_id: str) -> dict:
             self.run_calls += 1
             if self.run_calls == 1:
-                raise cli.commands.ApiError(503, "HTTP Error 503: Service Unavailable")
+                raise deploy_commands.ApiError(503, "HTTP Error 503: Service Unavailable")
             return {"run_id": run_id, "state": "running" if self.run_calls == 2 else "done"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
     client = _StatusFlakyClient()
 
-    result = cli.commands._poll_logs(client, "flash-offset", interval=0)
+    result = run_commands._poll_logs(client, "flash-offset", interval=0)
 
     assert result.state == "done"
     assert capsys.readouterr().out.count("step 1") == 1
@@ -5264,19 +5259,19 @@ def test_follow_gives_up_after_the_retry_window_and_names_the_run(monkeypatch, c
 
     class _DeadClient(_FakeClient):
         def get_logs(self, run_id: str, offset: int = 0) -> dict:
-            raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+            raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
 
         def get_run(self, run_id: str) -> dict:
-            raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+            raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
 
     # the retry budget reads the clock in `log_follow`; patch it there rather than relying on
-    # `cli.commands.time` happening to be the same module object.
+    # `run_commands.time` happening to be the same module object.
     clock = iter([0.0] + [1000.0] * 20)
-    monkeypatch.setattr(cli.commands.log_follow.time, "monotonic", lambda: next(clock))
-    monkeypatch.setattr(cli.commands.log_follow.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(log_follow.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(log_follow.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    assert cli.commands._follow_run(_DeadClient(), "flash-dead") == 1
+    assert run_commands._follow_run(_DeadClient(), "flash-dead") == 1
 
     err = capsys.readouterr().err
     assert "still going and still billing" in err
@@ -5295,16 +5290,16 @@ def test_follow_surfaces_a_client_error_immediately_without_retrying(monkeypatch
 
         def get_logs(self, run_id: str, offset: int = 0) -> dict:
             self.log_calls += 1
-            raise cli.commands.ApiError(401, "invalid or missing API key")
+            raise deploy_commands.ApiError(401, "invalid or missing API key")
 
         def get_run(self, run_id: str) -> dict:
             return {"run_id": run_id, "state": "running"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
     client = _UnauthorizedClient()
 
-    with pytest.raises(cli.commands.ApiError) as excinfo:
-        cli.commands._poll_logs(client, "flash-401", interval=0)
+    with pytest.raises(deploy_commands.ApiError) as excinfo:
+        run_commands._poll_logs(client, "flash-401", interval=0)
 
     assert excinfo.value.status == 401
     assert client.log_calls == 1
@@ -5321,12 +5316,12 @@ def test_status_follow_survives_a_transient_502(monkeypatch, capsys) -> None:
         def get_run(self, run_id: str) -> dict:
             self.calls += 1
             if self.calls == 1:
-                raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+                raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
             return {"run_id": run_id, "state": "done"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    assert cli.commands._follow_status(_FlakyStatusClient(), "flash-st", interval=0) == 0
+    assert run_commands._follow_status(_FlakyStatusClient(), "flash-st", interval=0) == 0
     assert "done" in capsys.readouterr().out
 
 
@@ -5347,11 +5342,11 @@ def test_follow_reports_a_finished_run_even_if_the_final_status_fetch_blips(
             self.run_calls += 1
             if self.run_calls == 1:
                 return {"run_id": run_id, "state": "done"}
-            raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+            raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    assert cli.commands._follow_run(_FinalBlipClient(), "flash-final") == 0
+    assert run_commands._follow_run(_FinalBlipClient(), "flash-final") == 0
 
     err = capsys.readouterr().err
     assert "could not fetch the final status" in err
@@ -5369,15 +5364,15 @@ def test_follow_warns_once_per_outage_not_once_per_attempt(monkeypatch, capsys) 
         def get_logs(self, run_id: str, offset: int = 0) -> dict:
             self.log_calls += 1
             if self.log_calls <= 3:
-                raise cli.commands.ApiError(502, "HTTP Error 502: Bad Gateway")
+                raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
             return {"run_id": run_id, "logs": "", "offset": 0, "state": "done"}
 
         def get_run(self, run_id: str) -> dict:
             return {"run_id": run_id, "state": "done"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    assert cli.commands._poll_logs(_RepeatFlakyClient(), "flash-noisy", interval=0).state == "done"
+    assert run_commands._poll_logs(_RepeatFlakyClient(), "flash-noisy", interval=0).state == "done"
     assert capsys.readouterr().err.count("retrying") == 1
 
 
@@ -5405,11 +5400,11 @@ def test_follow_surfaces_a_wrong_api_url_instead_of_retrying_it(monkeypatch, cap
         def get_run(self, run_id: str) -> dict:
             return {"run_id": run_id, "state": "running"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
     client = _ProxyClient()
 
-    with pytest.raises(cli.commands.ClientError) as excinfo:
-        cli.commands._poll_logs(client, "flash-proxy", interval=0)
+    with pytest.raises(deploy_commands.ClientError) as excinfo:
+        run_commands._poll_logs(client, "flash-proxy", interval=0)
 
     assert "Check that --api-url points at your Flash control plane" in str(excinfo.value)
     assert client.log_calls == 1
@@ -5436,7 +5431,7 @@ def test_follow_retries_a_genuinely_unreachable_service(monkeypatch, capsys) -> 
         def get_run(self, run_id: str) -> dict:
             return {"run_id": run_id, "state": "done"}
 
-    monkeypatch.setattr(cli.commands.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
 
-    assert cli.commands._poll_logs(_UnreachableClient(), "flash-down", interval=0).state == "done"
+    assert run_commands._poll_logs(_UnreachableClient(), "flash-down", interval=0).state == "done"
     assert "the service was unreachable" in capsys.readouterr().err

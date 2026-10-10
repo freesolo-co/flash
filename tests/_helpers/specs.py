@@ -12,7 +12,7 @@ fail the moment a test parsed it through the hosted submit path.
 from __future__ import annotations
 
 
-def raw_spec(model: str = "Qwen/Qwen3.5-0.8B", **kw) -> dict:
+def raw_spec(model: str = "Qwen/Qwen3.5-9B", **kw) -> dict:
     d = {
         "model": model,
         "algorithm": "sft",

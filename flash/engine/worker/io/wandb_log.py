@@ -5,7 +5,7 @@ Named ``wandb_log`` (not ``wandb``) so ``import wandb`` always resolves to the r
 
 from __future__ import annotations
 
-from flash.engine.worker.runtime.pkg_proxy import W as _w
+import flash.engine.worker.runtime.state as _worker_state
 
 
 def wandb_run_name() -> str:
@@ -14,7 +14,7 @@ def wandb_run_name() -> str:
     naming); otherwise a stable id tying the dashboard run to the Flash run
     (``flash-<phase>-<run_id>``). Passed into the verl config; the child process runs
     ``wandb.init`` and reports the run link back over the marker channel."""
-    configured = _w.JOB_SPEC.wandb.run_name if _w.JOB_SPEC else None
+    configured = _worker_state.JOB_SPEC.wandb.run_name if _worker_state.JOB_SPEC else None
     if configured and configured.strip():
         return configured.strip()
-    return f"flash-{_w.PHASE}-{_w.RUN_ID}"
+    return f"flash-{_worker_state.PHASE}-{_worker_state.RUN_ID}"

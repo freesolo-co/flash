@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from flash.core.grpo import DEFAULT_GRPO_GROUP_SIZE, DEFAULT_GRPO_PROMPTS_PER_STEP
 
 # keep in sync with catalog.default_model.
-HF_MODEL_ID = "Qwen/Qwen3.5-4B"
+HF_MODEL_ID = "Qwen/Qwen3.5-9B"
 
 
 @dataclass(frozen=True)
@@ -170,6 +170,7 @@ class SFTConfig:
     max_seq_len: int = 1024
     max_seq_len_thinking: int = 2048
     learning_rate: float = 1e-4
+    loraplus_ratio: float = 1.0
     warmup_frac: float = 0.03
     effective_batch: int = 32
     num_epochs: int = 2

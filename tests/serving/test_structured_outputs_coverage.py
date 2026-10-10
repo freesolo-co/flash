@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from flash.serving.src.structured_outputs import (
+from flash.serving.src.io.structured_outputs import (
     StructuredOutputsError,
     normalize_structured_outputs,
 )

@@ -8,11 +8,11 @@ import sys
 
 import pytest
 
-from flash.cli.commands import serve_deploy
-from flash.cli.commands.serve_status import cmd_serve_status
-from flash.cli.serve_parser import _add_serve_commands
+from flash.cli.commands.serving import deploy as serve_deploy
+from flash.cli.commands.serving.status import cmd_serve_status
+from flash.cli.parsing.serve_parser import _add_serve_commands
 from flash.serve.control import DeploymentResult
-from tests.test_cli_serve_deploy import IMAGE, MODEL, _stub_resolution
+from tests.test_cli_serve_deploy import IMAGE, MODEL, _historical_identity, _stub_resolution
 from tests.test_cli_serve_deploy import _result as ready_result
 
 
@@ -22,12 +22,12 @@ def _parse(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _args(provider: str = "modal") -> argparse.Namespace:
+def _args() -> argparse.Namespace:
     base = [
         "serve",
         "status",
         "--provider",
-        provider,
+        "modal",
         "--model",
         MODEL,
         "--run",
@@ -43,53 +43,39 @@ def _args(provider: str = "modal") -> argparse.Namespace:
         "--lora-rank",
         "32",
     ]
-    if provider == "modal":
-        base.extend(
-            [
-                "--modal-workspace",
-                "workspace",
-                "--modal-environment",
-                "dev",
-                "--modal-region",
-                "us-east",
-            ]
-        )
-    else:
-        base.extend(
-            [
-                "--runpod-account",
-                "account1",
-                "--runpod-data-center",
-                "US-KS-2",
-            ]
-        )
+    base.extend(
+        [
+            "--modal-workspace",
+            "workspace",
+            "--modal-environment",
+            "dev",
+            "--modal-region",
+            "us-east",
+        ]
+    )
     return _parse(base)
 
 
-def _args_with_identity(
-    monkeypatch: pytest.MonkeyPatch, provider: str = "modal"
-) -> argparse.Namespace:
-    from flash.cli.commands.serve_identity import encode_deployment_identity
+def _args_with_identity(monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace:
+    from flash.cli.commands.serving.identity import encode_deployment_identity
 
-    args = _args(provider)
+    args = _args()
     _stub_resolution(monkeypatch)
     args.deployment_identity = encode_deployment_identity(serve_deploy._deployment_bundle(args))
     return args
 
 
-def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str, str, str, str]:
+def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str, str, str]:
     values = (
         "modal-token-id-do-not-print",
         "modal-token-secret-do-not-print",
-        "runpod-api-key-do-not-print",
         "inference-key-do-not-print",
         "artifact-token-do-not-print",
     )
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_ID_ENV, values[0])
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_SECRET_ENV, values[1])
-    monkeypatch.setenv(serve_deploy.RUNPOD_API_KEY_ENV, values[2])
-    monkeypatch.setenv(serve_deploy.INFERENCE_KEY_ENV, values[3])
-    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, values[4])
+    monkeypatch.setenv(serve_deploy.INFERENCE_KEY_ENV, values[2])
+    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, values[3])
     return values
 
 
@@ -176,8 +162,8 @@ def test_status_invalid_inference_key_uses_the_credential_error_path(
 def test_status_uses_deploy_time_identity_after_the_model_tip_advances(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from flash.cli.commands.serve_identity import encode_deployment_identity
-    from flash.serve.provisioning._modal_plan import build_modal_create_plan
+    from flash.cli.commands.serving.identity import encode_deployment_identity
+    from flash.serve.provisioning.modal.planning.plan import build_modal_create_plan
 
     args = _args()
     _stub_resolution(monkeypatch)
@@ -185,7 +171,9 @@ def test_status_uses_deploy_time_identity_after_the_model_tip_advances(
     args.deployment_identity = encode_deployment_identity(deployed)
     deployed_name = build_modal_create_plan(deployed).names.app_or_pod
 
-    monkeypatch.setattr("flash.serve.resolve.resolve_base_revision", lambda *_a, **_k: "e" * 40)
+    monkeypatch.setattr(
+        "flash.serve.deployment.resolve.resolve_base_revision", lambda *_a, **_k: "e" * 40
+    )
     current_tip = serve_deploy._deployment_bundle(args)
     current_name = build_modal_create_plan(current_tip).names.app_or_pod
     assert current_name != deployed_name
@@ -197,57 +185,39 @@ def test_status_uses_deploy_time_identity_after_the_model_tip_advances(
         return _result(bundle, "absent")
 
     _stub_environment(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _reconcile)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
+        _reconcile,
+    )
 
     assert cmd_serve_status(args) == 0
     assert seen == [deployed_name]
 
 
-def test_status_without_inference_key_reports_provider_observable_states(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "retired_model",
+    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"],
+)
+def test_status_uses_immutable_identity_for_removed_model(
+    monkeypatch: pytest.MonkeyPatch, retired_model: str
 ) -> None:
-    observed: list[tuple[str, object]] = []
+    _stub_environment(monkeypatch)
+    args = _args()
+    args.deployment_identity = _historical_identity(monkeypatch, args, retired_model)
+    args.model = retired_model
+    seen = []
 
     def _modal(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        observed.append(("modal", secrets))
+        seen.append(bundle.spec.adapters[0].base_model)
         return _result(bundle, "absent")
 
-    def _runpod(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        observed.append(("runpod", secrets))
-        return _result(bundle, "provisioning")
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
+        _modal,
+    )
 
-    _stub_environment(monkeypatch)
-    monkeypatch.delenv(serve_deploy.INFERENCE_KEY_ENV)
-    modal_args = _args_with_identity(monkeypatch, "modal")
-    runpod_args = _args_with_identity(monkeypatch, "runpod")
-    monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _modal)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.reconcile_runpod_deployment", _runpod)
-
-    assert cmd_serve_status(modal_args) == 0
-    assert cmd_serve_status(runpod_args) == 0
-    assert observed == [("modal", None), ("runpod", None)]
-
-
-def test_status_routes_to_the_named_read_only_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[str] = []
-
-    def _modal(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        calls.append("modal")
-        return _result(bundle, "ready")
-
-    def _runpod(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        calls.append("runpod")
-        return _result(bundle, "ready")
-
-    _stub_environment(monkeypatch)
-    modal_args = _args_with_identity(monkeypatch, "modal")
-    runpod_args = _args_with_identity(monkeypatch, "runpod")
-    monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _modal)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.reconcile_runpod_deployment", _runpod)
-
-    assert cmd_serve_status(modal_args) == 0
-    assert cmd_serve_status(runpod_args) == 0
-    assert calls == ["modal", "runpod"]
+    assert cmd_serve_status(args) == 0
+    assert seen == [retired_model]
 
 
 @pytest.mark.parametrize(
@@ -273,7 +243,10 @@ def test_status_surfaces_every_outcome_distinctly(
 
     _stub_environment(monkeypatch)
     args = _args_with_identity(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _reconcile)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
+        _reconcile,
+    )
 
     assert cmd_serve_status(args) == expected_code
     captured = capsys.readouterr()
@@ -293,7 +266,10 @@ def test_non_ready_status_never_prints_ready(
 
     _stub_environment(monkeypatch)
     args = _args_with_identity(monkeypatch)
-    monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _reconcile)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
+        _reconcile,
+    )
 
     cmd_serve_status(args)
     output = capsys.readouterr().out
@@ -320,7 +296,10 @@ def test_status_credentials_never_enter_argv_output_or_artifacts(
     args = _args_with_identity(monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["flash", "serve", "status"])
-    monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _capture)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
+        _capture,
+    )
 
     assert cmd_serve_status(args) == 0
     captured = capsys.readouterr()
@@ -342,3 +321,24 @@ def test_parser_wires_serve_status_without_credential_flags() -> None:
     help_text = parser.format_help() + status.format_help()
     for forbidden in ("--token", "--api-key", "--password", "--credential"):
         assert forbidden not in help_text
+
+
+def test_status_without_inference_key_reports_provider_observable_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[object] = []
+
+    def _modal(bundle, credentials, secrets, *, deadline_at, **_kwargs):
+        observed.append(secrets)
+        return _result(bundle, "absent")
+
+    _stub_environment(monkeypatch)
+    monkeypatch.delenv(serve_deploy.INFERENCE_KEY_ENV)
+    args = _args_with_identity(monkeypatch)
+    monkeypatch.setattr(
+        "flash.serve.provisioning.modal.execution.operations.reconcile_modal_deployment",
+        _modal,
+    )
+
+    assert cmd_serve_status(args) == 0
+    assert observed == [None]

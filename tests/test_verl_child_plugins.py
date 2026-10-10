@@ -14,8 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from flash.engine.worker import opd_train, rl_train, sft_train
+import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
+import flash.engine.worker.train.opd.orchestration.overrides as opd_overrides
+import flash.engine.worker.train.rl.rollout.multi_turn as rl_multi_turn
 from flash.engine.worker.train.core.child import runtime
+from flash.engine.worker.train.entry import sft_train
 from flash.engine.worker.train.opd.child import entry as opd_entry
 from flash.engine.worker.train.rl.child import entry as grpo_entry
 from flash.engine.worker.train.sft.child import entry as sft_entry
@@ -41,8 +44,8 @@ def test_strict_entries_reject_a_missing_external_module(monkeypatch, entry, plu
 
 def test_each_runner_configures_exactly_one_algorithm_plugin():
     sft_source = inspect.getsource(sft_train._prepare_sft_child)
-    grpo_source = inspect.getsource(rl_train._build_rl_child_env)
-    opd_source = inspect.getsource(opd_train._build_opd_child_env)
+    grpo_source = inspect.getsource(rl_train_runner._build_rl_child_env)
+    opd_source = inspect.getsource(opd_overrides._build_opd_child_env)
 
     assert 'child_env["VERL_USE_EXTERNAL_MODULES"] = "flash_sft_plugin"' in sft_source
     assert 'env_for_verl["VERL_USE_EXTERNAL_MODULES"] = "flash_grpo_plugin"' in grpo_source
@@ -70,7 +73,7 @@ def test_large_grpo_plugin_config_uses_a_file_and_launches_the_child(tmp_path):
         "plugin_config_path": str(tmp_path / "flash_grpo_plugin_config.json"),
     }
     inp = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "dp_cards": 1,
         "reentrant_checkpointing": False,
         "multimodal": False,
@@ -85,12 +88,12 @@ def test_large_grpo_plugin_config_uses_a_file_and_launches_the_child(tmp_path):
         "kl_coef": 0.0,
         "multi_turn": False,
     }
-    rl_train._write_rl_shim(inp, files)
-    rl_train._write_rl_plugin_config(inp, files, gdn_reset_arch=None, loggers=[])
+    rl_train_runner._write_rl_shim(inp, files)
+    rl_train_runner._write_rl_plugin_config(inp, files, gdn_reset_arch=None, loggers=[])
 
     config_path = Path(files["plugin_config_path"])
     assert config_path.stat().st_size > 128 * 1024
-    env = rl_train._build_rl_child_env(inp, files, [], "http://127.0.0.1:9/")
+    env = rl_train_runner._build_rl_child_env(inp, files, [], "http://127.0.0.1:9/")
     assert "FLASH_GRPO_PLUGIN_CONFIG" not in env
     assert env["FLASH_GRPO_PLUGIN_CONFIG_PATH"] == str(config_path)
     assert len(env["FLASH_GRPO_PLUGIN_CONFIG_PATH"]) < 4096
@@ -115,8 +118,33 @@ print("config-loaded")
     assert "config-loaded" in result.stdout.splitlines()
 
 
+def test_staged_child_glue_imports_the_copied_reasoning_normalizer(tmp_path):
+    rl_multi_turn.copy_grpo_child_modules(str(tmp_path))
+    normalizer = tmp_path / "flash_reasoning_normalization.py"
+    normalizer.write_text(
+        normalizer.read_text()
+        + "\n\ndef messages_for_chat_template(messages):\n    return [{'role': 'assistant', 'content': 'staged'}]\n",
+        encoding="utf-8",
+    )
+    script = """
+import flash_multiturn_glue as glue
+assert glue._messages_for_chat_template([]) == [{'role': 'assistant', 'content': 'staged'}]
+print('staged-normalizer-used')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "staged-normalizer-used" in result.stdout
+
+
 def test_grpo_external_plugin_arms_without_importing_cuda_sensitive_targets(tmp_path):
-    rl_train.copy_grpo_child_modules(str(tmp_path))
+    rl_multi_turn.copy_grpo_child_modules(str(tmp_path))
     config_path = tmp_path / "flash_grpo_plugin_config.json"
     config_path.write_text(
         json.dumps(

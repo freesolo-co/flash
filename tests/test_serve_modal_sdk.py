@@ -10,10 +10,14 @@ from types import SimpleNamespace
 import pytest
 from synchronicity import Synchronizer
 
+from flash.serve.app.manifest import build_serving_manifest
 from flash.serve.control import ModalCredentials
-from flash.serve.provisioning._modal_plan import MODAL_VOLUME_MOUNT, build_modal_create_plan
-from flash.serve.provisioning._modal_sdk import ModalSdkFailure, PinnedModalSdk
-from flash.serve.provisioning._modal_wrapper import launch_modal_server
+from flash.serve.deployment.profiles import get_profile, placement_for
+from flash.serve.provisioning import DeploymentBundle, ServingImage
+from flash.serve.provisioning.modal.execution.sdk import ModalSdkFailure, PinnedModalSdk
+from flash.serve.provisioning.modal.planning.plan import MODAL_VOLUME_MOUNT, build_modal_create_plan
+from flash.serve.provisioning.modal.planning.wrapper import launch_modal_server
+from tests.test_serve_app_manifest import _profile_spec_and_inputs
 from tests.test_serve_provisioning_modal import (
     APP_ID,
     ARTIFACT_SECRET,
@@ -598,7 +602,7 @@ class _DeferredThread:
 
 
 def _defer_modal_watcher(monkeypatch) -> list[_DeferredThread]:
-    from flash.serve.provisioning import _modal_wrapper
+    from flash.serve.provisioning.modal.planning import wrapper as _modal_wrapper
 
     watchers = []
 
@@ -663,7 +667,7 @@ def _assert_modal_wrapper_signals_parent(monkeypatch, exit_code: int) -> None:
     import signal
 
     from flash.serve.app import launch
-    from flash.serve.provisioning import _modal_wrapper
+    from flash.serve.provisioning.modal.planning import wrapper as _modal_wrapper
 
     parent_pid = 2468
     signals = []
@@ -770,6 +774,51 @@ def test_client_close_interruption_does_not_escape_cleanup() -> None:
     assert modal.client.close_count == 1
 
 
+def _profile_modal_bundle(model_id: str) -> DeploymentBundle:
+    spec, inputs = _profile_spec_and_inputs(model_id)
+    profile = get_profile(model_id)
+    placement = placement_for(
+        profile,
+        "modal",
+        workspace_name="workspace",
+        environment="main",
+        region="us-east",
+    )
+    spec = replace(spec, placement=placement)
+    manifest = build_serving_manifest(spec, inputs)
+    return DeploymentBundle(
+        spec=spec,
+        manifest=manifest,
+        image=ServingImage(
+            reference=f"registry.example/flash/serve@{spec.engine.image_digest}",
+            digest=spec.engine.image_digest,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected_gpu"),
+    [
+        ("Qwen/Qwen3.5-9B", "L40S:1"),
+        ("Qwen/Qwen3.8-27B", "H100!:1"),
+        ("Qwen/Qwen3.6-35B-A3B", "H200:1"),
+    ],
+)
+def test_profile_gpu_request_reaches_the_literal_modal_function_payload(
+    model_id: str, expected_gpu: str
+) -> None:
+    plan = build_modal_create_plan(_profile_modal_bundle(model_id), phase="bootstrap")
+    modal = _ModalModule(plan)
+    sdk = _sdk(plan, modal)
+    sdk.create_inference_secret(plan, INFERENCE_SECRET)
+    sdk.create_artifact_secret(plan, ARTIFACT_SECRET)
+    sdk.create_volume(plan)
+
+    sdk.deploy_app(plan)
+
+    assert modal.calls["function"]["gpu"] == expected_gpu
+
+
 def test_pinned_sdk_deploys_exact_image_without_local_source_overlays() -> None:
     bootstrap = build_modal_create_plan(_bundle(), phase="bootstrap")
     modal = _ModalModule(bootstrap)
@@ -805,7 +854,7 @@ def test_pinned_sdk_deploys_exact_image_without_local_source_overlays() -> None:
     assert function["region"] == "us-east-1"
     assert function["include_source"] is False
     assert modal.calls["function_target"] is launch_modal_server
-    assert launch_modal_server.__module__ == "flash.serve.provisioning._modal_wrapper"
+    assert launch_modal_server.__module__ == "flash.serve.provisioning.modal.planning.wrapper"
     assert modal.calls["web_server"] == (
         8000,
         bootstrap.startup_timeout_seconds,
@@ -905,7 +954,7 @@ def test_id_mutation_deadline_is_ambiguous_and_cancels_the_owning_loop_rpc() -> 
 
 
 def test_id_mutation_declines_when_the_generated_request_is_unavailable(monkeypatch) -> None:
-    from flash.serve.provisioning import _modal_sdk
+    from flash.serve.provisioning.modal.execution import sdk as _modal_sdk
 
     plan = build_modal_create_plan(_bundle())
     modal = _ModalModule(plan)

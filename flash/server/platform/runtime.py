@@ -13,7 +13,8 @@ import threading
 
 from flash.adapters.artifacts import attempt_scoped_artifact_name
 from flash.core.spec import JobSpec
-from flash.runner import adapter_prefix, get_status, runs_file_path
+from flash.runner.lifecycle.state import adapter_prefix, runs_file_path
+from flash.runner.lifecycle.status import get_status
 from flash.server.platform import db
 
 _log = logging.getLogger("flash.server")
@@ -27,7 +28,7 @@ async def _reconcile_cost_loop() -> None:
     report it to the freesolo backend for estimator accuracy. The provider billing calls are
     blocking urllib, so each sweep is offloaded to a thread; failures are swallowed and retried
     next cycle. Off entirely when FREESOLO_INTERNAL_KEY is unset (see reconcile_enabled)."""
-    from flash.server.domain.reconcile import reconcile_once
+    from flash.server.domain.ops.reconcile import reconcile_once
 
     interval = 3600.0  # COGS reconcile sweep interval (fixed; flash is fully managed)
     while True:
@@ -54,7 +55,7 @@ async def _repo_cleanup_loop() -> None:
     The 7-day age and daily cadence are fixed in ``flash.server.domain.repo_cleanup``. Each threaded sweep
     fails closed when the live serving set is unconfirmed and requires operator ``HF_TOKEN``.
     """
-    from flash.server.domain.repo_cleanup import CleanupAborted, run_scheduled_cleanup
+    from flash.server.domain.ops.repo_cleanup import CleanupAborted, run_scheduled_cleanup
 
     interval = (
         24.0 * 3600.0
@@ -157,7 +158,7 @@ def _confirm_run_clear(spec) -> bool:
     ``submitted_instance_providers`` also blocks when it is now unconfigurable, because a lost
     non-idempotent create such as Vast ``PUT /asks`` may still be billing without a handle.
     """
-    from flash.providers import INSTANCE_PROVIDERS, configured_providers, get_provider
+    from flash.providers.core.registry import INSTANCE_PROVIDERS, configured_providers, get_provider
 
     try:
         recorded_raw = getattr(get_status(spec.run_id), "submitted_instance_providers", None)
@@ -207,7 +208,7 @@ def _confirm_run_clear(spec) -> bool:
 
 
 def _recovery_block_reason(spec) -> str | None:
-    from flash.runner import _spec_with_remaining_wall
+    from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
 
     try:
         _spec_with_remaining_wall(spec, require_provider_minimum=True)
@@ -217,7 +218,7 @@ def _recovery_block_reason(spec) -> str | None:
 
 
 def _recovery_wall_deadline_is_open(spec) -> bool:
-    from flash.runner import _remaining_run_wall_seconds
+    from flash.runner.lifecycle.deadlines import _remaining_run_wall_seconds
 
     try:
         return _remaining_run_wall_seconds(spec.run_id) > 0
@@ -231,7 +232,8 @@ def _fail_blocked_recovery(
     *,
     expected_remote: dict | None = None,
 ) -> bool:
-    from flash.runner import _compare_and_fail_remote, _load_run_deadline_at
+    from flash.runner.accounting.reconciliation import _compare_and_fail_remote
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.supervise.lifecycle import _adopt_completed_attempt, _CompletedAttemptPending
 
     status = get_status(spec.run_id)
@@ -267,56 +269,97 @@ def _fail_blocked_recovery(
     return applied
 
 
-def _start_resubmit(
-    spec,
-    *,
-    expected_remote: dict | None = None,
-    expected_state: str | None = None,
-) -> bool:
-    from flash.runner import (
-        _compare_and_prepare_resubmit,
-        _run_job_background,
-        _verified_opd_next_attempt,
+def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
+    """Claim one provider-clear handleless launch without advancing an active claim."""
+    from flash.runner.lifecycle.attempts import (
+        _verified_opd_retry_state,
+        active_launch_claim_from_raw,
+        claim_is_live,
+        reserve_handleless_recovery_launch,
+    )
+    from flash.runner.lifecycle.status import (
+        _load_status_json,
+        decode_next_attempt,
         source_snapshot_from_status,
     )
+    from flash.runner.supervise.lifecycle import _run_job_background
 
     try:
         source_snapshot_from_status(get_status(spec.run_id), required=True)
     except Exception as exc:
-        _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
+        _fail_blocked_recovery(spec, str(exc), expected_remote=None)
         return False
     reason = _recovery_block_reason(spec)
     if reason is not None:
         if _recovery_wall_deadline_is_open(spec):
             return False
-        _fail_blocked_recovery(spec, reason, expected_remote=expected_remote)
+        _fail_blocked_recovery(spec, reason, expected_remote=None)
         return False
+    raw = _load_status_json(spec.run_id)
+    stale_claim = active_launch_claim_from_raw(raw)
+    if stale_claim is not None and claim_is_live(spec.run_id, stale_claim):
+        return None
+    revision = world_size = None
+    verified_attempt = None
     if spec.algorithm == "opd":
+        # reclaiming a stale claim is not exempt. the lost worker can cross `optimizer.step()` and
+        # upload its mutation marker before provider cleanup finds and terminates it, so the claim's
+        # pre-launch resume evidence is already stale. reverify every attempt the counter names and
+        # carry that revision instead of the one the claim pinned.
         try:
-            _verified_opd_next_attempt(spec.run_id)
+            verified_attempt, revision, world_size = _verified_opd_retry_state(spec.run_id)
+            if verified_attempt != decode_next_attempt(raw):
+                raise RuntimeError("opd recovery attempt identity changed")
         except Exception as exc:
-            _fail_blocked_recovery(spec, str(exc), expected_remote=expected_remote)
+            _fail_blocked_recovery(spec, str(exc), expected_remote=None)
             return False
-    if not _compare_and_prepare_resubmit(
+    reservation = reserve_handleless_recovery_launch(
         spec.run_id,
-        expected_remote,
         expected_state=expected_state,
-    ):
-        return False
+        provider_clear_confirmed=True,
+        expected_stale_claim=stale_claim,
+        expected_next_attempt=verified_attempt,
+        resume_revision=revision,
+        resume_world_size=world_size,
+    )
+    if reservation.active:
+        return None
+    if reservation.claim is None:
+        if reservation.retry_plan is not None and not reservation.retry_plan.retry:
+            _fail_blocked_recovery(
+                spec,
+                "retry policy rejected handleless replacement",
+                expected_remote=None,
+            )
+            return False
+        return None
     with contextlib.suppress(Exception):
         _append_run_log(
             spec.run_id,
             "control plane restarted without a durable handle; resubmitting",
         )
-    threading.Thread(target=_run_job_background, args=(spec,), daemon=True).start()
+    try:
+        threading.Thread(
+            target=_run_job_background,
+            args=(spec, None, reservation.claim),
+            daemon=True,
+        ).start()
+    except Exception:
+        # nothing will ever run `_run_job_background`, so its `finally` cannot consume the claim.
+        # the caller retries, and an unconsumed claim reads as live to each later pass, which then
+        # defers until the wall deadline instead of launching the recovered run.
+        from flash.runner.supervise.lifecycle import _consume_reserved_claim
+
+        _consume_reserved_claim(spec.run_id, reservation.claim)
+        raise
     return True
 
 
 def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | None:
-    from flash.runner import _latest_reserved_attempt
+    from flash.runner.lifecycle.attempts import latest_reserved_attempt
     from flash.runner.supervise.lifecycle import _completed_attempt_metrics
 
-    attempt = _latest_reserved_attempt(spec.run_id)
+    attempt = latest_reserved_attempt(spec.run_id)
     if attempt is None:
         return None
     providers = {
@@ -341,11 +384,9 @@ def _deferred_resubmit_loop(spec) -> None:
     """Reconcile a handle-less maybe-live instance through the run wall deadline."""
     import time
 
-    from flash.runner import (
-        TERMINAL_STATES,
-        _compare_and_fail_remote,
-        _load_run_deadline_at,
-    )
+    from flash.runner.accounting.reconciliation import _compare_and_fail_remote
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+    from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.supervise.lifecycle import _adopt_completed_attempt
 
     while True:
@@ -401,11 +442,10 @@ def _deferred_resubmit_loop(spec) -> None:
             clear = False
         if clear:
             try:
-                started = _start_resubmit(
-                    spec,
-                    expected_remote=None,
-                    expected_state=status.state,
-                )
+                started = _start_handleless_resubmit(spec, status.state)
+                if started is None:
+                    time.sleep(_DEFERRED_RECOVERY_RETRY_S)
+                    continue
             except Exception:
                 time.sleep(_DEFERRED_RECOVERY_RETRY_S)
                 continue
@@ -502,6 +542,19 @@ def _worker_artifacts(spec) -> dict[str, str]:
     prefix = adapter_prefix(spec)
     out: dict[str, str] = {}
     error_name = _latest_error_artifact_name(repo, prefix, spec.phase)
+    # both console names, never a choice between them. the periodic snapshot and the terminal tail
+    # are written to DIFFERENT destinations on purpose (a late periodic upload must not clobber the
+    # terminal one), and each can be the only copy of the evidence: the scoped snapshot is the newest
+    # when the worker was killed before its terminal upload ran, while the canonical name holds the
+    # tail that contains the crash itself. `_latest_worker_artifact_name` scores the canonical name
+    # -1, so preferring it by rank would surface a stale attempt on a retry -- and preferring the
+    # scoped one alone is what hid the traceback. fetching both leaves the choice to the reader.
+    console_names = dict.fromkeys(
+        (
+            _latest_worker_artifact_name(repo, prefix, spec.phase, "console"),
+            f"console_{spec.phase}.txt",
+        )
+    )
     # ray's own session logs. the traceback beside them records only the downstream symptom of a
     # raylet death ("Failed to register worker to Raylet: ... End of file"), so without this the
     # collector that exists to disambiguate it uploads a diagnosis nothing ever reads back
@@ -510,7 +563,7 @@ def _worker_artifacts(spec) -> dict[str, str]:
     # non-ray failure, and the loop below skips it.
     ray_name = _ray_log_name_for_attempt(spec.phase, error_name)
     for name in (
-        _latest_worker_artifact_name(repo, prefix, spec.phase, "console"),
+        *console_names,
         error_name,
         *([ray_name] if ray_name else []),
     ):
@@ -535,13 +588,13 @@ def _worker_artifacts(spec) -> dict[str, str]:
 
 
 def _teardown_unrecoverable_remote(status) -> None:
-    """Stop the billable worker of a handle-backed run whose spec this build cannot parse.
+    """Stop the billable worker of a handle-backed run this build cannot activate.
 
     The run is already marked failed by the caller; what remains is the rented resource. Teardown
     runs off the persisted handle alone, so it works for exactly the spec the parse rejected.
     Best-effort and fully suppressed: recovery must finish for every other run regardless.
     """
-    from flash.runner import _record_cleanup_remote
+    from flash.runner.accounting.reconciliation import _record_cleanup_remote
     from flash.runner.supervise.lifecycle import _strict_teardown_handle
 
     remote = dict(status.remote or {})
@@ -579,7 +632,7 @@ def recover_runs() -> None:
 
 
 def _drain_cleanup_remotes_bg(run_id: str) -> None:
-    from flash.runner import _drain_cleanup_remotes
+    from flash.runner.accounting.reconciliation import _drain_cleanup_remotes
 
     with contextlib.suppress(Exception):
         _drain_cleanup_remotes(run_id)
@@ -594,14 +647,15 @@ def _classify_recoverable_runs(
     don't-touch scope), ``active`` only the handle-backed ones the sweep must keep, and ``resubmit``
     the handle-less ones, deferred so the orphan sweep runs before their fresh allocation.
     """
-    from flash.runner import (
-        _gc_run_endpoints,
-        _mark_warmstart_source,
+    from flash.runner.lifecycle.preparation import _mark_warmstart_source
+    from flash.runner.lifecycle.status import (
         _update,
-        attach_run,
+        effective_spec_from_status,
         get_status,
         reallocation_spec_from_status,
     )
+    from flash.runner.supervise.attach import attach_run
+    from flash.runner.supervise.recovery import _gc_run_endpoints
 
     for row in db.all_runs():
         known.add(row["run_id"])
@@ -617,6 +671,10 @@ def _classify_recoverable_runs(
         ).start()
         if status.state not in _RECOVERABLE:
             continue
+        if status.remote is None and status.cleanup_confirmed_remote is not None:
+            active.add(status.run_id)
+            threading.Thread(target=lambda rid=row["run_id"]: attach_run(rid), daemon=True).start()
+            continue
         if status.remote:
             # A spec this build can no longer parse cannot be reattached either: attach_run parses
             # it before its own except/finally handlers exist, so the daemon thread would die at
@@ -628,14 +686,14 @@ def _classify_recoverable_runs(
             # handle and the run id, never a parsed spec, so removal does not depend on the parse
             # that just failed.
             try:
-                JobSpec.from_dict(status.spec)
+                effective_spec_from_status(status)
             except Exception as exc:
                 _log.warning(
-                    "marking run %s failed: persisted spec could not be parsed for reattach",
+                    "marking run %s failed: persisted spec could not be activated for reattach",
                     status.run_id,
                     exc_info=True,
                 )
-                detail = f"unrecoverable: persisted spec is malformed: {exc}"
+                detail = f"unrecoverable: persisted spec cannot be activated: {exc}"
                 with contextlib.suppress(Exception):
                     _update(status.run_id, "failed", error=detail)
                 with contextlib.suppress(Exception):
@@ -665,13 +723,14 @@ def _classify_recoverable_runs(
             # otherwise GC any half-made endpoint and resubmit from scratch.
             try:
                 spec = JobSpec.from_dict(status.spec)
+                effective_spec_from_status(status)
             except Exception as exc:
                 _log.warning(
-                    "marking run %s failed: persisted spec could not be parsed",
+                    "marking run %s failed: persisted spec could not be activated",
                     status.run_id,
                     exc_info=True,
                 )
-                detail = f"unrecoverable: persisted spec is malformed: {exc}"
+                detail = f"unrecoverable: persisted spec cannot be activated: {exc}"
                 with contextlib.suppress(Exception):
                     _update(status.run_id, "failed", error=detail)
                 with contextlib.suppress(Exception):
@@ -686,7 +745,7 @@ def _classify_recoverable_runs(
                 # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
                 # persisted status without parsing the spec. Terminate by that reconstructed
                 # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
-                from flash.providers.runpod import terminate_persisted_endpoints
+                from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
 
                 terminate_persisted_endpoints(status.spec, status.run_id)
                 continue
@@ -715,7 +774,7 @@ def _classify_recoverable_runs(
 
 def _sweep_provider_orphans(active: set[str], known: set[str]) -> None:
     """Reap orphaned per-run provider resources; each provider sweeps its own."""
-    from flash.providers import configured_providers
+    from flash.providers.core.registry import configured_providers
 
     for prov in configured_providers():
         with contextlib.suppress(Exception):
@@ -724,7 +783,7 @@ def _sweep_provider_orphans(active: set[str], known: set[str]) -> None:
 
 def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
     """Relaunch the handle-less runs, deferring any whose teardown could not be confirmed."""
-    from flash.runner import get_status
+    from flash.runner.lifecycle.status import get_status
 
     for spec, prior_state in resubmit:
         reason = _recovery_block_reason(spec)
@@ -750,19 +809,20 @@ def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
         # MtzrJ: a handle-less run hit the submit->provisioning window, so a NON-IDEMPOTENT instance
         # create (Vast's PUT /asks) may have been accepted while the response/handle was lost — a
-        # phantom contract that bills and, worse, writes this run/seed's HF artifacts. The batch
+        # phantom contract that bills and, worse, writes this run's HF artifacts. The batch
         # sweep_orphans above reaps it only if it was VISIBLE then; _confirm_run_clear force-reaps this
         # run's label across the instance providers RIGHT BEFORE relaunching and verifies nothing for the
         # run remains, so a phantom that surfaced in the sweep->resubmit gap (Vast's instance list is
-        # eventually consistent) can't get a SECOND worker writing the same seed-scoped artifacts.
-        # A run still `queued` never reached that window: the runner enqueues as `queued` and lifecycle's
-        # `_update(..., "provisioning")` fires BEFORE any `provider.submit_run`, and nothing regresses
-        # `provisioning`->`queued`, so a `queued` run made no create and can't have left a phantom. Skip
+        # eventually consistent) can't get a SECOND worker writing the same run-scoped artifacts.
+        # A run still `queued` never reached that window: the runner enqueues as `queued` and
+        # lifecycle's `_update(..., "provisioning")` fires BEFORE any `provider.submit_attempt`, and
+        # nothing regresses `provisioning`->`queued`, so a `queued` run made no create and can't
+        # have left a phantom. Skip
         # the guard for it — else a purely-queued run whose VAST_API_KEY was dropped after submit would
         # fail closed in _confirm_run_clear (unenumerable recorded Vast) and defer forever. The guard
         # still runs for `provisioning`/`running`, the states that could have attempted a create.
         if prior_state == "queued" or _confirm_run_clear(spec):
-            if _start_resubmit(spec, expected_remote=None, expected_state=prior_state):
+            if _start_handleless_resubmit(spec, prior_state):
                 continue
             try:
                 current = get_status(spec.run_id)

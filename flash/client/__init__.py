@@ -33,7 +33,7 @@ def resolve_project(
     out. Every other status stays an ``ApiError``: a 500 is an outage, not a bad id.
 
     With no Freesolo backend to reach there is no org directory to resolve through, so the id is
-    only validated for SHAPE -- exactly what ``flash/server/domain/projects.py`` does under
+    only validated for SHAPE -- exactly what ``flash/server/domain/registry/projects.py`` does under
     ``standalone()`` when the same run is submitted. Without this the ownership lookup went to
     ``api.freesolo.co``, which has no relationship with the operator's key and answers 401, so
     ``flash env setup`` died before writing a file on the very quickstart SELF_HOSTING.md

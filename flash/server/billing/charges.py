@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from decimal import ROUND_HALF_UP, Decimal
 
+from flash._internal.http import _urlopen_no_redirect
 from flash.core.spec import attributed_gpu_type
+from flash.cost.currency import usd_cents as _cents
 from flash.server.platform.internal_client import (
     DEFAULT_TIMEOUT_S,
     build_internal_request,
@@ -25,12 +26,6 @@ class BillingError(Exception):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
-
-
-def _cents(usd: float) -> int:
-    """Whole cents, ROUND_HALF_UP (not banker's rounding), never negative."""
-    cents = Decimal(str(usd)).scaleb(2).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    return max(0, int(cents))
 
 
 def _http_reason(exc: urllib.error.HTTPError) -> str:
@@ -61,7 +56,7 @@ def _post_billing(*, token: str, path: str, body: dict) -> dict:
     """POST a JSON body to the backend billing path; raises BillingError on failure."""
     req = build_internal_request(path, body, token=token)
     try:
-        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
+        with _urlopen_no_redirect(req, timeout=DEFAULT_TIMEOUT_S) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         raise BillingError(exc.code, _http_error_detail(exc)) from exc
@@ -98,8 +93,14 @@ def _charge_run(
     if not org_id:
         raise BillingError(400, "missing billing org id for training run")
     spec = status.spec if isinstance(status.spec, dict) else {}
-    remote = status.remote if isinstance(status.remote, dict) else {}
-    gpu = attributed_gpu_type(status)
+    remote = status.remote or status.realized_cost_remote
+    remote = remote if isinstance(remote, dict) else {}
+    allocated_gpu = remote.get("allocated_gpu")
+    gpu = (
+        allocated_gpu
+        if isinstance(allocated_gpu, str) and allocated_gpu
+        else attributed_gpu_type(status)
+    )
     provider = remote.get("provider")
     total_usd = float(total_usd or 0.0)
     body = {

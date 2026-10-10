@@ -51,9 +51,9 @@ async def _serve(
         """stop serving once the vllm engine core dies.
 
         a dead engine core cannot be repaired in place. without this the http process stays bound
-        and answers 503 for every later request, so neither modal nor runpod ever replaces the
-        container. asking uvicorn to exit drains in-flight requests and ends the process, which
-        both providers treat as a container to restart.
+        and answers 503 for every later request, so the provider never replaces the container.
+        asking uvicorn to exit drains in-flight requests and ends the process, which lets the
+        provider restart the container.
         """
 
         print(

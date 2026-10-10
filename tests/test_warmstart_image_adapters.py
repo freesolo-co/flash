@@ -38,7 +38,7 @@ _PUBLISHED_IMAGE_ADAPTER_SIDECARS = (
     "processor_config.json",
 )
 
-_IMAGE_MODEL = "Qwen/Qwen3.5-4B"
+_IMAGE_MODEL = "Qwen/Qwen3.5-9B"
 
 # the live image sft gate run whose published adapter is the warm-start source for rl.
 _IMAGE_SFT_SOURCE = "image-gate-qwen35-4b-sft-20260818-06"
@@ -152,7 +152,7 @@ def test_image_sft_warm_start_inherits_the_source_pin_like_any_other_algorithm()
     """
     from dataclasses import replace
 
-    from flash.runner.preparation import _adopted_warmstart_revision
+    from flash.runner.lifecycle.preparation import _adopted_warmstart_revision
 
     spec = JobSpec.from_dict(_image_sft_spec())
     assert spec.algorithm == "sft"

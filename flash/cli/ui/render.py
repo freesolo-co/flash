@@ -6,16 +6,9 @@ import os
 import sys
 
 from flash._internal.channel import BRAND_NAME, CLI_NAME
-
-# Cost selection lives in `flash.cli.ui.cost` (split out to keep this module under the file-size
-# limit). Imported at the TOP rather than the bottom like `tables` below, because that module
-# depends on nothing here -- it decides a number, it renders nothing -- so there is no cycle to
-# order around. Re-exported so `render.run_cost` / `render.SETTLED_COST_STATES` keep resolving.
-from flash.cli.ui.cost import (  # noqa: F401
-    SETTLED_COST_STATES,
-    cost_estimate_reason,
-    run_cost,
-)
+from flash.cli.ui import cost as cost_ui
+from flash.cli.ui import heartbeat
+from flash.cost.currency import format_usd
 
 # one spelling of the VRAM clause for both quote renderers: the themed panel and
 # `CostEstimate.breakdown()` must not be able to describe the same shape differently.
@@ -447,7 +440,7 @@ def _color_json(obj, depth: int) -> str:
 
 def _hide_provider_metadata(obj):
     """Styled CLI details are for humans; keep backend provider names out of that view."""
-    from flash.providers import PROVIDER_NAMES
+    from flash.providers.core.registry import PROVIDER_NAMES
 
     if isinstance(obj, dict):
         return {
@@ -496,13 +489,21 @@ def _humanize_ts(value) -> str | None:
     return datetime.datetime.fromtimestamp(value, datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def gpu_label(spec: dict, remote: dict) -> str:
+    """Human-facing GPU label. Provider metadata stays internal."""
+    from flash.core.spec import persisted_gpu_types
+
+    authored = " | ".join(persisted_gpu_types(spec))
+    return remote.get("allocated_gpu") or authored
+
+
 def run_status(obj: dict) -> str:
     """A curated status panel for `flash runs status`, with the full JSON below for completeness."""
     spec = obj.get("spec") or {}
     where = gpu_label(spec, obj.get("remote") or {}) or None
-    amount, is_estimate = run_cost(obj)
+    amount, is_estimate = cost_ui.run_cost(obj)
     cost = (
-        f"{money(amount)} {_dim(f'({cost_estimate_reason(obj)})')}"
+        f"{money(amount)} {_dim(f'({cost_ui.cost_estimate_reason(obj)})')}"
         if is_estimate
         else money(amount)
     )
@@ -516,7 +517,7 @@ def run_status(obj: dict) -> str:
     realized = obj.get("realized_cost_usd")
     if realized is not None:
         pairs.append(("realized", money(realized)))
-    pairs += _heartbeat_pairs(obj)
+    pairs += heartbeat._heartbeat_pairs(obj, format_hint=_dim)
     pairs += [
         ("created", _humanize_ts(obj.get("created_at"))),
         ("updated", _humanize_ts(obj.get("updated_at"))),
@@ -568,8 +569,9 @@ def deployed(dep: dict) -> str:
     """`flash models deploy`: the endpoint and serving URL as an aligned card (not a JSON dump)."""
     endpoint = str(dep.get("endpoint_name") or "")
     url = str(dep.get("openai_base_url") or "")
+    checkpoint_id = str(dep.get("checkpoint_id") or dep.get("run_id") or "")
     pairs = [
-        ("run", _paint(dep.get("run_id", ""), _ACCENT2)),
+        ("checkpoint", _paint(checkpoint_id, _ACCENT2)),
         ("endpoint", _paint(endpoint, _GREEN) if endpoint else None),
         ("url", _paint(url, _ACCENT2) if url else None),
     ]
@@ -588,23 +590,22 @@ def deployed(dep: dict) -> str:
 
 
 def undeployed(result: dict) -> str:
-    """`flash models undeploy`: report the run-scoped aliases and immutable revisions disabled."""
-    rid = _paint(result.get("run_id", ""), _ACCENT2)
-    aliases = result.get("disabled_aliases") or []
-    revisions = result.get("disabled_revisions") or []
-    affected = [*aliases, *revisions]
-    line = ok(f"torn down {rid}")
-    if affected:
-        line += "\n" + _dim(f"  disabled {', '.join(str(item) for item in affected)}")
+    """`flash models undeploy`: report the exact permanent checkpoints disabled."""
+    checkpoint_id = str(result.get("checkpoint_id") or result.get("run_id") or "")
+    target = _paint(checkpoint_id, _ACCENT2)
+    disabled = result.get("disabled_checkpoints") or []
+    line = ok(f"torn down {target}")
+    if disabled:
+        line += "\n" + _dim(f"  disabled {', '.join(str(item) for item in disabled)}")
     else:
-        line += "\n" + _dim("  serving records were already disabled or absent")
+        line += "\n" + _dim("  serving record was already disabled or absent")
     return _safe(line)
 
 
 def exported(result: dict) -> str:
     """`flash models export`: where the adapter landed on HuggingFace, as an aligned card."""
     pairs = [
-        ("adapter", _paint(result.get("adapter_id", ""), _ACCENT2)),
+        ("checkpoint", _paint(result.get("checkpoint_id", ""), _ACCENT2)),
         ("repo", _paint(result.get("repository", ""), _ACCENT2)),
         ("url", _paint(result["url"], _ACCENT2) if result.get("url") else None),
         ("visibility", "private" if result.get("private") else "public"),
@@ -658,12 +659,24 @@ def cost_panel(est) -> str:
             )
         )
     panel = _kv(pairs)
-    total = f"  {_paint('TOTAL'.ljust(10), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} {_paint(f'${est.total_usd:.2f}', _TEAL, '1')}"
+    total = f"  {_paint('TOTAL'.ljust(10), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} {_paint(format_usd(est.total_usd), _TEAL, '1')}"
     out = f"{header('train', 'pre-flight cost estimate')}\n{panel}\n{_rule()}\n{total}"
     if est.notes:
         notes = "\n".join(f"  {_paint(_glyph('·', '-'), _FAINT)} {_dim(n)}" for n in est.notes)
         out += f"\n\n{_dim('notes')}\n{notes}"
     return _safe(out)
+
+
+def server_cost_panel(
+    rows: list[tuple[str, str | None]], total_usd: float, description: str
+) -> str:
+    """Server-prepared quote with no invented local hardware or timing details."""
+    panel = _kv([(key, _paint(value, _ACCENT2) if key == "run" else value) for key, value in rows])
+    total = (
+        f"  {_paint('TOTAL'.ljust(8), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} "
+        f"{_paint(format_usd(total_usd), _TEAL, '1')}"
+    )
+    return _safe(f"{header('train', description)}\n{panel}\n{_rule()}\n{total}")
 
 
 def sft_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
@@ -673,13 +686,7 @@ def sft_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
     CostEstimate, and this quote is frozen server-side, so those fields are not available here.
     Rendering them would mean inventing the numbers the exact path exists to stop guessing.
     """
-    panel = _kv([(k, _paint(v, _ACCENT2) if k == "run" else v) for k, v in rows])
-    total = (
-        f"  {_paint('TOTAL'.ljust(8), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} "
-        f"{_paint(f'${total_usd:.2f}', _TEAL, '1')}"
-    )
-    head = header("train", "cost estimate (packaged dataset rows)")
-    return _safe(f"{head}\n{panel}\n{_rule()}\n{total}")
+    return server_cost_panel(rows, total_usd, "cost estimate (packaged dataset rows)")
 
 
 def project_created(project_id: str, name: str) -> str:
@@ -786,42 +793,3 @@ def help_page(
     # trailing newline so the styled page matches argparse's newline-terminated help (argparse
     # writes format_help() verbatim via print_help, with no print() to add one).
     return _safe(f"{banner}\n{_rule()}\n{usage_line}\n\n{body}\n\n{foot}\n")
-
-
-# Table layouts live in `flash.cli.ui.tables`, which imports the primitives above. Re-exported
-# here (at the bottom, so those primitives are defined first) because every call site and the
-# render monkeypatches in the CLI tests reach them as `render.<name>`.
-# Heartbeat interpretation lives in `flash.cli.ui.heartbeat` for the same reason and on the same
-# terms: `run_status` above calls `_heartbeat_pairs`, and the CLI tests address every one of these
-# as `render.<name>`, so they have to stay resolvable here.
-# The env list renderer in `flash.cli.ui.env_panels` is re-exported on the same terms.
-from flash.cli.ui.env_panels import env_list as env_list  # noqa: E402
-from flash.cli.ui.heartbeat import (  # noqa: E402,F401
-    _HB_QUIET_HINT_AFTER_S,
-    _LIVENESS_SETUP_STAGES,
-    _QUIET_HEARTBEAT_HINT,
-    _SETUP_SILENT_AFTER_S,
-    _STALE_STEP_AFTER_S,
-    _TRAINING_STEP_STAGES,
-    _WARMUP_HEARTBEAT_FRESH_FOR_S,
-    _WARMUP_STAGES,
-    _heartbeat_age_seconds,
-    _heartbeat_pairs,
-    _humanize_age_seconds,
-    _stale_setup_hint,
-    _stale_step_hint,
-    _superseded_hint,
-    heartbeat_is_current_attempt,
-    heartbeat_is_superseded,
-    live_attempt,
-    warmup_message,
-)
-from flash.cli.ui.tables import (  # noqa: E402,F401
-    checkpoints_table,
-    deployments_table,
-    gpu_label,
-    gpus_table,
-    models_table,
-    projects_table,
-    runs_table,
-)

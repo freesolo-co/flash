@@ -102,7 +102,7 @@ class TestImagePadTokens:
     """Pad-run lengths, measured against a real Qwen3-VL processor.
 
     The expectations are the processor's own output, captured from
-    `AutoProcessor.from_pretrained("Qwen/Qwen3.5-0.8B")` counting `<|image_pad|>` ids in the
+    `AutoProcessor.from_pretrained("Qwen/Qwen3.5-9B")` counting `<|image_pad|>` ids in the
     tokenized row. They are ground truth, not a restatement of the formula.
     """
 

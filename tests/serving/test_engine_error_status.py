@@ -16,8 +16,8 @@ from modal.exception import ExecutionError, FunctionTimeoutError
 from test_router import QWEN, _allow, _router_for
 
 from flash.client.http import ClientError
-from flash.serve.streaming import _openai_stream_content
-from flash.serving.src.router import build_serving_app
+from flash.serve.request.streaming import _openai_stream_content
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 
 
 class VLLMValidationError(ValueError):
@@ -64,7 +64,12 @@ class _FailingPool:
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
         if self._mid_stream:
-            yield {"type": "ready", "checkpoint": "run-a/step-1", "thinking": False}
+            yield {
+                "type": "ready",
+                "checkpoint": "run-a/final",
+                "thinking": False,
+                "lora_request_adapter": record.adapter_id,
+            }
             yield {"type": "delta", "text": "Hello"}
         raise self._exc
 
@@ -77,7 +82,12 @@ class _FailingPool:
 
 class _CleanlyTruncatedPool(_FailingPool):
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
-        yield {"type": "ready", "checkpoint": "run-a/step-1", "thinking": False}
+        yield {
+            "type": "ready",
+            "checkpoint": "run-a/final",
+            "thinking": False,
+            "lora_request_adapter": record.adapter_id,
+        }
         yield {"type": "delta", "text": "partial"}
 
 
@@ -103,7 +113,7 @@ def _client(exc: Exception, *, mid_stream: bool = False, pool_cls=_FailingPool) 
 
 
 def _chat(client: TestClient, *, stream: bool = False):
-    body = {"model": "run-a", "messages": [{"role": "user", "content": "hi"}]}
+    body = {"model": "run-a/final", "messages": [{"role": "user", "content": "hi"}]}
     if stream:
         body["stream"] = True
     return client.post("/v1/chat/completions", json=body)
@@ -191,6 +201,7 @@ def test_clean_iterator_end_without_final_is_a_consumer_visible_error() -> None:
     )
     stream = _openai_stream_content(iter(response.text.splitlines()), thinking=False)
 
+    assert response.status_code == 200
     assert next(stream) == "partial"
     with pytest.raises(ClientError, match="ended without a terminal event"):
         next(stream)

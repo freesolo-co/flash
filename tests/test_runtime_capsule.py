@@ -17,7 +17,7 @@ import zipfile
 
 import pytest
 
-from flash.providers._lifecycle import instance
+from flash.providers._lifecycle.instances import instance
 from flash.providers.vast.jobs import builders as vast_builders
 from flash.runtime_capsule import (
     MANIFEST_NAME,

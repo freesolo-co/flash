@@ -45,5 +45,5 @@ def test_health_returns_ok():
         "ok": True,
         "service": "flash",
         "version": __version__,
-        "capabilities": ["chat_step_selector_v1"],
+        "capabilities": [],
     }

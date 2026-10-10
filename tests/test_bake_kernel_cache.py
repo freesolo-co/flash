@@ -146,7 +146,7 @@ def test_backoff_grows_and_is_bounded(no_sleep):
 
 
 def test_default_gpu_walk_covers_every_baked_arch():
-    from flash.providers._lifecycle.worker import BAKED_PER_SM_ARCHES
+    from flash.providers._lifecycle.net.worker import BAKED_PER_SM_ARCHES
 
     assert set(bake.GPU_WALK_BY_SM) == BAKED_PER_SM_ARCHES
     assert all(len(types) == len(set(types)) for types in bake.GPU_WALK_BY_SM.values())

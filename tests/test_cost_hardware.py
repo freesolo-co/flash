@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from flash.cost.facts import GPU_COMPUTE_TFLOPS, gpu_tflops, gpu_vram_gb
-from flash.providers.base import GPU_INFO
+from flash.providers.core.base import GPU_INFO
 
 
 def test_compute_table_only_lists_real_classes():
@@ -83,8 +83,8 @@ def test_nvlink_classification_tracks_the_provisioned_board():
     pricing it on an interconnect it no longer has.
     """
     from flash.cost.facts import has_nvlink
-    from flash.providers.base import GPU_INFO
-    from flash.providers.runpod.gpus import _POOL_MEMBERS_MISSING_FROM_SDK
+    from flash.providers.core.base import GPU_INFO
+    from flash.providers.runpod.client.gpus import _POOL_MEMBERS_MISSING_FROM_SDK
 
     assert GPU_INFO["H100"].enum_member == "NVIDIA_H100_80GB_HBM3"  # sxm, not the pcie board
     assert has_nvlink("H100")
@@ -248,7 +248,7 @@ def test_a_vast_sharded_quote_reads_the_provider_off_the_run_config():
 
     def cfg(provider, method="grpo"):
         return RunConfig(
-            model_id="Qwen/Qwen3.5-4B", method=method, steps=10, provider=provider, gpu_count=2
+            model_id="Qwen/Qwen3.5-9B", method=method, steps=10, provider=provider, gpu_count=2
         )
 
     for method in ("grpo", "sft"):
@@ -275,7 +275,7 @@ def test_ranking_prices_the_authored_rollout_batch_not_the_recipe_default():
     quote already reads the new key, so the two silently disagreed.
     """
     from flash.engine.plan.recipe import RECIPE
-    from flash.providers.base import run_config_for_ranking
+    from flash.providers.core.base import run_config_for_ranking
 
     authored = int(RECIPE.rl.prompts_per_step) // 2
     assert authored >= 1
@@ -284,15 +284,15 @@ def test_ranking_prices_the_authored_rollout_batch_not_the_recipe_default():
 
     for algorithm in ("grpo", "opd"):
         train = {"epochs": 1, "group_size": 4, "prompts_per_step": authored}
-        config = run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+        config = run_config_for_ranking("Qwen/Qwen3.5-9B", algorithm, train=train)
         assert config.batch_size == authored, algorithm
         assert config.normalized().batch_size == authored, algorithm
 
     # sft still authors the batch under its own name, and it is a different quantity.
-    sft = run_config_for_ranking("Qwen/Qwen3.5-4B", "sft", train={"epochs": 1, "batch_size": 4})
+    sft = run_config_for_ranking("Qwen/Qwen3.5-9B", "sft", train={"epochs": 1, "batch_size": 4})
     assert sft.batch_size == 4
     # an unauthored rollout batch still falls through to the recipe default.
-    bare = run_config_for_ranking("Qwen/Qwen3.5-4B", "grpo", train={"epochs": 1})
+    bare = run_config_for_ranking("Qwen/Qwen3.5-9B", "grpo", train={"epochs": 1})
     assert bare.batch_size is None
     assert bare.normalized().batch_size == RECIPE.rl.prompts_per_step
 
@@ -313,7 +313,7 @@ def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
 
     from flash.cost.spec import _on_policy_prompts_per_step, _on_policy_requested_prompts_per_step
     from flash.engine.plan.recipe import RECIPE
-    from flash.providers.base import run_config_for_ranking
+    from flash.providers.core.base import run_config_for_ranking
 
     for algorithm in ("grpo", "opd"):
         default = int((RECIPE.opd if algorithm == "opd" else RECIPE.rl).prompts_per_step)
@@ -336,7 +336,7 @@ def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
                 train["prompts_per_step"] = authored
             if retained is not None:
                 train["max_examples"] = retained
-            config = run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+            config = run_config_for_ranking("Qwen/Qwen3.5-9B", algorithm, train=train)
             assert config.batch_size == expected, (algorithm, authored, retained)
             # what actually gets priced, after the recipe fills any remaining None.
             assert config.normalized().batch_size == (
@@ -346,7 +346,7 @@ def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
     # sft is untouched: its `batch_size` is examples per update on a dataset it may revisit across
     # epochs, so a small `max_examples` does not bound it the way a rollout pool bounds a step.
     sft = run_config_for_ranking(
-        "Qwen/Qwen3.5-4B", "sft", train={"epochs": 1, "batch_size": 8, "max_examples": 2}
+        "Qwen/Qwen3.5-9B", "sft", train={"epochs": 1, "batch_size": 8, "max_examples": 2}
     )
     assert sft.batch_size == 8
 
@@ -364,7 +364,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
     `runconfig_from_spec` fed `RunConfig.batch_size` the raw authored `prompts_per_step`, so a run
     with `prompts_per_step = 128, max_examples = 2` was quoted for a batch of 128 while training on
     2. The persisted quote is what a completed or cancelled run is charged against
-    (`flash/runner/costs.py`), and it also gates the pre-submit affordability check, so the gap both
+    (`flash/runner/accounting/costs.py`), and it also gates the pre-submit affordability check, so the gap both
     overcharges and can reject an affordable run.
 
     Internally inconsistent too: `spec_steps` already counted steps against the CAPPED batch, so one
@@ -372,10 +372,10 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
     """
     from flash.core.spec import JobSpec
     from flash.cost.spec import runconfig_from_spec
-    from flash.providers.base import run_config_for_ranking
+    from flash.providers.core.base import run_config_for_ranking
 
     base = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "H100", "count": 1},
     }
@@ -411,7 +411,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
             )
             quoted = runconfig_from_spec(spec).normalized().batch_size
             ranked = (
-                run_config_for_ranking("Qwen/Qwen3.5-4B", algorithm, train=train)
+                run_config_for_ranking("Qwen/Qwen3.5-9B", algorithm, train=train)
                 .normalized()
                 .batch_size
             )
@@ -503,13 +503,13 @@ def test_allocator_ranking_narrows_a_vast_combination_it_is_pricing():
     nvlink curve, which is precisely the direction the module warns about: it lets a pcie
     combination win on scaling it does not deliver, then bills both cards for the longer wall.
     """
-    from flash.providers.allocator import _step_cost_ranker
-    from flash.providers.base import Candidate, run_config_for_ranking
+    from flash.providers.core.allocator import _step_cost_ranker
+    from flash.providers.core.base import Candidate, run_config_for_ranking
 
     # the defect's root: the config the allocator ranks with never names a provider.
-    assert run_config_for_ranking("Qwen/Qwen3.5-4B", "grpo").normalized().provider == "auto"
+    assert run_config_for_ranking("Qwen/Qwen3.5-9B", "grpo").normalized().provider == "auto"
 
-    key = _step_cost_ranker("Qwen/Qwen3.5-4B", "grpo", None, False, "")
+    key = _step_cost_ranker("Qwen/Qwen3.5-9B", "grpo", None, False, "")
     assert key is not None, "this model must be priceable, or the assertions below prove nothing"
 
     def at(provider, hourly=2.0):
@@ -551,7 +551,7 @@ def test_a_live_vast_allocation_is_requoted_without_nvlink_credit():
     from flash.cost.analytical import estimate_cost
     from flash.cost.types import RunConfig
 
-    config = RunConfig(model_id="Qwen/Qwen3.5-4B", method="grpo", steps=20)
+    config = RunConfig(model_id="Qwen/Qwen3.5-9B", method="grpo", steps=20)
     assert config.normalized().provider == "auto", "an auto run is the case that was mispriced"
 
     def quote(provider, gpu_count=2):
@@ -585,8 +585,8 @@ def test_sft_fit_credits_only_the_ranks_that_will_launch():
     rank with 24 GB and OOM'd on paid hardware. Allocating more cards must not be a way to pass a
     gate the executed run cannot pass.
     """
-    from flash.providers.allocator import _executed_gpu_count, _fits
-    from flash.providers.base import Candidate
+    from flash.providers.core.allocator import _executed_gpu_count, _fits
+    from flash.providers.core.base import Candidate
 
     need = 28.0
 
@@ -667,7 +667,7 @@ def test_sft_fit_credits_only_the_ranks_that_will_launch():
         train = {"prompts_per_step": prompts} | ({"group_size": group} if group else {})
         quoted = executed_gpu_count(
             RunConfig(
-                model_id="Qwen/Qwen3.5-4B",
+                model_id="Qwen/Qwen3.5-9B",
                 method=method,
                 steps=10,
                 batch_size=prompts,

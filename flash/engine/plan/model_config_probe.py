@@ -56,7 +56,7 @@ def _memoized_config_probe(model_id: str, revision: str) -> tuple:
     # imported through `vram` rather than from its defining module so the ~16 tests that
     # monkeypatch `vram.fetch_hf_model_geometry` still intercept this call.
     from flash.engine.plan import vram
-    from flash.envs.loader import is_commit_sha
+    from flash.envs.loading.loader import is_commit_sha
 
     key = (model_id, revision)
     cached = _CONFIG_PROBE_MEMO.get(key)

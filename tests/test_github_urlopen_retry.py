@@ -10,7 +10,7 @@ import urllib.request
 
 import pytest
 
-from flash.envs.loader import (
+from flash.envs.loading.loader import (
     GitHubRateLimitError,
     GitHubTransientError,
     GitHubUnavailableError,

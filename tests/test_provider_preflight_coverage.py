@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-import flash.providers.lambda_.preflight as lambda_preflight
-import flash.providers.runpod.preflight as runpod_preflight
-import flash.providers.vast.preflight as vast_preflight
+import flash.providers.lambda_.client.preflight as lambda_preflight
+import flash.providers.runpod.client.preflight as runpod_preflight
+import flash.providers.vast.client.preflight as vast_preflight
 
 
 @pytest.mark.parametrize("require_hf", [False, True])

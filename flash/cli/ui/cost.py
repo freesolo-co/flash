@@ -1,9 +1,6 @@
 """What cost to show for a run, and how sure we are of it.
 
-Split out of `flash.cli.ui.render` to keep that module under the file-size limit, the same way
-`flash.cli.ui.tables` was. Re-exported from `render`, so `render.run_cost(...)` and
-`render.SETTLED_COST_STATES` keep resolving for every call site and for the
-`monkeypatch.setattr(commands.render, ...)` seams the CLI tests use.
+This module is the canonical owner of run-cost selection.
 
 This module holds no rendering of its own: it decides the NUMBER and whether that number is soft.
 Turning either into styled text stays in `render`, which owns the palette.

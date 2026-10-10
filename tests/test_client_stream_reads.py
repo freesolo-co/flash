@@ -74,12 +74,96 @@ def test_chat_stream_reads_match_bytewise_utf8_chunks(
     response = response_type(payload)
     monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
 
-    chunks = list(ApiClient("http://test").chat_stream("run-a", []))
+    chunks = list(ApiClient("http://test").chat_stream("run-a/final", []))
 
     assert chunks == list(_decode_byte_by_byte(payload))
     assert "".join(chunks) == text
     assert response.calls
     assert all(call == (reader_name, read_size) for call in response.calls)
+
+
+def test_chat_stream_decodes_raw_openai_sse_for_cli_callers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = (
+        b'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"why"},"finish_reason":null}]}\n\n'
+        b'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":null}]}\n\n'
+        b'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+        b'data: {"id":"chatcmpl-1","choices":[],"usage":{"total_tokens":4}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    response = _Read1Response(payload)
+    response.headers = {"Content-Type": "Text/Event-Stream; Charset=UTF-8"}
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+
+    chunks = list(ApiClient("http://test").chat_stream("run-a/final", []))
+
+    assert "".join(chunks) == "<think>why</think>answer"
+
+
+def test_chat_stream_closes_reasoning_before_raising_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = (
+        b'data: {"choices":[{"delta":{"reasoning_content":"why"}}]}\n\n'
+        b'data: {"error":{"message":"engine failed"}}\n\n'
+        b"trailing bytes are not consumed"
+    )
+    response = _Read1Response(payload)
+    response.headers = {"Content-Type": "text/event-stream"}
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+    stream = ApiClient("http://test").chat_stream("run-a/final", [])
+    chunks = []
+
+    with pytest.raises(ClientError, match="engine failed"):
+        chunks.extend(stream)
+
+    assert "".join(chunks) == "<think>why</think>"
+
+
+def test_chat_stream_empty_reasoning_after_answer_does_not_reopen_thinking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = (
+        b'data: {"choices":[{"delta":{"reasoning_content":"why"}}]}\n\n'
+        b'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n'
+        b'data: {"choices":[{"delta":{"reasoning_content":""}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    response = _Read1Response(payload)
+    response.headers = {"Content-Type": "text/event-stream"}
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+
+    chunks = list(ApiClient("http://test").chat_stream("run-a/final", []))
+
+    assert "".join(chunks) == "<think>why</think>answer"
+
+
+@pytest.mark.parametrize("payload", [b"null", b"[]"])
+def test_chat_stream_rejects_non_object_sse_json(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+) -> None:
+    response = _Read1Response(b"data: " + payload + b"\n\ndata: [DONE]\n\n")
+    response.headers = {"Content-Type": "text/event-stream"}
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(ClientError, match="non-object openai sse payload"):
+        list(ApiClient("http://test").chat_stream("run-a/final", []))
+
+
+def test_chat_stream_rejects_complete_sse_eof_without_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+    response = _Read1Response(payload)
+    response.headers = {"Content-Type": "text/event-stream"}
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
+    stream = ApiClient("http://test").chat_stream("run-a/final", [])
+
+    assert next(stream) == "partial"
+    with pytest.raises(ClientError, match=r"terminal \[DONE\]"):
+        next(stream)
 
 
 def test_chat_stream_json_fallback_rejects_a_wrong_service_object(
@@ -91,7 +175,7 @@ def test_chat_stream_json_fallback_rejects_a_wrong_service_object(
     monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
 
     with pytest.raises(ClientError) as caught:
-        list(ApiClient("http://test").chat_stream("run-a", []))
+        list(ApiClient("http://test").chat_stream("run-a/final", []))
     assert "'choices'" in str(caught.value)
 
 
@@ -100,7 +184,7 @@ def test_chat_stream_without_read1_yields_before_full_body(
 ) -> None:
     response = _BlockingLargeReadResponse(b"first chunk")
     monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
-    stream = ApiClient("http://test").chat_stream("run-a", [])
+    stream = ApiClient("http://test").chat_stream("run-a/final", [])
 
     try:
         assert next(stream) == "f"
@@ -118,7 +202,7 @@ def test_chat_stream_yields_valid_prefix_before_unicode_error(
     monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
 
     expected = _collect_until_unicode_error(_decode_byte_by_byte(payload))
-    actual = _collect_until_unicode_error(ApiClient("http://test").chat_stream("run-a", []))
+    actual = _collect_until_unicode_error(ApiClient("http://test").chat_stream("run-a/final", []))
 
     assert actual == expected == list("visible prefix")
 
@@ -150,7 +234,7 @@ def test_chat_stream_truncated_body_raises_client_error(
     response = _TruncatedChunkedResponse(b"partial answer")
     monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: response)
 
-    stream = ApiClient("http://test").chat_stream("run-a", [])
+    stream = ApiClient("http://test").chat_stream("run-a/final", [])
     collected: list[str] = []
 
     def _drain() -> None:

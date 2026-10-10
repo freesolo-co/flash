@@ -1,127 +1,89 @@
-"""Run-execution machinery: the submit -> supervised training job -> GC flow.
-
-Sibling helpers are imported function-locally to avoid the flash.runner.__init__ import cycle
-and to keep monkeypatches reachable (``monkeypatch.setattr(runner, ...)`` vs a static copy).
-"""
+"""run-execution machinery for submission, supervision, and cleanup."""
 
 from __future__ import annotations
 
 import contextlib
 import os
 import time
-from dataclasses import dataclass
 
-from flash.core.spec import JobSpec, gpu_count_of, require_matching_seed
+from flash.core.spec import JobSpec, gpu_count_of
+from flash.runner.lifecycle.attempts import AttemptLaunchClaim
 
-# Floor so a streak of broken/busy GPUs doesn't kill a run that left retries enabled.
-# max_retries==0 (single-shot) is always respected; floor only applies when retries are on.
-INFRA_RETRY_FLOOR = 5
-INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error", "job_preempted"})
-RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 _STAGED_ENVIRONMENT_RETRY_S = 5.0
 
 
-class _SelectedQuoteUnaffordable(RuntimeError):
-    """The selected live candidate costs more than the owning organization can afford."""
+def _run_job_background(
+    spec: JobSpec,
+    runtime_secrets: dict[str, str] | None = None,
+    reserved_claim: AttemptLaunchClaim | None = None,
+) -> None:
+    """run a supervised job without leaking a daemon-thread traceback."""
+    import logging
 
+    from flash.runner.lifecycle.state import TERMINAL_STATES
+    from flash.runner.lifecycle.status import _update, get_status
 
-def _recheck_selected_quote_affordability(status, selected_quote: float, log) -> None:
-    """Recheck only a live quote that increases the amount accepted before allocation."""
-    accepted_quote = float(getattr(status, "estimated_cost_usd", 0.0) or 0.0)
-    if selected_quote <= accepted_quote:
-        return
-    context = getattr(status, "billing_context", None)
-    if not isinstance(context, dict):
-        return
-    org_id = str(context.get("org_id") or "").strip()
-    if not org_id:
-        return
-
-    from flash.server.platform.internal_client import internal_key
-
-    key = internal_key()
-    if not key:
-        return
     try:
-        from flash.server.billing.charges import precheck_training_run
-
-        precheck_training_run(internal_key=key, org_id=org_id, estimate_usd=selected_quote)
+        recovery = {"reserved_claim": reserved_claim} if reserved_claim is not None else {}
+        if runtime_secrets is not None:
+            _run_job(spec, runtime_secrets=runtime_secrets, **recovery)
+        else:
+            _run_job(spec, **recovery)
     except Exception as exc:
-        from flash.server.billing.charges import BillingError
-
-        if isinstance(exc, BillingError) and exc.status_code == 402:
-            raise _SelectedQuoteUnaffordable(
-                "selected live GPU quote exceeds the organization's available training balance"
-            ) from exc
-        print(
-            f"budget recheck skipped for selected quote (billing service error: {type(exc).__name__})",
-            file=log,
-            flush=True,
+        detail = f"{type(exc).__name__}: background run failed"
+        with contextlib.suppress(Exception):
+            if get_status(spec.run_id).state not in TERMINAL_STATES:
+                _update(spec.run_id, "failed", error=detail)
+        logging.getLogger(__name__).warning(
+            "background run %s ended in error: %s", spec.run_id, detail
         )
 
 
-@dataclass
-class _RetryBudget:
-    infra_retries: int
-    oom_retries: int
-    cache_fallbacks: int
-    infra_used: int = 0
-    oom_used: int = 0
-    cache_used: int = 0
-
-    @property
-    def max_attempts(self) -> int:
-        return 1 + self.infra_retries + self.oom_retries + self.cache_fallbacks
-
-    def infra_exhausted(self, *, cache_fallback_available: bool) -> bool:
-        return self.infra_used >= self.infra_retries and not cache_fallback_available
-
-    def can_retry(self, failure: str | None, *, cache_drop: bool) -> bool:
-        if failure not in RETRY_FAILURES:
-            return False
-        if cache_drop:
-            return self.cache_used < self.cache_fallbacks
-        if failure == "oom":
-            return self.oom_used < self.oom_retries
-        return self.infra_used < self.infra_retries
-
-    def record_retry(self, failure: str | None, *, cache_drop: bool) -> None:
-        if cache_drop:
-            self.cache_used += 1
-            return
-        if failure == "oom":
-            self.oom_used += 1
-        elif failure in INFRA_RETRY_FAILURES:
-            self.infra_used += 1
-
-
-def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> None:
-    from flash.content.multimodal import preflight_validate_image_opd
-
-    preflight_validate_image_opd(spec)
-
-    from flash.runner import (
-        RUNS_DIR,
-        TERMINAL_STATES,
-        _gc_run_endpoints,
-        _run_job_inner,
-        _update,
-        get_status,
-    )
-
-    # Cancel can land before this thread starts; don't overwrite a terminal state with provisioning.
-    if get_status(spec.run_id).state in TERMINAL_STATES:
+def _consume_reserved_claim(run_id: str, claim: AttemptLaunchClaim | None) -> None:
+    """Release a reserved claim this process will not launch. Idempotent and never raises."""
+    if claim is None:
         return
-    _update(spec.run_id, "provisioning")
-    log_path = os.path.join(RUNS_DIR, f"{spec.run_id}.log")
+    from flash.runner.lifecycle.attempts import consume_active_launch_claim
+
+    with contextlib.suppress(Exception):
+        consume_active_launch_claim(run_id, claim)
+
+
+def _run_job(
+    spec: JobSpec,
+    runtime_secrets: dict[str, str] | None = None,
+    reserved_claim: AttemptLaunchClaim | None = None,
+) -> None:
+    from flash.content.multimodal import preflight_validate_image_opd
+    from flash.runner.lifecycle.state import RUNS_DIR, TERMINAL_STATES
+    from flash.runner.lifecycle.status import _update, get_status
+    from flash.runner.supervise.lifecycle import _run_job_inner
+    from flash.runner.supervise.recovery import _gc_run_endpoints
+
+    # setup runs inside the cleanup scope: a raise from the opd preflight, the status read, or the
+    # provisioning update is caught by `_run_job_background`, which cannot consume the claim itself.
+    # an unconsumed claim holds its flock for the process lifetime and reads as live to every
+    # observer, so handleless recovery refuses to resume a run nobody is working on.
     try:
+        preflight_validate_image_opd(spec)
+
+        # Cancel can land before this thread starts; don't overwrite a terminal state with provisioning.
+        if get_status(spec.run_id).state in TERMINAL_STATES:
+            return
+        _update(spec.run_id, "provisioning")
+        log_path = os.path.join(RUNS_DIR, f"{spec.run_id}.log")
         while True:
             try:
-                _run_job_inner(spec, log_path, runtime_secrets=runtime_secrets)
+                _run_job_inner(
+                    spec,
+                    log_path,
+                    runtime_secrets=runtime_secrets,
+                    reserved_claim=reserved_claim,
+                )
                 break
             except Exception as exc:
-                from flash.envs.staged import StagedEnvironmentTransientError
-                from flash.runner import _load_run_deadline_at
+                from flash.envs.loading.staged import StagedEnvironmentTransientError
+                from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
                 if not isinstance(exc, StagedEnvironmentTransientError):
                     raise
@@ -145,6 +107,10 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
                     )
                 time.sleep(min(_STAGED_ENVIRONMENT_RETRY_S, remaining))
     finally:
+        # every exit before the supervised submit -- staging deadline exhaustion, a transient staging
+        # failure that turned terminal, or any raise out of _run_job_inner -- leaves the reserved claim
+        # unconsumed. consuming is idempotent, so the submission path's own release stays authoritative.
+        _consume_reserved_claim(spec.run_id, reserved_claim)
         # gc registered endpoints because undeleted endpoints count against the account-wide worker quota.
         # skip when the run is still non-terminal: another live supervisor then owns the durable handle,
         # and reaping here would tear down its still-active provider resources.
@@ -181,7 +147,7 @@ def _drop_weight_cache(spec: JobSpec) -> JobSpec:
     Only drops the platform-managed shared cache (WEIGHT_CACHE_VOLUME_NAME); a custom per-org
     network_volume is the user's own choice and is preserved across retries.
     """
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
     if getattr(spec.gpu, "network_volume", None) != WEIGHT_CACHE_VOLUME_NAME:
         return spec
@@ -190,29 +156,26 @@ def _drop_weight_cache(spec: JobSpec) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-def _submit_seed_supervised(
+def _run_attempts_supervised(
     spec: JobSpec,
-    seed: int,
     log,
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
-    attempt_start: int = 0,
+    reserved_claim: AttemptLaunchClaim | None = None,
 ) -> dict:
-    """Run one seed with bounded auto-retry on infra-shaped failures.
+    """Run one run's attempts with bounded auto-retry on infra-shaped failures.
 
     Retries resume from the latest HF checkpoint on a fresh host. Genuine worker errors fail fast.
     ``attempt_start`` offsets persisted identities without expanding this invocation's retry budget.
     """
-    seed = require_matching_seed(spec, seed)
-    from flash.runner.supervise.seed_submission import submit_seed_supervised
+    from flash.runner.supervise.attempt_supervision import run_attempts_supervised
 
-    return submit_seed_supervised(
+    return run_attempts_supervised(
         spec,
-        seed,
         log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
-        attempt_start=attempt_start,
+        reserved_claim=reserved_claim,
     )
 
 
@@ -226,7 +189,7 @@ def _terminal_failure_detail(exc: BaseException) -> str:
     plane-side credential indistinguishable from a bad spec, since both surfaced as a bare
     `RuntimeError: run failed`.
     """
-    from flash.server.domain.teacher_broker import TeacherBrokerConfigurationError
+    from flash.server.domain.teacher.broker import TeacherBrokerConfigurationError
 
     if isinstance(exc, TeacherBrokerConfigurationError):
         return f"{type(exc).__name__}: {exc}"
@@ -237,21 +200,20 @@ def _run_job_inner(
     spec: JobSpec,
     log_path: str,
     runtime_secrets: dict[str, str] | None = None,
+    reserved_claim: AttemptLaunchClaim | None = None,
 ) -> None:
-    from flash.runner import (
-        _load_run_deadline_at,
-        _run_training,
-        _RunCancelled,
-        _update,
-        get_status,
-        stage_environment_package,
-    )
+    from flash.runner.accounting.artifacts import stage_environment_package
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+    from flash.runner.lifecycle.status import _update, get_status
+    from flash.runner.supervise.errors import _RunCancelled
+    from flash.runner.supervise.lifecycle import _run_training
 
     try:
         # dev replaced the explicit code upload with managed source snapshots, so staging only has
         # to pin the environment package before the provider is allocated. the staged package rides
-        # into the persisted snapshot at the per-attempt persist in `_submit_seed_supervised`, which
-        # already runs after this with the fully planned spec -- persisting a second time here would
+        # into the persisted snapshot at the per-attempt persist in `_run_attempts_supervised`,
+        # which already runs after this with the fully planned spec -- persisting a second time
+        # here would
         # hash a half-planned spec no later integrity check can reproduce.
         deadline_at = _load_run_deadline_at(spec.run_id)
         spec = stage_environment_package(spec, deadline_at=deadline_at)
@@ -261,11 +223,12 @@ def _run_job_inner(
                 log,
                 prior_cost=0.0,
                 runtime_secrets=runtime_secrets,
+                reserved_claim=reserved_claim,
             )
     except _RunCancelled:
         return  # cancel_run already set the terminal state
     except Exception as exc:
-        from flash.envs.staged import StagedEnvironmentTransientError
+        from flash.envs.loading.staged import StagedEnvironmentTransientError
 
         if isinstance(exc, StagedEnvironmentTransientError):
             raise
@@ -281,29 +244,23 @@ def _run_training(
     prior_cost: float,
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
-    attempt_start: int = 0,
+    reserved_claim: AttemptLaunchClaim | None = None,
 ) -> None:
-    """Train the run's single adapter under supervision; finalize the run.
-
-    Shared by a fresh submit and post-restart recovery (the worker resumes from its last HF
-    checkpoint on a fresh allocation). ``prior_cost`` carries spend already booked before a
-    recovery so the total isn't under-reported. ``attempt_start`` preserves globally monotonic
-    worker identities while each invocation keeps its own bounded retry budget."""
-    from flash.runner import (
-        TERMINAL_STATES,
+    """Train one adapter while preserving run-global attempt authorization and cost."""
+    from flash.runner.accounting.costs import _status_estimated_charge
+    from flash.runner.lifecycle.state import TERMINAL_STATES, artifacts_dir
+    from flash.runner.lifecycle.status import (
         _persist_metrics,
-        _RunCancelled,
-        _status_estimated_charge,
-        _submit_seed_supervised,
         _update,
-        artifacts_dir,
         get_status,
         source_snapshot_from_status,
         validate_terminal_source_metrics,
     )
+    from flash.runner.supervise.errors import _RunCancelled
+    from flash.runner.supervise.lifecycle import _run_attempts_supervised
 
     if spec.algorithm == "opd":
-        from flash.server.domain.teacher_broker import preflight_validate_managed_teacher
+        from flash.server.domain.teacher.broker import preflight_validate_managed_teacher
 
         preflight_validate_managed_teacher(spec)
     status = get_status(spec.run_id)
@@ -326,19 +283,19 @@ def _run_training(
         file=log,
         flush=True,
     )
-    metrics = _submit_seed_supervised(
+    metrics = _run_attempts_supervised(
         spec,
-        spec.seed,
         log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
-        attempt_start=attempt_start,
+        reserved_claim=reserved_claim,
     )
     metrics, verified_attempt = validate_terminal_source_metrics(get_status(spec.run_id), metrics)
     # measured wall x $/hr is recorded in metrics.json for analytics, but is not what we charge.
     measured_cost = prior_cost + _persist_metrics(spec, metrics)
-    # The customer is charged the submit-time QUOTE, not measured wall. Legacy runs without a
-    # persisted quote are re-priced from the spec, falling back only for old/unpriceable records.
+    # full planned work is charged at the submit-time quote, never measured wall. a worker that
+    # finishes fewer optimizer steps pays the matching estimated-work fraction; legacy records
+    # without a completed-step metric preserve the quote exactly.
     charge_usd = _status_estimated_charge(get_status(spec.run_id), spec, fallback=measured_cost)
     # A cancel can land while this thread writes metrics — after the supervised late-cancel check.
     # Re-read before the terminal "done" so a late worker success doesn't resurrect a cancelled run.
@@ -375,17 +332,12 @@ from flash.runner.supervise.recovery import (  # noqa: E402,F401
     _adopt_completed_attempt,
     _apply_charge_with_state,
     _await_runpod_completed_metrics,
-    _candidate_usable_vram_gb,
     _canonical_provider_handle,
     _charge_completed_run_by_id,
     _completed_attempt_metrics,
     _CompletedAttemptPending,
-    _oom_escalated,
-    _projected_retry_class,
     _register_checkpoints_best_effort,
     _runpod_completed_metrics,
-    _select_candidate,
-    _shape_key,
     _strict_teardown_handle,
     _worker_provably_gone,
 )

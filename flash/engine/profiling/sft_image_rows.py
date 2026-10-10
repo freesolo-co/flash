@@ -11,6 +11,7 @@ from flash.content.multimodal import (
     decode_image_descriptors,
     messages_with_decoded_images,
 )
+from flash.content.thinking import messages_for_chat_template
 from flash.engine.profiling.image_tokens import (
     ImageGeometry,
     ImageProfileValidationState,
@@ -98,12 +99,14 @@ def estimate_sft_image_row(
     thinking: bool,
 ) -> tuple[list[int], list[int], bytes, int, bool]:
     """count the exact processor token ids without constructing image tensors."""
-    full_messages = [*prompt_messages, *completion_messages]
+    normalized_prompt = messages_for_chat_template(prompt_messages)
+    normalized_completion = messages_for_chat_template(completion_messages)
+    full_messages = [*normalized_prompt, *normalized_completion]
     rendered_probe = reject_rendered_message_token(
         tokenizer,
         full_messages,
         IMAGE_PAD_TOKEN,
-        template_kwargs={"enable_thinking": thinking},
+        template_kwargs={"enable_thinking": thinking, "preserve_thinking": False},
     )
     try:
         pad_token_id = _registered_token_id(tokenizer, IMAGE_PAD_TOKEN)
@@ -127,6 +130,7 @@ def estimate_sft_image_row(
                 return_dict=True,
                 add_generation_prompt=add_generation_prompt,
                 enable_thinking=thinking,
+                preserve_thinking=False,
             )
         )["input_ids"]
         return expand_image_pad_runs(_ids(rendered), pad_token_id, pad_counts)
@@ -134,7 +138,7 @@ def estimate_sft_image_row(
     untruncated_ids = token_ids(full_messages, add_generation_prompt=False)
     untruncated_length = len(untruncated_ids)
     input_ids = untruncated_ids[:max_length]
-    prompt_ids = token_ids(prompt_messages, add_generation_prompt=True)[:max_length]
+    prompt_ids = token_ids(normalized_prompt, add_generation_prompt=True)[:max_length]
     # the same narrowing the processor path applies. the quote has to agree with what training will
     # actually supervise: leaving the contiguous mask here would count the environment's replies as
     # supervised tokens the worker then masks away, and report a step budget for a different run.
@@ -142,12 +146,12 @@ def estimate_sft_image_row(
         completion_mask_from_ids(prompt_ids, input_ids),
         input_ids,
         tokenizer,
-        completion_messages,
+        normalized_completion,
         # this path appends nothing of its own, so there is no appended EOS to preserve.
         appended_eos=False,
         template_source=tokenizer,
         source_messages=full_messages,
-        template_kwargs={"enable_thinking": thinking},
+        template_kwargs={"enable_thinking": thinking, "preserve_thinking": False},
         rendered_probe=rendered_probe,
     )
     return input_ids, mask, b"", untruncated_length, role_aware
@@ -166,19 +170,23 @@ def process_sft_image_row(
     """tokenize one image row through the real processor and serialize its tensors."""
     images = cast("list[Any]", decode_image_descriptors(descriptors, package_root))
     try:
-        prepared_prompt = messages_with_decoded_images(prompt_messages, images)
-        full_messages = [*prepared_prompt, *completion_messages]
+        prepared_prompt = messages_for_chat_template(
+            messages_with_decoded_images(prompt_messages, images)
+        )
+        normalized_completion = messages_for_chat_template(completion_messages)
+        full_messages = [*prepared_prompt, *normalized_completion]
         rendered_probe = reject_rendered_message_token(
             processor,
             full_messages,
             IMAGE_PAD_TOKEN,
-            template_kwargs={"enable_thinking": thinking},
+            template_kwargs={"enable_thinking": thinking, "preserve_thinking": False},
         )
         common = {
             "tokenize": True,
             "return_dict": True,
             "return_tensors": "pt",
             "enable_thinking": thinking,
+            "preserve_thinking": False,
         }
         full = dict(
             processor.apply_chat_template(
@@ -205,12 +213,12 @@ def process_sft_image_row(
             completion_mask_from_ids(prompt_ids, input_ids),
             input_ids,
             getattr(processor, "tokenizer", processor),
-            completion_messages,
+            normalized_completion,
             # this path appends nothing of its own, so there is no appended EOS to preserve.
             appended_eos=False,
             template_source=processor,
             source_messages=full_messages,
-            template_kwargs={"enable_thinking": thinking},
+            template_kwargs={"enable_thinking": thinking, "preserve_thinking": False},
             rendered_probe=rendered_probe,
         )
         full.pop("attention_mask", None)

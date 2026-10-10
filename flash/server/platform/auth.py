@@ -11,6 +11,7 @@ import urllib.request
 from concurrent.futures import Future
 from typing import Any
 
+from flash._internal.http import _urlopen_no_redirect
 from flash.server.platform import db
 
 INTERNAL_KEY_ENV = "FREESOLO_INTERNAL_KEY"
@@ -19,6 +20,7 @@ FREESOLO_BASE_URL_ENV = "FREESOLO_BASE_URL"
 DEFAULT_FREESOLO_BASE_URL = "https://api.freesolo.co"
 
 STANDALONE_ENV = "FLASH_STANDALONE"
+STANDALONE_SERVING_ORG_ID = "flash-standalone"
 _VERIFY_TIMEOUT_S = 5.0
 _VERIFY_CACHE_TTL_S = 300.0
 # Short negative TTL: a transient backend 401 shouldn't lock out a valid key for 5 min.
@@ -161,6 +163,15 @@ def standalone() -> bool:
     return (os.environ.get(STANDALONE_ENV) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def serving_org_id(org_id: str | None) -> str:
+    """return the explicit tenant or the stable standalone serving scope."""
+
+    normalized = (org_id or "").strip()
+    if normalized:
+        return normalized
+    return STANDALONE_SERVING_ORG_ID if standalone() else ""
+
+
 def _freesolo_verify(token: str) -> bool:
     """Verify a token against the freesolo backend; network errors return False, never raise."""
     if not token or len(token) > _MAX_TOKEN_LEN:
@@ -186,13 +197,16 @@ def _freesolo_verify(token: str) -> bool:
         identity: dict[str, Any] = {}
         cache_result = True
         try:
-            with urllib.request.urlopen(req, timeout=_VERIFY_TIMEOUT_S) as resp:
+            with _urlopen_no_redirect(req, timeout=_VERIFY_TIMEOUT_S) as resp:
                 verified = resp.status == 200
                 if verified:
                     identity = _identity_from_verify_body(_response_body(resp))
         except urllib.error.HTTPError as exc:
-            # treat 5xx/429 as transient and do not cache them.
-            if exc.code >= 500 or exc.code == 429:
+            # treat 5xx/429 as transient and do not cache them. a 3xx is transient for a different
+            # reason: `_urlopen_no_redirect` raises it instead of following the hop, so the backend
+            # never judged this token at all. caching that as a negative would keep a valid key
+            # failing for the whole negative TTL after the redirect condition is gone.
+            if exc.code >= 500 or exc.code == 429 or 300 <= exc.code < 400:
                 cache_result = False
             verified = False
         except (OSError, ValueError):

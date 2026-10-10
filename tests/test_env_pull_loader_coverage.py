@@ -1,4 +1,4 @@
-"""Extra coverage for `flash.envs.pull` and `flash.envs.loader`.
+"""Extra coverage for `flash.envs.loading.pull` and `flash.envs.loading.loader`.
 
 Focuses on branches the existing env-pull suites don't reach: path-safety
 validation, destination-availability guards, oversized/malformed package
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from flash.envs import loader, pull
+from flash.envs.loading import loader, pull
 from flash.envs.package.limits import LimitedArchiveReader
 from flash.envs.package.unpack import extract_validated_archive_members
 
@@ -66,7 +66,7 @@ def test_extract_validated_archive_members_public_boundary(tmp_path: Path) -> No
     assert not (tmp_path / "filtered.txt").exists()
 
 
-# --- flash.envs.pull ------------------------------------------------------------------
+# --- flash.envs.loading.pull ------------------------------------------------------------------
 
 
 def test_safe_repo_relative_path_normalizes_and_rejects():
@@ -147,7 +147,7 @@ def test_pull_into_empty_dir_then_overwrite_nonempty_with_force(tmp_path):
     assert not (busy_dest / "stale.txt").exists()
 
 
-# --- flash.envs.loader ----------------------------------------------------------------
+# --- flash.envs.loading.loader ----------------------------------------------------------------
 
 
 def test_normalize_env_path_variants():

@@ -72,16 +72,11 @@ def grad_checkpointing_on(
 
 
 def _is_gdn_hybrid_family(model_id: str) -> bool:
-    """Offline family check for a Qwen3.5/3.6 GatedDeltaNet hybrid (no network/config probe).
-
-    Every catalog model is a Qwen3.5/3.6 GDN hybrid today, so this currently answers True for all of
-    them -- but the False branch is deliberately kept for the first non-Qwen entry someone adds when
-    forking to extend the catalog, which is the supported way to add a model. Kept as a string check
-    so ``grpo_use_reentrant`` stays pure and hermetic (callable at config-build time, unit-testable
-    without HF access).
-    """
+    """Minimal offline fallback for an uncataloged Qwen GatedDeltaNet fork."""
     mid = (model_id or "").lower()
-    return any(token in mid for token in ("qwen3.5", "qwen3_5", "qwen3.6", "qwen3_6"))
+    return any(
+        token in mid for token in ("qwen3.5", "qwen3_5", "qwen3.6", "qwen3_6", "qwen3.8", "qwen3_8")
+    )
 
 
 def grpo_use_reentrant(model_id: str) -> bool:
@@ -97,7 +92,7 @@ def grpo_use_reentrant(model_id: str) -> bool:
     - MoE (Qwen3.6-35B-A3B): the router re-dispatches tokens on recompute, so the grouped
       expert-buffer shapes differ (forward expert-dispatch tokens 28192 vs recompute 3524 ==
       group_size x). This is what #429 fixed.
-    - GDN hybrids (Qwen3.5/3.6 dense): FlashAttention-2 varlen-unpad on the full-attention layers,
+    - GDN hybrids (Qwen3.5/3.6/3.8): FlashAttention-2 varlen-unpad on the full-attention layers,
       the fused GatedDeltaNet chunk-scan on the linear-attention layers, and the fused Triton
       kernels each save shape-/data-dependent tensors that the non-reentrant metadata-equality check
       can't positionally reconcile (live-confirmed on Qwen3.5-0.8B GRPO / RTX 4090: forward packed
@@ -112,6 +107,6 @@ def grpo_use_reentrant(model_id: str) -> bool:
     from flash.core.catalog import MODELS
 
     info = MODELS.get(model_id)
-    if info is not None and info.is_moe:
-        return True
+    if info is not None:
+        return info.is_moe or info.num_linear_attention_layers > 0
     return _is_gdn_hybrid_family(model_id)

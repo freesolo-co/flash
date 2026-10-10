@@ -32,7 +32,7 @@ class _FakeResponse:
 
 def _capture_urlopen(monkeypatch, responses):
     """Mock urlopen; returns the list of (method, url, body_dict, auth_header) captured."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     calls = []
     seq = iter(responses)
@@ -57,7 +57,7 @@ def _capture_urlopen(monkeypatch, responses):
 
 
 def test_api_key_env_only(monkeypatch):
-    from flash.providers.vast.api import _CLIENT, VastApiError
+    from flash.providers.vast.client.api import _CLIENT, VastApiError
 
     monkeypatch.delenv("VAST_API_KEY", raising=False)
     with pytest.raises(VastApiError, match="VAST_API_KEY"):
@@ -67,7 +67,7 @@ def test_api_key_env_only(monkeypatch):
 
 
 def test_search_offers_query_shape(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(monkeypatch, [{"offers": [{"id": 1}]}])
@@ -95,7 +95,7 @@ def test_search_offers_query_shape(monkeypatch):
 
 
 def test_search_offers_applies_exact_gpu_names_server_side(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(monkeypatch, [{"offers": []}])
@@ -115,7 +115,7 @@ def test_search_offers_applies_duration_filter(monkeypatch):
     # offer. When min_duration_seconds is set, the search adds Vast's documented `duration` filter
     # (seconds, "available at least this long from now") in the same operator-dict form as the other
     # numeric filters; 0/unset leaves it off.
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(monkeypatch, [{"offers": []}, {"offers": []}])
@@ -126,7 +126,7 @@ def test_search_offers_applies_duration_filter(monkeypatch):
 
 
 def test_request_retries_5xx_and_429_then_succeeds(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(monkeypatch, [_http_error(503), _http_error(429), {"ok": True}])
@@ -135,7 +135,7 @@ def test_request_retries_5xx_and_429_then_succeeds(monkeypatch):
 
 
 def test_request_4xx_raises_immediately_without_provider_body(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(monkeypatch, [_http_error(400, b'{"msg": "no such ask"}')])
@@ -147,7 +147,7 @@ def test_request_4xx_raises_immediately_without_provider_body(monkeypatch):
 
 
 def test_create_instance_success_and_rejection(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(
@@ -178,7 +178,7 @@ def test_create_instance_success_and_rejection(monkeypatch):
 
 @pytest.mark.parametrize("status", [404, 410])
 def test_create_instance_non_2xx_explicit_false_is_rejected(monkeypatch, status):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(
@@ -206,7 +206,7 @@ def test_create_instance_non_2xx_explicit_false_is_rejected(monkeypatch, status)
     ],
 )
 def test_create_instance_non_2xx_uncertain_response_is_ambiguous(monkeypatch, status, body):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [_http_error(status, body)])
@@ -229,7 +229,7 @@ def test_create_instance_non_2xx_contradictory_response_is_ambiguous(monkeypatch
     # exist and bill, so it must be ambiguous even when the id is unparseable.
     import json as _json
 
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     body = _json.dumps({"success": False, "new_contract": contract}).encode()
@@ -254,7 +254,7 @@ def test_create_instance_non_2xx_long_false_body_is_still_rejected(monkeypatch):
     # structured metadata, so a long definitive rejection must still classify as rejected.
     import json as _json
 
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     body = _json.dumps({"success": False, "error": "x" * 800}).encode()
@@ -275,7 +275,7 @@ def test_create_instance_non_2xx_long_false_body_is_still_rejected(monkeypatch):
 def test_create_instance_missing_key_is_not_sent(monkeypatch):
     # a missing api key raises locally before any http request: the create was provably never
     # sent, so it must surface as an actionable config error, not a possibly-billed create.
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.delenv("VAST_API_KEY", raising=False)
     kwargs = {
@@ -306,7 +306,7 @@ def test_create_instance_missing_key_is_not_sent(monkeypatch):
     ],
 )
 def test_create_instance_malformed_response_is_ambiguous(monkeypatch, body):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [body])
@@ -327,7 +327,7 @@ def test_create_instance_malformed_response_is_ambiguous(monkeypatch, body):
 def test_create_instance_diagnostics_never_render_opaque_response_body(monkeypatch):
     import traceback
 
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     private = "opaque-private-sentinel-7f3c"
@@ -372,7 +372,7 @@ def test_create_instance_is_not_retried(monkeypatch):
     """Fix #4: ``PUT /asks/{id}`` is non-idempotent (each success rents a NEW instance),
     so a transient failure must NOT be blindly retried — a retry on a timeout where Vast
     already accepted the first request would double-provision (a billing leak)."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     # First call raises a transient 503; if create were retried it would hit the second
@@ -399,7 +399,7 @@ def test_create_instance_unreadable_response_is_ambiguous(monkeypatch):
     # IncompleteRead — neither an OSError, so the _http retry wrapper doesn't catch/wrap them) must
     # surface as a VastApiError the walk classifies AMBIGUOUS, NOT escape raw past
     # deploy_and_submit's `except VastApiError` and leak the contract.
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     monkeypatch.setattr(vast_api.time, "sleep", lambda s: None)
@@ -460,7 +460,7 @@ def test_create_instance_unparseable_new_contract_is_ambiguous(monkeypatch):
     # bare int() ValueError here would escape past deploy_and_submit's ``except VastApiError`` and skip
     # the ambiguous-create reconcile (leaking the contract). It must surface as a VastApiError the walk
     # classifies AMBIGUOUS, exactly like a ``success`` body that carried no contract id at all.
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     kwargs = {
@@ -480,7 +480,7 @@ def test_create_instance_unparseable_new_contract_is_ambiguous(monkeypatch):
 
 
 def test_get_instance_none_on_404(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [_http_error(404)])
@@ -491,7 +491,7 @@ def test_get_instance_reraises_non_404_with_404ish_body(monkeypatch):
     # a non-404 4xx whose body embeds an id like "4040" must NOT be misread as a
     # disappearance/preemption. get_instance keys off the chained HTTPError status (is_not_found),
     # not a bare "404" substring, so this raises instead of returning None.
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     private_body = "bad request for instance 4040"
@@ -509,7 +509,7 @@ def test_get_instance_raises_on_success_false_envelope(monkeypatch):
     # NOT be returned as instance detail — the poller would read it as a live-but-"unknown" instance
     # (.get("actual_status") is None) and RESET its missing-streak, masking a real disappearance. It
     # raises so the poll loop counts it as a bounded, retryable poll_error instead of a false read.
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     private_key = "opaque_provider_key_sentinel"
@@ -528,7 +528,7 @@ def test_get_instance_raises_on_success_false_envelope(monkeypatch):
 def test_get_instance_returns_dict_and_gone_signal(monkeypatch):
     # The success:false raise is narrow: a real {"instances": {...}} detail still returns the inst,
     # and the {"instances": null} "gone" signal still returns None (not an error).
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [{"instances": {"id": 5, "actual_status": "running"}}])
@@ -542,7 +542,7 @@ def test_create_error_is_ambiguous_classification():
     # success:false rejection, local not-sent failure) permit walking to another offer.
     # representative untyped errors stand in for the http/socket/decode failures that used to
     # be cause-inspected — all of them must stay ambiguous because the request may have landed.
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     def err(cause=None, msg="x"):
         e = vast_api.VastApiError(msg)
@@ -569,7 +569,7 @@ def test_create_error_is_ambiguous_classification():
 
 
 def test_destroy_instance_never_raises(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [{"success": True}])
@@ -580,7 +580,7 @@ def test_destroy_instance_never_raises(monkeypatch):
 
 def test_destroy_instance_respects_success_flag(monkeypatch):
     """only explicit success:true confirms deletion; explicit false remains unconfirmed."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [{"success": True}])
@@ -603,7 +603,7 @@ def test_destroy_instance_respects_success_flag(monkeypatch):
     ],
 )
 def test_destroy_instance_malformed_response_is_unconfirmed(monkeypatch, body):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [body, {"instances": {"id": 5, "actual_status": "running"}}])
@@ -611,7 +611,7 @@ def test_destroy_instance_malformed_response_is_unconfirmed(monkeypatch, body):
 
 
 def test_destroy_instance_exact_followup_can_confirm_absence(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(monkeypatch, [{}, {"instances": None}])
@@ -620,7 +620,7 @@ def test_destroy_instance_exact_followup_can_confirm_absence(monkeypatch):
 
 
 def test_destroy_instance_followup_error_envelope_is_unconfirmed(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [{}, {"instances": None, "detail": "lookup failed"}])
@@ -628,7 +628,7 @@ def test_destroy_instance_followup_error_envelope_is_unconfirmed(monkeypatch):
 
 
 def test_destroy_instance_unreadable_body_is_unconfirmed(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     class _UnreadableResponse:
         def read(self):
@@ -662,7 +662,7 @@ def test_destroy_instance_unreadable_body_is_unconfirmed(monkeypatch):
 
 
 def test_destroy_instance_permission_failure_is_unconfirmed(monkeypatch):
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(monkeypatch, [_http_error(403, b'{"detail":"forbidden"}')])
@@ -675,7 +675,7 @@ def test_destroy_instance_404_is_confirmed_gone(monkeypatch):
     a CONFIRMED non-billing state, so destroy_instance reports True. Otherwise the retry loop's
     pre-launch destroy would raise "unconfirmed teardown" on an already-gone box and fail the run
     instead of retrying. A non-404 4xx whose body merely embeds "404" stays unconfirmed (False)."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [_http_error(404)] * 3)
@@ -690,7 +690,7 @@ def test_list_instances_paginates_every_page(monkeypatch):
     `next_token` as `after_token`; `next_token` is null on the last page). list_instances must walk
     EVERY page — a flash orphan on a later page would otherwise never be seen by adoption / destroy /
     sweep and bill forever."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(
@@ -711,7 +711,7 @@ def test_list_instances_returns_partial_on_later_page_error(monkeypatch):
     """A LATER page failing must not discard pages already fetched — adoption/teardown/
     sweep should still act on what we saw (a single-page list would have). A FIRST-page failure has
     nothing useful, so it re-raises and the callers' existing try/except skips, exactly as before."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     # page 1 ok, page 2 errors after exhausting retries -> partial list of page 1
@@ -731,7 +731,7 @@ def test_list_instances_strict_raises_on_truncated_listing(monkeypatch):
     for this run remains") must NOT accept a partial page set — an unseen later page could hide the very
     instance it is ruling out. strict=True raises on ANY incompleteness instead of returning a truncated
     list, so the caller treats it as "could not confirm" (and defers) rather than a false clear."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     # page 1 ok, page 2 errors: the LENIENT default returns partial, but strict must RAISE.
@@ -751,7 +751,7 @@ def test_list_instances_strict_rejects_non_list_instances_page(monkeypatch):
     with no `next_token`) must NOT fall through as a complete empty page in strict mode — a strict caller
     would read it as 'no instance remains' and act on that false clear. strict raises; the lenient
     default still treats it as an (empty) page so the best-effort sweeps are unchanged."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     _capture_urlopen(monkeypatch, [{"success": False}])  # no 'instances' list, no next_token
@@ -764,7 +764,7 @@ def test_list_instances_strict_rejects_non_list_instances_page(monkeypatch):
 
 def test_search_offers_num_gpus_threads_into_query(monkeypatch):
     """num_gpus > 1 filters to multi-card hosts; the default (1) is exercised elsewhere."""
-    from flash.providers.vast import api as vast_api
+    from flash.providers.vast.client import api as vast_api
 
     monkeypatch.setenv("VAST_API_KEY", "vk-test")
     calls = _capture_urlopen(monkeypatch, [{"offers": [{"id": 1}]}])

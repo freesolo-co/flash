@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from flash.envs import cache_security
-from flash.envs import loader as adapter
+from flash.envs.loading import loader as adapter
+from flash.envs.meta import cache_security
 
 
 def _make_private_cache_root(root: Path) -> None:
@@ -38,7 +38,7 @@ def test_cache_config_ignores_ambient_overrides(tmp_path):
     script = (
         "import os; "
         "from pathlib import Path; "
-        "from flash.envs import loader; "
+        "from flash.envs.loading import loader; "
         "assert loader._CACHE_ROOT == Path(os.environ['EXPECTED_CACHE_ROOT']), "
         "loader._CACHE_ROOT; "
         "assert loader._CACHE_MAX_ENTRIES == 32; "

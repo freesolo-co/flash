@@ -914,7 +914,7 @@ class _LedgerBrokerTransport:
 
     def urlopen(self, request, *, timeout):
         del timeout
-        from flash.server.domain import teacher_broker
+        from flash.server.domain.teacher import broker as teacher_broker
 
         request_id = dict(request.header_items())["X-flash-teacher-request-id"]
         self.request_ids.append(request_id)
@@ -963,7 +963,7 @@ def _parasail_success():
 
 @pytest.fixture
 def broker_ledger(monkeypatch, tmp_path):
-    from flash.server.domain import teacher_broker
+    from flash.server.domain.teacher import broker as teacher_broker
     from flash.server.platform import db
 
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "server.db"))
@@ -1027,7 +1027,7 @@ def _ledger_row(request_id):
 
 def test_provider_500_is_terminal_and_never_redispatches(broker_ledger, monkeypatch):
     from flash.engine.worker.teacher import client as worker_teacher
-    from flash.server.domain import teacher_broker
+    from flash.server.domain.teacher import broker as teacher_broker
 
     dispatches = []
 
@@ -1056,7 +1056,7 @@ def test_provider_500_is_terminal_and_never_redispatches(broker_ledger, monkeypa
 
 def test_provider_429_is_retried_with_bounded_backoff(broker_ledger, monkeypatch):
     from flash.engine.worker.teacher import client as worker_teacher
-    from flash.server.domain import teacher_broker
+    from flash.server.domain.teacher import broker as teacher_broker
 
     outcomes = [(429, b"rate limited"), (429, b"rate limited"), (200, _parasail_success())]
     dispatches = []
@@ -1094,7 +1094,7 @@ def test_rate_limit_survives_a_stripped_error_body(broker_ledger, monkeypatch):
     the body stripped on the first attempt.
     """
     from flash.engine.worker.teacher import client as worker_teacher
-    from flash.server.domain import teacher_broker
+    from flash.server.domain.teacher import broker as teacher_broker
 
     outcomes = [(429, b"rate limited"), (200, _parasail_success())]
     dispatches = []
@@ -1154,7 +1154,7 @@ def _worker_client_after_http_error(monkeypatch, *, status, reason, body):
 )
 def test_bodyless_terminal_409_fails_closed_without_retry(monkeypatch, ledger_code):
     from flash.engine.worker.teacher import client as worker_teacher
-    from flash.server.domain import teacher_broker
+    from flash.server.domain.teacher import broker as teacher_broker
     from flash.server.platform import db
 
     broker_error = teacher_broker._map_ledger_error(
@@ -1179,7 +1179,7 @@ def test_bodyless_terminal_409_fails_closed_without_retry(monkeypatch, ledger_co
 
 def test_bodyless_request_in_progress_409_fails_closed(monkeypatch):
     from flash.engine.worker.teacher import client as worker_teacher
-    from flash.server.domain import teacher_broker
+    from flash.server.domain.teacher import broker as teacher_broker
     from flash.server.platform import db
 
     broker_error = teacher_broker._map_ledger_error(
@@ -1242,7 +1242,7 @@ def test_stripped_ambiguous_5xx_stays_terminal_and_never_redispatches(
     twice, so an ambiguous status must remain terminal even though the body is gone.
     """
     from flash.engine.worker.teacher import client as worker_teacher
-    from flash.server.domain import teacher_broker
+    from flash.server.domain.teacher import broker as teacher_broker
 
     dispatches = []
 
@@ -1278,7 +1278,7 @@ def test_ambiguous_provider_transport_failure_is_terminal_without_redispatch(
     broker_ledger, monkeypatch
 ):
     from flash.engine.worker.teacher import client as worker_teacher
-    from flash.server.domain import teacher_broker
+    from flash.server.domain.teacher import broker as teacher_broker
 
     dispatches = []
 
@@ -1314,7 +1314,7 @@ def test_lost_worker_response_replays_the_succeeded_result_without_a_second_bill
     broker_ledger, monkeypatch
 ):
     from flash.engine.worker.teacher import client as worker_teacher
-    from flash.server.domain import teacher_broker
+    from flash.server.domain.teacher import broker as teacher_broker
 
     dispatches = []
 
@@ -1343,7 +1343,7 @@ def test_lost_worker_response_replays_the_succeeded_result_without_a_second_bill
 
 def test_provider_401_rejection_stays_permanent_and_never_retries(broker_ledger, monkeypatch):
     from flash.engine.worker.teacher import client as worker_teacher
-    from flash.server.domain import teacher_broker
+    from flash.server.domain.teacher import broker as teacher_broker
 
     dispatches = []
 
@@ -1389,7 +1389,7 @@ def test_rate_limit_survives_a_proxy_substituted_error_body(
     """
     del label
     from flash.engine.worker.teacher import client as worker_teacher
-    from flash.server.domain import teacher_broker
+    from flash.server.domain.teacher import broker as teacher_broker
 
     outcomes = [(429, b"rate limited"), (200, _parasail_success())]
     dispatches = []
@@ -1419,7 +1419,7 @@ def test_proxy_body_that_does_classify_permanent_is_still_obeyed(broker_ledger, 
     terminal on a status the bodyless fallback would otherwise rescue.
     """
     from flash.engine.worker.teacher import client as worker_teacher
-    from flash.server.domain import teacher_broker
+    from flash.server.domain.teacher import broker as teacher_broker
 
     dispatches = []
 

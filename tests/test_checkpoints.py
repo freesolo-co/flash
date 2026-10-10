@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.engine.worker.io.hf as worker_hf
 from flash.core.spec import JobSpec
 from flash.runner.results.checkpoints import (
     CheckpointListingError,
@@ -20,7 +21,7 @@ from flash.runner.results.checkpoints import (
 _PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 
 SPEC_DICT = {
-    "model": "Qwen/Qwen3.5-4B",
+    "model": "Qwen/Qwen3.5-9B",
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/test-runs"},
@@ -54,20 +55,20 @@ class _RecordingHfApi:
 
 
 def _prime_worker(monkeypatch, recorder, *, repo="org/test-runs", phase="rl", run="flash-ckpt-1"):
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
-    monkeypatch.setattr(worker, "HF_REPO", repo)
-    monkeypatch.setattr(worker, "PHASE", phase)
-    monkeypatch.setattr(worker, "RUN_ID", run)
-    monkeypatch.setattr(worker, "SEED", 0)
-    monkeypatch.setattr(worker, "hf_api", lambda: recorder)
-    # heartbeat would otherwise commit to HF; silence it for the unit test.
-    monkeypatch.setattr(worker, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(worker._worker_state, "HF_REPO", repo)
+    monkeypatch.setattr(worker._worker_state, "PHASE", phase)
+    monkeypatch.setattr(worker._worker_state, "RUN_ID", run)
+    monkeypatch.setattr(worker._worker_state, "SEED", 0)
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: recorder)
+    # heartbeat would otherwise commit to hf; silence it for the unit test.
+    monkeypatch.setattr(worker._worker_heartbeat, "heartbeat", lambda *a, **k: None)
     return worker
 
 
 def test_publish_deployable_checkpoint_uploads_adapter_only(tmp_path, monkeypatch):
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
@@ -96,14 +97,14 @@ def test_publish_deployable_checkpoint_writes_base_model_provenance(tmp_path, mo
     # base-model provenance sidecar, sourced from the job spec's pinned base model, before uploading.
     import json
 
-    import flash.engine.worker as worker
     import flash.engine.worker.io.hf as hf
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
     commit = "e" * 40
     monkeypatch.setattr(
-        worker, "JOB_SPEC", SimpleNamespace(model="org/base", model_revision="main")
+        worker._worker_state, "JOB_SPEC", SimpleNamespace(model="org/base", model_revision="main")
     )
     monkeypatch.setattr(hf, "resolve_cached_model_commit", lambda model_id, revision: commit)
     ckpt = tmp_path / "checkpoint-80"
@@ -127,11 +128,11 @@ def test_publish_deployable_checkpoint_writes_base_model_provenance(tmp_path, mo
 def test_publish_deployable_checkpoint_without_job_spec_writes_no_provenance(tmp_path, monkeypatch):
     # back-compat: with no JOB_SPEC (e.g. local recipe runs) publish writes no base_model_provenance.json
     # rather than a misleading empty record, and still publishes the deployable (provenance is additive).
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
-    monkeypatch.setattr(worker, "JOB_SPEC", None, raising=False)
+    monkeypatch.setattr(worker._worker_state, "JOB_SPEC", None, raising=False)
     ckpt = tmp_path / "checkpoint-80"
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")
@@ -147,12 +148,15 @@ def test_publish_deployable_checkpoint_with_empty_model_writes_no_provenance(tmp
     # #542 finding: the guard mirrors the final-save path (write only for a non-empty base model), so a
     # JOB_SPEC with no model stamps no sidecar rather than a misleading empty-model_id record, and still
     # publishes the deployable.
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
     monkeypatch.setattr(
-        worker, "JOB_SPEC", SimpleNamespace(model="", model_revision=""), raising=False
+        worker._worker_state,
+        "JOB_SPEC",
+        SimpleNamespace(model="", model_revision=""),
+        raising=False,
     )
     ckpt = tmp_path / "checkpoint-80"
     ckpt.mkdir()
@@ -166,7 +170,7 @@ def test_publish_deployable_checkpoint_with_empty_model_writes_no_provenance(tmp
 
 
 def test_publish_deployable_checkpoint_rejects_bin_weights(tmp_path, monkeypatch):
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
@@ -181,7 +185,7 @@ def test_publish_deployable_checkpoint_rejects_bin_weights(tmp_path, monkeypatch
 
 def test_publish_deployable_checkpoint_skips_without_adapter(tmp_path, monkeypatch):
     """A checkpoint that carries no PEFT adapter is never advertised as deployable."""
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
@@ -195,7 +199,7 @@ def test_publish_deployable_checkpoint_skips_without_adapter(tmp_path, monkeypat
 
 def test_publish_deployable_checkpoint_skips_config_without_weights(tmp_path, monkeypatch):
     """A checkpoint with adapter_config.json but no weights file isn't loadable -> not published."""
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
@@ -208,7 +212,7 @@ def test_publish_deployable_checkpoint_skips_config_without_weights(tmp_path, mo
 
 
 def test_publish_deployable_checkpoint_no_repo_is_noop(tmp_path, monkeypatch):
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec, repo="")  # local run, no HF repo
@@ -221,11 +225,11 @@ def test_publish_deployable_checkpoint_no_repo_is_noop(tmp_path, monkeypatch):
 
 
 def test_publish_deployable_checkpoint_starts_no_upload_at_deadline(tmp_path, monkeypatch):
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
     _prime_worker(monkeypatch, rec)
-    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: 0.0)
+    monkeypatch.setattr(worker._worker_state, "_remaining_worker_wall_seconds", lambda: 0.0)
     ckpt = tmp_path / "checkpoint-5"
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")
@@ -455,7 +459,7 @@ _CKPTS = [
 
 
 def test_register_run_checkpoints_body_shape(monkeypatch):
-    import flash.server.domain.checkpoints as ck
+    import flash.server.domain.registry.checkpoints as ck
 
     captured = {}
     monkeypatch.setattr(
@@ -469,7 +473,7 @@ def test_register_run_checkpoints_body_shape(monkeypatch):
     body = captured["body"]
     assert body["orgId"] == "org-xyz"
     assert body["runId"] == "flash-ckpt-1"
-    assert body["baseModel"] == "Qwen/Qwen3.5-4B"
+    assert body["baseModel"] == "Qwen/Qwen3.5-9B"
     assert body["repoId"] == "org/test-runs"
     assert body["repoType"] == "dataset"
     # the receiver requires an explicit project and 422s the batch without one.
@@ -483,7 +487,7 @@ def test_register_run_checkpoints_body_shape(monkeypatch):
 def test_register_run_checkpoints_requires_a_project(monkeypatch):
     # a run whose spec carries no project must fail loudly here rather than posting a body the
     # backend rejects as a 422 that the best-effort wrapper would swallow.
-    import flash.server.domain.checkpoints as ck
+    import flash.server.domain.registry.checkpoints as ck
 
     posted = []
     monkeypatch.setattr(ck, "_post_checkpoints", lambda **kw: posted.append(kw) or {})
@@ -498,7 +502,7 @@ def test_register_run_checkpoints_requires_a_project(monkeypatch):
 
 
 def test_register_run_checkpoints_requires_org():
-    import flash.server.domain.checkpoints as ck
+    import flash.server.domain.registry.checkpoints as ck
 
     with pytest.raises(ValueError, match="org id"):
         ck.register_run_checkpoints(
@@ -511,8 +515,8 @@ def test_register_run_checkpoints_requires_org():
 def test_register_run_checkpoints_falls_back_to_platform_context(monkeypatch):
     # Internal/operator runs carry org only in platform_context (billing_context is None):
     # registration must still scope rows to that org. _run_org_id falls back to billing-then-platform
-    # (same order as routes/serving.py::_run_org; NOT run_registry, which is platform-first).
-    import flash.server.domain.checkpoints as ck
+    # (same order as routes/serving.py::_run_org; NOT runs, which is platform-first).
+    import flash.server.domain.registry.checkpoints as ck
 
     captured = {}
     monkeypatch.setattr(
@@ -527,7 +531,7 @@ def test_register_run_checkpoints_falls_back_to_platform_context(monkeypatch):
 
 
 def test_best_effort_noop_without_internal_key(monkeypatch):
-    import flash.server.domain.checkpoints as ck
+    import flash.server.domain.registry.checkpoints as ck
 
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     # Even if HF had checkpoints, no internal key => skip persistence (HF stays source of truth).
@@ -536,7 +540,7 @@ def test_best_effort_noop_without_internal_key(monkeypatch):
 
 
 def test_best_effort_registers(monkeypatch):
-    import flash.server.domain.checkpoints as ck
+    import flash.server.domain.registry.checkpoints as ck
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
     monkeypatch.setattr(ck, "list_checkpoints", lambda spec: _CKPTS)
@@ -553,7 +557,7 @@ def test_best_effort_swallows_backend_failure(monkeypatch):
     import io
     import urllib.error
 
-    import flash.server.domain.checkpoints as ck
+    import flash.server.domain.registry.checkpoints as ck
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
     monkeypatch.setattr(ck, "list_checkpoints", lambda spec: _CKPTS)
@@ -575,7 +579,7 @@ def test_best_effort_skips_silently_when_no_org(monkeypatch):
     # listing on an expected-skip run.
     import io
 
-    import flash.server.domain.checkpoints as ck
+    import flash.server.domain.registry.checkpoints as ck
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
     listed = {"called": False}
@@ -598,7 +602,7 @@ def test_best_effort_skips_silently_when_no_org(monkeypatch):
 
 
 def test_best_effort_no_checkpoints(monkeypatch):
-    import flash.server.domain.checkpoints as ck
+    import flash.server.domain.registry.checkpoints as ck
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
     monkeypatch.setattr(ck, "list_checkpoints", lambda spec: [])
@@ -618,23 +622,23 @@ def _finalize_src(module_name: str, fn_name: str) -> str:
 
 
 def test_run_rl_publishes_final_step_as_deployable_checkpoint():
-    src = _finalize_src("flash.engine.worker.rl_train", "run_rl_train")
+    src = _finalize_src("flash.engine.worker.train.entry.rl_train", "run_rl_train")
     # Warm-start CONTINUES the one adapter in place, so the saved adapter already carries SFT+GRPO on
     # the original catalog base and deploys as-is: the final adapter is uploaded as the default and
     # published as the deployable checkpoint directly — no recombine step.
     assert "save_pretrained(adapter_dir)" in src
-    assert '_w.hf_upload_folder(adapter_dir, "adapter", required=True)' in src
-    assert "_w.publish_deployable_checkpoint(adapter_dir, steps_run)" in src
+    assert '_worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True)' in src
+    assert "_worker_hf.publish_deployable_checkpoint(adapter_dir, steps_run)" in src
 
 
 def test_run_sft_publishes_final_step_as_deployable_checkpoint():
     # The invariant lives in the verl worker, which owns the whole SFT path; `run_sft` is a one-line
     # delegation to it. Asserting on the delegator's source would pass on any body at all, so this
     # follows the wiring to where the adapter is actually exported and published.
-    src = _finalize_src("flash.engine.worker.sft_train", "run_sft_train")
+    src = _finalize_src("flash.engine.worker.train.entry.sft_train", "run_sft_train")
     assert "_export_checkpoint_adapter(" in src
-    assert '_w.hf_upload_folder(adapter_dir, "adapter", required=True)' in src
-    assert "_w.publish_deployable_checkpoint(adapter_dir, final_step)" in src
+    assert '_worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True)' in src
+    assert "_worker_hf.publish_deployable_checkpoint(adapter_dir, final_step)" in src
 
 
 def test_worker_io_modules_only_reference_attributes_their_siblings_define():

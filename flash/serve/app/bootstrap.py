@@ -8,11 +8,12 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from flash.serve.request.tool_calls import qualified_tool_parser
 from flash.serve.runtime import AdapterSpec, EngineConfig, VllmLoraRuntime
 
 from .manifest import ManifestAdapter, ServingManifest
 from .materialize import locked_manifest_cache
-from .progress import emit_boot_progress
+from .progress import emit_boot_progress, emit_filesystem_usage
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +96,7 @@ def engine_config_from_manifest(manifest: ServingManifest) -> EngineConfig:
         mm_processor_cache_gb=identity.mm_processor_cache_gb,
         enable_tower_connector_lora=identity.enable_tower_connector_lora,
         reasoning_parser=identity.reasoning_parser,
+        tool_parser=qualified_tool_parser(manifest.logical_base_model),
         engine_args=named_args,
         tokenizer_kwargs=dict(manifest.tokenizer_kwargs),
         processor_kwargs=dict(manifest.processor_kwargs),
@@ -112,8 +114,7 @@ async def bootstrap_serving(
 
     `on_engine_death` is forwarded to the runtime so a dead vllm engine core can take the
     container down with it. without a handler the runtime only records the death and the http
-    process stays bound, answering 503 forever, and neither the modal container nor the runpod
-    pod is ever replaced.
+    process stays bound, answering 503 forever, and the provider container is never replaced.
     """
 
     config = engine_config_from_manifest(manifest)
@@ -131,16 +132,17 @@ async def bootstrap_serving(
                 revision=manifest.engine.model_revision,
             )
             await runtime.start()
+            emit_filesystem_usage("engine-constructed", cache_root)
             emit_boot_progress(
                 "engine-constructed",
                 model=manifest.engine.served_model,
                 revision=manifest.engine.model_revision,
             )
-            revisions: dict[str, PublishedAdapter] = {}
+            checkpoints: dict[str, PublishedAdapter] = {}
             for adapter in manifest.adapters:
-                path = paths[adapter.adapter_revision]
+                path = paths[adapter.checkpoint_id]
                 spec = AdapterSpec(
-                    adapter_id=adapter.adapter_revision,
+                    adapter_id=adapter.checkpoint_id,
                     path=str(path),
                     incarnation=adapter.aggregate_sha256,
                     thinking=adapter.thinking_default,
@@ -151,20 +153,14 @@ async def bootstrap_serving(
                     ),
                 )
                 await runtime.register_adapter(spec)
-                revisions[adapter.adapter_revision] = PublishedAdapter(
-                    requested_model=adapter.adapter_revision,
+                checkpoints[adapter.checkpoint_id] = PublishedAdapter(
+                    requested_model=adapter.checkpoint_id,
                     adapter=adapter,
                 )
-            emit_boot_progress("adapters-registered", count=len(revisions))
-        published = dict(revisions)
-        for alias, revision in manifest.aliases.items():
-            target = revisions[revision]
-            published[alias] = PublishedAdapter(
-                requested_model=alias,
-                adapter=target.adapter,
-            )
-        owner._models = MappingProxyType(dict(sorted(published.items())))
+            emit_boot_progress("adapters-registered", count=len(checkpoints))
+        owner._models = MappingProxyType(dict(sorted(checkpoints.items())))
         owner._ready = True
+        emit_filesystem_usage("serving-ready", cache_root)
         return owner
     except BaseException:
         await owner.close()

@@ -1,0 +1,111 @@
+"""Mirror a run's deployable training checkpoints to the freesolo backend.
+
+The worker streams each step's LoRA adapter to the run's HF repo; HF is the source of truth
+for what's deployable. This module persists that list to the backend's ``run_checkpoints``
+store so the dashboard/SDK can enumerate a run's checkpoints without crawling HF, and so a
+cancelled run's checkpoints survive in one queryable place.
+
+Like ``flash.server.billing.charges``, the POST is authenticated with the operator INTERNAL key (the
+control plane never persists a user's freesolo key) and carries the org id persisted WITH the
+run — ``billing_context`` for user runs, THEN ``platform_context`` for internal/operator runs
+(the submit-path order). That billing-then-platform precedence is the canonical
+``_internal_client.run_org_id`` (NOT ``runs._context_from_status``, which prefers
+``platform_context`` first). Unlike billing, checkpoint persistence is
+STRICTLY best-effort: a failure here must never disturb a run or a deploy, so the public entry
+point swallows everything. Internal/operator runs with no org attribution at all are skipped
+quietly (HF stays the source of truth) — only genuine backend failures warn."""
+
+from __future__ import annotations
+
+import json
+
+from flash._internal.http import _urlopen_no_redirect
+from flash.core.spec import require_project_id
+from flash.runner.results.checkpoints import list_checkpoints
+from flash.server.platform.internal_client import (
+    DEFAULT_TIMEOUT_S,
+    build_internal_request,
+    internal_key,
+    run_org_id,
+)
+
+_RECORD_PATH = "/api/runs/internal/checkpoints"
+
+
+def _post_checkpoints(*, token: str, body: dict) -> dict:
+    """POST the checkpoint batch to the backend; raise on any non-2xx/unreachable."""
+    req = build_internal_request(_RECORD_PATH, body, token=token)
+    with _urlopen_no_redirect(req, timeout=DEFAULT_TIMEOUT_S) as resp:
+        raw = resp.read()
+    try:
+        return json.loads(raw or b"{}")
+    except ValueError:
+        return {}
+
+
+def register_run_checkpoints(*, internal_key: str, status, checkpoints: list[dict]) -> dict:
+    """Upsert ``checkpoints`` for one run into the backend store (idempotent by run_id+step).
+
+    Pulls the org id from the run's persisted context (``billing_context`` then
+    ``platform_context``, via :func:`run_org_id`) and the project from the run's persisted
+    spec. Raises ``ValueError`` when there's nothing to record, no org id, or no valid
+    project; raises ``urllib`` errors through on a backend failure —
+    ``register_checkpoints_best_effort`` is the guarded wrapper most callers use."""
+    if not checkpoints:
+        raise ValueError("no checkpoints to record")
+    org_id = run_org_id(status)
+    if not org_id:
+        raise ValueError("missing org id for run checkpoints")
+    spec = status.spec or {}
+    # the receiver requires an explicit project and rejects the batch without one, so
+    # resolve it from the run's own spec rather than letting the post fail as a 422.
+    try:
+        project_id = require_project_id(spec.get("project"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"missing project id for run checkpoints: {exc}") from exc
+    first = checkpoints[0]
+    body = {
+        "orgId": org_id,
+        "projectId": project_id,
+        "runId": status.run_id,
+        "baseModel": spec.get("model"),
+        "repoId": first.get("repo_id"),
+        "repoType": first.get("repo_type", "dataset"),
+        "checkpoints": [{"step": c["step"], "subfolder": c["subfolder"]} for c in checkpoints],
+    }
+    return _post_checkpoints(token=internal_key, body=body)
+
+
+def register_checkpoints_best_effort(status, *, log=None) -> int:
+    """Mirror deployable checkpoints to the backend; returns count submitted, never raises."""
+
+    def _log(msg: str) -> None:
+        print(msg, file=log, flush=True) if log is not None else print(msg)
+
+    token = internal_key()  # already whitespace-stripped; None when unset/blank
+    if not token:
+        return 0  # local/dev control plane: HF still has the checkpoints
+    try:
+        # run_id + hf_repo are platform-managed and stripped from the public spec; read the
+        # authoritative values from the internal worker-spec carrier (see _internal_spec_from_status).
+        from flash.runner.lifecycle.state import _internal_spec_from_status
+
+        spec = _internal_spec_from_status(status)
+    except Exception as exc:
+        _log(f"[ckpt] register skipped ({status.run_id}): bad spec: {exc}")
+        return 0
+    if not run_org_id(status):
+        # Internal/operator run with no org attribution: nothing to scope the rows to. Skip
+        # quietly BEFORE the HF listing — HF stays the source of truth — so an expected-skip run
+        # does no unnecessary network work and emits no `[ckpt] list warn` noise.
+        return 0
+    checkpoints = list_checkpoints(spec)
+    if not checkpoints:
+        return 0
+    try:
+        register_run_checkpoints(internal_key=token, status=status, checkpoints=checkpoints)
+    except (ValueError, OSError) as exc:
+        _log(f"[ckpt] backend register warn ({status.run_id}): {exc}")
+        return 0
+    _log(f"[ckpt] registered {len(checkpoints)} checkpoint(s) for {status.run_id}")
+    return len(checkpoints)

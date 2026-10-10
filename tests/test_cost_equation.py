@@ -7,7 +7,7 @@ import dataclasses
 
 from flash.cost import RunConfig, estimate_cost
 from flash.cost.types import CostEstimate
-from flash.providers.base import GPU_INFO
+from flash.providers.core.base import GPU_INFO
 
 
 def test_no_output_multiplier_field():

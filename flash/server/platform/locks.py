@@ -32,7 +32,7 @@ class _RunLock:
             return False
         fd: int | None = None
         try:
-            from flash.runner import RUNS_DIR, runs_file_path
+            from flash.runner.lifecycle.state import RUNS_DIR, runs_file_path
 
             os.makedirs(RUNS_DIR, exist_ok=True)
             fd = os.open(

@@ -20,13 +20,17 @@ from flash.engine.profiling.sft_workload import prepare_sft_workload
 from flash.engine.profiling.tokenizer import load_control_plane_tokenizer
 from flash.engine.worker.entry.sft import select_sft_examples
 from flash.engine.worker.model.packing import worker_image_packing_support
-from flash.envs.base import with_system_prompt
-from flash.envs.dataset_selection import (
+from flash.envs.loading.base import with_system_prompt
+from flash.envs.loading.loader import (
+    _load_contract_text,
+    _resolve_environment_reference,
+    _resolve_path_arg,
+)
+from flash.envs.meta.dataset_selection import (
     _packaged_dataset_file,
     _validate_packaged_dataset_split,
     select_dataset_source,
 )
-from flash.envs.loader import _load_contract_text, _resolve_environment_reference, _resolve_path_arg
 
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
@@ -51,7 +55,7 @@ class _RawRecordEnvironment:
     def prompt_messages(self, row: dict[str, Any]) -> list[dict[str, Any]]:
         # the worker never reads the raw input itself: it builds a TaskExample, whose .input the sdk
         # has already rendered through serialize_value, and the scaffolded env puts exactly that
-        # string in one user turn (flash/envs/adapter.py:_task_example). so call the sdk here too
+        # string in one user turn (flash/envs/loading/adapter.py:_task_example). so call the sdk here too
         # rather than restating its rules. str() would tokenize a python repr, and reading a
         # message-shaped input as a transcript would quote a prompt the sdk never produces.
         from freesolo.datasets.records import task_example_from_record

@@ -17,10 +17,10 @@ from pathlib import Path
 import pytest
 
 from flash._internal.channel import CLI_NAME
-from flash.cli.commands.env import push as envpush
-from flash.cli.commands.env.push import cmd_env_pull
-from flash.envs import loader as adapter
-from flash.envs.pull import environment_local_dirname
+from flash.cli.commands.env.ops import push as envpush
+from flash.cli.commands.env.ops.push import cmd_env_pull
+from flash.envs.loading import loader as adapter
+from flash.envs.loading.pull import environment_local_dirname
 
 _TOP = "freesolo-co-environment-hub-deadbeef"
 
@@ -246,7 +246,7 @@ def _parse_as_cli(command: str) -> Namespace:
     A hint is only useful if pasting it back works, so assert against the parser the user would
     actually hit rather than against the string we happened to build.
     """
-    from flash.cli import _build_parser
+    from flash.cli.parsing.main import _build_parser
 
     argv = _split_as_shell(command)
     assert argv[:3] == [CLI_NAME, "env", "pull"], argv

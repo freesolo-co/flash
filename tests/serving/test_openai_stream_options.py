@@ -28,7 +28,7 @@ def test_hosted_chat_rejects_malformed_stream_options_before_generation(
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": "qa",
+                "model": "qa/final",
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": stream,
                 "stream_options": stream_options,
@@ -45,7 +45,7 @@ def test_hosted_chat_rejects_malformed_stream_options_before_generation(
 def test_hosted_chat_accepts_absent_or_null_stream_options(stream_options: object) -> None:
     pool = FakePool()
     payload = {
-        "model": "qa",
+        "model": "qa/final",
         "messages": [{"role": "user", "content": "hello"}],
     }
     if stream_options is not ...:

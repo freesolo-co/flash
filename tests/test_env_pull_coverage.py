@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-import flash.envs.pull as pull
+import flash.envs.loading.pull as pull
 
 
 def _source(tmp_path: Path, files: dict[str, str]) -> Path:

@@ -1,24 +1,19 @@
-"""Deploy, cancel, and recover run state transitions.
-
-Keep ``flash.runner`` imports function-local to avoid its import cycle and preserve package-level
-monkeypatch seams such as ``flash.runner._gc_run_endpoints``.
-"""
+"""deploy, cancel, and recover run state transitions."""
 
 from __future__ import annotations
 
 import contextlib
 import math
-import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from flash.core.spec import JobSpec
-from flash.schema import format_adapter_revision, parse_adapter_revision
+from flash.schema import parse_checkpoint_ref
 
 if TYPE_CHECKING:
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
 
 # reads the TOP-LEVEL `status.state`, where `deployed` is a live value this build writes.
 _FINAL_DEPLOYMENT_STATES = frozenset({"done", "deployed"})
@@ -29,9 +24,6 @@ _RESTORABLE_DEPLOYMENT_STATES = frozenset({"ready"})
 _DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 _REVOCATION_RETRY_STATE = "revocation_failed"
 _INACTIVE_DEPLOYMENT_STATES = frozenset({"undeployed", "dry_run"})
-_ATTACH_RECONCILE_INTERVAL_S = 120.0
-_ATTACH_RECONCILING: set[str] = set()
-_ATTACH_RECONCILING_LOCK = threading.Lock()
 
 
 class DeploymentRevocationError(RuntimeError):
@@ -48,7 +40,6 @@ class DeploymentRevocationError(RuntimeError):
 
 _BackendOutcome = Literal["confirmed", "not_required", "not_attempted"]
 _BACKEND_OUTCOMES = frozenset({"confirmed", "not_required", "not_attempted"})
-_UNKNOWN_ALIAS_UNCHECKED = object()
 
 
 class DeploymentStatePersistenceError(RuntimeError):
@@ -78,29 +69,6 @@ class DeploymentStatePersistenceError(RuntimeError):
         self.retryable = True
 
 
-def _carry_allocation_stamp(metrics: dict, remote: dict | None) -> None:
-    """Carry the persisted allocation stamp onto adopted metrics.
-
-    Workers do not know the allocator's card, count, or provider. Recovery must restore all three or
-    multi-card Vast/Lambda runs are priced as one RunPod card. ``setdefault`` preserves worker data.
-    """
-    if not isinstance(metrics, dict) or not isinstance(remote, dict):
-        return
-    allocated_gpu = remote.get("allocated_gpu")
-    if allocated_gpu:
-        metrics.setdefault("allocated_gpu", allocated_gpu)
-    allocated_count = remote.get("allocated_gpu_count")
-    if allocated_count:
-        metrics.setdefault("allocated_gpu_count", int(allocated_count))
-    # the substrate that billed the run. `_gpu_rate` falls back to whichever configured provider
-    # offers the class, which on a multi-provider plane is normally RunPod -- so an adopted lambda
-    # or vast run is otherwise priced at RunPod's rate and its notes name the wrong provider.
-    # `provider` is required on a persisted JobHandle, so it is always present here.
-    provider = remote.get("provider")
-    if provider:
-        metrics.setdefault("allocated_provider", provider)
-
-
 def _deployment_state_and_requires_revocation(
     deployment: object,
 ) -> tuple[str | None, bool]:
@@ -121,61 +89,28 @@ def _is_preservable_checkpoint_deployment(run_id: str, deployment: object) -> bo
     if state not in _RESTORABLE_DEPLOYMENT_STATES:
         return False
     checkpoint_step = deployment.get("checkpoint_step")
-    if (
-        isinstance(checkpoint_step, bool)
-        or not isinstance(checkpoint_step, int)
-        or checkpoint_step < 0
+    if isinstance(checkpoint_step, bool) or (
+        checkpoint_step is not None
+        and (not isinstance(checkpoint_step, int) or checkpoint_step < 0)
     ):
         return False
-    revision = deployment.get("adapter_revision")
-    if not isinstance(revision, str):
+    checkpoint_id = deployment.get("checkpoint_id")
+    parsed = parse_checkpoint_ref(checkpoint_id) if isinstance(checkpoint_id, str) else None
+    if parsed is None or parsed[0] != run_id or parsed[1] != checkpoint_step:
         return False
-    parsed_revision = parse_adapter_revision(revision)
-    if parsed_revision is None:
-        return False
-    revision_run_id, revision_step, hf_revision = parsed_revision
-    if revision_step is None:
-        return False
-    canonical_revision = format_adapter_revision(revision_run_id, revision_step, hf_revision)
-    if (
-        revision != canonical_revision
-        or revision_run_id != run_id
-        or revision_step != checkpoint_step
-    ):
-        return False
-    from flash.runner.results.verified_revisions import read_verified_adapter_revisions
+    from flash.runner.results.verified_revisions import read_verified_checkpoints
 
     try:
-        return revision in read_verified_adapter_revisions(run_id)
+        return checkpoint_id in read_verified_checkpoints(run_id)
     except Exception:
         return False
 
 
-def _preservable_checkpoint_deployment(
-    run_id: str,
-    deployment: object,
-    *,
-    live_alias_target: object = _UNKNOWN_ALIAS_UNCHECKED,
-) -> dict | None:
-    if not isinstance(deployment, dict):
-        return None
-    if deployment.get("activation_outcome_unknown"):
-        if live_alias_target is _UNKNOWN_ALIAS_UNCHECKED:
-            return None
-        predecessor = deployment.get("previous_deployment")
-        if (
-            isinstance(predecessor, dict)
-            and predecessor.get("adapter_revision") == live_alias_target
-            and _is_preservable_checkpoint_deployment(run_id, predecessor)
-        ):
-            return dict(predecessor)
-        return None
+def _preservable_checkpoint_deployment(run_id: str, deployment: object) -> dict | None:
+    """return the current exact verified checkpoint when it can survive cancellation."""
+
     if _is_preservable_checkpoint_deployment(run_id, deployment):
         return dict(deployment)
-    if deployment.get("state") in {"queued", "smoke_testing"}:
-        predecessor = deployment.get("previous_deployment")
-        if _is_preservable_checkpoint_deployment(run_id, predecessor):
-            return dict(predecessor)
     return None
 
 
@@ -200,7 +135,8 @@ class _CancellationFence:
         self.attempted = False
 
     def persist(self) -> None:
-        from flash.runner import TERMINAL_STATES, _update, get_status
+        from flash.runner.lifecycle.state import TERMINAL_STATES
+        from flash.runner.lifecycle.status import _update, get_status
 
         if self.attempted:
             return
@@ -231,13 +167,10 @@ def _clear_remote_if_unchanged(run_id: str, expected_remote: dict) -> bool:
     Compare-and-clear under the status guard: a racing write that installed a DIFFERENT remote must
     keep it, or the run loses the only handle to a live billing resource.
     """
-    from flash.runner import (
-        _remote_resource_identity,
-        _report_status,
-        _save_status_unlocked,
-        _status_guard,
-        get_status,
-    )
+    from flash.runner.accounting.reconciliation import _remote_resource_identity
+    from flash.runner.lifecycle.reporting import _report_status
+    from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
+    from flash.runner.lifecycle.status import get_status
 
     expected_identity = _remote_resource_identity(expected_remote)
     if expected_identity is None:
@@ -262,7 +195,7 @@ def _drain_confirmed_cleanup(run_id: str) -> set[tuple]:
     A record still present after the drain was NOT confirmed, so it is left for a later attempt;
     only records that disappeared are reported, and each has its status entry cleared.
     """
-    from flash.runner import (
+    from flash.runner.accounting.reconciliation import (
         _cleanup_remote_key,
         _drain_cleanup_remotes,
         _remote_resource_identity,
@@ -298,8 +231,8 @@ def _teardown_or_preserve_remote(run_id: str, remote: dict) -> bool:
     instead, so a leaked box stays addressable. Failing to record either is a hard error, since
     that would lose the only handle to a billing resource.
     """
-    from flash.providers.base import JobHandle
-    from flash.runner import _record_cleanup_remote
+    from flash.providers.core.base import JobHandle
+    from flash.runner.accounting.reconciliation import _record_cleanup_remote
     from flash.runner.supervise.lifecycle import _strict_teardown_handle
 
     try:
@@ -327,7 +260,8 @@ def _teardown_persisted_remotes(
     Stops on the first remote that could not be confirmed torn down, unless the status has since
     moved to a different one -- an already-confirmed identity is cleared without a second teardown.
     """
-    from flash.runner import _remote_resource_identity, get_status
+    from flash.runner.accounting.reconciliation import _remote_resource_identity
+    from flash.runner.lifecycle.status import get_status
 
     processed_remote_identities = set()
     while True:
@@ -359,93 +293,24 @@ class _ContendedFence:
     predecessor_recommitted: bool = False
 
 
-def _restore_contended_predecessor(
-    run_id: str,
-    predecessor: dict,
-    fenced_deployment: dict | None,
-) -> bool:
-    """Try to recommit the verified predecessor over the fenced attempt.
-
-    Returns whether the predecessor is now the authoritative deployment AND the only verified
-    revision. On failure, re-fence so no unverified attempt is left looking serveable.
-    """
-    from flash.runner import (
-        get_status,
-        mark_checkpoint_deployed,
-        mark_deployment_revocation_failed,
-        read_verified_adapter_revisions,
-        verified_adapter_revision_generation,
-    )
-
-    recommitted = False
-    if fenced_deployment is not None:
-        try:
-            restored_status = mark_checkpoint_deployed(
-                run_id,
-                predecessor,
-                verification_generation=verified_adapter_revision_generation(run_id),
-                owner_deployment=fenced_deployment,
-                retain_only_revision=True,
-            )
-            predecessor_revision = predecessor.get("adapter_revision")
-            recommitted = (
-                restored_status.deployment == predecessor
-                and isinstance(predecessor_revision, str)
-                and _is_preservable_checkpoint_deployment(run_id, restored_status.deployment)
-                and read_verified_adapter_revisions(run_id) == frozenset({predecessor_revision})
-            )
-        except Exception:
-            recommitted = False
-    if recommitted:
-        return True
-    current = get_status(run_id)
-    current_deployment = current.deployment if isinstance(current.deployment, dict) else {}
-    still_fenced = (
-        current_deployment.get("state") == _REVOCATION_RETRY_STATE
-        and read_verified_adapter_revisions(run_id) == frozenset()
-    )
-    if not still_fenced:
-        try:
-            mark_deployment_revocation_failed(
-                run_id,
-                "backend revocation pending: verified predecessor restoration failed",
-            )
-        except Exception as exc:
-            raise DeploymentStatePersistenceError(
-                run_id, str(exc), backend_outcome="not_attempted"
-            ) from exc
-    return False
-
-
 def _fence_contended_deployment(run_id: str) -> _ContendedFence:
-    """Fence a deployment that holds the deploy lock, before blocking on it.
+    """fence an in-progress deployment before blocking on its deploy lock."""
 
-    Runs BEFORE the blocking acquire so an in-progress deployment cannot finish and present itself
-    as serveable after the cancel decided to tear it down. A preservable checkpoint is left alone.
-    """
-    from flash.runner import get_status, mark_deployment_revocation_failed
+    from flash.runner.lifecycle.status import get_status
+    from flash.runner.supervise.transitions import mark_deployment_revocation_failed
 
-    prelock_status = get_status(run_id)
-    prelock_raw_deployment = prelock_status.deployment
-    prelock_deployment = (
-        dict(prelock_raw_deployment) if isinstance(prelock_raw_deployment, dict) else None
-    )
-    _, prelock_active = _deployment_state_and_requires_revocation(prelock_raw_deployment)
+    status = get_status(run_id)
+    deployment = dict(status.deployment) if isinstance(status.deployment, dict) else None
+    _, active = _deployment_state_and_requires_revocation(status.deployment)
     must_fence = (
-        prelock_status.state != "dry_run"
-        and prelock_active
-        and not _is_preservable_checkpoint_deployment(run_id, prelock_deployment)
+        status.state != "dry_run"
+        and active
+        and not _is_preservable_checkpoint_deployment(run_id, deployment)
     )
     if not must_fence:
         return _ContendedFence()
-
-    predecessor: dict | None = None
-    if prelock_deployment is not None:
-        candidate = prelock_deployment.get("previous_deployment")
-        if _is_preservable_checkpoint_deployment(run_id, candidate):
-            predecessor = dict(candidate)
     try:
-        fenced_status = mark_deployment_revocation_failed(
+        mark_deployment_revocation_failed(
             run_id,
             "backend revocation pending: cancellation fenced an in-progress deployment",
         )
@@ -453,19 +318,7 @@ def _fence_contended_deployment(run_id: str) -> _ContendedFence:
         raise DeploymentStatePersistenceError(
             run_id, str(exc), backend_outcome="not_attempted"
         ) from exc
-    if predecessor is None:
-        return _ContendedFence(active_attempt=True, captured_attempt=prelock_deployment)
-    fenced_deployment = (
-        dict(fenced_status.deployment) if isinstance(fenced_status.deployment, dict) else None
-    )
-    return _ContendedFence(
-        active_attempt=True,
-        captured_attempt=prelock_deployment,
-        predecessor=predecessor,
-        predecessor_recommitted=_restore_contended_predecessor(
-            run_id, predecessor, fenced_deployment
-        ),
-    )
+    return _ContendedFence(active_attempt=True, captured_attempt=deployment)
 
 
 def _checkpoint_to_preserve(
@@ -473,70 +326,39 @@ def _checkpoint_to_preserve(
     status,
     *,
     contended: _ContendedFence,
+    serving_active_at_entry: bool,
 ) -> dict | None:
-    """Decide which deployment, if any, survives this cancellation.
+    """preserve only serving that was active when cancellation began."""
 
-    A dry run preserves nothing. A contended attempt preserves ONLY its predecessor, and only when
-    every check agrees the predecessor is what is actually live: recommitted, still the stored
-    deployment, still verified, and the alias really points at it.
-    """
-    live_alias_target: object = _UNKNOWN_ALIAS_UNCHECKED
-    unknown_activation = isinstance(status.deployment, dict) and status.deployment.get(
-        "activation_outcome_unknown"
-    )
-    if status.state != "dry_run" and (contended.active_attempt or unknown_activation):
-        try:
-            from flash.serve.deploy import adapter_alias_target
-
-            live_alias_target = adapter_alias_target(run_id)
-        except Exception:
-            live_alias_target = None
-    if status.state == "dry_run":
+    if not serving_active_at_entry or status.state == "dry_run" or contended.active_attempt:
         return None
-    if not contended.active_attempt:
-        return _preservable_checkpoint_deployment(
-            run_id,
-            status.deployment,
-            live_alias_target=live_alias_target,
-        )
-    predecessor = contended.predecessor
-    predecessor_revision = predecessor.get("adapter_revision") if predecessor is not None else None
-    if (
-        contended.predecessor_recommitted
-        and isinstance(contended.captured_attempt, dict)
-        and isinstance(predecessor_revision, str)
-        and live_alias_target == predecessor_revision
-        and status.deployment == predecessor
-        and _is_preservable_checkpoint_deployment(run_id, status.deployment)
-    ):
-        return dict(predecessor)
-    return None
+    return _preservable_checkpoint_deployment(run_id, status.deployment)
 
 
 def _commit_preserved_checkpoint(run_id: str, status, preserved_checkpoint: dict | None):
-    """Make the preserved checkpoint authoritative and the only verified revision.
+    """Make the preserved checkpoint authoritative and the only verified checkpoint.
 
     Returns ``(status, preserved_checkpoint)``; the checkpoint comes back ``None`` when the first
     commit could not be confirmed, which drops the run through to normal revocation. The second
     commit is the authoritative one, so its failure is fatal rather than a downgrade.
     """
-    from flash.runner import (
-        get_status,
-        mark_checkpoint_deployed,
-        read_verified_adapter_revisions,
-        verified_adapter_revision_generation,
+    from flash.runner.lifecycle.status import get_status
+    from flash.runner.results.verified_revisions import (
+        read_verified_checkpoints,
+        verified_checkpoint_generation,
     )
+    from flash.runner.supervise.transitions import mark_checkpoint_deployed
 
     if preserved_checkpoint is None:
         return status, None
     if status.deployment != preserved_checkpoint:
-        intended_revision = preserved_checkpoint.get("adapter_revision")
+        intended_revision = preserved_checkpoint.get("checkpoint_id")
         owner_deployment = status.deployment if isinstance(status.deployment, dict) else None
         try:
             status = mark_checkpoint_deployed(
                 run_id,
                 preserved_checkpoint,
-                verification_generation=verified_adapter_revision_generation(run_id),
+                verification_generation=verified_checkpoint_generation(run_id),
                 owner_deployment=owner_deployment,
             )
         except Exception:
@@ -546,7 +368,7 @@ def _commit_preserved_checkpoint(run_id: str, status, preserved_checkpoint: dict
                 stored_deployment = status.deployment
                 if (
                     not isinstance(stored_deployment, dict)
-                    or stored_deployment.get("adapter_revision") != intended_revision
+                    or stored_deployment.get("checkpoint_id") != intended_revision
                     or not _is_preservable_checkpoint_deployment(run_id, stored_deployment)
                 ):
                     preserved_checkpoint = None
@@ -562,28 +384,19 @@ def _commit_preserved_checkpoint(run_id: str, status, preserved_checkpoint: dict
         if preserved_checkpoint is None:
             return status, None
 
-    preserved_revision = preserved_checkpoint.get("adapter_revision")
-    owner_deployment = status.deployment if isinstance(status.deployment, dict) else None
-    try:
-        status = mark_checkpoint_deployed(
-            run_id,
-            preserved_checkpoint,
-            verification_generation=verified_adapter_revision_generation(run_id),
-            owner_deployment=owner_deployment,
-            retain_only_revision=True,
-        )
-        if (
-            status.deployment != preserved_checkpoint
-            or not isinstance(preserved_revision, str)
-            or read_verified_adapter_revisions(run_id) != frozenset({preserved_revision})
-        ):
-            raise RuntimeError(
-                "authoritative checkpoint preservation did not prune verified revisions"
-            )
-    except Exception as exc:
+    preserved_revision = preserved_checkpoint.get("checkpoint_id")
+    if (
+        status.deployment != preserved_checkpoint
+        or not isinstance(preserved_revision, str)
+        or preserved_revision not in read_verified_checkpoints(run_id)
+    ):
         raise DeploymentStatePersistenceError(
-            run_id, str(exc), backend_outcome="not_required"
-        ) from exc
+            run_id,
+            "authoritative checkpoint preservation lost its verified checkpoint",
+            backend_outcome="not_required",
+        )
+    # verified siblings are independent serving authorities. cancellation preserves the complete
+    # ledger unless each sibling is exact-undeployed successfully by its own lifecycle operation.
     return status, preserved_checkpoint
 
 
@@ -599,14 +412,25 @@ def _revoke_serving(
     and persist the cancellation before surfacing either. Local authority is fenced BEFORE the
     backend call, so a crash between the two leaves the run visibly un-serveable, not silently live.
     """
-    from flash.runner import mark_deployment_revocation_failed, mark_deployment_undeployed
+    from flash.runner.supervise.transitions import (
+        mark_deployment_revocation_failed,
+        mark_undeployed,
+    )
 
+    deployment = status.deployment if isinstance(status.deployment, dict) else None
+    checkpoint_id = deployment.get("checkpoint_id") if deployment is not None else None
     if not active_deployment:
+        if deployment is None:
+            return None, None
+        if not isinstance(checkpoint_id, str):
+            return None, (ValueError("exact undeploy requires checkpoint_id"), "not_required")
         try:
-            mark_deployment_undeployed(run_id)
+            mark_undeployed(run_id, checkpoint_id)
         except Exception as exc:
             return None, (exc, "not_required")
         return None, None
+    if not isinstance(checkpoint_id, str):
+        return ValueError("exact undeploy requires checkpoint_id"), None
 
     already_fenced = (
         isinstance(status.deployment, dict)
@@ -624,15 +448,19 @@ def _revoke_serving(
                 run_id, str(exc), backend_outcome="not_attempted"
             ) from exc
     try:
-        from flash.serve.deploy import undeploy_adapter
+        from flash.serve.deployment.deploy import undeploy_adapter
+        from flash.server.platform.internal_client import run_serving_org_id
 
-        undeploy_adapter(run_id)
+        org_id = run_serving_org_id(status)
+        if not org_id:
+            raise ValueError(f"run {run_id} has no organization scope")
+        undeploy_adapter(checkpoint_id, org_id=org_id)
     except Exception as exc:
         with contextlib.suppress(Exception):
             mark_deployment_revocation_failed(run_id, str(exc))
         return exc, None
     try:
-        mark_deployment_undeployed(run_id)
+        mark_undeployed(run_id, checkpoint_id)
     except Exception as exc:
         return None, (exc, "confirmed")
     return None, None
@@ -653,7 +481,8 @@ def _cancellation_billing(
     no longer carries it after a confirmed teardown, and it is the only durable record of the
     provider and card shape the run rented, which the cancel price must be computed on.
     """
-    from flash.runner import actual_steps_run, cancelled_charge_usd, get_status
+    from flash.runner.accounting.costs import actual_steps_run, cancelled_charge_usd
+    from flash.runner.lifecycle.status import get_status
 
     if not bill_cancel:
         return None, {}
@@ -703,13 +532,9 @@ def _prepare_cancellation(run_id: str) -> list[Exception]:
 
 def cancel_run(run_id: str) -> RunStatus:
     """Cancel training while preserving verified serving and durable cleanup targets."""
-    from flash.runner import (
-        TERMINAL_STATES,
-        _gc_run_endpoints,
-        _update,
-        effective_spec_from_status,
-        get_status,
-    )
+    from flash.runner.lifecycle.state import TERMINAL_STATES
+    from flash.runner.lifecycle.status import _update, effective_spec_from_status, get_status
+    from flash.runner.supervise.recovery import _gc_run_endpoints
     from flash.server.platform import db as server_db
     from flash.server.platform.locks import _deploy_lock
 
@@ -774,9 +599,14 @@ def cancel_run(run_id: str) -> RunStatus:
         status = get_status(run_id)
         entered_deployed = entered_deployed or status.state == "deployed"
 
-        # teardown clears the durable handle on success and it is the only record of the rented
-        # basis (provider, card, count), so capture it now for billing (see _cancellation_billing).
-        rented_remote = dict(status.remote) if isinstance(status.remote, dict) else None
+        # teardown clears the active handle before cancellation pricing. successful work may already
+        # have moved that exact rented basis into the retained private accounting identity.
+        rented_basis = (
+            status.remote
+            or getattr(status, "realized_cost_remote", None)
+            or getattr(status, "cleanup_confirmed_remote", None)
+        )
+        rented_remote = dict(rented_basis) if isinstance(rented_basis, dict) else None
 
         _teardown_persisted_remotes(
             run_id,
@@ -799,6 +629,7 @@ def cancel_run(run_id: str) -> RunStatus:
                 predecessor=contended_predecessor,
                 predecessor_recommitted=contended_predecessor_recommitted,
             ),
+            serving_active_at_entry=initial_active,
         )
         status, preserved_checkpoint = _commit_preserved_checkpoint(
             run_id, status, preserved_checkpoint
@@ -829,7 +660,7 @@ def cancel_run(run_id: str) -> RunStatus:
                 _update(run_id, "cancelled", allow_from_terminal=entered_deployed, **cancel_updates)
 
         with contextlib.suppress(Exception):
-            from flash.server.domain.checkpoints import register_checkpoints_best_effort
+            from flash.server.domain.registry.checkpoints import register_checkpoints_best_effort
 
             register_checkpoints_best_effort(get_status(run_id))
 
@@ -846,14 +677,3 @@ def cancel_run(run_id: str) -> RunStatus:
     finally:
         if lock_acquired:
             deploy_lock.release()
-
-
-# re-exported at the bottom rather than imported at the top: `attach` resolves the patched
-# reconciliation names back through this module, so a top import would be circular. `flash.runner`
-# and the attach tests both address these as attributes of THIS module.
-from flash.runner.supervise.attach import (  # noqa: E402,F401
-    _reconcile_attached_remote,
-    _resume_after_confirmed_teardown,
-    _schedule_attach_reconciliation,
-    attach_run,
-)

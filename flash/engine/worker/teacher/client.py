@@ -23,7 +23,7 @@ from flash.engine.worker.teacher.encoding import (
     load_teacher_tokenizer,
 )
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
-from flash.envs.base import map_bounded
+from flash.envs.loading.base import map_bounded
 from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
 from flash.teacher.provider_status import (
     BODY_INDEPENDENT_TRANSIENT_STATUSES,

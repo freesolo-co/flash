@@ -60,6 +60,11 @@ jobs:
       - name: Function size check
         run: uv run python scripts/check_function_size.py
 
+      # Keep the source hierarchy reviewable: no directory may exceed ten tracked files, and package
+      # roots may mix subdirectories only with the three required marker files.
+      - name: Source layout check
+        run: uv run python scripts/check_source_layout.py
+
       # The job has always been NAMED offline (tests/conftest.py stubs the network boundaries in
       # Python), but nothing enforced it, so a test that reached hf.co passed on a connected
       # runner and would go red on a blip. Setting these makes the name true: an unstubbed call

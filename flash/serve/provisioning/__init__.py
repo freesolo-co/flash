@@ -1,6 +1,6 @@
 """provider-neutral serving provisioning foundation."""
 
-from ._common import (
+from flash.serve.provisioning.common.records import (
     MAX_CANONICAL_MANIFEST_BYTES,
     MAX_ENCODED_MANIFEST_BYTES,
     DeploymentBundle,

@@ -5,16 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar
 
-from flash.providers._lifecycle.instance import (
+from flash.providers._lifecycle.instances.instance import (
     InstanceJobHandle,
     instance_label,
     label_matches_run,
     run_label_prefix,
 )
-from flash.providers._lifecycle.instance import (
+from flash.providers._lifecycle.instances.instance import (
     build_payload as _shared_build_payload,
 )
-from flash.providers._lifecycle.instance import (
+from flash.providers._lifecycle.instances.instance import (
     build_user_data as _shared_build_user_data,
 )
 
@@ -85,14 +85,13 @@ class LambdaJobHandle(InstanceJobHandle):
 
 def lambda_image(gpu: str | None = None) -> str:
     """Return the worker Docker image for the given GPU class (per-SM tag or base)."""
-    from flash.providers._lifecycle.worker import worker_image_for_gpu
+    from flash.providers._lifecycle.net.worker import worker_image_for_gpu
 
     return worker_image_for_gpu(gpu)
 
 
 def build_payload(
     spec,
-    seed: int,
     attempt: int,
     runtime_secrets: dict | None = None,
     cache_host_mount: str | None = None,
@@ -104,7 +103,6 @@ def build_payload(
     """Build the Lambda bootstrap payload (arm='lambda')."""
     return _shared_build_payload(
         spec,
-        seed,
         attempt,
         arm="lambda",
         runtime_secrets=runtime_secrets,

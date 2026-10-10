@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import http.client
 import importlib.metadata
@@ -12,6 +13,7 @@ import json
 import math
 import multiprocessing
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -24,31 +26,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from flash.engine.worker import backend_common, opd_train, rl_train, score_batcher
-from flash.engine.worker.opd_train import (
-    _OPD_PARQUET_WRITE_BATCH_ROWS,
-    _BridgePrompt,
-    _build_opd_child_env,
-    _build_opd_plugin_config,
-    _failure_accounting_metadata,
-    _OpdProgressState,
-    _OpdVerlCheckpointWatcher,
-    _processor_expanded_prompt_ids,
-    _prompt_pool_fingerprint,
-    _raise_verl_failure,
-    _restore_verl_resume,
-    _seed_resume_lifecycle,
-    _stage_retry_contract,
-    _TeacherAlignmentBridge,
-    _TextTeacherBatcher,
-    _trim_response_and_forced,
-    _TruncationWindow,
-    _validate_forced_mask,
-    _write_opd_parquet,
-    build_opd_overrides,
-    encode_shifted_group_metadata,
-)
-from flash.engine.worker.opd_train_runner import _prepare_prompt_messages, _render_prompt_rows
+import flash.engine.worker.io.hf as worker_hf
+import flash.engine.worker.train.entry.opd_train_runner as opd_train_runner
+import flash.engine.worker.train.opd.bridging.batching as opd_batching
+import flash.engine.worker.train.opd.orchestration.failures as opd_failures
+import flash.engine.worker.train.opd.orchestration.prompt_preparation as opd_prompt_preparation
+import flash.engine.worker.train.opd.orchestration.protocol as opd_protocol
+import flash.engine.worker.train.rl.launch.verl_config as rl_verl_config
 from flash.engine.worker.teacher.client import TeacherScore
 from flash.engine.worker.teacher.tokenizer_align import TeacherToken
 from flash.engine.worker.train.core.child.glue import (
@@ -56,6 +40,17 @@ from flash.engine.worker.train.core.child.glue import (
     validate_structured_messages,
 )
 from flash.engine.worker.train.core.child.runtime import install_checkpoint_handler_filter
+from flash.engine.worker.train.entry import backend_common, opd_train, rl_train, score_batcher
+from flash.engine.worker.train.entry.sft_train import _seed_resume_lifecycle
+from flash.engine.worker.train.opd.bridging.batching import _TextTeacherBatcher
+from flash.engine.worker.train.opd.bridging.bridge import _TeacherAlignmentBridge
+from flash.engine.worker.train.opd.bridging.prompts import (
+    _processor_expanded_prompt_ids,
+    _prompt_pool_fingerprint,
+    _trim_response_and_forced,
+    _validate_forced_mask,
+    encode_shifted_group_metadata,
+)
 from flash.engine.worker.train.opd.child import plugin as opd_plugin
 from flash.engine.worker.train.opd.child.plugin import (
     FlashTeacherBridgeError,
@@ -78,9 +73,52 @@ from flash.engine.worker.train.opd.child.structured import (
     _count_legal_tokens,
     canonical_structured_spec,
 )
-from flash.engine.worker.train.opd.validation import validate_opd_structured_outputs
+from flash.engine.worker.train.opd.orchestration.failures import (
+    _failure_accounting_metadata,
+    _OpdVerlCheckpointWatcher,
+    _raise_verl_failure,
+    _restore_verl_resume,
+    _stage_retry_contract,
+    _TruncationWindow,
+)
+from flash.engine.worker.train.opd.orchestration.overrides import (
+    _OPD_PARQUET_WRITE_BATCH_ROWS,
+    _build_opd_child_env,
+    _build_opd_plugin_config,
+    _write_opd_parquet,
+    build_opd_overrides,
+)
+from flash.engine.worker.train.opd.orchestration.progress import _OpdProgressState
+from flash.engine.worker.train.opd.orchestration.prompt_preparation import (
+    _prepare_prompt_messages,
+)
+from flash.engine.worker.train.opd.orchestration.prompt_preparation import (
+    render_prompt_rows as _render_prompt_rows,
+)
+from flash.engine.worker.train.opd.orchestration.state import _BridgePrompt, _OpdRequest
+from flash.engine.worker.train.opd.orchestration.validation import validate_opd_structured_outputs
 from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 from flash.teacher.retry_contract import OPD_RESUME_STATE_VERSION
+
+
+def test_prompt_preparation_does_not_import_opd_train_entry_in_fresh_process():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "assert 'flash.engine.worker.train.entry.opd_train' not in sys.modules; "
+                "import flash.engine.worker.train.opd.orchestration.prompt_preparation; "
+                "assert 'flash.engine.worker.train.entry.opd_train' not in sys.modules"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.fixture(autouse=True)
@@ -145,7 +183,9 @@ def _send_malformed_json_response(handler, status, _payload):
 
 def _capture_client_only_score_delivery_loss(bridge, monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     failure_path = str(tmp_path / "score-delivery-failure")
     monkeypatch.setenv("FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH", failure_path)
@@ -625,7 +665,7 @@ def test_xgrammar_replay_uses_real_qwen_padded_model_vocab(spec, text):
     pytest.importorskip("xgrammar")
     from transformers import AutoConfig, AutoTokenizer
 
-    model_id = "Qwen/Qwen3.5-0.8B"
+    model_id = "Qwen/Qwen3.5-9B"
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     assert len(tokenizer.get_vocab()) == 248077
@@ -653,6 +693,42 @@ def test_image_prompt_positions_remain_outside_alignment_groups():
     )
     assert teacher_ids[: len(prompt_ids) - 1] == [-1, -1, -1]
     assert teacher_ids[len(prompt_ids) - 1] == 0
+
+
+def test_opd_prompt_rows_flatten_text_blocks_and_preserve_reasoning():
+    from flash.engine.worker.train.entry.prompt_rows import canonical_prompt_messages
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "hello "},
+                {"type": "text", "text": "world"},
+            ],
+        },
+        {"role": "assistant", "content": "answer", "reasoning_content": "later"},
+    ]
+
+    assert canonical_prompt_messages(messages, multimodal=False) == [
+        {"role": "user", "content": "hello world"},
+        {"role": "assistant", "content": "answer", "reasoning_content": "later"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "user", "content": None},
+        {"role": "assistant", "content": None},
+        {"role": "assistant", "content": {"text": "invalid"}},
+        {"role": "assistant", "content": 7},
+    ],
+)
+def test_opd_prompt_rows_reject_other_non_text_content(message):
+    from flash.engine.worker.train.entry.prompt_rows import canonical_prompt_messages
+
+    with pytest.raises(ValueError, match="content must be text or content blocks"):
+        canonical_prompt_messages([message], multimodal=False)
 
 
 @pytest.mark.parametrize("image_first", [False, True])
@@ -827,6 +903,88 @@ def test_verl_0_8_rlhf_dataset_builds_one_structured_block_per_image(
     ]
 
 
+def test_opd_reasoning_only_assistant_round_trips_with_empty_content(tmp_path):
+    from flash.engine.worker.train.entry.prompt_rows import canonical_prompt_messages
+
+    row = _opd_row(0, multimodal=False)
+    row["prompt"] = canonical_prompt_messages(
+        [{"role": "assistant", "content": None, "reasoning_content": "working"}],
+        multimodal=False,
+    )
+    path = tmp_path / "reasoning-only.parquet"
+
+    _write_opd_parquet([row], str(path))
+
+    datasets = pytest.importorskip("datasets")
+    restored = datasets.Dataset.from_parquet(str(path))
+    assert restored[0]["prompt"] == [
+        {"role": "assistant", "content": "", "reasoning_content": "working"}
+    ]
+
+
+def test_opd_multimodal_parquet_preserves_reasoning_content_for_child(tmp_path):
+    datasets = pytest.importorskip("datasets")
+    rows = [
+        {
+            "prompt": [
+                {"role": "user", "content": "first"},
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": "old",
+                },
+                {"role": "user", "content": "look<image>"},
+            ],
+            "images": [{"image": "file:///tmp/only.png"}],
+            "data_source": "flash_opd",
+            "reward_model": {"style": "rule", "ground_truth": ""},
+            "extra_info": {"index": 0},
+        }
+    ]
+    path = tmp_path / "reasoning.parquet"
+
+    _write_opd_parquet(rows, str(path))
+    restored = datasets.Dataset.from_parquet(str(path))[0]["prompt"]
+
+    assert restored[1] == {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_content": "old",
+    }
+
+
+def test_text_opd_parquet_preserves_reasoning_first_authored_after_initial_batch(tmp_path):
+    datasets = pytest.importorskip("datasets")
+    rows = [_opd_row(index, multimodal=False) for index in range(_OPD_PARQUET_WRITE_BATCH_ROWS + 1)]
+    rows[-1]["prompt"][0]["reasoning_content"] = "late reasoning"
+    path = tmp_path / "late-reasoning.parquet"
+
+    _write_opd_parquet(rows, str(path))
+
+    restored = datasets.Dataset.from_parquet(str(path))
+    assert restored[-1]["prompt"][0]["reasoning_content"] == "late reasoning"
+    assert "reasoning_content" in restored.features["prompt"].feature
+
+
+def test_text_opd_parquet_omits_reasoning_when_unauthored(tmp_path):
+    datasets = pytest.importorskip("datasets")
+    path = tmp_path / "no-reasoning.parquet"
+
+    _write_opd_parquet([_opd_row(0, multimodal=False)], str(path))
+
+    restored = datasets.Dataset.from_parquet(str(path))
+    assert "reasoning_content" not in restored.features["prompt"].feature
+    assert restored[0]["prompt"] == [{"role": "user", "content": "prompt 0"}]
+
+
+def test_opd_parquet_rejects_non_string_authored_reasoning(tmp_path):
+    row = _opd_row(0, multimodal=False)
+    row["prompt"][0]["reasoning_content"] = {"text": "not canonical"}
+
+    with pytest.raises(ValueError, match="reasoning_content must be text"):
+        _write_opd_parquet([row], str(tmp_path / "invalid-reasoning.parquet"))
+
+
 class _MockMultimodalProcessor:
     image_token_id = 151655
 
@@ -840,6 +998,7 @@ class _MockMultimodalProcessor:
             "tokenize": False,
             "add_generation_prompt": True,
             "enable_thinking": False,
+            "preserve_thinking": False,
         }
         self.rendered = messages
         return "<vision>describe"
@@ -866,8 +1025,12 @@ def test_image_observation_env_text_prompt_omits_empty_processor_images(monkeypa
         def prompt_messages(self, _example):
             return [{"role": "user", "content": "describe"}]
 
-    monkeypatch.setattr(opd_train, "seed_training_rngs", lambda _seed: None)
-    monkeypatch.setattr(opd_train, "liveness_heartbeat", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(opd_prompt_preparation, "seed_training_rngs", lambda _seed: None)
+    monkeypatch.setattr(
+        opd_prompt_preparation,
+        "liveness_heartbeat",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
     prompt_rows, multimodal = _render_prompt_rows(
         SimpleNamespace(env=_DynamicImageEnv(), spec=None)
     )
@@ -998,7 +1161,7 @@ def test_parent_preparation_orders_image_normalization_before_block_validation(m
         return [{"role": "user", "content": "q"}]
 
     monkeypatch.setattr(multimodal, "normalize_prompt_images", normalize)
-    monkeypatch.setattr(opd_train, "validate_transcript_messages", validate)
+    monkeypatch.setattr(opd_prompt_preparation, "validate_transcript_messages", validate)
 
     result = _prepare_prompt_messages(
         {"image": _IMAGE_DATA_URI},
@@ -1209,10 +1372,10 @@ def test_failure_accounting_metadata_uses_trl_skip_reason_names():
 def test_write_train_meta_integrates_canonical_failure_accounting_metadata():
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.train.entry.opd_train import run_opd_train
 
     source = inspect.getsource(run_opd_train)
-    write_train_meta_source = source[source.index("_w.write_train_meta(") :]
+    write_train_meta_source = source[source.index("_worker_finalize.write_train_meta(") :]
 
     assert "**_failure_accounting_metadata(final_accounting)" in write_train_meta_source
     assert '"teacher_transient":' not in write_train_meta_source
@@ -1550,7 +1713,7 @@ def test_text_teacher_batcher_enforces_max_batch_size_across_concurrent_requests
     # be queued and the assertion above would fail on the harness rather than on the batcher. at the
     # measured ceiling of 32 that leaves exactly 2x headroom, so this is now a real adjacency: a
     # future ceiling above 32 must raise the backlog with it.
-    total = min(bound + bound // 2, opd_train._TEXT_TEACHER_REQUEST_BACKLOG)
+    total = min(bound + bound // 2, opd_batching._TEXT_TEACHER_REQUEST_BACKLOG)
     assert total > bound, "prompt count must cross the batch bound for this test to mean anything"
     prompt_texts = [f"question-{index}" for index in range(total)]
     teacher = _BatchingTeacher(prompt_texts)
@@ -1576,10 +1739,10 @@ def test_text_teacher_batcher_enforces_max_batch_size_across_concurrent_requests
 
 def test_text_teacher_batcher_never_takes_more_than_max_batch_size():
     # the concurrent test above CANNOT observe the bound being exceeded: with a 0.1s flush window
-    # the pending queue never accumulates past the ceiling, so widening the slice in _take_batch
+    # the pending queue never accumulates past the ceiling, so widening the slice in _claim_batch
     # leaves it green (verified by mutation). this pins the slice directly against a pre-filled
     # queue -- no threads, no timer -- so the bound is falsifiable rather than merely unreached.
-    batcher = opd_train._TextTeacherBatcher(object(), max_batch_size=4, flush_wait_s=0.01)
+    batcher = _TextTeacherBatcher(object(), max_batch_size=4, flush_wait_s=0.01)
     batcher._pending = [
         score_batcher._Waiter(
             (f"prompt-{index}", "completion"), enqueued_at=0.0, label="test teacher"
@@ -1587,7 +1750,7 @@ def test_text_teacher_batcher_never_takes_more_than_max_batch_size():
         for index in range(10)
     ]
 
-    batch = batcher._take_batch()
+    batch = batcher._claim_batch()
 
     assert batch is not None
     assert len(batch) == 4
@@ -1626,9 +1789,7 @@ def test_text_teacher_batcher_flushes_final_partial_batch_within_bound():
 def test_text_teacher_batcher_deduplicates_exact_pairs_and_scatters_to_all_waiters(
     monkeypatch,
 ):
-    from flash.engine.worker import opd_train as opd_train_mod
-
-    monkeypatch.setattr(opd_train_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
+    monkeypatch.setattr(opd_protocol, "TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
     prompt_texts = ["same question"] * 8
     teacher = _BatchingTeacher(prompt_texts)
     bridge = _batching_bridge(teacher, prompt_texts)
@@ -1675,9 +1836,7 @@ def test_text_teacher_batcher_marks_dedup_copy_as_explicit_unbilled_score():
 
 
 def test_text_teacher_batcher_keeps_nonidentical_inputs_separate_and_ordered(monkeypatch):
-    from flash.engine.worker import opd_train as opd_train_mod
-
-    monkeypatch.setattr(opd_train_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
+    monkeypatch.setattr(opd_protocol, "TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
     prompt_texts = [f"distinct-{index}" for index in range(8)]
     teacher = _BatchingTeacher(prompt_texts)
     bridge = _batching_bridge(teacher, prompt_texts)
@@ -1696,9 +1855,7 @@ def test_text_teacher_batcher_keeps_nonidentical_inputs_separate_and_ordered(mon
 
 
 def test_text_teacher_batch_accepts_positive_rounding_for_every_logical_waiter(monkeypatch):
-    from flash.engine.worker import opd_train as opd_train_mod
-
-    monkeypatch.setattr(opd_train_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
+    monkeypatch.setattr(opd_protocol, "TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
     prompt_texts = ["rounding"] * 8
     teacher = _BatchingTeacher(prompt_texts, token_logprob=1e-9)
     bridge = _batching_bridge(teacher, prompt_texts)
@@ -1721,9 +1878,7 @@ def test_text_teacher_batch_accepts_positive_rounding_for_every_logical_waiter(m
 def test_text_teacher_batch_rejects_positive_value_above_tolerance_for_every_waiter(
     monkeypatch,
 ):
-    from flash.engine.worker import opd_train as opd_train_mod
-
-    monkeypatch.setattr(opd_train_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
+    monkeypatch.setattr(opd_protocol, "TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
     prompt_texts = ["invalid rounding"] * 8
     teacher = _BatchingTeacher(prompt_texts, token_logprob=2e-6)
     bridge = _batching_bridge(teacher, prompt_texts)
@@ -1749,9 +1904,7 @@ def test_text_teacher_batch_rejects_positive_value_above_tolerance_for_every_wai
 
 
 def test_text_teacher_batch_transient_failure_recovers_each_logical_sample_once(monkeypatch):
-    from flash.engine.worker import opd_train as opd_train_mod
-
-    monkeypatch.setattr(opd_train_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
+    monkeypatch.setattr(opd_protocol, "TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
     prompt_texts = [f"transient-{index}" for index in range(8)]
     teacher = _BatchingTeacher(prompt_texts, failure="transient")
     bridge = _batching_bridge(teacher, prompt_texts)
@@ -1800,9 +1953,7 @@ def test_text_teacher_batch_failures_complete_every_waiter_fail_closed(failure):
 
 
 def test_text_teacher_batch_mixed_dedup_preserves_logical_accounting(monkeypatch):
-    from flash.engine.worker import opd_train as opd_train_mod
-
-    monkeypatch.setattr(opd_train_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
+    monkeypatch.setattr(opd_protocol, "TEXT_TEACHER_FLUSH_WAIT_S", 1.0)
     prompt_texts = [
         "duplicate",
         "unique-a",
@@ -1897,10 +2048,125 @@ def test_text_teacher_batcher_close_allows_inflight_scatter_within_bound():
         )
 
 
-def test_text_teacher_batcher_shutdown_cannot_strand_pending_bridge_waiter(monkeypatch):
-    from flash.engine.worker import opd_train as opd_train_mod
+def test_text_teacher_batcher_close_cancels_before_dispatch_claim():
+    from flash.engine.worker.teacher.client import TeacherError
 
-    monkeypatch.setattr(opd_train_mod, "_TEXT_TEACHER_FLUSH_WAIT_S", 10.0)
+    class NeverCalledTeacher:
+        def __init__(self):
+            self.called = threading.Event()
+
+        def score_many(self, items):
+            self.called.set()
+            return [
+                _teacher_score([TeacherToken(text="AB", logprob=-1.0, start=0, end=2)])
+                for _ in items
+            ]
+
+    class FlushWaitCondition(threading.Condition):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+
+        def wait(self, timeout=None):
+            if (
+                threading.current_thread().name == "flash-opd-text-teacher-batcher"
+                and timeout is not None
+            ):
+                self.entered.set()
+            return super().wait(timeout)
+
+    teacher = NeverCalledTeacher()
+    batcher = _TextTeacherBatcher(teacher, max_batch_size=8, flush_wait_s=30.0)
+    condition = FlushWaitCondition()
+    batcher._condition = condition
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(batcher.score, "prompt", "AB")
+    try:
+        assert condition.entered.wait(timeout=10.0)
+        # a real bound, not zero: a zero bound cancels the queue even when the consumer is wrongly
+        # handed the claim window, so it cannot tell the two policies apart.
+        batcher.close(timeout_s=5.0)
+        with pytest.raises(TeacherError) as error:
+            future.result(timeout=10.0)
+    finally:
+        if batcher._thread is not None:
+            batcher._thread.join(timeout=10.0)
+        batcher.close(timeout_s=0.1)
+        executor.shutdown(wait=True)
+
+    assert error.value.permanent
+    assert str(error.value) == "text teacher batcher shut down"
+    assert not teacher.called.is_set(), "shutdown billed an unclaimed teacher batch"
+
+
+def test_text_teacher_batcher_close_waits_for_claimed_dispatch_result():
+    class RecordingTeacher:
+        def __init__(self):
+            self.called = threading.Event()
+            self.release = threading.Event()
+
+        def score_many(self, items):
+            self.called.set()
+            assert self.release.wait(timeout=10.0)
+            return [
+                _teacher_score([TeacherToken(text="AB", logprob=-1.0, start=0, end=2)])
+                for _ in items
+            ]
+
+    teacher = RecordingTeacher()
+    batcher = _TextTeacherBatcher(teacher, max_batch_size=1, flush_wait_s=0.01)
+    claimed = threading.Event()
+    allow_dispatch = threading.Event()
+    close_done = threading.Event()
+    claim_batch = batcher._claim_batch
+
+    def claim_then_hold():
+        batch = claim_batch()
+        if batch is not None:
+            # the dispatch decision is final before this gate; close must retain the claimed batch.
+            claimed.set()
+            assert allow_dispatch.wait(timeout=10.0)
+        return batch
+
+    def close_batcher():
+        try:
+            batcher.close(timeout_s=5.0)
+        finally:
+            close_done.set()
+
+    batcher._claim_batch = claim_then_hold
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(batcher.score, "prompt", "AB")
+    close_thread = None
+    try:
+        assert claimed.wait(timeout=10.0)
+        close_thread = threading.Thread(target=close_batcher)
+        close_thread.start()
+        with batcher._condition:
+            assert batcher._condition.wait_for(lambda: batcher._closed, timeout=10.0)
+        assert not close_done.is_set(), "close returned before the claimed batch reached an outcome"
+        allow_dispatch.set()
+        assert teacher.called.wait(timeout=10.0)
+        assert not close_done.is_set(), "close returned while the claimed scorer was still running"
+        teacher.release.set()
+        result = future.result(timeout=10.0)
+        assert close_done.wait(timeout=10.0)
+        close_thread.join(timeout=10.0)
+        assert not close_thread.is_alive()
+    finally:
+        allow_dispatch.set()
+        teacher.release.set()
+        if close_thread is not None:
+            close_thread.join(timeout=10.0)
+        batcher.close(timeout_s=0.1)
+        executor.shutdown(wait=True)
+
+    assert teacher.called.is_set()
+    assert result.tokens == (TeacherToken(text="AB", logprob=-1.0, start=0, end=2),)
+
+
+def test_text_teacher_batcher_shutdown_cannot_strand_pending_bridge_waiter(monkeypatch):
+    monkeypatch.setattr(opd_protocol, "TEXT_TEACHER_FLUSH_WAIT_S", 10.0)
     teacher = _BatchingTeacher(["question"])
     bridge = _batching_bridge(teacher, ["question"])
     bridge.start()
@@ -2099,9 +2365,11 @@ def test_recovered_transient_lost_response_promotes_transient_terminal_cause():
 
 
 def test_client_only_score_loss_promotes_recovered_transient_once(monkeypatch, tmp_path):
-    from flash.engine.worker.opd_train import _reconcile_score_delivery_failure
     from flash.engine.worker.perf import RetriableInfraError
     from flash.engine.worker.teacher.client import TeacherError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _reconcile_score_delivery_failure,
+    )
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -2138,8 +2406,10 @@ def test_client_only_score_loss_promotes_recovered_transient_once(monkeypatch, t
 
 
 def test_client_only_successful_score_loss_is_direct_retriable_once(monkeypatch, tmp_path):
-    from flash.engine.worker.opd_train import _reconcile_score_delivery_failure
     from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _reconcile_score_delivery_failure,
+    )
 
     bridge = _text_bridge(_BridgeTeacher())
     transport_error, exit_code, fallback = _capture_client_only_score_delivery_loss(
@@ -2169,7 +2439,9 @@ def test_client_only_successful_score_loss_is_direct_retriable_once(monkeypatch,
 
 
 def test_client_only_score_loss_preserves_authoritative_permanent_failure(monkeypatch, tmp_path):
-    from flash.engine.worker.opd_train import _reconcile_score_delivery_failure
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _reconcile_score_delivery_failure,
+    )
 
     bridge = _text_bridge(_BridgeTeacher())
     bridge._record_teacher_failure("permanent", "bad credentials", terminal=True)
@@ -2202,11 +2474,11 @@ def test_client_only_score_loss_preserves_authoritative_permanent_failure(monkey
 
 def test_malformed_score_success_is_transient_delivery_unknown(monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import (
+    from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.train.opd.orchestration.failures import (
         _read_classified_failure_fallback,
         _reconcile_score_delivery_failure,
     )
-    from flash.engine.worker.perf import RetriableInfraError
 
     failure_path = str(tmp_path / "score-delivery-failure")
     monkeypatch.setenv("FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH", failure_path)
@@ -2264,8 +2536,10 @@ def test_explicit_score_rejection_keeps_classification_without_delivery_fallback
     monkeypatch, tmp_path
 ):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher.client import TeacherError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     class PermanentTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -2721,11 +2995,11 @@ class _RecordingEnv:
     def __init__(self):
         self.recorded: list[str] = []
 
-    def new_rollout_state(self, _example):
+    def new_rollout_state(self, _example, prepared_prompt=None):
         # both keys, as the real adapter emits them: `prompt` is the frozen initial prefix and
         # `messages` starts as a copy of it that each turn appends to.
-        prompt = [{"role": "user", "content": "q"}]
-        return {"messages": [dict(message) for message in prompt], "prompt": prompt}
+        prompt = copy.deepcopy(prepared_prompt or [{"role": "user", "content": "q"}])
+        return {"messages": copy.deepcopy(prompt), "prompt": prompt}
 
     def record_model_turn(self, state, content):
         if not content.strip():
@@ -2785,12 +3059,13 @@ class _MultiTurnProcessor:
         return {"input_ids": [[ord(character) % 64 for character in text[0]]]}
 
 
-def _multiturn_bridge(env, *, max_turns=4, processor=None, teacher=None):
+def _multiturn_bridge(env, *, max_turns=4, processor=None, teacher=None, student_messages=None):
+    student_messages = student_messages or [{"role": "user", "content": "q"}]
     return _TeacherAlignmentBridge(
         prompts=[
             _BridgePrompt(
-                student_messages=[{"role": "user", "content": "q"}],
-                teacher_messages=[{"role": "user", "content": "q"}],
+                student_messages=student_messages,
+                teacher_messages=student_messages,
                 prompt_ids=(10, 11),
                 image_descriptors=(),
                 package_root=None,
@@ -2808,6 +3083,140 @@ def _multiturn_bridge(env, *, max_turns=4, processor=None, teacher=None):
         multi_turn=True,
         max_turns=max_turns,
     )
+
+
+def test_opd_multiturn_start_preserves_reasoning_content_and_rejects_metadata():
+    prompt = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "reasoning_content": "old", "content": "answer"},
+        {"role": "user", "content": "question"},
+    ]
+
+    class _ReasoningEnv(_RecordingEnv):
+        def new_rollout_state(self, _example, prepared_prompt=None):
+            frozen = copy.deepcopy(prepared_prompt or prompt)
+            return {
+                "messages": copy.deepcopy(frozen),
+                "prompt": frozen,
+            }
+
+    bridge = _multiturn_bridge(_ReasoningEnv(), student_messages=prompt)
+
+    assert bridge.start_multiturn(
+        index=0,
+        session_id="reasoning",
+        prompt_ids=[10, 11],
+        raw_prompt=prompt,
+        image_count=0,
+        image_digests=[],
+    ) == {"max_turns": 4}
+    assert bridge._sessions["reasoning"]["messages"] == prompt
+
+    with pytest.raises(ValueError, match="does not match the frozen environment prompt"):
+        _multiturn_bridge(_ReasoningEnv(), student_messages=prompt).start_multiturn(
+            index=0,
+            session_id="wrong-reasoning",
+            prompt_ids=[10, 11],
+            raw_prompt=[
+                *prompt[:1],
+                {**prompt[1], "reasoning_content": "different"},
+                *prompt[2:],
+            ],
+            image_count=0,
+            image_digests=[],
+        )
+
+    malformed = [*prompt[:1], {**prompt[1], "reasoning_content": {"text": "old"}}, *prompt[2:]]
+    with pytest.raises(ValueError, match="reasoning_content must be text"):
+        _multiturn_bridge(_ReasoningEnv(), student_messages=prompt).start_multiturn(
+            index=0,
+            session_id="bad-reasoning",
+            prompt_ids=[10, 11],
+            raw_prompt=malformed,
+            image_count=0,
+            image_digests=[],
+        )
+    with pytest.raises(ValueError, match="unsupported transcript metadata"):
+        _multiturn_bridge(_ReasoningEnv(), student_messages=prompt).start_multiturn(
+            index=0,
+            session_id="bad-metadata",
+            prompt_ids=[10, 11],
+            raw_prompt=[{**prompt[0], "name": None}, *prompt[1:]],
+            image_count=0,
+            image_digests=[],
+        )
+
+
+def test_opd_multiturn_start_reuses_the_frozen_prompt_without_rerunning_preparation():
+    frozen = [{"role": "user", "content": "nonce-from-preparation-1"}]
+
+    class _NondeterministicEnv(_RecordingEnv):
+        def __init__(self):
+            super().__init__()
+            self.unprepared_starts = 0
+            self.prepared_starts = []
+            self.examples = []
+
+        def new_rollout_state(self, example, prepared_prompt=None):
+            self.examples.append(example)
+            if prepared_prompt is None:
+                self.unprepared_starts += 1
+                prompt = [
+                    {
+                        "role": "user",
+                        "content": f"nonce-from-preparation-{self.unprepared_starts + 1}",
+                    }
+                ]
+            else:
+                self.prepared_starts.append(copy.deepcopy(prepared_prompt))
+                prompt = copy.deepcopy(prepared_prompt)
+            return {"prompt": prompt, "messages": copy.deepcopy(prompt)}
+
+    env = _NondeterministicEnv()
+    bridge = _multiturn_bridge(env, student_messages=frozen)
+    example = bridge.prompts[0].example
+
+    bridge.start_multiturn(
+        index=0,
+        session_id="frozen-state",
+        prompt_ids=[10, 11],
+        raw_prompt=frozen,
+        image_count=0,
+        image_digests=[],
+    )
+
+    assert env.unprepared_starts == 0
+    assert env.examples == [example]
+    assert env.examples[0] is example
+    assert env.prepared_starts == [frozen]
+    assert bridge._sessions["frozen-state"]["state"]["prompt"] == frozen
+    assert bridge._sessions["frozen-state"]["messages"] == frozen
+
+
+def test_opd_multiturn_frozen_prompt_is_copied_into_each_stateful_session():
+    frozen = [{"role": "user", "content": "prepared"}]
+    env = _RecordingEnv()
+    bridge = _multiturn_bridge(env, student_messages=frozen)
+
+    for session_id in ("left", "right"):
+        bridge.start_multiturn(
+            index=0,
+            session_id=session_id,
+            prompt_ids=[10, 11],
+            raw_prompt=frozen,
+            image_count=0,
+            image_digests=[],
+        )
+
+    left = bridge._sessions["left"]["state"]
+    right = bridge._sessions["right"]["state"]
+    left["prompt"][0]["content"] = "mutated-left"
+    left["messages"].append({"role": "assistant", "content": "answer"})
+
+    assert right["prompt"] == frozen
+    assert right["messages"] == frozen
+    assert bridge.prompts[0].student_messages == frozen
+    assert bridge._sessions["right"]["messages"] == frozen
 
 
 def test_an_unusable_opd_turn_is_never_shown_to_the_environment():
@@ -2885,7 +3294,7 @@ def test_a_usable_opd_turn_still_reaches_the_environment():
 
 
 def test_nested_model_eos_multiturn_response_reaches_teacher_scoring():
-    from flash.engine.worker.train.opd.gkd import _generation_eos_ids
+    from flash.engine.worker.train.opd.orchestration.gkd import _generation_eos_ids
 
     nested_eos = 248044
     tokenizer_eos = 248046
@@ -3014,7 +3423,7 @@ def test_terminal_reply_images_never_enter_actor_or_teacher_context(monkeypatch)
         image_count=0,
     )
     monkeypatch.setattr(
-        "flash.engine.worker.train.opd.bridge.normalize_environment_reply",
+        "flash.engine.worker.train.opd.bridging.bridge.normalize_environment_reply",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("terminal reply was normalized")
         ),
@@ -3318,7 +3727,7 @@ def _applied_shim_markers(tmp_path) -> str:
     the callbacks verify it on the first step line, so tests that drive steps need the real
     thing rather than a stub: a bare path would fail them for the reason the check exists.
     """
-    marker = Path(opd_train.shim_marker_file(str(tmp_path)))
+    marker = Path(backend_common.shim_marker_file(str(tmp_path)))
     marker.write_text("lora-rollout-guard\n", encoding="utf-8")
     return str(marker)
 
@@ -3475,23 +3884,27 @@ def test_opd_failure_diagnosis_is_not_cumulative_accounting_dict():
         _failure_accounting_metadata(diagnosis)
 
 
-def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path):
-    from flash.engine.worker import opd_train
-
+@pytest.mark.parametrize("expected_fsdp_generation", [1, 2])
+def test_restore_verl_resume_returns_validated_accounting(
+    monkeypatch, tmp_path, expected_fsdp_generation
+):
     resume = tmp_path / "checkpoint-2"
-    resume.mkdir()
+    actor = resume / "actor"
+    (actor / "huggingface").mkdir(parents=True)
     state = _resume_accounting()
     import json
 
     (resume / "opd_state.json").write_text(json.dumps(state))
     (resume / "payload.bin").write_bytes(b"checkpoint")
-    # this test is about accounting restoration, not topology matching; stamp a world_size that
-    # legitimately matches world_size=1 below rather than relying on unreadable-topology behaviour.
-    (resume / "fsdp_config.json").write_text(json.dumps({"world_size": 1}))
-    monkeypatch.setattr(opd_train._w, "OPD_RESUME_REVISION", "revision")
-    monkeypatch.setattr(opd_train._w, "SEED", 42)
+    (actor / "fsdp_config.json").write_text(
+        json.dumps({"FSDP_version": expected_fsdp_generation, "world_size": 1})
+    )
+    for kind in ("model", "optim", "extra_state"):
+        (actor / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
+    monkeypatch.setattr(opd_failures._worker_state, "OPD_RESUME_REVISION", "revision")
+    monkeypatch.setattr(opd_failures._worker_state, "SEED", 42)
     monkeypatch.setattr(
-        opd_train._w,
+        opd_failures._worker_hf,
         "hf_resume_checkpoint",
         lambda **_kwargs: str(resume),
     )
@@ -3499,7 +3912,11 @@ def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path)
     local_dir.mkdir()
 
     step, restored = _restore_verl_resume(
-        str(local_dir), prompt_pool_fingerprint="a" * 64, update_horizon=3, world_size=1
+        str(local_dir),
+        prompt_pool_fingerprint="a" * 64,
+        update_horizon=3,
+        world_size=1,
+        expected_fsdp_generation=expected_fsdp_generation,
     )
 
     assert step == 2
@@ -3507,8 +3924,42 @@ def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path)
     assert (local_dir / "global_step_2" / "payload.bin").read_bytes() == b"checkpoint"
 
 
+@pytest.mark.parametrize("expected_fsdp_generation", [1, 2])
+def test_restore_verl_resume_rejects_the_other_fsdp_generation(
+    monkeypatch, tmp_path, expected_fsdp_generation
+):
+    resume = tmp_path / "checkpoint-2"
+    actor = resume / "actor"
+    (actor / "huggingface").mkdir(parents=True)
+    checkpoint_generation = 2 if expected_fsdp_generation == 1 else 1
+    (actor / "fsdp_config.json").write_text(
+        json.dumps({"FSDP_version": checkpoint_generation, "world_size": 1})
+    )
+    for kind in ("model", "optim", "extra_state"):
+        (actor / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
+    monkeypatch.setattr(opd_failures._worker_state, "OPD_RESUME_REVISION", "revision")
+    monkeypatch.setattr(
+        opd_failures._worker_hf, "hf_resume_checkpoint", lambda **_kwargs: str(resume)
+    )
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+
+    with pytest.raises(
+        RuntimeError,
+        match="fsdp generation mismatch",
+    ):
+        _restore_verl_resume(
+            str(local_dir),
+            prompt_pool_fingerprint="a" * 64,
+            update_horizon=3,
+            world_size=1,
+            expected_fsdp_generation=expected_fsdp_generation,
+        )
+
+    assert not (local_dir / "global_step_2").exists()
+
+
 def test_opd_checkpoint_watcher_forwards_processor_to_every_export(monkeypatch, tmp_path):
-    from flash.engine.worker.train.opd import failures as opd_failures
 
     checkpoint_dir = tmp_path / "global_step_1"
     (checkpoint_dir / "actor").mkdir(parents=True)
@@ -3521,7 +3972,7 @@ def test_opd_checkpoint_watcher_forwards_processor_to_every_export(monkeypatch, 
     )
     monkeypatch.setattr(opd_failures, "_stage_retry_contract", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        opd_failures._w,
+        opd_failures._worker_hf,
         "upload_resume_checkpoint",
         lambda _step, _path, **kwargs: (kwargs["before_upload"](), kwargs["after_upload"](), True)[
             2
@@ -3549,15 +4000,15 @@ def test_opd_checkpoint_watcher_forwards_processor_to_every_export(monkeypatch, 
 
 
 def test_resume_leaves_missing_required_companion_for_checkpoint_watcher(monkeypatch, tmp_path):
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     class Api:
         def file_exists(self, **_kwargs):
             return False
 
-    monkeypatch.setattr(worker, "HF_REPO", "owner/artifacts")
+    monkeypatch.setattr(worker._worker_state, "HF_REPO", "owner/artifacts")
     monkeypatch.setattr(worker, "hf_prefix", lambda: "opd/run")
-    monkeypatch.setattr(worker, "hf_api", Api)
+    monkeypatch.setattr(worker_hf, "hf_api", Api)
     local_dir = tmp_path / "checkpoints"
     checkpoint_dir = local_dir / "global_step_3"
     checkpoint_dir.mkdir(parents=True)
@@ -3617,14 +4068,12 @@ def test_the_watcher_claims_every_step_but_publishes_only_required_ones(monkeypa
     comment and cannot fail when the logic moves. with save_at_steps empty, required_steps is empty,
     so every step must be discovered and none may be published.
     """
-    import flash.engine.worker as worker
+    import flash.engine.worker.io.hf as worker
 
     local_dir = tmp_path / "checkpoints"
     checkpoint_dir = local_dir / "global_step_2"
     (checkpoint_dir / "actor").mkdir(parents=True)
     (local_dir / "latest_checkpointed_iteration.txt").write_text("2")
-
-    from flash.engine.worker.train.opd import failures as opd_failures
 
     published: list[int] = []
     # patched where the watcher resolves them, not on opd_train: `_publish` calls the names bound
@@ -3671,8 +4120,7 @@ def test_an_opd_backlog_stages_a_retry_contract_for_every_step(monkeypatch, tmp_
     driven through a real three-step backlog rather than asserted on `_publishable` alone, so the
     contract staging and the upload are both counted.
     """
-    import flash.engine.worker as worker
-    from flash.engine.worker.train.opd import failures as opd_failures
+    import flash.engine.worker.io.hf as worker
 
     local_dir = tmp_path / "checkpoints"
     for step in (1, 2, 3):
@@ -3976,8 +4424,10 @@ def test_mixed_transient_and_truncated_exhaustion_remains_retriable():
 
 def test_abandonment_transport_fallback_promotes_pending_teacher_failure(monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher.client import TeacherError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -4008,8 +4458,10 @@ def test_abandonment_transport_fallback_promotes_pending_teacher_failure(monkeyp
 
 def test_accepted_abandonment_lost_response_does_not_duplicate_accounting(monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher.client import TeacherError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -4043,8 +4495,10 @@ def test_resample_transport_failure_before_acceptance_promotes_without_replaceme
     monkeypatch, tmp_path
 ):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher.client import TeacherError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -4087,8 +4541,10 @@ def test_resample_transport_failure_before_acceptance_promotes_without_replaceme
 
 def test_accepted_resample_lost_response_counts_once_and_promotes(monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher.client import TeacherError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -4120,7 +4576,9 @@ def test_accepted_resample_lost_response_counts_once_and_promotes(monkeypatch, t
 
 def test_resample_fallback_without_pending_transient_does_not_promote(monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     bridge = _text_bridge(_BridgeTeacher())
     bridge.score(0, 2, [10, 11, 65, 66])
@@ -4148,8 +4606,10 @@ def test_resample_fallback_without_pending_transient_does_not_promote(monkeypatc
 
 def test_successful_teacher_signal_suppresses_resample_fallback_promotion(monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher.client import TeacherError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     class TransientThenSuccessTeacher:
         def __init__(self):
@@ -4188,7 +4648,9 @@ def test_successful_teacher_signal_suppresses_resample_fallback_promotion(monkey
 
 def test_successful_resample_creates_no_marker_and_prepares_replacement(monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     bridge = _text_bridge(_BridgeTeacher())
     failure_path = str(tmp_path / "resample-failure")
@@ -4229,8 +4691,10 @@ def test_successful_resample_creates_no_marker_and_prepares_replacement(monkeypa
     ],
 )
 def test_permanent_no_signal_notification_precedes_pending_transient(failures):
-    from flash.engine.worker.opd_train import _reconcile_no_signal_notification_failure
     from flash.engine.worker.teacher.client import TeacherError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _reconcile_no_signal_notification_failure,
+    )
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -4259,8 +4723,10 @@ def test_authoritative_teacher_failure_precedes_transient_no_signal_evidence(
     classification,
     message,
 ):
-    from flash.engine.worker.opd_train import _reconcile_no_signal_notification_failure
     from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _reconcile_no_signal_notification_failure,
+    )
 
     bridge = _text_bridge(_BridgeTeacher())
     bridge._record_teacher_failure(classification, message, terminal=True)
@@ -4308,7 +4774,6 @@ def test_malformed_accepted_no_signal_notification_is_transient_once(
     reader_name,
     counter_name,
 ):
-    import flash.engine.worker.opd_train as opd_train
     import flash.engine.worker.train.opd.child.plugin as plugin
 
     failure_path = str(tmp_path / f"{channel}-failure")
@@ -4326,7 +4791,7 @@ def test_malformed_accepted_no_signal_notification_is_transient_once(
     try:
         with pytest.raises(FlashTeacherBridgeError) as error:
             getattr(plugin, f"_post_no_signal_{channel}")(bridge.url, bridge.token)
-        fallback = getattr(opd_train, reader_name)(failure_path)
+        fallback = getattr(opd_failures, reader_name)(failure_path)
     finally:
         bridge.close()
 
@@ -4342,8 +4807,10 @@ def test_malformed_accepted_no_signal_notification_is_transient_once(
 
 def test_malformed_accepted_cycle_commit_exhaustion_is_transient(monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     failure_path = str(tmp_path / "cycle-commit-failure")
     monkeypatch.setenv("FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH", failure_path)
@@ -4413,7 +4880,6 @@ def test_explicit_notification_rejection_remains_permanent(
     environment_key,
     reader_name,
 ):
-    import flash.engine.worker.opd_train as opd_train
     import flash.engine.worker.train.opd.child.plugin as plugin
 
     attempts = []
@@ -4433,7 +4899,7 @@ def test_explicit_notification_rejection_remains_permanent(
         getattr(plugin, poster_name)("http://bridge", "token")
 
     assert attempts == [True]
-    assert getattr(opd_train, reader_name)(failure_path) == (
+    assert getattr(opd_failures, reader_name)(failure_path) == (
         "permanent",
         "notification rejected",
     )
@@ -4470,7 +4936,6 @@ def test_unexpected_local_notification_error_remains_permanent(
     reader_name,
     message_prefix,
 ):
-    import flash.engine.worker.opd_train as opd_train
     import flash.engine.worker.train.opd.child.plugin as plugin
 
     failure_path = str(tmp_path / "notification-failure")
@@ -4484,15 +4949,17 @@ def test_unexpected_local_notification_error_remains_permanent(
     with pytest.raises(ValueError, match="local failure"):
         getattr(plugin, poster_name)("http://bridge", "token")
 
-    fallback = getattr(opd_train, reader_name)(failure_path)
+    fallback = getattr(opd_failures, reader_name)(failure_path)
     assert fallback is not None
     assert fallback[0] == "permanent"
     assert fallback[1] == f"{message_prefix}: ValueError"
 
 
 def test_transient_no_signal_notification_without_pending_is_retriable():
-    from flash.engine.worker.opd_train import _reconcile_no_signal_notification_failure
     from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _reconcile_no_signal_notification_failure,
+    )
 
     bridge = _text_bridge(_BridgeTeacher())
     failure = _reconcile_no_signal_notification_failure(
@@ -4507,8 +4974,10 @@ def test_transient_no_signal_notification_without_pending_is_retriable():
 
 
 def test_transient_no_signal_notification_promotes_causal_teacher_failure():
-    from flash.engine.worker.opd_train import _reconcile_no_signal_notification_failure
     from flash.engine.worker.teacher.client import TeacherError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _reconcile_no_signal_notification_failure,
+    )
 
     class TransientTeacher:
         def score(self, _prompt_text, _completion_text):
@@ -4604,8 +5073,10 @@ def test_incomplete_cycle_commit_response_retries_once_without_mutation_fallback
     monkeypatch, tmp_path
 ):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.teacher.client import TeacherError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     class SuccessThenTransientTeacher:
         def __init__(self):
@@ -4677,8 +5148,10 @@ def test_incomplete_cycle_commit_response_retries_once_without_mutation_fallback
 
 def test_transient_cycle_commit_failure_records_retriable_preupdate_cause(monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     attempts = []
     actor_updates = []
@@ -4714,7 +5187,9 @@ def test_transient_cycle_commit_failure_records_retriable_preupdate_cause(monkey
 
 def test_explicit_cycle_commit_rejection_aborts_before_actor_update(monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     attempts = []
     actor_updates = []
@@ -4749,8 +5224,10 @@ def test_explicit_cycle_commit_rejection_aborts_before_actor_update(monkeypatch,
 
 def test_persistent_cycle_commit_failure_aborts_before_actor_update(monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     bridge = _text_bridge(_BridgeTeacher())
     commit_calls = []
@@ -4824,7 +5301,9 @@ def test_persistent_cycle_commit_failure_aborts_before_actor_update(monkeypatch,
 )
 def test_failure_fallback_serialization_is_valid_and_within_reader_limit(tmp_path, message):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     failure_path = str(tmp_path / "cycle-commit-failure")
     plugin._write_failure_fallback(failure_path, "transient", message)
@@ -4848,7 +5327,9 @@ def test_failure_fallback_serialization_is_valid_and_within_reader_limit(tmp_pat
 
 def test_cycle_commit_fallback_reader_ignores_incomplete_records(monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     failure_path = str(tmp_path / "cycle-commit-failure")
     monkeypatch.setenv("FLASH_OPD_CYCLE_COMMIT_FAILURE_PATH", failure_path)
@@ -5120,12 +5601,12 @@ def test_multiturn_transient_bridge_failure_latches_terminal_cause():
 
 def test_client_only_multiturn_score_loss_publishes_retriable_fallback_once(monkeypatch, tmp_path):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import (
+    from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.train.opd.child.multiturn import _post_multiturn_score
+    from flash.engine.worker.train.opd.orchestration.failures import (
         _read_classified_failure_fallback,
         _reconcile_score_delivery_failure,
     )
-    from flash.engine.worker.perf import RetriableInfraError
-    from flash.engine.worker.train.opd.child.multiturn import _post_multiturn_score
 
     failure_path = str(tmp_path / "score-delivery-failure")
     monkeypatch.setenv("FLASH_OPD_SCORE_DELIVERY_FAILURE_PATH", failure_path)
@@ -5222,8 +5703,10 @@ def test_mutation_transport_failure_survives_actor_exit_and_generic_driver_statu
     monkeypatch, tmp_path
 ):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
     from flash.engine.worker.perf import RetriableInfraError
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     failure_path = str(tmp_path / "mutation-failure")
 
@@ -5250,7 +5733,9 @@ def test_mutation_transport_failure_survives_actor_exit_and_generic_driver_statu
 
 
 def test_mutation_failure_fallback_publishes_one_atomic_record_per_process(monkeypatch, tmp_path):
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     failure_path = str(tmp_path / "mutation-failure")
     messages = [f"bridge timeout {index}" for index in range(4)]
@@ -5300,7 +5785,9 @@ def test_mutation_failure_fallback_removes_temp_when_publication_fails(monkeypat
 def test_mutation_failure_fallback_selects_permanent_and_ignores_incomplete_records(
     tmp_path,
 ):
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     failure_path = str(tmp_path / "mutation-failure")
     Path(f"{failure_path}.100.transient.json").write_text(
@@ -5825,7 +6312,9 @@ def test_persistent_incomplete_mutation_response_fails_closed_after_one_retry(
     monkeypatch, tmp_path
 ):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     callback_calls = []
     optimizer_steps = []
@@ -5873,7 +6362,9 @@ def test_persistent_mutation_response_loss_writes_fallback_without_optimizer_ste
     monkeypatch, tmp_path
 ):
     import flash.engine.worker.train.opd.child.plugin as plugin
-    from flash.engine.worker.opd_train import _read_classified_failure_fallback
+    from flash.engine.worker.train.opd.orchestration.failures import (
+        _read_classified_failure_fallback,
+    )
 
     callback_calls = []
     optimizer_steps = []
@@ -5951,7 +6442,7 @@ def test_mutation_marker_failure_survives_actor_exit_and_generic_driver_status(
 
 
 def _reconcile_opd_failure(truncation_window: _TruncationWindow):
-    import flash.engine.worker.opd_train_runner as opd_runner
+    import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     bridge = SimpleNamespace(
         teacher_failure=None,
@@ -6064,7 +6555,7 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
 ):
     from contextlib import nullcontext
 
-    import flash.engine.worker.opd_train_runner as opd_runner
+    import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     watcher_failure = {"enabled": False}
     sampler_stops = []
@@ -6109,19 +6600,19 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
         wandb_link={"wandb_url": None, "wandb_id": None},
     )
     reconciled = []
-    monkeypatch.setattr(opd_runner._opd_train, "build_opd_overrides", lambda _config: [])
-    monkeypatch.setattr(opd_runner._opd_train, "_OpdProgressState", ProgressState)
+    monkeypatch.setattr(opd_runner._opd_overrides, "build_opd_overrides", lambda _config: [])
+    monkeypatch.setattr(opd_runner._opd_progress, "_OpdProgressState", ProgressState)
     monkeypatch.setattr(opd_runner, "_build_checkpoint_watcher", lambda *_args: Watcher())
     monkeypatch.setattr(opd_runner, "_build_child_callbacks", lambda *_args: callbacks)
     monkeypatch.setattr(opd_runner, "_build_child_env", lambda *_args: {})
-    monkeypatch.setattr(opd_runner._opd_train, "_NvidiaSmiPeakSampler", GpuSampler)
+    monkeypatch.setattr(opd_runner._sft, "_NvidiaSmiPeakSampler", GpuSampler)
     monkeypatch.setattr(
-        opd_runner._opd_train,
+        opd_runner._worker_heartbeat,
         "liveness_heartbeat",
         lambda *_args, **_kwargs: nullcontext(),
     )
     monkeypatch.setattr(
-        opd_runner._opd_train,
+        opd_runner._backend,
         "run_verl_training",
         lambda *_args, **_kwargs: 0,
     )
@@ -6131,7 +6622,7 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
         lambda *_args, truncation_window: reconciled.append(truncation_window),
     )
     monkeypatch.setattr(
-        opd_runner._opd_train,
+        opd_runner._backend,
         "latest_global_step_dir",
         lambda _path: ("/actor", 1),
     )
@@ -6196,6 +6687,7 @@ def _config(**overrides):
         "lora_alpha": 64,
         "target_modules": "all-linear",
         "exclude_modules": None,
+        "fsdp_generation": 1,
         "learning_rate": 1e-5,
         "local_dir": "/w/checkpoints",
         "save_freq": 20,
@@ -6218,8 +6710,16 @@ def _config(**overrides):
     return config
 
 
-def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
-    from flash.engine.worker import opd_train_runner as runner
+def _materialized_opd_save_freq(
+    monkeypatch,
+    *,
+    save_at_steps,
+    save_every,
+    horizon,
+    target_parameters=None,
+    resume_calls=None,
+):
+    from flash.engine.worker.train.entry import opd_train_runner as runner
 
     knobs = SimpleNamespace(
         save_at_steps=save_at_steps,
@@ -6229,7 +6729,7 @@ def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horiz
     )
     request = SimpleNamespace(
         knobs=knobs,
-        model_id="Qwen/Qwen3.5-4B",
+        model_id="Qwen/Qwen3.5-9B",
         model_revision="revision",
         spec=SimpleNamespace(
             gpu=SimpleNamespace(count=1),
@@ -6252,14 +6752,20 @@ def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horiz
         update_horizon=horizon,
         local_dir="/checkpoints",
         prompt_pool_fingerprint="fingerprint",
+        target_parameters=target_parameters,
+        fsdp_generation=2 if target_parameters else 1,
     )
-    monkeypatch.setattr(runner._opd_train, "_cached_model_path", lambda *_args: "/model")
-    monkeypatch.setattr(runner._opd_train, "resolve_verl_loggers", lambda _caps: ["console"])
-    monkeypatch.setattr(runner._opd_train._w, "wandb_run_name", lambda: "opd-test")
+    monkeypatch.setattr(runner._sft, "_cached_model_path", lambda *_args: "/model")
+    monkeypatch.setattr(runner._backend, "resolve_verl_loggers", lambda _caps: ["console"])
+    monkeypatch.setattr(runner._worker_wandb, "wandb_run_name", lambda: "opd-test")
     monkeypatch.setattr(runner, "_write_child_shims", lambda *_args: ("entry.py", "reward.py"))
-    monkeypatch.setattr(
-        runner._opd_train, "_restore_verl_resume", lambda *_args, **_kwargs: (0, None)
-    )
+
+    def restore(*_args, **kwargs):
+        if resume_calls is not None:
+            resume_calls.append(kwargs)
+        return 0, None
+
+    monkeypatch.setattr(runner._opd_failures, "_restore_verl_resume", restore)
 
     class Bridge:
         def __init__(self, **_kwargs):
@@ -6268,7 +6774,7 @@ def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horiz
         def start(self):
             pass
 
-    monkeypatch.setattr(runner._opd_train, "_TeacherAlignmentBridge", Bridge)
+    monkeypatch.setattr(runner._opd_bridge, "_TeacherAlignmentBridge", Bridge)
     return runner._materialize_child_files(
         request,
         prompt_state,
@@ -6278,6 +6784,27 @@ def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horiz
         None,
         (),
     ).save_freq
+
+
+@pytest.mark.parametrize(
+    ("target_parameters", "expected_generation"),
+    [(None, 1), (["mlp.experts.gate_up_proj"], 2)],
+)
+def test_opd_resume_gate_uses_the_same_generation_as_the_actor_strategy(
+    monkeypatch, target_parameters, expected_generation
+):
+    calls = []
+
+    _materialized_opd_save_freq(
+        monkeypatch,
+        save_at_steps=(),
+        save_every=20,
+        horizon=10,
+        target_parameters=target_parameters,
+        resume_calls=calls,
+    )
+
+    assert [call["expected_fsdp_generation"] for call in calls] == [expected_generation]
 
 
 def test_opd_save_freq_clamps_to_a_short_derived_horizon(monkeypatch):
@@ -6374,25 +6901,43 @@ def test_overrides_omit_layered_summon_for_dense_models():
     ]
 
 
-def test_overrides_keep_fused_expert_params_addressable_under_fsdp1():
-    # opd pins `actor.strategy=fsdp` explicitly, so it flattens by default exactly like grpo and
-    # needs the same flag for PEFT's forward-time parametrization to find the expert tensor.
-    overrides = dict(
-        value.split("=", 1)
-        for value in build_opd_overrides(
-            _config(target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
+@pytest.mark.parametrize(
+    ("target_parameters", "expected_strategy"),
+    [
+        (None, "fsdp"),
+        (["mlp.experts.gate_up_proj", "mlp.experts.down_proj"], "fsdp2"),
+    ],
+)
+def test_overrides_select_the_explicit_opd_fsdp_strategy(target_parameters, expected_strategy):
+    built = build_opd_overrides(
+        _config(
+            target_parameters=target_parameters,
+            fsdp_generation=2 if target_parameters else 1,
         )
     )
-    assert overrides["actor_rollout_ref.actor.fsdp_config.use_orig_params"] == "true"
-    assert overrides["actor_rollout_ref.actor.strategy"] == "fsdp"
+    overrides = dict(value.split("=", 1) for value in built)
+    assert overrides["actor_rollout_ref.actor.strategy"] == expected_strategy
+    # dict() would silently keep the last of a duplicated key, so count the exact bare override
+    strategy_overrides = [v for v in built if "actor_rollout_ref.actor.strategy=" in v]
+    assert strategy_overrides == [f"actor_rollout_ref.actor.strategy={expected_strategy}"]
 
 
-def test_overrides_omit_orig_params_for_dense_models():
-    assert not [
-        value
-        for value in build_opd_overrides(_config(target_parameters=None))
-        if "use_orig_params" in value
-    ]
+@pytest.mark.parametrize("reshard_after_forward", [False, True])
+def test_opd_fsdp_generation_does_not_change_zero2_or_zero3(reshard_after_forward):
+    for target_parameters in (None, ["mlp.experts.gate_up_proj"]):
+        overrides = dict(
+            value.split("=", 1)
+            for value in build_opd_overrides(
+                _config(
+                    target_parameters=target_parameters,
+                    reshard_after_forward=reshard_after_forward,
+                )
+            )
+        )
+        assert (
+            overrides["actor_rollout_ref.actor.fsdp_config.reshard_after_forward"]
+            == str(reshard_after_forward).lower()
+        )
 
 
 def test_overrides_match_verl_0_8_sync_distillation_contract():
@@ -6422,6 +6967,10 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     assert overrides["data.image_key"] == "images"
     assert overrides["data.return_raw_chat"] == "true"
     assert overrides["data.return_multi_modal_inputs"] == "false"
+    assert (
+        overrides["++data.apply_chat_template_kwargs"]
+        == "{enable_thinking:false,preserve_thinking:false}"
+    )
     # `++`-prefixed: these keys are absent from the composed node, so a bare assignment would abort
     # the run at hydra composition. see build_opd_overrides for the per-key reasoning.
     assert overrides["++actor_rollout_ref.rollout.limit_images"] == "4"
@@ -6451,7 +7000,7 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
     # `ulysses_sequence_parallel_size = runtime.gpu_count`. sequence parallelism corrupts
     # GatedDeltaNet state (ranks past 0 begin their recurrence from zero), and every catalog model is
     # a GDN hybrid, so this must hold at every width flash can rent.
-    from flash.engine.worker import opd_train_runner as _runner
+    from flash.engine.worker.train.entry import opd_train_runner as _runner
 
     # `_build_base_config` reads plain attributes off its four state objects, so namespaces carry the
     # inputs without re-listing every unrelated dataclass field (which a later field addition would
@@ -6460,7 +7009,7 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
         request=SimpleNamespace(
             multi_turn=False,
             structured_outputs=None,
-            model_id="Qwen/Qwen3.5-4B",
+            model_id="Qwen/Qwen3.5-9B",
             knobs=SimpleNamespace(
                 max_completion=512,
                 learning_rate=1e-5,
@@ -6480,6 +7029,8 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
             lora_rank=32,
             lora_alpha=64,
             target_modules="all-linear",
+            target_parameters=None,
+            fsdp_generation=1,
             exclude_modules="text-export-policy",
             warmstart_adapter=None,
         ),
@@ -6513,17 +7064,17 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
 def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
     """The gate must size off `request.spec`, never the process-global JOB_SPEC.
 
-    `opd_train` resolves its spec as `spec or _w.JOB_SPEC`, so a caller that passes one gets a run
+    the OPD entry resolves its spec as `spec or worker_state.JOB_SPEC`, so a caller that passes one gets a run
     whose hardware is NOT what JOB_SPEC describes. Sizing the gate off the global there would let it
     enable ZeRO-2 against a card the run never landed on -- the allocator/worker divergence the gate
     exists to prevent. Pinned with the two disagreeing so reading the wrong one cannot pass.
     """
-    from flash.engine.worker import opd_train as _opd_train
-    from flash.engine.worker import opd_train_runner as _runner
+    import flash.engine.worker.runtime.state as worker_state
+    from flash.engine.worker.train.entry import opd_train_runner as _runner
 
     # the global says a card with room to spare; the passed spec says a card without it.
     monkeypatch.setattr(
-        _opd_train._w,
+        worker_state,
         "JOB_SPEC",
         SimpleNamespace(gpu=SimpleNamespace(type="B200"), train=SimpleNamespace()),
         raising=False,
@@ -6534,7 +7085,7 @@ def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
             request=SimpleNamespace(
                 multi_turn=False,
                 structured_outputs=None,
-                model_id="Qwen/Qwen3.5-4B",
+                model_id="Qwen/Qwen3.5-9B",
                 model_revision="",
                 spec=spec,
                 knobs=SimpleNamespace(
@@ -6556,6 +7107,8 @@ def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
                 lora_rank=32,
                 lora_alpha=64,
                 target_modules="all-linear",
+                target_parameters=None,
+                fsdp_generation=1,
                 exclude_modules=None,
                 warmstart_adapter=None,
             ),
@@ -6622,7 +7175,7 @@ def test_rl_width_never_exceeds_the_sequences_one_step_holds():
     # the wiring is asserted on the source rather than by driving it offline.
     import inspect
 
-    from flash.engine.worker import opd_train_runner
+    from flash.engine.worker.train.entry import opd_train_runner
 
     src = inspect.getsource(opd_train_runner._materialize_child_files)
     assert "gpu_count = rl_data_parallel_cards(" in src
@@ -6781,8 +7334,8 @@ def test_both_ray_rollouts_honor_sleep_unsupported_from_the_same_catalog_flag():
     # one-trainer-only is precisely how the eager defect above reached production.
     # each trainer renders its overrides in a separate module from where it resolves the flag, so
     # both halves of this guard span two modules. keep these in step when a trainer is split again.
-    from flash.engine.worker.train.opd import overrides as opd_overrides
-    from flash.engine.worker.train.rl import verl_config as rl_verl_config
+    from flash.engine.worker.train.opd.orchestration import overrides as opd_overrides
+    from flash.engine.worker.train.rl.launch import verl_config as rl_verl_config
 
     opd_source = inspect.getsource(opd_train) + inspect.getsource(opd_overrides)
     rl_source = inspect.getsource(rl_train) + inspect.getsource(rl_verl_config)
@@ -6876,7 +7429,7 @@ def test_generated_opd_reward_shim_scores_every_rollout_zero():
     namespace: dict = {}
     # exec, not import: the shim only exists on disk inside a live workdir, and the constant is
     # what actually ships to the worker.
-    exec(opd_train._OPD_ZERO_REWARD_SOURCE, namespace)
+    exec(opd_protocol.OPD_ZERO_REWARD_SOURCE, namespace)
 
     compute_score = namespace["compute_score"]
     assert compute_score("flash_opd", "any completion", "") == 0.0
@@ -7237,7 +7790,7 @@ def test_multiturn_child_environment_carries_only_rollout_capabilities(tmp_path)
 
 
 def test_structured_validator_rejects_vllm_mistral_tokenizer_models(monkeypatch):
-    from flash.engine.worker.train.opd import validation as opd_validation
+    from flash.engine.worker.train.opd.orchestration import validation as opd_validation
 
     monkeypatch.setattr(
         opd_validation,
@@ -7254,7 +7807,7 @@ def test_structured_validator_rejects_vllm_mistral_tokenizer_models(monkeypatch)
 
 
 def test_unstructured_validator_does_not_resolve_model_metadata(monkeypatch):
-    from flash.engine.worker.train.opd import validation as opd_validation
+    from flash.engine.worker.train.opd.orchestration import validation as opd_validation
 
     def unexpected(*_args, **_kwargs):
         pytest.fail("unstructured OPD must not resolve structured model metadata")
@@ -7264,7 +7817,7 @@ def test_unstructured_validator_does_not_resolve_model_metadata(monkeypatch):
 
     result = validate_opd_structured_outputs(
         None,
-        model_id="Qwen/Qwen3.5-4B",
+        model_id="Qwen/Qwen3.5-9B",
         model_revision="d" * 40,
     )
 
@@ -7347,10 +7900,10 @@ def test_deterministic_seed_uses_every_rollout_identity_component():
 def test_train_meta_records_the_optimizer_steps_that_actually_produced_a_loss():
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.train.entry.opd_train import run_opd_train
 
     notes = inspect.getsource(run_opd_train)
-    notes = notes[notes.index("_w.write_train_meta(") :]
+    notes = notes[notes.index("_worker_finalize.write_train_meta(") :]
     # `steps` is the REQUESTED horizon. a step whose batch carried no teacher signal never applies
     # an update, so reporting the horizon as the work done would overstate a partly-starved run.
     assert '"steps": update_horizon,' in notes
@@ -7365,7 +7918,7 @@ def test_worker_filters_over_budget_prompts_before_downloading_the_weights():
     """
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.train.entry.opd_train import run_opd_train
 
     source = inspect.getsource(run_opd_train)
     budget_raise = source.index('raise RuntimeError("every OPD prompt exceeds the configured')
@@ -7375,17 +7928,19 @@ def test_worker_filters_over_budget_prompts_before_downloading_the_weights():
     load_phase = source.index("_load_opd_model(")
     assert budget_raise < load_phase
 
-    from flash.engine.worker.opd_train import _load_opd_model
+    from flash.engine.worker.train.entry.opd_train import _load_opd_model
 
     phase = inspect.getsource(_load_opd_model)
     # the eos read needs the downloaded snapshot, so it must follow the prefetch.
-    assert phase.index("_w.prefetch_model(") < phase.index("generation_eos_from_cached_config(")
+    assert phase.index("_worker_hf.prefetch_model(") < phase.index(
+        "generation_eos_from_cached_config("
+    )
 
 
 def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoint():
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.train.entry.opd_train import run_opd_train
 
     source = inspect.getsource(run_opd_train)
     # record_step only checks that each metric line FOLLOWS the previous one, so it cannot notice a
@@ -7398,17 +7953,17 @@ def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoin
     assert "raise RuntimeError(" in guard[:600]
     # and it must sit BEFORE the publish, not after it.
     assert source.index('if len(final_accounting["loss_curve"]) != final_step:') < source.index(
-        "_w.write_train_meta("
+        "_worker_finalize.write_train_meta("
     )
 
 
 def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.train.entry.opd_train import run_opd_train
 
     notes = inspect.getsource(run_opd_train)
-    notes = notes[notes.index("_w.write_train_meta(") :]
+    notes = notes[notes.index("_worker_finalize.write_train_meta(") :]
     # only single-turn text uses the serial batcher; multimodal and multi-turn use bridge threads.
     # report at most the samples one step can produce.
     assert (
@@ -7430,7 +7985,7 @@ def test_text_teacher_batcher_scores_one_batch_at_a_time():
     # opd_teacher_workers reports 1 for the text path. that is only honest while the batcher scores
     # serially, so assert the observable property rather than the thread count: no two score_many
     # calls may ever overlap, however the batcher is wired internally.
-    from flash.engine.worker.opd_train import _TextTeacherBatcher
+    from flash.engine.worker.train.opd.bridging.batching import _TextTeacherBatcher
 
     class _OverlapDetectingTeacher:
         def __init__(self):
@@ -7473,7 +8028,7 @@ def test_text_teacher_batcher_scores_one_batch_at_a_time():
 def test_worker_structured_validator_runs_before_model_download():
     import inspect
 
-    from flash.engine.worker.opd_train import run_opd_train
+    from flash.engine.worker.train.entry.opd_train import run_opd_train
 
     source = inspect.getsource(run_opd_train)
     # the prefetch moved into `_load_opd_model`; its call site is the boundary the cheap validator
@@ -7572,7 +8127,7 @@ def test_opd_delegates_to_verl_with_no_selector_left(monkeypatch):
     left to select between and no env key can route the phase anywhere else.
     """
     import flash.engine.worker.entry.opd as opd_mod
-    import flash.engine.worker.opd_train as ov
+    import flash.engine.worker.train.entry.opd_train as ov
 
     called = []
     monkeypatch.setattr(ov, "run_opd_train", lambda *a, **k: called.append(True))
@@ -7587,14 +8142,14 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
     verl sleep mode uses CuMemAllocator, which rejects expandable_segments.
     """
     from flash.core.spec import JobSpec
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     def _spec():
         return JobSpec.from_dict(
             {
                 "run_id": "r-alloc",
                 "algorithm": "opd",
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "environment": {"id": "org/env"},
                 "train": {
                     "hf_repo": "a/b",
@@ -7614,7 +8169,6 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
     assert spec.phase == "opd"
     alloc = build_worker_env(
         spec,
-        spec.seed,
         runtime_secrets=teacher_runtime,
     )["PYTORCH_CUDA_ALLOC_CONF"]
     assert "expandable_segments" not in alloc
@@ -7624,7 +8178,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
         {
             "run_id": "r-sft",
             "algorithm": "sft",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "environment": {"id": "org/env"},
             "train": {
                 "hf_repo": "a/b",
@@ -7635,18 +8189,18 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
             "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
         }
     )
-    assert build_worker_env(sft, sft.seed)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert build_worker_env(sft)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
 
 
 def test_worker_fails_closed_on_tool_env(monkeypatch):
     # multi-turn is now supported; native tool-calling OPD still fails closed at the worker layer.
-    import flash.engine.worker.opd_train as ov
+    import flash.engine.worker.train.entry.opd_train as ov
 
     class FakeEnv:
         is_tool_env = True
         multi_turn = False
 
-    monkeypatch.setattr(ov._w, "require_active_env", lambda: FakeEnv())
+    monkeypatch.setattr(ov._worker_state, "require_active_env", lambda: FakeEnv())
     with pytest.raises(
         RuntimeError, match="native tool-calling OPD environments are not supported"
     ):
@@ -7659,28 +8213,30 @@ def test_on_line_parses_the_numpy2_distillation_loss_the_image_actually_prints()
     The worker image uses numpy 2.2.6, whose pprint output makes bare ``float()`` drop every metric
     and leave the loss curve empty.
     """
-    import flash.engine.worker.opd_train as ov
-
     ray_prefixed = "(TaskRunner pid=3125) step:4 - actor/distillation/loss:np.float64(0.6421)"
-    assert ov.parse_verl_metric(ray_prefixed, "actor/distillation/loss") == 0.6421
+    assert backend_common.parse_verl_metric(ray_prefixed, "actor/distillation/loss") == 0.6421
     # the unprefixed numpy-1 spelling verl's own pin produces still parses.
     assert (
-        ov.parse_verl_metric("step:4 - actor/distillation/loss:0.6421", "actor/distillation/loss")
+        backend_common.parse_verl_metric(
+            "step:4 - actor/distillation/loss:0.6421", "actor/distillation/loss"
+        )
         == 0.6421
     )
     # the un-namespaced fallback key the handler tries second.
     assert (
-        ov.parse_verl_metric("step:4 - distillation/loss:np.float32(0.25)", "distillation/loss")
+        backend_common.parse_verl_metric(
+            "step:4 - distillation/loss:np.float32(0.25)", "distillation/loss"
+        )
         == 0.25
     )
 
 
 def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_train_runner as opd_runner
+    import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     emitted = []
     monkeypatch.setattr(
-        opd_train._w,
+        opd_runner._worker_heartbeat,
         "heartbeat",
         lambda stage, **payload: emitted.append((stage, payload)),
     )
@@ -7710,11 +8266,11 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch, tmp_path):
 
 
 def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_train_runner as opd_runner
+    import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     emitted = []
     monkeypatch.setattr(
-        opd_train._w,
+        opd_runner._worker_heartbeat,
         "heartbeat",
         lambda stage, **payload: emitted.append((stage, payload)),
     )
@@ -7749,11 +8305,11 @@ def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypat
     """
     import re
 
-    import flash.engine.worker.opd_train_runner as opd_runner
+    import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     emitted = []
     monkeypatch.setattr(
-        opd_train._w,
+        opd_runner._worker_heartbeat,
         "heartbeat",
         lambda stage, **payload: emitted.append((stage, payload)),
     )
@@ -7786,7 +8342,7 @@ def test_opd_line_handler_reads_the_loss_through_the_shared_parser():
     import inspect
     import textwrap
 
-    import flash.engine.worker.opd_train_runner as opd_runner
+    import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     source = textwrap.dedent(inspect.getsource(opd_runner._build_child_callbacks))
     handler = next(
@@ -7944,7 +8500,7 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
 
     The platform-injected key is mandatory, so reject before the GPU probe and model prefetch.
     """
-    from flash.engine.worker import opd_train as opd_mod
+    from flash.engine.worker.train.entry import opd_train as opd_mod
 
     env = SimpleNamespace(
         is_tool_env=False,
@@ -7962,24 +8518,17 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
         stop_sequences=(),
         structured_outputs="",
     )
+    monkeypatch.setattr(opd_mod._worker_state, "SEED", 0)
+    monkeypatch.setattr(opd_mod._worker_state, "THINKING", False)
+    monkeypatch.setattr(opd_mod._worker_state, "require_active_env", lambda: env)
     monkeypatch.setattr(
-        opd_mod,
-        "_w",
+        opd_mod._worker_state,
+        "JOB_SPEC",
         SimpleNamespace(
-            SEED=0,
-            THINKING=False,
-            require_active_env=lambda: env,
-            JOB_SPEC=SimpleNamespace(
-                train=train,
-                model="Qwen/Qwen3.5-4B",
-                model_revision="",
-                gpu=SimpleNamespace(type=None),
-            ),
-            heartbeat=lambda *args, **kwargs: None,
-            gpu_diagnostics=lambda **_kwargs: {},
-            prefetch_model=lambda *args, **kwargs: (_ for _ in ()).throw(
-                AssertionError("model prefetch must not be reached")
-            ),
+            train=train,
+            model="Qwen/Qwen3.5-9B",
+            model_revision="",
+            gpu=SimpleNamespace(type=None),
         ),
     )
     monkeypatch.setattr(
@@ -7990,7 +8539,7 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
         ),
     )
     # torch is not installed in this test env; the real seeding is covered in test_training_controls.
-    monkeypatch.setattr(opd_mod, "seed_training_rngs", lambda seed: None)
+    monkeypatch.setattr(opd_prompt_preparation, "seed_training_rngs", lambda seed: None)
     monkeypatch.delenv("FLASH_PUBLIC_URL", raising=False)
     monkeypatch.delenv("FLASH_TEACHER_CAPABILITY", raising=False)
 
@@ -8010,19 +8559,22 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
 def test_opd_preparation_propagates_derived_thinking_semantics(
     monkeypatch, thinking, rendered_prompt, expected_opened
 ):
-    from flash.engine.worker import opd_train as opd_mod
-    from flash.engine.worker import opd_train_runner
     from flash.engine.worker.model.decoding import prompt_opens_thinking
-    from flash.engine.worker.train.opd.state import _OpdRequest
+    from flash.engine.worker.train.opd.orchestration import prompt_preparation
 
     class _Tokenizer:
         pad_token = "<pad>"
         eos_token = "<eos>"
 
         def apply_chat_template(
-            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+            self, messages, *, tokenize, add_generation_prompt, enable_thinking, preserve_thinking
         ):
-            assert messages == [{"role": "user", "content": "question"}]
+            assert preserve_thinking is False
+            assert messages == [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "reasoning_content": "old", "content": "answer"},
+                {"role": "user", "content": "question"},
+            ]
             assert add_generation_prompt is True
             assert enable_thinking is thinking
             return [10, 11] if tokenize else rendered_prompt
@@ -8037,21 +8589,31 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
 
     env = SimpleNamespace(thinking=None, prompt_opens_thinking=None, package_root=None)
     tokenizer = _Tokenizer()
+    monkeypatch.setattr(prompt_preparation._worker_state, "THINKING", thinking)
     monkeypatch.setattr(
-        opd_mod,
-        "_w",
-        SimpleNamespace(
-            THINKING=thinking,
-            load_tokenizer=lambda model_id, revision: tokenizer,
-            prompt_opens_thinking=prompt_opens_thinking,
-        ),
+        prompt_preparation._worker_hf,
+        "load_tokenizer",
+        lambda model_id, revision: tokenizer,
     )
-    monkeypatch.setattr(opd_mod, "_thinking_prefill_text", lambda _tokenizer: "")
-    monkeypatch.setattr(opd_mod, "clamp_engine_len", lambda requested, _limit: requested)
-    monkeypatch.setattr(opd_mod, "model_max_position_embeddings", lambda *_args: None)
-    monkeypatch.setattr(opd_mod, "validate_glue_template", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prompt_preparation, "prompt_opens_thinking", prompt_opens_thinking)
+    monkeypatch.setattr(prompt_preparation, "_thinking_prefill_text", lambda _tokenizer: "")
     monkeypatch.setattr(
-        opd_mod,
+        prompt_preparation._backend,
+        "clamp_engine_len",
+        lambda requested, _limit: requested,
+    )
+    monkeypatch.setattr(
+        prompt_preparation._backend,
+        "model_max_position_embeddings",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        prompt_preparation,
+        "validate_glue_template",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        prompt_preparation,
         "liveness_heartbeat",
         lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
@@ -8072,15 +8634,29 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
         model_revision="revision",
     )
 
-    state = opd_train_runner._prepare_prompts(
+    state = prompt_preparation.prepare_prompts(
         request,
-        [({}, [{"role": "user", "content": "question"}])],
+        [
+            (
+                {},
+                [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "<think>old</think>answer"},
+                    {"role": "user", "content": "question"},
+                ],
+            )
+        ],
         False,
         "capability",
         "https://control.invalid",
     )
 
     assert len(state.prompts) == 1
+    assert state.prompts[0].student_messages[1] == {
+        "role": "assistant",
+        "reasoning_content": "old",
+        "content": "answer",
+    }
     assert env.thinking is thinking
     assert env.prompt_opens_thinking is expected_opened
 
@@ -8093,10 +8669,8 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
     had emitted its own `<think>`, returning the reasoning as the answer. grpo already derives it
     from the first RETAINED prompt (`_build_grpo_prompts`); opd must match.
     """
-    from flash.engine.worker import opd_train as opd_mod
-    from flash.engine.worker import opd_train_runner
     from flash.engine.worker.model.decoding import prompt_opens_thinking
-    from flash.engine.worker.train.opd.state import _OpdRequest
+    from flash.engine.worker.train.opd.orchestration import prompt_preparation
 
     # row 0 renders WITHOUT an open think tag and is over budget; row 1 renders WITH one and fits.
     rows = {
@@ -8109,8 +8683,9 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
         eos_token = "<eos>"
 
         def apply_chat_template(
-            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+            self, messages, *, tokenize, add_generation_prompt, enable_thinking, preserve_thinking
         ):
+            assert preserve_thinking is False
             rendered, ids = rows[messages[0]["content"]]
             return ids if tokenize else rendered
 
@@ -8119,21 +8694,33 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
             pass
 
     env = SimpleNamespace(thinking=None, prompt_opens_thinking=None, package_root=None)
+    monkeypatch.setattr(prompt_preparation._worker_state, "THINKING", True)
     monkeypatch.setattr(
-        opd_mod,
-        "_w",
-        SimpleNamespace(
-            THINKING=True,
-            load_tokenizer=lambda model_id, revision: _Tokenizer(),
-            prompt_opens_thinking=prompt_opens_thinking,
-        ),
+        prompt_preparation._worker_hf,
+        "load_tokenizer",
+        lambda model_id, revision: _Tokenizer(),
     )
-    monkeypatch.setattr(opd_mod, "_thinking_prefill_text", lambda _tokenizer: "")
-    monkeypatch.setattr(opd_mod, "clamp_engine_len", lambda requested, _limit: requested)
-    monkeypatch.setattr(opd_mod, "model_max_position_embeddings", lambda *_args: None)
-    monkeypatch.setattr(opd_mod, "validate_glue_template", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prompt_preparation, "prompt_opens_thinking", prompt_opens_thinking)
+    monkeypatch.setattr(prompt_preparation, "_thinking_prefill_text", lambda _tokenizer: "")
     monkeypatch.setattr(
-        opd_mod, "liveness_heartbeat", lambda *_args, **_kwargs: contextlib.nullcontext()
+        prompt_preparation._backend,
+        "clamp_engine_len",
+        lambda requested, _limit: requested,
+    )
+    monkeypatch.setattr(
+        prompt_preparation._backend,
+        "model_max_position_embeddings",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        prompt_preparation,
+        "validate_glue_template",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        prompt_preparation,
+        "liveness_heartbeat",
+        lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
     import flash.engine.worker.teacher.client as teacher_client
 
@@ -8148,7 +8735,7 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
         model_revision="revision",
     )
 
-    state = opd_train_runner._prepare_prompts(
+    state = prompt_preparation.prepare_prompts(
         request,
         [
             ({}, [{"role": "user", "content": "too-long"}]),
@@ -8174,9 +8761,9 @@ def test_opd_renders_each_prompt_once_so_a_stateful_environment_is_not_run_twice
     import ast
     import textwrap
 
-    from flash.engine.worker import opd_train_runner
+    from flash.engine.worker.train.opd.orchestration import prompt_preparation
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(opd_train_runner._render_prompt_rows)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(prompt_preparation.render_prompt_rows)))
     renders = [
         node
         for node in ast.walk(tree)
@@ -8385,7 +8972,7 @@ def test_groupwise_reverse_kl_keeps_the_exact_per_group_reduction():
 
 
 def test_opd_workdir_reset_removes_stale_state_and_fails_closed(monkeypatch, tmp_path):
-    import flash.engine.worker.opd_train_runner as opd_runner
+    import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     workdir = tmp_path / "attempt"
     workdir.mkdir()
@@ -8405,7 +8992,7 @@ def test_opd_workdir_reset_removes_stale_state_and_fails_closed(monkeypatch, tmp
 
 
 def test_opd_sitecustomize_is_only_the_startup_bootstrap(tmp_path, monkeypatch):
-    import flash.engine.worker.opd_train_runner as opd_runner
+    import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir()
@@ -8476,14 +9063,14 @@ def test_opd_stops_an_unguarded_child_at_its_first_step(tmp_path):
     the marker is checked at the first step boundary and the raise tears the child down there, so
     the failure costs one step instead of the whole gpu and teacher budget.
     """
-    import flash.engine.worker.opd_train_runner as opd_runner
+    import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     callbacks = opd_runner._build_child_callbacks(
         SimpleNamespace(raise_if_failed=lambda: None),
         _OpdProgressState(),
         _progress_bridge_snapshot(samples_seen=4, truncated_rollouts=3),
         0,
-        opd_train.shim_marker_file(str(tmp_path)),  # no marker: the plugin never applied
+        backend_common.shim_marker_file(str(tmp_path)),  # no marker: the plugin never applied
         ("opd-core", "lora-rollout-guard"),
     )
 
@@ -8501,7 +9088,7 @@ def test_opd_names_the_failed_fragment_when_the_child_exits_fail_closed():
     run surfaces as a bare "exited with status 97", which reads as an unclassified crash and
     invites a retry that fails identically on the same interpreter.
     """
-    from flash.engine.worker import backend_common
+    from flash.engine.worker.train.entry import backend_common
 
     with pytest.raises(
         RuntimeError, match="required flash runtime patch failed to apply"
@@ -8509,7 +9096,9 @@ def test_opd_names_the_failed_fragment_when_the_child_exits_fail_closed():
         _raise_verl_failure(backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE, None)
 
     # permanent: retrying re-runs the same incompatible verl/transformers stack.
-    assert not isinstance(excinfo.value, opd_train._w.RetriableInfraError)
+    from flash.engine.worker.perf import RetriableInfraError
+
+    assert not isinstance(excinfo.value, RetriableInfraError)
 
 
 def _drive_opd_multi_turn_episode(
@@ -8855,17 +9444,22 @@ def test_dynamic_opd_media_snapshots_are_cumulative_ordered_and_immutable(monkey
 
 
 class _StructuredImageEnv(_RecordingEnv):
-    def __init__(self, initial_messages):
+    def __init__(self, initial_messages, *, use_prepared_prompt=True):
         super().__init__()
         self.initial_messages = initial_messages
+        self.use_prepared_prompt = use_prepared_prompt
+        self.prepared_prompts = []
         self.reply_contexts = []
 
-    def new_rollout_state(self, _example):
+    def new_rollout_state(self, _example, prepared_prompt=None):
         # `prompt` carries the frozen initial prefix and `messages` its mutable copy, matching what
         # the real adapter builds; the media checks read the prefix, not the growing transcript.
+        self.prepared_prompts.append(copy.deepcopy(prepared_prompt))
+        source = prepared_prompt if self.use_prepared_prompt else self.initial_messages
+        prompt = copy.deepcopy(source)
         return {
-            "messages": [dict(message) for message in self.initial_messages],
-            "prompt": self.initial_messages,
+            "messages": copy.deepcopy(prompt),
+            "prompt": prompt,
         }
 
     def env_reply(self, messages, _state):
@@ -8954,7 +9548,7 @@ def test_multiturn_start_authenticates_parquet_text_block_canonicalization():
 def test_multiturn_start_rejects_rehydrated_media_placement_drift_at_same_count():
     frozen = _image_prompt()
     drifted = _image_prompt(image_first=True)
-    env = _StructuredImageEnv(drifted)
+    env = _StructuredImageEnv(drifted, use_prepared_prompt=False)
     bridge, normalized = _structured_image_bridge(env, frozen)
 
     with pytest.raises(ValueError, match="changed after prompt freezing"):
@@ -8973,7 +9567,7 @@ def test_multiturn_start_rejects_same_structure_with_different_fresh_descriptor(
 
     frozen = _image_prompt()
     changed_source = _image_prompt(_OTHER_IMAGE_DATA_URI)
-    env = _StructuredImageEnv(changed_source)
+    env = _StructuredImageEnv(changed_source, use_prepared_prompt=False)
     bridge, normalized = _structured_image_bridge(env, frozen)
     fresh = normalize_prompt_images({}, changed_source, None)
     assert fresh.messages == normalized.messages
@@ -9023,6 +9617,7 @@ def test_valid_image_prompt_reaches_environment_with_media_placement_intact():
     )
 
     assert started["max_turns"] >= 1
+    assert env.prepared_prompts == [normalized.messages]
     assert bridge._sessions["valid"]["messages"][0] == normalized.messages[0]
     assert env.reply_contexts[0][0] == normalized.messages[0]
     assert env.reply_contexts[0][1] == {"role": "assistant", "content": "A"}
@@ -9163,7 +9758,7 @@ def test_step_media_identity_requires_the_child_to_attest_its_media():
     unconditionally, so the one drift worth catching here -- a child that stopped reporting media --
     would be the single case the check cannot see. the real child always sends both keys.
     """
-    from flash.engine.worker.train.opd.multiturn_media import step_media_identity
+    from flash.engine.worker.train.opd.multiturn.media import step_media_identity
 
     session_digests = ["digest-a", "digest-b"]
     complete = {"image_count": 2, "image_digests": list(session_digests)}
@@ -9189,7 +9784,7 @@ def test_normalize_initial_prompt_rejects_a_state_with_no_prompt():
     frozen prompt's media -- on any state past turn zero that carries model turns the prompt never
     had. every producer sets `prompt`, so its absence is a corrupt state and must be named as one.
     """
-    from flash.engine.worker.train.opd.multiturn_media import normalize_initial_prompt
+    from flash.engine.worker.train.opd.multiturn.media import normalize_initial_prompt
 
     class _Prompt:
         image_descriptors = ()
@@ -9218,10 +9813,10 @@ def test_opd_multigpu_gpu_mem_util_matches_the_shared_tp_aware_resolver():
     runtime = SimpleNamespace(gpu_count=2)
     model_id = "Qwen/Qwen3.6-35B-A3B"
 
-    got = opd_train._resolve_opd_gpu_mem_util(
+    got = opd_train_runner._resolve_opd_gpu_mem_util(
         request, prompt_state, workload, runtime, model_id, fp8_kv=False
     )
-    want = rl_train.resolve_gpu_mem_util(
+    want = rl_verl_config.resolve_gpu_mem_util(
         {
             "model_id": model_id,
             "model_revision": "",
@@ -9237,7 +9832,7 @@ def test_opd_multigpu_gpu_mem_util_matches_the_shared_tp_aware_resolver():
     )
 
     assert got == want
-    assert got < rl_train._DEFAULT_GPU_MEM_UTIL
+    assert got < rl_verl_config._DEFAULT_GPU_MEM_UTIL
 
 
 def test_build_opd_overrides_sizes_the_rollout_memory_budget():
@@ -9283,7 +9878,7 @@ def test_opd_accounting_gate_reports_a_dead_child_instead_of_a_timeout():
     # a crashed child never records its last step, so the gate used to burn its full timeout and
     # then blame accounting for a failure that happened elsewhere. the 27B run's real cause was a
     # vllm wake_up CUDA OOM two frames deeper, and the reported error named none of it.
-    state = opd_train._OpdProgressState()
+    state = _OpdProgressState()
     state.fail("verl child exited with code 1")
     with pytest.raises(RuntimeError, match="exited before accounting for checkpoint step 3"):
         # the timeout is long: if the gate were still waiting on it, this test would hang rather
@@ -9293,7 +9888,7 @@ def test_opd_accounting_gate_reports_a_dead_child_instead_of_a_timeout():
 
 def test_opd_accounting_gate_keeps_the_first_failure_reason():
     # later errors are usually fallout of the first; reporting the newest would bury the cause.
-    state = opd_train._OpdProgressState()
+    state = _OpdProgressState()
     state.fail("verl child exited with code 1")
     state.fail("bridge shutdown")
     with pytest.raises(RuntimeError, match="exited with code 1"):
@@ -9321,3 +9916,417 @@ def test_overrides_floor_max_num_seqs_for_a_tiny_opd_rollout_batch():
         for value in build_opd_overrides(_config(train_batch_size=1, group_size=1))
     )
     assert overrides["actor_rollout_ref.rollout.max_num_seqs"] == "16"
+
+
+def _padded_teacher_batch(sample_lengths, *, prompt_width, response_width):
+    """Build the padded, mask-carrying batch the OPD trainer actually hands to the loss.
+
+    verl's list_of_dict_to_tensordict stacks a field when every sample's tensor shares one
+    shape and nests only when they differ, so a batch whose completions were all truncated at
+    max_completion_tokens arrives padded rather than nested. Prompts are left-padded and
+    responses right-padded, exactly as the attention mask records.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.bridging.prompts import encode_shifted_group_metadata
+
+    teacher, prompts, responses, masks = [], [], [], []
+    for prompt_len, response_len in sample_lengths:
+        _ids, logprobs = encode_shifted_group_metadata(
+            prompt_len, response_len, [(list(range(response_len)), -1.5)]
+        )
+        row = torch.tensor(logprobs, dtype=torch.float32)
+        teacher.append(
+            torch.cat(
+                [
+                    torch.zeros(prompt_width - prompt_len),
+                    row,
+                    torch.zeros(response_width - response_len),
+                ]
+            )
+        )
+        prompts.append(
+            torch.cat(
+                [
+                    torch.zeros(prompt_width - prompt_len, dtype=torch.int64),
+                    torch.arange(1, prompt_len + 1, dtype=torch.int64),
+                ]
+            )
+        )
+        responses.append(
+            torch.cat(
+                [
+                    torch.arange(1, response_len + 1, dtype=torch.int64),
+                    torch.zeros(response_width - response_len, dtype=torch.int64),
+                ]
+            )
+        )
+        masks.append(
+            torch.cat(
+                [
+                    torch.zeros(prompt_width - prompt_len, dtype=torch.int64),
+                    torch.ones(prompt_len + response_len, dtype=torch.int64),
+                    torch.zeros(response_width - response_len, dtype=torch.int64),
+                ]
+            )
+        )
+
+    data = TensorDict(
+        {
+            "prompts": torch.stack(prompts),
+            "responses": torch.stack(responses),
+            "attention_mask": torch.stack(masks),
+        },
+        batch_size=[len(sample_lengths)],
+    )
+    return torch.stack(teacher).unsqueeze(-1), data
+
+
+def _nested_teacher_batch(sample_lengths):
+    """The same samples in the nested layout verl's padding helper already supports."""
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.bridging.prompts import encode_shifted_group_metadata
+
+    rows, prompts, responses = [], [], []
+    for prompt_len, response_len in sample_lengths:
+        _ids, logprobs = encode_shifted_group_metadata(
+            prompt_len, response_len, [(list(range(response_len)), -1.5)]
+        )
+        rows.append(torch.tensor(logprobs, dtype=torch.float32).unsqueeze(-1))
+        prompts.append(torch.arange(1, prompt_len + 1, dtype=torch.int64))
+        responses.append(torch.arange(1, response_len + 1, dtype=torch.int64))
+
+    data = TensorDict(
+        {
+            "prompts": torch.nested.as_nested_tensor(prompts, layout=torch.jagged),
+            "responses": torch.nested.as_nested_tensor(responses, layout=torch.jagged),
+        },
+        batch_size=[len(sample_lengths)],
+    )
+    return torch.nested.as_nested_tensor(rows, layout=torch.jagged), data
+
+
+def _reference_no_padding_2_padding(tensor, data):
+    """Stand-in for verl's helper, matching the pinned implementation's contract.
+
+    Reads tensor.values() only when nested, otherwise treats the input as already flattened
+    to total_nnz -- which is why a padded (bsz, seq_len, *) tensor trips its assertion.
+
+    verl is not installed in the offline CI environment, so importing the real helper here
+    would skip these tests rather than run them. The test below pins this body against the
+    pinned source instead, so a drift fails loudly wherever verl IS installed.
+    """
+    torch = pytest.importorskip("torch")
+
+    values = tensor.values() if tensor.is_nested else tensor
+    prompt_ids, response_ids = data["prompts"], data["responses"]
+    max_response_len = data.get("max_response_len", -1)
+    if prompt_ids.is_nested:
+        prompt_lens = prompt_ids.offsets().diff()
+        response_lens = response_ids.offsets().diff()
+        if max_response_len < 0:
+            max_response_len = int(response_lens.max().item())
+    else:
+        attention_mask = data["attention_mask"]
+        assert not attention_mask.is_nested
+        prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
+        response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
+        max_response_len = response_ids.shape[1]
+
+    sequence_offsets = (prompt_lens + response_lens).cumsum(dim=0)
+    assert sequence_offsets[-1].item() == values.shape[0]
+    # the pinned helper's own guard: the slice below reads seq_offset - resp_len - 1.
+    assert not prompt_lens.eq(0).any(), f"prompt_len must be > 0, got {prompt_lens}"
+
+    skip_padding = (0, 0) * (values.ndim - 1)
+    sliced = [
+        torch.nn.functional.pad(
+            values[offset - resp_len - 1 : offset - 1],
+            (*skip_padding, 0, max_response_len - resp_len),
+        )
+        for resp_len, offset in zip(response_lens, sequence_offsets, strict=True)
+    ]
+    return torch.stack(sliced, dim=0)
+
+
+def test_reference_helper_agrees_with_the_real_pinned_verl_function():
+    """Pin the stand-in above against verl itself wherever verl is installed.
+
+    The offline CI image has no verl, so the tests around it must use the stand-in or they
+    would skip instead of running. That makes the stand-in a drift risk: it could diverge from
+    the pinned helper and keep passing. This test closes that gap on any environment that does
+    have verl, so a divergence fails somewhere rather than nowhere.
+
+    It proves agreement with the INSTALLED verl, not with the pin by construction. The two are
+    the same function today, but an environment installed off a different verl would move this
+    oracle with it. `test_verl_pin_is_an_immutable_commit_on_the_freesolo_fork` guards the pin.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+    padding = pytest.importorskip("verl.workers.utils.padding")
+
+    samples = [(100, 1024), (120, 900), (90, 1024)]
+    rows, prompts, responses, masks = [], [], [], []
+    prompt_width = max(prompt_len for prompt_len, _ in samples)
+    response_width = max(response_len for _, response_len in samples)
+    for prompt_len, response_len in samples:
+        rows.append(torch.arange(1, prompt_len + response_len + 1, dtype=torch.float32))
+        prompts.append(torch.arange(1, prompt_len + 1))
+        responses.append(torch.arange(1, response_len + 1))
+        masks.append(
+            torch.tensor(
+                [0] * (prompt_width - prompt_len)
+                + [1] * (prompt_len + response_len)
+                + [0] * (response_width - response_len)
+            )
+        )
+
+    nested_data = TensorDict(
+        {
+            "prompts": torch.nested.as_nested_tensor(prompts, layout=torch.jagged),
+            "responses": torch.nested.as_nested_tensor(responses, layout=torch.jagged),
+        },
+        batch_size=[len(samples)],
+    )
+    strided_data = TensorDict(
+        {
+            "prompts": torch.zeros(len(samples), prompt_width, dtype=torch.int64),
+            "responses": torch.zeros(len(samples), response_width, dtype=torch.int64),
+            "attention_mask": torch.stack(masks),
+        },
+        batch_size=[len(samples)],
+    )
+
+    for data in (nested_data, strided_data):
+        packed = torch.cat(rows).unsqueeze(-1)
+        assert torch.equal(
+            _reference_no_padding_2_padding(packed, data),
+            padding.no_padding_2_padding(packed, data),
+        )
+
+
+def test_padded_teacher_tensor_trips_the_verl_total_nnz_assertion():
+    """The layout that crashed a paid 8xH200 OPD run, reproduced against verl's contract.
+
+    Once every completion is truncated at max_completion_tokens the samples share one shape,
+    so the teacher tensor is stacked rather than nested and its leading dimension is the
+    batch size instead of total_nnz.
+    """
+    pytest.importorskip("torch")
+
+    teacher, data = _padded_teacher_batch([(120, 1024)] * 16, prompt_width=120, response_width=1024)
+    assert not teacher.is_nested
+    assert teacher.shape[0] == 16
+    assert int(data["attention_mask"].sum().item()) == 16 * (120 + 1024)
+    with pytest.raises(AssertionError):
+        _reference_no_padding_2_padding(teacher, data)
+
+
+@pytest.mark.parametrize(
+    "sample_lengths",
+    [
+        pytest.param([(120, 1024)] * 16, id="all-truncated"),
+        pytest.param([(120, 1024), (120, 800), (120, 512)], id="some-stopped-early"),
+    ],
+)
+def test_packed_full_sequence_matches_verls_nested_result(sample_lengths):
+    """The padded path must return exactly what verl produces from the same samples.
+
+    Not crashing is not enough: a wrong slice would silently train against misaligned teacher
+    logprobs, so this pins value equality against the nested layout verl already handles.
+    """
+    torch = pytest.importorskip("torch")
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    padded, padded_data = _padded_teacher_batch(
+        sample_lengths, prompt_width=120, response_width=1024
+    )
+    nested, nested_data = _nested_teacher_batch(sample_lengths)
+
+    packed = _packed_full_sequence(padded, padded_data)
+    actual = _reference_no_padding_2_padding(packed, padded_data)
+    expected = _reference_no_padding_2_padding(nested, nested_data)
+
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)
+
+
+def test_packed_full_sequence_leaves_a_nested_batch_untouched():
+    """A nested batch already satisfies verl's contract and must pass straight through."""
+    pytest.importorskip("torch")
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    nested, data = _nested_teacher_batch([(120, 1024), (120, 800)])
+    assert _packed_full_sequence(nested, data) is nested
+
+
+def test_packed_full_sequence_rejects_a_tensor_that_is_not_full_width():
+    """A teacher narrower than the mask must fail loudly rather than pack misaligned tokens."""
+    torch = pytest.importorskip("torch")
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    _teacher, data = _padded_teacher_batch([(120, 1024)] * 4, prompt_width=120, response_width=1024)
+    response_only = torch.zeros(4, 1024, 1)
+    with pytest.raises(IndexError):
+        _packed_full_sequence(response_only, data)
+
+
+@pytest.mark.parametrize("nested_prompts", [False, True])
+def test_packed_full_sequence_selects_by_mask_not_by_prefix(nested_prompts):
+    """verl pads a teacher row on BOTH sides, so a length can never say where the real tokens sit.
+
+    `_pad_teacher_outputs` left-pads by `prompt_width - prompt_length` and right-pads the
+    response. Selecting the first `length` positions therefore takes pad and drops real teacher
+    logprobs, which trains against silently misaligned supervision rather than crashing. The
+    values here are all nonzero so a prefix select cannot coincidentally match.
+
+    Both prompt layouts are covered because the mask, not the prompts field, decides which
+    positions are real. Reading the layout instead of the mask passes the strided case and
+    quietly mis-slices the nested one.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    samples = [(100, 1024), (120, 900), (90, 1024)]
+    prompt_width = max(prompt_len for prompt_len, _ in samples)
+    response_width = max(response_len for _, response_len in samples)
+
+    rows, expected, masks = [], [], []
+    for prompt_len, response_len in samples:
+        real = torch.arange(1, prompt_len + response_len + 1, dtype=torch.float32).unsqueeze(-1)
+        expected.append(real)
+        # exactly verl's padding: left on the prompt half, right on the response half.
+        rows.append(
+            torch.cat(
+                [
+                    real.new_zeros(prompt_width - prompt_len, 1),
+                    real,
+                    real.new_zeros(response_width - response_len, 1),
+                ]
+            )
+        )
+        masks.append(
+            torch.tensor(
+                [0] * (prompt_width - prompt_len)
+                + [1] * (prompt_len + response_len)
+                + [0] * (response_width - response_len)
+            )
+        )
+
+    if nested_prompts:
+        fields = {
+            "prompts": torch.nested.as_nested_tensor(
+                [torch.arange(1, prompt_len + 1) for prompt_len, _ in samples], layout=torch.jagged
+            ),
+            "responses": torch.nested.as_nested_tensor(
+                [torch.arange(1, response_len + 1) for _, response_len in samples],
+                layout=torch.jagged,
+            ),
+        }
+    else:
+        fields = {
+            "prompts": torch.zeros(len(samples), prompt_width, dtype=torch.int64),
+            "responses": torch.zeros(len(samples), response_width, dtype=torch.int64),
+        }
+    data = TensorDict(
+        {**fields, "attention_mask": torch.stack(masks)},
+        batch_size=[len(samples)],
+    )
+
+    packed = _packed_full_sequence(torch.stack(rows), data)
+    assert torch.equal(packed, torch.cat(expected))
+
+
+def test_packed_full_sequence_refuses_a_padded_teacher_with_no_mask():
+    """Without a mask there is no way to locate the real tokens, so fail rather than guess.
+
+    A nested-prompt batch need not carry `attention_mask`. verl stacks the teacher field only
+    when every sequence shares one length, so an unmasked stack should already be full-width.
+    If it is not, the batch violates that expectation and any selection would be a guess.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    samples = [(100, 1024), (120, 900), (90, 1024)]
+    prompts = [torch.arange(1, prompt_len + 1) for prompt_len, _ in samples]
+    responses = [torch.arange(1, response_len + 1) for _, response_len in samples]
+    data = TensorDict(
+        {
+            "prompts": torch.nested.as_nested_tensor(prompts, layout=torch.jagged),
+            "responses": torch.nested.as_nested_tensor(responses, layout=torch.jagged),
+        },
+        batch_size=[len(samples)],
+    )
+    assert "attention_mask" not in data
+
+    width = max(prompt_len + response_len for prompt_len, response_len in samples)
+    with pytest.raises(AssertionError, match="carries no attention mask"):
+        _packed_full_sequence(torch.zeros(len(samples), width, 1), data)
+
+
+def test_packed_full_sequence_refuses_a_strided_batch_with_no_mask():
+    """A strided batch carries neither a mask nor offsets, so nothing locates the real tokens.
+
+    The producer always writes `attention_mask`, so this is unreachable today. It is pinned
+    anyway because the alternative is an `AttributeError` from reading `.offsets()` off a
+    strided tensor, which reads as a coding slip rather than the batch being unusable.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    prompt_width, response_width = 120, 1024
+    data = TensorDict(
+        {
+            "prompts": torch.zeros(2, prompt_width, dtype=torch.int64),
+            "responses": torch.zeros(2, response_width, dtype=torch.int64),
+        },
+        batch_size=[2],
+    )
+    assert "attention_mask" not in data
+
+    with pytest.raises(AssertionError, match="carries no attention mask"):
+        _packed_full_sequence(torch.zeros(2, prompt_width + response_width, 1), data)
+
+
+def test_packed_full_sequence_flattens_a_full_unmasked_stack():
+    """The reachable no-mask case: prompt lengths differ but every total is equal.
+
+    Prompts nest because their lengths differ, while the teacher field stacks because the
+    totals agree. Nothing was padded, so every position is real and the whole stack flattens.
+    """
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+
+    from flash.engine.worker.train.opd.child.plugin import _packed_full_sequence
+
+    samples = [(100, 1024), (120, 1004)]
+    prompts = [torch.arange(1, prompt_len + 1) for prompt_len, _ in samples]
+    responses = [torch.arange(1, response_len + 1) for _, response_len in samples]
+    data = TensorDict(
+        {
+            "prompts": torch.nested.as_nested_tensor(prompts, layout=torch.jagged),
+            "responses": torch.nested.as_nested_tensor(responses, layout=torch.jagged),
+        },
+        batch_size=[len(samples)],
+    )
+
+    width = samples[0][0] + samples[0][1]
+    assert {prompt_len + response_len for prompt_len, response_len in samples} == {width}
+    teacher = torch.arange(1, len(samples) * width + 1, dtype=torch.float32).reshape(
+        len(samples), width, 1
+    )
+
+    packed = _packed_full_sequence(teacher, data)
+    assert torch.equal(packed, teacher.flatten(0, 1))

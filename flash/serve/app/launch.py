@@ -15,7 +15,7 @@ from pathlib import Path
 from types import FrameType, SimpleNamespace
 from typing import Any, Protocol, Self
 
-from .progress import emit_boot_progress
+from .progress import emit_boot_progress, emit_filesystem_usage
 
 _MANIFEST_ENV = "FLASH_SERVING_MANIFEST"
 _MANIFEST_ID_ENV = "FLASH_SERVING_MANIFEST_ID"
@@ -67,7 +67,6 @@ _FIXED_CHILD_ENVIRONMENT = {
 }
 # engine settings the vllm process needs regardless of which provider started the container.
 #
-# these used to be supplied only by the modal image, which is why modal served and runpod did not:
 # without the spawn method vllm forks its EngineCore after this process has already touched cuda,
 # and the child dies with "Cannot re-initialize CUDA in forked subprocess" before anything binds a
 # port. externally that is another silent boot failure, indistinguishable from a slow image pull.
@@ -532,6 +531,7 @@ def _run_with_secrets(
     _bind_hub_cache(environment, cache_root)
     inference_token, artifact_token = secrets._reveal_for_launch()
     _prepare_cache(manifest, cache_root, artifact_token)
+    emit_filesystem_usage("cache-prepared", cache_root)
     _seal_hub_offline(environment)
     args = SimpleNamespace(
         cache_root=cache_root,

@@ -1,7 +1,7 @@
 name: Publish serving image
 
 # The customer-owned serving path pins a digest-qualified OCI reference: `ServingImage`
-# (flash/serve/provisioning/_common.py) rejects a tag-only reference, so a deployment cannot
+# (flash/serve/provisioning/common/records.py) rejects a tag-only reference, so a deployment cannot
 # name "whatever :dev points at today". That digest has to come from somewhere, and nothing
 # published `Dockerfile.serve` -- which is why the provisioning code had no reachable caller.
 #
@@ -85,7 +85,8 @@ jobs:
       # while the tags keep pointing at the old one. that is the whole COPY set -- `flash`, the
       # lockfile, the launcher, and the files copied alongside them -- plus `.dockerignore`, which
       # decides what the build context contains at all, and this workflow file, so a change to the
-      # build here republishes rather than leaving the old image serving under the same tags.
+      # build here republishes rather than leaving the old image serving under the same tags. the
+      # build-time vllm repair lives outside flash/, so its exact path is an explicit image input.
       - name: Decide whether to publish
         id: gate
         working-directory: .
@@ -127,7 +128,7 @@ jobs:
             publish=true
           elif ! changed="$(git diff --name-only "$last_published_sha" "$CURRENT_SHA" 2>/dev/null)"; then
             publish=true
-          elif grep -qE "^(flash/|Dockerfile\.serve$|\.dockerignore$|serve_launch\.py$|pyproject\.toml$|uv\.lock$|README\.md$|LICENSE$|NOTICE$|\.github/workflows/publish-serving-image\.yml$)" <<< "$changed"; then
+          elif grep -qE "^(flash/|docker/patch_vllm_moe_lora\.py$|Dockerfile\.serve$|\.dockerignore$|serve_launch\.py$|pyproject\.toml$|uv\.lock$|README\.md$|LICENSE$|NOTICE$|\.github/workflows/publish-serving-image\.yml$)" <<< "$changed"; then
             publish=true
           fi
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
@@ -149,7 +150,7 @@ jobs:
 
       - name: Set up Docker Buildx
         if: steps.gate.outputs.publish == 'true'
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Log in to GHCR
         if: steps.gate.outputs.publish == 'true'

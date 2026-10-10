@@ -16,10 +16,15 @@ import numpy as np
 import pytest
 from safetensors.numpy import save_file
 
-from flash.serve import resolve as resolve_module
-from flash.serve.resolve import ADAPTER_CONFIG, ADAPTER_WEIGHTS, ResolveError, resolve_adapter
+from flash.serve.deployment import resolve as resolve_module
+from flash.serve.deployment.resolve import (
+    ADAPTER_CONFIG,
+    ADAPTER_WEIGHTS,
+    ResolveError,
+    resolve_adapter,
+)
 
-BASE = "Qwen/Qwen3.5-4B"
+BASE = "Qwen/Qwen3.5-9B"
 BASE_REVISION = "b" * 40
 ARTIFACT_REVISION = "a" * 40
 
@@ -93,7 +98,7 @@ def test_a_base_model_that_disagrees_with_the_config_is_rejected(monkeypatch, tm
     _install_hub(
         monkeypatch,
         tmp_path,
-        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": "Qwen/Qwen3.5-9B"},
+        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": "Qwen/Qwen3.8-27B"},
     )
 
     with pytest.raises(ResolveError, match="trained against"):
@@ -232,22 +237,19 @@ def test_checkpoint_provenance_is_derived_from_an_agreeing_step_subfolder(
         artifact_subfolder="rl/run1/checkpoints/step-10/adapter", checkpoint_step=10
     )
 
-    assert resolved.adapter.checkpoint == "step-10"
-    assert resolved.adapter.adapter_revision == f"run1@step-10.{ARTIFACT_REVISION}"
+    assert resolved.adapter.checkpoint_id == "run1/step-10"
+    assert resolved.adapter.artifact_revision == ARTIFACT_REVISION
 
 
-def test_unrecognized_artifact_layout_keeps_the_authored_checkpoint(monkeypatch, tmp_path) -> None:
-    # older or external layouts cannot attest a step from their path. refusing them would add a new
-    # deployment failure unrelated to the mismatch this guard can prove, so they remain pass-through.
-    _install_hub(
-        monkeypatch,
-        tmp_path,
-        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": BASE},
+def test_unrecognized_artifact_layout_is_rejected_before_hub_access(monkeypatch) -> None:
+    monkeypatch.setattr(
+        resolve_module,
+        "_hub_api",
+        lambda: pytest.fail("an unattested checkpoint path must fail before hub access"),
     )
 
-    resolved = _resolve(artifact_subfolder="sft/run-1-step-2", checkpoint_step=2)
-
-    assert resolved.adapter.checkpoint == "step-2"
+    with pytest.raises(ResolveError, match="does not identify a canonical Flash"):
+        _resolve(artifact_subfolder="sft/run-1-step-2", checkpoint_step=2)
 
 
 @pytest.mark.parametrize(
