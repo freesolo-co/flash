@@ -28,7 +28,6 @@ from flash.engine.worker.verl.checkpoints import restore_verl_resume
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 # todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
-_SFT_LORAPLUS_RATIO = 16.0
 # consecutive zero-grad-norm steps tolerated before the run is failed as untrainable (GRAD-001).
 # any nonzero grad norm is proof the backward graph is intact and resets the count. 2 is enough to
 # separate a one-off fully-masked batch from a severed graph, and keeps the wasted spend to a couple
@@ -488,6 +487,7 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "device_peak_gpu_gb": device_peak_gpu_gb,
             "loraplus_optim": _VERL_OPTIMIZER_NAME,
             "loraplus_applied": progress.loraplus_applied,
+            "loraplus_ratio": options.loraplus_ratio,
             "verl_backend": "fsdp2",
             # sft shards by DATA -- see ULYSSES_SEQUENCE_PARALLEL_SIZE for why. fsdp splits the batch
             # across the ranks actually LAUNCHED, which is the allocated card count only when the
@@ -585,7 +585,7 @@ def run_sft_train(spec=None) -> None:
     child = _prepare_sft_child(
         options, data, model, capabilities, use_remove_padding, gdn_reset_arch
     )
-    child_progress = _prepare_sft_progress(data, model, child)
+    child_progress = _prepare_sft_progress(options, data, model, child)
     progress = child_progress.values
 
     def on_line(line: str) -> None:
