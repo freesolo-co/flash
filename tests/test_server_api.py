@@ -800,6 +800,25 @@ def test_dry_run_rejects_invalid_structured_serving_constraints(
     assert message in response.json()["detail"]
 
 
+@pytest.mark.parametrize("ratio", [10**400, -(10**400)])
+def test_dry_run_rejects_overflowing_loraplus_ratio(api, monkeypatch, ratio) -> None:
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(
+        runs_route._app,
+        "prepare_job",
+        lambda *_a, **_k: pytest.fail("invalid ratio must fail before preparation"),
+    )
+    spec = {**SPEC, "algorithm": "sft", "train": {"loraplus_ratio": ratio}}
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+    assert response.status_code == 400, response.text
+    assert "train.loraplus_ratio must be a finite number" in response.json()["detail"]
+
+
 def test_warmstart_dry_run_preserves_serving_preflight_error(api) -> None:
     spec = {
         **SPEC,

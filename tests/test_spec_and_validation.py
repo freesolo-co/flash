@@ -169,6 +169,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "credit_assignment",
             "entropy_quantile",
             "lora_alpha",
+            "loraplus_ratio",
             "prompts_per_step",
         }
     } == {"0.2.0"}
@@ -316,6 +317,7 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
         "save_at_steps",
         "entropy_quantile",
         "prompts_per_step",
+        "loraplus_ratio",
     }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
     assert "advantage_clip" not in TRAIN_SCHEMA_KEYS
