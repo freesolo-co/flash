@@ -3072,7 +3072,7 @@ def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monk
     assert "bare assistant target coerced" not in output
 
 
-@pytest.mark.parametrize("ratio", [None, 1.0, 3.5])
+@pytest.mark.parametrize("ratio", [None, 1.0, 3.5, 16.0])
 def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch, ratio):
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.engine.worker.train.entry import sft_train
@@ -3080,8 +3080,9 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     monkeypatch.setenv("PYTHONPATH", "synthetic-sft-parent-path")
     monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PYTHONPATH")
     spec, captured = _stub_sft_run(monkeypatch)
-    spec.train.loraplus_ratio = ratio
-    effective_ratio = 16.0 if ratio is None else ratio
+    if ratio is not None:
+        spec.train.loraplus_ratio = ratio
+    effective_ratio = 1.0 if ratio is None else ratio
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         captured["command"] = command
