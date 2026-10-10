@@ -188,6 +188,9 @@ def _resolve_sft_options(spec) -> _SftOptions:
     model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
     train_spec = spec.train if spec else None
+    # new authored sft specs persist their ratio. an unset stored value predates the option and
+    # must retain the 16x optimizer groups used by its checkpoint, including across further retries.
+    default_loraplus_ratio = 16.0 if train_spec is not None else RECIPE.sft.loraplus_ratio
 
     def train_opt(name, default):
         value = getattr(train_spec, name, None) if train_spec else None
@@ -216,7 +219,7 @@ def _resolve_sft_options(spec) -> _SftOptions:
         model_revision=model_revision,
         epochs=int(train_opt("epochs", RECIPE.sft.num_epochs)),
         learning_rate=float(train_opt("learning_rate", RECIPE.sft.learning_rate)),
-        loraplus_ratio=float(train_opt("loraplus_ratio", RECIPE.sft.loraplus_ratio)),
+        loraplus_ratio=float(train_opt("loraplus_ratio", default_loraplus_ratio)),
         effective_batch=int(train_opt("batch_size", RECIPE.sft.effective_batch)),
         max_steps=int(train_opt("max_steps", 0) or 0),
         save_at_steps=tuple(getattr(train_spec, "save_at_steps", ()) or ()),
@@ -789,7 +792,7 @@ def _prepare_sft_progress(
         observed_grad_norms=observed_grad_norms,
         loss_curve=[],
         train_tokens=train_tokens,
-        loraplus_applied=resume_step >= model.update_horizon,
+        loraplus_applied=options.loraplus_ratio > 1 and resume_step >= model.update_horizon,
         loraplus_ratio=options.loraplus_ratio,
         wandb_link={},
         shim_markers=child.shim_markers,

@@ -366,7 +366,8 @@ class TrainSpec:
     hf_repo: str = ""
     # None -> worker's tuned recipe default.
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
-    # sft only: none keeps the recipe default; 1 uses equal adapter learning rates.
+    # sft only: none preserves a legacy persisted run's 16x optimizer. new configs freeze the
+    # recipe default at parse time; 1 uses equal adapter learning rates.
     loraplus_ratio: float | None = field(default=None, metadata={"introduced_in": "1.2.131"})
     # sft only. the packaged-dataset estimate resolves this against the selected row count into
     # examples_per_update (packed) or pins the optimizer batch to 1 (unpacked). grpo/opd have no
@@ -406,9 +407,13 @@ class TrainSpec:
             ratio = self.loraplus_ratio
             if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
                 raise TypeError("train.loraplus_ratio must be a number")
+            try:
+                ratio = float(ratio)
+            except OverflowError as exc:
+                raise ValueError("train.loraplus_ratio must be a finite number >= 1") from exc
             if not math.isfinite(ratio) or ratio < 1:
                 raise ValueError("train.loraplus_ratio must be a finite number >= 1")
-            object.__setattr__(self, "loraplus_ratio", float(ratio))
+            object.__setattr__(self, "loraplus_ratio", ratio)
         if not self.lora_alpha:
             object.__setattr__(self, "lora_alpha", 2 * self.lora_rank)
         max_steps = parse_max_steps(self.max_steps)

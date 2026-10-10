@@ -3072,16 +3072,71 @@ def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monk
     assert "bare assistant target coerced" not in output
 
 
+@pytest.mark.parametrize("legacy", [True, False])
+def test_sft_retries_preserve_the_prepared_optimizer_ratio(monkeypatch, legacy):
+    from flash.core.spec import JobSpec
+    from flash.engine.worker.train.entry import sft_train_runner
+    from flash.runner.lifecycle.state import RunStatus
+    from flash.runner.lifecycle.status import reallocation_spec_from_status
+    from flash.runner.lifecycle.submit import _effective_preparation_snapshot
+    from flash.schema import spec_from_dict
+
+    _stub_sft_run(monkeypatch)
+    raw = {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "sft",
+        "project": "11111111-1111-4111-8111-111111111111",
+        "environment": {"id": "owner/project/env"},
+        "train": {"epochs": 1, "learning_rate": 1e-5},
+        "gpu": {"type": "H100", "count": 1},
+    }
+    spec = JobSpec.from_dict(raw) if legacy else spec_from_dict(raw)
+    spec = replace(spec, run_id="legacy-sft", model_revision="a" * 40, model_revision_auto=True)
+    snapshot = _effective_preparation_snapshot(spec, spec, None)
+    if legacy:
+        # frozen before the recovery fix: old snapshots must still pass integrity validation.
+        assert snapshot["preparation_digest"] == (
+            "d190288e79077c89f6b79353947a393e2a0463c141757d844bd889511f91022b"
+        )
+        assert "loraplus_ratio" not in snapshot["worker_spec"]["train"]
+    original_digest = snapshot["preparation_digest"]
+    status = RunStatus(
+        state="running",
+        run_id=spec.run_id,
+        spec=spec.to_dict(),
+        effective_preparation=json.loads(json.dumps(snapshot)),
+    )
+    for _attempt in range(2):
+        recovered = reallocation_spec_from_status(status)
+        worker = JobSpec.from_json(recovered.to_json())
+        options = sft_train_runner._resolve_sft_options(worker)
+        assert options.loraplus_ratio == (16.0 if legacy else 1.0)
+        status.effective_preparation = _effective_preparation_snapshot(
+            JobSpec.from_dict(status.spec), worker, None, stored_public=status.spec
+        )
+        assert status.effective_preparation["preparation_digest"] == original_digest
+
+
 @pytest.mark.parametrize("ratio", [None, 1.0, 3.5, 16.0])
 def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch, ratio):
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+    from flash.core.spec import JobSpec
     from flash.engine.worker.train.entry import sft_train
+    from flash.schema import spec_from_dict
 
     monkeypatch.setenv("PYTHONPATH", "synthetic-sft-parent-path")
     monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PYTHONPATH")
     spec, captured = _stub_sft_run(monkeypatch)
-    if ratio is not None:
-        spec.train.loraplus_ratio = ratio
+    authored = spec_from_dict(
+        {
+            "model": spec.model,
+            "algorithm": "sft",
+            "project": "11111111-1111-4111-8111-111111111111",
+            "environment": {"id": "owner/project/env"},
+            "train": {} if ratio is None else {"loraplus_ratio": ratio},
+        }
+    )
+    spec.train.loraplus_ratio = JobSpec.from_json(authored.to_json()).train.loraplus_ratio
     effective_ratio = 1.0 if ratio is None else ratio
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
@@ -3331,7 +3386,8 @@ def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypa
     assert captured["published"][0][1] == 2
 
 
-def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatch):
+@pytest.mark.parametrize("ratio", [1.0, 3.5, 16.0])
+def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatch, ratio):
     """the seeded resume step must not suppress the final publish.
 
     the previous attempt's per-step deployable publish is best-effort (``required=False``) while
@@ -3340,6 +3396,7 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     from flash.engine.worker.train.entry import sft_train
 
     spec, captured = _stub_sft_run(monkeypatch)
+    spec.train.loraplus_ratio = ratio
     # max_steps is 2, so resuming at 2 means the watcher never runs and finalization is the only
     # path left that can publish the step.
     monkeypatch.setattr(
@@ -3356,6 +3413,8 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     sft_train.run_sft_train(spec)
 
     assert [step for _adapter, step in captured["published"]] == [2]
+    assert captured["meta"]["notes"]["loraplus_ratio"] == ratio
+    assert captured["meta"]["notes"]["loraplus_applied"] is (ratio > 1)
 
 
 def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
