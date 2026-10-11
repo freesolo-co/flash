@@ -23,6 +23,8 @@ if __package__:
     from flash.providers._lifecycle.bootstrapping import console as _bootstrap_console
     from flash.providers._lifecycle.bootstrapping import pip as bootstrap_pip
     from flash.providers._lifecycle.bootstrapping import processes as _bootstrap_processes
+    from flash.providers._lifecycle.bootstrapping.attempt import AttemptState
+    from flash.providers._lifecycle.bootstrapping.preload import run_preload
     from flash.providers._lifecycle.bootstrapping.secrets import (
         _payload_secrets,
         _read_console_tail,
@@ -36,6 +38,8 @@ else:
     import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
     import bootstrap_processes as _bootstrap_processes  # type: ignore[no-redef]
+    from bootstrap_attempt import AttemptState  # type: ignore[no-redef]
+    from bootstrap_preload import run_preload  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
         _read_console_tail,
@@ -800,9 +804,14 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
             run_id=run_id,
             attempt=attempt,
         )
-    p = "/tmp/attempt_marker.json"
-    with open(p, "w") as f:
-        json.dump(marker, f)
+    if payload.get("mode") == "preload":
+        p = "/tmp/attempt_marker.json"
+        with open(p, "w") as f:
+            json.dump(marker, f)
+    else:
+        state = AttemptState(_code_dir(payload), payload)
+        marker = state.save(marker)
+        p = state.publication_path(marker)
     hf_upload(
         payload,
         p,
@@ -832,68 +841,28 @@ def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Eve
     return timer, done
 
 
-def run_preload(payload: dict) -> dict:
-    """Download models into the bind-mounted weight cache. Fails if cache isn't mounted to avoid warming ephemeral disk."""
-    env = payload.get("env") or {}
-    cache_dir = env.get("FLASH_WEIGHT_CACHE_DIR") or ""
-    token = env.get("HF_TOKEN")
-    mount = os.path.dirname(os.path.dirname(cache_dir.rstrip("/"))) if cache_dir else ""
-    if not cache_dir or not mount or not os.path.isdir(mount):
-        return {
-            "preloaded": [],
-            "already_cached": [],
-            "failed": {},
-            "error": f"weight-cache not mounted (FLASH_WEIGHT_CACHE_DIR={cache_dir!r}); refusing to warm ephemeral disk",
-        }
-    # Sentinel written by cloud-init only onto a real mount; absent sentinel means Docker silently
-    # auto-created an empty host dir (isdir passes) — we'd warm ephemeral disk. Must check.
-    if payload.get("cache_mount_marker"):
-        marker = os.path.join(mount, payload["cache_mount_marker"])
-        if not os.path.exists(marker):
-            return {
-                "preloaded": [],
-                "already_cached": [],
-                "failed": {},
-                "error": (
-                    f"weight-cache NFS filesystem not mounted (no sentinel at {marker}); "
-                    "refusing to warm ephemeral disk"
-                ),
-            }
-    from huggingface_hub import snapshot_download
-
-    ignore_patterns = ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"]
-    done, already, failed = [], [], {}
-    for repo_id in payload.get("models") or []:
-        try:
-            # Probe with local_files_only first (HF's own resolution, not a dir-name guess).
-            try:
-                snapshot_download(
-                    repo_id=repo_id,
-                    token=token,
-                    cache_dir=cache_dir,
-                    ignore_patterns=ignore_patterns,
-                    local_files_only=True,
-                )
-                already.append(repo_id)
-                print(f"preload: {repo_id} -> {cache_dir} (cached)", flush=True)
-                continue
-            except Exception:
-                pass
-            snapshot_download(
-                repo_id=repo_id, token=token, cache_dir=cache_dir, ignore_patterns=ignore_patterns
-            )
-            done.append(repo_id)
-            print(f"preload: {repo_id} -> {cache_dir} (downloaded)", flush=True)
-        except Exception as exc:
-            failed[repo_id] = _safe_detail(exc, secrets=_payload_secrets(payload))
-            print(f"preload FAILED {repo_id}: {failed[repo_id]}", flush=True)
-    return {"preloaded": done, "already_cached": already, "failed": failed}
-
-
 def main() -> int:
     # SIGTERM → sys.exit so the finally block still uploads the terminal marker.
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(1))
     payload = load_payload()
+    if payload.get("mode") == "preload":
+        return _run_attempt(payload)
+    state = AttemptState(_code_dir(payload), payload)
+    with state.locked():
+        marker = state.read()
+        if marker is not None:
+            print("bootstrap: replaying the persisted terminal result", flush=True)
+            hf_upload(
+                payload,
+                state.publication_path(marker),
+                f"{_arm(payload)}_attempt{payload['attempt']}.json",
+                enforce_deadline=False,
+            )
+            return 0 if marker["ok"] else 1
+        return _run_attempt(payload)
+
+
+def _run_attempt(payload: dict) -> int:
     ok = False
     error = ""
     retriable = False
