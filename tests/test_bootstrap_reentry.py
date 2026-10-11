@@ -21,6 +21,9 @@ from flash.snapshot.archive import build_source_archive, descriptor_for_archive
 
 @pytest.fixture
 def capsule_run(tmp_path):
+    # include /tmp/ even on macos, where pytest normally uses /private/var/folders/.
+    tmp_path = tmp_path / "tmp" / "worker"
+    tmp_path.mkdir(parents=True)
     root = tmp_path / "build"
     repo = Path(__file__).resolve().parents[1]
     for source, _member in get_profile("instance-bootstrap").sources:
@@ -32,9 +35,10 @@ def capsule_run(tmp_path):
     metrics = tmp_path / "metrics.json"
     bootstrap = root / "flash/providers/_lifecycle/bootstrapping/bootstrap.py"
     text = bootstrap.read_text()
+    # redirect original scratch paths before inserting paths that may themselves contain /tmp/.
+    text = text.replace("/tmp/", str(tmp_path) + "/")
     text = text.replace('"/root/flash/payload.json"', repr(str(payload_path)))
     text = text.replace('"/runcode"', repr(str(code_root)))
-    text = text.replace("/tmp/", str(tmp_path) + "/")
     bootstrap.write_text(text)
     capsule = tmp_path / "capsule.pyz"
     capsule.write_bytes(build_capsule("instance-bootstrap", root=root)[0])
