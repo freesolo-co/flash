@@ -163,16 +163,16 @@ def test_a_rejected_redirect_is_not_cached_as_a_failed_verification(
     auth._verify_cache.clear()
     auth._verify_inflight.clear()
 
-    assert auth._freesolo_verify("redirected-secret") is False
+    assert auth._freesolo_verify("redirected-secret") is None
     assert source_seen == [("GET", "Bearer redirected-secret")]
     assert sink_seen == []
-    assert "redirected-secret" not in auth._verify_cache
+    assert auth._verify_key_digest("redirected-secret") not in auth._verify_cache
 
     # the redirect condition clears and the backend answers for real. a cached negative from the
-    # redirect would shadow this and keep returning False without a request.
+    # redirect would shadow this and keep returning None without a request.
     with _ok_server() as ok_url:
         monkeypatch.setenv(auth.FREESOLO_BASE_URL_ENV, ok_url)
-        assert auth._freesolo_verify("redirected-secret") is True
+        assert auth._freesolo_verify("redirected-secret") is not None
 
     assert len(source_seen) == 1
 

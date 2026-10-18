@@ -157,8 +157,7 @@ def make_client(tmp_path, monkeypatch):
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **_kwargs: {"ok": True})
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
-    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", _identity_for_token)
     with TestClient(app_mod.create_app()) as test_client:
 
         def fake_urlopen(req: urllib.request.Request, timeout: float | None = None):

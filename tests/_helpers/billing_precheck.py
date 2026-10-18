@@ -123,8 +123,7 @@ def billing_api(
     )
     monkeypatch.setattr(runs, "_post", lambda *a, **k: False, raising=False)
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(user_prefix))
-    monkeypatch.setattr(auth_mod, "_cached_identity", identity_for_token)
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", identity_for_token)
     monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **k: {"ok": True})
     with TestClient(app_mod.create_app()) as client:
         monkeypatch.delenv("GITHUB_TOKEN")
