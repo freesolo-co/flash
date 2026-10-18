@@ -15,9 +15,7 @@ class _CredentialBoundary:
     __slots__ = ()
 
     def __init_subclass__(cls, **_kwargs: object) -> None:
-        if cls.__module__ == __name__ and cls.__name__ in {
-            "ModalCredentials",
-        }:
+        if cls.__module__ == __name__ and cls.__name__ == "ModalCredentials":
             return
         raise TypeError("provider credential wrappers cannot be subclassed")
 

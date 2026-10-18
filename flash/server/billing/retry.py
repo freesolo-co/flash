@@ -29,7 +29,8 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Callable
 
-from flash import runner
+from flash.runner.lifecycle.state import RunStatus, runs_file_path
+from flash.runner.lifecycle.status import get_status, list_run_ids
 from flash.server.platform.internal_client import internal_key
 
 # States that produced a final, deployable adapter -> a completion charge applies. `deployed` is a
@@ -56,7 +57,7 @@ def charge_retry_enabled() -> bool:
     return internal_key() is not None
 
 
-def _needs_charge(status: runner.RunStatus) -> bool:
+def _needs_charge(status: RunStatus) -> bool:
     """True for a terminal run that carries customer billing context, has a price, and isn't charged.
 
     ``cost_usd`` is the amount we charge: the flash.cost quote for a completed run, or the estimate at
@@ -105,13 +106,13 @@ def retry_completion_charges_once(should_stop: Callable[[], bool] | None = None)
     from flash.runner.supervise.lifecycle import _charge_completed_run_by_id
 
     charged = 0
-    for run_id in runner.list_run_ids():
+    for run_id in list_run_ids():
         if should_stop is not None and should_stop():
             break
         with contextlib.suppress(Exception):
             # Load per-run so one unreadable/legacy status file is skipped (caught here), never
             # aborting recovery of the rest.
-            status = runner.get_status(run_id)
+            status = get_status(run_id)
             if not _needs_charge(status):
                 continue
             # Charge by run id -- the charge reads everything it needs from the persisted RunStatus
@@ -119,8 +120,8 @@ def retry_completion_charges_once(should_stop: Callable[[], bool] | None = None)
             # legacy/stale persisted spec that `JobSpec.from_dict` would reject must NOT block recovery
             # of a real pending/failed charge. Append to the run log so retries surface in
             # `flash runs log`.
-            with open(runner.runs_file_path(run_id, ".log"), "a") as log:
+            with open(runs_file_path(run_id, ".log"), "a") as log:
                 _charge_completed_run_by_id(run_id, log)
-            if runner.get_status(run_id).billing_state == "charged":
+            if get_status(run_id).billing_state == "charged":
                 charged += 1
     return charged

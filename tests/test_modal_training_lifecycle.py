@@ -5,7 +5,7 @@ import time
 import pytest
 
 from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-from flash.providers.base import JobHandle, PollResult
+from flash.providers.core.base import JobHandle, PollResult
 from flash.providers.modal import api, jobs
 from flash.providers.modal.handles import ModalJobHandle
 from flash.providers.modal.pricing import hourly_rate
@@ -29,7 +29,7 @@ def launch_state(monkeypatch):
 def spec(**gpu_changes):
     return JobSpec(
         run_id="modal-lifecycle",
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         seed=42,
         train=TrainSpec(hf_repo="org/artifacts"),
@@ -38,9 +38,8 @@ def spec(**gpu_changes):
 
 
 def submit(job, **kwargs):
-    return jobs.submit_run(
+    return jobs.submit_attempt(
         job,
-        job.seed,
         source_snapshot=valid_source_snapshot(),
         deadline_at=time.time() + 600,
         **kwargs,
@@ -143,7 +142,8 @@ def test_handleless_recovery_cannot_prove_absence_in_a_different_scope(monkeypat
     monkeypatch.setattr(runtime, "get_status", lambda _: status)
     monkeypatch.setenv(changed_key, "another-owner")
     monkeypatch.setattr(
-        "flash.providers.configured_providers", lambda: pytest.fail("must reject before cleanup")
+        "flash.providers.core.registry.configured_providers",
+        lambda: pytest.fail("must reject before cleanup"),
     )
     assert runtime._confirm_run_clear(spec()) is False
 

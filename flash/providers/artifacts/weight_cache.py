@@ -31,7 +31,7 @@ def provision_weight_cache():
 
 def teardown_weight_cache():
     async def remove(modal, client):
-        await modal.Volume.delete.aio(
+        await modal.Volume.objects.delete.aio(
             api.CACHE_NAME, environment_name=api.environment(), client=client
         )
 

@@ -1,6 +1,6 @@
 import pytest
 
-from flash.providers.realized import realized_cost_for_remote
+from flash.providers.core.realized import realized_cost_for_remote
 
 
 def test_modal_estimate_uses_resource_rate_and_actual_end():

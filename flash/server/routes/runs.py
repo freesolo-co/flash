@@ -10,19 +10,20 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
-import flash.runner as _runner
 from flash.engine.profiling.image_tokens import ImageGeometryUnavailable
-from flash.runner import (
+from flash.runner.lifecycle import status as runner_status
+from flash.runner.lifecycle.preparation import WarmStartPreparationError
+from flash.runner.lifecycle.state import new_run_id, runs_file_path
+from flash.runner.lifecycle.submit import SourceSnapshotPublicationError
+from flash.runner.supervise.deploy import (
     DeploymentRevocationError,
     DeploymentStatePersistenceError,
     cancel_run,
-    new_run_id,
-    runs_file_path,
 )
 from flash.schema import train_schema_metadata
-from flash.serve.preflight import ServingPreflightError
-from flash.server import app as _app
-from flash.server.domain.teacher_broker import TeacherBrokerConfigurationError
+from flash.serve.deployment.preflight import ServingPreflightError
+from flash.server.asgi import app as _app
+from flash.server.domain.teacher.broker import TeacherBrokerConfigurationError
 from flash.server.platform import db
 from flash.server.platform.deps import (
     _parse_spec,
@@ -120,30 +121,50 @@ def _schema_disagreement_detail(
     )
 
 
-def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) -> bool:
-    """Reject an unaffordable prepared run before recording or allocating it.
+_BILLING_UNAVAILABLE_DETAIL = "billing verification is unavailable; no paid work was started"
+_BILLING_FAILED_DETAIL = "billing verification failed; no paid work was started"
 
-    Returns whether affordability was actually VERIFIED. The two fail-open paths below deliberately
-    let the run through on a billing-infra problem, but a caller that reports the outcome must be
-    able to tell that apart from a real pass: an unverified run can still be rejected 402 later.
-    """
+
+def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) -> bool:
+    """Reject a permanently unverifiable prepared run before persistence or allocation."""
     from flash.server.platform.internal_client import internal_key as _internal_key
 
     key = _internal_key()
     if not key:
-        # internal reporting is off -> no completion billing either, so there is nothing to gate.
-        return False
+        _LOG.warning("billing precheck unavailable for run %s: internal key missing", run_id)
+        raise HTTPException(status_code=503, detail=_BILLING_UNAVAILABLE_DETAIL)
     try:
-        from flash.server.billing.charges import precheck_training_run
+        from flash.server.billing.charges import (
+            PrecheckError,
+            PrecheckFailureSource,
+            PrecheckRetryDisposition,
+            precheck_training_run,
+        )
 
-        precheck_training_run(internal_key=key, org_id=org_id, estimate_usd=estimate_usd)
+        precheck_training_run(
+            internal_key=key,
+            org_id=org_id,
+            estimate_usd=estimate_usd,
+        )
+    except PrecheckError as exc:
+        _LOG.warning("billing precheck failed for run %s: %s", run_id, exc.private_detail)
+        if exc.source is PrecheckFailureSource.HTTP and exc.status_code == 402:
+            raise HTTPException(
+                status_code=402,
+                detail=exc.public_detail or "payment required",
+            ) from exc
+        if exc.retry is PrecheckRetryDisposition.FAIL_OPEN:
+            return False
+        raise HTTPException(status_code=502, detail=_BILLING_FAILED_DETAIL) from exc
     except Exception as exc:
-        from flash.server.billing.charges import BillingError
+        from flash._internal.diagnostics import sanitize_diagnostic
 
-        if isinstance(exc, BillingError) and exc.status_code == 402:
-            raise HTTPException(status_code=402, detail=exc.detail) from exc
-        _LOG.warning("budget precheck skipped for %s (billing service error): %s", run_id, exc)
-        return False
+        _LOG.warning(
+            "billing precheck failed for run %s: %s",
+            run_id,
+            sanitize_diagnostic(exc, limit=500),
+        )
+        raise HTTPException(status_code=502, detail=_BILLING_FAILED_DETAIL) from exc
     return True
 
 
@@ -196,7 +217,7 @@ def _submission_context(
 
 def _resolve_managed_environment(spec, *, project_id: str, reporting_key: dict) -> str | None:
     """Return the canonical managed environment slug for ``spec``, or ``None`` when unmanaged."""
-    from flash.envs.adapter import canonical_managed_environment_slug
+    from flash.envs.loading.adapter import canonical_managed_environment_slug
 
     try:
         environment_slug = canonical_managed_environment_slug(spec.environment.id)
@@ -204,8 +225,8 @@ def _resolve_managed_environment(spec, *, project_id: str, reporting_key: dict) 
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if environment_slug is None:
         return None
-    from flash.server.domain import envs as managed_envs
-    from flash.server.domain.environment_registry import require_environment_project
+    from flash.server.domain.registry import envs as managed_envs
+    from flash.server.domain.registry.environment_registry import require_environment_project
 
     try:
         environment_slug = managed_envs.canonical_env_id(environment_slug)
@@ -225,7 +246,7 @@ def _record_environment_use(
 ) -> None:
     """Report the environment use for an already-submitted run; never fails the request."""
     try:
-        from flash.server.domain.environment_registry import record_environment_use
+        from flash.server.domain.registry.environment_registry import record_environment_use
 
         if environment_slug is not None:
             record_environment_use(
@@ -246,7 +267,7 @@ def _submit_failure_http_error(exc: Exception) -> HTTPException:
     Everything reaching here is a bad request by default. Submit-time errors may opt into 503 with
     a truthy ``plane_fault`` attribute when the submitter cannot fix the failure by changing the spec.
     """
-    if isinstance(exc, _runner.SourceSnapshotPublicationError):
+    if isinstance(exc, SourceSnapshotPublicationError):
         return HTTPException(status_code=503, detail=str(exc))
     if (
         isinstance(exc, (ImageGeometryUnavailable, TeacherBrokerConfigurationError))
@@ -290,7 +311,7 @@ def _dispose_failed_submission(
         # record that already reached a terminal state is left untouched.
         terminalized = False
         try:
-            _runner._update(
+            runner_status._update(
                 run_id,
                 "failed",
                 error=(
@@ -339,7 +360,7 @@ def create_run(
         if detail is None:
             raise
         raise HTTPException(status_code=400, detail=detail) from exc
-    from flash.server.domain.projects import require_project_access
+    from flash.server.domain.registry.projects import require_project_access
 
     project_id = require_project_access(
         project_id=spec.project,
@@ -362,6 +383,7 @@ def create_run(
     platform_context = ctx.platform_context
     run_id = spec.run_id
     affordability_verified = False
+    submission_started = False
     try:
         try:
             prepared = _app.prepare_job(
@@ -375,7 +397,7 @@ def create_run(
         # resolve the class off the module rather than binding it at import: flash.runner is
         # reloaded (tests, and any reimport), which rebinds the class to a new object, and a
         # bound name would silently stop matching the error the runner actually raises.
-        except _runner.WarmStartPreparationError as exc:
+        except WarmStartPreparationError as exc:
             # only failures raised while resolving the warm-start source reach here, so the adapter
             # really is the cause. the reason itself stays out of the response on purpose: it can
             # name internal storage paths and source-run internals. it is logged instead.
@@ -402,6 +424,7 @@ def create_run(
                 estimate_usd=prepared.estimated_cost_usd,
                 org_id=affordability_org_id,
             )
+        submission_started = True
         db.record_run(run_id, key["id"])
         submit_kwargs = {
             "dry_run": dry_run,
@@ -417,14 +440,15 @@ def create_run(
             submit_kwargs["platform_context"] = platform_context
         status = _app.submit_job(prepared.public_spec, **submit_kwargs)
     except Exception as exc:
-        _dispose_failed_submission(
-            run_id,
-            dry_run=dry_run,
-            had_runtime_secrets=bool(runtime_secrets),
-            environment_slug=environment_slug,
-            project_id=project_id,
-            reporting_key=reporting_key,
-        )
+        if submission_started:
+            _dispose_failed_submission(
+                run_id,
+                dry_run=dry_run,
+                had_runtime_secrets=bool(runtime_secrets),
+                environment_slug=environment_slug,
+                project_id=project_id,
+                reporting_key=reporting_key,
+            )
         if isinstance(exc, HTTPException):
             raise
         raise _submit_failure_http_error(exc) from exc
@@ -455,8 +479,13 @@ def list_runs(key: Annotated[dict, Depends(require_key)]):
 
 @router.get("/v1/runs/{run_id}")
 def run_status(run_id: str, key: Annotated[dict, Depends(require_key)]):
+    from flash.runner.results.verified_revisions import read_verified_checkpoints
+
     status = owned_run(run_id, key)
-    return status.to_dict()
+    return {
+        **status.to_dict(),
+        "verified_checkpoints": sorted(read_verified_checkpoints(run_id)),
+    }
 
 
 @router.get("/v1/runs/{run_id}/logs")
@@ -499,7 +528,7 @@ def run_worker_output(
     status = readable_run(run_id, key, x_freesolo_org_id)
     # hf_repo + run_id (adapter prefix) are platform-managed and stripped from the public spec;
     # the worker artifact repo lives under the internal carrier (see _internal_spec_from_status).
-    from flash.runner import _internal_spec_from_status
+    from flash.runner.lifecycle.state import _internal_spec_from_status
 
     return {
         "run_id": run_id,
@@ -541,12 +570,12 @@ def run_checkpoints(run_id: str, key: Annotated[dict, Depends(require_key)]):
     status = owned_run(run_id, key)
     # checkpoint listing keys off hf_repo + run_id, both platform-managed and stripped from the
     # public spec; resolve them from the internal carrier (see _internal_spec_from_status).
-    from flash.runner import _internal_spec_from_status
+    from flash.runner.lifecycle.state import _internal_spec_from_status
 
     spec = _internal_spec_from_status(status)
     checkpoints = _app.list_checkpoints(spec)
     with contextlib.suppress(Exception):
-        from flash.server.domain.checkpoints import register_checkpoints_best_effort
+        from flash.server.domain.registry.checkpoints import register_checkpoints_best_effort
 
         register_checkpoints_best_effort(status)
     return {"run_id": run_id, "checkpoints": checkpoints}

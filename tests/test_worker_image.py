@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
-import flash.providers._lifecycle.worker as worker_module
-from flash.providers._lifecycle.worker import WORKER_IMAGE, worker_image_for_gpu
+import flash.providers._lifecycle.net.worker as worker_module
+from flash.providers._lifecycle.net.worker import WORKER_IMAGE, worker_image_for_gpu
 
 
 def test_worker_image_defaults_to_per_sm_baked_tag_for_durable_jobs():

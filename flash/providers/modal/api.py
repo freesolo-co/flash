@@ -8,7 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from flash.providers.base import UnreconciledCreateError, get_gpu_info
+from flash.providers.core.base import UnreconciledCreateError, get_gpu_info
 from flash.providers.modal.auth import credentials
 from flash.providers.modal.pricing import CPU_PER_GPU, MEMORY_MIB_PER_GPU
 
@@ -68,6 +68,9 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, deadline_
         "flash_owner": "flash-training",
     }
     identity["flash_spec"] = hashlib.sha256(payload["job_spec_json"].encode()).hexdigest()
+    identity["flash_source"] = hashlib.sha256(
+        json.dumps(payload.get("source_snapshot"), sort_keys=True).encode()
+    ).hexdigest()
     with tempfile.TemporaryDirectory(prefix="flash-modal-") as directory:
         archive = Path(directory) / "capsule.pyz"
         archive.write_bytes(capsule)
@@ -121,7 +124,6 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, deadline_
                     workdir="/root/flash",
                     volumes=volumes,
                     client=client,
-                    environment_name=environment(),
                 )
                 return sandbox.object_id
             except Exception:

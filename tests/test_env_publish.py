@@ -13,8 +13,11 @@ from pathlib import Path
 
 import pytest
 
-from flash.server.domain import envs
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+from flash.server.domain.registry import envs
 from tests._helpers.source_snapshot import valid_source_snapshot
+from tests._helpers.wire_headers import sent_headers
 
 
 def _gnu_longname_bomb(name_len: int) -> bytes:
@@ -354,7 +357,7 @@ def test_publish_does_not_accept_github_pat_alias(monkeypatch):
 
 
 def test_record_published_environment_posts_to_backend(monkeypatch):
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -404,7 +407,7 @@ def test_record_published_environment_posts_to_backend(monkeypatch):
 
 def test_record_published_environment_sends_project_id(monkeypatch):
     """A validated project travels to the backend as `projectId`."""
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -438,7 +441,7 @@ def test_record_published_environment_sends_project_id(monkeypatch):
 
 
 def test_record_published_environment_rejects_blank_project_id(monkeypatch):
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -471,7 +474,7 @@ def test_record_published_environment_rejects_blank_project_id(monkeypatch):
 
 
 def test_record_published_environment_returns_false_without_internal_key(monkeypatch):
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     assert (
@@ -487,7 +490,7 @@ def test_record_published_environment_returns_false_without_internal_key(monkeyp
 
 def _capture_delete_request(monkeypatch):
     """Stub urlopen for record_deleted_environment and return the dict it records into."""
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -513,7 +516,7 @@ def _capture_delete_request(monkeypatch):
 
 def test_record_deleted_environment_uses_caller_org_for_internal_key(monkeypatch):
     # The internal key is org-agnostic, so the web UI delete supplies the org explicitly.
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     seen = _capture_delete_request(monkeypatch)
     ok = environment_registry.record_deleted_environment(
@@ -534,7 +537,7 @@ def test_record_deleted_environment_uses_caller_org_for_internal_key(monkeypatch
 def test_record_deleted_environment_prefers_key_org_over_supplied(monkeypatch):
     # A user key carries its own org, which must win over any caller-supplied override so a
     # forged header can't drop another org's row.
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     seen = _capture_delete_request(monkeypatch)
     ok = environment_registry.record_deleted_environment(
@@ -549,7 +552,7 @@ def test_record_deleted_environment_prefers_key_org_over_supplied(monkeypatch):
 
 def test_record_deleted_environment_without_any_org_is_noop(monkeypatch):
     # No key org and no supplied org: nothing to target, so it must not POST.
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setattr(
@@ -568,7 +571,7 @@ def test_record_deleted_environment_without_any_org_is_noop(monkeypatch):
 
 
 def test_require_environment_project_posts_strict_validation(monkeypatch):
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     seen: dict = {}
 
@@ -588,7 +591,7 @@ def test_require_environment_project_posts_strict_validation(monkeypatch):
         seen.update(
             url=req.full_url,
             method=req.method,
-            headers=dict(req.headers),
+            headers=sent_headers(req),
             body=json.loads(req.data),
             timeout=timeout,
         )
@@ -609,7 +612,7 @@ def test_require_environment_project_posts_strict_validation(monkeypatch):
         "method": "POST",
         "headers": {
             "Authorization": "Bearer internal-secret",
-            "Content-type": "application/json",
+            "Content-Type": "application/json",
         },
         "body": {
             "orgId": "org-A",
@@ -623,7 +626,7 @@ def test_require_environment_project_posts_strict_validation(monkeypatch):
 def test_require_environment_project_repairs_missing_legacy_environment(monkeypatch):
     import urllib.error
 
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     requests: list[dict] = []
     downloads: list[tuple[str, dict]] = []
@@ -689,7 +692,7 @@ def test_require_environment_project_repairs_missing_legacy_environment(monkeypa
 def test_require_environment_project_repairs_missing_row_without_error_detail(monkeypatch):
     import urllib.error
 
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     error = urllib.error.HTTPError(
         "https://backend.test/api/flash/environments/validate/internal",
@@ -742,7 +745,7 @@ def test_repairing_another_projects_environment_never_launches_the_run(monkeypat
 
     from fastapi import HTTPException
 
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     error = urllib.error.HTTPError(
         "https://backend.test/api/flash/environments/validate/internal",
@@ -787,7 +790,7 @@ def test_require_environment_project_missing_package_does_not_backfill(monkeypat
 
     from fastapi import HTTPException
 
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     error = urllib.error.HTTPError(
         "https://backend.test/api/flash/environments/validate/internal",
@@ -832,7 +835,7 @@ def test_require_environment_project_cross_namespace_repair_preserves_404(monkey
 
     from fastapi import HTTPException
 
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     error = urllib.error.HTTPError(
         "https://backend.test/api/flash/environments/validate/internal",
@@ -883,7 +886,7 @@ def test_internal_repair_without_org_namespace_preserves_404(monkeypatch, packag
 
     from fastapi import HTTPException
 
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     error = urllib.error.HTTPError(
         "https://backend.test/api/flash/environments/validate/internal",
@@ -933,7 +936,7 @@ def test_require_environment_project_backfill_failure_is_502(monkeypatch):
 
     from fastapi import HTTPException
 
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     error = urllib.error.HTTPError(
         "https://backend.test/api/flash/environments/validate/internal",
@@ -983,7 +986,7 @@ def _validate_http_error(code: int, body: bytes):
 
 def test_record_published_environment_keeps_failures_best_effort(monkeypatch):
     """A backend 500 stays a ``False`` so the retry advice still applies."""
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
     from flash.server.platform import internal_client
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
@@ -1011,7 +1014,7 @@ def test_require_environment_project_maps_project_mismatch(monkeypatch):
 
     from fastapi import HTTPException
 
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     error = urllib.error.HTTPError(
         "https://backend.test/api/flash/environments/validate/internal",
@@ -1047,7 +1050,7 @@ def test_require_environment_project_maps_project_mismatch(monkeypatch):
 def test_require_environment_project_fails_closed_without_internal_key(monkeypatch):
     from fastapi import HTTPException
 
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
 
@@ -1063,7 +1066,7 @@ def test_require_environment_project_fails_closed_without_internal_key(monkeypat
 
 
 def test_record_environment_use_posts_to_backend(monkeypatch):
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -1105,8 +1108,8 @@ def test_record_environment_use_posts_to_backend(monkeypatch):
 
 
 def test_record_training_run_posts_to_backend(monkeypatch):
-    from flash.runner import RunStatus
-    from flash.server.domain import run_registry
+    from flash.runner.lifecycle.state import RunStatus
+    from flash.server.domain.registry import runs
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -1127,14 +1130,14 @@ def test_record_training_run_posts_to_backend(monkeypatch):
         seen["body"] = req.data
         return _Resp()
 
-    monkeypatch.setattr(run_registry.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(runs.urllib.request, "urlopen", fake_urlopen)
 
-    ok = run_registry.record_training_run(
+    ok = runs.record_training_run(
         status=RunStatus(
             run_id="flash-1",
             state="running",
             spec={
-                "model": "Qwen/Qwen3.5-4B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "grpo",
                 "phase": "rl",
                 "environment": {"id": "acme/checkout-bot/my-env"},
@@ -1147,6 +1150,12 @@ def test_record_training_run_posts_to_backend(monkeypatch):
                 "api_key_id": "key-1",
             },
             source_snapshot=valid_source_snapshot(),
+            deployment={
+                "state": "ready",
+                "checkpoint_id": "flash-1/final",
+                "endpoint_name": "https://serve.example",
+                "adapter_hf_prefix": "private/path",
+            },
             last_heartbeat={
                 "attempt": 0,
                 "stage": "sft_step",
@@ -1170,15 +1179,23 @@ def test_record_training_run_posts_to_backend(monkeypatch):
     assert body["environmentSlug"] == "acme/checkout-bot/my-env"
     # the exact canonical project uuid is persisted with every managed training run.
     assert body["projectId"] == "11111111-1111-4111-8111-111111111111"
-    assert body["model"] == "Qwen/Qwen3.5-4B"
+    assert body["model"] == "Qwen/Qwen3.5-9B"
+    assert body["checkpointId"] == "flash-1/final"
+    assert body["deployment"] == {
+        "state": "ready",
+        "checkpoint_id": "flash-1/final",
+        "endpoint": "https://serve.example",
+    }
+    assert "adapterRef" not in body
     assert body["lastHeartbeat"] == {"attempt": 0, "stage": "sft_step"}
+    assert "private/path" not in json.dumps(body)
     assert "source_snapshot" not in json.dumps(body)
     assert "source_provenance" not in json.dumps(body)
 
 
 def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
-    from flash.runner import RunStatus
-    from flash.server.domain import run_registry
+    from flash.runner.lifecycle.state import RunStatus
+    from flash.server.domain.registry import runs
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -1197,10 +1214,10 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
         seen["body"] = req.data
         return _Resp()
 
-    monkeypatch.setattr(run_registry.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(runs.urllib.request, "urlopen", fake_urlopen)
 
     spec = {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "environment": {"id": "acme/checkout-bot/my-env"},
         "project": "11111111-1111-4111-8111-111111111111",
@@ -1209,7 +1226,7 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
     context = {"org_id": "org-1", "user_id": "user-1", "api_key_id": "key-1"}
 
     # terminal persistence clears the remote, so the effective worker spec retains the selected class.
-    run_registry.record_training_run(
+    runs.record_training_run(
         status=RunStatus(
             run_id="flash-1",
             state="cancelled",
@@ -1221,7 +1238,7 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
     assert json.loads(seen["body"])["gpuType"] == "A100 SXM"
 
     # before allocation, the authored head remains the best available attribution.
-    run_registry.record_training_run(
+    runs.record_training_run(
         status=RunStatus(
             run_id="flash-1",
             state="queued",
@@ -1233,14 +1250,13 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
 
 
 def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
-    from flash import runner
     from flash.core.spec import JobSpec
-    from flash.runner import RunStatus
-    from flash.server.domain import run_registry
+    from flash.runner.lifecycle.state import RunStatus
+    from flash.server.domain.registry import runs
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     seen: dict[str, object] = {}
 
     class _Resp:
@@ -1258,11 +1274,11 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
         seen["body"] = req.data
         return _Resp()
 
-    monkeypatch.setattr(run_registry.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(runs.urllib.request, "urlopen", fake_urlopen)
     spec = JobSpec.from_dict(
         {
             "run_id": "flash-1",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "project": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "algorithm": "grpo",
             "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/flashrun-flash-1"},
@@ -1270,7 +1286,7 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
     )
     persisted_spec = spec.to_dict()
     persisted_spec["project"] = " AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA "
-    runner._save_status(
+    runner_state._save_status(
         RunStatus(
             run_id="flash-1",
             state="running",
@@ -1280,9 +1296,9 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
         )
     )
 
-    ok = run_registry.record_training_checkpoint(
+    ok = runs.record_training_checkpoint(
         spec=spec,
-        metrics={"cost_usd": 0.25},
+        metrics={"cost_usd": 0.25, "step": 3},
         artifact_path="/tmp/artifacts",
     )
 
@@ -1293,11 +1309,10 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
         "orgId": "org-1",
         "projectId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         "runId": "flash-1",
-        "checkpointId": "final",
+        "checkpointId": "flash-1/final",
         "phase": "rl",
-        "adapterRef": "Freesolo-Co/flashrun-flash-1:rl/flash-1",
         "artifactPath": "/tmp/artifacts",
-        "metrics": {"cost_usd": 0.25},
+        "metrics": {"cost_usd": 0.25, "step": 3},
         "metadata": {"source": "flash.control_plane"},
         "updatedAt": "1970-01-01T00:00:00+00:00",
     }
@@ -1307,15 +1322,14 @@ def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):
 def test_record_training_checkpoint_rejects_invalid_persisted_project(
     monkeypatch, persisted_project
 ):
-    from flash import runner
     from flash.core.spec import JobSpec
-    from flash.runner import RunStatus
-    from flash.server.domain import run_registry
+    from flash.runner.lifecycle.state import RunStatus
+    from flash.server.domain.registry import runs
 
     spec = JobSpec.from_dict(
         {
             "run_id": "flash-1",
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "project": "11111111-1111-4111-8111-111111111111",
             "algorithm": "grpo",
             "train": {"epochs": 1, "max_examples": 1, "hf_repo": "Freesolo-Co/flashrun-flash-1"},
@@ -1332,15 +1346,15 @@ def test_record_training_checkpoint_rejects_invalid_persisted_project(
         spec=persisted_spec,
         platform_context={"org_id": "org-1"},
     )
-    monkeypatch.setattr(runner, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(runner_status, "get_status", lambda _run_id: status)
     monkeypatch.setattr(
-        run_registry,
+        runs,
         "_post",
         lambda *_args, **_kwargs: pytest.fail("invalid project must not be reported"),
     )
 
     assert (
-        run_registry.record_training_checkpoint(
+        runs.record_training_checkpoint(
             spec=spec,
             metrics={"cost_usd": 0.25},
             artifact_path="/tmp/artifacts",
@@ -1557,7 +1571,7 @@ def test_github_publish_once_commits_pull_rebases_and_pushes(tmp_path, monkeypat
     package.mkdir()
     (package / "environment.py").write_text("def load_environment(**k): pass\n")
 
-    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
 
     envs._github_publish_once(
         dest=package,
@@ -1597,7 +1611,7 @@ def test_github_publish_once_pushes_toml_configs(tmp_path, monkeypatch):
     (configs / "sft.toml").write_text(sft_config)
     (configs / "opd_thinking.toml").write_text(opd_config)
 
-    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
 
     envs._github_publish_once(
         dest=package,
@@ -1768,7 +1782,7 @@ def test_github_delete_once_removes_dir_and_pushes(tmp_path, monkeypatch):
     _git(seed, "remote", "add", "origin", str(remote))
     _git(seed, "push", "origin", "main")
 
-    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
     removed = envs._github_delete_once(
         repo="ignored/repo", token="tok", publish_root="ns/project/env", message="Delete test env"
     )
@@ -1795,7 +1809,7 @@ def test_github_delete_once_idempotent_when_absent(tmp_path, monkeypatch):
     _git(seed, "remote", "add", "origin", str(remote))
     _git(seed, "push", "origin", "main")
 
-    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
     removed = envs._github_delete_once(
         repo="ignored/repo", token="tok", publish_root="ns/project/absent", message="Delete absent"
     )
@@ -1850,7 +1864,7 @@ def test_github_delete_once_reapplies_removal_after_concurrent_publish(tmp_path,
     _git(seed, "remote", "add", "origin", str(remote))
     _git(seed, "push", "origin", "main")
 
-    monkeypatch.setattr(envs, "_credentialed_repo_url", lambda repo, token: str(remote))
+    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
 
     # Inject the concurrent publish exactly once, right as the original delete commit is staged
     # (the first `_staged_has_changes` call) — before `_push_environment_delete` rebases — by pushing
@@ -1858,8 +1872,8 @@ def test_github_delete_once_reapplies_removal_after_concurrent_publish(tmp_path,
     real_staged = envs._staged_has_changes
     state = {"injected": False}
 
-    def staged_with_injection(checkout):
-        result = real_staged(checkout)
+    def staged_with_injection(checkout, *, token=""):
+        result = real_staged(checkout, token=token)
         if not state["injected"]:
             state["injected"] = True
             other = tmp_path / "other"
@@ -1907,7 +1921,7 @@ def test_github_delete_retries_concurrent_push(monkeypatch):
 
 
 def test_record_deleted_environment_sends_delete(monkeypatch):
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://backend.test")
@@ -1949,7 +1963,7 @@ def test_record_deleted_environment_sends_delete(monkeypatch):
 
 
 def test_record_deleted_environment_is_best_effort(monkeypatch):
-    from flash.server.domain import environment_registry
+    from flash.server.domain.registry import environment_registry
 
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     assert (

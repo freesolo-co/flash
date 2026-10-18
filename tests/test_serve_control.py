@@ -5,13 +5,14 @@ from __future__ import annotations
 import copy
 import json
 import pickle
+import subprocess
+import sys
 from dataclasses import asdict, fields, replace
 from pathlib import Path
 
 import pytest
 
 from flash.serve.control import (
-    AdapterAliasIntent,
     DeploymentRequest,
     DeploymentResult,
     DeploymentSpec,
@@ -34,7 +35,6 @@ ENGINE_ARGS_FINGERPRINT = canonical_mapping_fingerprint({"dtype": "bfloat16"})
 TOKENIZER_KWARGS_FINGERPRINT = canonical_mapping_fingerprint({"use_fast": True})
 PROCESSOR_KWARGS_FINGERPRINT = canonical_mapping_fingerprint({"max_pixels": 1024})
 SECRET_SENTINEL = "provider-secret-sentinel"
-POD_ID = "abc123def4567"
 _ADAPTER_ENGINES: dict[int, EngineIdentity] = {}
 _ADAPTER_REFERENCES: list[ResolvedAdapter] = []
 
@@ -47,7 +47,7 @@ def _engine(**overrides: object) -> EngineIdentity:
         "tokenizer_revision": TOKENIZER_REVISION,
         "image_digest": IMAGE_DIGEST,
         "modality": "text",
-        "runtime_family": "vllm-0.23.0",
+        "runtime_family": "vllm-0.23.0-pr42120",
         "dtype": "bfloat16",
         "quantization": None,
         "kv_cache_dtype": None,
@@ -83,8 +83,7 @@ def _adapter(
     artifact_revision = f"{index + 10:040x}"
     values: dict[str, object] = {
         "run_id": run_id,
-        "checkpoint": "final",
-        "adapter_revision": f"{run_id}@final.{artifact_revision}",
+        "checkpoint_id": f"{run_id}/final",
         "artifact_repo_id": "flash-owned/runs",
         "artifact_repo_type": "model",
         "artifact_revision": artifact_revision,
@@ -95,7 +94,6 @@ def _adapter(
         "lora_rank": 16,
         "thinking_default": False,
         "structured_outputs_default_json": '{"json_object":true}',
-        "alias_intent": AdapterAliasIntent(activate=False, expected_adapter_revision=None),
     }
     values.update(overrides)
     adapter = ResolvedAdapter(**values)
@@ -331,33 +329,16 @@ def test_numeric_equivalent_engines_produce_permutation_stable_specs() -> None:
     assert forward == reverse
 
 
-def test_planning_rejects_provider_placement_and_gpu_count_mismatches() -> None:
-    with pytest.raises(PlanningError, match="Modal"):
-        plan_deployment(replace(_modal_request(_adapter(1)), provider="unsupported"))
-    request = _modal_request(_adapter(1))
-    with pytest.raises(ValueError, match="workspace_name"):
-        replace(request.placement, workspace_name="")
-
-    engine = _engine(tensor_parallel_size=2)
-    adapter = _adapter(1, engine)
-    with pytest.raises(PlanningError, match=r"gpu_count.*tensor_parallel_size"):
-        plan_deployment(_modal_request(adapter))
-    assert plan_deployment(
-        replace(_modal_request(adapter), placement=replace(request.placement, gpu_count=2))
-    )
-
-
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
-        ({"adapter_revision": "run-1/final"}, "full immutable"),
-        ({"adapter_revision": "run-1@final.main"}, "full immutable"),
-        ({"adapter_revision": f"other@final.{11:040x}"}, "does not belong"),
-        ({"checkpoint": "step-1"}, "checkpoint"),
+        ({"checkpoint_id": "run-1"}, "checkpoint_id"),
+        ({"checkpoint_id": "run-1/step-01"}, "checkpoint_id"),
+        ({"checkpoint_id": "other/final"}, "does not belong"),
         ({"artifact_repo_id": "missing-owner"}, "owner/name"),
         ({"artifact_repo_type": "space"}, "model or dataset"),
         ({"artifact_revision": "A" * 40}, "lowercase"),
-        ({"artifact_revision": "9" * 40}, "does not match"),
+        ({"artifact_revision": "g" * 40}, "lowercase"),
         ({"artifact_digest": "A" * 64}, "lowercase"),
         ({"artifact_digest": "a" * 63}, "lowercase"),
         ({"artifact_subfolder": "/sft/run-1"}, "safe relative"),
@@ -366,7 +347,6 @@ def test_planning_rejects_provider_placement_and_gpu_count_mismatches() -> None:
         ({"base_model": ""}, "base_model"),
         ({"base_model_revision": "A" * 40}, "lowercase"),
         ({"lora_rank": 0}, "positive"),
-        ({"alias_intent": None}, "explicit"),
     ],
 )
 def test_resolved_adapter_rejects_invalid_intrinsic_fields(
@@ -403,79 +383,27 @@ def test_engine_identity_rejects_invalid_capacity_on_direct_construction(
         _engine(**changes)
 
 
-def test_duplicate_revisions_and_multiple_alias_activations_are_rejected() -> None:
+def test_duplicate_checkpoint_identities_are_rejected() -> None:
     adapter = _adapter(1)
-    with pytest.raises(PlanningError, match="duplicate adapter revision"):
+    with pytest.raises(PlanningError, match="duplicate checkpoint identity"):
         plan_deployment(_modal_request(adapter, adapter))
 
-    first = replace(
-        adapter,
-        alias_intent=AdapterAliasIntent(activate=True, expected_adapter_revision=None),
-    )
-    artifact_revision = "d" * 40
+
+def test_sibling_checkpoints_remain_independent_in_one_deployment() -> None:
+    first = _adapter(1)
     second = replace(
         first,
-        checkpoint="step-2",
-        adapter_revision=f"run-1@step-2.{artifact_revision}",
-        artifact_revision=artifact_revision,
+        checkpoint_id="run-1/step-2",
+        artifact_revision="d" * 40,
         artifact_digest="e" * 64,
         artifact_subfolder="sft/run-1-step-2",
     )
-    with pytest.raises(PlanningError, match="at most one active alias intent per run"):
-        plan_deployment(_modal_request(first, second))
 
-    planned = plan_deployment(
-        _modal_request(first, replace(second, alias_intent=AdapterAliasIntent(False, None)))
-    )
-    assert len(planned.adapters) == 2
-
-
-def test_alias_compare_and_swap_revision_must_be_immutable_and_same_run() -> None:
-    for expected in ("main", f"other@final.{12:040x}"):
-        with pytest.raises(ValueError, match="same run"):
-            _adapter(
-                1,
-                alias_intent=AdapterAliasIntent(
-                    activate=True,
-                    expected_adapter_revision=expected,
-                ),
-            )
-
-    adapter = _adapter(
-        1,
-        alias_intent=AdapterAliasIntent(
-            activate=True,
-            expected_adapter_revision=f"run-1@step-2.{12:040x}",
-        ),
-    )
-    assert plan_deployment(_modal_request(adapter)).adapters == (adapter,)
-
-
-def test_provider_credentials_are_redacted_and_fail_closed_for_serialization() -> None:
-    credentials = (ModalCredentials("token-id", SECRET_SENTINEL),)
-    for credential in credentials:
-        assert SECRET_SENTINEL not in repr(credential)
-        assert "redacted" in repr(credential).lower()
-        with pytest.raises(TypeError):
-            asdict(credential)
-        with pytest.raises(TypeError):
-            json.dumps(credential)
-        with pytest.raises(TypeError, match="cannot be serialized"):
-            pickle.dumps(credential)
-        with pytest.raises(TypeError, match="cannot expose serialization state"):
-            credential.__getstate__()
-        with pytest.raises(TypeError, match="cannot be copied"):
-            copy.copy(credential)
-        with pytest.raises(TypeError, match="cannot be copied"):
-            copy.deepcopy(credential)
-        with pytest.raises(TypeError, match="cannot be subclassed"):
-            type("CredentialSubclass", (type(credential),), {})
-        with pytest.raises(TypeError):
-            vars(credential)
-
-    with pytest.raises(ValueError, match="token_secret") as exc_info:
-        ModalCredentials(SECRET_SENTINEL, "")
-    assert SECRET_SENTINEL not in str(exc_info.value)
+    planned = plan_deployment(_modal_request(first, second))
+    assert [adapter.checkpoint_id for adapter in planned.adapters] == [
+        "run-1/final",
+        "run-1/step-2",
+    ]
 
 
 def _modal_handle(spec: DeploymentSpec) -> ModalProviderHandle:
@@ -495,86 +423,6 @@ def _modal_handle(spec: DeploymentSpec) -> ModalProviderHandle:
         image_digest=spec.engine.image_digest,
         public_url="https://flash-app.modal.run",
     )
-
-
-def test_handles_and_results_expose_exact_secret_free_public_fields() -> None:
-    modal_spec = plan_deployment(_modal_request(_adapter(1)))
-    handles_and_specs = ((_modal_handle(modal_spec), modal_spec),)
-    assert modal_spec.placement.workspace_name == "workspace-1"
-    assert "workspace_id" not in {entry.name for entry in fields(modal_spec.placement)}
-    assert "volume_size_gb" not in {entry.name for entry in fields(modal_spec.placement)}
-
-    for handle, spec in handles_and_specs:
-        result = DeploymentResult.from_spec(spec, status="ready", handle=handle)
-        assert {entry.name for entry in fields(result)} == {
-            "spec",
-            "status",
-            "handle",
-            "error_code",
-            "error_reason",
-        }
-        assert result.deployment_id == spec.deployment_id
-        assert result.generation == spec.generation
-        assert result.provider == spec.provider
-        assert result.placement == spec.placement
-        assert result.engine_id == spec.engine.engine_id
-        assert result.image_digest == handle.image_digest
-        assert result.spec_id == spec.spec_id
-        assert result.status == "ready"
-        assert result.handle is handle
-        assert result.error_code is None
-        assert "group_id" not in {entry.name for entry in fields(handle)}
-        assert handle.inference_secret_name == "flash-inference-secret"
-        assert not any(entry.name.startswith("artifact_secret") for entry in fields(handle))
-        assert SECRET_SENTINEL not in repr(
-            (result.spec, result.status, result.handle, result.error_code)
-        )
-        if type(handle) is ModalProviderHandle:
-            assert handle.workspace_name == "workspace-1"
-            assert "workspace_id" not in {entry.name for entry in fields(handle)}
-        else:
-            assert handle.template_id == "template-1"
-            assert handle.template_name == "flash-template"
-
-    with pytest.raises(ValueError, match="app_id"):
-        replace(handles_and_specs[0][0], app_id="")
-    with pytest.raises(ValueError, match="inference_secret_id"):
-        replace(handles_and_specs[0][0], inference_secret_id="")
-
-
-def test_deployment_result_requires_an_exact_spec_and_matching_handle_provenance() -> None:
-    spec = plan_deployment(_modal_request(_adapter(1)))
-    handle = _modal_handle(spec)
-
-    with pytest.raises(TypeError, match="constructed from an exact DeploymentSpec"):
-        DeploymentResult()
-
-    legitimate = DeploymentResult.from_spec(spec, status="ready", handle=handle)
-    assert legitimate.spec_id == spec.spec_id
-
-    raw_error = RuntimeError(SECRET_SENTINEL)
-    with pytest.raises(ValueError, match="allowlisted deployment error") as exc_info:
-        DeploymentResult.from_spec(spec, status="failed", error_code=raw_error)
-    assert SECRET_SENTINEL not in str(exc_info.value)
-
-    with pytest.raises(ValueError, match="allowlisted deployment reason") as exc_info:
-        DeploymentResult.from_spec(
-            spec,
-            status="failed",
-            error_code="resource_ambiguous",
-            error_reason=SECRET_SENTINEL,
-        )
-    assert SECRET_SENTINEL not in str(exc_info.value)
-
-    mismatches = (
-        replace(handle, deployment_id="deployment-other"),
-        replace(handle, generation=spec.generation + 1),
-        replace(handle, engine_id="f" * 64),
-        replace(handle, image_digest="sha256:" + "f" * 64),
-    )
-    for mismatched in mismatches:
-        with pytest.raises(ValueError, match="provenance"):
-            DeploymentResult.from_spec(spec, status="ready", handle=mismatched)
 
 
 @pytest.mark.parametrize(
@@ -615,7 +463,7 @@ def test_deployment_result_accepts_complete_lifecycle_matrix(
         ("failed", False, None),
         ("outcome_unknown", True, None),
         ("absent", True, None),
-        ("absent", False, "not_found"),
+        ("absent", False, "conflict"),
     ],
 )
 def test_deployment_result_rejects_invalid_lifecycle_matrix(
@@ -632,22 +480,6 @@ def test_deployment_result_rejects_invalid_lifecycle_matrix(
             handle=handle,
             error_code=error_code,
         )
-
-
-def test_deployment_result_validates_shared_placement_provenance() -> None:
-    modal_spec = plan_deployment(_modal_request(_adapter(1)))
-    modal_handle = _modal_handle(modal_spec)
-    for field_name, value in (
-        ("workspace_name", "workspace-other"),
-        ("environment", "staging"),
-        ("region", "us-west"),
-    ):
-        with pytest.raises(ValueError, match="placement"):
-            DeploymentResult.from_spec(
-                modal_spec,
-                status="ready",
-                handle=replace(modal_handle, **{field_name: value}),
-            )
 
 
 def test_deployment_result_equality_and_fields_include_public_provenance() -> None:
@@ -741,6 +573,200 @@ def test_modal_handle_rejects_noncanonical_provider_urls(url: str) -> None:
     spec = plan_deployment(_modal_request(_adapter(1)))
     with pytest.raises(ValueError, match="public_url"):
         replace(_modal_handle(spec), public_url=url)
+
+
+def test_control_imports_without_runtime_or_provider_packages() -> None:
+    probe = r"""
+import builtins
+import sys
+
+blocked = ("torch", "vllm", "transformers", "PIL", "modal", "runpod", "runpod_flash", "httpx")
+real_import = builtins.__import__
+
+
+intercepted = []
+
+
+def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+    if name in blocked or name.startswith(tuple(item + "." for item in blocked)):
+        intercepted.append(name)
+        raise ModuleNotFoundError(name)
+    return real_import(name, globals, locals, fromlist, level)
+
+
+builtins.__import__ = guarded
+try:
+    __import__("modal")
+except ModuleNotFoundError:
+    pass
+assert intercepted == ["modal"]
+intercepted.clear()
+from flash.serve.control import DeploymentSpec, EngineIdentity, ModalCredentials, plan_deployment
+
+assert DeploymentSpec
+assert EngineIdentity
+assert ModalCredentials
+assert plan_deployment
+assert intercepted == []
+for name in blocked:
+    assert name not in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", probe],
+        cwd=ROOT,
+        env={"PYTHONPATH": str(ROOT), "PYTHONNOUSERSITE": "1", "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_planning_accepts_only_exact_modal_placements() -> None:
+    modal = plan_deployment(_modal_request(_adapter(1)))
+    assert modal.provider == "modal"
+    assert type(modal.placement) is ModalPlacement
+
+    for provider in ("vast", "lambda", "custom"):
+        with pytest.raises(PlanningError, match="provider must be modal"):
+            plan_deployment(_modal_request(_adapter(1), provider=provider))
+
+
+def test_planning_rejects_provider_placement_and_gpu_count_mismatches() -> None:
+    with pytest.raises(PlanningError, match="provider must be modal"):
+        plan_deployment(replace(_modal_request(_adapter(1)), provider="other"))
+    request = _modal_request(_adapter(1))
+    with pytest.raises(ValueError, match="workspace_name"):
+        replace(request.placement, workspace_name="")
+
+    engine = _engine(tensor_parallel_size=2)
+    adapter = _adapter(1, engine)
+    with pytest.raises(PlanningError, match=r"gpu_count.*tensor_parallel_size"):
+        plan_deployment(_modal_request(adapter))
+    assert plan_deployment(
+        replace(_modal_request(adapter), placement=replace(request.placement, gpu_count=2))
+    )
+
+
+def test_provider_credentials_are_redacted_and_fail_closed_for_serialization() -> None:
+    credentials = (ModalCredentials("token-id", SECRET_SENTINEL),)
+    for credential in credentials:
+        assert SECRET_SENTINEL not in repr(credential)
+        assert "redacted" in repr(credential).lower()
+        with pytest.raises(TypeError):
+            asdict(credential)
+        with pytest.raises(TypeError):
+            json.dumps(credential)
+        with pytest.raises(TypeError, match="cannot be serialized"):
+            pickle.dumps(credential)
+        with pytest.raises(TypeError, match="cannot expose serialization state"):
+            credential.__getstate__()
+        with pytest.raises(TypeError, match="cannot be copied"):
+            copy.copy(credential)
+        with pytest.raises(TypeError, match="cannot be copied"):
+            copy.deepcopy(credential)
+        with pytest.raises(TypeError, match="cannot be subclassed"):
+            type("CredentialSubclass", (type(credential),), {})
+        with pytest.raises(TypeError):
+            vars(credential)
+
+    with pytest.raises(ValueError, match="token_secret") as exc_info:
+        ModalCredentials(SECRET_SENTINEL, "")
+    assert SECRET_SENTINEL not in str(exc_info.value)
+
+
+def test_handles_and_results_expose_exact_secret_free_public_fields() -> None:
+    spec = plan_deployment(_modal_request(_adapter(1)))
+    handle = _modal_handle(spec)
+    result = DeploymentResult.from_spec(spec, status="ready", handle=handle)
+
+    assert spec.placement.workspace_name == "workspace-1"
+    assert "workspace_id" not in {entry.name for entry in fields(spec.placement)}
+    assert "volume_size_gb" not in {entry.name for entry in fields(spec.placement)}
+    assert {entry.name for entry in fields(result)} == {
+        "spec",
+        "status",
+        "handle",
+        "error_code",
+        "error_reason",
+    }
+    assert result.deployment_id == spec.deployment_id
+    assert result.generation == spec.generation
+    assert result.provider == "modal"
+    assert result.placement == spec.placement
+    assert result.engine_id == spec.engine.engine_id
+    assert result.image_digest == handle.image_digest
+    assert result.spec_id == spec.spec_id
+    assert result.status == "ready"
+    assert result.handle is handle
+    assert result.error_code is None
+    assert "group_id" not in {entry.name for entry in fields(handle)}
+    assert handle.inference_secret_name == "flash-inference-secret"
+    assert not any(entry.name.startswith("artifact_secret") for entry in fields(handle))
+    assert SECRET_SENTINEL not in repr(
+        (result.spec, result.status, result.handle, result.error_code)
+    )
+    assert handle.workspace_name == "workspace-1"
+    assert "workspace_id" not in {entry.name for entry in fields(handle)}
+
+    with pytest.raises(ValueError, match="app_id"):
+        replace(handle, app_id="")
+    with pytest.raises(ValueError, match="inference_secret_id"):
+        replace(handle, inference_secret_id="")
+
+
+def test_deployment_result_requires_an_exact_spec_and_matching_handle_provenance() -> None:
+    spec = plan_deployment(_modal_request(_adapter(1)))
+    handle = _modal_handle(spec)
+
+    with pytest.raises(TypeError, match="constructed from an exact DeploymentSpec"):
+        DeploymentResult()
+
+    legitimate = DeploymentResult.from_spec(spec, status="ready", handle=handle)
+    assert legitimate.spec_id == spec.spec_id
+
+    raw_error = RuntimeError(SECRET_SENTINEL)
+    with pytest.raises(ValueError, match="allowlisted deployment error") as exc_info:
+        DeploymentResult.from_spec(spec, status="failed", error_code=raw_error)
+    assert SECRET_SENTINEL not in str(exc_info.value)
+
+    with pytest.raises(ValueError, match="allowlisted deployment reason") as exc_info:
+        DeploymentResult.from_spec(
+            spec,
+            status="failed",
+            error_code="resource_ambiguous",
+            error_reason=SECRET_SENTINEL,
+        )
+    assert SECRET_SENTINEL not in str(exc_info.value)
+
+    mismatches = (
+        replace(handle, deployment_id="deployment-other"),
+        replace(handle, generation=spec.generation + 1),
+        replace(handle, engine_id="f" * 64),
+        replace(handle, image_digest="sha256:" + "f" * 64),
+    )
+    for mismatched in mismatches:
+        with pytest.raises(ValueError, match="provenance"):
+            DeploymentResult.from_spec(spec, status="ready", handle=mismatched)
+
+    with pytest.raises(ValueError, match="ModalProviderHandle"):
+        DeploymentResult.from_spec(spec, status="ready", handle=object())
+
+
+def test_deployment_result_validates_shared_placement_provenance() -> None:
+    modal_spec = plan_deployment(_modal_request(_adapter(1)))
+    modal_handle = _modal_handle(modal_spec)
+    for field_name, value in (
+        ("workspace_name", "workspace-other"),
+        ("environment", "staging"),
+        ("region", "us-west"),
+    ):
+        with pytest.raises(ValueError, match="placement"):
+            DeploymentResult.from_spec(
+                modal_spec,
+                status="ready",
+                handle=replace(modal_handle, **{field_name: value}),
+            )
 
 
 def test_control_records_have_no_credential_fields() -> None:

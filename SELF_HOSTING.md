@@ -22,6 +22,11 @@ Two credentials and at least one GPU account:
 
 Everything else is optional.
 
+The active training catalog is Qwen3.5 9B, Qwen3.8 27B, and Qwen3.6 35B-A3B. Hosted Qwen3.8
+27B remains inactive. Customer-owned Modal supports all three models; 27B and 35B-A3B are bound to
+the certified serving image digest. Customer-owned `flash serve` requires explicit
+`--provider modal`. Training and serving both use Modal; legacy provider identities are unsupported.
+
 ## Quickstart
 
 ```bash
@@ -105,7 +110,7 @@ has nothing to enumerate and says so; keep track of the ids you use:
 
 ```toml
 project = "11111111-1111-4111-8111-111111111111"
-model = "Qwen/Qwen3.5-4B"
+model = "Qwen/Qwen3.5-9B"
 algorithm = "sft"
 
 [environment]
@@ -224,12 +229,6 @@ ID before polling. It reconnects after a restart, streams artifacts through Hugg
 from streamed checkpoints after preemption, and confirms termination on cancellation. Ambiguous
 creation is reconciled by exact name and attempt metadata before another launch is allowed.
 
-The allocator prices Modal GPU reservations plus the configured Sandbox CPU and memory requests.
-These are estimates, not invoice totals: shared Volume storage and network transfer are not
-attributed to individual runs. Modal queues capacity; Flash cannot query a live GPU inventory.
-Each sandbox lasts at most 24 hours. Longer runs require checkpoint recovery across attempts and
-a sufficient retry budget. Ephemeral disk requests above 512 GiB are rejected.
-
 The shared `flash-weights` Modal Volume retains trusted public base-model weights. Tenant artifacts
 and compiled runtime caches remain isolated. Set `FLASH_WEIGHT_CACHE_DISABLED=1` to disable this
 cache. The supervisor also retains its bounded retry without the cache when appropriate.
@@ -241,6 +240,26 @@ python -m flash.providers.artifacts.weight_cache
 ```
 
 `--teardown` deletes this cache Volume. Stop users of the cache before deleting it.
+
+The training engine retains SFT, GRPO and OPD; LoRA/QLoRA, packing, FlashAttention, FP8 KV cache,
+compiled kernel images, multi-GPU sharding, checkpoint streaming and resume use the same worker
+implementation. GPU selection now uses Modal's supported card counts and estimated GPU, CPU and
+memory rates. Cross-cloud fallback and marketplace offer selection have been removed. Modal
+queues reservations subject to workspace capacity and quotas.
+
+Each sandbox reserves four CPU cores and 32 GiB RAM per GPU. A sandbox has a 24-hour lifetime
+limit and at most 512 GiB ephemeral disk. Cost records are resource-rate estimates, not Modal
+invoices; storage and network charges are not attributed to individual runs.
+
+To run the paid infrastructure smoke with your Modal credentials exported:
+
+```bash
+uv run python scripts/smoke_modal_training.py --run-paid-test
+```
+
+This reserves two L4 GPUs with a 15-minute deadline, checks NCCL, duplicate adoption, cache
+persistence and confirmed termination, then removes its own sandboxes and temporary Volume.
+
 
 Migrating an existing installation requires draining its active training runs and retiring its old
 provider resources using the pre-migration release before starting this Modal-only controller.
@@ -363,10 +382,19 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 
 ## Serving
 
-`flash serve deploy` provisions serving in **your own** Modal account, running the
-published worker image against one base model and one run's adapter. Training and export remain
-independent of serving. Catalog serving checkpoint repositories are informational only and are never
-resolved by the training path.
+`flash serve deploy` provisions serving in **your own** Modal account, running the published worker
+image against one exact base model and that model's compatible adapters. A separate deployment is
+required for each base model. Training and export remain independent of serving. The required
+provider argument has the sole accepted value `--provider modal`.
+Catalog serving checkpoint repositories are informational only and are never resolved by the
+training path.
+
+Customer-owned Modal is live-qualified for Qwen3.5 9B, Qwen3.8 27B, and Qwen3.6 35B-A3B. The 27B
+and 35B-A3B qualifications are bound to the certified serving image digest. The 27B engine runs on
+`H100!` and serves the pinned `Qwen/Qwen3.8-27B-FP8` checkpoint while retaining
+`Qwen/Qwen3.8-27B` as its logical base and tokenizer provenance. The 35B-A3B engine serves the BF16
+model on one H200 with FP8 KV cache, a 32K context, eight sequences, a 4096 batched-token cap, and
+six rank-64 LoRA slots.
 
 ```bash
 # the `server` extra, not the bare install: `serve deploy` resolves the adapter through
@@ -380,9 +408,9 @@ export MODAL_TOKEN_ID=... MODAL_TOKEN_SECRET=...
 
 flash serve deploy \
   --provider modal \
-  --model Qwen/Qwen3.5-4B \
+  --model Qwen/Qwen3.5-9B \
   --run <run-id> \
-  --deployment-id my-4b-serving \
+  --deployment-id my-9b-serving \
   --image ghcr.io/freesolo-co/freesolo-flash-serve@sha256:<digest> \
   --artifact-repo <hub-repo> \
   --artifact-subfolder <path-within-repo> \
@@ -392,8 +420,9 @@ flash serve deploy \
   --modal-region us-east
 ```
 
-The three `--modal-*` placement flags are required for `--provider modal` even though `--help`
-lists them as optional, but real deployments require their values.
+The three `--modal-*` placement flags are required for `--provider modal`. Omitting them exits with
+`modal placement requires environment, region, workspace_name`. Passing an unsupported provider is
+rejected by argument parsing before Hub resolution, credential reads, or provider access.
 
 Provider credentials are read from the process environment for the duration of a single call and are
 never written to the deployment record, logs, or command arguments — so any later resize or teardown

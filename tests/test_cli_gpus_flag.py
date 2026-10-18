@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 BASE = (
-    'model = "Qwen/Qwen3.5-4B"\n'
+    'model = "Qwen/Qwen3.5-9B"\n'
     'project = "11111111-1111-4111-8111-111111111111"\n'
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
@@ -20,7 +20,7 @@ BASE = (
 )
 
 BIG_GRPO = (
-    'model = "Qwen/Qwen3.6-27B"\n'
+    'model = "Qwen/Qwen3.8-27B"\n'
     'project = "11111111-1111-4111-8111-111111111111"\n'
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
@@ -32,7 +32,7 @@ BIG_GRPO = (
 
 def _overrides(*argv: str) -> list[str]:
     """the override list the real parser produces for `flash train run.toml <argv>`."""
-    from flash.cli import _build_parser
+    from flash.cli.parsing.main import _build_parser
 
     return _build_parser().parse_args(["train", "run.toml", *argv]).overrides
 
@@ -83,7 +83,7 @@ def test_explicit_one_card_pin_rejects_with_a_fitting_count(tmp_path):
     with pytest.raises(ConfigError) as exc:
         _spec(tmp_path, "--gpus", "1", config=BIG_GRPO)
     message = str(exc.value)
-    assert "grpo needs >= 229 GB VRAM" in message
+    assert "grpo needs >= 235 GB VRAM" in message
     assert "gpu.count=1 provides at most 180 GB (B200)" in message
     assert "--gpus 2" in message
     assert "max_context_tokens" in message
@@ -138,7 +138,7 @@ def test_gpus_is_validated_by_the_same_bound_as_the_config_key(tmp_path, bad):
 def test_a_non_integer_gpus_is_refused_at_parse_time(bad, capsys):
     # `--gpus 2.5` must not reach the config as the literal string "gpu.count=2.5" and get
     # diagnosed as a TOML problem. argparse rejects it where the user typed it.
-    from flash.cli import _build_parser
+    from flash.cli.parsing.main import _build_parser
 
     with pytest.raises(SystemExit):
         _build_parser().parse_args(["train", "run.toml", "--gpus", bad])
@@ -163,7 +163,7 @@ def test_gpus_is_accepted_on_every_provider(tmp_path, provider):
 
 def test_the_help_explains_auto_sizing_and_authored_ceilings():
     """The flag must distinguish an omitted auto-size from an authored hard ceiling."""
-    from flash.cli import _build_parser
+    from flash.cli.parsing.main import _build_parser
 
     # render the train subparser's help, which is the text `flash train --help` prints.
     sub = _build_parser()._subparsers._group_actions[0].choices["train"]  # type: ignore[union-attr]
@@ -191,7 +191,7 @@ def test_a_pinned_small_class_still_does_not_pin_the_card_count():
     experiment off it silently gets fewer ranks than they asked for. Driving the real allocator
     rather than reading the doc string, so the claim is pinned to behavior and not to wording.
     """
-    from flash.providers.allocator import allocate
+    from flash.providers.core.allocator import allocate
 
     # 9B SFT on a 24 GB class does not fit alone, so this is the combination path, not the
     # fit-alone one. the algorithm is load-bearing: the same model+class does not allocate AT ALL
@@ -220,8 +220,8 @@ def test_a_pinned_class_can_need_a_wider_ceiling_for_grpo_and_opd():
     """
     import pytest
 
-    from flash.providers.allocator import allocate
-    from flash.providers.base import UnsupportedGpuError
+    from flash.providers.core.allocator import allocate
+    from flash.providers.core.base import UnsupportedGpuError
 
     # same model and class; only the algorithm and resulting memory floor differ.
     assert (
@@ -263,7 +263,7 @@ def test_the_allocation_log_line_carries_the_count_that_status_does_not():
     Both spellings are asserted because the doc states both: multi-card carries the Nx prefix and
     single-card does not, so a user grepping for "1x" on a one-card run would find nothing.
     """
-    from flash.providers.allocator import Allocation, allocation_summary
+    from flash.providers.core.allocator import Allocation, allocation_summary
 
     def summarize(count: int) -> str:
         return allocation_summary(
@@ -290,7 +290,7 @@ def test_the_public_run_record_never_reports_the_allocated_count():
     IS recorded, but only in effective_preparation, which to_dict() pops as server-internal -- so
     if a future change starts publishing it there, this fails and the doc gets rewritten with it.
     """
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
 
     submitted_ceiling = 4
     status = RunStatus(

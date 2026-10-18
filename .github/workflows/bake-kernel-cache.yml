@@ -5,7 +5,7 @@ name: flash worker kernel-cache (per-arch)
 #   1. offloads the warmup to a Modal GPU of that arch (GH runners have none) -> build/kernel_cache,
 #   2. docker build --build-arg BUILD_KERNEL_CACHE=true -> ghcr.io/freesolo-co/flash-worker:cu128-<sm>,
 #   3. pushes it. The allocator then selects the cu128-<sm> tag per GPU class for baked arches
-#      (see flash/providers/_lifecycle/worker.py).
+#      (see flash/providers/_lifecycle/net/worker.py).
 #
 # Depends on the base ghcr.io/freesolo-co/flash-worker:cu128 image existing (worker-image.yml) — the
 # warmup runs INSIDE it so the cache matches the image's pinned torch/triton/fla/liger toolchain.
@@ -183,7 +183,7 @@ jobs:
 
       - name: Install uv
         if: steps.gate.outputs.run == 'true'
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           # pin the installed binary as well as the action implementation.
           version: "0.12.5"
@@ -225,7 +225,7 @@ jobs:
           sudo docker image prune -af || true
           df -h /
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         if: steps.gate.outputs.run == 'true'
 
       # thin layer FROM the SAME base the warmup ran inside -> the cache toolchain always matches the
@@ -233,7 +233,7 @@ jobs:
       # published base and bake a cache that silently won't load). GHCR auth from the login step above.
       - name: Build + push baked per-sm image (thin layer on the warmed base)
         if: steps.gate.outputs.run == 'true'
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/Dockerfile.kernelcache

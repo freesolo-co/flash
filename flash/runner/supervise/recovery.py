@@ -40,7 +40,7 @@ class _CompletedAttemptPending(RuntimeError):
 
 
 def _canonical_provider_handle(handle):
-    from flash.providers.base import JobHandle
+    from flash.providers.core.base import JobHandle
     from flash.providers.modal.handles import ModalJobHandle
 
     data = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
@@ -49,7 +49,7 @@ def _canonical_provider_handle(handle):
 
 def _completed_worker_metrics(handle, *, deadline_at=None):
     """Recover metrics only from this attempt's verified terminal artifacts."""
-    from flash.providers._lifecycle.terminal_artifacts import (
+    from flash.providers._lifecycle.instances.terminal_artifacts import (
         AttemptIdentity,
         ProbeBudget,
         TerminalKind,
@@ -102,7 +102,7 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
 
 
 def _strict_teardown_handle(handle, run_id: str) -> bool:
-    from flash.providers import get_provider
+    from flash.providers.core.registry import get_provider
 
     canonical = _canonical_provider_handle(handle)
     get_provider(canonical.provider).destroy(canonical)
@@ -121,14 +121,14 @@ def _completed_attempt_metrics(
     log=None,
 ) -> dict | None:
     """Read a strict successful instance marker plus its run-scoped metrics."""
-    if provider not in {"modal"} or not spec.train.hf_repo:
+    if provider != "modal" or not spec.train.hf_repo:
         return None
-    from flash.providers._lifecycle.poll import make_say
-    from flash.providers._lifecycle.poll_instance import (
+    from flash.providers._lifecycle.instances.poll import make_say
+    from flash.providers._lifecycle.instances.poll_instance import (
         _TERMINAL_REREAD_RETRIES,
         _TERMINAL_REREAD_WAIT_S,
     )
-    from flash.providers._lifecycle.terminal_artifacts import (
+    from flash.providers._lifecycle.instances.terminal_artifacts import (
         INVALID_MARKER_DETAIL,
         AttemptIdentity,
         ProbeBudget,
@@ -187,101 +187,13 @@ def _adopt_completed_attempt(
     log,
 ) -> bool:
     """Finalize a phantom-completed attempt through the expected-remote CAS."""
-    from flash.runner import _compare_and_complete_remote
+    from flash.runner.accounting.reconciliation import _compare_and_complete_remote
 
     applied = _compare_and_complete_remote(run_id, expected_remote, spec, metrics)
     if applied:
         _charge_completed_run_by_id(spec.run_id, log)
         _lifecycle()._register_checkpoints_best_effort(spec, log)
     return applied
-
-
-def _shape_key(candidate) -> tuple[str, str, int]:
-    """Retry-bookkeeping identity: a class at a CARD COUNT, not a class.
-
-    Providers report several counts for the same class (2x and 4x H100 are distinct rentable
-    shapes), so keying on (provider, gpu) alone would mark every count tried the moment one fails
-    and skip a wider shape that fits.
-    """
-    return (candidate.provider, candidate.gpu, int(getattr(candidate, "gpu_count", 1) or 1))
-
-
-def _select_candidate(
-    candidates, failed_providers: set[str], tried_classes: set[tuple[str, str, int]]
-):
-    """Pick the next (provider, class) from the cross-provider ranked candidate list.
-
-    Escapes a congested/sick provider cross-provider before walking classes within it, then takes
-    the allocator's own ranking.
-
-    That third key is the list position, not a re-priced one. ``allocate()`` first applies any
-    authored provider preference, then ranks within one preference rank on the dollars one optimizer
-    step costs, so preserving the list also preserves both policies. Re-sorting here on total $/hr
-    answered a different question and silently overrode it: for Qwen3.5-0.8B OPD the allocator ranks the
-    RTX 5090 cheapest per step, while hourly price picks the slower RTX 4090, so the FIRST paid
-    attempt ignored the choice the cost model had just made and ran slower for more money.
-    Preserving the incoming order keeps one owner of the cost policy. ``min`` returns the FIRST
-    minimal element, so dropping the price keys is what preserves it -- no index key needed.
-    """
-    return min(
-        candidates,
-        key=lambda c: (
-            c.provider in failed_providers,  # 1) escape providers that already failed this run
-            _shape_key(c) in tried_classes,  # 2) then prefer a shape not yet tried
-            # 3) ties keep the allocator's cheapest-per-step order, via min's first-wins semantics
-        ),
-    )
-
-
-def _projected_retry_class(
-    candidates, failed_providers, tried_classes, chosen, *, cache_drop: bool
-):
-    """The class the NEXT attempt is expected to select, given the failure this one records.
-
-    Mirrors the bookkeeping at the bottom of the retry loop: a cache-drop retry leaves both sets
-    untouched (same class, cold), any other retry marks this class tried and its provider failed.
-    Only valid off the OOM path, where the escalation floor rewrites the candidate list first.
-
-    Expected, not guaranteed: the next attempt calls ``allocate()`` again, and providers that build
-    candidates from live capacity can drop this class or surface a cheaper one. Callers must word it
-    as a projection.
-    """
-    if not candidates:
-        return None
-    if cache_drop:
-        return _select_candidate(candidates, failed_providers, tried_classes)
-    return _select_candidate(
-        candidates,
-        failed_providers | {chosen.provider},
-        tried_classes | {_shape_key(chosen)},
-    )
-
-
-def _candidate_usable_vram_gb(candidate) -> float:
-    """Run-usable VRAM under the allocator's fit model.
-
-    Use ``combined_vram_gb`` on both sides of OOM escalation. Raw card-count multiplication ignores
-    replicated floors and shard efficiency, so it can move a retry to a smaller effective shape. SFT
-    can launch fewer ranks than it rents; the allocator stamps that run-specific width, while an
-    unstamped candidate preserves the historical all-rented-cards behavior.
-    """
-    from flash.providers.base import combined_vram_gb
-
-    rented = int(getattr(candidate, "gpu_count", 1) or 1)
-    executed = getattr(candidate, "executed_gpu_count", None)
-    return combined_vram_gb(candidate.vram_gb, int(executed) if executed is not None else rented)
-
-
-def _oom_escalated(candidates, oom_vram_floor: float):
-    """Candidates strictly LARGER than the VRAM that just OOM'd. ``oom_vram_floor == 0`` (no prior OOM)
-    leaves the list unchanged; otherwise an 80GB OOM leaves only the >80GB classes (a same-size retry
-    would just OOM again). EMPTY means the run already OOM'd the largest available class.
-
-    Both sides are measured with `_candidate_usable_vram_gb`, and the floor recorded on OOM uses it
-    too -- the filter is only meaningful if the floor and the candidates are on one scale."""
-    if not oom_vram_floor:
-        return list(candidates)
-    return [c for c in candidates if _candidate_usable_vram_gb(c) > oom_vram_floor]
 
 
 def _await_completed_worker_metrics(
@@ -306,10 +218,10 @@ def _await_completed_worker_metrics(
 
 def _register_checkpoints_best_effort(spec: JobSpec, log) -> None:
     """Mirror a finished run's per-step checkpoints to the backend store (best-effort)."""
-    from flash.runner import get_status
+    from flash.runner.lifecycle.status import get_status
 
     try:
-        from flash.server.domain.checkpoints import register_checkpoints_best_effort
+        from flash.server.domain.registry.checkpoints import register_checkpoints_best_effort
 
         register_checkpoints_best_effort(get_status(spec.run_id), log=log)
     except Exception as exc:  # never let checkpoint bookkeeping disturb a run
@@ -348,7 +260,8 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
     dict. Reading org/cost from the
     persisted ``RunStatus`` (never a reparsed spec) is what lets a legacy/stale spec still be charged.
     """
-    from flash.runner import get_status, record_billing_state
+    from flash.runner.accounting.costs import record_billing_state
+    from flash.runner.lifecycle.status import get_status
     from flash.server.billing.charges import BillingError
     from flash.server.platform.auth import INTERNAL_KEY_ENV, standalone
     from flash.server.platform.internal_client import internal_key as operator_internal_key
@@ -403,13 +316,13 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
 
 
 def _gc_run_sandboxes(spec: JobSpec) -> None:
-    """Best-effort teardown of every sandbox a run may have registered."""
-    from flash.runner import (
+    """Best-effort teardown of every endpoint a run may have registered."""
+    from flash.runner.accounting.reconciliation import (
+        _compare_and_confirm_remote_teardown,
         _drain_cleanup_remotes,
         _remote_resource_identity,
-        effective_spec_from_status,
-        get_status,
     )
+    from flash.runner.lifecycle.status import effective_spec_from_status, get_status
 
     attempted_cleanup = set()
     with contextlib.suppress(Exception):
@@ -427,13 +340,15 @@ def _gc_run_sandboxes(spec: JobSpec) -> None:
     ):
         try:
             resource_deleted = _lifecycle()._strict_teardown_handle(status.remote, spec.run_id)
-            if status.remote.get("provider") == "modal" and not resource_deleted:
-                from flash.runner import _record_cleanup_remote
+            if resource_deleted:
+                _compare_and_confirm_remote_teardown(spec.run_id, status.remote)
+            elif status.remote.get("provider") == "modal":
+                from flash.runner.accounting.reconciliation import _record_cleanup_remote
 
                 _record_cleanup_remote(spec.run_id, status.remote)
         except Exception:
             pass
-    from flash.providers import available_providers, get_provider
+    from flash.providers.core.registry import available_providers, get_provider
 
     for _prov in available_providers():
         with contextlib.suppress(Exception):

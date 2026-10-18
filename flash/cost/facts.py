@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from flash.core.catalog import MODELS, ModelInfo
-from flash.providers.base import GPU_INFO
+from flash.providers.core.base import GPU_INFO
 
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
     "L4": 121.0,

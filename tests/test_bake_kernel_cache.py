@@ -13,8 +13,8 @@ def bake_module():
 
 
 def test_every_baked_arch_has_a_modal_gpu():
-    from flash.providers._lifecycle.worker import BAKED_PER_SM_ARCHES
-    from flash.providers.base import GPU_CLASSES
+    from flash.providers._lifecycle.net.worker import BAKED_PER_SM_ARCHES
+    from flash.providers.core.base import GPU_CLASSES
 
     mapping = bake_module().GPU_BY_SM
     assert set(mapping) == BAKED_PER_SM_ARCHES

@@ -1,6 +1,6 @@
 """Shared FastAPI request dependencies and spec/secret parsing for the route modules.
 
-Only import lazily from ``create_app()`` — never at ``flash.server.app`` import time.
+Only import lazily from ``create_app()`` — never at ``flash.server.asgi.app`` import time.
 ``owned_run`` resolves ``get_status`` via the module so test patches on ``app.get_status`` are honored.
 """
 
@@ -11,7 +11,7 @@ from fastapi import Header, HTTPException
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.core.spec import JobSpec, require_project_id
 from flash.schema import ConfigError, spec_from_dict
-from flash.server import app as _app
+from flash.server.asgi import app as _app
 from flash.server.platform import auth, db
 
 _RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
@@ -46,7 +46,7 @@ def owned_run(run_id: str, key: dict):
 def _internal_org_run(run_id: str, key: dict, org_id: str | None = None):
     org = (org_id or "").strip()
     if key.get("auth_kind") == "internal" and org:
-        from flash.runner import _status_org_id
+        from flash.runner.lifecycle.preparation import _status_org_id
 
         status = _load_status(run_id)
         if _status_org_id(status) == org:
@@ -151,7 +151,10 @@ def _require_supported_environment_form(env_raw: dict) -> None:
     env_id = env_raw.get("id")
     if not isinstance(env_id, str) or not env_id.strip():
         return  # absent/malformed ids are the schema's error to report, with its own message
-    from flash.envs.adapter import canonical_managed_environment_slug, is_managed_environment_slug
+    from flash.envs.loading.adapter import (
+        canonical_managed_environment_slug,
+        is_managed_environment_slug,
+    )
 
     env_id = env_id.strip()
     if auth.standalone():

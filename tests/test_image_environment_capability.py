@@ -4,9 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.engine.worker.runtime.state as worker_state
 from flash.content.multimodal import validate_image_observation_environment
-from flash.envs.adapter import FreesoloEnvironment
-from flash.envs.base import BaseEnvironment
+from flash.envs.loading.adapter import FreesoloEnvironment
+from flash.envs.loading.base import BaseEnvironment
 
 
 class _PlainEnvironment(BaseEnvironment):
@@ -43,7 +44,6 @@ def test_freesolo_adapter_carries_only_an_explicit_class_capability():
 
 
 def test_worker_environment_load_applies_the_capability_guard(monkeypatch):
-    from flash.engine import worker
 
     spec = SimpleNamespace(
         environment=SimpleNamespace(id="local", params={}, resolved_sha=""),
@@ -52,15 +52,15 @@ def test_worker_environment_load_applies_the_capability_guard(monkeypatch):
         train=SimpleNamespace(teacher_model=None, hf_repo=""),
         thinking=False,
     )
-    monkeypatch.setattr(worker, "JOB_SPEC", spec)
+    monkeypatch.setattr(worker_state, "JOB_SPEC", spec)
     monkeypatch.setattr(
-        worker,
+        worker_state,
         "load_staged_freesolo_environment",
         lambda *_args, **_kwargs: (SimpleNamespace(image_observations=True), None),
     )
 
     with pytest.raises(ValueError, match="does not support image-bearing"):
-        worker._load_active_env()
+        worker_state._load_active_env()
 
 
 def test_dynamic_image_capability_requires_an_image_capable_model_and_opd_teacher():
@@ -69,11 +69,11 @@ def test_dynamic_image_capability_requires_an_image_capable_model_and_opd_teache
 
     validate_image_observation_environment(
         dynamic,
-        _spec("Qwen/Qwen3.5-4B"),
+        _spec("Qwen/Qwen3.5-9B"),
     )
     validate_image_observation_environment(
         dynamic,
-        _spec("Qwen/Qwen3.5-4B", "opd", "qwen3-vl-235b"),
+        _spec("Qwen/Qwen3.5-9B", "opd", "qwen3-vl-235b"),
     )
     validate_image_observation_environment(
         static,
@@ -88,5 +88,5 @@ def test_dynamic_image_capability_requires_an_image_capable_model_and_opd_teache
     with pytest.raises(ValueError, match=r"selected teacher 'glm-5\.2' cannot see images"):
         validate_image_observation_environment(
             dynamic,
-            _spec("Qwen/Qwen3.5-4B", "opd", "glm-5.2"),
+            _spec("Qwen/Qwen3.5-9B", "opd", "glm-5.2"),
         )

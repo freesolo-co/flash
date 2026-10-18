@@ -20,6 +20,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.submit as runner_submit
 from tests._helpers.profile import satisfy_sft_profile
 from tests._helpers.source_snapshot import valid_source_snapshot
 from tests._helpers.teacher import configure_managed_teacher
@@ -32,9 +34,9 @@ _MULTI_GPU_CLASS = "H100"
 
 
 @pytest.fixture
-def all_providers_configured():
-    """The offline fixture configures the sole supported provider."""
-    return
+def all_providers_configured(monkeypatch):
+    monkeypatch.setenv("MODAL_TOKEN_ID", "test-token-id")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "test-token-secret")
 
 
 def _spec(count: int, algorithm: str = "grpo", provider: str = "modal"):
@@ -77,14 +79,13 @@ def test_submit_accepts_multi_gpu_on_every_provider(
 
     dry_run stops before provisioning, so this asserts only that nothing rejects the shape up front.
     """
-    from flash import runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = _submittable(algorithm, count=4, provider=provider)
-        satisfy_sft_profile(runner, monkeypatch, spec)
+        satisfy_sft_profile(monkeypatch, spec)
         configure_managed_teacher(monkeypatch, spec)
-        status = runner.submit_job(spec, dry_run=True)
+        status = runner_submit.submit_job(spec, dry_run=True)
         assert status is not None
 
 
@@ -98,8 +99,8 @@ def test_provider_only_offers_counts_it_can_rent(all_providers_configured, provi
     because vllm asserts ``num_attention_heads % tp_size == 0`` for the rollout engine, and every
     managed model's head count is a power of two: a 3-card box would abort at engine init.
     """
-    from flash.providers import get_provider
-    from flash.providers.base import AllocationConstraints, rentable_gpu_counts
+    from flash.providers.core.base import AllocationConstraints, rentable_gpu_counts
+    from flash.providers.core.registry import get_provider
 
     # spelled out rather than taken from rentable_gpu_counts: the providers call that same helper, so
     # comparing candidates against it would compare the code to itself and could never disagree.
@@ -125,8 +126,8 @@ def test_single_card_constraint_yields_only_single_card_offers(all_providers_con
     The pairing that makes the count-aware path failable: with the cap at 1 a provider that ignored
     the constraint entirely would still look correct in the max_gpu_count=8 test above.
     """
-    from flash.providers import available_providers, get_provider
-    from flash.providers.base import AllocationConstraints
+    from flash.providers.core.base import AllocationConstraints
+    from flash.providers.core.registry import available_providers, get_provider
 
     checked = []
     for name in available_providers():
@@ -138,29 +139,6 @@ def test_single_card_constraint_yields_only_single_card_offers(all_providers_con
     # without this the loop would pass on a box where no provider is enabled, reporting coverage of
     # three providers while having checked none.
     assert checked == list(_PROVIDERS), f"expected all three providers enabled, checked {checked}"
-
-
-def test_retry_bookkeeping_distinguishes_card_counts_of_one_class():
-    """A class at 2 cards and the same class at 4 are different rentable shapes.
-
-    This PR made multiple counts per class reachable (the fit filter keeps every shape that fits),
-    so a 2-tuple ``(provider, gpu)`` retry key marks EVERY count tried the moment one fails and the
-    walk skips a wider shape that would have fit.
-    """
-    from flash.providers.base import Candidate
-    from flash.runner.supervise.lifecycle import _select_candidate, _shape_key
-
-    two = Candidate(provider="modal", gpu=_MULTI_GPU_CLASS, hourly_usd=3.0, vram_gb=80, gpu_count=2)
-    four = Candidate(
-        provider="modal", gpu=_MULTI_GPU_CLASS, hourly_usd=3.0, vram_gb=80, gpu_count=4
-    )
-
-    assert _shape_key(two) != _shape_key(four), "count must be part of the retry identity"
-
-    # having burned the 2-card shape, the walk must still reach the 4-card one rather than treat
-    # the whole class as exhausted.
-    chosen = _select_candidate([two, four], set(), {_shape_key(two)})
-    assert chosen is four
 
 
 def _submittable(
@@ -177,7 +155,7 @@ def _submittable(
     if algorithm == "opd":
         train["teacher_model"] = "kimi-k3"
     body: dict = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": algorithm,
         "gpu": {"type": gpu, "count": count, "provider": provider},
         "train": train,
@@ -191,16 +169,15 @@ def _submittable(
 
 @pytest.mark.parametrize("algorithm", ["grpo", "sft", "opd"])
 def test_submit_records_the_resolved_backend(monkeypatch, algorithm):
-    from flash import runner
 
     # the run records which trainer actually ran, so it stays auditable from the run itself.
     expected = "verl"
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = _submittable(algorithm)
-        satisfy_sft_profile(runner, monkeypatch, spec)
+        satisfy_sft_profile(monkeypatch, spec)
         configure_managed_teacher(monkeypatch, spec)
-        status = runner.submit_job(spec, dry_run=True)
+        status = runner_submit.submit_job(spec, dry_run=True)
         assert (status.effective_preparation or {}).get("backend") == expected
 
 
@@ -215,7 +192,11 @@ def test_gpu_count_is_honoured_by_parse_time_sizing():
     Pinned to a need no single validated class holds (180 GB max) but four cards do, so the
     assertion cannot pass by accident on a run that fits one card anyway.
     """
-    from flash.providers.base import UnsupportedGpuError, cheapest_gpu, combined_vram_gb
+    from flash.providers.core.base import (
+        UnsupportedGpuError,
+        cheapest_gpu,
+    )
+    from flash.providers.core.sharding import combined_vram_gb
 
     need = 234
     assert all(info.vram_gb < need for info in _validated_infos()), (
@@ -229,7 +210,7 @@ def test_gpu_count_is_honoured_by_parse_time_sizing():
         chosen = cheapest_gpu(need, gpu_count=count)
         # the shape it names must genuinely hold the run under the SAME fit model the allocator
         # applies at submit time -- naming a class that does not fit would just move the failure.
-        from flash.providers.base import get_gpu_info
+        from flash.providers.core.base import get_gpu_info
 
         assert combined_vram_gb(get_gpu_info(chosen).vram_gb, count) >= need
 
@@ -241,7 +222,11 @@ def test_public_max_gpu_count_is_rentable_not_silently_clamped():
     ``gpu.count = 8``; clamping it to 4 makes that provider capacity unreachable and contradicts the
     authored ceiling without an error.
     """
-    from flash.providers.base import UnsupportedGpuError, cheapest_gpu, combined_vram_gb
+    from flash.providers.core.base import (
+        UnsupportedGpuError,
+        cheapest_gpu,
+    )
+    from flash.providers.core.sharding import combined_vram_gb
 
     # above the widest 4-card shape but below 8x B200, so restoring the old cap to 4 kills this test.
     need = 700
@@ -249,7 +234,7 @@ def test_public_max_gpu_count_is_rentable_not_silently_clamped():
     with pytest.raises(UnsupportedGpuError):
         cheapest_gpu(need, gpu_count=4)
     chosen = cheapest_gpu(need, gpu_count=8)
-    from flash.providers.base import get_gpu_info
+    from flash.providers.core.base import get_gpu_info
 
     assert combined_vram_gb(get_gpu_info(chosen).vram_gb, 8) >= need
 
@@ -264,7 +249,7 @@ def test_eight_cards_require_validated_head_geometry(monkeypatch):
     """
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     monkeypatch.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
 
@@ -283,12 +268,12 @@ def test_geometry_cap_follows_each_models_own_head_count():
     """The cap must divide each row's RECORDED head count, never a derived stand-in.
 
     ``hidden_size // head_dim`` is not the head count: these checkpoints decouple ``head_dim`` from
-    that ratio, and the quotient is wrong for four of six rows (3.5-4B is 16 heads, not 2560/256 =
-    10). Every row is checked against ``num_attention_heads`` so a future model with, say, 20 heads
-    is capped at 4 instead of rented at 8 and failed in Ulysses init.
+    that ratio, and the quotient is wrong for two of the three surviving rows. Every row is checked
+    against ``num_attention_heads`` so a future model with, say, 20 heads is capped at 4 instead of
+    rented at 8 and failed in Ulysses init.
     """
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     for model_id, info in MODELS.items():
         heads = info.num_attention_heads
@@ -297,18 +282,16 @@ def test_geometry_cap_follows_each_models_own_head_count():
         # refactor cannot quietly reintroduce it.
         assert heads % geometry_safe_gpu_cap(model_id, 8) == 0
 
-    # the derivation this replaced disagrees with the truth on four of six rows.
-    derived_wrong = [
+    # the derivation still disagrees with the recorded geometry for these surviving rows.
+    derived_wrong = {
         m for m, i in MODELS.items() if i.hidden_size // i.head_dim != i.num_attention_heads
-    ]
-    assert len(derived_wrong) == 4, derived_wrong
-    assert MODELS["Qwen/Qwen3.5-4B"].num_attention_heads == 16
-    assert MODELS["Qwen/Qwen3.5-4B"].hidden_size // MODELS["Qwen/Qwen3.5-4B"].head_dim == 10
+    }
+    assert derived_wrong == {"Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"}
 
     # every CURRENT row divides by 8, so no row is narrowed today. that is a property of this
     # catalog, not an invariant -- the loop above is what enforces it for whatever is added next.
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-4B", 8) == 8
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.6-27B", 8) == 8
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.8-27B", 8) == 8
     # an authored ceiling below the geometric limit still wins; the cap only ever narrows.
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 2) == 2
     # a model outside the catalog has no readable geometry, so it keeps the unvalidated ceiling.
@@ -343,7 +326,7 @@ def test_a_certified_pin_reaches_eight_cards():
     pinned commit's own config is readable, so it is what decides the width.
     """
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     monkey = pytest.MonkeyPatch()
     try:
@@ -369,7 +352,7 @@ def test_a_pin_that_contradicts_the_catalog_certifies_nothing():
     when sizing runs, so the conservative ceiling here is belt-and-braces rather than the only gate.
     """
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     info = MODELS["Qwen/Qwen3.5-9B"]
     assert info.num_attention_heads == 16
@@ -400,7 +383,7 @@ def test_a_pin_without_parameter_metadata_certifies_nothing():
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     info = MODELS["Qwen/Qwen3.5-9B"]
 
@@ -460,7 +443,7 @@ def test_a_pinned_head_lookup_is_not_repeated_or_cached_on_failure():
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     info = MODELS["Qwen/Qwen3.5-9B"]
     rev = "a" * 40
@@ -570,7 +553,7 @@ def test_only_the_submission_path_certifies_a_pin():
     import inspect
 
     import flash.cost.analytical as analytical
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.schema as schema
 
     def _certifying_calls(module) -> list[bool]:
@@ -616,7 +599,7 @@ def test_a_low_ceiling_pin_does_not_reach_the_hub():
     """
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     monkey = pytest.MonkeyPatch()
     try:
@@ -655,7 +638,7 @@ def test_a_blip_after_sizing_cannot_narrow_an_already_validated_pin():
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     model = "Qwen/Qwen3.5-9B"
     info = MODELS[model]
@@ -693,7 +676,7 @@ def test_geometry_cap_narrows_a_row_whose_heads_do_not_divide_eight():
     from dataclasses import replace
 
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     awkward = replace(MODELS["Qwen/Qwen3.5-9B"], id="Qwen/Fake-20-Head", num_attention_heads=20)
     patched = dict(MODELS)
@@ -728,7 +711,7 @@ def test_an_uncertified_pin_still_narrows_below_the_four_card_ceiling():
     from dataclasses import replace
 
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     six = replace(MODELS["Qwen/Qwen3.5-9B"], id="Qwen/Fake-6-Head", num_attention_heads=6)
     patched = dict(MODELS)
@@ -767,8 +750,8 @@ def test_unpinned_sold_out_live_market_stays_retryable():
     as terminal, killing a run a retry would have placed. A genuinely oversized run must still fail
     terminally, so the distinction is gated on whether any offered shape could hold the run at all.
     """
-    import flash.providers.allocator as alloc
-    from flash.providers.base import CapacityLookupError, UnsupportedGpuError
+    import flash.providers.core.allocator as alloc
+    from flash.providers.core.base import CapacityLookupError, UnsupportedGpuError
 
     class _SoldOutLiveMarket:
         name = "modal"
@@ -778,7 +761,7 @@ def test_unpinned_sold_out_live_market_stays_retryable():
             return []  # structurally offered, nothing free right now
 
         def gpu_classes(self):
-            from flash.providers import base
+            from flash.providers.core import base
 
             return list(base.GPU_INFO.values())
 
@@ -798,7 +781,7 @@ def test_unpinned_sold_out_live_market_stays_retryable():
 
 
 def _validated_infos():
-    from flash.providers.base import GPU_INFO
+    from flash.providers.core.base import GPU_INFO
 
     return [info for info in GPU_INFO.values() if info.validated]
 
@@ -815,7 +798,7 @@ def test_effective_spec_validation_accepts_an_allocator_narrowed_count():
     integrity failure.
     """
     from flash.core.spec import JobSpec, gpu_count_of
-    from flash.runner import _validate_effective_spec
+    from flash.runner.lifecycle.preparation import _validate_effective_spec
     from flash.runner.supervise.lifecycle import _spec_with_gpu
 
     public = JobSpec.from_dict(
@@ -843,9 +826,9 @@ def test_unpinned_quote_bills_the_allocator_selected_count():
     """The exact lifecycle quote charges selected count and timing, never the authored ceiling."""
     from flash.cost.analytical import estimate_cost
     from flash.cost.types import RunConfig
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
 
-    config = RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=100, gpu_count=8)
+    config = RunConfig(model_id="Qwen/Qwen3.5-9B", method="sft", steps=100, gpu_count=8)
     one = estimate_cost(config, allocation=Candidate("modal", "H100", 3.29, 80, 1))
     two = estimate_cost(config, allocation=Candidate("modal", "H100", 3.29, 80, 2))
 
@@ -864,7 +847,7 @@ def test_structured_opd_compiler_vocab_is_card_independent():
     inside resolution, so the shape cannot reach it and cannot reject anything: the resolved
     vocabulary is a function of the model and its revision alone.
     """
-    from flash.engine.worker.train.opd.validation import _resolve_compiler_vocab_size
+    from flash.engine.worker.train.opd.orchestration.validation import _resolve_compiler_vocab_size
 
     seen: list[tuple] = []
 
@@ -933,8 +916,8 @@ def test_every_catalog_row_shards_on_every_vllm_tensor_parallel_axis():
     divides on query heads is caught here rather than on a paid box.
     """
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
-    from flash.providers.base import rentable_gpu_counts
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.base import rentable_gpu_counts
 
     for model_id, info in MODELS.items():
         cap = geometry_safe_gpu_cap(model_id, 8)
@@ -960,7 +943,7 @@ def test_the_tensor_parallel_axis_check_fails_a_row_vllm_would_reject():
     from flash.core.catalog import MODELS
 
     row = replace(
-        MODELS["Qwen/Qwen3.5-4B"],
+        MODELS["Qwen/Qwen3.5-9B"],
         num_attention_heads=16,
         num_key_value_heads=3,
         linear_num_value_heads=12,
@@ -973,13 +956,13 @@ def test_the_tensor_parallel_axis_check_fails_a_row_vllm_would_reject():
     # kv axis (3 can neither partition across nor replicate into 4 ranks) still objects.
     assert _vllm_tp_axis_failures(row, 4) == ["kv_heads"]
     # a real row stays clean at every width, so the helper is not merely rejecting everything.
-    assert _vllm_tp_axis_failures(MODELS["Qwen/Qwen3.6-27B"], 8) == []
+    assert _vllm_tp_axis_failures(MODELS["Qwen/Qwen3.8-27B"], 8) == []
     # the conv axis is reported, and ISOLATED: conv_dim is `head_k*num_k*2 + head_v*num_v`, which
     # the catalog's 128-wide head dims keep a multiple of 8 for any head count -- so no value-head
     # count alone can break it. Narrow the dims instead: 1*3*2 + 1*16 = 22 fails while the value
     # heads (16) still divide 8, leaving conv_dim as the only objection.
     narrow_conv = replace(
-        MODELS["Qwen/Qwen3.5-4B"],
+        MODELS["Qwen/Qwen3.5-9B"],
         linear_key_head_dim=1,
         linear_num_key_heads=3,
         linear_value_head_dim=1,

@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.providers import PROVIDER_NAMES, available_providers, get_provider
-from flash.providers.base import AllocationConstraints, JobHandle, UnreconciledCreateError
+from flash.providers.core.base import AllocationConstraints, JobHandle, UnreconciledCreateError
+from flash.providers.core.registry import PROVIDER_NAMES, available_providers, get_provider
 from flash.providers.modal import api
 from flash.providers.modal.auth import scope_fingerprint
 from flash.providers.modal.handles import ModalJobHandle
@@ -253,10 +253,25 @@ def test_cold_retry_does_not_mount_or_create_volume(sdk):
 
 
 def test_bootstrap_consumes_secret_payload(monkeypatch):
-    from flash.providers._lifecycle.bootstrap import load_payload
+    from flash.providers._lifecycle.bootstrapping.bootstrap import load_payload
 
     monkeypatch.setenv("FLASH_BOOTSTRAP_PAYLOAD", json.dumps({"flash_arm": "modal"}))
     assert load_payload() == {"flash_arm": "modal"}
     import os
 
     assert "FLASH_BOOTSTRAP_PAYLOAD" not in os.environ
+
+
+def test_duplicate_with_different_source_snapshot_is_not_adopted(sdk):
+    launch()
+    with pytest.raises(UnreconciledCreateError, match="different launch"):
+        launch(
+            payload={
+                "run_id": "flash-test",
+                "attempt": 0,
+                "job_spec_json": "{}",
+                "env": {},
+                "source_snapshot": {"sha256": "different-source"},
+            }
+        )
+    assert len(sdk.created) == 1

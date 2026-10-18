@@ -1,13 +1,12 @@
 """Serving endpoints: deploy / undeploy an adapter, list deployments, and chat.
 
-Service functions are resolved through ``flash.server.app`` at call time so test-suite patches on
+Service functions are resolved through ``flash.server.asgi.app`` at call time so test-suite patches on
 ``app.<name>`` are honored here.
 """
 
 from __future__ import annotations
 
 import contextlib
-import math
 
 # `multiprocessing` has no call site left here since the smoke validation moved to
 # `.serving_smoke`, but the schema coverage tests patch `get_context` through THIS module and the
@@ -19,38 +18,31 @@ from typing import Annotated, NoReturn
 
 import regex as safe_regex  # noqa: F401
 from fastapi import APIRouter, Depends, Header, HTTPException
-from fastapi.responses import StreamingResponse
 from jsonschema.validators import validator_for  # noqa: F401
 
 from flash.core.spec import JobSpec, require_project_id
-from flash.runner import (
-    effective_spec_from_status,
-    # kept although this module no longer calls it: a deploy test patches
-    # `serving.mark_deployed`, and `monkeypatch.setattr` needs the attribute to already exist.
-    # `serving_completion` reads it back through this module, so the patch reaches the call sites.
-    mark_deployed,  # noqa: F401
+from flash.runner.lifecycle.status import effective_spec_from_status
+from flash.runner.results.verified_revisions import verified_checkpoint_generation
+from flash.runner.supervise.transitions import (
     mark_deployment_failed,
     mark_deployment_pending,
     mark_deployment_revocation_failed,
     mark_undeployed,
-    verified_adapter_revision_generation,
 )
-from flash.schema import parse_adapter_revision
 
 # `RetryableServingUnavailable` is raised by the serving-coverage tests as
 # `serving.RetryableServingUnavailable`, so it stays reachable here even though the smoke path
 # that catches it now lives in `.serving_smoke`.
-from flash.serve.deploy import (  # noqa: F401
-    ActivationOutcomeUnknown,
+from flash.serve.contract.errors import (  # noqa: F401
     AdapterConfigMissing,
     RetryableServingUnavailable,
     ServingError,
 )
-from flash.serve.urls import public_deployment
-from flash.server import app as _app
+from flash.serve.contract.urls import public_deployment
+from flash.server.asgi import app as _app
 from flash.server.platform import auth, db
 from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key
-from flash.server.platform.internal_client import run_org_id
+from flash.server.platform.internal_client import run_org_id, run_serving_org_id
 
 router = APIRouter()
 
@@ -68,17 +60,17 @@ def _public_deployment(deployment: dict) -> dict:
         {
             "run_id": run_id,
             "checkpoint_step": out.get("checkpoint_step"),
-            "adapter_revision": out.get("adapter_revision"),
+            "checkpoint_id": out.get("checkpoint_id"),
             "state": out.get("state"),
             "verified_at": out.get("verified_at"),
-            "openai_model": out.get("openai_model") or run_id,
+            "openai_model": out.get("openai_model") or out.get("checkpoint_id"),
         }
     )
     return out
 
 
 def _enqueue_deployment_report(status) -> None:
-    from flash.runner import _report_status, _report_status_async
+    from flash.runner.lifecycle.reporting import _report_status, _report_status_async
 
     if os.environ.get("FLASH_DEPLOY_SYNC") == "1":
         _report_status(status)
@@ -200,7 +192,7 @@ def _queued_deployment_record(
     # Validate the cheap configured-rank part synchronously so obvious spec errors return 400
     # instead of becoming background deployment failures.
     try:
-        from flash.serve.deploy import validate_serving_lora_rank
+        from flash.serve.deployment.adapter_check import validate_serving_lora_rank
 
         validate_serving_lora_rank(
             effective_spec.model,
@@ -227,9 +219,7 @@ def _queued_deployment_record(
         verify=True,
         requested_at=time.time(),
     )
-    dep_dict["verification_generation"] = verified_adapter_revision_generation(run_id)
-    if current_deployment.get("activation_outcome_unknown"):
-        dep_dict["activation_outcome_unknown"] = True
+    dep_dict["verification_generation"] = verified_checkpoint_generation(run_id)
     if is_checkpoint:
         dep_dict["checkpoint_step"] = checkpoint_step
     if previous_deployment:
@@ -248,8 +238,7 @@ def _validate_deploy_request(
         effective_spec = effective_spec_from_status(status)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    # smoke verification is mandatory for every real deployment: a loadable-but-broken
-    # revision must never become the bare-run alias target. reject an explicit opt-out
+    # smoke verification is mandatory for every real checkpoint deployment. reject an opt-out
     # before anything is queued or registered (dry runs never register or activate, so
     # the flag is meaningless there too).
     if _require_bool(payload, "verify", True) is False:
@@ -257,19 +246,14 @@ def _validate_deploy_request(
             status_code=400,
             detail=(
                 "verify=false is not supported: deployment smoke verification is "
-                "mandatory before alias activation"
+                "mandatory before checkpoint readiness"
             ),
         )
     current_deployment = status.deployment or {}
     current_deployment_state = current_deployment.get("state")
-    completed_unknown_activation = (
-        current_deployment_state == "reconciling"
-        and current_deployment.get("activation_outcome_unknown") is True
-    )
     if (
         not dry_run
         and current_deployment_state in _DEPLOYMENT_BUSY_STATES
-        and not completed_unknown_activation
         and not _deployment_attempt_is_stale(current_deployment)
     ):
         raise HTTPException(
@@ -329,7 +313,7 @@ def deploy(
             run_id,
             effective_spec,
             status,
-            payload.get("step"),
+            payload.get("checkpoint_id"),
             action="deploy",
             enforce_state=not dry_run,
         )
@@ -347,23 +331,7 @@ def deploy(
         # Prefer org from the run's own context over the caller's key (operator deploys land on run's owner).
         deploy_org_id = run_org_id(status) or str(key.get("org_id") or "").strip() or None
         _require_deploy_org(run_id, deploy_org_id)
-        previous_deployment = None
-        expected_adapter_revision = None
-        if not dry_run:
-            try:
-                expected_adapter_revision, previous_deployment = _activation_predecessor(
-                    run_id, current_deployment
-                )
-            except ServingError as exc:
-                raise HTTPException(
-                    status_code=502,
-                    detail={
-                        "code": "alias_reconciliation_failed",
-                        "run_id": run_id,
-                        "retryable": True,
-                        "message": str(exc),
-                    },
-                ) from exc
+        deploy_org_id = auth.serving_org_id(deploy_org_id)
         deploy_kwargs = {
             "run_id": run_id,
             "model": effective_spec.model,
@@ -378,7 +346,6 @@ def deploy(
             "structured_outputs": effective_spec.train.structured_outputs,
             "org_id": deploy_org_id,
             "checkpoint_step": checkpoint_step,
-            "expected_adapter_revision": expected_adapter_revision,
         }
         if dry_run:
             try:
@@ -396,7 +363,7 @@ def deploy(
             checkpoint_step,
             is_checkpoint,
             current_deployment,
-            previous_deployment,
+            None,
         )
         marked = mark_deployment_pending(run_id, dep_dict, expect_state=prev_state)
         if marked.deployment != dep_dict:
@@ -456,16 +423,33 @@ def deploy(
 @router.delete("/v1/runs/{run_id}/deploy")
 def undeploy(
     run_id: str,
+    checkpoint_id: str,
     key: Annotated[dict, Depends(require_key)],
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
     x_freesolo_project_id: Annotated[str | None, Header()] = None,
 ):
+    manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
     with _app._deploy_lock(run_id):
         status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
         try:
-            result = _app.undeploy_adapter(run_id)
+            from flash.schema import parse_checkpoint_ref
+
+            parsed = parse_checkpoint_ref(checkpoint_id)
+            if parsed is None or parsed[0] != run_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="checkpoint_id must be a canonical checkpoint belonging to the route run",
+                )
+            org_id = run_serving_org_id(status)
+            if not org_id:
+                raise HTTPException(
+                    status_code=409, detail=f"run {run_id} has no organization scope"
+                )
+            result = _app.undeploy_adapter(checkpoint_id, org_id=org_id)
         except ServingError as exc:
-            marked = mark_deployment_revocation_failed(run_id, str(exc))
+            marked = mark_deployment_revocation_failed(
+                run_id, str(exc), checkpoint_id=checkpoint_id
+            )
             persisted = isinstance(marked.deployment, dict) and (
                 marked.deployment.get("state") == "revocation_failed"
                 and marked.deployment.get("error") == str(exc)
@@ -480,7 +464,7 @@ def undeploy(
                     "message": str(exc),
                 },
             ) from exc
-        marked = mark_undeployed(run_id)
+        marked = mark_undeployed(run_id, checkpoint_id)
         persisted = isinstance(marked.deployment, dict) and (
             marked.deployment.get("state") == "undeployed"
         )
@@ -488,11 +472,24 @@ def undeploy(
         deployment = (
             marked.deployment if isinstance(marked.deployment, dict) else {"state": "undeployed"}
         )
-        response = _public_deployment({**deployment, "run_id": run_id})
+        removed_summary = (
+            deployment.get("state") == "undeployed"
+            and deployment.get("checkpoint_id") == checkpoint_id
+        )
+        response_state = (
+            deployment
+            if removed_summary
+            else {
+                "state": "undeployed",
+                "checkpoint_id": checkpoint_id,
+                "checkpoint_step": parsed[1],
+            }
+        )
+        response = _public_deployment({**response_state, "run_id": run_id})
         response.update(
             {
                 field: result[field]
-                for field in ("disabled_aliases", "disabled_revisions", "serving_deregistered")
+                for field in ("disabled_checkpoints", "serving_deregistered")
                 if field in result
             }
         )
@@ -503,28 +500,29 @@ def undeploy(
 def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dict | None = None):
     """Copy a run's trained adapter into a user-owned HuggingFace repo."""
     payload = payload or {}
-    with _app._deploy_lock(run_id):
-        repository = str(payload.get("repository") or "").strip()
-        if not repository:
-            raise HTTPException(
-                status_code=400,
-                detail="repository is required: the destination HuggingFace repo 'owner/name'",
-            )
-        if len(parts := repository.strip("/").split("/")) != 2 or not all(parts):
-            raise HTTPException(
-                status_code=400,
-                detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
-            )
-        repository = "/".join(parts)
-        _validate_hf_repo_id(repository)
-        hf_token = str(payload.get("hf_token") or "").strip()
-        if not hf_token:
-            raise HTTPException(
-                status_code=400,
-                detail="hf_token is required: a HuggingFace token with write access to the destination repo",
-            )
-        private = _require_bool(payload, "private", True)
+    owned_run(run_id, key)
+    repository = str(payload.get("repository") or "").strip()
+    if not repository:
+        raise HTTPException(
+            status_code=400,
+            detail="repository is required: the destination HuggingFace repo 'owner/name'",
+        )
+    if len(parts := repository.strip("/").split("/")) != 2 or not all(parts):
+        raise HTTPException(
+            status_code=400,
+            detail=f"repository must be a HuggingFace repo of the form 'owner/name', got {repository!r}",
+        )
+    repository = "/".join(parts)
+    _validate_hf_repo_id(repository)
+    hf_token = str(payload.get("hf_token") or "").strip()
+    if not hf_token:
+        raise HTTPException(
+            status_code=400,
+            detail="hf_token is required: a HuggingFace token with write access to the destination repo",
+        )
+    private = _require_bool(payload, "private", True)
 
+    with _app._deploy_lock(run_id):
         status = owned_run(run_id, key)
         try:
             effective_spec = effective_spec_from_status(status)
@@ -539,7 +537,12 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
                 ),
             )
         checkpoint_step, is_checkpoint, prefix = _resolve_deployable_target(
-            run_id, effective_spec, status, payload.get("step"), action="export", enforce_state=True
+            run_id,
+            effective_spec,
+            status,
+            payload.get("checkpoint_id"),
+            action="export",
+            enforce_state=True,
         )
         subfolder = f"{prefix}/adapter"
         try:
@@ -564,7 +567,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     # best-effort product-analytics report: exports never otherwise touch the
     # platform backend (the copy is hf-to-hf inside flash).
     with contextlib.suppress(Exception):
-        from flash.server.domain.run_registry import record_model_exported
+        from flash.server.domain.registry.runs import record_model_exported
 
         record_model_exported(
             status=status,
@@ -575,10 +578,10 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         )
     result = {
         "run_id": run_id,
-        "adapter_id": run_id,
+        "checkpoint_id": payload.get("checkpoint_id"),
         "repository": repository,
         "url": url,
-        "source": f"{run_id}/step-{checkpoint_step}" if is_checkpoint else run_id,
+        "source": payload.get("checkpoint_id"),
     }
     if is_checkpoint:
         result["step"] = checkpoint_step
@@ -616,7 +619,7 @@ def _deployment_listing_scope(
 
 def _in_deployment_listing_scope(status, org: str, project: str) -> bool:
     """Whether a run belongs to the requested org AND project (manageable_run's predicate)."""
-    from flash.runner import _status_org_id
+    from flash.runner.lifecycle.preparation import _status_org_id
 
     if _status_org_id(status) != org:
         return False
@@ -653,131 +656,27 @@ def deployments(
 
 
 @router.post("/v1/runs/{run_id}/chat")
-def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)]):
-    messages = _chat_messages_from_payload(payload)
-    status = owned_run(run_id, key)
-    adapter_revision = payload.get("adapter_revision")
-    step = payload.get("step")
-    verified_revisions = _verified_adapter_revisions(status)
-    deployment = status.deployment or {}
-    ready_deployment = _previous_ready_deployment(deployment)
-    ready_revision = (
-        ready_deployment.get("adapter_revision") if ready_deployment is not None else None
-    )
-    pinned_revision = _resolve_explicit_chat_revision(
+def chat(
+    run_id: str,
+    payload: dict,
+    key: Annotated[dict, Depends(require_key)],
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+    x_freesolo_project_id: Annotated[str | None, Header()] = None,
+):
+    return managed_chat(
         run_id,
-        adapter_revision,
-        step,
-        verified_revisions,
-        preferred_revision=ready_revision if isinstance(ready_revision, str) else None,
+        payload,
+        key,
+        x_freesolo_org_id,
+        x_freesolo_project_id,
     )
-    serving_model = pinned_revision or run_id
-    try:
-        effective_spec = effective_spec_from_status(status)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    deployment_state = deployment.get("state")
-    has_ready_deploy = pinned_revision is not None or ready_deployment is not None
-    if pinned_revision is None and ready_deployment is not None:
-        ready_revision = ready_deployment.get("adapter_revision")
-        parsed_ready_revision = (
-            parse_adapter_revision(ready_revision) if isinstance(ready_revision, str) else None
-        )
-        has_ready_deploy = bool(
-            parsed_ready_revision is not None
-            and parsed_ready_revision[0] == run_id
-            and ready_revision in verified_revisions
-        )
-    # A cancelled run can still serve a per-step checkpoint it deployed: checkpoint deploy records
-    # a live adapter that /v1/deployments lists as active without requiring a final adapter.
-    # Only block chat when there's no active deployment to serve.
-    if not has_ready_deploy:
-        if deployment_state in _DEPLOYMENT_BUSY_STATES:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"run {run_id} deployment is {deployment_state}; run "
-                    "`flash models deployments` to check progress"
-                ),
-            )
-        if deployment_state == "failed":
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"run {run_id} deployment failed: {deployment.get('error') or 'unknown error'}"
-                ),
-            )
-        if status.state == "cancelled":
-            raise HTTPException(
-                status_code=409,
-                detail=f"run {run_id} was cancelled; deploy a checkpoint with "
-                f"`flash models deploy {run_id}/step-<N>` first",
-            )
-        raise HTTPException(
-            status_code=409,
-            detail=f"run {run_id} has no active deployment; `flash models deploy {run_id}` first",
-        )
-    if not effective_spec.train.hf_repo:
-        raise HTTPException(
-            status_code=409,
-            detail=f"run {run_id} has no [train].hf_repo; its adapter cannot be served",
-        )
-    # Parse sampling params before the broad try so bad values are 400, not 502.
-    try:
-        temperature = float(payload.get("temperature") or 0.0)
-        # Avoid `or 512`: that silently coerces an explicit 0 to 512.
-        raw_max_tokens = payload.get("max_tokens")
-        # OverflowError (int(inf), an ArithmeticError) is NOT a TypeError/ValueError — catch it too so a
-        # JSON `Infinity`/`1e400` max_tokens is a clean 400, not an uncaught 500.
-        max_tokens = 512 if raw_max_tokens is None else int(raw_max_tokens)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise HTTPException(
-            status_code=400, detail=f"invalid temperature/max_tokens: {exc}"
-        ) from exc
-    if not math.isfinite(temperature):
-        raise HTTPException(
-            status_code=400, detail=f"temperature must be a finite number, got {temperature}"
-        )
-    if max_tokens <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"max_tokens must be a positive integer, got {max_tokens}",
-        )
-    # the same stops the deployment smoke verified with: a run trained to terminate on a delimiter
-    # rather than EOS would otherwise pass verification and then run to max_tokens, or emit trailing
-    # text past its answer, on every real request.
-    stop_sequences = [
-        str(value) for value in (getattr(effective_spec.train, "stop_sequences", ()) or ())
-    ] or None
-    try:
-        if payload.get("stream") is True:
-            # serve_chat_stream sends the upstream request and validates its status at call
-            # time, so an upstream 4xx/5xx raises here, inside the try, and becomes a real 502
-            # before the 200 headers are flushed. a failure after the first byte propagates out
-            # of the body iterator instead, which aborts the chunked response so the client
-            # cannot mistake the truncation for a finished answer.
-            return StreamingResponse(
-                _app.serve_chat_stream(
-                    run_id=serving_model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    thinking=effective_spec.thinking,
-                    stop=stop_sequences,
-                ),
-                media_type="text/plain; charset=utf-8",
-            )
-        return _app.serve_chat(
-            run_id=serving_model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            thinking=effective_spec.thinking,
-            stop=stop_sequences,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"inference failure: {exc}") from exc
 
+
+from flash.server.routes.serving_chat import (  # noqa: E402,F401
+    _upstream_response_headers,
+    _UpstreamStreamingResponse,
+    managed_chat,
+)
 
 # re-exported at the bottom rather than imported at the top: both modules resolve names back
 # through this one, so a top import would be circular. the server tests address these helpers as
@@ -788,10 +687,8 @@ def chat(run_id: str, payload: dict, key: Annotated[dict, Depends(require_key)])
 # `serving._finish_deployment_unlocked`, which `_finish_deployment` resolves as a global at call
 # time -- so the seam survives the move.
 from flash.server.routes.serving_completion import (  # noqa: E402,F401
-    _assert_deployment_activation_fence,
     _commit_ready_deployment,
     _finish_deployment_unlocked,
-    _reconcile_ready_commit_miss,
     _record_deployment_failure,
     recover_deployments,
     replay_status_reports,
@@ -799,17 +696,15 @@ from flash.server.routes.serving_completion import (  # noqa: E402,F401
 from flash.server.routes.serving_revisions import (  # noqa: E402,F401
     _DEPLOYMENT_BUSY_STATES,
     _DEPLOYMENT_READY_STATES,
-    _activation_predecessor,
+    _authorized_chat_checkpoint,
     _chat_messages_from_payload,
-    _deployment_predecessor,
     _format_deployed_steps,
+    _managed_chat_messages,
     _parse_checkpoint_step,
-    _previous_ready_deployment,
     _resolve_deploy_step,
     _resolve_deployable_target,
-    _resolve_explicit_chat_revision,
     _spec_is_unservable,
-    _verified_adapter_revisions,
+    _verified_checkpoints,
     _verified_step_index,
 )
 from flash.server.routes.serving_smoke import (  # noqa: E402,F401
@@ -829,5 +724,4 @@ from flash.server.routes.serving_smoke import (  # noqa: E402,F401
     _thinking_tag_is_guaranteed,
     _validate_json_schema,
     _validate_structured_smoke,
-    _verify_alias_thinking,
 )

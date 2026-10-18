@@ -638,7 +638,7 @@ def published_geometry(monkeypatch):
 def _image_profile(entrypoint: Path, *, max_context_tokens: int = 4096):
     """Quote one packaged image dataset through the torch-free control-plane path."""
     spec = replace(
-        _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B"),
+        _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-9B"),
         train=TrainSpec(epochs=2, batch_size=2, max_context_tokens=max_context_tokens),
     )
     return profile_packaged_sft_dataset(
@@ -810,7 +810,7 @@ def test_an_unreadable_image_is_a_packaging_error_not_a_crash(tmp_path, publishe
             "dataset/red.png": "this is not a png",
         },
     )
-    spec = _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-4B")
+    spec = _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-9B")
 
     with pytest.raises(ValueError, match="not a valid image"):
         _image_profile_from_spec(spec)

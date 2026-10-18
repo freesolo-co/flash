@@ -7,6 +7,12 @@ import tempfile
 
 import pytest
 
+import flash.engine.worker.io.heartbeat as worker_heartbeat
+import flash.engine.worker.runtime.state as worker_state
+import flash.providers._lifecycle.net.worker as provider_worker
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
+import flash.runner.lifecycle.submit as runner_submit
 from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 from tests._helpers.profile import satisfy_sft_profile
 from tests._helpers.source_snapshot import valid_source_snapshot
@@ -20,7 +26,7 @@ def _oversized_model_info():
     Sized off WEIGHT_CACHE_VOLUME_GB so it stays oversized if the volume grows again — the real
     catalog now fits entirely, so the size gate needs a stand-in to stay covered.
     """
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
     from flash.core.catalog import ModelInfo
 
     return ModelInfo(
@@ -35,7 +41,7 @@ def _oversized_model_info():
 
 def _vol_spec(name="flash-weights", gb=100, **gpu):
     return JobSpec(
-        model="m",
+        model="Qwen/Qwen3.5-9B",
         gpu=GpuSpec(network_volume=name, network_volume_gb=gb, **gpu),
         seed=0,
     )
@@ -84,7 +90,7 @@ def test_network_volume_gb_tolerant_of_bad_values():
 
 
 def test_weight_cache_env_is_base_model_scoped():
-    from flash.providers._lifecycle.worker import weight_cache_env
+    from flash.providers._lifecycle.net.worker import weight_cache_env
 
     env = weight_cache_env("/weight-cache")
     # BASE-MODEL-SCOPED: FLASH_WEIGHT_CACHE_DIR points the base-model prefetch at the mount's HF hub
@@ -102,13 +108,13 @@ def test_weight_cache_env_is_base_model_scoped():
 
 
 def test_weight_cache_env_custom_mount():
-    from flash.providers._lifecycle.worker import weight_cache_env
+    from flash.providers._lifecycle.net.worker import weight_cache_env
 
     assert weight_cache_env("/workspace")["FLASH_WEIGHT_CACHE_DIR"] == "/workspace/hf-cache/hub"
 
 
 def test_build_worker_env_sets_base_model_cache_with_volume():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     env = build_worker_env(_vol_spec(), 0)
     assert env["FLASH_WEIGHT_CACHE_DIR"] == "/weight-cache/hf-cache/hub"
@@ -117,7 +123,7 @@ def test_build_worker_env_sets_base_model_cache_with_volume():
 
 
 def test_build_worker_env_no_cache_without_volume():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     env = build_worker_env(JobSpec(model="m", seed=0), 0)
     # Without a volume the base-model cache var must NOT be set (pointing at a missing mount).
@@ -154,7 +160,7 @@ def _patch_prefetch_io(monkeypatch, ephemeral_hub):
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot)
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(ephemeral_hub))
     monkeypatch.setattr(hf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(hf._w, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *a, **k: None)
     return hf, calls
 
 
@@ -170,17 +176,17 @@ def test_prefetch_model_downloads_to_shared_mount_and_links(tmp_path, monkeypatc
     monkeypatch.setenv("FLASH_WEIGHT_CACHE_DIR", shared_hub)
     hf, calls = _patch_prefetch_io(monkeypatch, ephemeral_hub)
 
-    hf.prefetch_model("Qwen/Qwen3.5-0.8B")
+    hf.prefetch_model("Qwen/Qwen3.5-9B")
 
     # downloaded straight onto the shared mount, NOT the ephemeral default
     assert calls == [
         {
-            "repo_id": "Qwen/Qwen3.5-0.8B",
+            "repo_id": "Qwen/Qwen3.5-9B",
             "cache_dir": shared_hub,
             "ignore_patterns": ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"],
         }
     ]
-    folder = "models--Qwen--Qwen3.5-0.8B"
+    folder = "models--Qwen--Qwen3.5-9B"
     dst = ephemeral_hub / folder
     # the base model is now visible in the ephemeral cache as a SYMLINK pointing back to the mount
     assert _os.path.islink(dst)
@@ -196,7 +202,7 @@ def test_prefetch_model_uses_ephemeral_default_without_shared_cache(tmp_path, mo
     ephemeral_hub = tmp_path / "ephemeral" / "hub"
     hf, calls = _patch_prefetch_io(monkeypatch, ephemeral_hub)
 
-    hf.prefetch_model("Qwen/Qwen3.5-0.8B")
+    hf.prefetch_model("Qwen/Qwen3.5-9B")
 
     assert calls[0]["cache_dir"] is None  # ephemeral default cache, a correct cold run
     assert not ephemeral_hub.exists()  # nothing linked
@@ -210,7 +216,7 @@ def test_prefetch_model_falls_back_to_ephemeral_when_mount_absent(tmp_path, monk
     ephemeral_hub = tmp_path / "ephemeral" / "hub"
     hf, calls = _patch_prefetch_io(monkeypatch, ephemeral_hub)
 
-    hf.prefetch_model("Qwen/Qwen3.5-0.8B")
+    hf.prefetch_model("Qwen/Qwen3.5-9B")
 
     assert (
         calls[0]["cache_dir"] is None
@@ -220,9 +226,9 @@ def test_prefetch_model_falls_back_to_ephemeral_when_mount_absent(tmp_path, monk
 def test_prefetch_model_starts_no_download_at_deadline(tmp_path, monkeypatch):
     monkeypatch.delenv("FLASH_WEIGHT_CACHE_DIR", raising=False)
     hf, calls = _patch_prefetch_io(monkeypatch, tmp_path / "ephemeral" / "hub")
-    monkeypatch.setattr(hf._w, "_remaining_worker_wall_seconds", lambda: 0.0)
+    monkeypatch.setattr(worker_state, "_remaining_worker_wall_seconds", lambda: 0.0)
 
-    hf.prefetch_model("Qwen/Qwen3.5-0.8B")
+    hf.prefetch_model("Qwen/Qwen3.5-9B")
 
     assert calls == []
 
@@ -245,7 +251,7 @@ def test_shared_weight_cache_dir_requires_the_modal_mount(tmp_path, monkeypatch)
 
 
 def test_assign_weight_cache_attaches_to_a_run():
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
 
     out = runner._assign_weight_cache_volume(JobSpec(model="m", run_id="r"))
     assert out.gpu.network_volume == runner.WEIGHT_CACHE_VOLUME_NAME == "flash-weights"
@@ -254,7 +260,7 @@ def test_assign_weight_cache_attaches_to_a_run():
 
 def test_assign_weight_cache_keeps_a_custom_volume():
     # A NON-shared (per-org / custom) volume is the intended escape hatch — left intact.
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
 
     spec = JobSpec.from_dict(
         {
@@ -273,7 +279,7 @@ def test_assign_weight_cache_keeps_a_custom_volume():
 
 def test_assign_weight_cache_ignores_removed_kill_switch(monkeypatch):
     # Regression: the FLASH_WEIGHT_CACHE=0 kill switch is GONE — fully managed, always on.
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
 
     monkeypatch.setenv("FLASH_WEIGHT_CACHE", "0")
     out = runner._assign_weight_cache_volume(JobSpec(model="m", run_id="r"))
@@ -281,7 +287,7 @@ def test_assign_weight_cache_ignores_removed_kill_switch(monkeypatch):
 
 
 def test_assign_weight_cache_does_not_override_existing():
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
 
     spec = _vol_spec(name="explicit-vol")
     # network_volume is managed -> carried by the internal dict; an already-pinned volume is honored.
@@ -296,7 +302,7 @@ def test_assign_weight_cache_skips_oversized_catalog_model():
     # mid-download. It is left cache-less and downloads to the container disk instead. Every model
     # in the current catalog fits (see test_every_catalog_model_fits_the_weight_cache), so the gate
     # is exercised with a synthetic oversized entry rather than a real one.
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
 
     info = _oversized_model_info()
     out = runner._assign_weight_cache_volume(JobSpec(model=info.id, run_id="r"), info)
@@ -308,7 +314,7 @@ def test_assign_weight_cache_strips_preset_shared_cache_on_oversized_catalog_mod
     # already pinned ``flash-weights`` for an oversized model must NOT bypass the gate via the
     # "honor an existing volume" no-op and redirect the download onto the undersized mount. It is
     # stripped cache-less.
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
 
     info = _oversized_model_info()
     spec = JobSpec.from_dict(
@@ -329,7 +335,7 @@ def test_assign_weight_cache_strips_preset_shared_cache_on_oversized_catalog_mod
 def test_assign_weight_cache_keeps_preset_shared_cache_on_fitting_catalog_model():
     # The re-gate only strips when OVERSIZED: a fitting model that already carries the shared cache
     # keeps it (the pin is correct), exercising the honor-existing path for a shared-name spec.
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
@@ -351,7 +357,7 @@ def test_assign_weight_cache_keeps_preset_shared_cache_on_fitting_catalog_model(
 def test_assign_weight_cache_keeps_preset_custom_volume_on_oversized_catalog_model():
     # The re-gate is scoped to the SHARED name only: a custom/per-org volume on an oversized model is
     # left intact (the caller owns its sizing — it may be a 200 GB org cache that DOES fit).
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.6-35B-A3B"]
@@ -372,7 +378,7 @@ def test_assign_weight_cache_keeps_preset_custom_volume_on_oversized_catalog_mod
 
 def test_assign_weight_cache_attaches_fitting_catalog_model():
     # A model whose download fits the cache (with temp headroom) is still attached when info is passed.
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]  # ~19.4 GB download, peak ~39 GB < 100 GB
@@ -381,7 +387,7 @@ def test_assign_weight_cache_attaches_fitting_catalog_model():
 
 
 def test_fits_weight_cache_is_size_based():
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
 
     # Oversized models are still excluded: the gate is a size check, not "always true".
     assert not runner._fits_weight_cache(_oversized_model_info())
@@ -391,7 +397,7 @@ def test_every_catalog_model_fits_the_weight_cache():
     # The largest models have the slowest cold downloads, so they are exactly the ones the cache
     # must cover. WEIGHT_CACHE_VOLUME_GB must stay >= the peak footprint of the biggest catalog
     # entry; if a larger model is added, grow the volume rather than silently skipping its cache.
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
     from flash.core.catalog import MODELS
 
     for mid, info in MODELS.items():
@@ -405,13 +411,13 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
     # Integration: the assignment is wired into submit_job and visible on the effective worker spec.
     # network_volume is platform-managed -> stripped from the public status.spec, so observe the
     # managed assignment on the effective-preparation worker spec the worker actually runs.
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = JobSpec.from_dict(
             {
-                "model": "Qwen/Qwen3.5-0.8B",
+                "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "environment": {"id": "github:o/r@main:env/environment.py"},
                 "train": {"epochs": 1, "max_examples": 8},
@@ -420,8 +426,8 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
         )
         # sft submission is profile-gated; the cache attachment under test is not, so seed the
         # profile rather than exercising the hub round-trips a real submit performs.
-        satisfy_sft_profile(runner, monkeypatch, spec)
-        status = runner.submit_job(spec, dry_run=True)
+        spec = satisfy_sft_profile(monkeypatch, spec)
+        status = runner_submit.submit_job(spec, dry_run=True)
     gpu = status.effective_preparation["worker_spec"]["gpu"]
     assert gpu["network_volume"] == "flash-weights"
     assert gpu["network_volume_gb"] == runner.WEIGHT_CACHE_VOLUME_GB
@@ -446,7 +452,7 @@ def test_drop_weight_cache_preserves_non_shared_escape_hatch_volume():
     # Review (Copilot): the no-capacity cache-drop must NOT strip a non-shared per-org/custom volume —
     # that is the deliberate escape-hatch isolation the run opted into. Only the SHARED
     # platform cache (WEIGHT_CACHE_VOLUME_NAME) is dropped.
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
     from flash.runner.supervise.lifecycle import _drop_weight_cache
 
     custom = _vol_spec(name="org-1234-private")
@@ -465,7 +471,9 @@ def test_effective_spec_persists_managed_cache_removal(monkeypatch):
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
+        import flash.runner.accounting.weight_cache as runner
+
         public = JobSpec.from_dict(
             {**_vol_spec().to_internal_dict(), "run_id": "managed-cache-fallback"}
         )
@@ -473,8 +481,8 @@ def test_effective_spec_persists_managed_cache_removal(monkeypatch):
         selected_dict = public.to_internal_dict()
         selected_dict["gpu"]["network_volume"] = None
         selected = JobSpec.from_dict(selected_dict)
-        runner._save_status(
-            runner.RunStatus(
+        runner_state._save_status(
+            runner_state.RunStatus(
                 run_id=public.run_id,
                 state="provisioning",
                 spec=public.to_dict(),
@@ -487,12 +495,12 @@ def test_effective_spec_persists_managed_cache_removal(monkeypatch):
             )
         )
 
-        assert runner._persist_effective_worker_spec(selected)
+        assert runner_submit._persist_effective_worker_spec(selected)
 
-        stored = runner.get_status(public.run_id)
+        stored = runner_status.get_status(public.run_id)
         assert stored.effective_preparation["worker_spec"]["gpu"]["network_volume"] is None
         assert stored.effective_preparation["adapter_identity"] is None
-        assert runner.effective_spec_from_status(stored).gpu.network_volume is None
+        assert runner_status.effective_spec_from_status(stored).gpu.network_volume is None
 
 
 def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
@@ -504,7 +512,9 @@ def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        runner = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
+        import flash.runner.accounting.weight_cache as runner
+
         committed = JobSpec.from_dict(
             {
                 **_vol_spec(name="org-1234-private").to_internal_dict(),
@@ -512,8 +522,8 @@ def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
             }
         )
         assert committed.gpu.network_volume != runner.WEIGHT_CACHE_VOLUME_NAME
-        runner._save_status(
-            runner.RunStatus(
+        runner_state._save_status(
+            runner_state.RunStatus(
                 run_id=committed.run_id,
                 state="provisioning",
                 spec=committed.to_dict(),
@@ -530,7 +540,7 @@ def test_effective_spec_rejects_custom_volume_removal(monkeypatch):
         selected = JobSpec.from_dict(selected_dict)
 
         with pytest.raises(ValueError, match="effective preparation"):
-            runner._persist_effective_worker_spec(selected)
+            runner_submit._persist_effective_worker_spec(selected)
 
 
 def _supervised_walk(monkeypatch, failures):
@@ -541,36 +551,38 @@ def _supervised_walk(monkeypatch, failures):
     from tests._helpers.runner import fresh_runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        orch = fresh_runner(tmp, monkeypatch)
+        fresh_runner(tmp, monkeypatch)
         import flash.providers.modal.jobs as jobs
-        from flash.providers.base import PollResult
+        from flash.providers.core.base import PollResult
 
         seen: list = []
 
-        def fake_submit(spec, seed, log=None, on_handle=None, attempt=0, **_):
+        def fake_submit(spec, log=None, on_handle=None, attempt=0, **_):
             seen.append((spec.gpu.network_volume, spec.gpu.type))
             fail = failures.get(attempt)
             if fail:
                 return PollResult(False, failure=fail, detail="x")
             return PollResult(True, metrics={"cost_usd": 0.1})
 
-        monkeypatch.setattr(jobs, "submit_run", fake_submit)
-        monkeypatch.setattr(orch, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT)
+        monkeypatch.setattr(jobs, "submit_attempt", fake_submit)
         monkeypatch.setattr(
-            orch,
+            provider_worker, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT
+        )
+        monkeypatch.setattr(
+            runner_status,
             "validate_terminal_source_metrics",
             lambda _status, metrics, expected_attempt=None: (metrics, expected_attempt),
         )
 
         spec = JobSpec(
             run_id="wc-walk",
-            model="Qwen/Qwen3.5-0.8B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="grpo",
             train=TrainSpec(epochs=1, max_examples=1),
             gpu=GpuSpec(type="", max_retries=2),
         )
-        orch.submit_job(spec, dry_run=False, background=False)
-        assert orch.get_status("wc-walk").state == "done"
+        runner_submit.submit_job(spec, dry_run=False, background=False)
+        assert runner_status.get_status("wc-walk").state == "done"
         return seen
 
 
@@ -619,7 +631,7 @@ def test_non_capacity_failure_keeps_weight_cache(monkeypatch):
 def test_catalog_model_ids_are_the_cache_fitting_catalog():
     from flash.core.catalog import MODELS
     from flash.providers.artifacts import weight_cache as preload
-    from flash.runner import _fits_weight_cache
+    from flash.runner.accounting.weight_cache import _fits_weight_cache
 
     ids = set(preload.catalog_model_ids())
     # The default preload set is the catalog RESTRICTED to models that fit the weight cache (warming a
@@ -628,7 +640,7 @@ def test_catalog_model_ids_are_the_cache_fitting_catalog():
     assert ids <= set(MODELS)
     # The whole catalog fits the volume, so the large checkpoints — the ones with the
     # slowest cold downloads — are warmed too.
-    assert "Qwen/Qwen3.6-27B" in ids
+    assert "Qwen/Qwen3.8-27B" in ids
     assert "Qwen/Qwen3.6-35B-A3B" in ids
 
 
@@ -638,7 +650,10 @@ def test_volume_holds_whole_catalog_with_largest_model_in_transit():
     Persistent volumes evict nothing, so download order cannot prevent the observed 200 GB
     "Disk quota exceeded" failure.
     """
-    from flash.runner import WEIGHT_CACHE_VOLUME_GB, weight_cache_catalog_peak_gb
+    from flash.runner.accounting.weight_cache import (
+        WEIGHT_CACHE_VOLUME_GB,
+        weight_cache_catalog_peak_gb,
+    )
 
     needed = weight_cache_catalog_peak_gb()
     assert needed <= WEIGHT_CACHE_VOLUME_GB, (
@@ -654,7 +669,10 @@ def test_catalog_peak_counts_others_resident_not_just_the_largest():
     the largest model's own peak and the plain resident total.
     """
     from flash.core.catalog import MODELS
-    from flash.runner import _fits_weight_cache, weight_cache_catalog_peak_gb
+    from flash.runner.accounting.weight_cache import (
+        _fits_weight_cache,
+        weight_cache_catalog_peak_gb,
+    )
 
     sizes = sorted(
         ((info.params_b or 0.0) * 2.0 for info in MODELS.values() if _fits_weight_cache(info)),
@@ -673,7 +691,7 @@ def test_assign_refreshes_a_stale_shared_cache_size():
 
     A correct volume name can still carry the stale 100 GB size and admit models that need 250 GB.
     """
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]
@@ -699,7 +717,7 @@ def test_assign_leaves_a_custom_volume_size_alone():
     A per-org volume is the caller's to size, and rewriting it to the managed number would silently
     change what they are billed for.
     """
-    from flash import runner
+    import flash.runner.accounting.weight_cache as runner
     from flash.core.catalog import MODELS
 
     info = MODELS["Qwen/Qwen3.5-9B"]

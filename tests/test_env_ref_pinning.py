@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 
+import flash.runner.accounting.artifacts as runner_artifacts
 from flash.core.spec import JobSpec
 from tests._helpers.source_snapshot import valid_source_snapshot
 
@@ -16,7 +17,7 @@ _MANIFEST = "d" * 64
 def _staged_spec() -> JobSpec:
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "seed": 0,
             "run_id": "flash-staged-pin-test",
@@ -43,29 +44,28 @@ def test_worker_retry_path_has_no_github_pin_fallback() -> None:
 
 
 def test_submit_context_preserves_controller_staged_identity_without_resolving(monkeypatch) -> None:
-    import flash.runner as runner
-    from flash.runner.supervise import seed_submission
+    from flash.runner.supervise import attempt_supervision
 
     monkeypatch.setattr(
-        runner,
+        runner_artifacts,
         "_assign_resolved_env_sha",
         lambda _spec: (_ for _ in ()).throw(AssertionError("worker retry must not resolve github")),
     )
     spec = _staged_spec()
-    context = seed_submission._build_context(
+    context = attempt_supervision._build_context(
         spec,
-        spec.seed,
         io.StringIO(),
         None,
         valid_source_snapshot(),
-        0,
+        None,
     )
     assert context.spec.environment.package == spec.environment.package
     assert context.spec.environment.resolved_sha == _SHA
 
 
 def test_attempt_shape_rebuild_preserves_staged_package() -> None:
-    from flash.runner.supervise.lifecycle import _drop_weight_cache, _spec_with_gpu
+    from flash.runner.supervise.lifecycle import _spec_with_gpu
+    from flash.runner.supervise.retry_decision import _drop_weight_cache
 
     spec = _staged_spec()
     shaped = _spec_with_gpu(spec, "H100", 2)

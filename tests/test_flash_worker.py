@@ -21,7 +21,7 @@ def _spec():
     from flash.core.spec import JobSpec, TrainSpec
 
     return JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
@@ -40,7 +40,8 @@ def _run_deadline_fields() -> dict[str, float | int]:
 
 def test_build_worker_env_does_not_forward_removed_tuning_knobs(monkeypatch):
     """Flash is managed: process-env tuning toggles do not change worker behavior."""
-    from flash.providers._lifecycle.worker import build_worker_env
+
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     knobs = {
         "VLLM_USE_V1": "0",
@@ -49,7 +50,7 @@ def test_build_worker_env_does_not_forward_removed_tuning_knobs(monkeypatch):
     for k, v in knobs.items():
         monkeypatch.setenv(k, v)
 
-    env = build_worker_env(_spec(), 0)
+    env = build_worker_env(_spec())
     for k in knobs:
         assert k not in env, f"{k} should not be forwarded to worker"
     # fragmentation-safe allocator default is always set
@@ -59,10 +60,10 @@ def test_build_worker_env_does_not_forward_removed_tuning_knobs(monkeypatch):
 def test_build_worker_env_ignores_alloc_conf_override(monkeypatch):
     """flash is fully managed: an operator PYTORCH_CUDA_ALLOC_CONF in the process env does NOT
     override flash's computed allocator conf (RL is non-expandable, sleep-safe)."""
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:999")
-    env = build_worker_env(_spec(), 0)  # grpo -> sleep-safe non-expandable
+    env = build_worker_env(_spec())  # grpo -> sleep-safe non-expandable
     assert env["PYTORCH_CUDA_ALLOC_CONF"] != "max_split_size_mb:999"
     assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
 
@@ -78,19 +79,18 @@ def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
     step 1. SFT keeps expandable: its verl trainer is pure FSDP and builds no rollout at all.
     """
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
     )
     env = build_worker_env(
         opd_spec,
-        0,
         runtime_secrets={
             "FLASH_PUBLIC_URL": "https://broker.example",
             "FLASH_TEACHER_CAPABILITY": "capability-test-value",
@@ -99,7 +99,7 @@ def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
     assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
     assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
     # GRPO still ships the sleep-safe non-expandable conf.
-    grpo_env = build_worker_env(_spec(), 0)
+    grpo_env = build_worker_env(_spec())
     assert "expandable_segments" not in grpo_env["PYTORCH_CUDA_ALLOC_CONF"]
 
 
@@ -109,21 +109,21 @@ def test_build_worker_env_does_not_forward_judge_creds(monkeypatch):
     [environment].secrets entry (forwarded via runtime_secrets); the env's own default judge model
     otherwise applies. A stray control-plane OPENROUTER_API_KEY / OPENAI_API_KEY / FLASH_JUDGE_MODEL
     must NOT leak into every worker."""
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "FLASH_JUDGE_MODEL"):
         monkeypatch.setenv(key, "control-plane-should-not-forward")
-    env = build_worker_env(_spec(), 0)
+    env = build_worker_env(_spec())
     for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "FLASH_JUDGE_MODEL"):
         assert key not in env
 
 
 def test_build_worker_env_forwards_github_only_for_private_vcs_pip(monkeypatch):
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-secret")
     monkeypatch.setenv("GIT_ASKPASS", "/tmp/operator-askpass")
-    env = build_worker_env(_spec(), 0)
+    env = build_worker_env(_spec())
     assert env["GITHUB_TOKEN"] == "ghp-secret"
     assert "GIT_ASKPASS" not in env
 
@@ -131,18 +131,17 @@ def test_build_worker_env_forwards_github_only_for_private_vcs_pip(monkeypatch):
 def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monkeypatch):
     """opd receives bounded broker transport while provider credentials remain control-plane-only."""
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     monkeypatch.setenv("PARASAIL_API_KEY", "platform-managed-parasail")
     opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
     )
     env = build_worker_env(
         opd_spec,
-        0,
         runtime_secrets={
             "FLASH_PUBLIC_URL": "https://broker.example",
             "FLASH_TEACHER_CAPABILITY": "capability-test-value",
@@ -151,17 +150,17 @@ def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monke
     assert env["FLASH_PUBLIC_URL"] == "https://broker.example"
     assert env["FLASH_TEACHER_CAPABILITY"] == "capability-test-value"
     assert "PARASAIL_API_KEY" not in env
-    grpo = build_worker_env(_spec(), 0)
+    grpo = build_worker_env(_spec())
     assert "FLASH_PUBLIC_URL" not in grpo
     assert "FLASH_TEACHER_CAPABILITY" not in grpo
 
 
 def test_build_worker_env_does_not_accept_legacy_teacher_broker_url():
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
@@ -170,7 +169,6 @@ def test_build_worker_env_does_not_accept_legacy_teacher_broker_url():
     with pytest.raises(RuntimeError, match="control-panel teacher transport is missing"):
         build_worker_env(
             opd_spec,
-            0,
             runtime_secrets={
                 "FLASH_TEACHER_BROKER_URL": "https://broker.example",
                 "FLASH_TEACHER_CAPABILITY": "capability-test-value",
@@ -180,10 +178,10 @@ def test_build_worker_env_does_not_accept_legacy_teacher_broker_url():
 
 def test_build_worker_env_rejects_managed_teacher_byo_names():
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="opd",
         environment=EnvironmentSpec(id="org/env", secrets=("PARASAIL_API_KEY",)),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
@@ -192,7 +190,6 @@ def test_build_worker_env_rejects_managed_teacher_byo_names():
     with pytest.raises(ValueError, match="managed teacher credential names"):
         build_worker_env(
             opd_spec,
-            0,
             runtime_secrets={
                 "PARASAIL_API_KEY": "byo-parasail-key",
                 "FLASH_PUBLIC_URL": "https://broker.example",
@@ -207,22 +204,22 @@ def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(mon
     WANDB_API_KEY must therefore come from the per-submit runtime secret path, not from the
     control-plane process env.
     """
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     monkeypatch.setenv("WANDB_API_KEY", "platform-should-not-forward")
-    env = build_worker_env(_spec(), 0)
+    env = build_worker_env(_spec())
     assert "WANDB_API_KEY" not in env
 
-    env = build_worker_env(_spec(), 0, runtime_secrets={"WANDB_API_KEY": "user-wb"})
+    env = build_worker_env(_spec(), runtime_secrets={"WANDB_API_KEY": "user-wb"})
     assert env["WANDB_API_KEY"] == "user-wb"
 
 
 def test_build_worker_env_forwards_declared_environment_runtime_secrets():
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         environment=EnvironmentSpec(id="owner/env", secrets=("SERPAPI_API_KEY",)),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
@@ -231,7 +228,6 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
 
     env = build_worker_env(
         spec,
-        0,
         runtime_secrets={
             "SERPAPI_API_KEY": "serp-user",
             "UNDECLARED_API_KEY": "must-not-forward",
@@ -245,8 +241,8 @@ def test_build_worker_env_lists_declared_secret_names_for_the_redactors(monkeypa
     """the producer's exact applied-name metadata is also the verl child scrub contract."""
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-    from flash.engine.worker.sft_train import _build_verl_child_env
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.engine.worker.train.entry.sft_train import _build_verl_child_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     declared = (
         "AWS_SECRET_ACCESS_KEY",
@@ -256,7 +252,7 @@ def test_build_worker_env_lists_declared_secret_names_for_the_redactors(monkeypa
         "WANDB_USER_SECRET",
     )
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         environment=EnvironmentSpec(id="owner/env", secrets=declared),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
@@ -264,14 +260,14 @@ def test_build_worker_env_lists_declared_secret_names_for_the_redactors(monkeypa
     )
     supplied = {name: f"synthetic-{name.lower()}" for name in declared}
     supplied["WANDB_API_KEY"] = "synthetic-wandb-key"
-    env = build_worker_env(spec, 0, runtime_secrets=supplied)
+    env = build_worker_env(spec, runtime_secrets=supplied)
 
     listed = set(env[SECRET_ENV_KEYS_ENV].split(","))
     assert listed == {*declared, "WANDB_API_KEY"}
     for name in listed:
         assert name in env
     # a run with no applied secrets carries no list at all.
-    assert SECRET_ENV_KEYS_ENV not in build_worker_env(_spec(), 0)
+    assert SECRET_ENV_KEYS_ENV not in build_worker_env(_spec())
 
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -315,14 +311,14 @@ def test_grpo_worker_env_keeps_native_thread_policy_managed():
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
     from flash.core.spec import EnvironmentSpec, JobSpec
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         environment=EnvironmentSpec(id="owner/project/env", secrets=("OMP_NUM_THREADS",)),
     )
-    env = build_worker_env(spec, spec.seed, runtime_secrets={"OMP_NUM_THREADS": "999"})
+    env = build_worker_env(spec, runtime_secrets={"OMP_NUM_THREADS": "999"})
 
     assert env["OMP_NUM_THREADS"] == GRPO_NATIVE_THREAD_ENV["OMP_NUM_THREADS"]
     assert "OMP_NUM_THREADS" not in set(env.get(SECRET_ENV_KEYS_ENV, "").split(","))
@@ -331,14 +327,14 @@ def test_grpo_worker_env_keeps_native_thread_policy_managed():
 def test_sft_worker_env_forwards_declared_native_thread_secret():
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.core.spec import EnvironmentSpec, JobSpec
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         environment=EnvironmentSpec(id="owner/project/env", secrets=("OMP_NUM_THREADS",)),
     )
-    env = build_worker_env(spec, spec.seed, runtime_secrets={"OMP_NUM_THREADS": "7"})
+    env = build_worker_env(spec, runtime_secrets={"OMP_NUM_THREADS": "7"})
 
     assert env["OMP_NUM_THREADS"] == "7"
     assert "OMP_NUM_THREADS" in set(env[SECRET_ENV_KEYS_ENV].split(","))
@@ -349,7 +345,7 @@ def test_declared_secret_names_cannot_contain_the_metadata_delimiter():
     as two unrelated names, the real key goes unrecognized, and its value reaches diagnostics
     verbatim. rejecting the delimiter at declaration keeps that channel unambiguous."""
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
     from flash.schema.fields import ConfigError, _environment_secrets
 
     with pytest.raises(ConfigError, match="invalid environment variable name"):
@@ -360,14 +356,14 @@ def test_declared_secret_names_cannot_contain_the_metadata_delimiter():
     # and the metadata builder fails closed rather than emitting an ambiguous list, for a spec
     # constructed around the parser.
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         environment=EnvironmentSpec(id="owner/env", secrets=("FOO,BAR",)),
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
     )
     with pytest.raises(RuntimeError, match="delimiter"):
-        build_worker_env(spec, 0, runtime_secrets={"FOO,BAR": "leaky"})
+        build_worker_env(spec, runtime_secrets={"FOO,BAR": "leaky"})
 
 
 def test_removed_keys_cannot_reach_the_worker_through_environment_secrets():
@@ -378,12 +374,12 @@ def test_removed_keys_cannot_reach_the_worker_through_environment_secrets():
     _REMOVED_OPTIMIZATION_ENV blocks dead keys that configure nothing.
     """
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-    from flash.providers._lifecycle.worker import _REMOVED_OPTIMIZATION_ENV, build_worker_env
+    from flash.providers._lifecycle.net.worker import _REMOVED_OPTIMIZATION_ENV, build_worker_env
 
     # every removed key, not a chalk special case. FLASH_TRITON_LORA stands in for the rest.
     declared = ["FLASH_CHALK_SPEC", "FLASH_TRITON_LORA", "MY_TOKEN"]
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
@@ -394,7 +390,7 @@ def test_removed_keys_cannot_reach_the_worker_through_environment_secrets():
         "FLASH_TRITON_LORA": "1",
         "MY_TOKEN": "keep-me",
     }
-    env = build_worker_env(spec, 0, runtime_secrets=supplied)
+    env = build_worker_env(spec, runtime_secrets=supplied)
 
     # assert on the values this call supplied, not on key presence: some removed names (e.g.
     # PYTORCH_ALLOC_CONF) are legitimately set by flash itself downstream, so "key absent from env"
@@ -412,20 +408,20 @@ def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     HF_REPO env var (which no longer exists). An operator HF_REPO in the process env is
     ignored — the worker reads its own seeded value, sourced from the spec."""
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     # an operator HF_REPO in the env must NOT leak into the worker env
     monkeypatch.setenv("HF_REPO", "operator/default")
     per_run = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="myorg/runs"),
         seed=0,
     )
-    assert build_worker_env(per_run, 0)["HF_REPO"] == "myorg/runs"
+    assert build_worker_env(per_run)["HF_REPO"] == "myorg/runs"
     # still the per-run value even with no operator HF_REPO at all
     monkeypatch.delenv("HF_REPO", raising=False)
-    assert build_worker_env(per_run, 0)["HF_REPO"] == "myorg/runs"
+    assert build_worker_env(per_run)["HF_REPO"] == "myorg/runs"
 
 
 def test_alloc_conf_rl_is_non_expandable(monkeypatch):
@@ -433,11 +429,11 @@ def test_alloc_conf_rl_is_non_expandable(monkeypatch):
     # sleep-SAFE non-expandable conf; the worker upgrades to expandable_segments at boot once it
     # resolves sleep OFF for the model/context (engine.worker.finalize_alloc_conf_for_sleep). The
     # conf is deterministic — there is no launcher sleep/alloc knob.
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    env = build_worker_env(_spec(), 0)  # grpo
+    env = build_worker_env(_spec())  # grpo
     assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
     assert env["PYTORCH_ALLOC_CONF"] == env["PYTORCH_CUDA_ALLOC_CONF"]
     # no launcher->worker FLASH_ALLOC_AUTO signal anymore (the worker gates on PHASE == "rl")
@@ -446,24 +442,24 @@ def test_alloc_conf_rl_is_non_expandable(monkeypatch):
 
 def test_alloc_conf_default_expandable_for_sft(monkeypatch):
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     spec = JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         train=TrainSpec(epochs=1, max_examples=2),
         seed=0,
     )
-    env = build_worker_env(spec, 0)
+    env = build_worker_env(spec)
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
 
 def test_error_artifact_name_is_per_phase_and_attempt():
     """Error files are scoped per-phase and per-attempt so a stale prior-attempt
     traceback can't be mistaken for the current attempt's crash on a retry."""
-    from flash.engine.worker import error_artifact_name
+    from flash.engine.worker.io.hf import error_artifact_name
 
     names = {error_artifact_name(m) for m in ("sft", "rl")}
     assert len(names) == 2  # distinct per phase -> no clobber
@@ -479,7 +475,7 @@ def test_ray_log_artifact_name_is_scoped_exactly_like_the_traceback_beside_it():
     """Ray's failure logs upload to the same per-RUN hf_prefix() as the traceback, so they need the
     same per-attempt scoping. A raylet failure is precisely the case that gets retried, and an
     unscoped name would let the retry overwrite the attempt that actually reproduced it."""
-    from flash.engine.worker import error_artifact_name, ray_log_artifact_name
+    from flash.engine.worker.io.hf import error_artifact_name, ray_log_artifact_name
 
     assert ray_log_artifact_name("rl") == "raylogs_rl_attempt0.txt"
     assert ray_log_artifact_name("rl", 0) != ray_log_artifact_name("rl", 1)
@@ -501,7 +497,7 @@ def test_worker_and_control_plane_agree_on_the_error_artifact_name():
     agree by coincidence of two assertions rather than by construction -- so the assertion is
     writer-against-reader, not either against a string.
     """
-    from flash.engine.worker import error_artifact_name as worker_name
+    from flash.engine.worker.io.hf import error_artifact_name as worker_name
     from flash.providers.artifacts.hf import error_artifact_name as plane_name
 
     for phase in ("sft", "rl", "opd"):
@@ -580,7 +576,7 @@ def _extra_pip_input(monkeypatch) -> dict:
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **_kwargs: "/source.zip")
     monkeypatch.setattr(
-        "flash.source_snapshot.materialize_verified_archive_file",
+        "flash.snapshot.archive.materialize_verified_archive_file",
         lambda *_args: None,
     )
     monkeypatch.setattr("importlib.util.spec_from_file_location", lambda *_args: None)
@@ -632,8 +628,8 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     import inspect
 
     from flash.engine.profiling import sft_image_rows, sft_workload
-    from flash.engine.worker import sft_train
     from flash.engine.worker.entry import sft
+    from flash.engine.worker.train.entry import sft_train
 
     # run_sft is now a pure delegation: no backend selector, no trainer of its own.
     assert "run_sft_train()" in inspect.getsource(sft.run_sft)
@@ -647,8 +643,8 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
 
     # sft renders its hydra overrides and child shims in train.sft.config, so the trainer's half of
     # this guard spans both modules. keep these in step when sft_train is split further.
-    from flash.engine.worker.train.sft import config as sft_config
     from flash.engine.worker.train.sft.child import plugin as sft_plugin
+    from flash.engine.worker.train.sft.setup import config as sft_config
 
     train_src = inspect.getsource(sft_train) + inspect.getsource(sft_config)
     plugin_src = inspect.getsource(sft_plugin)
@@ -686,7 +682,7 @@ def test_console_heartbeat_stays_flat_so_the_scanner_can_match_on_substrings(tmp
     import json
 
     from flash.engine.worker.io.heartbeat import _console_heartbeat_snapshot
-    from flash.providers._lifecycle import bootstrap_console
+    from flash.providers._lifecycle.bootstrapping import console as bootstrap_console
 
     snapshot = _console_heartbeat_snapshot(
         {

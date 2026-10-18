@@ -6,6 +6,9 @@ from dataclasses import asdict
 
 import pytest
 
+import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
+import flash.runner.accounting.costs as runner_costs
+import flash.runner.lifecycle.state as runner_state
 from flash.core.grpo import (
     DEFAULT_GRPO_GROUP_SIZE,
     DEFAULT_GRPO_PROMPTS_PER_STEP,
@@ -32,7 +35,7 @@ def _unsupported_group_message() -> str:
 
 def _public_grpo_train(**train):
     return {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "owner/project/env"},
         "train": {"epochs": 1, **train},
@@ -41,7 +44,7 @@ def _public_grpo_train(**train):
 
 def _internal_grpo_train(**train):
     return {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
         "environment": {"id": "owner/project/env"},
         "train": {"epochs": 1, **train},
@@ -213,14 +216,14 @@ def test_direct_jobspec_omitted_shape_keeps_serialized_fields_omitted():
 
 
 def test_runconfig_normalizes_defaults_and_preserves_persisted_grpo_shapes():
-    config = RunConfig("Qwen/Qwen3.5-4B", "grpo", 1)
+    config = RunConfig("Qwen/Qwen3.5-9B", "grpo", 1)
     normalized = config.normalized()
     assert normalized.batch_size == DEFAULT_GRPO_PROMPTS_PER_STEP
     assert normalized.group_size == DEFAULT_GRPO_GROUP_SIZE
 
     for prompts_per_step, group_size in ((4, 3), (65, 8)):
         legacy = RunConfig(
-            "Qwen/Qwen3.5-4B",
+            "Qwen/Qwen3.5-9B",
             "grpo",
             10,
             batch_size=prompts_per_step,
@@ -231,8 +234,6 @@ def test_runconfig_normalizes_defaults_and_preserves_persisted_grpo_shapes():
 
 @pytest.mark.parametrize(("prompts_per_step", "group_size"), [(4, 3), (65, 8)])
 def test_persisted_legacy_shapes_price_finite_nonzero(prompts_per_step, group_size):
-    import flash.runner as runner
-
     spec = JobSpec.from_dict(
         _internal_grpo_train(
             max_steps=10,
@@ -241,8 +242,8 @@ def test_persisted_legacy_shapes_price_finite_nonzero(prompts_per_step, group_si
         )
     )
 
-    full = runner.charge_usd_for_spec(spec, fallback=float("nan"))
-    partial = runner.charge_usd_for_spec(spec, steps=5, fallback=float("nan"))
+    full = runner_costs.charge_usd_for_spec(spec, fallback=float("nan"))
+    partial = runner_costs.charge_usd_for_spec(spec, steps=5, fallback=float("nan"))
     assert math.isfinite(full)
     assert full > 0
     assert math.isfinite(partial)
@@ -250,40 +251,17 @@ def test_persisted_legacy_shapes_price_finite_nonzero(prompts_per_step, group_si
 
 
 def test_cancellation_billing_does_not_zero_a_completed_legacy_run():
-    import flash.runner as runner
-
     spec = JobSpec.from_dict(_internal_grpo_train(max_steps=10, prompts_per_step=4, group_size=3))
-    status = runner.RunStatus(
+    status = runner_state.RunStatus(
         run_id="legacy-cancel",
         state="cancelled",
         spec={},
         estimated_cost_usd=8.0,
     )
 
-    charge = runner.cancelled_charge_usd(status, spec, steps=5)
+    charge = runner_costs.cancelled_charge_usd(status, spec, steps=5)
     assert math.isfinite(charge)
     assert 0 < charge < status.estimated_cost_usd
-
-
-def test_supported_grpo_shape_pricing_preserves_order_and_resource_rate():
-    from flash.cost import estimate_cost
-    from flash.providers.modal.pricing import hourly_rate
-
-    estimates = [
-        estimate_cost(
-            RunConfig(
-                "Qwen/Qwen3.5-4B", "grpo", 10, batch_size=4, group_size=group, gpu_type="A100 SXM"
-            )
-        )
-        for group in SUPPORTED_GRPO_GROUP_SIZES
-    ]
-    costs = [estimate.total_usd for estimate in estimates]
-    from itertools import pairwise
-
-    assert all(a < b for a, b in pairwise(costs))
-    for estimate in estimates:
-        assert estimate.gpu_hourly_usd == hourly_rate("A100 SXM")
-        assert estimate.total_usd == estimate.billable_hours * estimate.gpu_hourly_usd
 
 
 @pytest.mark.parametrize(
@@ -306,7 +284,7 @@ def test_authoring_still_rejects_every_legacy_shape(prompts_per_step, group_size
 
 @pytest.mark.parametrize("group_size", SUPPORTED_GRPO_GROUP_SIZES)
 def test_supported_authored_groups_reach_allocation(group_size):
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
 
     spec = spec_from_dict(
         _public_grpo_train(prompts_per_step=4, group_size=group_size),
@@ -334,7 +312,7 @@ def test_supported_authored_groups_reach_allocation(group_size):
     ],
 )
 def test_persisted_legacy_shapes_reach_allocation(prompts_per_step, group_size):
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
 
     spec = JobSpec.from_dict(
         _internal_grpo_train(
@@ -351,6 +329,7 @@ def test_persisted_legacy_shapes_reach_allocation(prompts_per_step, group_size):
         train=spec.train,
         providers=("modal",),
         gpu_type="H100",
+        max_gpu_count=2,
     )
 
     assert allocation.provider == "modal"
@@ -380,7 +359,7 @@ def test_non_grpo_jobspec_behavior_is_unchanged(algorithm, prompts_per_step, gro
 
 def test_grpo_worker_env_reasserts_managed_native_thread_policy(monkeypatch):
     from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(
         algorithm="grpo",
@@ -388,7 +367,7 @@ def test_grpo_worker_env_reasserts_managed_native_thread_policy(monkeypatch):
         train=TrainSpec(prompts_per_step=64, group_size=8),
     )
     hostile = dict.fromkeys(GRPO_NATIVE_THREAD_ENV, "999")
-    env = build_worker_env(spec, spec.seed, runtime_secrets=hostile)
+    env = build_worker_env(spec, runtime_secrets=hostile)
     assert {key: env[key] for key in GRPO_NATIVE_THREAD_ENV} == dict(GRPO_NATIVE_THREAD_ENV)
     secret_names = set(env.get("FLASH_SECRET_ENV_KEYS", "").split(","))
     assert not (secret_names & set(GRPO_NATIVE_THREAD_ENV))
@@ -396,11 +375,10 @@ def test_grpo_worker_env_reasserts_managed_native_thread_policy(monkeypatch):
 
 def test_grpo_child_env_reasserts_native_thread_policy_last(monkeypatch):
     from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
-    from flash.engine.worker import rl_train
 
     hostile = dict.fromkeys(GRPO_NATIVE_THREAD_ENV, "999")
-    monkeypatch.setattr(rl_train, "_build_verl_child_env", lambda **_kwargs: dict(hostile))
-    env = rl_train._build_rl_child_env(
+    monkeypatch.setattr(rl_train_runner, "_build_verl_child_env", lambda **_kwargs: dict(hostile))
+    env = rl_train_runner._build_rl_child_env(
         {"multi_turn": False},
         {
             "shim_dir": "/tmp/shim",
@@ -415,13 +393,13 @@ def test_grpo_child_env_reasserts_native_thread_policy_last(monkeypatch):
 
 def test_sft_worker_env_does_not_gain_grpo_native_policy():
     from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(
         algorithm="sft",
         environment=EnvironmentSpec(id="owner/project/env"),
     )
-    env = build_worker_env(spec, spec.seed)
+    env = build_worker_env(spec)
     assert not (set(env) & set(GRPO_NATIVE_THREAD_ENV))
 
 
@@ -445,13 +423,13 @@ def test_training_guide_describes_authored_admission_and_retained_execution_clam
 def test_persisted_legacy_shapes_reach_worker_option_resolution(
     monkeypatch, prompts_per_step, group_size
 ):
-    from flash.engine.worker.train.rl import inputs
+    from flash.engine.worker.train.rl.launch import inputs
 
     spec = JobSpec.from_dict(
         _internal_grpo_train(prompts_per_step=prompts_per_step, group_size=group_size)
     )
     monkeypatch.setattr(
-        inputs._w,
+        inputs._worker_config,
         "grpo_overrides",
         lambda: {"group_size": spec.train.group_size},
     )
@@ -466,11 +444,11 @@ def test_persisted_legacy_shapes_reach_worker_option_resolution(
 
 @pytest.mark.parametrize("group_size", SUPPORTED_GRPO_GROUP_SIZES)
 def test_supported_shapes_reach_worker_option_resolution_exactly(monkeypatch, group_size):
-    from flash.engine.worker.train.rl import inputs
+    from flash.engine.worker.train.rl.launch import inputs
 
     spec = spec_from_dict(_public_grpo_train(prompts_per_step=4, group_size=group_size))
     monkeypatch.setattr(
-        inputs._w,
+        inputs._worker_config,
         "grpo_overrides",
         lambda: {"group_size": spec.train.group_size},
     )

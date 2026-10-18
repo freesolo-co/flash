@@ -14,7 +14,7 @@ from flash.server.routes import envs as routes
 
 
 def test_list_endpoint_returns_published_slugs(monkeypatch):
-    import flash.server.domain.envs as domain
+    import flash.server.domain.registry.envs as domain
 
     seen: dict = {}
 
@@ -31,7 +31,7 @@ def test_list_endpoint_returns_published_slugs(monkeypatch):
 
 
 def test_list_endpoint_preserves_hub_failure_status(monkeypatch):
-    import flash.server.domain.envs as domain
+    import flash.server.domain.registry.envs as domain
 
     def fail(**_kwargs):
         raise domain.EnvPublishError("hub is unreachable", status=502)

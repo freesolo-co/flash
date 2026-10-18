@@ -16,19 +16,16 @@ import os
 import time
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.engine.huggingface import hub_error_transience, model_revision_kwargs
+from flash.engine.support.huggingface import hub_error_transience, model_revision_kwargs
 from flash.engine.worker.perf import RetriableInfraError
-from flash.envs.loader import is_commit_sha
+from flash.envs.loading.loader import is_commit_sha
 
 
 def _hf():
     """The io module, imported lazily because it imports this one.
 
-    Five names are patched as attributes of `io.hf` by the prefetch and provenance tests -- the
-    worker proxy `_w`, `gpu_diagnostics`, `_require_hf_deadline_allowance`,
-    `_shared_weight_cache_dir` and `resolve_cached_model_commit` -- and every caller of theirs is
-    in this file. Resolving them through the parent is what keeps those patches effective; a
-    direct call would bind this module's own function and run the real one under the patch.
+    prefetch tests patch selected attributes of `io.hf`. resolving them through the parent keeps
+    those patches effective while avoiding an import cycle.
     """
     from flash.engine.worker.io import hf
 
@@ -280,11 +277,14 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
                 # cache lookup may still succeed (warm cache), and prefetch is best-effort there.
                 print("prefetch_model warn:", e)
     secs = round(time.time() - t0, 1)
-    _hf()._w.heartbeat(
+    from flash.engine.worker.io.heartbeat import heartbeat
+    from flash.engine.worker.perf import gpu_diagnostics
+
+    heartbeat(
         "model_prefetched",
         model=model_id,
         download_seconds=secs,
         hf_transfer=os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
-        gpu=_hf().gpu_diagnostics(),
+        gpu=gpu_diagnostics(),
     )
     return secs

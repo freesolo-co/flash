@@ -8,7 +8,7 @@ import tempfile
 import pytest
 
 BASE = (
-    'model = "Qwen/Qwen3.5-4B"\n'
+    'model = "Qwen/Qwen3.5-9B"\n'
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
     "[train]\nepochs = 1\nmax_examples = 100\n"

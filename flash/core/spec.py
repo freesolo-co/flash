@@ -12,7 +12,7 @@ they are told apart:
 - resolved worker payload -- `to_internal_dict()` / `to_json()`, complete, including every managed
   and resolved field the GPU worker needs.
 
-`flash/runner/preparation.py::_preparation_digest` hashes the canonical JSON of `to_dict()` and
+`flash/runner/lifecycle/preparation.py::_preparation_digest` hashes the canonical JSON of `to_dict()` and
 `to_internal_dict()`, so the BYTES those two emit are a recovery contract, not an implementation
 detail. See their docstrings before changing either.
 """
@@ -103,7 +103,7 @@ def _validated_gpu_type(value: Any, *, field_name: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string")
 
-    from flash.providers.base import GPU_INFO, UnsupportedGpuError, canonical_gpu
+    from flash.providers.core.base import GPU_INFO, UnsupportedGpuError, canonical_gpu
 
     try:
         canonical = canonical_gpu(value)
@@ -178,7 +178,7 @@ def attributed_gpu_type(status: Any) -> str:
     def field(name: str) -> Any:
         return status.get(name) if isinstance(status, dict) else getattr(status, name, None)
 
-    remote = field("remote")
+    remote = field("remote") or field("realized_cost_remote")
     allocated = remote.get("allocated_gpu") if isinstance(remote, dict) else None
     if isinstance(allocated, str) and allocated:
         return allocated
@@ -269,18 +269,6 @@ CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
 TRAINER_BACKEND = "verl"
 
 
-def require_matching_seed(spec: JobSpec, seed: Any) -> int:
-    """Require the retained provider seed argument to match the authoritative JobSpec seed."""
-    provided = parse_seed(seed)
-    canonical = parse_seed(spec.seed)
-    if provided != canonical:
-        raise ValueError(
-            f"provider seed {provided} does not match JobSpec.seed {canonical}; "
-            "use spec.seed as the provider seed"
-        )
-    return canonical
-
-
 def _model_revision(value: Any) -> str:
     """parse an optional exact model-repository revision."""
     if not isinstance(value, str):
@@ -313,7 +301,7 @@ class EnvironmentPackageSpec:
     manifest_sha256: str
 
     def __post_init__(self) -> None:
-        from flash.envs.identity import is_commit_sha
+        from flash.envs.meta.identity import is_commit_sha
 
         if (
             not is_commit_sha(self.artifact_revision)
@@ -348,7 +336,7 @@ class EnvironmentSpec:
     def __post_init__(self) -> None:
         if self.package is None:
             return
-        from flash.envs.identity import canonical_environment_id, is_commit_sha
+        from flash.envs.meta.identity import canonical_environment_id, is_commit_sha
 
         canonical_environment_id(self.id)
         if not is_commit_sha(self.resolved_sha) or self.resolved_sha.lower() != self.resolved_sha:
@@ -380,7 +368,7 @@ class TrainSpec:
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     # sft only: none preserves a legacy persisted run's 16x optimizer. new configs freeze the
     # recipe default at parse time; 1 uses equal adapter learning rates.
-    loraplus_ratio: float | None = field(default=None, metadata={"introduced_in": "1.2.111.post1"})
+    loraplus_ratio: float | None = field(default=None, metadata={"introduced_in": "1.2.131"})
     # sft only. the packaged-dataset estimate resolves this against the selected row count into
     # examples_per_update (packed) or pins the optimizer batch to 1 (unpacked). grpo/opd have no
     # profile, so they take prompts_per_step instead and reject this key: the two are not the same
@@ -464,7 +452,7 @@ class GpuSpec:
 
     def __post_init__(self) -> None:
         # coerce/validate here so every path (from_dict and direct construction) is guarded.
-        from flash.providers import validated_provider_preferences
+        from flash.providers.core.registry import validated_provider_preferences
 
         providers = validated_provider_preferences(
             self.providers, allow_empty=isinstance(self.providers, tuple)

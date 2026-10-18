@@ -6,7 +6,6 @@ import hashlib
 
 from ._canonical import canonical_json
 from .types import (
-    AdapterAliasIntent,
     DeploymentSpec,
     EngineIdentity,
     ModalPlacement,
@@ -60,18 +59,10 @@ def serialize_engine(value: EngineIdentity) -> dict[str, object]:
     return _engine_payload(value)
 
 
-def _alias_payload(value: AdapterAliasIntent) -> dict[str, object]:
-    return {
-        "activate": value.activate,
-        "expected_adapter_revision": value.expected_adapter_revision,
-    }
-
-
 def _adapter_payload(value: ResolvedAdapter) -> dict[str, object]:
     return {
         "run_id": value.run_id,
-        "checkpoint": value.checkpoint,
-        "adapter_revision": value.adapter_revision,
+        "checkpoint_id": value.checkpoint_id,
         "artifact_repo_id": value.artifact_repo_id,
         "artifact_repo_type": value.artifact_repo_type,
         "artifact_revision": value.artifact_revision,
@@ -82,7 +73,6 @@ def _adapter_payload(value: ResolvedAdapter) -> dict[str, object]:
         "lora_rank": value.lora_rank,
         "thinking_default": value.thinking_default,
         "structured_outputs_default_json": value.structured_outputs_default_json,
-        "alias_intent": _alias_payload(value.alias_intent),
     }
 
 
@@ -95,9 +85,13 @@ def canonical_adapter_sort_key(value: ResolvedAdapter) -> str:
 
 
 def _placement_payload(value: ModalPlacement) -> dict[str, object]:
+    _require_exact(value, ModalPlacement, "placement")
     return {
         "workspace_name": value.workspace_name,
         "environment": value.environment,
+        # part of the identity, not decoration: the suffix is what makes the public url
+        # `<workspace>-<suffix>--<label>.modal.run`, so two placements that differ only here
+        # are two different endpoints. omitting it would collapse them to one `spec_id`.
         "web_suffix": value.web_suffix,
         "gpu": value.gpu,
         "region": value.region,

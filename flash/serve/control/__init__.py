@@ -4,7 +4,6 @@ from ._canonical import canonical_mapping_fingerprint
 from .credentials import ModalCredentials
 from .planning import PlanningError, plan_deployment
 from .types import (
-    AdapterAliasIntent,
     DeploymentErrorCode,
     DeploymentErrorReason,
     DeploymentRequest,
@@ -23,7 +22,6 @@ from .types import (
 )
 
 __all__ = [
-    "AdapterAliasIntent",
     "DeploymentErrorCode",
     "DeploymentErrorReason",
     "DeploymentRequest",

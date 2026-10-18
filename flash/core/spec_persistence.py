@@ -47,7 +47,7 @@ def validated_persisted_providers(
     gpu: dict[str, Any], gpu_type: str, gpu_type_fallbacks: tuple[str, ...]
 ) -> tuple[str, tuple[str, ...]]:
     """Return persisted provider preferences cross-checked against gpu classes."""
-    from flash.providers import PROVIDER_NAMES, validated_provider_preferences
+    from flash.providers.core.registry import PROVIDER_NAMES, validated_provider_preferences
 
     provider = gpu.get("provider", "")
     if not isinstance(provider, str):
@@ -59,7 +59,7 @@ def validated_persisted_providers(
     if provider and providers:
         raise ValueError("gpu.provider and gpu.providers cannot both be set")
     if provider or providers or gpu_type:
-        from flash.providers.base import providers_for
+        from flash.providers.core.base import providers_for
 
         if provider and provider not in PROVIDER_NAMES:
             raise ValueError(f"unknown gpu.provider {provider!r}")

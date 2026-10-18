@@ -3,7 +3,7 @@
 import re
 from dataclasses import dataclass
 
-from flash.providers._lifecycle.instance import InstanceJobHandle
+from flash.providers._lifecycle.instances.instance import InstanceJobHandle
 
 
 @dataclass

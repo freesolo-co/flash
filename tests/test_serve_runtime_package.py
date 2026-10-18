@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tomllib
 import zipfile
 from pathlib import Path
 
-from flash.engine.worker.backend_common import TRANSFORMERS_REQUIREMENT
+from flash.engine.worker.train.entry.backend_common import TRANSFORMERS_REQUIREMENT
 
 ROOT = Path(__file__).resolve().parents[1]
 # the packaged serving app runs from these modules, so a wheel that omits them leaves
@@ -60,7 +61,20 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
     assert "vllm==0.19.1" in extras["gpu"]
     assert project["tool"]["uv"]["conflicts"] == [[{"extra": "gpu"}, {"extra": "serve-runtime"}]]
     lock = (ROOT / "uv.lock").read_text()
-    assert 'name = "modal"\nversion = "1.5.4"' in lock
+    server_modal = [
+        requirement for requirement in extras["server"] if requirement.startswith("modal==")
+    ]
+    serving_modal = [
+        requirement for requirement in extras["serving"] if requirement.startswith("modal==")
+    ]
+    assert len(server_modal) == 1
+    assert serving_modal == server_modal
+    locked_versions = {
+        package["version"]
+        for package in tomllib.loads(lock)["package"]
+        if package["name"] == "modal"
+    }
+    assert locked_versions == {server_modal[0].removeprefix("modal==")}
     # the lockfile must actually RESOLVE the extra, not merely mention it: Dockerfile.serve runs
     # `uv sync --frozen --extra serve-runtime`, and --frozen refuses to re-resolve. adding the extra
     # to pyproject without re-locking leaves provides-extras stale, and the image build dies at that
@@ -77,7 +91,7 @@ def test_wheel_contains_runtime_and_declares_extra(tmp_path: Path) -> None:
     output = tmp_path / "dist"
     env = os.environ.copy()
     result = subprocess.run(
-        ["uv", "build", "--wheel", "--out-dir", str(output)],
+        ["uv", "build", "--out-dir", str(output)],
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -91,8 +105,36 @@ def test_wheel_contains_runtime_and_declares_extra(tmp_path: Path) -> None:
     with zipfile.ZipFile(wheels[0]) as wheel:
         names = set(wheel.namelist())
         assert names >= APP_FILES | RUNTIME_FILES | CONTROL_FILES
+        # derive the complete python module inventory from the source tree, so lazy imports cannot
+        # hide omitted wheel files and the same test works from a checkout or an extracted sdist.
+        source_modules = {
+            path.relative_to(ROOT).as_posix() for path in (ROOT / "flash").rglob("*.py")
+        }
+        assert names >= source_modules
         metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
         metadata = wheel.read(metadata_name).decode()
+
+    # import the changed cli and profile paths from the built wheel with site packages disabled,
+    # so the relocation cannot pass by leaking modules in from the editable checkout.
+    import_env = {
+        "PATH": "/usr/bin:/bin",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": str(wheels[0].resolve()),
+    }
+    imported = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            "import flash.cli.commands.serving.deploy; import flash.serve.deployment.profiles",
+        ],
+        cwd=tmp_path,
+        env=import_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert imported.returncode == 0, imported.stdout + imported.stderr
 
     assert "Provides-Extra: serve-runtime" in metadata
     for dependency in ("fastapi", "uvicorn", "huggingface-hub", "safetensors"):

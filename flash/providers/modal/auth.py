@@ -1,6 +1,6 @@
 """Explicit operator credentials for Modal training."""
 
-from flash.providers._lifecycle.auth import load_provider_key
+from flash.providers._lifecycle.net.auth import load_provider_key
 
 
 def credentials() -> tuple[str, str] | None:

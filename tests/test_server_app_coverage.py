@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import builtins
 import sys
+import threading
 import types
 
 import pytest
 
-import flash.server.app as app_mod
+import flash.server.asgi.app as app_mod
 
 
 def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> None:
@@ -51,6 +52,75 @@ def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> No
     ]
     with app_mod._DEPLOYMENT_JOBS_LOCK:
         assert not app_mod._DEPLOYMENT_JOBS
+
+
+@pytest.fixture
+def blocking_deployment_jobs(monkeypatch):
+    """Start real capped deployment jobs that block until the test releases them."""
+    monkeypatch.delenv("FLASH_DEPLOY_SYNC", raising=False)
+    app_mod._open_deployment_jobs()
+    release = threading.Event()
+
+    def fill(count):
+        started = 0
+        for _ in range(count):
+            app_mod.start_deployment_job(release.wait, 60)
+            started += 1
+        return started
+
+    try:
+        yield release, fill
+    finally:
+        release.set()
+        app_mod._wait_for_deployment_jobs(30)
+        app_mod._open_deployment_jobs()
+
+
+def test_start_deployment_job_rejects_past_the_active_capacity(blocking_deployment_jobs) -> None:
+    """A deployment job holds its thread for minutes, so the live set must be bounded."""
+    release, fill = blocking_deployment_jobs
+    cap = app_mod._MAX_ACTIVE_DEPLOYMENT_JOBS
+
+    assert fill(cap) == cap
+    with app_mod._DEPLOYMENT_JOBS_LOCK:
+        assert len(app_mod._DEPLOYMENT_JOBS) == cap
+
+    with pytest.raises(app_mod.DeploymentJobStartError, match="capacity reached"):
+        app_mod.start_deployment_job(release.wait, 60)
+
+    with app_mod._DEPLOYMENT_JOBS_LOCK:
+        assert len(app_mod._DEPLOYMENT_JOBS) == cap
+
+
+def test_drained_deployment_job_frees_its_capacity_slot(blocking_deployment_jobs) -> None:
+    """Capacity is a live-set bound, not a lifetime quota: a finished job returns its slot."""
+    release, fill = blocking_deployment_jobs
+    cap = app_mod._MAX_ACTIVE_DEPLOYMENT_JOBS
+
+    fill(cap)
+    with pytest.raises(app_mod.DeploymentJobStartError, match="capacity reached"):
+        app_mod.start_deployment_job(release.wait, 60)
+
+    release.set()
+    assert app_mod._wait_for_deployment_jobs(30) is True
+    app_mod._open_deployment_jobs()
+    with app_mod._DEPLOYMENT_JOBS_LOCK:
+        assert not app_mod._DEPLOYMENT_JOBS
+
+    done = threading.Event()
+    assert app_mod.start_deployment_job(done.set) is False
+    assert done.wait(30) is True
+
+
+def test_shutdown_rejection_outranks_the_capacity_rejection(blocking_deployment_jobs) -> None:
+    """A draining plane reports shutdown, never a capacity message a caller would retry."""
+    release, fill = blocking_deployment_jobs
+
+    fill(app_mod._MAX_ACTIVE_DEPLOYMENT_JOBS)
+    assert app_mod._wait_for_deployment_jobs(0.01) is False
+
+    with pytest.raises(app_mod.DeploymentJobStartError, match="shutting down"):
+        app_mod.start_deployment_job(release.wait, 60)
 
 
 def _run_loop_once(monkeypatch, loop, worker):
@@ -157,7 +227,7 @@ def test_run_server_builds_the_app_and_delegates_to_uvicorn(monkeypatch) -> None
     monkeypatch.setattr(app_mod, "create_app", lambda: application)
     # run_server preflights the operator's configuration before starting uvicorn; this test runs
     # with none set, so stub it out -- the preflight behaviour itself is covered separately.
-    monkeypatch.setattr("flash.providers.preflight.require_operator_config", lambda: None)
+    monkeypatch.setattr("flash.providers.core.preflight.require_operator_config", lambda: None)
 
     app_mod.run_server(host="0.0.0.0", port=9000)
 
@@ -171,7 +241,7 @@ def test_run_server_preflights_before_starting_uvicorn(monkeypatch) -> None:
     operator gets it rendered as an unhandled ASGI startup exception under ~20 frames of
     starlette/contextlib. Running the check first is what lets __main__ print `error: ...` instead.
     """
-    from flash.providers.preflight import PreflightError
+    from flash.providers.core.preflight import PreflightError
 
     fake_uvicorn = types.ModuleType("uvicorn")
     fake_uvicorn.run = lambda *_args, **_kwargs: pytest.fail(
@@ -183,7 +253,7 @@ def test_run_server_preflights_before_starting_uvicorn(monkeypatch) -> None:
     def _fail():
         raise PreflightError("HF_TOKEN is required")
 
-    monkeypatch.setattr("flash.providers.preflight.require_operator_config", _fail)
+    monkeypatch.setattr("flash.providers.core.preflight.require_operator_config", _fail)
 
     with pytest.raises(PreflightError, match="HF_TOKEN"):
         app_mod.run_server(host="0.0.0.0", port=9000)
@@ -202,11 +272,11 @@ def test_run_server_does_not_repeat_the_advisory_preflight_logging(monkeypatch) 
     monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
     monkeypatch.setattr(app_mod, "create_app", lambda: object())
     monkeypatch.setattr(
-        "flash.providers.preflight.require_operator_config",
+        "flash.providers.core.preflight.require_operator_config",
         lambda: seen.append("require"),
     )
     monkeypatch.setattr(
-        "flash.providers.preflight.check_run_preflight",
+        "flash.providers.core.preflight.check_run_preflight",
         lambda: seen.append("check"),
     )
 

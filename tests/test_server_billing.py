@@ -2,22 +2,32 @@
 
 from __future__ import annotations
 
-import importlib
+import http.client
 import io
 import json
-import time
+import socket
+import ssl
 import urllib.error
 import urllib.request
 
 import pytest
 
-pytest.importorskip("fastapi")
-from fastapi.testclient import TestClient
+import flash.runner.lifecycle.preparation as runner_preparation
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.status as runner_status
 
+pytest.importorskip("fastapi")
+
+from tests._helpers.billing_precheck import (
+    PrecheckResponse,
+    billing_api,
+    precheck_http_error,
+    sabotage_submission_boundaries,
+)
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 SPEC = {
-    "model": "Qwen/Qwen3.5-4B",
+    "model": "Qwen/Qwen3.5-9B",
     "project": "11111111-1111-4111-8111-111111111111",
     "algorithm": "grpo",
     # A hub slug, because this fixture drives the HOSTED api: the managed plane accepts
@@ -47,9 +57,6 @@ def _identity_for_token(token: str) -> dict[str, str]:
 
 def _bearer(key: str) -> dict:
     return {"Authorization": f"Bearer {key}"}
-
-
-# --------------------------------------------------------------------------- client unit
 
 
 def _spec(monkeypatch):
@@ -82,7 +89,7 @@ def test_cents_rounds_half_up_not_bankers():
 
 
 def _completed_status(monkeypatch, *, cost_usd: float = 12.345, org_id: str = "org-A"):
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
 
     spec = _spec(monkeypatch)
     return RunStatus(
@@ -134,7 +141,7 @@ def test_charge_posts_completed_run_cost_and_parses_response(monkeypatch):
     assert body["gpu"] == "L40S"
     assert body["provider"] == "modal"
     assert body["method"] == "grpo"
-    assert body["model"] == "Qwen/Qwen3.5-4B"
+    assert body["model"] == "Qwen/Qwen3.5-9B"
     assert body["estimate"] == {
         "totalUsd": 12.345,
         "costBasis": "estimate",
@@ -145,7 +152,7 @@ def test_charge_posts_completed_run_cost_and_parses_response(monkeypatch):
 def test_charge_bills_cost_usd_for_a_cancelled_run(monkeypatch):
     """A cancelled run is charged its cost_usd exactly like a completed one -- the cancel path already
     set cost_usd to the estimate at the steps actually run, so charge_completed_run just bills it."""
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
     from flash.server.billing import charges as billing
 
     captured = {}
@@ -251,66 +258,123 @@ def test_http_error_detail_falls_back_to_reason():
     assert "Payment Required" in _http_error_detail(empty)
 
 
-# ------------------------------------------------------------------------- create_run gate
+def test_precheck_http_classifier_is_exhaustive():
+    from flash.server.billing.charges import (
+        PrecheckHttpDisposition as Disposition,
+    )
+    from flash.server.billing.charges import (
+        classify_precheck_http_status,
+    )
+
+    transient = {408, 425, 429, 500, 502, 503, 504}
+    for status in range(100, 600):
+        expected = (
+            Disposition.SUCCESS
+            if status == 200
+            else Disposition.AFFORDABILITY
+            if status == 402
+            else Disposition.FAIL_OPEN
+            if status in transient
+            else Disposition.BLOCK
+        )
+        assert classify_precheck_http_status(status) is expected
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "valid"),
+    [
+        (200, {"ok": True}, True),
+        (201, {"ok": True}, False),
+        (204, {"ok": True}, False),
+        (200, {"ok": True, "extra": 1}, False),
+        (200, b"not-json", False),
+        (200, b"", False),
+        (200, {}, False),
+        (200, [], False),
+        (200, "ok", False),
+        (200, {"ok": False}, False),
+        (200, {"ok": 1}, False),
+    ],
+)
+def test_precheck_response_protocol_matrix(monkeypatch, status, body, valid):
+    from flash.server.billing import charges as billing
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: PrecheckResponse(status, body))
+    if valid:
+        assert (
+            billing.precheck_training_run(internal_key="key", org_id="org", estimate_usd=1) == body
+        )
+        return
+    with pytest.raises(billing.PrecheckError) as excinfo:
+        billing.precheck_training_run(internal_key="key", org_id="org", estimate_usd=1)
+    assert excinfo.value.source is billing.PrecheckFailureSource.PROTOCOL
+
+
+@pytest.mark.parametrize(
+    ("failure", "source", "fail_open"),
+    [
+        (TimeoutError("slow"), "transport", True),
+        (ConnectionRefusedError("refused"), "transport", True),
+        (urllib.error.URLError(urllib.error.URLError(TimeoutError("slow"))), "transport", True),
+        (socket.gaierror(socket.EAI_AGAIN, "again"), "transport", True),
+        (OSError("disk"), "transport", False),
+        (OSError("socket"), "transport", False),
+        (ssl.SSLCertVerificationError(1, "certificate"), "transport", False),
+        (socket.gaierror(socket.EAI_NONAME, "not found"), "transport", False),
+        (urllib.error.URLError("connection refused"), "transport", False),
+        (http.client.RemoteDisconnected("closed without response"), "transport", False),
+        (ValueError("unknown url type"), "protocol", False),
+        (http.client.BadStatusLine("bad framing"), "protocol", False),
+    ],
+)
+def test_precheck_failure_source_and_retry_matrix(monkeypatch, failure, source, fail_open):
+    from flash.server.billing import charges as billing
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: (_ for _ in ()).throw(failure))
+    with pytest.raises(billing.PrecheckError) as excinfo:
+        billing.precheck_training_run(internal_key="key", org_id="org", estimate_usd=1)
+    assert excinfo.value.source.value == source
+    expected_retry = (
+        billing.PrecheckRetryDisposition.FAIL_OPEN
+        if fail_open
+        else billing.PrecheckRetryDisposition.BLOCK
+    )
+    assert excinfo.value.retry is expected_retry
+
+
+@pytest.mark.parametrize("status", [302, 402, 408, 409, 425, 429, 500, 501, 502, 503, 504])
+def test_precheck_preserves_actual_http_failure_source(monkeypatch, status):
+    from flash.server.billing import charges as billing
+
+    detail = "insufficient balance" if status == 402 else "private upstream detail"
+
+    def fail(req, **_kwargs):
+        body = json.dumps({"detail": detail}).encode()
+        raise urllib.error.HTTPError(req.full_url, status, "failed", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+    with pytest.raises(billing.PrecheckError) as excinfo:
+        billing.precheck_training_run(internal_key="key", org_id="org", estimate_usd=1)
+    assert excinfo.value.source is billing.PrecheckFailureSource.HTTP
+    assert excinfo.value.status_code == status
+    assert excinfo.value.public_detail == (detail if status == 402 else None)
+    expected_retry = (
+        billing.PrecheckRetryDisposition.FAIL_OPEN
+        if status in {408, 425, 429, 500, 502, 503, 504}
+        else billing.PrecheckRetryDisposition.BLOCK
+    )
+    assert excinfo.value.retry is expected_retry
 
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    monkeypatch.setenv("HF_TOKEN", "hf-test")
-
-    import flash.runner as runner
-    import flash.server.platform.auth as auth_mod
-    import flash.server.platform.db as db_mod
-
-    importlib.reload(runner)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "publish_source_snapshot", lambda _repo: _SOURCE_SNAPSHOT)
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-    monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
-    # Keep submit offline: validate + record, but the GPU job body is a no-op.
-    monkeypatch.setattr(runner, "_run_job", lambda *a, **k: None)
-
-    import flash.server.app as app_mod
-
-    importlib.reload(app_mod)
-    # configured provider keys would trigger orphan sweeps and status reporting. stub both because
-    # these billing tests assert only on the API response and must remain network-free.
-    import flash.providers as providers_mod
-    import flash.server.domain.projects as projects_mod
-    import flash.server.domain.run_registry as run_registry
-
-    monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
-    monkeypatch.setattr(
-        projects_mod,
-        "require_project_access",
-        lambda *, project_id, **_kwargs: project_id,
-    )
-    # A hub environment is validated against the Freesolo backend at submit. These are BILLING
-    # tests, so stub it to a pass the same way `require_project_access` is stubbed above; without
-    # it every submit here 4xxs on environment authorization before reaching any billing code.
-    import flash.server.domain.environment_registry as environment_registry_mod
-
-    monkeypatch.setattr(
-        environment_registry_mod,
-        "require_environment_project",
-        lambda **_kwargs: None,
-        raising=False,
-    )
-    monkeypatch.setattr(run_registry, "_post", lambda *a, **k: False, raising=False)
-    auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
-    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
-    # The new submit-time budget precheck would urllib-POST the real backend; stub it to a pass so
-    # the default submit path stays hermetic. Gate-specific tests below override this per-test.
-    import flash.server.billing.charges as billing_mod
-
-    monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **k: {"ok": True})
-    with TestClient(app_mod.create_app()) as client:
-        # startup preflight needs the fake token above; billing requests do not. keeping `ghp-test`
-        # here turns an offline billing test into a real environment-pin request to GitHub.
-        monkeypatch.delenv("GITHUB_TOKEN")
+    with billing_api(
+        tmp_path,
+        monkeypatch,
+        source_snapshot=_SOURCE_SNAPSHOT,
+        user_prefix=_USER_PREFIX,
+        identity_for_token=_identity_for_token,
+    ) as client:
         yield client
 
 
@@ -358,37 +422,19 @@ def test_external_submit_requires_org_for_completion_billing(api):
     assert api.get("/v1/runs", headers=_bearer("fslo-user-noorg")).json()["runs"] == []
 
 
-def test_dry_run_skips_billing(api):
-    res = api.post("/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer("fslo-user-3"))
-    assert res.status_code == 200, res.text
-    assert res.json()["state"] == "dry_run"
-    assert res.json()["billing_state"] is None
-    assert res.json()["billing_context"] is None
-
-
-def test_internal_identity_skips_billing(api, monkeypatch):
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-secret")
-
-    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-internal-secret"))
-    assert res.status_code == 200, res.text
-    assert res.json()["billing_state"] is None
-    assert res.json()["billing_context"] is None
-
-
 def test_submit_blocked_when_precheck_402(api, monkeypatch):
-    # a hard 402 from the budget precheck rejects the run up front, before any GPU is allocated,
-    # and the run is never recorded.
     import flash.server.billing.charges as billing_mod
 
+    events = sabotage_submission_boundaries(monkeypatch)
+
     def _block(**k):
-        raise billing_mod.BillingError(402, "insufficient balance")
+        raise precheck_http_error(402, detail="insufficient balance")
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
     assert res.status_code == 402, res.text
     assert "insufficient" in res.text
-    # rejected before record_run: nothing persisted for this user.
-    assert api.get("/v1/runs", headers=_bearer("fslo-user-1")).json()["runs"] == []
+    assert events == []
 
 
 def test_a_nonexistent_environment_is_refused_before_the_402(api, monkeypatch):
@@ -398,12 +444,12 @@ def test_a_nonexistent_environment_is_refused_before_the_402(api, monkeypatch):
     balance" for a typo'd environment -- sending the user to top up, for a run no balance can buy.
     Both faults are live here at once, and the spec's own defect has to win.
     """
-    import flash.envs.loader as env_loader
+    import flash.envs.loading.loader as env_loader
     import flash.server.billing.charges as billing_mod
-    from flash.envs.identity import GitHubPermanentError
+    from flash.envs.meta.identity import GitHubPermanentError
 
     def _block(**k):
-        raise billing_mod.BillingError(402, "insufficient balance")
+        raise precheck_http_error(402, detail="insufficient balance")
 
     def _permanent(_parsed, *_a, **_k):
         raise GitHubPermanentError("GitHub environment request failed (404): Not Found")
@@ -421,8 +467,8 @@ def test_a_nonexistent_environment_is_refused_before_the_402(api, monkeypatch):
 
 def test_transient_environment_resolve_is_attempted_once_per_request(api, monkeypatch):
     """packaged opd defers after one bounded request-side attempt on a transient failure."""
-    import flash.envs.loader as env_loader
-    from flash.envs.identity import GitHubUnavailableError
+    import flash.envs.loading.loader as env_loader
+    from flash.envs.meta.identity import GitHubUnavailableError
 
     calls = []
 
@@ -433,7 +479,7 @@ def test_transient_environment_resolve_is_attempted_once_per_request(api, monkey
     monkeypatch.setattr(env_loader, "_github_token", lambda: "ghp_test")
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", _transient)
     monkeypatch.setattr(
-        "flash.server.domain.teacher_broker.preflight_validate_managed_teacher",
+        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
         lambda _spec: None,
     )
     spec = {
@@ -455,8 +501,8 @@ def test_transient_environment_resolve_is_attempted_once_per_request(api, monkey
 
 def test_tokenless_packaged_opd_defers_without_anonymous_github_lookup(api, monkeypatch):
     """a tokenless plane must not turn a private packaged opd environment into a false 404."""
-    import flash.envs.loader as env_loader
-    from flash.envs.identity import GitHubPermanentError
+    import flash.envs.loading.loader as env_loader
+    from flash.envs.meta.identity import GitHubPermanentError
 
     calls = []
 
@@ -467,7 +513,7 @@ def test_tokenless_packaged_opd_defers_without_anonymous_github_lookup(api, monk
     monkeypatch.setattr(env_loader, "_github_token", lambda: None)
     monkeypatch.setattr(env_loader, "_resolve_ref_sha", _anonymous_404)
     monkeypatch.setattr(
-        "flash.server.domain.teacher_broker.preflight_validate_managed_teacher",
+        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
         lambda _spec: None,
     )
     spec = {
@@ -487,20 +533,42 @@ def test_tokenless_packaged_opd_defers_without_anonymous_github_lookup(api, monk
     assert calls == []
 
 
-def test_submit_fails_open_when_precheck_unreachable(api, monkeypatch):
-    # a non-402 billing error (backend unreachable / 5xx) must not block training; the completion
-    # charge is the backstop. the run is still accepted and recorded.
+@pytest.mark.parametrize("status", [408, 425, 429, 500, 502, 503, 504])
+def test_submit_fails_open_only_for_transient_http_statuses(api, monkeypatch, status):
     import flash.server.billing.charges as billing_mod
 
-    def _unreachable(**k):
-        raise billing_mod.BillingError(503, "billing service unavailable")
+    def _unreachable(**_kwargs):
+        raise precheck_http_error(status)
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", _unreachable)
-    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer(f"fslo-user-{status}"))
     assert res.status_code == 200, res.text
     assert [
-        r["run_id"] for r in api.get("/v1/runs", headers=_bearer("fslo-user-1")).json()["runs"]
+        r["run_id"]
+        for r in api.get("/v1/runs", headers=_bearer(f"fslo-user-{status}")).json()["runs"]
     ] == [res.json()["run_id"]]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_submit_fails_open_for_typed_transport_failure(api, monkeypatch, dry_run):
+    import flash.server.billing.charges as billing_mod
+
+    def _unreachable(**_kwargs):
+        raise billing_mod.PrecheckError(
+            source=billing_mod.PrecheckFailureSource.TRANSPORT,
+            retry=billing_mod.PrecheckRetryDisposition.FAIL_OPEN,
+            private_detail=TimeoutError("billing timed out"),
+        )
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", _unreachable)
+    res = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": dry_run},
+        headers=_bearer(f"fslo-user-transport-{dry_run}"),
+    )
+    assert res.status_code == 200, res.text
+    if dry_run:
+        assert res.json()["affordability_verified"] is False
 
 
 def test_dry_run_verifies_affordability_and_still_persists(api, monkeypatch):
@@ -531,6 +599,7 @@ def test_dry_run_verifies_affordability_and_still_persists(api, monkeypatch):
 
     assert res.status_code == 200, res.text
     assert res.json()["state"] == "dry_run"
+    assert res.json()["affordability_verified"] is True
     # verified before the run is recorded, and it stays a dry run: no billing context is attached
     assert events == [("precheck", "org-1"), ("record", res.json()["run_id"])]
     assert res.json()["billing_state"] is None
@@ -543,7 +612,7 @@ def test_dry_run_blocked_when_org_cannot_afford_the_estimate(api, monkeypatch):
     import flash.server.billing.charges as billing_mod
 
     def _block(**k):
-        raise billing_mod.BillingError(402, "insufficient balance")
+        raise precheck_http_error(402, detail="insufficient balance")
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
     res = api.post(
@@ -556,55 +625,92 @@ def test_dry_run_blocked_when_org_cannot_afford_the_estimate(api, monkeypatch):
     assert "insufficient" in res.text
 
 
-def test_dry_run_fails_open_when_billing_backend_is_unreachable(api, monkeypatch):
-    # a billing-infra blip must not block local validation, matching real submission's behavior.
-    import flash.server.billing.charges as billing_mod
-
-    def _unreachable(**k):
-        raise billing_mod.BillingError(503, "billing service unavailable")
-
-    monkeypatch.setattr(billing_mod, "precheck_training_run", _unreachable)
-    res = api.post(
-        "/v1/runs",
-        json={"spec": SPEC, "dry_run": True},
-        headers=_bearer("fslo-user-1"),
-    )
-
-    assert res.status_code == 200, res.text
-    assert res.json()["state"] == "dry_run"
-    # failing open is intentional, but the response must not imply cost was validated: the same
-    # spec can still be rejected 402 once the backend recovers.
-    assert res.json()["affordability_verified"] is False
-
-
-def test_dry_run_reports_affordability_verified_when_the_check_ran(api, monkeypatch):
-    """A real pass and a failed-open skip must be distinguishable, since both answer 200."""
-    import flash.server.billing.charges as billing_mod
-
-    monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **k: {"ok": True})
-    res = api.post(
-        "/v1/runs",
-        json={"spec": SPEC, "dry_run": True},
-        headers=_bearer("fslo-user-1"),
-    )
-
-    assert res.status_code == 200, res.text
-    assert res.json()["affordability_verified"] is True
-
-
-def test_dry_run_reports_unverified_when_internal_reporting_is_off(api, monkeypatch):
-    """The other fail-open path: no internal key, so the precheck returns before calling billing."""
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_hosted_billable_submit_blocks_when_internal_key_is_missing(api, monkeypatch, dry_run):
     import flash.server.platform.internal_client as internal_mod
 
+    events = sabotage_submission_boundaries(monkeypatch)
     monkeypatch.setattr(internal_mod, "internal_key", lambda: None)
     res = api.post(
         "/v1/runs",
-        json={"spec": SPEC, "dry_run": True},
+        json={"spec": SPEC, "dry_run": dry_run},
         headers=_bearer("fslo-user-1"),
     )
 
-    assert res.status_code == 200, res.text
-    assert res.json()["affordability_verified"] is False
+    assert res.status_code == 503, res.text
+    assert res.json()["detail"] == "billing verification is unavailable; no paid work was started"
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "failure"),
+    [
+        ("raise", precheck_http_error(302)),
+        ("raise", precheck_http_error(409)),
+        ("raise", precheck_http_error(501)),
+        ("protocol", "invalid response"),
+        ("transport", ssl.SSLCertVerificationError(1, "certificate")),
+        ("transport", socket.gaierror(socket.EAI_NONAME, "not found")),
+        ("transport", http.client.RemoteDisconnected("closed")),
+        ("transport", OSError("permanent os error")),
+        ("raise", RuntimeError("unexpected")),
+    ],
+)
+def test_permanent_precheck_failures_block_all_submission_boundaries(
+    api, monkeypatch, mode, failure
+):
+    from flash.server.billing import charges as billing
+
+    events = sabotage_submission_boundaries(monkeypatch)
+
+    def fail(**_kwargs):
+        if mode == "protocol":
+            raise billing.PrecheckError(
+                source=billing.PrecheckFailureSource.PROTOCOL,
+                status_code=502,
+                private_detail=failure,
+            )
+        if mode == "transport":
+            raise billing._precheck_error_from_exception(failure)
+        raise failure
+
+    monkeypatch.setattr(billing, "precheck_training_run", fail)
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-permanent"))
+
+    assert res.status_code == 502, res.text
+    assert res.json()["detail"] == "billing verification failed; no paid work was started"
+    assert "private upstream detail" not in res.text
+    assert events == []
+
+
+def test_precheck_logging_redacts_and_bounds_private_detail(api, monkeypatch, caplog):
+    from flash.server.billing import charges as billing
+
+    secret = "billing-secret-value"
+    monkeypatch.setenv("BILLING_API_KEY", secret)
+    error = billing.PrecheckError(
+        source=billing.PrecheckFailureSource.PROTOCOL,
+        private_detail=f"token={secret} {'x' * 2000}",
+    )
+    monkeypatch.setattr(
+        billing, "precheck_training_run", lambda **_kwargs: (_ for _ in ()).throw(error)
+    )
+    caplog.set_level("WARNING", logger="flash.server.runs")
+
+    res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-log"))
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "billing precheck" in record.getMessage()
+    ]
+    assert res.status_code == 502
+    assert secret not in res.text
+    assert secret not in "".join(messages)
+    assert messages
+    assert "run " in messages[-1]
+    assert "<redacted>" in messages[-1]
+    assert len(messages[-1]) <= 600
 
 
 def test_billable_dry_run_without_an_org_is_rejected_like_a_real_submit(api, monkeypatch):
@@ -633,7 +739,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
     import flash.server.billing.charges as billing_mod
 
     def _block(**k):
-        raise billing_mod.BillingError(402, "insufficient balance")
+        raise precheck_http_error(402, detail="insufficient balance")
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
     unsupported_spec = {
@@ -675,11 +781,17 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
     assert "insufficient" not in res.text
 
 
-def test_internal_submit_skips_affordability_precheck_before_persistence(api, monkeypatch):
+@pytest.mark.parametrize("standalone", [False, True])
+def test_internal_submit_skips_affordability_precheck_before_persistence(
+    api, monkeypatch, standalone
+):
     import flash.server.billing.charges as billing_mod
     import flash.server.platform.db as db_mod
 
-    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-secret")
+    key = "operator-key" if standalone else "fslo-internal-secret"
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", key)
+    if standalone:
+        monkeypatch.setenv("FLASH_STANDALONE", "1")
     events = []
     original_record_run = db_mod.record_run
 
@@ -693,11 +805,10 @@ def test_internal_submit_skips_affordability_precheck_before_persistence(api, mo
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", unexpected_precheck)
     monkeypatch.setattr(db_mod, "record_run", capture_record_run)
-    res = api.post(
-        "/v1/runs",
-        json={"spec": SPEC},
-        headers=_bearer("fslo-internal-secret"),
-    )
+    spec = SPEC
+    if standalone:
+        spec = {**SPEC, "environment": {"id": "github:owner/repo@main:env/environment.py"}}
+    res = api.post("/v1/runs", json={"spec": spec}, headers=_bearer(key))
 
     assert res.status_code == 200, res.text
     assert res.json()["billing_context"] is None
@@ -708,15 +819,19 @@ def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch
     import flash.server.platform.auth as auth_mod
 
     token = "fslo-user-spoof"
-    auth_mod._verify_cache[token] = (
-        True,
-        {
-            "key_prefix": "internal",
-            "email": "user@example.com",
-            "org_id": "org-spoof",
-            "org_slug": "org-spoof",
-        },
-        time.time() + auth_mod._VERIFY_CACHE_TTL_S,
+    monkeypatch.setattr(
+        auth_mod,
+        "_freesolo_verify",
+        lambda candidate: (
+            {
+                "key_prefix": "internal",
+                "email": "user@example.com",
+                "org_id": "org-spoof",
+                "org_slug": "org-spoof",
+            }
+            if candidate == token
+            else None
+        ),
     )
 
     me = api.get("/v1/me", headers=_bearer(token))
@@ -733,7 +848,7 @@ def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch
 
 def test_submit_failure_records_nothing(api, monkeypatch):
     """If submit_job fails, no run row is left behind and no billing reversal is needed."""
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     def failing_submit(spec, dry_run=False, background=True, **kwargs):
         raise RuntimeError("provider out of capacity")
@@ -748,7 +863,7 @@ def test_submit_failure_records_nothing(api, monkeypatch):
 
 def test_record_run_failure_does_not_submit(api, monkeypatch):
     """If ``db.record_run`` fails (e.g. SQLite locked/full), submit_job is not reached."""
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
     import flash.server.platform.db as db_mod
 
     def failing_record(run_id, key_id):
@@ -771,15 +886,14 @@ _SFT_SPEC = {**SPEC, "algorithm": "sft", "train": {"epochs": 1, "max_examples": 
 
 
 def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
-    import flash.runner as runner
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
     from flash.runner.supervise import lifecycle
 
     spec = _spec(monkeypatch)
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
-    runner._save_status(
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
+    runner_state._save_status(
         RunStatus(
             run_id=spec.run_id,
             state="done",
@@ -802,7 +916,7 @@ def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
     lifecycle._charge_completed_run_by_id(spec.run_id, log)
 
     assert calls == [("fslo-internal", "run-1", 1.23)]
-    status = runner.get_status("run-1")
+    status = runner_status.get_status("run-1")
     assert status.billing_state == "charged"
     assert status.billing_error is None
     assert status.billing_charge == {"amountCents": 123, "balanceCents": 877, "replay": False}
@@ -810,14 +924,13 @@ def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
 
 
 def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
-    import flash.runner as runner
-    from flash.runner import RunStatus
+    from flash.runner.lifecycle.state import RunStatus
     from flash.runner.supervise import lifecycle
 
     spec = _spec(monkeypatch)
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    runner._save_status(
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    runner_state._save_status(
         RunStatus(
             run_id=spec.run_id,
             state="done",
@@ -834,7 +947,7 @@ def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
 
     lifecycle._charge_completed_run_by_id(spec.run_id, io.StringIO())
 
-    status = runner.get_status("run-1")
+    status = runner_status.get_status("run-1")
     assert status.billing_state == "failed"
     assert "FREESOLO_INTERNAL_KEY" in (status.billing_error or "")
 
@@ -844,13 +957,13 @@ def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
 
 def test_route_blames_the_adapter_only_for_tagged_failures(api, monkeypatch):
     # a genuine adapter-resolution failure keeps the actionable 400 that names the source.
-    import flash.runner as runner_mod
-    import flash.server.app as app_mod
+
+    import flash.server.asgi.app as app_mod
 
     # raise the class off the reloaded module: the api fixture reloads flash.runner, so a symbol
     # imported at module scope here would be a different object than the route's.
     def _prepare(*args, **kwargs):
-        raise runner_mod.WarmStartPreparationError("private-owner/private-repo:sft/step-20")
+        raise runner_preparation.WarmStartPreparationError("private-owner/private-repo:sft/step-20")
 
     monkeypatch.setattr(app_mod, "prepare_job", _prepare)
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
@@ -865,13 +978,16 @@ def test_route_blames_the_adapter_only_for_tagged_failures(api, monkeypatch):
 def test_route_does_not_blame_the_adapter_for_unrelated_failures(api, monkeypatch):
     # prepare_job also performs gpu, budget, and environment checks. with init_from_adapter set,
     # unrelated failures must retain their own attribution.
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
 
     def _prepare(*args, **kwargs):
         raise ValueError("no gpu class satisfies the requested memory")
 
     monkeypatch.setattr(app_mod, "prepare_job", _prepare)
-    warm_start_spec = {**SPEC, "train": {**SPEC["train"], "init_from_adapter": "source-run"}}
+    warm_start_spec = {
+        **SPEC,
+        "train": {**SPEC["train"], "init_from_adapter": "source-run/final"},
+    }
     res = api.post("/v1/runs", json={"spec": warm_start_spec}, headers=_bearer("fslo-user-1"))
 
     assert "no gpu class satisfies" in res.text

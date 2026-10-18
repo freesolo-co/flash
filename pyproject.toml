@@ -28,7 +28,7 @@ dependencies = []
 # stack in Dockerfile.worker, with the fallback verl venv mirrored in capabilities.py).
 gpu = [
     "torch==2.10.0",
-    "transformers>=5.6,<5.13",
+    "transformers>=5.8,<5.13",
     "tokenizers>=0.22",
     "tiktoken>=0.12",
     "peft>=0.19",
@@ -40,7 +40,7 @@ gpu = [
     "uv>=0.5",
     # Worker runtime: Freesolo environment loading and HF checkpoint I/O.
     "datasets>=2.19",
-    "freesolo>=0.4.1",
+    "freesolo>=0.4.2",
     "huggingface-hub>=1.2.0",
 ]
 # Operator dependencies stay out of the base CLI install. Modal runs the GPU workloads;
@@ -61,15 +61,17 @@ server = [
     "fastapi>=0.136,<1",
     "uvicorn>=0.52,<1",
     # customer-owned modal lifecycle mutations execute in the control plane.
-    "modal==1.5.4",
+    "modal==1.6.1",
     "httpx>=0.27",
     "jsonschema>=4.23",
     "referencing>=0.28.4",
     "regex>=2024.11.6",
     "huggingface-hub>=1.2.0",
     "datasets>=2.19",
-    "freesolo>=0.4.1",
-    "transformers>=5.6,<5.13",
+    "freesolo>=0.4.2",
+    "transformers>=5.8,<5.13",
+    # Tokenizer chat templates are rendered during control-plane workload profiling.
+    "jinja2>=3.1.0",
     # the control plane decodes images: flash/server/routes/runs.py imports
     # preflight_validate_image_opd at module load, and flash/content/multimodal.py opens every image
     # source with PIL to validate it. without Pillow a self-hoster on [server] gets
@@ -100,14 +102,15 @@ serving = [
     # this one is what the serving image installs ALONE -- so a range here lets the container
     # resolve a different modal than the control plane was validated against, on a rebuild that
     # changed nothing else. one policy per package.
-    "modal==1.5.4",
+    "modal==1.6.1",
     "orjson>=3.10.0",
     # `src/multimodal.py` decodes and normalizes inbound images at module scope. the `gpu` extra
     # gets Pillow transitively via vllm, but this extra deliberately excludes vllm, so it has to
     # state Pillow itself.
     "pillow>=11",
-    # imported directly by `src/schemas.py`, `src/serving_io.py` and `src/settings.py`. it does
-    # arrive under `pydantic-settings`, but a direct module-scope import should not rely on
+    # imported directly by `src/io/schemas.py`, `src/io/requests.py` and
+    # `src/store/settings.py`. it does arrive under `pydantic-settings`, but a direct module-scope
+    # import should not rely on
     # another package's dependency to keep supplying it.
     "pydantic>=2.7.0",
     "pydantic-settings>=2.6.0",
@@ -126,12 +129,12 @@ serve-runtime = [
     "pillow>=11.0.0",
     # same range as every other extra: the serving image resolves from these bounds rather than the
     # lockfile, so an unbounded declaration silently rides a transformers line nothing validated.
-    "transformers>=5.6,<5.13",
+    "transformers>=5.8,<5.13",
     "vllm==0.23.0",
 ]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
 dev = [
-    "modal==1.5.4",
+    "modal==1.6.1",
     "orjson>=3.10",
     "pydantic-settings>=2.7",
     "cloudpickle>=3.0",
@@ -139,11 +142,11 @@ dev = [
     "pytest>=9.0.3",
     # dependency contract tests parse exact pins without relying on a transitive install.
     "packaging>=24,<27",
-    # Upper bound tracks uv.lock (ruff 0.16.x), which is what CI lints with. Without it, an
+    # Upper bound tracks uv.lock (ruff 0.17.x), which is what CI lints with. Without it, an
     # install that ignores the lockfile (`uv pip install -e '.[dev]'`, plain pip) resolves whatever
     # ruff is newest, whose added rules fail on a tree CI calls clean. Raise both sites together
     # with the lockfile, never ahead of it.
-    "ruff>=0.6,<0.17",
+    "ruff>=0.6,<0.18",
     # mirror server's 0.136 floor so dev remains compatible with the deployed serving extra pair.
     "fastapi>=0.136,<1",
     "uvicorn>=0.52,<1",
@@ -153,8 +156,8 @@ dev = [
     "regex>=2024.11.6",
     "huggingface-hub>=1.2.0",
     "datasets>=2.19",
-    "freesolo>=0.4.1",
-    "transformers>=5.6,<5.13",
+    "freesolo>=0.4.2",
+    "transformers>=5.8,<5.13",
     "tokenizers>=0.22",
     "tiktoken>=0.12",
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
@@ -171,12 +174,12 @@ Homepage = "https://github.com/freesolo-co/flash"
 Repository = "https://github.com/freesolo-co/flash"
 
 [project.scripts]
-flash = "flash.cli:main"
-# Keep the established explicit alias alongside the standard `flash` command.
-flash-cli = "flash.cli:main"
+flash = "flash.cli.parsing.main:main"
+# Established explicit alias for the Flash command.
+flash-cli = "flash.cli.parsing.main:main"
 # Operator-only: the control plane is a separate service, run once on the host, not a `flash`
 # subcommand. Requires the `server` extra (`pip install 'freesolo-flash[server]'`).
-flash-server = "flash.server.__main__:main"
+flash-server = "flash.server.asgi.cli:main"
 
 [build-system]
 # bound the build backend to the validated major line for reproducible package builds.
@@ -233,11 +236,11 @@ dev = [
     # dependency contract tests parse exact pins without relying on a transitive install.
     "packaging>=24,<27",
     # Keep in lockstep with the `dev` extra above and with uv.lock.
-    "ruff>=0.6,<0.17",
+    "ruff>=0.6,<0.18",
     # Offline worker/env tests import these without the heavy `gpu` stack; the CI test env
     # (`--extra server --dev`) gets httpx + huggingface-hub from the `server` extra.
     "datasets>=2.19",
-    "freesolo>=0.4.1",
+    "freesolo>=0.4.2",
     "tokenizers>=0.22",
     "tiktoken>=0.12",
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
@@ -320,7 +323,7 @@ ignore = [
 # Routes live inside the create_app() closure; with PEP 563 lazy annotations,
 # Annotated[..., Depends(closure_local)] cannot be resolved by get_type_hints,
 # so the definition-time `= Depends(...)` form is required here.
-"flash/server/app.py" = ["FAST002"]
+"flash/server/asgi/app.py" = ["FAST002"]
 # `_ScoredResponseText` subclasses `str` to stay grader-compatible while carrying the structured
 # views as attributes; __slots__ would defeat that.
-"flash/envs/adapter.py" = ["SLOT000"]
+"flash/envs/loading/adapter.py" = ["SLOT000"]

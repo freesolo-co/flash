@@ -1,6 +1,6 @@
 import pytest
 
-from flash.providers import preflight
+from flash.providers.core import preflight
 
 
 @pytest.mark.parametrize(

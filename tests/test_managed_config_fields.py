@@ -74,7 +74,7 @@ def _fully_managed_internal_spec() -> JobSpec:
     """An internal spec carrying every managed field (the worker's view)."""
     spec = JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "environment": {
                 "id": "github:owner/repo@main:env/environment.py",
@@ -136,7 +136,7 @@ def test_public_spec_round_trips_through_user_parser():
     # the run_id travels as the separate server-assigned parameter, not in the config body.
     public = _fully_managed_internal_spec().to_dict()
     reparsed = spec_from_dict(public, run_id="flash-managed-run")
-    assert reparsed.model == "Qwen/Qwen3.5-0.8B"
+    assert reparsed.model == "Qwen/Qwen3.5-9B"
     assert reparsed.run_id == "flash-managed-run"  # from the parameter, not the config body
     # the server re-derives managed defaults; the user never supplied them
     assert reparsed.train.hf_repo == ""

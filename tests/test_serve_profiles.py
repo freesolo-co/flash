@@ -6,9 +6,9 @@ from dataclasses import replace
 
 import pytest
 
-from flash.core.catalog import get_model, supports_image_training
+from flash.core.catalog import MODELS, get_model, supports_image_training
 from flash.serve.control import ModalPlacement
-from flash.serve.profiles import (
+from flash.serve.deployment.profiles import (
     SERVE_RUNTIME_FAMILY,
     ProfileError,
     ServingProfile,
@@ -18,10 +18,11 @@ from flash.serve.profiles import (
 )
 from flash.serve.provisioning import ServingImage
 from flash.serve.runtime.multimodal import _MAX_IMAGES
-from flash.serving.src.model_config import reasoning_parser_for
-from flash.serving.src.settings import KV_CACHE_DTYPE
+from flash.serving.src.engine.model_config import reasoning_parser_for
+from flash.serving.src.store.settings import KV_CACHE_DTYPE
 
 MODEL = "Qwen/Qwen3.5-9B"
+MODELS_WITH_PROFILES = tuple(sorted(MODELS))
 DIGEST = "sha256:" + "a" * 64
 REVISION = "b" * 40
 
@@ -43,10 +44,10 @@ def _engine(profile: ServingProfile, **overrides: object):
     return profile.engine(**kwargs)  # type: ignore[arg-type]
 
 
-def test_supported_models_are_all_resolvable() -> None:
+def test_supported_models_exactly_cover_the_public_catalog() -> None:
     models = supported_models()
 
-    assert models, "the registry must expose at least one profile"
+    assert models == tuple(sorted(MODELS))
     for model_id in models:
         assert get_profile(model_id).model_id == model_id
 
@@ -94,22 +95,11 @@ def test_no_profile_forces_a_quantization_the_checkpoint_would_reject() -> None:
         )
 
 
-def test_profiles_carry_the_reasoning_parser_hosted_serving_configures() -> None:
-    # `_structured_state` raises `PromptError` -- a 400 -- when a request asks for structured
-    # outputs while thinking is on and no reasoning parser is configured. these adapters carry a
-    # `thinking_default` and the public endpoint accepts per-request `structured_outputs` /
-    # `response_format`, so an unset parser made that supported combination fail every time on a
-    # perfectly healthy engine.
-    #
-    # read from the hosted config rather than hardcoded: these are the same base models on the
-    # same checkpoints, so the two must not drift apart in either direction.
+def test_profiles_carry_the_qwen3_reasoning_parser() -> None:
     for model_id in supported_models():
-        expected = reasoning_parser_for(model_id)
-        assert expected is not None, f"hosted serving configures no parser for {model_id}"
-        assert get_profile(model_id).reasoning_parser == expected, (
-            f"{model_id} diverges from the parser hosted serving runs for the same checkpoint; "
-            "thinking plus structured outputs would 400"
-        )
+        assert get_profile(model_id).reasoning_parser == "qwen3"
+        if model_id != "Qwen/Qwen3.8-27B":
+            assert reasoning_parser_for(model_id) == "qwen3"
 
 
 def test_profiles_keep_the_validated_fp8_kv_cache() -> None:
@@ -143,18 +133,36 @@ def test_unknown_model_fails_closed_rather_than_defaulting() -> None:
     assert "no customer-owned serving profile" in str(excinfo.value)
 
 
-def test_profile_matches_the_catalog_serving_capacity() -> None:
-    profile = get_profile(MODEL)
-    serving = get_model(MODEL).serving
+@pytest.mark.parametrize("model_id", MODELS_WITH_PROFILES)
+def test_profile_matches_the_catalog_serving_capacity(model_id: str) -> None:
+    profile = get_profile(model_id)
+    serving = get_model(model_id).serving
     assert serving is not None
 
     assert profile.max_model_len == serving.max_model_len
     assert profile.max_num_seqs == serving.max_num_seqs
+    assert profile.max_num_batched_tokens == (serving.max_num_batched_tokens or None)
     assert profile.max_loras == serving.max_loras
+    assert profile.max_cpu_loras == serving.max_cpu_loras
     assert profile.max_lora_rank == serving.max_lora_rank
+    assert profile.tensor_parallel_size == serving.tensor_parallel_size
     assert profile.gpu_memory_utilization == serving.gpu_memory_utilization
+    assert profile.image_limit == serving.image_limit
     assert profile.served_model == serving.serve_model_id
-    assert profile.modal_gpu == serving.gpu
+    # SHAPE agrees with the catalog (above); the CARD deliberately does not. serving.gpu is the
+    # freesolo-owned hosted plane's card, modal_gpu is the card THIS customer-owned profile was
+    # live-qualified on. Pinned per model rather than asserted "different", so a profile silently
+    # drifting to some other unqualified card still fails here.
+    assert serving.gpu == "B200"  # every hosted tier
+    assert (
+        profile.modal_gpu
+        == {
+            "Qwen/Qwen3.5-9B": "L40S",
+            "Qwen/Qwen3.8-27B": "H100",
+            "Qwen/Qwen3.6-35B-A3B": "H200",
+        }[model_id]
+    )
+    assert profile.modal_live_qualified is True
 
 
 @pytest.mark.parametrize(
@@ -163,9 +171,12 @@ def test_profile_matches_the_catalog_serving_capacity() -> None:
         ("max_model_len", 65536),
         ("max_lora_rank", 64),
         ("max_num_seqs", 4),
+        ("max_num_batched_tokens", 2048),
+        ("max_cpu_loras", 32),
+        ("tensor_parallel_size", 2),
         ("gpu_memory_utilization", 0.5),
+        ("image_limit", 2),
         ("served_model", "Freesolo-Co/other"),
-        ("modal_gpu", "H100"),
     ],
 )
 def test_profile_drifting_from_the_catalog_is_rejected(
@@ -173,7 +184,7 @@ def test_profile_drifting_from_the_catalog_is_rejected(
 ) -> None:
     # the catalog is the advertised serving capacity contract. a profile that quietly serves a
     # longer context or a higher rank than the catalog would deploy a shape no gate checked.
-    from flash.serve import profiles
+    from flash.serve.deployment import profiles
 
     drifted = replace(get_profile(MODEL), **{field: value})
     monkeypatch.setitem(profiles._PROFILES, MODEL, drifted)
@@ -182,6 +193,89 @@ def test_profile_drifting_from_the_catalog_is_rejected(
         get_profile(MODEL)
 
     assert "disagrees with the catalog" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("modal_live_qualified", 1, "must be an exact bool"),
+        ("served_model", " ", "must be a nonempty unpadded string"),
+        ("modal_gpu", "", "must be a nonempty unpadded string"),
+        ("modality", "text", "text engines cannot declare an image_limit"),
+        ("max_loras", 0, "max_loras must be a positive integer"),
+        ("served_model_revision", "A" * 40, "not an immutable commit"),
+        ("engine_args", {"bad": object()}, "invalid engine inputs"),
+    ],
+)
+def test_structurally_invalid_profile_fails_the_whole_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    from flash.serve.deployment import profiles
+
+    monkeypatch.setitem(profiles._PROFILES, MODEL, replace(get_profile(MODEL), **{field: value}))
+
+    with pytest.raises(ProfileError, match=message):
+        supported_models()
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "sha256:" + "A" * 64,
+        "sha256:" + "a" * 63,
+        "sha512:" + "a" * 64,
+        "sha256:" + "g" * 64,
+    ],
+)
+def test_invalid_certified_image_digest_fails_the_whole_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    digest: str,
+) -> None:
+    from flash.serve.deployment import profiles
+
+    monkeypatch.setitem(
+        profiles._PROFILES,
+        MODEL,
+        replace(get_profile(MODEL), modal_certified_image_digest=digest),
+    )
+
+    with pytest.raises(
+        ProfileError, match="must be sha256: followed by 64 lowercase hex characters"
+    ):
+        supported_models()
+
+
+def test_missing_profile_fails_the_whole_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    from flash.serve.deployment import profiles
+
+    monkeypatch.delitem(profiles._PROFILES, "Qwen/Qwen3.8-27B")
+    with pytest.raises(ProfileError, match=r"missing=Qwen/Qwen3\.8-27B"):
+        get_profile(MODEL)
+
+
+def test_extra_profile_fails_the_whole_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    from flash.serve.deployment import profiles
+
+    monkeypatch.setitem(
+        profiles._PROFILES, "extra/model", replace(get_profile(MODEL), model_id="extra/model")
+    )
+    with pytest.raises(ProfileError, match="extra=extra/model"):
+        supported_models()
+
+
+def test_profile_key_must_match_model_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    from flash.serve.deployment import profiles
+
+    monkeypatch.setitem(
+        profiles._PROFILES,
+        "Qwen/Qwen3.8-27B",
+        replace(get_profile("Qwen/Qwen3.8-27B"), model_id="Qwen/Qwen3.5-9B"),
+    )
+    with pytest.raises(ProfileError, match=r"profile\.model_id"):
+        get_profile(MODEL)
 
 
 def test_engine_derives_fingerprints_from_the_carried_kwargs() -> None:
@@ -233,29 +327,12 @@ def test_modal_placement_uses_the_validated_gpu_and_matches_tensor_parallelism()
     )
 
     assert type(placement) is ModalPlacement
-    assert placement.gpu == profile.modal_gpu
+    assert placement.gpu == profile.modal_gpu_request
     # _validate_placement rejects a None region, so a placement built without one could never be
     # provisioned. asserting it here keeps the profile from silently reverting to that.
     assert placement.region == "us-east"
     # DeploymentSpec requires placement gpu_count == engine tensor_parallel_size.
     assert placement.gpu_count == profile.tensor_parallel_size
-
-
-@pytest.mark.parametrize(
-    ("provider", "supplied"),
-    [
-        ("modal", {"workspace_name": "workspace", "region": "us-east"}),
-        ("modal", {"environment": "dev", "region": "us-east"}),
-        ("modal", {"workspace_name": "workspace", "environment": "dev"}),
-    ],
-)
-def test_incomplete_placement_inputs_are_rejected(provider: str, supplied: dict) -> None:
-    profile = get_profile(MODEL)
-
-    with pytest.raises(ProfileError) as excinfo:
-        placement_for(profile, provider, **supplied)  # type: ignore[arg-type]
-
-    assert "requires" in str(excinfo.value)
 
 
 def test_unsupported_provider_is_rejected() -> None:
@@ -292,3 +369,48 @@ def test_image_capable_profiles_enable_tower_connector_lora() -> None:
             f"{model_id} serves images but disables tower connector lora, so vllm would reject "
             "every adapter trained on images"
         )
+
+
+def test_model_specific_checkpoint_and_scheduler_choices() -> None:
+    nine = get_profile("Qwen/Qwen3.5-9B")
+    twenty_seven = get_profile("Qwen/Qwen3.8-27B")
+    thirty_five = get_profile("Qwen/Qwen3.6-35B-A3B")
+
+    assert nine.served_model == "Freesolo-Co/Qwen3.5-9B-FP8"
+    assert twenty_seven.served_model == "Qwen/Qwen3.8-27B-FP8"
+    assert twenty_seven.served_model_revision == "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
+    assert twenty_seven.tokenizer_model == "Qwen/Qwen3.8-27B"
+    assert twenty_seven.modal_gpu == "H100"
+    assert twenty_seven.modal_gpu_request == "H100!"
+    assert twenty_seven.modal_live_qualified is True
+    assert twenty_seven.modal_certified_image_digest == (
+        "sha256:2bf27b51f6e4b7f0b2d805d96202579d94868e2c594b7c496777d350ad6936f6"
+    )
+    assert thirty_five.served_model == "Qwen/Qwen3.6-35B-A3B"
+    assert thirty_five.modal_gpu_request == "H200"
+    assert thirty_five.quantization is None
+    assert thirty_five.tensor_parallel_size == 1
+    assert thirty_five.max_num_batched_tokens == 4096
+    assert thirty_five.max_num_seqs == 8
+    assert thirty_five.max_loras == 6
+    assert thirty_five.max_lora_rank == 64
+    assert thirty_five.modal_live_qualified is True
+    assert thirty_five.modal_certified_image_digest == twenty_seven.modal_certified_image_digest
+    assert nine.modal_certified_image_digest is None
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        {"workspace_name": "workspace", "region": "us-east"},
+        {"environment": "dev", "region": "us-east"},
+        {"workspace_name": "workspace", "environment": "dev"},
+    ],
+)
+def test_incomplete_placement_inputs_are_rejected(supplied: dict) -> None:
+    profile = get_profile(MODEL)
+
+    with pytest.raises(ProfileError) as excinfo:
+        placement_for(profile, "modal", **supplied)  # type: ignore[arg-type]
+
+    assert "requires" in str(excinfo.value)
