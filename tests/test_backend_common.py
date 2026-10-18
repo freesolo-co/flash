@@ -393,7 +393,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     # looking healthy. with the package absent, use_liger=true raises ImportError at verl's lazy
     # import (transformer_impl.py) instead of silently producing a zero-delta adapter.
     assert "liger-kernel" not in install
-    assert "bitsandbytes==0.50.1" in install
+    assert "bitsandbytes" not in install
     assert "qwen-vl-utils==0.0.14" in install
     assert "torchvision==0.25.0" in install
     assert "xgrammar==0.1.25" in install

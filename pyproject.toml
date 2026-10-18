@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.2.133"
+version = "1.2.134"
 description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -31,9 +31,9 @@ gpu = [
     "transformers>=5.8,<5.13",
     "tokenizers>=0.22",
     "tiktoken>=0.12",
+    "httpx>=0.27",  # client-lived managed teacher connection pool
     "peft>=0.19",
     "vllm==0.19.1",
-    "bitsandbytes>=0.49",
     "accelerate>=1.4",
     # resolve_verl_python shells out to `uv` to provision the isolated verl interpreter whenever
     # FLASH_VERL_PYTHON is unset. sft and opd are verl-only, so that call is unconditional here.
@@ -153,6 +153,7 @@ dev = [
     "transformers>=5.8,<5.13",
     "tokenizers>=0.22",
     "tiktoken>=0.12",
+    "httpx>=0.27",  # client-lived managed teacher connection pool
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. the control plane decodes images too, so `server`
@@ -196,7 +197,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.2.133"
+version = "1.2.134"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -239,6 +240,7 @@ dev = [
     "freesolo>=0.4.2",
     "tokenizers>=0.22",
     "tiktoken>=0.12",
+    "httpx>=0.27",  # client-lived managed teacher connection pool
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. the control plane decodes images too, so `server`

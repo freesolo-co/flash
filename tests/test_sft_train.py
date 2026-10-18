@@ -3127,7 +3127,7 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     monkeypatch.setenv("PYTHONPATH", "synthetic-sft-parent-path")
     monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PYTHONPATH")
     spec, captured = _stub_sft_run(monkeypatch)
-    authored = spec_from_dict(
+    authored = (spec_from_dict if ratio is None else JobSpec.from_dict)(
         {
             "model": spec.model,
             "algorithm": "sft",

@@ -104,3 +104,41 @@ def test_worker_skips_baked_cache_when_arch_undetermined(monkeypatch, tmp_path):
 
     assert kernel_warmup.load_mega_cache() is False
     assert loaded["called"] is False
+
+
+def test_warmup_saves_real_raw_kernels_without_a_compile_graph(monkeypatch, tmp_path):
+    monkeypatch.setattr(kernel_warmup, "_require_gpu", lambda: _FakeTorch)
+    monkeypatch.setattr(kernel_warmup, "warm_flash_attn", lambda torch: True)
+
+    def warm_gdn(torch):
+        artifact = tmp_path / "triton" / "gdn.cubin"
+        artifact.write_bytes(b"compiled-gdn")
+        return True
+
+    monkeypatch.setattr(kernel_warmup, "warm_fla_gdn", warm_gdn)
+    monkeypatch.setattr(kernel_warmup, "save_mega_cache", lambda *_: False)
+    assert kernel_warmup.warmup(str(tmp_path), arch="8.9") == 0
+    assert not (tmp_path / kernel_warmup.MEGA_CACHE_FILENAME).exists()
+    monkeypatch.setattr(kernel_warmup, "DEFAULT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setitem(sys.modules, "torch", _FakeTorch)
+    assert kernel_warmup.load_mega_cache() is True
+
+
+def test_warmup_rejects_empty_cache_even_if_smoke_tests_pass(monkeypatch, tmp_path):
+    monkeypatch.setattr(kernel_warmup, "_require_gpu", lambda: _FakeTorch)
+    monkeypatch.setattr(kernel_warmup, "warm_flash_attn", lambda torch: True)
+    monkeypatch.setattr(kernel_warmup, "warm_fla_gdn", lambda torch: True)
+    monkeypatch.setattr(kernel_warmup, "save_mega_cache", lambda *_: False)
+    assert kernel_warmup.warmup(str(tmp_path)) == 1
+
+
+def test_raw_cache_arch_mismatch_redirects_to_fresh_cache(monkeypatch, tmp_path):
+    (tmp_path / "triton").mkdir()
+    (tmp_path / "triton" / "gdn.cubin").write_bytes(b"wrong-arch")
+    (tmp_path / kernel_warmup.MEGA_CACHE_META_FILENAME).write_text('{"sm": "sm90"}')
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
+    monkeypatch.setattr(kernel_warmup, "DEFAULT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setitem(sys.modules, "torch", _FakeTorch)
+    assert kernel_warmup.load_mega_cache() is False
+    assert os.environ["TRITON_CACHE_DIR"] != str(tmp_path / "triton")

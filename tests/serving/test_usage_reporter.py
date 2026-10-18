@@ -91,18 +91,6 @@ def test_hosted_usage_outbox_worker_id_is_unique_per_instance(modal_app_module):
     asyncio.run(second.aclose())
 
 
-def test_stream_text_delta_keeps_native_delta_chunks(modal_app_module):
-    previous = ""
-    deltas = []
-
-    for text in ("Hel", "lo", " hello"):
-        delta, previous = engine_support._stream_text_delta(text, previous)
-        deltas.append(delta)
-
-    assert deltas == ["Hel", "lo", " hello"]
-    assert previous == "Hello hello"
-
-
 def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     # every gpu engine class scales to zero, while the cpu router stays available to trigger them.
     assert modal_app_module.MIN_CONTAINERS == 0
@@ -144,26 +132,6 @@ def test_gpu_engines_are_capped_at_four_and_each_keeps_one_buffer(modal_app_modu
     router_kwargs = modal_app_module.app.function.call_args.kwargs
     assert "max_containers" not in router_kwargs
     assert router_kwargs["buffer_containers"] == 1
-
-
-def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app_module):
-    # The whole point of the table: an idle container bills at the full gpu rate, so a cheap
-    # fast-booting tier must not hold a card as long as the 35B's ~1010s-boot H200 does.
-    from flash.serving.src.engine.model_config import base_models, gpu_for
-
-    window_for = modal_app_module.scaledown_window_for
-
-    assert window_for("L4") < window_for("L40S") < window_for("H100") < window_for("H200")
-    # The H200 keeps the full 30-minute hold (boot is ~17 min; a miss stalls the user that long).
-    assert window_for("H200") == 1800
-    # Every catalog tier resolves to a positive window, so no model falls back by accident.
-    assert all(window_for(gpu_for(bm)) > 0 for bm in base_models())
-    # B200 now carries all three shipped tiers and its window is MEASURED, not inherited: the
-    # slowest cold boot on the card was the 27B at 1821s, so it holds longer than the H200 it
-    # replaced.
-    assert window_for("B200") == 2100
-    # Every tier that actually serves holds at least as long as its slowest measured cold boot.
-    assert all(window_for(gpu_for(bm)) >= 2100 for bm in base_models())
 
 
 def test_unknown_gpu_tier_is_rejected_not_silently_defaulted(modal_app_module):
@@ -672,31 +640,6 @@ def test_runtime_secret_exports_canonical_hf_token_and_deployment_identity(
     }
 
 
-def test_load_adapters_for_base_filters_records(modal_app_module, monkeypatch):
-    class _Record:
-        def __init__(self, base_model: str) -> None:
-            self.base_model = base_model
-            self.status = "ready"
-            self.is_checkpoint = True
-
-    records = [_Record("Qwen/Qwen3.8-27B"), _Record("Qwen/Qwen3.5-9B")]
-    monkeypatch.setattr(
-        "flash.serving.src.store.persistence.load_adapters", lambda settings: records
-    )
-
-    assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-9B") == [records[1]]
-
-
-def test_load_adapters_for_base_skips_hydration_failures(modal_app_module, monkeypatch, capsys):
-    def _boom(_settings):
-        raise TimeoutError("supabase timeout")
-
-    monkeypatch.setattr("flash.serving.src.store.persistence.load_adapters", _boom)
-
-    assert engine_support._load_adapters_for_base(object(), "Qwen/Qwen3.5-9B") == []
-    assert "adapter hydration skipped" in capsys.readouterr().out
-
-
 def _checkpoint_record(
     run_id: str,
     repo_id: str,
@@ -914,61 +857,6 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
     assert engine.registry.paths == {record.adapter_id: partial_adapter_path}
 
 
-def test_preload_cached_loras_adds_only_volume_cached_adapters(
-    modal_app_module, monkeypatch, tmp_path
-):
-    import asyncio
-
-    from flash.serve.contract.provenance import engine_adapter_name
-    from flash.serving.src.io.schemas import AdapterRecord
-    from flash.serving.src.store.registry import AdapterRegistry, lora_int_id
-
-    cached = AdapterRecord.model_validate(
-        _checkpoint_record("cached", "org/cached", subfolder="sft/cached/seed0/adapter")
-    )
-    missing = AdapterRecord.model_validate(
-        _checkpoint_record("missing", "org/missing", subfolder="sft/missing/seed0/adapter")
-    )
-    cache_path = engine_support._adapter_source_cache_dir(tmp_path / "adapters", cached)
-    cache_path = cache_path / "sft/cached/seed0/adapter"
-    cache_path.mkdir(parents=True)
-    (cache_path / "adapter_config.json").write_text("{}", encoding="utf-8")
-    (cache_path / "adapter_model.safetensors").write_bytes(b"weights")
-    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
-
-    class _Engine:
-        def __init__(self) -> None:
-            self.added: list[Any] = []
-            self.pinned: list[int] = []
-
-        async def add_lora(self, lora_request: Any) -> None:
-            self.added.append(lora_request)
-
-        async def pin_lora(self, lora_id: int) -> None:
-            self.pinned.append(lora_id)
-
-    registry = AdapterRegistry()
-    registry.hydrate([cached, missing])
-    engine = object.__new__(modal_app_module._LoraEngineImpl)
-    engine.registry = registry
-    engine.engine = _Engine()
-    engine._adapter_locks = {}
-    engine._adapter_locks_guard = asyncio.Lock()
-    engine._source_paths = {}
-    engine._lora_entries = {}
-    # _load() normally sets this; the object.__new__ engine here must too, or _add_lora_locked's
-    # `if self._pin_loras` raises AttributeError (swallowed by the preload) and pinning never runs.
-    engine._pin_loras = True
-
-    asyncio.run(engine._preload_cached_loras())
-
-    adapter_name = engine_adapter_name(cached.org_id, cached.adapter_id)
-    assert [request.lora_name for request in engine.engine.added] == [adapter_name]
-    assert engine.engine.pinned == [lora_int_id(adapter_name)]
-    assert registry.local_path(cached) == cache_path
-    assert registry.local_path(missing) is None
-
-
 def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkeypatch, tmp_path):
     # two distinct adapters whose sha1 masks collide to the same vllm int id must not share it.
     # unconfirmed entries still occupy their id because vllm may retain the corresponding weights.
@@ -1026,3 +914,11 @@ def test_evict_uncached_alias_does_not_remove_a_colliding_adapter(modal_app_modu
 
     assert engine.engine.removed == []
     assert "tenant-b" in engine._lora_entries
+
+
+def test_only_shipped_b200_has_a_hosted_idle_window(modal_app_module):
+    assert {"B200"} == modal_app_module.SUPPORTED_GPUS
+    assert modal_app_module.scaledown_window_for("B200") == 2100
+    for dormant_gpu in ("L4", "L40S", "H100", "H200", "B300"):
+        with pytest.raises(ValueError, match="Unsupported serving GPU tier"):
+            modal_app_module.scaledown_window_for(dormant_gpu)

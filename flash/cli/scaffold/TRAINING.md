@@ -294,7 +294,7 @@ ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `
 | `batch_size`                                                                                                    | yes      | rejected | rejected |
 | `prompts_per_step`                                                                                              | rejected | yes      | yes      |
 | `group_size`, `temperature`, `max_completion_tokens`, `kl_penalty_coef`, `stop_sequences`, `structured_outputs` | rejected | yes      | yes      |
-| `entropy_quantile`, `thinking_length_penalty_coef`, `credit_assignment`                                         | rejected | yes      | rejected |
+| `thinking_length_penalty_coef`, `credit_assignment`                                         | rejected | yes      | rejected |
 | `teacher_model`                                                                                                 | rejected | rejected | yes      |
 
 **The optimizer batch has a different name per algorithm because it is a different quantity.**
@@ -1815,3 +1815,6 @@ flash models export --adapter-id <run-id>/step-N --repository <you>/<repo>  # ex
 ```
 
 See the full reference at https://docs.freesolo.co.
+
+LoRA+ learning-rate ratios and entropy-quantile filtering are retired for new runs.
+Existing stored runs retain their original optimizer and loss settings when resumed.

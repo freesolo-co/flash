@@ -163,3 +163,20 @@ def test_bake_goes_through_the_gpu_walk_helper():
     body = BAKE_SCRIPT.read_text().split("def main()")[1]
     assert "_create_pod_with_gpu_walk(" in body
     assert "runpod.create_pod(" not in body
+
+
+@pytest.mark.parametrize("artifact", ["mega_cache.bin", "triton/kernel.cubin"])
+def test_verify_accepts_blob_or_real_raw_artifacts(tmp_path, artifact):
+    path = tmp_path / artifact
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(b"compiled")
+    (tmp_path / "mega_cache.json").write_text('{"sm": "sm100"}')
+    assert bake._verify(str(tmp_path), "sm100") == 0
+    assert bake._verify(str(tmp_path), "sm90") == 1
+
+
+def test_verify_rejects_metadata_and_lock_files_without_kernels(tmp_path):
+    (tmp_path / "triton").mkdir()
+    (tmp_path / "triton" / "kernel.lock").write_text("lock")
+    (tmp_path / "mega_cache.json").write_text('{"sm": "sm100"}')
+    assert bake._verify(str(tmp_path), "sm100") == 1

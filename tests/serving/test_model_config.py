@@ -78,14 +78,9 @@ def test_35b_serves_bf16_base_not_fp8() -> None:
     assert "kv_cache_dtype" not in ov  # KV inherits the global fp8
 
 
-def test_35b_does_not_pin_loras() -> None:
-    # max_loras (GPU slots) is capped below max_cpu_loras for the MoE while max_cpu_loras stays at 256,
-    # so the 35B opts OUT of pinning — otherwise the first max_loras adapters would lock the GPU slots
-    # and the surplus could never load. Unpinned, vLLM LRU-swaps from the CPU cache on demand.
-    assert engine_overrides_for("Qwen/Qwen3.6-35B-A3B").get("pin_loras") is False
-    # Dense text models carry no explicit pin override; modal_app derives the default from whether
-    # max_loras covers max_cpu_loras.
-    assert "pin_loras" not in engine_overrides_for("Qwen/Qwen3.5-9B")
+def test_hosted_models_have_no_pinning_override() -> None:
+    for model in base_models():
+        assert "pin_loras" not in engine_overrides_for(model)
 
 
 def test_dense_models_serve_fp8_and_35b_serves_bf16_base() -> None:

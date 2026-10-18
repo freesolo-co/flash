@@ -17,13 +17,17 @@ def _raw(train, algorithm="sft"):
 
 
 @pytest.mark.parametrize("ratio", [1, 3.5, 16, 32])
-def test_loraplus_ratio_survives_public_and_worker_round_trips(ratio):
-    spec = spec_from_dict(_raw({"loraplus_ratio": ratio, "learning_rate": 1e-5}))
-    public = spec_from_dict(spec.to_dict())
+def test_legacy_loraplus_ratio_survives_worker_round_trips(ratio):
+    spec = JobSpec.from_dict(_raw({"loraplus_ratio": ratio, "learning_rate": 1e-5}))
     worker = JobSpec.from_json(spec.to_json())
-    for result in (spec, public, worker):
-        assert result.train.loraplus_ratio == ratio
-        assert result.train.learning_rate == 1e-5
+    assert worker.train.loraplus_ratio == ratio
+    assert worker.train.learning_rate == 1e-5
+
+
+@pytest.mark.parametrize("ratio", [3.5, 16, 32])
+def test_new_nondefault_loraplus_ratio_is_retired(ratio):
+    with pytest.raises(ConfigError, match="loraplus_ratio is retired"):
+        spec_from_dict(_raw({"loraplus_ratio": ratio}))
 
 
 @pytest.mark.parametrize("train", [{}, {"loraplus_ratio": None}])
@@ -86,12 +90,18 @@ def test_toml_ratio_and_cli_override_are_user_authored_keys(tmp_path):
         '[environment]\nid = "owner/project/env"\n'
         "[train]\nloraplus_ratio = 4.0\nlearning_rate = 0.00001\n"
     )
-    spec, keys = spec_and_train_keys_from_file(str(config), run_id="test")
-    assert spec.train.loraplus_ratio == 4.0
-    assert "loraplus_ratio" in keys
-    spec, keys = spec_and_train_keys_from_file(
+    with pytest.raises(ConfigError, match="loraplus_ratio is retired"):
+        spec_and_train_keys_from_file(str(config), run_id="test")
+    spec, _ = spec_and_train_keys_from_file(
         str(config), run_id="test", overrides=["train.loraplus_ratio=1.0"]
     )
     assert spec.train.loraplus_ratio == 1.0
-    assert spec.train.learning_rate == 1e-5
-    assert "loraplus_ratio" in keys
+
+
+@pytest.mark.parametrize("quantile", [0.0, 0.5, 1.0])
+def test_entropy_filter_is_retired_for_new_runs_but_preserved_for_legacy_runs(quantile):
+    raw = _raw({"entropy_quantile": quantile}, "grpo")
+    with pytest.raises(ConfigError, match="entropy_quantile is retired"):
+        spec_from_dict(raw)
+    spec = JobSpec.from_dict(raw)
+    assert JobSpec.from_json(spec.to_json()).train.entropy_quantile == quantile

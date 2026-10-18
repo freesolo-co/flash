@@ -684,7 +684,7 @@ def liveness_heartbeat(
                             last_val = float(v)
                         elif float(v) > last_val:
                             last_val, made_progress = float(v), True
-            gpu = worker_perf.gpu_diagnostics(include_torch=False)
+            gpu = worker_perf.gpu_diagnostics()
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return
             extra = field_sampler.latest() if field_sampler is not None else {}

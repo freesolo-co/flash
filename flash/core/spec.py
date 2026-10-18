@@ -368,6 +368,7 @@ class TrainSpec:
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     # sft only: none preserves a legacy persisted run's 16x optimizer. new configs freeze the
     # recipe default at parse time; 1 uses equal adapter learning rates.
+    # legacy optimizer state must retain its learning-rate ratio on resume.
     loraplus_ratio: float | None = field(default=None, metadata={"introduced_in": "1.2.131"})
     # sft only. the packaged-dataset estimate resolves this against the selected row count into
     # examples_per_update (packed) or pins the optimizer batch to 1 (unpacked). grpo/opd have no
@@ -387,6 +388,7 @@ class TrainSpec:
     temperature: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     max_completion_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
     kl_penalty_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    # legacy loss masking is decoded for resume; no new runs may opt into it.
     entropy_quantile: float | None = field(default=None, metadata={"introduced_in": "1.0.15"})
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}

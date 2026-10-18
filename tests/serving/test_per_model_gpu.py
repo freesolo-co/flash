@@ -780,13 +780,13 @@ def test_every_catalog_model_forwards_its_reasoning_parser(
     assert args.reasoning_parser == "qwen3"
 
 
-def test_lora_pinning_only_when_hot_pool_covers_cpu_pool(modal_app_module, monkeypatch, tmp_path):
+def test_hosted_hot_pools_remain_unpinned(modal_app_module, monkeypatch, tmp_path):
     """Pinned LoRAs cannot be LRU-evicted, so capped hot pools must stay unpinned if 256 adapters
     are deployable through max_cpu_loras."""
     engine, args = _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-9B")
     assert args.max_loras == 16
     assert args.max_cpu_loras == 256
-    assert engine._pin_loras is False
+    assert not hasattr(engine, "_pin_loras")
 
     for model, max_loras in (
         ("Qwen/Qwen3.5-9B", 16),
@@ -795,7 +795,7 @@ def test_lora_pinning_only_when_hot_pool_covers_cpu_pool(modal_app_module, monke
         engine, args = _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, model)
         assert args.max_loras == max_loras
         assert args.max_cpu_loras == 256
-        assert engine._pin_loras is False
+        assert not hasattr(engine, "_pin_loras")
 
 
 def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path):
@@ -844,3 +844,16 @@ def test_load_bf16_base_with_full_experts_for_35b(modal_app_module, monkeypatch,
     # language_model_only is NOT enabled: the full VL model (vision encoder included) is loaded so
     # flash adapters' vision-tower LoRA keys have real modules to bind to.
     assert not args.language_model_only
+
+
+def test_engine_boot_never_reads_the_adapter_database(modal_app_module, monkeypatch, tmp_path):
+    reads = []
+
+    def load_adapters(settings):
+        reads.append(settings)
+        raise AssertionError("GPU engines do not have database credentials")
+
+    monkeypatch.setattr("flash.serving.src.store.persistence.load_adapters", load_adapters)
+    engine, _ = _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-9B")
+    assert reads == []
+    assert engine.registry.list_ready() == []

@@ -18,7 +18,6 @@ from flash.serve.app.openai import split_reasoning
 from flash.serve.request.openai import NormalizedChatRequest
 from flash.serving.src.io.provenance import _checkpoint_provenance, _provenance_headers
 from flash.serving.src.io.schemas import AdapterRecord
-from flash.serving.src.io.structured_outputs import StructuredOutputsError
 
 _THINK_CLOSE = "</think>"
 
@@ -130,66 +129,6 @@ def _usage_block(prompt_tokens: int, completion_tokens: int, cached_tokens: Any)
     if cached > 0:
         usage["prompt_tokens_details"] = {"cached_tokens": cached}
     return usage
-
-
-def _openai_structured_outputs(payload: dict[str, Any]) -> Any:
-    """The structured-outputs spec carried by an OpenAI-style chat payload, or None.
-
-    Our first-class extension (``structured_outputs``) and the OpenAI-standard
-    ``response_format`` are mutually exclusive. The latter is accepted only here, at the
-    OpenAI-compatible ``/v1/chat/completions`` boundary, and translated to our canonical spec, so an
-    OpenAI-SDK client gets structured output with no code change. The result is returned raw so
-    GenerateRequest's validator normalizes it (consistent 422s across every entry point). Checked
-    with ``is not None``, not truthiness: ``{}`` / ``false`` are explicit "unconstrained" markers,
-    distinct from an absent field.
-    """
-    spec = payload.get("structured_outputs")
-    response_format = payload.get("response_format")
-    if spec is not None and response_format is not None:
-        raise StructuredOutputsError("structured_outputs and response_format cannot both be set")
-    if spec is not None:
-        return spec
-    if response_format is not None:
-        return _response_format_to_spec(response_format)
-    return None
-
-
-def _response_format_to_spec(response_format: Any) -> Any:
-    """Translate an OpenAI ``response_format`` object to our canonical structured-outputs spec.
-
-    Kept at this endpoint only (the core normalizer stays strict-canonical). ``{"type": "text"}``
-    -> ``{}`` (explicit "unconstrained", overriding any adapter default); ``{"type":
-    "json_object"}`` -> ``{"json_object": True}``; ``{"type": "json_schema", "json_schema":
-    {"schema": {...}}}`` (or the flattened ``{"type": "json_schema", "schema": {...}}``) ->
-    ``{"json": schema}``. An unrecognized ``type`` is rejected here with a clean 422 (rather than
-    letting the greedy normalizer silently wrap it as a schema); a non-dict is returned as-is for
-    the GenerateRequest validator to normalize.
-    """
-    if not isinstance(response_format, dict):
-        return response_format
-    rf_type = response_format.get("type")
-    if rf_type == "text":
-        return {}
-    if rf_type == "json_object":
-        return {"json_object": True}
-    if rf_type == "json_schema":
-        wrapper = response_format.get("json_schema")
-        schema = (
-            wrapper.get("schema") if isinstance(wrapper, dict) else response_format.get("schema")
-        )
-        if schema is None:
-            raise StructuredOutputsError(
-                'response_format {"type": "json_schema"} requires a schema '
-                "(json_schema.schema = {...} or schema = {...})"
-            )
-        return {"json": schema}
-    # OpenAI response_format has exactly these three types. Reject anything else here (a typo'd type
-    # or a bare schema) with a clean 422, rather than letting the greedy normalizer silently wrap the
-    # whole object as a JSON schema; to pass a raw schema, use the structured_outputs field instead.
-    raise StructuredOutputsError(
-        f'unsupported response_format type {rf_type!r}; use "text", "json_object", or '
-        '"json_schema" (or pass a raw schema via the structured_outputs field)'
-    )
 
 
 def openai_chat_completion(

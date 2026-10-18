@@ -158,7 +158,9 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
         item.name: item.metadata["introduced_in"] for item in train_fields
     } == TRAIN_KEY_MIN_VERSIONS
     assert train_schema_metadata() == {
-        key: TRAIN_KEY_MIN_VERSIONS[key] for key in sorted(TRAIN_KEY_MIN_VERSIONS)
+        key: TRAIN_KEY_MIN_VERSIONS[key]
+        for key in sorted(TRAIN_KEY_MIN_VERSIONS)
+        if key not in {"loraplus_ratio", "entropy_quantile"}
     }
     # hf_repo is platform-managed (no introduced_in), so it is absent from both the user-facing
     # train schema and the min-version registry.
@@ -869,7 +871,6 @@ _APPLICABLE_CASES = [
     ("opd", "stop_sequences", ["END"]),
     ("grpo", "structured_outputs", '{"type": "object"}'),
     ("opd", "structured_outputs", '{"type": "object"}'),
-    ("grpo", "entropy_quantile", 0.5),
     ("grpo", "thinking_length_penalty_coef", 0.1),
     ("grpo", "credit_assignment", "per_turn"),
     ("opd", "teacher_model", "glm-5.2"),

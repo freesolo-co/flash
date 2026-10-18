@@ -1,7 +1,6 @@
-"""Pre-compile hot worker kernels on a GPU builder and persist a portable mega-cache.
+"""Pre-compile hot worker kernels on a GPU builder and persist their caches.
 
-Measured: cold compile ~124s -> warm load ~0.2s. Import-safe without torch (every heavy import is
-inside a function). CLI: ``python -m flash.engine.worker.runtime.kernel_warmup --arch <sm> --out <dir>``.
+Import-safe without torch (every heavy import is inside a function). CLI: ``python -m flash.engine.worker.runtime.kernel_warmup --arch <sm> --out <dir>``.
 """
 
 from __future__ import annotations
@@ -169,23 +168,14 @@ def warm_fla_gdn(torch) -> bool:
         return False
 
 
-def warm_torch_compile(torch) -> bool:
-    """Trigger a representative ``torch.compile`` so TorchInductor populates its cache."""
-    try:
-
-        @torch.compile
-        def _fused(a, b):
-            return torch.nn.functional.gelu(a @ b)
-
-        a = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
-        b = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
-        _fused(a, b)
-        torch.cuda.synchronize()
-        _log("torch.compile (TorchInductor) warmed")
-        return True
-    except Exception as e:
-        _log(f"torch.compile warm skipped: {e}")
-        return False
+def has_raw_kernel_cache(out_dir: str) -> bool:
+    """Require compiled artifacts, not just empty directories or lock files."""
+    return any(
+        name.endswith((".cubin", ".ptx", ".so")) and os.path.getsize(os.path.join(root, name)) > 0
+        for subdir in ("triton", "inductor")
+        for root, _, files in os.walk(os.path.join(out_dir, subdir))
+        for name in files
+    )
 
 
 def save_mega_cache(torch, out_dir: str) -> bool:
@@ -230,7 +220,7 @@ def save_cache_metadata(torch, out_dir: str, *, requested_arch: str | None, warm
 
 
 def load_mega_cache() -> bool:
-    """Load a baked mega-cache at worker boot; no-op (returns False) if absent or wrong arch."""
+    """Validate baked kernel caches and load their optional portable blob."""
     cache_file = os.path.join(DEFAULT_CACHE_DIR, MEGA_CACHE_FILENAME)
     meta_file = os.path.join(DEFAULT_CACHE_DIR, MEGA_CACHE_META_FILENAME)
 
@@ -244,7 +234,7 @@ def load_mega_cache() -> bool:
             os.environ[var] = d
         return False
 
-    if not os.path.isfile(cache_file):
+    if not os.path.isfile(cache_file) and not has_raw_kernel_cache(DEFAULT_CACHE_DIR):
         print(f"[kernel-cache] no baked cache at {cache_file} -> first-run JIT (expected default)")
         return False
     try:
@@ -265,6 +255,9 @@ def load_mega_cache() -> bool:
             return _reject(
                 f"baked cache arch {cached_sm or 'unknown'} does not match worker arch {current_sm}"
             )
+        if not os.path.isfile(cache_file):
+            print(f"[kernel-cache] using baked raw kernel caches for {cached_sm}")
+            return True
         with open(cache_file, "rb") as f:
             blob = f.read()
         torch.compiler.load_cache_artifacts(blob)
@@ -278,7 +271,7 @@ def load_mega_cache() -> bool:
 
 
 def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
-    """Run every warm step then persist the mega-cache. Returns a process exit code."""
+    """Warm real training kernels and persist raw caches plus an optional portable blob."""
     t0 = time.time()
     _point_backends_at(out_dir)
     if arch:
@@ -303,18 +296,17 @@ def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
         [
             warm_flash_attn(torch),
             warm_fla_gdn(torch),
-            warm_torch_compile(torch),
         ]
     )
-    _log(f"{warmed}/3 kernel groups compiled in {time.time() - t0:.1f}s; saving mega-cache")
+    _log(f"{warmed}/2 kernel groups compiled in {time.time() - t0:.1f}s; saving mega-cache")
     saved = save_mega_cache(torch, out_dir)
     meta_saved = save_cache_metadata(torch, out_dir, requested_arch=arch, warmed=warmed)
     _log(f"done in {time.time() - t0:.1f}s (saved={saved})")
-    return 0 if saved and meta_saved else 1
+    return 0 if warmed and meta_saved and (saved or has_raw_kernel_cache(out_dir)) else 1
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="pre-compile hot worker kernels and bake a mega-cache")
+    ap = argparse.ArgumentParser(description="pre-compile hot worker kernels and bake their caches")
     ap.add_argument(
         "--arch",
         default=None,
@@ -323,7 +315,7 @@ def main() -> int:
     ap.add_argument(
         "--out",
         default=DEFAULT_CACHE_DIR,
-        help=f"cache output dir (default: {DEFAULT_CACHE_DIR}); the bake produces <out>/{MEGA_CACHE_FILENAME}",
+        help=f"cache output dir (default: {DEFAULT_CACHE_DIR}); the bake produces raw kernel caches and architecture metadata",
     )
     args = ap.parse_args()
     return warmup(out_dir=args.out, arch=args.arch)

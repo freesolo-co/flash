@@ -11,7 +11,6 @@ from flash.serving.src.engine.lora_engine import _LoraEngineImpl, _LoraEntry
 from flash.serving.src.engine.support import (
     _adapter_source_cache_dir,
     _adapter_source_ident,
-    _load_adapters_for_base,
 )
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.store.registry import AdapterRegistry
@@ -49,27 +48,6 @@ def test_distinct_hub_shas_have_distinct_source_and_cache_identity(tmp_path: Pat
     assert _adapter_source_cache_dir(tmp_path, first) != _adapter_source_cache_dir(tmp_path, second)
 
 
-def test_engine_hydration_excludes_base_models_and_disabled_checkpoints(monkeypatch) -> None:
-    ready = _revision("a" * 40)
-    records = [
-        ready,
-        AdapterRecord.model_validate(
-            {
-                "adapter_id": BASE_MODEL,
-                "repo_id": BASE_MODEL,
-                "base_model": BASE_MODEL,
-                "serve_base_model": True,
-                "thinking": False,
-            }
-        ),
-        _revision("b" * 40, status="disabled"),
-    ]
-    monkeypatch.setattr(
-        "flash.serving.src.store.persistence.load_adapters", lambda settings: records
-    )
-    assert _load_adapters_for_base(object(), BASE_MODEL) == [ready]
-
-
 def test_unregister_skips_cleanup_for_a_newer_deployment_generation() -> None:
     record = _revision("a" * 40).model_copy(update={"deployment_generation": "generation-new"})
     engine = _LoraEngineImpl()
@@ -103,7 +81,6 @@ def test_unregister_skips_cleanup_for_a_newer_deployment_generation() -> None:
 def test_add_lora_exception_releases_new_entry_for_retry(tmp_path: Path) -> None:
     record = _revision("a" * 40)
     engine = _LoraEngineImpl()
-    engine._pin_loras = False
     calls = 0
 
     class _Engine:
@@ -128,7 +105,6 @@ def test_add_lora_exception_releases_new_entry_for_retry(tmp_path: Path) -> None
 def test_rejected_new_lora_releases_entry_and_reaches_engine_on_retry(tmp_path: Path) -> None:
     record = _revision("a" * 40)
     engine = _LoraEngineImpl()
-    engine._pin_loras = False
     outcomes = iter((False, True))
     calls = 0
 

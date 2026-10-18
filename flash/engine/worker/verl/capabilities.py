@@ -471,7 +471,6 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 "TransferQueue==0.1.7",
                 # older raises AttributeError on PyArrow PyExtensionType.
                 "datasets==5.0.1",
-                "bitsandbytes==0.50.1",
                 "qwen-vl-utils==0.0.14",
                 "torchvision==0.25.0",
                 "xgrammar==0.1.25",

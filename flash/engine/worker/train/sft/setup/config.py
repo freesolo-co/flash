@@ -134,7 +134,8 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         # table; triton wins on sm90+ and loses below it.
         "model.use_fused_kernels=true",
         f"model.fused_kernel_options.impl_backend={cfg['fused_ce_backend']}",
-        f"model.use_liger={_hydra_val(cfg.get('use_liger', False))}",
+        # liger severs lora gradients under fsdp2; fused CE uses use_fused_kernels instead.
+        "model.use_liger=false",
         f"model.enable_gradient_checkpointing={_hydra_val(cfg.get('gradient_checkpointing', True))}",
         f"engine.strategy={'fsdp2' if cfg['fsdp_generation'] == 2 else 'fsdp'}",
         "engine.model_dtype=bfloat16",

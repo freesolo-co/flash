@@ -773,7 +773,7 @@ def _report_training_complete(result: _ChildResult, started_at: float) -> float:
         "opd_trained",
         step=result.final_step,
         train_wall=result.train_wall,
-        gpu=_worker_perf.gpu_diagnostics(include_torch=False),
+        gpu=_worker_perf.gpu_diagnostics(),
     )
     return result.train_started_at - started_at
 

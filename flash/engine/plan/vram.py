@@ -185,9 +185,9 @@ _LOGITS_BUDGET_GB = 6.0
 # 16 B/elem: fp32 logits+grad + bf16 logits+grad + CE temp. 8 B/elem under-counts (live OOM confirmed).
 _SFT_LOGITS_BYTES_PER_ELEM = 16.0
 _SFT_CHUNKED_NLL_TOKENS = VERL_FUSED_CE_CHUNK_TOKENS
-# shared thresholds for the independent liger and worker memory gates.
-_LIGER_MIN_PARAMS_B = 3.0
-_LIGER_LONG_CTX_TOKENS = 2048
+# thresholds for the worker gradient-checkpointing memory gate.
+_CHECKPOINT_MIN_PARAMS_B = 3.0
+_CHECKPOINT_LONG_CTX_TOKENS = 2048
 
 # these model types have validated dense-logit-free fused SFT loss; others retain plain NLL.
 # verl dispatches `qwen3_5` and `qwen3_5_moe` through its fused torch backend. liger remains off

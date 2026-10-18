@@ -265,7 +265,11 @@ TRAIN_SCHEMA_KEYS = frozenset(TRAIN_KEY_MIN_VERSIONS)
 
 def train_schema_metadata() -> dict[str, str]:
     """return the deterministic [train] field-to-release mapping."""
-    return {key: TRAIN_KEY_MIN_VERSIONS[key] for key in sorted(TRAIN_KEY_MIN_VERSIONS)}
+    return {
+        key: TRAIN_KEY_MIN_VERSIONS[key]
+        for key in sorted(TRAIN_KEY_MIN_VERSIONS)
+        if key not in {"loraplus_ratio", "entropy_quantile"}
+    }
 
 
 def validate_train_keys(keys: Collection[str]) -> None:
@@ -402,6 +406,14 @@ def _validate_train_section(raw: dict[str, Any], algorithm: str) -> dict[str, An
         raise ConfigError("[train] must be a table")
     validate_train_keys(train_raw)
     validate_train_keys_for_algorithm(train_raw, algorithm)
+    # persisted jobs use JobSpec.from_dict and retain their original objective/optimizer.
+    # accept neutral serialized defaults so current specs still round-trip through this parser.
+    if train_raw.get("loraplus_ratio") not in (None, 1, 1.0) or isinstance(
+        train_raw.get("loraplus_ratio"), bool
+    ):
+        raise ConfigError("train.loraplus_ratio is retired; new SFT runs use standard LoRA (1.0)")
+    if train_raw.get("entropy_quantile") is not None:
+        raise ConfigError("train.entropy_quantile is retired; omit it for new runs")
     return train_raw
 
 

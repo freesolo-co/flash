@@ -180,7 +180,7 @@ def _resolve_sft_options(spec) -> _SftOptions:
     # targets for any env whose row construction uses python/numpy randomness.
     _sft_train.seed_training_rngs(_worker_state.SEED)
     started_at = time.time()
-    _worker_heartbeat.heartbeat("sft_start", gpu=_worker_perf.gpu_diagnostics(include_torch=False))
+    _worker_heartbeat.heartbeat("sft_start", gpu=_worker_perf.gpu_diagnostics())
     gpu_probe = _sft_train._probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
@@ -351,7 +351,7 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
     _worker_heartbeat.heartbeat(
         "sft_model_load",
         setup_seconds=setup_seconds,
-        gpu=_worker_perf.gpu_diagnostics(include_torch=False),
+        gpu=_worker_perf.gpu_diagnostics(),
     )
     # everything below reads adapter/tokenizer/architecture config from the hub or cache, which is
     # minutes on a cold mount and emits nothing of its own. without this the run's last ping is the
@@ -668,10 +668,6 @@ def _prepare_sft_child(
         "experiment_name": experiment_name,
         "loop_epochs": model.loop_epochs,
         "loggers": loggers,
-        # liger produces a 0.0 lora grad norm under fsdp2 + peft + gradient checkpointing, versus
-        # 7.02 off in a matched qwen3.5-9b test. fused linear ce remains provided by
-        # use_fused_kernels with the impl_backend resolved below.
-        **_sft_train._sft_liger_config(),
         "gradient_checkpointing": model.gradient_checkpointing
         and not model.reentrant_gradient_checkpointing,
         # the accepted quote's step count binds whether or not the user authored max_steps. the

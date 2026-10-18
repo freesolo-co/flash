@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import copy
 import math
-import os
 
 import flash.engine.worker.runtime.state as _worker_state
 from flash.adapters.targets import resolve_lora_targeting
@@ -724,7 +723,6 @@ def _build_verl_train_notes(
     wandb_id: str | None = None,
     reward_bridge_batching: bool = False,
     gdn_boundary_resets: bool | None = None,
-    host_census: dict | None = None,
     rollout_identity_evidence: dict | None = None,
     advantage_spread_history: list[float] | None = None,
     advantage_bounds: list[dict] | None = None,
@@ -742,7 +740,6 @@ def _build_verl_train_notes(
         "reward_history": reward_history,
         "loss_curve": loss_curve,
         "download_seconds": download_seconds,
-        "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
         # verl trains out-of-process, so torch's in-process allocator counter would read ~0 here and
         # miss the trainer entirely. nvidia-smi is the only reading that sees the child, so both keys
         # carry the same device-level figure. (on the retired in-process trl path peak_gpu_gb was the
@@ -786,7 +783,6 @@ def _build_verl_train_notes(
         "wandb_url": wandb_url,
         "wandb_id": wandb_id,
         "reward_bridge_batching": bool(reward_bridge_batching),
-        "host_census": copy.deepcopy(host_census or {}),
         "rollout_identity_evidence": copy.deepcopy(
             rollout_identity_evidence or {"steps": [], "validation": []}
         ),

@@ -12,7 +12,6 @@ from flash.serving.src.store.persistence import (
     PersistenceConflict,
     PersistenceRecordError,
     PersistenceReferenceError,
-    _adapter_to_row,
     _row_to_adapter,
     get_adapter,
     insert_adapter,
@@ -67,8 +66,26 @@ def _record(**overrides: object) -> AdapterRecord:
 
 
 def _row(**overrides: object) -> dict[str, object]:
-    record = _record()
-    row = _adapter_to_row(record, "2026-07-14T00:00:01+00:00")
+    row = {
+        "org_id": ORG_ID,
+        "run_id": RUN_ID,
+        "checkpoint": "step-20",
+        "checkpoint_id": CHECKPOINT_ID,
+        "source_repo_type": "dataset",
+        "source_repository": _record().repo_id,
+        "source_revision": SHA,
+        "source_subfolder": _record().subfolder,
+        "artifact_digest": DIGEST,
+        "artifact_fingerprint": _record().artifact_fingerprint,
+        "base_model": _record().base_model,
+        "lora_config": {"rank": 32},
+        "serving_defaults": {"thinking": False, "structured_outputs": None},
+        "url": _record().url,
+        "status": "disabled",
+        "deployment_generation": None,
+        "created_at": "2026-07-14T00:00:00+00:00",
+        "updated_at": "2026-07-14T00:00:01+00:00",
+    }
     row.update(overrides)
     return row
 
@@ -258,9 +275,9 @@ def test_hydration_skips_legacy_rows_and_targeted_reads_reject_them() -> None:
         get_adapter(ORG_ID, CHECKPOINT_ID, _settings())
 
 
-def test_row_round_trip_preserves_exact_source_identity() -> None:
+def test_row_hydration_preserves_exact_source_identity() -> None:
     record = _record().model_copy(update={"deployment_generation": "generation-1"})
-    row = _adapter_to_row(record, "2026-07-14T00:00:03+00:00")
+    row = _row(deployment_generation="generation-1")
     hydrated = PersistedAdapterRecord.model_validate(_row_to_adapter(row))
 
     assert hydrated.repo_id == record.repo_id
