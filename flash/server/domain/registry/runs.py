@@ -212,6 +212,9 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "orgId": org_id,
         "runId": status.run_id,
         "status": status.state,
+        # Legacy records may not yet have a durable sequence. The backend permits
+        # these only until this run receives its first numbered report.
+        "reportSequence": getattr(status, "report_sequence", 0) or None,
         "userId": context.get("user_id"),
         "apiKeyId": context.get("api_key_id"),
         "projectId": project_id,

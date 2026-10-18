@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from flash.runner.lifecycle.state import RunStatus
@@ -23,12 +23,6 @@ _STATUS_REPORT_ACCEPTING = True
 _STATUS_REPORT_LAST_SENT: dict[str, int] = {}
 _STATUS_REPORT_LAST_ATTEMPTED: dict[str, int] = {}
 _STATUS_REPORT_LAST_QUEUED: dict[str, int] = {}
-# Run IDs with no pending reports, ordered by when their queues last drained; oldest first.
-# The three sequence dicts above retain recent entries to suppress duplicate reports. Once this
-# idle list exceeds its limit, forget the oldest run's sequence state. Idle here describes status
-# reporting, not whether the training run has finished.
-_STATUS_REPORT_IDLE_RUNS: OrderedDict[str, None] = OrderedDict()
-_MAX_IDLE_STATUS_REPORT_RUNS = 512
 
 
 def _send_status_report(status: RunStatus) -> bool:
@@ -73,15 +67,15 @@ def _deliver_status_report(status: RunStatus, sequence: int, attempt_budget: int
     return False
 
 
-def _mark_status_report_run_idle_unlocked(run_id: str) -> None:
-    """Mark a run idle after its queue drains, evicting the oldest idle state above the limit."""
-    _STATUS_REPORT_IDLE_RUNS.pop(run_id, None)
-    _STATUS_REPORT_IDLE_RUNS[run_id] = None
-    while len(_STATUS_REPORT_IDLE_RUNS) > _MAX_IDLE_STATUS_REPORT_RUNS:
-        evicted, _ = _STATUS_REPORT_IDLE_RUNS.popitem(last=False)
-        _STATUS_REPORT_LAST_SENT.pop(evicted, None)
-        _STATUS_REPORT_LAST_ATTEMPTED.pop(evicted, None)
-        _STATUS_REPORT_LAST_QUEUED.pop(evicted, None)
+def _forget_status_report_run_unlocked(run_id: str) -> None:
+    """Drop temporary delivery state once no reports remain for this run.
+
+    The backend persists report sequences and rejects duplicates/older snapshots,
+    so correctness does not depend on remembering delivered reports in this process.
+    """
+    _STATUS_REPORT_LAST_SENT.pop(run_id, None)
+    _STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
+    _STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
 
 
 def _finish_status_report(done: threading.Event) -> None:
@@ -104,7 +98,7 @@ def _drain_status_report_run(run_id: str) -> None:
                 _STATUS_REPORT_QUEUES.pop(run_id, None)
                 _STATUS_REPORT_ACTIVE.discard(run_id)
                 _STATUS_REPORT_DRAINING.discard(run_id)
-                _mark_status_report_run_idle_unlocked(run_id)
+                _forget_status_report_run_unlocked(run_id)
                 _STATUS_REPORT_CONDITION.notify_all()
                 return
             status, sequence, done, attempt_budget = queue.popleft()
@@ -133,6 +127,8 @@ def _discard_status_report_worker(run_id: str, future: Future[None]) -> None:
             _STATUS_REPORT_ACTIVE.discard(run_id)
             if _STATUS_REPORT_QUEUES.get(run_id):
                 fallback = not _start_status_report_worker_unlocked(run_id)
+            else:
+                _forget_status_report_run_unlocked(run_id)
         _STATUS_REPORT_CONDITION.notify_all()
     if fallback:
         _drain_status_report_run(run_id)
@@ -191,6 +187,8 @@ def _cancel_status_report_run_unlocked(run_id: str, *, forget_sequence: bool) ->
             _STATUS_REPORT_LAST_QUEUED[run_id] = attempted
         else:
             _STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+    if run_id not in _STATUS_REPORT_ACTIVE and run_id not in _STATUS_REPORT_DRAINING:
+        _forget_status_report_run_unlocked(run_id)
     _STATUS_REPORT_CONDITION.notify_all()
 
 
@@ -222,8 +220,6 @@ def _queue_status_report(status: RunStatus, *, wait: bool) -> None:
         if sequence <= _STATUS_REPORT_LAST_QUEUED.get(run_id, 0):
             return
         _STATUS_REPORT_LAST_QUEUED[run_id] = sequence
-        # Reports are pending again, so protect this run from idle-state eviction.
-        _STATUS_REPORT_IDLE_RUNS.pop(run_id, None)
         _STATUS_REPORT_QUEUES.setdefault(run_id, deque()).append(
             (snapshot, sequence, done, attempt_budget)
         )
@@ -249,7 +245,7 @@ def _report_status_async(status: RunStatus) -> None:
 def _wait_for_status_reports(timeout: float | None = None) -> bool:
     deadline = None if timeout is None else time.monotonic() + timeout
     with _STATUS_REPORT_CONDITION:
-        while _STATUS_REPORT_PENDING:
+        while _STATUS_REPORT_PENDING or _STATUS_REPORT_DRAINING:
             if deadline is None:
                 _STATUS_REPORT_CONDITION.wait()
                 continue

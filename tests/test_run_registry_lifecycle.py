@@ -377,3 +377,24 @@ def test_cleanup_requires_no_active_remote_and_an_empty_private_set(monkeypatch,
     status.report_sequence = raw["report_sequence"]
     lifecycle = _report(monkeypatch, status)["lifecycle"]
     assert lifecycle["cleanupComplete"] is False
+
+
+def test_status_report_sends_durable_sequence_for_backend_ordering(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    status = _status(_spec())
+    runner_state._save_status(status)
+    first = _report(monkeypatch, status)
+    assert first["reportSequence"] == 1
+    assert "report_sequence" not in status.to_dict()
+
+    # Reload from disk as another process or a restarted reporter would do.
+    reloaded = runner_status.get_status(status.run_id)
+    runner_state._save_status(reloaded)
+    assert _report(monkeypatch, reloaded)["reportSequence"] == 2
+    assert _report(monkeypatch, status)["reportSequence"] == 1
+
+
+def test_legacy_status_report_does_not_invent_a_persistent_sequence(monkeypatch):
+    status = _status(_spec())
+    assert status.report_sequence == 0
+    assert _report(monkeypatch, status)["reportSequence"] is None

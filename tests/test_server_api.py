@@ -4058,8 +4058,8 @@ def test_sync_deploy_execution_error_keeps_specific_persisted_outcome(api, monke
 def test_replay_status_reports_mirrors_all_persisted_outcomes_sequentially(monkeypatch):
     from flash.server.routes import serving
 
-    ready = SimpleNamespace(run_id="run-ready", deployment={"state": "ready"})
-    complete = SimpleNamespace(run_id="run-complete", deployment=None)
+    ready = SimpleNamespace(run_id="run-ready", report_sequence=1, deployment={"state": "ready"})
+    complete = SimpleNamespace(run_id="run-complete", report_sequence=1, deployment=None)
     reported = []
     monkeypatch.setattr(
         serving.db, "all_runs", lambda: [{"run_id": "run-ready"}, {"run_id": "run-complete"}]
@@ -4079,8 +4079,8 @@ def test_replay_status_reports_mirrors_all_persisted_outcomes_sequentially(monke
 def test_replay_status_reports_skips_unreadable_records_and_continues(monkeypatch):
     from flash.server.routes import serving
 
-    first = SimpleNamespace(run_id="run-first")
-    last = SimpleNamespace(run_id="run-last")
+    first = SimpleNamespace(run_id="run-first", report_sequence=1)
+    last = SimpleNamespace(run_id="run-last", report_sequence=1)
     outcomes = {
         "run-first": first,
         "run-missing": FileNotFoundError("missing"),
@@ -4105,7 +4105,9 @@ def test_replay_status_reports_skips_unreadable_records_and_continues(monkeypatc
     assert reported == [first, last]
 
 
-def test_replay_status_reports_repairs_malformed_report_sequence_and_continues(monkeypatch):
+def test_replay_status_reports_repairs_malformed_report_sequence_and_continues(
+    monkeypatch, tmp_path
+):
     from flash.server.routes import serving
 
     malformed = runner_status._runstatus_from_json(
@@ -4124,6 +4126,7 @@ def test_replay_status_reports_repairs_malformed_report_sequence_and_continues(m
             "report_sequence": 1,
         }
     )
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     statuses = {status.run_id: status for status in (malformed, valid)}
     delivered = []
     monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": key} for key in statuses])
@@ -4135,8 +4138,29 @@ def test_replay_status_reports_repairs_malformed_report_sequence_and_continues(m
     try:
         assert serving.replay_status_reports() == 2
         assert delivered == [malformed, valid]
+        assert runner_status.get_status(malformed.run_id).report_sequence == 1
+        assert delivered[0].report_sequence == 1
     finally:
         runner_reporting._shutdown_status_reporter()
+
+
+def test_legacy_status_replay_uses_concurrent_saved_update(monkeypatch, tmp_path):
+    from flash.server.routes import serving
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    legacy = SimpleNamespace(run_id="run-legacy-race", report_sequence=0)
+    current = SimpleNamespace(run_id=legacy.run_id, report_sequence=2)
+    snapshots = iter((legacy, current))
+    reported = []
+    saves = []
+    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": legacy.run_id}])
+    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: next(snapshots))
+    monkeypatch.setattr(runner_state, "_save_status_unlocked", saves.append)
+    monkeypatch.setattr(runner_reporting, "_report_status", reported.append)
+
+    assert serving.replay_status_reports() == 1
+    assert reported == [current]
+    assert saves == []
 
 
 def test_replay_status_reports_stops_between_items(monkeypatch):
@@ -4146,8 +4170,8 @@ def test_replay_status_reports_stops_between_items(monkeypatch):
 
     stop = Event()
     statuses = {
-        "run-a": SimpleNamespace(run_id="run-a"),
-        "run-b": SimpleNamespace(run_id="run-b"),
+        "run-a": SimpleNamespace(run_id="run-a", report_sequence=1),
+        "run-b": SimpleNamespace(run_id="run-b", report_sequence=1),
     }
     reported = []
     monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": key} for key in statuses])
@@ -4271,7 +4295,7 @@ def test_save_status_repairs_wrong_typed_report_sequence(api):
     assert runner_status.get_status(run_id).report_sequence == 1
 
 
-def test_legacy_replay_sequence_advances_first_post_restart_save(api, monkeypatch):
+def test_legacy_replay_persists_sequence_before_first_post_restart_save(api, monkeypatch):
     from flash.server.routes import serving
 
     key = _login()
@@ -4301,14 +4325,15 @@ def test_legacy_replay_sequence_advances_first_post_restart_save(api, monkeypatc
 
     try:
         assert serving.replay_status_reports() == 1
-        assert runner_reporting._STATUS_REPORT_LAST_SENT[run_id] == 1
+        assert runner_reporting._wait_for_status_reports(5)
+        assert runner_status.get_status(run_id).report_sequence == 1
 
         updated = runner_status.get_status(run_id)
         runner_state._save_status(updated)
         assert updated.report_sequence == 2
         runner_reporting._report_status(updated)
 
-        assert runner_reporting._STATUS_REPORT_LAST_SENT[run_id] == 2
+        assert reported[-1].report_sequence == 2
         assert len(reported) == 2
     finally:
         runner_reporting._shutdown_status_reporter()
@@ -4442,7 +4467,10 @@ def test_status_report_workers_recover_and_use_persisted_sequence(monkeypatch):
     def send(status):
         if status.deployment["state"] == "broken":
             raise RuntimeError("report failed")
-        reported.append(status)
+        # Model the backend's durable comparison. Reports arriving after a queue
+        # drains may repeat or arrive late; only newer sequences change its record.
+        if not reported or status.report_sequence > reported[-1].report_sequence:
+            reported.append(status)
 
     monkeypatch.setattr(runner_reporting, "_send_status_report", send)
 
@@ -4507,7 +4535,7 @@ def test_sync_older_status_report_skips_newer_in_flight_sequence(monkeypatch):
     runner_reporting._shutdown_status_reporter()
 
 
-def test_sync_equal_status_report_waits_for_async_success_without_duplicate(monkeypatch):
+def test_sync_equal_status_report_waits_for_async_success(monkeypatch):
     from threading import Event, Thread
 
     runner_reporting._shutdown_status_reporter()
@@ -4551,8 +4579,11 @@ def test_sync_equal_status_report_waits_for_async_success_without_duplicate(monk
 
     assert not sync.is_alive()
     assert sync_done.is_set()
-    assert attempts == [1]
-    assert runner_reporting._STATUS_REPORT_LAST_SENT[run_id] == 1
+    # If the first worker drains before the waiter resumes, the second call
+    # resends the same sequence for the backend to acknowledge as a duplicate.
+    assert attempts in ([1], [1, 1])
+    assert runner_reporting._wait_for_status_reports(5)
+    assert run_id not in runner_reporting._STATUS_REPORT_LAST_SENT
     runner_reporting._shutdown_status_reporter()
 
 
@@ -4602,7 +4633,8 @@ def test_sync_equal_status_report_retries_once_after_async_failure(monkeypatch):
     assert not sync.is_alive()
     assert sync_done.is_set()
     assert attempts == [1, 1, 1]
-    assert runner_reporting._STATUS_REPORT_LAST_SENT[run_id] == 1
+    assert runner_reporting._wait_for_status_reports(5)
+    assert run_id not in runner_reporting._STATUS_REPORT_LAST_SENT
     runner_reporting._shutdown_status_reporter()
 
 
@@ -4634,7 +4666,8 @@ def test_failed_sync_status_report_sequence_can_be_retried(monkeypatch):
 
     runner_reporting._report_status(status)
     assert attempts == [1, 1]
-    assert runner_reporting._STATUS_REPORT_LAST_SENT[run_id] == 1
+    assert runner_reporting._wait_for_status_reports(5)
+    assert run_id not in runner_reporting._STATUS_REPORT_LAST_SENT
     runner_reporting._shutdown_status_reporter()
 
 
@@ -5008,16 +5041,6 @@ def test_status_report_shutdown_stops_retry_after_active_attempt(monkeypatch):
     runner_reporting._shutdown_status_reporter()
 
 
-def _clear_status_report_sequence_state():
-    runner_reporting._STATUS_REPORT_IDLE_RUNS.clear()
-    for values in (
-        runner_reporting._STATUS_REPORT_LAST_SENT,
-        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED,
-        runner_reporting._STATUS_REPORT_LAST_QUEUED,
-    ):
-        values.clear()
-
-
 def _drained_report(run_id, sequence, *, state="done"):
     return SimpleNamespace(
         run_id=run_id,
@@ -5028,88 +5051,39 @@ def _drained_report(run_id, sequence, *, state="done"):
     )
 
 
-def test_status_report_sequence_state_is_bounded_by_idle_runs(monkeypatch):
-    # the three sequence dicts have no eviction of their own, so a long-lived server would keep
-    # three entries for every run it ever reported. runs with drained queues enter a bounded idle list.
+def test_drained_status_reports_release_all_sequence_bookkeeping(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     runner_reporting._open_status_reporter()
-    _clear_status_report_sequence_state()
     monkeypatch.setattr(runner_reporting, "_send_status_report", lambda _status: True)
-
-    cap = runner_reporting._MAX_IDLE_STATUS_REPORT_RUNS
-    overflow = cap + 20
-    try:
-        for index in range(overflow):
-            runner_reporting._report_status(_drained_report(f"run-bounded-{index}", 1))
-        assert runner_reporting._wait_for_status_reports(30)
-
-        # every per-run structure that already self-cleaned still returns to zero
-        assert not runner_reporting._STATUS_REPORT_QUEUES
-        assert not runner_reporting._STATUS_REPORT_ACTIVE
-        assert not runner_reporting._STATUS_REPORT_WORKERS
-        # and the sequence dicts are now bounded rather than growing with every run
-        assert len(runner_reporting._STATUS_REPORT_IDLE_RUNS) == cap
-        assert len(runner_reporting._STATUS_REPORT_LAST_SENT) == cap
-        assert len(runner_reporting._STATUS_REPORT_LAST_ATTEMPTED) == cap
-        assert len(runner_reporting._STATUS_REPORT_LAST_QUEUED) == cap
-        # the oldest runs are the ones forgotten, and the newest are the ones kept
-        assert "run-bounded-0" not in runner_reporting._STATUS_REPORT_LAST_SENT
-        assert f"run-bounded-{overflow - 1}" in runner_reporting._STATUS_REPORT_LAST_SENT
-    finally:
-        _clear_status_report_sequence_state()
-        runner_reporting._shutdown_status_reporter()
+    for index in range(600):
+        runner_reporting._report_status(_drained_report(f"run-bounded-{index}", 1))
+    assert runner_reporting._wait_for_status_reports(5)
+    for values in (
+        runner_reporting._STATUS_REPORT_QUEUES,
+        runner_reporting._STATUS_REPORT_ACTIVE,
+        runner_reporting._STATUS_REPORT_DRAINING,
+        runner_reporting._STATUS_REPORT_LAST_SENT,
+        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED,
+        runner_reporting._STATUS_REPORT_LAST_QUEUED,
+    ):
+        assert not values
+    runner_reporting._shutdown_status_reporter()
 
 
-def test_idle_status_report_run_still_suppresses_duplicate_sequence(monkeypatch):
-    # Keep recent idle sequence state so re-reporting the same sequence is still suppressed.
+def test_completed_reports_delegate_duplicate_and_stale_detection_to_backend(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     runner_reporting._open_status_reporter()
-    _clear_status_report_sequence_state()
     delivered = []
     monkeypatch.setattr(
         runner_reporting, "_send_status_report", lambda status: delivered.append(status) or True
     )
-
-    run_id = "run-idle-duplicate"
     try:
-        runner_reporting._report_status(_drained_report(run_id, 1))
-        assert runner_reporting._wait_for_status_reports(5)
-        assert len(delivered) == 1
-        assert run_id in runner_reporting._STATUS_REPORT_IDLE_RUNS
-
-        runner_reporting._report_status(_drained_report(run_id, 1))
-        assert runner_reporting._wait_for_status_reports(5)
-        assert len(delivered) == 1
-
-        # a later deploy or reconcile report on the same terminal run still advances
-        runner_reporting._report_status(_drained_report(run_id, 2, state="deployed"))
-        assert runner_reporting._wait_for_status_reports(5)
-        assert [status.report_sequence for status in delivered] == [1, 2]
+        for sequence in (2, 2, 1, 3):
+            runner_reporting._report_status(_drained_report("run-replay", sequence))
+            assert runner_reporting._wait_for_status_reports(5)
+        assert [status.report_sequence for status in delivered] == [2, 2, 1, 3]
+        assert "run-replay" not in runner_reporting._STATUS_REPORT_LAST_SENT
     finally:
-        _clear_status_report_sequence_state()
-        runner_reporting._shutdown_status_reporter()
-
-
-def test_requeued_status_report_run_becomes_most_recently_idle(monkeypatch):
-    # A run that reports again becomes the most recently idle entry after its queue drains.
-    runner_reporting._shutdown_status_reporter()
-    runner_reporting._open_status_reporter()
-    _clear_status_report_sequence_state()
-    monkeypatch.setattr(runner_reporting, "_send_status_report", lambda _status: True)
-
-    run_id = "run-idle-requeue"
-    try:
-        runner_reporting._report_status(_drained_report(run_id, 1))
-        assert runner_reporting._wait_for_status_reports(5)
-        assert run_id in runner_reporting._STATUS_REPORT_IDLE_RUNS
-
-        # Re-report the run, then check that it is the most recently idle entry after draining.
-        runner_reporting._report_status(_drained_report(run_id, 2, state="deployed"))
-        assert runner_reporting._wait_for_status_reports(5)
-        idle_runs = list(runner_reporting._STATUS_REPORT_IDLE_RUNS)
-        assert idle_runs[-1] == run_id
-    finally:
-        _clear_status_report_sequence_state()
         runner_reporting._shutdown_status_reporter()
 
 
