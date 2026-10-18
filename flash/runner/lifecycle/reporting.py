@@ -16,12 +16,13 @@ _STATUS_REPORT_CONDITION = threading.Condition(_STATUS_REPORT_LOCK)
 _STATUS_REPORT_EXECUTOR: ThreadPoolExecutor | None = None
 _STATUS_REPORT_QUEUES: dict[str, deque[tuple[RunStatus, int, threading.Event, int]]] = {}
 _STATUS_REPORT_WORKERS: dict[str, Future[None]] = {}
+# ACTIVE includes scheduled workers; DRAINING holds runs actually being processed,
+# including a report removed from its queue but still in flight.
 _STATUS_REPORT_ACTIVE: set[str] = set()
 _STATUS_REPORT_DRAINING: set[str] = set()
 _STATUS_REPORT_PENDING = 0
 _STATUS_REPORT_ACCEPTING = True
 _STATUS_REPORT_LAST_SENT: dict[str, int] = {}
-_STATUS_REPORT_LAST_ATTEMPTED: dict[str, int] = {}
 _STATUS_REPORT_LAST_QUEUED: dict[str, int] = {}
 
 
@@ -49,9 +50,6 @@ def _deliver_status_report(status: RunStatus, sequence: int, attempt_budget: int
     with _STATUS_REPORT_LOCK:
         if sequence <= _STATUS_REPORT_LAST_SENT.get(status.run_id, 0):
             return True
-        if sequence < _STATUS_REPORT_LAST_ATTEMPTED.get(status.run_id, 0):
-            return True
-        _STATUS_REPORT_LAST_ATTEMPTED[status.run_id] = sequence
     for attempt in range(attempt_budget):
         try:
             if _send_status_report(status) is not False:
@@ -74,8 +72,20 @@ def _forget_status_report_run_unlocked(run_id: str) -> None:
     so correctness does not depend on remembering delivered reports in this process.
     """
     _STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    _STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     _STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+
+
+def _reset_queued_sequence_unlocked(run_id: str) -> None:
+    """Allow failed or cancelled reports to be queued again.
+
+    Only acknowledged delivery suppresses retries. The backend rejects stale
+    reports even when an earlier request succeeded but its response was lost.
+    """
+    sent = _STATUS_REPORT_LAST_SENT.get(run_id, 0)
+    if sent:
+        _STATUS_REPORT_LAST_QUEUED[run_id] = sent
+    else:
+        _STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
 
 
 def _finish_status_report(done: threading.Event) -> None:
@@ -109,11 +119,7 @@ def _drain_status_report_run(run_id: str) -> None:
             if not delivered:
                 with _STATUS_REPORT_CONDITION:
                     if _STATUS_REPORT_LAST_QUEUED.get(run_id) == sequence:
-                        sent = _STATUS_REPORT_LAST_SENT.get(run_id, 0)
-                        if sent:
-                            _STATUS_REPORT_LAST_QUEUED[run_id] = sent
-                        else:
-                            _STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+                        _reset_queued_sequence_unlocked(run_id)
             _finish_status_report(done)
 
 
@@ -170,7 +176,7 @@ def _start_status_report_worker_unlocked(run_id: str) -> bool:
     return True
 
 
-def _cancel_status_report_run_unlocked(run_id: str, *, forget_sequence: bool) -> None:
+def _cancel_status_report_run_unlocked(run_id: str) -> None:
     global _STATUS_REPORT_PENDING
     queue = _STATUS_REPORT_QUEUES.pop(run_id, None)
     if queue is not None:
@@ -181,12 +187,7 @@ def _cancel_status_report_run_unlocked(run_id: str, *, forget_sequence: bool) ->
     worker = _STATUS_REPORT_WORKERS.get(run_id)
     if (worker is None or worker.done()) and run_id not in _STATUS_REPORT_DRAINING:
         _STATUS_REPORT_ACTIVE.discard(run_id)
-    if forget_sequence:
-        attempted = _STATUS_REPORT_LAST_ATTEMPTED.get(run_id, 0)
-        if attempted:
-            _STATUS_REPORT_LAST_QUEUED[run_id] = attempted
-        else:
-            _STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
+    _reset_queued_sequence_unlocked(run_id)
     if run_id not in _STATUS_REPORT_ACTIVE and run_id not in _STATUS_REPORT_DRAINING:
         _forget_status_report_run_unlocked(run_id)
     _STATUS_REPORT_CONDITION.notify_all()
@@ -227,7 +228,7 @@ def _queue_status_report(status: RunStatus, *, wait: bool) -> None:
         if run_id not in _STATUS_REPORT_ACTIVE:
             fallback = not _start_status_report_worker_unlocked(run_id)
         if fallback and not wait:
-            _cancel_status_report_run_unlocked(run_id, forget_sequence=True)
+            _cancel_status_report_run_unlocked(run_id)
     if fallback and wait:
         _drain_status_report_run(run_id)
     if wait:
@@ -256,9 +257,9 @@ def _wait_for_status_reports(timeout: float | None = None) -> bool:
         return True
 
 
-def _cancel_queued_status_reports_unlocked(*, forget_sequences: bool) -> None:
+def _cancel_queued_status_reports_unlocked() -> None:
     for run_id in tuple(_STATUS_REPORT_QUEUES):
-        _cancel_status_report_run_unlocked(run_id, forget_sequence=forget_sequences)
+        _cancel_status_report_run_unlocked(run_id)
 
 
 def _shutdown_status_reporter(timeout: float = 15.0, *, close: bool = False) -> bool:
@@ -270,7 +271,7 @@ def _shutdown_status_reporter(timeout: float = 15.0, *, close: bool = False) -> 
         executor = _STATUS_REPORT_EXECUTOR
         _STATUS_REPORT_EXECUTOR = None
         if not flushed:
-            _cancel_queued_status_reports_unlocked(forget_sequences=close)
+            _cancel_queued_status_reports_unlocked()
             for future in tuple(_STATUS_REPORT_WORKERS.values()):
                 future.cancel()
     if executor is not None:

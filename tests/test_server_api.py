@@ -4094,7 +4094,6 @@ def test_legacy_replay_persists_sequence_before_first_post_restart_save(api, mon
     runner_reporting._open_status_reporter()
     for values in (
         runner_reporting._STATUS_REPORT_LAST_SENT,
-        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED,
         runner_reporting._STATUS_REPORT_LAST_QUEUED,
     ):
         values.pop(run_id, None)
@@ -4187,7 +4186,6 @@ def test_status_reports_preserve_run_order_without_cross_run_blocking(monkeypatc
     run_b = "run-ordered-report-b"
     for run_id in (run_a, run_b):
         runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
         runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     started = Event()
     release = Event()
@@ -4241,7 +4239,6 @@ def test_status_report_workers_recover_and_use_persisted_sequence(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     run_id = "run-stale-report"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     reported = []
 
@@ -4280,7 +4277,6 @@ def test_sync_older_status_report_skips_newer_in_flight_sequence(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     run_id = "run-report-race"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     newer_started = Event()
     release_newer = Event()
@@ -4322,7 +4318,6 @@ def test_sync_equal_status_report_waits_for_async_success(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     run_id = "run-report-equal-success"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     async_started = Event()
     release_async = Event()
@@ -4374,7 +4369,6 @@ def test_sync_equal_status_report_retries_once_after_async_failure(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     run_id = "run-report-equal-failure"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     async_started = Event()
     release_async = Event()
@@ -4424,7 +4418,6 @@ def test_failed_sync_status_report_sequence_can_be_retried(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     run_id = "run-report-retry"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     attempts = []
 
@@ -4458,7 +4451,6 @@ def test_wait_for_status_reports_includes_work_queued_while_waiting(monkeypatch)
     runner_reporting._shutdown_status_reporter()
     run_id = "run-report-wait"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     first_started = Event()
     first_release = Event()
@@ -4514,7 +4506,6 @@ def test_duplicate_status_drains_preserve_per_run_serialization(monkeypatch):
     run_id = "run-duplicate-drain"
     for state in (
         runner_reporting._STATUS_REPORT_LAST_SENT,
-        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED,
         runner_reporting._STATUS_REPORT_LAST_QUEUED,
     ):
         state.pop(run_id, None)
@@ -4585,7 +4576,6 @@ def test_async_status_report_drops_when_executor_cannot_start(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     run_id = "run-report-fallback"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     reported = []
     executor = BrokenExecutor()
@@ -4623,7 +4613,6 @@ def test_failed_executor_submission_preserves_queued_peer_work(monkeypatch):
     for run_id in (peer_run_id, failed_run_id):
         for values in (
             runner_reporting._STATUS_REPORT_LAST_SENT,
-            runner_reporting._STATUS_REPORT_LAST_ATTEMPTED,
             runner_reporting._STATUS_REPORT_LAST_QUEUED,
         ):
             values.pop(run_id, None)
@@ -4686,7 +4675,6 @@ def test_sync_status_report_falls_back_when_executor_cannot_start(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     run_id = "run-sync-report-fallback"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     reported = []
     executor = BrokenExecutor()
@@ -4740,7 +4728,6 @@ def test_status_report_shutdown_is_bounded_and_cancels_queued_work(monkeypatch):
     run_b = "run-report-shutdown-b"
     for run_id in (run_a, run_b):
         runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
         runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     started = Event()
     release = Event()
@@ -4789,7 +4776,6 @@ def test_status_report_shutdown_stops_retry_after_active_attempt(monkeypatch):
     run_id = "run-report-stop-retry"
     for values in (
         runner_reporting._STATUS_REPORT_LAST_SENT,
-        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED,
         runner_reporting._STATUS_REPORT_LAST_QUEUED,
     ):
         values.pop(run_id, None)
@@ -4844,7 +4830,6 @@ def test_drained_status_reports_release_all_sequence_bookkeeping(monkeypatch):
         runner_reporting._STATUS_REPORT_ACTIVE,
         runner_reporting._STATUS_REPORT_DRAINING,
         runner_reporting._STATUS_REPORT_LAST_SENT,
-        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED,
         runner_reporting._STATUS_REPORT_LAST_QUEUED,
     ):
         assert not values
