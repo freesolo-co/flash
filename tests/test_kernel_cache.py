@@ -142,3 +142,14 @@ def test_raw_cache_arch_mismatch_redirects_to_fresh_cache(monkeypatch, tmp_path)
     monkeypatch.setitem(sys.modules, "torch", _FakeTorch)
     assert kernel_warmup.load_mega_cache() is False
     assert os.environ["TRITON_CACHE_DIR"] != str(tmp_path / "triton")
+
+
+def test_unbaked_runtime_jit_cache_is_preserved_without_loading_torch(monkeypatch, tmp_path):
+    triton = tmp_path / "triton"
+    triton.mkdir()
+    (triton / "runtime.cubin").write_bytes(b"compiled-on-this-worker")
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(triton))
+    monkeypatch.setattr(kernel_warmup, "DEFAULT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setitem(sys.modules, "torch", None)
+    assert kernel_warmup.load_mega_cache() is False
+    assert os.environ["TRITON_CACHE_DIR"] == str(triton)

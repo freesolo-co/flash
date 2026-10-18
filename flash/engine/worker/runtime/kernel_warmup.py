@@ -234,6 +234,11 @@ def load_mega_cache() -> bool:
             os.environ[var] = d
         return False
 
+    # an unbaked image may accumulate raw JIT files across runs. without bake metadata or a
+    # portable blob these are runtime caches, not an artifact to reject or inspect through CUDA.
+    if not os.path.isfile(cache_file) and not os.path.isfile(meta_file):
+        print("[kernel-cache] no baked metadata -> using runtime JIT caches")
+        return False
     if not os.path.isfile(cache_file) and not has_raw_kernel_cache(DEFAULT_CACHE_DIR):
         print(f"[kernel-cache] no baked cache at {cache_file} -> first-run JIT (expected default)")
         return False
