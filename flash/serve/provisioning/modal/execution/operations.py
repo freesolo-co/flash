@@ -9,6 +9,7 @@ from flash.serve.control import (
     ModalCredentials,
     ModalProviderHandle,
 )
+from flash.serve.control._urls import modal_public_url_matches
 from flash.serve.control.types import validate_modal_handle
 from flash.serve.provisioning.common.records import (
     Clock,
@@ -361,7 +362,7 @@ def _validate_handle(plan: ModalCreatePlan, handle: ModalProviderHandle) -> None
         or handle.app_name != plan.names.app_or_pod
         or handle.volume_name != plan.names.volume
         or handle.inference_secret_name != plan.names.inference_secret
-        or handle.public_url != plan.expected_public_url
+        or not modal_public_url_matches(handle.public_url, plan.expected_public_url)
     ):
         raise ValueError("modal handle does not match the exact deployment generation")
 

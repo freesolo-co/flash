@@ -78,6 +78,41 @@ def _download_pinned_hf_bytes(
         return file.read()
 
 
+def _transported_checkpoint_files(api, *, hf_repo, prefix, paths, revision, token):
+    """Prove all chunk members at the pinned revision before admitting a resume."""
+    from flash.engine.support.checkpoint_transport import MANIFEST, parse_manifest
+
+    manifest_path = f"{prefix}/{MANIFEST}"
+    if manifest_path not in paths:
+        return {}
+    raw = _download_pinned_hf_bytes(hf_repo, manifest_path, revision=revision, token=token)
+    if len(raw) > 4 * 1024 * 1024:
+        raise ValueError("checkpoint transport manifest is too large")
+    files = parse_manifest(raw)
+    expected = {}
+    for name, entry in files.items():
+        if f"{prefix}/{name}" in paths:
+            raise ValueError("checkpoint contains both native and transported file")
+        for part in entry["parts"]:
+            path = f"{prefix}/{part['path']}"
+            if path not in paths or path in expected:
+                raise ValueError("checkpoint transport part is missing or duplicated")
+            expected[path] = part["size"]
+    infos = api.get_paths_info(
+        repo_id=hf_repo, paths=list(expected), repo_type="dataset", revision=revision
+    )
+    actual = {}
+    for info in infos:
+        path = getattr(info, "path", None)
+        size = getattr(info, "size", None)
+        if path not in expected or path in actual or type(size) is not int:
+            raise ValueError("checkpoint transport metadata is ambiguous")
+        actual[path] = size
+    if actual != expected:
+        raise ValueError("checkpoint transport part length mismatch")
+    return {name: entry["size"] for name, entry in files.items()}
+
+
 def _opd_resume_checkpoint(
     api,
     *,
@@ -118,6 +153,12 @@ def _opd_resume_checkpoint(
     if not opd_resume_checkpoint_complete(by_step[step]):
         return None
     prefix = f"{base}checkpoint-{step}"
+    try:
+        transported = _transported_checkpoint_files(
+            api, hf_repo=hf_repo, prefix=prefix, paths=paths, revision=revision, token=token
+        )
+    except Exception:
+        return None
     stamp_path = f"{prefix}/actor/{VERL_FSDP_CONFIG_FILE}"
     try:
         stamp_raw = _download_pinned_hf_bytes(
@@ -131,10 +172,18 @@ def _opd_resume_checkpoint(
     stamp = parse_fsdp_stamp(stamp_raw)
     sizes: dict[str, int | None] = {}
     names = actor_names.get(step, [])
+    transported_sizes = {
+        name.removeprefix("actor/"): size
+        for name, size in transported.items()
+        if name.startswith("actor/") and "/" not in name.removeprefix("actor/")
+    }
+    names.extend(transported_sizes)
     if stamp is not None:
         _generation, width = stamp
         expected_names = expected_native_fsdp_shard_names(width)
-        expected_paths = [f"{prefix}/actor/{name}" for name in expected_names]
+        expected_paths = [
+            f"{prefix}/actor/{name}" for name in expected_names if name not in transported_sizes
+        ]
         try:
             infos = api.get_paths_info(
                 repo_id=hf_repo,
@@ -153,6 +202,7 @@ def _opd_resume_checkpoint(
                 )
         except Exception:
             sizes = dict.fromkeys(expected_names, 0)
+        sizes.update(transported_sizes)
         for name in expected_names:
             if name not in sizes:
                 sizes[name] = 0

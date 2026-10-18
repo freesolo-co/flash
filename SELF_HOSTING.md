@@ -1,22 +1,22 @@
 # Self-hosting Flash
 
-Run your own Flash control plane against your own GPU accounts, with no Freesolo backend
+Run your own Flash control plane against your own Modal workspace, with no Freesolo backend
 involved.
 
-This is an operator deployment, not a one-command install: you supply the GPU credentials,
-you hold the auth key, and you decide which of the three providers to use. What it gets
+This is an operator deployment, not a one-command install: you supply the Modal credentials
+and hold the auth key. What it gets
 you is the whole training path - SFT, GRPO, and on-policy distillation on verl with
 colocated vLLM rollouts, the allocator, the stall watchdog, checkpoint streaming, and
 endpoint GC - pointed at hardware you pay for directly.
 
 ## What you need
 
-Two credentials and at least one GPU account:
+Your Modal credentials, a Hugging Face write token, and a control-plane auth key:
 
 |                         |                                                                                                                                                                               |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **One GPU provider**    | a Modal workspace with GPU access.                                                                                                                         |
-| `HF_TOKEN`              | a HuggingFace token with **write** access. Flash streams code, checkpoints, and adapters through HuggingFace dataset repos, so every run needs it whichever provider you use. |
+| **Modal workspace**    | a Modal workspace with GPU access.                                                                                                                         |
+| `HF_TOKEN`              | a HuggingFace token with **write** access. Flash streams code, checkpoints, and adapters through HuggingFace dataset repos, so every run needs it. |
 | `FLASH_HF_NAMESPACE`    | the HuggingFace user or org those repos are created under - **set this to one your `HF_TOKEN` can write to.** It defaults to Freesolo's namespace, which you cannot write to. |
 | `FREESOLO_INTERNAL_KEY` | the key your clients present to your plane. Generate it yourself.                                                                                                             |
 
@@ -228,6 +228,9 @@ Flash creates named GPU Sandboxes in `flash-training`. The controller persists t
 ID before polling. It reconnects after a restart, streams artifacts through Hugging Face, resumes
 from streamed checkpoints after preemption, and confirms termination on cancellation. Ambiguous
 creation is reconciled by exact name and attempt metadata before another launch is allowed.
+Native resume files larger than 40 GB are uploaded in checksum-verified parts and reassembled
+before restore, so single-GPU checkpoints can exceed Hugging Face's per-file upload limit.
+Staging and reassembly temporarily need another copy of those large files on local disk.
 
 The shared `flash-weights` Modal Volume retains trusted public base-model weights. Tenant artifacts
 and compiled runtime caches remain isolated. Set `FLASH_WEIGHT_CACHE_DISABLED=1` to disable this

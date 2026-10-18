@@ -103,3 +103,32 @@ def test_teardown_ownership_still_requires_exact_app_id() -> None:
 
     with pytest.raises(ModalResourceConflict, match="exact handle"):
         exact_teardown_resources(plan, handle, _observation(plan, app_id=OTHER_APP_ID))
+
+
+@pytest.mark.parametrize("regional", [False, True])
+def test_exact_endpoint_accepts_legacy_and_us_east_routing_urls(regional):
+    from flash.serve.provisioning.modal.execution.operations import _validate_handle
+
+    plan, handle = _plan_and_handle()
+    url = plan.expected_public_url
+    if regional:
+        url = url.removesuffix(".modal.run") + ".us-east.modal.run"
+    handle = replace(handle, public_url=url)
+    app = replace(_observation(plan).apps[0], public_url=url)
+    assert deployed_app_matches(plan, app)
+    _validate_handle(plan, handle)
+
+
+@pytest.mark.parametrize(
+    "suffix", [".us-west.modal.run", ".evil.modal.run", ".us-east.modal.run.evil.test"]
+)
+def test_regional_url_cannot_change_endpoint_ownership(suffix):
+    from flash.serve.control._urls import modal_public_url_matches
+
+    plan, _ = _plan_and_handle()
+    assert not modal_public_url_matches(
+        plan.expected_public_url.removesuffix(".modal.run") + suffix, plan.expected_public_url
+    )
+    assert not modal_public_url_matches(
+        "https://other--endpoint.us-east.modal.run", plan.expected_public_url
+    )
