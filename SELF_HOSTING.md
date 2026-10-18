@@ -317,7 +317,7 @@ curated ones on both deployments; see [adding a model](#adding-a-model).
 
 ## Adding a model
 
-The catalog (`flash models list`) is six curated Qwen checkpoints. Anything else is rejected
+The catalog (`flash models list`) contains three curated Qwen checkpoints. Anything else is rejected
 at config parse time, before a GPU is rented:
 
 ```
