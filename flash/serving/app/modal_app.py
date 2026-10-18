@@ -12,6 +12,12 @@ from typing import Any
 
 import modal
 
+from flash.serving.app.timeouts import (
+    REQUEST_TIMEOUT_SECONDS,
+    ROUTER_TIMEOUT_SECONDS,
+    STARTUP_TIMEOUT_SECONDS,
+)
+
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - only relevant for global modal installs
@@ -92,16 +98,6 @@ HOSTING_CACHE_MOUNT = "/vol/hosting-cache"
 # doesn't; there is nothing to tune at deploy time. Every value is the proven default. (The wiring
 # below — HF/internal key, backend + Supabase URLs — stays env-configured because it is per-deploy
 # credentials, not tuning.)
-TIMEOUT_SECONDS = 600
-# 2700s (45 min): the slowest MEASURED cold boot on the shipped B200 tiers is the 27B at 1821s
-# (a cold torch.compile cache alone costs ~354s of Dynamo), on top of image pull. The old 1200s
-# ceiling was already blown by the 35B's ~1010s of engine init — Modal SIGTERMs the container
-# mid-warmup and it cold-cycles forever. 2700s leaves ~880s of margin over the worst measurement,
-# and a higher ceiling is harmless for the fast tiers: this is only a kill-if-stuck bound.
-STARTUP_TIMEOUT_SECONDS = 2700
-# The router awaits the engine call, which on a cold base model includes vLLM startup, so its
-# timeout must cover startup + a request (else it's killed mid cold-start).
-ROUTER_TIMEOUT_SECONDS = STARTUP_TIMEOUT_SECONDS + TIMEOUT_SECONDS
 # Maximum idle window before a gpu model container scales down, PER GPU TIER.
 #
 # Sizing rule: an idle container bills at the full GPU rate, so holding one is only worth it while
@@ -459,7 +455,7 @@ def _build_engine(
         volumes={HOSTING_CACHE_MOUNT: hf_cache_volume},
         scaledown_window=scaledown_window_for(gpu),
         startup_timeout=STARTUP_TIMEOUT_SECONDS,
-        timeout=TIMEOUT_SECONDS,
+        timeout=REQUEST_TIMEOUT_SECONDS,
         min_containers=MIN_CONTAINERS,
         max_containers=MAX_CONTAINERS,
         buffer_containers=BUFFER_CONTAINERS,

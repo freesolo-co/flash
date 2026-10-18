@@ -684,8 +684,7 @@ def test_the_job_cap_leaves_room_for_a_rollback_after_every_wait_is_exhausted():
     from flash.serving.promotion import gate as gate_module
 
     gate_budget = (
-        gate_module._DEFAULT_CANARY_TIMEOUT_SECONDS
-        + gate_module._DEFAULT_ACCOUNTING_DEADLINE_SECONDS
+        gate_module.CANARY_TIMEOUT_SECONDS + gate_module._DEFAULT_ACCOUNTING_DEADLINE_SECONDS
     )
     # two `modal deploy` invocations (forward and restore), image build included, plus checkout and
     # dependency installation. deliberately generous: the assertion should fail while there is still
@@ -731,7 +730,13 @@ PREVIOUS = "1111111111111111111111111111111111111111"
 CURRENT = "2222222222222222222222222222222222222222"
 
 
-def _run_rollback(*, previous_sha: str, is_ancestor: bool, health: str) -> tuple[int, str, str]:
+def _run_rollback(
+    *,
+    previous_sha: str,
+    is_ancestor: bool,
+    health: str,
+    entrypoint: str | None = "flash/serving/app/modal_app.py",
+) -> tuple[int, str, str]:
     """Execute the rollback script with `modal`, `curl`, `git`, and `sleep` stubbed on PATH.
 
     RUN it rather than grep it, for the same reason the dispatch and fork guards above are run:
@@ -748,9 +753,13 @@ def _run_rollback(*, previous_sha: str, is_ancestor: bool, health: str) -> tuple
         root = Path(tmp)
         bin_dir = root / "bin"
         bin_dir.mkdir()
+        # the working tree starts at the new layout; checkout installs the predecessor's layout.
+        app = root / "flash/serving/app/modal_app.py"
+        app.parent.mkdir(parents=True, exist_ok=True)
+        app.touch()
         calls = root / "modal-calls.txt"
         (bin_dir / "modal").write_text(
-            '#!/bin/sh\nprintf "%s sha=%s id=%s\\n" "$*" "$FREESOLO_DEPLOYMENT_SHA" '
+            '#!/bin/sh\n[ -f "$2" ] || exit 2\nprintf "%s sha=%s id=%s\\n" "$*" "$FREESOLO_DEPLOYMENT_SHA" '
             '"$FREESOLO_DEPLOYMENT_ID" >> "$MODAL_CALLS"\nexit 0\n'
         )
         # the health body is served from a file; `--output` is where the script wants it.
@@ -759,11 +768,15 @@ def _run_rollback(*, previous_sha: str, is_ancestor: bool, health: str) -> tuple
             '  if [ "$prev" = "--output" ]; then out="$arg"; fi\n  prev="$arg"\ndone\n'
             'printf "%s" "$HEALTH_BODY" > "$out"\nexit 0\n'
         )
-        # `merge-base --is-ancestor` answers from the fixture; `checkout` is a no-op. A real repo
-        # would make the ancestor case depend on this checkout's history rather than on the branch
-        # under test.
+        # ancestry comes from the fixture, while checkout changes the files visible to rollback.
         (bin_dir / "git").write_text(
-            '#!/bin/sh\nif [ "$1" = "merge-base" ]; then exit "$ANCESTOR_EXIT"; fi\nexit 0\n'
+            '#!/bin/sh\nif [ "$1" = "merge-base" ]; then exit "$ANCESTOR_EXIT"; fi\n'
+            'if [ "$1" = "checkout" ]; then\n'
+            "  rm -f flash/serving/app/modal_app.py flash/serving/modal_app.py\n"
+            '  if [ -n "$RESTORED_ENTRYPOINT" ]; then\n'
+            '    mkdir -p "$(dirname "$RESTORED_ENTRYPOINT")"\n'
+            '    touch "$RESTORED_ENTRYPOINT"\n'
+            "  fi\nfi\nexit 0\n"
         )
         for stub in bin_dir.iterdir():
             stub.chmod(0o755)
@@ -786,6 +799,7 @@ def _run_rollback(*, previous_sha: str, is_ancestor: bool, health: str) -> tuple
             env={
                 "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
                 "MODAL_CALLS": str(calls),
+                "RESTORED_ENTRYPOINT": entrypoint or "",
                 "ANCESTOR_EXIT": "0" if is_ancestor else "1",
                 "HEALTH_BODY": health,
                 "PREVIOUS_SHA": previous_sha,
@@ -934,6 +948,54 @@ def test_a_failure_before_the_deploy_never_restores_over_an_untouched_production
 
     # and a green run never restores, whatever the deploy did.
     assert not _rollback_fires(deploy_outcome="success", job_failed=False)
+
+
+def test_rollback_can_restore_a_release_before_the_serving_source_move():
+    code, deployed, logged = _run_rollback(
+        previous_sha=PREVIOUS,
+        is_ancestor=True,
+        health=_health(PREVIOUS, "9-1-rollback"),
+        entrypoint="flash/serving/modal_app.py",
+    )
+    assert "deploy flash/serving/modal_app.py" in deployed
+    assert f"sha={PREVIOUS}" in deployed
+    assert code != 0
+    assert "is NOT deployed" in logged
+
+
+def test_rollback_refuses_a_release_without_a_serving_entrypoint():
+    code, deployed, logged = _run_rollback(
+        previous_sha=PREVIOUS,
+        is_ancestor=True,
+        health=_health(PREVIOUS, "9-1-rollback"),
+        entrypoint=None,
+    )
+    assert code != 0
+    assert deployed == ""
+    assert "no supported serving entrypoint" in logged
+
+
+@pytest.mark.parametrize("org_id", ["", "   ", "invalid", "11111111-2222-4333-8444-555555555555"])
+def test_canary_attribution_is_validated_before_production_deployment(org_id):
+    step = _deploy_steps()[_step_index("Verify required serving runtime secrets")]
+    env = dict.fromkeys(
+        (
+            "HF_TOKEN",
+            "SUPABASE_URL",
+            "SUPABASE_SERVICE_ROLE_KEY",
+            "FREESOLO_INTERNAL_KEY",
+            "PLATFORM_BACKEND_URL",
+        ),
+        "configured",
+    )
+    result = subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        capture_output=True,
+        text=True,
+        env={**env, "PATH": os.environ["PATH"], "SERVING_CANARY_ORG_ID": org_id},
+    )
+    assert (result.returncode == 0) == org_id.startswith("11111111-")
+    assert _step_index("Verify required serving runtime secrets") < _step_index("Deploy serving")
 
 
 @pytest.mark.parametrize("workflow", ["deploy-modal.yml", "deploy-modal-dev.yml"])

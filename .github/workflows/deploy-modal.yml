@@ -11,6 +11,7 @@ name: Deploy serving Modal app
 #   FREESOLO_INTERNAL_KEY                - shared platform internal key (backend + serving)
 #   PLATFORM_BACKEND_URL                 - platform backend base URL
 #   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY - serving startup hydration (durable adapter registry)
+# required Actions variable: SERVING_CANARY_ORG_ID - existing internal organization billed for probes
 # modal_app.py reads these from the environment (load_dotenv only supplements os.environ), so no
 # .env file is written in CI. the "Verify required runtime secrets" step below hard-fails the deploy
 # if a required secret is absent, preventing a broken production config with external chat failures,
@@ -40,13 +41,13 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     # the job's own bounded waits now sum well past the old 30: two 300s readiness polls, the remote
-    # image build, a 420s canary that pays a GPU cold start, a 180s accounting deadline, and on the
-    # failure path a SECOND `modal deploy` plus a 300s restore poll. 60 minutes clears that worst
+    # image build, a 3360s canary that pays a GPU cold start, a 180s accounting deadline, and on the
+    # failure path a SECOND `modal deploy` plus a 300s restore poll. 90 minutes clears that worst
     # case with room while keeping a wedged deploy from holding the runner for GitHub's 6-hour
     # default. the headroom is specifically for the rollback: a job killed partway through the
     # restore leaves the broken release live with no second attempt, which is the one outcome this
     # workflow exists to prevent.
-    timeout-minutes: 60
+    timeout-minutes: 90
     # serialize serving deploys across runs because each deploy mutates the live app. github can still
     # replace a pending run, so the gate compares against the sha reported by the deployed app rather
     # than assuming every push predecessor was deployed.
@@ -75,6 +76,7 @@ jobs:
       # (empty => default *.modal.run url), so non-prod/fork/local workspaces stay deployable. This
       # domain is verified in the production Modal workspace, so prod keeps serving on serve.freesolo.co.
       SERVING_CUSTOM_DOMAIN: serve.freesolo.co
+      SERVING_CANARY_ORG_ID: ${{ vars.SERVING_CANARY_ORG_ID }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -198,7 +200,7 @@ jobs:
           if [ -z "$SUPABASE_SERVICE_ROLE_KEY" ]; then
             missing="$missing SUPABASE_SERVICE_ROLE_KEY"
           fi
-          required="FREESOLO_INTERNAL_KEY PLATFORM_BACKEND_URL"
+          required="FREESOLO_INTERNAL_KEY PLATFORM_BACKEND_URL SERVING_CANARY_ORG_ID"
           for name in $required; do
             # indirect expansion: the secrets are exported into the env via the job-level `env:` block.
             if [ -z "${!name}" ]; then
@@ -206,10 +208,21 @@ jobs:
             fi
           done
           if [ -n "$missing" ]; then
-            echo "::error::Refusing to deploy serving to prod: missing required secret(s):${missing}. Set them in repo Settings -> Secrets and variables -> Actions."
+            echo "::error::Refusing to deploy serving to prod: missing required setting(s):${missing}. Set them in repo Settings -> Secrets and variables -> Actions."
             exit 1
           fi
-          echo "All required serving runtime secrets are present."
+          # reject malformed attribution before replacing the live app.
+          python - <<'PY'
+          import os
+          import sys
+          import uuid
+
+          try:
+              uuid.UUID(os.environ["SERVING_CANARY_ORG_ID"].strip())
+          except ValueError:
+              sys.exit("::error::SERVING_CANARY_ORG_ID must be an existing internal organization UUID.")
+          PY
+          echo "All required serving runtime secrets and canary settings are present."
 
       - name: Wait for production adapter schema readiness
         if: steps.gate.outputs.deploy == 'true'
@@ -411,6 +424,7 @@ jobs:
           # durably. this step is the only thing standing between "the process booted" and "the
           # release can actually serve", so a failure here must not be promoted.
           SERVING_BASE_URL: https://serve.freesolo.co
+          SERVING_CANARY_ORG_ID: ${{ vars.SERVING_CANARY_ORG_ID }}
           FREESOLO_INTERNAL_KEY: ${{ secrets.FREESOLO_INTERNAL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -456,10 +470,20 @@ jobs:
           echo "Promotion failed; restoring ${PREVIOUS_SHA}."
           git checkout --quiet --force "$PREVIOUS_SHA"
 
+          # resolve the entrypoint in the restored tree, including releases before the source move.
+          if [ -f flash/serving/app/modal_app.py ]; then
+            rollback_app=flash/serving/app/modal_app.py
+          elif [ -f flash/serving/modal_app.py ]; then
+            rollback_app=flash/serving/modal_app.py
+          else
+            echo "::error::Previous release has no supported serving entrypoint. Restore production manually."
+            exit 1
+          fi
+
           # the restored app must report the RESTORED sha, deployed from the restored tree.
           FREESOLO_DEPLOYMENT_SHA="$PREVIOUS_SHA" \
           FREESOLO_DEPLOYMENT_ID="$ROLLBACK_DEPLOYMENT_ID" \
-            modal deploy flash/serving/app/modal_app.py
+            modal deploy "$rollback_app"
 
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
