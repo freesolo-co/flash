@@ -182,7 +182,7 @@ def _usage_fields(
         "completion_tokens": len(completion_token_ids),
         "cached_tokens": _num_cached_tokens(request_output),
         "cached_tokens_reported": _cached_tokens_reported(request_output),
-        "inference_time_seconds": time.time() - start,
+        "inference_time_seconds": time.monotonic() - start,
         **(
             {"time_to_first_token_seconds": time_to_first_token_seconds}
             if time_to_first_token_seconds is not None
@@ -224,7 +224,7 @@ async def generate(
     _reject_tools_with_structured_outputs(payload, structured)
     sampling = _sampling_params(payload, structured, RequestOutputKind.FINAL_ONLY)
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
-    start = time.time()
+    start = time.monotonic()
     final_output = None
     prompt_input = await owner._prepare_prompt_input(payload, thinking)
     try:
@@ -415,7 +415,7 @@ async def stream_generate(
     _reject_tools_with_structured_outputs(payload, structured)
     sampling = _sampling_params(payload, structured, RequestOutputKind.DELTA)
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
-    start = time.time()
+    start = time.monotonic()
     prompt_input = await owner._prepare_prompt_input(payload, thinking)
     # the new interval starts at engine submission, excluding prompt and image preparation.
     first_output_started = time.perf_counter()
