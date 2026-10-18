@@ -193,7 +193,11 @@ def _install_clocks(monkeypatch: pytest.MonkeyPatch, wall_values: list[float]) -
     monkeypatch.setattr(
         generation,
         "time",
-        SimpleNamespace(time=wall_clock, monotonic=monotonic_clock),
+        SimpleNamespace(
+            time=wall_clock,
+            monotonic=monotonic_clock,
+            perf_counter=_SequenceClock([20.0, 20.05]),
+        ),
     )
     monkeypatch.setattr(
         inference_routes,

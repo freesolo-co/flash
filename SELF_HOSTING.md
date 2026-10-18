@@ -235,6 +235,12 @@ placeholder value to set for the ones you skip.
 | Lambda   | `LAMBDA_API_KEY` |                                                                 |
 | Vast     | `VAST_API_KEY`   |                                                                 |
 
+Vast log retrieval accepts signed result URLs only from exact HTTPS origins in
+`FLASH_VAST_RESULT_ORIGINS`. The variable is control-plane-only and comma-separated. Leaving it
+unset or blank allows only `https://s3.amazonaws.com`; setting it replaces that default. Origins
+must be canonical HTTPS origins without credentials, explicit ports, paths, queries, fragments,
+wildcards, spaces, or control characters.
+
 The allocator ranks candidate GPU classes only on the substrates you configured, so a
 plane with just `VAST_API_KEY` set allocates on Vast and never proposes a class it cannot
 provision. Startup fails only when **all three** are missing.

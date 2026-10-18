@@ -21,6 +21,22 @@ def exact_reasoning_tokens(result: Mapping[str, Any]) -> int:
     raise ReasoningSettlementUnavailable("exact_reasoning_tokens_unavailable")
 
 
+def _optional_nonnegative_float(value: Any) -> float | None:
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return normalized if math.isfinite(normalized) and normalized >= 0 else None
+
+
+def _optional_nonnegative_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    return value if type(value) is bool else None
+
+
 def usage_facts(result: Mapping[str, Any]) -> UsageFacts:
     prompt_ids = result.get("prompt_token_ids")
     completion_ids = result.get("completion_token_ids", result.get("token_ids"))
@@ -51,5 +67,16 @@ def usage_facts(result: Mapping[str, Any]) -> UsageFacts:
         cached_tokens_reported=cached_tokens_reported,
         reasoning_tokens=exact_reasoning_tokens(result),
         generation_duration_seconds=duration,
+        time_to_first_token_seconds=_optional_nonnegative_float(
+            result.get("time_to_first_token_seconds")
+        ),
+        queue_wait_seconds=_optional_nonnegative_float(result.get("queue_wait_seconds")),
+        replica_in_flight_requests_at_admission=_optional_nonnegative_int(
+            result.get("replica_in_flight_requests_at_admission")
+        ),
+        replica_boot_duration_seconds=_optional_nonnegative_float(
+            result.get("replica_boot_duration_seconds")
+        ),
+        replica_freshly_booted=_optional_bool(result.get("replica_freshly_booted")),
         engine_replica_id=replica if isinstance(replica, str) and replica else None,
     )

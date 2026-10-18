@@ -92,7 +92,6 @@ def lambda_image(gpu: str | None = None) -> str:
 
 def build_payload(
     spec,
-    seed: int,
     attempt: int,
     runtime_secrets: dict | None = None,
     cache_host_mount: str | None = None,
@@ -104,7 +103,6 @@ def build_payload(
     """Build the Lambda bootstrap payload (arm='lambda')."""
     return _shared_build_payload(
         spec,
-        seed,
         attempt,
         arm="lambda",
         runtime_secrets=runtime_secrets,

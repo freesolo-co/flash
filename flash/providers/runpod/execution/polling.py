@@ -30,7 +30,6 @@ from flash.providers.runpod.execution.jobs import (
     GraceTimer,
     _append_failure_artifacts,
     _safe_failure_text,
-    capacity_escalation_note,
     decode_output,
     surfaced_worker_flags,
 )
@@ -61,7 +60,6 @@ class _PollContext:
     absolute_deadline: float | None
     current_attempt: int
     launch_ts: float
-    next_gpu_note: str
     poll_errors: PollErrorTracker
 
 
@@ -233,7 +231,7 @@ def _classify_queue_state(
             failure="no_capacity",
             detail=f"never scheduled: job stuck IN_QUEUE for "
             f"{int(now - state.queued_timer.since)}s "
-            f"(no RunPod capacity for the pinned GPU class); {context.next_gpu_note}",
+            "(no RunPod capacity for the pinned GPU class)",
         )
     if status != "IN_QUEUE":
         # the in-queue grace timers measure continuous throttle/unhealthy while queued (like
@@ -307,8 +305,8 @@ def _classify_queue_state(
                 False,
                 failure="no_capacity",
                 detail=f"never scheduled: worker stuck THROTTLED for "
-                f"{int(now - state.throttled_timer.since)}s while IN_QUEUE (no RunPod "
-                f"capacity for the pinned GPU class); {context.next_gpu_note}",
+                f"{int(now - state.throttled_timer.since)}s while IN_QUEUE "
+                "(no RunPod capacity for the pinned GPU class)",
             )
     except Exception:
         pass
@@ -456,12 +454,11 @@ def poll_job(
     queue_grace_s: float = 300.0,
     deadline_at: float | None = None,
     current_attempt: int | None = None,
-    on_last_gpu: bool = False,
 ) -> PollResult:
     """Poll a queue job to completion; resilient to transient API errors.
 
     Use setup grace before the first heartbeat, then stall grace; fail fast on sustained throttled,
-    unhealthy, or over-queued states. `on_last_gpu` states only whether escalation remains.
+    unhealthy, or over-queued states.
     """
     if not handle.job_id:
         raise ValueError("endpoint-only RunPod handles cannot be polled")
@@ -487,7 +484,6 @@ def poll_job(
         absolute_deadline=absolute_deadline,
         current_attempt=attempt_id,
         launch_ts=launch_ts,
-        next_gpu_note=capacity_escalation_note(on_last_gpu),
         poll_errors=PollErrorTracker(say, interval_s),
     )
     state = _PollState(

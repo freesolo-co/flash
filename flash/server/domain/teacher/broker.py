@@ -335,7 +335,7 @@ _reject_duplicate_keys = reject_duplicate_keys(
 
 
 def _require_current_attempt(capability: dict[str, Any]) -> None:
-    from flash.runner.lifecycle.attempts import _latest_reserved_attempt
+    from flash.runner.lifecycle.attempts import latest_reserved_attempt
     from flash.runner.lifecycle.state import _internal_spec_from_status
     from flash.runner.lifecycle.status import get_status
 
@@ -345,7 +345,7 @@ def _require_current_attempt(capability: dict[str, Any]) -> None:
         raise TeacherBrokerError("run_not_found", status_code=401) from exc
     if status.state != "running":
         raise TeacherBrokerError("run_not_active", status_code=401)
-    if _latest_reserved_attempt(capability["run_id"]) != capability["attempt"]:
+    if latest_reserved_attempt(capability["run_id"]) != capability["attempt"]:
         raise TeacherBrokerError("attempt_replaced", status_code=401)
     try:
         spec = _internal_spec_from_status(status)

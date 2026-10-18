@@ -47,6 +47,7 @@ def _registration(run_id: str, source: dict, *, step: int | None = 10) -> dict:
         source["repo_id"],
         source["subfolder"],
         artifact_revision=source["hf_revision"],
+        expected_base_model=source["base_model"],
     )
     return {
         "adapter_id": checkpoint_id,
