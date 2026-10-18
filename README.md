@@ -44,9 +44,10 @@ path is self-hostable end to end — see **[SELF_HOSTING.md](SELF_HOSTING.md)**.
 
 ## Using the hosted service
 
+Operators promoting `dev` to `main` must follow the [coordinated checkpoint cutover](docs/dev-main-cutover.md).
+
 The active training catalog is `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
-`Qwen/Qwen3.6-35B-A3B`. Hosted serving is active for 9B and 35B-A3B; hosted Qwen3.8 27B remains
-inactive. The retired dense Qwen3.6 27B identity is never translated into Qwen3.8. Customer-owned
+`Qwen/Qwen3.6-35B-A3B`. Hosted serving is configured for all three models on B200. The retired dense Qwen3.6 27B identity is never translated into Qwen3.8. Customer-owned
 Modal supports all three active models; 27B and 35B-A3B are bound to the certified serving image
 digest. Customer-owned `flash serve` requires explicit `--provider modal`. Customer-serving RunPod
 commands and deployment identities are unsupported, with no migration or teardown shim. Managed
