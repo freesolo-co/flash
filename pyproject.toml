@@ -134,7 +134,7 @@ dev = [
     "pytest>=9.0.3",
     # dependency contract tests parse exact pins without relying on a transitive install.
     "packaging>=24,<27",
-    # Upper bound tracks uv.lock (ruff 0.16.x), which is what CI lints with. Without it, an
+    # Upper bound tracks uv.lock (ruff 0.17.x), which is what CI lints with. Without it, an
     # install that ignores the lockfile (`uv pip install -e '.[dev]'`, plain pip) resolves whatever
     # ruff is newest, whose added rules fail on a tree CI calls clean. Raise both sites together
     # with the lockfile, never ahead of it.
