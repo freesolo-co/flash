@@ -189,58 +189,16 @@ def _selected_dataset_path(base_dir: Path, params: dict[str, Any]) -> Path:
     )
 
 
-def _worker_json_record(value: object) -> dict[str, Any]:
-    """decode one json item with the locked freesolo worker's file semantics."""
-    if isinstance(value, str):
-        return {_CANONICAL_INPUT_KEY: value}
-    if not isinstance(value, dict):
-        raise TypeError("dataset row is not an object")
-    return value
-
-
-def _read_jsonl_rows(path: Path, *, max_examples: int) -> tuple[int, list[dict[str, Any]]]:
-    source_examples = 0
-    values = []
-    missing = []
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            row = _worker_json_record(json.loads(line))
-            if (_CANONICAL_INPUT_KEY not in row or row.get(_CANONICAL_INPUT_KEY) is None) and len(
-                missing
-            ) < 10:
-                missing.append(source_examples)
-            source_examples += 1
-            if max_examples <= 0 or len(values) < max_examples:
-                values.append(row)
-    if missing:
-        raise ValueError(
-            "Freesolo dataset records must contain an input field; missing at row indexes "
-            f"{missing}"
-        )
-    return source_examples, values
-
-
 def _validate_dataset_rows(
     values: object,
     *,
     invalid_message: str,
     max_examples: int,
-    decode_string_rows: bool = False,
     empty_message: str | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
-    if not isinstance(values, list):
+    if not isinstance(values, list) or not all(isinstance(row, dict) for row in values):
         raise PackagedDatasetUnavailable(invalid_message)
-    if decode_string_rows:
-        try:
-            rows = [_worker_json_record(row) for row in values]
-        except TypeError:
-            raise PackagedDatasetUnavailable(invalid_message) from None
-    else:
-        if not all(isinstance(row, dict) for row in values):
-            raise PackagedDatasetUnavailable(invalid_message)
-        rows = [dict(row) for row in values]
+    rows = values
     source_examples = len(rows)
     missing = [
         index
@@ -259,45 +217,36 @@ def _validate_dataset_rows(
 
 
 def _read_dataset_rows(path: Path, *, max_examples: int) -> tuple[int, list[dict[str, Any]]]:
+    from freesolo.datasets.records import load_records
+
+    invalid_message = (
+        f"environment dataset file {path.name!r} must contain JSON object or string rows. Add a "
+        "valid dataset/train.jsonl to the environment package."
+    )
     try:
         if path.stat().st_size > _MAX_PROFILE_DATASET_BYTES:
             raise PackagedDatasetUnavailable(
                 f"environment dataset file {path.name!r} exceeds the 32 MiB control-plane profiling "
                 "limit. Reduce the packaged training dataset."
             )
-        if path.suffix.lower() == ".jsonl":
-            source_examples, values = _read_jsonl_rows(path, max_examples=max_examples)
-        elif path.suffix.lower() == ".json":
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            values = (
-                loaded["data"]
-                if isinstance(loaded, dict) and isinstance(loaded.get("data"), list)
-                else loaded
-            )
-            source_examples, values = _validate_dataset_rows(
-                values,
-                invalid_message=(
-                    f"environment dataset file {path.name!r} must contain JSON object rows. Add a "
-                    "valid dataset/train.jsonl to the environment package."
-                ),
-                max_examples=max_examples,
-                decode_string_rows=True,
-            )
-        else:
-            raise ValueError("dataset file must end in .jsonl or .json")
+        if path.suffix.lower() not in {".jsonl", ".json"}:
+            raise PackagedDatasetUnavailable("dataset file must end in .jsonl or .json")
+        # use the worker's decoder; it materializes all rows before profiling selects a prefix.
+        rows = load_records(path)
     except PackagedDatasetUnavailable:
         raise
-    except TypeError as exc:
-        raise PackagedDatasetUnavailable(
-            f"environment dataset file {path.name!r} must contain JSON object rows. Add a valid "
-            "dataset/train.jsonl to the environment package."
-        ) from exc
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise PackagedDatasetUnavailable(
             f"environment dataset file {path.name!r} is not readable JSON. Add a valid "
             "dataset/train.jsonl to the environment package."
         ) from exc
-    return source_examples, [dict(row) for row in values]
+    except (TypeError, ValueError) as exc:
+        raise PackagedDatasetUnavailable(invalid_message) from exc
+    return _validate_dataset_rows(
+        rows,
+        invalid_message=invalid_message,
+        max_examples=max_examples,
+    )
 
 
 def profile_packaged_sft_dataset(

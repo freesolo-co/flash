@@ -653,20 +653,26 @@ def test_profile_honors_split_and_dataset_path(tmp_path) -> None:
         (".jsonl", "\n", []),
     ],
 )
-def test_control_plane_decoder_matches_locked_freesolo_rows(
-    tmp_path, suffix, content, expected
-) -> None:
-    from freesolo.datasets.records import load_records
+def test_control_plane_uses_locked_worker_loader(tmp_path, monkeypatch, suffix, content, expected):
+    from freesolo.datasets import records
+
+    load_records = records.load_records
+    calls = []
+
+    def record_load(path):
+        calls.append(path)
+        return load_records(path)
+
+    monkeypatch.setattr(records, "load_records", record_load)
 
     from flash.engine.profiling.dataset_profile import _read_dataset_rows
 
     path = tmp_path / f"train{suffix}"
     path.write_text(content, encoding="utf-8")
 
-    worker_rows = load_records(path)
     source_examples, control_rows = _read_dataset_rows(path, max_examples=0)
 
-    assert worker_rows == expected
+    assert calls == [path]
     assert control_rows == expected
     assert source_examples == len(expected)
 
@@ -728,6 +734,20 @@ def test_control_plane_and_locked_worker_reject_the_same_missing_inputs(
         load_task_examples(load_records(path))
     with pytest.raises(ValueError, match="input"):
         _read_dataset_rows(path, max_examples=0)
+
+
+@pytest.mark.parametrize("suffix", [".json", ".jsonl"])
+@pytest.mark.parametrize("invalid", [{"output": "missing"}, {"input": None}, 1])
+def test_profile_validates_rows_beyond_max_examples(tmp_path, suffix, invalid):
+    from flash.engine.profiling.dataset_profile import _read_dataset_rows
+
+    rows = [{"input": "selected", "output": "yes"}, invalid]
+    path = tmp_path / f"train{suffix}"
+    content = json.dumps(rows) if suffix == ".json" else "\n".join(map(json.dumps, rows))
+    path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"input field|JSON object or string rows"):
+        _read_dataset_rows(path, max_examples=1)
 
 
 def test_profile_rejects_an_empty_packaged_dataset_at_the_shared_worker_gate(tmp_path) -> None:
@@ -1264,7 +1284,7 @@ def test_image_sft_is_rejected_for_a_model_that_cannot_see_images(tmp_path) -> N
         _image_profile_from_spec(spec)
 
 
-def test_profile_streams_jsonl_and_tokenizes_only_the_deterministic_max_examples_prefix(
+def test_profile_tokenizes_only_the_deterministic_max_examples_prefix(
     tmp_path, monkeypatch
 ) -> None:
     from flash.engine.profiling import dataset_profile
