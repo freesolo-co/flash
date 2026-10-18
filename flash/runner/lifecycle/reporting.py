@@ -23,14 +23,12 @@ _STATUS_REPORT_ACCEPTING = True
 _STATUS_REPORT_LAST_SENT: dict[str, int] = {}
 _STATUS_REPORT_LAST_ATTEMPTED: dict[str, int] = {}
 _STATUS_REPORT_LAST_QUEUED: dict[str, int] = {}
-# runs whose queue, worker, and active marks have all cleared, newest last. every other per-run
-# structure self-cleans on drain, but the three sequence dicts above have no eviction at all, so a
-# long-lived server accumulates three entries for every run it has ever reported. they cannot simply
-# be dropped on drain: a run that re-reports the same sequence (a replay, or a retry after a failed
-# send) relies on them to suppress the duplicate delivery. so retire drained runs into a bounded
-# ring instead, and only forget the oldest once the ring is full.
-_STATUS_REPORT_RETIRED: OrderedDict[str, None] = OrderedDict()
-_MAX_RETIRED_STATUS_REPORT_RUNS = 512
+# Run IDs with no pending reports, ordered by when their queues last drained; oldest first.
+# The three sequence dicts above retain recent entries to suppress duplicate reports. Once this
+# idle list exceeds its limit, forget the oldest run's sequence state. Idle here describes status
+# reporting, not whether the training run has finished.
+_STATUS_REPORT_IDLE_RUNS: OrderedDict[str, None] = OrderedDict()
+_MAX_IDLE_STATUS_REPORT_RUNS = 512
 
 
 def _send_status_report(status: RunStatus) -> bool:
@@ -75,12 +73,12 @@ def _deliver_status_report(status: RunStatus, sequence: int, attempt_budget: int
     return False
 
 
-def _retire_status_report_run_unlocked(run_id: str) -> None:
-    """Mark a fully drained run retired, forgetting the oldest retirees once the ring is full."""
-    _STATUS_REPORT_RETIRED.pop(run_id, None)
-    _STATUS_REPORT_RETIRED[run_id] = None
-    while len(_STATUS_REPORT_RETIRED) > _MAX_RETIRED_STATUS_REPORT_RUNS:
-        evicted, _ = _STATUS_REPORT_RETIRED.popitem(last=False)
+def _mark_status_report_run_idle_unlocked(run_id: str) -> None:
+    """Mark a run idle after its queue drains, evicting the oldest idle state above the limit."""
+    _STATUS_REPORT_IDLE_RUNS.pop(run_id, None)
+    _STATUS_REPORT_IDLE_RUNS[run_id] = None
+    while len(_STATUS_REPORT_IDLE_RUNS) > _MAX_IDLE_STATUS_REPORT_RUNS:
+        evicted, _ = _STATUS_REPORT_IDLE_RUNS.popitem(last=False)
         _STATUS_REPORT_LAST_SENT.pop(evicted, None)
         _STATUS_REPORT_LAST_ATTEMPTED.pop(evicted, None)
         _STATUS_REPORT_LAST_QUEUED.pop(evicted, None)
@@ -106,7 +104,7 @@ def _drain_status_report_run(run_id: str) -> None:
                 _STATUS_REPORT_QUEUES.pop(run_id, None)
                 _STATUS_REPORT_ACTIVE.discard(run_id)
                 _STATUS_REPORT_DRAINING.discard(run_id)
-                _retire_status_report_run_unlocked(run_id)
+                _mark_status_report_run_idle_unlocked(run_id)
                 _STATUS_REPORT_CONDITION.notify_all()
                 return
             status, sequence, done, attempt_budget = queue.popleft()
@@ -224,8 +222,8 @@ def _queue_status_report(status: RunStatus, *, wait: bool) -> None:
         if sequence <= _STATUS_REPORT_LAST_QUEUED.get(run_id, 0):
             return
         _STATUS_REPORT_LAST_QUEUED[run_id] = sequence
-        # in flight again, so it is no longer a retirement candidate
-        _STATUS_REPORT_RETIRED.pop(run_id, None)
+        # Reports are pending again, so protect this run from idle-state eviction.
+        _STATUS_REPORT_IDLE_RUNS.pop(run_id, None)
         _STATUS_REPORT_QUEUES.setdefault(run_id, deque()).append(
             (snapshot, sequence, done, attempt_budget)
         )
