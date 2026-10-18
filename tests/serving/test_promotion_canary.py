@@ -26,6 +26,7 @@ def _request(**overrides) -> CanaryRequest:
         "base_url": "https://serve.freesolo.co",
         "model": "Qwen/Qwen3.5-9B",
         "api_key": API_KEY,
+        "org_id": "11111111-2222-4333-8444-555555555555",
         "correlation_id": correlation_id_for("12345", "1"),
         "timeout_seconds": 5.0,
         "max_tokens": 32,
@@ -241,3 +242,27 @@ def test_a_complete_stream_reports_every_field_the_verdict_needs():
     assert evidence.finish_reason == "stop"
     assert evidence.completion_tokens == 7
     assert evidence.saw_done_sentinel is True
+
+
+def test_canary_attributes_a_base_model_to_the_configured_internal_organization():
+    from flash.serving.promotion.canary import _headers
+    from flash.serving.src.accounting.usage import TrustedInternalAuthorization
+    from flash.serving.src.http.context import require_attributed_traffic
+    from flash.serving.src.http.headers import optional_internal_org_id
+    from flash.serving.src.io.schemas import AdapterRecord
+
+    canary = _request()
+    request = SimpleNamespace(headers=_headers(canary))
+    target = AdapterRecord(
+        adapter_id=canary.model,
+        base_model=canary.model,
+        serve_base_model=True,
+        org_id=None,
+        repo_id=canary.model,
+        thinking=False,
+    )
+    traffic = require_attributed_traffic(
+        TrustedInternalAuthorization(org_id=optional_internal_org_id(request)), target
+    )
+    assert traffic.principal.kind == "trusted_internal"
+    assert traffic.principal.orgId == canary.org_id

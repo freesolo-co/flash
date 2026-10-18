@@ -75,6 +75,16 @@ Required production wiring is `HF_TOKEN`, `FREESOLO_INTERNAL_KEY`,
 
 #### Promotion gate
 
+Set the repository Actions variable `SERVING_CANARY_ORG_ID` to an existing Freesolo-owned
+organization UUID with billing configured. The canary sends it as `X-Freesolo-Org-Id`; its
+usage is attributed and charged to that organization, never to an invented tenant or an
+arbitrary customer. Missing or malformed UUIDs fail before deployment; operators must also
+verify that the organization exists and can settle usage before enabling the workflow.
+The streaming probe allows 3000 seconds: the full 2700-second engine startup allowance plus
+300 seconds for dispatch and generation. The job allows 90 minutes including rollback.
+Rollback resolves the serving entrypoint from the restored tree, including the pre-reorganization
+`flash/serving/modal_app.py` path.
+
 `modal deploy` replaces the live app in place, and a `/healthz` poll only reads back the identity
 the deploy step just injected. That proves a router process booted; it does not prove a GPU engine
 started, that a generation ran, that streaming works, or that usage settled. So after readiness the

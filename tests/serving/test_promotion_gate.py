@@ -279,7 +279,11 @@ def _gate_step_env() -> dict[str, str]:
     steps = workflow["jobs"]["deploy"]["steps"]
     gate_step = next(s for s in steps if s.get("run", "").strip().endswith("promotion.gate"))
     supplied = set(gate_step.get("env", {}))
-    values = {"SUPABASE_SERVICE_ROLE_KEY": "sb_secret_x", "SUPABASE_URL": "https://db.example"}
+    values = {
+        "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_x",
+        "SUPABASE_URL": "https://db.example",
+        "SERVING_CANARY_ORG_ID": "11111111-2222-4333-8444-555555555555",
+    }
     return {n: values.get(n, "x") for n in gate_module._REQUIRED_ENV if n in supplied}
 
 
@@ -359,3 +363,29 @@ def test_an_unexpected_canary_exception_fails_the_gate_instead_of_crashing_it():
     assert verdict.ok is False
     assert verdict.reason == CANARY_TRANSPORT_FAILURE
     assert "accounting" not in calls, "a failed stream must not be followed by an accounting wait"
+
+
+@pytest.mark.parametrize("org_id", ["", "   ", "not-an-org", "org\r\nInjected: header"])
+def test_gate_rejects_missing_or_invalid_canary_organization(org_id):
+    env = {**_gate_step_env(), "SERVING_CANARY_ORG_ID": org_id}
+    with pytest.raises(gate_module.GateConfigError):
+        gate_module._resolve("https://serve.freesolo.co", env)
+
+
+def test_canary_budget_covers_the_actual_engine_startup_budget():
+    import ast
+
+    app = pathlib.Path(gate_module.__file__).parents[1] / "app/modal_app.py"
+    tree = ast.parse(app.read_text())
+    startup = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "STARTUP_TIMEOUT_SECONDS"
+            for target in node.targets
+        )
+    )
+    plan = gate_module._resolve("https://serve.freesolo.co", _gate_step_env())
+    assert plan.request.timeout_seconds >= startup + 300
+    assert plan.request.org_id == _gate_step_env()["SERVING_CANARY_ORG_ID"]
