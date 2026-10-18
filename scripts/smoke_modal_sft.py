@@ -42,7 +42,7 @@ class SmokeEnvironment(EnvironmentSingleTurn):
     def build_prompt_messages(self, example, prompt_text):
         return [{"role": "user", "content": example.input}]
     def score_response(self, example, response_text):
-        return RewardResult(reward=1.0)
+        return RewardResult(score=1.0)
 def load_environment(**kwargs):
     return SmokeEnvironment()
 """
