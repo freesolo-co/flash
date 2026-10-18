@@ -96,7 +96,7 @@ def test_default_max_retries():
     budget to — so the declared default now reflects the real GPU-walk budget. Covers both the
     GpuSpec default and the JobSpec.from_dict default (the worker payload path)."""
     from flash.core.spec import GpuSpec, JobSpec
-    from flash.runner.supervise.lifecycle import INFRA_RETRY_FLOOR
+    from flash.runner.supervise.retry_decision import INFRA_RETRY_FLOOR
 
     assert GpuSpec().max_retries == 5
     assert GpuSpec().max_retries == INFRA_RETRY_FLOOR  # default tracks the runner's infra floor

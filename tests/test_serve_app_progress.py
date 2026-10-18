@@ -36,6 +36,7 @@ def test_filesystem_usage_emits_root_mib_and_nested_cache_logical_bytes(
     monkeypatch.setattr(progress, "_STARTED_AT", 10.0)
     monkeypatch.setattr(progress.time, "perf_counter", lambda: 11.25)
 
+    assert progress.boot_elapsed_seconds() == 1.25
     progress.emit_filesystem_usage("cache-prepared", cache_root)
 
     output = capsys.readouterr().out

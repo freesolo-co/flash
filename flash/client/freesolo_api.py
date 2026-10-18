@@ -9,6 +9,7 @@ import urllib.request
 from typing import Any
 
 from flash._internal.channel import CLI_NAME
+from flash._internal.http import _urlopen_no_redirect
 from flash.client.http import (
     FREESOLO_AUTH_VERIFY_PATH,
     FREESOLO_EVAL_RUNS_PATH,
@@ -34,7 +35,7 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _urlopen_no_redirect(req, timeout=30) as resp:
             resp.read()
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
@@ -77,7 +78,7 @@ def _freesolo_request(
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen_no_redirect(req, timeout=timeout) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         if exc.code == 401:

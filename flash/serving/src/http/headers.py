@@ -24,6 +24,12 @@ def internal_org_id(request: Request) -> str:
     return org_id
 
 
+def optional_internal_org_id(request: Request) -> str | None:
+    """read the tenant scope an internal caller supplied, without requiring one."""
+
+    return (request.headers.get("X-Freesolo-Org-Id") or "").strip() or None
+
+
 def assert_internal(request: Request, internal_key: str | None) -> None:
     if not internal_key:
         # No internal key configured -> the control plane can't be authenticated. Fail closed

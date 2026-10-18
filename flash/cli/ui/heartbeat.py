@@ -69,7 +69,7 @@ def live_attempt(obj: dict) -> int | None:
 def heartbeat_is_current_attempt(obj: dict, heartbeat: dict) -> bool:
     """False only when the heartbeat provably belongs to a superseded retry attempt.
 
-    Retries reuse the seed's heartbeat path, so a recovered run flips back to ``running`` for the
+    Every attempt of a run shares one heartbeat path, so a recovered run flips back to ``running`` for the
     replacement worker while ``last_heartbeat`` can still be the previous attempt's setup ping until
     the new worker publishes one. ``remote.attempt`` is the live attempt; ``last_heartbeat.attempt``
     is the one that produced the ping. When the live attempt is known, keep the reassurance only for a
