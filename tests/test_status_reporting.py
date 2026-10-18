@@ -8,6 +8,22 @@ import pytest
 from flash.runner.lifecycle import reporting
 
 
+@pytest.mark.parametrize("wait", [False, True])
+@pytest.mark.parametrize("sequence", [0, None, True, -1, "7", 1.5, {"corrupt": True}])
+def test_invalid_sequence_is_rejected_without_inventing_a_number(monkeypatch, wait, sequence):
+    reporting._shutdown_status_reporter()
+    reporting._open_status_reporter()
+    monkeypatch.setattr(
+        reporting,
+        "_send_status_report",
+        lambda _status: pytest.fail("invalid sequence must not be delivered"),
+    )
+    status = SimpleNamespace(run_id="run-invalid-sequence", report_sequence=sequence)
+    with pytest.raises(ValueError, match="persisted positive report_sequence"):
+        reporting._queue_status_report(status, wait=wait)
+    assert reporting._wait_for_status_reports(0)
+
+
 @pytest.mark.parametrize("close", [False, True])
 @pytest.mark.parametrize("in_flight_succeeds", [False, True])
 def test_cancelled_report_can_be_requeued_before_in_flight_delivery_finishes(

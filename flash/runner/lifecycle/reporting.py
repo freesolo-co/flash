@@ -38,12 +38,11 @@ def _valid_status_report_sequence(value) -> int:
     return value
 
 
-def _status_report_sequence_unlocked(status: RunStatus) -> int:
-    run_id = status.run_id
-    persisted = _valid_status_report_sequence(getattr(status, "report_sequence", 0))
-    if persisted > 0:
-        return persisted
-    return _STATUS_REPORT_LAST_QUEUED.get(run_id, 0) + 1
+def _require_status_report_sequence(value: object) -> int:
+    sequence = _valid_status_report_sequence(value)
+    if not sequence:
+        raise ValueError("status report requires a persisted positive report_sequence")
+    return sequence
 
 
 def _deliver_status_report(status: RunStatus, sequence: int, attempt_budget: int) -> bool:
@@ -209,7 +208,7 @@ def _queue_status_report(status: RunStatus, *, wait: bool) -> None:
     with _STATUS_REPORT_CONDITION:
         if not _STATUS_REPORT_ACCEPTING:
             return
-        sequence = _status_report_sequence_unlocked(snapshot)
+        sequence = _require_status_report_sequence(snapshot.report_sequence)
         while (
             wait
             and sequence == _STATUS_REPORT_LAST_QUEUED.get(run_id, 0)

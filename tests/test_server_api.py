@@ -3886,62 +3886,47 @@ def test_replay_status_reports_skips_unreadable_records_and_continues(monkeypatc
     assert reported == [first, last]
 
 
-def test_replay_status_reports_repairs_malformed_report_sequence_and_continues(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    "sequence_fields",
+    [
+        {},
+        {"report_sequence": 0},
+        {"report_sequence": None},
+        {"report_sequence": True},
+        {"report_sequence": -1},
+        {"report_sequence": "not-an-integer"},
+        {"report_sequence": {"corrupt": True}},
+    ],
+)
+def test_replay_skips_invalid_sequences_without_rewriting_records(
+    monkeypatch, tmp_path, sequence_fields
 ):
     from flash.server.routes import serving
 
-    malformed = runner_status._runstatus_from_json(
-        {
-            "run_id": "run-malformed-sequence",
-            "state": "done",
-            "spec": SPEC,
-            "report_sequence": "not-an-integer",
-        }
-    )
-    valid = runner_status._runstatus_from_json(
-        {
-            "run_id": "run-valid-sequence",
-            "state": "done",
-            "spec": SPEC,
-            "report_sequence": 1,
-        }
-    )
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    statuses = {status.run_id: status for status in (malformed, valid)}
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
+    invalid = {"run_id": "run-invalid-sequence", "state": "done", "spec": SPEC, **sequence_fields}
+    valid = {"run_id": "run-valid-sequence", "state": "done", "spec": SPEC, "report_sequence": 7}
+    paths = [tmp_path / f"{record['run_id']}.json" for record in (invalid, valid)]
+    for path, record in zip(paths, (invalid, valid), strict=True):
+        path.write_text(json.dumps(record))
+    before = [path.read_bytes() for path in paths]
     delivered = []
-    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": key} for key in statuses])
-    monkeypatch.setattr(serving._app, "get_status", statuses.__getitem__)
+    monkeypatch.setattr(
+        serving.db, "all_runs", lambda: [{"run_id": row["run_id"]} for row in (invalid, valid)]
+    )
+    monkeypatch.setattr(serving._app, "get_status", runner_status.get_status)
     monkeypatch.setattr(runner_reporting, "_send_status_report", delivered.append)
 
     runner_reporting._shutdown_status_reporter()
     runner_reporting._open_status_reporter()
     try:
-        assert serving.replay_status_reports() == 2
-        assert delivered == [malformed, valid]
-        assert runner_status.get_status(malformed.run_id).report_sequence == 1
-        assert delivered[0].report_sequence == 1
+        assert serving.replay_status_reports() == 1
+        assert [(status.run_id, status.report_sequence) for status in delivered] == [
+            (valid["run_id"], 7)
+        ]
+        assert [path.read_bytes() for path in paths] == before
     finally:
         runner_reporting._shutdown_status_reporter()
-
-
-def test_legacy_status_replay_uses_concurrent_saved_update(monkeypatch, tmp_path):
-    from flash.server.routes import serving
-
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    legacy = SimpleNamespace(run_id="run-legacy-race", report_sequence=0)
-    current = SimpleNamespace(run_id=legacy.run_id, report_sequence=2)
-    snapshots = iter((legacy, current))
-    reported = []
-    saves = []
-    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": legacy.run_id}])
-    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: next(snapshots))
-    monkeypatch.setattr(runner_state, "_save_status_unlocked", saves.append)
-    monkeypatch.setattr(runner_reporting, "_report_status", reported.append)
-
-    assert serving.replay_status_reports() == 1
-    assert reported == [current]
-    assert saves == []
 
 
 def test_replay_status_reports_stops_between_items(monkeypatch):
@@ -3985,7 +3970,7 @@ def test_replay_status_reports_continues_after_report_failure(monkeypatch):
     def report(status):
         if status.run_id == "run-failing":
             raise ValueError("invalid stored report")
-        runner_reporting._status_report_sequence_unlocked(status)
+        runner_reporting._require_status_report_sequence(status.report_sequence)
         reported.append(status)
 
     monkeypatch.setattr(runner_reporting, "_report_status", report)
@@ -4076,19 +4061,14 @@ def test_save_status_repairs_wrong_typed_report_sequence(api):
     assert runner_status.get_status(run_id).report_sequence == 1
 
 
-def test_legacy_replay_persists_sequence_before_first_post_restart_save(api, monkeypatch):
+def test_replay_preserves_saved_sequence_before_next_update(api, monkeypatch):
     from flash.server.routes import serving
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    path = runner_state.runs_file_path(run_id, ".json")
-    with open(path) as f:
-        stored = json.load(f)
-    stored["report_sequence"] = 0
-    with open(path, "w") as f:
-        json.dump(stored, f)
+    saved_sequence = runner_status.get_status(run_id).report_sequence
 
     runner_reporting._shutdown_status_reporter()
     runner_reporting._open_status_reporter()
@@ -4106,14 +4086,14 @@ def test_legacy_replay_persists_sequence_before_first_post_restart_save(api, mon
     try:
         assert serving.replay_status_reports() == 1
         assert runner_reporting._wait_for_status_reports(5)
-        assert runner_status.get_status(run_id).report_sequence == 1
+        assert runner_status.get_status(run_id).report_sequence == saved_sequence
 
         updated = runner_status.get_status(run_id)
         runner_state._save_status(updated)
-        assert updated.report_sequence == 2
+        assert updated.report_sequence == saved_sequence + 1
         runner_reporting._report_status(updated)
 
-        assert reported[-1].report_sequence == 2
+        assert reported[-1].report_sequence == saved_sequence + 1
         assert len(reported) == 2
     finally:
         runner_reporting._shutdown_status_reporter()
