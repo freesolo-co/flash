@@ -80,8 +80,10 @@ organization UUID with billing configured. The canary sends it as `X-Freesolo-Or
 usage is attributed and charged to that organization, never to an invented tenant or an
 arbitrary customer. Missing or malformed UUIDs fail before deployment; operators must also
 verify that the organization exists and can settle usage before enabling the workflow.
-The streaming probe allows 3000 seconds: the full 2700-second engine startup allowance plus
-300 seconds for dispatch and generation. The job allows 90 minutes including rollback.
+The streaming probe uses the shared deadlines in `timeouts.py`: the full 2700-second engine
+startup allowance plus 600 seconds for the request and 60 seconds of network headroom (3360
+seconds total). The server and probe derive their limits from the same constants. The job allows
+90 minutes including rollback.
 Rollback resolves the serving entrypoint from the restored tree, including the pre-reorganization
 `flash/serving/modal_app.py` path.
 

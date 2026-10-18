@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import httpx
 
+from flash.serving.app.timeouts import CANARY_TIMEOUT_SECONDS
 from flash.serving.promotion.canary import (
     CANARY_TRANSPORT_FAILURE,
     CanaryError,
@@ -67,15 +68,6 @@ BacklogReader = Callable[["httpx.AsyncClient"], Awaitable[Any]]
 GATE_CONFIG_INCOMPLETE = "gate_config_incomplete"
 HEALTH_UNREACHABLE = "health_unreachable"
 
-# the canary is the FIRST request to a freshly deployed release, and engines are scale-to-zero
-# (`MIN_CONTAINERS = 0`), so this budget must cover a full GPU cold start before the first token.
-# `/healthz` cannot have pre-warmed anything: `health_body` reports CONFIGURED per-model tiers and
-# says so explicitly ("remains stable when demand-driven containers scale to zero"), so a passing
-# identity check proves a router booted, not that any engine is up. Sized for a cold engine boot
-# with headroom rather than the warm-path latency, because a promotion that fails on `canary_timeout`
-# does not merely fail -- it rolls a healthy release back to its predecessor.
-# allow the full 2700s engine startup budget plus 300s for dispatch and generation.
-_DEFAULT_CANARY_TIMEOUT_SECONDS = 3000.0
 # long enough for a lease that expired to be RECLAIMED, not merely observed. `modal deploy` replaces
 # the router containers, and a container holding a claimed row when it goes away leaves that lease to
 # expire rather than releasing it -- so a deploy itself produces the exact signal `stalled` reads.
@@ -280,7 +272,7 @@ def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
             api_key=env["FREESOLO_INTERNAL_KEY"],
             org_id=org_id,
             correlation_id=correlation_id_for(run_id, attempt),
-            timeout_seconds=_DEFAULT_CANARY_TIMEOUT_SECONDS,
+            timeout_seconds=CANARY_TIMEOUT_SECONDS,
             max_tokens=_MAX_TOKENS,
         ),
         read_backlog=read_backlog,

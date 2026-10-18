@@ -682,8 +682,7 @@ def test_the_job_cap_leaves_room_for_a_rollback_after_every_wait_is_exhausted():
     from flash.serving.promotion import gate as gate_module
 
     gate_budget = (
-        gate_module._DEFAULT_CANARY_TIMEOUT_SECONDS
-        + gate_module._DEFAULT_ACCOUNTING_DEADLINE_SECONDS
+        gate_module.CANARY_TIMEOUT_SECONDS + gate_module._DEFAULT_ACCOUNTING_DEADLINE_SECONDS
     )
     # two `modal deploy` invocations (forward and restore), image build included, plus checkout and
     # dependency installation. deliberately generous: the assertion should fail while there is still

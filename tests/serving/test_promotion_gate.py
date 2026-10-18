@@ -372,20 +372,13 @@ def test_gate_rejects_missing_or_invalid_canary_organization(org_id):
         gate_module._resolve("https://serve.freesolo.co", env)
 
 
-def test_canary_budget_covers_the_actual_engine_startup_budget():
-    import ast
-
-    app = pathlib.Path(gate_module.__file__).parents[1] / "app/modal_app.py"
-    tree = ast.parse(app.read_text())
-    startup = next(
-        ast.literal_eval(node.value)
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "STARTUP_TIMEOUT_SECONDS"
-            for target in node.targets
-        )
+def test_canary_budget_covers_the_full_router_deadline_with_network_headroom():
+    from flash.serving.app.timeouts import (
+        CANARY_NETWORK_HEADROOM_SECONDS,
+        ROUTER_TIMEOUT_SECONDS,
     )
+
     plan = gate_module._resolve("https://serve.freesolo.co", _gate_step_env())
-    assert plan.request.timeout_seconds >= startup + 300
+    assert CANARY_NETWORK_HEADROOM_SECONDS > 0
+    assert plan.request.timeout_seconds == ROUTER_TIMEOUT_SECONDS + CANARY_NETWORK_HEADROOM_SECONDS
     assert plan.request.org_id == _gate_step_env()["SERVING_CANARY_ORG_ID"]
