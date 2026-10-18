@@ -279,7 +279,16 @@ def test_readiness_backoff_honors_retry_after_and_cap(monkeypatch):
 def test_adapter_preflight_validates_config_before_listing_tensors(monkeypatch, tmp_path):
 
     config_path = tmp_path / "adapter_config.json"
-    config_path.write_text(json.dumps({"r": 32}), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(
+            {
+                "r": 32,
+                "peft_type": "LORA",
+                "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            }
+        ),
+        encoding="utf-8",
+    )
     calls = []
 
     def hf_hub_download(**_kwargs):
@@ -308,6 +317,7 @@ def test_adapter_preflight_validates_config_before_listing_tensors(monkeypatch, 
             "org/repo",
             "sft/run-1/seed0/adapter",
             artifact_revision="a" * 40,
+            expected_base_model="Qwen/Qwen3.5-4B",
         ).lora_rank
         == 32
     )
@@ -338,6 +348,7 @@ def test_adapter_preflight_config_failure_does_not_start_tensor_listing(monkeypa
             "org/repo",
             "sft/run-1/seed0/adapter",
             artifact_revision="a" * 40,
+            expected_base_model="Qwen/Qwen3.5-4B",
         )
 
     assert tensor_started is False
