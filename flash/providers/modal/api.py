@@ -17,6 +17,7 @@ CACHE_NAME = "flash-weights"
 CACHE_MOUNT = "/weight-cache"
 MAX_SANDBOX_SECONDS = 86400
 API_TIMEOUT_SECONDS = 60.0
+TERMINATION_TIMEOUT_SECONDS = 180.0
 
 
 class ModalApiError(RuntimeError):
@@ -172,7 +173,9 @@ def terminate(instance_id):
         except modal.exception.NotFoundError:
             pass
 
-    call(stop)
+    # Modal may spend a full minute stopping GPU descendants and committing mounted Volumes.
+    # Keep ownership until that shutdown is confirmed instead of timing out at the grace boundary.
+    call(stop, timeout=TERMINATION_TIMEOUT_SECONDS)
 
 
 def list_instances():

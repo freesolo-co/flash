@@ -275,3 +275,10 @@ def test_duplicate_with_different_source_snapshot_is_not_adopted(sdk):
             }
         )
     assert len(sdk.created) == 1
+
+
+def test_shutdown_has_a_bounded_budget_beyond_gpu_grace_period(monkeypatch):
+    calls = []
+    monkeypatch.setattr(api, "call", lambda operation, **kwargs: calls.append(kwargs))
+    api.terminate("sb-stopping")
+    assert api.API_TIMEOUT_SECONDS < calls[0]["timeout"] <= 180
