@@ -375,7 +375,6 @@ def _stub_structured_opd_hub(monkeypatch):
             return SimpleNamespace(sha="a" * 40)
 
     monkeypatch.setattr(huggingface_hub, "HfApi", Api)
-    # the structured path calls this with kwargs the shared stub's lambda does not accept.
     monkeypatch.setattr(
         "flash.adapters.lora_rank.preflight_train_context_within_serving",
         lambda _spec, **_kwargs: None,

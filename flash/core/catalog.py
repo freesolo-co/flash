@@ -68,7 +68,7 @@ def normalize_algorithm(value: str) -> str:
     return value
 
 
-DEFAULT_GPU = "RTX 5090"
+DEFAULT_GPU = "L40S"
 
 # Over-estimating is memory-safe (larger VRAM estimate, smaller cap); fallback = largest catalog vocab.
 _DEFAULT_VOCAB_SIZE = 248_320
@@ -254,7 +254,7 @@ MODELS: dict[str, ModelInfo] = {
         ),
         algos=ALGORITHMS,
         min_vram_gb=12,
-        recommended_gpu="RTX 4090",
+        recommended_gpu="L4",
         serving=ServingCapacity(
             gpu="L4",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-0.8B"],
@@ -300,7 +300,7 @@ MODELS: dict[str, ModelInfo] = {
         ),
         algos=ALGORITHMS,
         min_vram_gb=16,
-        recommended_gpu="RTX 4090",
+        recommended_gpu="L4",
         serving=ServingCapacity(
             gpu="L4",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-2B"],
@@ -345,7 +345,7 @@ MODELS: dict[str, ModelInfo] = {
         ),
         algos=ALGORITHMS,
         min_vram_gb=32,
-        recommended_gpu="RTX 5090",
+        recommended_gpu="L40S",
         serving=ServingCapacity(
             gpu="L4",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-4B"],
@@ -399,7 +399,7 @@ MODELS: dict[str, ModelInfo] = {
         # trainer's, and the importance ratio those two log-probs form collapses to 0.
         grpo_min_vram_gb=80,
         quant="bf16",
-        recommended_gpu="A100 PCIe",
+        recommended_gpu="H100",
         serving=ServingCapacity(
             gpu="L40S",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-9B"],
@@ -454,7 +454,7 @@ MODELS: dict[str, ModelInfo] = {
         grpo_min_vram_gb=142,  # colocated GRPO (two ~54GB copies) needs B200; triggers resident-peak sizing ~150GB
         sft_min_vram_gb=80,
         quant="bf16",
-        recommended_gpu="A100 PCIe",
+        recommended_gpu="H100",
         min_disk_gb=160,
         serving=ServingCapacity(
             gpu="H100",
@@ -636,7 +636,7 @@ def resolve_vocab_size(model_id: str, revision: str = "") -> int:
 def _with_merge_disk_floor(info: ModelInfo) -> ModelInfo:
     """Floor the container disk at what publishing a checkpoint actually holds at once.
 
-    `min_disk_gb` sizes the RunPod container disk (`template.containerDiskInGb`), which is where the
+    `min_disk_gb` sizes the Modal container disk (`template.containerDiskInGb`), which is where the
     verl workdir and every export live. Publishing is concurrent with training, so at the moment the
     merger runs that one filesystem holds THREE full bf16 model copies, not one:
 

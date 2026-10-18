@@ -3,7 +3,7 @@
 `setup_seconds` and `train_wall` are DISJOINT intervals in the worker -- setup is stamped before
 the training subprocess launches, and `train_wall` wraps `run_verl_training` plus the upload drain.
 So verl startup, model load, LoRA wrap and FSDP init sit INSIDE the wall the customer is billed for,
-and the FLOPs term priced them at zero: 17 measured RunPod arms scored 28.6x UNDER their realized
+and the FLOPs term priced them at zero: 17 measured provider arms scored 28.6x UNDER their realized
 train wall, 0/17 inside the 0.70-1.43x acceptance band.
 
 The block scales with checkpoint size (measured median implied block 82s at 0.8B against 248s at
@@ -36,7 +36,7 @@ def _sft(**overrides):
         "seq_len": 1024,
         "batch_size": 8,
         "gpu_type": "H100",
-        "provider": "runpod",
+        "provider": "modal",
     }
     base.update(overrides)
     return RunConfig(**base)
@@ -81,7 +81,7 @@ def test_only_sft_pays_this_block(method, monkeypatch):
         batch_size=8,
         group_size=4,
         gpu_type="H100",
-        provider="runpod",
+        provider="modal",
     )
     before = estimate_cost(config).train_seconds
     monkeypatch.setattr(analytical, "SFT_STARTUP_BASE_SECONDS", 9_999.0)

@@ -2,7 +2,7 @@
 
 Covers:
 - build_worker_env sets managed worker defaults without forwarding removed tuning knobs;
-- the runpod_flash backoff OverflowError that aborted long runs is patched;
+- the another CLI package backoff OverflowError that aborted long runs is patched;
 - per-phase error artifact names don't collide (train error survives a later eval error).
 """
 
@@ -40,7 +40,7 @@ def _run_deadline_fields() -> dict[str, float | int]:
 
 def test_build_worker_env_does_not_forward_removed_tuning_knobs(monkeypatch):
     """Flash is managed: process-env tuning toggles do not change worker behavior."""
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     knobs = {
         "VLLM_USE_V1": "0",
@@ -59,7 +59,7 @@ def test_build_worker_env_does_not_forward_removed_tuning_knobs(monkeypatch):
 def test_build_worker_env_ignores_alloc_conf_override(monkeypatch):
     """flash is fully managed: an operator PYTORCH_CUDA_ALLOC_CONF in the process env does NOT
     override flash's computed allocator conf (RL is non-expandable, sleep-safe)."""
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:999")
     env = build_worker_env(_spec(), 0)  # grpo -> sleep-safe non-expandable
@@ -78,7 +78,7 @@ def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
     step 1. SFT keeps expandable: its verl trainer is pure FSDP and builds no rollout at all.
     """
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
@@ -109,7 +109,7 @@ def test_build_worker_env_does_not_forward_judge_creds(monkeypatch):
     [environment].secrets entry (forwarded via runtime_secrets); the env's own default judge model
     otherwise applies. A stray control-plane OPENROUTER_API_KEY / OPENAI_API_KEY / FLASH_JUDGE_MODEL
     must NOT leak into every worker."""
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "FLASH_JUDGE_MODEL"):
         monkeypatch.setenv(key, "control-plane-should-not-forward")
@@ -119,7 +119,7 @@ def test_build_worker_env_does_not_forward_judge_creds(monkeypatch):
 
 
 def test_build_worker_env_forwards_github_only_for_private_vcs_pip(monkeypatch):
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-secret")
     monkeypatch.setenv("GIT_ASKPASS", "/tmp/operator-askpass")
@@ -131,7 +131,7 @@ def test_build_worker_env_forwards_github_only_for_private_vcs_pip(monkeypatch):
 def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monkeypatch):
     """opd receives bounded broker transport while provider credentials remain control-plane-only."""
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     monkeypatch.setenv("PARASAIL_API_KEY", "platform-managed-parasail")
     opd_spec = JobSpec(
@@ -158,7 +158,7 @@ def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monke
 
 def test_build_worker_env_does_not_accept_legacy_teacher_broker_url():
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     opd_spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -180,7 +180,7 @@ def test_build_worker_env_does_not_accept_legacy_teacher_broker_url():
 
 def test_build_worker_env_rejects_managed_teacher_byo_names():
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     opd_spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -207,7 +207,7 @@ def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(mon
     WANDB_API_KEY must therefore come from the per-submit runtime secret path, not from the
     control-plane process env.
     """
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     monkeypatch.setenv("WANDB_API_KEY", "platform-should-not-forward")
     env = build_worker_env(_spec(), 0)
@@ -219,7 +219,7 @@ def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(mon
 
 def test_build_worker_env_forwards_declared_environment_runtime_secrets():
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -246,7 +246,7 @@ def test_build_worker_env_lists_declared_secret_names_for_the_redactors(monkeypa
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
     from flash.engine.worker.sft_train import _build_verl_child_env
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     declared = (
         "AWS_SECRET_ACCESS_KEY",
@@ -306,7 +306,7 @@ def test_the_redactor_metadata_name_is_reserved_from_declared_secrets():
     # tests ownership on the uppercased name, so accepting it here would drop the secret from the
     # worker env without a word and launch the job missing a credential it declared as required.
     # every reserved name is refused across its whole case-space for that reason.
-    for variant in (SECRET_ENV_KEYS_ENV.lower(), "Hf_Token", "runpod_api_key"):
+    for variant in (SECRET_ENV_KEYS_ENV.lower(), "Hf_Token", "modal_token_secret"):
         with pytest.raises(ConfigError, match="platform-managed key"):
             _environment_secrets([variant], "grpo")
 
@@ -315,7 +315,7 @@ def test_grpo_worker_env_keeps_native_thread_policy_managed():
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
     from flash.core.spec import EnvironmentSpec, JobSpec
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -331,7 +331,7 @@ def test_grpo_worker_env_keeps_native_thread_policy_managed():
 def test_sft_worker_env_forwards_declared_native_thread_secret():
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.core.spec import EnvironmentSpec, JobSpec
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     spec = JobSpec(
         model="Qwen/Qwen3.5-4B",
@@ -349,7 +349,7 @@ def test_declared_secret_names_cannot_contain_the_metadata_delimiter():
     as two unrelated names, the real key goes unrecognized, and its value reaches diagnostics
     verbatim. rejecting the delimiter at declaration keeps that channel unambiguous."""
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
     from flash.schema.fields import ConfigError, _environment_secrets
 
     with pytest.raises(ConfigError, match="invalid environment variable name"):
@@ -370,256 +370,6 @@ def test_declared_secret_names_cannot_contain_the_metadata_delimiter():
         build_worker_env(spec, 0, runtime_secrets={"FOO,BAR": "leaky"})
 
 
-def test_the_handlers_inline_redactor_covers_multiline_secret_components():
-    """the handler is source-shipped, so it carries its OWN copy of the redactor rather than
-    importing the shared one. the child's stdout is sanitized one line at a time, so a PEM key
-    never appears whole in any single call and only its component lines can match. extract that
-    copy and exercise it directly, since drift here leaks a credential nothing else catches."""
-    import ast
-    import inspect
-    import os
-    import re
-    import textwrap
-
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    # os/re come from _train_body's own local imports, which the handler makes at the top of its
-    # body; urllib.parse it imports itself.
-    namespace: dict = {"os": os, "re": re}
-    for name in ("_percent_pattern", "_needles", "_safe_detail"):
-        node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
-        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-    safe_detail = namespace["_safe_detail"]
-
-    pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----"
-    # DEPLOY_KEY matches no suffix heuristic, so this also covers the declared-name channel.
-    secrets = {"DEPLOY_KEY": pem, "FLASH_SECRET_ENV_KEYS": "DEPLOY_KEY"}
-
-    assert (
-        safe_detail("ssh auth: MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", secrets) == "ssh auth: <redacted>"
-    )
-    assert safe_detail(pem, secrets) == "<redacted>"
-    # the length floor keeps short structural fragments of a MULTILINE value readable: a short
-    # component is punctuation, not a credential.
-    assert safe_detail("near }", {"B": "{\n}\nlongenoughcomponent"}) == "near }"
-    # a whole declared value below the floor is a credential, though, and must not leak. it is
-    # redacted where it stands alone, and only there: as a global needle `ati` would rewrite
-    # `authentication`.
-    short = {"PIN": "ati", "FLASH_SECRET_ENV_KEYS": "PIN"}
-    assert safe_detail("worker rejected pin ati", short) == "worker rejected pin <redacted>"
-    assert safe_detail("trainer crashed after validation", short) == (
-        "trainer crashed after validation"
-    )
-    long = {"PIN": "sk-live-abc123456", "FLASH_SECRET_ENV_KEYS": "PIN"}
-    assert safe_detail("trainer crashed holding sk-live-abc123456", long) == (
-        "trainer crashed holding <redacted>"
-    )
-    # the word guard is per EDGE: a value whose own edge is punctuation already separates itself,
-    # and requiring a non-word character beyond it would leak "/a" out of "https://host/a/repo".
-    path_like = {"S": "/a", "FLASH_SECRET_ENV_KEYS": "S"}
-    assert safe_detail("https://host/a/repo", path_like) == "https://host<redacted>/repo"
-    punctuation = {"PIN": ".", "FLASH_SECRET_ENV_KEYS": "PIN"}
-    assert safe_detail("module.py: failed at /tmp/a.py", punctuation) == (
-        "module.py: failed at /tmp/a.py"
-    )
-    assert safe_detail("token=.", punctuation) == "token=<redacted>"
-    shaped = {
-        "KEYED_PIN": ";",
-        "BEARER_PIN": "!",
-        "FLASH_SECRET_ENV_KEYS": "KEYED_PIN,BEARER_PIN",
-    }
-    assert safe_detail("token=;", shaped) == "token=<redacted>"
-    assert safe_detail("Bearer !", shaped) == "Bearer <redacted>"
-    overlapping_shape = {"KEY": "token", "PIN": ";", "FLASH_SECRET_ENV_KEYS": "KEY,PIN"}
-    detail = safe_detail("token=;", overlapping_shape)
-    assert detail == "<redacted>"
-    assert ";" not in detail
-    overlapping_shape.update({"KEY": "Bearer", "PIN": "!"})
-    detail = safe_detail("Bearer !", overlapping_shape)
-    assert detail == "<redacted>"
-    assert "!" not in detail
-    for secret, encoded in ((".", "%2E"), ("-", "%2D"), ("~", "%7E"), ("/", "%2f")):
-        mapping = {"PIN": secret, "FLASH_SECRET_ENV_KEYS": "PIN"}
-        assert safe_detail(f"encoded {encoded}", mapping) == "encoded <redacted>"
-    literal_case = {"PIN": "A/B", "FLASH_SECRET_ENV_KEYS": "PIN"}
-    assert safe_detail("encoded A%2fB", literal_case) == "encoded <redacted>"
-    assert safe_detail("encoded a%2fb", literal_case) == "encoded a%2fb"
-    for secret, case_variant in (
-        ("A%2FB", "A%2fB"),
-        ("literal%2Fsecret", "literal%2fsecret"),
-    ):
-        mapping = {"PIN": secret, "FLASH_SECRET_ENV_KEYS": "PIN"}
-        assert safe_detail(f"literal {secret}", mapping) == "literal <redacted>"
-        assert safe_detail(f"literal {case_variant}", mapping) == f"literal {case_variant}"
-    overlap = {
-        "LONG_TOKEN": "a%2Fb%2B",
-        "SHORT_TOKEN": "a/b+c&d",
-        "FLASH_SECRET_ENV_KEYS": "LONG_TOKEN,SHORT_TOKEN",
-    }
-    detail = safe_detail("fetch failed for a%2Fb%2Bc%26d", overlap)
-    assert detail == "fetch failed for <redacted>"
-    for secret in ("a%2Fb%2B", "c%26d", "a/b+c&d"):
-        assert secret not in detail
-
-
-def test_all_worker_redactors_share_the_same_secret_corpus(monkeypatch):
-    """the canonical, bootstrap, and source-shipped redactors must stay behaviorally identical."""
-    import ast
-    import inspect
-    import os
-    import re
-    import textwrap
-
-    from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV, sanitize_diagnostic
-    from flash.providers._lifecycle.bootstrap_secrets import _safe_detail as bootstrap_safe_detail
-    from flash.providers.runpod.serverless import endpoints
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(endpoints._train_body)))
-    namespace: dict = {"os": os, "re": re}
-    for name in ("_percent_pattern", "_needles", "_safe_detail"):
-        node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
-        exec(compile(ast.Module(body=[node], type_ignores=[]), "<handler>", "exec"), namespace)
-    handler_safe_detail = namespace["_safe_detail"]
-
-    def canonical_safe_detail(text: str, secrets: dict[str, str]) -> str:
-        with monkeypatch.context() as environment:
-            environment.setenv(SECRET_ENV_KEYS_ENV, ",".join(secrets))
-            for key, secret in secrets.items():
-                environment.setenv(key, secret)
-            return sanitize_diagnostic(text, limit=1000)
-
-    multiline_secret = (
-        "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----"
-    )
-    redacted_prefix = "token=<redacted> "
-    cases = [
-        (
-            "comma-delimited-semicolon",
-            "token=;, next",
-            {"PIN_SECRET": ";"},
-            "token=<redacted>, next",
-        ),
-        (
-            "comma-delimited-comma",
-            "token=,, next",
-            {"PIN_SECRET": ","},
-            "token=<redacted>, next",
-        ),
-        (
-            "comma-delimited-bearer",
-            "Bearer !, next",
-            {"PIN_SECRET": "!"},
-            "Bearer <redacted>, next",
-        ),
-        (
-            "semicolon-delimited-keyed",
-            "token=;; next",
-            {"PIN_SECRET": ";"},
-            "token=<redacted>; next",
-        ),
-        (
-            "semicolon-delimited-bearer",
-            "Bearer !; next",
-            {"PIN_SECRET": "!"},
-            "Bearer <redacted>; next",
-        ),
-        ("non-delimited-keyed", "token=;next", {"PIN_SECRET": ";"}, "token=;next"),
-        ("non-delimited-comma", "token=,next", {"PIN_SECRET": ","}, "token=,next"),
-        ("non-delimited-bearer", "Bearer !next", {"PIN_SECRET": "!"}, "Bearer !next"),
-        ("keyed-punctuation", "token=;", {"PIN_SECRET": ";"}, "token=<redacted>"),
-        ("bearer-punctuation", "Bearer !", {"PIN_SECRET": "!"}, "Bearer <redacted>"),
-        (
-            "ordinary-punctuation",
-            "module.py: values a,b; failed at /tmp/a.py",
-            {"PIN_SECRET": "."},
-            "module.py: values a,b; failed at /tmp/a.py",
-        ),
-        (
-            "encoded-literal-case",
-            "literal A%2FB",
-            {"PIN_SECRET": "A%2FB"},
-            "literal <redacted>",
-        ),
-        (
-            "encoded-literal-case-control",
-            "literal A%2fB",
-            {"PIN_SECRET": "A%2FB"},
-            "literal A%2fB",
-        ),
-        (
-            "encoded-raw-case",
-            "encoded A%2fB",
-            {"PIN_SECRET": "A/B"},
-            "encoded <redacted>",
-        ),
-        (
-            "encoded-raw-case-control",
-            "encoded a%2fb",
-            {"PIN_SECRET": "A/B"},
-            "encoded a%2fb",
-        ),
-        (
-            "multiline-component",
-            "ssh auth: MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
-            {"DEPLOY_SECRET": multiline_secret},
-            "ssh auth: <redacted>",
-        ),
-        (
-            "long-bounded-output",
-            "token=; " + "x" * 1200,
-            {"PIN_SECRET": ";"},
-            redacted_prefix + "x" * (1000 - len(redacted_prefix)),
-        ),
-    ]
-    for label, secret, encoded in (
-        ("dot", ".", "%2E"),
-        ("dash", "-", "%2D"),
-        ("tilde", "~", "%7E"),
-        ("slash", "/", "%2f"),
-    ):
-        cases.append(
-            (
-                f"generated-percent-{label}",
-                f"encoded {encoded}",
-                {"PIN_SECRET": secret},
-                "encoded <redacted>",
-            )
-        )
-
-    for label, text, secrets, expected in cases:
-        actual = (
-            canonical_safe_detail(text, secrets),
-            bootstrap_safe_detail(text, limit=1000, secrets=secrets),
-            handler_safe_detail(text, secrets, 1000),
-        )
-        assert actual == (expected, expected, expected), label
-
-
-def test_worker_console_always_uploaded_and_no_flag(monkeypatch):
-    """The worker console is ALWAYS uploaded — live (periodic) while the worker runs and once more
-    when it exits — so every print reaches `flash runs log`, not just a post-mortem tail on
-    crash. There is no FLASH_UPLOAD_CONSOLE flag to forget: it is NOT forwarded to the worker (even
-    if an operator sets it), and neither worker run_mode path gates the upload."""
-    import inspect
-
-    from flash.providers._lifecycle import bootstrap as _instance_bootstrap
-    from flash.providers.runpod.serverless import build_worker_env, endpoints
-
-    # the flag is gone — setting it in the control-plane env does not reach the worker
-    monkeypatch.setenv("FLASH_UPLOAD_CONSOLE", "1")
-    assert "FLASH_UPLOAD_CONSOLE" not in build_worker_env(_spec(), 0)
-
-    # both worker run_mode paths upload unconditionally (no flag, no gating var)
-    for src in (
-        inspect.getsource(_instance_bootstrap.run_mode),
-        inspect.getsource(endpoints._train_body),
-    ):
-        assert "FLASH_UPLOAD_CONSOLE" not in src
-        assert "upload_enabled" not in src
-        assert "_force_console" not in src
-
-
 def test_removed_keys_cannot_reach_the_worker_through_environment_secrets():
     """declared runtime secrets must not deliver removed optimization keys to the worker.
 
@@ -628,8 +378,7 @@ def test_removed_keys_cannot_reach_the_worker_through_environment_secrets():
     _REMOVED_OPTIMIZATION_ENV blocks dead keys that configure nothing.
     """
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-    from flash.providers._lifecycle.worker import _REMOVED_OPTIMIZATION_ENV
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import _REMOVED_OPTIMIZATION_ENV, build_worker_env
 
     # every removed key, not a chalk special case. FLASH_TRITON_LORA stands in for the rest.
     declared = ["FLASH_CHALK_SPEC", "FLASH_TRITON_LORA", "MY_TOKEN"]
@@ -663,7 +412,7 @@ def test_build_worker_env_hf_repo_is_per_run(monkeypatch):
     HF_REPO env var (which no longer exists). An operator HF_REPO in the process env is
     ignored — the worker reads its own seeded value, sourced from the spec."""
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     # an operator HF_REPO in the env must NOT leak into the worker env
     monkeypatch.setenv("HF_REPO", "operator/default")
@@ -684,7 +433,7 @@ def test_alloc_conf_rl_is_non_expandable(monkeypatch):
     # sleep-SAFE non-expandable conf; the worker upgrades to expandable_segments at boot once it
     # resolves sleep OFF for the model/context (engine.worker.finalize_alloc_conf_for_sleep). The
     # conf is deterministic — there is no launcher sleep/alloc knob.
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
@@ -697,7 +446,7 @@ def test_alloc_conf_rl_is_non_expandable(monkeypatch):
 
 def test_alloc_conf_default_expandable_for_sft(monkeypatch):
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
@@ -709,38 +458,6 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
     )
     env = build_worker_env(spec, 0)
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
-
-
-def test_runpod_backoff_preserves_strategies_cap_jitter_and_idempotence(monkeypatch):
-    pytest.importorskip("runpod_flash")
-    from flash.providers.runpod.serverless import _patch_runpod_backoff
-
-    _patch_runpod_backoff()
-    from runpod_flash.core.resources import serverless
-    from runpod_flash.core.utils import backoff
-
-    patched = backoff.get_backoff_delay
-    assert serverless.get_backoff_delay is patched
-    _patch_runpod_backoff()
-    assert backoff.get_backoff_delay is patched
-    assert serverless.get_backoff_delay is patched
-
-    jitter_bounds: list[tuple[float, float]] = []
-
-    def _uniform(low: float, high: float) -> float:
-        jitter_bounds.append((low, high))
-        return high
-
-    monkeypatch.setattr("random.uniform", _uniform)
-    strategy = backoff.BackoffStrategy
-    assert patched(5000, max_seconds=5, jitter=0) == 5
-    assert patched(3, base=0.5, max_seconds=10, jitter=0, strategy=strategy.LINEAR) == 2
-    assert patched(2, base=0.5, max_seconds=10, jitter=0, strategy=strategy.LOGARITHMIC) == 1
-    assert patched(1000, base=0.5, max_seconds=3, jitter=0, strategy=strategy.LINEAR) == 3
-    assert patched(1, base=1, max_seconds=10, jitter=0.2) == pytest.approx(2.4)
-    assert jitter_bounds[-1] == (0.8, 1.2)
-    with pytest.raises(ValueError, match="Unsupported backoff strategy"):
-        patched(1, strategy=object())
 
 
 def test_error_artifact_name_is_per_phase_and_attempt():
@@ -821,17 +538,6 @@ def _unresolved_source_globals(source: str) -> set[str]:
     return unresolved
 
 
-def test_train_body_imports_every_name_it_uses():
-    """the source-shipped handler must resolve without module globals."""
-    import inspect
-
-    from flash.providers.runpod import serverless as train
-
-    source = inspect.getsource(train._train_body)
-    assert _unresolved_source_globals(source) == set()
-    assert "_CONSOLE_UPLOAD_INTERVAL_S" not in source
-
-
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
@@ -854,16 +560,6 @@ def test_train_body_imports_every_name_it_uses():
 )
 def test_source_global_check_sensitivity(source, expected):
     assert _unresolved_source_globals(source) == expected
-
-
-def test_train_body_has_no_prime_install_path():
-    import inspect
-
-    from flash.providers.runpod import serverless as train
-
-    src = inspect.getsource(train._train_body)
-    assert '"install", "prime"' not in src
-    assert 'shutil.which("prime")' not in src
 
 
 class _FakePipProc:
@@ -902,127 +598,6 @@ def _extra_pip_input(monkeypatch) -> dict:
     }
 
 
-def test_train_body_source_verification_failure_prevents_pip(monkeypatch):
-    from flash import source_snapshot
-    from flash.providers.runpod.serverless import endpoints
-
-    input_data = _extra_pip_input(monkeypatch)
-    pip_calls = []
-    monkeypatch.setattr(
-        source_snapshot,
-        "materialize_verified_archive_file",
-        lambda *_args: (_ for _ in ()).throw(
-            source_snapshot.SourceSnapshotError("source verification failed")
-        ),
-    )
-    monkeypatch.setattr(
-        "subprocess.Popen", lambda *args, **kwargs: pip_calls.append((args, kwargs))
-    )
-
-    with pytest.raises(source_snapshot.SourceSnapshotError, match="verification"):
-        endpoints._train_body(input_data)
-    assert pip_calls == []
-
-
-@pytest.mark.parametrize(
-    ("status", "retriable"),
-    [(401, False), (403, False), (404, False), (429, True), (500, True), (599, True)],
-)
-def test_train_body_source_fetch_http_classification(monkeypatch, status, retriable):
-    import types
-
-    import huggingface_hub
-
-    from flash.providers.runpod.serverless import endpoints
-
-    input_data = _extra_pip_input(monkeypatch)
-    input_data["extra_pip"] = []
-    calls = []
-
-    class FetchError(RuntimeError):
-        pass
-
-    def fail_download(**_kwargs):
-        calls.append(status)
-        error = FetchError("private upstream response")
-        error.response = types.SimpleNamespace(status_code=status, headers={})
-        raise error
-
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fail_download)
-    monkeypatch.setattr("time.sleep", lambda _seconds: None)
-
-    with pytest.raises(RuntimeError, match="pinned flash source") as raised:
-        endpoints._train_body(input_data)
-    assert getattr(raised.value, "flash_retriable", False) is retriable
-    assert len(calls) == (6 if retriable else 1)
-
-
-def test_train_body_extra_pip_uses_worker_env_credentials(monkeypatch):
-    import os
-    from pathlib import Path
-
-    from flash.providers.runpod.serverless import endpoints
-
-    calls = []
-    askpass_paths = []
-
-    def fake_popen(cmd, *, env=None, **_kwargs):
-        askpass = Path(env["GIT_ASKPASS"])
-        assert askpass.exists()
-        assert os.access(askpass, os.X_OK)
-        assert "ghp-secret" not in askpass.read_text()
-        askpass_paths.append(askpass)
-        calls.append({"cmd": cmd, "env": env})
-        return _FakePipProc()
-
-    monkeypatch.setenv("GITHUB_TOKEN", "operator-secret")
-    monkeypatch.setenv("GIT_ASKPASS", "/tmp/operator-askpass")
-    monkeypatch.setattr("subprocess.Popen", fake_popen)
-
-    with pytest.raises(RuntimeError, match="could not load downloaded module"):
-        endpoints._train_body(_extra_pip_input(monkeypatch))
-
-    assert len(calls) == 1
-    env = calls[0]["env"]
-    assert env["GITHUB_TOKEN"] == "ghp-secret"
-    assert env["GIT_TERMINAL_PROMPT"] == "0"
-    assert askpass_paths
-    assert all(not path.exists() for path in askpass_paths)
-
-
-def test_train_body_extra_pip_ignores_askpass_cleanup_errors(monkeypatch):
-    import os
-    from pathlib import Path
-
-    from flash.providers.runpod.serverless import endpoints
-
-    askpass_paths = []
-
-    def fake_popen(_cmd, *, env=None, **_kwargs):
-        askpass_paths.append(Path(env["GIT_ASKPASS"]))
-        return _FakePipProc()
-
-    original_remove = os.remove
-
-    def fake_remove(path):
-        if Path(path) in askpass_paths:
-            raise PermissionError("locked askpass helper")
-        return original_remove(path)
-
-    monkeypatch.setattr("subprocess.Popen", fake_popen)
-    monkeypatch.setattr(os, "remove", fake_remove)
-
-    try:
-        with pytest.raises(RuntimeError, match="could not load downloaded module"):
-            endpoints._train_body(_extra_pip_input(monkeypatch))
-    finally:
-        for askpass in askpass_paths:
-            if askpass.exists():
-                original_remove(askpass)
-
-    assert askpass_paths
-
-
 def _wire_train_body_pip(monkeypatch, results):
     """Patch Popen to replay ``results`` (output, rc) in order; returns the recorded calls."""
     calls = []
@@ -1036,139 +611,6 @@ def _wire_train_body_pip(monkeypatch, results):
     monkeypatch.setattr("subprocess.Popen", fake_popen)
     monkeypatch.setattr("time.sleep", lambda _s: None)
     return calls
-
-
-def test_train_body_extra_pip_retries_a_transient_index_failure(monkeypatch):
-    # Same contract as the instance bootstrap: a PyPI blip is infra, not a bad requirement, so the
-    # handler retries in place instead of failing the paid run on the first connection error.
-    from flash.providers.runpod.serverless import endpoints
-
-    calls = _wire_train_body_pip(
-        monkeypatch,
-        [
-            (
-                "WARNING: Retrying (Retry(total=4)) after connection broken by NewConnectionError\n",
-                1,
-            ),
-            ("Successfully installed some-env-pkg-1.0\n", 0),
-        ],
-    )
-    with pytest.raises(RuntimeError, match="could not load downloaded module"):
-        endpoints._train_body(_extra_pip_input(monkeypatch))
-    assert len(calls) == 2
-
-
-def test_train_body_extra_pip_resolution_error_stays_terminal(monkeypatch):
-    # A bad package spec reached the index fine; retrying it would just burn another attempt.
-    from flash.providers.runpod.serverless import endpoints
-
-    calls = _wire_train_body_pip(
-        monkeypatch,
-        [("ERROR: No matching distribution found for definitely-not-a-package\n", 1)],
-    )
-    with pytest.raises(RuntimeError, match="extra_pip install failed"):
-        endpoints._train_body(_extra_pip_input(monkeypatch))
-    assert len(calls) == 1  # fails fast, never walks the retry ladder
-
-
-def test_train_body_extra_pip_build_failure_outranks_earlier_transient_text(monkeypatch):
-    # pip warns "Retrying (Retry(" on an index blip, recovers, then fails compiling a wheel. Both
-    # lines sit in the same captured tail, so matching transient text alone would call a
-    # deterministic failure infra and repeat it three more times for nothing.
-    from flash.providers.runpod.serverless import endpoints
-
-    calls = _wire_train_body_pip(
-        monkeypatch,
-        [
-            (
-                (
-                    "WARNING: Retrying (Retry(total=4)) after connection broken by "
-                    "NewConnectionError\n"
-                    "Collecting some-env-pkg\n"
-                    "  error: subprocess-exited-with-error\n"
-                    "ERROR: Failed building wheel for some-env-pkg\n"
-                ),
-                1,
-            )
-        ],
-    )
-    with pytest.raises(RuntimeError, match="extra_pip install failed"):
-        endpoints._train_body(_extra_pip_input(monkeypatch))
-    assert len(calls) == 1  # the build failure names the cause, so no retry ladder
-
-
-def test_train_body_extra_pip_matches_the_bootstrap_on_git_http_blips(monkeypatch):
-    # the two classifiers must agree on what is retriable. A VCS pin fails through git, whose
-    # phrasing carries none of the urllib shapes, so a 502 must retry here exactly as it does on
-    # the instance bootstrap; a 404 is a bad pin and must still fail fast in both.
-    from flash.providers.runpod.serverless import endpoints
-
-    blip = (
-        "  Running command git clone --filter=blob:none -q https://github.com/org/repo\n"
-        "  fatal: unable to access 'https://github.com/org/repo/': "
-        "The requested URL returned error: 502\n"
-        "  error: subprocess-exited-with-error\n"
-    )
-    calls = _wire_train_body_pip(
-        monkeypatch, [(blip, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
-    )
-    with pytest.raises(RuntimeError, match="could not load downloaded module"):
-        endpoints._train_body(_extra_pip_input(monkeypatch))
-    assert len(calls) == 2
-
-    # git's DNS wording, which urllib never emits, must retry here too.
-    dns = blip.replace(
-        "The requested URL returned error: 502", "Could not resolve host: github.com"
-    )
-    calls = _wire_train_body_pip(
-        monkeypatch, [(dns, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
-    )
-    with pytest.raises(RuntimeError, match="could not load downloaded module"):
-        endpoints._train_body(_extra_pip_input(monkeypatch))
-    assert len(calls) == 2
-
-    missing = blip.replace("returned error: 502", "returned error: 404")
-    calls = _wire_train_body_pip(monkeypatch, [(missing, 1)])
-    with pytest.raises(RuntimeError, match="extra_pip install failed"):
-        endpoints._train_body(_extra_pip_input(monkeypatch))
-    assert len(calls) == 1
-
-
-def test_train_body_extra_pip_matches_the_bootstrap_on_an_index_outage_footer(monkeypatch):
-    # an unreachable index prints the same no-candidate footer a typo'd name does, so that footer
-    # alone must not be terminal when the tail also carries a transient marker. A build failure in
-    # the same tail still decides it, since pip only reaches one with real content in hand. Both
-    # classifiers must agree on this, so the RunPod copy is pinned exactly as the bootstrap is.
-    from flash.providers.runpod.serverless import endpoints
-
-    outage = (
-        "WARNING: Retrying (Retry(total=4, connect=None)) after connection broken by "
-        "NewConnectionError\n"
-        "ERROR: Could not find a version that satisfies the requirement requests "
-        "(from versions: none)\n"
-        "ERROR: No matching distribution found for requests\n"
-    )
-    calls = _wire_train_body_pip(
-        monkeypatch, [(outage, 1), ("Successfully installed some-env-pkg-1.0\n", 0)]
-    )
-    with pytest.raises(RuntimeError, match="could not load downloaded module"):
-        endpoints._train_body(_extra_pip_input(monkeypatch))
-    assert len(calls) == 2
-
-    built = outage + "ERROR: Failed building wheel for requests\n"
-    calls = _wire_train_body_pip(monkeypatch, [(built, 1)])
-    with pytest.raises(RuntimeError, match="extra_pip install failed"):
-        endpoints._train_body(_extra_pip_input(monkeypatch))
-    assert len(calls) == 1
-
-
-def test_train_body_extra_pip_stops_after_the_bounded_retries(monkeypatch):
-    from flash.providers.runpod.serverless import endpoints
-
-    calls = _wire_train_body_pip(monkeypatch, [("read timed out\n", 1)] * 4)
-    with pytest.raises(RuntimeError, match="could not reach the package index"):
-        endpoints._train_body(_extra_pip_input(monkeypatch))
-    assert len(calls) == 4  # one attempt plus the three bounded retries
 
 
 def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
@@ -1233,235 +675,6 @@ def _serialized_sft_console():
         yield
 
 
-@pytest.mark.usefixtures("_serialized_sft_console")
-@pytest.mark.parametrize(
-    ("console_lines", "terminated"),
-    [
-        (
-            ["worker booting\n", ("x" * 70_000) + "\n", "torch.cuda.OutOfMemoryError: CUDA OOM\n"],
-            True,
-        ),
-        # the same crash with NO newline anywhere: one huge unterminated line, which is what a json
-        # blob, a native stack or a stream of progress output actually looks like.
-        (["q" * 70_000 + "torch.cuda.OutOfMemoryError: CUDA OOM"], False),
-    ],
-    ids=["oversized-line-then-rootcause", "single-unterminated-line"],
-)
-def test_train_body_uploads_console_on_missing_metrics(
-    monkeypatch, tmp_path, console_lines, terminated
-):
-    """The 'crashed before finishing' path (no /tmp/metrics.json) MUST upload the captured console
-    even when the worker exited 0 — run_mode only uploads on a non-zero exit, so an OOM/segfault or
-    silent early-exit otherwise leaves the failure undebuggable (no metrics, often no error_<phase>,
-    and the message points at a console that was never uploaded)."""
-    import contextlib
-    import os
-    import subprocess
-
-    import huggingface_hub
-
-    from flash.providers.runpod.serverless import endpoints
-
-    monkeypatch.setenv("GITHUB_TOKEN", "operator-secret")
-    monkeypatch.setenv("GIT_ASKPASS", "/tmp/operator-askpass")
-    run_code = tmp_path / "runcode"
-    late_marker = tmp_path / "late-live-attempted"
-    real_join = os.path.join
-
-    def mapped_join(*parts):
-        joined = real_join(*parts)
-        if joined == "/runcode" or joined.startswith("/runcode/"):
-            return str(run_code) + joined.removeprefix("/runcode")
-        return joined
-
-    monkeypatch.setattr(os.path, "join", mapped_join)
-    download_calls = []
-
-    uploads = []
-
-    class _FakeApi:
-        def __init__(self, token=None):
-            pass
-
-        def upload_file(self, **kw):
-            uploads.append(kw)
-            if str(kw.get("path_in_repo", "")).endswith("/console_sft.txt"):
-                time.sleep(0.05)
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
-
-    def fake_hf_hub_download(**kwargs):
-        download_calls.append(kwargs)
-        return str(tmp_path / "source.zip")
-
-    def materialize(_archive_path, _descriptor, destination):
-        target = run_code / "flash-test-run-attempt-7"
-        assert destination == str(target)
-        console = target / "flash/providers/_lifecycle/bootstrap_console.py"
-        console.parent.mkdir(parents=True, exist_ok=True)
-        console.write_text(
-            "import threading, time\n"
-            "def _run_console_upload_loop(console, interval, stop, *, upload):\n"
-            "    upload()\n"
-            "    def late():\n"
-            "        stop.wait(); time.sleep(0.01); upload()\n"
-            f"        open({str(late_marker)!r}, 'w').write('1')\n"
-            "    threading.Thread(target=late, daemon=True).start()\n"
-            "    stop.wait()\n"
-        )
-        artifacts = target / "flash/adapters/artifacts.py"
-        artifacts.parent.mkdir(parents=True, exist_ok=True)
-        artifacts.write_text(
-            "def attempt_scoped_artifact_name(kind, phase, attempt):\n"
-            "    return f'exact_{kind}_{phase}_attempt{attempt}.txt'\n"
-        )
-
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
-
-    def materialization_path(root, run_id, attempt):
-        assert root == "/runcode"
-        return run_code / f"{run_id}-attempt-{attempt}"
-
-    monkeypatch.setattr("flash.source_snapshot.attempt_materialization_path", materialization_path)
-    monkeypatch.setattr("flash.source_snapshot.materialize_verified_archive_file", materialize)
-
-    class _FakeProc:
-        # Worker boots, logs an OOM, then the kernel/clean-exit leaves NO metrics.json.
-        def __init__(self, *a, **k):
-            assert k["cwd"] == str(run_code / "flash-test-run-attempt-7")
-            assert "GITHUB_TOKEN" not in k["env"]
-            assert "GIT_ASKPASS" not in k["env"]
-            self.stdout = iter(console_lines)
-            self.returncode = 0  # the bug case: exits 0, so run_mode skips the console upload
-
-        def wait(self):
-            return 0
-
-    monkeypatch.setattr(subprocess, "Popen", _FakeProc)
-
-    job_spec = '{"algorithm": "sft", "run_id": "flash-test-run"}'
-    input_data = {
-        "phase": "sft",
-        "seed": 0,
-        "hf_repo": "owner/runs",
-        "job_spec_json": job_spec,
-        "env": {
-            "HF_TOKEN": "tok",
-            "GITHUB_TOKEN": "payload-secret",
-            "GIT_ASKPASS": "/tmp/payload-askpass",
-            "PYTHONPATH": "",
-            "ATTEMPT": "999",
-        },
-        "source_snapshot": SOURCE_SNAPSHOT,
-        "run_id": "flash-test-run",
-        "attempt": 7,
-        **_run_deadline_fields(),
-    }
-
-    try:
-        with pytest.raises(RuntimeError, match=r"produced no /tmp/metrics\.json"):
-            endpoints._train_body(input_data)
-
-        paths = [upload["path_in_repo"] for upload in uploads]
-        assert paths == [
-            "sft/flash-test-run/exact_console_sft_attempt7.txt",
-            "sft/flash-test-run/console_sft.txt",
-        ]
-        assert late_marker.exists(), (
-            "the late live callback must run after terminal teardown begins"
-        )
-        with open(uploads[-1]["path_or_fileobj"], encoding="utf-8") as f:
-            uploaded_console = f.read()
-        if terminated:
-            assert not uploaded_console.startswith("worker booting\n")
-            # the 64k byte boundary fell inside the giant x-line, so that truncated line is dropped
-            # whole before redaction: a partial line could hold a credential suffix that no longer
-            # value-matches.
-            assert "x" not in uploaded_console
-            assert uploaded_console == "torch.cuda.OutOfMemoryError: CUDA OOM\n"
-        else:
-            # a tail that is ONE unterminated line is dropped whole, so this uploads nothing. that
-            # costs the root cause on exactly the crash that emits one huge line, and keeping it was
-            # tried and reverted: every bound that would let the line through is measured against
-            # the credentials this process KNOWS, and a value minted at runtime contributes no
-            # needle -- so a margin sized from an unrelated secret leaves a long fragment of it
-            # behind. the empty console never leaked.
-            assert uploaded_console == ""
-        assert len(download_calls) == 1
-        assert download_calls[0]["filename"] == SOURCE_SNAPSHOT["archive_path"]
-        assert download_calls[0]["revision"] == SOURCE_SNAPSHOT["revision"]
-    finally:
-        # _train_body writes hardcoded console paths; remove them for parallel runs.
-        import shutil
-
-        shutil.rmtree(run_code, ignore_errors=True)
-        for _p in (
-            "/tmp/console_sft.txt",
-            "/tmp/console_sft.txt.live.tail",
-            "/tmp/console_sft.txt.final.tail",
-        ):
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(_p)
-
-
-def test_train_body_rejects_malformed_source_descriptor_before_download(monkeypatch):
-    import huggingface_hub
-
-    from flash.providers.runpod.serverless import endpoints
-
-    monkeypatch.setattr(
-        huggingface_hub,
-        "hf_hub_download",
-        lambda *a, **k: pytest.fail("download should not run with an invalid source descriptor"),
-    )
-    with pytest.raises(RuntimeError, match="descriptor"):
-        endpoints._train_body(
-            {
-                "phase": "sft",
-                "seed": 0,
-                "hf_repo": "owner/runs",
-                "job_spec_json": '{"algorithm": "sft", "run_id": "flash-test-run"}',
-                "env": {"HF_TOKEN": "tok"},
-                "source_snapshot": {"invalid": True},
-                "run_id": "flash-test-run",
-                "attempt": 0,
-                **_run_deadline_fields(),
-            }
-        )
-
-
-def test_live_console_uploads_are_throttled_for_shared_artifact_repos():
-    import flash.engine.worker as worker
-    from flash.providers._lifecycle import bootstrap as instance_bootstrap
-    from flash.providers.runpod.serverless import endpoints
-
-    assert endpoints._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
-    assert instance_bootstrap._CONSOLE_UPLOAD_INTERVAL_S == 3600.0
-    steady_state_commits_per_hour = (
-        3600.0 / worker._HB_MIN_INTERVAL_S + 3600.0 / endpoints._CONSOLE_UPLOAD_INTERVAL_S
-    )
-    assert steady_state_commits_per_hour <= 5.0
-
-
-def test_first_console_snapshot_precedes_stall_teardown():
-    import importlib
-    import inspect
-
-    from flash.providers._lifecycle import bootstrap_console
-
-    importlib.import_module("flash.providers.runpod.jobs")
-    poll_job = importlib.import_module("flash.providers.runpod.job_execution").poll_job
-    defaults = inspect.signature(poll_job).parameters
-    training_stall_s = defaults["stall_after_s"].default
-    setup_grace_s = defaults["setup_grace_s"].default
-
-    # the serverless handler loads this exact module rather than shipping its own copy, so these
-    # constants have one home and both providers are bound by the same margin.
-    assert training_stall_s > bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    assert setup_grace_s > bootstrap_console._CONSOLE_UPLOAD_FIRST_SNAPSHOT_S
-    assert training_stall_s > 2 * bootstrap_console._CONSOLE_UPLOAD_POLL_S
-
-
 def test_console_heartbeat_stays_flat_so_the_scanner_can_match_on_substrings(tmp_path):
     """the console scanner matches marker keys as raw substrings, which is only sound because the
     producer compacts every nested field away first.
@@ -1493,27 +706,6 @@ def test_console_heartbeat_stays_flat_so_the_scanner_can_match_on_substrings(tmp
     console = tmp_path / "console_large_managed_heartbeat.txt"
     console.write_bytes(f"HEARTBEAT {snapshot}\n".encode())
     assert bootstrap_console._console_progress(str(console), 0)[2:] == (1, 1)
-
-
-def test_min_cuda_for_uses_the_gpu_class_floor():
-    # the CUDA floor is a property of the GPU class, not of the image tag
-    from flash.providers.runpod.serverless.endpoints import min_cuda_for
-
-    assert min_cuda_for("B200") == "13.0"  # blackwell needs cu13 drivers
-    assert min_cuda_for("H200") == "12.8"
-
-
-def test_apply_disk_raises_to_the_requested_floor():
-    from types import SimpleNamespace
-
-    from flash.providers.runpod.jobs import apply_disk_gb
-
-    tpl = SimpleNamespace(containerDiskInGb=64)
-    cfg = SimpleNamespace(template=tpl)
-    apply_disk_gb(cfg, 80)
-    assert tpl.containerDiskInGb == 80  # raise-only: the request wins over the smaller default
-    apply_disk_gb(cfg, 32)
-    assert tpl.containerDiskInGb == 80  # never lowers an already-larger disk
 
 
 def test_snapshot_weight_validation(tmp_path):

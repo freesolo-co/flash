@@ -522,9 +522,6 @@ def _execute_rl_child(
     _reward_observability,
     files=None,
 ) -> int:
-    # claimed before the child exists, so a grandchild it orphans reparents here and can be
-    # reaped at teardown. this process is not pid 1 (the runpod handler is), so without it
-    # every wait answers ChildProcessError for a zombie nobody will collect.
     adopt_orphaned_descendants()
     resume_step = int((files or {}).get("resume_step", 0))
     state.resume_step = resume_step

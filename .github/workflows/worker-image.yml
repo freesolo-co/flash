@@ -1,7 +1,7 @@
 name: flash worker image
 
 # builds the prebuilt flash worker image (full training stack + flash-attn baked in) and
-# pushes it to ghcr, so runpod/vast/lambda training cold-start skips the per-host dependency
+# pushes it to ghcr, so Modal training cold-start skips the per-host dependency
 # install (the dominant cold-start cost). training providers select the pinned image through
 # flash/providers/_lifecycle/worker.py; there is no override, so a new build means bumping the
 # WORKER_IMAGE constant. serving has no consumer for this training-worker image.
@@ -145,7 +145,7 @@ jobs:
           context: .
           file: Dockerfile.worker
           push: true
-          # pin the freesolo-co namespace: runpod, vast, and lambda training paths pull the image
+          # pin the freesolo-co namespace: Modal training paths pull the image
           # declared in flash/providers/_lifecycle/worker.py, so a fork run must not push to its own owner
           # namespace and leave the real image stale.
           tags: ghcr.io/freesolo-co/flash-worker:${{ steps.source.outputs.tag }}

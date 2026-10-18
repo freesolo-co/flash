@@ -120,6 +120,9 @@ def _descriptor_path(descriptor: int) -> str:
     return os.readlink(f"/proc/self/fd/{descriptor}")
 
 
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").exists(), reason="requires Linux procfs filesystem probes"
+)
 def test_hydration_synchronizes_directory_metadata_before_validation(
     monkeypatch,
     tmp_path: Path,
@@ -220,6 +223,9 @@ def test_directory_fsync_io_failure_blocks_hydration(monkeypatch, tmp_path: Path
         )
 
 
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").exists(), reason="requires Linux procfs filesystem probes"
+)
 def test_transient_directory_mutation_during_validation_is_detected(
     monkeypatch,
     tmp_path: Path,
@@ -490,9 +496,6 @@ def test_cache_ancestor_policy_allows_narrow_root_directories() -> None:
         _directory_stat(uid=0, permissions=0o1777),
         "root sticky shared ancestor",
     )
-    # a root-owned world-writable ancestor is accepted with OR without the sticky bit. runpod
-    # mounts its network volume as root-owned 0777 and non-sticky (measured on a live pod), and
-    # rejecting that killed the container about two seconds into every startup, forever.
     _validate_cache_ancestor_stat(
         _directory_stat(uid=0, permissions=0o777),
         "root writable non-sticky ancestor",
@@ -561,7 +564,7 @@ def test_cache_rejects_symlinked_parent_and_unsafe_mode(tmp_path: Path) -> None:
 def _simulate_modeless_filesystem(monkeypatch, root: Path) -> None:
     """make every path under root read back as 0777/0666 no matter what mode it was created with.
 
-    this is what runpod's moosefs volume does: `mkdir -m 700` and an explicit `chmod 700` both read
+    this is what provider's moosefs volume does: `mkdir -m 700` and an explicit `chmod 700` both read
     back as 777, and files read back as 666 (measured on a live pod). a mocked stat_result cannot
     exercise this, because the behaviour under test is the interaction between creating a file and
     reading its mode back -- so patch at the syscall boundary and let the real code run.
@@ -619,17 +622,13 @@ def _simulate_modeless_filesystem(monkeypatch, root: Path) -> None:
     monkeypatch.setattr(os, "fstat", _patched_fstat)
 
 
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").exists(), reason="requires Linux procfs filesystem probes"
+)
 def test_hydration_survives_a_filesystem_that_cannot_store_modes(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    # runpod mounts its network volume from moosefs, which reports a fixed 0777 for directories and
-    # 0666 for files and silently discards chmod. the mode assertion can therefore NEVER be
-    # satisfied there, and it rejected every runpod deployment about two seconds into startup --
-    # a permanent restart loop that externally looks like a slow image pull.
-    #
-    # the payload's integrity does not rest on the mode bit: every adapter file is verified against
-    # the manifest's sha256 with a before/after identity check around the read.
     config_bytes, weights_bytes = _artifact_bytes(tmp_path)
     manifest = _manifest(config_bytes, weights_bytes)
     cache = tmp_path / "modeless-cache"
@@ -766,13 +765,6 @@ def test_adapter_without_a_peft_adapter_name_segment_validates(tmp_path: Path) -
 
 
 def test_convolution_lora_factors_validate(tmp_path: Path) -> None:
-    # flash trains with peft `all-linear`, which on an image model wraps `visual.patch_embed.proj`
-    # -- a Conv3d. peft writes that pair as A (r, in_ch, *kernel) / B (out_ch, r, 1, 1, 1), so the
-    # factors are 5-D. requiring rank 2 rejected the ENTIRE adapter over that single pair, which
-    # made every image adapter undeployable: observed live as a crash loop on both a Modal app and
-    # a $0.49/hr RunPod L4, after the provider had already allocated and started billing.
-    # vllm loads the pair, warns it cannot wrap a convolution, and leaves it unapplied, so
-    # refusing the other 346 pairs is strictly worse than what the engine itself does.
     source = tmp_path / "source"
     source.mkdir()
     config = {

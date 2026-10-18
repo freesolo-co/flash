@@ -4,7 +4,7 @@
 client, shared runtime, and customer-owned provider deployment. Freesolo's hosted backend
 (`flash/serving/`) is another implementation of this contract.
 A deployment serves one base model and its LoRA adapters. Use `flash serve deploy` to provision one
-in your own Modal or RunPod account, or implement these endpoints and run the conformance suite
+in your own Modal account, or implement these endpoints and run the conformance suite
 below.
 
 ## Identity model

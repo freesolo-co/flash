@@ -232,10 +232,9 @@ def collect_inputs(
         # whole-Dockerfile hash catches ANY base change the parsed fields miss (apt/ENV/CMD/cache-dir);
         # it lives in fp_base, so such a change triggers only the FREE re-layer, never a paid re-warm.
         "dockerfile_sha256": _sha256_file(root / "Dockerfile.worker"),
-        "endpoints_sha256": _sha256_file(
-            root / "flash" / "providers" / "runpod" / "serverless" / "endpoints.py"
+        "bootstrap_sha256": _sha256_file(
+            root / "flash" / "providers" / "_lifecycle" / "bootstrap.py"
         ),
-        "make_rp_handler_sha256": _sha256_file(root / "docker" / "make_rp_handler.py"),
         "source_snapshot_sha256": _sha256_file(root / "flash" / "source_snapshot.py"),
     }
     return cache_inputs, base_inputs_partial

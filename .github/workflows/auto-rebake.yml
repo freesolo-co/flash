@@ -92,7 +92,7 @@ jobs:
         env:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          # canonical digest ref (repo@sha256, no tag) so every tool (crane/docker/runpod) accepts it.
+          # canonical digest ref (repo@sha256, no tag) so every tool (crane/docker/modal) accepts it.
           digest=$(crane digest "$BASE")
           repo=${BASE%:*}
           cfg=$(crane config "$repo@$digest")

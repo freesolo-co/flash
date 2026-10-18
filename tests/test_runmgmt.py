@@ -11,53 +11,25 @@ import pytest
 from tests._helpers.runner import provisioned_status
 from tests._helpers.source_snapshot import valid_source_snapshot
 
-_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
-def _runpod_remote(endpoint_id="endpoint", job_id="job", attempt=0, started_ts=1.0, **extra):
-    remote = {
-        "provider": "runpod",
-        "endpoint_id": endpoint_id,
-        "endpoint_name": f"{endpoint_id}-name",
-        "key_fingerprint": _RUNPOD_FINGERPRINT,
-        "attempt": attempt,
-        "started_ts": started_ts,
-        **extra,
-    }
-    if job_id is not None:
-        remote["job_id"] = job_id
-    return remote
+def _modal_remote(instance_id="sb-endpoint", job_id="job", attempt=0, started_ts=1.0, **extra):
+    from tests._helpers.modal import modal_remote
+
+    return modal_remote(instance_id, attempt, started_ts, **extra)
 
 
-def _lambda_remote(instance_id="instance", attempt=0, started_ts=1.0, **extra):
-    return {
-        "provider": "lambda",
-        "instance_id": instance_id,
-        "instance_type": "gpu_1x_a100",
-        "region": "us-east-1",
-        "name": f"flash-{instance_id}",
-        "gpu": "A100",
-        "hourly_usd": 1.0,
-        "attempt": attempt,
-        "started_ts": started_ts,
-        **extra,
-    }
+def _second_modal_remote(instance_id="sb-instance", attempt=0, started_ts=1.0, **extra):
+    from tests._helpers.modal import modal_remote
+
+    return modal_remote(instance_id, attempt, started_ts, **extra)
 
 
-def _vast_remote(instance_id=7, attempt=0, started_ts=1.0, **extra):
-    return {
-        "provider": "vast",
-        "instance_id": instance_id,
-        "offer_id": 101,
-        "machine_id": 202,
-        "label": f"flash-{instance_id}",
-        "gpu": "RTX 4090",
-        "hourly_usd": 0.5,
-        "attempt": attempt,
-        "started_ts": started_ts,
-        **extra,
-    }
+def _third_modal_remote(instance_id="sb-instance", attempt=0, started_ts=1.0, **extra):
+    from tests._helpers.modal import modal_remote
+
+    return modal_remote(instance_id, attempt, started_ts, **extra)
 
 
 def test_background_run_redacts_private_exception_content(monkeypatch, caplog):
@@ -358,7 +330,7 @@ def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
                 "step": 20,
                 "ts": 123.0,
                 "gpu": {
-                    "device_name": "RTX 5090",
+                    "device_name": "L40S",
                     "gpu_util_pct": 94,
                     "memory_used_gb": 19.5,
                     "processes": [{"pid": 42, "process_name": "python", "used_memory_gb": 19.0}],
@@ -370,7 +342,7 @@ def test_record_heartbeat_updates_status_without_state_change(monkeypatch):
         assert out.state == "running"
         assert out.last_heartbeat["stage"] == "sft_step"
         assert out.last_heartbeat["step"] == 20
-        assert out.gpu_status["device_name"] == "RTX 5090"
+        assert out.gpu_status["device_name"] == "L40S"
         assert out.gpu_status["gpu_util_pct"] == 94
 
 
@@ -593,15 +565,14 @@ def test_persist_metrics_keeps_stamped_zero_vast(monkeypatch):
         with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
         assert on_disk["cost_usd"] == 1.0
-        # No allocated_provider stamped -> say so, rather than attributing the cost to RunPod.
         assert on_disk["notes"]["provider"] == "unknown"
 
 
 def test_persist_metrics_attributes_the_provider_that_billed_the_run(monkeypatch):
     """The note records the substrate that ran the job, not a hardcoded default.
 
-    A plane with no RunPod key still prices its runs, and a Lambda/Vast run is not filed under
-    RunPod's rate table.
+    A plane with no provider key still prices its runs, and a Lambda/provider run is not filed under
+    provider's rate table.
     """
     import json
     import os
@@ -623,13 +594,13 @@ def test_persist_metrics_attributes_the_provider_that_billed_the_run(monkeypatch
         spec = JobSpec(run_id="r-vast", model="Qwen/Qwen3.5-4B", algorithm="grpo")
         runner._persist_metrics(
             spec,
-            {"wall_seconds": 1.0, "allocated_gpu": "RTX 5090", "allocated_provider": "vast"},
+            {"wall_seconds": 1.0, "allocated_gpu": "L40S", "allocated_provider": "modal"},
         )
-        assert seen == {"gpu": "RTX 5090", "provider": "vast"}
+        assert seen == {"gpu": "L40S", "provider": "modal"}
         with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
-        assert on_disk["notes"]["provider"] == "vast"
-        assert on_disk["notes"]["gpu"] == "RTX 5090"
+        assert on_disk["notes"]["provider"] == "modal"
+        assert on_disk["notes"]["gpu"] == "L40S"
         assert on_disk["notes"]["gpu_rate_usd_hr"] == 3600.0
 
 
@@ -647,7 +618,7 @@ def test_persist_metrics_falls_back_when_cost_absent(monkeypatch):
 
         spec = JobSpec(run_id="r1", model="Qwen/Qwen3.5-4B", algorithm="grpo")
         # No cost_usd stamped: fall back to wall * rate.
-        out = runner._persist_metrics(spec, {"wall_seconds": 1.0, "allocated_gpu": "RTX 5090"})
+        out = runner._persist_metrics(spec, {"wall_seconds": 1.0, "allocated_gpu": "L40S"})
         assert out == 1.0  # 1s / 3600 * 3600/hr
         with open(os.path.join(runner.artifacts_dir(spec), "metrics.json")) as f:
             on_disk = json.load(f)
@@ -671,7 +642,7 @@ def test_persist_metrics_bills_training_wall_not_setup(monkeypatch):
             "wall_seconds": 10.0,  # worker training loop only
             "setup_seconds": 590.0,  # reported for observability, not customer cost
             "train_tokens": 190_679,
-            "allocated_gpu": "RTX 5090",
+            "allocated_gpu": "L40S",
         }
         out = runner._persist_metrics(spec, metrics)
         assert out == pytest.approx(10.0)  # 10s / 3600 * $3600/hr
@@ -758,13 +729,13 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
         _next_attempt=0,
     )
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    candidate = Candidate("modal", "L4", 0.69, 24)
     monkeypatch.setattr(
         allocator,
         "allocate",
         lambda *args, **kwargs: Allocation(
-            provider="runpod",
-            gpu="RTX 4090",
+            provider="modal",
+            gpu="L4",
             hourly_usd=0.69,
             min_vram_gb=24,
             candidates=(candidate,),
@@ -781,8 +752,8 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
         def submit_run(self, _spec, _seed, *, on_handle, attempt, **_kwargs):
             self.attempts.append(attempt)
             on_handle(
-                _runpod_remote(
-                    endpoint_id=f"endpoint-{attempt}",
+                _modal_remote(
+                    instance_id=f"endpoint-{attempt}",
                     job_id=f"job-{attempt}",
                     attempt=attempt,
                     started_ts=float(attempt + 1),
@@ -838,13 +809,13 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
         _next_attempt=0,
     )
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    candidate = Candidate("modal", "L4", 0.69, 24)
     monkeypatch.setattr(
         allocator,
         "allocate",
         lambda *_args, **_kwargs: Allocation(
-            provider="runpod",
-            gpu="RTX 4090",
+            provider="modal",
+            gpu="L4",
             hourly_usd=0.69,
             min_vram_gb=24,
             candidates=(candidate,),
@@ -863,8 +834,8 @@ def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monke
             if attempt == 0:
                 raise RuntimeError("provider accepted create but response was lost")
             on_handle(
-                _runpod_remote(
-                    endpoint_id="endpoint-1",
+                _modal_remote(
+                    instance_id="sb-endpoint-1",
                     job_id="job-1",
                     attempt=attempt,
                     started_ts=float(attempt + 1),
@@ -915,14 +886,14 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
     )
     now = {"value": 100.0}
     monkeypatch.setattr(runner.time, "time", lambda: now["value"])
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    candidate = Candidate("modal", "L4", 0.69, 24)
     allocation_walls = []
 
     def fake_allocate(*_args, **kwargs):
         allocation_walls.append(kwargs["max_wall_seconds"])
         return Allocation(
-            provider="runpod",
-            gpu="RTX 4090",
+            provider="modal",
+            gpu="L4",
             hourly_usd=0.69,
             min_vram_gb=24,
             candidates=(candidate,),
@@ -942,8 +913,8 @@ def test_retry_receives_only_remaining_run_global_wall_allowance(monkeypatch, tm
             self.walls.append(run_spec.gpu.max_wall_seconds)
             self.attempts.append(attempt)
             on_handle(
-                _runpod_remote(
-                    endpoint_id=f"endpoint-{attempt}",
+                _modal_remote(
+                    instance_id=f"endpoint-{attempt}",
                     job_id=f"job-{attempt}",
                     attempt=attempt,
                     started_ts=float(attempt + 1),
@@ -1013,14 +984,14 @@ def test_retry_backoff_cannot_cross_provider_minimum(monkeypatch, tmp_path):
         clock["now"] += seconds
 
     monkeypatch.setattr(lifecycle.time, "sleep", sleep)
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    candidate = Candidate("modal", "L4", 0.69, 24)
     allocations = []
 
     def fake_allocate(*_args, **_kwargs):
         allocations.append(True)
         return Allocation(
-            provider="runpod",
-            gpu="RTX 4090",
+            provider="modal",
+            gpu="L4",
             hourly_usd=0.69,
             min_vram_gb=24,
             candidates=(candidate,),
@@ -1297,9 +1268,9 @@ def test_multiprocess_attempt_reservations_preserve_concurrent_status_update(mon
 @pytest.mark.parametrize(
     "remote",
     [
-        _runpod_remote(attempt=2),
-        _runpod_remote(job_id=None, attempt=2),
-        _vast_remote(attempt=2),
+        _modal_remote(attempt=2),
+        _modal_remote(job_id=None, attempt=2),
+        _third_modal_remote(attempt=2),
     ],
 )
 def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
@@ -1327,16 +1298,16 @@ def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
     ("original", "newer"),
     [
         (
-            _runpod_remote(job_id="job-old", attempt=1),
-            _runpod_remote(job_id="job-new", attempt=2, started_ts=2.0),
+            _modal_remote(job_id="job-old", attempt=1),
+            _modal_remote(job_id="job-new", attempt=2, started_ts=2.0),
         ),
         (
-            _runpod_remote(job_id=None, attempt=1),
-            _runpod_remote(job_id="job-new", attempt=2, started_ts=2.0),
+            _modal_remote(job_id=None, attempt=1),
+            _modal_remote(job_id="job-new", attempt=2, started_ts=2.0),
         ),
         (
-            _lambda_remote(instance_id="instance-old", attempt=1),
-            _lambda_remote(instance_id="instance-new", attempt=2, started_ts=2.0),
+            _second_modal_remote(instance_id="instance-old", attempt=1),
+            _second_modal_remote(instance_id="instance-new", attempt=2, started_ts=2.0),
         ),
     ],
 )
@@ -1368,8 +1339,8 @@ def test_cleanup_collection_deduplicates_and_survives_status_writes_and_reload(
     runs_dir = str(tmp_path / "runs")
     monkeypatch.setattr(runner, "RUNS_DIR", runs_dir)
     spec = JobSpec(run_id="cleanup-dedup", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    public_remote = _runpod_remote("endpoint-a", "job-a", attempt=0)
-    cleanup_remote = _runpod_remote("endpoint-b", None, attempt=1, started_ts=2.0)
+    public_remote = _modal_remote("sb-endpoint-a", "job-a", attempt=0)
+    cleanup_remote = _modal_remote("sb-endpoint-b", None, attempt=1, started_ts=2.0)
     runner._save_status(
         runner.RunStatus(
             run_id=spec.run_id,
@@ -1400,7 +1371,7 @@ def test_record_cleanup_remote_does_not_revive_cleared_remote(monkeypatch, tmp_p
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="cleanup-record", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    remote = _runpod_remote("endpoint-cleanup", "job-cleanup", attempt=1)
+    remote = _modal_remote("sb-endpoint-cleanup", "job-cleanup", attempt=1)
     runner._save_status(runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()))
 
     assert runner._record_cleanup_remote(spec.run_id, remote) is True
@@ -1417,7 +1388,7 @@ def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, 
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="completion-cancel", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    remote = _runpod_remote("endpoint-active", "job-active", attempt=0)
+    remote = _modal_remote("sb-endpoint-active", "job-active", attempt=0)
     runner._save_status(
         runner.RunStatus(
             run_id=spec.run_id,
@@ -1458,7 +1429,7 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id=f"recovered-{terminal_state}", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    remote = _runpod_remote("endpoint-cost", "job-cost", attempt=0, started_ts=100.0)
+    remote = _modal_remote("sb-endpoint-cost", "job-cost", attempt=0, started_ts=100.0)
     runner._save_status(
         runner.RunStatus(
             run_id=spec.run_id,
@@ -1490,15 +1461,15 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     runner._save_status(
         runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
     )
-    confirmed = _runpod_remote("endpoint-confirmed", "job-confirmed", attempt=1)
-    endpoint_only = _runpod_remote(
-        "endpoint-only",
+    confirmed = _modal_remote("sb-endpoint-confirmed", "job-confirmed", attempt=1)
+    endpoint_only = _modal_remote(
+        "sb-endpoint-only",
         None,
         attempt=2,
         started_ts=2.0,
     )
-    unconfirmed = _runpod_remote(
-        "endpoint-unconfirmed",
+    unconfirmed = _modal_remote(
+        "sb-endpoint-unconfirmed",
         "job-unconfirmed",
         attempt=3,
         started_ts=3.0,
@@ -1511,14 +1482,14 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     class Provider:
         def cancel(self, handle):
             data = handle.to_dict()
-            events.append(("cancel", data["endpoint_id"]))
-            if data["endpoint_id"] == "endpoint-unconfirmed":
+            events.append(("cancel", data["instance_id"]))
+            if data["instance_id"] == "sb-endpoint-unconfirmed":
                 raise RuntimeError("cancellation unconfirmed")
 
         def destroy(self, handle):
-            endpoint_id = handle.to_dict()["endpoint_id"]
-            events.append(("destroy", endpoint_id))
-            if endpoint_id == "endpoint-unconfirmed":
+            instance_id = handle.to_dict()["instance_id"]
+            events.append(("destroy", instance_id))
+            if instance_id == "sb-endpoint-unconfirmed":
                 raise RuntimeError("endpoint deletion unconfirmed")
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
@@ -1526,169 +1497,17 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
     attempted = runner._drain_cleanup_remotes(spec.run_id)
 
     assert attempted == {
-        ("runpod", 1, "endpoint-confirmed", "job-confirmed", _RUNPOD_FINGERPRINT),
-        ("runpod", 2, "endpoint-only", None, _RUNPOD_FINGERPRINT),
-        ("runpod", 3, "endpoint-unconfirmed", "job-unconfirmed", _RUNPOD_FINGERPRINT),
+        ("modal", 1, "sb-endpoint-confirmed", "flash-test-s0-a1", "flash-test"),
+        ("modal", 2, "sb-endpoint-only", "flash-test-s0-a2", "flash-test"),
+        ("modal", 3, "sb-endpoint-unconfirmed", "flash-test-s0-a3", "flash-test"),
     }
     assert events == [
-        ("cancel", "endpoint-confirmed"),
-        ("destroy", "endpoint-confirmed"),
-        ("destroy", "endpoint-only"),
-        ("cancel", "endpoint-unconfirmed"),
-        ("destroy", "endpoint-unconfirmed"),
+        ("destroy", "sb-endpoint-confirmed"),
+        ("destroy", "sb-endpoint-only"),
+        ("destroy", "sb-endpoint-unconfirmed"),
     ]
     raw = runner._load_status_json(spec.run_id)
     assert raw[runner._CLEANUP_REMOTES_KEY] == [unconfirmed]
-    assert raw["remote"] == confirmed
-
-
-def test_cleanup_drain_tears_down_a_record_that_fails_strict_canonicalization(
-    monkeypatch, tmp_path
-):
-    """A deployed-format record still names a billable endpoint, so teardown must reach it.
-
-    `key_fingerprint` is validated at exactly 68 chars, but the deployed release writes the 16-char
-    form, so such a record fails the strict `from_dict` behind `_canonical_cleanup_remote` and
-    `_remote_resource_identity`. The teardown loop builds a base `JobHandle` (which validates only
-    `provider`) and `_delete_runpod_endpoint` resolves that exact fingerprint through
-    `resolve_prefix_key_fingerprint`. Filtering the record out before teardown would leave a live
-    RunPod endpoint billing forever with nothing left to delete it.
-    """
-    import json as _json
-
-    import flash.runner as runner
-    from flash.core.spec import JobSpec
-    from flash.providers.runpod import api as runpod_api
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="cleanup-legacy", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
-    )
-    legacy_fingerprint = "rpk-" + "0" * 12
-    resolved_fingerprint = "rpk-" + "a" * 64
-    legacy = _runpod_remote("endpoint-legacy", None, attempt=1, key_fingerprint=legacy_fingerprint)
-    # the strict writer rejects the legacy record, so seed the status file directly.
-    path = runner.runs_file_path(spec.run_id, ".json")
-    with open(path) as f:
-        raw = _json.load(f)
-    raw[runner._CLEANUP_REMOTES_KEY] = [legacy]
-    with open(path, "w") as f:
-        _json.dump(raw, f)
-
-    def _key_for_fingerprint(fingerprint):
-        raise runpod_api.RunpodApiError("no configured key matches the stored fingerprint")
-
-    resolved = []
-    deleted = []
-
-    def resolve_legacy(endpoint_id, fingerprint):
-        resolved.append((endpoint_id, fingerprint))
-        return resolved_fingerprint
-
-    def delete_endpoint(endpoint_id, fingerprint):
-        deleted.append((endpoint_id, fingerprint))
-        return True
-
-    monkeypatch.setattr(runpod_api, "_key_for_fingerprint", _key_for_fingerprint)
-    monkeypatch.setattr(runpod_api, "resolve_prefix_key_fingerprint", resolve_legacy)
-    monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
-
-    attempted = runner._drain_cleanup_remotes(spec.run_id)
-
-    assert resolved == [("endpoint-legacy", legacy_fingerprint)], (
-        "the legacy fingerprint resolver was never reached"
-    )
-    assert deleted == [("endpoint-legacy", resolved_fingerprint)], (
-        "the billable endpoint was never deleted"
-    )
-    assert any("endpoint-legacy" in repr(item) for item in attempted)
-    # and the confirmed-deleted record must actually leave the file. removal derives its key from
-    # the same record the drain admitted, so a strict-only derivation would return None here and
-    # clear nothing -- leaving every later sweep to tear down an endpoint that is already gone.
-    with open(path) as f:
-        assert not _json.load(f).get(runner._CLEANUP_REMOTES_KEY), (
-            "the confirmed-deleted record survived, so every later sweep retries a deleted endpoint"
-        )
-
-
-def test_cleanup_collection_removes_only_fully_confirmed_runpod_record(monkeypatch, tmp_path):
-    import flash.runner as runner
-    from flash.core.spec import JobSpec
-    from flash.providers.runpod import api as runpod_api
-
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(run_id="cleanup-absent", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    runner._save_status(
-        runner.RunStatus(run_id=spec.run_id, state="cancelled", spec=spec.to_dict())
-    )
-    other_fingerprint = "rpk-" + "f" * 64
-    confirmed = _runpod_remote("endpoint-shared", "job-confirmed", attempt=1)
-    different_owner = _runpod_remote(
-        "endpoint-shared",
-        "job-confirmed",
-        attempt=1,
-        key_fingerprint=other_fingerprint,
-        started_ts=2.0,
-    )
-    different_job = _runpod_remote(
-        "endpoint-shared",
-        "job-other",
-        attempt=1,
-        started_ts=3.0,
-    )
-    different_attempt = _runpod_remote(
-        "endpoint-shared",
-        "job-confirmed",
-        attempt=2,
-        started_ts=4.0,
-    )
-    for remote in (confirmed, different_owner, different_job, different_attempt):
-        assert runner._preserve_cleanup_remote(spec.run_id, remote) is True
-
-    monkeypatch.setattr(
-        runpod_api,
-        "cancel_job",
-        lambda _endpoint_id, job_id, **_kwargs: {
-            "id": job_id,
-            "status": "CANCELLED",
-        },
-    )
-    monkeypatch.setattr(
-        runpod_api,
-        "delete_endpoint_for_fingerprint",
-        lambda _endpoint_id, _fingerprint: False,
-    )
-    exact_lookups = []
-
-    def exact_lookup(endpoint_id, fingerprint):
-        exact_lookups.append((endpoint_id, fingerprint))
-        if len(exact_lookups) == 1:
-            return True
-        raise runpod_api.RunpodApiError("exact endpoint lookup unconfirmed")
-
-    monkeypatch.setattr(runpod_api, "endpoint_absent_for_fingerprint", exact_lookup)
-
-    attempted = runner._drain_cleanup_remotes(spec.run_id)
-
-    assert attempted == {
-        ("runpod", 1, "endpoint-shared", "job-confirmed", _RUNPOD_FINGERPRINT),
-        ("runpod", 1, "endpoint-shared", "job-confirmed", other_fingerprint),
-        ("runpod", 1, "endpoint-shared", "job-other", _RUNPOD_FINGERPRINT),
-        ("runpod", 2, "endpoint-shared", "job-confirmed", _RUNPOD_FINGERPRINT),
-    }
-    assert exact_lookups == [
-        ("endpoint-shared", _RUNPOD_FINGERPRINT),
-        ("endpoint-shared", other_fingerprint),
-        ("endpoint-shared", _RUNPOD_FINGERPRINT),
-        ("endpoint-shared", _RUNPOD_FINGERPRINT),
-    ]
-    raw = runner._load_status_json(spec.run_id)
-    assert raw[runner._CLEANUP_REMOTES_KEY] == [
-        different_owner,
-        different_job,
-        different_attempt,
-    ]
     assert raw["remote"] == confirmed
 
 
@@ -1806,8 +1625,8 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
         algorithm="sft",
         gpu=GpuSpec(max_wall_seconds=200),
     )
-    remote = _runpod_remote(
-        "endpoint-old",
+    remote = _modal_remote(
+        "sb-endpoint-old",
         "job-old",
         attempt=persisted_attempt,
     )
@@ -1833,7 +1652,7 @@ def test_attach_failed_worker_resumes_with_next_attempt_identity(monkeypatch, tm
             return None
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: FailedProvider())
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda _spec: None)
     resumed = []
 
     def fake_run_training(_spec, _log, **kwargs):
@@ -1866,7 +1685,7 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
         gpu=GpuSpec(max_wall_seconds=120),
     )
-    remote = _vast_remote(instance_id=7, attempt=0, started_ts=101.0)
+    remote = _third_modal_remote(instance_id=7, attempt=0, started_ts=101.0)
     runner._save_status(
         provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=220.0,
@@ -1878,7 +1697,7 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
 
     def artifact_reader(_repo, path):
         def read(force=False):
-            if path.endswith("/vast_attempt0.json"):
+            if path.endswith("/modal_attempt0.json"):
                 return (
                     '{"attempt":0,"error":"","ok":true,"retriable":false,'
                     '"run_id":"attach-expired-completed","ts":219.0}'
@@ -1895,7 +1714,7 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
 
     monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
     monkeypatch.setattr(lifecycle, "_completed_attempt_metrics", completed_metrics)
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda _spec: None)
     monkeypatch.setattr(
         lifecycle,
         "_strict_teardown_handle",
@@ -1910,7 +1729,7 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     assert len(completion_checks) == 1
     _, kwargs = completion_checks[0]
     assert kwargs == {
-        "provider": "vast",
+        "provider": "modal",
         "attempt": 0,
         "launch_floor": 101.0,
         "deadline_at": 220.0,
@@ -1924,11 +1743,6 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
 
 
 def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp_path):
-    # same gap as the reconciler's, on the OTHER adoption path: attach_run pops the allocation
-    # stamp off the persisted remote before building the handle, and only restores it on the
-    # poll-success return. an adopted run leaves through _completed_attempt_metrics instead, whose
-    # payload is the worker's own metrics.json -- and the worker never knew the card count. without
-    # the carry, a 4-card vast run recovered after a control-plane restart prices its wall as one.
     import io
 
     import flash.providers.artifacts.hf as hf_artifacts
@@ -1945,11 +1759,11 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
         train=TrainSpec(epochs=1, hf_repo="org/repo"),
         gpu=GpuSpec(max_wall_seconds=120),
     )
-    remote = _vast_remote(
+    remote = _third_modal_remote(
         instance_id=7,
         attempt=0,
         started_ts=101.0,
-        allocated_gpu="RTX 4090",
+        allocated_gpu="L4",
         allocated_gpu_count=4,
     )
     runner._save_status(
@@ -1961,7 +1775,7 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
 
     def artifact_reader(_repo, path):
         def read(force=False):
-            if path.endswith("/vast_attempt0.json"):
+            if path.endswith("/modal_attempt0.json"):
                 return (
                     '{"attempt":0,"error":"","ok":true,"retriable":false,'
                     '"run_id":"attach-adopt-multicard","ts":219.0}'
@@ -1982,7 +1796,7 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
 
     monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
     monkeypatch.setattr(lifecycle, "_adopt_completed_attempt", capture_adopt)
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda _spec: None)
 
     status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
 
@@ -1991,31 +1805,27 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
         "an adopted multi-card run reached persistence with no card count, so its wall prices "
         "as a single card"
     )
-    assert adopted["allocated_gpu"] == "RTX 4090"
+    assert adopted["allocated_gpu"] == "L4"
     # and the substrate that billed it. _gpu_rate falls back to whichever configured provider
     # offers the class, so without this the run is priced on a provider that never ran it.
-    assert adopted["allocated_provider"] == "vast", (
-        "an adopted vast run reached persistence with no provider, so it is priced on whichever "
+    assert adopted["allocated_provider"] == "modal", (
+        "an adopted sandbox run reached persistence with no provider, so it is priced on whichever "
         "provider the plane happens to try first"
     )
 
 
 def test_attach_poll_success_carries_the_whole_allocation_stamp(monkeypatch):
-    # the OTHER attach exit: a provider poll that returns ok. the wall-deadline route above carries
-    # all three fields through `_carry_allocation_stamp`, but this one restored only gpu and count
-    # from the context -- so a vast or lambda run that simply finished its poll was priced by
-    # `_gpu_rate`'s fallback (normally RunPod) and its notes named a provider that never ran it.
     import io
     from types import SimpleNamespace
 
     import flash.runner.supervise.attach as attach
     from flash.providers.base import JobHandle
 
-    remote = _vast_remote(allocated_gpu="RTX 4090", allocated_gpu_count=4)
+    remote = _third_modal_remote(allocated_gpu="L4", allocated_gpu_count=4)
     context = attach._AttachContext(
         worker_spec=None,
         persisted_remote=remote,
-        handle=JobHandle.from_dict({"provider": "vast", "instance_id": 7}),
+        handle=JobHandle.from_dict({"provider": "modal", "instance_id": 7}),
         seed=0,
         recovered_attempt=0,
         next_attempt=1,
@@ -2035,10 +1845,10 @@ def test_attach_poll_success_carries_the_whole_allocation_stamp(monkeypatch):
 
     attach._adopt_attached_poll_result("attach-poll-multicard", context, result, io.StringIO())
 
-    assert adopted["allocated_gpu"] == "RTX 4090"
+    assert adopted["allocated_gpu"] == "L4"
     assert adopted["allocated_gpu_count"] == 4
-    assert adopted["allocated_provider"] == "vast", (
-        "a polled vast run reached persistence with no provider, so its wall is priced at "
+    assert adopted["allocated_provider"] == "modal", (
+        "a polled sandbox run reached persistence with no provider, so its wall is priced at "
         "whichever provider offers the class rather than the one that billed it"
     )
 
@@ -2059,7 +1869,7 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
         train=TrainSpec(hf_repo="org/repo"),
         gpu=GpuSpec(max_wall_seconds=120),
     )
-    remote = _vast_remote(instance_id=7, attempt=0, started_ts=101.0)
+    remote = _third_modal_remote(instance_id=7, attempt=0, started_ts=101.0)
     runner._save_status(
         provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=220.0,
@@ -2087,162 +1897,6 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
     assert len(scheduled) == 1
 
 
-def test_completed_attempt_metrics_rereads_a_marker_that_is_not_visible_yet(monkeypatch):
-    """Recovery must RE-READ the marker, not sample it once.
-
-    The marker and metrics are two uploads of the same completion racing HF read-after-write lag, so
-    a marker that is invisible on the first read routinely surfaces moments later. Reading once would
-    report ABSENT and let the caller tear down an attempt that had already finished its paid work.
-    """
-    import io
-
-    import flash.providers._lifecycle.poll_instance as instance_poll
-    import flash.providers._lifecycle.terminal_artifacts as ta
-    import flash.providers.artifacts.hf as hf_artifacts
-    import flash.runner.supervise.lifecycle as lifecycle
-    from flash.core.spec import JobSpec, TrainSpec
-
-    spec = JobSpec(
-        run_id="lagging-marker",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        train=TrainSpec(hf_repo="org/repo"),
-    )
-    # the reread window must stay NONZERO: the shared cutoff is `now + tries * wait_s`, so a zero
-    # wait would expire the budget before the second read and the test would pass for the wrong
-    # reason. sleep is faked instead, leaving the retry loop real.
-    monkeypatch.setattr(instance_poll, "_TERMINAL_REREAD_WAIT_S", 5.0)
-    monkeypatch.setattr(lifecycle.time, "time", lambda: 201.0)
-    monkeypatch.setattr(ta.time, "sleep", lambda _s: None)
-    marker_reads = {"n": 0}
-
-    def artifact_reader(_repo, path):
-        def read(force=False):
-            if path.endswith("/vast_attempt0.json"):
-                marker_reads["n"] += 1
-                # invisible on the first read, exactly as HF lag presents it
-                if marker_reads["n"] <= 1:
-                    return None
-                return (
-                    '{"attempt":0,"error":"","ok":true,"retriable":false,'
-                    '"run_id":"lagging-marker","ts":199.0}'
-                )
-            return json.dumps({"train_tokens": 4096})
-
-        return read
-
-    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
-
-    assert lifecycle._completed_attempt_metrics(
-        spec,
-        provider="vast",
-        attempt=0,
-        launch_floor=100.0,
-        deadline_at=200.0,
-        log=io.StringIO(),
-    ) == {"train_tokens": 4096}
-    assert marker_reads["n"] >= 2  # a single sample would have reported ABSENT
-
-
-def test_completed_attempt_metrics_never_adopts_an_unverifiable_marker(monkeypatch):
-    """Recovery must not adopt an artifact it cannot tie to this attempt, and must SAY so.
-
-    Live polling classifies an unverifiable marker as a terminal failure while recovery used to
-    swallow the decode error into a bare ``None``, so identical bytes produced different stories
-    depending on which layer observed the attempt. Both now route through one resolver: recovery
-    still returns ``None`` (there is no completed work to adopt) but names the artifact instead of
-    logging silence, and a corrupt marker can never be mistaken for a success.
-    """
-    import io
-
-    import flash.providers.artifacts.hf as hf_artifacts
-    import flash.runner.supervise.lifecycle as lifecycle
-    from flash.core.spec import JobSpec, TrainSpec
-
-    spec = JobSpec(
-        run_id="corrupt-marker",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        train=TrainSpec(hf_repo="org/repo"),
-    )
-
-    def artifact_reader(_repo, path):
-        # a well-formed marker body that speaks for a DIFFERENT run: it decodes as json but can
-        # never be validated against this attempt's identity.
-        def read(force=False):
-            if path.endswith("/vast_attempt0.json"):
-                return (
-                    '{"attempt":0,"error":"","ok":true,"retriable":false,'
-                    '"run_id":"some-other-run","ts":199.0}'
-                )
-            return json.dumps({"train_tokens": 4096})
-
-        return read
-
-    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
-    monkeypatch.setattr(lifecycle.time, "time", lambda: 201.0)
-    log = io.StringIO()
-
-    assert (
-        lifecycle._completed_attempt_metrics(
-            spec,
-            provider="vast",
-            attempt=0,
-            launch_floor=100.0,
-            deadline_at=200.0,
-            log=log,
-        )
-        is None
-    )
-    assert "invalid or unverifiable" in log.getvalue()
-
-
-@pytest.mark.parametrize(
-    ("marker_ts", "expected"),
-    [
-        (280.0, {"wall_seconds": 5.0}),
-        (7420.0, None),
-    ],
-)
-def test_completed_attempt_metrics_bounds_marker_to_wall_grace(monkeypatch, marker_ts, expected):
-    import flash.providers.artifacts.hf as hf_artifacts
-    import flash.runner.supervise.lifecycle as lifecycle
-    from flash.core.spec import JobSpec, TrainSpec
-
-    spec = JobSpec(
-        run_id="late-marker-complete",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        train=TrainSpec(epochs=1, hf_repo="org/repo"),
-    )
-    monkeypatch.setattr(lifecycle.time, "time", lambda: 8000.0)
-
-    def artifact_reader(_repo, path):
-        def read(force=False):
-            if path.endswith("/vast_attempt0.json"):
-                return (
-                    '{"attempt":0,"error":"","ok":true,"retriable":false,'
-                    f'"run_id":"late-marker-complete","ts":{marker_ts}}}'
-                )
-            if path.endswith("/metrics.json"):
-                return '{"wall_seconds":5.0}'
-            return None
-
-        return read
-
-    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
-
-    metrics = lifecycle._completed_attempt_metrics(
-        spec,
-        provider="vast",
-        attempt=0,
-        launch_floor=101.0,
-        deadline_at=220.0,
-    )
-
-    assert metrics == expected
-
-
 def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
     import io
 
@@ -2264,7 +1918,7 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
             spec,
             state="running",
             created_at=100.0,
-            remote=_runpod_remote("endpoint-old", "job-old", attempt=0),
+            remote=_modal_remote("sb-endpoint-old", "job-old", attempt=0),
         ),
         _run_deadline_at=220.0,
         _next_attempt=1,
@@ -2294,7 +1948,7 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
     monkeypatch.setattr(
-        runner, "_gc_run_endpoints", lambda cleanup_spec: gc_runs.append(cleanup_spec.run_id)
+        runner, "_gc_run_sandboxes", lambda cleanup_spec: gc_runs.append(cleanup_spec.run_id)
     )
     monkeypatch.setattr(runner, "_run_training", lambda *_args, **_kwargs: resumed.append(True))
 
@@ -2304,10 +1958,10 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
     assert resumed == []
     assert len(completion_checks) == 1
     assert completion_checks[0][1]["attempt"] == 0
-    assert [action for action, _handle in teardown] == ["cancel", "destroy"]
+    assert [action for action, _handle in teardown] == ["destroy"]
     assert gc_runs == [spec.run_id]
     assert status.state == "failed"
-    assert status.remote["endpoint_id"] == "endpoint-old"
+    assert status.remote["instance_id"] == "sb-endpoint-old"
     assert "deadline exhausted" in status.error
 
 
@@ -2324,7 +1978,7 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
         model="Qwen/Qwen3.5-4B",
         gpu=GpuSpec(max_wall_seconds=120),
     )
-    remote = _runpod_remote("endpoint-old", "job-old", attempt=0)
+    remote = _modal_remote("sb-endpoint-old", "job-old", attempt=0)
     runner._save_status(
         provisioned_status(runner, spec, state="running", created_at=100.0, remote=remote),
         _run_deadline_at=220.0,
@@ -2343,7 +1997,7 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
             raise AssertionError("expired recovery must not poll")
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda _spec: None)
     resumed = []
     monkeypatch.setattr(runner, "_run_training", lambda *_args, **_kwargs: resumed.append(True))
 
@@ -2353,45 +2007,6 @@ def test_attach_expired_run_retains_handle_when_teardown_is_unconfirmed(monkeypa
     assert status.state == "failed"
     assert status.remote == remote
     assert "deadline exhausted" in status.error
-
-
-def test_runpod_submit_propagates_attempt_to_worker_environment_and_handle(monkeypatch):
-    import flash.providers.runpod.jobs as jobs
-    import flash.providers.runpod.serverless as train
-    from flash.core.spec import JobSpec
-    from flash.providers.base import PollResult
-
-    spec = JobSpec(run_id="worker-attempt", model="Qwen/Qwen3.5-4B", algorithm="sft")
-    payloads = []
-    handles = []
-    monkeypatch.setattr(train, "build_worker_env", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(
-        jobs,
-        "deploy_train_endpoint",
-        lambda *_args, **_kwargs: ("endpoint", "name", _RUNPOD_FINGERPRINT),
-    )
-    monkeypatch.setattr(
-        jobs.runpod_api,
-        "submit_job",
-        lambda _endpoint, payload, **_kwargs: payloads.append(payload) or "job",
-    )
-    monkeypatch.setattr(
-        jobs,
-        "poll_job",
-        lambda *_args, **_kwargs: PollResult(True, metrics={"wall_seconds": 1.0}),
-    )
-
-    jobs.submit_run(
-        spec,
-        0,
-        attempt=2,
-        source_snapshot=_SOURCE_SNAPSHOT,
-        on_handle=handles.append,
-        deadline_at=10_000_000_000.0,
-    )
-
-    assert payloads[0]["env"]["ATTEMPT"] == "2"
-    assert handles[0]["attempt"] == 2
 
 
 def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, tmp_path):
@@ -2511,7 +2126,7 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
     )
     monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
     monkeypatch.setattr(runner, "_drain_cleanup_remotes", lambda _run_id: None)
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda _spec: None)
     monkeypatch.setattr(runner, "_mark_warmstart_source", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runner, "effective_spec_from_status", lambda _status, **_kwargs: spec)
     monkeypatch.setattr(providers, "configured_providers", list)
@@ -2569,7 +2184,7 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
     from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    remote = {"provider": "runpod", "endpoint_id": "ep-stale", "attempt": 0}
+    remote = {"provider": "modal", "instance_id": "ep-stale", "attempt": 0}
     runner._save_status(
         runner.RunStatus(
             run_id="recover-unparseable",
@@ -2614,6 +2229,7 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_spec_no_longer_parses
             # only the cleanup drain is backgrounded here; attach_run must never be dispatched.
             self._target(*self._args)
 
+    monkeypatch.setattr(runner, "_report_status", lambda status: None)
     monkeypatch.setattr(runtime.threading, "Thread", Thread)
 
     runtime.recover_runs()
@@ -2638,14 +2254,7 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
     monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
     # a COMPLETE handle: `_record_cleanup_remote` drops anything it cannot resolve to an exact
     # provider resource identity, so a partial one would make this test pass for the wrong reason.
-    remote = {
-        "provider": "runpod",
-        "endpoint_id": "ep-unconfirmed",
-        "endpoint_name": "flash-recover-unconfirmed",
-        "key_fingerprint": "rpk-" + "0" * 64,
-        "attempt": 0,
-        "started_ts": 1.0,
-    }
+    remote = _modal_remote("sb-unconfirmed")
     assert runner._remote_resource_identity(remote) is not None
     runner._save_status(
         runner.RunStatus(
@@ -2872,54 +2481,6 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
     assert "deadline exhausted" in (status.error or "")
 
 
-@pytest.mark.parametrize(("now", "pending"), [(201.0, True), (321.0, False)])
-def test_completed_attempt_metrics_bounds_success_marker_metrics_grace(monkeypatch, now, pending):
-    import flash.providers._lifecycle.poll_instance as instance_poll
-    import flash.providers.artifacts.hf as hf_artifacts
-    import flash.runner.supervise.lifecycle as lifecycle
-    from flash.core.spec import JobSpec, TrainSpec
-
-    spec = JobSpec(
-        run_id="metrics-lag",
-        model="Qwen/Qwen3.5-4B",
-        algorithm="sft",
-        train=TrainSpec(hf_repo="org/repo"),
-    )
-    monkeypatch.setattr(instance_poll, "_TERMINAL_REREAD_RETRIES", 1)
-    monkeypatch.setattr(instance_poll, "_TERMINAL_REREAD_WAIT_S", 0.0)
-    monkeypatch.setattr(instance_poll, "_METRICS_AFTER_SUCCESS_RETRIES", 1)
-    monkeypatch.setattr(instance_poll, "_METRICS_AFTER_SUCCESS_WAIT_S", 0.0)
-    monkeypatch.setattr(lifecycle.time, "time", lambda: now)
-
-    def artifact_reader(_repo, path):
-        def read(force=False):
-            if path.endswith("/vast_attempt0.json"):
-                return (
-                    '{"attempt":0,"error":"","ok":true,"retriable":false,'
-                    '"run_id":"metrics-lag","ts":199.0}'
-                )
-            return None
-
-        return read
-
-    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
-
-    def call():
-        return lifecycle._completed_attempt_metrics(
-            spec,
-            provider="vast",
-            attempt=0,
-            launch_floor=100.0,
-            deadline_at=200.0,
-        )
-
-    if pending:
-        with pytest.raises(lifecycle._CompletedAttemptPending, match=r"metrics\.json"):
-            call()
-    else:
-        assert call() is None
-
-
 def test_deferred_handleless_legacy_run_without_attempt_metadata_fails_at_deadline(
     monkeypatch, tmp_path
 ):
@@ -2991,13 +2552,13 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
         _next_attempt=0,
     )
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    candidate = Candidate("modal", "L4", 0.69, 24)
     monkeypatch.setattr(
         allocator,
         "allocate",
         lambda *_args, **_kwargs: Allocation(
-            provider="runpod",
-            gpu="RTX 4090",
+            provider="modal",
+            gpu="L4",
             hourly_usd=0.69,
             min_vram_gb=24,
             candidates=(candidate,),
@@ -3015,8 +2576,8 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
             self.submits.append(attempt)
             runner._update(spec.run_id, "cancelled")
             on_handle(
-                _runpod_remote(
-                    "endpoint-race",
+                _modal_remote(
+                    "sb-endpoint-race",
                     "job-race",
                     attempt=attempt,
                 )
@@ -3044,17 +2605,17 @@ def test_terminal_handle_race_tears_down_or_preserves_cleanup_identity(
 
     status = runner.get_status(spec.run_id)
     assert provider.submits == [0]
-    assert [event for event, _handle in provider.teardown] == ["cancel", "destroy"]
+    assert [event for event, _handle in provider.teardown] == ["destroy"]
     assert status.state == "cancelled"
     if cleanup_confirmed:
         assert status.remote is None
     else:
-        assert status.remote["endpoint_id"] == "endpoint-race"
-        assert status.remote["job_id"] == "job-race"
+        assert status.remote["instance_id"] == "sb-endpoint-race"
+        assert status.remote["name"] == "flash-test-s0-a0"
         assert status.remote["attempt"] == 0
         raw = runner._load_status_json(spec.run_id)
         assert raw[runner._CLEANUP_REMOTES_KEY] == [
-            _runpod_remote("endpoint-race", "job-race", attempt=0)
+            _modal_remote("sb-endpoint-race", "job-race", attempt=0)
         ]
 
 
@@ -3086,20 +2647,20 @@ def test_terminal_handle_race_retains_second_unconfirmed_cleanup_remote(monkeypa
         runner.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
         _next_attempt=0,
     )
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    candidate = Candidate("modal", "L4", 0.69, 24)
     monkeypatch.setattr(
         allocator,
         "allocate",
         lambda *_args, **_kwargs: Allocation(
-            provider="runpod",
-            gpu="RTX 4090",
+            provider="modal",
+            gpu="L4",
             hourly_usd=0.69,
             min_vram_gb=24,
             candidates=(candidate,),
         ),
     )
-    remote_a = _runpod_remote("endpoint-a", "job-a", attempt=0)
-    remote_b = _runpod_remote("endpoint-b", "job-b", attempt=0)
+    remote_a = _modal_remote("sb-endpoint-a", "job-a", attempt=0)
+    remote_b = _modal_remote("sb-endpoint-b", "job-b", attempt=0)
 
     class Provider:
         supports_weight_cache = False
@@ -3160,3 +2721,10 @@ def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     with pytest.raises(runner._RunCancelled):
         lifecycle._run_training(spec, None, prior_cost=0.0, source_snapshot=_SOURCE_SNAPSHOT)
     assert submitted == []  # never charged a GPU for an already-terminal run
+
+
+@pytest.fixture(autouse=True)
+def _offline_sandbox_status(monkeypatch):
+    from flash.providers.modal import api
+
+    monkeypatch.setattr(api, "get_instance", lambda *a, **k: None)

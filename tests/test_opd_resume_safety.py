@@ -22,7 +22,6 @@ from flash.teacher.retry_contract import (
 from tests._helpers.runner import provisioned_status
 from tests._helpers.source_snapshot import valid_source_snapshot
 
-_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
@@ -83,16 +82,10 @@ def _valid_resume_state(step: int, *, seed: int = 42, **overrides) -> dict:
     return state
 
 
-def _remote(*, attempt: int = 0) -> dict:
-    return {
-        "provider": "runpod",
-        "endpoint_id": f"endpoint-{attempt}",
-        "endpoint_name": f"endpoint-{attempt}-name",
-        "key_fingerprint": _RUNPOD_FINGERPRINT,
-        "job_id": f"job-{attempt}",
-        "attempt": attempt,
-        "started_ts": float(attempt + 1),
-    }
+def _remote(*, attempt=0):
+    from tests._helpers.modal import modal_remote
+
+    return modal_remote(f"sb-endpoint-{attempt}", attempt, float(attempt + 1))
 
 
 def _opd_spec(run_id: str, *, max_retries: int = 1, seed: int = 42):
@@ -104,7 +97,7 @@ def _opd_spec(run_id: str, *, max_retries: int = 1, seed: int = 42):
         algorithm="opd",
         seed=seed,
         train=TrainSpec(hf_repo="private/runs", max_examples=1, epochs=1),
-        gpu=GpuSpec(type="RTX 4090", max_retries=max_retries),
+        gpu=GpuSpec(type="L4", max_retries=max_retries),
     )
 
 
@@ -615,13 +608,13 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     private_hf.install(monkeypatch)
     spec = _opd_spec("automatic-retry-absent")
     _save_status(runner, spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    candidate = Candidate("modal", "L4", 0.69, 24)
     monkeypatch.setattr(
         allocator,
         "allocate",
         lambda *_args, **_kwargs: Allocation(
-            provider="runpod",
-            gpu="RTX 4090",
+            provider="modal",
+            gpu="L4",
             hourly_usd=0.69,
             min_vram_gb=24,
             candidates=(candidate,),
@@ -662,16 +655,15 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
 
     assert metrics == {
         "train_tokens": 1,
-        "allocated_gpu": "RTX 4090",
+        "allocated_gpu": "L4",
         # stamped alongside the gpu so cost attribution prices the class on the substrate
         # that actually billed it.
-        "allocated_provider": "runpod",
+        "allocated_provider": "modal",
         # and the card count, since the hourly rate is per card.
         "allocated_gpu_count": 1,
     }
     assert provider.attempts == [0, 1]
     retry_submit = provider.events.index(("submit", 1))
-    assert provider.events.index(("cancel", 0)) < retry_submit
     assert provider.events.index(("destroy", 0)) < retry_submit
     assert [name for name, _kwargs in private_hf.calls] == ["repo_info", "get_paths_info"]
     assert private_hf.calls[1][1]["paths"] == [opd_optimizer_start_marker_path(spec.run_id, 0)]
@@ -689,13 +681,13 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
     private_hf.install(monkeypatch)
     spec = _opd_spec("automatic-retry-pinned")
     _save_status(runner, spec, next_attempt=0, source_snapshot=_SOURCE_SNAPSHOT)
-    candidate = Candidate("runpod", "RTX 4090", 0.69, 24)
+    candidate = Candidate("modal", "L4", 0.69, 24)
     monkeypatch.setattr(
         allocator,
         "allocate",
         lambda *_args, **_kwargs: Allocation(
-            provider="runpod",
-            gpu="RTX 4090",
+            provider="modal",
+            gpu="L4",
             hourly_usd=0.69,
             min_vram_gb=24,
             candidates=(candidate,),
@@ -752,10 +744,10 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
 
     assert metrics == {
         "train_tokens": 1,
-        "allocated_gpu": "RTX 4090",
+        "allocated_gpu": "L4",
         # stamped alongside the gpu so cost attribution prices the class on the substrate
         # that actually billed it.
-        "allocated_provider": "runpod",
+        "allocated_provider": "modal",
         # and the card count, since the hourly rate is per card.
         "allocated_gpu_count": 1,
     }
@@ -809,13 +801,13 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
             events.append("destroy")
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda _spec: None)
     resumed = []
     monkeypatch.setattr(runner, "_run_training", lambda *_args, **_kwargs: resumed.append(True))
 
     status = runner.attach_run(spec.run_id, log_stream=io.StringIO())
 
-    assert events == ["cancel", "destroy"]
+    assert events == ["destroy"]
     assert resumed == []
     assert status.state == "failed"
     assert status.remote == _remote(attempt=0)
@@ -851,7 +843,7 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
     )
     started = []
     monkeypatch.setattr(runner, "_run_job_background", lambda *_args: started.append(True))
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda _spec: None)
     monkeypatch.setattr(_runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
     monkeypatch.setattr(providers, "configured_providers", list)
 
@@ -1117,7 +1109,7 @@ def test_nested_shards_do_not_count_toward_checkpoint_completeness(monkeypatch, 
 @pytest.mark.parametrize(
     ("resume_world_size", "survivor_indexes", "headline"),
     [
-        pytest.param(2, (0, 1), ("runpod", "h100", 1.0, 4), id="accept-four-cards-two-ranks"),
+        pytest.param(2, (0, 1), ("modal", "h100", 1.0, 4), id="accept-four-cards-two-ranks"),
         pytest.param(4, (2,), ("modal", "b200", 3.0, 4), id="reject-four-cards-two-ranks"),
     ],
 )
@@ -1129,12 +1121,12 @@ def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width(
     from flash.runner.supervise.seed_submission import _pinned_to_resume_width
 
     candidates = (
-        Candidate("runpod", "h100", 1.0, 80, 4, 2),
-        Candidate("vast", "h200", 2.0, 141, 2, 2),
+        Candidate("modal", "h100", 1.0, 80, 4, 2),
+        Candidate("modal", "h200", 2.0, 141, 2, 2),
         Candidate("modal", "b200", 3.0, 180, 4, 4),
     )
     allocation = Allocation(
-        provider="runpod",
+        provider="modal",
         gpu="h100",
         hourly_usd=1.0,
         min_vram_gb=80,
@@ -1169,8 +1161,8 @@ def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
         _pinned_to_resume_width,
     )
 
-    rented_two_executes_one = Candidate("runpod", "h100", 1.0, 80, 2, 1)
-    allocation = Allocation("runpod", "h100", 1.0, 80, (rented_two_executes_one,), gpu_count=2)
+    rented_two_executes_one = Candidate("modal", "h100", 1.0, 80, 2, 1)
+    allocation = Allocation("modal", "h100", 1.0, 80, (rented_two_executes_one,), gpu_count=2)
     filtered = _pinned_to_resume_width(allocation, 2)
     ctx = SimpleNamespace(oom_vram_floor=0.0, last_detail=None, seed=42, log=io.StringIO())
     prepared = SimpleNamespace(resume_world_size=2)
@@ -1213,12 +1205,12 @@ def test_retry_allocation_falls_back_for_unusable_executed_width(
     from flash.runner.supervise.seed_submission import _pinned_to_resume_width
 
     if executed_present:
-        candidate = Candidate("runpod", "h100", 1.0, 80, 4, executed_gpu_count)
+        candidate = Candidate("modal", "h100", 1.0, 80, 4, executed_gpu_count)
     else:
         candidate = SimpleNamespace(
-            provider="runpod", gpu="h100", hourly_usd=1.0, vram_gb=80, gpu_count=4
+            provider="modal", gpu="h100", hourly_usd=1.0, vram_gb=80, gpu_count=4
         )
-    allocation = Allocation("runpod", "h100", 1.0, 80, (candidate,), gpu_count=4)
+    allocation = Allocation("modal", "h100", 1.0, 80, (candidate,), gpu_count=4)
 
     fallback = _pinned_to_resume_width(allocation, 4)
     assert fallback.candidates == (candidate,)
@@ -1403,3 +1395,10 @@ def test_gate_ignores_nested_files_when_checking_completeness(monkeypatch, tmp_p
     _install_marker_gate(monkeypatch, tmp_path, checkpoint_files=files)
     with pytest.raises(RuntimeError, match="no complete resume checkpoint is available"):
         _run_gate()
+
+
+@pytest.fixture(autouse=True)
+def _offline_sandbox_status(monkeypatch):
+    from flash.providers.modal import api
+
+    monkeypatch.setattr(api, "get_instance", lambda *a, **k: None)

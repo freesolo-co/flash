@@ -16,7 +16,7 @@ BASE = (
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
     "[train]\nepochs = 1\nmax_examples = 100\n"
-    '[gpu]\ntype = "B200"\nprovider = "runpod"\n'
+    '[gpu]\ntype = "B200"\nprovider = "modal"\n'
 )
 
 BIG_GRPO = (
@@ -145,19 +145,19 @@ def test_a_non_integer_gpus_is_refused_at_parse_time(bad, capsys):
     assert "--gpus" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("provider", ["runpod", "lambda", "vast"])
+@pytest.mark.parametrize("provider", ["modal"])
 def test_gpus_is_accepted_on_every_provider(tmp_path, provider):
     """The flag carries no provider special-casing: 4 cards is a legal ask on all three.
 
-    This replaces a test of the old RunPod-only submit gate. That gate existed because Lambda and
-    Vast ignored the count and would have landed 4 ranks on one rented card while billing for four;
-    both now rent the allocated shape (Lambda names the count in the instance type, Vast filters
+    This replaces a test of the old provider-only submit gate. That gate existed because Lambda and
+    provider ignored the count and would have landed 4 ranks on one rented card while billing for four;
+    both now rent the allocated shape (Lambda names the count in the instance type, provider filters
     offers by num_gpus), so rejecting the ask is no longer correct for any provider.
 
     H100 rather than the shared BASE's B200: it is the one managed class all three stock, so the
     spec is not rejected on catalog grounds before the count is ever considered.
     """
-    config = BASE.replace('type = "B200"', 'type = "H100"').replace('"runpod"', f'"{provider}"')
+    config = BASE.replace('type = "B200"', 'type = "H100"').replace('"modal"', f'"{provider}"')
     assert _spec(tmp_path, "--gpus", "4", config=config).gpu.count == 4
 
 
@@ -198,7 +198,7 @@ def test_a_pinned_small_class_still_does_not_pin_the_card_count():
     # under grpo or opd, which the next test pins.
     allocated = [
         allocate(
-            "Qwen/Qwen3.5-9B", "sft", provider="runpod", gpu_type="RTX 4090", max_gpu_count=asked
+            "Qwen/Qwen3.5-9B", "sft", provider="modal", gpu_type="L4", max_gpu_count=asked
         ).gpu_count
         for asked in (2, 3, 4)
     ]
@@ -212,7 +212,7 @@ def test_a_pinned_small_class_still_does_not_pin_the_card_count():
 
 
 def test_a_pinned_class_can_need_a_wider_ceiling_for_grpo_and_opd():
-    """The doc's 9B/RTX 4090 example is labelled SFT because fit is per algorithm.
+    """The doc's 9B/L4 example is labelled SFT because fit is per algorithm.
 
     SFT fits on two cards. GRPO and OPD exceed a four-card ceiling but fit at the public maximum of
     eight, so copying the SFT example into a rollout config without widening the ceiling fails
@@ -226,7 +226,7 @@ def test_a_pinned_class_can_need_a_wider_ceiling_for_grpo_and_opd():
     # same model and class; only the algorithm and resulting memory floor differ.
     assert (
         allocate(
-            "Qwen/Qwen3.5-9B", "sft", provider="runpod", gpu_type="RTX 4090", max_gpu_count=4
+            "Qwen/Qwen3.5-9B", "sft", provider="modal", gpu_type="L4", max_gpu_count=4
         ).gpu_count
         == 2
     )
@@ -235,16 +235,16 @@ def test_a_pinned_class_can_need_a_wider_ceiling_for_grpo_and_opd():
             allocate(
                 "Qwen/Qwen3.5-9B",
                 algorithm,
-                provider="runpod",
-                gpu_type="RTX 4090",
+                provider="modal",
+                gpu_type="L4",
                 max_gpu_count=4,
             )
         assert (
             allocate(
                 "Qwen/Qwen3.5-9B",
                 algorithm,
-                provider="runpod",
-                gpu_type="RTX 4090",
+                provider="modal",
+                gpu_type="L4",
                 max_gpu_count=8,
             ).gpu_count
             == 8
@@ -268,8 +268,8 @@ def test_the_allocation_log_line_carries_the_count_that_status_does_not():
     def summarize(count: int) -> str:
         return allocation_summary(
             Allocation(
-                provider="runpod",
-                gpu="RTX 4090",
+                provider="modal",
+                gpu="L4",
                 hourly_usd=0.69,
                 min_vram_gb=31,
                 candidates=(),
@@ -277,9 +277,9 @@ def test_the_allocation_log_line_carries_the_count_that_status_does_not():
             )
         )
 
-    assert summarize(2).startswith("allocated 2x RTX 4090 on runpod at $1.38/hr"), summarize(2)
+    assert summarize(2).startswith("allocated 2x L4 on modal at $1.38/hr"), summarize(2)
     # one card is spelled bare, and the hourly total is per-run rather than per-card.
-    assert summarize(1).startswith("allocated RTX 4090 on runpod at $0.69/hr"), summarize(1)
+    assert summarize(1).startswith("allocated L4 on modal at $0.69/hr"), summarize(1)
 
 
 def test_the_public_run_record_never_reports_the_allocated_count():
@@ -296,7 +296,7 @@ def test_the_public_run_record_never_reports_the_allocated_count():
     status = RunStatus(
         run_id="x",
         state="running",
-        spec={"gpu": {"type": "RTX 4090", "provider": "runpod", "count": submitted_ceiling}},
+        spec={"gpu": {"type": "L4", "provider": "modal", "count": submitted_ceiling}},
         # what the allocator actually chose, recorded exactly where the runner records it.
         effective_preparation={"worker_spec": {"gpu": {"count": 2}}},
     )
@@ -334,7 +334,7 @@ def test_a_pinned_class_below_the_whole_run_floor_is_only_rejected_on_one_card(t
         'algorithm = "grpo"\n'
         '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
         "[train]\nepochs = 1\nmax_examples = 100\n"
-        '[gpu]\ntype = "H200"\nprovider = "runpod"\n'
+        '[gpu]\ntype = "H200"\nprovider = "modal"\n'
     )
 
     # one card genuinely cannot hold it, so the gate must still fire. the 35B GRPO floor now exceeds

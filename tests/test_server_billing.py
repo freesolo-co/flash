@@ -90,7 +90,7 @@ def _completed_status(monkeypatch, *, cost_usd: float = 12.345, org_id: str = "o
         state="done",
         spec=spec.to_dict(),
         cost_usd=cost_usd,
-        remote={"provider": "runpod", "allocated_gpu": "RTX 5090"},
+        remote={"provider": "modal", "allocated_gpu": "L40S"},
         billing_context={"org_id": org_id},
         billing_state="pending",
     )
@@ -131,8 +131,8 @@ def test_charge_posts_completed_run_cost_and_parses_response(monkeypatch):
     assert body["orgId"] == "org-A"
     assert body["runId"] == "run-1"
     assert body["costCents"] == 1235
-    assert body["gpu"] == "RTX 5090"
-    assert body["provider"] == "runpod"
+    assert body["gpu"] == "L40S"
+    assert body["provider"] == "modal"
     assert body["method"] == "grpo"
     assert body["model"] == "Qwen/Qwen3.5-4B"
     assert body["estimate"] == {
@@ -172,7 +172,7 @@ def test_charge_bills_cost_usd_for_a_cancelled_run(monkeypatch):
         state="cancelled",
         spec=spec.to_dict(),
         cost_usd=2.50,  # cancel path priced this at the actual steps run
-        remote={"provider": "runpod", "allocated_gpu": "RTX 5090"},
+        remote={"provider": "modal", "allocated_gpu": "L40S"},
         billing_context={"org_id": "org-A"},
         billing_state="pending",
     )
@@ -256,16 +256,10 @@ def test_http_error_detail_falls_back_to_reason():
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
-    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
-    # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
-    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
-    import flash.providers.runpod.auth as runpod_keys
 
-    runpod_keys.reset()
     import flash.runner as runner
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod

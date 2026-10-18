@@ -324,8 +324,8 @@ def _reconcile_attached_remote(
     )
     from flash.runner.supervise.lifecycle import (
         _RECOVERY_MARKER_GRACE_S,
+        _completed_worker_metrics,
         _CompletedAttemptPending,
-        _runpod_completed_metrics,
         _strict_teardown_handle,
         _worker_provably_gone,
     )
@@ -353,7 +353,7 @@ def _reconcile_attached_remote(
                 continue
             return
         try:
-            completed_metrics = _runpod_completed_metrics(
+            completed_metrics = _completed_worker_metrics(
                 expected_remote,
                 deadline_at=deadline_at,
             )
@@ -404,7 +404,7 @@ def _reconcile_attached_remote(
             worker_gone = _worker_provably_gone(run_id, handle)
         if not worker_gone:
             continue
-        if handle.provider == "runpod" and not resource_deleted:
+        if handle.provider == "modal" and not resource_deleted:
             try:
                 cleanup_preserved = _record_cleanup_remote(run_id, expected_remote)
             except Exception:
@@ -472,10 +472,10 @@ def _schedule_attach_reconciliation(
             )
         finally:
             try:
-                from flash.runner import TERMINAL_STATES, _gc_run_endpoints, get_status
+                from flash.runner import TERMINAL_STATES, _gc_run_sandboxes, get_status
 
                 if get_status(run_id).state in TERMINAL_STATES:
-                    _gc_run_endpoints(worker_spec)
+                    _gc_run_sandboxes(worker_spec)
             except Exception:
                 pass
             with _ATTACH_RECONCILING_LOCK:
@@ -544,7 +544,7 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     # attach_run is dispatched on a daemon thread, so an escaped parse failure is silent: the run
     # stays nonterminal with a live handle and its worker keeps billing. A spec stops parsing when
     # the plane upgrades past an algorithm a still-in-flight run was accepted under. It cannot be
-    # resumed, so fail it closed and tear the worker down. `_gc_run_endpoints` needs a parsed spec
+    # resumed, so fail it closed and tear the worker down. `_gc_run_sandboxes` needs a parsed spec
     # we do not have; the endpoint name is derived from the run id plus GPU class, both readable
     # from the raw persisted status, which is the same route recover_runs takes for its own
     # unparseable-spec branch.
@@ -559,9 +559,9 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     if not resource_deleted:
         _record_cleanup_remote(run_id, persisted_remote)
     _compare_and_fail_remote(run_id, persisted_remote, detail)
-    from flash.providers.runpod import terminate_persisted_endpoints
+    from flash.providers.modal import terminate_persisted_resources
 
-    terminate_persisted_endpoints(status.spec, run_id)
+    terminate_persisted_resources(status.spec, run_id)
     print(f"attach: {run_id} {detail}", file=log)
     return get_status(run_id)
 
@@ -582,12 +582,12 @@ def _handle_attach_wall_deadline(
     from flash.runner.supervise.lifecycle import (
         _adopt_completed_attempt,
         _completed_attempt_metrics,
-        _runpod_completed_metrics,
+        _completed_worker_metrics,
         _strict_teardown_handle,
     )
 
     deadline_at = _load_run_deadline_at(run_id)
-    metrics = _runpod_completed_metrics(
+    metrics = _completed_worker_metrics(
         context.persisted_remote,
         deadline_at=deadline_at,
     )
@@ -632,7 +632,7 @@ def _handle_attach_wall_deadline(
             str(exc),
         )
         print(
-            f"attach: {run_id} completed RunPod work at the wall deadline; "
+            f"attach: {run_id} completed Modal work at the wall deadline; "
             "deferring adoption to reconciliation",
             file=log,
         )
@@ -658,14 +658,14 @@ def _handle_failed_attach_poll(
     from flash.runner import _load_run_deadline_at, _record_cleanup_remote, get_status
     from flash.runner.supervise.lifecycle import (
         _adopt_completed_attempt,
-        _runpod_completed_metrics,
+        _completed_worker_metrics,
         _strict_teardown_handle,
         _worker_provably_gone,
     )
 
     failure = f"{result.failure or 'job_failed'}: {result.detail or 'provider attempt failed'}"
     print(f"attach: {run_id} ended ({result.failure}); evaluating recovery", file=log)
-    completed_metrics = _runpod_completed_metrics(
+    completed_metrics = _completed_worker_metrics(
         context.persisted_remote,
         deadline_at=_load_run_deadline_at(run_id),
     )
@@ -686,7 +686,7 @@ def _handle_failed_attach_poll(
         except Exception:
             adopted = False
         if adopted:
-            print(f"attach: {run_id} adopted completed RunPod work", file=log)
+            print(f"attach: {run_id} adopted completed Modal work", file=log)
             return get_status(run_id)
         _deploy()._schedule_attach_reconciliation(
             run_id,
@@ -698,7 +698,7 @@ def _handle_failed_attach_poll(
             failure,
         )
         print(
-            f"attach: {run_id} completed RunPod work; deferring adoption to reconciliation",
+            f"attach: {run_id} completed Modal work; deferring adoption to reconciliation",
             file=log,
         )
         return get_status(run_id)
@@ -710,7 +710,7 @@ def _handle_failed_attach_poll(
         worker_gone = _worker_provably_gone(run_id, context.handle)
     if (
         worker_gone
-        and context.handle.provider == "runpod"
+        and context.handle.provider == "modal"
         and not resource_deleted
         and not _record_cleanup_remote(run_id, context.persisted_remote)
     ):
@@ -752,11 +752,6 @@ def _adopt_attached_poll_result(
     from flash.runner.supervise.deploy import _carry_allocation_stamp
     from flash.runner.supervise.lifecycle import _adopt_completed_attempt
 
-    # the shared carrier, not a local copy of two of its three fields: `_build_attach_context` pops
-    # gpu and count off its handle copy but leaves `persisted_remote` whole, so the provider is
-    # available here too. dropping it left `_gpu_rate` to fall back to whichever configured provider
-    # offers the class -- normally RunPod -- so an attached vast or lambda run was priced at the
-    # wrong substrate's rate and its notes named a provider that never ran it.
     _carry_allocation_stamp(result.metrics, context.persisted_remote)
     if not _adopt_completed_attempt(
         run_id,
@@ -778,7 +773,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     from flash.runner import (
         TERMINAL_STATES,
         _compare_and_fail_remote,
-        _gc_run_endpoints,
+        _gc_run_sandboxes,
         _load_run_deadline_at,
         _record_cleanup_remote,
         _RunCancelled,
@@ -900,5 +895,5 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
             cleanup_terminal = get_status(run_id).state in TERMINAL_STATES
         if cleanup_terminal:
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(worker_spec)
+                _gc_run_sandboxes(worker_spec)
     return status_for_return()

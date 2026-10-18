@@ -1,7 +1,7 @@
 """Deploy, cancel, and recover run state transitions.
 
 Keep ``flash.runner`` imports function-local to avoid its import cycle and preserve package-level
-monkeypatch seams such as ``flash.runner._gc_run_endpoints``.
+monkeypatch seams such as ``flash.runner._gc_run_sandboxes``.
 """
 
 from __future__ import annotations
@@ -79,11 +79,7 @@ class DeploymentStatePersistenceError(RuntimeError):
 
 
 def _carry_allocation_stamp(metrics: dict, remote: dict | None) -> None:
-    """Carry the persisted allocation stamp onto adopted metrics.
-
-    Workers do not know the allocator's card, count, or provider. Recovery must restore all three or
-    multi-card Vast/Lambda runs are priced as one RunPod card. ``setdefault`` preserves worker data.
-    """
+    """Carry the persisted allocation stamp onto adopted metrics."""
     if not isinstance(metrics, dict) or not isinstance(remote, dict):
         return
     allocated_gpu = remote.get("allocated_gpu")
@@ -92,10 +88,6 @@ def _carry_allocation_stamp(metrics: dict, remote: dict | None) -> None:
     allocated_count = remote.get("allocated_gpu_count")
     if allocated_count:
         metrics.setdefault("allocated_gpu_count", int(allocated_count))
-    # the substrate that billed the run. `_gpu_rate` falls back to whichever configured provider
-    # offers the class, which on a multi-provider plane is normally RunPod -- so an adopted lambda
-    # or vast run is otherwise priced at RunPod's rate and its notes name the wrong provider.
-    # `provider` is required on a persisted JobHandle, so it is always present here.
     provider = remote.get("provider")
     if provider:
         metrics.setdefault("allocated_provider", provider)
@@ -705,7 +697,7 @@ def cancel_run(run_id: str) -> RunStatus:
     """Cancel training while preserving verified serving and durable cleanup targets."""
     from flash.runner import (
         TERMINAL_STATES,
-        _gc_run_endpoints,
+        _gc_run_sandboxes,
         _update,
         effective_spec_from_status,
         get_status,
@@ -785,7 +777,7 @@ def cancel_run(run_id: str) -> RunStatus:
         )
         if cleanup_spec is not None:
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(cleanup_spec)
+                _gc_run_sandboxes(cleanup_spec)
 
         status = get_status(run_id)
         entered_deployed = entered_deployed or status.state == "deployed"

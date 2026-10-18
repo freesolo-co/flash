@@ -120,19 +120,11 @@ def _identity_for_token(token: str) -> dict[str, str]:
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
-    # Full operator config so the app's startup preflight passes (>= 2 RunPod accounts + Lambda +
-    # the shared tokens + the internal key); see tests/test_preflight.py for the gate.
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
-    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
-    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
-    import flash.providers.runpod.auth as runpod_keys
 
-    runpod_keys.reset()
     import flash.runner as runner
     import flash.server.domain.environment_registry as environment_registry_mod
     import flash.server.domain.projects as projects_mod
@@ -153,12 +145,6 @@ def api(tmp_path, monkeypatch):
         "serve_chat",
         lambda **_k: {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]},
     )
-    # The new preflight requires the Lambda key above, which also makes
-    # `configured_providers()` treat it as live -- so the startup lifespan's `recover_runs()`
-    # and the orphan-sweep loop would dispatch real `sweep_orphans()` (Lambda list calls) and
-    # break test hermeticity. These API tests don't exercise orphan reaping, so stub the
-    # provider set to empty: preflight still passes on the keys, but startup stays CPU-only
-    # with no network.
     import flash.providers as providers_mod
     import flash.server.domain.run_registry as run_registry
 
@@ -2181,7 +2167,7 @@ def test_runtime_secret_validation_and_non_persistence(api):
         json={
             "spec": SPEC,
             "dry_run": True,
-            "runtime_secrets": {"RUNPOD_API_KEY": "must-stay-platform-side"},
+            "runtime_secrets": {"MODAL_TOKEN_SECRET": "must-stay-platform-side"},
         },
         headers=_bearer(key),
     )
@@ -4331,7 +4317,6 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
         shutdown_steps.append(("status_reports", close))
         return True
 
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
     monkeypatch.setattr(preflight, "check_run_preflight", lambda: None)
     monkeypatch.setattr(app_mod, "_open_deployment_jobs", lambda: None)
     monkeypatch.setattr(runner, "_open_status_reporter", lambda: None)
@@ -5270,7 +5255,7 @@ def test_cancel_while_smoke_is_blocked_prevents_alias_activation(api, monkeypatc
     monkeypatch.setattr(deploy_mod, "adapter_alias_target", lambda target: previous_revision)
     monkeypatch.setattr(deploy_mod, "undeploy_adapter", fake_undeploy)
     monkeypatch.setattr(runner, "mark_deployment_revocation_failed", mark_pending_then_release)
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda spec: None)
     # cancel_run consults the live serving alias when the activation outcome is unknown; left
     # unstubbed that is a REAL https call to the serving backend (60s timeout) and the 5s thread
     # joins below then race prod latency. no alias exists for this synthetic run.
@@ -5420,7 +5405,7 @@ def test_contended_cancel_revokes_activation_completed_after_predecessor_restore
     monkeypatch.setattr(app_mod, "deploy_adapter", fake_deploy)
     monkeypatch.setattr(runner, "mark_deployment_revocation_failed", fence_after_activation_started)
     monkeypatch.setattr(runner, "mark_checkpoint_deployed", observe_restore)
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda _spec: None)
     monkeypatch.setattr(deploy_mod, "adapter_alias_target", alias_target)
     monkeypatch.setattr(deploy_mod, "undeploy_adapter", lambda target: undeploys.append(target))
 
@@ -5473,7 +5458,7 @@ def test_cancel_local_persistence_failure_returns_structured_retryable_error(api
     assert runner.DeploymentStatePersistenceError is DeploymentStatePersistenceError
     key = _login()
     run_id = _make_run(api, key, "running")
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda _spec: None)
     real_mark_undeployed = runner.mark_deployment_undeployed
     attempts = []
 
@@ -5526,7 +5511,7 @@ def test_cancel_double_undeploy_failure_returns_structured_retryable_error(api, 
         raise deploy_mod.ServingError("backend unavailable")
 
     monkeypatch.setattr(deploy_mod, "undeploy_adapter", fail_undeploy)
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda spec: None)
 
     response = api.post(f"/v1/runs/{run_id}/cancel", headers=_bearer(key))
 
@@ -6745,7 +6730,7 @@ def test_activation_unknown_synthetic_checkpoint_predecessor_survives_cancel(api
     assert failed["activation_outcome_unknown"] is True
     assert failed["previous_deployment"]["checkpoint_step"] == 20
 
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda _spec: None)
     monkeypatch.setattr(
         deploy,
         "undeploy_adapter",
@@ -6791,7 +6776,7 @@ def test_cancel_restores_owned_previous_checkpoint_and_bare_chat_authority(api, 
     }
     status.deployment = busy
     runner._save_status(status)
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda _spec: None)
     monkeypatch.setattr(deploy, "adapter_alias_target", lambda _run_id: previous_revision)
     monkeypatch.setattr(
         deploy,
@@ -8201,18 +8186,14 @@ def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "nohandle-1"}])
     gced = []
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: gced.append(s.run_id))
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda s: gced.append(s.run_id))
     resubmitted = []
     monkeypatch.setattr(runner, "_run_job", lambda s: resubmitted.append(s.run_id))
 
-    # a handle-less run may have left a phantom instance from a non-idempotent create (Vast PUT
-    # /asks) that surfaces via eventual consistency. Recovery must force-reap the run's label across
-    # instance providers RIGHT BEFORE resubmitting, so a phantom isn't left writing the same
-    # seed-scoped artifacts as the fresh worker. Capture the gc-by-run.
     reaped = []
 
-    class _FakeVast:
-        name = "vast"
+    class _Fakeprovider:
+        name = "modal"
 
         def gc(self, s):
             reaped.append(s.run_id)
@@ -8222,7 +8203,7 @@ def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
 
     import flash.providers as providers_mod
 
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_Fakeprovider()])
 
     app_mod.recover_runs()
 
@@ -8252,7 +8233,7 @@ def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_p
     importlib.reload(app_mod)
     run_id = "terminal-cleanup-recovery"
     remote = {
-        "provider": "runpod",
+        "provider": "modal",
         "endpoint_id": "endpoint-cleanup",
         "job_id": "job-cleanup",
         "attempt": 1,
@@ -8322,7 +8303,7 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(runner.time, "time", lambda: deadline + 1.0)
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": spec.run_id}])
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda _spec: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda _spec: None)
     submitted = []
     monkeypatch.setattr(
         runner, "_run_job_background", lambda recovered: submitted.append(recovered.run_id)
@@ -8338,8 +8319,6 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
 
 
 def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeypatch, tmp_path):
-    # an unconfirmed Vast delete may leave a live phantom. recovery must defer while
-    # ``run_instances_remaining`` reports it, or a second worker can write the same HF artifacts.
     import flash.runner as runner
     import flash.server.platform.db as db_mod
 
@@ -8363,14 +8342,14 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
         runner.RunStatus(run_id="phantom-1", state="provisioning", spec=spec, remote=None)
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "phantom-1"}])
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda s: None)
     resubmitted = []
     monkeypatch.setattr(runner, "_run_job", lambda s: resubmitted.append(s.run_id))
 
     reaped = []
 
-    class _FakeVast:
-        name = "vast"
+    class _Fakeprovider:
+        name = "modal"
 
         def gc(self, s):  # unconfirmed DELETE -> destroys nothing, returns no error
             reaped.append(s.run_id)
@@ -8384,7 +8363,7 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
     import flash.providers as providers_mod
     import flash.server.platform.runtime as rt
 
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_Fakeprovider()])
     # Disable the background retry budget so the defer is a clean no-op for this assertion (no lingering
     # daemon thread polling a torn-down tmp db); the reschedule behavior has its own test below.
     monkeypatch.setattr(rt, "_deferred_resubmit_loop", lambda _spec: None)
@@ -8399,8 +8378,6 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
 
 
 def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, tmp_path):
-    # dropped Vast credentials can hide a live phantom from ``configured_providers``. fail closed for
-    # providers recorded at submit, or recovery can launch a second billed worker on the same HF prefix.
     import flash.runner as runner
     import flash.server.platform.db as db_mod
 
@@ -8427,35 +8404,32 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
             spec=spec,
             remote=None,
             submitted_instance_providers=[
-                "vast"
-            ],  # Vast was configured when this run was submitted
+                "modal"
+            ],  # provider was configured when this run was submitted
         )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "unconf-1"}])
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda s: None)
     resubmitted = []
     monkeypatch.setattr(runner, "_run_job", lambda s: resubmitted.append(s.run_id))
 
     import flash.providers as providers_mod
     import flash.server.platform.runtime as rt
 
-    # Vast is no longer configured -> omitted from configured_providers(); the real get_provider("vast")
-    # still exposes run_instances_remaining, so the recorded-but-unconfigurable provider can't be
-    # enumerated -> the guard must fail closed rather than declare clear.
     monkeypatch.setattr(providers_mod, "configured_providers", list)
     monkeypatch.setattr(rt, "_deferred_resubmit_loop", lambda _spec: None)
 
     app_mod.recover_runs()
 
-    assert resubmitted == [], "must NOT resubmit while an uncheckable Vast phantom may still bill"
+    assert resubmitted == [], (
+        "must NOT resubmit while an uncheckable provider phantom may still bill"
+    )
     assert runner.get_status("unconf-1").state != "failed", (
         "deferred, not failed (later restart retries)"
     )
 
 
 def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypatch, tmp_path):
-    # queued runs never attempted Vast's non-idempotent create, so skip the phantom guard. otherwise
-    # removed credentials can defer a run forever even though no provider resource can exist.
     import threading
 
     import flash.runner as runner
@@ -8484,11 +8458,11 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
             spec=spec,
             remote=None,
             source_snapshot=_SOURCE_SNAPSHOT,
-            submitted_instance_providers=["vast"],  # Vast configured at submit, creds now gone
+            submitted_instance_providers=["modal"],  # provider configured at submit, creds now gone
         )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "queued-1"}])
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda s: None)
 
     resubmitted = []
     done = threading.Event()
@@ -8502,9 +8476,6 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
     import flash.providers as providers_mod
     import flash.server.platform.runtime as rt
 
-    # Vast unconfigurable now: the OLD unconditional guard would fail closed here and defer forever. A
-    # queued run must resubmit anyway, because it provably never created the phantom the guard protects
-    # against. _confirm_run_clear must not even be consulted (Vast enumeration would raise/defer).
     monkeypatch.setattr(providers_mod, "configured_providers", list)
     monkeypatch.setattr(rt, "_deferred_resubmit_loop", lambda _spec: None)
 
@@ -8514,17 +8485,12 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
         "queued run must launch a resubmit thread, not defer on a phantom check"
     )
     assert resubmitted == ["queued-1"], (
-        "a never-provisioned queued run resubmits despite unconfigurable Vast"
+        "a never-provisioned queued run resubmits despite unconfigurable provider"
     )
     assert runner.get_status("queued-1").state != "failed"
 
 
 def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch, tmp_path):
-    # The fail-closed must stay SCOPED: a handle-less run on a plane that never configured Vast records
-    # no Vast in submitted_instance_providers, so it can't have left a Vast phantom and must still
-    # recover (resubmit) even though get_provider("vast") exposes the capability. Guards against the
-    # over-broad "any unconfigured capability provider blocks" regression that would strand RunPod/Lambda
-    # -only deployments.
     import threading
 
     import flash.runner as runner
@@ -8557,7 +8523,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
         )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "novast-1"}])
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda s: None)
     resubmitted = []
     done = threading.Event()
     monkeypatch.setattr(runner, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set()))
@@ -8569,7 +8535,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
     app_mod.recover_runs()
 
     assert done.wait(timeout=5), (
-        "a run that never recorded Vast must still recover on a Vast-less plane"
+        "a run that never recorded provider must still recover on a provider-less plane"
     )
     assert resubmitted == ["novast-1"]
 
@@ -8609,13 +8575,13 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
         )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "newvast-1"}])
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda s: None)
     resubmitted = []
     done = threading.Event()
     monkeypatch.setattr(runner, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set()))
 
-    class _NewVast:
-        name = "vast"
+    class _Newprovider:
+        name = "modal"
 
         def gc(self, s):
             raise AssertionError("newly configured unrecorded provider must not be reaped")
@@ -8628,11 +8594,11 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
 
     import flash.providers as providers_mod
 
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_NewVast()])
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_Newprovider()])
 
     app_mod.recover_runs()
 
-    assert done.wait(timeout=5), "newly configured unrecorded Vast must not block recovery"
+    assert done.wait(timeout=5), "newly configured unrecorded provider must not block recovery"
     assert resubmitted == ["newvast-1"]
 
 
@@ -8671,7 +8637,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
         )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "retry-1"}])
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda s: None)
     resubmitted = []
     done = threading.Event()
     monkeypatch.setattr(runner, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set()))
@@ -8679,8 +8645,8 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
 
     calls = {"n": 0}
 
-    class _FakeVast:
-        name = "vast"
+    class _Fakeprovider:
+        name = "modal"
 
         def gc(self, s):
             pass
@@ -8694,7 +8660,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
 
     import flash.providers as providers_mod
 
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_Fakeprovider()])
 
     app_mod.recover_runs()  # first check sees the box -> defers + schedules the background retry
 
@@ -8738,7 +8704,7 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
         )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "clear-1"}])
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda s: None)
     resubmitted = []
     done = threading.Event()
 
@@ -8748,8 +8714,8 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
 
     monkeypatch.setattr(runner, "_run_job", fake_run_job)
 
-    class _FakeVast:
-        name = "vast"
+    class _Fakeprovider:
+        name = "modal"
 
         def gc(self, s):
             pass
@@ -8762,7 +8728,7 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
 
     import flash.providers as providers_mod
 
-    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
+    monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_Fakeprovider()])
 
     app_mod.recover_runs()
 
@@ -8834,7 +8800,7 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
         )
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "nohandle-warm"}])
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda s: None)
     monkeypatch.setattr(
         rank_mod,
         "load_hf_adapter_config",
@@ -8935,7 +8901,7 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
         ),
     )
     cleaned = []
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda spec: cleaned.append(spec))
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda spec: cleaned.append(spec))
     monkeypatch.setattr(
         runner,
         "_run_job",
@@ -8960,7 +8926,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     import threading
 
     import flash.providers as providers_mod
-    import flash.providers.runpod.serverless as runpod_train
+    import flash.providers.modal as modal_train
     import flash.runner as runner
     import flash.server.platform.db as db_mod
 
@@ -8979,7 +8945,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         "algorithm": "grpo",
         "environment": {"path": "/legacy/local/env"},
         "train": {"epochs": 1, "max_examples": 1},
-        "gpu": {"type": "RTX 5090"},
+        "gpu": {"type": "L40S"},
         "run_id": "bad-1",
     }
     # Run #2: a valid no-handle spec — must still be recovered (resubmitted) despite run #1.
@@ -9014,18 +8980,13 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     )
     # Order matters: the bad run is iterated FIRST, so an unguarded parse would abort here.
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "bad-1"}, {"run_id": "good-2"}])
-    monkeypatch.setattr(runner, "_gc_run_endpoints", lambda s: None)
+    monkeypatch.setattr(runner, "_gc_run_sandboxes", lambda s: None)
 
-    # A malformed spec can't be parsed into a JobSpec, so the good-spec branch's
-    # `_gc_run_endpoints(spec)` is unavailable -- yet the aborted attempt may still have
-    # registered its uniquely-named RunPod endpoint before crashing, which the no-op RunPod
-    # `sweep_orphans` won't reap. recover_runs must instead derive the endpoint name from the
-    # RAW persisted status (gpu.type + run_id, no spec parse) and `terminate_endpoint` it.
     terminated = []
     monkeypatch.setattr(
-        runpod_train,
-        "terminate_endpoint",
-        lambda gpu_type, run_id=None: terminated.append((gpu_type, run_id)) or [],
+        modal_train,
+        "terminate_persisted_resources",
+        lambda spec, run_id: terminated.append(run_id),
     )
 
     # The orphan sweep must still run after the loop. recover_runs resolves it via a
@@ -9073,13 +9034,9 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
         "the failure note must explain the malformed spec to the operator"
     )
 
-    # Resource-leak guard: even though the spec couldn't be parsed, the malformed run's RunPod
-    # endpoint must still be torn down -- derived from the RAW persisted gpu.type + run_id,
-    # not from a JobSpec -- so a crash that registered an endpoint before persisting a handle
-    # can't leak it (RunPod's `sweep_orphans` is a no-op and would never catch it).
-    assert ("RTX 5090", "bad-1") in terminated, (
+    assert "bad-1" in terminated, (
         "a malformed-spec run's endpoint must be GC'd by reconstructed name (raw gpu.type + "
-        "run_id), since its spec can't be parsed and the RunPod orphan sweep is a no-op"
+        "run_id), since its spec can't be parsed and the provider orphan sweep is a no-op"
     )
 
 

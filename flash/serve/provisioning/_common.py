@@ -46,12 +46,7 @@ class LifecycleFailure:
 
 
 def validate_deadline(deadline_at: float, clock: Clock) -> None:
-    """reject a deadline that cannot describe a future instant.
-
-    Neither the rule nor the clock is provider-specific, so the modal and runpod copies of this
-    were character-for-character identical.
-    """
-
+    """reject a deadline that cannot describe a future instant."""
     if type(deadline_at) not in {int, float} or not math.isfinite(float(deadline_at)):
         raise ValueError("deadline_at must be finite")
     if float(deadline_at) <= clock():
@@ -160,15 +155,7 @@ _LOOPBACK_REGISTRY_HOSTS = frozenset({"localhost", "localhost.localdomain"})
 
 
 def reject_unreachable_registry(image: ServingImage) -> None:
-    """reject a registry only the operator's machine can reach.
-
-    `_validate_registry` accepts loopback and private hosts because a local registry is a
-    legitimate target for a locally executed pull. modal and runpod resolve the reference inside
-    their own build or pod infrastructure instead, and neither path uploads the image or opens a
-    tunnel back, so such a reference fails only after provider resources exist and bill. reject it
-    while building the plan, before any provider call.
-    """
-
+    """reject a registry only the operator's machine can reach."""
     registry = image.reference.rsplit("@", 1)[0].split("/", 1)[0]
     host = registry.rsplit(":", 1)[0] if registry.count(":") == 1 else registry
     if (
@@ -176,8 +163,6 @@ def reject_unreachable_registry(image: ServingImage) -> None:
         or host == "local"
         or host.endswith((".localhost", ".local"))
     ):
-        # rfc 6761 reserves `.localhost` for loopback, while rfc 6762 reserves `.local` for
-        # link-local mdns. neither namespace is reachable from remote provider infrastructure.
         raise ValueError("remote provider image registry cannot be a loopback or link-local host")
     try:
         address = ipaddress.IPv4Address(host)
@@ -440,7 +425,7 @@ class InterruptedProvisioning(KeyboardInterrupt):
     __slots__ = ("provider",)
 
     def __init__(self, provider: str) -> None:
-        if provider not in ("modal", "runpod"):
+        if provider not in ("modal",):
             raise ValueError("interrupted provisioning requires a known provider")
         self.provider = provider
         super().__init__(

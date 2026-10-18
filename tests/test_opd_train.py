@@ -6573,7 +6573,7 @@ def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
 
     # a spec whose card cannot hold the retained copy must stay on zero-3 even though the global
     # would have admitted it. reading JOB_SPEC here returns the B200 answer and fails.
-    tight = SimpleNamespace(gpu=SimpleNamespace(type="RTX 4090"), train=SimpleNamespace())
+    tight = SimpleNamespace(gpu=SimpleNamespace(type="L4"), train=SimpleNamespace())
     assert _build(tight)["reshard_after_forward"] is True
 
     # and with no spec at all the gate falls closed rather than silently reaching for the global.
@@ -7602,7 +7602,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
                     "max_examples": 1,
                     "credit_assignment": "per_episode",
                 },
-                "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
+                "gpu": {"type": "B200", "count": 1, "provider": "modal"},
             }
         )
 
@@ -7632,7 +7632,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
                 "max_examples": 1,
                 "credit_assignment": "per_episode",
             },
-            "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
+            "gpu": {"type": "B200", "count": 1, "provider": "modal"},
         }
     )
     assert build_worker_env(sft, sft.seed)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"

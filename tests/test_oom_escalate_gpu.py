@@ -254,7 +254,7 @@ def test_is_cuda_oom_none_is_never_oom(monkeypatch):
 
 
 def _card(gpu, vram):
-    return types.SimpleNamespace(gpu=gpu, vram_gb=vram, provider="runpod", hourly_usd=1.0)
+    return types.SimpleNamespace(gpu=gpu, vram_gb=vram, provider="modal", hourly_usd=1.0)
 
 
 def test_oom_escalated_keeps_only_strictly_larger_cards():
@@ -270,7 +270,7 @@ def test_oom_escalated_keeps_only_strictly_larger_cards():
 
 def _shape(gpu, vram, count):
     return types.SimpleNamespace(
-        gpu=gpu, vram_gb=vram, gpu_count=count, provider="runpod", hourly_usd=1.0
+        gpu=gpu, vram_gb=vram, gpu_count=count, provider="modal", hourly_usd=1.0
     )
 
 
@@ -279,8 +279,8 @@ def test_sft_oom_escalation_uses_the_ranks_that_joined():
     from flash.providers.base import Candidate, combined_vram_gb
     from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
 
-    failed = Candidate("runpod", "RTX 4090", 0.69, 24, 4)
-    fallback = Candidate("runpod", "A100 SXM 40GB", 1.0, 40, 1)
+    failed = Candidate("modal", "L4", 0.69, 24, 4)
+    fallback = Candidate("modal", "A100 SXM 40GB", 1.0, 40, 1)
     candidates = _fitting_candidates(
         [failed, fallback],
         35,
@@ -301,8 +301,8 @@ def test_non_sft_oom_escalation_still_uses_every_rented_card():
     from flash.providers.base import Candidate, combined_vram_gb
     from flash.runner.supervise.lifecycle import _candidate_usable_vram_gb, _oom_escalated
 
-    failed = Candidate("runpod", "RTX 4090", 0.69, 24, 4)
-    fallback = Candidate("runpod", "A100 SXM 40GB", 1.0, 40, 1)
+    failed = Candidate("modal", "L4", 0.69, 24, 4)
+    fallback = Candidate("modal", "A100 SXM 40GB", 1.0, 40, 1)
     failed = _fitting_candidates(
         [failed],
         35,
@@ -322,7 +322,7 @@ def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
     from flash.runner.supervise.lifecycle import _oom_escalated, _RetryBudget
 
     failed = _fitting_candidates(
-        [Candidate("runpod", "RTX 4090", 0.69, 24, 4)],
+        [Candidate("modal", "L4", 0.69, 24, 4)],
         35,
         _executed_width("sft", {"batch_size": 8}, {"sft_retained_examples": 10}),
     )[0]
@@ -348,7 +348,7 @@ def test_oom_floor_and_filter_use_one_executed_width_scale(monkeypatch):
         run_spec=types.SimpleNamespace(gpu=types.SimpleNamespace(network_volume=None)),
     )
     monkeypatch.setattr(
-        seed_submission._lifecycle, "_await_runpod_completed_metrics", lambda *a, **k: None
+        seed_submission._lifecycle, "_await_completed_worker_metrics", lambda *a, **k: None
     )
     monkeypatch.setattr("flash.runner._load_run_deadline_at", lambda _run_id: None)
 
@@ -385,36 +385,6 @@ def test_an_oom_retry_never_moves_to_a_shape_the_fit_model_calls_smaller():
     triple_40 = _shape("L40Sx3", 40, 3)
     single_96 = _shape("Pro6000", 96, 1)
     assert single_96 in _oom_escalated([single_96], _candidate_usable_vram_gb(triple_40))
-
-
-def test_surfaced_worker_flags_reads_both_flags_in_one_pass():
-    from flash.providers.runpod.jobs import surfaced_worker_flags
-
-    say = lambda _m: None  # noqa: E731
-    reads = {"n": 0}
-
-    def reader(force=False):
-        reads["n"] += 1
-        return {"oom": True, "attempt": 0, "retriable": False, "stage": "rl_train"}
-
-    _key, retriable, oom = surfaced_worker_flags(reader, None, say, 0, launch_ts=1.0)
-    assert (retriable, oom) == (False, True)
-    assert reads["n"] == 1
-    assert surfaced_worker_flags(
-        lambda force=False: {"retriable": True, "attempt": 0, "ts": 10_500.0},
-        None,
-        say,
-        0,
-        launch_ts=10_000.0,
-    )[1:] == (True, False)
-    assert surfaced_worker_flags(
-        lambda force=False: {"retriable": True, "attempt": 1, "ts": 10_500.0},
-        None,
-        say,
-        0,
-        launch_ts=10_000.0,
-    )[1:] == (False, False)
-    assert surfaced_worker_flags(None, None, say)[1:] == (False, False)
 
 
 def test_heartbeat_oom_for_attempt_gates_stale_flag():
@@ -493,35 +463,6 @@ def test_heartbeat_oom_rejects_malformed_current_attempt(malformed_attempt):
     assert heartbeat_oom_for_attempt({"oom": True, "attempt": 1}, malformed_attempt) is False
 
 
-def test_poll_job_maps_only_matching_oom_attempt(monkeypatch):
-    from flash.providers.runpod import api as runpod_api
-    from flash.providers.runpod import jobs
-
-    monkeypatch.setattr(jobs.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(
-        runpod_api,
-        "job_status",
-        lambda _eid, _jid, **_kw: {"status": "FAILED", "error": "x"},
-    )
-    handle = jobs.JobHandle("ep", "name", "rpk-" + "0" * 64, "job", 2, 1.0)
-
-    res = jobs.poll_job(
-        handle,
-        interval_s=0,
-        heartbeat_reader=lambda force=False: {"oom": True, "attempt": 2},
-        current_attempt=2,
-    )
-    assert res.failure == "oom"
-
-    res = jobs.poll_job(
-        handle,
-        interval_s=0,
-        heartbeat_reader=lambda force=False: {"oom": True, "attempt": 1},
-        current_attempt=2,
-    )
-    assert res.failure == "job_failed"
-
-
 def test_worker_failure_flags_prioritize_retriable_over_oom(monkeypatch):
     import flash.engine.worker as worker
 
@@ -539,7 +480,7 @@ def test_worker_failure_flags_prioritize_retriable_over_oom(monkeypatch):
 def test_a_dirty_card_is_infra_retriable_and_never_an_oom(monkeypatch):
     """A co-tenanted card must retry on a FRESH instance, not escalate to a bigger one.
 
-    The observed failure: Flash sized the run at >=19 GB, RunPod handed over a 4090 reporting
+    The observed failure: Flash sized the run at >=19 GB, provider handed over a 4090 reporting
     total=22.5 used=18.6 free=3.4, with only 0.486 GB owned by any process in our container. The
     sizing was right and the card was dirty, but the run trained anyway and died on an OOM ~80s of
     paid GPU later -- classified `oom`, which escalates to a larger card and spends the small OOM

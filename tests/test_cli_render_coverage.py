@@ -236,10 +236,10 @@ def test_kv_returns_empty_when_no_rows(styled_plain) -> None:
 def test_hide_provider_metadata_over_lists_and_bare_strings() -> None:
     # a bare provider name anywhere in the tree becomes "managed"; provider/flash_arm keys drop
     got = render._hide_provider_metadata(
-        ["runpod", {"provider": "vast", "flash_arm": "x", "keep": 1}, 5, "other"]
+        ["modal", {"provider": "vast", "flash_arm": "x", "keep": 1}, 5, "other"]
     )
     assert got == ["managed", {"keep": 1}, 5, "other"]
-    assert render._hide_provider_metadata("RunPod") == "managed"  # case-insensitive
+    assert render._hide_provider_metadata("Modal") == "managed"  # case-insensitive
 
 
 # --------------------------------------------------------------------------- timestamp / age
@@ -352,7 +352,7 @@ def test_cost_panel_grpo_with_teacher_and_wall_cap(styled_plain) -> None:
         method="grpo",
         model_id="Qwen/Qwen3.5-4B",
         steps=100,
-        gpu="RTX 5090",
+        gpu="L40S",
         gpu_vram_gb=32,
         # a stub standing in for CostEstimate has to carry the fields the panel reads; one card
         # offers exactly itself, so offered_vram_gb matches gpu_vram_gb here and the joined width
@@ -388,7 +388,7 @@ def test_cost_panel_sft_omits_optional_sections(styled_plain) -> None:
         method="sft",
         model_id="Qwen/Qwen3.5-4B",
         steps=50,
-        gpu="RTX 4090",
+        gpu="L4",
         gpu_vram_gb=24,
         offered_vram_gb=24,
         gpu_count=1,
@@ -619,7 +619,7 @@ def test_runs_table_renders_an_ordered_gpu_pin_that_has_not_allocated_yet(styled
                 "spec": {
                     "model": "m",
                     "algorithm": "sft",
-                    "gpu": {"type": ["A100 PCIe", "A100 SXM"]},
+                    "gpu": {"type": ["H100", "A100 SXM"]},
                 },
                 "remote": {},
             },
@@ -632,7 +632,7 @@ def test_runs_table_renders_an_ordered_gpu_pin_that_has_not_allocated_yet(styled
             },
         ]
     )
-    assert "A100 PCIe | A100 SXM" in out
+    assert "H100 | A100 SXM" in out
     # the unrelated run is still listed, which is what the crash used to prevent.
     assert "flash-other" in out
     assert "H200" in out

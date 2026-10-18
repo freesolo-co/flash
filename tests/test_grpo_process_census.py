@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -27,7 +28,7 @@ def _census(
 def _stable_auxiliary_metrics(monkeypatch):
     monkeypatch.setattr(census_module, "_cgroup_pids", lambda: (10, 100, 90))
     monkeypatch.setattr(census_module, "_cpu_quota_millicores", lambda: 2000)
-    monkeypatch.setattr(census_module.os, "sched_getaffinity", lambda _pid: {0, 1})
+    monkeypatch.setattr(census_module.os, "sched_getaffinity", lambda _pid: {0, 1}, raising=False)
 
 
 def _complete_proc_view(monkeypatch, *, with_child: bool):
@@ -36,6 +37,9 @@ def _complete_proc_view(monkeypatch, *, with_child: bool):
     children = {(1, 1): {2} if with_child else set(), (2, 2): set(), (2, 3): set()}
     monkeypatch.setattr(census_module, "_read_start_time", lambda pid: starts.get(pid))
     monkeypatch.setattr(census_module, "_list_task_ids", lambda pid: tasks.get(pid))
+    monkeypatch.setattr(
+        census_module, "_task_present", lambda pid, task_id: task_id in tasks.get(pid, ())
+    )
     monkeypatch.setattr(
         census_module,
         "_read_task_children",
@@ -472,6 +476,7 @@ def test_pids_peak_and_headroom_update_on_partial_samples():
     assert summary["incomplete_sample_count"] == 1
 
 
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="requires Linux procfs")
 def test_process_census_reports_numeric_bounded_summary():
     census = GrpoProcessCensus(
         __import__("os").getpid(), expected_steps=(1,), interval_s=0.02
@@ -539,6 +544,9 @@ def test_scan_keeps_the_tree_when_a_descendant_exits_mid_walk(monkeypatch):
     children = {(1, 1): {2, 3}, (2, 2): None, (3, 3): set()}
     monkeypatch.setattr(census_module, "_read_start_time", lambda pid: starts.get(pid))
     monkeypatch.setattr(census_module, "_list_task_ids", lambda pid: tasks.get(pid))
+    monkeypatch.setattr(
+        census_module, "_task_present", lambda pid, task_id: task_id in tasks.get(pid, ())
+    )
     monkeypatch.setattr(
         census_module,
         "_read_task_children",

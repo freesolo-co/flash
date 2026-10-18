@@ -145,23 +145,23 @@ def _real_console_scripts() -> dict[str, str]:
 def test_flash_cli_alias_reaches_the_same_entry_point():
     """`flash-cli` must exist and be the same entry point as `flash`.
 
-    The `server` and `dev` extras install runpod-flash, which declares its own `flash` console
+    The `server` and `dev` extras install another CLI package, which declares its own `flash` console
     script. Whichever distribution is installed last wins, so on a control-plane host `flash` can
-    silently belong to runpod-flash -- it exits 0 without doing anything. `flash-cli` is the name
+    silently belong to another CLI package -- it exits 0 without doing anything. `flash-cli` is the name
     nothing else claims, so it is what SELF_HOSTING.md points operators at.
     """
     scripts = _real_console_scripts()
     assert scripts.get("flash") == "flash.cli:main"
     assert scripts.get("flash-cli") == scripts["flash"], (
         "flash-cli must stay an alias of flash. SELF_HOSTING.md tells self-hosters to use it "
-        "when runpod-flash's console script shadows `flash`."
+        "when another CLI package's console script shadows `flash`."
     )
 
 
 def test_printed_commands_name_the_executable_the_operator_invoked():
     """Generated commands must name the script actually run, not the channel default.
 
-    On the documented `[server]` install, `flash` can be runpod-flash's console script. Printing
+    On the documented `[server]` install, `flash` can be another CLI package's console script. Printing
     `flash runs cancel <id>` there hands the operator a command that exits 0 without cancelling,
     leaving a billed run alive -- so an operator who reached us via `flash-cli` must be told
     `flash-cli`. Anything that is not one of our scripts (a test runner, a renamed copy) falls
@@ -246,7 +246,7 @@ def test_scaffolded_files_follow_flash_cli_invocation(tmp_path, monkeypatch):
     """The GENERATED environment.py / evaluations.py must name the invoked CLI too.
 
     The terminal output above already did, but the scaffold guidance was a literal `flash env push`.
-    Those files outlive the terminal session -- an operator on a host where `flash` is RunPod's CLI
+    Those files outlive the terminal session -- an operator on a host where `flash` is provider's CLI
     reads the docstring later, runs the shadowed binary, and it exits 0 having published nothing.
     That is the failure mode the alias exists to prevent, so the two renderings have to agree.
     """
@@ -516,7 +516,7 @@ def test_the_attached_dash_m_form_is_recognised_as_a_module_launch():
     A short option may carry its value attached, and CPython accepts it; the only difference is
     that `sys.orig_argv` holds one token, `-mflash.cli`, instead of two. Matching the separated
     spelling alone sends this form to the `flash` fallback -- on the host where `flash` may be
-    RunPod's console script, so the printed cancel exits 0 without cancelling. That is the exact
+    provider's console script, so the printed cancel exits 0 without cancelling. That is the exact
     failure this module exists to prevent, reached through a spelling rather than a bug.
     """
     import sys
@@ -550,7 +550,7 @@ def test_the_attached_dash_m_form_is_recognised_as_a_module_launch():
 def test_windows_console_script_names_match_case_insensitively():
     """Windows filenames are case-insensitive, so `FLASH-CLI.EXE` IS the script we installed.
 
-    Rejecting it falls back to `flash` -- which on the `[server]` install may be RunPod's, so the
+    Rejecting it falls back to `flash` -- which on the `[server]` install may be provider's, so the
     operator is pointed at the shadowed name the alias exists to escape. `.EXE` also survives a
     lowercase-only suffix strip, so the name then fails the membership test for a second reason.
 

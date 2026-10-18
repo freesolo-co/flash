@@ -1,4 +1,4 @@
-"""Focused hermetic coverage for the shared instance bootstrap (Vast/Lambda worker container).
+"""Focused hermetic coverage for the shared instance bootstrap (provider/Lambda worker container).
 
 These target under-covered helpers in ``flash.providers._lifecycle.bootstrap``: payload loading,
 code-prefix validation, the Hugging Face transient-retry machinery (status/Retry-After parsing +
@@ -30,7 +30,7 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
-@pytest.mark.parametrize("arm", ["lambda", "vast"])
+@pytest.mark.parametrize("arm", ["modal"])
 def test_arm_accepts_current_provider_identity(arm):
     assert b._arm({"flash_arm": arm}) == arm
 
@@ -1494,7 +1494,7 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
         "job_spec_json": "{}",
         "phase": "sft",
         "seed": 0,
-        "flash_arm": "lambda",
+        "flash_arm": "modal",
         "env": {},
         "extra_pip": [],
         "hf_prefix": "sft/run",
@@ -1781,7 +1781,7 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
         "job_spec_json": "{}",
         "phase": "sft",
         "seed": 0,
-        "flash_arm": "lambda",
+        "flash_arm": "modal",
         "env": {},
         "extra_pip": [],
         "hf_prefix": "sft/run",
@@ -1874,7 +1874,7 @@ def test_main_accepts_required_completion_artifacts_at_deadline(monkeypatch, bou
         "job_spec_json": "{}",
         "phase": "sft",
         "seed": 0,
-        "flash_arm": "lambda",
+        "flash_arm": "modal",
         "env": {},
         "extra_pip": [],
         "hf_prefix": "sft/run",
@@ -1938,7 +1938,7 @@ def test_write_attempt_marker_truncates_error_and_uploads_arm_named(monkeypatch)
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "p",
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 3,
         "run_id": "run-marker",
         "deadline_at": 200.0,
@@ -1951,7 +1951,7 @@ def test_write_attempt_marker_truncates_error_and_uploads_arm_named(monkeypatch)
 
     path, sub, kwargs = uploads[-1]
     assert path == "/tmp/attempt_marker.json"
-    assert sub == "vast_attempt3.json"  # <arm>_attempt<N>.json
+    assert sub == "modal_attempt3.json"  # <arm>_attempt<N>.json
     assert kwargs == {"enforce_deadline": False}
     with open(path) as f:
         marker = json.load(f)
@@ -1970,7 +1970,7 @@ def test_write_attempt_marker_preserves_success_after_deadline(monkeypatch):
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "p",
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 3,
         "run_id": "run-marker",
         "deadline_at": 200.0,
@@ -1999,7 +1999,7 @@ def test_write_attempt_marker_rejects_noncanonical_deadline(monkeypatch):
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "p",
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 3,
         "run_id": "run-marker",
         "deadline_at": 200.0,
@@ -2029,7 +2029,7 @@ def test_arm_deadline_watchdog_publishes_marker_before_exit(monkeypatch):
         "deadline_at": 160.0,
         "run_created_at": 100.0,
         "run_max_wall_seconds": 60.0,
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 0,
         "run_id": "run",
         "hf_repo": "o/r",
@@ -2081,7 +2081,7 @@ def test_arm_preload_wall_cap_uses_remaining_absolute_deadline(monkeypatch):
         "deadline_at": 160.0,
         "run_created_at": 100.0,
         "run_max_wall_seconds": 60.0,
-        "flash_arm": "lambda",
+        "flash_arm": "modal",
         "attempt": 0,
         "hf_repo": "o/r",
         "env": {},
@@ -2221,7 +2221,7 @@ def test_attempt_marker_error_redacts_a_payload_env_secret(monkeypatch):
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "p",
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 1,
         "run_id": "run-marker",
         "deadline_at": 200.0,
@@ -2576,7 +2576,7 @@ def _preload_payload(**over):
         "mode": "preload",
         "hf_repo": "org/repo",
         "hf_prefix": "preload/run",
-        "flash_arm": "lambda",
+        "flash_arm": "modal",
         "run_id": "preload-run",
         "seed": 0,
         "attempt": 0,

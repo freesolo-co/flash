@@ -65,16 +65,6 @@ _FIXED_CHILD_ENVIRONMENT = {
     "PATH": "/opt/flash-venv/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin",
     "PYTHONUNBUFFERED": "1",
 }
-# engine settings the vllm process needs regardless of which provider started the container.
-#
-# these used to be supplied only by the modal image, which is why modal served and runpod did not:
-# without the spawn method vllm forks its EngineCore after this process has already touched cuda,
-# and the child dies with "Cannot re-initialize CUDA in forked subprocess" before anything binds a
-# port. externally that is another silent boot failure, indistinguishable from a slow image pull.
-#
-# they belong to the runtime rather than to a provider image: the engine's requirements do not
-# change with the machine that rented the gpu, and a second provider must not have to rediscover
-# them. applied to the running process and to the child, since the engine reads them at import.
 _ENGINE_RUNTIME_ENVIRONMENT = {
     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
     # the xet download path intermittently fails engine init, so force the http downloader.

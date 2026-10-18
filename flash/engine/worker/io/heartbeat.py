@@ -258,7 +258,7 @@ def heartbeat(
         payload["progress_age_s"] = round(max(0.0, ts - latest_progress_ts), 1)
     else:
         payload.pop("progress_age_s", None)
-    dc = os.environ.get("RUNPOD_DC_ID") or ""
+    dc = os.environ.get("MODAL_REGION") or ""
     if dc:
         payload.setdefault("dc", dc)
     snapshot = json.dumps(payload)

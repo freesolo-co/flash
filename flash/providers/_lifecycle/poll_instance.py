@@ -68,11 +68,7 @@ def _reread_budget(cutoff_at: float | None) -> ProbeBudget:
 
 @dataclass
 class InstancePollAdapter:
-    """The per-provider seams :func:`poll_instance_job` is parameterized by. A wrapper (poll_vast_job /
-    poll_lambda_job) builds one — resolving its api module + readers at CALL time so test monkeypatches
-    of ``vast_api.get_instance`` / ``_make_hf_file_reader`` / heartbeat readers all still bite — then
-    hands it to the shared driver. Everything NOT here is identical across providers and lives in the
-    driver, baselined on Vast."""
+    """Provider operations and artifact readers used by the sandbox supervisor."""
 
     instance_id: object
     run_id: str
@@ -87,17 +83,13 @@ class InstancePollAdapter:
     # Instance status fetch + classification.
     fetch_instance: Callable[[], dict | None]  # resolves the api's get_instance at call time
     poll_error_exceptions: tuple  # transient fetch errors: count against the budget, keep polling
-    status_field: str  # "actual_status" (vast) / "status" (lambda)
-    running_status: str  # the "up" value: "running" (vast) / "active" (lambda)
+    status_field: str
+    running_status: str
     dead_states: frozenset  # states meaning "the box is gone / won't progress"
-    missing_dead_threshold: (
-        int  # consecutive missing reads that count as a disappearance (vast 4/lambda 3)
-    )
+    missing_dead_threshold: int
 
     # Liveness + failure evidence.
-    early_liveness_alive: Callable[
-        [], bool
-    ]  # non-empty container log (vast) / boot.log present (lambda)
+    early_liveness_alive: Callable[[], bool]
     read_current_error: Callable[
         [], str | None
     ]  # THIS attempt's error_<phase>_attempt<N>.txt, force-read

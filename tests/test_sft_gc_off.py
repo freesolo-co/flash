@@ -94,7 +94,7 @@ def test_gc_off_peak_scales_linearly_with_seq():
 def test_dense_activation_constant_matches_the_live_rtx5090_peak():
     """The dense K is a live measurement, not the MoE's safety pad.
 
-    Measured on an RTX 5090 (31.37 GB usable), Qwen3.5-0.8B (hidden 1024, 24 layers), LoRA rank 32
+    Measured on an L40S (31.37 GB usable), Qwen3.5-0.8B (hidden 1024, 24 layers), LoRA rank 32
     all-linear, bs 4, bf16, chunked dense-logit-free CE matching ``model.use_fused_kernels=true``:
     seq 1024 -> 15.09 GB, seq 2048 -> 28.18 GB, seq 4096 -> OOM. The shared 18.0 predicted 9.89 GB at
     seq 1024 and 20.76 GB at seq 4096 -- it called a run that OOMs a FIT, which is the failure this
@@ -329,7 +329,7 @@ def test_grpo_use_reentrant_true_for_gdn_hybrid():
     # Dense Qwen3.5/3.6 GatedDeltaNet hybrids ALSO need reentrant GC under GRPO: FA2 varlen-unpad +
     # the fused GDN chunk-scan + the fused Triton kernels save data-dependent tensors the non-reentrant
     # metadata-equality assert can't reconcile (forward packed [1636,..] vs recompute padded [1024,..]),
-    # crashing at step 0 exactly like MoE. Live-confirmed on Qwen3.5-0.8B GRPO / RTX 4090.
+    # crashing at step 0 exactly like MoE. Live-confirmed on Qwen3.5-0.8B GRPO / L4.
     from flash.engine.worker.perf.memory import grpo_use_reentrant
 
     for gdn_id in (

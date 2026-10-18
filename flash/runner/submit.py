@@ -277,6 +277,7 @@ def submit_job(
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd
     from flash.providers import INSTANCE_PROVIDERS, available_providers
+    from flash.providers.modal.auth import credentials, scope_fingerprint
 
     source_snapshot = None
     if not dry_run:
@@ -316,6 +317,7 @@ def submit_job(
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
         # Creds-only check (available_providers -> is_configured), no network on the create path.
         submitted_instance_providers=[n for n in available_providers() if n in INSTANCE_PROVIDERS],
+        submitted_modal_scope=scope_fingerprint() if credentials() else None,
     )
     save_kwargs = {
         "_run_deadline_at": status.created_at + float(public_spec.gpu.max_wall_seconds),

@@ -36,7 +36,7 @@ Two components stay Freesolo-operated and are **not** in this repository:
 | Component                 | Where it lives                                                                                         | Self-hosted equivalent                                                      |
 | ------------------------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
 | Multi-tenant identity     | `api.freesolo.co`; verifies keys and owns projects/orgs                                                | `FLASH_STANDALONE=1` runs single-tenant on your own key                     |
-| Hosted Multi-LoRA serving | `serve.freesolo.co`, deployed from `flash/serving/`; `flash/serve/` owns the client and shared runtime | `flash serve deploy` provisions serving in your own Modal or RunPod account |
+| Hosted Multi-LoRA serving | `serve.freesolo.co`, deployed from `flash/serving/`; `flash/serve/` owns the client and shared runtime | `flash serve deploy` provisions serving in your own Modal account |
 
 So there are three ways to use Flash: against the **hosted service**, **self-hosted** against
 your own GPU accounts, or as **training and provider code to read and modify**. The training
@@ -160,11 +160,7 @@ uv run pytest -q -m wallclock                 # asserts on real elapsed time; ru
 `mypy` also runs in CI but is **advisory** — it reports existing type errors without failing
 the build. Formatting is gated, so run `uv run ruff format .` before you push.
 
-> **The `flash` command can belong to something else.** The `server` and `dev` extras install
-> `runpod-flash`, which declares its own `flash` console script; whichever installs last wins,
-> and RunPod's exits 0 while doing nothing. Use **`flash-cli`** — the same entry point under a
-> name nothing else claims — or `python -m flash.cli` from a checkout. A base
-> `pip install freesolo-flash` is unaffected.
+Use `flash`, `flash-cli`, or `python -m flash.cli` from a checkout.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the branching model — in short, **pull requests go
 into `dev`**.
@@ -203,14 +199,15 @@ export FLASH_STANDALONE=1
 export FREESOLO_INTERNAL_KEY=$(openssl rand -hex 32)
 export HF_TOKEN=hf_...
 export FLASH_HF_NAMESPACE=your-hf-username   # a namespace your HF_TOKEN can write to
-export RUNPOD_API_KEY=...                    # or LAMBDA_API_KEY, or VAST_API_KEY
+export MODAL_TOKEN_ID=...
+export MODAL_TOKEN_SECRET=...
 
 flash-server --host 0.0.0.0 --port 8080
 ```
 
-You need **one** of RunPod, Lambda, or Vast. Providers whose key is unset are never
-considered, and the allocator only proposes classes it can actually provision. Startup fails
-only when all three are missing.
+Training and serving use **Modal**. Both Modal token variables are required. Training runs in GPU
+Sandboxes with persisted attempt identities, checkpoint recovery, cancellation, and a shared
+`flash-weights` Volume. GPU selection remains automatic within Modal's supported shapes.
 
 `FLASH_STANDALONE=1` stops the plane calling out for project, environment, and billing
 validation, and trusts `FREESOLO_INTERNAL_KEY` as a single-tenant operator credential.
@@ -218,7 +215,7 @@ External bearer tokens are rejected rather than accepted unverified. A standalon
 **single-tenant** — whoever holds that key can spend your GPU budget, so keep it off
 untrusted networks. See [the security model](SELF_HOSTING.md#the-security-model).
 
-`flash serve deploy` provisions serving in your own Modal or RunPod account, implementing the
+`flash serve deploy` provisions serving in your own Modal account, implementing the
 same contract `flash/serve/` speaks; [docs/serving-contract.md](docs/serving-contract.md)
 documents it if you would rather write your own.
 

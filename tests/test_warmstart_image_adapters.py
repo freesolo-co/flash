@@ -197,7 +197,7 @@ def _image_rl_spec(algorithm: str, source: str = "image-gate-qwen35-4b-opd-20260
         "run_id": f"image-warmstart-{algorithm}",
         "environment": _image_environment(),
         "train": train,
-        "gpu": {"provider": "runpod", "type": "H100", "count": 1},
+        "gpu": {"provider": "modal", "type": "H100", "count": 1},
     }
 
 
@@ -218,5 +218,5 @@ def _image_sft_spec() -> dict:
             "max_context_tokens": 512,
             "init_from_adapter": "image-gate-qwen35-4b-sft-20260818-06",
         },
-        "gpu": {"provider": "runpod", "type": "H100", "count": 1},
+        "gpu": {"provider": "modal", "type": "H100", "count": 1},
     }

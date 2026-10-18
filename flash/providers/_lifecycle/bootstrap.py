@@ -1,8 +1,4 @@
-"""Bootstrap shared by instance-based providers (e.g. Lambda). Runs inside the worker container.
-
-Stdlib + huggingface_hub only — never import flash here. Reads payload from ``/root/flash/payload.json``.
-Launch scripts must ship ``bootstrap_console.py``, ``bootstrap_secrets.py`` and ``bootstrap_pip.py``.
-"""
+"""Bootstrap the verified worker source inside a Modal training sandbox."""
 
 from __future__ import annotations
 
@@ -132,6 +128,9 @@ def arm_deadline_watchdog(
 
 
 def load_payload() -> dict:
+    raw = os.environ.pop("FLASH_BOOTSTRAP_PAYLOAD", "")
+    if raw:
+        return json.loads(raw)
     with open(PAYLOAD_PATH) as f:
         return json.load(f)
 
@@ -546,7 +545,6 @@ def build_worker_env(payload: dict) -> dict:
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         raise RuntimeError("bootstrap attempt identity is invalid")
     env["ATTEMPT"] = str(attempt)
-    # Override runpod-stamped FLASH_ARM to the real backend from the payload.
     env["FLASH_ARM"] = _arm(payload)
     code_dir = _code_dir(payload)
     env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")

@@ -3,7 +3,7 @@
 The control plane observes a remote worker purely through the artifacts it uploads to a private HF
 dataset repo: rate-limited text/JSON readers for ``heartbeat.json`` / ``error_*.txt`` / console logs,
 plus the provenance predicates that decide whether a heartbeat belongs to THIS attempt or a leftover
-prior one. None of this is provider-specific — RunPod, Lambda, and Vast all poll the same artifact
+prior one. None of this is provider-specific — Modal all poll the same artifact
 shape — so it lives here in the shared kernel and no provider package imports another for it.
 
 The worker-side bootstrap (``_instance_bootstrap``) cannot import flash, so it re-implements the

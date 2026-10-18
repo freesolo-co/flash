@@ -15,7 +15,7 @@ Two credentials and at least one GPU account:
 
 |                         |                                                                                                                                                                               |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **One GPU provider**    | a RunPod, Lambda, **or** Vast account. One is enough.                                                                                                                         |
+| **One GPU provider**    | a Modal workspace with GPU access.                                                                                                                         |
 | `HF_TOKEN`              | a HuggingFace token with **write** access. Flash streams code, checkpoints, and adapters through HuggingFace dataset repos, so every run needs it whichever provider you use. |
 | `FLASH_HF_NAMESPACE`    | the HuggingFace user or org those repos are created under - **set this to one your `HF_TOKEN` can write to.** It defaults to Freesolo's namespace, which you cannot write to. |
 | `FREESOLO_INTERNAL_KEY` | the key your clients present to your plane. Generate it yourself.                                                                                                             |
@@ -31,7 +31,8 @@ export FLASH_STANDALONE=1
 export FREESOLO_INTERNAL_KEY=$(openssl rand -hex 32)
 export HF_TOKEN=hf_...
 export FLASH_HF_NAMESPACE=your-hf-username   # where run artifacts are created
-export RUNPOD_API_KEY=...              # or LAMBDA_API_KEY, or VAST_API_KEY
+export MODAL_TOKEN_ID=...
+export MODAL_TOKEN_SECRET=...
 
 flash-server --host 0.0.0.0 --port 8080
 ```
@@ -58,12 +59,7 @@ lives in its own venv, and a plain `pip install freesolo` lands in your shell's 
 environment and refuses a generic `github:` ref outright, which is the only kind a standalone plane
 accepts - so installing the SDK does not make it usable self-hosted.)
 
-The `server` extra pulls in `runpod-flash`, which declares its own `flash` console script.
-Whichever distribution installs last wins, so on a plane host the bare `flash` command may launch
-RunPod's CLI instead of this one - it exits 0 and does nothing, which is easy to miss. Use
-**`flash-cli`**: the same CLI under a name nothing else claims. Check with `flash --help`; if it
-does not mention `train`, use `flash-cli` (or `python -m flash.cli`) wherever this guide says
-`flash`. A client-only machine that never installs the `server` extra is unaffected.
+Use `flash`, `flash-cli`, or `python -m flash.cli` for the CLI.
 
 `flash-server` speaks plain HTTP. For anything but loopback, put a TLS-terminating reverse proxy
 (nginx, Caddy, a cloud load balancer) in front of it and point DNS for your hostname at the proxy -
@@ -217,26 +213,39 @@ environment itself, so it needs a source it can reach; an `[environment] path` i
 at submit. Push your environment to a GitHub repository (public or private with
 `GITHUB_TOKEN`) and reference it with the `github:` form above.
 
-## Choosing providers
+## Modal training
 
-Flash allocates across RunPod, Lambda, and Vast. **Configure the ones you have; the rest
-are simply never considered.** There is no requirement to hold all three, and no
-placeholder value to set for the ones you skip.
+Export `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` on the control plane. `MODAL_ENVIRONMENT`
+defaults to `main`. Keep that environment and credential owner stable while runs are active;
+persisted attempts are bound to their owner, and cleanup refuses a different credential scope.
 
-| Provider | Variable         | Notes                                                           |
-| -------- | ---------------- | --------------------------------------------------------------- |
-| RunPod   | `RUNPOD_API_KEY` | One key, or several comma-separated for multi-account failover. |
-| Lambda   | `LAMBDA_API_KEY` |                                                                 |
-| Vast     | `VAST_API_KEY`   |                                                                 |
+Flash creates named GPU Sandboxes in `flash-training`. The controller persists the exact sandbox
+ID before polling. It reconnects after a restart, streams artifacts through Hugging Face, resumes
+from streamed checkpoints after preemption, and confirms termination on cancellation. Ambiguous
+creation is reconciled by exact name and attempt metadata before another launch is allowed.
 
-The allocator ranks candidate GPU classes only on the substrates you configured, so a
-plane with just `VAST_API_KEY` set allocates on Vast and never proposes a class it cannot
-provision. Startup fails only when **all three** are missing.
+The allocator prices Modal GPU reservations plus the configured Sandbox CPU and memory requests.
+These are estimates, not invoice totals: shared Volume storage and network transfer are not
+attributed to individual runs. Modal queues capacity; Flash cannot query a live GPU inventory.
+Each sandbox lasts at most 24 hours. Longer runs require checkpoint recovery across attempts and
+a sufficient retry budget. Ephemeral disk requests above 512 GiB are rejected.
 
-A single RunPod key works. It logs a warning at startup because a one-account pool cannot
-ride out that account's quota or credit exhaustion by moving to another - an availability
-property, not a correctness one. Runs still allocate, and idle endpoints are still reaped
-within the account you configured.
+The shared `flash-weights` Modal Volume retains trusted public base-model weights. Tenant artifacts
+and compiled runtime caches remain isolated. Set `FLASH_WEIGHT_CACHE_DISABLED=1` to disable this
+cache. The supervisor also retains its bounded retry without the cache when appropriate.
+
+```bash
+python -m flash.providers.artifacts.weight_cache --dry-run
+python -m flash.providers.artifacts.weight_cache --provision
+python -m flash.providers.artifacts.weight_cache
+```
+
+`--teardown` deletes this cache Volume. Stop users of the cache before deleting it.
+
+Migrating an existing installation requires draining its active training runs and retiring its old
+provider resources using the pre-migration release before starting this Modal-only controller.
+Historical provider handles are not converted into Modal identities. Existing Hugging Face
+checkpoints and adapters remain usable; the provider migration does not rewrite those artifacts.
 
 ## What `FLASH_STANDALONE=1` does
 
@@ -316,13 +325,8 @@ nobody had checked. Writing the entry means the numbers are real.
 Gated repos (Llama among them) still require you to have accepted the licence on your HF
 account, and private repos need `HF_TOKEN` to have read access.
 
-> **RunPod endpoint concurrency is not capped by Flash**, on a self-hosted plane or a
-> managed one. Flash used to carry a slot store intended to hold the account to a
-> 58-endpoint ceiling, but it was claimed from a code path the live deploy replaced and so
-> never enforced anything; it has been removed rather than left to imply a guarantee. If
-> you expect many concurrent runs, cap them upstream of Flash or raise the worker quota on
-> your RunPod account - otherwise a large enough burst hits RunPod's account limit and the
-> excess deploys fail there.
+Modal workspace GPU quotas bound concurrent reservations. Size the control plane's admission
+limits to the workspace quota, and monitor queued jobs and budget usage in Modal.
 
 ### The security model
 
@@ -359,7 +363,7 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 
 ## Serving
 
-`flash serve deploy` provisions serving in **your own** Modal or RunPod account, running the
+`flash serve deploy` provisions serving in **your own** Modal account, running the
 published worker image against one base model and one run's adapter. Training and export remain
 independent of serving. Catalog serving checkpoint repositories are informational only and are never
 resolved by the training path.
@@ -389,30 +393,7 @@ flash serve deploy \
 ```
 
 The three `--modal-*` placement flags are required for `--provider modal` even though `--help`
-lists them as optional: they are optional to _argparse_ because RunPod takes its own pair instead,
-and `placement_for` is what requires exactly one provider's set. Omitting them exits with
-`modal placement requires environment, region, workspace_name`.
-
-For RunPod, export `RUNPOD_API_KEY` instead and swap the placement flags rather than adding to
-them -- `placement_for` rejects the other provider's inputs instead of ignoring them, so keeping
-`--modal-*` alongside `--provider runpod` fails before anything is created:
-
-```bash
-flash serve deploy \
-  --provider runpod \
-  --model Qwen/Qwen3.5-4B \
-  --run <run-id> \
-  --deployment-id my-4b-serving \
-  --image ghcr.io/freesolo-co/freesolo-flash-serve@sha256:<digest> \
-  --artifact-repo <hub-repo> \
-  --artifact-subfolder <path-within-repo> \
-  --lora-rank 32 \
-  --runpod-account <your-account-id> \
-  --runpod-data-center <data-center-id>
-```
-
-Both `--runpod-*` flags are required and must be nonempty, for the same reason the `--modal-*`
-trio is: `--help` lists them as optional only because each provider takes its own set.
+lists them as optional, but real deployments require their values.
 
 Provider credentials are read from the process environment for the duration of a single call and are
 never written to the deployment record, logs, or command arguments — so any later resize or teardown
@@ -463,16 +444,15 @@ configuration that only degrades an optional capability warns instead of blockin
 
 It fails on:
 
-- no GPU provider configured (all three keys missing) - the error names every acceptable
-  way out
+- either `MODAL_TOKEN_ID` or `MODAL_TOKEN_SECRET` missing
 - `HF_TOKEN` missing
 - `FREESOLO_INTERNAL_KEY` missing
 
-It warns on a single-account RunPod pool and a missing `GITHUB_TOKEN`, then logs the
+It warns on a missing `GITHUB_TOKEN`, then logs the
 providers it resolved:
 
 ```
-GPU provider(s) configured: vast
+GPU provider(s) configured: modal
 ```
 
 That line is the quickest confirmation your credentials were picked up. Then submit a
@@ -488,8 +468,7 @@ Confirm `FREESOLO_API_KEY` contains that exact value, with no trailing newline, 
 `flash login` again.
 
 **Startup says no GPU provider is configured** but you set a key. The value must be
-non-empty and non-whitespace. For RunPod specifically, a value of `","` parses to zero
-usable accounts.
+non-empty and non-whitespace. Both Modal token variables must be present.
 
 **Runs fail to allocate on a class you expected.** The allocator only proposes classes on
 configured providers. Check the `GPU provider(s) configured:` startup line.

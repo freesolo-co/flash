@@ -8,24 +8,10 @@ import pytest
 def test_canonical_gpu_aliases():
     from flash.providers.base import canonical_gpu
 
-    for alias in ("RTX 5090", "rtx5090", "5090", "RTX_5090", "NVIDIA GeForce RTX 5090"):
-        assert canonical_gpu(alias) == "RTX 5090"
-    for alias in ("RTX 4090", "rtx4090", "4090", "RTX_4090"):
-        assert canonical_gpu(alias) == "RTX 4090"
-    assert canonical_gpu("NVIDIA A100-SXM4-40GB") == "A100 SXM 40GB"
-
-
-def test_ambiguous_provider_aliases_are_not_user_canonicalizable():
-    from flash.providers.base import UnsupportedGpuError, canonical_gpu, vast_gpu_for_offer
-
-    for alias in ("A100 SXM4", "NVIDIA A100 SXM4"):
-        with pytest.raises(UnsupportedGpuError):
-            canonical_gpu(alias)
-
-    assert canonical_gpu("A100 SXM 40GB") == "A100 SXM 40GB"
-    assert canonical_gpu("A100 SXM") == "A100 SXM"
-    assert vast_gpu_for_offer("A100 SXM4", 40 * 1024) == "A100 SXM 40GB"
-    assert vast_gpu_for_offer("A100 SXM4", 80 * 1024) == "A100 SXM"
+    assert canonical_gpu("a100-80gb") == "A100 SXM"
+    assert canonical_gpu("A100-40GB") == "A100 SXM 40GB"
+    assert canonical_gpu("l40s") == "L40S"
+    assert canonical_gpu("RTX-PRO-6000") == "RTX Pro 6000"
 
 
 def test_unknown_gpu_rejected():
@@ -37,31 +23,9 @@ def test_unknown_gpu_rejected():
 
 
 def test_providers_for():
-    from flash.providers.base import providers_for
+    from flash.providers.base import GPU_CLASSES, providers_for
 
-    # Consumer GeForce cards are RunPod + Vast (Vast's verified-datacenter market carries GeForce;
-    # Lambda's datacenter fleet does not). Order follows the registry: runpod, lambda, vast.
-    assert providers_for("RTX 4090") == ("runpod", "vast")
-    assert providers_for("RTX 5090") == ("runpod", "vast")
-    # Datacenter cards span the instance-based complements where the hardware exists.
-    assert providers_for("H100") == ("runpod", "lambda", "vast")
-    assert providers_for("A100 PCIe") == ("runpod", "vast")
-    assert providers_for("RTX Pro 6000") == ("runpod",)  # no vast_name (RunPod-only)
-    # Provider-exclusive / mixed instance classes.
-    assert providers_for("A10") == ("lambda",)  # Lambda-only (no RunPod A10, no Vast A10)
-    assert providers_for("A100 SXM 40GB") == ("lambda", "vast")  # instance-only 40 GB SXM4
-
-
-def test_vast_gpu_for_offer_accepts_h100_pcie_alias():
-    # Vast lists PCIe H100s as "H100 PCIE" (distinct from the SXM "H100 SXM"). Both must map to the
-    # canonical H100 class, else a PCIe-only market is dropped as unknown capacity.
-    from flash.providers.base import vast_gpu_for_offer
-
-    h100_ram = 80 * 1024  # MB
-    assert vast_gpu_for_offer("H100 SXM", h100_ram) == "H100"
-    assert vast_gpu_for_offer("H100 PCIE", h100_ram) == "H100"
-    # an unmanaged name still maps to nothing (the Ampere+ floor / unknown-board guard holds)
-    assert vast_gpu_for_offer("Tesla T4", 16 * 1024) is None
+    assert all(providers_for(g.name) == ("modal",) for g in GPU_CLASSES)
 
 
 def test_removed_gpu_class_is_unmanaged():
@@ -75,17 +39,21 @@ def test_removed_gpu_class_is_unmanaged():
 
 
 def test_expanded_gpu_table():
-    from flash.providers.base import GPU_INFO, canonical_gpu, get_gpu_info, gpu_short
+    from flash.providers.base import GPU_INFO
 
-    # Cheap-capacity classes the cheapest policy exists for are all mapped.
-    assert canonical_gpu("A100") == "A100 PCIe"
-    assert canonical_gpu("h100") == "H100"
-    assert get_gpu_info("A100 PCIe").vram_gb == 80
-    # endpoint-name tokens stay single-word safe
-    assert gpu_short("A100 PCIe") == "a100pcie"
-    assert gpu_short("A100 SXM 40GB") == "a100sxm40"
-    # architecture floor: nothing below Ampere (sm80)
-    assert all(int(g.sm.removeprefix("sm")) >= 80 for g in GPU_INFO.values())
+    assert set(GPU_INFO) == {
+        "L4",
+        "L40S",
+        "A10",
+        "A100 SXM 40GB",
+        "A100 SXM",
+        "H100",
+        "H200",
+        "RTX Pro 6000",
+        "B200",
+    }
+    assert GPU_INFO["A10"].max_count == 4
+    assert GPU_INFO["H100"].max_count == 8
 
 
 def test_sm_capability_and_fp8_kv_support():
@@ -111,9 +79,9 @@ def test_sm_capability_and_fp8_kv_support():
     assert _sm_capability("sm100") == (10, 0)
     assert _sm_capability("sm120") == (12, 0)
     assert _sm_capability("bogus") == (0, 0)  # unparseable -> pre-fp8
-    for name in ("RTX 4090", "H100", "H200", "B200", "RTX Pro 6000", "RTX 5090"):
+    for name in ("L4", "H100", "H200", "B200", "RTX Pro 6000", "L40S"):
         assert fp8_kv(name), name
-    for name in ("A100 PCIe", "A100 SXM", "A10"):
+    for name in ("A100 SXM", "A100 SXM", "A10"):
         assert not fp8_kv(name), name
     # the largest validated card WITHOUT fp8 KV is the 80 GB A100 -> a run needing more can only land
     # on a modern (fp8-capable) card.
@@ -123,41 +91,10 @@ def test_sm_capability_and_fp8_kv_support():
 def test_blackwell_min_cuda_pin():
     from flash.providers.base import min_cuda_modern
 
-    assert min_cuda_modern("RTX 5090") == "13.0"
+    assert min_cuda_modern("B200") == "13.0"
     assert min_cuda_modern("RTX Pro 6000") == "13.0"
-    assert min_cuda_modern("RTX 4090") == "12.8"
+    assert min_cuda_modern("L4") == "12.8"
     assert min_cuda_modern("A100 SXM") == "12.8"
-
-
-def test_cheapest_gpu_policy(monkeypatch):
-    from flash.providers import base as gpus
-    from flash.providers.runpod import pricing
-
-    # Validated-only by default: the cheapest validated enum class that fits each VRAM tier
-    # wins on static rates. 24 GB is the floor now (sub-24 GB classes dropped), and the cheapest
-    # validated card is the 24 GB RTX 4090 ($0.69).
-    assert (
-        gpus.cheapest_gpu(16) == "RTX 4090"
-    )  # no sub-24 GB tier -> cheapest validated card ($0.69)
-    # cheapest VALIDATED >=24G.
-    assert gpus.cheapest_gpu(24) == "RTX 4090"
-    assert gpus.cheapest_gpu(32) == "RTX 5090"  # 32G 5090 ($0.99) is the cheapest validated >=32G
-    assert (
-        gpus.cheapest_gpu(48) == "A100 PCIe"
-    )  # cheapest validated >=48G is the 80G A100 PCIe ($1.39)
-    # The error names the REAL constraint -- validation, not provider. The pool is every validated
-    # class across all three providers, so naming RunPod here would be the special-casing the
-    # multi-provider contract removes, and would misdescribe a Lambda-only class like the A10.
-    with pytest.raises(gpus.UnsupportedGpuError, match="no validated GPU class has >= 4096 GB"):
-        gpus.cheapest_gpu(4096)
-    # ...and the card count is part of that constraint: the same need a single card cannot hold is
-    # holdable across four, so sizing must say which shape it rejected.
-    assert gpus.cheapest_gpu(200, gpu_count=4) == "A100 PCIe"
-    with pytest.raises(gpus.UnsupportedGpuError, match="even as a 4-card combination"):
-        gpus.cheapest_gpu(4096, gpu_count=4)
-    # static rates cover every RunPod-provisionable class
-    rates = pricing.static_rates()
-    assert set(rates) == {name for name, info in gpus.GPU_INFO.items() if info.enum_member}
 
 
 def test_sft_provisional_count_credits_only_the_batch_bound_width():
@@ -293,7 +230,7 @@ def test_parse_and_allocator_agree_on_batch_bound_sft(sequence, accepted):
             need=required_vram_gb(model_id, "sft", train=train),
             requested_gpu_count=None,
             model_revision="",
-            available=("runpod",),
+            available=("modal",),
             exact="",
             executed_width=_executed_width("sft", train, None),
         )
@@ -311,12 +248,12 @@ def test_provisional_gpu_cheapest_for_model(monkeypatch):
     from flash.providers.base import provisional_gpu
 
     # provisional_gpu remains the offline auto-sizing path and returns the cheapest fitting
-    # validated class. 0.8B GRPO -> cheapest validated >=24G (RTX 4090). 9B is now bf16 (QLoRA dropped: the
+    # validated class. 0.8B GRPO -> cheapest validated >=24G (L4). 9B is now bf16 (QLoRA dropped: the
     # 4-bit vLLM-rollout merge broke GRPO learning), so colocated 9B GRPO needs an 80G-class card
-    # -> the cheapest validated 80G class (A100 PCIe).
-    assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "RTX 4090"
-    assert provisional_gpu("Qwen/Qwen3.5-9B", algorithm="grpo") == "A100 PCIe"
-    assert provisional_gpu("Qwen/Qwen3.6-27B", algorithm="sft") == "A100 PCIe"
+    # -> the cheapest validated 80G class (A100 SXM).
+    assert provisional_gpu("Qwen/Qwen3.5-0.8B", algorithm="grpo") == "L4"
+    assert provisional_gpu("Qwen/Qwen3.5-9B", algorithm="grpo") == "A100 SXM"
+    assert provisional_gpu("Qwen/Qwen3.6-27B", algorithm="sft") == "H100"
     assert provisional_gpu("Qwen/Qwen3.6-27B", algorithm="grpo") == "B200"
 
 
@@ -332,7 +269,7 @@ def test_config_gpu_type_is_empty_for_auto_and_preserves_pins():
     }
     assert spec_from_dict(raw, run_id="x").gpu.type == ""
 
-    for klass in ("RTX 4090", "A100 SXM", "H100"):
+    for klass in ("L4", "A100 SXM", "H100"):
         raw["gpu"] = {"type": klass}
         assert spec_from_dict(raw, run_id="x").gpu.type == klass
 
@@ -341,49 +278,11 @@ def test_config_gpu_type_is_empty_for_auto_and_preserves_pins():
         spec_from_dict(raw, run_id="x")
 
 
-def test_flash_gpu_enum_members():
-    pytest.importorskip("runpod_flash")
-
-    from flash.providers.runpod.gpus import flash_gpu
-
-    assert flash_gpu("RTX 5090").name == "NVIDIA_GEFORCE_RTX_5090"
-    assert flash_gpu("4090").name == "NVIDIA_GEFORCE_RTX_4090"
-    # B200 is newly added; resolving it fails fast (AttributeError) if the installed runpod_flash SDK
-    # doesn't expose the NVIDIA_B200 enum member, so CI catches an SDK/version gap before a live run.
-    assert flash_gpu("B200").name == "NVIDIA_B200"
-
-
-def test_explicit_gpu_pin_cannot_widen_to_its_whole_pool():
-    """An explicit class pin must serialize to that card, never to "any card in its pool".
-
-    The SDK's POOLS_TO_TYPES lists 1 of ADA_80_PRO's 3 real members, and to_gpu_ids_str derives
-    negations from that table, so an unpatched H100 pin sends a bare 'ADA_80_PRO' -- RunPod may
-    then assign an H100 NVL, which verify_gpu rejects as an exact-class mismatch.
-    """
-    pytest.importorskip("runpod_flash")
-
-    from runpod_flash.core.resources.gpu import GpuGroup
-
-    from flash.providers.runpod.gpus import flash_gpu
-
-    ids = GpuGroup.to_gpu_ids_str([flash_gpu("H100")])
-    assert "-NVIDIA H100 NVL" in ids
-    assert "-NVIDIA H100 PCIe" in ids
-
-    # repeated resolution must not accumulate duplicate negations
-    for _ in range(3):
-        flash_gpu("H100")
-    assert GpuGroup.to_gpu_ids_str([flash_gpu("H100")]) == ids
-
-    # classes whose SDK pool table is already complete stay exactly as they were
-    assert GpuGroup.to_gpu_ids_str([flash_gpu("A100 SXM")]) == "AMPERE_80,-NVIDIA A100 80GB PCIe"
-
-
 def test_gpu_short():
     from flash.providers.base import gpu_short
 
-    assert gpu_short("RTX 5090") == "5090"
-    assert gpu_short("rtx_4090") == "4090"
+    assert gpu_short("L40S") == "l40s"
+    assert gpu_short("l4") == "l4"
 
 
 def test_config_defaults_gpu_to_auto():
@@ -401,7 +300,7 @@ def test_config_defaults_gpu_to_auto():
 
 def test_build_worker_env():
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers.runpod.serverless import build_worker_env
+    from flash.providers._lifecycle.worker import build_worker_env
 
     spec = JobSpec(
         run_id="r1",

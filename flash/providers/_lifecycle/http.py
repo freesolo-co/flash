@@ -50,7 +50,6 @@ class RestClient:
         self.missing_key_message = f"{env_var} not configured on the control-plane host"
         self.keys_provider = keys_provider
         self.failover_predicate = failover_predicate
-        # Lambda sits behind Cloudflare, which 403s the stdlib default UA — pass a real UA via extra_headers.
         self.extra_headers = dict(extra_headers or {})
 
     def api_key(self) -> str:

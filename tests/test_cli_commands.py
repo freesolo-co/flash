@@ -60,7 +60,7 @@ class _FakeClient:
                 "algos": ["sft", "grpo"],
                 "min_vram_gb": 12,
                 "quant": "bf16",
-                "recommended_gpu": "RTX 4090",
+                "recommended_gpu": "L4",
                 "experimental": False,
                 "notes": "",
             }
@@ -1245,7 +1245,7 @@ def test_gpus_tip_explains_automatic_default_and_type_pin(fake_client, capsys) -
     assert 'type = "<CLASS>"' in out
     assert "don't pin" not in out
     assert "cannot pin" not in out
-    assert "runpod" not in out.lower()
+    assert "modal" not in out.lower()
     assert "lambda" not in out.lower()
 
 
@@ -2335,7 +2335,6 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
         in training_text
     )
     assert "HF_TOKEN" in training_text
-    assert "runpod" not in training_text.lower()
     assert "lambda" not in training_text.lower()
     out = capsys.readouterr().out
     assert "evaluations.py" in out

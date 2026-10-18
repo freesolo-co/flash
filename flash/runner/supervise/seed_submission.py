@@ -37,7 +37,7 @@ class _SubmitContext:
     current_on_last_gpu: bool = False
     current_attempt: int = 0
     # tracks complete rN-suffixed retry handles that registry-less gc cannot reconstruct by name.
-    seen_endpoints: dict[str, dict] = field(default_factory=dict)
+    seen_sandboxes: dict[str, dict] = field(default_factory=dict)
     submission_lock: object | None = None
     # grow only when an attempt actually provisioned a class and lost it to infra.
     failed_providers: set[str] = field(default_factory=set)
@@ -71,8 +71,8 @@ class _SubmitContext:
                 raise RuntimeError("provider handle attempt does not match the reserved attempt")
             self.last_handle.clear()
             self.last_handle.update(canonical_handle)
-            if canonical_handle.get("endpoint_id"):
-                self.seen_endpoints[canonical_handle["endpoint_id"]] = dict(canonical_handle)
+            if canonical_handle.get("instance_id"):
+                self.seen_sandboxes[canonical_handle["instance_id"]] = dict(canonical_handle)
             persisted_handle = {
                 **canonical_handle,
                 "seed": int(self.seed),
@@ -104,26 +104,25 @@ class _SubmitContext:
             if lock is not None:
                 lock.release()
 
-    def gc_seen_endpoints(self) -> None:
-        # only runpod handles carry an endpoint_id, so this set is empty on a plane without it.
-        if not self.seen_endpoints:
+    def gc_seen_sandboxes(self) -> None:
+        if not self.seen_sandboxes:
             return
         from flash.providers import get_provider
         from flash.providers.base import JobHandle
 
-        rp = get_provider("runpod")
-        for remote in self.seen_endpoints.values():
+        provider = get_provider("modal")
+        for remote in self.seen_sandboxes.values():
             with contextlib.suppress(Exception):
-                rp.destroy(JobHandle.from_dict(remote))
+                provider.destroy(JobHandle.from_dict(remote))
 
     def cancel(self):
-        """Reap this seed's tracked endpoints before unwinding on cancel."""
+        """Reap this seed's tracked sandboxes before unwinding on cancel."""
         from flash.runner import _RunCancelled
 
         # a handle whose `running` write loses the terminal-stickiness race never lands in
-        # status.remote, so only seen_endpoints (rN walk endpoints _gc_run_endpoints can't name)
+        # status.remote, so only seen_sandboxes (earlier attempts _gc_run_sandboxes can't name)
         # can free it.
-        self.gc_seen_endpoints()
+        self.gc_seen_sandboxes()
         return _RunCancelled(f"run {self.spec.run_id} was cancelled")
 
     def raise_if_cancelled(self) -> None:
@@ -135,16 +134,13 @@ class _SubmitContext:
         except FileNotFoundError:
             pass
 
-    def return_completed_runpod_metrics(self, metrics: dict) -> dict:
+    def return_completed_worker_metrics(self, metrics: dict) -> dict:
         self.raise_if_cancelled()
-        self.gc_seen_endpoints()
+        self.gc_seen_sandboxes()
         if self.current_gpu.get("name"):
             metrics.setdefault("allocated_gpu", self.current_gpu["name"])
         if self.current_gpu.get("provider"):
             metrics.setdefault("allocated_provider", self.current_gpu["provider"])
-        # the runpod serverless route returns here rather than through the `res.ok` stamp below, so
-        # the card count has to be recorded on both or a sharded serverless run is still priced as
-        # one card. same source either way: the candidate allocation actually chose.
         if self.current_gpu.get("count"):
             metrics.setdefault("allocated_gpu_count", int(self.current_gpu["count"]))
         return metrics
@@ -259,7 +255,7 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
         _record_cleanup_remote,
     )
 
-    completed_metrics = _lifecycle._await_runpod_completed_metrics(
+    completed_metrics = _lifecycle._await_completed_worker_metrics(
         ctx.last_handle,
         _load_run_deadline_at(ctx.spec.run_id),
         check_cancelled=ctx.raise_if_cancelled,
@@ -274,19 +270,19 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
         )
     except Exception as exc:
         teardown_error = exc
-    resource_kind = "endpoint" if ctx.last_handle.get("endpoint_id") else "instance"
-    resource_id = ctx.last_handle.get("endpoint_id") or ctx.last_handle.get("instance_id")
+    resource_kind = "sandbox"
+    resource_id = ctx.last_handle.get("instance_id")
     worker_gone = teardown_error is None or _lifecycle._worker_provably_gone(
         ctx.spec.run_id, ctx.last_handle
     )
     if (
         worker_gone
-        and ctx.last_handle.get("provider") == "runpod"
+        and ctx.last_handle.get("provider") == "modal"
         and not resource_deleted
         and not _record_cleanup_remote(ctx.spec.run_id, ctx.last_handle)
     ):
         raise RuntimeError(
-            f"seed {ctx.seed}: terminal worker's leaked endpoint cleanup target could not be persisted"
+            f"seed {ctx.seed}: terminal worker's leaked sandbox cleanup target could not be persisted"
         )
     if worker_gone:
         if not _compare_and_clear_remote(ctx.spec.run_id, ctx.last_handle):
@@ -309,7 +305,7 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
         return None
     with contextlib.suppress(Exception):
         get_provider(ctx.last_handle["provider"]).gc(ctx.spec)
-    ctx.gc_seen_endpoints()
+    ctx.gc_seen_sandboxes()
     print(
         f"retry {attempt}: {ctx.last_handle.get('provider')} {resource_kind} {resource_id} "
         f"teardown unconfirmed ({type(teardown_error).__name__}); keeping the handle so the "
@@ -353,12 +349,15 @@ def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
 
 
 def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOutcome:
+    from flash.providers.modal.auth import require_recorded_scope
     from flash.runner import (
         _reserve_attempt,
         _spec_with_remaining_wall,
         _verified_opd_retry_state,
+        get_status,
     )
 
+    require_recorded_scope(get_status(ctx.spec.run_id))
     attempt = ctx.attempt_start + local_attempt
     ctx.raise_if_cancelled()
     if local_attempt > 0:
@@ -368,7 +367,7 @@ def _prepare_attempt(ctx: _SubmitContext, local_attempt: int) -> _PreparationOut
     try:
         attempt_spec = _spec_with_remaining_wall(ctx.spec, require_provider_minimum=True)
     except RuntimeError:
-        ctx.gc_seen_endpoints()
+        ctx.gc_seen_sandboxes()
         raise
     if ctx.spec.algorithm == "opd":
         expected_next_attempt, opd_resume_revision, resume_world_size = _verified_opd_retry_state(
@@ -423,16 +422,7 @@ def _allocate_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt):
             # the work that will run, not the authored request. see `sft_ranking_overrides`.
             overrides=sft_ranking_overrides(prepared.attempt_spec),
             thinking=prepared.attempt_spec.thinking,
-            # the run's requested disk, so the vast capacity check searches at the same effective
-            # floor submit provisions with — else a high-disk run is advertised vast capacity that
-            # only exists at 60 gb and then can't rent.
             disk_gb=float(getattr(prepared.attempt_spec.gpu, "disk_gb", 0.0) or 0.0),
-            # the remaining run-global wall cap, so retries cannot reset the duration budget.
-            # searched at the LAUNCH DEADLINE, not the bare work grant: vast's rent-duration floor
-            # widens the offer search to the deadline, and an unarmed profile carries a queue
-            # allowance on top of its grant. Searching on the grant alone advertised classes whose
-            # offers expire before submit's own floor, so the rent then found nothing at the wider
-            # window and the run failed on capacity that was never really there.
             max_wall_seconds=max(
                 float(getattr(prepared.attempt_spec.gpu, "max_wall_seconds", 0.0) or 0.0),
                 max(0.0, _load_run_deadline_at(ctx.spec.run_id) - _lifecycle.time.time()),
@@ -584,7 +574,7 @@ def _build_candidate_plan(
     try:
         run_spec = _spec_with_remaining_wall(effective_spec, require_provider_minimum=True)
     except RuntimeError:
-        ctx.gc_seen_endpoints()
+        ctx.gc_seen_sandboxes()
         raise
     ctx.current_gpu.update(
         name=chosen.gpu,
@@ -800,12 +790,10 @@ def _run_attempt(ctx: _SubmitContext, prepared: _PreparedAttempt) -> _AttemptOut
 def _return_success_metrics(ctx: _SubmitContext, outcome: _AttemptOutcome) -> dict:
     # a late worker success must not resurrect a cancelled run.
     ctx.raise_if_cancelled()
-    ctx.gc_seen_endpoints()
+    ctx.gc_seen_sandboxes()
     metrics = outcome.result.metrics
     if outcome.chosen is not None and isinstance(metrics, dict):
         metrics.setdefault("allocated_gpu", outcome.chosen.gpu)
-        # the provider that actually billed this run, so cost attribution prices the
-        # class on its substrate rather than assuming runpod's table.
         metrics.setdefault("allocated_provider", outcome.chosen.provider)
         # and how many cards of it. `hourly_rate(gpu_type)` is per card, so a fallback that
         # prices the wall once records a 2x/4x run at half or a quarter of its real spend.
@@ -825,13 +813,13 @@ def _handle_failure(
 
     # cancel wins over any retry-shaped failure.
     ctx.raise_if_cancelled()
-    completed_metrics = _lifecycle._await_runpod_completed_metrics(
+    completed_metrics = _lifecycle._await_completed_worker_metrics(
         ctx.last_handle,
         _load_run_deadline_at(ctx.spec.run_id),
         check_cancelled=ctx.raise_if_cancelled,
     )
     if completed_metrics is not None:
-        return _FailureDecision(ctx.return_completed_runpod_metrics(completed_metrics), False)
+        return _FailureDecision(ctx.return_completed_worker_metrics(completed_metrics), False)
     result = outcome.result
     ctx.last_detail = f"{result.failure}: {result.detail}"
     if outcome.chosen is not None and result.failure in ("stalled", "job_preempted", "oom"):
@@ -938,7 +926,7 @@ def submit_seed_supervised(
     for local_attempt in range(ctx.retry_budget.max_attempts):
         preparation = _prepare_attempt(ctx, local_attempt)
         if preparation.completed_metrics is not None:
-            return ctx.return_completed_runpod_metrics(preparation.completed_metrics)
+            return ctx.return_completed_worker_metrics(preparation.completed_metrics)
         prepared = preparation.prepared
         outcome = _run_attempt(ctx, prepared)
         if outcome.stop:
@@ -950,5 +938,5 @@ def submit_seed_supervised(
             return decision.metrics
         if not decision.retry:
             break
-    ctx.gc_seen_endpoints()
+    ctx.gc_seen_sandboxes()
     raise RuntimeError(f"seed {seed} failed after retries: {ctx.last_detail}")

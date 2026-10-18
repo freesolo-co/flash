@@ -1,19 +1,15 @@
-"""Control-plane startup preflight - fail fast on missing operator config.
-
-The rule is "enough to run a job", not "everything Freesolo runs in production". A
-self-hosted plane picks its own GPU substrate, so the provider check is a floor (at
-least ONE of RunPod/Lambda/Vast configured), not a roll call. Configuration that only
-degrades an optional capability warns instead of refusing to boot - a plane that cannot
-fail over between RunPod accounts still trains runs, and refusing to start teaches the
-operator nothing it could not learn from a log line.
-"""
+"""Validate Modal credentials, artifact access, and control-plane authentication at startup."""
 
 from __future__ import annotations
 
 import os
 
 from flash._internal.logging import get_logger
-from flash.providers.runpod.preflight import PreflightError
+
+
+class PreflightError(RuntimeError):
+    """Required operator configuration is missing."""
+
 
 __all__ = [
     "PreflightError",
@@ -23,20 +19,7 @@ __all__ = [
 
 logger = get_logger(__name__)
 
-# Cross-account reap/failover needs >= 2 distinct RunPod accounts. WARN-only: a single-account
-# pool still provisions, still reaps its own idle endpoints (the sweep lists per key), and only
-# loses the ability to ride out one account's quota/credit exhaustion by moving to another.
-# That is an availability property, not a correctness one, so it must not block a self-hosted
-# plane whose operator has exactly one RunPod account.
-_RECOMMENDED_RUNPOD_ACCOUNTS = 2
-
-# How an operator turns each provider on. Reported together when NONE is configured, so the
-# error names every acceptable way out rather than the one Freesolo happens to use.
-_PROVIDER_SETUP = (
-    ("runpod", "RUNPOD_API_KEY", "one or more comma-separated RunPod account keys"),
-    ("lambda", "LAMBDA_API_KEY", "a Lambda Cloud API key"),
-    ("vast", "VAST_API_KEY", "a Vast.ai API key"),
-)
+_PROVIDER_SETUP = (("modal", "MODAL_TOKEN_ID + MODAL_TOKEN_SECRET", "Modal workspace credentials"),)
 
 
 def _present(var: str) -> bool:
@@ -91,7 +74,7 @@ def _normalize_operator_credentials() -> None:
     Fixed here rather than at ~40 call sites because this is where the two halves disagree: the
     check that ACCEPTS the padded value is the right place to make it true. Every other operator
     credential already normalizes at its single accessor (``load_provider_key``, ``internal_key``,
-    ``artifact_namespace``, the RunPod key pool), so this brings the odd ones out into line rather
+    ``artifact_namespace``), so this brings the odd ones out into line rather
     than adding a new convention.
 
     Stripping and accepting, not rejecting: a stray newline is a typo, and every other credential
@@ -182,33 +165,7 @@ def require_operator_config() -> None:
 
 
 def check_run_preflight() -> None:
-    """Raise PreflightError if the plane cannot run a job; warn on degraded-but-workable config."""
-    from flash.providers import available_providers
-    from flash.providers.runpod import auth as runpod_keys
-
     require_operator_config()
-    _warn_degraded(available_providers(), runpod_keys)
-
-
-def _warn_degraded(configured: tuple[str, ...], runpod_keys) -> None:
-    """Log capabilities this config gives up. Never raises: the plane can run every job type."""
-    if "runpod" in configured:
-        distinct = len(set(runpod_keys.keys()))
-        if distinct < _RECOMMENDED_RUNPOD_ACCOUNTS:
-            logger.warning(
-                "RUNPOD_API_KEY holds %d distinct account key(s); >= %d comma-separated keys are "
-                "recommended so a run can fail over when one account hits its quota or credit "
-                "limit. Runs still allocate and idle endpoints are still reaped within the "
-                "account you did configure.",
-                distinct,
-                _RECOMMENDED_RUNPOD_ACCOUNTS,
-            )
-
     if not _present("GITHUB_TOKEN"):
-        logger.warning(
-            "GITHUB_TOKEN is not set. Environments hosted on PUBLIC GitHub repos still load "
-            "(subject to GitHub's unauthenticated rate limit), but private repos and "
-            "`flash env push` are unavailable."
-        )
-
-    logger.info("GPU provider(s) configured: %s", ", ".join(configured))
+        logger.warning("GITHUB_TOKEN is not set; private environment repositories are unavailable.")
+    logger.info("GPU provider configured: modal")

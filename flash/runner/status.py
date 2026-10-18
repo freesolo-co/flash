@@ -359,7 +359,7 @@ def validate_terminal_source_metrics(
 
 
 def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
-    """Write metrics to results/runpod/<phase>/<run_id> and return the customer training cost.
+    """Write metrics to results/modal/<phase>/<run_id> and return the customer training cost.
 
     The run id keeps concurrent/sequential runs of the same phase from
     overwriting each other's artifacts. ``metrics["wall_seconds"]`` is the worker's training-loop

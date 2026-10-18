@@ -378,7 +378,7 @@ def test_a_duplicate_key_is_rejected_before_provider_resources_exist(monkeypatch
 
     `json.load` keeps the last value, so a config declaring `r` twice resolves cleanly here against
     one rank while the materializer's `_reject_duplicate_keys` refuses the identical bytes. that
-    split means the artifact is only rejected after the modal app or runpod pod exists -- billing
+    split means the artifact is only rejected after the modal app or provider pod exists -- billing
     the user for a deployment that could never have started. this function exists specifically to
     catch provenance problems before provisioning, so the rule has to match on both sides.
     """

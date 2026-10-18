@@ -323,11 +323,12 @@ def test_an_untranslated_transport_failure_is_contained_not_printed(failure, mon
     escaped = []
     monkeypatch.setattr(threading, "excepthook", lambda args: escaped.append(args.exc_type))
 
+    existing_threads = set(threading.enumerate())
     assert _alias_move_warning(_Client(raises=failure), "flash-1", 50) is None
 
-    # the worker is a daemon thread, so wait for it before judging whether anything escaped.
+    # Await this read's worker, not unrelated long-lived workers from other tests.
     for thread in threading.enumerate():
-        if thread is not threading.current_thread():
+        if thread not in existing_threads:
             thread.join(5.0)
     assert escaped == []
 

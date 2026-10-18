@@ -1,6 +1,6 @@
 """input validation, sdk construction, and the modal call wrapper.
 
-The mirror of `_runpod_lifecycle`: the wrapper decides whether a failed provider call is merely
+The mirror of `_modal_lifecycle`: the wrapper decides whether a failed provider call is merely
 failed or leaves the outcome unknown. This module imports nothing from `modal.py`, so the
 dependency stays one-way.
 """

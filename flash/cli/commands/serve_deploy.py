@@ -1,8 +1,6 @@
-"""provision one exact deployment on the user's own modal or runpod account.
+"""provision one exact deployment on the user's own modal account.
 
-This is the command path into ``provision_modal_deployment`` / ``provision_runpod_deployment``.
-Before this existed, both functions had only test callers: nothing composed the complete
-``DeploymentBundle`` they require, so no command could reach a provider.
+Composes and provisions the complete Modal deployment bundle.
 
 Provider credentials are read from the process environment for the duration of one call and
 wrapped in the request-scoped credential boundary. They are never accepted as arguments (a
@@ -17,7 +15,7 @@ import os
 import sys
 import time
 
-from flash.serve.control import ModalCredentials, RunPodCredentials
+from flash.serve.control import ModalCredentials
 from flash.serve.provisioning import (
     FreshDeploymentArtifactTokenRequired,
     InterruptedProvisioning,
@@ -25,7 +23,6 @@ from flash.serve.provisioning import (
 
 MODAL_TOKEN_ID_ENV = "MODAL_TOKEN_ID"
 MODAL_TOKEN_SECRET_ENV = "MODAL_TOKEN_SECRET"
-RUNPOD_API_KEY_ENV = "RUNPOD_API_KEY"
 # the serving app authenticates callers with this. a provider endpoint url is public, so without
 # it anyone who finds the url can load adapters and spend the customer's gpu budget.
 INFERENCE_KEY_ENV = "FLASH_SERVING_KEY"
@@ -56,14 +53,12 @@ def _optional_env(name: str) -> str | None:
 
 
 def _credentials(provider: str):
-    """build request-scoped provider credentials from the environment."""
-
-    if provider == "modal":
-        return ModalCredentials(
-            token_id=_required_env(MODAL_TOKEN_ID_ENV),
-            token_secret=_required_env(MODAL_TOKEN_SECRET_ENV),
-        )
-    return RunPodCredentials(api_key=_required_env(RUNPOD_API_KEY_ENV))
+    if provider != "modal":
+        raise ValueError("Flash serving requires Modal")
+    return ModalCredentials(
+        token_id=_required_env(MODAL_TOKEN_ID_ENV),
+        token_secret=_required_env(MODAL_TOKEN_SECRET_ENV),
+    )
 
 
 def _image(reference: str):
@@ -79,19 +74,12 @@ def _image(reference: str):
 
 
 def _report_handle(handle, *, endpoint: bool = True) -> None:
-    """print only sanitized provider identity, never request credentials."""
-
+    """Print the Modal resource identity needed for status and teardown."""
     if endpoint:
         print(f"endpoint    {handle.public_url}")
-    if handle.provider == "modal":
-        print(f"app id      {handle.app_id}")
-        print(f"volume id   {handle.volume_id}")
-        print(f"secret id   {handle.inference_secret_id}")
-    else:
-        print(f"pod id      {handle.pod_id}")
-        print(f"volume id   {handle.network_volume_id}")
-        print(f"template id {handle.template_id}")
-        print(f"secret id   {handle.inference_secret_id}")
+    print(f"app id      {handle.app_id}")
+    print(f"volume id   {handle.volume_id}")
+    print(f"secret id   {handle.inference_secret_id}")
 
 
 def _report(result, bundle) -> int:
@@ -111,42 +99,22 @@ def _report(result, bundle) -> int:
     if result.error_reason:
         print(f"reason      {result.error_reason}", file=sys.stderr)
     if str(result.error_reason or "").startswith("artifact_cleanup_") and handle is not None:
-        # every artifact-cleanup reason is raised after readiness proved, so the provider resource
-        # is live and billing whatever the status says.
-        resource_kind = "pod" if handle.provider == "runpod" else "app"
-        resource_id = handle.pod_id if handle.provider == "runpod" else handle.app_id
+        resource_kind = "app"
+        resource_id = handle.app_id
         print(
-            f"\nthe service reached readiness on {resource_kind} {resource_id}, but artifact cleanup "
-            f"did not settle. the {resource_kind} is live and billing. run `flash serve status` to "
-            "inspect the deployment, then `flash serve undeploy` to stop it billing if you do not "
-            "want it.",
+            f"\nthe service reached readiness on {resource_kind} {resource_id}, but artifact cleanup did not settle. the {resource_kind} is live and billing. run `flash serve status` to inspect the deployment, then `flash serve undeploy` to stop it billing if you do not want it.",
             file=sys.stderr,
         )
     elif result.status == "provisioning" and handle is not None:
         print(
-            f"\nthe pod {handle.pod_id} did not prove ready before the deadline, but may be live "
-            "and billing. run `flash serve status` to inspect the deployment, then `flash serve "
-            "undeploy` to stop it billing if you do not want it.",
+            f"\nthe app {handle.app_id} did not prove ready before the deadline, but may be live and billing. run `flash serve status` to inspect the deployment, then `flash serve undeploy` to stop it billing if you do not want it.",
             file=sys.stderr,
         )
     elif result.status == "outcome_unknown":
-        # the provider may or may not hold live resources. saying "failed" here would invite a
-        # retry that double-provisions and bills twice.
-        if result.provider == "runpod":
-            print(
-                "\nthe provider outcome could not be confirmed. resources may exist; run `flash "
-                "serve undeploy` with the identity printed above to stop them billing before "
-                "retrying. if create returned no runpod resource ids, omit all four id flags to "
-                "reclaim by that exact deployment identity.",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                "\nthe provider outcome could not be confirmed. resources may exist; run `flash "
-                "serve status` to inspect them, then `flash serve undeploy` to stop them billing "
-                "before retrying rather than provisioning again.",
-                file=sys.stderr,
-            )
+        print(
+            "\nthe provider outcome could not be confirmed. resources may exist; run `flash serve status` to inspect them, then `flash serve undeploy` to stop them billing before retrying rather than provisioning again.",
+            file=sys.stderr,
+        )
     return 1
 
 
@@ -163,15 +131,10 @@ def _report_identity(bundle) -> None:
 
 def _build_provider_plan(provider: str, bundle) -> None:
     """run the provider's own plan validation without contacting it."""
+    from flash.serve.provisioning._modal_plan import build_modal_create_plan
 
-    if provider == "modal":
-        from flash.serve.provisioning._modal_plan import build_modal_create_plan
-
-        build_modal_create_plan(bundle, phase="finalized")
-        return
-    from flash.serve.provisioning._runpod_plan import build_runpod_create_plan
-
-    build_runpod_create_plan(bundle)
+    build_modal_create_plan(bundle, phase="finalized")
+    return
 
 
 def _runtime_secrets():
@@ -187,7 +150,6 @@ def _runtime_secrets():
 
 def _deployment_bundle(args):
     """rebuild the exact immutable deployment input shared by deploy and undeploy."""
-
     from flash.serve.control import DeploymentRequest
     from flash.serve.profiles import get_profile, placement_for
     from flash.serve.resolve import execution_inputs, resolve_adapter, resolve_base_revision
@@ -202,11 +164,7 @@ def _deployment_bundle(args):
         workspace_name=getattr(args, "modal_workspace", "") or "",
         environment=getattr(args, "modal_environment", "") or "",
         region=getattr(args, "modal_region", "") or "",
-        # "" means the no-suffix environment, which is a real modal configuration, so it maps
-        # to none rather than being rejected as missing.
         web_suffix=(getattr(args, "modal_web_suffix", "") or "") or None,
-        account_id=getattr(args, "runpod_account", "") or "",
-        data_center_id=getattr(args, "runpod_data_center", "") or "",
     )
     base_revision = resolve_base_revision(profile.served_model)
     resolved = resolve_adapter(
@@ -221,9 +179,7 @@ def _deployment_bundle(args):
         thinking_default=bool(getattr(args, "thinking", False)),
     )
     engine = profile.engine(
-        model_revision=base_revision,
-        tokenizer_revision=base_revision,
-        image=image,
+        model_revision=base_revision, tokenizer_revision=base_revision, image=image
     )
     request = DeploymentRequest(
         deployment_id=args.deployment_id,
@@ -233,82 +189,43 @@ def _deployment_bundle(args):
         engine=engine,
         adapters=(resolved.adapter,),
     )
-    return resolve_deployment_bundle(
-        request,
-        execution_inputs(profile, image, (resolved,)),
-        image,
-    )
+    return resolve_deployment_bundle(request, execution_inputs(profile, image, (resolved,)), image)
 
 
 def cmd_serve_deploy(args) -> int:
     provider = args.provider
     try:
         bundle = _deployment_bundle(args)
-    # resolver errors subclass valueerror. the wider catch also covers validation beneath the
-    # resolver and bundle construction, so bad user input stays on the normal cli error path.
     except (ValueError, TypeError) as exc:
         return _err(str(exc))
-
     from flash.server.domain.serving_resources import dry_run_deployment
 
     try:
-        # build the provider plan too, not just the bundle. the generic placement types accept
-        # any nonempty string, while the provider-specific `_validate_placement` is what
-        # enforces the hostname charset -- so an uppercase workspace or an underscored region
-        # passed the dry run and then raised an uncaught ValueError during a real deployment,
-        # after hub resolution. "validated every input" has to mean the ones the provider
-        # applies. this runs on both paths: gating it on `--dry-run` meant the real deployment
-        # -- the one that allocates and bills -- was the only path that surfaced a raw traceback.
         _build_provider_plan(provider, bundle)
     except (ValueError, TypeError) as exc:
         return _err(str(exc))
-
     if getattr(args, "dry_run", False):
         for key, value in dry_run_deployment(bundle).items():
             print(f"{key:18} {value}")
         print("\ndry run: no provider was contacted and nothing was provisioned.")
         return 0
-
     try:
         credentials = _credentials(provider)
-        # the artifact token is passed rather than omitted whenever the operator has one. absence
-        # remains valid through provider observation because adopting an existing generation does
-        # not hydrate. a fresh create rejects it before mutation; with a token, bootstrap deploys
-        # with the secret, hydrates the volume, then redeploys without it and deletes the secret, so
-        # the token never outlives hydration.
         runtime_secrets = _runtime_secrets()
     except ValueError as exc:
         return _err(
-            f"{exc}. provider credentials are read from the environment for this one request "
-            f"and are never stored"
+            f"{exc}. provider credentials are read from the environment for this one request and are never stored"
         )
-
     deadline_at = time.monotonic() + float(args.timeout)
     try:
-        if provider == "modal":
-            from flash.serve.provisioning.modal import provision_modal_deployment
+        from flash.serve.provisioning.modal import provision_modal_deployment
 
-            result = provision_modal_deployment(
-                bundle, credentials, runtime_secrets, deadline_at=deadline_at
-            )
-        else:
-            from flash.serve.provisioning.runpod import (
-                RunPodDataCenterUnsupported,
-                provision_runpod_deployment,
-            )
-
-            try:
-                result = provision_runpod_deployment(
-                    bundle, credentials, runtime_secrets, deadline_at=deadline_at
-                )
-            except RunPodDataCenterUnsupported as exc:
-                return _err(str(exc))
+        result = provision_modal_deployment(
+            bundle, credentials, runtime_secrets, deadline_at=deadline_at
+        )
     except FreshDeploymentArtifactTokenRequired as exc:
         return _err(f"{ARTIFACT_TOKEN_ENV} is not set. {exc}")
     except InterruptedProvisioning as interrupted:
-        # the interrupt still propagates -- the user pressed Ctrl-C and the exit code must say so.
-        # but the generic handler prints only "aborted", which reads as "nothing was created",
-        # and here something was: cleanup ran and could not confirm the resources are gone.
         _report_identity(bundle)
         _warn_unconfirmed_cleanup(interrupted.provider, args.deployment_id)
         raise

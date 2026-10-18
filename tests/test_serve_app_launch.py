@@ -533,12 +533,6 @@ def test_engine_runtime_environment_is_applied_on_every_provider(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    # vllm forks its EngineCore, and the serving process has already touched cuda by then, so
-    # without the spawn start method the child dies with "Cannot re-initialize CUDA in forked
-    # subprocess" before anything binds a port. measured on a live runpod l4.
-    #
-    # these were previously set only by the modal image, so modal served and runpod did not. the
-    # launcher must set them itself, because it is the only piece both providers share.
     environment = _environment(tmp_path, artifact=False)
     captured: dict[str, object] = {}
 
@@ -580,9 +574,6 @@ def test_compile_cache_is_bound_to_the_volume_on_every_provider(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    # vllm's compile cache defaults to ephemeral container storage, so an unset cache root makes
-    # every cold start recompile the model. it was set only by the modal image, like the engine
-    # settings above, so runpod recompiled on each start while modal reused the volume's graphs.
     environment = _environment(tmp_path, artifact=False)
     captured: dict[str, object] = {}
 
@@ -981,10 +972,6 @@ def test_parent_helper_scrubs_environment_argv_and_closes_descriptors(tmp_path: 
         "LD_LIBRARY_PATH",
     ):
         assert rejected not in captured["env"]
-    # the engine settings are not inherited from the ambient environment either: the child gets the
-    # runtime's own fixed value, whatever the provider image happened to set. the launcher applies
-    # these because without the spawn start method vllm's forked EngineCore cannot re-initialize
-    # cuda, which is what killed every runpod deployment while modal's image happened to set it.
     assert environment["VLLM_WORKER_MULTIPROC_METHOD"] == "arbitrary-module-control"
     assert captured["env"]["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
     assert captured["env"]["FLASH_SERVING_MANIFEST_ID"] == _manifest().manifest_id

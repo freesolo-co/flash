@@ -112,7 +112,7 @@ async def bootstrap_serving(
 
     `on_engine_death` is forwarded to the runtime so a dead vllm engine core can take the
     container down with it. without a handler the runtime only records the death and the http
-    process stays bound, answering 503 forever, and neither the modal container nor the runpod
+    process stays bound, answering 503 forever, and neither the modal container nor the modal
     pod is ever replaced.
     """
 

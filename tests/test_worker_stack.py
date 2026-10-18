@@ -289,7 +289,7 @@ def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
         joined = " ".join(cmd)
         if "--query-gpu=" in joined:
             return _Completed(
-                "0, GPU-abc, 575.57, NVIDIA GeForce RTX 5090, 98, 77, "
+                "0, GPU-abc, 575.57, NVIDIA GeForce L40S, 98, 77, "
                 "32607, 24000, 8607, 69, 412.5, 575.0, P0, 2700, 14001, 5, 16\n"
             )
         if "--query-compute-apps=" in joined:
@@ -302,7 +302,7 @@ def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
 
     diag = perf.gpu_diagnostics()
 
-    assert diag["device_name"] == "NVIDIA GeForce RTX 5090"
+    assert diag["device_name"] == "NVIDIA GeForce L40S"
     assert diag["driver_version"] == "575.57"
     assert diag["gpu_util_pct"] == 98
     assert diag["mem_util_pct"] == 77
@@ -1116,7 +1116,7 @@ def test_venv_sanity_block_uses_no_cuda_gated_probe():
     root = pathlib.Path(__file__).resolve().parent.parent
     dockerfile = (root / "Dockerfile.worker").read_text()
     venv_sanity = dockerfile[dockerfile.index("# Sanity: the verl venv must be able to LAUNCH") :]
-    venv_sanity = venv_sanity[: venv_sanity.index("# RunPod Serverless worker entrypoint")]
+    venv_sanity = venv_sanity[: venv_sanity.index("CMD [")]
 
     for probe in ("is_flash_linear_attention_available", "is_causal_conv1d_available"):
         assert f"assert {probe}()" not in venv_sanity, (

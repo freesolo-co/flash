@@ -62,33 +62,15 @@ def _args(provider: str = "modal") -> argparse.Namespace:
                 "st-" + "1" * 22,
             ]
         )
-    else:
-        base.extend(
-            [
-                "--runpod-account",
-                "account1",
-                "--runpod-data-center",
-                "US-KS-2",
-                "--runpod-pod-id",
-                "pod1234567890",
-                "--runpod-network-volume-id",
-                "vol1234567890",
-                "--runpod-template-id",
-                "tpl1234567890",
-                "--runpod-inference-secret-id",
-                "sec1234567890",
-            ]
-        )
     return _parse(base)
 
 
 def _stub_credentials(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str, str]:
     token_id = "modal-token-id-do-not-print"
     token_secret = "modal-token-secret-do-not-print"
-    api_key = "runpod-api-key-do-not-print"
+    api_key = "unused-secret-do-not-print"
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_ID_ENV, token_id)
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_SECRET_ENV, token_secret)
-    monkeypatch.setenv(serve_deploy.RUNPOD_API_KEY_ENV, api_key)
     return token_id, token_secret, api_key
 
 
@@ -127,7 +109,6 @@ def _fail_hub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     ("provider", "handle_field", "expected_id"),
     [
         ("modal", "app_id", "ap-" + "1" * 22),
-        ("runpod", "pod_id", "pod1234567890"),
     ],
 )
 def test_undeploy_uses_supplied_identity_when_hub_resolution_fails(
@@ -303,65 +284,6 @@ def test_modal_undeploy_rejects_partial_provider_ids(
 
     assert cmd_serve_undeploy(args) == 1
     assert "modal provider ids must be supplied together or omitted" in capsys.readouterr().err
-
-
-def test_runpod_undeploy_without_provider_ids_routes_to_identity_reclaim(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    args = _args_with_identity(monkeypatch, "runpod")
-    args.runpod_pod_id = ""
-    args.runpod_network_volume_id = ""
-    args.runpod_template_id = ""
-    args.runpod_inference_secret_id = ""
-    _stub_credentials(monkeypatch)
-    handles = []
-
-    def _reclaim(bundle, handle, credentials, *, deadline_at, **_kwargs):
-        handles.append(handle)
-        return _result(bundle, "absent")
-
-    monkeypatch.setattr("flash.serve.provisioning.runpod.teardown_runpod_deployment", _reclaim)
-
-    assert cmd_serve_undeploy(args) == 0
-    assert handles == [None]
-
-
-def test_runpod_undeploy_rejects_partial_provider_ids(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    args = _args_with_identity(monkeypatch, "runpod")
-    args.runpod_pod_id = ""
-    _stub_credentials(monkeypatch)
-
-    def _explode(*_args, **_kwargs):
-        raise AssertionError("teardown ran with a partial provider handle")
-
-    monkeypatch.setattr("flash.serve.provisioning.runpod.teardown_runpod_deployment", _explode)
-
-    assert cmd_serve_undeploy(args) == 1
-    assert "runpod provider ids must be supplied together or omitted" in capsys.readouterr().err
-
-
-def test_undeploy_routes_to_the_named_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str]] = []
-
-    def _modal(bundle, handle, credentials, *, deadline_at, **_kwargs):
-        calls.append(("modal", handle.app_id))
-        return _result(bundle, "absent")
-
-    def _runpod(bundle, handle, credentials, *, deadline_at, **_kwargs):
-        calls.append(("runpod", handle.pod_id))
-        return _result(bundle, "absent")
-
-    _stub_credentials(monkeypatch)
-    modal_args = _args_with_identity(monkeypatch, "modal")
-    runpod_args = _args_with_identity(monkeypatch, "runpod")
-    monkeypatch.setattr("flash.serve.provisioning.modal.teardown_modal_deployment", _modal)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.teardown_runpod_deployment", _runpod)
-
-    assert cmd_serve_undeploy(modal_args) == 0
-    assert cmd_serve_undeploy(runpod_args) == 0
-    assert calls == [("modal", "ap-" + "1" * 22), ("runpod", "pod1234567890")]
 
 
 @pytest.mark.parametrize(

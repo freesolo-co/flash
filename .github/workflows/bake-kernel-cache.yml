@@ -2,7 +2,7 @@ name: flash worker kernel-cache (per-arch)
 
 # Builds per-SM worker images with the compiled-kernel mega-cache baked in, killing the ~10-15 min
 # first-use JIT on a cold worker (the regression #194 reintroduced). Each matrix leg:
-#   1. offloads the warmup to a RunPod GPU of that arch (GH runners have none) -> build/kernel_cache,
+#   1. offloads the warmup to a Modal GPU of that arch (GH runners have none) -> build/kernel_cache,
 #   2. docker build --build-arg BUILD_KERNEL_CACHE=true -> ghcr.io/freesolo-co/flash-worker:cu128-<sm>,
 #   3. pushes it. The allocator then selects the cu128-<sm> tag per GPU class for baked arches
 #      (see flash/providers/_lifecycle/worker.py).
@@ -10,7 +10,7 @@ name: flash worker kernel-cache (per-arch)
 # Depends on the base ghcr.io/freesolo-co/flash-worker:cu128 image existing (worker-image.yml) — the
 # warmup runs INSIDE it so the cache matches the image's pinned torch/triton/fla/liger toolchain.
 #
-# Secrets: RUNPOD_API_KEY (the warmup GPU pod) + HF_TOKEN (the temp dataset that ferries code + the
+# Secrets: MODAL_TOKEN_ID + MODAL_TOKEN_SECRET (the warmup GPU sandbox) + HF_TOKEN (the temp dataset that ferries code + the
 # cache artifact) are native repo Actions secrets, synced from Infisical (prod:/flash-ci) by the
 # github-ci-flash Secret Sync; the GHCR push uses the default GITHUB_TOKEN. Heavy + paid,
 # but UNGATED: the fingerprint detection in auto-rebake.yml decides WHEN this runs (only on a real
@@ -62,7 +62,7 @@ permissions:
   packages: write
 
 jobs:
-  # Ungated: the PAID RunPod bake runs as soon as it's called/dispatched. The decision of WHEN to run
+  # Ungated: the PAID Modal bake runs as soon as it's called/dispatched. The decision of WHEN to run
   # lives in auto-rebake.yml's fingerprint gate (it only invokes this when fp_cache changed), so a
   # second manual approval here would be redundant. Re-add an `approve` job with `environment: gpu-bake`
   # (and `needs: approve`) if you ever want a human checkpoint back.
@@ -71,20 +71,14 @@ jobs:
     # any repository may start it. This workflow is directly dispatchable (`workflow_dispatch`), so
     # a fork reaches it without passing auto-rebake's fingerprint gate, and it both requests the
     # org-only `ubuntu-24.04-8core` runner (a label a fork has no runner for, so the job QUEUES
-    # instead of failing) and creates paid RunPod resources. `workflow_call` from auto-rebake still
+    # instead of failing) and creates paid Modal resources. `workflow_call` from auto-rebake still
     # satisfies this, because a called workflow evaluates `github.repository` as the CALLER's repo.
     if: github.repository == 'freesolo-co/flash'
     runs-on: ubuntu-24.04-8core
     # 47min is the slowest run on record (the rest sit at 12-23min); 120 absorbs a slow provider
     # allocation without letting a hung bake hold the runner for the 6-hour default.
     #
-    # This bounds the RUNNER, and only indirectly the spend. The rented pod is released by the
-    # `finally` in docker/bake_kernel_cache.py, so the pod outlives the timeout in exactly the case
-    # the timeout exists for: if the controller is wedged inside a blocking call, GitHub kills it
-    # and that `finally` may never complete, leaving a billed pod with nothing left to terminate it.
-    # Closing that needs a server-side pod lifetime or an out-of-band reaper -- a change to the bake
-    # tooling rather than to this workflow, so it is deliberately NOT bundled here. Until then, read
-    # this cap as "the runner stops waiting", not "the bill stops".
+    # Modal also enforces the sandbox lifetime when the CI controller disappears.
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -93,12 +87,10 @@ jobs:
           - {
               sm: sm80,
               arch: "8.0",
-              allowed_cuda: "",
             }
           - {
               sm: sm86,
               arch: "8.6",
-              allowed_cuda: "",
             }
           # the controller walks ordered same-sm secure-cloud gpu types from its per-sm map.
           # preferred datacenter cards stay first, but one empty sku cannot strand this architecture
@@ -106,24 +98,20 @@ jobs:
           - {
               sm: sm89,
               arch: "8.9",
-              allowed_cuda: "",
             }
           - {
               sm: sm90,
               arch: "9.0",
-              allowed_cuda: "",
             }
           # blackwell needs cuda-13 hosts to jit its ptx (matches min_cuda_for in the provider).
           - {
               sm: sm120,
               arch: "12.0",
-              allowed_cuda: "13.0",
             }
           # datacenter blackwell is distinct from sm120. b200 is the only validated sm100 type.
           - {
               sm: sm100,
               arch: "10.0",
-              allowed_cuda: "13.0",
             }
     steps:
       # Gate FIRST (no checkout needed) so skipped arches do no crane / checkout / build work.
@@ -204,25 +192,25 @@ jobs:
           # marks the whole job red even though the bake + push already succeeded.
           enable-cache: false
 
-      - name: Sync deps (flash + runpod + hf)
+      - name: Sync deps (flash + modal + hf)
         if: steps.gate.outputs.run == 'true'
         run: uv sync --extra server
 
-      # RUNPOD_API_KEY (the warmup GPU pod) + HF_TOKEN (the temp dataset that ferries code/cache) are
+      # MODAL_TOKEN_ID + MODAL_TOKEN_SECRET (the warmup GPU sandbox) + HF_TOKEN (the temp dataset that ferries code/cache) are
       # native repo Actions secrets, synced from Infisical (prod:/flash-ci) by the github-ci-flash
       # Secret Sync. No Infisical CLI/login at job time -- Infisical stays the source of truth and
       # rotations propagate via the sync. BASE_IMAGE
       # is digest-pinned so the warm runs inside the EXACT base the per-arch tag will sit on.
-      - name: Warm kernels on a RunPod ${{ matrix.sm }} GPU -> build/kernel_cache
+      - name: Warm kernels on a Modal ${{ matrix.sm }} GPU -> build/kernel_cache
         if: steps.gate.outputs.run == 'true'
         env:
-          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           BASE_IMAGE: ${{ steps.base.outputs.ref }}
         run: |
           uv run python docker/bake_kernel_cache.py \
             --arch "${{ matrix.arch }}" --sm "${{ matrix.sm }}" \
-            --allowed-cuda "${{ matrix.allowed_cuda }}" \
             --image "$BASE_IMAGE" \
             --out build/kernel_cache
 

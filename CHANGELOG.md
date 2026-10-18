@@ -9,6 +9,13 @@ Releases happen by merging a version bump from `dev` into `main`, which publishe
 This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 `git log` for anything before that.
 
+## 1.3.0 — Modal migration
+
+- Modal is now the sole training and serving provider. Removed RunPod, Lambda, and Vast integrations and dependencies.
+- Training uses named GPU Sandboxes with durable attempt identities, artifact-based recovery, confirmed cancellation, and multi-GPU reservations.
+- Migrated shared model-weight caching and kernel-cache builds to Modal. GPU quotes include reserved CPU and memory; realized-cost reporting remains an estimate rather than an invoice reconciliation.
+- Replaced the GPU catalog with supported Modal classes. Before upgrading an existing control plane, drain old-provider jobs and retire their resources using the previous release. Saved Hugging Face checkpoints and adapters remain usable.
+
 ## Unreleased
 
 ### Added

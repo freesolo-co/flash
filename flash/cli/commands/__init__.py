@@ -319,11 +319,11 @@ def cmd_models(args) -> int:
 def cmd_gpus(args) -> int:
     """List validated managed GPU classes, VRAM, and estimated $/hr."""
     from flash.providers.base import GPU_INFO
-    from flash.providers.runpod.pricing import static_rates as runpod_static_rates
+    from flash.providers.modal.pricing import static_rates
 
-    runpod_rates = runpod_static_rates()
+    modal_rates = static_rates()
     infos = sorted(
-        (info for info in GPU_INFO.values() if info.enum_member), key=lambda g: g.hourly_usd
+        (info for info in GPU_INFO.values() if info.modal_name), key=lambda g: g.hourly_usd
     )
     tip = (
         "Tip: GPU allocation is automatic by default.\n"
@@ -331,7 +331,7 @@ def cmd_gpus(args) -> int:
         'adding type = "<CLASS>" to the [gpu] section.'
     )
     if render.styled():
-        rows = [(info.name, info.vram_gb, runpod_rates.get(info.name)) for info in infos]
+        rows = [(info.name, info.vram_gb, modal_rates.get(info.name)) for info in infos]
         print(render.gpus_table(rows, tip))
         return 0
 
@@ -340,8 +340,8 @@ def cmd_gpus(args) -> int:
 
     print(f"{'gpu':<16}{'vram':>6}{'$/hr':>11}")
     for info in infos:
-        runpod_rate = runpod_rates.get(info.name)
-        print(f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(runpod_rate):>11}")
+        modal_rate = modal_rates.get(info.name)
+        print(f"{info.name:<16}{info.vram_gb:>5}G{fmt_rate(modal_rate):>11}")
     print(f"\n{tip}")
     return 0
 

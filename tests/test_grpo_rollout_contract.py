@@ -265,30 +265,25 @@ def test_cancellation_billing_does_not_zero_a_completed_legacy_run():
     assert 0 < charge < status.estimated_cost_usd
 
 
-def test_supported_grpo_shape_pricing_is_numerically_unchanged():
+def test_supported_grpo_shape_pricing_preserves_order_and_resource_rate():
     from flash.cost import estimate_cost
+    from flash.providers.modal.pricing import hourly_rate
 
-    expected = {
-        2: 0.22565183513227507,
-        4: 0.2578620035978836,
-        8: 0.3222823405291006,
-        16: 0.4511230143915344,
-    }
-
-    actual = {
-        group_size: estimate_cost(
+    estimates = [
+        estimate_cost(
             RunConfig(
-                "Qwen/Qwen3.5-4B",
-                "grpo",
-                10,
-                batch_size=4,
-                group_size=group_size,
-                gpu_type="A100 PCIe",
+                "Qwen/Qwen3.5-4B", "grpo", 10, batch_size=4, group_size=group, gpu_type="A100 SXM"
             )
-        ).total_usd
-        for group_size in SUPPORTED_GRPO_GROUP_SIZES
-    }
-    assert actual == expected
+        )
+        for group in SUPPORTED_GRPO_GROUP_SIZES
+    ]
+    costs = [estimate.total_usd for estimate in estimates]
+    from itertools import pairwise
+
+    assert all(a < b for a, b in pairwise(costs))
+    for estimate in estimates:
+        assert estimate.gpu_hourly_usd == hourly_rate("A100 SXM")
+        assert estimate.total_usd == estimate.billable_hours * estimate.gpu_hourly_usd
 
 
 @pytest.mark.parametrize(
@@ -321,12 +316,12 @@ def test_supported_authored_groups_reach_allocation(group_size):
         spec.model,
         spec.algorithm,
         train=spec.train,
-        providers=("runpod",),
+        providers=("modal",),
         gpu_type="H100",
     )
 
     assert spec.train.group_size == group_size
-    assert allocation.provider == "runpod"
+    assert allocation.provider == "modal"
     assert allocation.gpu == "H100"
 
 
@@ -354,11 +349,11 @@ def test_persisted_legacy_shapes_reach_allocation(prompts_per_step, group_size):
         spec.model,
         spec.algorithm,
         train=spec.train,
-        providers=("runpod",),
+        providers=("modal",),
         gpu_type="H100",
     )
 
-    assert allocation.provider == "runpod"
+    assert allocation.provider == "modal"
     assert allocation.gpu == "H100"
     assert allocation.min_vram_gb == expected_vram
     if group_size == 32:

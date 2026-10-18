@@ -7,7 +7,7 @@ import dataclasses
 
 from flash.cost import RunConfig, estimate_cost
 from flash.cost.types import CostEstimate
-from flash.providers.base import GPU_INFO
+from flash.providers.modal.pricing import hourly_rate
 
 
 def test_no_output_multiplier_field():
@@ -23,4 +23,4 @@ def test_total_is_exactly_billable_train_hours_times_rate():
     assert e.total_usd == e.billable_hours * e.gpu_hourly_usd
     assert e.billable_hours == e.train_seconds / 3600.0
     assert e.total_usd < e.wall_clock_hours * e.gpu_hourly_usd
-    assert e.gpu_hourly_usd == GPU_INFO[e.gpu].hourly_usd
+    assert e.gpu_hourly_usd == hourly_rate(e.gpu)

@@ -1,6 +1,6 @@
 """complete immutable serving inputs for one model on one supported provider.
 
-``provision_modal_deployment`` and ``provision_runpod_deployment`` take a ``DeploymentBundle``,
+``provision_modal_deployment`` and ``provision_modal_deployment`` take a ``DeploymentBundle``,
 which requires an exact ``EngineIdentity`` (27 fields), an exact provider ``Placement``, and a
 digest-qualified ``ServingImage``. Nothing in flash produced those, so the provisioning code had
 no caller outside its tests. This module is that producer.
@@ -29,7 +29,6 @@ from flash.serve.control import (
     Modality,
     ModalPlacement,
     Provider,
-    RunPodPlacement,
     canonical_mapping_fingerprint,
 )
 from flash.serve.provisioning import ServingImage
@@ -42,40 +41,6 @@ SERVE_RUNTIME_FAMILY = "vllm-0.23.0"
 
 class ProfileError(ValueError):
     """the requested serving profile is unknown or its inputs are incomplete."""
-
-
-@dataclass(frozen=True, slots=True)
-class RunPodGpu:
-    """one runpod gpu type id with the container and volume sizing it is validated for.
-
-    ``gpu_type_id`` is runpod's own display id (the value its api returns as ``gpuTypeId``), not a
-    flash GPU_CLASSES name. flash's runpod training path resolves cards through the runpod-flash
-    SDK's ``GpuType`` enum, which the serving path deliberately does not import: the provisioning
-    transport speaks the rest api directly, and the SDK is not in the serving install. The two are
-    also not interchangeable strings, so this is stated rather than translated.
-    """
-
-    gpu_type_id: str
-    container_disk_gb: int
-    volume_size_gb: int
-
-
-# runpod's L40S and L4 ids. catalog `serving.gpu` holds MODAL gpu names, and L4/L40S have no
-# GPU_CLASSES row at all (that table covers training cards), so a runpod id cannot be derived
-# from either and is stated per profile below.
-# containerDiskInGb must hold the EXTRACTED image, not the registry download. the serving image is
-# 13.7 GB compressed but 40.7 GB on disk (`docker system df -v`), and the container disk also holds
-# the extraction scratch and the runtime's own writes. the previous 40 GB was read off the
-# compressed number, so the image could not fit on the disk it was pulled onto at all.
-#
-# do not try to confirm this from the runpod api's `runtime` field: it reads null on pods that are
-# serving fine. the pod proxy is the signal that discriminates -- a live pod answers
-# `https://{podId}-8000.proxy.runpod.net/` with 200 and an exited one with 404.
-_RUNPOD_L40S = RunPodGpu(gpu_type_id="NVIDIA L40S", container_disk_gb=100, volume_size_gb=120)
-# 24 GB card, so the VOLUME (weights and adapters) is sized down relative to the 9B set. the
-# container disk is NOT sized down: it holds the same image on either card. both ids are the exact
-# `gpuTypes.id` strings the runpod api returns ("NVIDIA L4", "NVIDIA L40S"), not display names.
-_RUNPOD_L4 = RunPodGpu(gpu_type_id="NVIDIA L4", container_disk_gb=100, volume_size_gb=60)
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,7 +70,6 @@ class ServingProfile:
     tokenizer_kwargs: Mapping[str, Any]
     processor_kwargs: Mapping[str, Any]
     modal_gpu: str
-    runpod_gpu: RunPodGpu
     tensor_parallel_size: int = 1
 
     def __post_init__(self) -> None:
@@ -178,23 +142,7 @@ class ServingProfile:
             web_suffix=web_suffix,
         )
 
-    def runpod_placement(self, *, account_id: str, data_center_id: str) -> RunPodPlacement:
-        """build the exact persistent-pod placement for this profile's validated gpu."""
 
-        return RunPodPlacement(
-            account_id=account_id,
-            gpu_type_id=self.runpod_gpu.gpu_type_id,
-            gpu_count=self.tensor_parallel_size,
-            data_center_id=data_center_id,
-            container_disk_gb=self.runpod_gpu.container_disk_gb,
-            volume_size_gb=self.runpod_gpu.volume_size_gb,
-        )
-
-
-# only models whose serving shape is validated on BOTH supported providers appear here. a catalog
-# entry alone is not enough: `serving.gpu` names a modal card, and the runpod id, container disk,
-# and volume size have no catalog source. an unlisted model raises rather than defaulting, because
-# a guessed placement is a real gpu rental in the customer's account.
 _PROFILES: dict[str, ServingProfile] = {
     "Qwen/Qwen3.5-9B": ServingProfile(
         model_id="Qwen/Qwen3.5-9B",
@@ -249,7 +197,6 @@ _PROFILES: dict[str, ServingProfile] = {
         tokenizer_kwargs={},
         processor_kwargs={},
         modal_gpu="L40S",
-        runpod_gpu=_RUNPOD_L40S,
     ),
     "Qwen/Qwen3.5-4B": ServingProfile(
         model_id="Qwen/Qwen3.5-4B",
@@ -285,7 +232,6 @@ _PROFILES: dict[str, ServingProfile] = {
         tokenizer_kwargs={},
         processor_kwargs={},
         modal_gpu="L4",
-        runpod_gpu=_RUNPOD_L4,
     ),
 }
 
@@ -356,55 +302,20 @@ def placement_for(
     environment: str = "",
     region: str = "",
     web_suffix: str | None = None,
-    account_id: str = "",
-    data_center_id: str = "",
-) -> ModalPlacement | RunPodPlacement:
-    """build the placement for one provider, requiring exactly that provider's inputs.
-
-    the unused provider's arguments are rejected rather than ignored: passing a runpod data center
-    to a modal deployment means the caller believes something untrue about where this will run.
-    """
-
-    if provider == "modal":
-        _reject_foreign(provider, (("account_id", account_id), ("data_center_id", data_center_id)))
-        _require_inputs(
-            provider,
-            (
-                ("workspace_name", workspace_name),
-                ("environment", environment),
-                ("region", region),
-            ),
-        )
-        return profile.modal_placement(
-            workspace_name=workspace_name,
-            environment=environment,
-            region=region,
-            web_suffix=web_suffix,
-        )
-    if provider == "runpod":
-        _reject_foreign(
-            provider,
-            (
-                ("workspace_name", workspace_name),
-                ("environment", environment),
-                ("region", region),
-                # `None` is the real "this environment has no suffix" value, so normalize it to the
-                # empty string the guard treats as absent rather than letting `None.strip()` raise.
-                ("web_suffix", web_suffix or ""),
-            ),
-        )
-        _require_inputs(provider, (("account_id", account_id), ("data_center_id", data_center_id)))
-        return profile.runpod_placement(account_id=account_id, data_center_id=data_center_id)
-    raise ProfileError("provider must be modal or runpod")
+) -> ModalPlacement:
+    """Build the Modal placement, requiring workspace, environment, and region."""
+    if provider != "modal":
+        raise ProfileError("Flash serving requires Modal")
+    _require_inputs(
+        provider,
+        (("workspace_name", workspace_name), ("environment", environment), ("region", region)),
+    )
+    return profile.modal_placement(
+        workspace_name=workspace_name, environment=environment, region=region, web_suffix=web_suffix
+    )
 
 
 def _require_inputs(provider: str, supplied: tuple[tuple[str, str], ...]) -> None:
     missing = [name for name, value in supplied if not value.strip()]
     if missing:
         raise ProfileError(f"{provider} placement requires {', '.join(sorted(missing))}")
-
-
-def _reject_foreign(provider: str, supplied: tuple[tuple[str, str], ...]) -> None:
-    present = [name for name, value in supplied if value.strip()]
-    if present:
-        raise ProfileError(f"{provider} placement does not accept {', '.join(sorted(present))}")

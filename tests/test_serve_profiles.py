@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 
 from flash.core.catalog import get_model, supports_image_training
-from flash.serve.control import ModalPlacement, RunPodPlacement
+from flash.serve.control import ModalPlacement
 from flash.serve.profiles import (
     SERVE_RUNTIME_FAMILY,
     ProfileError,
@@ -241,27 +241,12 @@ def test_modal_placement_uses_the_validated_gpu_and_matches_tensor_parallelism()
     assert placement.gpu_count == profile.tensor_parallel_size
 
 
-def test_runpod_placement_uses_the_runpod_gpu_id_not_the_modal_name() -> None:
-    profile = get_profile(MODEL)
-
-    placement = placement_for(profile, "runpod", account_id="account", data_center_id="US-KS-2")
-
-    assert type(placement) is RunPodPlacement
-    assert placement.gpu_type_id == profile.runpod_gpu.gpu_type_id
-    assert placement.gpu_type_id != profile.modal_gpu
-    assert placement.gpu_count == profile.tensor_parallel_size
-    assert placement.container_disk_gb == profile.runpod_gpu.container_disk_gb
-    assert placement.volume_size_gb == profile.runpod_gpu.volume_size_gb
-
-
 @pytest.mark.parametrize(
     ("provider", "supplied"),
     [
         ("modal", {"workspace_name": "workspace", "region": "us-east"}),
         ("modal", {"environment": "dev", "region": "us-east"}),
         ("modal", {"workspace_name": "workspace", "environment": "dev"}),
-        ("runpod", {"account_id": "account"}),
-        ("runpod", {"data_center_id": "US-KS-2"}),
     ],
 )
 def test_incomplete_placement_inputs_are_rejected(provider: str, supplied: dict) -> None:
@@ -271,38 +256,6 @@ def test_incomplete_placement_inputs_are_rejected(provider: str, supplied: dict)
         placement_for(profile, provider, **supplied)  # type: ignore[arg-type]
 
     assert "requires" in str(excinfo.value)
-
-
-@pytest.mark.parametrize(
-    ("provider", "supplied"),
-    [
-        (
-            "modal",
-            {
-                "workspace_name": "w",
-                "environment": "dev",
-                "region": "us-east",
-                "data_center_id": "US-KS-2",
-            },
-        ),
-        ("runpod", {"account_id": "a", "data_center_id": "US-KS-2", "environment": "dev"}),
-        ("runpod", {"account_id": "a", "data_center_id": "US-KS-2", "region": "us-east"}),
-        # a modal web suffix is as foreign to runpod as a modal region: dropping it would let
-        # `--modal-web-suffix --provider runpod` look accepted while changing nothing.
-        ("runpod", {"account_id": "a", "data_center_id": "US-KS-2", "web_suffix": "team"}),
-    ],
-)
-def test_foreign_provider_inputs_are_rejected_rather_than_ignored(
-    provider: str, supplied: dict
-) -> None:
-    # silently dropping a runpod data center on a modal deployment would let the caller keep a
-    # false belief about where this runs.
-    profile = get_profile(MODEL)
-
-    with pytest.raises(ProfileError) as excinfo:
-        placement_for(profile, provider, **supplied)  # type: ignore[arg-type]
-
-    assert "does not accept" in str(excinfo.value)
 
 
 def test_unsupported_provider_is_rejected() -> None:
@@ -338,22 +291,4 @@ def test_image_capable_profiles_enable_tower_connector_lora() -> None:
         assert profile.enable_tower_connector_lora, (
             f"{model_id} serves images but disables tower connector lora, so vllm would reject "
             "every adapter trained on images"
-        )
-
-
-def test_runpod_container_disk_holds_the_extracted_serving_image() -> None:
-    # the container disk must hold the image as EXTRACTED, not as downloaded. the serving image is
-    # 13.7 GB compressed and 40.7 GB on disk (`docker system df -v`), so a 40 GB disk sized from the
-    # compressed number cannot hold the image it is pulling at all.
-    #
-    # this floor is deliberately stated as the extracted size plus room for extraction scratch and
-    # the runtime's own writes. it is not a guess at "big enough": anything at or under ~41 GB is
-    # known-broken by direct observation.
-    extracted_image_gb = 41
-    for model_id in supported_models():
-        profile = get_profile(model_id)
-        assert profile.runpod_gpu.container_disk_gb > extracted_image_gb, (
-            f"{model_id} provisions a {profile.runpod_gpu.container_disk_gb} GB runpod container "
-            f"disk, which cannot hold the {extracted_image_gb} GB extracted serving image; the pod "
-            "will hang mid-pull and bill without ever serving"
         )

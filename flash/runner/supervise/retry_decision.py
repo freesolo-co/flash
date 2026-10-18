@@ -134,16 +134,6 @@ def _retry_target(
     will_retry: bool,
     first_cache_drop: bool,
 ) -> str:
-    # name the class the retry will actually land on. on_last_gpu only says no further class
-    # escalation follows -- it does not mean this class is reused: with several fitting classes
-    # the picker clamps back to the cheapest already-tried one (a100 pcie, a100 sxm, then a100
-    # pcie again). so re-run the picker against the sets this failure is about to update.
-    #
-    # projected off the current candidate list, which the next attempt rebuilds by calling
-    # allocate() again. lambda/vast rebuild from live capacity and pricing, so the named class
-    # can disappear or lose to a newly available one -- word it as the expected target, not a
-    # guarantee. a cache-drop retry projects too: it leaves both sets untouched and so reuses
-    # this class cold, which is exactly the escalation the generic line failed to describe.
     projected = None
     if (
         will_retry

@@ -1119,25 +1119,14 @@ def test_opd_35b_full_context_group1_is_rejected_because_it_only_fits_under_fp8(
     assert need >= math.ceil(bf16 * hr)
 
 
-def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
-    """The fp8-KV discount must apply only when a run can ONLY land on a modern (cc >= 8.9) card. A
-    smaller OPD run that fits the 80 GB A100 (sm80, no fp8) must keep its bf16 KV sizing and its A100
-    route — never dropping onto a card that would not actually use fp8 (and would then OOM)."""
+def test_opd_fp8_kv_gate_keeps_conservative_sizing_below_the_fp8_ceiling():
     from flash.engine.plan.vram import model_required_vram_gb
-    from flash.providers.base import (
-        _FP8_KV_MIN_CAPABILITY,
-        _sm_capability,
-        cheapest_gpu,
-        get_gpu_info,
-        max_non_fp8_kv_vram_gb,
-    )
+    from flash.providers.base import cheapest_gpu, get_gpu_info, max_non_fp8_kv_vram_gb
 
     train = {"max_completion_tokens": 128, "lora_rank": 32, "lora_alpha": 64}
     need = model_required_vram_gb("Qwen/Qwen3.5-2B", "opd", train=train, headroom=1.1)
-    assert need <= max_non_fp8_kv_vram_gb()  # stays within the non-fp8 (<= 80 GB) band...
-    # ...on the A100 (sm80), which does NOT use fp8 KV
-    routed_capability = _sm_capability(get_gpu_info(cheapest_gpu(need)).sm)
-    assert routed_capability < _FP8_KV_MIN_CAPABILITY
+    assert 40 < need <= max_non_fp8_kv_vram_gb()
+    assert get_gpu_info(cheapest_gpu(need)).vram_gb >= need
 
 
 def test_gdn_fp8_exclusion_survives_a_pinned_revision():

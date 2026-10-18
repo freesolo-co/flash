@@ -2984,12 +2984,6 @@ def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(mon
             os.waitpid(pid, 0)
 
 
-# the worker as the runpod handler really runs it: a short-lived process that records a straggler
-# and then EXITS, with no second job to sweep it. `_train_body.run_mode` in
-# `flash/providers/runpod/serverless/endpoints.py`
-# spawns one of these per phase and waits for it, so anything the phase leaves behind reparents to
-# the persistent handler -- which waits only on the worker -- and stays a zombie for the container's
-# life. driven as a subprocess because the leak is about process EXIT, which pytest cannot perform.
 _SHORT_LIVED_WORKER = r"""
 import os, sys, time
 sys.path.insert(0, {repo!r})
@@ -3016,7 +3010,7 @@ sys.stdout.flush()
 def test_a_worker_that_exits_after_one_phase_still_collects_its_straggler():
     """The deferred reap has to happen before this process exits, because nothing follows it.
 
-    A per-phase RunPod worker loses remembered pids at exit, leaving stragglers as permanent
+    A per-phase provider worker loses remembered pids at exit, leaving stragglers as permanent
     zombies.
     """
     done = subprocess.run(
@@ -3028,7 +3022,7 @@ def test_a_worker_that_exits_after_one_phase_still_collects_its_straggler():
     assert done.returncode == 0, f"worker failed: {done.stderr[-2000:]}"
     straggler = int(done.stdout.strip())
     assert not os.path.exists(f"/proc/{straggler}"), (
-        f"straggler {straggler} outlived the worker that owed its status, so the runpod handler "
+        f"straggler {straggler} outlived the worker that owed its status, so the provider handler "
         "inherits a zombie it never waits on: one leaked pid per phase"
     )
 
@@ -4489,7 +4483,7 @@ def test_fused_ce_backend_picks_triton_only_where_it_measured_faster():
         assert vc.fused_ce_backend({"capability": list(capability)}) == "triton", capability
 
     # sm80 (A100) and sm86 (A10/A40) are real fleet classes, not hypotheticals, and sm89 is the
-    # RTX 4090 -- the cheapest class the allocator reaches first.
+    # L4 -- the cheapest class the allocator reaches first.
     for capability in ((8, 0), (8, 6), (8, 9)):
         assert vc.fused_ce_backend({"capability": list(capability)}) == "torch", capability
 

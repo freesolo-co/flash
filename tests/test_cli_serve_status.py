@@ -54,15 +54,6 @@ def _args(provider: str = "modal") -> argparse.Namespace:
                 "us-east",
             ]
         )
-    else:
-        base.extend(
-            [
-                "--runpod-account",
-                "account1",
-                "--runpod-data-center",
-                "US-KS-2",
-            ]
-        )
     return _parse(base)
 
 
@@ -81,13 +72,12 @@ def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> tuple[str, str, str, s
     values = (
         "modal-token-id-do-not-print",
         "modal-token-secret-do-not-print",
-        "runpod-api-key-do-not-print",
+        "unused-secret-do-not-print",
         "inference-key-do-not-print",
         "artifact-token-do-not-print",
     )
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_ID_ENV, values[0])
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_SECRET_ENV, values[1])
-    monkeypatch.setenv(serve_deploy.RUNPOD_API_KEY_ENV, values[2])
     monkeypatch.setenv(serve_deploy.INFERENCE_KEY_ENV, values[3])
     monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, values[4])
     return values
@@ -201,53 +191,6 @@ def test_status_uses_deploy_time_identity_after_the_model_tip_advances(
 
     assert cmd_serve_status(args) == 0
     assert seen == [deployed_name]
-
-
-def test_status_without_inference_key_reports_provider_observable_states(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    observed: list[tuple[str, object]] = []
-
-    def _modal(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        observed.append(("modal", secrets))
-        return _result(bundle, "absent")
-
-    def _runpod(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        observed.append(("runpod", secrets))
-        return _result(bundle, "provisioning")
-
-    _stub_environment(monkeypatch)
-    monkeypatch.delenv(serve_deploy.INFERENCE_KEY_ENV)
-    modal_args = _args_with_identity(monkeypatch, "modal")
-    runpod_args = _args_with_identity(monkeypatch, "runpod")
-    monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _modal)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.reconcile_runpod_deployment", _runpod)
-
-    assert cmd_serve_status(modal_args) == 0
-    assert cmd_serve_status(runpod_args) == 0
-    assert observed == [("modal", None), ("runpod", None)]
-
-
-def test_status_routes_to_the_named_read_only_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[str] = []
-
-    def _modal(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        calls.append("modal")
-        return _result(bundle, "ready")
-
-    def _runpod(bundle, credentials, secrets, *, deadline_at, **_kwargs):
-        calls.append("runpod")
-        return _result(bundle, "ready")
-
-    _stub_environment(monkeypatch)
-    modal_args = _args_with_identity(monkeypatch, "modal")
-    runpod_args = _args_with_identity(monkeypatch, "runpod")
-    monkeypatch.setattr("flash.serve.provisioning.modal.reconcile_modal_deployment", _modal)
-    monkeypatch.setattr("flash.serve.provisioning.runpod.reconcile_runpod_deployment", _runpod)
-
-    assert cmd_serve_status(modal_args) == 0
-    assert cmd_serve_status(runpod_args) == 0
-    assert calls == ["modal", "runpod"]
 
 
 @pytest.mark.parametrize(

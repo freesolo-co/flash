@@ -21,11 +21,6 @@ from flash.engine.worker.runtime.pkg_proxy import W as _w
 from flash.engine.worker.verl.checkpoints import resume_checkpoint_is_loadable
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
-# todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
-# consecutive zero-grad-norm steps tolerated before the run is failed as untrainable (GRAD-001).
-# any nonzero grad norm is proof the backward graph is intact and resets the count. 2 is enough to
-# separate a one-off fully-masked batch from a severed graph, and keeps the wasted spend to a couple
-# of steps rather than the whole run.
 _MAX_ZERO_GRAD_STEPS = 2
 
 

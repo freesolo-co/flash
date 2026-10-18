@@ -397,7 +397,7 @@ def test_sft_quote_credits_only_the_ranks_that_will_execute():
 
     def speedup(method: str, batch: int, cards: int) -> float:
         config = RunConfig(model_id="Qwen/Qwen3.5-4B", method=method, steps=10, batch_size=batch)
-        return analytical.method_card_speedup(config, cards, "H100", "runpod")
+        return analytical.method_card_speedup(config, cards, "H100", "modal")
 
     one_card = speedup("sft", 1, 1)
     # unpacked sft: 2 billed cards, 1 executing rank -> quoted like the single card it is.
@@ -2256,7 +2256,7 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypat
     monkeypatch.setenv("WANDB_API_KEY", "wandb-secret")
     monkeypatch.setenv("PARASAIL_API_KEY", "teacher-secret")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "control-secret")
-    monkeypatch.setenv("RUNPOD_API_KEY", "provider-secret")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "provider-secret")
     monkeypatch.setenv("HF_TOKEN", "hub-secret")
 
     without_wandb = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=False)
@@ -2268,7 +2268,7 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypat
     for secret in (
         "PARASAIL_API_KEY",
         "FREESOLO_INTERNAL_KEY",
-        "RUNPOD_API_KEY",
+        "MODAL_TOKEN_SECRET",
         "HF_TOKEN",
     ):
         assert secret not in without_wandb
@@ -2669,7 +2669,7 @@ def _stub_sft_run(
             params={},
             pip=(),
         ),
-        gpu=SimpleNamespace(type="RTX 4090", exact_type="", count=2),
+        gpu=SimpleNamespace(type="L4", exact_type="", count=2),
         train=SimpleNamespace(
             epochs=1,
             learning_rate=5e-5,
@@ -4344,7 +4344,7 @@ def test_sft_quote_credits_the_width_the_rows_allow_not_just_the_batch():
             batch_size=8,
             sft_retained_examples=rows,
         )
-        return analytical.method_card_speedup(config, 4, "H100", "runpod")
+        return analytical.method_card_speedup(config, 4, "H100", "modal")
 
     # the worker would launch 2 ranks on 10 rows and 4 on 16; the quote must agree with both.
     assert sft_data_parallel_cards(4, 8, 10) == 2

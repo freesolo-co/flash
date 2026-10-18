@@ -255,13 +255,7 @@ def _executed_width(algorithm: str, train, overrides):
 
 
 def _fitting_candidates(candidates, need: int, executed_width) -> list:
-    """The shapes that hold the run on the ranks they will actually launch.
-
-    Providers report the shapes they can genuinely rent (RunPod takes a count, Lambda names it in the
-    instance type, Vast bakes it into the offer); the allocator owns only whether a shape fits. The
-    executed width is per-candidate because it is bounded by that candidate's own card count. Stamp it
-    on every survivor so recovery values the failed and retry shapes with the exact rule used here.
-    """
+    """The shapes that hold the run on the ranks they will actually launch."""
     fitting = []
     for candidate in candidates:
         executed_gpu_count = executed_width(candidate.gpu_count)
@@ -452,11 +446,6 @@ def _resolve_exact_gpu(
     if provider and provider not in exact_providers:
         raise UnsupportedGpuError(f"provider {provider!r} cannot provision exact GPU {exact!r}")
     reachable = tuple(name for name in available if name in exact_providers)
-    # a card ceiling is the user's own `[gpu] count`, so a pin that fits at a wider rentable shape
-    # is one flag from working; `above` is the width already tried, so the remedy only ever names
-    # a wider one. bounded by the model's geometry cap so the suggestion is a width verl accepts
-    # rather than one it rejects after the box is rented. only offered when a provider still in
-    # play rents counts freely -- a Lambda/Vast-only pin has no offline proof the wider SKU exists.
     widths = (exact_info.vram_gb,) if rents_arbitrary_card_counts(reachable) else ()
     # the pin may be the only reason no width is offerable: this class can be carried by a provider
     # the pin excluded that DOES rent counts freely. saying so beats a bare shortfall the user
@@ -754,11 +743,6 @@ def _raise_no_candidate_error(
     # copies of this question is what let the sft width clamp reach one branch and not the others.
     could_fit = _structurally_fits(supported_available, need, cap, executed_width, acceptable)
     if lookup_failed and could_fit:
-        # No candidate fit, but a live capacity lookup blipped and was the only possible source of one
-        # -> retryable, NOT terminal: a Vast/Lambda-only run must ride out a market/API outage on its
-        # infra budget instead of dying as if the job exceeds every GPU class. The class list stays
-        # readable during the outage (it is static), so `could_fit` keeps a run the blip did not
-        # cause and cannot cure from burning that budget.
         raise CapacityLookupError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}): a provider's live capacity lookup "
             f"failed transiently and was the only source of a fitting class — retry may find hidden capacity"

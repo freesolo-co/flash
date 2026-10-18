@@ -20,33 +20,6 @@ class _FakeConfig:
     template: _FakeTemplate | None = field(default_factory=_FakeTemplate)
 
 
-def test_apply_disk_gb_raises_disk():
-    from flash.providers.runpod.jobs import apply_disk_gb
-
-    cfg = _FakeConfig()
-    apply_disk_gb(cfg, 160)
-    assert cfg.template.containerDiskInGb == 160
-
-
-def test_apply_disk_gb_never_shrinks():
-    """Configs carry a historical disk_gb=60 default; it must not shrink the 64 default."""
-    from flash.providers.runpod.jobs import apply_disk_gb
-
-    cfg = _FakeConfig()
-    apply_disk_gb(cfg, 60)
-    assert cfg.template.containerDiskInGb == 64
-
-
-def test_apply_disk_gb_noops():
-    from flash.providers.runpod.jobs import apply_disk_gb
-
-    cfg = _FakeConfig()
-    apply_disk_gb(cfg, None)
-    apply_disk_gb(cfg, 0)
-    assert cfg.template.containerDiskInGb == 64
-    apply_disk_gb(_FakeConfig(template=None), 160)  # missing template: warn, don't raise
-
-
 def test_oversized_catalog_models_carry_disk_floors():
     """Models whose transient download peak exceeds the shared cache need per-job disk floors."""
     from flash.core.catalog import MODELS
@@ -186,7 +159,7 @@ def test_submit_applies_derived_model_disk_floor(monkeypatch):
                 "algorithm": "sft",
                 "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
                 "train": {"max_examples": 8},
-                "gpu": {"type": "RTX 5090", "disk_gb": 60},
+                "gpu": {"type": "L40S", "disk_gb": 60},
             }
         )
         # sft submission is profile-gated, and this synthetic catalog model has no hub revision to
@@ -203,7 +176,7 @@ def test_submit_applies_derived_model_disk_floor(monkeypatch):
                 "algorithm": "sft",
                 "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
                 "train": {"max_examples": 8},
-                "gpu": {"type": "RTX 5090", "disk_gb": 200},
+                "gpu": {"type": "L40S", "disk_gb": 200},
             }
         )
         status = runner.submit_job(spec_big, dry_run=True)

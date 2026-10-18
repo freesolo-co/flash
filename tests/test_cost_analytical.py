@@ -48,7 +48,7 @@ def test_sft_train_tokens_price_actual_tokens_instead_of_padded_slots():
 
 
 def test_grpo_costs_more_than_sft():
-    gpu = "RTX 5090"
+    gpu = "L40S"
     # Per-step: GRPO (rollout + update) dominates SFT on the same card.
     assert seconds_per_step(RunConfig(MID, "grpo", 1), gpu) > seconds_per_step(
         RunConfig(MID, "sft", 1), gpu
@@ -60,7 +60,7 @@ def test_grpo_costs_more_than_sft():
 
 
 def test_bigger_model_costs_more_per_step():
-    gpu = "RTX 5090"
+    gpu = "L40S"
     small = seconds_per_step(RunConfig(SMALL, "sft", 1), gpu)
     big = seconds_per_step(RunConfig(BIG, "sft", 1), gpu)
     assert big > small
@@ -121,10 +121,10 @@ def test_cold_start_calibrated_to_real_short_sft_run():
     # Calibration anchor: a real fresh-worker run (0.8B SFT, 391 examples -> 26 priced steps at
     # the recipe batch) was cold-start-dominated (a fresh worker spent ~12.5 min in model load).
     # Static pricing picks the cheapest fitting class; the cheapest managed card is the 24 GB
-    # RTX 4090 ($0.69). 26 = ceil(391 / 32) * 2 epochs.
+    # L4 ($0.69). 26 = ceil(391 / 32) * 2 epochs.
     e = estimate_cost(RunConfig(SMALL, "sft", 26))
-    assert e.gpu == "RTX 4090"
-    assert e.gpu_hourly_usd == pytest.approx(0.69, abs=1e-3)
+    assert e.gpu == "L40S"
+    assert e.gpu_hourly_usd == pytest.approx(3.287232, abs=1e-6)
     assert e.total_usd == pytest.approx(e.billable_hours * e.gpu_hourly_usd)
     assert e.total_usd < e.wall_clock_hours * e.gpu_hourly_usd
     # Model load (not boot/deps) is the dominant cold-start term for a short job.
@@ -343,7 +343,7 @@ def test_opd_teacher_latency_uses_conservative_retry_and_turn_wave_policy(
         opd_max_turns=max_turns,
     )
 
-    _gpu_seconds, fixed_seconds = step_seconds_split(config, "RTX 5090")
+    _gpu_seconds, fixed_seconds = step_seconds_split(config, "L40S")
 
     # hand-write the policy request count, including retries and per-turn scoring, but derive waves
     # from the measured concurrency constant. using the production count helper would make this test
@@ -414,7 +414,7 @@ def test_offline_quote_and_allocator_agree_on_the_executed_sft_width():
         config = RunConfig("Qwen/Qwen3.6-27B", "sft", 10, **kwargs)
         gpu, need, count, _provider, rate = _offline_gpu_shape(config)
         candidate = Candidate(
-            provider="runpod",
+            provider="modal",
             gpu=gpu,
             hourly_usd=rate,
             vram_gb=GPU_INFO[gpu].vram_gb,

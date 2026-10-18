@@ -1,7 +1,7 @@
 """report the proved state of one exact customer-owned serving deployment.
 
 This is the user-facing read-only path into ``reconcile_modal_deployment`` and
-``reconcile_runpod_deployment``. It never mutates provider resources and never turns an unproved
+``reconcile_modal_deployment``. It never mutates provider resources and never turns an unproved
 state into ready or absent.
 """
 
@@ -59,12 +59,9 @@ def cmd_serve_status(args) -> int:
     provider = args.provider
     try:
         bundle = existing_deployment_bundle(args)
-        # bundle construction only validates the generic placement type. the provider plan applies
-        # the exact hostname contract before reconciliation can contact the provider.
         _build_provider_plan(provider, bundle)
     except (ValueError, TypeError) as exc:
         return _err(str(exc))
-
     try:
         credentials = _credentials(provider)
         inference_token = _optional_env(INFERENCE_KEY_ENV)
@@ -75,26 +72,12 @@ def cmd_serve_status(args) -> int:
         )
     except (ValueError, TypeError) as exc:
         return _err(
-            f"{exc}. credentials are read from the environment for this one request and are never "
-            f"stored"
+            f"{exc}. credentials are read from the environment for this one request and are never stored"
         )
     deadline_at = time.monotonic() + float(args.timeout)
-    if provider == "modal":
-        from flash.serve.provisioning.modal import reconcile_modal_deployment
+    from flash.serve.provisioning.modal import reconcile_modal_deployment
 
-        result = reconcile_modal_deployment(
-            bundle,
-            credentials,
-            runtime_secrets,
-            deadline_at=deadline_at,
-        )
-    else:
-        from flash.serve.provisioning.runpod import reconcile_runpod_deployment
-
-        result = reconcile_runpod_deployment(
-            bundle,
-            credentials,
-            runtime_secrets,
-            deadline_at=deadline_at,
-        )
+    result = reconcile_modal_deployment(
+        bundle, credentials, runtime_secrets, deadline_at=deadline_at
+    )
     return _report_status(result)

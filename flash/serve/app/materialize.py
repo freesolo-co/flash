@@ -557,27 +557,18 @@ def _ensure_trusted_child_directory(
 
 
 def _validate_cache_ancestor_stat(
-    details: os.stat_result,
-    name: str,
-    *,
-    directory_fd: int | None = None,
+    details: os.stat_result, name: str, *, directory_fd: int | None = None
 ) -> None:
     if not stat.S_ISDIR(details.st_mode):
         raise MaterializationError(f"{name} is not a directory")
     owner = details.st_uid
-    writable = bool(details.st_mode & 0o022)
-    # root-owned shared directories include sticky /tmp and runpod's non-sticky 0777 moosefs mount.
-    # only root can replace their entries, while every inner cache object must still be owned by us.
-    # filesystems that cannot store modes rely on the manifest digest and before/after identity
-    # checks instead; _permission_bits_are_enforceable distinguishes those mounts below.
+    writable = bool(details.st_mode & 18)
     root_shared = owner == 0
     if owner not in {0, os.getuid()}:
         raise MaterializationError(f"{name} is owned by an untrusted uid")
     if not writable or root_shared:
         return
-    # probe only at rejection: a mode-preserving mount is unsafe, while a modeless mount reports a
-    # writable bit it cannot change and must rely on the content and identity checks instead.
-    if directory_fd is not None and not _permission_bits_are_enforceable(directory_fd):
+    if directory_fd is not None and (not _permission_bits_are_enforceable(directory_fd)):
         return
     raise MaterializationError(f"{name} is group or world writable")
 
@@ -585,17 +576,15 @@ def _validate_cache_ancestor_stat(
 def _permission_bits_are_enforceable(directory_fd: int) -> bool:
     """report whether this filesystem preserves a private mode on a probe directory.
 
-    runpod's moosefs mount reports fixed 0777/0666 modes, so a capability probe avoids an
+    modal's moosefs mount reports fixed 0777/0666 modes, so a capability probe avoids an
     unsatisfiable assertion without coupling the policy to a provider or filesystem name.
     """
-
     probe = f".flash-mode-probe-{os.getpid()}"
     with contextlib.suppress(OSError):
         os.rmdir(probe, dir_fd=directory_fd)
     try:
         os.mkdir(probe, mode=0o700, dir_fd=directory_fd)
     except OSError:
-        # cannot tell, so assume the strict reading: an unwritable directory fails elsewhere anyway.
         return True
     try:
         try:
@@ -603,11 +592,10 @@ def _permission_bits_are_enforceable(directory_fd: int) -> bool:
         except OSError:
             return True
         try:
-            return not (os.fstat(probe_fd).st_mode & 0o022)
+            return not os.fstat(probe_fd).st_mode & 18
         finally:
             os.close(probe_fd)
     finally:
-        # every exit after mkdir must remove the entry before an exact-set validation.
         with contextlib.suppress(OSError):
             os.rmdir(probe, dir_fd=directory_fd)
 

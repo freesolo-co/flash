@@ -1,4 +1,4 @@
-"""Orchestrator end-to-end path with the Flash submission mocked (no RunPod calls)."""
+"""Orchestrator end-to-end path with the Flash submission mocked (no provider calls)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ SOURCE_SNAPSHOT = valid_source_snapshot()
 
 def test_run_job_persists_flash_metrics(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
-        import flash.providers.runpod.serverless as flash_train
+        import flash.providers._lifecycle.worker as flash_train
         import flash.runner as runner
 
         importlib.reload(flash_train)
@@ -45,14 +45,14 @@ def test_run_job_persists_flash_metrics(monkeypatch):
             assert persisted.source_snapshot == SOURCE_SNAPSHOT
             attempt = runner._reserve_attempt(spec.run_id)
             return {
-                "arm": "runpod",
+                "arm": "modal",
                 "phase": spec.phase,
                 "seed": seed,
                 "wall_seconds": 3600.0,
                 "trained_eval_acc": 0.7,
                 "base_eval_acc": 0.3,
                 "cost_usd": 0.0,
-                "allocated_gpu": "RTX 4090",
+                "allocated_gpu": "L4",
                 "notes": {},
                 TERMINAL_ATTESTATION_KEY: source_attestation(
                     SOURCE_SNAPSHOT,
@@ -77,7 +77,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         status = runner.submit_job(spec, dry_run=False, background=False)
 
         assert status.state == "done", status.error
-        from flash.providers.runpod.pricing import hourly_rate
+        from flash.providers.modal.pricing import hourly_rate
 
         # We charge the QUOTE (flash.cost estimate); the measured 1h-on-a-4090 cost lands in metrics.json.
         assert status.cost_usd == runner.charge_usd_for_spec(spec), status.cost_usd
@@ -88,13 +88,13 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         assert status.source_verified_attempt == 0
 
         # Metrics are namespaced by run id so same-phase runs cannot collide.
-        metrics_path = os.path.join(tmp, "results", "runpod", "rl", status.run_id, "metrics.json")
+        metrics_path = os.path.join(tmp, "results", "modal", "rl", status.run_id, "metrics.json")
         assert os.path.exists(metrics_path)
         with open(metrics_path) as f:
             m = json.load(f)
-        assert abs(m["cost_usd"] - hourly_rate("RTX 4090")) < 1e-6  # measured: 1h on the 4090
+        assert abs(m["cost_usd"] - hourly_rate("L4")) < 1e-6  # measured: 1h on the 4090
         assert m["trained_eval_acc"] == 0.7
-        assert m["notes"]["gpu"] == "RTX 4090"
+        assert m["notes"]["gpu"] == "L4"
 
 
 def test_source_publication_failure_is_generic_at_submission_and_api_boundary(monkeypatch, caplog):
@@ -260,7 +260,7 @@ def test_publish_source_snapshot_creates_missing_repo(monkeypatch, tmp_path):
 
 
 def test_hf_call_honors_retry_after(monkeypatch):
-    import flash.providers.runpod.serverless as flash_train
+    import flash.providers._lifecycle.worker as flash_train
 
     sleeps: list[float] = []
     logs: list[tuple[str, tuple]] = []
@@ -291,7 +291,7 @@ def test_hf_call_honors_retry_after(monkeypatch):
 
 
 def test_hf_call_caps_http_date_retry_after(monkeypatch):
-    import flash.providers.runpod.serverless as flash_train
+    import flash.providers._lifecycle.worker as flash_train
 
     sleeps: list[float] = []
 

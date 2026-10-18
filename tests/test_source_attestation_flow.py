@@ -158,7 +158,7 @@ def test_attach_freezes_top_level_descriptor_and_discards_legacy_prefix(
         }
     )
     remote = {
-        "provider": "runpod",
+        "provider": "modal",
         "endpoint_id": "endpoint",
         "endpoint_name": "name",
         "key_fingerprint": "c" * 64,

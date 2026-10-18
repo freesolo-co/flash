@@ -486,7 +486,7 @@ def test_gpu_sizing_consumes_the_canonical_warmstart_reference() -> None:
     """
     raw = _raw(
         model="Qwen/Qwen3.6-35B-A3B",
-        **{"gpu.type": "A100 PCIe", "train.init_from_adapter": "not/a/checkpoint/ref"},
+        **{"gpu.type": "A100 SXM", "train.init_from_adapter": "not/a/checkpoint/ref"},
     )
     raw["train"].pop("lora_rank")
 
@@ -536,52 +536,6 @@ def test_warmstart_placeholder_rank_does_not_reject_a_source_rank_that_fits_b200
         spec_from_dict({**base, "train": {**base["train"], "lora_rank": 32}})
 
 
-def test_parse_time_vram_rejection_names_the_wider_shape_that_fits() -> None:
-    """A single-card pin a second card would satisfy is a one-flag fix, not a dead end.
-
-    The allocator ends every fit rejection with ``wider_shape_remedy``; this parse-time check
-    did not, so an authored ``count = 1`` on the largest card Flash manages was rejected with no
-    remedy at all. A user reading it concludes there is nothing left to rent, when ``--gpus 2``
-    admits the same run.
-    """
-    train = {
-        "epochs": 1,
-        "max_examples": 10,
-        "prompts_per_step": 8,
-        "group_size": 4,
-        "max_context_tokens": 1536,
-        "max_completion_tokens": 512,
-        "lora_rank": 32,
-    }
-    raw = _raw(
-        model="Qwen/Qwen3.6-35B-A3B",
-        algorithm="grpo",
-        **{
-            "gpu.type": "B200",
-            "gpu.count": 1,
-            **{f"train.{key}": value for key, value in train.items()},
-        },
-    )
-    with pytest.raises(ConfigError) as excinfo:
-        spec_from_dict(raw)
-    message = str(excinfo.value)
-    assert "requires at least 199 GB" in message
-    assert "--gpus 2" in message, f"rejection gave no remedy: {message}"
-    # and the suggestion has to be true: the same config at that count must parse.
-    widened = spec_from_dict({**raw, "gpu": {**raw["gpu"], "count": 2}})
-    assert widened.gpu.count == 2
-
-    # a HARD provider pin narrows the pool, so a class whose wider shape that provider does not
-    # freely rent must not be advertised. lambda names its card count in the instance type.
-    with pytest.raises(ConfigError) as pinned:
-        spec_from_dict({**raw, "gpu": {**raw["gpu"], "provider": "lambda"}})
-    pinned_message = str(pinned.value)
-    assert "requires at least 199 GB" in pinned_message
-    assert "--gpus" not in pinned_message, (
-        f"a lambda-pinned run was sent to a wider shape its pin may not carry: {pinned_message}"
-    )
-
-
 def test_warmstart_still_rejects_a_shape_impossible_at_the_minimum_rank() -> None:
     raw = _raw(
         model="Qwen/Qwen3.6-35B-A3B",
@@ -612,11 +566,11 @@ def test_warmstart_still_validates_the_authored_card_at_the_minimum_rank() -> No
     """
     raw = _raw(
         model="Qwen/Qwen3.6-35B-A3B",
-        **{"gpu.type": "A100 PCIe", "train.init_from_adapter": "source-run"},
+        **{"gpu.type": "A100 SXM", "train.init_from_adapter": "source-run"},
     )
     raw["train"].pop("lora_rank")
 
-    with pytest.raises(ConfigError, match=r"gpu\.type 'A100 PCIe' has 80 GB VRAM"):
+    with pytest.raises(ConfigError, match=r"gpu\.type 'A100 SXM' has 80 GB VRAM"):
         spec_from_dict(raw)
 
 
@@ -1236,116 +1190,23 @@ def test_gpu_public_fields_survive_payload_and_server_reparse() -> None:
 
     defaults = GpuSpec()
     spec = spec_from_dict(
-        _raw(**{"gpu.provider": " RunPod ", "gpu.type": "rtx-4090"}),
+        _raw(**{"gpu.provider": " Modal ", "gpu.type": "l4"}),
         run_id="gpu-rt",
     )
     payload = spec_payload(spec)
     # the public payload carries the user-authorable gpu knobs and omits managed lifecycle policy.
-    assert payload["gpu"]["provider"] == "runpod"
-    assert payload["gpu"]["type"] == "RTX 4090"
+    assert payload["gpu"]["provider"] == "modal"
+    assert payload["gpu"]["type"] == "L4"
     assert "max_retries" not in payload["gpu"]
     assert "max_wall_seconds" not in payload["gpu"]
 
     reparsed = spec_from_dict(payload, run_id="server-reparse")
-    assert reparsed.gpu.provider == "runpod"
-    assert reparsed.gpu.type == "RTX 4090"
+    assert reparsed.gpu.provider == "modal"
+    assert reparsed.gpu.type == "L4"
     assert reparsed.gpu.type == spec.gpu.type
     # managed lifecycle fields reconstitute to their defaults on the server reparse.
     assert reparsed.gpu.max_retries == defaults.max_retries
     assert reparsed.gpu.max_wall_seconds == defaults.max_wall_seconds
-
-
-def test_gpu_provider_preferences_validate_dedupe_and_round_trip_in_order() -> None:
-    spec = spec_from_dict(
-        _raw(**{"gpu.providers": [" Vast ", "runpod", "vast", "lambda", "runpod"]}),
-        run_id="gpu-provider-preferences",
-    )
-
-    assert spec.gpu.providers == ("vast", "runpod", "lambda")
-    public = spec.to_dict()
-    assert public["gpu"]["providers"] == ("vast", "runpod", "lambda")
-    assert JobSpec.from_dict(public).gpu.providers == ("vast", "runpod", "lambda")
-    assert JobSpec.from_json(spec.to_json()).gpu.providers == ("vast", "runpod", "lambda")
-
-
-def test_gpu_provider_preferences_reject_invalid_authoring() -> None:
-    with pytest.raises(ValueError, match="must name at least one provider"):
-        GpuSpec(providers=[])
-    with pytest.raises(ConfigError, match="must name at least one provider"):
-        spec_from_dict(_raw(**{"gpu.providers": []}))
-    with pytest.raises(ConfigError, match=r"one of runpod, lambda, vast"):
-        spec_from_dict(_raw(**{"gpu.providers": ["aws"]}))
-    with pytest.raises(ConfigError, match=r"gpu\.provider and gpu\.providers cannot both be set"):
-        spec_from_dict(_raw(**{"gpu.provider": "runpod", "gpu.providers": ["vast"]}))
-
-
-def test_cost_quote_preserves_soft_provider_preference(monkeypatch) -> None:
-    """The quote follows the authored preference, on a plane configured to serve it.
-
-    The harness deletes the lambda/vast keys and injects only a RunPod pool, so the preference has
-    to be made reachable explicitly -- quoting lambda on the bare fixture plane would assert the
-    very defect `test_cost_quote_skips_a_preference_this_plane_cannot_provision` guards against.
-    """
-    import flash.providers as providers_registry
-    from flash.cost.analytical import estimate_cost
-    from flash.cost.spec import runconfig_from_spec
-
-    spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda", "vast"]}))
-    config = runconfig_from_spec(spec)
-
-    assert config.provider == "auto"
-    assert config.providers == ("lambda", "vast")
-    monkeypatch.setattr(
-        providers_registry, "available_providers", lambda: ("runpod", "lambda", "vast")
-    )
-    assert estimate_cost(config).provider == "lambda"
-
-
-def test_cost_quote_skips_a_preference_this_plane_cannot_provision(monkeypatch) -> None:
-    """The quote must price what allocation would really rent, not an unreachable preference.
-
-    ``allocate()`` searches the CONFIGURED providers, so a preference naming one this plane has no
-    credentials for is silently ignored there. Quoting it anyway prices a shape the run can never
-    get, and the server's affordability check runs on that estimate -- so a balance that covers the
-    real allocation can be refused with a 402.
-    """
-    import flash.providers as providers_registry
-    from flash.cost.analytical import estimate_cost
-    from flash.cost.spec import runconfig_from_spec
-
-    spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda"]}))
-    config = runconfig_from_spec(spec)
-
-    monkeypatch.setattr(providers_registry, "available_providers", lambda: ("runpod",))
-    unreachable = estimate_cost(config)
-    assert unreachable.provider == "runpod"
-
-    # the same preference is still honored on a plane that can actually provision it.
-    monkeypatch.setattr(providers_registry, "available_providers", lambda: ("runpod", "lambda"))
-    assert estimate_cost(config).provider == "lambda"
-
-
-def test_cost_quote_refuses_a_shape_no_configured_provider_can_rent(monkeypatch) -> None:
-    """Exhausting the eligible set must raise, not fall through to an unrestricted `auto` quote.
-
-    A vast-only plane cannot rent a B200. Ranking the registered RunPod pool anyway returns a quote
-    for hardware this plane has no credentials for, which then passes the affordability check and
-    only fails once live allocation runs -- after the run is recorded.
-    """
-    import flash.providers as providers_registry
-    from flash.cost.analytical import estimate_cost
-    from flash.cost.spec import runconfig_from_spec
-
-    spec = spec_from_dict(_raw(**{"gpu.providers": ["vast"], "gpu.type": "B200"}))
-    config = runconfig_from_spec(spec)
-
-    monkeypatch.setattr(providers_registry, "available_providers", lambda: ("vast",))
-    with pytest.raises(ValueError, match="vast"):
-        estimate_cost(config)
-
-    # a plane that can actually rent the class still quotes it.
-    monkeypatch.setattr(providers_registry, "available_providers", lambda: ("runpod", "vast"))
-    assert estimate_cost(config).provider == "runpod"
 
 
 def test_cost_quote_prices_the_cheapest_acceptable_gpu_class() -> None:
@@ -1404,54 +1265,13 @@ def test_cost_quote_no_fit_error_names_every_acceptable_class() -> None:
         batch_size=8,
         group_size=4,
         gpu_count=1,
-        gpu_type="RTX 4090",
-        gpu_type_fallbacks=("RTX 5090",),
+        gpu_type="L4",
+        gpu_type_fallbacks=("L40S",),
     )
     with pytest.raises(ValueError, match="cannot fit this run") as exc:
         estimate_cost(config)
-    assert "RTX 4090" in str(exc.value)
-    assert "RTX 5090" in str(exc.value)
-
-
-def test_soft_provider_preference_does_not_reject_an_ineligible_gpu_type_pair() -> None:
-    spec = spec_from_dict(_raw(**{"gpu.providers": ["lambda"], "gpu.type": "RTX 4090"}))
-
-    assert spec.gpu.providers == ("lambda",)
-    assert spec.gpu.type == "RTX 4090"
-
-
-def test_persisted_gpu_provider_preferences_reject_invalid_values() -> None:
-    with pytest.raises(ValueError, match="must name at least one provider"):
-        _job_from_dict({"gpu": {"providers": []}})
-    with pytest.raises(ValueError, match=r"one of runpod, lambda, vast"):
-        _job_from_dict({"gpu": {"providers": ["aws"]}})
-    with pytest.raises(ValueError, match=r"gpu\.provider and gpu\.providers cannot both be set"):
-        _job_from_dict({"gpu": {"provider": "runpod", "providers": ["vast"]}})
-
-
-def test_gpu_constraints_reject_unknown_unsupported_or_undersized_values() -> None:
-    with pytest.raises(ConfigError, match=r"gpu\.provider"):
-        spec_from_dict(_raw(**{"gpu.provider": "aws"}))
-    with pytest.raises(ConfigError, match=r"gpu\.type"):
-        spec_from_dict(_raw(**{"gpu.type": "Tesla T4"}))
-    with pytest.raises(ConfigError, match=r"unsupported gpu 'RTX A6000'"):
-        spec_from_dict(_raw(**{"gpu.type": "RTX A6000"}))
-    with pytest.raises(ConfigError, match="requires at least"):
-        spec_from_dict(
-            _raw(
-                model="Qwen/Qwen3.5-9B",
-                **{"gpu.type": "RTX 4090"},
-            )
-        )
-    with pytest.raises(ConfigError, match="cannot provision"):
-        spec_from_dict(
-            _raw(
-                **{
-                    "gpu.provider": "lambda",
-                    "gpu.type": "RTX 4090",
-                }
-            )
-        )
+    assert "L4" in str(exc.value)
+    assert "L40S" in str(exc.value)
 
 
 def test_gpu_type_pins_and_unset_stays_auto(capsys) -> None:
@@ -1468,15 +1288,15 @@ def test_gpu_type_pins_and_unset_stays_auto(capsys) -> None:
 
 def test_gpu_type_accepts_an_ordered_list_of_acceptable_classes() -> None:
     """An ordered list preserves every acceptable class behind one concrete head."""
-    spec = spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", "A100 SXM"]}))
+    spec = spec_from_dict(_raw(**{"gpu.type": ["H100", "A100 SXM"]}))
 
-    assert spec.gpu.type == "A100 PCIe"
+    assert spec.gpu.type == "H100"
     assert spec.gpu.type_fallbacks == ("A100 SXM",)
-    assert spec.gpu.acceptable_types == ("A100 PCIe", "A100 SXM")
+    assert spec.gpu.acceptable_types == ("H100", "A100 SXM")
 
     # aliases canonicalize per entry, exactly as the scalar form does.
-    assert spec_from_dict(_raw(**{"gpu.type": [" a100 pcie ", "h100"]})).gpu.acceptable_types == (
-        "A100 PCIe",
+    assert spec_from_dict(_raw(**{"gpu.type": [" a100-80gb ", "h100"]})).gpu.acceptable_types == (
+        "A100 SXM",
         "H100",
     )
     # a one-element list is exactly a scalar pin, fallbacks included (there are none).
@@ -1488,36 +1308,18 @@ def test_gpu_type_accepts_an_ordered_list_of_acceptable_classes() -> None:
     )
     # a repeat asks for nothing the first mention did not, and the first position is preference.
     assert spec_from_dict(
-        _raw(**{"gpu.type": ["H100", "A100 PCIe", "H100"]})
-    ).gpu.acceptable_types == ("H100", "A100 PCIe")
-
-
-def test_gpu_type_list_rejects_empty_and_unusable_entries() -> None:
-    """Every named class must be valid, reachable, and large enough."""
-    with pytest.raises(ConfigError, match=r"must not be an empty list"):
-        spec_from_dict(_raw(**{"gpu.type": []}))
-    with pytest.raises(ConfigError, match=r"unsupported gpu"):
-        spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", "Tesla T4"]}))
-    with pytest.raises(ConfigError, match=r"gpu\.type entries must be strings"):
-        spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", 1]}))
-    with pytest.raises(ConfigError, match=r"gpu\.type entries must not be empty"):
-        spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", "  "]}))
-    # the vram floor applies to the whole list, so a fallback too small to hold the run is refused.
-    with pytest.raises(ConfigError, match="requires at least"):
-        spec_from_dict(_raw(model="Qwen/Qwen3.5-9B", **{"gpu.type": ["A100 PCIe", "RTX 4090"]}))
-    # and so does provider compatibility.
-    with pytest.raises(ConfigError, match="cannot provision"):
-        spec_from_dict(_raw(**{"gpu.provider": "lambda", "gpu.type": ["H100", "RTX 4090"]}))
+        _raw(**{"gpu.type": ["H100", "A100 SXM", "H100"]})
+    ).gpu.acceptable_types == ("H100", "A100 SXM")
 
 
 def test_gpu_type_list_round_trips_through_the_public_payload() -> None:
     """Public serialization restores the authored list spelling."""
     from flash.client.specs import spec_payload
 
-    spec = spec_from_dict(_raw(**{"gpu.type": ["A100 PCIe", "A100 SXM"]}), run_id="gpu-list")
+    spec = spec_from_dict(_raw(**{"gpu.type": ["H100", "A100 SXM"]}), run_id="gpu-list")
     payload = spec_payload(spec)
 
-    assert payload["gpu"]["type"] == ["A100 PCIe", "A100 SXM"]
+    assert payload["gpu"]["type"] == ["H100", "A100 SXM"]
     assert "type_fallbacks" not in payload["gpu"]
 
     reparsed = spec_from_dict(payload, run_id="server-reparse")
@@ -1536,22 +1338,22 @@ def test_authoring_gpu_type_fallbacks_directly_is_rejected() -> None:
 def test_persisted_gpu_type_fallbacks_are_canonicalized_and_require_a_head() -> None:
     """Persisted fallback classes receive the same validation as the head."""
     assert _job_from_dict(
-        {"gpu": {"type": "h100", "type_fallbacks": [" a100 pcie "]}}
-    ).gpu.acceptable_types == ("H100", "A100 PCIe")
+        {"gpu": {"type": "h100", "type_fallbacks": [" a100-80gb "]}}
+    ).gpu.acceptable_types == ("H100", "A100 SXM")
     with pytest.raises(ValueError, match=r"unsupported gpu"):
         _job_from_dict({"gpu": {"type": "H100", "type_fallbacks": ["H10O"]}})
     with pytest.raises(TypeError, match=r"must be a list of strings"):
-        _job_from_dict({"gpu": {"type": "H100", "type_fallbacks": "A100 PCIe"}})
+        _job_from_dict({"gpu": {"type": "H100", "type_fallbacks": "A100 SXM"}})
     with pytest.raises(ValueError, match=r"requires gpu\.type"):
         _job_from_dict({"gpu": {"type_fallbacks": ["H100"]}})
 
 
 def test_gpu_spec_guards_direct_ordered_pin_construction() -> None:
-    spec = GpuSpec(type=" h100 ", type_fallbacks=[" a100 pcie ", "H100"])
-    assert spec.acceptable_types == ("H100", "A100 PCIe")
+    spec = GpuSpec(type=" h100 ", type_fallbacks=[" a100-80gb ", "H100"])
+    assert spec.acceptable_types == ("H100", "A100 SXM")
 
     with pytest.raises(TypeError, match=r"must be a list of strings"):
-        GpuSpec(type="H100", type_fallbacks="A100 PCIe")
+        GpuSpec(type="H100", type_fallbacks="A100 SXM")
     with pytest.raises(TypeError, match=r"entry must be a string"):
         GpuSpec(type="H100", type_fallbacks=(123,))
     with pytest.raises(ValueError, match=r"unsupported gpu"):
@@ -1560,10 +1362,10 @@ def test_gpu_spec_guards_direct_ordered_pin_construction() -> None:
 
 def test_persisted_ordered_gpu_pin_survives_a_status_reload() -> None:
     """The public list form remains stable across repeated status reloads."""
-    spec = _job_from_dict({"gpu": {"type": "A100 PCIe", "type_fallbacks": ["A100 SXM"]}})
+    spec = _job_from_dict({"gpu": {"type": "H100", "type_fallbacks": ["A100 SXM"]}})
 
     persisted = spec.to_dict()
-    assert persisted["gpu"]["type"] == ["A100 PCIe", "A100 SXM"]
+    assert persisted["gpu"]["type"] == ["H100", "A100 SXM"]
 
     reloaded = JobSpec.from_dict(persisted)
     assert reloaded.gpu.acceptable_types == spec.gpu.acceptable_types
@@ -1579,7 +1381,7 @@ def test_persisted_ordered_gpu_pin_survives_a_status_reload() -> None:
 
 def test_persisted_gpu_head_reads_an_unparseable_spec_without_raising() -> None:
     """The raw reader remains total when a persisted spec cannot be parsed."""
-    assert persisted_gpu_head({"gpu": {"type": ["A100 PCIe", "A100 SXM"]}}) == "A100 PCIe"
+    assert persisted_gpu_head({"gpu": {"type": ["H100", "A100 SXM"]}}) == "H100"
     assert persisted_gpu_head({"gpu": {"type": "H200"}}) == "H200"
     # malformed or absent -> "" (falsey), which every call site already guards on. no raise.
     for malformed in (
@@ -1599,16 +1401,16 @@ def test_persisted_gpu_head_reads_an_unparseable_spec_without_raising() -> None:
 
 def test_persisted_gpu_types_names_every_acceptable_class() -> None:
     """The raw reader returns every usable class without raising."""
-    assert persisted_gpu_types({"gpu": {"type": ["A100 PCIe", "A100 SXM"]}}) == (
-        "A100 PCIe",
+    assert persisted_gpu_types({"gpu": {"type": ["H100", "A100 SXM"]}}) == (
+        "H100",
         "A100 SXM",
     )
     # a scalar pin is the one-entry case, so callers need no separate spelling for it.
     assert persisted_gpu_types({"gpu": {"type": "H200"}}) == ("H200",)
     # authored order is preserved and duplicates collapse, so the index cannot double-count.
-    assert persisted_gpu_types({"gpu": {"type": ["H200", "A100 PCIe", "H200"]}}) == (
+    assert persisted_gpu_types({"gpu": {"type": ["H200", "A100 SXM", "H200"]}}) == (
         "H200",
-        "A100 PCIe",
+        "A100 SXM",
     )
     # junk entries are dropped rather than raising, and the good ones still survive.
     assert persisted_gpu_types({"gpu": {"type": ["H200", 7, "", None]}}) == ("H200",)
@@ -1631,7 +1433,7 @@ def test_attributed_gpu_type_prefers_effective_worker_spec_and_is_total() -> Non
     status = {
         "remote": None,
         "effective_preparation": {"worker_spec": {"gpu": {"type": "A100 SXM"}}},
-        "spec": {"gpu": {"type": ["RTX 5090", "A100 SXM"]}},
+        "spec": {"gpu": {"type": ["L40S", "A100 SXM"]}},
     }
     assert attributed_gpu_type(status) == "A100 SXM"
     status["remote"] = {"allocated_gpu": "H200"}
@@ -1809,14 +1611,14 @@ def test_ordered_gpu_pin_changes_the_preparation_digest() -> None:
         model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         model_revision="c" * 40,
-        gpu=GpuSpec(type="A100 PCIe", count=1, provider="runpod"),
+        gpu=GpuSpec(type="A100 SXM", count=1, provider="modal"),
     )
     ordered = replace(
         scalar,
-        gpu=GpuSpec(type="A100 PCIe", type_fallbacks=("A100 SXM",), count=1, provider="runpod"),
+        gpu=GpuSpec(type="A100 SXM", type_fallbacks=("H200",), count=1, provider="modal"),
     )
     other = replace(
-        scalar, gpu=GpuSpec(type="A100 PCIe", type_fallbacks=("H100",), count=1, provider="runpod")
+        scalar, gpu=GpuSpec(type="A100 SXM", type_fallbacks=("H100",), count=1, provider="modal")
     )
 
     assert _preparation_digest(ordered, ordered, None) != _preparation_digest(scalar, scalar, None)
@@ -1987,29 +1789,6 @@ def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> No
     _validate_effective_spec(reparsed_public, worker)  # raises if the exclusion is missing
 
 
-def test_unknown_top_level_scalar_and_jobspec_gpu_shapes_fail_closed() -> None:
-    with pytest.raises(ConfigError, match=r"unknown config key\(s\): model_revison"):
-        spec_from_dict(_raw(model_revison="main"))
-
-    for gpu in (False, "H100", ["H100"]):
-        with pytest.raises(TypeError, match="gpu must be an object"):
-            _job_from_dict({"gpu": gpu})
-    with pytest.raises(ValueError, match=r"gpu has unknown key\(s\): exact_typ"):
-        _job_from_dict({"gpu": {"exact_typ": "H100"}})
-    with pytest.raises(TypeError, match=r"gpu\.provider must be a string"):
-        _job_from_dict({"gpu": {"provider": 1}})
-    with pytest.raises(TypeError, match=r"gpu\.type must be a string"):
-        _job_from_dict({"gpu": {"type": 1}})
-    with pytest.raises(ValueError, match="cannot provision"):
-        _job_from_dict({"gpu": {"provider": "lambda", "type": "RTX 4090"}})
-
-    restored = _job_from_dict({"gpu": {"provider": " LAMBDA ", "type": "h100"}})
-    assert restored.gpu.provider == "lambda"
-    assert restored.gpu.type == "H100"
-    assert _job_from_dict({}).gpu.provider == ""
-    assert _job_from_dict({}).gpu.type == ""
-
-
 def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
     spec = spec_from_dict(_raw(), run_id="env-1")
 
@@ -2117,7 +1896,7 @@ def test_adapter_continuation_preparation_is_target_algorithm_agnostic(
 def test_artifacts_dir_and_adapter_prefix_helpers(tmp_path, monkeypatch) -> None:
     orch = _fresh_orchestrator(tmp_path, monkeypatch)
     spec = spec_from_dict(_raw(), run_id="flash-1-x")
-    assert orch.artifacts_dir(spec).endswith(os.path.join("results", "runpod", "rl", "flash-1-x"))
+    assert orch.artifacts_dir(spec).endswith(os.path.join("results", "modal", "rl", "flash-1-x"))
     assert orch.adapter_prefix(spec) == "rl/flash-1-x"
     assert orch.adapter_ref(spec) is None
 

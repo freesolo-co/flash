@@ -103,7 +103,7 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
     from flash.runner import (
         RUNS_DIR,
         TERMINAL_STATES,
-        _gc_run_endpoints,
+        _gc_run_sandboxes,
         _run_job_inner,
         _update,
         get_status,
@@ -149,7 +149,7 @@ def _run_job(spec: JobSpec, runtime_secrets: dict[str, str] | None = None) -> No
         # skip when the run is still non-terminal: another live supervisor then owns the durable handle,
         # and reaping here would tear down its still-active provider resources.
         if get_status(spec.run_id).state in TERMINAL_STATES:
-            _gc_run_endpoints(spec)
+            _gc_run_sandboxes(spec)
 
 
 def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:
@@ -369,21 +369,21 @@ def _run_training(
 # run-management tests both address these as attributes of THIS module, which is why they stay on
 # it after the move.
 from flash.runner.supervise.recovery import (  # noqa: E402,F401
+    _MODAL_STATUS_PROBE_TIMEOUT_S,
     _RECOVERY_MARKER_GRACE_S,
     _RECOVERY_METRICS_POLL_S,
-    _RUNPOD_STATUS_PROBE_TIMEOUT_S,
     _adopt_completed_attempt,
     _apply_charge_with_state,
-    _await_runpod_completed_metrics,
+    _await_completed_worker_metrics,
     _candidate_usable_vram_gb,
     _canonical_provider_handle,
     _charge_completed_run_by_id,
     _completed_attempt_metrics,
+    _completed_worker_metrics,
     _CompletedAttemptPending,
     _oom_escalated,
     _projected_retry_class,
     _register_checkpoints_best_effort,
-    _runpod_completed_metrics,
     _select_candidate,
     _shape_key,
     _strict_teardown_handle,

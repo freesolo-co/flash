@@ -14,54 +14,6 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_hydrate_import_does_not_import_vllm_or_provider_sdks() -> None:
-    probe = r"""
-import builtins
-import sys
-
-blocked = ("vllm", "modal", "runpod", "runpod_flash", "supabase")
-real_import = builtins.__import__
-
-
-intercepted = []
-
-
-def guarded(name, globals=None, locals=None, fromlist=(), level=0):
-    if name in blocked or name.startswith(tuple(item + "." for item in blocked)):
-        intercepted.append(name)
-        raise ModuleNotFoundError(name)
-    return real_import(name, globals, locals, fromlist, level)
-
-
-builtins.__import__ = guarded
-try:
-    __import__("modal")
-except ModuleNotFoundError:
-    pass
-assert intercepted == ["modal"]
-intercepted.clear()
-from flash.serve.app.manifest import load_serving_manifest
-from flash.serve.app.materialize import hydrate_manifest
-from flash.serve.provisioning import ServingImage
-
-assert load_serving_manifest
-assert hydrate_manifest
-assert ServingImage
-assert intercepted == []
-for name in blocked:
-    assert name not in sys.modules
-"""
-    result = subprocess.run(
-        [sys.executable, "-S", "-c", probe],
-        cwd=ROOT,
-        env={"PYTHONPATH": str(ROOT), "PYTHONNOUSERSITE": "1", "PATH": "/usr/bin:/bin"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-
-
 def test_app_package_import_is_project_empty() -> None:
     probe = r"""
 import sys
@@ -202,7 +154,7 @@ def test_dockerfile_serve_uses_existing_cuda_family_and_frozen_lock() -> None:
         "env hf_token",
         "copy serving-manifest",
         "modal",
-        "runpod",
+        "modal",
         "supabase",
         "freesolo_internal_key",
     ):

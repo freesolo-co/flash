@@ -1,4 +1,4 @@
-"""Pod-side entry for the kernel-cache bake (runs INSIDE the cu128 worker image on a GPU pod).
+"""Sandbox-side entry for the kernel-cache bake (runs INSIDE the cu128 worker image on a GPU sandbox).
 
 The published worker image ships DEPS only — the flash code (incl. kernel_warmup.py) is fetched from
 HF at runtime, exactly like a real worker. So this entry:
@@ -7,7 +7,7 @@ HF at runtime, exactly like a real worker. So this entry:
   3. uploads the produced /out (mega_cache.bin + .json + triton/inductor trees) back under out/,
   4. writes an out/STATUS marker LAST so the helper knows the run finished (and its rc).
 
-It is invoked by the CI helper via the pod's docker_args (base64-decoded to /tmp, then run). Env:
+It is invoked by the CI helper via the sandbox command. Env:
   BAKE_HF_REPO  the temp HF dataset (private) holding code/** and receiving out/
   BAKE_ARCH     TORCH_CUDA_ARCH_LIST target, e.g. "9.0"
   HF_TOKEN      write token for BAKE_HF_REPO

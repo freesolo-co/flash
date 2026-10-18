@@ -1,4 +1,4 @@
-"""Platform runner: drives managed RunPod GPUs, one allocation per run."""
+"""Platform runner: drives managed Modal GPUs, one allocation per run."""
 
 from __future__ import annotations
 
@@ -77,8 +77,8 @@ MIN_PROVIDER_WALL_SECONDS = 60
 
 
 def artifacts_dir(spec: JobSpec) -> str:
-    """Run-scoped artifact root: results/runpod/<phase>/<run_id>."""
-    return os.path.join(RESULTS_DIR, "runpod", spec.phase, spec.run_id)
+    """Run-scoped artifact root: results/modal/<phase>/<run_id>."""
+    return os.path.join(RESULTS_DIR, "modal", spec.phase, spec.run_id)
 
 
 def adapter_prefix(spec: JobSpec) -> str:
@@ -161,12 +161,8 @@ class RunStatus:
     adapter_ref: str | None = None
     deployment: dict | None = None
     remote: dict | None = None
-    # Instance providers (lambda/vast) configured WHEN THIS RUN WAS SUBMITTED — the set that could have
-    # owned a pre-handle non-idempotent create. Recovery's phantom guard (_confirm_run_clear) fails
-    # closed for any of these that is no longer configurable (so it can't ENUMERATE to prove clear),
-    # scoped here so a plane that never configured Vast never blocks a handle-less recovery on it. None
-    # for runs created outside submit() / pre-feature records.
     submitted_instance_providers: list[str] | None = None
+    submitted_modal_scope: str | None = None
     # Realized provider cost (COGS), pulled from the provider's billing API after the run
     # finishes by the reconciliation job (flash/server/domain/reconcile.py) and reported to the
     # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the flash.cost ESTIMATE
@@ -877,7 +873,7 @@ from flash.runner.supervise.lifecycle import (  # noqa: E402,F401
     _spec_with_gpu,
     _submit_seed_supervised,
 )
-from flash.runner.supervise.recovery import _gc_run_endpoints  # noqa: E402,F401
+from flash.runner.supervise.recovery import _gc_run_sandboxes  # noqa: E402,F401
 from flash.runner.supervise.transitions import (  # noqa: E402,F401
     mark_checkpoint_deployed,
     mark_deployed,

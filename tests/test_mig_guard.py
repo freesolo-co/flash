@@ -55,8 +55,8 @@ def test_mismatch_reason_flags_smaller_vram():
 
 
 def test_mismatch_reason_flags_old_driver_for_blackwell():
-    # RTX 5090 (sm120) needs CUDA 13.0 to JIT the wheels' PTX; a 12.8 driver is below floor.
-    r = _gpu_mismatch_reason("RTX 5090", (12, 0), 32.0, 12.8)
+    # L40S (sm120) needs CUDA 13.0 to JIT the wheels' PTX; a 12.8 driver is below floor.
+    r = _gpu_mismatch_reason("RTX Pro 6000", (12, 0), 96.0, 12.8)
     assert r is not None
     assert "driver CUDA" in r
     assert "13" in r
@@ -84,8 +84,8 @@ def test_mismatch_reason_best_effort_on_unknowns():
 
 
 def test_mismatch_reason_joins_multiple():
-    # Both VRAM and driver wrong for an RTX 5090 -> both reasons reported.
-    r = _gpu_mismatch_reason("RTX 5090", (12, 0), 16.0, 12.0)
+    # Both VRAM and driver wrong for an L40S -> both reasons reported.
+    r = _gpu_mismatch_reason("RTX Pro 6000", (12, 0), 16.0, 12.0)
     assert r is not None
     assert "VRAM" in r
     assert "driver CUDA" in r

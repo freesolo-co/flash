@@ -1153,15 +1153,15 @@ def test_higher_warm_start_rank_can_select_cheaper_hardware(monkeypatch):
     from flash.providers import base
 
     b200 = replace(base.GPU_INFO["B200"], hourly_usd=5.50)
-    h200 = replace(base.GPU_INFO["H200"], hourly_usd=4.00)
+    h200 = replace(base.GPU_INFO["H200"], hourly_usd=3.00)
     monkeypatch.setattr(base, "GPU_INFO", {"B200": b200, "H200": h200})
 
     config = _warm_start_rank_boundary_config()
     rank_1 = estimate_cost(replace(config, lora_rank=1))
     rank_8 = estimate_cost(replace(config, lora_rank=8))
 
-    assert (rank_1.gpu, rank_1.gpu_count, rank_1.gpu_hourly_usd) == ("B200", 1, 5.50)
-    assert (rank_8.gpu, rank_8.gpu_count, rank_8.gpu_hourly_usd) == ("H200", 2, 4.00)
+    assert (rank_1.gpu, rank_1.gpu_count, rank_1.gpu_hourly_usd) == ("B200", 1, 5.50 + 1.336032)
+    assert (rank_8.gpu, rank_8.gpu_count, rank_8.gpu_hourly_usd) == ("H200", 2, 3.00 + 1.336032)
     assert rank_8.total_usd < rank_1.total_usd
 
 

@@ -71,11 +71,11 @@ def _headroom(params_b: float, algo: str, quant: str, gpu: str) -> str:
 @pytest.mark.parametrize(
     ("params_b", "algo", "quant", "gpu", "expected"),
     [
-        (4.0, "grpo", "bf16", "RTX 5090", "fits"),  # Qwen3-4B colocate on 32 GB (measured)
-        (4.0, "sft", "bf16", "RTX 4090", "fits"),
-        (9.65, "sft", "bf16", "RTX 5090", "tight"),  # Qwen3.5-9B SFT real logits peak
-        (36.0, "sft", "bf16", "RTX 5090", "too_big"),  # 72 GB of weights
-        (36.0, "grpo", "bf16", "RTX 5090", "too_big"),  # 2 bf16 copies + KV >> 32 GB
+        (4.0, "grpo", "bf16", "L40S", "fits"),  # Qwen3-4B colocate on 32 GB (measured)
+        (4.0, "sft", "bf16", "L4", "fits"),
+        (9.65, "sft", "bf16", "L40S", "fits"),  # Qwen3.5-9B SFT real logits peak
+        (36.0, "sft", "bf16", "L40S", "too_big"),  # 72 GB of weights
+        (36.0, "grpo", "bf16", "L40S", "too_big"),  # 2 bf16 copies + KV >> 32 GB
     ],
 )
 def test_estimator_anchors(params_b, algo, quant, gpu, expected):
