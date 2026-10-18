@@ -124,26 +124,21 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     assert modal_app_module.app.function.call_args.kwargs["min_containers"] == 1
 
 
-def test_no_gpu_engine_is_capped_and_each_keeps_one_buffer(modal_app_module):
-    # `base_model` is a modal.parameter(), so Modal gives each distinct value its own container pool
-    # with its own autoscaling accounting. A fixed cap therefore ceilings a SINGLE model's capacity
-    # rather than bounding total spend -- sustained load on one model cannot borrow headroom from an
-    # idle one, so the cap converts demand into queueing on the hot tier. Spend is bounded by workspace
-    # quotas and billing alerts instead. Asserted on the kwargs modal is actually CALLED with, because
-    # a module constant that never reaches `app.cls` governs nothing.
-    assert modal_app_module.MAX_CONTAINERS is None
+def test_gpu_engines_are_capped_at_four_and_each_keeps_one_buffer(modal_app_module):
+    # Verify the limit reaches Modal's decorators. Each base_model parameter has its own pool.
+    assert modal_app_module.MAX_CONTAINERS == 4
     assert modal_app_module.BUFFER_CONTAINERS == 1
 
     cls_calls = [call.kwargs for call in modal_app_module.app.cls.call_args_list]
     assert len(cls_calls) == len(modal_app_module.ENGINE_BY_KEY)
-    assert all(kwargs["max_containers"] is None for kwargs in cls_calls)
+    assert all(kwargs["max_containers"] == 4 for kwargs in cls_calls)
     # One spare warm container per engine absorbs a burst past TARGET_INPUTS without a cold boot.
     # `buffer_containers` only provisions while the Function is ACTIVE, so this preserves scale-to-zero
     # (MIN_CONTAINERS stays 0) rather than paying for an idle gpu.
     assert all(kwargs["buffer_containers"] == 1 for kwargs in cls_calls)
     assert all(kwargs["min_containers"] == 0 for kwargs in cls_calls)
 
-    # The cpu router is likewise uncapped: it is the front door that triggers cold engines, and
+    # The cpu router is uncapped: it is the front door that triggers cold engines, and
     # capping it would throttle every model at once rather than bounding gpu spend per model. It
     # carries the same buffer, so a burst does not queue behind the front door it just cleared.
     router_kwargs = modal_app_module.app.function.call_args.kwargs
@@ -159,15 +154,14 @@ def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app
     window_for = modal_app_module.scaledown_window_for
 
     assert window_for("L4") < window_for("L40S") < window_for("H100") < window_for("H200")
-    # The H200 keeps the full legacy hold (boot is ~17 min; a miss stalls the user that long).
+    # The H200 keeps the full 30-minute hold (boot is ~17 min; a miss stalls the user that long).
     assert window_for("H200") == 1800
     # Every catalog tier resolves to a positive window, so no model falls back by accident.
     assert all(window_for(gpu_for(bm)) > 0 for bm in base_models())
     # B200 now carries all three shipped tiers and its window is MEASURED, not inherited: the
     # slowest cold boot on the card was the 27B at 1821s, so it holds longer than the H200 it
-    # replaced. B300 ships nothing and keeps the unmeasured placeholder.
+    # replaced.
     assert window_for("B200") == 2100
-    assert window_for("B300") == 1800
     # Every tier that actually serves holds at least as long as its slowest measured cold boot.
     assert all(window_for(gpu_for(bm)) >= 2100 for bm in base_models())
 
@@ -175,12 +169,12 @@ def test_scaledown_window_is_per_tier_and_cheaper_tiers_release_sooner(modal_app
 def test_unknown_gpu_tier_is_rejected_not_silently_defaulted(modal_app_module):
     # `gpu` in the serving catalog is a plain string. A typo or an unvalidated new card used to fall
     # through `dict.get` to the default window and DEPLOY, billing that card's real hourly rate on a
-    # tier nobody qualified. Every one of these once returned 1800 silently.
+    # tier nobody qualified. Reject unsupported cards as well as misspelled tiers.
     from flash.serving.src.engine.model_config import base_models, gpu_for
 
     window_for = modal_app_module.scaledown_window_for
 
-    for bogus in ("b200", "B2OO", "H2OO", "A100", "TOTALLY_FAKE", ""):
+    for bogus in ("B300", "b200", "B2OO", "H2OO", "A100", "TOTALLY_FAKE", ""):
         with pytest.raises(ValueError, match="Unsupported serving GPU tier"):
             window_for(bogus)
 

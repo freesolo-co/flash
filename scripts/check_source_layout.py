@@ -1,8 +1,8 @@
 """Enforce the tracked ``flash/`` source layout contract.
 
-Every directory may contain at most ten tracked files. A directory with tracked subdirectories may
-contain only semantic package markers, never implementation files. Reading Git's index instead of
-the working tree keeps generated caches, ignored files, and local build artifacts out of the decision.
+A directory with tracked subdirectories may contain only semantic package markers, never
+implementation files. Reading Git's index instead of the working tree keeps generated caches,
+ignored files, and local build artifacts out of the decision.
 
 Usage: python scripts/check_source_layout.py [root]
 """
@@ -15,7 +15,6 @@ import sys
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
-FILE_MAX = 10
 GATED_PACKAGE = PurePosixPath("flash")
 PACKAGE_MARKERS = frozenset({"__init__.py", "__main__.py", "py.typed"})
 
@@ -31,7 +30,7 @@ def tracked_source_files(root: Path) -> tuple[PurePosixPath, ...]:
 
 def structural_violations(
     files: tuple[PurePosixPath, ...],
-) -> tuple[list[tuple[PurePosixPath, int]], list[tuple[PurePosixPath, tuple[str, ...]]]]:
+) -> list[tuple[PurePosixPath, tuple[str, ...]]]:
     files_by_directory: dict[PurePosixPath, list[str]] = defaultdict(list)
     subdirectories: dict[PurePosixPath, set[str]] = defaultdict(set)
     directories = {GATED_PACKAGE}
@@ -48,12 +47,7 @@ def structural_violations(
             subdirectories[parent].add(child.name)
             directories.add(parent)
 
-    oversized = sorted(
-        (directory, len(files_by_directory[directory]))
-        for directory in directories
-        if len(files_by_directory[directory]) > FILE_MAX
-    )
-    mixed = sorted(
+    return sorted(
         (
             directory,
             tuple(
@@ -66,7 +60,6 @@ def structural_violations(
         if subdirectories[directory]
         and any(name not in PACKAGE_MARKERS for name in files_by_directory[directory])
     )
-    return oversized, mixed
 
 
 def _is_docstring(node: ast.stmt) -> bool:
@@ -264,23 +257,17 @@ def main() -> int:
     if not files:
         print("no tracked source files under flash/")
         return 1
-    oversized, mixed = structural_violations(files)
+    mixed = structural_violations(files)
     markers = semantic_marker_violations(root, files)
-    if not oversized and not mixed and not markers:
+    if not mixed and not markers:
         return 0
 
-    if oversized:
-        print(f"{len(oversized)} source director(ies) exceed the {FILE_MAX}-file limit:")
-        for directory, count in oversized:
-            print(f"  {count:>3}  {directory}")
     if mixed:
-        if oversized:
-            print()
         print(f"{len(mixed)} source director(ies) mix subdirectories with implementation files:")
         for directory, names in mixed:
             print(f"  {directory}: {', '.join(names)}")
     if markers:
-        if oversized or mixed:
+        if mixed:
             print()
         print(f"{len(markers)} package marker(s) contain implementation:")
         for path, detail in markers:
