@@ -197,6 +197,8 @@ def _lifecycle_projection(status: Any, public_status: dict[str, Any]) -> dict[st
 
 
 def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bool:
+    from flash.runner.lifecycle.reporting import _require_status_report_sequence
+
     context = {**_context_from_status(status), **(key or {})}
     org_id = org_id_of(context)
     if not org_id:
@@ -205,6 +207,7 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
     spec = _spec_from_status(status)
     try:
         project_id = require_project_id(spec.get("project"))
+        sequence = _require_status_report_sequence(status.report_sequence)
     except (TypeError, ValueError):
         return False
     public_status = status.to_dict()
@@ -212,9 +215,7 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "orgId": org_id,
         "runId": status.run_id,
         "status": status.state,
-        # Legacy records may not yet have a durable sequence. The backend permits
-        # these only until this run receives its first numbered report.
-        "reportSequence": getattr(status, "report_sequence", 0) or None,
+        "reportSequence": sequence,
         "userId": context.get("user_id"),
         "apiKeyId": context.get("api_key_id"),
         "projectId": project_id,

@@ -394,7 +394,11 @@ def test_status_report_sends_durable_sequence_for_backend_ordering(monkeypatch, 
     assert _report(monkeypatch, status)["reportSequence"] == 1
 
 
-def test_legacy_status_report_does_not_invent_a_persistent_sequence(monkeypatch):
+@pytest.mark.parametrize("sequence", [0, None, True, -1, "7", 1.5, {"corrupt": True}])
+def test_status_report_rejects_invalid_sequence_before_http_post(monkeypatch, sequence):
     status = _status(_spec())
-    assert status.report_sequence == 0
-    assert _report(monkeypatch, status)["reportSequence"] is None
+    status.report_sequence = sequence
+    monkeypatch.setattr(
+        runs, "_post", lambda *_args: pytest.fail("invalid sequence must not reach the backend")
+    )
+    assert runs.record_training_run(status=status) is False

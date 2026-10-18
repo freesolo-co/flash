@@ -211,7 +211,7 @@ class RunStatus:
 
 
 def _public_status_spec(raw):
-    """Canonicalize valid specs and safely redact malformed legacy shapes."""
+    """Canonicalize valid specs and safely redact malformed stored shapes."""
     if not isinstance(raw, dict):
         return raw
     try:

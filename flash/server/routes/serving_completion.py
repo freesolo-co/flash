@@ -81,8 +81,7 @@ def recover_deployments() -> int:
 
 
 def replay_status_reports(stop: Event | None = None) -> int:
-    from flash.runner.lifecycle import state
-    from flash.runner.lifecycle.reporting import _report_status, _valid_status_report_sequence
+    from flash.runner.lifecycle.reporting import _report_status
 
     replayed = 0
     for row in db.all_runs():
@@ -90,13 +89,6 @@ def replay_status_reports(stop: Event | None = None) -> int:
             break
         try:
             status = _app.get_status(row["run_id"])
-            if not _valid_status_report_sequence(status.report_sequence):
-                # Give legacy records a durable number before replay. Re-read under
-                # the run lock so a concurrent live update is not overwritten.
-                with state._status_guard(status.run_id):
-                    status = _app.get_status(status.run_id)
-                    if not _valid_status_report_sequence(status.report_sequence):
-                        state._save_status_unlocked(status)
             _report_status(status)
         except (OSError, TypeError, ValueError):
             continue

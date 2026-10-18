@@ -1135,6 +1135,7 @@ def test_record_training_run_posts_to_backend(monkeypatch):
     ok = runs.record_training_run(
         status=RunStatus(
             run_id="flash-1",
+            report_sequence=1,
             state="running",
             spec={
                 "model": "Qwen/Qwen3.5-9B",
@@ -1229,6 +1230,7 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
     runs.record_training_run(
         status=RunStatus(
             run_id="flash-1",
+            report_sequence=1,
             state="cancelled",
             spec=spec,
             effective_preparation={"worker_spec": {"gpu": {"type": "A100 SXM"}}},
@@ -1241,6 +1243,7 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
     runs.record_training_run(
         status=RunStatus(
             run_id="flash-1",
+            report_sequence=1,
             state="queued",
             spec=spec,
             platform_context=context,
