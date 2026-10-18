@@ -61,7 +61,20 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
     assert "vllm==0.19.1" in extras["gpu"]
     assert project["tool"]["uv"]["conflicts"] == [[{"extra": "gpu"}, {"extra": "serve-runtime"}]]
     lock = (ROOT / "uv.lock").read_text()
-    assert 'name = "modal"\nversion = "1.5.4"' in lock
+    server_modal = [
+        requirement for requirement in extras["server"] if requirement.startswith("modal==")
+    ]
+    serving_modal = [
+        requirement for requirement in extras["serving"] if requirement.startswith("modal==")
+    ]
+    assert len(server_modal) == 1
+    assert serving_modal == server_modal
+    locked_versions = {
+        package["version"]
+        for package in tomllib.loads(lock)["package"]
+        if package["name"] == "modal"
+    }
+    assert locked_versions == {server_modal[0].removeprefix("modal==")}
     # the lockfile must actually RESOLVE the extra, not merely mention it: Dockerfile.serve runs
     # `uv sync --frozen --extra serve-runtime`, and --frozen refuses to re-resolve. adding the extra
     # to pyproject without re-locking leaves provides-extras stale, and the image build dies at that
