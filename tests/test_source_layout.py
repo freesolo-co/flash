@@ -14,19 +14,10 @@ def _paths(*values: str) -> tuple[PurePosixPath, ...]:
     return tuple(PurePosixPath(value) for value in values)
 
 
-def test_ten_files_in_one_directory_are_allowed() -> None:
-    files = tuple(PurePosixPath(f"flash/group/module_{index}.py") for index in range(10))
+def test_more_than_ten_files_in_one_directory_are_allowed() -> None:
+    files = tuple(PurePosixPath(f"flash/group/module_{index}.py") for index in range(20))
 
-    assert structural_violations(files) == ([], [])
-
-
-def test_eleven_files_in_one_directory_are_rejected() -> None:
-    files = tuple(PurePosixPath(f"flash/group/module_{index}.py") for index in range(11))
-
-    oversized, mixed = structural_violations(files)
-
-    assert oversized == [(PurePosixPath("flash/group"), 11)]
-    assert mixed == []
+    assert structural_violations(files) == []
 
 
 def test_package_markers_can_share_a_directory_with_subdirectories() -> None:
@@ -35,7 +26,7 @@ def test_package_markers_can_share_a_directory_with_subdirectories() -> None:
         "flash/package/child/module.py",
     )
 
-    assert structural_violations(files) == ([], [])
+    assert structural_violations(files) == []
 
 
 def test_implementation_file_cannot_share_a_directory_with_subdirectories() -> None:
@@ -45,10 +36,7 @@ def test_implementation_file_cannot_share_a_directory_with_subdirectories() -> N
         "flash/package/child/module.py",
     )
 
-    oversized, mixed = structural_violations(files)
-
-    assert oversized == []
-    assert mixed == [(PurePosixPath("flash/package"), ("runtime.py",))]
+    assert structural_violations(files) == [(PurePosixPath("flash/package"), ("runtime.py",))]
 
 
 def test_paths_outside_flash_do_not_affect_the_contract() -> None:
@@ -57,7 +45,7 @@ def test_paths_outside_flash_do_not_affect_the_contract() -> None:
         "flash/package/module.py",
     )
 
-    assert structural_violations(files) == ([], [])
+    assert structural_violations(files) == []
 
 
 def test_checker_reads_only_git_tracked_files(tmp_path) -> None:

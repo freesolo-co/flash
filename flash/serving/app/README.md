@@ -14,7 +14,7 @@ starts the matching GPU container when none is running. Inference similarly star
 through its remote generation method. Uncataloged base models are rejected instead of falling
 onto the default L4 tier.
 
-GPU engines use `MIN_CONTAINERS = 0` and scale down after up to 30 idle minutes. A normal deploy does
+GPU engines use `MIN_CONTAINERS = 0` and scale down after up to 35 idle minutes. A normal deploy does
 not boot any GPU model; registration or inference starts the matching engine on demand. The product
 chat route allows 30 minutes and gives
 first-party serving a 1,700-second request budget, leaving frontend headroom. Adapter undeploy
@@ -46,13 +46,15 @@ Modal environment `dev` and that production mode does not. The mode does not cha
 engine behavior.
 
 Both environments keep `MIN_CONTAINERS = 0`, so every GPU engine scales to zero and starts on demand.
-The CPU router remains warm. The hardcoded settings remain `MAX_CONTAINERS = None`,
-`BUFFER_CONTAINERS = 1` (on the router AND every engine), `SCALEDOWN_WINDOW_SECONDS = 1800`, and
-`MAX_INPUTS = 64` with `TARGET_INPUTS = 48`. `MAX_CONTAINERS` is deliberately uncapped: `base_model` is a
-`modal.parameter()`, so each model has its own container pool and a fixed cap would ceiling one
-model's capacity rather than bounding total spend. Bound spend with workspace quotas and billing
-alerts instead. `BUFFER_CONTAINERS` only provisions while a Function is active, so engines still
-scale to zero when idle.
+GPU autoscaling is capped at `MAX_CONTAINERS = 4` per model, including its active buffer.
+`base_model` is a `modal.parameter()`, so each model has its own container pool. With three models,
+the configured limits total 12 GPU containers per environment. Requests queue when a model's four
+containers are busy; an idle model's capacity cannot be borrowed by another model.
+
+The CPU router remains warm and uncapped. `BUFFER_CONTAINERS = 1` applies to the router and every
+engine, but only while active, so GPU engines still scale to zero when idle. Idle windows are set by
+`SCALEDOWN_WINDOW_SECONDS_BY_GPU`; the active B200 tiers use 2100 seconds. The router uses
+`MAX_INPUTS = 64` with `TARGET_INPUTS = 48`; engine concurrency follows each model's `max_num_seqs`.
 
 ### Production
 
