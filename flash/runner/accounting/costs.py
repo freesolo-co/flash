@@ -105,9 +105,8 @@ def charge_usd_for_spec(
     """Return the estimated customer charge, prorated by completed steps when requested.
 
     ``provider`` overrides the pricing substrate for a training estimate. the persisted worker spec
-    of an auto-allocated run carries no provider, so its offline reprice would credit nvlink
-    scaling on a substrate (vast) that cannot deliver it; the cancel path passes the provider the
-    run actually rented so the estimate reproduces the accepted quote's work model. ``gpu_type``
+    of an auto-allocated run carries no provider; the cancel path passes the provider the run
+    actually rented so the estimate reproduces the accepted quote's work model. ``gpu_type``
     and ``gpu_count`` together pin the rented card shape the same way: the spec's count is only the
     ceiling the allocator searched under, so without the pin a 4-card rental could be repriced on
     the 1-card offline optimum.
@@ -234,9 +233,8 @@ def cancelled_charge_usd(
         # cancelled before any training step: nothing rented, nothing owed.
         return 0.0
     # the persisted worker spec of an auto-allocated run names no provider and carries the card
-    # count only as the ceiling the allocator searched under, so pricing it bare credits nvlink
-    # scaling a vast rental cannot deliver and can re-optimize a 4-card rental onto the 1-card
-    # offline optimum. either topology error is a factor on the per-step term only, so it does not
+    # count only as the ceiling the allocator searched under, so pricing it bare can re-optimize
+    # a 4-card rental onto the 1-card offline optimum. that changes the per-step term, so it does not
     # cancel out of partial / full whenever the estimate also carries fixed work (moe compile,
     # required saves) or a wall cap: both estimates are computed on the substrate and card shape
     # the run actually rented.
