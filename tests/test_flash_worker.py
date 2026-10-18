@@ -1182,7 +1182,7 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     the optimizations now live in three modules rather than one. dataset preprocessing moved to
     flash.engine.profiling.sft_workload so estimate construction and training share one implementation,
     image-row tokenization lives in flash.engine.profiling.sft_image_rows, sizing and memory choices
-    stayed with the trainer and hydra config, and LoRA+ grouping moved to the external child plugin.
+    stay with the trainer and hydra config; the external child plugin owns the runtime patches.
     each assertion reads the module that actually owns its behaviour: pointing them all at one module
     would let a symbol disappear from another and still pass.
     """
@@ -1218,8 +1218,7 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     # gradient checkpointing, with the MoE/GDN reentrant rule shared with grpo.
     assert "grad_checkpointing_on(" in train_src
     assert "grpo_use_reentrant(" in train_src
-    # LoRA+ survives in the external child plugin that owns verl's optimizer grouping.
-    assert "create_loraplus_optimizer" in plugin_src
+    assert "_install_linear_scheduler" in plugin_src
 
 
 @pytest.fixture

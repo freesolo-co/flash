@@ -983,14 +983,20 @@ def test_attach_run_recovery_skips_training_when_raced_terminal(tmp_path, monkey
     assert runner_status.get_status(spec.run_id).state == "failed"
 
 
-def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkeypatch):
-    """Happy-path guard: the TOCTOU fix must NOT regress a genuine recovery. A not-ok poll on a
-    run that is STILL active (no terminal race) must resume `_run_training` exactly as before."""
+@pytest.mark.parametrize("ratio", [None, 1.0, 16.0])
+def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkeypatch, ratio):
+    """An active ordinary-LoRA run resumes; a retired optimizer fails before paid replacement."""
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
     from flash.core.spec import JobSpec
 
-    spec = JobSpec.from_dict({"gpu": {"type": "RTX 5090"}, "run_id": "flash-recover-active"})
+    spec = JobSpec.from_dict(
+        {
+            "gpu": {"type": "RTX 5090"},
+            "run_id": "flash-recover-active",
+            "train": {} if ratio is None else {"loraplus_ratio": ratio},
+        }
+    )
     st = provisioned_status(spec, state="running", remote=_remote("ep-1", "job-1", 0))
     st.source_snapshot = _SOURCE_SNAPSHOT
     save_provisioned_status(st)
@@ -1009,6 +1015,11 @@ def test_attach_run_recovery_resumes_training_when_still_active(tmp_path, monkey
     )
 
     out = runner_attach.attach_run(spec.run_id)
+    if ratio != 1.0:
+        assert training_calls["n"] == 0
+        assert out.state == "failed"
+        assert "LoRA+ training has been removed" in out.error
+        return
     assert training_calls["n"] == 1, "a still-active run must resume training (no regression)"
     # the replacement attempt is reserved as `provisioning`; the real `_run_training` (stubbed
     # here) is what flips it back to `running`. what matters is that the run stays live.

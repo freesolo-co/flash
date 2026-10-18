@@ -366,9 +366,10 @@ class TrainSpec:
     hf_repo: str = ""
     # None -> worker's tuned recipe default.
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
-    # sft only: none preserves a legacy persisted run's 16x optimizer. new configs freeze the
-    # recipe default at parse time; 1 uses equal adapter learning rates.
-    loraplus_ratio: float | None = field(default=None, metadata={"introduced_in": "1.2.131"})
+    # Retired option: retained only to preserve persisted preparation digests and identify old
+    # optimizer state. New specs use ordinary LoRA; from_dict keeps absent legacy values as None.
+    # No introduced_in metadata: this is no longer a selectable training parameter.
+    loraplus_ratio: float | None = 1.0
     # sft only. the packaged-dataset estimate resolves this against the selected row count into
     # examples_per_update (packed) or pins the optimizer batch to 1 (unpacked). grpo/opd have no
     # profile, so they take prompts_per_step instead and reject this key: the two are not the same
@@ -581,7 +582,7 @@ class JobSpec:
     project: str = ""
 
     def __post_init__(self) -> None:
-        if self.train.loraplus_ratio is not None and self.algorithm != "sft":
+        if self.train.loraplus_ratio not in (None, 1.0) and self.algorithm != "sft":
             raise ValueError("train.loraplus_ratio only applies to sft")
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
@@ -698,8 +699,8 @@ class JobSpec:
         differently, so removing either pop would break existing digests.
         """
         data = asdict(self)
-        # preserve historical preparation digests when the new option was not authored.
-        if data["train"]["loraplus_ratio"] is None:
+        # Preserve historical digests, including the absent pre-LoRA-option SFT shape.
+        if data["train"]["loraplus_ratio"] is None or self.algorithm != "sft":
             data["train"].pop("loraplus_ratio")
         # missing and unset are the same internal state. omitting the empty value preserves that state
         # without serializing it into an explicit empty preference, which every parser rejects.
@@ -870,3 +871,13 @@ def load_job_spec_from_env() -> JobSpec | None:
         with open(path) as f:
             return JobSpec.from_json(f.read())
     return None
+
+
+def require_supported_sft_optimizer(spec: JobSpec) -> None:
+    """Reject execution of retired optimizer state while keeping historical records readable."""
+    if spec.algorithm == "sft" and spec.train.loraplus_ratio != 1.0:
+        raise ValueError(
+            "LoRA+ training has been removed: this SFT run used train.loraplus_ratio > 1 "
+            "or the legacy implicit 16x default. It cannot restart with this Flash version. "
+            "Use its original Flash version to resume, or submit a new ordinary-LoRA run."
+        )

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
-import inspect
 import io
 import json
 import os
@@ -30,7 +29,6 @@ from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
 from flash.engine.worker.train.entry.backend_common import parse_verl_metric, verl_step_number
 from flash.engine.worker.train.entry.sft_train import (
     _CHILD_ENV_PREFIXES,
-    _LORAPLUS_READY_MARKER,
     _MAX_ZERO_GRAD_STEPS,
     _VERL_OPTIMIZER_IMPL,
     _VERL_OPTIMIZER_NAME,
@@ -198,12 +196,7 @@ def test_verl_sft_optimizer_is_dtensor_safe():
 
 
 def test_sft_engine_strategy_stays_fsdp2():
-    """LoRA+ groups parameters by name ("lora_B" in name).
-
-    fsdp1 flattens parameters into a 1-D flat_param, which would route every parameter
-    into the 16x group B and silently corrupt the learning rates, so the DTensor problem
-    above must not be "fixed" by downgrading the strategy.
-    """
+    """Optimizer cleanup must preserve the validated FSDP2 execution strategy."""
     assert _as_map(build_sft_overrides(_cfg()))["engine.strategy"] == "fsdp2"
 
 
@@ -314,7 +307,6 @@ def test_sft_warns_while_the_run_is_live_when_it_leaves_cards_idle(monkeypatch, 
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         captured["command"] = command
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
         heartbeat()
@@ -431,7 +423,6 @@ def test_sft_stays_quiet_when_every_allocated_card_is_used(monkeypatch, capsys):
     spec.gpu.count = 1
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
         heartbeat()
@@ -1750,171 +1741,6 @@ def test_seeded_dataloader_handles_missing_and_present_validation_sampler(
     assert exc_info.value is original_error
 
 
-@pytest.mark.parametrize("ratio", [1.0, 3.5, 16.0])
-def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus(
-    monkeypatch, capsys, ratio
-):
-    class FakeLoader:
-        def __init__(self, *args, **kwargs):
-            self.kwargs = kwargs
-
-    class FakeTrainer:
-        def _build_dataloader(self):
-            self.train_sampler = SimpleNamespace(seed=None)
-            self.val_sampler = None
-            return "loader"
-
-    class FakeCheckpointHandler:
-        def save_checkpoint(self, step):
-            return step
-
-    class FakeEngine:
-        rank = 0
-
-        def _build_optimizer(self, module):
-            return "plain"
-
-        def _build_lr_scheduler(self, optimizer):
-            return "constant"
-
-        def _build_module(self):
-            return SimpleNamespace(gradient_checkpointing_enable=lambda **kwargs: None)
-
-    fake_torch = _module("torch")
-    fake_torch.manual_seed = lambda seed: None
-    fake_torch.set_float32_matmul_precision = lambda value: None
-    fake_torch.backends = SimpleNamespace(
-        cuda=SimpleNamespace(matmul=SimpleNamespace(allow_tf32=False)),
-        cudnn=SimpleNamespace(allow_tf32=False),
-    )
-    fake_numpy = _module("numpy", random=SimpleNamespace(seed=lambda seed: None))
-    scheduler_calls = []
-    fake_transformers = _module(
-        "transformers",
-        get_linear_schedule_with_warmup=lambda optimizer, **kwargs: (
-            scheduler_calls.append((optimizer, kwargs)) or "linear"
-        ),
-    )
-    fake_sft_module = _module(
-        "verl.trainer.sft_trainer",
-        StatefulDataLoader=FakeLoader,
-        SFTTrainer=FakeTrainer,
-    )
-    fake_checkpoint_module = _module(
-        "verl.utils.checkpoint.checkpoint_handler",
-        CheckpointHandler=FakeCheckpointHandler,
-    )
-    fake_fsdp_module = _module(
-        "verl.workers.engine.fsdp.transformer_impl",
-        FSDPEngine=FakeEngine,
-    )
-    optimizer_calls = []
-    fake_peft = _module(
-        "peft.optimizers",
-        create_loraplus_optimizer=lambda **kwargs: optimizer_calls.append(kwargs) or "lora+",
-    )
-    fake_optimizer_module = _module("fake_optimizer", AdamW=type("AdamW", (), {}))
-
-    modules = {
-        "torch": fake_torch,
-        "numpy": fake_numpy,
-        "transformers": fake_transformers,
-        "verl": _module("verl"),
-        "verl.trainer": _module("verl.trainer", sft_trainer=fake_sft_module),
-        "verl.trainer.sft_trainer": fake_sft_module,
-        "verl.utils": _module("verl.utils"),
-        "verl.utils.checkpoint": _module("verl.utils.checkpoint"),
-        "verl.utils.checkpoint.checkpoint_handler": fake_checkpoint_module,
-        "verl.workers": _module("verl.workers"),
-        "verl.workers.engine": _module("verl.workers.engine"),
-        "verl.workers.engine.fsdp": _module("verl.workers.engine.fsdp"),
-        "verl.workers.engine.fsdp.transformer_impl": fake_fsdp_module,
-        "peft": _module("peft"),
-        "peft.optimizers": fake_peft,
-        "fake_optimizer": fake_optimizer_module,
-    }
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
-
-    sft_plugin._install_seeded_dataloader(43)
-    sft_plugin._install_linear_scheduler()
-    original_builder = FakeEngine._build_optimizer
-    sft_plugin._install_loraplus(ratio, "CUSTOM_LORAPLUS_READY")
-
-    engine = FakeEngine()
-    engine.optimizer_config = SimpleNamespace(
-        optimizer_impl="fake_optimizer",
-        optimizer="AdamW",
-        lr=5e-5,
-        weight_decay=0.0,
-        betas=(0.9, 0.999),
-        override_optimizer_config={"eps": 1e-8},
-        lr_warmup_steps=-1,
-        lr_warmup_steps_ratio=0.1,
-        total_training_steps=20,
-    )
-    assert engine._build_optimizer(SimpleNamespace()) == ("lora+" if ratio > 1 else "plain")
-    output = capsys.readouterr().out
-    assert _LORAPLUS_READY_MARKER not in output
-    if ratio > 1:
-        assert f"CUSTOM_LORAPLUS_READY ratio={ratio:g} optimizer=AdamW" in output
-        assert optimizer_calls[0]["optimizer_kwargs"]["eps"] == 1e-8
-        assert optimizer_calls[0]["loraplus_lr_ratio"] == ratio
-    else:
-        assert FakeEngine._build_optimizer is original_builder
-        assert optimizer_calls == []
-        assert "CUSTOM_LORAPLUS_READY" not in output
-    assert engine._build_lr_scheduler("optimizer") == "linear"
-    assert scheduler_calls == [("optimizer", {"num_warmup_steps": 2, "num_training_steps": 20})]
-
-
-def test_sft_plugin_config_carries_the_canonical_loraplus_marker(tmp_path):
-    from flash.engine.worker.train.entry import sft_train_runner
-
-    shim_dir = tmp_path / "shim"
-    shim_dir.mkdir()
-    _, _, raw_config = sft_train_runner._write_sft_child_shims(
-        SimpleNamespace(save_at_steps=(3,), loraplus_ratio=16.0),
-        SimpleNamespace(update_horizon=7, reentrant_gradient_checkpointing=False),
-        shim_dir=str(shim_dir),
-        custom_dataset_path=str(shim_dir / "dataset.py"),
-        seed=42,
-        loggers=[],
-        gdn_reset_arch=None,
-        multimodal=False,
-    )
-
-    assert json.loads(raw_config)["loraplus_ready_marker"] == _LORAPLUS_READY_MARKER
-
-
-@pytest.mark.parametrize("ratio", [1.0, 3.5, 16.0])
-@pytest.mark.parametrize("gate", ["step", "exit"])
-def test_loraplus_marker_is_required_only_for_the_runs_selected_ratio(ratio, gate):
-    from flash.engine.worker.train.entry import sft_train_runner
-
-    progress = sft_train_runner._prepare_sft_progress(
-        SimpleNamespace(loraplus_ratio=ratio),
-        SimpleNamespace(rows=[]),
-        SimpleNamespace(update_horizon=1),
-        SimpleNamespace(resume_step=0, shim_markers="", expected_shims=()),
-    )
-
-    def check():
-        if gate == "step":
-            return sft_train_runner._consume_sft_marker_line(progress, "step:1 - train/loss:1.0")
-        return sft_train_runner._finish_sft_child(
-            SimpleNamespace(stop_gb=lambda: 0.0), 0.0, 0, progress
-        )
-
-    if ratio > 1:
-        with pytest.raises(RuntimeError, match="required lora\\+ shim"):
-            check()
-        sft_train_runner._consume_sft_marker_line(
-            progress, f"{_LORAPLUS_READY_MARKER} ratio={ratio:g} optimizer=AdamW"
-        )
-    check()
-
-
 def _exec_dataloader_shim(monkeypatch):
     """Execute the real rendered dataloader shim against fake torch classes, and return them.
 
@@ -2180,7 +2006,6 @@ def test_zero_grad_norm_fails_the_run(monkeypatch, lines):
     spec, _ = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         for step, line in enumerate(lines, start=1):
             on_line(line + "\n")
             on_step(step)
@@ -2220,7 +2045,6 @@ def test_healthy_grad_norms_do_not_trip_the_guard(monkeypatch, lines):
     spec, _ = _stub_sft_run(monkeypatch)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         for step, line in enumerate(lines, start=1):
             on_line(line + "\n")
             on_step(step)
@@ -2252,15 +2076,6 @@ def test_step_gate_admits_a_line_a_tqdm_bar_was_flushed_in_front_of():
     # and the metrics behind the gate are the ones the guard needs.
     assert parse_verl_metric(glued, "train/grad_norm") == 0.0
     assert parse_verl_metric(glued, "train/lr") == 5e-05
-
-
-def test_loraplus_installer_has_no_plain_lora_fallback():
-    source = inspect.getsource(sft_plugin._install_loraplus)
-    assert "ready_marker" in source
-    assert not hasattr(sft_plugin, "_LORAPLUS_READY_MARKER")
-    assert "falling back" not in source
-    assert "original_build_optimizer" not in source
-    assert "if ratio <= 1" in source
 
 
 def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypatch, tmp_path):
@@ -2703,6 +2518,7 @@ def _stub_sft_run(
         train=SimpleNamespace(
             epochs=1,
             learning_rate=5e-5,
+            loraplus_ratio=1.0,
             batch_size=2,
             max_context_tokens=1024,
             max_examples=2,
@@ -3072,14 +2888,16 @@ def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monk
     assert "bare assistant target coerced" not in output
 
 
-@pytest.mark.parametrize("legacy", [True, False])
-def test_sft_retries_preserve_the_prepared_optimizer_ratio(monkeypatch, legacy):
+@pytest.mark.parametrize("ratio", [None, 1.0, 3.5, 16.0])
+def test_sft_recovery_preserves_records_but_only_restarts_plain_lora(monkeypatch, ratio):
     from flash.core.spec import JobSpec
     from flash.engine.worker.train.entry import sft_train_runner
     from flash.runner.lifecycle.state import RunStatus
-    from flash.runner.lifecycle.status import reallocation_spec_from_status
+    from flash.runner.lifecycle.status import (
+        effective_spec_from_status,
+        reallocation_spec_from_status,
+    )
     from flash.runner.lifecycle.submit import _effective_preparation_snapshot
-    from flash.schema import spec_from_dict
 
     _stub_sft_run(monkeypatch)
     raw = {
@@ -3090,10 +2908,12 @@ def test_sft_retries_preserve_the_prepared_optimizer_ratio(monkeypatch, legacy):
         "train": {"epochs": 1, "learning_rate": 1e-5},
         "gpu": {"type": "H100", "count": 1},
     }
-    spec = JobSpec.from_dict(raw) if legacy else spec_from_dict(raw)
+    if ratio is not None:
+        raw["train"]["loraplus_ratio"] = ratio
+    spec = JobSpec.from_dict(raw)
     spec = replace(spec, run_id="legacy-sft", model_revision="a" * 40, model_revision_auto=True)
     snapshot = _effective_preparation_snapshot(spec, spec, None)
-    if legacy:
+    if ratio is None:
         # frozen before the recovery fix: old snapshots must still pass integrity validation.
         assert snapshot["preparation_digest"] == (
             "d190288e79077c89f6b79353947a393e2a0463c141757d844bd889511f91022b"
@@ -3106,18 +2926,26 @@ def test_sft_retries_preserve_the_prepared_optimizer_ratio(monkeypatch, legacy):
         spec=spec.to_dict(),
         effective_preparation=json.loads(json.dumps(snapshot)),
     )
+    assert effective_spec_from_status(status).train.loraplus_ratio == ratio
+    if ratio != 1.0:
+        with pytest.raises(ValueError, match="LoRA\\+ training has been removed"):
+            reallocation_spec_from_status(status)
+        with pytest.raises(ValueError, match="LoRA\\+ training has been removed"):
+            sft_train_runner._resolve_sft_options(spec)
+        return
     for _attempt in range(2):
         recovered = reallocation_spec_from_status(status)
         worker = JobSpec.from_json(recovered.to_json())
         options = sft_train_runner._resolve_sft_options(worker)
-        assert options.loraplus_ratio == (16.0 if legacy else 1.0)
+        assert worker.train.loraplus_ratio == 1.0
+        assert options.learning_rate == 1e-5
         status.effective_preparation = _effective_preparation_snapshot(
             JobSpec.from_dict(status.spec), worker, None, stored_public=status.spec
         )
         assert status.effective_preparation["preparation_digest"] == original_digest
 
 
-@pytest.mark.parametrize("ratio", [None, 1.0, 3.5, 16.0])
+@pytest.mark.parametrize("ratio", [None, 1.0])
 def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch, ratio):
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.core.spec import JobSpec
@@ -3137,15 +2965,13 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
         }
     )
     spec.train.loraplus_ratio = JobSpec.from_json(authored.to_json()).train.loraplus_ratio
-    effective_ratio = 1.0 if ratio is None else ratio
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         captured["command"] = command
         captured["child_env"] = env
         config = json.loads(env["FLASH_SFT_PLUGIN_CONFIG"])
-        assert config["loraplus_ratio"] == effective_ratio
-        if effective_ratio > 1:
-            on_line(f"{_LORAPLUS_READY_MARKER} ratio={effective_ratio:g} optimizer=AdamW\n")
+        assert "loraplus_ratio" not in config
+        assert "loraplus_ready_marker" not in config
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
         heartbeat()
@@ -3178,8 +3004,7 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     assert captured["meta"]["step"] == 2
     assert captured["meta"]["train_tokens"] > 0
     assert captured["meta"]["notes"]["loss_curve"] == [1.0]
-    assert captured["meta"]["notes"]["loraplus_applied"] is (effective_ratio > 1)
-    assert captured["meta"]["notes"]["loraplus_ratio"] == effective_ratio
+    assert not any(key.startswith("loraplus") for key in captured["meta"]["notes"])
     notes = captured["meta"]["notes"]
     realized_max_length = notes["realized_max_length"]
     assert 0 < realized_max_length < notes["configured_max_length"]
@@ -3268,7 +3093,6 @@ def test_final_sft_export_reuses_text_checkpoint_exclusion_after_two_saves(monke
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         captured["command"] = command
         captured["child_env"] = env
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line("step:1 - train/loss:1.1 - train/global_tokens:4\n")
         on_step(1)
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
@@ -3332,7 +3156,6 @@ def test_sft_runner_carries_the_prepared_processor_to_every_export(monkeypatch, 
         captured["final_preprocessor"] = kwargs["preprocessor"]
 
     def fake_training(_command, *, env, on_step, on_line, heartbeat):
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
         return 0
@@ -3370,7 +3193,6 @@ def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypa
     spec, captured = _stub_sft_run(monkeypatch, watcher_cls=Watcher)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
         return 0
@@ -3386,8 +3208,7 @@ def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypa
     assert captured["published"][0][1] == 2
 
 
-@pytest.mark.parametrize("ratio", [1.0, 3.5, 16.0])
-def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatch, ratio):
+def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatch):
     """the seeded resume step must not suppress the final publish.
 
     the previous attempt's per-step deployable publish is best-effort (``required=False``) while
@@ -3396,7 +3217,6 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     from flash.engine.worker.train.entry import sft_train
 
     spec, captured = _stub_sft_run(monkeypatch)
-    spec.train.loraplus_ratio = ratio
     # max_steps is 2, so resuming at 2 means the watcher never runs and finalization is the only
     # path left that can publish the step.
     monkeypatch.setattr(
@@ -3413,8 +3233,6 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     sft_train.run_sft_train(spec)
 
     assert [step for _adapter, step in captured["published"]] == [2]
-    assert captured["meta"]["notes"]["loraplus_ratio"] == ratio
-    assert captured["meta"]["notes"]["loraplus_applied"] is (ratio > 1)
 
 
 def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
@@ -3435,7 +3253,6 @@ def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
         model_revision="revision",
         epochs=1,
         learning_rate=5e-5,
-        loraplus_ratio=16.0,
         effective_batch=64,
         max_steps=0,
         save_at_steps=save_at_steps,
@@ -3672,7 +3489,6 @@ def test_environment_processing_may_change_the_static_estimate_without_repricing
 
     def completed_training(command, *, env, on_step, on_line, heartbeat):
         training_calls.append(command)
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
         heartbeat()
@@ -3728,7 +3544,6 @@ def test_a_guard_failure_is_not_replaced_by_the_watcher_completeness_error(monke
     spec, _ = _stub_sft_run(monkeypatch, save_at_steps=(2,), watcher_cls=Watcher)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         for step in range(1, _MAX_ZERO_GRAD_STEPS + 1):
             on_line(
                 f"step:{step} - train/loss:1.0 - train/grad_norm:0.0 - train/lr:5e-05 "
@@ -3764,7 +3579,6 @@ def test_zero_grad_guard_survives_an_lr_that_decays_to_zero(monkeypatch):
     spec, _ = _stub_sft_run(monkeypatch, watcher_cls=_TolerantWatcher)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         on_line(
             "step:1 - train/loss:0.5464 - train/grad_norm:0.0 - train/lr:5e-05 "
             "- train/global_tokens:6588\n"
@@ -3793,7 +3607,6 @@ def test_zero_grad_guard_clears_on_a_recovered_step(monkeypatch):
     spec, captured = _stub_sft_run(monkeypatch)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         # zero, healthy (clears), zero, healthy (clears). two zero-grad steps in total but never
         # two in a row, so the run must survive.
         for step, grad in enumerate([0.0, 1.4, 0.0, 0.9], start=1):
@@ -3828,7 +3641,6 @@ def test_a_single_step_run_with_no_gradient_is_rejected(monkeypatch):
     monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         # both updates report a dead gradient. the in-loop guard would also fire on two consecutive
         # zeros, so the horizon is cut to one below to isolate the end-of-run check.
         on_line(
@@ -3861,7 +3673,6 @@ def test_a_fresh_run_with_any_real_gradient_still_completes(monkeypatch, grads):
     monkeypatch.setattr(sft_train, "_restore_verl_resume", lambda local_dir, **_kwargs: 0)
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
         for step, grad in enumerate(grads, start=1):
             on_line(
                 f"step:{step} - train/loss:1.0 - train/grad_norm:{grad} - train/lr:5e-05 "
@@ -5432,3 +5243,41 @@ def test_resume_upload_unavailable_reports_the_oversized_member(tmp_path, capsys
     assert "largest member" in out, "the size that caused the failure must be reported"
     # the deepest file must be walked, not just the top level, or a sharded layout reports 0.
     assert "0.0 GB" in out
+
+
+def test_sft_core_keeps_verl_optimizer_and_installs_linear_scheduler(monkeypatch):
+    class FakeEngine:
+        def _build_optimizer(self, module):
+            return module
+
+    original_builder = FakeEngine._build_optimizer
+    scheduler_calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.engine.fsdp.transformer_impl",
+        _module("verl.workers.engine.fsdp.transformer_impl", FSDPEngine=FakeEngine),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        _module(
+            "transformers",
+            get_linear_schedule_with_warmup=lambda optimizer, **kwargs: (
+                scheduler_calls.append((optimizer, kwargs)) or "linear"
+            ),
+        ),
+    )
+    monkeypatch.setattr(sft_plugin, "_install_exact_dataloaders", lambda: None)
+    monkeypatch.setattr(sft_plugin, "_install_seeded_dataloader", lambda seed: None)
+    # No PEFT optimizer module or LoRA+ configuration is needed by the real installer.
+    monkeypatch.setitem(sys.modules, "peft.optimizers", None)
+    sft_plugin._install_core({"seed": 43})
+    assert FakeEngine._build_optimizer is original_builder
+    engine = FakeEngine()
+    engine.optimizer_config = SimpleNamespace(
+        lr_warmup_steps=-1, lr_warmup_steps_ratio=0.1, total_training_steps=20
+    )
+    optimizer = object()
+    assert engine._build_optimizer(optimizer) is optimizer
+    assert engine._build_lr_scheduler(optimizer) == "linear"
+    assert scheduler_calls == [(optimizer, {"num_warmup_steps": 2, "num_training_steps": 20})]

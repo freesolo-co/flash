@@ -25,7 +25,6 @@ from flash.core.spec import (
     parse_seed,
     require_project_id,
 )
-from flash.engine.plan.recipe import RECIPE
 from flash.providers.core.base import (
     UnsupportedGpuError,
     authored_gpu_ceiling,
@@ -162,7 +161,7 @@ def spec_and_train_keys_from_file(
     authored_train_keys = frozenset(train_raw) if isinstance(train_raw, dict) else frozenset()
     return (
         spec_from_dict(raw, run_id=run_id, project_required=project_required),
-        authored_train_keys,
+        authored_train_keys - {"loraplus_ratio"},
     )
 
 
@@ -298,8 +297,6 @@ def validate_train_keys_for_algorithm(train_raw: Mapping[str, Any], algorithm: s
     every spec fail to reparse its own output and break resubmit, warm-start and server reparse.
     A null is the absence of an authored value, which is exactly what the user is being asked for.
     """
-    if train_raw.get("loraplus_ratio") is not None and algorithm != "sft":
-        raise ConfigError("train.loraplus_ratio only applies to sft")
     for key, allowed in _ALGORITHM_ONLY_TRAIN_KEYS.items():
         if train_raw.get(key) is None or algorithm in allowed:
             continue
@@ -400,6 +397,16 @@ def _validate_train_section(raw: dict[str, Any], algorithm: str) -> dict[str, An
         train_raw = {}
     if not isinstance(train_raw, dict):
         raise ConfigError("[train] must be a table")
+    # Ratio 1 is an inert compatibility value emitted by existing plain-LoRA clients and
+    # persisted public specs. Reject every other explicit value rather than changing its meaning.
+    if "loraplus_ratio" in train_raw:
+        ratio = train_raw["loraplus_ratio"]
+        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or ratio != 1:
+            raise ConfigError(
+                "train.loraplus_ratio: LoRA+ has been removed; omit this option for ordinary LoRA. "
+                "Resume existing LoRA+ runs with their original Flash version."
+            )
+        train_raw = {key: value for key, value in train_raw.items() if key != "loraplus_ratio"}
     validate_train_keys(train_raw)
     validate_train_keys_for_algorithm(train_raw, algorithm)
     return train_raw
@@ -681,10 +688,6 @@ def spec_from_dict(
     )
     wandb_spec = _validate_wandb_section(raw)
 
-    loraplus_ratio = _train_float(train_raw, "loraplus_ratio", minimum=1.0)
-    if algorithm == "sft" and loraplus_ratio is None:
-        # freeze the new default; an absent persisted value identifies the legacy 16x optimizer.
-        loraplus_ratio = RECIPE.sft.loraplus_ratio
     try:
         train_spec = TrainSpec(
             epochs=_train_int(train_raw, "epochs", minimum=1),
@@ -693,7 +696,7 @@ def spec_from_dict(
             init_from_adapter=init_from_adapter,
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
-            loraplus_ratio=loraplus_ratio,
+            loraplus_ratio=1.0 if algorithm == "sft" else None,
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
             prompts_per_step=_train_int(train_raw, "prompts_per_step", minimum=1),
             max_context_tokens=_train_int(train_raw, "max_context_tokens", minimum=1),

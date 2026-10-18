@@ -732,7 +732,7 @@ def test_submit_job_assigns_weight_cache(monkeypatch):
                 "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
                 "environment": {"id": "github:o/r@main:env/environment.py"},
-                "train": {"epochs": 1, "max_examples": 8},
+                "train": {"epochs": 1, "max_examples": 8, "loraplus_ratio": 1.0},
                 "run_id": "flash-wc-1",
             }
         )
