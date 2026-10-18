@@ -15,8 +15,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -994,3 +996,27 @@ def test_canary_attribution_is_validated_before_production_deployment(org_id):
     )
     assert (result.returncode == 0) == org_id.startswith("11111111-")
     assert _step_index("Verify required serving runtime secrets") < _step_index("Deploy serving")
+
+
+@pytest.mark.parametrize("workflow", ["deploy-modal.yml", "deploy-modal-dev.yml"])
+def test_modal_deploy_client_matches_the_runtime_dependency_pin(workflow):
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    expected = next(
+        requirement
+        for requirement in project["project"]["optional-dependencies"]["serving"]
+        if requirement.startswith("modal==")
+    )
+    installs = [
+        step
+        for job in _jobs(_load(WORKFLOW_DIR / workflow)).values()
+        for step in _steps(job)
+        if step.get("name") == "Install Modal client"
+    ]
+    assert len(installs) == 1
+    requirements = [
+        argument
+        for line in installs[0]["run"].splitlines()
+        for argument in shlex.split(line, comments=True)
+        if argument.startswith("modal==")
+    ]
+    assert requirements == [expected]

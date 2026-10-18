@@ -30,6 +30,13 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_bootstrap_state(tmp_path, monkeypatch):
+    from flash.providers._lifecycle.bootstrapping import bootstrap
+
+    monkeypatch.setattr(bootstrap, "CODE_ROOT", str(tmp_path / "runcode"))
+
+
 @pytest.mark.parametrize("arm", ["lambda", "vast"])
 def test_arm_accepts_current_provider_identity(arm):
     assert b._arm({"flash_arm": arm}) == arm
@@ -569,7 +576,12 @@ def test_fetch_code_uses_exact_revision_and_verified_file_materialization(monkey
     assert seen["revision"] == SOURCE_SNAPSHOT["revision"]
     assert events == [
         "download",
-        ("materialize", "/tmp/archive.zip", SOURCE_SNAPSHOT["sha256"], "/runcode/run-1-attempt-0"),
+        (
+            "materialize",
+            "/tmp/archive.zip",
+            SOURCE_SNAPSHOT["sha256"],
+            b._code_dir(_source_payload()),
+        ),
     ]
 
 
@@ -2150,7 +2162,7 @@ def test_write_attempt_marker_truncates_error_and_uploads_arm_named(monkeypatch)
     b.write_attempt_marker(payload, ok=False, error=long_error, retriable=True)
 
     path, sub, kwargs = uploads[-1]
-    assert path == "/tmp/attempt_marker.json"
+    assert path == str(b.AttemptState(b._code_dir(payload), payload).marker_path)
     assert sub == "vast_attempt3.json"  # <arm>_attempt<N>.json
     assert kwargs == {"enforce_deadline": False}
     with open(path) as f:
@@ -2182,7 +2194,7 @@ def test_write_attempt_marker_preserves_success_after_deadline(monkeypatch):
 
     b.write_attempt_marker(payload, ok=True)
 
-    with open("/tmp/attempt_marker.json") as f:
+    with b.AttemptState(b._code_dir(payload), payload).marker_path.open() as f:
         marker = json.load(f)
     assert marker["ok"] is True
     assert marker["retriable"] is False
@@ -2432,7 +2444,7 @@ def test_attempt_marker_error_redacts_a_payload_env_secret(monkeypatch):
 
     b.write_attempt_marker(payload, ok=False, error=f"worker died holding {_PAYLOAD_SECRET}")
 
-    with open("/tmp/attempt_marker.json") as f:
+    with b.AttemptState(b._code_dir(payload), payload).marker_path.open() as f:
         marker = json.load(f)
     assert marker["error"] == "worker died holding <redacted>"
 

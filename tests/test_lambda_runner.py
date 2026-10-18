@@ -23,6 +23,13 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_bootstrap_state(tmp_path, monkeypatch):
+    from flash.providers._lifecycle.bootstrapping import bootstrap
+
+    monkeypatch.setattr(bootstrap, "CODE_ROOT", str(tmp_path / "runcode"))
+
+
 def _capsule_member(member: str) -> str:
     """The source of one member as it is SHIPPED, read back out of the built capsule archive.
 
@@ -3347,6 +3354,7 @@ def test_main_marks_spilled_spec_fetch_failure_retriable(monkeypatch):
             "env": {},
             "extra_pip": [],
             "hf_prefix": "sft/x",
+            "run_id": "x",
             "source_snapshot": SOURCE_SNAPSHOT,
             "deadline_at": created_at + 60.0,
             "run_created_at": created_at,

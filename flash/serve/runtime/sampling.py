@@ -121,6 +121,9 @@ def _normalize_token_position(
             selected = record
     if selected is None:
         raise RuntimeNotReadyError("vllm logprobs omitted the selected token")
+    # vllm may insert the sampled token before higher-probability alternatives.
+    # rank before truncating; token id makes equal-probability ties deterministic.
+    normalized.sort(key=lambda item: (-item[1]["logprob"], item[0]))
     return {
         **selected,
         "top_logprobs": [record for _, record in normalized[:top_logprobs]],

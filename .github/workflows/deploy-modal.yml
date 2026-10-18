@@ -170,7 +170,7 @@ jobs:
           # pinned to the exact client pyproject declares and the provisioning path was validated
           # against: deploy behaviour (app lifecycle, tags, lookup) is client-version sensitive, so
           # an unbounded range lets a future release change deploys with no diff here.
-          python -m pip install "modal==1.5.4" "python-dotenv==1.2.3"
+          python -m pip install "modal==1.6.1" "python-dotenv==1.2.3"
 
       - name: Verify Modal auth is configured
         if: steps.gate.outputs.deploy == 'true'
