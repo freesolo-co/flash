@@ -11,6 +11,7 @@ import flash.serve.contract.errors as serving_errors
 import flash.serve.contract.urls as serving_urls
 import flash.serve.deployment.adapter_check as adapter_check
 import flash.serve.request.transport as serving_transport
+from flash.adapters.config import DeclaredAdapterConfig
 from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
 from flash.serve.contract.protocol import (
     PERMANENT_CHECKPOINT_IDENTITY_CAPABILITY,
@@ -46,6 +47,17 @@ def test_dependency_light_health_parser_normalizes_the_serving_contract() -> Non
     assert health.requires_key is False
     assert health.base_models == ("Qwen/Qwen3.5-9B",)
     assert set(health.capabilities) >= REQUIRED_SERVING_CAPABILITIES
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_ok"),
+    [
+        ({"capabilities": [], "ok": False}, False),
+        ({"capabilities": []}, None),
+    ],
+)
+def test_dependency_light_health_parser_preserves_optional_ok(payload, expected_ok):
+    assert parse_serving_health(payload).ok is expected_ok
 
 
 @pytest.mark.parametrize(
@@ -97,13 +109,21 @@ def test_deploy_dry_run_uses_explicit_final_checkpoint() -> None:
 def test_adapter_artifact_metadata_reads_the_exported_modality_marker(
     monkeypatch, marker, targets_images
 ) -> None:
-    config = {"r": 32}
+    config = {"r": 32, "peft_type": "LORA", "base_model_name_or_path": "Qwen/Qwen3.5-4B"}
     if marker is not ...:
         config["exclude_modules"] = marker
     monkeypatch.setattr(
         adapter_check,
         "_load_adapter_config",
-        lambda *_args, **_kwargs: (config, "run/adapter/adapter_config.json"),
+        lambda *_args, **_kwargs: (
+            DeclaredAdapterConfig(
+                config=config,
+                lora_rank=32,
+                base_model="Qwen/Qwen3.5-4B",
+                base_revision=None,
+            ),
+            "run/adapter/adapter_config.json",
+        ),
     )
     monkeypatch.setattr(
         adapter_check,
@@ -112,7 +132,10 @@ def test_adapter_artifact_metadata_reads_the_exported_modality_marker(
     )
 
     metadata = adapter_check.adapter_artifact_metadata(
-        "org/repo", "run/adapter", artifact_revision="a" * 40
+        "org/repo",
+        "run/adapter",
+        artifact_revision="a" * 40,
+        expected_base_model="Qwen/Qwen3.5-4B",
     )
 
     assert metadata.lora_rank == 32
@@ -179,6 +202,84 @@ def test_real_deploy_4xx_hint_points_at_client(monkeypatch) -> None:
         )
     assert exc_info.value.status_code == 401
     assert "FREESOLO_INTERNAL_KEY" in str(exc_info.value)
+
+
+def _stub_healthz(
+    monkeypatch, deploy_mod, capabilities: list[str], *, ok: bool | None = None
+) -> None:
+    """stub the serving /healthz response used by the capability preflight."""
+
+    class _Resp:
+        def json(self):
+            payload = {"capabilities": list(capabilities)}
+            if ok is not None:
+                payload["ok"] = ok
+            return payload
+
+    monkeypatch.setattr(serving_transport, "serving_request", lambda method, url, **k: _Resp())
+
+
+@pytest.mark.parametrize("ok", [None, True], ids=["omitted", "true"])
+def test_require_capabilities_accepts_healthy_or_compatible_health_payload(monkeypatch, ok):
+    import flash.serve.deployment.deploy as deploy_mod
+
+    capabilities = sorted(REQUIRED_SERVING_CAPABILITIES | PREFERRED_SERVING_CAPABILITIES)
+    _stub_healthz(monkeypatch, deploy_mod, capabilities, ok=ok)
+
+    assert deploy_mod._require_serving_capabilities() == set(capabilities)
+
+
+def test_false_health_rejects_before_adapter_registration(monkeypatch):
+    import flash.serve.deployment.deploy as deploy_mod
+    from flash.serve.contract.errors import ServingError
+
+    monkeypatch.setattr(deploy_mod, "resolve_artifact_revision", lambda repo: "a" * 40)
+    monkeypatch.setattr(
+        adapter_check,
+        "adapter_artifact_metadata",
+        lambda *args, **kwargs: types.SimpleNamespace(lora_rank=32, targets_images=False),
+    )
+    calls = []
+
+    class _Resp:
+        def json(self):
+            return {
+                "ok": False,
+                "capabilities": sorted(
+                    REQUIRED_SERVING_CAPABILITIES | PREFERRED_SERVING_CAPABILITIES
+                ),
+            }
+
+    def request(method, url, **kwargs):
+        calls.append((method, url))
+        if method != "GET":
+            pytest.fail("adapter deployment continued after unhealthy serving response")
+        return _Resp()
+
+    monkeypatch.setattr(serving_transport, "serving_request", request)
+
+    with pytest.raises(ServingError, match="reported ok=false"):
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-9B", "repo", "rl/r1/seed0")
+
+    assert calls == [("GET", f"{serving_urls.serving_base_url()}/healthz")]
+
+
+def test_capability_preflight_preserves_non_200_health_failure(monkeypatch):
+    import flash.serve.deployment.deploy as deploy_mod
+    from flash.serve.contract.errors import ServingError
+
+    url = f"{serving_urls.serving_base_url()}/healthz"
+    response = httpx.Response(
+        503,
+        json={"ok": False, "capabilities": sorted(REQUIRED_SERVING_CAPABILITIES)},
+        request=httpx.Request("GET", url),
+    )
+    monkeypatch.setattr(httpx, "get", lambda *args, **kwargs: response)
+
+    with pytest.raises(ServingError, match="HTTP 503") as exc_info:
+        deploy_mod._require_serving_capabilities()
+
+    assert exc_info.value.status_code == 503
 
 
 def test_deploy_registers_one_exact_checkpoint_without_activation(monkeypatch) -> None:

@@ -46,6 +46,12 @@ _log = logging.getLogger("flash.server")
 _DEPLOYMENT_JOBS_LOCK = threading.Lock()
 _DEPLOYMENT_JOBS: set[threading.Thread] = set()
 _DEPLOYMENT_JOBS_ACCEPTING = True
+# a deployment job holds a thread for its whole lifecycle, and that lifecycle is minutes long: the
+# readiness budget alone reaches 15 minutes. every accepted deploy for a distinct run got its own
+# thread, and per-run locking only deduplicates one run id, so concurrent deploys across runs grew
+# without any limit. cap the live set instead. the deploy route already turns a start failure into a
+# retryable 503, so a full plane sheds load through the path it already has.
+_MAX_ACTIVE_DEPLOYMENT_JOBS = 64
 
 
 class DeploymentJobStartError(RuntimeError):
@@ -83,25 +89,23 @@ __all__ = [
 ]
 
 
-def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
-    """Return canonical training-endpoint names derived from the run registry.
+def _train_endpoint_targets(*, include_terminal: bool) -> set[str]:
+    """Return the run-scoped endpoint targets derived from the run registry.
 
-    Include persisted and spec-derived names. Non-terminal names are protected; all known names
-    scope
-    reaping to this control plane.
+    A target names a run, not one of its attempts: every attempt of that run is named
+    ``<target>-a<n>``, so one target covers all of them. Non-terminal targets are protected; all
+    known targets scope reaping to this control plane.
     """
     from flash.core.spec import persisted_gpu_types
     from flash.providers.core.base import canonical_gpu
-    from flash.providers.runpod.execution.resources import canonical_endpoint_name
-    from flash.providers.runpod.serverless.endpoints import _run_suffix, endpoint_name
+    from flash.providers.runpod.serverless.naming import (
+        endpoint_name,
+        run_suffix,
+        run_target_of,
+    )
     from flash.runner.lifecycle.state import TERMINAL_STATES
 
-    names: set[str] = set()
-
-    def _add(name: str | None) -> None:
-        if name:
-            names.add(canonical_endpoint_name(name))
-
+    targets: set[str] = set()
     for row in db.all_runs():
         try:
             status = get_status(row["run_id"])
@@ -109,22 +113,25 @@ def _train_endpoint_names(*, include_terminal: bool) -> set[str]:
             continue
         if not include_terminal and status.state in TERMINAL_STATES:
             continue
-        _add((status.remote or {}).get("endpoint_name"))
+        # the persisted name is one attempt's; its target covers that run's other attempts too.
+        persisted = run_target_of((status.remote or {}).get("endpoint_name") or "")
+        if persisted:
+            targets.add(persisted)
         # index every acceptable class so fallback endpoints remain in the reaper's scope.
         for gpu in persisted_gpu_types(status.spec):
             with contextlib.suppress(Exception):
-                _add(endpoint_name(canonical_gpu(gpu), _run_suffix(status.run_id)))
-    return names
+                targets.add(endpoint_name(canonical_gpu(gpu), run_suffix(status.run_id)))
+    return targets
 
 
-def _protected_train_endpoint_names() -> set[str]:
-    """Endpoint names tied to a LIVE (non-terminal) run — never reaped (see ``_train_endpoint_names``)."""
-    return _train_endpoint_names(include_terminal=False)
+def _protected_train_endpoint_targets() -> set[str]:
+    """Endpoint targets tied to a LIVE (non-terminal) run — never reaped."""
+    return _train_endpoint_targets(include_terminal=False)
 
 
-def _known_train_endpoint_names() -> set[str]:
-    """Endpoint names for EVERY run this plane has a record of — the reaper's multi-plane scope."""
-    return _train_endpoint_names(include_terminal=True)
+def _known_train_endpoint_targets() -> set[str]:
+    """Endpoint targets for EVERY run this plane has a record of — the reaper's multi-plane scope."""
+    return _train_endpoint_targets(include_terminal=True)
 
 
 def _open_deployment_jobs() -> None:
@@ -174,6 +181,10 @@ def start_deployment_job(target, *args, **kwargs) -> bool:
     with _DEPLOYMENT_JOBS_LOCK:
         if not _DEPLOYMENT_JOBS_ACCEPTING:
             raise DeploymentJobStartError("deployment jobs are shutting down")
+        if len(_DEPLOYMENT_JOBS) >= _MAX_ACTIVE_DEPLOYMENT_JOBS:
+            raise DeploymentJobStartError(
+                f"deployment job capacity reached ({_MAX_ACTIVE_DEPLOYMENT_JOBS} active)"
+            )
         _DEPLOYMENT_JOBS.add(thread)
         try:
             thread.start()
@@ -188,9 +199,9 @@ def _reap_idle_endpoints_once(min_idle_s: float) -> int:
     from flash.providers.runpod.execution.resources import _sweep_idle_flash_endpoints
 
     return _sweep_idle_flash_endpoints(
-        _protected_train_endpoint_names(),
+        _protected_train_endpoint_targets(),
         min_idle_s=min_idle_s,
-        known=_known_train_endpoint_names(),
+        known=_known_train_endpoint_targets(),
     )
 
 

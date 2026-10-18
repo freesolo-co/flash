@@ -36,12 +36,16 @@ _RUN_DEADLINE_AT_KEY = "run_deadline_at"
 _NEXT_ATTEMPT_KEY = "next_attempt"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"
 _OPD_RETRY_CONTRACT_KEY = OPD_RETRY_CONTRACT_STATUS_KEY
+_RETRY_STATE_KEY = "retry_state"
+_ACTIVE_LAUNCH_CLAIM_KEY = "active_launch_claim"
 _PRIVATE_STATUS_KEYS = frozenset(
     {
         _RUN_DEADLINE_AT_KEY,
         _NEXT_ATTEMPT_KEY,
         _CLEANUP_REMOTES_KEY,
         _OPD_RETRY_CONTRACT_KEY,
+        _RETRY_STATE_KEY,
+        _ACTIVE_LAUNCH_CLAIM_KEY,
     }
 )
 _PRIVATE_VALUE_UNSET = object()
@@ -329,6 +333,8 @@ def _save_status(
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
+    _retry_state: dict | object | None = _PRIVATE_VALUE_UNSET,
+    _active_launch_claim: dict | object | None = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import deadlines
 
@@ -338,23 +344,39 @@ def _save_status(
             if JobSpec.from_dict(status.spec).algorithm != "opd":
                 raise ValueError("opd retry contract cannot be stored for a non-opd run")
         if not os.path.exists(runs_file_path(status.run_id, ".json")):
-            if _run_deadline_at is _PRIVATE_VALUE_UNSET:
+            # both defaults below are derived from the internal spec, so parse it once. a record
+            # whose spec no longer parses (an older writer's shape, reached by the billing sweep)
+            # still has to persist, so an unreadable spec yields no spec-derived default rather
+            # than failing the save.
+            try:
+                spec = _internal_spec_from_status(status)
+            except (ValueError, TypeError):
+                spec = None
+            if _run_deadline_at is _PRIVATE_VALUE_UNSET and spec is not None:
                 # max_wall_seconds is managed and stripped from the public status.spec; source the
                 # run-global wall budget from the internal worker spec so the auto-computed deadline
                 # reloads consistently (see _canonical_run_deadline).
-                spec = _internal_spec_from_status(status)
                 base = deadlines._require_valid_deadline(status.created_at)
                 _run_deadline_at = deadlines._require_valid_deadline(
                     base + deadlines._require_valid_deadline(spec.gpu.max_wall_seconds)
                 )
             if _next_attempt is _PRIVATE_VALUE_UNSET:
                 _next_attempt = 0
+            if _retry_state is _PRIVATE_VALUE_UNSET and spec is not None:
+                from flash.runner.supervise.retry_decision import RetryState
+
+                # retry policy is derived from the spec, so a record without one gets no snapshot.
+                # every reader requires one and fails closed, which is the right answer here: a run
+                # whose spec cannot be read cannot be relaunched either.
+                _retry_state = RetryState.initial_for_spec(spec).to_snapshot()
         _save_status_unlocked(
             status,
             _run_deadline_at=_run_deadline_at,
             _next_attempt=_next_attempt,
             _cleanup_remotes=_cleanup_remotes,
             _opd_retry_contract_version=_opd_retry_contract_version,
+            _retry_state=_retry_state,
+            _active_launch_claim=_active_launch_claim,
         )
 
 
@@ -365,6 +387,8 @@ def _save_status_unlocked(
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
     _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
+    _retry_state: dict | object | None = _PRIVATE_VALUE_UNSET,
+    _active_launch_claim: dict | object | None = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import reporting
     from flash.runner.lifecycle.status import _load_status_json
@@ -386,6 +410,8 @@ def _save_status_unlocked(
         _NEXT_ATTEMPT_KEY: _next_attempt,
         _CLEANUP_REMOTES_KEY: _cleanup_remotes,
         _OPD_RETRY_CONTRACT_KEY: _opd_retry_contract_version,
+        _RETRY_STATE_KEY: _retry_state,
+        _ACTIVE_LAUNCH_CLAIM_KEY: _active_launch_claim,
     }
     data = _status_storage_dict(status)
     for key in _PRIVATE_STATUS_KEYS:
