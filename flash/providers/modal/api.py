@@ -6,6 +6,7 @@ import asyncio
 import os
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from flash.providers.core.base import UnreconciledCreateError, get_gpu_info
@@ -50,7 +51,15 @@ def call(operation, *, deadline_at=None, timeout=API_TIMEOUT_SECONDS):
         return await asyncio.wait_for(invoke(), timeout=budget)
 
     try:
-        return asyncio.run(bounded())
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(bounded())
+        # Startup reconciliation also calls this synchronous API from ASGI's loop.
+        # Construct the coroutine in the worker so its client opens and closes on
+        # the same loop, without nesting asyncio.run or leaking an unawaited task.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(lambda: asyncio.run(bounded())).result()
     except (UnreconciledCreateError, ModalApiError):
         raise
     except Exception:
