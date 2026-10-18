@@ -213,8 +213,8 @@ def test_create_carries_secrets_outside_tags_and_command(sdk):
     args, kwargs = sdk.created[0]
     assert kwargs["gpu"] == "H100!:2"
     assert kwargs["timeout"] == 86400
-    assert kwargs["cpu"] == (8, 8)
-    assert kwargs["memory"] == (65536, 65536)
+    assert kwargs["cpu"] == 8
+    assert kwargs["memory"] == 65536
     assert "/weight-cache" in kwargs["volumes"]
     assert "FLASH_BOOTSTRAP_PAYLOAD" in sdk.secrets[0]
     assert "FLASH_BOOTSTRAP_PAYLOAD" not in str(args) + str(kwargs["tags"])

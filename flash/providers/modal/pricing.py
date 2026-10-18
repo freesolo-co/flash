@@ -1,7 +1,7 @@
 """Modal reservations and list-price estimates, retrieved 2026-10-18.
 
 https://modal.com/pricing lists Sandbox CPU/memory separately from Function compute.
-These are estimates, not an invoice: storage and network usage are not attributed to a run.
+These are estimates, not an invoice: CPU/RAM bursts, storage and network usage are not attributed to a run.
 """
 
 from flash.providers.core.base import get_gpu_info

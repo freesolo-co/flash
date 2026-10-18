@@ -247,9 +247,11 @@ implementation. GPU selection now uses Modal's supported card counts and estimat
 memory rates. Cross-cloud fallback and marketplace offer selection have been removed. Modal
 queues reservations subject to workspace capacity and quotas.
 
-Each sandbox reserves four CPU cores and 32 GiB RAM per GPU. A sandbox has a 24-hour lifetime
+Each sandbox reserves at least four CPU cores and 32 GiB RAM per GPU, and can burst above these
+requests during compilation and checkpoint export. A sandbox has a 24-hour lifetime
 limit and at most 512 GiB ephemeral disk. Cost records are resource-rate estimates, not Modal
-invoices; storage and network charges are not attributed to individual runs.
+invoices; CPU/RAM usage above the reservation, storage, and network charges are not attributed
+to individual runs.
 
 To run the paid infrastructure smoke with your Modal credentials exported:
 
@@ -259,6 +261,17 @@ uv run python scripts/smoke_modal_training.py --run-paid-test
 
 This reserves two L4 GPUs with a 15-minute deadline, checks NCCL, duplicate adoption, cache
 persistence and confirmed termination, then removes its own sandboxes and temporary Volume.
+
+With `HF_TOKEN` exported and a disposable private dataset repo, run the full two-step SFT smoke:
+
+```bash
+uv run python scripts/smoke_modal_sft.py --run-paid-test --repo your-account/private-smoke
+```
+
+It verifies artifact recovery, then removes the run's completion marker and launches a fresh attempt
+to verify checkpoint resume. GPU attempts have a 30-minute cap. Its own cache and sandboxes are
+removed afterward; artifacts remain in the supplied repository for inspection.
+
 
 
 Migrating an existing installation requires draining its active training runs and retiring its old

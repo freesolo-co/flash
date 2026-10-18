@@ -118,8 +118,10 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, deadline_
                     image=image,
                     secrets=[secret],
                     gpu=f"{get_gpu_info(gpu).modal_name}:{gpu_count}",
-                    cpu=(CPU_PER_GPU * gpu_count, CPU_PER_GPU * gpu_count),
-                    memory=(MEMORY_MIB_PER_GPU * gpu_count, MEMORY_MIB_PER_GPU * gpu_count),
+                    # These are minimum reservations. Checkpoint export and compilation must
+                    # be able to burst beyond them; a matching hard limit kills healthy workers.
+                    cpu=CPU_PER_GPU * gpu_count,
+                    memory=MEMORY_MIB_PER_GPU * gpu_count,
                     timeout=timeout,
                     workdir="/root/flash",
                     volumes=volumes,

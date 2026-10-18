@@ -52,7 +52,7 @@ def instance_label(run_id: str, attempt: int) -> str:
 
 @dataclass
 class InstanceJobHandle:
-    """Fields + (de)serialization common to every rent-a-box provider handle (Lambda, Vast).
+    """Common resource identity and validation for persisted sandbox handles.
 
     Persisted in `RunStatus.remote` for reattach and cancellation. Subclasses add locator fields;
     `instance_id` has no safe default because it is the poll/destroy target.
@@ -68,7 +68,7 @@ class InstanceJobHandle:
 
     @staticmethod
     def _coerce_instance_id(raw: Any) -> Any:
-        """Provider-specific instance_id coercion (Vast=int, Lambda=str). Overridden per subclass."""
+        """Validate the concrete resource identifier in the subclass."""
         return raw
 
     def _extra_to_dict(self) -> dict:
@@ -127,22 +127,12 @@ class InstanceJobHandle:
         )
 
 
-# fixed container path for Lambda's per-region NFS cache bind mount.
-CACHE_CONTAINER_MOUNT = "/weight-cache"
-CACHE_HF_HOME = f"{CACHE_CONTAINER_MOUNT}/hf-cache"
-# Sentinel on a successfully-mounted cache so the preload check can tell a real mount from an empty bind.
-CACHE_MOUNT_MARKER = ".flash-cache-mounted"
-
-
 def build_payload(
     spec,
     attempt: int,
     *,
     arm: str,
     runtime_secrets: dict | None = None,
-    cache_host_mount: str | None = None,
-    mode: str | None = None,
-    models: list | None = None,
     source_snapshot: dict | None = None,
     deadline_at: float | None = None,
 ) -> dict:
@@ -154,8 +144,6 @@ def build_payload(
     from flash.snapshot.archive import parse_descriptor
 
     env = build_worker_env(spec, runtime_secrets=runtime_secrets)
-    if cache_host_mount and not env.get("FLASH_WEIGHT_CACHE_DIR") and not env.get("HF_HOME"):
-        env["FLASH_WEIGHT_CACHE_DIR"] = f"{CACHE_HF_HOME}/hub"
     absolute_deadline = require_deadline_at(deadline_at)
     attempt_id = _attempt_int(attempt)
     if attempt_id is None:
@@ -178,14 +166,5 @@ def build_payload(
         "run_max_wall_seconds": max_wall_seconds,
         "attempt": attempt_id,
     }
-    if mode != "preload":
-        payload["source_snapshot"] = parse_descriptor(source_snapshot).to_dict()
-    if cache_host_mount:
-        payload["cache_host_mount"] = cache_host_mount
-        # Carry the mount sentinel filename so the bootstrap's mount-check reads it from one constant.
-        payload["cache_mount_marker"] = CACHE_MOUNT_MARKER
-    # Preload (warm) mode: the bootstrap downloads ``models`` into the cache and exits — no worker.
-    if mode:
-        payload["mode"] = mode
-        payload["models"] = list(models or [])
+    payload["source_snapshot"] = parse_descriptor(source_snapshot).to_dict()
     return payload

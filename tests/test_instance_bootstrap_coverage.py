@@ -491,31 +491,6 @@ def test_hf_file_exists_starts_no_request_at_deadline(monkeypatch):
     assert calls == []
 
 
-def test_fetch_spec_from_hf_returns_downloaded_file_contents(tmp_path, monkeypatch):
-    local = tmp_path / "job_spec.json"
-    local.write_text('{"spilled": true}')
-    seen = {}
-
-    def _dl(**kw):
-        seen.update(kw)
-        return str(local)
-
-    _install_fake_hf(monkeypatch, hf_hub_download=_dl)
-    created_at = b.time.time()
-    payload = {
-        "hf_repo": "o/r",
-        "hf_prefix": "sft/run",
-        "env": {"HF_TOKEN": "tok"},
-        "deadline_at": created_at + 60.0,
-        "run_created_at": created_at,
-        "run_max_wall_seconds": 60.0,
-    }
-    assert b.fetch_spec_from_hf(payload) == '{"spilled": true}'
-    assert seen["filename"] == "sft/run/job_spec.json"
-    assert seen["repo_type"] == "dataset"
-    assert seen["token"] == "tok"
-
-
 def test_install_extra_pip_starts_no_process_at_deadline(monkeypatch):
     monkeypatch.setattr(b.time, "time", lambda: 200.0)
     monkeypatch.setattr(
@@ -2280,69 +2255,11 @@ def test_deadline_watchdog_hard_exits_when_terminal_marker_writer_blocks(monkeyp
 # ---------------------------------------------------------------------------
 # _arm_preload_wall_cap: the _fire watchdog path
 # ---------------------------------------------------------------------------
-def test_arm_preload_wall_cap_uses_remaining_absolute_deadline(monkeypatch):
-    marks: list[tuple] = []
-    exits: list[int] = []
-    monkeypatch.setattr(b.time, "time", lambda: 100.0)
-    monkeypatch.setattr(
-        b, "write_attempt_marker", lambda p, ok, error="", **k: marks.append((ok, error))
-    )
-    monkeypatch.setattr(b.os, "_exit", lambda code: exits.append(code))
-
-    payload = {
-        "deadline_at": 160.0,
-        "run_created_at": 100.0,
-        "run_max_wall_seconds": 60.0,
-        "flash_arm": "modal",
-        "attempt": 0,
-        "hf_repo": "o/r",
-        "env": {},
-    }
-    timer, _done = b._arm_preload_wall_cap(payload)
-    timer.cancel()
-    assert timer.interval == 60.0
-
-    # manually invoke the watchdog closure: not done means marker then hard exit.
-    timer.function()
-    assert exits == [124]
-    assert marks
-    assert marks[-1][0] is False
-    assert "run wall deadline" in marks[-1][1]
-
-    # if the download already finished, the watchdog is a no-op.
-    marks.clear()
-    exits.clear()
-    timer2, done2 = b._arm_preload_wall_cap(payload)
-    timer2.cancel()
-    done2.set()
-    timer2.function()
-    assert exits == []
-    assert marks == []
 
 
 # ---------------------------------------------------------------------------
 # run_preload: per-model download failure is captured, not raised
 # ---------------------------------------------------------------------------
-def test_run_preload_records_download_failure(tmp_path, monkeypatch):
-    (tmp_path / ".flash-cache-mounted").write_text("")  # real-mount sentinel
-
-    def _snap(**k):
-        if k.get("local_files_only"):
-            raise FileNotFoundError("not cached")  # force the real download attempt
-        raise RuntimeError("network exploded")  # the real download fails
-
-    _install_fake_hf(monkeypatch, snapshot_download=_snap)
-    cache_dir = str(tmp_path / "hf-cache" / "hub")
-    r = b.run_preload(
-        {
-            "env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir},
-            "models": ["a/b"],
-            "cache_mount_marker": ".flash-cache-mounted",
-        }
-    )
-    assert r["preloaded"] == []
-    assert r["already_cached"] == []
-    assert r["failed"]["a/b"] == "RuntimeError: network exploded"
 
 
 # ---------------------------------------------------------------------------
@@ -2782,66 +2699,3 @@ def test_hf_call_retry_log_redacts_payload_secrets(monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 # main(): the preload branch
 # ---------------------------------------------------------------------------
-def _preload_payload(**over):
-    created_at = b.time.time()
-    base = {
-        "mode": "preload",
-        "hf_repo": "org/repo",
-        "hf_prefix": "preload/run",
-        "flash_arm": "modal",
-        "run_id": "preload-run",
-        "seed": 0,
-        "attempt": 0,
-        "env": {},
-        "run_created_at": created_at,
-        "run_max_wall_seconds": 999.0,
-        "deadline_at": created_at + 999.0,
-    }
-    base.update(over)
-    return base
-
-
-def test_main_preload_success_returns_zero_and_writes_ok_marker(monkeypatch):
-    markers: list[tuple] = []
-    monkeypatch.setattr(b, "load_payload", lambda path=b.PAYLOAD_PATH: _preload_payload())
-    monkeypatch.setattr(
-        b, "run_preload", lambda p: {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
-    )
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
-    monkeypatch.setattr(
-        b, "hf_file_exists", lambda p, sub: True
-    )  # completion file confirmed first try
-    monkeypatch.setattr(
-        b,
-        "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
-    )
-    assert b.main() == 0
-    assert markers == [(True, "", False)]
-    with open("/tmp/preload_result.json") as f:
-        assert json.load(f)["preloaded"] == ["a/b"]
-
-
-def test_main_preload_failure_arms_wall_cap_and_reports_failed_models(monkeypatch):
-    markers: list[tuple] = []
-    monkeypatch.setattr(b.time, "sleep", lambda s: None)  # neutralize the confirm-retry backoff
-    monkeypatch.setattr(b, "load_payload", lambda path=b.PAYLOAD_PATH: _preload_payload())
-    monkeypatch.setattr(
-        b,
-        "run_preload",
-        lambda p: {"preloaded": [], "already_cached": [], "failed": {"a/b": "oom"}},
-    )
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
-    monkeypatch.setattr(
-        b, "hf_file_exists", lambda p, sub: False
-    )  # confirm loop exhausts -> else branch
-    monkeypatch.setattr(
-        b,
-        "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
-    )
-    assert b.main() == 1
-    ok, error, retriable = markers[0]
-    assert ok is False
-    assert error == "model preload failed"
-    assert retriable is False

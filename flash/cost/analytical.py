@@ -450,22 +450,7 @@ def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) 
 
 
 def _catalog_check_remedy(config: RunConfig, need: float, names: tuple[str, ...]) -> str:
-    """The width to ASK a fixed-count provider for, when no width can be promised offline.
-
-    ``_wider_shape_remedy`` drops classes whose providers name the count in the SKU, which leaves a
-    Lambda- or Vast-pinned exact quote with no remedy at all -- so it fell through to knob advice
-    telling the user to shrink a run that already fits at a wider count. `live_capacity` means the
-    count is confirmed dynamically, not that the SKU is absent: Lambda resolves `gpu_4x_h100_pcie`
-    against its own catalog. This mirrors the allocator's ``_catalog_check_hint`` so the same
-    shortfall reads the same whether it surfaced from `--cost` or from submit.
-
-    Still a check and never a promise: nothing offline proved the wider SKU is purchasable.
-
-    Withheld when the run would not LAUNCH on the width found, mirroring ``_catalog_check_hint``:
-    ``smallest_fitting_gpu_count`` credits rented cards, so for an sft run the batch caps at fewer
-    ranks it names a count that buys idle cards. The mirror has to hold in both directions or
-    `--cost` promises a width submit rejects.
-    """
+    """Suggest a wider supported allocation only when all purchased GPUs can execute."""
     from flash.providers.core.base import smallest_fitting_gpu_count
     from flash.providers.core.sharding import MAX_COMBINATION_CARDS
 

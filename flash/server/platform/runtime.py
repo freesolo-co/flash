@@ -153,10 +153,10 @@ _DEFERRED_RECOVERY_RETRY_S = 120.0
 def _confirm_run_clear(spec) -> bool:
     """Force-reap this run's label and confirm no instance remains.
 
-    ``gc`` alone cannot prove Vast teardown. Providers with ``run_instances_remaining`` must return
+    ``gc`` alone cannot prove sandbox teardown. Providers with ``run_instances_remaining`` must return
     ``[]``; a live instance or enumeration failure blocks resubmit. A provider recorded in
     ``submitted_instance_providers`` also blocks when it is now unconfigurable, because a lost
-    non-idempotent create such as Vast ``PUT /asks`` may still be billing without a handle.
+    create with a lost response may still be billing without a persisted handle.
     """
     from flash.providers.core.registry import INSTANCE_PROVIDERS, configured_providers, get_provider
 
@@ -168,7 +168,7 @@ def _confirm_run_clear(spec) -> bool:
         recorded_raw = getattr(status, "submitted_instance_providers", None)
     except Exception:
         # Can't read the durable record of providers available at submit -> can't rule out a recorded
-        # Vast phantom that this restart can no longer enumerate -> fail CLOSED.
+        # unacknowledged sandbox that this restart can no longer enumerate -> fail CLOSED.
         return False
     recorded = {str(name) for name in recorded_raw} if recorded_raw is not None else None
     configured = {getattr(p, "name", None): p for p in configured_providers()}
@@ -620,7 +620,7 @@ def recover_runs() -> None:
     a worker."""
     active: set[str] = set()
     # Every run this plane knows about (whatever its state). This is the multi-plane safety scope for
-    # the orphan sweep below — WITHOUT it, a restarting plane sharing a Vast/Lambda account sees the
+    # the orphan sweep below — WITHOUT it, a restarting plane sharing a Modal workspace sees the
     # OTHER plane's `flash-` instances as "not active locally" and the providers' unscoped
     # known_labels=None path would DESTROY them (the same guard app.py's periodic sweep already
     # passes). `active` (handle-backed/resuming only) is the narrower must-keep set; `known` is the

@@ -254,13 +254,12 @@ def test_capsule_members_import_with_flash_absent(tmp_path):
         "import pickle\n"
         "assert pickle.loads(pickle.dumps(bootstrap._console_upload_loop)) "
         "is bootstrap._console_upload_loop\n"
-        # EVERY non-entry member, deadline_sleep included. Importing a member must be INERT: these
+        # Every non-entry member. Importing a member must be INERT: these
         # are programs, and an unguarded one reads argv, reads the box payload, and can exit the
         # importing process or fire a real HF upload. Anything that walks flash's modules (a
         # packaging probe, a test collector) imports them, so a missing guard is a live defect --
         # and an omission HERE is how it reaches main.
-        "for name in ('bootstrap_secrets', 'bootstrap_pip', 'deadline_sleep', 'hostlog', "
-        "'failmark'):\n"
+        "for name in ('bootstrap_secrets', 'bootstrap_pip', 'bootstrap_console', 'bootstrap_attempt'):\n"
         "    importlib.import_module(name)\n"
         "print('OK')\n"
     )
@@ -279,13 +278,7 @@ def test_importing_any_member_is_inert(tmp_path):
     """No member may DO anything when imported -- derived from the profile, not a hand list.
 
     The helpers are programs; the capsule runs them with `runpy.run_module(run_name="__main__")`.
-    Without a `__main__` guard, an ordinary import runs the program: deadline_sleep exits the
-    importing process with 125, and hostlog attempts a real HF upload while its blanket `except`
-    hides that it tried. `tests/test_client_import_purity.py` imports every flash module, so this
-    is a live defect, not a hypothetical.
-
-    Enumerated from the profile so a member added later is covered automatically -- a hand-written
-    list is exactly how deadline_sleep slipped through in the first place.
+    Every embedded module must be inert when imported by spawned children.
     """
     from flash.runtime_capsule import get_profile
 
@@ -352,31 +345,6 @@ def test_capsule_refuses_an_unknown_program_instead_of_running_the_default(tmp_p
     assert "unknown program" in result.stderr, result.stderr
     # the refusal names what IS runnable, so the fix is obvious from the box's log.
     assert "bootstrap" in result.stderr
-
-
-def test_capsule_runs_a_named_host_helper_and_passes_its_arguments(tmp_path):
-    """The dispatch is only fail-closed if the real names still work -- and still get their args.
-
-    deadline_sleep takes the number of seconds to sleep, so an argv that arrives shifted (or not at
-    all) turns every bounded wait on the box into an immediate return or a hang.
-    """
-    archive, _ = build_capsule(PROFILE)
-    capsule = tmp_path / "capsule.pyz"
-    write_capsule(capsule, archive)
-    (tmp_path / "payload.json").write_text("{}")
-
-    # no payload at the box path -> the helper exits 125 (its "cannot read the deadline" code)
-    # rather than sleeping. What matters here is that it RAN: an unknown-name refusal exits 1 with
-    # "unknown program", and the default (bootstrap) would fail differently again.
-    result = subprocess.run(
-        [sys.executable, "-S", str(capsule), "deadline_sleep", "0"],
-        capture_output=True,
-        text=True,
-        cwd=tmp_path,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
-    )
-    assert "unknown program" not in result.stderr, result.stderr
-    assert result.returncode == 125, (result.returncode, result.stderr)
 
 
 def test_capsule_entry_does_not_own_spawn_targets():

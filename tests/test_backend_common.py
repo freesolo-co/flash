@@ -4113,7 +4113,7 @@ def test_the_child_fragment_repoints_the_tilelang_libcudart_stub(tmp_path):
     # the marker naming the resolved runtime is the only evidence in a run log that the repoint
     # happened and WHICH libcudart it picked. without it a silently-skipped swap and a successful one
     # read identically, and the next undefined-symbol crash has nothing to bisect against.
-    assert f"{vc.FLASH_CUDART_STUB_MARKER} -> {real}" in result.stdout, (
+    assert f"{vc.FLASH_CUDART_STUB_MARKER} -> {real}" in result.stderr, (
         f"the fragment did not report the repoint it performed: {result.stdout[-1000:]}"
     )
 
@@ -4223,7 +4223,7 @@ def test_a_failed_repoint_still_lets_the_child_start(tmp_path):
     assert "FRAGMENT_DONE" in result.stdout, (
         f"the exception escaped sitecustomize and killed the run: {result.stderr[-2000:]}"
     )
-    assert "repoint failed" in result.stdout, (
+    assert "repoint failed" in result.stderr, (
         "a swallowed failure must still say so; a silent one is unbisectable from a log"
     )
     assert not stub.is_symlink(), "the stub must be left intact when the swap could not complete"
@@ -4898,3 +4898,27 @@ def test_rollout_max_num_seqs_rejects_a_nonpositive_batch():
 
     with pytest.raises(ValueError, match="rollout_batch must be positive"):
         rollout_max_num_seqs(0)
+
+
+def test_startup_optimizations_preserve_subprocess_json_stdout(tmp_path):
+    """cpuinfo/vLLM helpers parse stdout as JSON; sitecustomize diagnostics must use stderr."""
+    (tmp_path / "torch.py").write_text(
+        "from types import SimpleNamespace as S\n"
+        "backends=S(cuda=S(matmul=S(allow_tf32=False)),cudnn=S(allow_tf32=False))\n"
+        "def set_float32_matmul_precision(value): pass\n"
+    )
+    (tmp_path / "sitecustomize.py").write_text(vc.render_sitecustomize_bootstrap())
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json,torch; print(json.dumps({'tf32':torch.backends.cuda.matmul.allow_tf32}))",
+        ],
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(result.stdout) == {"tf32": True}
+    assert vc.FLASH_TF32_MARKER in result.stderr

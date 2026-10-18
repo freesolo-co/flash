@@ -147,10 +147,10 @@ class RunStatus:
     # exact torn-down provider handle retained until both delayed realized-cost reconciliation and any
     # pending customer charge complete. it is private and is not an active resource.
     realized_cost_remote: dict | None = None
-    # Instance providers (lambda/vast) configured WHEN THIS RUN WAS SUBMITTED — the set that could have
+    # Sandbox providers configured WHEN THIS RUN WAS SUBMITTED — the set that could have
     # owned a pre-handle non-idempotent create. Recovery's phantom guard (_confirm_run_clear) fails
     # closed for any of these that is no longer configurable (so it can't ENUMERATE to prove clear),
-    # scoped here so a plane that never configured Vast never blocks a handle-less recovery on it. None
+    # scoped here so a plane blocks recovery only for providers that could have launched this run. None
     # for runs created outside submit() / pre-feature records.
     submitted_instance_providers: list[str] | None = None
     submitted_modal_scope: str | None = None

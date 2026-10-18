@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import os
-import re
 import time
 from collections.abc import Callable
 from typing import Any
@@ -14,31 +13,7 @@ from flash.adapters.artifacts import MAX_ATTEMPT_ID
 from flash.engine.result.rollout_samples import sampled_completion_scalar
 from flash.providers._lifecycle.net.deadline import remaining_seconds
 
-# Generous grace past embedded deadline before orphan sweep reaps a driver-lost warm box.
-PRELOAD_REAP_GRACE_S = 1800.0
-
-
-def preload_instance_run_id(
-    provider: str, region: str, reap_deadline_epoch: int, suffix: str
-) -> str:
-    """Build a ``flash-preload-*`` run id embedding its wall-clock reap deadline.
-
-    Epoch placed right after ``flash-preload-`` so ``run_label_prefix`` tail-truncation never drops it.
-    Keep in sync with ``preload_box_reap_due``'s parser."""
-    return f"flash-preload-d{int(reap_deadline_epoch)}-{provider}-{region.lower()}-{suffix}"
-
-
-def preload_box_reap_due(name: str, now: float, grace_s: float = PRELOAD_REAP_GRACE_S) -> bool:
-    """True when a preload instance name's embedded deadline has elapsed past grace.
-
-    Names without a parseable deadline return False. 10+ digit guard avoids matching region segments."""
-    m = re.search(r"-d(\d{10,})-", name)
-    if not m:
-        return False
-    return float(m.group(1)) + grace_s < now
-
-
-# Fast-fail threshold: active box with no boot.log and no heartbeat this long means cloud-init never ran.
+# Maximum initial bootstrap silence before an active sandbox is considered unhealthy.
 FIRST_LIVENESS_S = 900.0
 
 # Minimum observed-active time before fast-failover fires — protects a freshly-reattached box on
