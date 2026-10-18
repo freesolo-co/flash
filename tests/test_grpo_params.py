@@ -236,7 +236,6 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
             "temperature": 0.7,
             "max_completion_tokens": 256,
             "kl_penalty_coef": 0.02,
-            "entropy_quantile": 0.2,
             "thinking_length_penalty_coef": 0.001,
         },
     }
@@ -245,19 +244,21 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
     assert spec.train.temperature == 0.7
     assert spec.train.max_completion_tokens == 256
     assert spec.train.kl_penalty_coef == 0.02
-    assert spec.train.entropy_quantile == 0.2
+    assert spec.train.entropy_quantile is None
     assert spec.train.thinking_length_penalty_coef == 0.001
     # survives the JSON round-trip the worker reconstructs from
     rt = JobSpec.from_dict(spec.to_dict()).train
     assert rt.group_size == 4
-    assert rt.entropy_quantile == 0.2
+    assert rt.entropy_quantile is None
     assert rt.thinking_length_penalty_coef == 0.001
     # GRPO knobs are NOT in environment.params (that goes verbatim to load_environment)
     assert spec.environment.params == {}
 
 
-def test_entropy_knobs_parse_from_toml_roundtrip_and_override(tmp_path, monkeypatch) -> None:
-    from flash.schema import spec_and_train_keys_from_file
+def test_retired_entropy_toml_is_rejected_but_legacy_worker_override_survives(
+    tmp_path, monkeypatch
+) -> None:
+    from flash.schema import load_toml, spec_and_train_keys_from_file
 
     config = tmp_path / "grpo.toml"
     config.write_text(
@@ -275,7 +276,9 @@ def test_entropy_knobs_parse_from_toml_roundtrip_and_override(tmp_path, monkeypa
         )
     )
 
-    spec = spec_and_train_keys_from_file(str(config), run_id="entropy")[0]
+    with pytest.raises(ConfigError, match="entropy_quantile is retired"):
+        spec_and_train_keys_from_file(str(config), run_id="entropy")
+    spec = JobSpec.from_dict(load_toml(str(config)))
     assert spec.train.entropy_quantile == 0.2
 
     roundtripped = JobSpec.from_dict(spec.to_dict())
