@@ -320,12 +320,12 @@ def test_choice_normalization_rejects_malformed_complete_sets(outputs):
 @pytest.mark.parametrize(
     ("top_logprobs", "candidates", "expected_tokens"),
     [
-        (2, [(12, -1.2, "å"), (10, -0.1, "a"), (13, -2.0, "c")], ["å", "a"]),
-        (2, [(12, -1.2, "å"), (13, -2.0, "c"), (10, -0.1, "a")], ["å", "c"]),
+        (2, [(12, -1.2, "å"), (10, -0.1, "a"), (13, -2.0, "c")], ["a", "å"]),
+        (2, [(12, -1.2, "å"), (13, -2.0, "c"), (10, -0.1, "a")], ["a", "å"]),
         (0, [(10, -0.1, "a"), (12, -1.2, "å")], []),
     ],
 )
-def test_vllm_logprobs_match_openai_candidate_slicing(top_logprobs, candidates, expected_tokens):
+def test_vllm_logprobs_rank_candidates_before_truncating(top_logprobs, candidates, expected_tokens):
     def candidate(value, token):
         return SimpleNamespace(logprob=value, decoded_token=token)
 
@@ -675,3 +675,27 @@ def test_text_only_stream_rejects_wrong_control_types_before_transport(
         deploy.chat_stream(
             "run/final", [{"role": "user", "content": "hi"}], org_id="org-1", **kwargs
         )
+
+
+@pytest.mark.parametrize("top_count", [0, 1, 2, 3, 20])
+def test_logprob_ranking_is_independent_of_candidate_insertion_order(top_count):
+    from itertools import permutations
+
+    candidates = [(99, -9.0, "sampled"), (1, -0.1, "best"), (2, -0.1, "tied")]
+    for ordering in permutations(candidates):
+        result = normalize_token_logprobs(
+            [99],
+            [
+                {
+                    token_id: SimpleNamespace(logprob=value, decoded_token=token)
+                    for token_id, value, token in ordering
+                }
+            ],
+            top_logprobs=top_count,
+        )
+        assert result is not None
+        assert result[0]["token"] == "sampled"
+        assert result[0]["logprob"] == -9.0
+        assert [item["token"] for item in result[0]["top_logprobs"]] == ["best", "tied", "sampled"][
+            :top_count
+        ]

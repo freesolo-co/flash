@@ -406,6 +406,23 @@ assert "flash.serving.src.io.multimodal" not in sys.modules
     assert result.returncode == 0, result.stderr
 
 
+def test_deployed_timeouts_use_the_shared_serving_budget(modal_app_module):
+    from flash.serving.app import timeouts
+
+    app = modal_app_module.modal.App.return_value
+    engine_calls = app.cls.call_args_list
+    assert engine_calls
+    for call in engine_calls:
+        assert call.kwargs["startup_timeout"] == timeouts.STARTUP_TIMEOUT_SECONDS
+        assert call.kwargs["timeout"] == timeouts.REQUEST_TIMEOUT_SECONDS
+    router_calls = app.function.call_args_list
+    assert len(router_calls) == 1
+    assert router_calls[0].kwargs["timeout"] == timeouts.ROUTER_TIMEOUT_SECONDS
+    assert timeouts.ROUTER_TIMEOUT_SECONDS == (
+        timeouts.STARTUP_TIMEOUT_SECONDS + timeouts.REQUEST_TIMEOUT_SECONDS
+    )
+
+
 def test_one_engine_class_per_distinct_engine_key(modal_app_module):
     """a loraengine class is built for each active gpu tier and concurrency key."""
     # all three active tiers serve on B200 with the same concurrency, so they legitimately share

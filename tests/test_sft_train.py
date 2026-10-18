@@ -1750,8 +1750,9 @@ def test_seeded_dataloader_handles_missing_and_present_validation_sampler(
     assert exc_info.value is original_error
 
 
+@pytest.mark.parametrize("ratio", [1.0, 3.5, 16.0])
 def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus(
-    monkeypatch, capsys
+    monkeypatch, capsys, ratio
 ):
     class FakeLoader:
         def __init__(self, *args, **kwargs):
@@ -1837,7 +1838,8 @@ def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus
 
     sft_plugin._install_seeded_dataloader(43)
     sft_plugin._install_linear_scheduler()
-    sft_plugin._install_loraplus(16, "CUSTOM_LORAPLUS_READY")
+    original_builder = FakeEngine._build_optimizer
+    sft_plugin._install_loraplus(ratio, "CUSTOM_LORAPLUS_READY")
 
     engine = FakeEngine()
     engine.optimizer_config = SimpleNamespace(
@@ -1851,11 +1853,17 @@ def test_generated_sitecustomize_installs_linear_scheduler_and_required_loraplus
         lr_warmup_steps_ratio=0.1,
         total_training_steps=20,
     )
-    assert engine._build_optimizer(SimpleNamespace()) == "lora+"
+    assert engine._build_optimizer(SimpleNamespace()) == ("lora+" if ratio > 1 else "plain")
     output = capsys.readouterr().out
-    assert "CUSTOM_LORAPLUS_READY ratio=16 optimizer=AdamW" in output
     assert _LORAPLUS_READY_MARKER not in output
-    assert optimizer_calls[0]["optimizer_kwargs"]["eps"] == 1e-8
+    if ratio > 1:
+        assert f"CUSTOM_LORAPLUS_READY ratio={ratio:g} optimizer=AdamW" in output
+        assert optimizer_calls[0]["optimizer_kwargs"]["eps"] == 1e-8
+        assert optimizer_calls[0]["loraplus_lr_ratio"] == ratio
+    else:
+        assert FakeEngine._build_optimizer is original_builder
+        assert optimizer_calls == []
+        assert "CUSTOM_LORAPLUS_READY" not in output
     assert engine._build_lr_scheduler("optimizer") == "linear"
     assert scheduler_calls == [("optimizer", {"num_warmup_steps": 2, "num_training_steps": 20})]
 
@@ -1866,7 +1874,7 @@ def test_sft_plugin_config_carries_the_canonical_loraplus_marker(tmp_path):
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir()
     _, _, raw_config = sft_train_runner._write_sft_child_shims(
-        SimpleNamespace(save_at_steps=(3,)),
+        SimpleNamespace(save_at_steps=(3,), loraplus_ratio=16.0),
         SimpleNamespace(update_horizon=7, reentrant_gradient_checkpointing=False),
         shim_dir=str(shim_dir),
         custom_dataset_path=str(shim_dir / "dataset.py"),
@@ -1877,6 +1885,34 @@ def test_sft_plugin_config_carries_the_canonical_loraplus_marker(tmp_path):
     )
 
     assert json.loads(raw_config)["loraplus_ready_marker"] == _LORAPLUS_READY_MARKER
+
+
+@pytest.mark.parametrize("ratio", [1.0, 3.5, 16.0])
+@pytest.mark.parametrize("gate", ["step", "exit"])
+def test_loraplus_marker_is_required_only_for_the_runs_selected_ratio(ratio, gate):
+    from flash.engine.worker.train.entry import sft_train_runner
+
+    progress = sft_train_runner._prepare_sft_progress(
+        SimpleNamespace(loraplus_ratio=ratio),
+        SimpleNamespace(rows=[]),
+        SimpleNamespace(update_horizon=1),
+        SimpleNamespace(resume_step=0, shim_markers="", expected_shims=()),
+    )
+
+    def check():
+        if gate == "step":
+            return sft_train_runner._consume_sft_marker_line(progress, "step:1 - train/loss:1.0")
+        return sft_train_runner._finish_sft_child(
+            SimpleNamespace(stop_gb=lambda: 0.0), 0.0, 0, progress
+        )
+
+    if ratio > 1:
+        with pytest.raises(RuntimeError, match="required lora\\+ shim"):
+            check()
+        sft_train_runner._consume_sft_marker_line(
+            progress, f"{_LORAPLUS_READY_MARKER} ratio={ratio:g} optimizer=AdamW"
+        )
+    check()
 
 
 def _exec_dataloader_shim(monkeypatch):
@@ -3036,18 +3072,80 @@ def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monk
     assert "bare assistant target coerced" not in output
 
 
-def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch):
+@pytest.mark.parametrize("legacy", [True, False])
+def test_sft_retries_preserve_the_prepared_optimizer_ratio(monkeypatch, legacy):
+    from flash.core.spec import JobSpec
+    from flash.engine.worker.train.entry import sft_train_runner
+    from flash.runner.lifecycle.state import RunStatus
+    from flash.runner.lifecycle.status import reallocation_spec_from_status
+    from flash.runner.lifecycle.submit import _effective_preparation_snapshot
+    from flash.schema import spec_from_dict
+
+    _stub_sft_run(monkeypatch)
+    raw = {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "sft",
+        "project": "11111111-1111-4111-8111-111111111111",
+        "environment": {"id": "owner/project/env"},
+        "train": {"epochs": 1, "learning_rate": 1e-5},
+        "gpu": {"type": "H100", "count": 1},
+    }
+    spec = JobSpec.from_dict(raw) if legacy else spec_from_dict(raw)
+    spec = replace(spec, run_id="legacy-sft", model_revision="a" * 40, model_revision_auto=True)
+    snapshot = _effective_preparation_snapshot(spec, spec, None)
+    if legacy:
+        # frozen before the recovery fix: old snapshots must still pass integrity validation.
+        assert snapshot["preparation_digest"] == (
+            "d190288e79077c89f6b79353947a393e2a0463c141757d844bd889511f91022b"
+        )
+        assert "loraplus_ratio" not in snapshot["worker_spec"]["train"]
+    original_digest = snapshot["preparation_digest"]
+    status = RunStatus(
+        state="running",
+        run_id=spec.run_id,
+        spec=spec.to_dict(),
+        effective_preparation=json.loads(json.dumps(snapshot)),
+    )
+    for _attempt in range(2):
+        recovered = reallocation_spec_from_status(status)
+        worker = JobSpec.from_json(recovered.to_json())
+        options = sft_train_runner._resolve_sft_options(worker)
+        assert options.loraplus_ratio == (16.0 if legacy else 1.0)
+        status.effective_preparation = _effective_preparation_snapshot(
+            JobSpec.from_dict(status.spec), worker, None, stored_public=status.spec
+        )
+        assert status.effective_preparation["preparation_digest"] == original_digest
+
+
+@pytest.mark.parametrize("ratio", [None, 1.0, 3.5, 16.0])
+def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch, ratio):
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
+    from flash.core.spec import JobSpec
     from flash.engine.worker.train.entry import sft_train
+    from flash.schema import spec_from_dict
 
     monkeypatch.setenv("PYTHONPATH", "synthetic-sft-parent-path")
     monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PYTHONPATH")
     spec, captured = _stub_sft_run(monkeypatch)
+    authored = spec_from_dict(
+        {
+            "model": spec.model,
+            "algorithm": "sft",
+            "project": "11111111-1111-4111-8111-111111111111",
+            "environment": {"id": "owner/project/env"},
+            "train": {} if ratio is None else {"loraplus_ratio": ratio},
+        }
+    )
+    spec.train.loraplus_ratio = JobSpec.from_json(authored.to_json()).train.loraplus_ratio
+    effective_ratio = 1.0 if ratio is None else ratio
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         captured["command"] = command
         captured["child_env"] = env
-        on_line(f"{_LORAPLUS_READY_MARKER} ratio=16 optimizer=AdamW\n")
+        config = json.loads(env["FLASH_SFT_PLUGIN_CONFIG"])
+        assert config["loraplus_ratio"] == effective_ratio
+        if effective_ratio > 1:
+            on_line(f"{_LORAPLUS_READY_MARKER} ratio={effective_ratio:g} optimizer=AdamW\n")
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
         heartbeat()
@@ -3080,7 +3178,8 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     assert captured["meta"]["step"] == 2
     assert captured["meta"]["train_tokens"] > 0
     assert captured["meta"]["notes"]["loss_curve"] == [1.0]
-    assert captured["meta"]["notes"]["loraplus_applied"] is True
+    assert captured["meta"]["notes"]["loraplus_applied"] is (effective_ratio > 1)
+    assert captured["meta"]["notes"]["loraplus_ratio"] == effective_ratio
     notes = captured["meta"]["notes"]
     realized_max_length = notes["realized_max_length"]
     assert 0 < realized_max_length < notes["configured_max_length"]
@@ -3287,7 +3386,8 @@ def test_the_sft_runner_seeds_the_watcher_with_the_step_it_resumed_from(monkeypa
     assert captured["published"][0][1] == 2
 
 
-def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatch):
+@pytest.mark.parametrize("ratio", [1.0, 3.5, 16.0])
+def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatch, ratio):
     """the seeded resume step must not suppress the final publish.
 
     the previous attempt's per-step deployable publish is best-effort (``required=False``) while
@@ -3296,6 +3396,7 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     from flash.engine.worker.train.entry import sft_train
 
     spec, captured = _stub_sft_run(monkeypatch)
+    spec.train.loraplus_ratio = ratio
     # max_steps is 2, so resuming at 2 means the watcher never runs and finalization is the only
     # path left that can publish the step.
     monkeypatch.setattr(
@@ -3312,6 +3413,8 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     sft_train.run_sft_train(spec)
 
     assert [step for _adapter, step in captured["published"]] == [2]
+    assert captured["meta"]["notes"]["loraplus_ratio"] == ratio
+    assert captured["meta"]["notes"]["loraplus_applied"] is (ratio > 1)
 
 
 def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
@@ -3332,6 +3435,7 @@ def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon):
         model_revision="revision",
         epochs=1,
         learning_rate=5e-5,
+        loraplus_ratio=16.0,
         effective_batch=64,
         max_steps=0,
         save_at_steps=save_at_steps,

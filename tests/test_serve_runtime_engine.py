@@ -759,7 +759,7 @@ def test_packaged_engine_threads_top_logprobs_through_buffered_and_streaming() -
         runtime.generate(GenerationRequest(prompt="hello", logprobs=True, top_logprobs=1))
     )
     assert result.choices[0].logprobs is not None
-    assert [record["token"] for record in result.choices[0].logprobs[0]["top_logprobs"]] == ["b"]
+    assert [record["token"] for record in result.choices[0].logprobs[0]["top_logprobs"]] == ["a"]
 
     engine.responses.append([_output("a", [1], logprobs=[candidates])])
 

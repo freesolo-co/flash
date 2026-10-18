@@ -18,7 +18,6 @@ from flash.serve.app import materialize as materialize_module
 from flash.serve.app.manifest import ArtifactFile, build_serving_manifest
 from flash.serve.app.materialize import (
     MaterializationError,
-    _load_strict_config,
     _validate_cache_ancestor_stat,
     adapter_cache_path,
     base_weights_are_cached,
@@ -326,18 +325,31 @@ def test_serve_revalidation_rejects_corruption_without_downloading(tmp_path: Pat
 @pytest.mark.parametrize(
     "constant",
     [
-        pytest.param("NaN", id="nan"),
-        pytest.param("Infinity", id="positive-infinity"),
-        pytest.param("-Infinity", id="negative-infinity"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
     ],
 )
-def test_non_finite_adapter_config_constants_are_not_strict_json(constant: str) -> None:
-    raw = f'{{"peft_type":"LORA","r":16,"lora_alpha":{constant}}}'.encode()
+def test_non_finite_adapter_config_constants_are_not_strict_json(
+    tmp_path: Path, constant: float
+) -> None:
+    """a non-finite constant is refused here exactly as hosted admission refuses it.
 
-    with pytest.raises(
-        MaterializationError, match=r"adapter_config\.json is not strict utf-8 json"
-    ):
-        _load_strict_config(raw)
+    ``json.dumps`` emits bare ``NaN``/``Infinity``, which plain decoding accepts and no engine can
+    load. this goes through the real hydration entry point rather than a private helper so the test
+    keeps proving the container's verdict after the rule moved to the shared reader.
+    """
+
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path, lora_alpha=constant)
+    manifest = _manifest(config_bytes, weights_bytes)
+
+    with pytest.raises(MaterializationError, match=r"adapter_config\.json is not readable json"):
+        hydrate_manifest(
+            manifest,
+            tmp_path / "cache",
+            token_fd=_token_fd(),
+            snapshot_download_fn=_download_stub(config_bytes, weights_bytes, []),
+        )
 
 
 def test_invalid_current_adapter_metadata_never_publishes_cache(tmp_path: Path) -> None:

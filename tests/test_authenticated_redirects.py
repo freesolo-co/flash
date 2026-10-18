@@ -17,7 +17,14 @@ from flash._internal.http import (
 )
 from flash.client.freesolo_api import _freesolo_request, verify_freesolo_key
 from flash.client.http import ApiClient, ApiError
-from flash.server.billing.charges import BillingError, _post_billing
+from flash.server.billing.charges import (
+    BillingError,
+    PrecheckError,
+    PrecheckFailureSource,
+    PrecheckRetryDisposition,
+    _post_billing,
+    precheck_training_run,
+)
 from flash.server.platform import auth
 from flash.server.platform import internal_client as ic
 from tests._helpers.wire_headers import sent_headers
@@ -156,16 +163,16 @@ def test_a_rejected_redirect_is_not_cached_as_a_failed_verification(
     auth._verify_cache.clear()
     auth._verify_inflight.clear()
 
-    assert auth._freesolo_verify("redirected-secret") is False
+    assert auth._freesolo_verify("redirected-secret") is None
     assert source_seen == [("GET", "Bearer redirected-secret")]
     assert sink_seen == []
-    assert "redirected-secret" not in auth._verify_cache
+    assert auth._verify_key_digest("redirected-secret") not in auth._verify_cache
 
     # the redirect condition clears and the backend answers for real. a cached negative from the
-    # redirect would shadow this and keep returning False without a request.
+    # redirect would shadow this and keep returning None without a request.
     with _ok_server() as ok_url:
         monkeypatch.setenv(auth.FREESOLO_BASE_URL_ENV, ok_url)
-        assert auth._freesolo_verify("redirected-secret") is True
+        assert auth._freesolo_verify("redirected-secret") is not None
 
     assert len(source_seen) == 1
 
@@ -201,6 +208,22 @@ def test_billing_keeps_billing_error_classification_and_does_not_reach_redirect_
         _post_billing(token="billing-secret", path="/api/billing", body={"runId": "run-a"})
 
     assert exc_info.value.status_code == 302
+    assert source_seen == [("POST", "Bearer billing-secret")]
+    assert sink_seen == []
+
+
+def test_billing_precheck_blocks_redirect_without_reaching_sink(
+    monkeypatch, redirect_servers
+) -> None:
+    source_url, source_seen, sink_seen = redirect_servers
+    monkeypatch.setenv(auth.FREESOLO_BASE_URL_ENV, source_url)
+
+    with pytest.raises(PrecheckError) as exc_info:
+        precheck_training_run(internal_key="billing-secret", org_id="org-a", estimate_usd=1)
+
+    assert exc_info.value.status_code == 302
+    assert exc_info.value.source is PrecheckFailureSource.HTTP
+    assert exc_info.value.retry is PrecheckRetryDisposition.BLOCK
     assert source_seen == [("POST", "Bearer billing-secret")]
     assert sink_seen == []
 

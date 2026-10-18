@@ -48,6 +48,7 @@ class CanaryRequest:
     # exact hazard `CanaryError`'s docstring names; the field must not be able to cause it.
     api_key: str = field(repr=False)
     correlation_id: str
+    org_id: str
     timeout_seconds: float
     # `max_tokens`, not `max_completion_tokens`. The hosted router parses with
     # `flash.serve.request.openai.parse_chat_request`, whose `_ALLOWED_REQUEST_KEYS` is a strict
@@ -87,6 +88,7 @@ def _headers(request: CanaryRequest) -> dict[str, str]:
     return {
         "X-Freesolo-Internal-Key": request.api_key,
         "X-Correlation-ID": request.correlation_id,
+        "X-Freesolo-Org-Id": request.org_id,
         "Accept": "text/event-stream",
         "Content-Type": "application/json",
     }

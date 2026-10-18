@@ -98,7 +98,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         if: steps.gate.outputs.deploy == 'true'
         with:
           # pin the installed binary as well as the action implementation.
@@ -114,7 +114,7 @@ jobs:
           # pinned to the exact client pyproject declares; see deploy-modal.yml for why an
           # unbounded range is unsafe for the deploy path.
           # exact pins keep the deploy client bootstrap reproducible across runner image changes.
-          uv pip install --system "modal==1.5.4" "python-dotenv==1.2.3"
+          uv pip install --system "modal==1.6.1" "python-dotenv==1.2.3"
 
       - name: Verify development deployment inputs
         if: steps.gate.outputs.deploy == 'true'
