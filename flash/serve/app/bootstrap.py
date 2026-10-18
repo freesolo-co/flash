@@ -8,6 +8,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from flash.serve.request.tool_calls import qualified_tool_parser
 from flash.serve.runtime import AdapterSpec, EngineConfig, VllmLoraRuntime
 
 from .manifest import ManifestAdapter, ServingManifest
@@ -95,6 +96,7 @@ def engine_config_from_manifest(manifest: ServingManifest) -> EngineConfig:
         mm_processor_cache_gb=identity.mm_processor_cache_gb,
         enable_tower_connector_lora=identity.enable_tower_connector_lora,
         reasoning_parser=identity.reasoning_parser,
+        tool_parser=qualified_tool_parser(manifest.logical_base_model),
         engine_args=named_args,
         tokenizer_kwargs=dict(manifest.tokenizer_kwargs),
         processor_kwargs=dict(manifest.processor_kwargs),

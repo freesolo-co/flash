@@ -60,12 +60,19 @@ def _stub_adapter_config(
     tmp_path,
     *,
     rank: int = 32,
+    base_model: str = "Qwen/Qwen3.5-9B",
     config: dict | None = None,
     tensor_files: dict[str, int | None] | None = None,
     stub_capabilities: bool = True,
 ):
+    # the default is what every flash publish path actually stamps: the exporter writes
+    # `base_model_name_or_path` unconditionally and the builder always sets peft_type. a stub that
+    # omitted them described an artifact the gpu container would refuse, so it could not stand in
+    # for a real one at admission.
+    if config is None:
+        config = {"r": rank, "peft_type": "LORA", "base_model_name_or_path": base_model}
     cfg = tmp_path / "adapter_config.json"
-    cfg.write_text(json.dumps({"r": rank} if config is None else config), encoding="utf-8")
+    cfg.write_text(json.dumps(config), encoding="utf-8")
     seen: dict = {}
 
     def fake_hf_hub_download(**kwargs):
@@ -505,7 +512,12 @@ def test_deploy_rejects_bin_adapter_tensor(monkeypatch, tmp_path):
     seen = _stub_adapter_config(monkeypatch, tmp_path, tensor_files={"adapter_model.bin": None})
 
     with pytest.raises(AdapterTensorMissing, match="has no adapter_model tensor file"):
-        adapter_artifact_metadata("org/repo", "sft/r-bin/seed0/adapter", artifact_revision="a" * 40)
+        adapter_artifact_metadata(
+            "org/repo",
+            "sft/r-bin/seed0/adapter",
+            artifact_revision="a" * 40,
+            expected_base_model="Qwen/Qwen3.5-9B",
+        )
     assert seen["list_repo_tree"]["path_in_repo"] == "sft/r-bin/seed0/adapter"
 
 
@@ -879,7 +891,7 @@ def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_
     """`deploy_adapter` must pass the scaled budget; the default argument alone is the old bug."""
     import flash.serve.deployment.deploy as d
 
-    _stub_adapter_config(monkeypatch, tmp_path, rank=32)
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32, base_model="Qwen/Qwen3.6-35B-A3B")
     monkeypatch.setattr(d, "resolve_artifact_revision", lambda _repo: "a" * 40)
     monkeypatch.setattr(d, "_registered_adapter", lambda *_args, **_kwargs: None)
 

@@ -14,18 +14,18 @@ from fastapi.testclient import TestClient
 
 from flash.serving.src.accounting.usage import (
     _FREESOLO_USD_PER_MTOK,
+    FREESOLO_PRICING_SOURCE,
     build_usage_session,
     freesolo_price,
     new_generation_id,
+    principal_for_external_org,
 )
 from flash.serving.src.accounting.usage_facts import usage_facts
 from flash.serving.src.accounting.usage_outbox import (
-    AcceptedPriceSnapshot,
     AuthoritativeProviderDay,
     DurableUsageOutbox,
     FreesoloOrgTrafficPrincipal,
     OfflineUsageStore,
-    OpenRouterTrafficPrincipal,
     OutboxSnapshot,
     ProviderSettlementRecord,
     ReconciliationDayResult,
@@ -33,6 +33,7 @@ from flash.serving.src.accounting.usage_outbox import (
     RequestIdentity,
     UsageEvent,
     UsageOutboxError,
+    _settlement_principal,
 )
 from flash.serving.src.engine.model_config import base_models
 from flash.serving.src.http.inference_routes import _discard_prepared_stream
@@ -227,16 +228,10 @@ def test_generation_id_format_and_public_identity_separation() -> None:
         request_id=generation_id,
         correlation_id="correlation-1",
         openai_completion_id="chatcmpl-1",
-        openrouter_request_id="or-request-1",
-        openrouter_generation_id="or-generation-1",
-        upstream_id="upstream-1",
     )
     assert identity.request_id not in {
         identity.correlation_id,
         identity.openai_completion_id,
-        identity.openrouter_request_id,
-        identity.openrouter_generation_id,
-        identity.upstream_id,
     }
 
 
@@ -288,6 +283,55 @@ def test_empty_or_omitted_token_ids_preserve_resolved_scalar_counts(
     assert facts.completion_tokens == 3
     assert facts.cached_tokens == 2
     assert facts.cached_tokens <= facts.prompt_tokens
+
+
+def test_capacity_facts_use_top_level_optional_rpc_fields() -> None:
+    event = _usage_event()
+    event = replace(
+        event,
+        facts=replace(
+            event.facts,
+            time_to_first_token_seconds=0.75,
+            queue_wait_seconds=0.25,
+            replica_in_flight_requests_at_admission=3,
+            replica_boot_duration_seconds=91.5,
+            replica_freshly_booted=True,
+        ),
+    )
+
+    payload = event.rpc_payload()
+
+    assert payload["time_to_first_token_seconds"] == 0.75
+    assert payload["queue_wait_seconds"] == 0.25
+    assert payload["replica_in_flight_requests_at_admission"] == 3
+    assert payload["replica_boot_duration_seconds"] == 91.5
+    assert payload["replica_freshly_booted"] is True
+    assert "capacity" not in payload["attestation_evidence"]
+
+
+def test_invalid_or_missing_capacity_facts_are_omitted_without_raising() -> None:
+    facts = usage_facts(
+        {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "cached_tokens": 0,
+            "cached_tokens_reported": False,
+            "reasoning_tokens": 0,
+            "thinking": False,
+            "time_to_first_token_seconds": "not-a-number",
+            "queue_wait_seconds": -1,
+            "replica_in_flight_requests_at_admission": True,
+            "replica_boot_duration_seconds": float("inf"),
+            "replica_freshly_booted": "yes",
+        }
+    )
+    payload = replace(_usage_event(), facts=facts).rpc_payload()
+
+    assert "time_to_first_token_seconds" not in payload
+    assert "queue_wait_seconds" not in payload
+    assert "replica_in_flight_requests_at_admission" not in payload
+    assert "replica_boot_duration_seconds" not in payload
+    assert "replica_freshly_booted" not in payload
 
 
 def test_nonstream_capture_is_awaited_before_successful_response() -> None:
@@ -479,22 +523,11 @@ def test_nonstream_capture_failure_returns_controlled_503() -> None:
     assert response.json() == {"detail": "durable serving accounting unavailable"}
 
 
-def test_openrouter_event_omits_org_and_billable_requested_adapter() -> None:
+def test_every_settled_event_carries_an_attributed_org() -> None:
     record = _revision()
-    principal = OpenRouterTrafficPrincipal(
-        publicModelId="public/model",
-        providerCatalogDigest="catalog-digest-1",
-        acceptedPriceSnapshot=AcceptedPriceSnapshot(
-            promptTokenUsd="0.000001",
-            cachedPromptTokenUsd="0.0000005",
-            completionTokenUsd="0.000002",
-        ),
-    )
     identity = RequestIdentity(
         request_id=new_generation_id(),
         correlation_id="correlation-1",
-        openrouter_request_id="or-request-1",
-        openrouter_generation_id="or-generation-1",
     )
     result = attest(
         record,
@@ -510,7 +543,7 @@ def test_openrouter_event_omits_org_and_billable_requested_adapter() -> None:
     session = build_usage_session(
         OfflineUsageStore(),
         identity,
-        principal,
+        principal_for_external_org("org-1"),
         record,
         record,
         result,
@@ -521,12 +554,39 @@ def test_openrouter_event_omits_org_and_billable_requested_adapter() -> None:
 
     payload = session.event(result).rpc_payload()
 
-    assert payload["traffic_principal_kind"] == "openrouter"
-    assert payload["org_id"] is None
-    assert payload["checkpoint_id"] is None
-    assert payload["public_model_id"] == "public/model"
-    assert payload["provider_catalog_digest"] == "catalog-digest-1"
-    assert payload["accepted_price_snapshot"]["completionTokenUsd"] == "0.000002"
+    assert payload["traffic_principal_kind"] == "freesolo_org"
+    assert payload["org_id"] == "org-1"
+    assert payload["checkpoint_id"] == record.adapter_id
+    assert payload["public_model_id"] == record.adapter_id
+    assert payload["pricing_source"] == FREESOLO_PRICING_SOURCE
+    # no marketplace-specific settlement surface survives on the wire.
+    for absent in (
+        "traffic_source",
+        "openrouter_request_id",
+        "openrouter_generation_id",
+        "upstream_id",
+        "provider_catalog_digest",
+        "accepted_price_snapshot",
+        "quoted_provider_amount_micro_usd",
+    ):
+        assert absent not in payload
+
+
+def test_trusted_internal_settlement_requires_explicit_attribution() -> None:
+    row = _claimed_row()
+    row["traffic_principal_kind"] = "trusted_internal"
+    row["billing_attribution_explicit"] = False
+
+    with pytest.raises(UsageOutboxError, match="usage_principal_invalid"):
+        _settlement_principal(row)
+
+
+def test_settlement_rejects_a_row_without_an_org() -> None:
+    row = _claimed_row()
+    row["org_id"] = None
+
+    with pytest.raises(UsageOutboxError, match="usage_principal_invalid"):
+        _settlement_principal(row)
 
 
 def _usage_event() -> UsageEvent:
@@ -622,6 +682,22 @@ async def _no_sleep(_seconds: float) -> None:
     return None
 
 
+class _MutableClocks:
+    def __init__(self, wall: datetime, monotonic: float = 0.0) -> None:
+        self.wall = wall
+        self.monotonic = monotonic
+
+    def wall_time(self) -> datetime:
+        return self.wall
+
+    def monotonic_time(self) -> float:
+        return self.monotonic
+
+    def advance(self, seconds: float) -> None:
+        self.wall += timedelta(seconds=seconds)
+        self.monotonic += seconds
+
+
 def test_capture_uses_deployment_owner_process_epoch_and_server_timing() -> None:
     client = _QueuedClient(
         [
@@ -658,11 +734,11 @@ def test_capture_uses_deployment_owner_process_epoch_and_server_timing() -> None
 
 def test_slow_capture_starts_full_heartbeat_lease_after_rpc_success() -> None:
     event = _usage_event()
-    now = [datetime(2026, 8, 24, 12, 0, tzinfo=UTC)]
+    clocks = _MutableClocks(datetime(2026, 8, 24, 12, 0, tzinfo=UTC), monotonic=1_000.0)
     sleeps: list[float] = []
 
     async def delayed_capture() -> tuple[int, Any]:
-        now[0] += timedelta(seconds=119)
+        clocks.advance(119)
         return (
             200,
             [
@@ -676,7 +752,7 @@ def test_slow_capture_starts_full_heartbeat_lease_after_rpc_success() -> None:
 
     async def advance_clock(seconds: float) -> None:
         sleeps.append(seconds)
-        now[0] += timedelta(seconds=seconds)
+        clocks.advance(seconds)
 
     client = _QueuedClient(
         [
@@ -701,14 +777,13 @@ def test_slow_capture_starts_full_heartbeat_lease_after_rpc_success() -> None:
         client=client,
         worker_id="worker-1",
         sleep=advance_clock,
-        clock=lambda: now[0],
+        clock=clocks.wall_time,
+        monotonic=clocks.monotonic_time,
     )
 
     async def run() -> None:
         await outbox.capture(event)
-        assert outbox._generation_lease_deadlines[event.identity.request_id] == datetime(
-            2026, 8, 24, 12, 3, 59, tzinfo=UTC
-        )
+        assert outbox._generation_lease_deadlines[event.identity.request_id] == 1_239.0
         await outbox._heartbeat_active_generations_with_retry()
         await outbox.finalize(event)
 
@@ -790,6 +865,7 @@ def test_transient_heartbeat_failure_recovers_without_poisoning_terminal_rpc(
 ) -> None:
     event = _usage_event()
     fixed_now = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+    fixed_monotonic = 1_000.0
     client = _QueuedClient(
         [
             *heartbeat_failures,
@@ -816,13 +892,12 @@ def test_transient_heartbeat_failure_recovers_without_poisoning_terminal_rpc(
         worker_id="worker-1",
         sleep=record_sleep,
         clock=lambda: fixed_now,
+        monotonic=lambda: fixed_monotonic,
     )
     outbox._heartbeat_seconds = 20
     outbox._generation_lease_seconds = 120
     outbox._active_generations.add(event.identity.request_id)
-    outbox._generation_lease_deadlines[event.identity.request_id] = fixed_now + timedelta(
-        seconds=120
-    )
+    outbox._generation_lease_deadlines[event.identity.request_id] = fixed_monotonic + 120
 
     async def run() -> None:
         await outbox._heartbeat_active_generations_with_retry()
@@ -837,7 +912,71 @@ def test_transient_heartbeat_failure_recovers_without_poisoning_terminal_rpc(
     assert event.identity.request_id not in outbox._active_generations
 
 
-def test_generation_churn_does_not_postpone_existing_heartbeat_deadline() -> None:
+@pytest.mark.parametrize(
+    "wall_jump",
+    [
+        pytest.param(timedelta(days=-1), id="backward"),
+        pytest.param(timedelta(days=1), id="forward"),
+    ],
+)
+def test_wall_clock_jump_does_not_change_heartbeat_retry_budget(
+    wall_jump: timedelta,
+) -> None:
+    event = _usage_event()
+    clocks = _MutableClocks(datetime(2026, 8, 25, 12, 0, tzinfo=UTC), monotonic=1_000.0)
+    sleeps: list[float] = []
+    client = _QueuedClient(
+        [
+            (
+                200,
+                [
+                    {
+                        "state": "in_progress",
+                        "lease_seconds": 25,
+                        "heartbeat_seconds": 20,
+                    }
+                ],
+            ),
+            (503, {"error": "temporarily unavailable"}),
+            (503, {"error": "temporarily unavailable"}),
+            (503, {"error": "temporarily unavailable"}),
+        ]
+    )
+
+    async def advance_with_jump(seconds: float) -> None:
+        sleeps.append(seconds)
+        clocks.advance(seconds)
+        if len(sleeps) == 1:
+            clocks.wall += wall_jump
+
+    outbox = DurableUsageOutbox(
+        _outbox_settings(),
+        client=client,
+        worker_id="worker-1",
+        sleep=advance_with_jump,
+        clock=clocks.wall_time,
+        monotonic=clocks.monotonic_time,
+    )
+
+    async def run() -> None:
+        await outbox.capture(event)
+        with pytest.raises(UsageOutboxError, match="generation_heartbeat_lease_expired"):
+            await outbox._heartbeat_active_generations_with_retry()
+
+    asyncio.run(run())
+
+    assert sleeps == [20.0, 5.0]
+    assert clocks.monotonic == 1_025.0
+
+
+@pytest.mark.parametrize(
+    "wall_jump",
+    [
+        pytest.param(timedelta(days=-1), id="backward"),
+        pytest.param(timedelta(days=1), id="forward"),
+    ],
+)
+def test_wall_clock_jump_does_not_change_heartbeat_cadence(wall_jump: timedelta) -> None:
     first = _usage_event()
     second = replace(
         first,
@@ -846,7 +985,7 @@ def test_generation_churn_does_not_postpone_existing_heartbeat_deadline() -> Non
             correlation_id="correlation-2",
         ),
     )
-    now = [datetime(2026, 8, 25, 12, 0, tzinfo=UTC)]
+    clocks = _MutableClocks(datetime(2026, 8, 25, 12, 0, tzinfo=UTC), monotonic=1_000.0)
     sleeps_started: asyncio.Queue[float] = asyncio.Queue()
     release_sleep = asyncio.Event()
 
@@ -854,7 +993,7 @@ def test_generation_churn_does_not_postpone_existing_heartbeat_deadline() -> Non
         await sleeps_started.put(seconds)
         await release_sleep.wait()
         release_sleep.clear()
-        now[0] += timedelta(seconds=seconds)
+        clocks.advance(seconds)
 
     capture_result = (
         200,
@@ -885,7 +1024,8 @@ def test_generation_churn_does_not_postpone_existing_heartbeat_deadline() -> Non
         client=client,
         worker_id="worker-1",
         sleep=controlled_sleep,
-        clock=lambda: now[0],
+        clock=clocks.wall_time,
+        monotonic=clocks.monotonic_time,
     )
 
     async def run() -> None:
@@ -893,7 +1033,9 @@ def test_generation_churn_does_not_postpone_existing_heartbeat_deadline() -> Non
         outbox._heartbeat_worker = asyncio.create_task(outbox._run_heartbeat_worker())
         assert await sleeps_started.get() == 20
         for remaining in (16, 12, 8, 4):
-            now[0] += timedelta(seconds=4)
+            clocks.advance(4)
+            if remaining == 16:
+                clocks.wall += wall_jump
             await outbox.capture(second)
             outbox.relinquish(second.identity.request_id)
             assert await sleeps_started.get() == remaining
@@ -919,12 +1061,65 @@ def test_generation_churn_does_not_postpone_existing_heartbeat_deadline() -> Non
 
     asyncio.run(run())
 
-    assert now[0] == datetime(2026, 8, 25, 12, 0, 20, tzinfo=UTC)
+    assert clocks.wall == datetime(2026, 8, 25, 12, 0, 20, tzinfo=UTC) + wall_jump
     assert first.identity.request_id in outbox._active_generations
-    assert outbox._generation_lease_deadlines[first.identity.request_id] == datetime(
-        2026, 8, 25, 12, 2, 20, tzinfo=UTC
-    )
+    # the renewal is dated from the monotonic instant the heartbeat left, so the deadline is
+    # unaffected by the wall jump the server timestamp would have carried into it.
+    assert outbox._generation_lease_deadlines[first.identity.request_id] == 1_140.0
     assert outbox._background_error is None
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    [
+        pytest.param("2026-08-25T12:02:20", id="naive"),
+        pytest.param("not-a-timestamp", id="unparseable"),
+        pytest.param(1_787_000_000, id="epoch-int"),
+        pytest.param({"at": "2026-08-25T12:02:20Z"}, id="object"),
+    ],
+)
+def test_heartbeat_rejects_a_malformed_server_lease_expiry(expires_at: Any) -> None:
+    """A renewal the server could not describe is not a renewal.
+
+    The absolute expiry is no longer stored, since comparing it against a local wall clock is the
+    skew this fix removes. It is still parsed: a heartbeat row carrying an expiry the server cannot
+    express is a broken contract, and accepting it would extend the local deadline on the strength
+    of a field nobody checked.
+    """
+    event = _usage_event()
+    client = _QueuedClient(
+        [
+            (200, [{"state": "in_progress", "lease_seconds": 120, "heartbeat_seconds": 20}]),
+            (
+                200,
+                [
+                    {
+                        "request_id": event.identity.request_id,
+                        "generation_lease_expires_at": expires_at,
+                    }
+                ],
+            ),
+        ]
+    )
+    clocks = _MutableClocks(datetime(2026, 8, 25, 12, 0, tzinfo=UTC), monotonic=1_000.0)
+    outbox = DurableUsageOutbox(
+        _outbox_settings(),
+        client=client,
+        worker_id="worker-1",
+        clock=clocks.wall_time,
+        monotonic=clocks.monotonic_time,
+    )
+
+    async def run() -> None:
+        await outbox.capture(event)
+        assert outbox._generation_lease_deadlines[event.identity.request_id] == 1_120.0
+        with pytest.raises(UsageOutboxError, match="usage_snapshot_timestamp_invalid"):
+            await outbox._heartbeat_active_generations()
+
+    asyncio.run(run())
+
+    # the capture deadline stands: a rejected row must not silently extend the lease.
+    assert outbox._generation_lease_deadlines[event.identity.request_id] == 1_120.0
 
 
 def test_heartbeat_batches_exact_active_generation_authority() -> None:
@@ -1000,6 +1195,31 @@ def test_heartbeat_ignores_generation_terminalized_before_terminal_rpc_returns(
     assert event.identity.request_id not in outbox._active_generations
     assert event.identity.request_id not in outbox._terminal_generations
     assert outbox._background_error is None
+
+
+def test_background_failure_refuses_new_work_but_still_settles_admitted_work() -> None:
+    """a dead delivery worker must not strand the charge for a request already served.
+
+    admission is the gate that refuses new chargeable traffic. once a request has passed it and
+    generated, the terminal rpcs are idempotent, so refusing to attempt one loses the charge for
+    work the customer already received.
+    """
+
+    event = _usage_event()
+    client = _QueuedClient([(200, [{"state": "completed", "replay": False}])])
+    outbox = DurableUsageOutbox(
+        _outbox_settings(),
+        client=client,
+        worker_id="worker-1",
+    )
+    outbox._background_error = RuntimeError("permanent delivery failure")
+
+    with pytest.raises(UsageOutboxError):
+        outbox.assert_healthy()
+
+    asyncio.run(outbox.finalize(event))
+
+    assert client.calls[-1][0].endswith("/rpc/finalize_serving_usage")
 
 
 def test_shutdown_timeout_is_observable_without_erasing_generation(monkeypatch) -> None:
@@ -1224,6 +1444,10 @@ def test_startup_claim_recovers_expired_lease_and_delivers() -> None:
                 },
             ),
             acknowledge,
+            # the worker wakes itself after delivering a claimed batch, so it polls again before
+            # shutdown. an exhausted queue would surface as a non-transient background failure.
+            (200, []),
+            (200, []),
             (200, []),
         ]
     )
@@ -1543,8 +1767,13 @@ def test_stream_finalizes_before_successful_terminal_usage_event() -> None:
     assert len(session.finalized) == 1
     assert session.finalized[0]["type"] == "final"
     assert session.captured == []
-    terminal_index = next(i for i, chunk in enumerate(chunks) if b'"usage"' in chunk)
-    assert chunks[terminal_index + 1] == _sse("[DONE]")
+    finish = json.loads(chunks[-3][6:-2])
+    usage = json.loads(chunks[-2][6:-2])
+    assert finish["choices"] == [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    assert "usage" not in finish
+    assert usage["choices"] == []
+    assert usage["usage"]["completion_tokens"] == 1
+    assert chunks[-1] == _sse("[DONE]")
 
 
 def test_final_event_wins_same_tick_disconnect_and_emits_one_terminal_pair() -> None:
@@ -1605,7 +1834,9 @@ def test_final_event_wins_same_tick_disconnect_and_emits_one_terminal_pair() -> 
     assert len(session.finalized) == 1
     assert session.finalized[0]["type"] == "final"
     assert session.failed == []
+    assert sum(b'"finish_reason":"stop"' in chunk for chunk in chunks) == 1
     assert sum(b'"usage"' in chunk for chunk in chunks) == 1
+    assert json.loads(chunks[-2][6:-2])["choices"] == []
     assert chunks.count(_sse("[DONE]")) == 1
     assert chunks[-1] == _sse("[DONE]")
 
@@ -1633,7 +1864,10 @@ def test_stream_finalization_failure_emits_terminal_sse_error_and_snapshot() -> 
     chunks = asyncio.run(run())
 
     assert not any(b'"usage"' in chunk for chunk in chunks)
-    assert any(b'"type":"accounting_error"' in chunk for chunk in chunks)
+    assert not any(b'"finish_reason":"stop"' in chunk for chunk in chunks)
+    error = json.loads(chunks[-2][6:-2])
+    assert error["choices"] == [{"index": 0, "delta": {}, "finish_reason": "error"}]
+    assert error["error"]["type"] == "accounting_error"
     assert chunks[-1] == _sse("[DONE]")
     assert session.captured[-1]["type"] == "final"
     assert session.relinquished == 1
@@ -1729,6 +1963,25 @@ def test_pre_response_disconnect_persists_ready_snapshot_and_closes_iterator() -
     assert session.failed[-1][0]["type"] == "ready"
     assert session.failed[-1][1] == "client_disconnected"
     assert session.finalized == []
+
+
+def test_stream_output_emits_one_terminal_sequence() -> None:
+    output: asyncio.Queue[tuple[bytes | None, Exception | None]] = asyncio.Queue()
+    stream_output = _StreamOutput(
+        output,
+        asyncio.Event(),
+        completion_id="chatcmpl-terminal",
+        created=123,
+        adapter_id="adapter-1",
+    )
+
+    async def run() -> list[bytes | None]:
+        await stream_output.terminal(b"finish", b"usage")
+        await stream_output.terminal(b"duplicate-error")
+        await stream_output.finish()
+        return [output.get_nowait()[0] for _ in range(output.qsize())]
+
+    assert asyncio.run(run()) == [b"finish", b"usage", _sse("[DONE]"), None]
 
 
 def test_finish_makes_sentinel_space_after_blocked_terminal_refills_queue() -> None:
@@ -1915,9 +2168,15 @@ def test_stream_engine_error_persists_latest_valid_snapshot() -> None:
             )
         ]
 
-    asyncio.run(run())
+    chunks = asyncio.run(run())
 
     assert session.finalized == []
     assert session.failed[-1][0]["type"] == "delta"
     assert session.failed[-1][0]["completion_tokens"] == 1
     assert session.failed[-1][1] == "engine_failed"
+    error = json.loads(chunks[-2][6:-2])
+    assert error["choices"] == [{"index": 0, "delta": {}, "finish_reason": "error"}]
+    assert error["error"]["code"] == 400
+    assert "usage" not in error
+    assert chunks.count(_sse("[DONE]")) == 1
+    assert chunks[-1] == _sse("[DONE]")

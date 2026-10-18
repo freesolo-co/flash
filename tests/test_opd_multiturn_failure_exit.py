@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import os
@@ -447,3 +448,40 @@ assert replay_guard._render_rollout_failure is bridge._render_rollout_failure
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_every_flat_module_a_copied_shim_imports_is_itself_copied(tmp_path):
+    """A `flash_*` import with no matching copy is a crash the child reaches only on a paid GPU.
+
+    The test above imports three modules by hand, so a bundle entry nothing in it names can go
+    missing unnoticed. This reads the imports out of the copied sources instead, which keeps the
+    guard honest as the bundle grows. Parsing beats importing here: several of these modules pull
+    in torch or verl at module scope and would skip rather than fail on a CPU runner.
+    """
+    import flash.engine.worker.train.entry.opd_train_runner as runner
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    runner._write_child_shims(
+        SimpleNamespace(),
+        SimpleNamespace(shim_dir=str(shim_dir)),
+        None,
+        [],
+    )
+
+    copied = {path.stem for path in shim_dir.glob("*.py")}
+    assert "flash_opd_plugin" in copied, sorted(copied)
+
+    missing = {}
+    for name in sorted(copied):
+        imported = set()
+        for node in ast.walk(ast.parse((shim_dir / f"{name}.py").read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                imported |= {alias.name for alias in node.names if alias.name.startswith("flash_")}
+            elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("flash_"):
+                imported.add(node.module)
+        absent = imported - copied
+        if absent:
+            missing[name] = sorted(absent)
+
+    assert missing == {}, f"copied shims import modules the bundle never copies: {missing}"

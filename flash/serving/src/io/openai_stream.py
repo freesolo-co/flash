@@ -151,7 +151,7 @@ class _StreamOutput:
             }
         )
 
-    async def terminal(self, chunk: bytes, *, ignore_disconnect: bool = False) -> None:
+    async def terminal(self, *chunks: bytes, ignore_disconnect: bool = False) -> None:
         if self._terminal_sent:
             return
         self._terminal_sent = True
@@ -159,7 +159,8 @@ class _StreamOutput:
             with contextlib.suppress(asyncio.QueueEmpty):
                 while True:
                     self._output.get_nowait()
-        await self.emit(chunk, ignore_disconnect=ignore_disconnect)
+        for chunk in chunks:
+            await self.emit(chunk, ignore_disconnect=ignore_disconnect)
         await self.emit(_sse("[DONE]"), ignore_disconnect=ignore_disconnect)
 
     async def finish(self) -> None:
@@ -236,7 +237,7 @@ async def _produce_openai_chat_stream(
         await stream_output.emit(
             _assistant_role_chunk(completion_id, created, adapter_id, choice_count)
         )
-        while True:
+        while final is None:
             try:
                 event = await _next_event_or_disconnect(guarded_events, disconnect_wait)
             except StopAsyncIteration:
@@ -268,7 +269,7 @@ async def _produce_openai_chat_stream(
                     terminal_persisted = True
                 await stream_output.terminal(stream_output.error(event["message"], event["code"]))
                 return
-            elif kind != "ready":
+            elif kind not in {"ready", "usage_progress"}:
                 raise RuntimeError("invalid engine stream event")
         if disconnected.is_set() and final is None:
             if latest_usage:
@@ -293,7 +294,7 @@ async def _produce_openai_chat_stream(
         for index in range(choice_count):
             for key, value in splitters[index].finish():
                 await stream_output.emit(stream_output.delta({key: value}, index=index))
-        terminal_chunk = _terminal_chunk(
+        terminal_chunks = _terminal_chunks(
             completion_id,
             created,
             adapter_id,
@@ -302,7 +303,7 @@ async def _produce_openai_chat_stream(
             include_usage,
         )
         await stream_output.terminal(
-            _sse(terminal_chunk),
+            *(_sse(chunk) for chunk in terminal_chunks),
             ignore_disconnect=disconnected.is_set(),
         )
     except Exception as exc:
@@ -334,6 +335,15 @@ async def _emit_delta(
     index = _event_index(event, len(splitters))
     if index in terminals:
         raise RuntimeError("choice delta followed its terminal")
+    tool_calls = event.get("tool_calls")
+    if tool_calls:
+        deltas = []
+        for call_index, call in enumerate(tool_calls):
+            delta = dict(call)
+            delta["index"] = call_index
+            deltas.append(delta)
+        await stream_output.emit(stream_output.delta({"tool_calls": deltas}, index=index))
+        return
     rendered = splitters[index].feed(str(event.get("text") or ""))
     logprobs = event.get("logprobs")
     if logprobs is not None and len(rendered) > 1:
@@ -381,35 +391,46 @@ async def _finalize_usage(
     return True
 
 
-def _terminal_chunk(
+def _terminal_chunks(
     completion_id: str,
     created: int,
     adapter_id: str,
     terminals: dict[int, dict[str, Any]],
     final: dict[str, Any],
     include_usage: bool,
-) -> dict[str, Any]:
-    chunk: dict[str, Any] = {
+) -> list[dict[str, Any]]:
+    common = {
         "id": completion_id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": adapter_id,
-        "choices": [
-            {
-                "index": index,
-                "delta": {},
-                "finish_reason": terminals[index]["finish_reason"],
-            }
-            for index in sorted(terminals)
-        ],
     }
+    chunks = [
+        {
+            **common,
+            "choices": [
+                {
+                    "index": index,
+                    "delta": {},
+                    "finish_reason": terminals[index]["finish_reason"],
+                }
+            ],
+        }
+        for index in sorted(terminals)
+    ]
     if include_usage and _has_usage(final):
-        chunk["usage"] = _usage_block(
-            int(final["prompt_tokens"]),
-            int(final["completion_tokens"]),
-            final.get("cached_tokens"),
+        chunks.append(
+            {
+                **common,
+                "choices": [],
+                "usage": _usage_block(
+                    int(final["prompt_tokens"]),
+                    int(final["completion_tokens"]),
+                    final.get("cached_tokens"),
+                ),
+            }
         )
-    return chunk
+    return chunks
 
 
 async def openai_chat_stream(
@@ -425,7 +446,9 @@ async def openai_chat_stream(
     thinking: bool = False,
     choice_count: int = 1,
 ) -> AsyncIterator[bytes]:
-    output: asyncio.Queue[tuple[bytes | None, Exception | None]] = asyncio.Queue(maxsize=3)
+    output: asyncio.Queue[tuple[bytes | None, Exception | None]] = asyncio.Queue(
+        maxsize=max(3, choice_count + 3)
+    )
     disconnected = asyncio.Event()
     producer = asyncio.create_task(
         _produce_openai_chat_stream(

@@ -6,21 +6,21 @@ import asyncio
 import contextlib
 import hashlib
 import re
+import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
 from typing import Annotated, Any, Literal, Protocol
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from flash.serving.src.accounting.usage_retry import is_transient_rpc_code
 from flash.serving.src.store.settings import Settings
 from flash.serving.src.store.supabase_rest import supabase_headers
 
 StableId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)]
-DecimalString = Annotated[str, StringConstraints(pattern=r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")]
 _GENERATION_ID_RE = re.compile(r"^fsgen-[0-9a-f]{32}$")
 _HEARTBEAT_BATCH_SIZE = 128
 _RECOVERY_BATCH_SIZE = 500
@@ -41,24 +41,6 @@ _RESPONSE_LOSS_SAFE_RPCS = frozenset(
 )
 
 
-class AcceptedPriceSnapshot(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    promptTokenUsd: DecimalString
-    cachedPromptTokenUsd: DecimalString | None = None
-    completionTokenUsd: DecimalString
-    requestUsd: DecimalString | None = None
-
-
-class OpenRouterTrafficPrincipal(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    kind: Literal["openrouter"] = "openrouter"
-    publicModelId: StableId
-    providerCatalogDigest: StableId
-    acceptedPriceSnapshot: AcceptedPriceSnapshot
-
-
 class FreesoloOrgTrafficPrincipal(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -70,18 +52,12 @@ class TrustedInternalTrafficPrincipal(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     kind: Literal["trusted_internal"] = "trusted_internal"
-    orgId: StableId | None = None
-    billingAttributionExplicit: bool = False
-
-    @model_validator(mode="after")
-    def validate_attribution(self) -> TrustedInternalTrafficPrincipal:
-        if self.orgId is not None and not self.billingAttributionExplicit:
-            raise ValueError("trusted_internal org billing requires explicit attribution")
-        return self
+    orgId: StableId
+    billingAttributionExplicit: Literal[True] = True
 
 
 ServingTrafficPrincipal = Annotated[
-    OpenRouterTrafficPrincipal | FreesoloOrgTrafficPrincipal | TrustedInternalTrafficPrincipal,
+    FreesoloOrgTrafficPrincipal | TrustedInternalTrafficPrincipal,
     Field(discriminator="kind"),
 ]
 
@@ -91,9 +67,6 @@ class RequestIdentity:
     request_id: str
     correlation_id: str
     openai_completion_id: str | None = None
-    openrouter_request_id: str | None = None
-    openrouter_generation_id: str | None = None
-    upstream_id: str | None = None
 
     def __post_init__(self) -> None:
         if _GENERATION_ID_RE.fullmatch(self.request_id) is None:
@@ -103,9 +76,6 @@ class RequestIdentity:
             for value in (
                 self.correlation_id,
                 self.openai_completion_id,
-                self.openrouter_request_id,
-                self.openrouter_generation_id,
-                self.upstream_id,
             )
             if value is not None
         }
@@ -126,7 +96,6 @@ class CapturedPrice:
     source: str
     version: str
     snapshot: Mapping[str, Any]
-    quoted_provider_amount_micro_usd: int | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +106,11 @@ class UsageFacts:
     cached_tokens_reported: bool
     reasoning_tokens: int
     generation_duration_seconds: float | None
+    time_to_first_token_seconds: float | None
+    queue_wait_seconds: float | None
+    replica_in_flight_requests_at_admission: int | None
+    replica_boot_duration_seconds: float | None
+    replica_freshly_booted: bool | None
     engine_replica_id: str | None
 
 
@@ -156,28 +130,16 @@ class UsageEvent:
 
     def rpc_payload(self) -> dict[str, Any]:
         principal = self.principal
-        openrouter = principal if principal.kind == "openrouter" else None
-        org_id = None if principal.kind == "openrouter" else principal.orgId
-        explicit = (
-            principal.billingAttributionExplicit if principal.kind == "trusted_internal" else False
-        )
-        accepted = openrouter.acceptedPriceSnapshot.model_dump(mode="json") if openrouter else None
         return {
             "request_id": self.identity.request_id,
             "correlation_id": self.identity.correlation_id,
             "traffic_principal_kind": principal.kind,
-            "billing_attribution_explicit": explicit,
-            "org_id": org_id,
-            "traffic_source": "openrouter" if openrouter else "freesolo",
-            "openrouter_request_id": self.identity.openrouter_request_id,
-            "openrouter_generation_id": self.identity.openrouter_generation_id,
+            "billing_attribution_explicit": principal.kind == "trusted_internal",
+            "org_id": principal.orgId,
             "openai_completion_id": self.identity.openai_completion_id,
-            "upstream_id": self.identity.upstream_id,
-            "public_model_id": (
-                openrouter.publicModelId if openrouter else self.target.public_model_id
-            ),
+            "public_model_id": self.target.public_model_id,
             "base_model": self.target.base_model,
-            "checkpoint_id": None if openrouter else self.target.checkpoint_id,
+            "checkpoint_id": self.target.checkpoint_id,
             "artifact_fingerprint": self.target.artifact_fingerprint,
             "prompt_tokens": self.facts.prompt_tokens,
             "completion_tokens": self.facts.completion_tokens,
@@ -187,6 +149,20 @@ class UsageEvent:
             "tokenizer_identity": self.tokenizer_identity,
             "tokenizer_version": self.tokenizer_version,
             "generation_duration_seconds": self.facts.generation_duration_seconds,
+            **{
+                key: value
+                for key, value in (
+                    ("time_to_first_token_seconds", self.facts.time_to_first_token_seconds),
+                    ("queue_wait_seconds", self.facts.queue_wait_seconds),
+                    (
+                        "replica_in_flight_requests_at_admission",
+                        self.facts.replica_in_flight_requests_at_admission,
+                    ),
+                    ("replica_boot_duration_seconds", self.facts.replica_boot_duration_seconds),
+                    ("replica_freshly_booted", self.facts.replica_freshly_booted),
+                )
+                if value is not None
+            },
             "engine_replica_id": self.facts.engine_replica_id,
             "serving_deployment_id": self.deployment_id,
             "serving_release": self.serving_release,
@@ -195,9 +171,6 @@ class UsageEvent:
             "pricing_source": self.price.source,
             "price_version": self.price.version,
             "price_snapshot": dict(self.price.snapshot),
-            "quoted_provider_amount_micro_usd": self.price.quoted_provider_amount_micro_usd,
-            "provider_catalog_digest": (openrouter.providerCatalogDigest if openrouter else None),
-            "accepted_price_snapshot": accepted,
         }
 
 
@@ -230,6 +203,7 @@ class ReconciliationUnavailable(UsageOutboxError):
 class UsageStore(Protocol):
     enabled: bool
 
+    def assert_healthy(self) -> None: ...
     async def start(self) -> None: ...
     async def capture(self, event: UsageEvent) -> None: ...
     async def finalize(self, event: UsageEvent) -> None: ...
@@ -244,6 +218,9 @@ class OfflineUsageStore:
     """Explicit offline-only store used when app tests do not inject persistence."""
 
     enabled = False
+
+    def assert_healthy(self) -> None:
+        return None
 
     async def start(self) -> None:
         return None
@@ -356,8 +333,9 @@ class ProviderSettlementAdapter(Protocol):
 
 
 Jitter = Callable[[str, int, float], float]
-Sleep = Callable[[float], Awaitable[None]]
-Clock = Callable[[], datetime]
+Sleep = Callable[[float], Coroutine[Any, Any, None]]
+WallClock = Callable[[], datetime]
+MonotonicClock = Callable[[], float]
 
 
 def _deterministic_jitter(outbox_id: str, attempt: int, base: float) -> float:
@@ -382,7 +360,8 @@ class DurableUsageOutbox:
         poll_seconds: float = 2.0,
         jitter: Jitter = _deterministic_jitter,
         sleep: Sleep = asyncio.sleep,
-        clock: Clock = lambda: datetime.now(UTC),
+        clock: WallClock = lambda: datetime.now(UTC),
+        monotonic: MonotonicClock = time.monotonic,
         owner_epoch: uuid.UUID | None = None,
     ) -> None:
         if (
@@ -406,6 +385,7 @@ class DurableUsageOutbox:
         self._jitter = jitter
         self._sleep = sleep
         self._clock = clock
+        self._monotonic = monotonic
         self._wake = asyncio.Event()
         self._heartbeat_wake = asyncio.Event()
         self._stopping = asyncio.Event()
@@ -415,9 +395,18 @@ class DurableUsageOutbox:
         self._generation_lease_seconds: int | None = None
         self._active_generations: set[str] = set()
         self._terminal_generations: set[str] = set()
-        self._generation_lease_deadlines: dict[str, datetime] = {}
+        self._generation_lease_deadlines: dict[str, float] = {}
         self._active_leases: set[str] = set()
         self._background_error: BaseException | None = None
+
+    def assert_healthy(self) -> None:
+        self._raise_background_error()
+        if self._stopping.is_set():
+            raise UsageOutboxError("usage_outbox_not_accepting_requests")
+        if self._worker is not None and self._worker.done():
+            raise UsageOutboxError("usage_outbox_worker_stopped")
+        if self._heartbeat_worker is not None and self._heartbeat_worker.done():
+            raise UsageOutboxError("usage_outbox_heartbeat_stopped")
 
     async def start(self) -> None:
         if self._worker is not None:
@@ -430,14 +419,14 @@ class DurableUsageOutbox:
     async def capture(self, event: UsageEvent) -> None:
         self._raise_background_error()
         result = await self._generation_rpc("capture_serving_usage", event)
-        lease_started_at = self._clock()
+        lease_started_at = self._monotonic()
         timing = _generation_capture_result(result)
         self._set_generation_timing(timing["heartbeat_seconds"], timing["lease_seconds"])
         if timing["state"] == "in_progress":
             request_id = event.identity.request_id
             self._active_generations.add(request_id)
-            self._generation_lease_deadlines[request_id] = lease_started_at + timedelta(
-                seconds=timing["lease_seconds"]
+            self._generation_lease_deadlines[request_id] = (
+                lease_started_at + timing["lease_seconds"]
             )
             self._heartbeat_wake.set()
 
@@ -451,7 +440,9 @@ class DurableUsageOutbox:
     async def _terminal_rpc(
         self, name: str, event: UsageEvent, *, failure_code: str | None = None
     ) -> None:
-        self._raise_background_error()
+        # a background delivery failure refuses NEW work at admission; it must not refuse to
+        # settle work already performed. the terminal rpcs are idempotent, so attempting one after
+        # the worker died is safe, while skipping it drops the charge for a served request.
         request_id = event.identity.request_id
         self._terminal_generations.add(request_id)
         try:
@@ -636,7 +627,15 @@ class DurableUsageOutbox:
                     self._wake.set()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                # a non-transient delivery failure is a settlement defect, not a blip. keep it
+                # instead of looping forever so the health gate can refuse new chargeable traffic.
+                if not _is_transient_rpc_error(exc):
+                    self._background_error = exc
+                    self._stopping.set()
+                    self._wake.set()
+                    self._heartbeat_wake.set()
+                    return
                 await self._sleep(self._poll_seconds)
             if self._wake.is_set():
                 continue
@@ -644,7 +643,7 @@ class DurableUsageOutbox:
                 await asyncio.wait_for(self._wake.wait(), timeout=self._poll_seconds)
 
     async def _run_heartbeat_worker(self) -> None:
-        next_heartbeat_at: datetime | None = None
+        next_heartbeat_at: float | None = None
         while not self._stopping.is_set():
             self._heartbeat_wake.clear()
             heartbeat_seconds = self._heartbeat_seconds
@@ -653,8 +652,8 @@ class DurableUsageOutbox:
                 await self._heartbeat_wake.wait()
                 continue
             if next_heartbeat_at is None:
-                next_heartbeat_at = self._clock() + timedelta(seconds=heartbeat_seconds)
-            remaining = (next_heartbeat_at - self._clock()).total_seconds()
+                next_heartbeat_at = self._monotonic() + heartbeat_seconds
+            remaining = next_heartbeat_at - self._monotonic()
             if remaining > 0:
                 async with asyncio.TaskGroup() as group:
                     wake = group.create_task(self._heartbeat_wake.wait())
@@ -668,7 +667,7 @@ class DurableUsageOutbox:
                     continue
             try:
                 await self._heartbeat_active_generations_with_retry()
-                next_heartbeat_at = self._clock() + timedelta(seconds=heartbeat_seconds)
+                next_heartbeat_at = self._monotonic() + heartbeat_seconds
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -685,7 +684,7 @@ class DurableUsageOutbox:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if not _is_transient_heartbeat_error(exc):
+                if not _is_transient_rpc_error(exc):
                     raise
                 active_deadlines = [
                     deadline
@@ -694,7 +693,7 @@ class DurableUsageOutbox:
                 ]
                 if not active_deadlines:
                     return
-                remaining = (min(active_deadlines) - self._clock()).total_seconds()
+                remaining = min(active_deadlines) - self._monotonic()
                 if remaining <= 0:
                     raise UsageOutboxError("generation_heartbeat_lease_expired") from exc
                 retry_delay = min(float(self._heartbeat_seconds or 1), remaining)
@@ -704,6 +703,7 @@ class DurableUsageOutbox:
         request_ids = sorted(self._active_generations)
         for offset in range(0, len(request_ids), _HEARTBEAT_BATCH_SIZE):
             batch = request_ids[offset : offset + _HEARTBEAT_BATCH_SIZE]
+            renewal_started_at = self._monotonic()
             result = await self._rpc(
                 "heartbeat_serving_generation",
                 {
@@ -720,7 +720,16 @@ class DurableUsageOutbox:
                 renewed.add(request_id)
                 expires_at = row.get("generation_lease_expires_at")
                 if request_id in self._active_generations and expires_at is not None:
-                    self._generation_lease_deadlines[request_id] = _parse_datetime(expires_at)
+                    # the server's absolute expiry is validated but not stored: comparing it to a
+                    # local wall clock is what the skew this fix removes would corrupt. the lease
+                    # length is fixed for the outbox, so the renewal is dated from the monotonic
+                    # instant the request left here, which is the earliest the server could have
+                    # started counting.
+                    _parse_datetime(expires_at)
+                    if self._generation_lease_seconds is not None:
+                        self._generation_lease_deadlines[request_id] = (
+                            renewal_started_at + self._generation_lease_seconds
+                        )
             missing = (
                 (set(batch) - renewed) & self._active_generations
             ) - self._terminal_generations
@@ -903,17 +912,8 @@ class DurableUsageOutbox:
             raise UsageOutboxError("usage_outbox_shutdown_failed") from errors[0]
 
 
-def _is_transient_heartbeat_error(exc: BaseException) -> bool:
-    if not isinstance(exc, UsageOutboxError):
-        return False
-    code = str(exc)
-    if code == "supabase_transport_failure":
-        return True
-    match = re.fullmatch(r"supabase_rpc_([0-9]{3})", code)
-    if match is None:
-        return False
-    status_code = int(match.group(1))
-    return status_code in {408, 429} or status_code >= 500
+def _is_transient_rpc_error(exc: BaseException) -> bool:
+    return isinstance(exc, UsageOutboxError) and is_transient_rpc_code(str(exc))
 
 
 def _generation_capture_result(data: Any) -> dict[str, Any]:
@@ -944,15 +944,16 @@ def _generation_capture_result(data: Any) -> dict[str, Any]:
 
 def _settlement_principal(row: Mapping[str, Any]) -> dict[str, Any]:
     kind = row.get("traffic_principal_kind")
-    if kind == "openrouter":
-        return {"kind": "openrouter", "publicModelId": row.get("public_model_id")}
+    org_id = row.get("org_id")
+    if not isinstance(org_id, str) or not org_id.strip():
+        raise UsageOutboxError("usage_principal_invalid")
     if kind == "freesolo_org":
-        return {"kind": "freesolo_org", "orgId": row.get("org_id")}
-    if kind == "trusted_internal":
+        return {"kind": "freesolo_org", "orgId": org_id}
+    if kind == "trusted_internal" and row.get("billing_attribution_explicit") is True:
         return {
             "kind": "trusted_internal",
-            "orgId": row.get("org_id"),
-            "billingAttributionExplicit": bool(row.get("billing_attribution_explicit")),
+            "orgId": org_id,
+            "billingAttributionExplicit": True,
         }
     raise UsageOutboxError("usage_principal_invalid")
 
@@ -967,13 +968,3 @@ def _parse_datetime(value: Any) -> datetime:
     if parsed.tzinfo is None:
         raise UsageOutboxError("usage_snapshot_timestamp_invalid")
     return parsed
-
-
-def accepted_price_micro_usd(snapshot: AcceptedPriceSnapshot, facts: UsageFacts) -> int:
-    uncached = facts.prompt_tokens - facts.cached_tokens
-    cost = Decimal(snapshot.promptTokenUsd) * uncached
-    cost += Decimal(snapshot.cachedPromptTokenUsd or snapshot.promptTokenUsd) * facts.cached_tokens
-    cost += Decimal(snapshot.completionTokenUsd) * facts.completion_tokens
-    if snapshot.requestUsd is not None:
-        cost += Decimal(snapshot.requestUsd)
-    return int((cost * 1_000_000).quantize(Decimal("1")))

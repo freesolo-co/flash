@@ -34,7 +34,13 @@ def _minimal_config(monkeypatch) -> None:
 
 @pytest.fixture
 def clean_env(monkeypatch):
-    for var in ("HF_REPO", "GITHUB_TOKEN", *_ALWAYS_REQUIRED, *_PROVIDER_KEYS):
+    for var in (
+        "HF_REPO",
+        "GITHUB_TOKEN",
+        "FLASH_VAST_RESULT_ORIGINS",
+        *_ALWAYS_REQUIRED,
+        *_PROVIDER_KEYS,
+    ):
         monkeypatch.delenv(var, raising=False)
     runpod_keys.reset()  # don't let a previously-cached pool leak in
     _clear_provider_cache()
@@ -92,6 +98,38 @@ def test_preflight_accepts_any_single_provider(clean_env, monkeypatch, provider_
         "VAST_API_KEY": "vast",
     }[provider_var]
     assert available_providers() == (expected,)
+
+
+def test_preflight_validates_vast_result_origins_when_vast_is_configured(clean_env, monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "hf")
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fsk")
+    monkeypatch.setenv("VAST_API_KEY", "vast-key")
+    monkeypatch.setenv("FLASH_VAST_RESULT_ORIGINS", "http://signed-secret.example.com")
+    _clear_provider_cache()
+
+    with pytest.raises(pf.PreflightError) as exc_info:
+        pf.require_operator_config()
+    detail = str(exc_info.value)
+    assert "FLASH_VAST_RESULT_ORIGINS" in detail
+    assert "exact canonical HTTPS origins" in detail
+    assert "signed-secret.example.com" not in detail
+
+
+def test_preflight_validates_present_vast_result_origins_without_vast(clean_env, monkeypatch):
+    _minimal_config(monkeypatch)
+    monkeypatch.setenv("FLASH_VAST_RESULT_ORIGINS", "https://user:secret@logs.example.com")
+
+    with pytest.raises(pf.PreflightError) as exc_info:
+        pf.require_operator_config()
+    detail = str(exc_info.value)
+    assert "FLASH_VAST_RESULT_ORIGINS" in detail
+    assert "user:secret" not in detail
+
+
+def test_preflight_accepts_blank_vast_result_origins_as_default(clean_env, monkeypatch):
+    _minimal_config(monkeypatch)
+    monkeypatch.setenv("FLASH_VAST_RESULT_ORIGINS", "")
+    pf.require_operator_config()
 
 
 def test_preflight_rejects_zero_providers(clean_env, monkeypatch):

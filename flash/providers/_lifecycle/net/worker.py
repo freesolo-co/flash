@@ -17,7 +17,7 @@ from flash.core.spec import (
     PUBLIC_URL_ENV,
     TEACHER_CAPABILITY_ENV,
     JobSpec,
-    require_matching_seed,
+    parse_seed,
 )
 from flash.providers.artifacts.hf import hf_call, hf_status_code
 from flash.providers.core.base import get_gpu_info
@@ -106,11 +106,9 @@ def strip_runpod_volume_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict
 
 def build_worker_env(
     spec: JobSpec,
-    seed: int,
     runtime_secrets: dict[str, str] | None = None,
 ) -> dict:
     """Per-run env passed to the worker from managed control-plane inputs."""
-    canonical_seed = require_matching_seed(spec, seed)
     declared_managed_credentials = sorted(
         set(spec.environment.secrets) & MANAGED_TEACHER_CREDENTIAL_ENV_KEYS
     )
@@ -133,7 +131,9 @@ def build_worker_env(
         "RUN_ID": spec.run_id,
         "FLASH_ARM": "runpod",
         "BENCH_HF_MODEL": spec.model,
-        "SEED": str(canonical_seed),
+        # one run owns exactly one seed, so it is read straight off the spec: a second seed
+        # travelling beside it could only ever agree or be wrong.
+        "SEED": str(parse_seed(spec.seed)),
         "PYTORCH_CUDA_ALLOC_CONF": _alloc_conf,
         "PYTORCH_ALLOC_CONF": _alloc_conf,
     }

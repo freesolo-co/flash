@@ -484,9 +484,9 @@ def _humanize_ts(value) -> str | None:
     """Format an epoch seconds value as a compact UTC timestamp, leaving non-numbers alone."""
     if not isinstance(value, (int, float)) or value <= 0:
         return None
-    import datetime
+    import datetime as dt
 
-    return datetime.datetime.fromtimestamp(value, datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
+    return dt.datetime.fromtimestamp(value, dt.UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def gpu_label(spec: dict, remote: dict) -> str:

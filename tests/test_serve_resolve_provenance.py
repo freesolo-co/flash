@@ -2,7 +2,7 @@
 
 The resolver downloads `adapter_config.json` to digest it, then used to discard it and write the
 caller-supplied `--lora-rank` / `--model` straight into the immutable manifest. Every one of these
-mismatches was therefore caught only by `_validate_adapter_config` *inside the paid GPU container*,
+mismatches was therefore caught only by the GPU container's own revalidation *after provisioning*,
 so `--dry-run` reported success and a real deployment could leave billable resources in a failed or
 outcome-unknown state.
 """
@@ -267,7 +267,7 @@ def test_a_config_the_container_will_refuse_is_rejected_before_provisioning(
 ) -> None:
     """Each of these is decided by the config alone, so paying a gpu to learn it is waste.
 
-    ``_validate_adapter_config`` rejects every one of these inside the serving container, and the
+    the serving container rejects every one of these when it revalidates its cache entry, and the
     verdict never depends on anything the gpu observes at runtime. Resolving them anyway meant a
     deployment that could not possibly serve still allocated provider resources and started billing
     before failing for a reason that was readable here, for free, from bytes already on disk.
@@ -317,7 +317,7 @@ def test_padded_provenance_is_rejected_before_provider_resources_exist(
 ) -> None:
     """A value that matches only after stripping must not resolve.
 
-    `_validate_adapter_config` compares these raw bytes for equality inside the container, so a
+    the container compares these raw bytes for equality when it revalidates, so a
     padded value it will refuse used to pass resolution, provision, and start billing before
     failing -- the exact outcome this guard exists to prevent. Normalizing the padding away
     instead would be worse for `revision`, which the resolver *adopts* into the immutable
@@ -469,7 +469,7 @@ def test_a_config_the_container_cannot_decode_is_rejected_here(
 ) -> None:
     """The control plane must decode these bytes exactly as the gpu container will.
 
-    `_load_strict_config` decodes strict utf-8 and refuses a BOM. Passing the raw handle to
+    The shared reader decodes strict utf-8 and refuses a BOM. Passing the raw handle to
     `json.load` instead lets it auto-detect utf-16 and skip a BOM (RFC 4627), so a config the
     container rejects outright resolved cleanly, provisioned, and started billing before failing
     -- the same split this function already closes for duplicate keys.
