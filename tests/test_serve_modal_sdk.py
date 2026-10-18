@@ -6,7 +6,6 @@ import asyncio
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -706,7 +705,7 @@ def test_wrapper_signals_parent_after_zero_child_exit(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("failure_stage", ["creation", "start"])
-def test_wrapper_reaps_child_when_watcher_startup_fails(monkeypatch, failure_stage: str) -> None:
+def test_wrapper_stops_launcher_when_watcher_startup_fails(monkeypatch, failure_stage: str) -> None:
     from flash.serve.app import launch
     from flash.serve.provisioning.modal.planning import wrapper as _modal_wrapper
 
@@ -748,11 +747,11 @@ def test_wrapper_reaps_child_when_watcher_startup_fails(monkeypatch, failure_sta
     assert process.wait_calls == [launch._CHILD_STOP_TIMEOUT_SECONDS]
 
 
-def test_wrapper_watcher_failure_retains_unreaped_child_and_original_cause(monkeypatch) -> None:
+def test_wrapper_watcher_failure_reports_unconfirmed_exit_and_original_cause(monkeypatch) -> None:
     from flash.serve.app import launch
     from flash.serve.provisioning.modal.planning import wrapper as _modal_wrapper
 
-    class _UnreapedProcess:
+    class _ProcessWithUnconfirmedExit:
         pid = 5150
 
         def terminate(self) -> None:
@@ -765,7 +764,7 @@ def test_wrapper_watcher_failure_retains_unreaped_child_and_original_cause(monke
             assert timeout is not None
             raise subprocess.TimeoutExpired("launcher", timeout)
 
-    process = _UnreapedProcess()
+    process = _ProcessWithUnconfirmedExit()
     watcher_failure = RuntimeError("watcher creation failed")
 
     def fail_thread(**_kwargs):
@@ -774,30 +773,25 @@ def test_wrapper_watcher_failure_retains_unreaped_child_and_original_cause(monke
     monkeypatch.setattr(launch, "start_launcher_process", lambda: process)
     monkeypatch.setattr(_modal_wrapper, "Thread", fail_thread)
 
-    with pytest.raises(launch.ChildReapUnconfirmed) as exc_info:
+    with pytest.raises(launch.LauncherShutdownUnconfirmed) as exc_info:
         launch_modal_server()
 
     assert exc_info.value.pid == process.pid
     assert exc_info.value.__cause__ is watcher_failure
 
 
-def test_wrapper_real_subprocess_is_reaped_when_real_thread_start_fails(monkeypatch) -> None:
+def test_wrapper_stops_real_subprocess_when_thread_start_fails(monkeypatch, tmp_path: Path) -> None:
     from flash.serve.app import launch
     from flash.serve.provisioning.modal.planning import wrapper as _modal_wrapper
 
-    state_root = Path(tempfile.mkdtemp(prefix="flash-wrapper-", dir="/dev/shm"))
-    pid_path = state_root / "child.pid"
+    pid_path = tmp_path / "child.pid"
     script = (
         "import os, pathlib, signal, time; "
-        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
         "time.sleep(60)"
     )
     process = subprocess.Popen([sys.executable, "-c", script])
-    deadline = time.monotonic() + 1
-    while not pid_path.exists() and process.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.001)
-    assert pid_path.is_file()
 
     class _BrokenThread:
         def __init__(self, **_kwargs) -> None:
@@ -810,6 +804,10 @@ def test_wrapper_real_subprocess_is_reaped_when_real_thread_start_fails(monkeypa
     monkeypatch.setattr(launch, "_CHILD_STOP_TIMEOUT_SECONDS", 0.1)
     monkeypatch.setattr(_modal_wrapper, "Thread", _BrokenThread)
     try:
+        deadline = time.monotonic() + 5
+        while not pid_path.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert pid_path.is_file()
         with pytest.raises(RuntimeError, match="real thread start sabotage"):
             launch_modal_server()
         assert process.poll() == -signal.SIGKILL
@@ -818,8 +816,6 @@ def test_wrapper_real_subprocess_is_reaped_when_real_thread_start_fails(monkeypa
         if process.poll() is None:
             process.kill()
             process.wait(timeout=1)
-        pid_path.unlink(missing_ok=True)
-        state_root.rmdir()
 
 
 def test_pinned_sdk_binds_exact_client_workspace_environment_and_secret_sinks() -> None:

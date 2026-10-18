@@ -338,7 +338,7 @@ def _unpredictable_artifact_token() -> tuple[str, bytes]:
     return token, hashlib.sha256(token.encode()).digest()
 
 
-def test_secret_descriptor_releases_its_source_after_the_consumer_reads() -> None:
+def test_secret_pipe_releases_its_source_after_the_consumer_reads() -> None:
     class WeakToken(str):
         __slots__ = ("__weakref__",)
 
@@ -346,7 +346,7 @@ def test_secret_descriptor_releases_its_source_after_the_consumer_reads() -> Non
     token = WeakToken(expected)
     token_reference = weakref.ref(token)
 
-    with launch._secret_descriptor(token) as token_fd:
+    with launch._open_secret_pipe(token) as token_fd:
         del token
         assert read_artifact_token_fd(token_fd) == expected
         deadline = time.monotonic() + 1
@@ -356,7 +356,7 @@ def test_secret_descriptor_releases_its_source_after_the_consumer_reads() -> Non
         assert token_reference() is None
 
 
-def test_secret_descriptor_chains_the_original_write_failure(monkeypatch) -> None:
+def test_secret_pipe_chains_the_original_write_failure(monkeypatch) -> None:
     failure = OSError("write failed")
 
     def fail_write(_fd: int, _value: str) -> None:
@@ -367,14 +367,14 @@ def test_secret_descriptor_chains_the_original_write_failure(monkeypatch) -> Non
         pytest.raises(
             launch.LaunchError, match=r"^secret descriptor could not be populated$"
         ) as exc_info,
-        launch._secret_descriptor(INFERENCE_TOKEN) as token_fd,
+        launch._open_secret_pipe(INFERENCE_TOKEN) as token_fd,
     ):
         assert os.read(token_fd, 1) == b""
 
     assert exc_info.value.__cause__ is failure
 
 
-def test_secret_descriptor_retains_a_stuck_writer_ownership_handle(monkeypatch) -> None:
+def test_secret_pipe_error_retains_stuck_writer(monkeypatch) -> None:
     real_pipe = os.pipe
     read_fd, write_fd = real_pipe()
     join_calls: list[float | None] = []
@@ -399,10 +399,10 @@ def test_secret_descriptor_retains_a_stuck_writer_ownership_handle(monkeypatch) 
     try:
         with (
             pytest.raises(
-                launch.CredentialWriterCleanupUnconfirmed,
-                match=r"^credential writer cleanup could not be confirmed$",
+                launch.CredentialWriterShutdownUnconfirmed,
+                match=r"^credential writer shutdown could not be confirmed$",
             ) as exc_info,
-            launch._secret_descriptor(INFERENCE_TOKEN),
+            launch._open_secret_pipe(INFERENCE_TOKEN),
         ):
             pass
     finally:
@@ -415,7 +415,7 @@ def test_secret_descriptor_retains_a_stuck_writer_ownership_handle(monkeypatch) 
         os.fstat(read_fd)
 
 
-def test_secret_descriptor_join_failure_retains_owner_and_chains_body_failure(monkeypatch) -> None:
+def test_secret_pipe_join_failure_retains_thread_and_original_error(monkeypatch) -> None:
     read_fd, write_fd = os.pipe()
     body_failure = RuntimeError("body failed")
 
@@ -436,13 +436,13 @@ def test_secret_descriptor_join_failure_retains_owner_and_chains_body_failure(mo
             return True
 
     def fail_body() -> None:
-        with launch._secret_descriptor(INFERENCE_TOKEN):
+        with launch._open_secret_pipe(INFERENCE_TOKEN):
             raise body_failure
 
     monkeypatch.setattr(launch.os, "pipe", lambda: (read_fd, write_fd))
     monkeypatch.setattr(launch.threading, "Thread", BrokenJoinWriter)
     try:
-        with pytest.raises(launch.CredentialWriterCleanupUnconfirmed) as exc_info:
+        with pytest.raises(launch.CredentialWriterShutdownUnconfirmed) as exc_info:
             fail_body()
     finally:
         os.close(write_fd)
@@ -453,7 +453,7 @@ def test_secret_descriptor_join_failure_retains_owner_and_chains_body_failure(mo
         os.fstat(read_fd)
 
 
-def test_secret_descriptor_closes_both_descriptors_when_real_thread_start_fails(
+def test_secret_pipe_closes_both_descriptors_when_real_thread_start_fails(
     monkeypatch,
 ) -> None:
     opened: tuple[int, int] | None = None
@@ -473,7 +473,7 @@ def test_secret_descriptor_closes_both_descriptors_when_real_thread_start_fails(
 
     with (
         pytest.raises(RuntimeError, match="thread start failed"),
-        launch._secret_descriptor(INFERENCE_TOKEN),
+        launch._open_secret_pipe(INFERENCE_TOKEN),
     ):
         pytest.fail("body must not run")
 
@@ -484,7 +484,7 @@ def test_secret_descriptor_closes_both_descriptors_when_real_thread_start_fails(
             os.fstat(fd)
 
 
-def test_secret_descriptor_real_thread_cleanup_chains_the_body_failure(monkeypatch) -> None:
+def test_secret_pipe_real_thread_cleanup_chains_the_body_failure(monkeypatch) -> None:
     started = launch.threading.Event()
     release = launch.threading.Event()
     body_failure = RuntimeError("body failed")
@@ -494,14 +494,14 @@ def test_secret_descriptor_real_thread_cleanup_chains_the_body_failure(monkeypat
         release.wait()
 
     def fail_body() -> None:
-        with launch._secret_descriptor(INFERENCE_TOKEN):
+        with launch._open_secret_pipe(INFERENCE_TOKEN):
             assert started.wait(1)
             raise body_failure
 
     monkeypatch.setattr(launch, "_write_all", block_write)
     monkeypatch.setattr(launch, "_CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS", 0.01)
 
-    with pytest.raises(launch.CredentialWriterCleanupUnconfirmed) as exc_info:
+    with pytest.raises(launch.CredentialWriterShutdownUnconfirmed) as exc_info:
         fail_body()
 
     writer = exc_info.value.writer
@@ -513,7 +513,7 @@ def test_secret_descriptor_real_thread_cleanup_chains_the_body_failure(monkeypat
     assert INFERENCE_TOKEN not in str(exc_info.value)
 
 
-def test_secret_descriptor_writer_deadline_survives_subprocess_sabotage() -> None:
+def test_secret_pipe_cleanup_times_out_with_blocked_writer() -> None:
     secret = f"subprocess-secret-{uuid.uuid4().hex}"
     script = f"""
 import threading
@@ -531,10 +531,10 @@ def ignore_descriptor_closure(_fd, _value):
 launch._write_all = ignore_descriptor_closure
 launch._CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS = 0.01
 try:
-    with launch._secret_descriptor({secret!r}):
+    with launch._open_secret_pipe({secret!r}):
         if not started.wait(1):
             raise RuntimeError("credential writer did not start")
-except launch.CredentialWriterCleanupUnconfirmed as exc:
+except launch.CredentialWriterShutdownUnconfirmed as exc:
     if not exc.writer.is_alive():
         raise RuntimeError("stuck credential writer ownership was lost")
     release.set()
@@ -1124,12 +1124,12 @@ class _FakeProcess:
         self,
         *,
         resist_terminate: bool = False,
-        resist_kill_reap: bool = False,
+        exit_unconfirmed: bool = False,
     ) -> None:
         self.terminated = False
         self.killed = False
         self.resist_terminate = resist_terminate
-        self.resist_kill_reap = resist_kill_reap
+        self.exit_unconfirmed = exit_unconfirmed
         self.wait_calls: list[float] = []
 
     def terminate(self) -> None:
@@ -1145,26 +1145,26 @@ class _FakeProcess:
     def wait(self, timeout: float | None = None) -> int:
         assert timeout is not None, "launcher child waits must always have a deadline"
         self.wait_calls.append(timeout)
-        if self.resist_kill_reap or (self.resist_terminate and not self.killed):
+        if self.exit_unconfirmed or (self.resist_terminate and not self.killed):
             raise launch.subprocess.TimeoutExpired("launcher", timeout)
         return -9 if self.killed else -15
 
 
-def test_terminate_and_reap_confirms_normal_shutdown() -> None:
+def test_stop_launcher_process_confirms_normal_shutdown() -> None:
     process = _FakeProcess()
 
-    launch._terminate_and_reap(process)
+    launch.stop_launcher_process(process)
 
     assert process.terminated is True
     assert process.killed is False
     assert process.wait_calls == [launch._CHILD_STOP_TIMEOUT_SECONDS]
 
 
-def test_terminate_and_reap_propagates_a_wait_failure_instead_of_escalating() -> None:
+def test_stop_launcher_process_propagates_a_wait_failure_instead_of_escalating() -> None:
     """only a timeout means the child is still running.
 
     treating every wait failure as "still running" turns an interrupt or a waitpid error into a
-    kill and then into a false unconfirmed reap, reporting a survivor that already exited.
+    kill and then into a false shutdown failure, reporting a survivor that already exited.
     """
 
     class _InterruptedWait:
@@ -1186,7 +1186,7 @@ def test_terminate_and_reap_propagates_a_wait_failure_instead_of_escalating() ->
     process = _InterruptedWait()
 
     with pytest.raises(KeyboardInterrupt):
-        launch._terminate_and_reap(process)
+        launch.stop_launcher_process(process)
 
     assert process.killed is False, "a non-timeout wait failure must not escalate to a kill"
 
@@ -1348,7 +1348,7 @@ def test_parent_helper_terminates_child_and_cleans_up_on_pipe_failure(
             os.fstat(fd)
 
 
-def test_parent_helper_kills_and_reaps_a_termination_resistant_child(
+def test_launcher_start_failure_force_kills_child_that_ignores_termination(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -1374,12 +1374,12 @@ def test_parent_helper_kills_and_reaps_a_termination_resistant_child(
     assert ARTIFACT_TOKEN not in str(exc_info.value)
 
 
-def test_parent_helper_surfaces_unconfirmed_reap_without_releasing_child(
+def test_launcher_start_failure_reports_unconfirmed_exit_and_original_error(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     environment = _environment(tmp_path)
-    process = _FakeProcess(resist_kill_reap=True)
+    process = _FakeProcess(exit_unconfirmed=True)
 
     monkeypatch.setattr(
         launch,
@@ -1388,8 +1388,8 @@ def test_parent_helper_surfaces_unconfirmed_reap_without_releasing_child(
     )
 
     with pytest.raises(
-        launch.ChildReapUnconfirmed,
-        match=r"^launcher child reap could not be confirmed after terminate and kill deadlines$",
+        launch.LauncherShutdownUnconfirmed,
+        match=r"^launcher process exit could not be confirmed after terminate and kill deadlines$",
     ) as exc_info:
         launch.start_launcher_process(environment, popen_factory=lambda *_args, **_kwargs: process)
 
