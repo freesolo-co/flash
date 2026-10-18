@@ -18,7 +18,7 @@ import os
 import time
 
 from flash.core.catalog import validate_model_for_algorithm
-from flash.core.spec import JobSpec, require_supported_sft_optimizer
+from flash.core.spec import JobSpec
 from flash.core.spec_persistence import validate_persisted_spec_envelope
 from flash.providers._lifecycle.instances.poll import _attempt_int
 from flash.runner.lifecycle import attempts, preparation, reporting, state
@@ -204,7 +204,6 @@ def reallocation_spec_from_status(status: RunStatus, *, verify_source: bool = Fa
     is a CEILING, so restoring it re-widens the search rather than forcing a size.
     """
     worker_spec = effective_spec_from_status(status, verify_source=verify_source)
-    require_supported_sft_optimizer(worker_spec)
     public_gpu = JobSpec.from_dict(status.spec).gpu
     # `gpu_count_auto` needs no restoring here: it is provenance, so the worker half carries it
     # verbatim through allocation. The public half cannot supply it -- to_dict strips the marker and

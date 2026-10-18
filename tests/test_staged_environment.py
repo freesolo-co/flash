@@ -64,7 +64,7 @@ def _spec(
             "algorithm": "sft",
             "run_id": run_id,
             "environment": environment,
-            "train": {"hf_repo": "owner/run-artifacts", "max_examples": 1, "loraplus_ratio": 1.0},
+            "train": {"hf_repo": "owner/run-artifacts", "max_examples": 1},
             "gpu": {"type": "H100", "max_retries": 1},
         }
     )

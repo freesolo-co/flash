@@ -2518,7 +2518,6 @@ def _stub_sft_run(
         train=SimpleNamespace(
             epochs=1,
             learning_rate=5e-5,
-            loraplus_ratio=1.0,
             batch_size=2,
             max_context_tokens=1024,
             max_examples=2,
@@ -2888,90 +2887,17 @@ def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monk
     assert "bare assistant target coerced" not in output
 
 
-@pytest.mark.parametrize("ratio", [None, 1.0, 3.5, 16.0])
-def test_sft_recovery_preserves_records_but_only_restarts_plain_lora(monkeypatch, ratio):
-    from flash.core.spec import JobSpec
-    from flash.engine.worker.train.entry import sft_train_runner
-    from flash.runner.lifecycle.state import RunStatus
-    from flash.runner.lifecycle.status import (
-        effective_spec_from_status,
-        reallocation_spec_from_status,
-    )
-    from flash.runner.lifecycle.submit import _effective_preparation_snapshot
-
-    _stub_sft_run(monkeypatch)
-    raw = {
-        "model": "Qwen/Qwen3.5-9B",
-        "algorithm": "sft",
-        "project": "11111111-1111-4111-8111-111111111111",
-        "environment": {"id": "owner/project/env"},
-        "train": {"epochs": 1, "learning_rate": 1e-5},
-        "gpu": {"type": "H100", "count": 1},
-    }
-    if ratio is not None:
-        raw["train"]["loraplus_ratio"] = ratio
-    spec = JobSpec.from_dict(raw)
-    spec = replace(spec, run_id="legacy-sft", model_revision="a" * 40, model_revision_auto=True)
-    snapshot = _effective_preparation_snapshot(spec, spec, None)
-    if ratio is None:
-        # frozen before the recovery fix: old snapshots must still pass integrity validation.
-        assert snapshot["preparation_digest"] == (
-            "d190288e79077c89f6b79353947a393e2a0463c141757d844bd889511f91022b"
-        )
-        assert "loraplus_ratio" not in snapshot["worker_spec"]["train"]
-    original_digest = snapshot["preparation_digest"]
-    status = RunStatus(
-        state="running",
-        run_id=spec.run_id,
-        spec=spec.to_dict(),
-        effective_preparation=json.loads(json.dumps(snapshot)),
-    )
-    assert effective_spec_from_status(status).train.loraplus_ratio == ratio
-    if ratio != 1.0:
-        with pytest.raises(ValueError, match="LoRA\\+ training has been removed"):
-            reallocation_spec_from_status(status)
-        with pytest.raises(ValueError, match="LoRA\\+ training has been removed"):
-            sft_train_runner._resolve_sft_options(spec)
-        return
-    for _attempt in range(2):
-        recovered = reallocation_spec_from_status(status)
-        worker = JobSpec.from_json(recovered.to_json())
-        options = sft_train_runner._resolve_sft_options(worker)
-        assert worker.train.loraplus_ratio == 1.0
-        assert options.learning_rate == 1e-5
-        status.effective_preparation = _effective_preparation_snapshot(
-            JobSpec.from_dict(status.spec), worker, None, stored_public=status.spec
-        )
-        assert status.effective_preparation["preparation_digest"] == original_digest
-
-
-@pytest.mark.parametrize("ratio", [None, 1.0])
-def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch, ratio):
+def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch):
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
-    from flash.core.spec import JobSpec
     from flash.engine.worker.train.entry import sft_train
-    from flash.schema import spec_from_dict
 
     monkeypatch.setenv("PYTHONPATH", "synthetic-sft-parent-path")
     monkeypatch.setenv(SECRET_ENV_KEYS_ENV, "PYTHONPATH")
     spec, captured = _stub_sft_run(monkeypatch)
-    authored = spec_from_dict(
-        {
-            "model": spec.model,
-            "algorithm": "sft",
-            "project": "11111111-1111-4111-8111-111111111111",
-            "environment": {"id": "owner/project/env"},
-            "train": {} if ratio is None else {"loraplus_ratio": ratio},
-        }
-    )
-    spec.train.loraplus_ratio = JobSpec.from_json(authored.to_json()).train.loraplus_ratio
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
         captured["command"] = command
         captured["child_env"] = env
-        config = json.loads(env["FLASH_SFT_PLUGIN_CONFIG"])
-        assert "loraplus_ratio" not in config
-        assert "loraplus_ready_marker" not in config
         on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
         on_step(2)
         heartbeat()
@@ -3004,7 +2930,6 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypa
     assert captured["meta"]["step"] == 2
     assert captured["meta"]["train_tokens"] > 0
     assert captured["meta"]["notes"]["loss_curve"] == [1.0]
-    assert not any(key.startswith("loraplus") for key in captured["meta"]["notes"])
     notes = captured["meta"]["notes"]
     realized_max_length = notes["realized_max_length"]
     assert 0 < realized_max_length < notes["configured_max_length"]
@@ -5269,7 +5194,7 @@ def test_sft_core_keeps_verl_optimizer_and_installs_linear_scheduler(monkeypatch
     )
     monkeypatch.setattr(sft_plugin, "_install_exact_dataloaders", lambda: None)
     monkeypatch.setattr(sft_plugin, "_install_seeded_dataloader", lambda seed: None)
-    # No PEFT optimizer module or LoRA+ configuration is needed by the real installer.
+    # The core installer does not need the PEFT optimizer module.
     monkeypatch.setitem(sys.modules, "peft.optimizers", None)
     sft_plugin._install_core({"seed": 43})
     assert FakeEngine._build_optimizer is original_builder

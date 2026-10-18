@@ -186,7 +186,7 @@ def test_submit_applies_derived_model_disk_floor(monkeypatch):
                 "model": "test/big-disk",
                 "algorithm": "sft",
                 "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-                "train": {"max_examples": 8, "loraplus_ratio": 1.0},
+                "train": {"max_examples": 8},
                 "gpu": {"type": "RTX 5090", "disk_gb": 60},
             }
         )
@@ -203,7 +203,7 @@ def test_submit_applies_derived_model_disk_floor(monkeypatch):
                 "model": "test/big-disk",
                 "algorithm": "sft",
                 "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-                "train": {"max_examples": 8, "loraplus_ratio": 1.0},
+                "train": {"max_examples": 8},
                 "gpu": {"type": "RTX 5090", "disk_gb": 200},
             }
         )

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core import catalog
-from flash.core.spec import TRAINER_BACKEND, JobSpec, require_supported_sft_optimizer
+from flash.core.spec import TRAINER_BACKEND, JobSpec
 from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 from flash.providers._lifecycle.net import worker as provider_worker
 from flash.runner.accounting import artifacts, weight_cache
@@ -60,7 +60,6 @@ def prepare_job(
     owner_key_id: int | None = None,
 ) -> PreparedJob:
     """Prepare all read-only submission inputs before persistence or allocation."""
-    require_supported_sft_optimizer(spec)
     # before _resolve_model_revision, and before every sizing step below: a warm start inherits its
     # source's pin and provenance, and `resolve_model`/`_with_model_disk` size against whatever
     # revision the spec carries by then.
@@ -282,7 +281,6 @@ def submit_job(
         )
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
-    require_supported_sft_optimizer(worker_spec)
     estimated_cost_usd = prepared.estimated_cost_usd
     from flash.providers.core.registry import INSTANCE_PROVIDERS, available_providers
 

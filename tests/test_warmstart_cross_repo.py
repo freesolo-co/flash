@@ -1129,12 +1129,7 @@ def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
             "model": source.model,
             "algorithm": "sft",
             "environment": {"id": "freesolo/math-agent/gsm8k"},
-            "train": {
-                "init_from_adapter": "source-run/final",
-                "epochs": 1,
-                "max_examples": 8,
-                "loraplus_ratio": 1.0,
-            },
+            "train": {"init_from_adapter": "source-run/final", "epochs": 1, "max_examples": 8},
         }
     )
     resolver_calls = []
@@ -1417,7 +1412,7 @@ def test_persisting_a_pre_alpha_run_does_not_rewrite_its_digest_out_of_reach(mon
     # the record recovers BEFORE the rewrite -- so a failure after it is caused by the rewrite
     # itself, not by a fixture that was never valid.
     assert (
-        runner_status.effective_spec_from_status(
+        runner_status.reallocation_spec_from_status(
             runner_status.get_status(public.run_id)
         ).train.lora_rank
         == 32
@@ -1427,11 +1422,8 @@ def test_persisting_a_pre_alpha_run_does_not_rewrite_its_digest_out_of_reach(mon
 
     # the run survives its own attach: the rewritten digest is still reproducible from the stored
     # public spec, which the rewrite left untouched.
-    recovered = runner_status.effective_spec_from_status(runner_status.get_status(public.run_id))
+    recovered = runner_status.reallocation_spec_from_status(runner_status.get_status(public.run_id))
     assert recovered.train.lora_rank == 32
-    # Integrity recovery remains supported, but this pre-ratio SFT optimizer cannot be restarted.
-    with pytest.raises(ValueError, match="LoRA\\+ training has been removed"):
-        runner_status.reallocation_spec_from_status(runner_status.get_status(public.run_id))
 
 
 def test_digest_matches_the_shape_the_deployed_release_writes(monkeypatch, tmp_path):
@@ -1506,7 +1498,7 @@ def test_digest_matches_the_shape_the_deployed_release_writes(monkeypatch, tmp_p
         == canonical_digest
     )
 
-    # Historical records must remain readable even when their optimizer can no longer restart.
+    # and a record carrying that digest -- the shape production writes -- recovers on the retry path.
     runner_state._save_status(
         runner_state.RunStatus(
             run_id=spec.run_id,
@@ -1522,7 +1514,7 @@ def test_digest_matches_the_shape_the_deployed_release_writes(monkeypatch, tmp_p
         )
     )
     assert (
-        runner_status.effective_spec_from_status(
+        runner_status.reallocation_spec_from_status(
             runner_status.get_status(spec.run_id)
         ).train.lora_rank
         == 32

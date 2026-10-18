@@ -153,19 +153,6 @@ string also refuses, since that is what a `${VAR}` with nothing behind it produc
 a deliberate request for the plain-environment path. See `deploy/infisical/README.md` for the
 full variable list, and copy its entrypoint if you use a different secret manager.
 
-### Upgrading past LoRA+
-
-Flash 1.2.133 removes LoRA+ optimizer grouping. New SFT runs use ordinary LoRA with the
-configured `train.learning_rate`. Remove `train.loraplus_ratio` from training configs; the
-old value `1` is accepted only for compatibility with existing plain-LoRA clients.
-
-Historical run records and preparation digests remain readable. Runs with a persisted
-ratio of `1` can still retry. SFT records with a ratio greater than `1`, or with no persisted
-ratio (the historical implicit `16`), cannot restart under this version. Finish those runs
-using their original Flash version before upgrading, or submit a new ordinary-LoRA run.
-Do not edit a stored ratio to bypass the check: its checkpoint has different optimizer groups.
-Attaching to an existing worker and reading completed runs do not require restarting training.
-
 ### The state directory
 
 Everything the plane persists locally - the SQLite database of keys and run ownership, run

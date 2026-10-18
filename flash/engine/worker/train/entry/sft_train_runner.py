@@ -24,7 +24,6 @@ import flash.engine.worker.runtime.state as _worker_state
 from flash.adapters.fused_experts import lora_target_parameters
 from flash.adapters.targets import resolve_lora_targeting
 from flash.core.catalog import get_model
-from flash.core.spec import require_supported_sft_optimizer
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
 from flash.engine.support.verl_policy import _resolve_fsdp_generation
 from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
@@ -171,8 +170,6 @@ class _SftOutputs:
 
 def _resolve_sft_options(spec) -> _SftOptions:
     spec = spec or _worker_state.JOB_SPEC
-    if spec is not None:
-        require_supported_sft_optimizer(spec)
     env = _worker_state.require_active_env()
     # the child trainer is seeded through its shim, but the environment's dataset/completion calls
     # run HERE in the parent. without this the documented top-level seed no longer reproduces sft

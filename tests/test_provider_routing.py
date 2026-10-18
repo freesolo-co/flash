@@ -71,11 +71,7 @@ def _spec(run_id="flash-1700000001-rt01", algorithm="sft", **gpu_kw) -> JobSpec:
                         "manifest_sha256": "d" * 64,
                     },
                 },
-                "train": {
-                    "epochs": 1,
-                    "max_examples": 8,
-                    "loraplus_ratio": 1.0 if algorithm == "sft" else None,
-                },
+                "train": {"epochs": 1, "max_examples": 8},
                 "gpu": gpu,
             }
         )

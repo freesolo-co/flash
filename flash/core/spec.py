@@ -20,7 +20,6 @@ detail. See their docstrings before changing either.
 from __future__ import annotations
 
 import json
-import math
 import os
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
@@ -366,10 +365,6 @@ class TrainSpec:
     hf_repo: str = ""
     # None -> worker's tuned recipe default.
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
-    # Retired option: retained only to preserve persisted preparation digests and identify old
-    # optimizer state. New specs use ordinary LoRA; from_dict keeps absent legacy values as None.
-    # No introduced_in metadata: this is no longer a selectable training parameter.
-    loraplus_ratio: float | None = 1.0
     # sft only. the packaged-dataset estimate resolves this against the selected row count into
     # examples_per_update (packed) or pins the optimizer batch to 1 (unpacked). grpo/opd have no
     # profile, so they take prompts_per_step instead and reject this key: the two are not the same
@@ -404,17 +399,6 @@ class TrainSpec:
     )
 
     def __post_init__(self) -> None:
-        if self.loraplus_ratio is not None:
-            ratio = self.loraplus_ratio
-            if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
-                raise TypeError("train.loraplus_ratio must be a number")
-            try:
-                ratio = float(ratio)
-            except OverflowError as exc:
-                raise ValueError("train.loraplus_ratio must be a finite number >= 1") from exc
-            if not math.isfinite(ratio) or ratio < 1:
-                raise ValueError("train.loraplus_ratio must be a finite number >= 1")
-            object.__setattr__(self, "loraplus_ratio", ratio)
         if not self.lora_alpha:
             object.__setattr__(self, "lora_alpha", 2 * self.lora_rank)
         max_steps = parse_max_steps(self.max_steps)
@@ -582,8 +566,6 @@ class JobSpec:
     project: str = ""
 
     def __post_init__(self) -> None:
-        if self.train.loraplus_ratio not in (None, 1.0) and self.algorithm != "sft":
-            raise ValueError("train.loraplus_ratio only applies to sft")
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
         for field_name in ("model_revision_auto", "model_revision_force_pin"):
@@ -699,9 +681,6 @@ class JobSpec:
         differently, so removing either pop would break existing digests.
         """
         data = asdict(self)
-        # Preserve historical digests, including the absent pre-LoRA-option SFT shape.
-        if data["train"]["loraplus_ratio"] is None or self.algorithm != "sft":
-            data["train"].pop("loraplus_ratio")
         # missing and unset are the same internal state. omitting the empty value preserves that state
         # without serializing it into an explicit empty preference, which every parser rejects.
         if not data["gpu"].get("providers"):
@@ -807,7 +786,6 @@ class JobSpec:
                 init_from_adapter_revision=str(train.get("init_from_adapter_revision") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=opt_float(train.get("learning_rate")),
-                loraplus_ratio=train.get("loraplus_ratio"),
                 batch_size=opt_int(train.get("batch_size")),
                 prompts_per_step=opt_int(train.get("prompts_per_step")),
                 max_context_tokens=opt_int(train.get("max_context_tokens")),
@@ -871,13 +849,3 @@ def load_job_spec_from_env() -> JobSpec | None:
         with open(path) as f:
             return JobSpec.from_json(f.read())
     return None
-
-
-def require_supported_sft_optimizer(spec: JobSpec) -> None:
-    """Reject execution of retired optimizer state while keeping historical records readable."""
-    if spec.algorithm == "sft" and spec.train.loraplus_ratio != 1.0:
-        raise ValueError(
-            "LoRA+ training has been removed: this SFT run used train.loraplus_ratio > 1 "
-            "or the legacy implicit 16x default. It cannot restart with this Flash version. "
-            "Use its original Flash version to resume, or submit a new ordinary-LoRA run."
-        )

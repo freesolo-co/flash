@@ -719,7 +719,6 @@ def _submittable(
     if algorithm == "sft":
         # sft is workload-profiled before it is quoted, and the profile is keyed on an immutable
         # environment revision. Pair this with satisfy_sft_profile at the submit site.
-        train["loraplus_ratio"] = 1.0
         body["environment"] = {"id": "github:owner/repo@main:env/environment.py"}
     return JobSpec.from_dict(body)
 
