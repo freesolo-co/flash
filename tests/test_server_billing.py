@@ -7,7 +7,6 @@ import io
 import json
 import socket
 import ssl
-import time
 import urllib.error
 import urllib.request
 
@@ -820,15 +819,19 @@ def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch
     import flash.server.platform.auth as auth_mod
 
     token = "fslo-user-spoof"
-    auth_mod._verify_cache[token] = (
-        True,
-        {
-            "key_prefix": "internal",
-            "email": "user@example.com",
-            "org_id": "org-spoof",
-            "org_slug": "org-spoof",
-        },
-        time.time() + auth_mod._VERIFY_CACHE_TTL_S,
+    monkeypatch.setattr(
+        auth_mod,
+        "_freesolo_verify",
+        lambda candidate: (
+            {
+                "key_prefix": "internal",
+                "email": "user@example.com",
+                "org_id": "org-spoof",
+                "org_slug": "org-spoof",
+            }
+            if candidate == token
+            else None
+        ),
     )
 
     me = api.get("/v1/me", headers=_bearer(token))

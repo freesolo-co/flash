@@ -32,6 +32,7 @@ _DEFAULT_CACHE_ROOT = "/var/lib/flash-serving"
 _VLLM_CACHE_DIRNAME = "vllm"
 _DEFAULT_HOST = "0.0.0.0"
 _DEFAULT_PORT = 8000
+_CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS = 5.0
 _CHILD_STOP_TIMEOUT_SECONDS = 5.0
 _BOOTSTRAP_PATH = "/app/serve_launch.py"
 _SAFE_CHILD_COPIED_ENV_NAMES = frozenset(
@@ -107,6 +108,24 @@ class StartupTerminated(LaunchError):
     def __init__(self, exit_code: int) -> None:
         self.exit_code = exit_code
         super().__init__("serving startup was terminated")
+
+
+class LauncherShutdownUnconfirmed(LaunchError):
+    """the launcher did not confirm exit after termination and force-kill waits."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        super().__init__(
+            "launcher process exit could not be confirmed after terminate and kill deadlines"
+        )
+
+
+class CredentialWriterShutdownUnconfirmed(LaunchError):
+    """the credential writer could not be joined; retain its thread for inspection."""
+
+    def __init__(self, writer: threading.Thread) -> None:
+        self.writer = writer
+        super().__init__("credential writer shutdown could not be confirmed")
 
 
 class _PopenFactory(Protocol):
@@ -344,33 +363,55 @@ def _write_all(fd: int, value: str) -> None:
 
 
 @contextlib.contextmanager
-def _secret_descriptor(value: str):
+def _open_secret_pipe(value: str):
+    """yield a pipe reading end and wait up to five seconds for its writer on cleanup."""
     read_fd, write_fd = os.pipe()
     errors: list[BaseException] = []
     value_holder = [value]
     del value
 
-    def populate() -> None:
+    def write_secret_to_pipe() -> None:
         secret = value_holder.pop()
         try:
             _write_all(write_fd, secret)
         except BaseException as exc:
             errors.append(exc)
         finally:
-            # the writer may block until a large value is consumed, so drop its final raw reference
-            # as soon as the write finishes rather than retaining it for the long-lived with-body.
+            # release the credential once written; the consumer may run for the server's lifetime.
             del secret
             with contextlib.suppress(OSError):
                 os.close(write_fd)
 
-    writer = threading.Thread(target=populate, name="flash-secret-pipe", daemon=True)
-    writer.start()
+    writer: threading.Thread | None = None
+    operation_error: BaseException | None = None
     try:
+        writer = threading.Thread(
+            target=write_secret_to_pipe, name="flash-secret-pipe", daemon=True
+        )
+        writer.start()
         yield read_fd
+    except BaseException as exc:
+        operation_error = exc
+        raise
     finally:
         with contextlib.suppress(OSError):
             os.close(read_fd)
-        writer.join()
+        if writer is None or (writer.ident is None and not writer.is_alive()):
+            with contextlib.suppress(OSError):
+                os.close(write_fd)
+        else:
+            try:
+                writer.join(timeout=_CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS)
+            except BaseException as join_error:
+                cleanup_error = CredentialWriterShutdownUnconfirmed(writer)
+                if operation_error is not None:
+                    raise cleanup_error from operation_error
+                raise cleanup_error from join_error
+            if writer.is_alive():
+                cleanup_error = CredentialWriterShutdownUnconfirmed(writer)
+                if operation_error is not None:
+                    raise cleanup_error from operation_error
+                raise cleanup_error
     if errors:
         raise LaunchError("secret descriptor could not be populated") from errors[0]
 
@@ -409,10 +450,10 @@ def _prepare_cache(manifest: Any, cache_root: str, artifact_token: str | None) -
         raise LaunchError("artifact token is required when serving cache hydration is missing")
     try:
         if weights_missing:
-            with _secret_descriptor(artifact_token) as token_fd:
+            with _open_secret_pipe(artifact_token) as token_fd:
                 hydrate_base_weights(manifest, cache_root, token_fd=token_fd)
         if adapters_missing:
-            with _secret_descriptor(artifact_token) as token_fd:
+            with _open_secret_pipe(artifact_token) as token_fd:
                 hydrate_manifest(manifest, cache_root, token_fd=token_fd)
             emit_boot_progress("adapters-validated", count=len(manifest.adapters))
     except MaterializationError as exc:
@@ -556,7 +597,7 @@ def _run_prepared(prepared: list[Any], startup_signals: _StartupSignalGuard) -> 
     inference_token = prepared.pop(0)
     args, manifest = prepared
     emit_boot_progress("entering-serve", host=args.host, port=args.port)
-    with _secret_descriptor(inference_token) as inference_fd:
+    with _open_secret_pipe(inference_token) as inference_fd:
         # the descriptor owns the write now, so this frame must not retain the raw token while serving.
         del inference_token
         asyncio.run(
@@ -613,23 +654,31 @@ def _close_descriptors(descriptors: list[int]) -> None:
             os.close(fd)
 
 
-def _terminate_and_reap(process: subprocess.Popen[Any]) -> None:
+def _wait_for_process_exit(process: subprocess.Popen[Any], timeout: float) -> bool:
+    """wait up to timeout seconds; return False on timeout and propagate other errors."""
+
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
+def stop_launcher_process(process: subprocess.Popen[Any]) -> None:
+    """terminate, then force-kill if needed, waiting up to five seconds after each signal.
+
+    raise LauncherShutdownUnconfirmed if neither wait confirms exit.
+    """
+
     with contextlib.suppress(Exception):
         process.terminate()
-    try:
-        process.wait(timeout=_CHILD_STOP_TIMEOUT_SECONDS)
+    if _wait_for_process_exit(process, _CHILD_STOP_TIMEOUT_SECONDS):
         return
-    except Exception:
-        pass
     with contextlib.suppress(Exception):
         process.kill()
-    try:
-        process.wait(timeout=_CHILD_STOP_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(Exception):
-            process.wait()
-    except Exception:
-        pass
+    if _wait_for_process_exit(process, _CHILD_STOP_TIMEOUT_SECONDS):
+        return
+    raise LauncherShutdownUnconfirmed(process.pid)
 
 
 def start_launcher_process(
@@ -673,9 +722,12 @@ def start_launcher_process(
         if artifact_token is not None:
             _write_all(write_fds[1], artifact_token)
         return process
-    except BaseException:
+    except BaseException as launch_error:
         if process is not None:
-            _terminate_and_reap(process)
+            try:
+                stop_launcher_process(process)
+            except LauncherShutdownUnconfirmed as shutdown_error:
+                raise shutdown_error from launch_error
         raise
     finally:
         _close_descriptors(read_fds)
