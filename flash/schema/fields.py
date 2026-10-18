@@ -65,7 +65,10 @@ def _train_float(
         return None
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise ConfigError(f"train.{key} must be a number")
-    v = float(v)
+    try:
+        v = float(v)
+    except OverflowError as exc:
+        raise ConfigError(f"train.{key} must be a finite number") from exc
     # nan/inf slip past range checks (nan compares false, inf passes any minimum).
     if not math.isfinite(v):
         raise ConfigError(f"train.{key} must be a finite number")

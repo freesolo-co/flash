@@ -96,7 +96,7 @@ def _generic_handle() -> JobHandle:
             "instance_id": 17,
             "offer_id": 18,
             "machine_id": 19,
-            "label": "flash-1-s0-a0",
+            "label": "flash-1-a0",
             "gpu": "H100",
             "hourly_usd": 1.5,
             "attempt": 0,

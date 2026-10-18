@@ -25,7 +25,6 @@ FAILURE_TEXT_LIMIT = 64_000
 __all__ = [
     "JobHandle",
     "PollResult",
-    "capacity_escalation_note",
     "capacity_grace_multiplier",
     "decode_output",
 ]
@@ -33,16 +32,12 @@ __all__ = [
 
 # capacity grace on the LAST candidate class: there is nowhere left to walk, so wait longer before
 # giving up. purely a timing knob -- it says nothing about whether a retry follows, because
-# on_last_gpu (runner/lifecycle.py) is also true when the infra retry budget is exhausted.
+# on_last_gpu (runner/supervise/retry_decision.py) is also true when the infra retry budget is exhausted.
 LAST_GPU_CAPACITY_GRACE_S = 900.0
 
 # multi-card shapes are rarer than single cards, so a grace sized for 1x expires on a 4x wait that
-# was merely slow rather than starved. expiring it does not find capacity faster: the supervisor
-# tears the endpoint down and re-requests THE SAME class (`_select_candidate` re-picks the only
-# fitting shape once nothing is untried), so the run pays a fresh cold start to rejoin the same
-# queue it just left. observed: 3-5 attempts and ~55 min of queueing per arm before a single
-# optimizer step, with the multi-GPU arms churning most. scale the wait with the card count
-# instead, so scarcity is waited out on one queue position rather than re-requested.
+# was merely slow rather than starved. scale the wait with the card count so scarcity is waited out
+# on one queue position rather than paying another cold start.
 CAPACITY_GRACE_PER_GPU_CAP = 4
 
 
@@ -207,19 +202,6 @@ class GraceTimer:
         if self.since is not None and self.seen is not None:
             self.since += now - self.seen
         self.seen = now
-
-
-def capacity_escalation_note(on_last_gpu: bool) -> str:
-    """The escalation clause a capacity failure detail carries. States the escalation fact ONLY.
-
-    `on_last_gpu` means no further class escalation follows, not that classes are exhausted or a
-    retry occurs. Keep both branches neutral; the supervisor owns target selection and budget.
-    """
-    return (
-        "no further GPU-class escalation follows"
-        if on_last_gpu
-        else "GPU-class escalation may follow"
-    )
 
 
 # heartbeat readers and provenance checks are provider-neutral and live in

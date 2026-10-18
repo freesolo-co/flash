@@ -149,6 +149,13 @@ def make_client(tmp_path, monkeypatch):
     # the urllib shim that POST would otherwise route into THIS app (no such route) and log a 404 warn
     # on every status change. Stub it (as the other server fixtures do) to keep output clean.
     monkeypatch.setattr(runs, "_post", lambda *a, **k: False, raising=False)
+    # Submitting a billable run now precheck-POSTs the real billing backend, which the fixture's
+    # own offline urlopen guard below refuses -- a transport failure the route correctly blocks on.
+    # Stub the affordability answer (as the other server fixtures do) so these tests keep covering
+    # the client/server contract rather than the billing precheck, which test_server_billing owns.
+    import flash.server.billing.charges as billing_mod
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **_kwargs: {"ok": True})
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
     monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)

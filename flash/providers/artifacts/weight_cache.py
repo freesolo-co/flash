@@ -371,7 +371,6 @@ def _warm_one_lambda_instance(
             try:
                 lambda_jobs.launch_and_submit(
                     spec,
-                    seed=spec.seed,
                     instances=[cand],
                     attempt=0,
                     mode="preload",

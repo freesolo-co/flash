@@ -140,7 +140,7 @@ def _balanced_thinking_content(message: dict, *, thinking: bool) -> str:
 
 def _balance_thinking_payload(payload: object, *, thinking: bool) -> None:
     """Rewrite each choice's ``content`` in place so the returned payload is balanced."""
-    if not isinstance(payload, dict):
+    if not thinking or not isinstance(payload, dict):
         return
     for choice in payload.get("choices") or []:
         message = choice.get("message") if isinstance(choice, dict) else None

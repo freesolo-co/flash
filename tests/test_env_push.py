@@ -34,14 +34,18 @@ def _fake_client(capture: dict, *, slug: str = "acme/environment"):
     return lambda: _C()
 
 
-def _members(package_b64: str) -> dict[str, str]:
+def _member_bytes(package_b64: str) -> dict[str, bytes]:
     raw = base64.b64decode(package_b64)
-    out: dict[str, str] = {}
+    out: dict[str, bytes] = {}
     with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
-        for m in tar.getmembers():
-            if m.isfile():
-                out[m.name] = tar.extractfile(m).read().decode()
+        for member in tar.getmembers():
+            if member.isfile():
+                out[member.name] = tar.extractfile(member).read()
     return out
+
+
+def _members(package_b64: str) -> dict[str, str]:
+    return {name: content.decode() for name, content in _member_bytes(package_b64).items()}
 
 
 def _member_names(package_b64: str) -> list[str]:
@@ -83,6 +87,244 @@ def _deny_archive_and_upload(monkeypatch, calls: list[str]) -> None:
         "flash.client.client_from_config",
         lambda: calls.append("upload") or pytest.fail("upload must not start"),
     )
+
+
+def _deny_push_side_effects(monkeypatch, calls: list[str]) -> None:
+    class _Client:
+        def publish_env(self, **_kwargs):
+            calls.append("upload")
+            return {"id": "acme/project/environment"}
+
+    def deny_temporary_package(*_args, **_kwargs):
+        calls.append("temporary-package")
+        pytest.fail("temporary package must not be created")
+
+    monkeypatch.setattr(
+        "flash.envs.package.direct_tokens.package_contains_direct_token",
+        lambda _pkg: calls.append("direct-token-scan") or False,
+    )
+    monkeypatch.setattr(
+        "flash.cli.commands.env.ops.push.tempfile.TemporaryDirectory", deny_temporary_package
+    )
+    monkeypatch.setattr(
+        "flash.cli.commands.env.ops.push._tar_b64",
+        lambda _pkg: calls.append("archive") or "package",
+    )
+    monkeypatch.setattr(
+        "flash.client.client_from_config",
+        lambda: calls.append("client") or _Client(),
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def broken(:\n    pass\n",
+        "return 1\n",
+        "yield 1\n",
+        "break\n",
+        "continue\n",
+        "nonlocal value\n",
+        "await work()\n",
+        "def duplicate(value, value):\n    pass\n",
+        "from __future__ import unknown_feature\n",
+    ],
+    ids=[
+        "parser-error",
+        "return-outside-function",
+        "yield-outside-function",
+        "break-outside-loop",
+        "continue-outside-loop",
+        "nonlocal-at-module-level",
+        "await-outside-function",
+        "duplicate-argument",
+        "unknown-future-feature",
+    ],
+)
+def test_push_rejects_invalid_original_entrypoint_before_any_side_effect(
+    monkeypatch, tmp_path, capsys, source
+):
+    env_file = tmp_path / "environment.py"
+    env_file.write_text(source)
+    calls: list[str] = []
+    _deny_push_side_effects(monkeypatch, calls)
+
+    assert cli.cmd_env_push(_args(env_file)) == 1
+
+    error = capsys.readouterr().err
+    assert "environment entrypoint has invalid Python syntax" in error
+    assert "line " in error
+    assert calls == []
+
+
+def test_push_rejects_invalid_published_entrypoint_before_any_side_effect(
+    monkeypatch, tmp_path, capsys
+):
+    from flash.cli.commands.env.ops import push as envpush
+
+    env_file = tmp_path / "environment.py"
+    env_file.write_text("VALUE = 1\n")
+    monkeypatch.setattr(envpush, "_ENV_SYSPATH_BOOTSTRAP", "def broken(:\n")
+    calls: list[str] = []
+    _deny_push_side_effects(monkeypatch, calls)
+
+    assert cli.cmd_env_push(_args(env_file)) == 1
+
+    error = capsys.readouterr().err
+    assert "environment entrypoint has invalid Python syntax" in error
+    assert "line " in error
+    assert calls == []
+
+
+def test_push_syntax_error_does_not_leak_source_text(monkeypatch, tmp_path, capsys):
+    secret = "super_secret_identifier"
+    env_file = tmp_path / "environment.py"
+    env_file.write_text(f"f'{{value!{secret}}}'\n")
+    calls: list[str] = []
+    _deny_push_side_effects(monkeypatch, calls)
+
+    assert cli.cmd_env_push(_args(env_file)) == 1
+
+    error = capsys.readouterr().err
+    assert "environment entrypoint has invalid Python syntax" in error
+    assert secret not in error
+    assert calls == []
+
+
+def test_push_rejects_invalid_bytes_for_encoding_cookie_before_side_effects(
+    monkeypatch, tmp_path, capsys
+):
+    secret = "source_secret_marker"
+    env_file = tmp_path / "environment.py"
+    env_file.write_bytes(f"# coding: ascii\n{secret} = '".encode() + b"\xe9'\n")
+    calls: list[str] = []
+    _deny_push_side_effects(monkeypatch, calls)
+
+    assert cli.cmd_env_push(_args(env_file)) == 1
+
+    error = capsys.readouterr().err
+    assert "environment entrypoint has invalid Python syntax" in error
+    assert secret not in error
+    assert calls == []
+
+
+def test_push_rejects_bom_cookie_mismatch_before_side_effects(monkeypatch, tmp_path, capsys):
+    env_file = tmp_path / "environment.py"
+    env_file.write_bytes(b"\xef\xbb\xbf# coding: latin-1\nVALUE = 1\n")
+    calls: list[str] = []
+    _deny_push_side_effects(monkeypatch, calls)
+
+    assert cli.cmd_env_push(_args(env_file)) == 1
+
+    assert "environment entrypoint has invalid Python syntax" in capsys.readouterr().err
+    assert calls == []
+
+
+def test_push_preserves_valid_latin1_entrypoint_bytes_in_archive(monkeypatch, tmp_path):
+    from flash.cli.commands.env.ops import push as envpush
+
+    source = (
+        b"#!/usr/bin/env python3\n"
+        b"# coding: latin-1\n"
+        b'"""caf\xe9 environment"""\n'
+        b"from __future__ import annotations\n"
+        b"from __future__ import generator_stop\n"
+        b"LABEL = 'ol\xe9'"
+    )
+    env_file = tmp_path / "environment.py"
+    env_file.write_bytes(source)
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file)) == 0
+
+    archived = _member_bytes(cap["package_b64"])["environment.py"]
+    expected = source.replace(
+        b"LABEL = 'ol\xe9'",
+        envpush._ENV_SYSPATH_BOOTSTRAP.encode("latin-1") + b"LABEL = 'ol\xe9'",
+    )
+    assert archived == expected
+    assert not archived.endswith(b"\n")
+    compile(archived, "environment.py", "exec")
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_prefix"),
+    [
+        (b"#!/usr/bin/env python3\nVALUE = 1\n", "#!/usr/bin/env python3\n"),
+        (b"# coding: latin-1\nVALUE = 1\n", "# coding: latin-1\n"),
+        (b"\n# coding: latin-1\nVALUE = 1\n", "\n# coding: latin-1\n"),
+        (
+            b"#!/usr/bin/env python3\n# coding: latin-1\nVALUE = 1\n",
+            "#!/usr/bin/env python3\n# coding: latin-1\n",
+        ),
+        (b"\xef\xbb\xbfVALUE = 1\n", ""),
+    ],
+    ids=[
+        "shebang-only",
+        "encoding-cookie-only",
+        "second-line-encoding-cookie",
+        "shebang-and-encoding-cookie",
+        "utf8-bom",
+    ],
+)
+def test_syspath_bootstrap_preserves_python_lexical_preamble(source, expected_prefix):
+    import tokenize
+
+    from flash.cli.commands.env.ops import push as envpush
+
+    published = envpush._prepare_env_entrypoint_source(source)
+
+    before_encoding = tokenize.detect_encoding(io.BytesIO(source).readline)[0]
+    after_encoding = tokenize.detect_encoding(io.BytesIO(published).readline)[0]
+    assert after_encoding == before_encoding
+    decoded = published.decode(after_encoding)
+    assert decoded == expected_prefix + envpush._ENV_SYSPATH_BOOTSTRAP + "VALUE = 1\n"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_prefix"),
+    [
+        ('"""environment docs"""\nVALUE = 1\n', '"""environment docs"""\n'),
+        (
+            "from __future__ import annotations\nVALUE: Missing = 1\n",
+            "from __future__ import annotations\n",
+        ),
+        (
+            (
+                '"""environment docs"""\n'
+                "from __future__ import annotations\n"
+                "from __future__ import generator_stop\n"
+                "VALUE: Missing = 1\n"
+            ),
+            (
+                '"""environment docs"""\n'
+                "from __future__ import annotations\n"
+                "from __future__ import generator_stop\n"
+            ),
+        ),
+        ("from __future__ import annotations", "from __future__ import annotations\n"),
+    ],
+    ids=["docstring", "future-import", "docstring-and-futures", "future-without-final-newline"],
+)
+def test_syspath_bootstrap_follows_docstring_and_future_imports(source, expected_prefix):
+    import ast
+
+    from flash.cli.commands.env.ops import push as envpush
+
+    published = envpush._prepare_env_entrypoint_source(source.encode()).decode()
+
+    bootstrap = envpush._ENV_SYSPATH_BOOTSTRAP
+    if not source.endswith("\n"):
+        bootstrap = bootstrap.removesuffix("\n")
+    assert published.startswith(expected_prefix + bootstrap)
+    assert published.endswith("\n") == source.endswith("\n")
+    tree = ast.parse(published)
+    if source.startswith('"""'):
+        assert ast.get_docstring(tree, clean=False) == "environment docs"
+    assert any(
+        isinstance(node, ast.ImportFrom) and node.module == "__future__" for node in tree.body
+    ) == ("from __future__" in source)
 
 
 @pytest.mark.parametrize(
@@ -1731,3 +1973,26 @@ def test_push_directory_still_rejects_two_real_candidate_modules(monkeypatch, tm
     monkeypatch.setattr("flash.client.client_from_config", _fake_client({}))
 
     assert cli.cmd_env_push(_args(env_dir)) == 1
+
+
+def test_push_non_utf8_entrypoint_still_ships_the_helpers_it_imports(monkeypatch, tmp_path):
+    # the publish path decodes the entrypoint with `tokenize.detect_encoding`, so a file carrying a
+    # non-utf-8 encoding cookie is publishable. the import walk read the same file as utf-8 and
+    # swallowed the decode error as "no imports", so the sibling it imports never entered the
+    # archive: `env push` exits 0 and prints an id, and the missing helper only surfaces when a
+    # worker imports the module -- after a gpu has been rented.
+    env_file = tmp_path / "environment.py"
+    env_file.write_bytes(
+        b"# -*- coding: latin-1 -*-\n"
+        b"# caf\xe9\n"
+        b"import helper\n"
+        b"def load_environment(**k):\n"
+        b"    return helper.VALUE\n"
+    )
+    (tmp_path / "helper.py").write_text("VALUE = 1\n")
+    cap: dict = {}
+    monkeypatch.setattr("flash.client.client_from_config", _fake_client(cap))
+
+    assert cli.cmd_env_push(_args(env_file)) == 0
+
+    assert "helper.py" in _member_names(cap["package_b64"])

@@ -121,30 +121,50 @@ def _schema_disagreement_detail(
     )
 
 
-def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) -> bool:
-    """Reject an unaffordable prepared run before recording or allocating it.
+_BILLING_UNAVAILABLE_DETAIL = "billing verification is unavailable; no paid work was started"
+_BILLING_FAILED_DETAIL = "billing verification failed; no paid work was started"
 
-    Returns whether affordability was actually VERIFIED. The two fail-open paths below deliberately
-    let the run through on a billing-infra problem, but a caller that reports the outcome must be
-    able to tell that apart from a real pass: an unverified run can still be rejected 402 later.
-    """
+
+def _precheck_budget_or_block(*, run_id: str, estimate_usd: float, org_id: str) -> bool:
+    """Reject a permanently unverifiable prepared run before persistence or allocation."""
     from flash.server.platform.internal_client import internal_key as _internal_key
 
     key = _internal_key()
     if not key:
-        # internal reporting is off -> no completion billing either, so there is nothing to gate.
-        return False
+        _LOG.warning("billing precheck unavailable for run %s: internal key missing", run_id)
+        raise HTTPException(status_code=503, detail=_BILLING_UNAVAILABLE_DETAIL)
     try:
-        from flash.server.billing.charges import precheck_training_run
+        from flash.server.billing.charges import (
+            PrecheckError,
+            PrecheckFailureSource,
+            PrecheckRetryDisposition,
+            precheck_training_run,
+        )
 
-        precheck_training_run(internal_key=key, org_id=org_id, estimate_usd=estimate_usd)
+        precheck_training_run(
+            internal_key=key,
+            org_id=org_id,
+            estimate_usd=estimate_usd,
+        )
+    except PrecheckError as exc:
+        _LOG.warning("billing precheck failed for run %s: %s", run_id, exc.private_detail)
+        if exc.source is PrecheckFailureSource.HTTP and exc.status_code == 402:
+            raise HTTPException(
+                status_code=402,
+                detail=exc.public_detail or "payment required",
+            ) from exc
+        if exc.retry is PrecheckRetryDisposition.FAIL_OPEN:
+            return False
+        raise HTTPException(status_code=502, detail=_BILLING_FAILED_DETAIL) from exc
     except Exception as exc:
-        from flash.server.billing.charges import BillingError
+        from flash._internal.diagnostics import sanitize_diagnostic
 
-        if isinstance(exc, BillingError) and exc.status_code == 402:
-            raise HTTPException(status_code=402, detail=exc.detail) from exc
-        _LOG.warning("budget precheck skipped for %s (billing service error): %s", run_id, exc)
-        return False
+        _LOG.warning(
+            "billing precheck failed for run %s: %s",
+            run_id,
+            sanitize_diagnostic(exc, limit=500),
+        )
+        raise HTTPException(status_code=502, detail=_BILLING_FAILED_DETAIL) from exc
     return True
 
 
@@ -363,6 +383,7 @@ def create_run(
     platform_context = ctx.platform_context
     run_id = spec.run_id
     affordability_verified = False
+    submission_started = False
     try:
         try:
             prepared = _app.prepare_job(
@@ -403,6 +424,7 @@ def create_run(
                 estimate_usd=prepared.estimated_cost_usd,
                 org_id=affordability_org_id,
             )
+        submission_started = True
         db.record_run(run_id, key["id"])
         submit_kwargs = {
             "dry_run": dry_run,
@@ -418,14 +440,15 @@ def create_run(
             submit_kwargs["platform_context"] = platform_context
         status = _app.submit_job(prepared.public_spec, **submit_kwargs)
     except Exception as exc:
-        _dispose_failed_submission(
-            run_id,
-            dry_run=dry_run,
-            had_runtime_secrets=bool(runtime_secrets),
-            environment_slug=environment_slug,
-            project_id=project_id,
-            reporting_key=reporting_key,
-        )
+        if submission_started:
+            _dispose_failed_submission(
+                run_id,
+                dry_run=dry_run,
+                had_runtime_secrets=bool(runtime_secrets),
+                environment_slug=environment_slug,
+                project_id=project_id,
+                reporting_key=reporting_key,
+            )
         if isinstance(exc, HTTPException):
             raise
         raise _submit_failure_http_error(exc) from exc
