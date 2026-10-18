@@ -1020,3 +1020,26 @@ def test_modal_deploy_client_matches_the_runtime_dependency_pin(workflow):
         if argument.startswith("modal==")
     ]
     assert requirements == [expected]
+
+
+@pytest.mark.parametrize("branch", ["dev", "main", "codex/modal-migration", ".feature"])
+def test_serving_publish_tags_support_feature_branches(branch, tmp_path):
+    workflow = _load(WORKFLOW_DIR / "publish-serving-image.yml")
+    job = _jobs(workflow)["publish-serving-image"]
+    script = next(step["run"] for step in _steps(job) if step.get("name") == "Compute tags")
+    output = tmp_path / "outputs"
+    env = {
+        **os.environ,
+        "GITHUB_REF_NAME": branch,
+        "IMAGE": "ghcr.io/example/serve",
+        "GITHUB_OUTPUT": str(output),
+    }
+    subprocess.run(["bash", "-eu", "-c", script], cwd=REPO_ROOT, env=env, check=True)
+    refs = [line for line in output.read_text().splitlines() if line.startswith(env["IMAGE"])]
+    assert refs
+    assert all(
+        re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", ref.rsplit(":", 1)[1]) for ref in refs
+    )
+    assert (env["IMAGE"] + ":latest" in refs) is (branch == "main")
+    if branch == "dev":
+        assert env["IMAGE"] + ":dev" in refs
