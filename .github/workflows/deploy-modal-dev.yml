@@ -114,7 +114,7 @@ jobs:
           # pinned to the exact client pyproject declares; see deploy-modal.yml for why an
           # unbounded range is unsafe for the deploy path.
           # exact pins keep the deploy client bootstrap reproducible across runner image changes.
-          uv pip install --system "modal==1.5.4" "python-dotenv==1.2.3"
+          uv pip install --system "modal==1.6.1" "python-dotenv==1.2.3"
 
       - name: Verify development deployment inputs
         if: steps.gate.outputs.deploy == 'true'
