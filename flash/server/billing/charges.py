@@ -6,10 +6,10 @@ import http.client
 import json
 import socket
 import urllib.error
-import urllib.request
 from enum import Enum
 
 from flash._internal.diagnostics import sanitize_diagnostic
+from flash._internal.http import _urlopen_no_redirect
 from flash.core.spec import attributed_gpu_type
 from flash.cost.currency import usd_cents as _cents
 from flash.server.platform.internal_client import (
@@ -99,7 +99,7 @@ def _post_billing(*, token: str, path: str, body: dict) -> dict:
     """POST a JSON body to the backend billing path; raises BillingError on failure."""
     req = build_internal_request(path, body, token=token)
     try:
-        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as resp:
+        with _urlopen_no_redirect(req, timeout=DEFAULT_TIMEOUT_S) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         raise BillingError(exc.code, _http_error_detail(exc)) from exc
@@ -194,7 +194,7 @@ def precheck_training_run(*, internal_key: str, org_id: str, estimate_usd: float
     body = {"orgId": org_id, "estimateCents": _cents(estimate_usd)}
     req = build_internal_request(_PRECHECK_PATH, body, token=internal_key)
     try:
-        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT_S) as response:
+        with _urlopen_no_redirect(req, timeout=DEFAULT_TIMEOUT_S) as response:
             status_code = _precheck_response_status(response)
             disposition = classify_precheck_http_status(status_code)
             if disposition is not PrecheckHttpDisposition.SUCCESS:

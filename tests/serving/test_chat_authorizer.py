@@ -313,7 +313,10 @@ def test_malformed_200_fails_closed_without_dispatch_or_cache(
         assert pool.generate_calls == 0
 
         allowed = _chat(client, Authorization="Bearer fs-user-key")
-        internal = _chat(client, **{"X-Freesolo-Internal-Key": _INTERNAL_KEY})
+        internal = _chat(
+            client,
+            **{"X-Freesolo-Internal-Key": _INTERNAL_KEY, "X-Freesolo-Org-Id": "org-2"},
+        )
 
     assert allowed.status_code == 200
     assert internal.status_code == 200
@@ -322,7 +325,7 @@ def test_malformed_200_fails_closed_without_dispatch_or_cache(
     assert len(store.finalized) == 2
     assert store.finalized[0].principal.orgId == "org-1"
     assert store.finalized[1].principal.kind == "trusted_internal"
-    assert store.finalized[1].principal.orgId is None
+    assert store.finalized[1].principal.orgId == "org-2"
 
 
 def test_cancelled_waiter_does_not_cancel_shared_authorization(modal_app_module, monkeypatch):

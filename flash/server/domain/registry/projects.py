@@ -10,6 +10,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from flash._internal.http import _urlopen_no_redirect
 from flash.core.spec import require_project_id
 from flash.server.platform.auth import freesolo_base_url, standalone
 from flash.server.platform.internal_client import build_internal_request, internal_key
@@ -104,7 +105,7 @@ def _require_internal_project_access(*, project_id: str, org_id: str) -> tuple[s
         token=token,
     )
     try:
-        with urllib.request.urlopen(request, timeout=_PROJECT_TIMEOUT_S) as response:
+        with _urlopen_no_redirect(request, timeout=_PROJECT_TIMEOUT_S) as response:
             status = int(response.status)
             raw = response.read()
     except urllib.error.HTTPError as exc:
@@ -260,7 +261,7 @@ def _project_access(
         headers=headers,
     )
     try:
-        with urllib.request.urlopen(req, timeout=_PROJECT_TIMEOUT_S) as resp:
+        with _urlopen_no_redirect(req, timeout=_PROJECT_TIMEOUT_S) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         detail = _error_detail(exc)

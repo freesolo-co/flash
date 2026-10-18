@@ -136,8 +136,8 @@ class _TextTeacherBatcher(ScoreBatcher):
     temperature), and the teacher charges per scored item. Sending the pair once and marking the
     repeats unbilled keeps the answer identical while paying for it once.
 
-    ``recheck_closed_after_wait`` is on: a batch assembled during the flush window after ``close``
-    must NOT be sent, because a teacher call bills real money and the run is already shutting down.
+    ``cancel_undispatched_on_close`` is on: ``close`` cancels any batch that has not yet won the
+    dispatch claim, because a teacher call bills real money and the run is already shutting down.
     """
 
     def __init__(
@@ -158,7 +158,7 @@ class _TextTeacherBatcher(ScoreBatcher):
             thread_name="flash-opd-text-teacher-batcher",
             make_error=_permanent_teacher_error,
             wrap_batch_error=_teacher_batch_error,
-            recheck_closed_after_wait=True,
+            cancel_undispatched_on_close=True,
         )
         self.teacher = teacher
         self.on_scored = on_scored

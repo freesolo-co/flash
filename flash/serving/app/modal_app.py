@@ -93,10 +93,11 @@ HOSTING_CACHE_MOUNT = "/vol/hosting-cache"
 # below — HF/internal key, backend + Supabase URLs — stays env-configured because it is per-deploy
 # credentials, not tuning.)
 TIMEOUT_SECONDS = 600
-# 2700s (45 min): the 35B bf16/H200 cold boot takes ~1010s of engine init alone (67 GiB load +
-# ~377s torch.compile + graph capture + warmup) on top of image pull, which blows past the old 1200s
-# ceiling — Modal SIGTERMs the container mid-warmup and it cold-cycles forever. A higher ceiling is
-# harmless for the fast tiers (they still boot in a minute; this is only a kill-if-stuck bound).
+# 2700s (45 min): the slowest MEASURED cold boot on the shipped B200 tiers is the 27B at 1821s
+# (a cold torch.compile cache alone costs ~354s of Dynamo), on top of image pull. The old 1200s
+# ceiling was already blown by the 35B's ~1010s of engine init — Modal SIGTERMs the container
+# mid-warmup and it cold-cycles forever. 2700s leaves ~880s of margin over the worst measurement,
+# and a higher ceiling is harmless for the fast tiers: this is only a kill-if-stuck bound.
 STARTUP_TIMEOUT_SECONDS = 2700
 # The router awaits the engine call, which on a cold base model includes vLLM startup, so its
 # timeout must cover startup + a request (else it's killed mid cold-start).
@@ -116,7 +117,6 @@ ROUTER_TIMEOUT_SECONDS = STARTUP_TIMEOUT_SECONDS + TIMEOUT_SECONDS
 # The H200 keeps a LONGER hold than break-even alone would suggest: the 35B's boot is ~1010s of
 # engine init (67 GiB of weights + ~377s torch.compile + graph capture), so a miss is a ~17-minute
 # user-visible stall. Cost and latency point the same way there, and the window stays at 1800s.
-DEFAULT_SCALEDOWN_WINDOW_SECONDS = 1800
 SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     # ~60s cold boot (small FP8 checkpoints, cached compile artifacts on the shared volume).
     "L4": 300,
@@ -127,12 +127,36 @@ SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     # ~1010s cold boot (35B bf16, 67 GiB + ~377s torch.compile). Break-even AND a ~17-min
     # user-visible stall on a miss both argue for keeping the full window here.
     "H200": 1800,
+    # B200 now carries all three tiers. Measured cold boots (2026-08-30/31, this card): 9B 723s,
+    # 35B 488s, 27B 1821s. The 27B dominates because a cold torch.compile cache costs ~354s of
+    # Dynamo alone; warm-cache boots of the same tiers run 153-473s. Sized to the slowest MEASURED
+    # cold boot rather than the warm case, so a scale-out replacement is not cycled mid-boot.
+    "B200": 2100,
+    # B300 has no shipped tier. It also wedges intermittently serving above max_num_seqs (sm 10.3;
+    # B200 served 20/20 on the same workload), so it is not a deployment target yet -- the window
+    # stays a placeholder rather than a measurement.
+    "B300": 1800,
 }
+# The tiers this app is allowed to run an engine on. `gpu` in the serving catalog is a plain string,
+# so a typo ("b200", "B2OO") or an unvalidated new card used to fall through `dict.get` to a default
+# window and deploy anyway, at that card's real hourly rate. Membership here is the one gate.
+SUPPORTED_GPUS: frozenset[str] = frozenset(SCALEDOWN_WINDOW_SECONDS_BY_GPU)
 
 
 def scaledown_window_for(gpu: str) -> int:
-    """Idle seconds before ``gpu``'s engine containers scale down (see the table above)."""
-    return SCALEDOWN_WINDOW_SECONDS_BY_GPU.get(gpu, DEFAULT_SCALEDOWN_WINDOW_SECONDS)
+    """Idle seconds before ``gpu``'s engine containers scale down (see the table above).
+
+    Raises ``ValueError`` for a tier this app has no window for, rather than silently applying a
+    default to an unrecognized card.
+    """
+    try:
+        return SCALEDOWN_WINDOW_SECONDS_BY_GPU[gpu]
+    except KeyError:
+        supported = ", ".join(sorted(SUPPORTED_GPUS))
+        raise ValueError(
+            f"Unsupported serving GPU tier {gpu!r}; supported tiers: {supported}. "
+            "Add the tier to SCALEDOWN_WINDOW_SECONDS_BY_GPU with its measured cold-boot window."
+        ) from None
 
 
 # gpu model engines scale to zero. inference and adapter registration remote calls start the matching
@@ -256,7 +280,7 @@ image = (
             # artifacts to VLLM_CACHE_ROOT/torch_compile_cache/<hash>/ (vllm/compilation/backends.py),
             # plus modelinfos/ and the GPU p2p cache. With MIN_CONTAINERS = 0 and a 30-minute
             # scaledown window that cost is paid on every cold start — it is the torch.compile +
-            # graph-capture portion of the ~1010s 35B engine init measured for STARTUP_TIMEOUT_SECONDS.
+            # graph-capture portion of the cold boots measured for STARTUP_TIMEOUT_SECONDS.
             # vLLM's own startup benchmark DEFINES a cold start this way (benchmarks/startup.py
             # cold_startup() points VLLM_CACHE_ROOT at a fresh mkdtemp), so leaving it unset on
             # ephemeral storage reproduces that worst case involuntarily.
@@ -317,17 +341,22 @@ from flash.serving.src.engine.model_config import (  # noqa: E402
 
 
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
-    """(max_inputs, target_inputs) sized to the model's REAL vLLM concurrency (``max_num_seqs``).
+    """return Modal input admission aligned with the engine's sequence capacity.
 
-    Modal's ``max_inputs`` is how many requests it packs onto ONE container before it must add
-    another. If it far exceeds the engine's ``max_num_seqs`` (e.g. the global 64 on the 35B, which
-    decodes only 8 at a time), Modal piles requests 9..64 INSIDE the container instead of autoscaling
-    — high latency and no scale-out until ~target_inputs are packed. So cap ``max_inputs`` near the
-    engine's capacity with a small boot buffer (2x, so a cold-booting replacement doesn't reject
-    bursts), bounded by the global ``MAX_INPUTS``; scale out at 3/4 of that. Models that leave
-    ``max_num_seqs`` at the vLLM default keep the global sizing."""
-    seqs = int(engine_overrides_for(base_model).get("max_num_seqs", MAX_INPUTS))
-    max_inputs = max(8, min(MAX_INPUTS, seqs * 2))
+    Modal counts requests while vLLM schedules sequences. The prior 2x buffer admitted 16 requests
+    onto every current 8-sequence engine, so normal ``n=1`` traffic queued half of them inside the
+    container and delayed scale-out until 12 inputs. OpenAI ``n`` can fan one input out to as many as
+    four sequences, but sizing every container for that rare worst case would leave normal traffic
+    underutilizing the GPU and cold-boot expensive replicas prematurely. Cap request admission at the
+    authored sequence capacity instead: current tiers admit 8 and scale out at 6. This deliberately
+    changes Modal's request knobs, not ``max_num_seqs``: raising the engine cap is not allocation-free,
+    and the 35B tier has a documented startup profiling OOM at higher sequence counts. Models without
+    an authored sequence cap retain the global sizing until their real capacity is explicit.
+    """
+    configured = engine_overrides_for(base_model).get("max_num_seqs")
+    if configured is None:
+        return MAX_INPUTS, TARGET_INPUTS
+    max_inputs = max(1, min(MAX_INPUTS, int(configured)))
     target_inputs = max(1, max_inputs * 3 // 4)
     return max_inputs, target_inputs
 

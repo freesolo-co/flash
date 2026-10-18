@@ -10,6 +10,7 @@ from collections.abc import Set as AbstractSet
 
 from fastapi import HTTPException
 
+from flash._internal.http import _urlopen_no_redirect
 from flash.core.spec import require_project_id
 from flash.server.platform.auth import standalone
 from flash.server.platform.internal_client import (
@@ -117,7 +118,7 @@ def require_environment_project(
         token=token,
     )
     try:
-        with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT_S) as response:
+        with _urlopen_no_redirect(request, timeout=DEFAULT_TIMEOUT_S) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
         detail = error_detail(exc)

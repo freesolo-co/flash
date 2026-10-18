@@ -12,17 +12,17 @@ import contextlib
 # Stamped on the propagating exception once some path has terminated the exact instance it rented.
 # The coarse run-label reap must stay armed until exact ownership is taken, and must then stand
 # down: layering terminate_run_instances(run_id) on top of an exact cleanup would also reap every
-# other concurrently-launched seed sharing this run id.
+# other concurrently-launched attempt of this run.
 _EXACT_CLEANUP_ATTR = "_flash_exact_cleanup_done"
 
 
 class _CoarseReapGuard:
-    """What this seed owes on an interrupt: a run-label sweep, an exact terminate, or nothing.
+    """What this attempt owes on an interrupt: a run-label sweep, an exact terminate, or nothing.
 
     Armed for exactly the window a launch request is in flight with no instance id in hand, when
     the label reap is the ONLY thing that can find a box that is rented but not yet named. It is
-    an object rather than a local so the cache-less retry can arm it around its own request
-    instead of the caller arming across that whole call.
+    an object rather than a local so each region can arm it around its own request instead of the
+    caller arming across the whole walk.
 
     ``owns`` narrows the guard the instant an id exists. Ownership transfer would otherwise span
     two statements (the publication helper returns, then the caller disarms), and an interrupt

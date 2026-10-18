@@ -49,6 +49,17 @@ def test_dependency_light_health_parser_normalizes_the_serving_contract() -> Non
 
 
 @pytest.mark.parametrize(
+    ("payload", "expected_ok"),
+    [
+        ({"capabilities": [], "ok": False}, False),
+        ({"capabilities": []}, None),
+    ],
+)
+def test_dependency_light_health_parser_preserves_optional_ok(payload, expected_ok):
+    assert parse_serving_health(payload).ok is expected_ok
+
+
+@pytest.mark.parametrize(
     ("payload", "code"),
     [
         ([], "non_object"),
@@ -179,6 +190,84 @@ def test_real_deploy_4xx_hint_points_at_client(monkeypatch) -> None:
         )
     assert exc_info.value.status_code == 401
     assert "FREESOLO_INTERNAL_KEY" in str(exc_info.value)
+
+
+def _stub_healthz(
+    monkeypatch, deploy_mod, capabilities: list[str], *, ok: bool | None = None
+) -> None:
+    """stub the serving /healthz response used by the capability preflight."""
+
+    class _Resp:
+        def json(self):
+            payload = {"capabilities": list(capabilities)}
+            if ok is not None:
+                payload["ok"] = ok
+            return payload
+
+    monkeypatch.setattr(serving_transport, "serving_request", lambda method, url, **k: _Resp())
+
+
+@pytest.mark.parametrize("ok", [None, True], ids=["omitted", "true"])
+def test_require_capabilities_accepts_healthy_or_compatible_health_payload(monkeypatch, ok):
+    import flash.serve.deployment.deploy as deploy_mod
+
+    capabilities = sorted(REQUIRED_SERVING_CAPABILITIES | PREFERRED_SERVING_CAPABILITIES)
+    _stub_healthz(monkeypatch, deploy_mod, capabilities, ok=ok)
+
+    assert deploy_mod._require_serving_capabilities() == set(capabilities)
+
+
+def test_false_health_rejects_before_adapter_registration(monkeypatch):
+    import flash.serve.deployment.deploy as deploy_mod
+    from flash.serve.contract.errors import ServingError
+
+    monkeypatch.setattr(deploy_mod, "resolve_artifact_revision", lambda repo: "a" * 40)
+    monkeypatch.setattr(
+        adapter_check,
+        "adapter_artifact_metadata",
+        lambda *args, **kwargs: types.SimpleNamespace(lora_rank=32, targets_images=False),
+    )
+    calls = []
+
+    class _Resp:
+        def json(self):
+            return {
+                "ok": False,
+                "capabilities": sorted(
+                    REQUIRED_SERVING_CAPABILITIES | PREFERRED_SERVING_CAPABILITIES
+                ),
+            }
+
+    def request(method, url, **kwargs):
+        calls.append((method, url))
+        if method != "GET":
+            pytest.fail("adapter deployment continued after unhealthy serving response")
+        return _Resp()
+
+    monkeypatch.setattr(serving_transport, "serving_request", request)
+
+    with pytest.raises(ServingError, match="reported ok=false"):
+        deploy_adapter("flash-1-abc", "Qwen/Qwen3.5-9B", "repo", "rl/r1/seed0")
+
+    assert calls == [("GET", f"{serving_urls.serving_base_url()}/healthz")]
+
+
+def test_capability_preflight_preserves_non_200_health_failure(monkeypatch):
+    import flash.serve.deployment.deploy as deploy_mod
+    from flash.serve.contract.errors import ServingError
+
+    url = f"{serving_urls.serving_base_url()}/healthz"
+    response = httpx.Response(
+        503,
+        json={"ok": False, "capabilities": sorted(REQUIRED_SERVING_CAPABILITIES)},
+        request=httpx.Request("GET", url),
+    )
+    monkeypatch.setattr(httpx, "get", lambda *args, **kwargs: response)
+
+    with pytest.raises(ServingError, match="HTTP 503") as exc_info:
+        deploy_mod._require_serving_capabilities()
+
+    assert exc_info.value.status_code == 503
 
 
 def test_deploy_registers_one_exact_checkpoint_without_activation(monkeypatch) -> None:

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 from contextlib import contextmanager, suppress
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
@@ -52,6 +53,7 @@ class _FakeRuntime:
         self.fail_registration_at: int | None = None
         self.generation_requests = []
         self.generate_error: BaseException | None = None
+        self.result_thinking = True
         self.stream_events = []
         self.stream_closed = False
 
@@ -90,7 +92,7 @@ class _FakeRuntime:
             completion_tokens=2,
             cached_tokens=3,
             cached_tokens_reported=True,
-            thinking=True,
+            thinking=self.result_thinking,
         )
 
     def stream(self, request):
@@ -113,12 +115,17 @@ def _manifest():
     return build_serving_manifest(*_spec_and_inputs())
 
 
-def _published_owner() -> tuple[ServingBootstrap, _FakeRuntime]:
+def _published_owner(
+    *, thinking_default: bool | None = None
+) -> tuple[ServingBootstrap, _FakeRuntime]:
     manifest = _manifest()
     runtime = _FakeRuntime()
     runtime.started = True
     owner = ServingBootstrap(manifest, runtime)
     adapter = manifest.adapters[0]
+    if thinking_default is not None:
+        adapter = replace(adapter, thinking_default=thinking_default)
+        runtime.result_thinking = thinking_default
     checkpoint = PublishedAdapter(adapter.checkpoint_id, adapter)
     owner._models = MappingProxyType({adapter.checkpoint_id: checkpoint})
     owner._ready = True
@@ -181,6 +188,7 @@ def test_engine_config_loads_served_checkpoint_not_logical_provenance() -> None:
     assert config.effective_served_model == manifest.engine.served_model
     assert config.model != manifest.logical_base_model
     assert config.model_revision == manifest.engine.model_revision
+    assert config.tool_parser == "qwen3_coder"
 
 
 @pytest.mark.parametrize(
@@ -205,6 +213,9 @@ def test_profile_fields_reach_the_runtime_engine_config(model_id: str) -> None:
     assert config.max_lora_rank == manifest.engine.max_lora_rank
     assert config.image_limit == manifest.engine.image_limit
     assert config.enable_tower_connector_lora is manifest.engine.enable_tower_connector_lora
+    assert config.tool_parser == (
+        "qwen3_coder" if manifest.logical_base_model == "Qwen/Qwen3.5-9B" else None
+    )
     if manifest.engine.max_num_batched_tokens is None:
         assert "max_num_batched_tokens" not in config.engine_args
     else:
@@ -391,6 +402,40 @@ def test_engine_death_handler_reaches_the_runtime(monkeypatch, tmp_path: Path) -
     owner = asyncio.run(bootstrap_serving(manifest, tmp_path, runtime_factory=_plain_factory))
     assert len(plain) == 1
     asyncio.run(owner.close())
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
+def test_packaged_chat_rejects_active_tool_stop_marker_collisions(stream: bool) -> None:
+    owner, runtime = _published_owner()
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            headers=_auth(),
+            json=_chat_body(tools=tools, stop="</tool_call>", stream=stream),
+        )
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert runtime.generation_requests == []
 
 
 def test_health_auth_models_and_no_model_fallback() -> None:
@@ -698,6 +743,9 @@ def test_nonstream_reasoning_accounting_provenance_and_structured_precedence() -
     )
 
     assert response.status_code == 200
+    assert response.headers["content-type"] == "application/json"
+    assert "cache-control" not in response.headers
+    assert "x-accel-buffering" not in response.headers
     payload = response.json()
     message = payload["choices"][0]["message"]
     assert message == {"role": "assistant", "content": "answer", "reasoning_content": "why"}
@@ -794,6 +842,10 @@ def test_stream_primes_before_200_splits_reasoning_and_emits_one_real_finish() -
     payloads = _sse_payloads(response)
 
     assert response.status_code == 200
+    assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert response.text.startswith("data: ")
     assert payloads[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
     deltas = [
         payload["choices"][0]["delta"]
@@ -893,13 +945,32 @@ def test_a_chat_request_may_override_the_registered_grammar_for_its_own_call() -
     rather than a mutation of an immutable revision.
     """
 
-    owner, runtime = _published_owner()
+    owner, runtime = _published_owner(thinking_default=False)
     assert owner.models["run-1/final"].adapter.structured_outputs_default == {"json_object": True}
     app = create_app(owner, bearer_token=AUTH_TOKEN)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
 
     for override, expected in (
         ({"structured_outputs": {"regex": "[ab]+"}}, {"regex": "[ab]+"}),
         ({"response_format": {"type": "text"}}, {}),
+        (
+            {"response_format": {"type": "text"}, "tools": tools},
+            {},
+        ),
+        ({"structured_outputs": {}, "tools": tools}, {}),
         ({}, None),
     ):
         response = asyncio.run(
@@ -916,6 +987,42 @@ def test_a_chat_request_may_override_the_registered_grammar_for_its_own_call() -
 
     # the revision still carries its own default after every override above.
     assert owner.models["run-1/final"].adapter.structured_outputs_default == {"json_object": True}
+
+
+def test_packaged_route_treats_tool_choice_none_as_inactive() -> None:
+    owner, runtime = _published_owner(thinking_default=True)
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            headers=_auth(),
+            json=_chat_body(
+                tools=tools,
+                tool_choice="none",
+                parallel_tool_calls=True,
+            ),
+        )
+    )
+
+    assert response.status_code == 200
+    assert runtime.generation_requests[-1].tool_choice == "none"
 
 
 @pytest.mark.parametrize(
@@ -950,6 +1057,31 @@ def test_non_finite_json_constants_are_rejected_as_invalid_json(body: str) -> No
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_json"
+    assert runtime.generation_requests == []
+
+
+@pytest.mark.parametrize("number", ["1.0", "1e3", "9007199254740993.0", "1e-400"])
+def test_packaged_raw_json_rejects_decimal_numeric_enums(number: str) -> None:
+    owner, runtime = _published_owner()
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+    tools = (
+        '"tools":[{"type":"function","function":{"name":"weather","parameters":'
+        '{"type":"object","properties":{"value":{"type":"number","enum":['
+        + number
+        + ']}},"required":["value"],"additionalProperties":false}}}]'
+    )
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            headers={**_auth(), "content-type": "application/json"},
+            content=_raw_chat_body(tools),
+        )
+    )
+
+    assert response.status_code == 422
     assert runtime.generation_requests == []
 
 
@@ -1274,6 +1406,68 @@ def test_a_malformed_message_is_rejected_before_the_runtime_is_reached(
     )
 
 
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
+def test_tool_result_text_parts_reach_follow_up_generation(stream: bool) -> None:
+    owner, runtime = _published_owner(thinking_default=False)
+    checkpoint = owner.models["run-1/final"].adapter.checkpoint_id
+    incarnation = owner.models["run-1/final"].adapter.aggregate_sha256
+    if stream:
+        choice = GenerationChoice(0, "answer", "stop", (1,))
+        runtime.stream_events = [
+            StreamReady("request-history", "runtime", checkpoint, incarnation, False),
+            StreamDelta(0, "answer"),
+            StreamChoiceFinished(0, "answer", "stop", (1,)),
+            StreamFinished(
+                request_id="request-history",
+                runtime_id="runtime",
+                adapter_id=checkpoint,
+                incarnation=incarnation,
+                choices=(choice,),
+                prompt_tokens=3,
+                completion_tokens=1,
+                cached_tokens=0,
+                cached_tokens_reported=False,
+                thinking=False,
+            ),
+        ]
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": [
+                {"type": "input_text", "text": "sun"},
+                {"type": "text", "text": "ny"},
+            ],
+        },
+        {"role": "user", "content": "summarize"},
+    ]
+    app = create_app(owner, bearer_token=AUTH_TOKEN)
+
+    response = asyncio.run(
+        _request(
+            app,
+            "POST",
+            "/v1/chat/completions",
+            headers=_auth(),
+            json=_chat_body(messages=messages, stream=stream),
+        )
+    )
+
+    assert response.status_code == 200, response.text
+    assert runtime.generation_requests[-1].messages == tuple(messages)
+
+
 @pytest.mark.parametrize(
     ("label", "messages"),
     [
@@ -1290,8 +1484,18 @@ def test_a_malformed_message_is_rejected_before_the_runtime_is_reached(
             "assistant tool calls",
             [
                 {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
-                {"role": "tool", "content": "result"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "result", "tool_call_id": "1"},
             ],
         ),
     ],
