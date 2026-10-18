@@ -211,7 +211,7 @@ class RunStatus:
 
 
 def _public_status_spec(raw):
-    """Canonicalize valid specs and safely redact malformed legacy shapes."""
+    """Canonicalize valid specs and safely redact malformed stored shapes."""
     if not isinstance(raw, dict):
         return raw
     try:
@@ -399,12 +399,8 @@ def _save_status_unlocked(
     existing = _load_status_json(status.run_id) if os.path.exists(path) else {}
     existing_sequence = reporting._valid_status_report_sequence(existing.get("report_sequence", 0))
     current_sequence = reporting._valid_status_report_sequence(status.report_sequence)
-    with reporting._STATUS_REPORT_LOCK:
-        local_sequence = max(
-            reporting._STATUS_REPORT_LAST_QUEUED.get(status.run_id, 0),
-            reporting._STATUS_REPORT_LAST_SENT.get(status.run_id, 0),
-        )
-    status.report_sequence = max(current_sequence, existing_sequence, local_sequence) + 1
+    # Delivery caches are temporary; the durable record owns the next report number.
+    status.report_sequence = max(current_sequence, existing_sequence) + 1
     private_values = {
         _RUN_DEADLINE_AT_KEY: _run_deadline_at,
         _NEXT_ATTEMPT_KEY: _next_attempt,

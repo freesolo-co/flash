@@ -377,3 +377,28 @@ def test_cleanup_requires_no_active_remote_and_an_empty_private_set(monkeypatch,
     status.report_sequence = raw["report_sequence"]
     lifecycle = _report(monkeypatch, status)["lifecycle"]
     assert lifecycle["cleanupComplete"] is False
+
+
+def test_status_report_sends_durable_sequence_for_backend_ordering(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    status = _status(_spec())
+    runner_state._save_status(status)
+    first = _report(monkeypatch, status)
+    assert first["reportSequence"] == 1
+    assert "report_sequence" not in status.to_dict()
+
+    # Reload from disk as another process or a restarted reporter would do.
+    reloaded = runner_status.get_status(status.run_id)
+    runner_state._save_status(reloaded)
+    assert _report(monkeypatch, reloaded)["reportSequence"] == 2
+    assert _report(monkeypatch, status)["reportSequence"] == 1
+
+
+@pytest.mark.parametrize("sequence", [0, None, True, -1, "7", 1.5, {"corrupt": True}])
+def test_status_report_rejects_invalid_sequence_before_http_post(monkeypatch, sequence):
+    status = _status(_spec())
+    status.report_sequence = sequence
+    monkeypatch.setattr(
+        runs, "_post", lambda *_args: pytest.fail("invalid sequence must not reach the backend")
+    )
+    assert runs.record_training_run(status=status) is False

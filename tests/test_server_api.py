@@ -3839,8 +3839,8 @@ def test_sync_deploy_execution_error_keeps_specific_persisted_outcome(api, monke
 def test_replay_status_reports_mirrors_all_persisted_outcomes_sequentially(monkeypatch):
     from flash.server.routes import serving
 
-    ready = SimpleNamespace(run_id="run-ready", deployment={"state": "ready"})
-    complete = SimpleNamespace(run_id="run-complete", deployment=None)
+    ready = SimpleNamespace(run_id="run-ready", report_sequence=1, deployment={"state": "ready"})
+    complete = SimpleNamespace(run_id="run-complete", report_sequence=1, deployment=None)
     reported = []
     monkeypatch.setattr(
         serving.db, "all_runs", lambda: [{"run_id": "run-ready"}, {"run_id": "run-complete"}]
@@ -3860,8 +3860,8 @@ def test_replay_status_reports_mirrors_all_persisted_outcomes_sequentially(monke
 def test_replay_status_reports_skips_unreadable_records_and_continues(monkeypatch):
     from flash.server.routes import serving
 
-    first = SimpleNamespace(run_id="run-first")
-    last = SimpleNamespace(run_id="run-last")
+    first = SimpleNamespace(run_id="run-first", report_sequence=1)
+    last = SimpleNamespace(run_id="run-last", report_sequence=1)
     outcomes = {
         "run-first": first,
         "run-missing": FileNotFoundError("missing"),
@@ -3886,36 +3886,45 @@ def test_replay_status_reports_skips_unreadable_records_and_continues(monkeypatc
     assert reported == [first, last]
 
 
-def test_replay_status_reports_repairs_malformed_report_sequence_and_continues(monkeypatch):
+@pytest.mark.parametrize(
+    "sequence_fields",
+    [
+        {},
+        {"report_sequence": 0},
+        {"report_sequence": None},
+        {"report_sequence": True},
+        {"report_sequence": -1},
+        {"report_sequence": "not-an-integer"},
+        {"report_sequence": {"corrupt": True}},
+    ],
+)
+def test_replay_skips_invalid_sequences_without_rewriting_records(
+    monkeypatch, tmp_path, sequence_fields
+):
     from flash.server.routes import serving
 
-    malformed = runner_status._runstatus_from_json(
-        {
-            "run_id": "run-malformed-sequence",
-            "state": "done",
-            "spec": SPEC,
-            "report_sequence": "not-an-integer",
-        }
-    )
-    valid = runner_status._runstatus_from_json(
-        {
-            "run_id": "run-valid-sequence",
-            "state": "done",
-            "spec": SPEC,
-            "report_sequence": 1,
-        }
-    )
-    statuses = {status.run_id: status for status in (malformed, valid)}
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
+    invalid = {"run_id": "run-invalid-sequence", "state": "done", "spec": SPEC, **sequence_fields}
+    valid = {"run_id": "run-valid-sequence", "state": "done", "spec": SPEC, "report_sequence": 7}
+    paths = [tmp_path / f"{record['run_id']}.json" for record in (invalid, valid)]
+    for path, record in zip(paths, (invalid, valid), strict=True):
+        path.write_text(json.dumps(record))
+    before = [path.read_bytes() for path in paths]
     delivered = []
-    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": key} for key in statuses])
-    monkeypatch.setattr(serving._app, "get_status", statuses.__getitem__)
+    monkeypatch.setattr(
+        serving.db, "all_runs", lambda: [{"run_id": row["run_id"]} for row in (invalid, valid)]
+    )
+    monkeypatch.setattr(serving._app, "get_status", runner_status.get_status)
     monkeypatch.setattr(runner_reporting, "_send_status_report", delivered.append)
 
     runner_reporting._shutdown_status_reporter()
     runner_reporting._open_status_reporter()
     try:
-        assert serving.replay_status_reports() == 2
-        assert delivered == [malformed, valid]
+        assert serving.replay_status_reports() == 1
+        assert [(status.run_id, status.report_sequence) for status in delivered] == [
+            (valid["run_id"], 7)
+        ]
+        assert [path.read_bytes() for path in paths] == before
     finally:
         runner_reporting._shutdown_status_reporter()
 
@@ -3927,8 +3936,8 @@ def test_replay_status_reports_stops_between_items(monkeypatch):
 
     stop = Event()
     statuses = {
-        "run-a": SimpleNamespace(run_id="run-a"),
-        "run-b": SimpleNamespace(run_id="run-b"),
+        "run-a": SimpleNamespace(run_id="run-a", report_sequence=1),
+        "run-b": SimpleNamespace(run_id="run-b", report_sequence=1),
     }
     reported = []
     monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": key} for key in statuses])
@@ -3961,7 +3970,7 @@ def test_replay_status_reports_continues_after_report_failure(monkeypatch):
     def report(status):
         if status.run_id == "run-failing":
             raise ValueError("invalid stored report")
-        runner_reporting._status_report_sequence_unlocked(status)
+        runner_reporting._require_status_report_sequence(status.report_sequence)
         reported.append(status)
 
     monkeypatch.setattr(runner_reporting, "_report_status", report)
@@ -4052,25 +4061,19 @@ def test_save_status_repairs_wrong_typed_report_sequence(api):
     assert runner_status.get_status(run_id).report_sequence == 1
 
 
-def test_legacy_replay_sequence_advances_first_post_restart_save(api, monkeypatch):
+def test_replay_preserves_saved_sequence_before_next_update(api, monkeypatch):
     from flash.server.routes import serving
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
-    path = runner_state.runs_file_path(run_id, ".json")
-    with open(path) as f:
-        stored = json.load(f)
-    stored["report_sequence"] = 0
-    with open(path, "w") as f:
-        json.dump(stored, f)
+    saved_sequence = runner_status.get_status(run_id).report_sequence
 
     runner_reporting._shutdown_status_reporter()
     runner_reporting._open_status_reporter()
     for values in (
         runner_reporting._STATUS_REPORT_LAST_SENT,
-        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED,
         runner_reporting._STATUS_REPORT_LAST_QUEUED,
     ):
         values.pop(run_id, None)
@@ -4082,14 +4085,15 @@ def test_legacy_replay_sequence_advances_first_post_restart_save(api, monkeypatc
 
     try:
         assert serving.replay_status_reports() == 1
-        assert runner_reporting._STATUS_REPORT_LAST_SENT[run_id] == 1
+        assert runner_reporting._wait_for_status_reports(5)
+        assert runner_status.get_status(run_id).report_sequence == saved_sequence
 
         updated = runner_status.get_status(run_id)
         runner_state._save_status(updated)
-        assert updated.report_sequence == 2
+        assert updated.report_sequence == saved_sequence + 1
         runner_reporting._report_status(updated)
 
-        assert runner_reporting._STATUS_REPORT_LAST_SENT[run_id] == 2
+        assert reported[-1].report_sequence == saved_sequence + 1
         assert len(reported) == 2
     finally:
         runner_reporting._shutdown_status_reporter()
@@ -4162,7 +4166,6 @@ def test_status_reports_preserve_run_order_without_cross_run_blocking(monkeypatc
     run_b = "run-ordered-report-b"
     for run_id in (run_a, run_b):
         runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
         runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     started = Event()
     release = Event()
@@ -4216,14 +4219,16 @@ def test_status_report_workers_recover_and_use_persisted_sequence(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     run_id = "run-stale-report"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     reported = []
 
     def send(status):
         if status.deployment["state"] == "broken":
             raise RuntimeError("report failed")
-        reported.append(status)
+        # Model the backend's durable comparison. Reports arriving after a queue
+        # drains may repeat or arrive late; only newer sequences change its record.
+        if not reported or status.report_sequence > reported[-1].report_sequence:
+            reported.append(status)
 
     monkeypatch.setattr(runner_reporting, "_send_status_report", send)
 
@@ -4252,7 +4257,6 @@ def test_sync_older_status_report_skips_newer_in_flight_sequence(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     run_id = "run-report-race"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     newer_started = Event()
     release_newer = Event()
@@ -4288,13 +4292,12 @@ def test_sync_older_status_report_skips_newer_in_flight_sequence(monkeypatch):
     runner_reporting._shutdown_status_reporter()
 
 
-def test_sync_equal_status_report_waits_for_async_success_without_duplicate(monkeypatch):
+def test_sync_equal_status_report_waits_for_async_success(monkeypatch):
     from threading import Event, Thread
 
     runner_reporting._shutdown_status_reporter()
     run_id = "run-report-equal-success"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     async_started = Event()
     release_async = Event()
@@ -4332,8 +4335,11 @@ def test_sync_equal_status_report_waits_for_async_success_without_duplicate(monk
 
     assert not sync.is_alive()
     assert sync_done.is_set()
-    assert attempts == [1]
-    assert runner_reporting._STATUS_REPORT_LAST_SENT[run_id] == 1
+    # If the first worker drains before the waiter resumes, the second call
+    # resends the same sequence for the backend to acknowledge as a duplicate.
+    assert attempts in ([1], [1, 1])
+    assert runner_reporting._wait_for_status_reports(5)
+    assert run_id not in runner_reporting._STATUS_REPORT_LAST_SENT
     runner_reporting._shutdown_status_reporter()
 
 
@@ -4343,7 +4349,6 @@ def test_sync_equal_status_report_retries_once_after_async_failure(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     run_id = "run-report-equal-failure"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     async_started = Event()
     release_async = Event()
@@ -4383,7 +4388,8 @@ def test_sync_equal_status_report_retries_once_after_async_failure(monkeypatch):
     assert not sync.is_alive()
     assert sync_done.is_set()
     assert attempts == [1, 1, 1]
-    assert runner_reporting._STATUS_REPORT_LAST_SENT[run_id] == 1
+    assert runner_reporting._wait_for_status_reports(5)
+    assert run_id not in runner_reporting._STATUS_REPORT_LAST_SENT
     runner_reporting._shutdown_status_reporter()
 
 
@@ -4392,7 +4398,6 @@ def test_failed_sync_status_report_sequence_can_be_retried(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     run_id = "run-report-retry"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     attempts = []
 
@@ -4415,7 +4420,8 @@ def test_failed_sync_status_report_sequence_can_be_retried(monkeypatch):
 
     runner_reporting._report_status(status)
     assert attempts == [1, 1]
-    assert runner_reporting._STATUS_REPORT_LAST_SENT[run_id] == 1
+    assert runner_reporting._wait_for_status_reports(5)
+    assert run_id not in runner_reporting._STATUS_REPORT_LAST_SENT
     runner_reporting._shutdown_status_reporter()
 
 
@@ -4425,7 +4431,6 @@ def test_wait_for_status_reports_includes_work_queued_while_waiting(monkeypatch)
     runner_reporting._shutdown_status_reporter()
     run_id = "run-report-wait"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     first_started = Event()
     first_release = Event()
@@ -4481,7 +4486,6 @@ def test_duplicate_status_drains_preserve_per_run_serialization(monkeypatch):
     run_id = "run-duplicate-drain"
     for state in (
         runner_reporting._STATUS_REPORT_LAST_SENT,
-        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED,
         runner_reporting._STATUS_REPORT_LAST_QUEUED,
     ):
         state.pop(run_id, None)
@@ -4552,7 +4556,6 @@ def test_async_status_report_drops_when_executor_cannot_start(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     run_id = "run-report-fallback"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     reported = []
     executor = BrokenExecutor()
@@ -4590,7 +4593,6 @@ def test_failed_executor_submission_preserves_queued_peer_work(monkeypatch):
     for run_id in (peer_run_id, failed_run_id):
         for values in (
             runner_reporting._STATUS_REPORT_LAST_SENT,
-            runner_reporting._STATUS_REPORT_LAST_ATTEMPTED,
             runner_reporting._STATUS_REPORT_LAST_QUEUED,
         ):
             values.pop(run_id, None)
@@ -4653,7 +4655,6 @@ def test_sync_status_report_falls_back_when_executor_cannot_start(monkeypatch):
     runner_reporting._shutdown_status_reporter()
     run_id = "run-sync-report-fallback"
     runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-    runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
     runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     reported = []
     executor = BrokenExecutor()
@@ -4707,7 +4708,6 @@ def test_status_report_shutdown_is_bounded_and_cancels_queued_work(monkeypatch):
     run_b = "run-report-shutdown-b"
     for run_id in (run_a, run_b):
         runner_reporting._STATUS_REPORT_LAST_SENT.pop(run_id, None)
-        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED.pop(run_id, None)
         runner_reporting._STATUS_REPORT_LAST_QUEUED.pop(run_id, None)
     started = Event()
     release = Event()
@@ -4756,7 +4756,6 @@ def test_status_report_shutdown_stops_retry_after_active_attempt(monkeypatch):
     run_id = "run-report-stop-retry"
     for values in (
         runner_reporting._STATUS_REPORT_LAST_SENT,
-        runner_reporting._STATUS_REPORT_LAST_ATTEMPTED,
         runner_reporting._STATUS_REPORT_LAST_QUEUED,
     ):
         values.pop(run_id, None)
@@ -4787,6 +4786,51 @@ def test_status_report_shutdown_stops_retry_after_active_attempt(monkeypatch):
     assert attempts == [1]
     runner_reporting._open_status_reporter()
     runner_reporting._shutdown_status_reporter()
+
+
+def _drained_report(run_id, sequence, *, state="done"):
+    return SimpleNamespace(
+        run_id=run_id,
+        state=state,
+        updated_at=1.0,
+        report_sequence=sequence,
+        deployment={"state": "ready", "updated_at": 1.0},
+    )
+
+
+def test_drained_status_reports_release_all_sequence_bookkeeping(monkeypatch):
+    runner_reporting._shutdown_status_reporter()
+    runner_reporting._open_status_reporter()
+    monkeypatch.setattr(runner_reporting, "_send_status_report", lambda _status: True)
+    for index in range(600):
+        runner_reporting._report_status(_drained_report(f"run-bounded-{index}", 1))
+    assert runner_reporting._wait_for_status_reports(5)
+    for values in (
+        runner_reporting._STATUS_REPORT_QUEUES,
+        runner_reporting._STATUS_REPORT_ACTIVE,
+        runner_reporting._STATUS_REPORT_DRAINING,
+        runner_reporting._STATUS_REPORT_LAST_SENT,
+        runner_reporting._STATUS_REPORT_LAST_QUEUED,
+    ):
+        assert not values
+    runner_reporting._shutdown_status_reporter()
+
+
+def test_completed_reports_delegate_duplicate_and_stale_detection_to_backend(monkeypatch):
+    runner_reporting._shutdown_status_reporter()
+    runner_reporting._open_status_reporter()
+    delivered = []
+    monkeypatch.setattr(
+        runner_reporting, "_send_status_report", lambda status: delivered.append(status) or True
+    )
+    try:
+        for sequence in (2, 2, 1, 3):
+            runner_reporting._report_status(_drained_report("run-replay", sequence))
+            assert runner_reporting._wait_for_status_reports(5)
+        assert [status.report_sequence for status in delivered] == [2, 2, 1, 3]
+        assert "run-replay" not in runner_reporting._STATUS_REPORT_LAST_SENT
+    finally:
+        runner_reporting._shutdown_status_reporter()
 
 
 def test_deploy_rejects_verify_false_before_anything_registers(api, monkeypatch):
