@@ -202,27 +202,6 @@ def _score_case(
         )
 
 
-_READY_DEPLOYMENT_STATES = frozenset({"ready", "deployed"})
-_BUSY_DEPLOYMENT_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
-
-
-def _live_deployment(client, run_id: str) -> dict | None:
-    """The run's deployment record, whatever state it is in, or None when it has none.
-
-    Match by run id because `deployment_for` misses step deployments. Busy records name the rollout
-    target and hide the revision that may still be serving.
-    """
-    for entry in client.deployments() or ():
-        listed = entry.get("deployment") or {}
-        if run_id not in (listed.get("run_id"), entry.get("run_id")):
-            continue
-        # the listing omits undeployed/dry_run rows, so anything here is servable.
-        if not listed.get("run_id") and entry.get("run_id"):
-            listed = {**listed, "run_id": entry["run_id"]}
-        return listed
-    return None
-
-
 def _case_ids(cases: list[EvalCase]) -> list[str]:
     """Stable per-case ids, disambiguating sidecars that reuse one id across cases.
 

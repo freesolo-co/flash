@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import sys
+import threading
 import types
 
 import pytest
@@ -51,6 +52,75 @@ def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> No
     ]
     with app_mod._DEPLOYMENT_JOBS_LOCK:
         assert not app_mod._DEPLOYMENT_JOBS
+
+
+@pytest.fixture
+def blocking_deployment_jobs(monkeypatch):
+    """Start real capped deployment jobs that block until the test releases them."""
+    monkeypatch.delenv("FLASH_DEPLOY_SYNC", raising=False)
+    app_mod._open_deployment_jobs()
+    release = threading.Event()
+
+    def fill(count):
+        started = 0
+        for _ in range(count):
+            app_mod.start_deployment_job(release.wait, 60)
+            started += 1
+        return started
+
+    try:
+        yield release, fill
+    finally:
+        release.set()
+        app_mod._wait_for_deployment_jobs(30)
+        app_mod._open_deployment_jobs()
+
+
+def test_start_deployment_job_rejects_past_the_active_capacity(blocking_deployment_jobs) -> None:
+    """A deployment job holds its thread for minutes, so the live set must be bounded."""
+    release, fill = blocking_deployment_jobs
+    cap = app_mod._MAX_ACTIVE_DEPLOYMENT_JOBS
+
+    assert fill(cap) == cap
+    with app_mod._DEPLOYMENT_JOBS_LOCK:
+        assert len(app_mod._DEPLOYMENT_JOBS) == cap
+
+    with pytest.raises(app_mod.DeploymentJobStartError, match="capacity reached"):
+        app_mod.start_deployment_job(release.wait, 60)
+
+    with app_mod._DEPLOYMENT_JOBS_LOCK:
+        assert len(app_mod._DEPLOYMENT_JOBS) == cap
+
+
+def test_drained_deployment_job_frees_its_capacity_slot(blocking_deployment_jobs) -> None:
+    """Capacity is a live-set bound, not a lifetime quota: a finished job returns its slot."""
+    release, fill = blocking_deployment_jobs
+    cap = app_mod._MAX_ACTIVE_DEPLOYMENT_JOBS
+
+    fill(cap)
+    with pytest.raises(app_mod.DeploymentJobStartError, match="capacity reached"):
+        app_mod.start_deployment_job(release.wait, 60)
+
+    release.set()
+    assert app_mod._wait_for_deployment_jobs(30) is True
+    app_mod._open_deployment_jobs()
+    with app_mod._DEPLOYMENT_JOBS_LOCK:
+        assert not app_mod._DEPLOYMENT_JOBS
+
+    done = threading.Event()
+    assert app_mod.start_deployment_job(done.set) is False
+    assert done.wait(30) is True
+
+
+def test_shutdown_rejection_outranks_the_capacity_rejection(blocking_deployment_jobs) -> None:
+    """A draining plane reports shutdown, never a capacity message a caller would retry."""
+    release, fill = blocking_deployment_jobs
+
+    fill(app_mod._MAX_ACTIVE_DEPLOYMENT_JOBS)
+    assert app_mod._wait_for_deployment_jobs(0.01) is False
+
+    with pytest.raises(app_mod.DeploymentJobStartError, match="shutting down"):
+        app_mod.start_deployment_job(release.wait, 60)
 
 
 def _run_loop_once(monkeypatch, loop, worker):

@@ -22,6 +22,9 @@ from email.utils import parsedate_to_datetime
 if __package__:
     from flash.providers._lifecycle.bootstrapping import console as _bootstrap_console
     from flash.providers._lifecycle.bootstrapping import pip as bootstrap_pip
+    from flash.providers._lifecycle.bootstrapping import processes as _bootstrap_processes
+    from flash.providers._lifecycle.bootstrapping.attempt import AttemptState
+    from flash.providers._lifecycle.bootstrapping.preload import run_preload
     from flash.providers._lifecycle.bootstrapping.secrets import (
         _payload_secrets,
         _read_console_tail,
@@ -34,6 +37,9 @@ else:
     import archive as _source_snapshot  # type: ignore[no-redef]
     import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
+    import bootstrap_processes as _bootstrap_processes  # type: ignore[no-redef]
+    from bootstrap_attempt import AttemptState  # type: ignore[no-redef]
+    from bootstrap_preload import run_preload  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
         _read_console_tail,
@@ -297,7 +303,24 @@ def _upload_cleanup_deadlines(deadline_at: float) -> tuple[float, float]:
 
 
 def _worker_execution_deadline(upload_deadline_at: float) -> float:
+    """When the worker must be done, leaving the console upload window intact behind it."""
     return upload_deadline_at - _CONSOLE_UPLOAD_STOP_TIMEOUT_S - _CONSOLE_UPLOAD_FINAL_TIMEOUT_S
+
+
+def _group_teardown_deadline(upload_deadline_at: float) -> float:
+    """How long killing the worker's process group may take once the wall-clock cap has fired.
+
+    Teardown begins at the worker deadline, so it cannot be bounded by that same instant: a group
+    supervised against its own start time gets a zero wait, SIGKILL is never given time to be
+    reaped, and an ordinary capped run is reported as a surviving group holding the gpu.
+
+    What it must not eat into is the final console tail, since that tail carries the survivor line
+    to the user -- hence stopping one full ``_CONSOLE_UPLOAD_FINAL_TIMEOUT_S`` short of the upload
+    deadline. The uploader stop that runs in between is capped by its own constant against the same
+    absolute deadline, so it is not squeezed by a teardown that runs long. And running long is only
+    ever the stuck case: a group that dies on SIGKILL is reaped in milliseconds.
+    """
+    return upload_deadline_at - _CONSOLE_UPLOAD_FINAL_TIMEOUT_S
 
 
 def _join_upload_process_before(process, deadline_at: float, max_wait_s: float) -> None:
@@ -604,6 +627,7 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     console = f"/tmp/console_{mode}.txt"
     upload_deadline_at, reaping_deadline_at = _upload_cleanup_deadlines(deadline_ts)
     worker_deadline_at = _worker_execution_deadline(upload_deadline_at)
+    teardown_deadline_at = _group_teardown_deadline(upload_deadline_at)
     # cap work from its actual start: the absolute deadline includes boot grace, whose unused
     # portion must not extend the declared wall-time budget.
     budget = payload.get("run_max_wall_seconds")
@@ -615,12 +639,15 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                 _finite_positive_number(time.time(), "current clock") + budget,
             )
     timed_out = False
+    survived_teardown = ""
 
     with open(console, "w", buffering=1) as cf:
         code_dir = _code_dir(payload)
         if worker_deadline_at - _finite_positive_number(time.time(), "current clock") <= 0:
             raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
-        proc = subprocess.Popen(
+        # own group: the worker fans out into torchrun/vllm children that hold cuda contexts, and
+        # signalling only the leader leaves them holding the gpu after the cap kills the run.
+        proc, worker_process_group_id = _bootstrap_processes.start_process_group(
             [sys.executable, "-m", "flash.engine.support.worker_entrypoint"],
             cwd=code_dir,
             env={
@@ -679,13 +706,18 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
                 proc.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                proc.kill()
-                remaining = max(
-                    0.0,
-                    worker_deadline_at - _finite_positive_number(time.time(), "current clock"),
-                )
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=remaining)
+                # the whole group, not just the leader: a surviving child keeps the gpu busy for
+                # every later run on this box. a survivor is recorded rather than raised here, so
+                # the console tail below still uploads and explains why the run was killed.
+                try:
+                    _bootstrap_processes.terminate_process_group(
+                        proc,
+                        process_group_id=worker_process_group_id,
+                        deadline_at=teardown_deadline_at,
+                    )
+                except RuntimeError as exc:
+                    survived_teardown = str(exc)
+                    print(survived_teardown, flush=True)
 
             drain_timeout = max(
                 0.0,
@@ -711,6 +743,8 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
         extra = ""
         if timed_out:
             extra = f"\n--- bootstrap: mode '{mode}' hit the wall-clock cap; killed ---\n"
+            if survived_teardown:
+                extra += f"--- bootstrap: {survived_teardown} ---\n"
         if upload_deadline_at <= _finite_positive_number(time.time(), "current clock"):
             print("final console upload skipped; uploader reaping reserve reached", flush=True)
         elif not _upload_console_tail_bounded(
@@ -728,6 +762,12 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             flush=True,
         )
     if timed_out:
+        if survived_teardown:
+            # the box is still occupied, so this is not a clean capped run: say so loudly enough
+            # that the failure is not filed as an ordinary timeout.
+            raise TimeoutError(
+                f"worker mode '{mode}' exceeded the wall-clock cap and {survived_teardown}"
+            )
         raise TimeoutError(f"worker mode '{mode}' exceeded the wall-clock cap")
     return proc.returncode
 
@@ -764,9 +804,14 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
             run_id=run_id,
             attempt=attempt,
         )
-    p = "/tmp/attempt_marker.json"
-    with open(p, "w") as f:
-        json.dump(marker, f)
+    if payload.get("mode") == "preload":
+        p = "/tmp/attempt_marker.json"
+        with open(p, "w") as f:
+            json.dump(marker, f)
+    else:
+        state = AttemptState(_code_dir(payload), payload)
+        marker = state.save(marker)
+        p = state.publication_path(marker)
     hf_upload(
         payload,
         p,
@@ -796,68 +841,28 @@ def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Eve
     return timer, done
 
 
-def run_preload(payload: dict) -> dict:
-    """Download models into the bind-mounted weight cache. Fails if cache isn't mounted to avoid warming ephemeral disk."""
-    env = payload.get("env") or {}
-    cache_dir = env.get("FLASH_WEIGHT_CACHE_DIR") or ""
-    token = env.get("HF_TOKEN")
-    mount = os.path.dirname(os.path.dirname(cache_dir.rstrip("/"))) if cache_dir else ""
-    if not cache_dir or not mount or not os.path.isdir(mount):
-        return {
-            "preloaded": [],
-            "already_cached": [],
-            "failed": {},
-            "error": f"weight-cache not mounted (FLASH_WEIGHT_CACHE_DIR={cache_dir!r}); refusing to warm ephemeral disk",
-        }
-    # Sentinel written by cloud-init only onto a real mount; absent sentinel means Docker silently
-    # auto-created an empty host dir (isdir passes) — we'd warm ephemeral disk. Must check.
-    if payload.get("cache_mount_marker"):
-        marker = os.path.join(mount, payload["cache_mount_marker"])
-        if not os.path.exists(marker):
-            return {
-                "preloaded": [],
-                "already_cached": [],
-                "failed": {},
-                "error": (
-                    f"weight-cache NFS filesystem not mounted (no sentinel at {marker}); "
-                    "refusing to warm ephemeral disk"
-                ),
-            }
-    from huggingface_hub import snapshot_download
-
-    ignore_patterns = ["*.pth", "*.gguf", "original/*", "*.onnx", "*.msgpack", "*.h5"]
-    done, already, failed = [], [], {}
-    for repo_id in payload.get("models") or []:
-        try:
-            # Probe with local_files_only first (HF's own resolution, not a dir-name guess).
-            try:
-                snapshot_download(
-                    repo_id=repo_id,
-                    token=token,
-                    cache_dir=cache_dir,
-                    ignore_patterns=ignore_patterns,
-                    local_files_only=True,
-                )
-                already.append(repo_id)
-                print(f"preload: {repo_id} -> {cache_dir} (cached)", flush=True)
-                continue
-            except Exception:
-                pass
-            snapshot_download(
-                repo_id=repo_id, token=token, cache_dir=cache_dir, ignore_patterns=ignore_patterns
-            )
-            done.append(repo_id)
-            print(f"preload: {repo_id} -> {cache_dir} (downloaded)", flush=True)
-        except Exception as exc:
-            failed[repo_id] = _safe_detail(exc, secrets=_payload_secrets(payload))
-            print(f"preload FAILED {repo_id}: {failed[repo_id]}", flush=True)
-    return {"preloaded": done, "already_cached": already, "failed": failed}
-
-
 def main() -> int:
     # SIGTERM → sys.exit so the finally block still uploads the terminal marker.
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(1))
     payload = load_payload()
+    if payload.get("mode") == "preload":
+        return _run_attempt(payload)
+    state = AttemptState(_code_dir(payload), payload)
+    with state.locked():
+        marker = state.read()
+        if marker is not None:
+            print("bootstrap: replaying the persisted terminal result", flush=True)
+            hf_upload(
+                payload,
+                state.publication_path(marker),
+                f"{_arm(payload)}_attempt{payload['attempt']}.json",
+                enforce_deadline=False,
+            )
+            return 0 if marker["ok"] else 1
+        return _run_attempt(payload)
+
+
+def _run_attempt(payload: dict) -> int:
     ok = False
     error = ""
     retriable = False

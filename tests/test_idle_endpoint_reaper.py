@@ -7,7 +7,7 @@ from __future__ import annotations
 import flash.providers.runpod.execution.resources as runpod_resources
 import flash.server.asgi.app as app_mod
 from flash.providers.core.base import canonical_gpu
-from flash.providers.runpod.serverless.endpoints import _run_suffix, endpoint_name
+from flash.providers.runpod.serverless.naming import endpoint_name, run_suffix
 from flash.runner.lifecycle.state import RunStatus
 
 # Test run-ids below are plain fixtures: a run id is any string starting with ``flash-`` (the
@@ -18,7 +18,7 @@ from flash.runner.lifecycle.state import RunStatus
 
 
 def _derived(gpu: str, run_id: str) -> str:
-    return endpoint_name(canonical_gpu(gpu), _run_suffix(run_id))
+    return endpoint_name(canonical_gpu(gpu), run_suffix(run_id))
 
 
 def test_protected_names_cover_live_runs_only(monkeypatch):
@@ -29,7 +29,7 @@ def test_protected_names_cover_live_runs_only(monkeypatch):
             run_id="flash-active",
             state="running",
             spec={"gpu": {"type": "RTX 5090"}},
-            remote={"endpoint_name": "flash-5090-handle", "endpoint_id": "e", "job_id": "j"},
+            remote={"endpoint_name": "flash-5090-handle-a3", "endpoint_id": "e", "job_id": "j"},
         ),
         # provisioning run with no handle yet (submit -> handle-persist window)
         "flash-prov": RunStatus(
@@ -43,12 +43,14 @@ def test_protected_names_cover_live_runs_only(monkeypatch):
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: rows)
     monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
 
-    names = app_mod._protected_train_endpoint_names()
+    names = app_mod._protected_train_endpoint_targets()
 
-    # active run: the persisted handle name AND the spec-derived name. The set holds the CANONICAL
-    # bare form only — the reaper canonicalizes the ``live-flash-...`` names RunPod lists before
-    # comparing, so the ``live-`` form is deliberately NOT stored here.
+    # active run: the persisted handle's RUN TARGET and the spec-derived target. The persisted
+    # name belongs to one attempt, so its target is stored instead -- that covers this run's other
+    # attempts too. The set holds the CANONICAL bare form only: the reaper canonicalizes the
+    # ``live-flash-...`` names RunPod lists before comparing, so ``live-`` is deliberately absent.
     assert "flash-5090-handle" in names
+    assert "flash-5090-handle-a3" not in names
     assert "live-flash-5090-handle" not in names
     active_derived = _derived("RTX 5090", "flash-active")
     assert active_derived in names
@@ -72,7 +74,7 @@ def test_ordered_gpu_pin_is_protected_before_its_handle_is_persisted(monkeypatch
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: rows)
     monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
 
-    names = app_mod._protected_train_endpoint_names()
+    names = app_mod._protected_train_endpoint_targets()
 
     assert names, "an ordered-pin run contributed no protected name at all"
     assert _derived("A100 PCIe", "flash-ordered") in names
@@ -92,7 +94,7 @@ def test_an_orphaned_fallback_endpoint_stays_in_the_reapers_scope(monkeypatch):
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: rows)
     monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
 
-    known = app_mod._known_train_endpoint_names()
+    known = app_mod._known_train_endpoint_targets()
 
     # the fallback is the one the head-only index missed, and the one that leaks.
     assert _derived("A100 SXM", "flash-orphan") in known
@@ -100,11 +102,11 @@ def test_an_orphaned_fallback_endpoint_stays_in_the_reapers_scope(monkeypatch):
 
 
 def test_reap_once_passes_protected_set_and_grace(monkeypatch):
-    monkeypatch.setattr(app_mod, "_protected_train_endpoint_names", lambda: {"flash-live"})
+    monkeypatch.setattr(app_mod, "_protected_train_endpoint_targets", lambda: {"flash-live"})
     # The reaper also passes the KNOWN set (every run this plane has a record of) so it only reaps
     # this plane's own idle endpoints, never another control plane's between-jobs endpoint.
     monkeypatch.setattr(
-        app_mod, "_known_train_endpoint_names", lambda: {"flash-live", "flash-done"}
+        app_mod, "_known_train_endpoint_targets", lambda: {"flash-live", "flash-done"}
     )
     captured: dict = {}
 
@@ -133,7 +135,7 @@ def test_protected_names_skip_unreadable_run(monkeypatch):
         return RunStatus(run_id="live", state="running", spec={"gpu": {"type": "A100"}})
 
     monkeypatch.setattr(app_mod, "get_status", get_status)
-    names = app_mod._protected_train_endpoint_names()
+    names = app_mod._protected_train_endpoint_targets()
     assert _derived("A100", "live") in names
 
 
@@ -272,10 +274,10 @@ def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
     )
 
     lam_instances = [
-        {"id": "i-live", "name": lambda_jobs.instance_label("flash-live", 0, 0)},  # live -> KEEP
+        {"id": "i-live", "name": lambda_jobs.instance_label("flash-live", 0)},  # live -> KEEP
         {
             "id": "i-orphan",
-            "name": lambda_jobs.instance_label("flash-dead", 0, 0),
+            "name": lambda_jobs.instance_label("flash-dead", 0),
         },  # our leak -> kill
         {"id": "i-foreign", "name": "not-ours"},  # non-flash name -> never touch
     ]
@@ -311,9 +313,9 @@ def test_sweep_spares_other_control_planes_live_instances(monkeypatch):
     )
 
     lam_instances = [
-        {"id": "i-mine", "name": lambda_jobs.instance_label("flash-mine", 0, 0)},  # ours, live
+        {"id": "i-mine", "name": lambda_jobs.instance_label("flash-mine", 0)},  # ours, live
         # Another control plane's box, named with ITS run id — we have no record of it.
-        {"id": "i-theirs", "name": lambda_jobs.instance_label("flash-theirs", 0, 0)},
+        {"id": "i-theirs", "name": lambda_jobs.instance_label("flash-theirs", 0)},
     ]
     terminated = []
     monkeypatch.setattr(lambda_api, "list_instances", lambda: lam_instances)
@@ -335,8 +337,8 @@ def test_sweep_resolves_active_labels_after_listing(monkeypatch):
     from flash.providers.lambda_.client import api as lambda_api
 
     events = []
-    fresh = jobs.instance_label("flash-fresh", 0, 0)
-    orphan = jobs.instance_label("flash-old", 0, 0)
+    fresh = jobs.instance_label("flash-fresh", 0)
+    orphan = jobs.instance_label("flash-old", 0)
 
     def fake_list():
         events.append("list")
@@ -370,7 +372,7 @@ def test_sweep_skips_when_active_set_resolution_raises(monkeypatch):
     monkeypatch.setattr(
         lambda_api,
         "list_instances",
-        lambda: [{"id": "i-live", "name": jobs.instance_label("flash-live", 0, 0)}],
+        lambda: [{"id": "i-live", "name": jobs.instance_label("flash-live", 0)}],
     )
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
@@ -451,8 +453,8 @@ def test_sweep_skips_endpoints_outside_known_scope(monkeypatch):
     THIS plane has a record of. An idle endpoint owned by another control plane on the same account
     (its name absent from ``known``) is left alone, even though it is idle and unprotected."""
     runpod_resources._idle_since.clear()
-    mine = {"id": "ep-mine", "name": "live-flash-mine-idle"}
-    theirs = {"id": "ep-theirs", "name": "live-flash-theirs-idle"}
+    mine = {"id": "ep-mine", "name": "live-flash-mine-idle-a0"}
+    theirs = {"id": "ep-theirs", "name": "live-flash-theirs-idle-a0"}
     monkeypatch.setattr(
         runpod_resources.runpod_api, "list_endpoints_by_key", lambda: ({"fpA": [mine, theirs]}, [])
     )
@@ -468,13 +470,54 @@ def test_sweep_skips_endpoints_outside_known_scope(monkeypatch):
         lambda eid, fp: deletes.append(eid) or True,
     )
 
-    # known carries only OUR endpoint name (bare form); the reaper compares both bare and live- forms.
+    # known carries only OUR run target; the reaper resolves each endpoint's name back to its
+    # target, so one entry covers every attempt of that run in both bare and live- forms.
     deleted = runpod_resources._sweep_idle_flash_endpoints(
         protected=set(), min_idle_s=0.0, known={"flash-mine-idle"}
     )
 
     assert deleted == 1
     assert deletes == ["ep-mine"]  # only ours; the other plane's idle endpoint is untouched
+
+
+def test_sweep_honours_an_exact_name_as_well_as_a_run_target(monkeypatch):
+    """An endpoint answers to both identities it carries, so neither caller loses its protection.
+
+    The periodic reaper passes run targets, which cover every attempt of a run. But the deploy-time
+    quota sweep protects the single endpoint it is about to create by its exact name, and a warm
+    preload endpoint carries no attempt ordinal at all -- so resolving names to targets and matching
+    only on those would silently stop protecting either one and reap a live endpoint.
+    """
+    runpod_resources._idle_since.clear()
+    attempt = {"id": "ep-attempt", "name": "live-flash-5090-abc-a3"}
+    warm = {"id": "ep-warm", "name": "flash-a100-preload-eu-ro-1-9f3c21"}
+    other = {"id": "ep-other", "name": "flash-5090-def-a0"}
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda: ({"fpA": [attempt, warm, other]}, []),
+    )
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "endpoint_health_for_fingerprint",
+        lambda eid, fp: _idle_health(),
+    )
+    deletes = []
+    monkeypatch.setattr(
+        runpod_resources.runpod_api,
+        "delete_endpoint_for_fingerprint",
+        lambda eid, fp: deletes.append(eid) or True,
+    )
+
+    deleted = runpod_resources._sweep_idle_flash_endpoints(
+        # the run target protects the attempt endpoint; the exact name protects the attemptless warm
+        # endpoint the quota sweep is about to create.
+        protected={"flash-5090-abc", "flash-a100-preload-eu-ro-1-9f3c21"},
+        min_idle_s=0.0,
+    )
+
+    assert deleted == 1
+    assert deletes == ["ep-other"]
 
 
 def test_sweep_preserves_grace_for_unlisted_account(monkeypatch):

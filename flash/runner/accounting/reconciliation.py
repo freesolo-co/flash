@@ -99,31 +99,6 @@ def _compare_and_clear_remote(run_id: str, expected_remote: dict) -> bool:
     return True
 
 
-def _compare_and_prepare_resubmit(
-    run_id: str,
-    expected_remote: dict | None,
-    *,
-    expected_state: str | None = None,
-) -> bool:
-    """Claim a nonterminal recovery launch only while its expected remote still owns the run."""
-    report_status: RunStatus | None = None
-    with state._status_guard(run_id):
-        status = status_ops.get_status(run_id)
-        if status.state in state.TERMINAL_STATES:
-            return False
-        if expected_state is not None and status.state != expected_state:
-            return False
-        if not _expected_remote_matches(status.remote, expected_remote):
-            return False
-        status.state = "provisioning"
-        status.updated_at = time.time()
-        state._save_status_unlocked(status)
-        report_status = status
-    if report_status is not None:
-        reporting._report_status(report_status)
-    return True
-
-
 def _compare_and_fail_remote(
     run_id: str,
     expected_remote: dict | None,
@@ -180,7 +155,7 @@ def _compare_and_complete_remote(
     expected_attempt = (
         expected_remote.get("attempt")
         if isinstance(expected_remote, dict)
-        else attempts._latest_reserved_attempt(run_id)
+        else attempts.latest_reserved_attempt(run_id)
     )
     metrics, verified_attempt = status_ops.validate_terminal_source_metrics(
         status,
@@ -236,15 +211,18 @@ def _canonical_cleanup_remote(remote: object) -> dict | None:
         if provider == "runpod":
             from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
 
-            return RunpodJobHandle.from_dict(remote).to_dict()
-        if provider == "lambda":
+            record = RunpodJobHandle.from_dict(remote).to_dict()
+        elif provider == "lambda":
             from flash.providers.lambda_.jobs.builders import LambdaJobHandle
 
-            return LambdaJobHandle.from_dict(remote).to_dict()
-        if provider == "vast":
+            record = LambdaJobHandle.from_dict(remote).to_dict()
+        elif provider == "vast":
             from flash.providers.vast.jobs.builders import VastJobHandle
 
-            return VastJobHandle.from_dict(remote).to_dict()
+            record = VastJobHandle.from_dict(remote).to_dict()
+        else:
+            return None
+        return record
     except (TypeError, ValueError):
         return None
     return None

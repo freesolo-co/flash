@@ -14,12 +14,15 @@ already persisted to HF inside the handler), bypassing the hanging teardown.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+import httpx
 import huggingface_hub
 import pytest
+from huggingface_hub.errors import HfHubHTTPError, RemoteEntryNotFoundError
 
 import flash.engine.worker.entry.opd as opd_entry
 import flash.engine.worker.entry.sft as sft_entry
@@ -199,6 +202,156 @@ def test_worker_dispatches_opd_run_mode(monkeypatch):
     assert ran["v"] is True, "RUN_MODE=opd must invoke run_opd"
     assert raised is not None
     assert raised.code == 0
+
+
+def _hub_download_error(error_type, status_code):
+    if status_code is None:
+        from types import SimpleNamespace
+
+        response = SimpleNamespace(status_code=None, headers={}, request=SimpleNamespace())
+    else:
+        response = httpx.Response(
+            status_code,
+            request=httpx.Request("GET", "https://huggingface.co/datasets/owner/run-dataset"),
+        )
+    return error_type("hub read failed", response=response)
+
+
+def _patch_done_marker_worker(monkeypatch):
+    heartbeats = []
+    events = []
+
+    def fake_exit(code=0):
+        raise _HardExit(code)
+
+    monkeypatch.setattr(worker.os, "_exit", fake_exit)
+    monkeypatch.setattr(worker_state, "HF_REPO", "owner/run-dataset")
+    monkeypatch.setattr(worker_state, "RUN_MODE", "sft")
+    monkeypatch.setattr(worker_state, "_cleanup_active_env_package", lambda: None)
+    monkeypatch.setattr(hf_io, "hf_prefix", lambda: "sft/run-id")
+    monkeypatch.setattr(hf_io, "error_artifact_name", lambda *a, **k: "error.txt")
+    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *a, **k: None)
+    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *a, **k: heartbeats.append((a, k)))
+    monkeypatch.setattr(worker.backend_common, "collect_ray_failure_logs", lambda **k: "")
+    monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **k: {})
+    monkeypatch.setattr(worker, "_preflight_gpu_occupancy_for_spec", lambda: events.append("gpu"))
+    monkeypatch.setattr(worker_perf, "_force_fla_triton_gdn_on_sm100", lambda: None)
+    monkeypatch.setattr(worker_perf, "_ensure_fla_fastpath_on_hopper", lambda: None)
+    monkeypatch.setattr(worker_perf, "_restrict_fla_gdn_autotune_on_blackwell", lambda: None)
+    monkeypatch.setattr(worker.kernel_warmup, "load_mega_cache", lambda: None)
+    monkeypatch.setattr(sft_entry, "run_sft", lambda: events.append("handler"))
+    return heartbeats, events
+
+
+def test_done_marker_present_restores_metrics_without_gpu_or_handler(monkeypatch, tmp_path):
+    heartbeats, events = _patch_done_marker_worker(monkeypatch)
+    done_marker = tmp_path / "DONE"
+    done_marker.write_text("done")
+    metrics = tmp_path / "metrics.json"
+    metrics.write_text('{"loss": 1.25}')
+    downloads = []
+    copies = []
+
+    def fake_download(*, repo_id, repo_type, filename, token=None):
+        downloads.append(filename)
+        return str(done_marker if filename.endswith("/DONE") else metrics)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.setattr(
+        shutil, "copy", lambda source, destination: copies.append((source, destination))
+    )
+
+    with pytest.raises(_HardExit) as exc_info:
+        worker.main()
+
+    assert exc_info.value.code == 0
+    assert downloads == ["sft/run-id/DONE", "sft/run-id/metrics.json"]
+    assert copies == [(str(metrics), "/tmp/metrics.json")]
+    assert events == []
+    assert any(args == ("already_done",) for args, _kwargs in heartbeats)
+
+
+def test_exact_remote_done_entry_absence_reaches_gpu_and_handler(monkeypatch):
+    _heartbeats, events = _patch_done_marker_worker(monkeypatch)
+    absence = _hub_download_error(RemoteEntryNotFoundError, 404)
+    monkeypatch.setattr(
+        huggingface_hub,
+        "hf_hub_download",
+        lambda **kwargs: (_ for _ in ()).throw(absence),
+    )
+
+    with pytest.raises(_HardExit) as exc_info:
+        worker.main()
+
+    assert exc_info.value.code == 0
+    assert events == ["gpu", "handler"]
+
+
+def test_done_marker_transient_failure_wraps_before_gpu(monkeypatch):
+    heartbeats, events = _patch_done_marker_worker(monkeypatch)
+    transient = httpx.ReadTimeout(
+        "timed out",
+        request=httpx.Request("GET", "https://huggingface.co"),
+    )
+    monkeypatch.setattr(
+        huggingface_hub,
+        "hf_hub_download",
+        lambda **kwargs: (_ for _ in ()).throw(transient),
+    )
+
+    with pytest.raises(worker_perf.RetriableInfraError) as exc_info:
+        worker.main()
+
+    assert exc_info.value.__cause__ is transient
+    assert events == []
+    error_heartbeats = [kwargs for _args, kwargs in heartbeats if "retriable" in kwargs]
+    assert error_heartbeats[-1]["retriable"] is True
+
+
+@pytest.mark.parametrize(
+    "error_factory",
+    [
+        pytest.param(lambda: _hub_download_error(HfHubHTTPError, 404), id="generic-404"),
+        pytest.param(lambda: _hub_download_error(HfHubHTTPError, 401), id="authorization"),
+        pytest.param(lambda: RuntimeError("unexpected failure"), id="unexpected"),
+    ],
+)
+def test_done_marker_terminal_failures_fail_closed_before_gpu(monkeypatch, error_factory):
+    heartbeats, events = _patch_done_marker_worker(monkeypatch)
+    error = error_factory()
+    monkeypatch.setattr(
+        huggingface_hub,
+        "hf_hub_download",
+        lambda **kwargs: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(type(error)):
+        worker.main()
+
+    assert events == []
+    error_heartbeats = [kwargs for _args, kwargs in heartbeats if "retriable" in kwargs]
+    assert error_heartbeats[-1]["retriable"] is False
+
+
+def test_done_marker_remote_absence_subclass_is_terminal_before_gpu(monkeypatch):
+    class SyntheticRemoteEntryNotFoundError(RemoteEntryNotFoundError):
+        pass
+
+    heartbeats, events = _patch_done_marker_worker(monkeypatch)
+    error = _hub_download_error(SyntheticRemoteEntryNotFoundError, 404)
+    monkeypatch.setattr(
+        huggingface_hub,
+        "hf_hub_download",
+        lambda **kwargs: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(SyntheticRemoteEntryNotFoundError):
+        worker.main()
+
+    assert events == []
+    error_heartbeats = [kwargs for _args, kwargs in heartbeats if "retriable" in kwargs]
+    assert error_heartbeats[-1]["retriable"] is False
 
 
 def test_idempotency_replay_metrics_read_failure_is_retriable(monkeypatch, tmp_path):

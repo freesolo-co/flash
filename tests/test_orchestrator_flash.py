@@ -39,19 +39,22 @@ def test_run_job_persists_flash_metrics(monkeypatch):
 
         captured = {}
 
-        def fake_submit(spec, seed, log=None, **kwargs):
+        def fake_submit(spec, log=None, **kwargs):
             from flash.snapshot.archive import TERMINAL_ATTESTATION_KEY, source_attestation
 
             captured["gpu"] = spec.gpu.type
-            captured["seed"] = seed
+            captured["seed"] = spec.seed
             captured["source_snapshot"] = kwargs["source_snapshot"]
             persisted = runner_status.get_status(spec.run_id)
             assert persisted.source_snapshot == SOURCE_SNAPSHOT
-            attempt = runner_attempts._reserve_attempt(spec.run_id)
+            claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+            assert claim is not None
+            attempt = claim.attempt
+            runner_attempts.release_launch_claim(spec.run_id, claim)
             return {
                 "arm": "runpod",
                 "phase": spec.phase,
-                "seed": seed,
+                "seed": spec.seed,
                 "wall_seconds": 3600.0,
                 "trained_eval_acc": 0.7,
                 "base_eval_acc": 0.3,
@@ -68,7 +71,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         # Stub the submit/poll path (the seam that used to be the in-process
         # offline shortcut) so the run completes without provisioning a GPU.
         # _run_training resolves it from the canonical supervise lifecycle owner.
-        monkeypatch.setattr(runner_lifecycle, "_submit_seed_supervised", fake_submit)
+        monkeypatch.setattr(runner_lifecycle, "_run_attempts_supervised", fake_submit)
 
         spec = JobSpec(
             run_id="flash-run",

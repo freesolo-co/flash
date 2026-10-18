@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.2.123"
+version = "1.2.132"
 description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
@@ -60,7 +60,7 @@ server = [
     "fastapi>=0.136,<1",
     "uvicorn>=0.52,<1",
     # customer-owned modal lifecycle mutations execute in the control plane.
-    "modal==1.5.4",
+    "modal==1.6.1",
     "runpod-flash>=1.19,<2",
     "httpx>=0.27",
     "jsonschema>=4.23",
@@ -98,7 +98,7 @@ serving = [
     # this one is what the serving image installs ALONE -- so a range here lets the container
     # resolve a different modal than the control plane was validated against, on a rebuild that
     # changed nothing else. one policy per package.
-    "modal==1.5.4",
+    "modal==1.6.1",
     "orjson>=3.10.0",
     # `src/multimodal.py` decodes and normalizes inbound images at module scope. the `gpu` extra
     # gets Pillow transitively via vllm, but this extra deliberately excludes vllm, so it has to
@@ -134,11 +134,11 @@ dev = [
     "pytest>=9.0.3",
     # dependency contract tests parse exact pins without relying on a transitive install.
     "packaging>=24,<27",
-    # Upper bound tracks uv.lock (ruff 0.16.x), which is what CI lints with. Without it, an
+    # Upper bound tracks uv.lock (ruff 0.17.x), which is what CI lints with. Without it, an
     # install that ignores the lockfile (`uv pip install -e '.[dev]'`, plain pip) resolves whatever
     # ruff is newest, whose added rules fail on a tree CI calls clean. Raise both sites together
     # with the lockfile, never ahead of it.
-    "ruff>=0.6,<0.17",
+    "ruff>=0.6,<0.18",
     # mirror server's 0.136 floor so dev remains compatible with the deployed serving extra pair.
     "fastapi>=0.136,<1",
     "uvicorn>=0.52,<1",
@@ -196,7 +196,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.2.123"
+version = "1.2.132"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -232,7 +232,7 @@ dev = [
     # dependency contract tests parse exact pins without relying on a transitive install.
     "packaging>=24,<27",
     # Keep in lockstep with the `dev` extra above and with uv.lock.
-    "ruff>=0.6,<0.17",
+    "ruff>=0.6,<0.18",
     # Offline worker/env tests import these without the heavy `gpu` stack; the CI test env
     # (`--extra server --dev`) gets httpx + huggingface-hub from the `server` extra.
     "datasets>=2.19",

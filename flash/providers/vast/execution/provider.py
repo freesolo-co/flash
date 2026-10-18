@@ -49,10 +49,9 @@ class VastProvider(InstanceProvider):
 
         return hourly_rate(gpu)
 
-    def _submit_run(
+    def _submit_attempt(
         self,
         spec,
-        seed: int,
         *,
         log: Any,
         on_handle: Any,
@@ -61,11 +60,10 @@ class VastProvider(InstanceProvider):
         source_snapshot: dict | None,
         deadline_at: float | None,
     ) -> PollResult:
-        from flash.providers.vast.jobs import submit_run_vast
+        from flash.providers.vast.jobs import submit_attempt_vast
 
-        return submit_run_vast(
+        return submit_attempt_vast(
             spec,
-            seed,
             log=log,
             on_handle=on_handle,
             attempt=attempt,
@@ -78,7 +76,6 @@ class VastProvider(InstanceProvider):
         self,
         handle: JobHandle,
         spec,
-        seed: int,
         *,
         log: Any,
         heartbeat_reader: Any,
@@ -89,7 +86,6 @@ class VastProvider(InstanceProvider):
         return poll_vast_job(
             handle,
             spec,
-            seed,
             log=log,
             heartbeat_reader=heartbeat_reader,
             deadline_at=deadline_at,
@@ -101,7 +97,7 @@ class VastProvider(InstanceProvider):
         if not _best_effort_destroy(handle.instance_id, context="poll recovery teardown"):
             # unconfirmed teardown: the active-run sweep shields this label, so escalate to a
             # run-scoped reap by label (re-lists + retries, not active-shielded), mirroring the
-            # submit_run_vast teardown finally.
+            # submit_attempt_vast teardown finally.
             destroy_run_instances(spec.run_id)
 
     def _gc(self, run_id: str) -> None:

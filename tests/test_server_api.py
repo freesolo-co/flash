@@ -1,8 +1,8 @@
 """Control-plane API: freesolo bearer auth, multi-tenant isolation (CPU-only).
 
 User auth is freesolo API keys only (no native key system). Tests run offline: the `api` fixture
-monkeypatches ``auth._freesolo_verify`` to accept any token shaped like a freesolo user key, so each
-distinct token resolves to its own run-ownership identity via ``db.ensure_external_key``.
+monkeypatches ``auth._freesolo_verify`` to return an identity for tokens shaped like freesolo user
+keys, so each distinct token resolves to its own run-ownership identity via ``db.ensure_external_key``.
 """
 
 from __future__ import annotations
@@ -177,11 +177,13 @@ def api(tmp_path, monkeypatch):
     # runs._post() would urllib-POST the real backend (or wait out its 10s timeout). Stub the
     # single network choke-point so these offline tests stay hermetic (same as the billing fixture).
     monkeypatch.setattr(runs, "_post", lambda *a, **k: False, raising=False)
+    import flash.server.billing.charges as billing_mod
+
+    monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **_kwargs: {"ok": True})
     # Offline auth: a token is a valid freesolo USER key iff it has the test prefix. This stub
     # replaces the real network verify.
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: token.startswith(_USER_PREFIX))
-    monkeypatch.setattr(auth_mod, "_cached_identity", _identity_for_token)
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", _identity_for_token)
 
     def validate_project(*, project_id, key, authorization, org_id=None):
         assert isinstance(project_id, str)
@@ -809,6 +811,25 @@ def test_dry_run_rejects_invalid_structured_serving_constraints(
     assert message in response.json()["detail"]
 
 
+@pytest.mark.parametrize("ratio", [10**400, -(10**400)])
+def test_dry_run_rejects_overflowing_loraplus_ratio(api, monkeypatch, ratio) -> None:
+    import flash.server.routes.runs as runs_route
+
+    monkeypatch.setattr(
+        runs_route._app,
+        "prepare_job",
+        lambda *_a, **_k: pytest.fail("invalid ratio must fail before preparation"),
+    )
+    spec = {**SPEC, "algorithm": "sft", "train": {"loraplus_ratio": ratio}}
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer(_login()),
+        json={"spec": spec, "dry_run": True},
+    )
+    assert response.status_code == 400, response.text
+    assert "train.loraplus_ratio must be a finite number" in response.json()["detail"]
+
+
 def test_warmstart_dry_run_preserves_serving_preflight_error(api) -> None:
     spec = {
         **SPEC,
@@ -1122,18 +1143,11 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
 
     def fake_verify(token):
         calls["n"] += 1
-        return token == "fslo-user-good"
+        if token != "fslo-user-good":
+            return None
+        return {"email": "user-good@example.com", "key_prefix": "fslo_good", "org_slug": "acme"}
 
     monkeypatch.setattr(auth_mod, "_freesolo_verify", fake_verify)
-    monkeypatch.setattr(
-        auth_mod,
-        "_cached_identity",
-        lambda token: (
-            {"email": "user-good@example.com", "key_prefix": "fslo_good", "org_slug": "acme"}
-            if token == "fslo-user-good"
-            else {}
-        ),
-    )
 
     row = auth_mod.authenticate("Bearer fslo-user-good")
     assert row is not None
@@ -1145,16 +1159,53 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
     assert again["id"] == row["id"]
 
 
+def test_revoked_external_key_is_rejected_across_critical_routes(api, monkeypatch):
+    import flash.server.platform.auth as auth_mod
+
+    key = _login()
+    headers = _bearer(key)
+    run_id = api.post(
+        "/v1/runs",
+        json={"spec": SPEC, "dry_run": True},
+        headers=headers,
+    ).json()["run_id"]
+
+    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: None)
+
+    requests = (
+        ("post", "/v1/runs", {"spec": SPEC, "runtime_secrets": {"HF_TOKEN": "secret"}}),
+        ("post", f"/v1/runs/{run_id}/cancel", None),
+        ("post", f"/v1/runs/{run_id}/deploy", {}),
+        (
+            "post",
+            f"/v1/runs/{run_id}/export",
+            {"repository": "me/adapter", "hf_token": "hf-secret"},
+        ),
+        ("get", f"/v1/runs/{run_id}/worker", None),
+        (
+            "post",
+            "/v1/envs",
+            {
+                "project_id": SPEC["project"],
+                "name": "revoked",
+                "package_b64": ENV_PACKAGE_B64,
+            },
+        ),
+    )
+    for method, path, payload in requests:
+        response = api.request(method, path, headers=headers, json=payload)
+        assert response.status_code == 401, (method, path, response.text)
+
+
 def test_freesolo_user_key_without_org_slug_is_rejected(api, monkeypatch):
     # A verified external key must include an org slug. Do not fall back to email or
     # token-derived namespaces for env publishing.
     import flash.server.platform.auth as auth_mod
 
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
     monkeypatch.setattr(
         auth_mod,
-        "_cached_identity",
+        "_freesolo_verify",
         lambda token: {"email": "user@example.com", "key_prefix": "fslo_noorg"},
     )
 
@@ -1165,11 +1216,14 @@ def test_freesolo_user_key_without_email_authenticates_with_org_slug(api, monkey
     import flash.server.platform.auth as auth_mod
 
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
     monkeypatch.setattr(
         auth_mod,
-        "_cached_identity",
-        lambda token: {"key_prefix": "fslo_noemail", "org_slug": "acme", "org_id": "org-acme"},
+        "_freesolo_verify",
+        lambda token: {
+            "key_prefix": "fslo_noemail",
+            "org_slug": "acme",
+            "org_id": "org-acme",
+        },
     )
 
     row = auth_mod.authenticate("Bearer fslo-no-email")
@@ -1182,10 +1236,9 @@ def test_invalid_external_email_is_not_persisted(api, monkeypatch):
     import flash.server.platform.auth as auth_mod
 
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
     monkeypatch.setattr(
         auth_mod,
-        "_cached_identity",
+        "_freesolo_verify",
         lambda token: {
             "email": "not-an-email",
             "key_prefix": "fslo_invalidemail",
@@ -1816,10 +1869,9 @@ def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     import flash.server.platform.db as db_mod
 
     auth_mod._verify_cache.clear()
-    monkeypatch.setattr(auth_mod, "_freesolo_verify", lambda token: True)
     monkeypatch.setattr(
         auth_mod,
-        "_cached_identity",
+        "_freesolo_verify",
         lambda token: {
             "email": "revoked@example.com",
             "key_prefix": "fslo_revoked",
@@ -1837,183 +1889,9 @@ def test_freesolo_user_key_disabled_is_401_not_500(api, monkeypatch):
     assert auth_mod.authenticate("Bearer fslo-revoked") is None
 
 
-def test_freesolo_verify_does_not_cache_network_errors(monkeypatch):
-    # A transient network error must NOT be cached as a rejection, or a valid key would be
-    # locked out for the whole TTL. The next call (backend recovered) must succeed.
-    import urllib.error
-
-    import flash.server.platform.auth as auth_mod
-
-    # Use the real _freesolo_verify (not the fixture stub) and let it touch the (patched) net.
-    importlib.reload(auth_mod)
-    auth_mod._verify_cache.clear()
-
-    class _Resp:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    state = {"fail": True}
-
-    def flaky(req, timeout=None):
-        if state["fail"]:
-            raise urllib.error.URLError("connection timed out")
-        return _Resp()
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", flaky)
-    assert auth_mod._freesolo_verify("tok") is False  # transient failure
-    assert "tok" not in auth_mod._verify_cache  # NOT cached
-    state["fail"] = False
-    assert auth_mod._freesolo_verify("tok") is True  # recovers immediately
-
-
-def test_freesolo_verify_5xx_transient_but_4xx_cached(monkeypatch):
-    # A backend 5xx/429 is a transient hiccup (urllib raises HTTPError for these too): it must
-    # NOT be cached, so a valid key recovers immediately. A definitive 4xx (401/403) IS cached.
-    import urllib.error
-
-    import flash.server.platform.auth as auth_mod
-
-    importlib.reload(auth_mod)
-    auth_mod._verify_cache.clear()
-
-    class _Resp:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    state = {"code": 503}
-
-    def responder(req, timeout=None):
-        code = state["code"]
-        if code == 200:
-            return _Resp()
-        raise urllib.error.HTTPError(req.full_url, code, "err", {}, None)
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", responder)
-    # 5xx -> transient, not cached
-    assert auth_mod._freesolo_verify("tok") is False
-    assert "tok" not in auth_mod._verify_cache
-    # 429 -> transient, not cached
-    state["code"] = 429
-    assert auth_mod._freesolo_verify("tok") is False
-    assert "tok" not in auth_mod._verify_cache
-    # backend recovers -> immediately verified (no stale negative cached)
-    state["code"] = 200
-    assert auth_mod._freesolo_verify("tok") is True
-
-    # a definitive 401 IS cached as a rejection (no repeated backend round-trips)
-    auth_mod._verify_cache.clear()
-    state["code"] = 401
-    assert auth_mod._freesolo_verify("bad") is False
-    assert auth_mod._verify_cache.get("bad", (None,))[0] is False
-
-
-def test_freesolo_verify_discards_identity_on_exit_http_error(monkeypatch):
-    import io
-    import urllib.error
-
-    import flash.server.platform.auth as auth_mod
-
-    importlib.reload(auth_mod)
-    auth_mod._verify_cache.clear()
-
-    class _Resp:
-        status = 200
-
-        def read(self):
-            return b'{"email":"user@example.com","org_id":"org-1","org_slug":"acme"}'
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            raise urllib.error.HTTPError(
-                "https://api.freesolo.co/api/auth/verify",
-                401,
-                "unauthorized",
-                {},
-                io.BytesIO(b'{"detail":"unauthorized"}'),
-            )
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
-
-    assert auth_mod._freesolo_verify("tok") is False
-    verified, identity, _expires_at = auth_mod._verify_cache["tok"]
-    assert verified is False
-    assert identity == {}
-
-
-def test_freesolo_verify_negative_short_ttl_positive_long_ttl(monkeypatch):
-    # A negative verdict (a 401 may be a TRANSIENT backend auth-lookup outage, not a real
-    # rejection) gets the short negative TTL so a valid key isn't locked out for 5 minutes;
-    # a positive keeps the long TTL.
-    import urllib.error
-
-    import flash.server.platform.auth as auth_mod
-
-    importlib.reload(auth_mod)
-    auth_mod._verify_cache.clear()
-
-    class _Resp:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    state = {"code": 401}
-
-    def responder(req, timeout=None):
-        code = state["code"]
-        if code == 200:
-            return _Resp()
-        raise urllib.error.HTTPError(req.full_url, code, "err", {}, None)
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", responder)
-
-    # Negative (401) -> cached with the SHORT negative TTL.
-    now = time.time()
-    assert auth_mod._freesolo_verify("neg") is False
-    neg_exp = auth_mod._verify_cache["neg"][2]
-    assert neg_exp <= now + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1
-    # ...and definitely shorter than the long TTL.
-    assert neg_exp < now + auth_mod._VERIFY_CACHE_TTL_S
-
-    # Positive -> cached with the LONG TTL.
-    auth_mod._verify_cache.clear()
-    state["code"] = 200
-    now = time.time()
-    assert auth_mod._freesolo_verify("pos") is True
-    pos_exp = auth_mod._verify_cache["pos"][2]
-    assert pos_exp > now + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1
-    assert pos_exp <= now + auth_mod._VERIFY_CACHE_TTL_S + 1
-
-    # The negative entry expires after the short TTL: simulate the clock advancing past
-    # _VERIFY_CACHE_NEG_TTL_S (but not the long TTL) and confirm the negative is treated as
-    # expired while a same-age positive would still be live.
-    auth_mod._verify_cache.clear()
-    base = time.time()
-    auth_mod._verify_cache["neg"] = (False, {}, base + auth_mod._VERIFY_CACHE_NEG_TTL_S)
-    auth_mod._verify_cache["pos"] = (True, {}, base + auth_mod._VERIFY_CACHE_TTL_S)
-    later = base + auth_mod._VERIFY_CACHE_NEG_TTL_S + 1.0  # past neg TTL, well under pos TTL
-    assert auth_mod._verify_cache["neg"][2] <= later  # negative entry has expired
-    assert auth_mod._verify_cache["pos"][2] > later  # positive entry is still live
-
-
 def test_freesolo_verify_rejects_oversized_token(monkeypatch):
-    # An oversized bearer must be rejected before it touches the cache or the network, so it
-    # can't bloat _verify_cache (keyed by the raw token) or send a huge Authorization header.
+    # An oversized bearer must be rejected before it hashes, touches the cache, or reaches the
+    # network, so it cannot consume verifier state or send a huge Authorization header.
     import flash.server.platform.auth as auth_mod
 
     importlib.reload(auth_mod)
@@ -2024,13 +1902,13 @@ def test_freesolo_verify_rejects_oversized_token(monkeypatch):
 
     monkeypatch.setattr(auth_mod.urllib.request, "urlopen", boom)
     huge = "x" * (auth_mod._MAX_TOKEN_LEN + 1)
-    assert auth_mod._freesolo_verify(huge) is False
-    assert huge not in auth_mod._verify_cache
+    assert auth_mod._freesolo_verify(huge) is None
+    assert auth_mod._verify_cache == {}
 
 
 def test_freesolo_user_key_unverified_when_backend_unreachable(api, monkeypatch):
     # When the backend verify can't be reached (the offline test harness makes urlopen fail),
-    # _freesolo_verify returns False and authenticate yields None — an unverifiable key is
+    # _freesolo_verify returns None and authenticate yields None — an unverifiable key is
     # never admitted.
     import urllib.error
 
@@ -2046,81 +1924,6 @@ def test_freesolo_user_key_unverified_when_backend_unreachable(api, monkeypatch)
         lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError("offline")),
     )
     assert auth_mod.authenticate("Bearer unknown-token") is None
-
-
-def test_freesolo_verify_cache_prevents_second_call(monkeypatch):
-    # The in-process cache means a second authenticate for the same token doesn't re-hit the
-    # backend within the TTL (positives and negatives are both cached).
-    import flash.server.platform.auth as auth_mod
-
-    # Use the real _freesolo_verify (not the fixture stub) and let it touch the (patched) net.
-    importlib.reload(auth_mod)
-    auth_mod._verify_cache.clear()
-    calls = {"n": 0}
-
-    def fake_urlopen(req, timeout=None):
-        calls["n"] += 1
-
-        class _Resp:
-            status = 200
-
-            def read(self):
-                return (
-                    b'{"email":"cached@example.com","key_prefix":"fslo_cached","org_slug":"acme"}'
-                )
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        return _Resp()
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", fake_urlopen)
-
-    first = auth_mod.authenticate("Bearer fslo-cached")
-    second = auth_mod.authenticate("Bearer fslo-cached")
-    assert first is not None
-    assert second is not None
-    assert calls["n"] == 1  # second authenticate served from cache, no second backend call
-
-
-def test_freesolo_verify_cache_is_bounded_and_prunes_expired(monkeypatch):
-    # The verify cache keys by the raw bearer token, so a stream of distinct tokens could
-    # grow it without bound. Each write prunes expired entries and caps the cache size.
-    import time
-
-    import flash.server.platform.auth as auth_mod
-
-    importlib.reload(auth_mod)
-    auth_mod._verify_cache.clear()
-
-    class _Resp:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr(auth_mod.urllib.request, "urlopen", lambda req, timeout=None: _Resp())
-
-    # An already-expired entry must be removed on the next write (no longer reachable).
-    auth_mod._verify_cache["stale"] = (True, {}, time.time() - 1)
-    auth_mod._freesolo_verify("fresh-token")
-    assert "stale" not in auth_mod._verify_cache
-    assert "fresh-token" in auth_mod._verify_cache
-
-    # Verifying many distinct (live) tokens never grows the cache past the cap.
-    monkeypatch.setattr(auth_mod, "_VERIFY_CACHE_MAX", 8)
-    auth_mod._verify_cache.clear()
-    for i in range(50):
-        auth_mod._freesolo_verify(f"tok-{i}")
-        assert len(auth_mod._verify_cache) <= auth_mod._VERIFY_CACHE_MAX
-    assert len(auth_mod._verify_cache) <= auth_mod._VERIFY_CACHE_MAX
-    auth_mod._verify_cache.clear()
 
 
 def test_keys_are_hashed_at_rest(api):
@@ -5554,7 +5357,7 @@ def test_deploy_without_any_org_context_is_rejected(api, monkeypatch):
     # a verified identity without org_id (but with the org_slug that auth requires)
     monkeypatch.setattr(
         auth_mod,
-        "_cached_identity",
+        "_freesolo_verify",
         lambda token: {k: v for k, v in _identity_for_token(token).items() if k != "org_id"},
     )
     monkeypatch.setattr(
@@ -5881,7 +5684,7 @@ def test_recover_runs_fails_descriptorless_no_handle_run(monkeypatch, tmp_path):
     gced = []
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda s: gced.append(s.run_id))
     resubmitted = []
-    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s: resubmitted.append(s.run_id))
+    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s, **_kw: resubmitted.append(s.run_id))
 
     # a handle-less run may have left a phantom instance from a non-idempotent create (Vast PUT
     # /asks) that surfaces via eventual consistency. Recovery must force-reap the run's label across
@@ -6041,7 +5844,7 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "phantom-1"}])
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda s: None)
     resubmitted = []
-    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s: resubmitted.append(s.run_id))
+    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s, **_kw: resubmitted.append(s.run_id))
 
     reaped = []
 
@@ -6108,7 +5911,7 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "unconf-1"}])
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda s: None)
     resubmitted = []
-    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s: resubmitted.append(s.run_id))
+    monkeypatch.setattr(runner_lifecycle, "_run_job", lambda s, **_kw: resubmitted.append(s.run_id))
 
     import flash.server.platform.runtime as rt
     from flash.providers.core import registry as providers_mod
@@ -6165,7 +5968,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
     resubmitted = []
     done = threading.Event()
 
-    def fake_run_job(s):
+    def fake_run_job(s, **_kwargs):
         resubmitted.append(s.run_id)
         done.set()
 
@@ -6231,7 +6034,7 @@ def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch
     resubmitted = []
     done = threading.Event()
     monkeypatch.setattr(
-        runner_lifecycle, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set())
+        runner_lifecycle, "_run_job", lambda s, **_kw: (resubmitted.append(s.run_id), done.set())
     )
 
     from flash.providers.core import registry as providers_mod
@@ -6283,7 +6086,7 @@ def test_recover_runs_ignores_newly_configured_unrecorded_provider(monkeypatch, 
     resubmitted = []
     done = threading.Event()
     monkeypatch.setattr(
-        runner_lifecycle, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set())
+        runner_lifecycle, "_run_job", lambda s, **_kw: (resubmitted.append(s.run_id), done.set())
     )
 
     class _NewVast:
@@ -6345,7 +6148,7 @@ def test_recover_runs_deferred_resubmit_retries_until_clear(monkeypatch, tmp_pat
     resubmitted = []
     done = threading.Event()
     monkeypatch.setattr(
-        runner_lifecycle, "_run_job", lambda s: (resubmitted.append(s.run_id), done.set())
+        runner_lifecycle, "_run_job", lambda s, **_kw: (resubmitted.append(s.run_id), done.set())
     )
     monkeypatch.setattr(rt, "_DEFERRED_RECOVERY_RETRY_S", 0.01)  # fast background retry
 
@@ -6412,7 +6215,12 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
     resubmitted = []
     done = threading.Event()
 
-    def fake_run_job(s):
+    claims = []
+
+    def fake_run_job(s, **kwargs):
+        # recovery must hand the background launch the attempt it durably reserved, so the
+        # replacement runs under that exact claim rather than reserving a second one.
+        claims.append(kwargs.get("reserved_claim"))
         resubmitted.append(s.run_id)
         done.set()
 
@@ -6438,6 +6246,10 @@ def test_recover_runs_resubmits_when_instance_confirmed_clear(monkeypatch, tmp_p
 
     assert done.wait(timeout=5), "a confirmed-clear run must still resubmit"
     assert resubmitted == ["clear-1"]
+    assert len(claims) == 1
+    # recovery must hand the launch the attempt it reserved, not let it reserve a second one.
+    assert claims[0] is not None
+    assert claims[0].attempt == 0
 
 
 def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
@@ -6518,7 +6330,7 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
     resubmitted: list[tuple[str, int]] = []
     done = threading.Event()
 
-    def fake_run_job(s):
+    def fake_run_job(s, **_kwargs):
         resubmitted.append((s.train.init_from_adapter, s.train.lora_rank))
         done.set()
 
@@ -6605,7 +6417,7 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
     monkeypatch.setattr(
         runner_lifecycle,
         "_run_job",
-        lambda s: pytest.fail("drifted warm-start source must not be resubmitted"),
+        lambda s, **_kw: pytest.fail("drifted warm-start source must not be resubmitted"),
     )
 
     app_mod.recover_runs()
@@ -6710,7 +6522,7 @@ def test_recover_runs_bad_spec_is_isolated_not_fatal(monkeypatch, tmp_path):
     resubmitted = []
     done = threading.Event()
 
-    def fake_run_job(s):
+    def fake_run_job(s, **_kwargs):
         resubmitted.append(s.run_id)
         done.set()
 
@@ -8094,54 +7906,141 @@ def test_export_sends_the_runner_assigned_revision_not_the_public_blank(api, mon
     assert seen["base_model_revision"] == "a" * 40
 
 
-def test_export_holds_deploy_lock_across_owned_run(api, monkeypatch):
-    """The /export handler must take the per-run deploy lock FROM THE VERY TOP — before even the
+@pytest.mark.parametrize("operation", ["export", "undeploy"])
+def test_unauthorized_deployment_operation_returns_while_lock_is_held(api, monkeypatch, operation):
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
-    Taking the lock after body validation leaves a window for another deploy, undeploy, or export
-    operation to interleave with the request. Assert the lock is already held during the payload
-    validation (``_validate_hf_repo_id``, which runs first) AND by the time owned_run runs.
-    """
+    import flash.server.asgi.app as app_mod
+
+    owner = _login()
+    other = _login()
+    run_id = _finished_run(api, owner)
+    calls = []
+    monkeypatch.setattr(app_mod, "export_adapter", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda target: calls.append(target))
+
+    deploy_lock = app_mod._deploy_lock(run_id)
+    assert deploy_lock.acquire(blocking=False) is True
+    executor = ThreadPoolExecutor(max_workers=1)
+    if operation == "export":
+        future = executor.submit(
+            api.post,
+            f"/v1/runs/{run_id}/export",
+            json={},
+            headers=_bearer(other),
+        )
+    else:
+        future = executor.submit(
+            api.delete,
+            f"/v1/runs/{run_id}/deploy?checkpoint_id={run_id}/final",
+            headers=_bearer(other),
+        )
+    try:
+        try:
+            response = future.result(timeout=2)
+        except TimeoutError:
+            pytest.fail(f"unauthorized {operation} waited for the deployment lock")
+        assert deploy_lock.acquire(blocking=False) is False
+    finally:
+        deploy_lock.release()
+        executor.shutdown(wait=True)
+
+    assert response.status_code == 404, response.text
+    assert calls == []
+
+
+def test_invalid_export_returns_while_lock_is_held(api, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+    import flash.server.asgi.app as app_mod
+
+    owner = _login()
+    run_id = _finished_run(api, owner)
+    calls = []
+    monkeypatch.setattr(app_mod, "export_adapter", lambda **kwargs: calls.append(kwargs))
+
+    deploy_lock = app_mod._deploy_lock(run_id)
+    assert deploy_lock.acquire(blocking=False) is True
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(
+        api.post,
+        f"/v1/runs/{run_id}/export",
+        json={},
+        headers=_bearer(owner),
+    )
+    try:
+        try:
+            response = future.result(timeout=2)
+        except TimeoutError:
+            pytest.fail("invalid export waited for the deployment lock")
+        assert deploy_lock.acquire(blocking=False) is False
+    finally:
+        deploy_lock.release()
+        executor.shutdown(wait=True)
+
+    assert response.status_code == 400, response.text
+    assert "repository" in response.json()["detail"]
+    assert calls == []
+
+
+@pytest.mark.parametrize("operation", ["export", "undeploy"])
+def test_deployment_operation_rechecks_authorization_after_waiting(api, monkeypatch, operation):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
     import flash.server.asgi.app as app_mod
     from flash.server.routes import serving as serving_routes
 
-    key = _login()
-    run_id = _finished_run(api, key)
+    owner = _login()
+    run_id = _finished_run(api, owner)
+    authorization_checked = threading.Event()
+    authorization_attempts = []
+    authorized_statuses = []
+    calls = []
+    authorization_name = "owned_run" if operation == "export" else "manageable_run"
+    real_authorize = getattr(serving_routes, authorization_name)
 
-    real_owned_run = serving_routes.owned_run
-    real_validate = serving_routes._validate_hf_repo_id
-    seen: dict = {}
+    def observed_authorize(*args, **kwargs):
+        authorization_attempts.append(None)
+        status = real_authorize(*args, **kwargs)
+        authorized_statuses.append(status)
+        authorization_checked.set()
+        return status
 
-    def checking_validate(repository):
-        # The payload validation runs BEFORE owned_run; assert it too is inside the lock.
-        lk = app_mod._deploy_lock(run_id)
-        acquired = lk.acquire(blocking=False)
-        seen["locked_during_validation"] = not acquired
-        if acquired:
-            lk.release()
-        return real_validate(repository)
+    monkeypatch.setattr(serving_routes, authorization_name, observed_authorize)
+    monkeypatch.setattr(app_mod, "export_adapter", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(app_mod, "undeploy_adapter", lambda target: calls.append(target))
 
-    def checking_owned_run(rid, k):
-        # A non-blocking acquire from outside must FAIL (lock already held by the handler) — proving
-        # the handler is INSIDE the `with _deploy_lock(...)` block by the time owned_run runs.
-        lk = app_mod._deploy_lock(rid)
-        acquired = lk.acquire(blocking=False)
-        seen["locked_during_owned_run"] = not acquired
-        if acquired:
-            lk.release()
-        return real_owned_run(rid, k)
+    deploy_lock = app_mod._deploy_lock(run_id)
+    assert deploy_lock.acquire(blocking=False) is True
+    executor = ThreadPoolExecutor(max_workers=1)
+    if operation == "export":
+        future = executor.submit(
+            api.post,
+            f"/v1/runs/{run_id}/export",
+            json={"repository": "me/a", "hf_token": "hf"},
+            headers=_bearer(owner),
+        )
+    else:
+        future = executor.submit(
+            api.delete,
+            f"/v1/runs/{run_id}/deploy?checkpoint_id={run_id}/final",
+            headers=_bearer(owner),
+        )
+    try:
+        assert authorization_checked.wait(timeout=2)
+        assert len(authorization_attempts) == 1
+        assert len(authorized_statuses) == 1
+        _db_mod.delete_run(run_id)
+    finally:
+        deploy_lock.release()
+    response = future.result(timeout=5)
+    executor.shutdown(wait=True)
 
-    monkeypatch.setattr(serving_routes, "_validate_hf_repo_id", checking_validate)
-    monkeypatch.setattr(serving_routes, "owned_run", checking_owned_run)
-    monkeypatch.setattr(app_mod, "export_adapter", lambda **kw: "https://huggingface.co/me/a")
-
-    resp = api.post(
-        f"/v1/runs/{run_id}/export",
-        json={"repository": "me/a", "hf_token": "hf", "checkpoint_id": f"{run_id}/final"},
-        headers=_bearer(key),
-    )
-    assert resp.status_code == 200, resp.text
-    assert seen["locked_during_validation"] is True
-    assert seen["locked_during_owned_run"] is True
+    assert response.status_code == 404, response.text
+    assert len(authorization_attempts) == 2
+    assert len(authorized_statuses) == 1
+    assert calls == []
 
 
 def test_export_public_flag_sets_private_false(api, monkeypatch):
