@@ -58,6 +58,14 @@ class RetriableBootstrapError(RuntimeError):
     """Infra-shaped failure → marker carries retriable=True → poller retries (job_preempted) instead of job_failed."""
 
 
+class WorkerInterrupted(BaseException):
+    """A host shutdown signal interrupted the worker, rather than user-code failure."""
+
+
+def _interrupt_worker(signum, _frame) -> None:
+    raise WorkerInterrupted(f"worker interrupted by signal {signum}")
+
+
 def _finite_positive_number(value: object, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RuntimeError(f"{label} is invalid")
@@ -783,22 +791,29 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
 
 
 def main() -> int:
-    # SIGTERM → sys.exit so the finally block still uploads the terminal marker.
-    signal.signal(signal.SIGTERM, lambda *a: sys.exit(1))
-    payload = load_payload()
-    state = AttemptState(_code_dir(payload), payload)
-    with state.locked():
-        marker = state.read()
-        if marker is not None:
-            print("bootstrap: replaying the persisted terminal result", flush=True)
-            hf_upload(
-                payload,
-                state.publication_path(marker),
-                f"{_arm(payload)}_attempt{payload['attempt']}.json",
-                enforce_deadline=False,
-            )
-            return 0 if marker["ok"] else 1
-        return _run_attempt(payload)
+    # Modal can deliver SIGINT during termination. Publish an infrastructure failure so
+    # an owned, active run can resume; persisted cancellation and deadline guards still win.
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for sig in previous:
+            signal.signal(sig, _interrupt_worker)
+        payload = load_payload()
+        state = AttemptState(_code_dir(payload), payload)
+        with state.locked():
+            marker = state.read()
+            if marker is not None:
+                print("bootstrap: replaying the persisted terminal result", flush=True)
+                hf_upload(
+                    payload,
+                    state.publication_path(marker),
+                    f"{_arm(payload)}_attempt{payload['attempt']}.json",
+                    enforce_deadline=False,
+                )
+                return 0 if marker["ok"] else 1
+            return _run_attempt(payload)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def _run_attempt(payload: dict) -> int:
@@ -851,8 +866,8 @@ def _run_attempt(payload: dict) -> int:
                 f"error_{phase}_attempt*.txt and console_{phase}.txt in the HF dataset repo"
             )
         ok = True
-    except BaseException as exc:  # incl. SIGTERM's SystemExit / KeyboardInterrupt
-        retriable = isinstance(exc, RetriableBootstrapError)
+    except BaseException as exc:  # shutdown signals must still publish an attempt marker
+        retriable = isinstance(exc, (RetriableBootstrapError, WorkerInterrupted))
         detail = _safe_detail(exc, 1800, secrets=_payload_secrets(payload))
         error = f"run wall deadline exceeded: {detail}" if isinstance(exc, TimeoutError) else detail
         print(f"bootstrap failed: {error}", flush=True)

@@ -976,8 +976,13 @@ def test_run_mode_reaps_uploader_before_base_exception_propagates(monkeypatch, w
 
 @pytest.mark.parametrize(
     "wait_error",
-    [SystemExit(17), KeyboardInterrupt("interrupted"), RuntimeError("wait failed")],
-    ids=["system-exit", "keyboard-interrupt", "unexpected-exception"],
+    [
+        SystemExit(17),
+        KeyboardInterrupt("interrupted"),
+        RuntimeError("wait failed"),
+        b.WorkerInterrupted("worker interrupted by signal 2"),
+    ],
+    ids=["system-exit", "keyboard-interrupt", "unexpected-exception", "host-interruption"],
 )
 def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeypatch, wait_error):
     uploader = _ReapTrackedUploader()
@@ -1039,7 +1044,7 @@ def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeyp
     ok, error, retriable, uploader_alive, uploader_closed = marker_states[0]
     assert ok is False
     assert type(wait_error).__name__ in error
-    assert retriable is False
+    assert retriable is isinstance(wait_error, b.WorkerInterrupted)
     assert uploader_alive is False
     assert uploader_closed is True
 
@@ -2699,3 +2704,19 @@ def test_hf_call_retry_log_redacts_payload_secrets(monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 # main(): the preload branch
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_bootstrap_shutdown_handlers_classify_host_interruption_and_restore(monkeypatch, signum):
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    monkeypatch.setattr(b, "load_payload", lambda: _source_payload())
+
+    def run_attempt(_payload):
+        handler = signal.getsignal(signum)
+        with pytest.raises(b.WorkerInterrupted, match=f"signal {signum}"):
+            handler(signum, None)
+        return 1
+
+    monkeypatch.setattr(b, "_run_attempt", run_attempt)
+    assert b.main() == 1
+    assert {sig: signal.getsignal(sig) for sig in previous} == previous
