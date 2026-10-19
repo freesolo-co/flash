@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
-import inspect
 import io
 import json
 import os
@@ -197,7 +196,7 @@ def test_verl_sft_optimizer_is_dtensor_safe():
 
 
 def test_sft_engine_strategy_stays_fsdp2():
-    """Keep the validated FSDP2 strategy with standard AdamW."""
+    """Optimizer cleanup must preserve the validated FSDP2 execution strategy."""
     assert _as_map(build_sft_overrides(_cfg()))["engine.strategy"] == "fsdp2"
 
 
@@ -2902,7 +2901,7 @@ def test_sft_retries_preserve_the_preparation_digest(monkeypatch):
         "gpu": {"type": "H100", "count": 1},
     }
     spec = spec_from_dict(raw)
-    spec = replace(spec, run_id="legacy-sft", model_revision="a" * 40, model_revision_auto=True)
+    spec = replace(spec, run_id="retry-sft", model_revision="a" * 40, model_revision_auto=True)
     snapshot = _effective_preparation_snapshot(spec, spec, None)
     original_digest = snapshot["preparation_digest"]
     status = RunStatus(
@@ -5199,12 +5198,12 @@ def test_resume_upload_unavailable_reports_the_oversized_member(tmp_path, capsys
     assert "0.0 GB" in out
 
 
-def test_sft_core_keeps_upstream_optimizer_and_installs_linear_scheduler(monkeypatch):
+def test_sft_core_keeps_verl_optimizer_and_installs_linear_scheduler(monkeypatch):
     class FakeEngine:
         def _build_optimizer(self, module):
-            return "upstream-adamw"
+            return module
 
-    optimizer_builder = FakeEngine._build_optimizer
+    original_builder = FakeEngine._build_optimizer
     scheduler_calls = []
     monkeypatch.setitem(
         sys.modules,
@@ -5223,14 +5222,15 @@ def test_sft_core_keeps_upstream_optimizer_and_installs_linear_scheduler(monkeyp
     )
     monkeypatch.setattr(sft_plugin, "_install_exact_dataloaders", lambda: None)
     monkeypatch.setattr(sft_plugin, "_install_seeded_dataloader", lambda seed: None)
-    sft_plugin._install_core({"seed": 42, "save_at_steps": ()})
+    # The core installer does not need the PEFT optimizer module.
+    monkeypatch.setitem(sys.modules, "peft.optimizers", None)
+    sft_plugin._install_core({"seed": 43})
+    assert FakeEngine._build_optimizer is original_builder
     engine = FakeEngine()
     engine.optimizer_config = SimpleNamespace(
-        lr_warmup_steps=-1,
-        lr_warmup_steps_ratio=0.1,
-        total_training_steps=20,
+        lr_warmup_steps=-1, lr_warmup_steps_ratio=0.1, total_training_steps=20
     )
-    assert FakeEngine._build_optimizer is optimizer_builder
-    assert engine._build_optimizer(None) == "upstream-adamw"
-    assert engine._build_lr_scheduler("optimizer") == "linear"
-    assert scheduler_calls == [("optimizer", {"num_warmup_steps": 2, "num_training_steps": 20})]
+    optimizer = object()
+    assert engine._build_optimizer(optimizer) is optimizer
+    assert engine._build_lr_scheduler(optimizer) == "linear"
+    assert scheduler_calls == [(optimizer, {"num_warmup_steps": 2, "num_training_steps": 20})]

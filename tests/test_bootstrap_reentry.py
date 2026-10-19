@@ -61,7 +61,7 @@ while not (root / 'release').exists():
     if time.monotonic() >= deadline:
         raise RuntimeError('test worker timed out')
     time.sleep(0.01)
-Path({str(metrics)!r}).write_text(json.dumps({{'step': 2, 'learning_rate': 0.0001}}))
+Path({str(metrics)!r}).write_text(json.dumps({{'step': 2}}))
 print('NODE DONE', flush=True)
 """
     (package / "engine/support/worker_entrypoint.py").write_text(worker)

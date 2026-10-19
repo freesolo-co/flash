@@ -350,7 +350,7 @@ def _sft_profile_max_length(profile) -> int:
 
 
 # re-exported so the child-render helpers stay reachable as `sft_train.<name>`: the other
-# trainers import `_hydra_val` from here, and the sft tests import the renderers from here.
+# trainers import `_hydra_val` from here, and the sft tests import the renderers.
 # the runner resolves patched seams through this parent module at call time, so these imports must
 # remain attributes of `sft_train` rather than direct imports in the split module.
 from flash.engine.plan.recipe import RECIPE  # noqa: E402,F401
@@ -574,7 +574,7 @@ def run_sft_train(spec=None) -> None:
     child = _prepare_sft_child(
         options, data, model, capabilities, use_remove_padding, gdn_reset_arch
     )
-    child_progress = _prepare_sft_progress(options, data, model, child)
+    child_progress = _prepare_sft_progress(data, model, child)
     progress = child_progress.values
 
     def on_line(line: str) -> None:
@@ -595,7 +595,7 @@ def run_sft_train(spec=None) -> None:
     if child.resume_step < model.update_horizon:
         child.watcher.start()
         # check save completeness only after normal training completion. callback failures occur before
-        # return_code assignment; checking anyway would replace the real training diagnosis
+        # return_code assignment; checking anyway would replace the real zero-grad or runtime-patch diagnosis
         # with a missing-save error. opd_train uses the same guard.
         training_completed = False
         try:

@@ -749,9 +749,7 @@ def _prepare_sft_child(
     )
 
 
-def _prepare_sft_progress(
-    options: _SftOptions, data: _SftData, model: _SftModelSetup, child: _SftChild
-) -> _SftProgress:
+def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, child: _SftChild) -> _SftProgress:
     resume_step = child.resume_step
     progress = {"step": resume_step, "loss": None, "grad_norm": None, "lr": None}
     # consecutive steps seen with grad_norm == 0.0 at a nonzero lr. one step can legitimately be
@@ -822,8 +820,8 @@ def _invoke_sft_child(child: _SftChild, callbacks: _SftProgressCallbacks, on_lin
 def _consume_sft_marker_line(progress: _SftProgress, line: str) -> bool:
     """Fold a child log line's non-metric markers in; answer whether it is an optimizer step.
 
-    False means the caller has nothing further to do with the line. A True answer additionally
-    verifies the required runtime patches before accepting the first optimizer step.
+    False means the caller has nothing further to do with the line. Before the first optimizer
+    step, verify that the required child runtime patches applied.
     """
     link = _sft_train.parse_wandb_link(line)
     if link is not None:
