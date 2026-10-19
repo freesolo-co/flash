@@ -128,10 +128,6 @@ SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     # Dynamo alone; warm-cache boots of the same tiers run 153-473s. Sized to the slowest MEASURED
     # cold boot rather than the warm case, so a scale-out replacement is not cycled mid-boot.
     "B200": 2100,
-    # B300 has no shipped tier. It also wedges intermittently serving above max_num_seqs (sm 10.3;
-    # B200 served 20/20 on the same workload), so it is not a deployment target yet -- the window
-    # stays a placeholder rather than a measurement.
-    "B300": 1800,
 }
 # The tiers this app is allowed to run an engine on. `gpu` in the serving catalog is a plain string,
 # so a typo ("b200", "B2OO") or an unvalidated new card used to fall through `dict.get` to a default
@@ -158,12 +154,10 @@ def scaledown_window_for(gpu: str) -> int:
 # gpu model engines scale to zero. inference and adapter registration remote calls start the matching
 # parameter-bound engine on demand.
 MIN_CONTAINERS = 0
-# No autoscaling cap per base-model engine; modal adds capacity as concurrency demands. A fixed cap
-# here is a hard ceiling on a SINGLE model's capacity: `base_model` is a modal.parameter() and Modal
-# gives each value its own container pool, so sustained load on one model cannot borrow headroom from
-# an idle one. Bound spend with workspace quotas and billing alerts, which do not silently convert
-# demand into queueing on the hot tier.
-MAX_CONTAINERS = None
+# Limit GPU autoscaling to four containers per model, including its active buffer. `base_model` is
+# a modal.parameter(), so each model has its own pool and cannot borrow another model's capacity.
+# Requests queue when all four containers are busy. This applies independently in each environment.
+MAX_CONTAINERS = 4
 # One spare warm container for each autoscaling pool -- every base-model engine AND the cpu router --
 # so a burst past `TARGET_INPUTS` does not pay a full cold boot (420s on L40S, 900s on H100, 1010s on
 # H200) before it can be served. Modal only provisions the buffer while a Function is ACTIVE, so this

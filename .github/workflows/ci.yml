@@ -60,8 +60,7 @@ jobs:
       - name: Function size check
         run: uv run python scripts/check_function_size.py
 
-      # Keep the source hierarchy reviewable: no directory may exceed ten tracked files, and package
-      # roots may mix subdirectories only with the three required marker files.
+      # Package roots may mix subdirectories only with semantic package marker files.
       - name: Source layout check
         run: uv run python scripts/check_source_layout.py
 
