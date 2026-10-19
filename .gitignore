@@ -13,7 +13,7 @@ dist/
 build/*
 # ...the opt-in baked kernel-cache staging dir IS tracked: its .keep placeholder keeps
 # Dockerfile.worker's `COPY build/kernel_cache/` source present. build/kernel_cache/.gitignore then
-# ignores the GPU-produced mega_cache.bin (a large binary, baked into the image, not a deliverable).
+# ignores GPU-produced kernel caches (baked into the image, not source deliverables).
 !build/kernel_cache/
 .ruff_cache/
 .cache/

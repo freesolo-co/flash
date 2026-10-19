@@ -12,8 +12,8 @@ import tempfile
 import time
 
 DEFAULT_CACHE_DIR = "/opt/flash/kernelcache"
-MEGA_CACHE_FILENAME = "mega_cache.bin"
-MEGA_CACHE_META_FILENAME = "mega_cache.json"
+# Keep the metadata filename used by already-published worker images.
+CACHE_META_FILENAME = "mega_cache.json"
 
 # every env var that addresses the baked kernel cache, mapped to its subdirectory of the cache root.
 # Dockerfile.worker sets these image-wide to the same layout; this module re-forces them so a stale
@@ -84,7 +84,7 @@ def warm_flash_attn(torch) -> bool:
     FA2 only. The FA3 (``flash_attn_interface``) warm was removed with the wheel: it was installed
     into this interpreter while training runs in /opt/verl-venv, and nothing ever set
     ``attn_implementation``, so verl's "flash_attention_2" default meant FA3 never ran in a training
-    forward on any arch. Warming a kernel the trainer cannot reach only bloated the mega-cache.
+    forward on any arch. Warming a kernel the trainer cannot reach only added unused warmup work.
     """
     warmed = False
     try:
@@ -178,25 +178,6 @@ def has_raw_kernel_cache(out_dir: str) -> bool:
     )
 
 
-def save_mega_cache(torch, out_dir: str) -> bool:
-    """Persist compiled kernels into a portable blob via ``torch.compiler.save_cache_artifacts()``."""
-    try:
-        artifacts = torch.compiler.save_cache_artifacts()
-        if not artifacts:
-            _log("save_cache_artifacts returned nothing — no compiled kernels to persist")
-            return False
-        blob = artifacts[0] if isinstance(artifacts, tuple) else artifacts
-        os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, MEGA_CACHE_FILENAME)
-        with open(path, "wb") as f:
-            f.write(blob)
-        _log(f"mega-cache saved: {path} ({len(blob)} bytes)")
-        return True
-    except Exception as e:
-        _log(f"save_cache_artifacts failed: {e}")
-        return False
-
-
 def save_cache_metadata(torch, out_dir: str, *, requested_arch: str | None, warmed: int) -> bool:
     try:
         meta = {
@@ -209,7 +190,7 @@ def save_cache_metadata(torch, out_dir: str, *, requested_arch: str | None, warm
             "created_at": int(time.time()),
         }
         os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, MEGA_CACHE_META_FILENAME)
+        path = os.path.join(out_dir, CACHE_META_FILENAME)
         with open(path, "w") as f:
             json.dump(meta, f, sort_keys=True)
         _log(f"cache metadata saved: {path} ({meta['sm']})")
@@ -219,10 +200,9 @@ def save_cache_metadata(torch, out_dir: str, *, requested_arch: str | None, warm
         return False
 
 
-def load_mega_cache() -> bool:
-    """Validate baked kernel caches and load their optional portable blob."""
-    cache_file = os.path.join(DEFAULT_CACHE_DIR, MEGA_CACHE_FILENAME)
-    meta_file = os.path.join(DEFAULT_CACHE_DIR, MEGA_CACHE_META_FILENAME)
+def configure_kernel_cache() -> bool:
+    """Validate baked raw kernels and point backends at their cache directories."""
+    meta_file = os.path.join(DEFAULT_CACHE_DIR, CACHE_META_FILENAME)
 
     def _reject(reason: str) -> bool:
         # Repoint triton/inductor off baked trees so JIT compiles fresh; wrong-arch entries would collide.
@@ -234,13 +214,12 @@ def load_mega_cache() -> bool:
             os.environ[var] = d
         return False
 
-    # an unbaked image may accumulate raw JIT files across runs. without bake metadata or a
-    # portable blob these are runtime caches, not an artifact to reject or inspect through CUDA.
-    if not os.path.isfile(cache_file) and not os.path.isfile(meta_file):
+    # An unbaked image may accumulate runtime JIT files; leave those alone without probing CUDA.
+    if not os.path.isfile(meta_file):
         print("[kernel-cache] no baked metadata -> using runtime JIT caches")
         return False
-    if not os.path.isfile(cache_file) and not has_raw_kernel_cache(DEFAULT_CACHE_DIR):
-        print(f"[kernel-cache] no baked cache at {cache_file} -> first-run JIT (expected default)")
+    if not has_raw_kernel_cache(DEFAULT_CACHE_DIR):
+        print("[kernel-cache] no baked raw kernels -> first-run JIT")
         return False
     try:
         import torch
@@ -249,8 +228,6 @@ def load_mega_cache() -> bool:
         try:
             with open(meta_file) as f:
                 meta = json.load(f)
-        except FileNotFoundError:
-            return _reject("baked cache has no metadata")
         except Exception as e:
             return _reject(f"metadata unreadable ({e})")
         cached_sm = str(meta.get("sm") or "")
@@ -260,23 +237,15 @@ def load_mega_cache() -> bool:
             return _reject(
                 f"baked cache arch {cached_sm or 'unknown'} does not match worker arch {current_sm}"
             )
-        if not os.path.isfile(cache_file):
-            print(f"[kernel-cache] using baked raw kernel caches for {cached_sm}")
-            return True
-        with open(cache_file, "rb") as f:
-            blob = f.read()
-        torch.compiler.load_cache_artifacts(blob)
-        print(
-            f"[kernel-cache] loaded baked mega-cache for {cached_sm or 'unknown'} "
-            f"({len(blob)} bytes) -> skipping first-run JIT"
-        )
+        _point_backends_at(DEFAULT_CACHE_DIR)
+        print(f"[kernel-cache] using baked raw kernel caches for {cached_sm}")
         return True
     except Exception as e:
-        return _reject(f"load skipped ({e})")
+        return _reject(f"cache setup failed ({e})")
 
 
 def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
-    """Warm real training kernels and persist raw caches plus an optional portable blob."""
+    """Warm real training kernels and persist raw caches plus architecture metadata."""
     t0 = time.time()
     _point_backends_at(out_dir)
     if arch:
@@ -303,11 +272,11 @@ def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
             warm_fla_gdn(torch),
         ]
     )
-    _log(f"{warmed}/2 kernel groups compiled in {time.time() - t0:.1f}s; saving mega-cache")
-    saved = save_mega_cache(torch, out_dir)
+    _log(f"{warmed}/2 kernel groups warmed in {time.time() - t0:.1f}s")
+    has_kernels = has_raw_kernel_cache(out_dir)
     meta_saved = save_cache_metadata(torch, out_dir, requested_arch=arch, warmed=warmed)
-    _log(f"done in {time.time() - t0:.1f}s (saved={saved})")
-    return 0 if warmed and meta_saved and (saved or has_raw_kernel_cache(out_dir)) else 1
+    _log(f"done in {time.time() - t0:.1f}s (raw_kernels={has_kernels}, metadata={meta_saved})")
+    return 0 if warmed and meta_saved and has_kernels else 1
 
 
 def main() -> int:

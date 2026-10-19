@@ -371,11 +371,10 @@ def _status_present(api, repo: str, retries: int = 1) -> bool:
 
 def _verify(out: str, sm: str) -> int:
     """Confirm the artifact actually landed and its metadata matches the requested arch."""
-    blob = os.path.join(out, "mega_cache.bin")
-    meta = os.path.join(out, "mega_cache.json")
-    from flash.engine.worker.runtime.kernel_warmup import has_raw_kernel_cache
+    from flash.engine.worker.runtime.kernel_warmup import CACHE_META_FILENAME, has_raw_kernel_cache
 
-    if not os.path.isfile(blob) and not has_raw_kernel_cache(out):
+    meta = os.path.join(out, CACHE_META_FILENAME)
+    if not has_raw_kernel_cache(out):
         log(f"FAIL: no compiled kernel artifacts in {out}; what the warmup actually produced:")
         for root, _, files in os.walk(out):
             for f in sorted(files):

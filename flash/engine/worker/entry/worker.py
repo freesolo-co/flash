@@ -154,7 +154,7 @@ def _run_worker_mode() -> None:
     # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).
     worker_perf._restrict_fla_gdn_autotune_on_blackwell()
     heartbeat_io.heartbeat("boot", gpu=worker_perf.gpu_diagnostics())
-    kernel_warmup.load_mega_cache()
+    kernel_warmup.configure_kernel_cache()
     try:
         handler()
     finally:

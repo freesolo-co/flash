@@ -4,7 +4,7 @@ The published worker image ships DEPS only — the flash code (incl. kernel_warm
 HF at runtime, exactly like a real worker. So this entry:
   1. snapshot_downloads the flash package (code/**) the CI helper uploaded to a temp HF dataset,
   2. runs flash.engine.worker.runtime.kernel_warmup --arch <arch> --out /out on the live GPU,
-  3. uploads the produced /out (mega_cache.bin + .json + triton/inductor trees) back under out/,
+  3. uploads the produced /out (architecture metadata + triton/inductor trees) back under out/,
   4. writes an out/STATUS marker LAST so the helper knows the run finished (and its rc).
 
 It is invoked by the CI helper via the pod's docker_args (base64-decoded to /tmp, then run). Env:
@@ -70,13 +70,13 @@ def main() -> int:
         cmd += ["--arch", arch]
     print(f"[bake] running: {' '.join(cmd)}", flush=True)
     # capture the warmup output into /out so it ships back with the cache -- lets the CI helper show
-    # WHICH warm steps compiled and what save_cache_artifacts returned when no mega_cache.bin lands.
+    # which warm steps ran and why a bake failed to produce compiled kernel files.
     os.makedirs("/out", exist_ok=True)
     with open("/out/warmup.log", "wb") as lf:
         rc = subprocess.call(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT)
     print(f"[bake] kernel_warmup rc={rc}", flush=True)
 
-    # ship the whole cache tree back (mega blob + metadata + raw triton/inductor dirs).
+    # ship the whole cache tree back (metadata + raw triton/inductor dirs).
     if os.path.isdir("/out"):
         try:
             api.upload_folder(

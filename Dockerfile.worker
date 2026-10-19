@@ -21,9 +21,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 # Compiled-kernel cache dirs (Triton JIT + TorchInductor). Point both backends at a stable on-image
-# location so a BAKED mega-cache (below, opt-in) lands where the runtime looks, and so a first-run
+# location so a BAKED kernel cache (below, opt-in) lands where the runtime looks, and so a first-run
 # JIT on a cold worker writes here too. These ENVs are always set (cheap); whether the dir is
-# pre-populated is what the opt-in bake controls. engine.worker._load_kernel_cache_if_present reads
+# pre-populated is what the opt-in bake controls. kernel_warmup.configure_kernel_cache checks
 # /opt/flash/kernelcache at boot.
 # FLASHINFER_CUBIN_DIR / FLASHINFER_CACHE_DIR / FLASHINFER_WORKSPACE_BASE: FlashInfer's attention-backend
 # cubins (the Blackwell sm120 / B200 rollout attention backend) are NOT bundled in the wheel — flashinfer
@@ -194,10 +194,9 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
 # first-use JIT as a per-run RUNTIME cost on a cold worker.
 #
 # OPT-IN PATH: build on a real GPU runner with --build-arg BUILD_KERNEL_CACHE=true after running
-# flash/engine/worker/runtime/kernel_warmup.py there to produce a portable mega-cache under build/kernel_cache/
-# (torch.compiler.save_cache_artifacts). The conditional COPY below then bakes it into
-# /opt/flash/kernelcache, and engine.worker._load_kernel_cache_if_present loads it at boot
-# (torch.compiler.load_cache_artifacts) — measured cold compile ~124s -> warm load ~0.2s (537x).
+# flash/engine/worker/runtime/kernel_warmup.py there to produce raw kernel caches and architecture
+# metadata under build/kernel_cache/. The COPY below bakes them into /opt/flash/kernelcache;
+# kernel_warmup.configure_kernel_cache validates the architecture and configures cache paths at boot.
 #
 # FALLBACK (the DEFAULT, BUILD_KERNEL_CACHE=false): NOTHING is baked and the build needs no GPU. The
 # first-run JIT happens on the worker exactly as before; flash #163's init heartbeat keeps the stall
@@ -206,7 +205,7 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
 # The COPY is made safe-when-absent with the standard "COPY a path that always exists + a guard"
 # trick. `build/kernel_cache/` is checked into the repo with just a `.keep` placeholder, so the COPY
 # source ALWAYS exists (a bare glob that matches nothing is a hard BuildKit error — this avoids it).
-# kernel_warmup.py drops arch metadata + triton/inductor trees (and an optional mega-cache) next
+# kernel_warmup.py drops arch metadata + triton/inductor trees next
 # to that placeholder on a GPU builder. COPY STRAIGHT to the final /opt/flash/kernelcache so a
 # multi-GB baked cache lives in exactly ONE layer -- staging in /tmp then cp/mv would leave the
 # bytes in BOTH the COPY layer and the RUN layer (doubling image size). with the default the dir
