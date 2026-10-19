@@ -8989,25 +8989,34 @@ def test_opd_child_records_the_core_marker_only_when_a_save_schedule_was_authore
         "install_deferred_lora_rollout_guard",
         lambda marker: armed.append("lora-rollout-guard"),
     )
-    monkeypatch.setattr(
-        opd_child.runtime,
-        "install_checkpoint_handler_filter",
-        lambda steps, total: armed.append(("checkpoint", tuple(steps), total)),
-    )
+    saved = []
 
-    opd_child.install(
-        {
-            "marker_file": str(marker_file),
-            "save_at_steps": list(save_at_steps),
-            "total_steps": 10,
-            "wandb": False,
-        }
-    )
+    class SyncPPOTrainer:
+        global_steps = 0
 
+        def _save_checkpoint(self):
+            saved.append(self.global_steps)
+            return self.global_steps
+
+    config = {
+        "marker_file": str(marker_file),
+        "save_at_steps": list(save_at_steps),
+        "total_steps": 10,
+        "wandb": False,
+    }
+    opd_child.install(config)
+    # The marker must attest the actual PPO save path, after the trainer import.
+    assert not marker_file.exists()
+    opd_child.install_checkpoint_schedule(SyncPPOTrainer, config)
+    opd_child.install_checkpoint_schedule(SyncPPOTrainer, config)
+    trainer = SyncPPOTrainer()
+    for step in range(1, 11):
+        trainer.global_steps = step
+        trainer._save_checkpoint()
+
+    assert saved == ([3, 10] if save_at_steps else list(range(1, 11)))
     recorded = marker_file.read_text().splitlines() if marker_file.exists() else []
     assert ("opd-core" in recorded) is expects_core
-    assert (("checkpoint", save_at_steps, 10) in armed) is expects_core
-    # the rollout guard is required regardless of the checkpoint schedule.
     assert "lora-rollout-guard" in armed
 
 
