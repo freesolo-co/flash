@@ -11,7 +11,9 @@ class ServingSmokeSuite:
     def cases(self):
         return [
             EvalCase(id="addition", input="What is 2+2? Reply with a single number.", expected="4"),
-            EvalCase(id="subtraction", input="What is 9-2? Reply with a single number.", expected="7"),
+            EvalCase(
+                id="subtraction", input="What is 9-2? Reply with a single number.", expected="7"
+            ),
         ]
 
     def score(self, case, response):
