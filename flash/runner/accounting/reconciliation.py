@@ -413,7 +413,7 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     if not records:
         return attempted
     from flash.providers.core.base import JobHandle
-    from flash.runner.supervise.lifecycle import _strict_teardown_handle
+    from flash.runner.supervise.recovery import _strict_teardown_handle
 
     for record in records:
         # a record that fails strict canonicalization still names a billable resource; the base

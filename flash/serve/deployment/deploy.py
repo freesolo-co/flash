@@ -117,28 +117,12 @@ def deployment_record(
     )
 
 
-def _call_before_ready(
-    callback: Callable[..., None],
-    revision: str,
-    checkpoint: str,
-    advertised: frozenset[str],
-    *,
-    adapter_targets_images: bool,
-) -> None:
-    """Invoke the pre-activation callback with the deployment facts it declares."""
-    import inspect
-
-    try:
-        parameters = inspect.signature(callback).parameters
-    except (TypeError, ValueError):  # builtins and C callables are not introspectable
-        parameters = {}
-    accepts_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
-    kwargs = {}
-    if accepts_kwargs or "advertised_capabilities" in parameters:
-        kwargs["advertised_capabilities"] = advertised
-    if accepts_kwargs or "adapter_targets_images" in parameters:
-        kwargs["adapter_targets_images"] = adapter_targets_images
-    callback(revision, checkpoint, **kwargs)
+@dataclass(frozen=True)
+class DeploymentReadinessFacts:
+    checkpoint_id: str
+    expected_checkpoint: str
+    advertised_capabilities: frozenset[str]
+    adapter_targets_images: bool
 
 
 def deploy_adapter(
@@ -153,10 +137,8 @@ def deploy_adapter(
     structured_outputs: str = "",
     org_id: str | None = None,
     checkpoint_step: int | None = None,
-    # called with the immutable target plus keyword-only deployment facts already read here. handing
-    # them down avoids re-fetching either health or adapter metadata from inside the paid smoke path.
-    # keywords preserve two-argument callbacks that do not need those facts.
-    before_ready: Callable[..., None] | None = None,
+    # Pass the immutable target and facts already fetched for this deployment to smoke testing.
+    before_ready: Callable[[DeploymentReadinessFacts], None] | None = None,
 ) -> Deployment:
     """register, load, and verify one permanent checkpoint identity.
 
@@ -264,12 +246,13 @@ def deploy_adapter(
         budget_s=readiness.revision_ready_budget_seconds(model),
     )
     if before_ready is not None:
-        _call_before_ready(
-            before_ready,
-            checkpoint_id,
-            checkpoint_id,
-            frozenset(advertised),
-            adapter_targets_images=artifact_metadata.targets_images,
+        before_ready(
+            DeploymentReadinessFacts(
+                checkpoint_id=checkpoint_id,
+                expected_checkpoint=checkpoint_id,
+                advertised_capabilities=frozenset(advertised),
+                adapter_targets_images=artifact_metadata.targets_images,
+            )
         )
     dep.state = "ready"
     dep.openai_model = checkpoint_id

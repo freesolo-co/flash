@@ -2,27 +2,12 @@
 
 from __future__ import annotations
 
-import inspect
 import math
 import time
 
 # Minimum a provider create needs left on the run deadline. Best-effort work that runs before a
 # create must yield this much, or it becomes the reason the create is rejected.
 CREATE_ALLOWANCE_S = 60.0
-
-
-def deadline_kwargs(call, deadline_at: float | None) -> dict[str, float | None]:
-    """Return a deadline keyword only when the callable accepts it."""
-    try:
-        parameters = inspect.signature(call).parameters.values()
-    except (TypeError, ValueError):
-        return {"deadline_at": deadline_at}
-    if any(
-        parameter.name == "deadline_at" or parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters
-    ):
-        return {"deadline_at": deadline_at}
-    return {}
 
 
 def require_finite_positive(value: object, invalid_message: str) -> float:

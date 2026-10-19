@@ -29,6 +29,7 @@ import flash.engine.worker.train.rl.launch.checkpoints as rl_checkpoints
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 import flash.runner.supervise.lifecycle as runner_lifecycle
+import flash.runner.supervise.recovery as attempt_recovery
 from flash.core.spec import JobSpec
 from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 from tests._helpers.source_snapshot import valid_source_snapshot
@@ -1226,8 +1227,6 @@ def test_await_runpod_completed_metrics_bounds_pending_poll_to_grace(monkeypatch
     # to ~the grace window measured from first observation, not the run deadline that callers pass in.
     import time as _time
 
-    import flash.runner.supervise.lifecycle as lifecycle
-
     fake_clock = {"now": 1_000.0}
     monkeypatch.setattr(_time, "time", lambda: fake_clock["now"])
     monkeypatch.setattr(
@@ -1240,23 +1239,25 @@ def test_await_runpod_completed_metrics_bounds_pending_poll_to_grace(monkeypatch
         probes["n"] += 1
         if (
             deadline_at is not None
-            and _time.time() >= deadline_at + lifecycle._RECOVERY_MARKER_GRACE_S
+            and _time.time() >= deadline_at + attempt_recovery._RECOVERY_MARKER_GRACE_S
         ):
             return  # grace expired: signal "no metrics" like _runpod_completed_metrics
-        raise lifecycle._CompletedAttemptPending("output metrics not readable yet")
+        raise attempt_recovery._CompletedAttemptPending("output metrics not readable yet")
 
-    monkeypatch.setattr(lifecycle, "_runpod_completed_metrics", always_pending)
+    monkeypatch.setattr(attempt_recovery, "_runpod_completed_metrics", always_pending)
     far_deadline = fake_clock["now"] + 24 * 3600.0
 
-    result = lifecycle._await_runpod_completed_metrics(object(), far_deadline)
+    result = attempt_recovery._await_runpod_completed_metrics(object(), far_deadline)
 
     assert result is None
     # bounded to ~grace/poll-interval probes and ~grace of elapsed time, not the 24h deadline.
-    max_probes = lifecycle._RECOVERY_MARKER_GRACE_S / lifecycle._RECOVERY_METRICS_POLL_S + 2
+    max_probes = (
+        attempt_recovery._RECOVERY_MARKER_GRACE_S / attempt_recovery._RECOVERY_METRICS_POLL_S + 2
+    )
     assert probes["n"] <= max_probes
     assert (
         fake_clock["now"] - 1_000.0
-        <= lifecycle._RECOVERY_MARKER_GRACE_S + lifecycle._RECOVERY_METRICS_POLL_S
+        <= attempt_recovery._RECOVERY_MARKER_GRACE_S + attempt_recovery._RECOVERY_METRICS_POLL_S
     )
 
 
@@ -1265,10 +1266,10 @@ def test_await_runpod_completed_metrics_checks_cancellation_before_sleep(monkeyp
     from flash.runner.supervise.errors import _RunCancelled
 
     monkeypatch.setattr(
-        lifecycle,
+        attempt_recovery,
         "_runpod_completed_metrics",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            lifecycle._CompletedAttemptPending("output metrics not readable yet")
+            attempt_recovery._CompletedAttemptPending("output metrics not readable yet")
         ),
     )
     monkeypatch.setattr(
@@ -1283,7 +1284,7 @@ def test_await_runpod_completed_metrics_checks_cancellation_before_sleep(monkeyp
         raise _RunCancelled("run was cancelled")
 
     with pytest.raises(_RunCancelled, match="was cancelled"):
-        lifecycle._await_runpod_completed_metrics(
+        attempt_recovery._await_runpod_completed_metrics(
             object(),
             lifecycle.time.time() + 1_000.0,
             check_cancelled=check_cancelled,

@@ -1,17 +1,17 @@
 """Shared FastAPI request dependencies and spec/secret parsing for the route modules.
 
 Only import lazily from ``create_app()`` — never at ``flash.server.asgi.app`` import time.
-``owned_run`` resolves ``get_status`` via the module so test patches on ``app.get_status`` are honored.
+``owned_run`` reads persisted run status through the lifecycle service.
 """
 
 from __future__ import annotations
 
 from fastapi import Header, HTTPException
 
+import flash.runner.lifecycle.status as run_status
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.core.spec import JobSpec, require_project_id
 from flash.schema import ConfigError, spec_from_dict
-from flash.server.asgi import app as _app
 from flash.server.platform import auth, db
 
 _RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
@@ -29,9 +29,9 @@ def require_key(authorization: str | None = Header(default=None)) -> dict:
 
 
 def _load_status(run_id: str):
-    """Resolve `run_id` to its status via the module (so `app.get_status` patches are honored)."""
+    """Read persisted status and translate a missing run into an HTTP 404."""
     try:
-        return _app.get_status(run_id)
+        return run_status.get_status(run_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

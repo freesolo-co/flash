@@ -1186,7 +1186,7 @@ def test_teardown_lambda_filesystems_deletes_only_fleet(monkeypatch):
         {"id": "f3", "name": "someones-data", "region": {"name": "us-east-1"}},  # NOT ours
     ]
     deleted = []
-    monkeypatch.setattr(lambda_api, "list_filesystems", lambda: fses)
+    monkeypatch.setattr(lambda_api, "list_filesystems", lambda *, deadline_at=None: fses)
     monkeypatch.setattr(lambda_api, "delete_filesystem", lambda i: deleted.append(i) or True)
 
     out = preload.teardown_lambda_filesystems()
@@ -1201,7 +1201,9 @@ def test_teardown_lambda_filesystems_no_key_is_noop(monkeypatch):
     monkeypatch.setattr(
         lambda_api,
         "list_filesystems",
-        lambda: (_ for _ in ()).throw(lambda_api.LambdaApiError("LAMBDA_API_KEY not set")),
+        lambda *, deadline_at=None: (_ for _ in ()).throw(
+            lambda_api.LambdaApiError("LAMBDA_API_KEY not set")
+        ),
     )
     assert (
         preload.teardown_lambda_filesystems() == []
@@ -1862,8 +1864,10 @@ def test_lambda_launch_threads_preload_mode_into_payload(monkeypatch):
         "ensure_filesystem",
         lambda n, r, deadline_at=None: f"/lambda/nfs/{n}",
     )
-    monkeypatch.setattr(lambda_api, "resolve_ssh_key_names", lambda: ["k"], raising=False)
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["k"])
+    monkeypatch.setattr(
+        lambda_api, "resolve_ssh_key_names", lambda *, deadline_at=None: ["k"], raising=False
+    )
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["k"])
     monkeypatch.setattr(
         lambda_api,
         "launch_instance",
@@ -1915,8 +1919,10 @@ def test_lambda_warm_caller_uses_source_independent_preload_payload(monkeypatch)
         "ensure_filesystem",
         lambda name, region, deadline_at=None: f"/lambda/nfs/{name}",
     )
-    monkeypatch.setattr(lambda_api, "resolve_ssh_key_names", lambda: ["key"], raising=False)
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["key"])
+    monkeypatch.setattr(
+        lambda_api, "resolve_ssh_key_names", lambda *, deadline_at=None: ["key"], raising=False
+    )
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["key"])
     monkeypatch.setattr(
         lambda_api,
         "launch_instance",
@@ -1957,8 +1963,8 @@ def _wire_warm(monkeypatch, marker):
     monkeypatch.setattr(
         preload,
         "make_hf_text_reader",
-        lambda repo, path, min_interval_s=45.0: (
-            lambda force=False: _json.dumps(marker) if marker else None
+        lambda repo, path, min_interval_s=45.0, *, deadline_at=None: (
+            lambda force=False, *, deadline_at=None: _json.dumps(marker) if marker else None
         ),
     )
 
@@ -1977,7 +1983,11 @@ def test_warm_instances_one_launch_per_region_and_terminates(monkeypatch):
     monkeypatch.setattr(
         lj,
         "usable_instances",
-        lambda gpu: [_cand("us-east-1"), _cand("us-east-1"), _cand("us-west-2")],
+        lambda gpu, *, deadline_at=None: [
+            _cand("us-east-1"),
+            _cand("us-east-1"),
+            _cand("us-west-2"),
+        ],
     )
 
     res = preload.warm_instances(models=["a/b"], timeout_s=5, poll_interval_s=0.0)
@@ -1992,7 +2002,9 @@ def test_warm_instance_partial_when_a_model_failed(monkeypatch):
     preload, lj, _launched, terminated = _wire_warm(
         monkeypatch, {"preloaded": ["a/b"], "already_cached": [], "failed": {"c/d": "gated"}}
     )
-    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
+    monkeypatch.setattr(
+        lj, "usable_instances", lambda gpu, *, deadline_at=None: [_cand("us-east-1")]
+    )
     res = preload.warm_instances(models=["a/b", "c/d"], timeout_s=5, poll_interval_s=0.0)
     assert [r["status"] for r in res] == ["partial"]
     assert len(terminated) == 1
@@ -2002,7 +2014,9 @@ def test_warm_instance_times_out_when_no_marker(monkeypatch):
     import types as _types
 
     preload, lj, _launched, terminated = _wire_warm(monkeypatch, None)  # marker never appears
-    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
+    monkeypatch.setattr(
+        lj, "usable_instances", lambda gpu, *, deadline_at=None: [_cand("us-east-1")]
+    )
     # Fake clock: jump straight past the deadline so the poll loop exits at once (no real 60s wait,
     # which the effective-budget floor of 60 would otherwise impose). sleep is a no-op.
     clock = {"t": 0.0}
@@ -2024,7 +2038,9 @@ def test_warm_poll_budget_matches_worker_wall_cap_below_floor(monkeypatch):
     import types as _types
 
     preload, lj, _launched, terminated = _wire_warm(monkeypatch, None)
-    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
+    monkeypatch.setattr(
+        lj, "usable_instances", lambda gpu, *, deadline_at=None: [_cand("us-east-1")]
+    )
 
     # Capture the wall cap the spec was built with.
     wall_caps = []
@@ -2059,8 +2075,14 @@ def test_warm_instance_terminates_on_launch_failure(monkeypatch):
 
     terminated = []
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
-    monkeypatch.setattr(preload, "make_hf_text_reader", lambda *a, **k: lambda force=False: None)
-    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
+    monkeypatch.setattr(
+        preload,
+        "make_hf_text_reader",
+        lambda *a, **k: lambda force=False, *, deadline_at=None: None,
+    )
+    monkeypatch.setattr(
+        lj, "usable_instances", lambda gpu, *, deadline_at=None: [_cand("us-east-1")]
+    )
     monkeypatch.setattr(
         lj, "launch_and_submit", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no capacity"))
     )
@@ -2084,13 +2106,17 @@ def test_warm_instance_stops_early_on_failure_marker(monkeypatch):
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
 
     # Two distinct readers by path: the completion file never appears; the attempt-failure marker does.
-    def reader_factory(repo, path, min_interval_s=45.0):
+    def reader_factory(repo, path, min_interval_s=45.0, *, deadline_at=None):
         if path.endswith("preload_result.json"):
-            return lambda force=False: None
-        return lambda force=False: '{"ok": false, "error": "image pull failed"}'
+            return lambda force=False, *, deadline_at=None: None
+        return lambda force=False, *, deadline_at=None: (
+            '{"ok": false, "error": "image pull failed"}'
+        )
 
     monkeypatch.setattr(preload, "make_hf_text_reader", reader_factory)
-    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [_cand("us-east-1")])
+    monkeypatch.setattr(
+        lj, "usable_instances", lambda gpu, *, deadline_at=None: [_cand("us-east-1")]
+    )
     monkeypatch.setattr(lj, "launch_and_submit", lambda *a, **k: None)
     monkeypatch.setattr(lj, "terminate_run_instances", lambda rid: terminated.append(rid))
     # Clock that ticks 1 virtual second per sleep — if the early-out works, the poll exits on the FIRST
@@ -2116,7 +2142,7 @@ def test_warm_instances_no_capacity_returns_empty(monkeypatch):
     from flash.providers.lambda_ import jobs as lj
 
     monkeypatch.setattr(preload, "_ensure_status_repo", lambda token: None)
-    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [])
+    monkeypatch.setattr(lj, "usable_instances", lambda gpu, *, deadline_at=None: [])
     assert preload.warm_instances(models=["a/b"]) == []
 
 
@@ -2131,7 +2157,7 @@ def test_warm_instances_uses_managed_lambda_gpu_ladder(monkeypatch):
     importlib.reload(preload)
     asked = []
 
-    def capture_gpu(gpu):
+    def capture_gpu(gpu, *, deadline_at=None):
         asked.append(gpu)
         return []
 
@@ -2161,7 +2187,7 @@ def _stocked(**by_class):
 
     Carries ``price_usd_hr`` like the real call does, since selection ranks on the live price.
     """
-    return lambda gpu: [
+    return lambda gpu, *, deadline_at=None: [
         types.SimpleNamespace(region=r, gpu=gpu, price_usd_hr=_LADDER_PRICE.get(gpu))
         for r in by_class.get(gpu.replace(" ", "_"), [])
     ]
@@ -2208,7 +2234,7 @@ def test_lambda_ladder_skips_a_class_whose_capacity_lookup_fails(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
     from flash.providers.lambda_ import jobs as lj
 
-    def flaky(gpu):
+    def flaky(gpu, *, deadline_at=None):
         if gpu == "A10":
             raise RuntimeError("instance-types API down")
         return [types.SimpleNamespace(region="asia-south-1", gpu=gpu)] if gpu == "H100" else []
@@ -2228,7 +2254,7 @@ def test_lambda_explicit_gpu_pins_the_class_and_skips_the_ladder(monkeypatch):
 
     asked = []
 
-    def capture(gpu):
+    def capture(gpu, *, deadline_at=None):
         asked.append(gpu)
         return [types.SimpleNamespace(region="us-east-1", gpu=gpu)]
 
@@ -2741,7 +2767,7 @@ def test_warm_ranks_contested_regions_by_live_price_not_ladder_order(monkeypatch
     from flash.providers.artifacts import weight_cache as preload
     from flash.providers.lambda_ import jobs as lj
 
-    def discounted(gpu):
+    def discounted(gpu, *, deadline_at=None):
         # H100 discounted below A10 -- the ladder tuple still lists A10 first.
         price = {"A10": 1.29, "H100": 0.49}.get(gpu)
         if price is None:
@@ -2760,7 +2786,7 @@ def test_warm_ties_and_missing_prices_keep_ladder_order(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
     from flash.providers.lambda_ import jobs as lj
 
-    def priceless(gpu):
+    def priceless(gpu, *, deadline_at=None):
         return [types.SimpleNamespace(region="us-east-1", gpu=gpu, price_usd_hr=None)]
 
     monkeypatch.setattr(lj, "usable_instances", priceless)
@@ -2805,7 +2831,7 @@ def test_warm_instances_explicit_gpu_overrides_default(monkeypatch):
     seen = {}
 
     def _rec(provider):
-        def _u(gpu):
+        def _u(gpu, *, deadline_at=None):
             seen[provider] = gpu
             return []
 
@@ -2842,11 +2868,13 @@ def test_preload_status_repo_is_managed_across_all_paths(monkeypatch):
         def create_repo(self, repo, **kwargs):
             created.append((repo, self.token, kwargs))
 
-    def reader_factory(repo, path, min_interval_s=45.0):
+    def reader_factory(repo, path, min_interval_s=45.0, *, deadline_at=None):
         readers.append((repo, path))
         if path.endswith("preload_result.json"):
-            return lambda force=False: json.dumps({"preloaded": ["a/b"], "failed": {}})
-        return lambda force=False: None
+            return lambda force=False, *, deadline_at=None: json.dumps(
+                {"preloaded": ["a/b"], "failed": {}}
+            )
+        return lambda force=False, *, deadline_at=None: None
 
     def capture_launch(spec, *args, **kwargs):
         submitted.append(spec)
@@ -2919,7 +2947,9 @@ def test_warm_instances_requires_status_repo_before_launch(monkeypatch):
 
     # lambda has capacity -> a real launch target exists.
     monkeypatch.setattr(
-        lj, "usable_instances", lambda gpu: [types.SimpleNamespace(region="us-east-1")]
+        lj,
+        "usable_instances",
+        lambda gpu, *, deadline_at=None: [types.SimpleNamespace(region="us-east-1")],
     )
     monkeypatch.setattr(
         lj,
@@ -2988,7 +3018,7 @@ def test_warm_instances_no_targets_is_noop_without_status_repo(monkeypatch):
     from flash.providers.artifacts import weight_cache as preload
     from flash.providers.lambda_ import jobs as lj
 
-    monkeypatch.setattr(lj, "usable_instances", lambda gpu: [])
+    monkeypatch.setattr(lj, "usable_instances", lambda gpu, *, deadline_at=None: [])
     monkeypatch.setattr(
         preload,
         "_ensure_status_repo",

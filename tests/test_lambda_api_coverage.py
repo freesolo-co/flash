@@ -446,7 +446,7 @@ def test_terminate_instance_confirmed_requires_acceptance_and_disappearance(monk
     from flash.providers.lambda_.client import api as lambda_api
 
     monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: list(ids))
-    monkeypatch.setattr(lambda_api, "get_instance", lambda iid, *, strict: None)
+    monkeypatch.setattr(lambda_api, "get_instance", lambda iid, *, strict, deadline_at=None: None)
     lambda_api.terminate_instance_confirmed("i-1")
 
     monkeypatch.setattr(lambda_api, "terminate_instances", lambda ids: [])
@@ -457,7 +457,7 @@ def test_terminate_instance_confirmed_requires_acceptance_and_disappearance(monk
     monkeypatch.setattr(
         lambda_api,
         "get_instance",
-        lambda iid, *, strict: {"id": iid, "status": "terminating"},
+        lambda iid, *, strict, deadline_at=None: {"id": iid, "status": "terminating"},
     )
     with pytest.raises(lambda_api.LambdaApiError, match="remains"):
         lambda_api.terminate_instance_confirmed("i-1")

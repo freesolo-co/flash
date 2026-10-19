@@ -16,7 +16,6 @@ import time
 from flash._internal.logging import get_logger
 from flash.providers._lifecycle.net.deadline import (
     CREATE_ALLOWANCE_S,
-    deadline_kwargs,
     remaining_seconds,
 )
 from flash.providers.runpod.client import api as runpod_api
@@ -181,9 +180,7 @@ def _sweep_idle_flash_endpoints(
     """
     deleted = 0
     try:
-        by_fp, failed_fps = runpod_api.list_endpoints_by_key(
-            **deadline_kwargs(runpod_api.list_endpoints_by_key, deadline_at)
-        )
+        by_fp, failed_fps = runpod_api.list_endpoints_by_key(deadline_at=deadline_at)
     except Exception:
         logger.warning(
             "idle-sweep: could not list any RunPod pool account; skipping sweep", exc_info=True
@@ -223,9 +220,7 @@ def _sweep_idle_flash_endpoints(
                         runpod_api.endpoint_health_for_fingerprint(
                             eid,
                             fp,
-                            **deadline_kwargs(
-                                runpod_api.endpoint_health_for_fingerprint, deadline_at
-                            ),
+                            deadline_at=deadline_at,
                         )
                         or {}
                     )

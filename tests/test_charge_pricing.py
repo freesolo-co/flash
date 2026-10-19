@@ -544,7 +544,7 @@ def test_cancel_run_prices_the_rented_basis_after_teardown_clears_the_handle(mon
     durable record of the rented substrate and card shape -- so cancel must capture it while it
     still holds the handle, or the charge silently reprices on the offline auto topology."""
     from flash.cost.types import RunConfig
-    from flash.runner.supervise import deploy, lifecycle
+    from flash.runner.supervise import deploy
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
@@ -556,7 +556,7 @@ def test_cancel_run_prices_the_rented_basis_after_teardown_clears_the_handle(mon
         torn_down.append(handle.provider)
         return True
 
-    monkeypatch.setattr(lifecycle, "_strict_teardown_handle", teardown)
+    monkeypatch.setattr(runner_recovery, "_strict_teardown_handle", teardown)
     spec = _spec()
     runner_state._save_status(
         runner_state.RunStatus(

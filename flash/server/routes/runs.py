@@ -10,6 +10,9 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
+import flash.runner.lifecycle.submit as run_submission
+import flash.runner.results.checkpoints as checkpoint_service
+import flash.server.platform.runtime as server_runtime
 from flash.engine.profiling.image_tokens import ImageGeometryUnavailable
 from flash.runner.lifecycle import status as runner_status
 from flash.runner.lifecycle.preparation import WarmStartPreparationError
@@ -22,7 +25,6 @@ from flash.runner.supervise.deploy import (
 )
 from flash.schema import train_schema_metadata
 from flash.serve.deployment.preflight import ServingPreflightError
-from flash.server.asgi import app as _app
 from flash.server.domain.teacher.broker import TeacherBrokerConfigurationError
 from flash.server.platform import db
 from flash.server.platform.deps import (
@@ -386,7 +388,7 @@ def create_run(
     submission_started = False
     try:
         try:
-            prepared = _app.prepare_job(
+            prepared = run_submission.prepare_job(
                 spec,
                 billing_context=billing_context,
                 platform_context=platform_context or None,
@@ -438,7 +440,7 @@ def create_run(
             submit_kwargs["billing_context"] = billing_context
         if platform_context:
             submit_kwargs["platform_context"] = platform_context
-        status = _app.submit_job(prepared.public_spec, **submit_kwargs)
+        status = run_submission.submit_job(prepared.public_spec, **submit_kwargs)
     except Exception as exc:
         if submission_started:
             _dispose_failed_submission(
@@ -471,7 +473,7 @@ def list_runs(key: Annotated[dict, Depends(require_key)]):
     out = []
     for row in db.runs_for_key(key["id"]):
         try:
-            out.append(_app.get_status(row["run_id"]).to_dict())
+            out.append(runner_status.get_status(row["run_id"]).to_dict())
         except FileNotFoundError:
             continue
     return {"runs": out}
@@ -532,7 +534,7 @@ def run_worker_output(
 
     return {
         "run_id": run_id,
-        "worker": _app._worker_artifacts(_internal_spec_from_status(status)),
+        "worker": server_runtime._worker_artifacts(_internal_spec_from_status(status)),
     }
 
 
@@ -573,7 +575,7 @@ def run_checkpoints(run_id: str, key: Annotated[dict, Depends(require_key)]):
     from flash.runner.lifecycle.state import _internal_spec_from_status
 
     spec = _internal_spec_from_status(status)
-    checkpoints = _app.list_checkpoints(spec)
+    checkpoints = checkpoint_service.list_checkpoints(spec)
     with contextlib.suppress(Exception):
         from flash.server.domain.registry.checkpoints import register_checkpoints_best_effort
 

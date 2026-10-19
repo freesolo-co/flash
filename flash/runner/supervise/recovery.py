@@ -17,20 +17,6 @@ from collections.abc import Callable
 
 from flash.core.spec import JobSpec
 
-
-def _lifecycle():
-    """The supervisor module, imported lazily because it re-exports this one.
-
-    `_register_checkpoints_best_effort`, `_strict_teardown_handle` and `_runpod_completed_metrics`
-    are patched as attributes of `flash.runner.supervise.lifecycle` by the run-management and
-    resume tests, and their callers live here. Resolving them through the parent is what keeps
-    those patches effective; a direct call would bind this module's own function.
-    """
-    from flash.runner.supervise import lifecycle
-
-    return lifecycle
-
-
 _RECOVERY_MARKER_GRACE_S = 120.0
 _RECOVERY_METRICS_POLL_S = 5.0
 _RUNPOD_STATUS_PROBE_TIMEOUT_S = 10.0
@@ -378,7 +364,7 @@ def _adopt_completed_attempt(
     applied = _compare_and_complete_remote(run_id, expected_remote, spec, metrics)
     if applied:
         _charge_completed_run_by_id(spec.run_id, log)
-        _lifecycle()._register_checkpoints_best_effort(spec, log)
+        _register_checkpoints_best_effort(spec, log)
     return applied
 
 
@@ -404,9 +390,7 @@ def _await_runpod_completed_metrics(
         observation_floor = min(observation_floor, deadline_at)
     while True:
         try:
-            return _lifecycle()._runpod_completed_metrics(
-                last_handle, deadline_at=observation_floor
-            )
+            return _runpod_completed_metrics(last_handle, deadline_at=observation_floor)
         except _CompletedAttemptPending:
             if check_cancelled is not None:
                 check_cancelled()
@@ -536,7 +520,7 @@ def _gc_run_endpoints(spec: JobSpec) -> None:
         and _remote_resource_identity(status.remote) not in attempted_cleanup
     ):
         try:
-            resource_deleted = _lifecycle()._strict_teardown_handle(status.remote, spec.run_id)
+            resource_deleted = _strict_teardown_handle(status.remote, spec.run_id)
             if resource_deleted:
                 _compare_and_confirm_remote_teardown(spec.run_id, status.remote)
             elif status.remote.get("provider") == "runpod":

@@ -75,7 +75,7 @@ def test_lambda_sweep_reports_only_truly_reaped(monkeypatch):
         {"id": "i-a", "name": "flash-1700-aaaa-a0"},
         {"id": "i-b", "name": "flash-1700-bbbb-a0"},
     ]
-    monkeypatch.setattr(la_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(la_api, "list_instances", lambda *, deadline_at=None: instances)
     # i-b terminate fails -> terminate_instances returns only the ids actually torn down
     monkeypatch.setattr(la_api, "terminate_instances", lambda ids: [i for i in ids if i == "i-a"])
     out = jobs.sweep_orphans(active_labels=set())

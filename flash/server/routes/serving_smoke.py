@@ -18,9 +18,11 @@ import time
 
 import regex as safe_regex
 from jsonschema import SchemaError, ValidationError
+from jsonschema.validators import validator_for
 from referencing import Registry
 from referencing.exceptions import Unresolvable
 
+import flash.serve.deployment.deploy as serving_deploy
 from flash.adapters.lora_rank import serving_completion_token_capacity
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.core.spec import JobSpec
@@ -37,21 +39,6 @@ from flash.serve.deployment.preflight import (
     validate_local_json_schema,
     validate_structured_output_patterns,
 )
-from flash.server.asgi import app as _app
-
-
-def _serving():
-    """The route module, imported lazily because it re-exports this one.
-
-    `validator_for` is patched as an attribute of `flash.server.routes.serving` by the schema
-    coverage test, which makes the validator factory raise to prove the spawned worker reports the
-    failure instead of hanging. Binding it by value here would capture the real factory at import
-    time, so the patch would rebind a name this module never reads.
-    """
-    from flash.server.routes import serving
-
-    return serving
-
 
 _SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
 _SMOKE_IMAGE_PROMPT = (
@@ -174,9 +161,7 @@ def _sanitized_schema_error(exc: Exception) -> str:
 
 def _json_schema_validation_worker(connection, instance, schema) -> None:
     try:
-        validator_class = validate_local_json_schema(
-            schema, validator_factory=_serving().validator_for
-        )
+        validator_class = validate_local_json_schema(schema, validator_factory=validator_for)
         registry = Registry(retrieve=reject_external_schema_reference)
         validator_class(schema, registry=registry).validate(instance)
     except (ExternalSchemaReference, Unresolvable) as exc:
@@ -493,7 +478,7 @@ def _bounded_smoke_chat(
                 }
                 if structured_outputs is not None:
                     chat_kwargs["structured_outputs"] = structured_outputs
-                return _app.serve_chat(**chat_kwargs)
+                return serving_deploy.chat(**chat_kwargs)
 
             return _bounded_call(_chat_call, deadline=deadline, budget_s=budget_s)
         except RetryableServingUnavailable as exc:

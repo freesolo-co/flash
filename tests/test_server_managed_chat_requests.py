@@ -5,6 +5,7 @@ import json
 import pytest
 from fastapi import HTTPException
 
+import flash.serve.deployment.deploy as serving_deploy
 from flash.serve.contract.provenance import (
     CheckpointProvenance,
     decode_flash_body,
@@ -81,7 +82,6 @@ def test_managed_chat_rejects_mandatory_whitespace_stop_for_active_tool_grammar(
     import flash.runner.lifecycle.status as runner_status
     import flash.runner.results.verified_revisions as runner_verified_revisions
     import flash.runner.supervise.transitions as runner_transitions
-    import flash.server.asgi.app as app_mod
 
     key = _login()
     spec = json.loads(json.dumps(SPEC))
@@ -104,8 +104,8 @@ def test_managed_chat_rejects_mandatory_whitespace_stop_for_active_tool_grammar(
         verification_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
     monkeypatch.setattr(
-        app_mod,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_kwargs: pytest.fail("mandatory whitespace stop must not reach serving"),
     )
     response = api.post(
@@ -126,12 +126,11 @@ def test_managed_chat_rejects_mandatory_whitespace_stop_for_active_tool_grammar(
 def test_managed_chat_rejects_active_tool_stop_marker_collision_before_forwarding(
     api, monkeypatch, stream
 ):
-    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
     monkeypatch.setattr(
-        app_mod,
-        "serve_chat_sse" if stream else "serve_chat",
+        serving_deploy,
+        "chat_sse" if stream else "chat",
         lambda **_kwargs: pytest.fail("colliding stop must not reach serving"),
     )
     response = api.post(
@@ -152,12 +151,11 @@ def test_managed_chat_rejects_active_tool_stop_marker_collision_before_forwardin
 
 @pytest.mark.parametrize("number", ["1.0", "1e3", "9007199254740993.0", "1e-400"])
 def test_managed_raw_json_rejects_decimal_numeric_enums(api, monkeypatch, number):
-    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
     monkeypatch.setattr(
-        app_mod,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_kwargs: pytest.fail("decimal numeric enum must not reach serving"),
     )
     raw = (
@@ -180,7 +178,6 @@ def test_managed_raw_json_rejects_decimal_numeric_enums(api, monkeypatch, number
 
 
 def test_managed_chat_forwards_normalized_tools_without_parsing_output(api, monkeypatch):
-    import flash.server.asgi.app as app_mod
 
     key, run_id = _deployed_chat_run(api)
     seen = {}
@@ -205,7 +202,7 @@ def test_managed_chat_forwards_normalized_tools_without_parsing_output(api, monk
         }
         return result
 
-    monkeypatch.setattr(app_mod, "serve_chat", fake_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_chat)
     response = api.post(
         f"/v1/runs/{run_id}/chat",
         json={

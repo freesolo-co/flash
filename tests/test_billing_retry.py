@@ -17,6 +17,7 @@ import flash.runner.accounting.costs as runner_costs
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 import flash.runner.supervise.lifecycle as runner_lifecycle
+import flash.runner.supervise.recovery as attempt_recovery
 from flash.server.billing import retry as billing_retry
 
 SPEC = {
@@ -684,7 +685,6 @@ def test_startup_does_not_block_on_slow_charge_backlog(monkeypatch, tmp_path):
 def test_completion_hook_failure_is_recoverable_by_sweep(monkeypatch, tmp_path):
     """End to end across the two paths: the inline hook hits a transient BillingError and marks the
     run failed; the sweep then recovers it. This is the exact silent-revenue-leak scenario."""
-    from flash.runner.supervise import lifecycle
     from flash.server.billing.charges import BillingError
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
@@ -701,7 +701,7 @@ def test_completion_hook_failure_is_recoverable_by_sweep(monkeypatch, tmp_path):
     monkeypatch.setattr("flash.server.billing.charges.charge_completed_run", charge)
 
     # inline completion hook (runs right after `done`) hits the blip and records failure
-    lifecycle._charge_completed_run_by_id(spec.run_id, io.StringIO())
+    attempt_recovery._charge_completed_run_by_id(spec.run_id, io.StringIO())
     assert runner_status.get_status("run-1").billing_state == "failed"
 
     # blip clears; the background sweep recovers the uncharged run
