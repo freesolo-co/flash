@@ -355,8 +355,7 @@ def _sft_liger_config() -> dict[str, bool]:
 
 
 # re-exported so the child-render helpers stay reachable as `sft_train.<name>`: the other
-# trainers import `_hydra_val` from here, and the sft tests import the renderers and the
-# LoRA+ marker from here.
+# trainers import `_hydra_val` from here, and the sft tests import the renderers.
 # the runner resolves patched seams through this parent module at call time, so these imports must
 # remain attributes of `sft_train` rather than direct imports in the split module.
 from flash.engine.plan.recipe import RECIPE  # noqa: E402,F401
@@ -394,7 +393,6 @@ from flash.engine.worker.train.sft.setup.checkpoints import (  # noqa: E402,F401
     _VerlCheckpointWatcher,
 )
 from flash.engine.worker.train.sft.setup.config import (  # noqa: E402,F401
-    _LORAPLUS_READY_MARKER,
     _REQUIRED_OVERRIDE_KEYS,
     _VERL_OPTIMIZER_IMPL,
     _VERL_OPTIMIZER_NAME,
@@ -485,9 +483,6 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "loss_curve": progress.loss_curve[:400],
             "peak_gpu_gb": device_peak_gpu_gb,
             "device_peak_gpu_gb": device_peak_gpu_gb,
-            "loraplus_optim": _VERL_OPTIMIZER_NAME,
-            "loraplus_applied": progress.loraplus_applied,
-            "loraplus_ratio": options.loraplus_ratio,
             "verl_backend": "fsdp2",
             # sft shards by DATA -- see ULYSSES_SEQUENCE_PARALLEL_SIZE for why. fsdp splits the batch
             # across the ranks actually LAUNCHED, which is the allocated card count only when the
@@ -585,7 +580,7 @@ def run_sft_train(spec=None) -> None:
     child = _prepare_sft_child(
         options, data, model, capabilities, use_remove_padding, gdn_reset_arch
     )
-    child_progress = _prepare_sft_progress(options, data, model, child)
+    child_progress = _prepare_sft_progress(data, model, child)
     progress = child_progress.values
 
     def on_line(line: str) -> None:
@@ -606,7 +601,7 @@ def run_sft_train(spec=None) -> None:
     if child.resume_step < model.update_horizon:
         child.watcher.start()
         # check save completeness only after normal training completion. callback failures occur before
-        # return_code assignment; checking anyway would replace the real zero-grad or lora+ diagnosis
+        # return_code assignment; checking anyway would replace the real zero-grad or runtime-patch diagnosis
         # with a missing-save error. opd_train uses the same guard.
         training_completed = False
         try:
