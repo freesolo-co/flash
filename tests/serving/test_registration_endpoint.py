@@ -7,7 +7,7 @@ from flash.serving.src.http.router import build_offline_serving_app
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.schemas import ImmutableCheckpointRegistration
 from tests.serving.checkpoint_fixtures import checkpoint_registration_payload
-from tests.serving.test_router import FakePool, QWEN
+from tests.serving.test_router import QWEN, FakePool
 
 
 def test_registration_persists_router_endpoint_before_ready(monkeypatch):
