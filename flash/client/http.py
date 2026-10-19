@@ -150,7 +150,11 @@ def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
     A structured detail stays a dict so the caller can read its ``code``; anything else is the
     string it always was. ``str()`` it for a message, but branch on the object itself.
     """
-    body = exc.read()
+    try:
+        body = exc.read()
+    except (OSError, http.client.HTTPException):
+        # The status is authoritative even when the peer closes its error body early.
+        return str(exc)
     try:
         detail = json.loads(body).get("detail") or body.decode()
     except (ValueError, AttributeError):
