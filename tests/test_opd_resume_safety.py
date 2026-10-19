@@ -472,7 +472,6 @@ def test_strict_reader_pins_one_sha_and_any_present_marker_blocks(monkeypatch, t
             next_attempt=2,
             contract_version=1,
             phase="opd",
-            expected_fsdp_generation=1,
         )
 
     assert [name for name, _kwargs in calls] == ["repo_info", "get_paths_info", "download"]
@@ -507,7 +506,6 @@ def test_strict_reader_all_absent_is_safe(monkeypatch):
         next_attempt=2,
         contract_version=1,
         phase="opd",
-        expected_fsdp_generation=1,
     )
 
 
@@ -542,7 +540,6 @@ def test_strict_reader_malformed_or_outage_blocks(monkeypatch, tmp_path, mode):
             next_attempt=1,
             contract_version=1,
             phase="opd",
-            expected_fsdp_generation=1,
         )
 
 
@@ -561,7 +558,6 @@ def test_strict_reader_missing_repo_or_unsupported_contract_blocks(repo, version
             next_attempt=1,
             contract_version=version,
             phase="opd",
-            expected_fsdp_generation=1,
         )
 
 
@@ -725,7 +721,10 @@ def test_opd_automatic_retry_after_teardown_requires_all_markers_absent(monkeypa
     assert private_hf.calls[1][1]["paths"] == [opd_optimizer_start_marker_path(spec.run_id, 0)]
 
 
-def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch, tmp_path):
+@pytest.mark.parametrize("checkpoint_generation", [1, 2])
+def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(
+    monkeypatch, tmp_path, checkpoint_generation
+):
     import flash.providers.core.allocator as allocator
     from flash.providers.core import registry as providers
     from flash.providers.core.base import Allocation, Candidate, PollResult
@@ -781,7 +780,9 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
                     if path.endswith("/opd_state.json"):
                         payload = json.dumps(_valid_resume_state(20)).encode()
                     elif path.endswith("/actor/fsdp_config.json"):
-                        payload = json.dumps({"FSDP_version": 1, "world_size": 1}).encode()
+                        payload = json.dumps(
+                            {"FSDP_version": checkpoint_generation, "world_size": 1}
+                        ).encode()
                     else:
                         payload = b"checkpoint"
                     private_hf.files[path] = payload
@@ -796,6 +797,13 @@ def test_opd_retry_passes_gate_revision_and_overwrites_spoofed_value(monkeypatch
 
     provider = Provider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
+
+    if checkpoint_generation == 1:
+        with pytest.raises(RuntimeError, match="fsdp generation mismatch"):
+            lifecycle._run_attempts_supervised(spec, io.StringIO())
+        # a legacy dense-opd checkpoint must block replacement before another worker is rented.
+        assert len(provider.runtime_secrets) == 1
+        return
 
     metrics = lifecycle._run_attempts_supervised(
         spec,
@@ -1015,7 +1023,7 @@ def _install_marker_gate(
     checkpoint_files,
     checkpoint_state=None,
     state_download_error=None,
-    fsdp_generation=1,
+    checkpoint_generation=2,
     fsdp_world_size=2,
     shard_size_overrides=None,
 ):
@@ -1062,7 +1070,7 @@ def _install_marker_gate(
         if kwargs["filename"].endswith("/actor/fsdp_config.json"):
             path = tmp_path / "fsdp_config.json"
             path.write_text(
-                json.dumps({"FSDP_version": fsdp_generation, "world_size": fsdp_world_size})
+                json.dumps({"FSDP_version": checkpoint_generation, "world_size": fsdp_world_size})
             )
             return str(path)
         if state_download_error is not None:
@@ -1086,7 +1094,6 @@ def _run_gate():
         next_attempt=2,
         contract_version=1,
         phase="opd",
-        expected_fsdp_generation=1,
     )
 
 
@@ -1203,7 +1210,7 @@ def test_gate_blocks_wrong_private_fsdp_generation(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
         checkpoint_files=_sharded_ckpt(40, 2),
-        fsdp_generation=2,
+        checkpoint_generation=1,
     )
 
     with pytest.raises(RuntimeError, match="fsdp generation mismatch"):

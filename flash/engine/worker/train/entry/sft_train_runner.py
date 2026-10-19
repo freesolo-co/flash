@@ -25,7 +25,6 @@ from flash.adapters.fused_experts import lora_target_parameters
 from flash.adapters.targets import resolve_lora_targeting
 from flash.core.catalog import get_model
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
-from flash.engine.support.verl_policy import _resolve_fsdp_generation
 from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
 from flash.engine.worker.train.entry import sft_train as _sft_train
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
@@ -626,7 +625,6 @@ def _prepare_sft_child(
     # take the RAISING gate there rather than the soft form.
     world_size, micro_batch = _resolve_sft_width_and_micro_batch(options, data, model)
     target_parameters = lora_target_parameters(options.model_id)
-    fsdp_generation = _resolve_fsdp_generation("sft", target_parameters)
     config = {
         "train_files": data.train_file,
         "train_batch_size": model.train_batch_size,
@@ -684,7 +682,6 @@ def _prepare_sft_child(
     resume_step = _sft_train._restore_verl_resume(
         options.paths.local_dir,
         world_size=world_size,
-        expected_fsdp_generation=fsdp_generation,
     )
     watcher = _sft_train._VerlCheckpointWatcher(
         local_dir=options.paths.local_dir,

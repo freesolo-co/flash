@@ -37,7 +37,6 @@ from flash.engine.support.verl_checkpoint import (
     FsdpManifestFile,
     inspect_fsdp_checkpoint_manifest,
 )
-from flash.engine.support.verl_policy import FsdpGeneration
 from flash.engine.worker.model.lora import (
     _open_safetensors_numpy,
     _read_adapter_tensor_metadata,
@@ -285,7 +284,6 @@ def inspect_resume_checkpoint(
     resume_dir: str,
     *,
     world_size: int,
-    expected_fsdp_generation: FsdpGeneration,
 ) -> FsdpCheckpointInspection:
     """Parse and validate one local native checkpoint exactly once."""
     actor_dir = resolve_checkpoint_actor_dir(resume_dir)
@@ -313,7 +311,6 @@ def inspect_resume_checkpoint(
     return inspect_fsdp_checkpoint_manifest(
         stamp_raw,
         files,
-        expected_generation=expected_fsdp_generation,
         expected_world_size=world_size,
     )
 
@@ -321,7 +318,6 @@ def inspect_resume_checkpoint(
 def select_verl_resume_checkpoint(
     *,
     world_size: int,
-    expected_fsdp_generation: FsdpGeneration,
     accept: Callable[[str, FsdpCheckpointInspection], bool] | None = None,
 ) -> tuple[str | None, FsdpCheckpointInspection | None]:
     """select the newest caller-accepted loadable checkpoint and return its cached inspection."""
@@ -335,7 +331,6 @@ def select_verl_resume_checkpoint(
             inspection = inspect_resume_checkpoint(
                 path,
                 world_size=world_size,
-                expected_fsdp_generation=expected_fsdp_generation,
             )
             inspections[path] = inspection
         return inspection.loadable and (accept is None or accept(path, inspection))
@@ -354,13 +349,11 @@ def restore_verl_resume(
     local_dir: str,
     *,
     world_size: int,
-    expected_fsdp_generation: FsdpGeneration,
     job_label: str,
 ) -> int:
     """select, inspect once, and stage the newest loadable streamed checkpoint."""
     resume, inspection = select_verl_resume_checkpoint(
         world_size=world_size,
-        expected_fsdp_generation=expected_fsdp_generation,
     )
     if not resume:
         return 0
@@ -371,7 +364,6 @@ def restore_verl_resume(
         local_dir,
         job_label=job_label,
         world_size=world_size,
-        expected_fsdp_generation=expected_fsdp_generation,
         inspection=inspection,
     )
 
@@ -380,7 +372,6 @@ def resume_topology_matches(
     resume_dir: str,
     *,
     world_size: int,
-    expected_fsdp_generation: FsdpGeneration,
     job_label: str,
     inspection: FsdpCheckpointInspection | None = None,
 ) -> bool:
@@ -389,7 +380,6 @@ def resume_topology_matches(
         inspection = inspect_resume_checkpoint(
             resume_dir,
             world_size=world_size,
-            expected_fsdp_generation=expected_fsdp_generation,
         )
     if inspection.loadable:
         return True
@@ -407,7 +397,6 @@ def stage_verl_resume(
     *,
     job_label: str,
     world_size: int,
-    expected_fsdp_generation: FsdpGeneration,
     inspection: FsdpCheckpointInspection | None = None,
 ) -> int:
     """stage a downloaded ``checkpoint-N`` into local_dir where verl looks; return its step.
@@ -418,7 +407,7 @@ def stage_verl_resume(
     ``job_label`` names the job in the error raised for an unparseable path and in the discard log.
 
     returns 0, staging nothing, when the checkpoint is not complete native state for the expected
-    generation and ``world_size``. 0 is the fresh-run answer every caller handles.
+    fsdp2 format and ``world_size``. 0 is the fresh-run answer every caller handles.
     """
     match = re.fullmatch(r"checkpoint-(\d+)", os.path.basename(resume_dir))
     if match is None:
@@ -427,7 +416,6 @@ def stage_verl_resume(
     if not resume_topology_matches(
         resume_dir,
         world_size=world_size,
-        expected_fsdp_generation=expected_fsdp_generation,
         job_label=job_label,
         inspection=inspection,
     ):
