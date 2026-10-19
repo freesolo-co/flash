@@ -1094,12 +1094,9 @@ def test_opd_vram_reserves_colocated_vllm_rollout_copy():
     from flash.engine.plan.vram import estimate_vram_gb
 
     kw = {"seq_len": 1536, "max_tokens": 512, "vocab": 248_320, "lora_rank": 16}
-    grpo_without_vllm = estimate_vram_gb(4.0, "grpo", "bf16", use_vllm=False, **kw)
-    opd_with_vllm = estimate_vram_gb(4.0, "opd", "bf16", use_vllm=True, **kw)
-    opd_flag_ignored = estimate_vram_gb(4.0, "opd", "bf16", use_vllm=False, **kw)
-    assert opd_with_vllm > grpo_without_vllm + 8.0  # second bf16 4B copy plus KV
-    assert opd_flag_ignored == opd_with_vllm
-    assert estimate_vram_gb(4.0, "opd", "bf16", **kw) == opd_with_vllm
+    sft = estimate_vram_gb(4.0, "sft", "bf16", **kw)
+    opd = estimate_vram_gb(4.0, "opd", "bf16", **kw)
+    assert opd > sft + 8.0  # resident second bf16 4B copy plus KV and distillation loss
 
 
 def test_opd_vram_sizes_rollout_kv_for_full_prompt_batch():
@@ -1460,7 +1457,6 @@ def test_the_resident_grpo_wall_and_the_worker_agree_on_the_kv_dtype():
         "lora_rank": 32,
         "group_size": 4,
         "thinking": False,
-        "use_vllm": True,
         "vocab": vocab_size_for(model_id),
         "sleep_offload": False,
         "active_params_b": info.active_params_b,

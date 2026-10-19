@@ -83,7 +83,6 @@ def test_grpo_sleep_preflight_matches_worker_kv_budget_and_group_size():
             max_tokens=1,
             lora_rank=rank,
             group_size=group_size,
-            use_vllm=True,
             vocab=1,
             sleep_offload=True,
             model_info=info,

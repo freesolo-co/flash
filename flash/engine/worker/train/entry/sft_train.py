@@ -389,10 +389,7 @@ from flash.engine.worker.train.sft.setup.checkpoints import (  # noqa: E402,F401
 )
 from flash.engine.worker.train.sft.setup.config import (  # noqa: E402,F401
     _REQUIRED_OVERRIDE_KEYS,
-    _VERL_OPTIMIZER_IMPL,
-    _VERL_OPTIMIZER_NAME,
     _hydra_val,
-    _optimizer_override_config,
     _render_sft_dataset_module,
     _sft_parquet_features,
     _write_sft_parquet,

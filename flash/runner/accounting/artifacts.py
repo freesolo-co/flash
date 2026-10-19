@@ -215,11 +215,6 @@ def _pin_env_sha_with_reason(spec: JobSpec) -> tuple[JobSpec, str]:
     return spec, str(error).strip()
 
 
-def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
-    """Best-effort preflight pin for diagnostics before authoritative controller staging."""
-    return _pin_env_sha_with_reason(spec)[0]
-
-
 def preflight_validate_environment_ref(spec: JobSpec) -> tuple[JobSpec, bool]:
     """reject permanent refs and report whether github-dependent work must defer.
 

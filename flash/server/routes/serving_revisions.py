@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-
 from fastapi import HTTPException
 
 from flash.content.multimodal import messages_with_image_data_uris, normalize_prompt_images
@@ -12,7 +10,6 @@ from flash.runner.lifecycle.state import adapter_prefix
 from flash.runner.results.checkpoints import checkpoint_adapter_prefix
 from flash.runner.results.verified_revisions import read_verified_checkpoints
 from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
-from flash.serve.request.openai import OpenAIRequestError, parse_chat_request
 from flash.server.asgi import app as _app
 
 _DEPLOYMENT_BUSY_STATES = {"queued", "smoke_testing"}
@@ -75,25 +72,6 @@ def _spec_is_unservable(status) -> bool:
     return False
 
 
-def _chat_messages_from_payload(payload: dict) -> list[dict]:
-    raw = payload.get("messages")
-    if raw is None:
-        return []
-    if not isinstance(raw, list):
-        raise HTTPException(status_code=400, detail="messages must be a list")
-    for index, message in enumerate(raw):
-        if not isinstance(message, dict):
-            raise HTTPException(
-                status_code=400,
-                detail=f"messages[{index}] must be a chat message object",
-            )
-    try:
-        parse_chat_request(payload, require_model=False, allow_managed_selectors=True)
-    except OpenAIRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _managed_chat_messages(raw)
-
-
 def _managed_chat_messages(messages: list[dict]) -> list[dict]:
     try:
         normalized = normalize_prompt_images({}, messages, None)
@@ -102,22 +80,6 @@ def _managed_chat_messages(messages: list[dict]) -> list[dict]:
         return messages_with_image_data_uris(normalized.messages, normalized.descriptors, None)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"invalid image request: {exc}") from exc
-
-
-def _parse_checkpoint_step(raw_step) -> int:
-    want: int | None = None
-    if isinstance(raw_step, bool):
-        want = None
-    elif isinstance(raw_step, int):
-        want = raw_step
-    elif isinstance(raw_step, float):
-        want = int(raw_step) if raw_step.is_integer() else None
-    elif isinstance(raw_step, str):
-        stripped = raw_step.strip()
-        want = int(stripped) if re.fullmatch(r"-?[0-9]{1,18}", stripped) else None
-    if want is None or want < 0:
-        raise HTTPException(status_code=400, detail=f"invalid checkpoint step: {raw_step!r}")
-    return want
 
 
 def _resolve_deploy_step(run_id: str, spec, checkpoint_id: object) -> int | None:

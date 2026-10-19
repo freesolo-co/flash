@@ -33,8 +33,6 @@ from flash.providers.core.base import rentable_gpu_counts
 
 RECIPE = _sft_train.RECIPE
 _MAX_ZERO_GRAD_STEPS = _sft_train._MAX_ZERO_GRAD_STEPS
-_VERL_OPTIMIZER_IMPL = _sft_train._VERL_OPTIMIZER_IMPL
-_VERL_OPTIMIZER_NAME = _sft_train._VERL_OPTIMIZER_NAME
 build_sft_overrides = _sft_train.build_sft_overrides
 # taken from the parent like every other name here, so the runner and `sft_train`'s own
 # `sft_data_loading`/`sft_configuring` wraps use one object rather than two imports of it.
@@ -642,14 +640,10 @@ def _prepare_sft_child(
         "target_modules": model.target_modules,
         "exclude_modules": None,
         "target_parameters": target_parameters,
-        "fsdp_generation": fsdp_generation,
         "lora_adapter_path": model.warmstart_adapter,
         "ulysses_sp_size": ULYSSES_SEQUENCE_PARALLEL_SIZE,
         "lr": options.learning_rate,
         "warmup_ratio": RECIPE.sft.warmup_frac,
-        "optimizer_impl": _VERL_OPTIMIZER_IMPL,
-        "optimizer_name": _VERL_OPTIMIZER_NAME,
-        "optimizer_kwargs": None,
         "local_dir": options.paths.local_dir,
         "save_freq": model.save_freq,
         "n_gpus_per_node": world_size,
@@ -664,10 +658,8 @@ def _prepare_sft_child(
         # plane profiles raw records without running environment.py, so an environment that expands
         # or replaces rows makes steps_per_epoch larger than the quote assumed; without an explicit
         # cap the loop would run a full realized epoch past the horizon the run was priced and
-        # wall-budgeted for. build_sft_overrides rejects setting both, so the horizon replaces the
-        # epoch count rather than joining it -- loop_epochs already covers the authored epochs.
+        # wall-budgeted for. loop_epochs allows enough passes to reach this explicit horizon.
         "total_training_steps": model.update_horizon,
-        "total_epochs": None,
         "use_remove_padding": use_remove_padding,
         # resolved from the out-of-process capability probe, never by opening cuda in this parent.
         "fused_ce_backend": _sft_train._resolve_sft_fused_ce_backend(capabilities.caps),

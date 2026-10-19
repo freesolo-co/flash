@@ -51,22 +51,6 @@ def load_adapters(settings: Settings) -> list[AdapterRecord]:
     )
 
 
-def list_run_adapters(org_id: str, run_id: str, settings: Settings) -> list[AdapterRecord]:
-    """load every exact checkpoint for one tenant run, regardless of lifecycle status."""
-
-    if not settings.has_supabase:
-        return []
-    return _list_adapters(
-        settings,
-        {
-            "org_id": f"eq.{org_id}",
-            "run_id": f"eq.{run_id}",
-            "order": "checkpoint_id.asc",
-        },
-        "load hosted run checkpoints",
-    )
-
-
 def _list_adapters(
     settings: Settings,
     filters: dict[str, str],

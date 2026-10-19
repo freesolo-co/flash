@@ -48,7 +48,7 @@ def test_submit_context_preserves_controller_staged_identity_without_resolving(m
 
     monkeypatch.setattr(
         runner_artifacts,
-        "_assign_resolved_env_sha",
+        "_pin_env_sha_with_reason",
         lambda _spec: (_ for _ in ()).throw(AssertionError("worker retry must not resolve github")),
     )
     spec = _staged_spec()

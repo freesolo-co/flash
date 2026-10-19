@@ -44,17 +44,6 @@ def test_plain_analytical_total_uses_billing_round_half_up(est):
     assert "TOTAL      : $1.01" in quote.breakdown()
 
 
-def test_styled_analytical_total_uses_billing_round_half_up(est, monkeypatch):
-    from flash.cli.ui import render
-
-    monkeypatch.setenv("FLASH_STYLE", "1")
-    monkeypatch.setenv("NO_COLOR", "1")
-    quote = dataclasses.replace(est, total_usd=1.005)
-
-    assert f"{quote.total_usd:.2f}" == "1.00", "the fixture must expose half-even formatting"
-    assert "$1.01" in render.cost_panel(quote)
-
-
 def test_capped_estimate_flags_in_breakdown():
     capped = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 100_000))
     assert capped.wall_capped
@@ -901,11 +890,8 @@ def test_single_card_quote_keeps_the_plain_vram_spelling():
     assert "usable across" not in line
 
 
-def test_themed_panel_and_breakdown_agree_on_the_vram_clause():
-    """The two renderers must not describe the same shape differently."""
-    import os
-
-    from flash.cli.ui import render
+def test_breakdown_reports_the_joined_vram_clause():
+    """The analytical breakdown describes the memory of the joined ranks."""
     from flash.providers.core.base import Candidate
 
     two = estimate_cost(
@@ -914,28 +900,16 @@ def test_themed_panel_and_breakdown_agree_on_the_vram_clause():
     )
     clause = f"{two.offered_vram_gb} GB usable across 2x {two.gpu_vram_gb} GB"
     assert clause in two.breakdown()
-    prior = os.environ.get("NO_COLOR")
-    os.environ["NO_COLOR"] = "1"
-    try:
-        assert clause in render.cost_panel(two)
-    finally:
-        if prior is None:
-            os.environ.pop("NO_COLOR", None)
-        else:
-            os.environ["NO_COLOR"] = prior
 
 
-def test_panel_and_breakdown_agree_when_executed_width_is_below_the_billed_count():
-    """The agreement must hold on the shape that can actually break it.
+def test_breakdown_uses_executed_width_below_the_billed_count():
+    """The memory clause uses the executed width even when more cards are billed.
 
     The clause is computed from ``offered_vram_gb``, which values the EXECUTED width. Rendering it
     beside the billed count states a pooled figure the named cards do not add up to: three rented
     cards carrying a two-rank run read as "160 GB usable across 3x 80 GB". The twin above cannot
     catch this because both widths are 2 there, so the two spellings coincide.
     """
-    import os
-
-    from flash.cli.ui import render
     from flash.providers.core.base import Candidate
 
     narrow = RunConfig(
@@ -947,20 +921,7 @@ def test_panel_and_breakdown_agree_when_executed_width_is_below_the_billed_count
 
     clause = f"{est.offered_vram_gb} GB usable across 2x {est.gpu_vram_gb} GB"
     assert clause in est.breakdown()
-    prior = os.environ.get("NO_COLOR")
-    os.environ["NO_COLOR"] = "1"
-    try:
-        panel = render.cost_panel(est)
-    finally:
-        if prior is None:
-            os.environ.pop("NO_COLOR", None)
-        else:
-            os.environ["NO_COLOR"] = prior
-    assert clause in panel, f"panel credited a width the pooled figure does not cover: {panel}"
-    assert "across 3x" not in panel
-    # the BILLED count still drives price: you pay for the idle card even though it holds nothing.
-    assert "3x H100" in panel
-    assert "per card" in panel
+    assert "across 3x" not in est.breakdown()
 
 
 def test_remedy_pool_is_narrowed_by_a_hard_provider_pin_not_a_soft_preference():

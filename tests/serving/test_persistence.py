@@ -15,7 +15,6 @@ from flash.serving.src.store.persistence import (
     _row_to_adapter,
     get_adapter,
     insert_adapter,
-    list_run_adapters,
     load_adapters,
     replace_adapter_cas,
 )
@@ -150,18 +149,6 @@ def test_load_uses_explicit_projected_columns_and_ready_filter() -> None:
     assert request["params"]["status"] == "eq.ready"
     assert record.adapter_id == CHECKPOINT_ID
     assert record.org_id == ORG_ID
-
-
-def test_run_listing_reads_disabled_checkpoints_with_tenant_scope() -> None:
-    FakeClient.get_rows = [_row(status="disabled")]
-
-    [record] = list_run_adapters(ORG_ID, RUN_ID, _settings())
-
-    params = FakeClient.requests[0]["params"]
-    assert params["org_id"] == f"eq.{ORG_ID}"
-    assert params["run_id"] == f"eq.{RUN_ID}"
-    assert "status" not in params
-    assert record.status == "disabled"
 
 
 def test_targeted_get_reads_exact_tenant_checkpoint() -> None:
