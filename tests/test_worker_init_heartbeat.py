@@ -32,7 +32,7 @@ from flash.engine.worker.perf import diagnostics
 
 @pytest.fixture
 def fast_nvidia(monkeypatch):
-    """A fast, GPU-free nvidia-smi stand-in so the ``include_torch=False`` path returns instantly
+    """A fast, GPU-free nvidia-smi stand-in so the diagnostics path returns instantly
     regardless of whether nvidia-smi exists on the test host."""
     monkeypatch.setattr(
         diagnostics, "_query_nvidia_gpu", lambda: {"gpu_util_pct": 0, "device_name": "FAKE-GPU"}
@@ -74,33 +74,16 @@ def _run_async(fn):
     return th, state
 
 
-def test_include_torch_true_freezes_when_cuda_is_locked(monkeypatch, fast_nvidia):
-    """Repro: with the torch path on, a side-thread diag wedges while CUDA is "locked"."""
-    gate = threading.Event()
-    _install_blocking_torch(monkeypatch, gate)
-
-    th, state = _run_async(lambda: diagnostics.gpu_diagnostics(include_torch=True))
-    th.join(timeout=1.5)
-    assert not state.get("done"), (
-        "expected gpu_diagnostics(include_torch=True) to block on the CUDA query "
-        "(this is the heartbeat freeze the fix removes)"
-    )
-
-    gate.set()  # main thread released the CUDA lock
-    th.join(timeout=5.0)
-    assert state.get("done"), "diag should complete once the CUDA lock is released"
-
-
-def test_include_torch_false_stays_responsive_while_cuda_locked(monkeypatch, fast_nvidia):
+def test_diagnostics_stay_responsive_while_cuda_locked(monkeypatch, fast_nvidia):
     """Fix: with the torch path off, the diag returns promptly even while CUDA is wedged."""
     gate = threading.Event()  # NEVER set -> CUDA stays "locked" for the whole test
     _install_blocking_torch(monkeypatch, gate)
 
-    th, state = _run_async(lambda: diagnostics.gpu_diagnostics(include_torch=False))
+    th, state = _run_async(lambda: diagnostics.gpu_diagnostics())
     th.join(timeout=2.0)
 
     assert state.get("done"), (
-        "gpu_diagnostics(include_torch=False) must NOT touch torch.cuda and must return even while "
+        "gpu_diagnostics() must NOT touch torch.cuda and must return even while "
         "the init thread holds the CUDA lock"
     )
     diag = state["value"]
@@ -119,14 +102,14 @@ def test_include_torch_false_stays_responsive_while_cuda_locked(monkeypatch, fas
 def _liveness_env(monkeypatch, *, tick=0.01):
     """Patch heartbeat's module globals for a fast, side-effect-free liveness run.
 
-    Returns (hb_module, diag_include_torch_calls)."""
+    Returns (hb_module, diagnostic_calls)."""
     hb = importlib.import_module("flash.engine.worker.io.heartbeat")
     monkeypatch.setattr(hb, "_LIVENESS_TICK_S", tick)
     diag: list = []
     monkeypatch.setattr(
         worker_perf,
         "gpu_diagnostics",
-        lambda include_torch=True: (diag.append(include_torch), {})[1],
+        lambda: (diag.append(True), {})[1],
     )
     monkeypatch.setattr(hb, "_dump_thread_stacks", lambda reason: None)  # don't dump real stacks
     return hb, diag
@@ -145,7 +128,7 @@ def test_liveness_heartbeat_emits_liveness_pings_nvidia_smi_only(monkeypatch):
         "bare liveness_heartbeat emits LIVENESS pings (liveness=True)"
     )
     assert diag, "diagnostics collected"
-    assert all(it is False for it in diag), "must use gpu_diagnostics(include_torch=False)"
+    assert all(diag)
 
 
 def test_liveness_heartbeat_reports_progress_advance_as_real_heartbeat(monkeypatch):
@@ -303,7 +286,7 @@ def test_liveness_heartbeat_rechecks_done_after_diagnostics():
     daemon must re-check done BETWEEN diagnostics and the emit, so no stale stage lands afterward."""
     hb = importlib.import_module("flash.engine.worker.io.heartbeat")
     src = inspect.getsource(inspect.unwrap(hb.liveness_heartbeat))
-    between = src[src.index("gpu_diagnostics(include_torch=False)") : src.index("heartbeat(stage")]
+    between = src[src.index("gpu_diagnostics()") : src.index("heartbeat(stage")]
     assert "done.is_set()" in between, "must re-check done.is_set() between diagnostics and emit"
 
 

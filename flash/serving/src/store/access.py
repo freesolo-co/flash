@@ -8,22 +8,8 @@ from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.store.persistence import PersistenceRecordError
 
 
-async def _list_run_stored(org_id: str, run_id: str) -> list[AdapterRecord]:
-    from flash.serving.src.store.persistence import list_run_adapters
-    from flash.serving.src.store.settings import get_settings
-
-    try:
-        return await asyncio.to_thread(list_run_adapters, org_id, run_id, get_settings())
-    except PersistenceRecordError:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE, "adapter storage is unavailable"
-        ) from exc
-
-
 async def _get_stored(org_id: str, adapter_id: str) -> AdapterRecord | None:
-    from flash.serving.src.store.persistence import PersistenceRecordError, get_adapter
+    from flash.serving.src.store.persistence import get_adapter
     from flash.serving.src.store.settings import get_settings
 
     try:

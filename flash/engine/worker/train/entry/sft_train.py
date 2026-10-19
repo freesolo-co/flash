@@ -171,7 +171,6 @@ _CHILD_ENV_EXACT = frozenset(
         "HUGGINGFACE_HUB_CACHE",
         "TRANSFORMERS_CACHE",
         "HF_HUB_OFFLINE",
-        "HF_HUB_ENABLE_HF_TRANSFER",
         "HF_HUB_DISABLE_XET",
         "TRANSFORMERS_OFFLINE",
         "TOKENIZERS_PARALLELISM",
@@ -345,10 +344,6 @@ def _sft_profile_max_length(profile) -> int:
     return max_length  # noqa: RET504
 
 
-def _sft_liger_config() -> dict[str, bool]:
-    return {"use_liger": False}
-
-
 # re-exported so the child-render helpers stay reachable as `sft_train.<name>`: the other
 # trainers import `_hydra_val` from here, and the sft tests import the renderers.
 # the runner resolves patched seams through this parent module at call time, so these imports must
@@ -389,10 +384,7 @@ from flash.engine.worker.train.sft.setup.checkpoints import (  # noqa: E402,F401
 )
 from flash.engine.worker.train.sft.setup.config import (  # noqa: E402,F401
     _REQUIRED_OVERRIDE_KEYS,
-    _VERL_OPTIMIZER_IMPL,
-    _VERL_OPTIMIZER_NAME,
     _hydra_val,
-    _optimizer_override_config,
     _render_sft_dataset_module,
     _sft_parquet_features,
     _write_sft_parquet,
@@ -425,7 +417,7 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
         "sft_trained",
         train_wall=train_wall,
         step=verified.final_step,
-        gpu=_worker_perf.gpu_diagnostics(include_torch=False),
+        gpu=_worker_perf.gpu_diagnostics(),
     )
     _worker_finalize.write_train_meta(
         phase="sft",
@@ -441,7 +433,6 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "resumed": bool(child.resume_step),
             "warm_started": bool(model.warmstart_adapter),
             "download_seconds": model.download_seconds,
-            "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "thinking": _worker_state.THINKING,
             "multimodal": data.multimodal,
             "gradient_checkpointing": model.gradient_checkpointing,

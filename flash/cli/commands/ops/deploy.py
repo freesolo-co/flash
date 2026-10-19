@@ -178,11 +178,6 @@ def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
     return None
 
 
-def _served_step_label(step: int | None) -> str:
-    """Name a deployment's checkpoint the way the user addressed it: `step-N`, or `final`."""
-    return "final" if step is None else f"step-{step}"
-
-
 def _deployment_attempt_failed(requested: dict, final: dict) -> bool:
     """True when the requested revision is not the one now served.
 

@@ -383,7 +383,6 @@ class TrainSpec:
     temperature: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     max_completion_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
     kl_penalty_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
-    entropy_quantile: float | None = field(default=None, metadata={"introduced_in": "1.0.15"})
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}
     )
@@ -797,7 +796,6 @@ class JobSpec:
                 temperature=opt_float(train.get("temperature")),
                 max_completion_tokens=opt_int(train.get("max_completion_tokens")),
                 kl_penalty_coef=opt_float(train.get("kl_penalty_coef")),
-                entropy_quantile=opt_float(train.get("entropy_quantile")),
                 thinking_length_penalty_coef=opt_float(train.get("thinking_length_penalty_coef")),
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=str_tuple(train.get("stop_sequences")),

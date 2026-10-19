@@ -138,9 +138,3 @@ def print_warmstart_context_supplement(local_budget: PromptBudget | None, status
     ):
         return
     _print_warning(_warmstart_context_sentence(served_budget.get("warm_start_context")))
-
-
-def warn_cost_prompt_budget(spec) -> None:
-    """print the local prompt-budget warning for the offline ``--cost`` path."""
-    budget = rl_prompt_budget(spec)
-    _print_warning(prompt_budget_warning(budget, derived_locally=True))

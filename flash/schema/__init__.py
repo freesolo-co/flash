@@ -677,7 +677,6 @@ def spec_from_dict(
             temperature=_train_float(train_raw, "temperature", minimum=0.0),
             max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
             kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
-            entropy_quantile=_train_float(train_raw, "entropy_quantile", minimum=0.0, maximum=1.0),
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
@@ -751,7 +750,6 @@ _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
         "kl_penalty_coef": (
             "only applies to rollout algorithms (grpo, opd); SFT's objective has no KL term"
         ),
-        "entropy_quantile": "only applies to grpo; SFT has no rollout tokens to rank by entropy",
         "thinking_length_penalty_coef": (
             "only applies to grpo; it penalizes generated reasoning length, and SFT never generates"
         ),
@@ -766,10 +764,6 @@ _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
         ),
     },
     "opd": {
-        "entropy_quantile": (
-            "only applies to grpo; opd distils every sampled token against the teacher rather than "
-            "ranking tokens by entropy"
-        ),
         "thinking_length_penalty_coef": (
             "only applies to grpo; it shapes the grpo reward, and opd optimizes a distillation "
             "objective with no reward term"

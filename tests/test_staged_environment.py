@@ -900,7 +900,7 @@ def test_worker_cleans_materialized_package_after_training_handler(
     monkeypatch.setattr(worker_perf, "_restrict_fla_gdn_autotune_on_blackwell", lambda: None)
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **_kwargs: {})
     monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(worker_kernel_warmup, "load_mega_cache", lambda: None)
+    monkeypatch.setattr(worker_kernel_warmup, "configure_kernel_cache", lambda: None)
     monkeypatch.setattr(
         worker_entry.os,
         "_exit",

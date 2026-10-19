@@ -120,7 +120,7 @@ def test_worker_stack_pins_qwen35_capable_versions():
     assert exact_versions["vllm"] == [Version("0.19.1")]
     assert len(exact_versions["transformers"]) == 1
     assert exact_versions["transformers"][0].major == 5  # qwen3_5 model types need transformers 5.x
-    assert exact_versions["bitsandbytes"] == [Version("0.50.1")]  # 8-bit paged AdamW state
+    assert "bitsandbytes" not in exact_versions
 
 
 def _import_worker(monkeypatch):
@@ -162,12 +162,14 @@ def test_model_revision_threads_through_config_probes(monkeypatch, revision):
 
     from flash.engine.worker.entry import sft
     from flash.engine.worker.model import packing
-    from flash.engine.worker.perf import liger
+    from flash.engine.worker.perf import model_size
 
     assert packing.model_is_gdn_hybrid("org/model", revision=revision)
     assert packing.gdn_model_type("org/model", revision=revision)
     assert sft._model_arch_dims("uncataloged/model", revision=revision) == (4096, 32)
-    assert isinstance(liger._liger_default_for_model("org/model", revision=revision), bool)
+    assert isinstance(
+        model_size._checkpointing_default_for_model("org/model", revision=revision), bool
+    )
 
     expected = {"trust_remote_code": True}
     if revision:
@@ -564,7 +566,7 @@ def test_heartbeat_terminal_only_mode(monkeypatch):
     assert calls.count("heartbeat.json") == 3
 
 
-def test_liger_default_model_size_gate(monkeypatch):
+def test_checkpointing_default_model_size_gate(monkeypatch):
     """The model-size gate is OFF for small models (1B-class) and ON at ≥ ~3B.
 
     Named for liger because that is where the threshold was measured (PR #174, fused-CE's memory win
@@ -594,11 +596,11 @@ def test_liger_default_model_size_gate(monkeypatch):
         monkeypatch.setitem(sys.modules, "transformers", fake)
 
     fake_cfg(small)
-    assert w._liger_default_for_model("meta-llama/Llama-3.2-1B") is False
+    assert w._checkpointing_default_for_model("meta-llama/Llama-3.2-1B") is False
     # grad checkpointing follows the same small=speed(off) / large=memory(on) principle
     assert w.grad_checkpointing_on("meta-llama/Llama-3.2-1B") is False
     fake_cfg(big)
-    assert w._liger_default_for_model("Qwen/Qwen3-4B") is True
+    assert w._checkpointing_default_for_model("Qwen/Qwen3-4B") is True
     assert w.grad_checkpointing_on("Qwen/Qwen3-4B") is True
     # context-aware: a SMALL model at LONG context is memory-bound -> memory mode ON (PR #174:
     # 1B GRPO OOMs at 4096 in speed mode, fits in memory mode).

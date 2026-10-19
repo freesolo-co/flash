@@ -17,14 +17,13 @@
 FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel@sha256:b574d4ccf6d8856a5d87dcadc667aa4f95dc18d337ef3a28d02b7b01897d7081
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    HF_HUB_ENABLE_HF_TRANSFER=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     PYTHONUNBUFFERED=1
 
 # Compiled-kernel cache dirs (Triton JIT + TorchInductor). Point both backends at a stable on-image
-# location so a BAKED mega-cache (below, opt-in) lands where the runtime looks, and so a first-run
+# location so a BAKED kernel cache (below, opt-in) lands where the runtime looks, and so a first-run
 # JIT on a cold worker writes here too. These ENVs are always set (cheap); whether the dir is
-# pre-populated is what the opt-in bake controls. engine.worker._load_kernel_cache_if_present reads
+# pre-populated is what the opt-in bake controls. kernel_warmup.configure_kernel_cache checks
 # /opt/flash/kernelcache at boot.
 # FLASHINFER_CUBIN_DIR / FLASHINFER_CACHE_DIR / FLASHINFER_WORKSPACE_BASE: FlashInfer's attention-backend
 # cubins (the Blackwell sm120 / B200 rollout attention backend) are NOT bundled in the wheel — flashinfer
@@ -54,16 +53,15 @@ RUN pip install --no-cache-dir \
     "peft==0.20.0" \
     "vllm==0.19.1" \
     "flashinfer-python==0.6.6" \
-    "bitsandbytes==0.50.1" \
     "datasets==5.0.1" \
     "huggingface_hub==1.28.0" \
+    "httpx==0.28.1" \
     "accelerate==1.14.0" \
     "wandb==0.28.2" \
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@9c8e42e762fce087c27b673af4922795d9edb85e" \
     "flash-qla==0.1.2" \
     "tilelang==0.1.9" \
     "apache-tvm-ffi==0.1.9" \
-    "hf_transfer==0.1.9" \
     "freesolo==0.4.2"
 # Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
@@ -195,10 +193,9 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
 # first-use JIT as a per-run RUNTIME cost on a cold worker.
 #
 # OPT-IN PATH: build on a real GPU runner with --build-arg BUILD_KERNEL_CACHE=true after running
-# flash/engine/worker/runtime/kernel_warmup.py there to produce a portable mega-cache under build/kernel_cache/
-# (torch.compiler.save_cache_artifacts). The conditional COPY below then bakes it into
-# /opt/flash/kernelcache, and engine.worker._load_kernel_cache_if_present loads it at boot
-# (torch.compiler.load_cache_artifacts) — measured cold compile ~124s -> warm load ~0.2s (537x).
+# flash/engine/worker/runtime/kernel_warmup.py there to produce raw kernel caches and architecture
+# metadata under build/kernel_cache/. The COPY below bakes them into /opt/flash/kernelcache;
+# kernel_warmup.configure_kernel_cache validates the architecture and configures cache paths at boot.
 #
 # FALLBACK (the DEFAULT, BUILD_KERNEL_CACHE=false): NOTHING is baked and the build needs no GPU. The
 # first-run JIT happens on the worker exactly as before; flash #163's init heartbeat keeps the stall
@@ -207,14 +204,14 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
 # The COPY is made safe-when-absent with the standard "COPY a path that always exists + a guard"
 # trick. `build/kernel_cache/` is checked into the repo with just a `.keep` placeholder, so the COPY
 # source ALWAYS exists (a bare glob that matches nothing is a hard BuildKit error — this avoids it).
-# kernel_warmup.py drops `mega_cache.bin` + `mega_cache.json` (+ triton/inductor cache trees) next
+# kernel_warmup.py drops arch metadata + triton/inductor trees next
 # to that placeholder on a GPU builder. COPY STRAIGHT to the final /opt/flash/kernelcache so a
 # multi-GB baked cache lives in exactly ONE layer -- staging in /tmp then cp/mv would leave the
 # bytes in BOTH the COPY layer and the RUN layer (doubling image size). with the default the dir
 # holds only `.keep`, so the copy is harmless; the guard just removes any stale cache + logs.
 ARG BUILD_KERNEL_CACHE=false
 COPY build/kernel_cache/ /opt/flash/kernelcache/
-RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_cache.bin ]; then \
+RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_cache.json ]; then \
       echo "kernel-cache: baked from build/kernel_cache/ -> /opt/flash/kernelcache"; \
     else \
       rm -rf /opt/flash/kernelcache/mega_cache.bin /opt/flash/kernelcache/mega_cache.json \
@@ -226,7 +223,7 @@ RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_
 # Sanity: the worker imports must succeed (catches a broken stack at build time, not run time).
 # Import EVERY package the worker runtime uses (derived from a full AST scan of the engine/envs/
 # bootstrap code + the WORKER_DEPS list above): the core stack, the optimizer/accelerator libs
-# (flash-linear-attention=fla, flash_attn, bitsandbytes, triton), and the HF/env libs. A
+# (flash-linear-attention=fla, flash_attn, triton), and the HF/env libs. A
 # missing or ABI-broken package fails the build HERE instead of silently shipping (the FA wheel in
 # particular can install yet fail to import against this torch). cuDNN comes from the base image.
 # flash_attn is BEST-EFFORT (the install above tolerates a build failure -> SDPA fallback), so it
@@ -234,7 +231,7 @@ RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_
 # could never be produced. The rest of the stack is mandatory.
 RUN python -c "import importlib.metadata as M; \
 import torch, transformers, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
-fla, bitsandbytes, hf_transfer, triton, freesolo; \
+fla, triton, freesolo, httpx; \
 import importlib; \
 fa_ok = False; \
 exec('try:\n import flash_attn\n fa_ok = True\nexcept Exception:\n fa_ok = False'); \
@@ -246,8 +243,8 @@ cudnn = torch.backends.cudnn.version(); assert cudnn, 'cuDNN not compiled into t
 ver = lambda n: M.version(n); \
 print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)', '| flash_attn_3', 'present (Hopper FA3)' if fa3_ok else 'ABSENT (SDPA on Hopper)', '| flashinfer', 'present (B200 MoE/attn)' if fi_ok else 'ABSENT (Triton fused-MoE fallback)'); \
 [print('  ', d, ver(d)) for d in ['transformers','peft','vllm','flashinfer-python','datasets','huggingface-hub', \
-'accelerate','wandb','flash-linear-attention','bitsandbytes', \
-'hf-transfer','freesolo']]"
+'accelerate','wandb','flash-linear-attention', \
+'freesolo','httpx']]"
 
 # ---------------------------------------------------------------------------------------------
 # verl venv (GRPO/OPD/SFT verl backends): ISOLATED from the main interpreter on purpose.
@@ -337,7 +334,7 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
         "transformers==5.12.1" \
         "datasets==5.0.1" \
         "TransferQueue==0.1.7" \
-        "bitsandbytes==0.50.1" "qwen-vl-utils==0.0.14" \
+        "qwen-vl-utils==0.0.14" \
         "wandb==0.28.2" \
         "cachetools==7.1.7" "uvicorn==0.52.4" "fastapi==0.141.1" \
         "torchvision==0.25.0" "tqdm==4.70.0" "pyarrow==25.0.1" \

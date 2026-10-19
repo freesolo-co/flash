@@ -8,14 +8,13 @@ import json
 import math
 import os
 import secrets
-import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Any, Literal
+from typing import Any
 
 from flash.engine.worker.teacher.encoding import (
     EncodedTeacherToken,
@@ -73,110 +72,48 @@ def _remaining_run_wall_seconds() -> float | None:
     return max(0.0, deadline - now)
 
 
-class _ReusableHttpsResponse:
-    def __init__(self, transport, connection, response) -> None:
-        self._transport = transport
-        self._connection = connection
-        self._response = response
-        self._read_complete = False
-
-    def read(self) -> bytes:
-        try:
-            body = self._response.read()
-        except http.client.IncompleteRead:
-            self._transport.discard(self._connection)
-            raise
-        self._read_complete = True
-        if self._response.will_close or self._connection.sock is None:
-            self._transport.discard(self._connection)
-        return body
-
-    def close(self) -> None:
-        self._response.close()
-        if not self._read_complete or self._response.will_close or self._connection.sock is None:
-            self._transport.discard(self._connection)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args) -> Literal[False]:
-        self.close()
-        return False
-
-
-class _ThreadLocalHttpsTransport:
-    _stale_errors = (
-        http.client.RemoteDisconnected,
-        http.client.CannotSendRequest,
-        http.client.ResponseNotReady,
-        BrokenPipeError,
-        ConnectionResetError,
-    )
+class _TeacherHttpTransport:
+    """A client-lived pool shared by all scoring batches, with no automatic retries."""
 
     def __init__(self) -> None:
-        self._local = threading.local()
+        import httpx
 
-    def discard(self, connection) -> None:
-        if getattr(self._local, "connection", None) is connection:
-            self._local.connection = None
-            self._local.origin = None
-        connection.close()
+        self._client = httpx.Client(
+            limits=httpx.Limits(
+                max_connections=OPD_TEACHER_SCORING_CONCURRENCY,
+                max_keepalive_connections=OPD_TEACHER_SCORING_CONCURRENCY,
+            ),
+            follow_redirects=False,
+            trust_env=False,
+        )
 
-    def _connection(self, parsed, timeout: float):
-        origin = (parsed.hostname, parsed.port or 443)
-        connection = getattr(self._local, "connection", None)
-        if connection is not None and getattr(self._local, "origin", None) != origin:
-            self.discard(connection)
-            connection = None
-        if connection is None:
-            connection = http.client.HTTPSConnection(origin[0], origin[1], timeout=timeout)
-            self._local.connection = connection
-            self._local.origin = origin
-        else:
-            connection.timeout = timeout
-            if connection.sock is not None:
-                connection.sock.settimeout(timeout)
-        return connection
+    def close(self) -> None:
+        self._client.close()
 
     def urlopen(self, req: urllib.request.Request, *, timeout: float):
-        parsed = urllib.parse.urlsplit(req.full_url)
-        if parsed.scheme != "https":
+        import httpx
+
+        # retain the local HTTP broker's urllib contract; production always uses HTTPS.
+        if urllib.parse.urlsplit(req.full_url).scheme != "https":
             return urllib.request.urlopen(req, timeout=timeout)
-        connection = self._connection(parsed, timeout)
-        selector = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         try:
-            connection.request(
+            response = self._client.request(
                 req.get_method(),
-                selector,
-                body=req.data,
-                headers=dict(req.header_items()),
-            )
-            response = connection.getresponse()
-        except self._stale_errors as exc:
-            self.discard(connection)
-            raise urllib.error.URLError(exc) from exc
-        except OSError:
-            self.discard(connection)
-            raise
-        except http.client.HTTPException as exc:
-            self.discard(connection)
-            raise urllib.error.URLError(exc) from exc
-        if response.status < 200 or response.status >= 300:
-            try:
-                body = response.read()
-            except http.client.IncompleteRead:
-                self.discard(connection)
-                raise
-            if response.will_close or connection.sock is None:
-                self.discard(connection)
-            raise urllib.error.HTTPError(
                 req.full_url,
-                response.status,
-                response.reason,
-                response.headers,
-                io.BytesIO(body),
+                content=req.data,
+                headers=dict(req.header_items()),
+                timeout=timeout,
             )
-        return _ReusableHttpsResponse(self, connection, response)
+        except httpx.HTTPError as exc:
+            raise urllib.error.URLError(exc) from exc
+        # request() consumes the body and returns the connection to the shared pool. HTTP errors
+        # retain their body/status for the broker retry classifier, including rejected redirects.
+        body = io.BytesIO(response.content)
+        if not 200 <= response.status_code < 300:
+            raise urllib.error.HTTPError(
+                req.full_url, response.status_code, response.reason_phrase, response.headers, body
+            )
+        return body
 
 
 @dataclass(frozen=True)
@@ -546,7 +483,10 @@ class TeacherClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.tokenizer = tokenizer or load_teacher_tokenizer(model)
-        self._transport = _ThreadLocalHttpsTransport()
+        self._transport = _TeacherHttpTransport()
+
+    def close(self) -> None:
+        self._transport.close()
 
     def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         data = json.dumps(body, allow_nan=False, separators=(",", ":")).encode()

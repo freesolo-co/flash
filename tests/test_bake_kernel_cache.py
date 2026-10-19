@@ -1,6 +1,7 @@
 import importlib.util
-import json
 from pathlib import Path
+
+import pytest
 
 
 def bake_module():
@@ -28,7 +29,26 @@ def test_missing_bake_artifact_fails_verification(tmp_path):
     assert bake_module()._verify(str(tmp_path), "sm90") != 0
 
 
-def test_wrong_bake_arch_fails_verification(tmp_path):
-    (tmp_path / "mega_cache.bin").write_bytes(b"cache")
-    (tmp_path / "mega_cache.json").write_text(json.dumps({"arch": "sm80"}))
-    assert bake_module()._verify(str(tmp_path), "sm90") != 0
+@pytest.mark.parametrize(
+    "artifact", ["triton/kernel.cubin", "triton/kernel.ptx", "inductor/kernel.so"]
+)
+def test_verify_accepts_real_raw_artifacts(tmp_path, artifact):
+    path = tmp_path / artifact
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(b"compiled")
+    (tmp_path / "mega_cache.json").write_text('{"sm": "sm100"}')
+    assert bake_module()._verify(str(tmp_path), "sm100") == 0
+    assert bake_module()._verify(str(tmp_path), "sm90") == 1
+
+
+def test_verify_rejects_metadata_and_lock_files_without_kernels(tmp_path):
+    (tmp_path / "triton").mkdir()
+    (tmp_path / "triton" / "kernel.lock").write_text("lock")
+    (tmp_path / "mega_cache.json").write_text('{"sm": "sm100"}')
+    assert bake_module()._verify(str(tmp_path), "sm100") == 1
+
+
+def test_verify_rejects_legacy_blob_without_raw_kernels(tmp_path):
+    (tmp_path / "mega_cache.bin").write_bytes(b"legacy-blob")
+    (tmp_path / "mega_cache.json").write_text('{"sm": "sm100"}')
+    assert bake_module()._verify(str(tmp_path), "sm100") == 1

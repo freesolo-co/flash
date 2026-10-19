@@ -198,16 +198,16 @@ def test_grpo_estimator_grows_with_context_and_completion():
     from flash.engine.plan.vram import estimate_vram_gb
 
     short_context = estimate_vram_gb(
-        9.7, "grpo", seq_len=1024, max_tokens=512, group_size=8, use_vllm=False
+        9.7, "grpo", seq_len=1024, max_tokens=512, group_size=8, sleep_offload=False
     )
     long_context = estimate_vram_gb(
-        9.7, "grpo", seq_len=8192, max_tokens=512, group_size=8, use_vllm=False
+        9.7, "grpo", seq_len=8192, max_tokens=512, group_size=8, sleep_offload=False
     )
     short_completion = estimate_vram_gb(
-        9.7, "grpo", seq_len=4096, max_tokens=128, group_size=8, use_vllm=False
+        9.7, "grpo", seq_len=4096, max_tokens=128, group_size=8, sleep_offload=False
     )
     long_completion = estimate_vram_gb(
-        9.7, "grpo", seq_len=4096, max_tokens=2048, group_size=8, use_vllm=False
+        9.7, "grpo", seq_len=4096, max_tokens=2048, group_size=8, sleep_offload=False
     )
 
     assert long_context > short_context

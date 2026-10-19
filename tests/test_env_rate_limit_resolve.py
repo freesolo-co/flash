@@ -10,7 +10,7 @@ import flash.runner.supervise.lifecycle as runner_lifecycle
 Covers the review feedback on both PRs:
   - #209: _urlopen raises the typed GitHubRateLimitError on 429 / rate-limit 403, and a plain
     RuntimeError on a non-rate-limit 403 (so only rate limits are reclassified as retriable).
-  - #214 (comment 1): runner_artifacts._assign_resolved_env_sha resolves the env ref->sha once and pins it
+  - #214 (comment 1): runner_artifacts._pin_env_sha_with_reason resolves the env ref->sha once and pins it
     on the spec; failures leave it empty for authoritative controller staging.
   - #214 (comment 2): registry.load_environment forwards a user [environment.params] entry named
     "resolved_sha" verbatim to the SDK loader and threads the control-plane pin under the reserved
@@ -219,19 +219,20 @@ def test_registry_omits_pin_when_unset(monkeypatch):
 _GH_ENV = "github:owner/repo@main:env/environment.py"
 
 
-def test_assign_resolved_env_sha_pins_when_resolver_succeeds(monkeypatch):
+def test_pin_env_sha_with_reason_pins_when_resolver_succeeds(monkeypatch):
     import flash.envs.loading.loader as adapter
     from flash.core.spec import EnvironmentSpec, JobSpec
 
     monkeypatch.setattr(adapter, "_resolve_ref_sha", lambda parsed, *a, **k: "b" * 40)
     spec = JobSpec(environment=EnvironmentSpec(id=_GH_ENV))
-    out = runner_artifacts._assign_resolved_env_sha(spec)
+    out, reason = runner_artifacts._pin_env_sha_with_reason(spec)
     assert out.environment.resolved_sha == "b" * 40
+    assert reason == ""
     # Untouched fields survive the rebuild.
     assert out.environment.id == _GH_ENV
 
 
-def test_assign_resolved_env_sha_uses_fast_no_retry_resolver(monkeypatch):
+def test_pin_env_sha_with_reason_uses_fast_no_retry_resolver(monkeypatch):
     # the control-plane preflight must never block run creation on github retries: it resolves with a
     # short timeout and zero rate-limit retries before authoritative controller staging.
     import flash.envs.loading.loader as adapter
@@ -245,12 +246,12 @@ def test_assign_resolved_env_sha_uses_fast_no_retry_resolver(monkeypatch):
         return "d" * 40
 
     monkeypatch.setattr(adapter, "_resolve_ref_sha", fake_resolve)
-    runner_artifacts._assign_resolved_env_sha(JobSpec(environment=EnvironmentSpec(id=_GH_ENV)))
+    runner_artifacts._pin_env_sha_with_reason(JobSpec(environment=EnvironmentSpec(id=_GH_ENV)))
     assert seen["max_rate_limit_retries"] == 0
     assert seen["timeout"] <= 15.0
 
 
-def test_assign_resolved_env_sha_best_effort_on_failure(monkeypatch):
+def test_pin_env_sha_with_reason_best_effort_on_failure(monkeypatch):
     import flash.envs.loading.loader as adapter
     from flash.core.spec import EnvironmentSpec, JobSpec
 
@@ -259,11 +260,12 @@ def test_assign_resolved_env_sha_best_effort_on_failure(monkeypatch):
 
     monkeypatch.setattr(adapter, "_resolve_ref_sha", boom)
     spec = JobSpec(environment=EnvironmentSpec(id=_GH_ENV))
-    out = runner_artifacts._assign_resolved_env_sha(spec)
+    out, reason = runner_artifacts._pin_env_sha_with_reason(spec)
     assert out.environment.resolved_sha == ""  # controller staging resolves before allocation
+    assert reason == "github down"
 
 
-def test_assign_resolved_env_sha_noop_without_env_or_already_pinned(monkeypatch):
+def test_pin_env_sha_with_reason_noop_without_env_or_already_pinned(monkeypatch):
     import flash.envs.loading.loader as adapter
     from flash.core.spec import EnvironmentSpec, JobSpec
 
@@ -273,10 +275,10 @@ def test_assign_resolved_env_sha_noop_without_env_or_already_pinned(monkeypatch)
 
     monkeypatch.setattr(adapter, "_resolve_ref_sha", boom)
     # No env id.
-    assert runner_artifacts._assign_resolved_env_sha(JobSpec()).environment.resolved_sha == ""
+    assert runner_artifacts._pin_env_sha_with_reason(JobSpec())[0].environment.resolved_sha == ""
     # Already pinned.
     pinned = JobSpec(environment=EnvironmentSpec(id=_GH_ENV, resolved_sha="c" * 40))
-    assert runner_artifacts._assign_resolved_env_sha(pinned).environment.resolved_sha == "c" * 40
+    assert runner_artifacts._pin_env_sha_with_reason(pinned)[0].environment.resolved_sha == "c" * 40
 
 
 def test_background_submit_keeps_environment_staging_off_creation_path(monkeypatch, tmp_path):

@@ -283,10 +283,10 @@ def test_estimator_logits_term_uses_max_tokens_and_caps_at_budget():
     from flash.engine.plan.vram import estimate_vram_gb as e
 
     # Holding seq fixed, a longer completion (max_tokens) raises the GRPO train-phase estimate.
-    # Use the non-colocate path (use_vllm=False) so the rollout term doesn't mask the train peak
+    # Use the resident path (sleep_offload=False) so the rollout term does not mask the train peak
     # (for small vLLM models the 2nd-copy rollout dominates and hides the logits term).
-    lo = e(2.0, "grpo", seq_len=4096, max_tokens=256, group_size=8, use_vllm=False)
-    hi = e(2.0, "grpo", seq_len=4096, max_tokens=8192, group_size=8, use_vllm=False)
+    lo = e(2.0, "grpo", seq_len=4096, max_tokens=256, group_size=8, sleep_offload=False)
+    hi = e(2.0, "grpo", seq_len=4096, max_tokens=8192, group_size=8, sleep_offload=False)
     assert hi > lo
     # ... but never by more than the logits budget (the per_device=1 floor is capped there)
     assert hi - lo <= vram._LOGITS_BUDGET_GB + 1e-6

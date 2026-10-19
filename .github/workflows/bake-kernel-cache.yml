@@ -1,9 +1,9 @@
 name: flash worker kernel-cache (per-arch)
 
-# Builds per-SM worker images with the compiled-kernel mega-cache baked in, killing the ~10-15 min
-# first-use JIT on a cold worker (the regression #194 reintroduced). Each matrix leg:
+# Builds per-SM worker images with compiled kernel caches baked in to reuse matching kernels
+# on cold workers. Each matrix leg:
 #   1. offloads the warmup to a Modal GPU of that arch (GH runners have none) -> build/kernel_cache,
-#   2. docker build --build-arg BUILD_KERNEL_CACHE=true -> ghcr.io/freesolo-co/flash-worker:cu128-<sm>,
+#   2. builds docker/Dockerfile.kernelcache -> ghcr.io/freesolo-co/flash-worker:cu128-<sm>,
 #   3. pushes it. The allocator then selects the cu128-<sm> tag per GPU class for baked arches
 #      (see flash/providers/_lifecycle/net/worker.py).
 #

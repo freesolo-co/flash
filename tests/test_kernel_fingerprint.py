@@ -127,7 +127,7 @@ def test_fa_sha256_digest_only_change_moves_fp_base_not_fp_cache():
     """The exact remediation this fp_base input exists for: a maintainer dispatches worker-image.yml
     with the SAME wheel url but an UPDATED sha256 (a replaced release asset). A digest rotation must
     move fp_base (so auto-rebake re-layers every stale per-arch tag) while leaving fp_cache untouched
-    (a wheel digest plays no part in what the Triton/Inductor mega-cache holds, so no GPU re-warm)."""
+    (a wheel digest plays no part in what the Triton/Inductor kernel cache holds, so no GPU re-warm)."""
     fp_cache0, fp_base0, _, _ = kf.fingerprints(ROOT)
     fp_cache1, fp_base1, _, _ = kf.fingerprints(ROOT, fa2_sha256="0" * 64)
     assert fp_cache1 == fp_cache0, "a wheel digest rotation must not invalidate the kernel cache"

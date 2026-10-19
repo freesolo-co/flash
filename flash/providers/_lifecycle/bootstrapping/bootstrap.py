@@ -822,13 +822,6 @@ def _run_attempt(payload: dict) -> int:
     retriable = False
     deadline_watchdog = None
     try:
-        try:
-            import importlib.util
-
-            if importlib.util.find_spec("hf_transfer") is not None:
-                os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-        except Exception as exc:
-            print("hf_transfer setup skipped:", exc, flush=True)
         deadline = require_deadline_at(payload)
         deadline_watchdog = arm_deadline_watchdog(deadline, payload)
         # fetch and verify the pinned archive before pip, downloaded imports, path mutation, or child.

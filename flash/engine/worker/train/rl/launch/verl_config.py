@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import copy
 import math
-import os
 
 import flash.engine.worker.runtime.state as _worker_state
 from flash.adapters.targets import resolve_lora_targeting
@@ -460,11 +459,6 @@ def build_verl_overrides(cfg: dict) -> list[str]:
     else:
         # flash default: dr-grpo with no kl term, so no reference policy.
         o.append("actor_rollout_ref.actor.use_kl_loss=False")
-    if cfg.get("entropy_quantile") is not None:
-        # the top-entropy shim thresholds on per-token entropy, which verl computes only when asked:
-        # calculate_entropy defaults to false and entropy_coeff is 0 on the flash recipe, so without
-        # this the shim would receive no entropy and raise rather than silently skip the masking.
-        o.append("actor_rollout_ref.actor.calculate_entropy=True")
     if cfg.get("fp8_kv"):
         # fp8 kv cache on ada/hopper+ (cc>=8.9), matching engine/vram.py's sizing; tis (above) covers
         # the extra rollout-vs-train mismatch fp8 introduces. '+' appends the key under the existing
@@ -662,7 +656,6 @@ def _build_verl_training_cfg(
         "temperature": inp["temperature"],
         "top_p": inp["top_p"],
         "kl_coef": inp["kl_coef"],
-        "entropy_quantile": inp["entropy_quantile"],
         "stop_sequences": inp["stop_sequences"],
         "structured_outputs": inp["structured_outputs"],
         "thinking": thinking,
@@ -727,7 +720,6 @@ def _build_verl_train_notes(
     wandb_id: str | None = None,
     reward_bridge_batching: bool = False,
     gdn_boundary_resets: bool | None = None,
-    host_census: dict | None = None,
     rollout_identity_evidence: dict | None = None,
     advantage_spread_history: list[float] | None = None,
     advantage_bounds: list[dict] | None = None,
@@ -745,7 +737,6 @@ def _build_verl_train_notes(
         "reward_history": reward_history,
         "loss_curve": loss_curve,
         "download_seconds": download_seconds,
-        "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
         # verl trains out-of-process, so torch's in-process allocator counter would read ~0 here and
         # miss the trainer entirely. nvidia-smi is the only reading that sees the child, so both keys
         # carry the same device-level figure. (on the retired in-process trl path peak_gpu_gb was the
@@ -789,7 +780,6 @@ def _build_verl_train_notes(
         "wandb_url": wandb_url,
         "wandb_id": wandb_id,
         "reward_bridge_batching": bool(reward_bridge_batching),
-        "host_census": copy.deepcopy(host_census or {}),
         "rollout_identity_evidence": copy.deepcopy(
             rollout_identity_evidence or {"steps": [], "validation": []}
         ),
@@ -803,7 +793,6 @@ def _build_verl_train_notes(
         "multi_turn_accounting": copy.deepcopy(multi_turn_accounting),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
-            "entropy_quantile": inp["entropy_quantile"],
             "stop_sequences": list(inp["stop_sequences"]),
             "structured_outputs": inp["structured_outputs"],
             "temperature": inp["temperature"],

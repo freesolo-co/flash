@@ -55,7 +55,6 @@ MAX_LORAS = 16
 MAX_LORA_RANK = 32
 MAX_CPU_LORAS = 256
 PROMPT_TOKEN_CACHE_SIZE = 2048
-PRELOAD_CACHED_LORAS = True
 # Prefix caching: measured ~4.7x throughput / ~10x lower TTFT for shared system prompts, zero
 # overhead on misses. CUDA graphs stay on by default, with per-model eager fallbacks when boot
 # canaries show that graph memory leaves too little KV-cache headroom.

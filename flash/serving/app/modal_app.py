@@ -98,37 +98,9 @@ HOSTING_CACHE_MOUNT = "/vol/hosting-cache"
 # doesn't; there is nothing to tune at deploy time. Every value is the proven default. (The wiring
 # below — HF/internal key, backend + Supabase URLs — stays env-configured because it is per-deploy
 # credentials, not tuning.)
-# Maximum idle window before a gpu model container scales down, PER GPU TIER.
-#
-# Sizing rule: an idle container bills at the full GPU rate, so holding one is only worth it while
-# waiting costs less than re-paying the cold boot. Boot is a fixed cost (weights + torch.compile +
-# graph capture + warmup); idle is a rate. The break-even idle window is therefore ~the tier's own
-# cold-boot time — hold roughly as long as a restart would cost, then release the card.
-#
-# A single flat 1800s applied that same 30-minute hold to every tier, so a cheap L4 that boots in
-# ~60s still burned 30 GPU-minutes after its last request. Per Modal's rates the idle tax per cold
-# wake was $0.40 (L4) / $0.97 (L40S) / $1.98 (H100) / $2.27 (H200) regardless of how much work the
-# request did.
-#
-# The H200 keeps a LONGER hold than break-even alone would suggest: the 35B's boot is ~1010s of
-# engine init (67 GiB of weights + ~377s torch.compile + graph capture), so a miss is a ~17-minute
-# user-visible stall. Cost and latency point the same way there, and the window stays at 1800s.
-SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
-    # ~60s cold boot (small FP8 checkpoints, cached compile artifacts on the shared volume).
-    "L4": 300,
-    # ~120s cold boot (9B FP8 at 32k).
-    "L40S": 420,
-    # ~400s cold boot (27B FP8 at 32k, graph capture).
-    "H100": 900,
-    # ~1010s cold boot (35B bf16, 67 GiB + ~377s torch.compile). Break-even AND a ~17-min
-    # user-visible stall on a miss both argue for keeping the full window here.
-    "H200": 1800,
-    # B200 now carries all three tiers. Measured cold boots (2026-08-30/31, this card): 9B 723s,
-    # 35B 488s, 27B 1821s. The 27B dominates because a cold torch.compile cache costs ~354s of
-    # Dynamo alone; warm-cache boots of the same tiers run 153-473s. Sized to the slowest MEASURED
-    # cold boot rather than the warm case, so a scale-out replacement is not cycled mid-boot.
-    "B200": 2100,
-}
+# all hosted engines use b200. the slowest measured cold boot is 1821s (27b); retain
+# its 2100s idle window so warm replicas survive normal gaps between requests.
+SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {"B200": 2100}
 # The tiers this app is allowed to run an engine on. `gpu` in the serving catalog is a plain string,
 # so a typo ("b200", "B2OO") or an unvalidated new card used to fall through `dict.get` to a default
 # window and deploy anyway, at that card's real hourly rate. Membership here is the one gate.

@@ -181,7 +181,7 @@ def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_pa
     from flash.cost.spec import estimate_for_spec
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner_artifacts, "_assign_resolved_env_sha", lambda spec: spec)
+    monkeypatch.setattr(runner_artifacts, "_pin_env_sha_with_reason", lambda spec: (spec, ""))
     monkeypatch.setattr(
         provider_worker, "publish_source_snapshot", lambda _repo=None: _SOURCE_SNAPSHOT
     )

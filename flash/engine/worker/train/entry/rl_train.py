@@ -122,7 +122,6 @@ def _write_terminal_metadata(
             wandb_id=reward_runtime.wandb_link.get("wandb_id"),
             reward_bridge_batching=not inp["multi_turn"],
             gdn_boundary_resets=gdn_hybrid or None,
-            host_census=state.host_census,
             rollout_identity_evidence=state.rollout_identity_evidence,
             advantage_spread_history=state.adv_spread_history,
             advantage_bounds=state.advantage_bounds_evidence,

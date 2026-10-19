@@ -46,7 +46,6 @@ from flash.serving.src.engine.support import (
     _adapter_source_ident,
     _assert_source_cache_containment,
     _engine_is_dead,
-    _load_adapters_for_base,
     _safe_chat_template_kwargs,
     enforce_expected_checkpoint,
 )
@@ -71,12 +70,12 @@ class _LoraEngineImpl:
         return replica_id
 
     async def _load(self) -> None:
-        # async so the cached-LoRA preload (and the engine's first async use) run on the SAME event
+        # async so the engine's first use runs on the same event
         # loop that serves requests. A one-off asyncio.run() here would bind vLLM's AsyncLLMEngine
         # to a loop that's then closed, breaking generate() on the real serving loop.
         from vllm import AsyncEngineArgs, AsyncLLMEngine
 
-        from flash.serving.src.engine.boot import load_engine_config, pin_loras_default
+        from flash.serving.src.engine.boot import load_engine_config
         from flash.serving.src.store import settings as cfg
         from flash.serving.src.store.registry import AdapterRegistry
         from flash.serving.src.store.settings import ADAPTER_CACHE_DIR, Settings
@@ -95,16 +94,13 @@ class _LoraEngineImpl:
         self._lora_entries: dict[tuple[str, str], _LoraEntry] = {}
         self._prompt_token_cache: OrderedDict[tuple[str, str], tuple[int, ...]] = OrderedDict()
         self._prompt_cache_size = cfg.PROMPT_TOKEN_CACHE_SIZE
-        base_model_adapters = _load_adapters_for_base(self.settings, self.base_model)
-        self.registry.hydrate(base_model_adapters)
         ADAPTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-        self.processor, self.tokenizer, overrides, kwargs = load_engine_config(
+        self.processor, self.tokenizer, _overrides, kwargs = load_engine_config(
             self.base_model,
             self.settings,
             cfg,
         )
-        self._pin_loras = pin_loras_default(overrides, cfg)
         self.reasoning_parser = kwargs.get("reasoning_parser")
         self.tool_parser = tool_parser_for(self.base_model)
         self.engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**kwargs))
@@ -127,8 +123,6 @@ class _LoraEngineImpl:
         # fresh engine instead of leaving a permanently dead container in rotation.
         self._self_heal_triggered = False
         self._liveness_task = asyncio.create_task(self._liveness_monitor())
-        if cfg.PRELOAD_CACHED_LORAS:
-            await self._preload_cached_loras()
         try:
             self._replica_boot_duration_seconds = boot_elapsed_seconds()
         except Exception:
@@ -250,14 +244,6 @@ class _LoraEngineImpl:
             raise RuntimeError("vLLM rejected LoRA removal")
         entries.pop(adapter_key)
 
-    async def _pin_lora(self, lora_request: Any) -> None:
-        pin = getattr(self.engine, "pin_lora", None)
-        if pin is None:
-            return
-        result = pin(lora_request.lora_int_id)
-        if inspect.isawaitable(result):
-            await result
-
     async def _add_lora_locked(self, record: Any, path: Path) -> None:
         adapter_key = record_key(record)
         entries = self._entries()
@@ -274,30 +260,6 @@ class _LoraEngineImpl:
             raise RuntimeError("vLLM rejected a new LoRA registration")
         entry = entries[adapter_key]
         entries[adapter_key] = _LoraEntry(entry.source_ident, lora_request, "loaded")
-        if self._pin_loras:  # capped pools stay unpinned so surplus adapters can lru-swap
-            await self._pin_lora(lora_request)
-
-    async def _preload_cached_loras(self) -> None:
-        from flash.serving.src.store.settings import ADAPTER_CACHE_DIR
-
-        for record in self.registry.list_ready():
-            source_ident = _adapter_source_ident(record)
-            local_dir = _adapter_source_cache_dir(ADAPTER_CACHE_DIR, record)
-            subfolder = getattr(record, "subfolder", None)
-            path = _adapter_cache_path(local_dir, subfolder)
-            if not _adapter_cache_ready(path):
-                continue
-            lock = await self._adapter_lock(record_key(record))
-            async with lock:
-                self._source_paths[source_ident] = path
-                self.registry.set_local_path(record, path)
-                try:
-                    await self._add_lora_locked(record, path)
-                except Exception as exc:  # a bad cached LoRA must not kill startup
-                    print(
-                        f"cached LoRA preload skipped for {record.adapter_id}: {exc!r}",
-                        flush=True,
-                    )
 
     async def _ensure_adapter_local_locked(self, record: Any) -> Path:
         # Download body; caller must already hold self._adapter_lock(record_key(record)).
@@ -418,7 +380,12 @@ class _LoraEngineImpl:
             if not record.serve_base_model and not record.is_checkpoint:
                 raise ValueError(f"Unknown adapter id on {self.base_model}: {adapter_id}")
             path = await self._ensure_adapter_local_locked(record)
-            return self._cached_lora_request_locked(record, path), record
+            lora_request = self._cached_lora_request_locked(record, path)
+            # first-use loading must enter the same lifecycle as explicit registration so
+            # undeploy removes the adapter from vllm as well as our registry.
+            if self._entries()[adapter_key].state == "reserved":
+                await self._add_lora_locked(record, path)
+            return lora_request, record
 
     def _thinking_default(self, record: Any, payload: Any) -> bool:
         """The ``enable_thinking`` to render with. A trained LoRA forces its own value; a base-model
@@ -743,12 +710,21 @@ class _LoraEngineImpl:
         lock = await self._adapter_lock(adapter_key)
         async with lock:
             current = self.registry.get(org_id, adapter_id)
-            current_generation = current.deployment_generation if current is not None else None
-            stale = current is not None and (
-                current_generation is not None
-                if expected_generation is None
-                else current_generation != expected_generation
-            )
+            if current is None:
+                from flash.serving.src.store.undeploy import get_authoritative
+
+                current = await get_authoritative(org_id, adapter_id)
+                if current is None:
+                    return {"ok": True, "removed": None, "base_model": self.base_model}
+                # durable disable clears the generation. a ready or loading row means this
+                # cleanup lost to a redeploy, even if this replica has never seen the adapter.
+                stale = current.status == "ready" or current.deployment_generation is not None
+            else:
+                stale = (
+                    current.deployment_generation is not None
+                    if expected_generation is None
+                    else current.deployment_generation != expected_generation
+                )
             if stale:
                 return {
                     "ok": True,
@@ -756,6 +732,9 @@ class _LoraEngineImpl:
                     "skipped_stale_generation": True,
                     "base_model": self.base_model,
                 }
+            # use the disabled row's timestamp, not wall-clock cleanup time: a concurrent
+            # redeploy after the lookup must be able to supersede this tombstone.
+            self.registry.upsert(current)
             self.registry.remove(org_id, adapter_id)
             await self._evict_loaded_lora(adapter_key)
         return {"ok": True, "removed": adapter_id, "base_model": self.base_model}

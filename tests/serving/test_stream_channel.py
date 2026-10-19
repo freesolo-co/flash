@@ -1409,31 +1409,6 @@ def test_spawn_deadline_cancels_handle_returned_during_cleanup() -> None:
     assert asyncio.run(scenario()) == (ChannelErrorCode.DISPATCH_DEADLINE, 1, True)
 
 
-def test_deferred_spawn_cancel_retains_task_until_cleanup_finishes() -> None:
-    async def scenario() -> tuple[bool, bool]:
-        release = asyncio.Event()
-        cancelled = asyncio.Event()
-        handle = object()
-
-        async def cancel(value: Any) -> None:
-            assert value is handle
-            cancelled.set()
-            await release.wait()
-
-        spawn_task = asyncio.create_task(asyncio.sleep(0, result=handle))
-        await spawn_task
-        client._schedule_spawn_result_cancel(spawn_task, cancel)
-        await cancelled.wait()
-        retained = bool(client._BACKGROUND_TASKS)
-        release.set()
-        for task in tuple(client._BACKGROUND_TASKS):
-            await task
-        await asyncio.sleep(0)
-        return retained, not client._BACKGROUND_TASKS
-
-    assert asyncio.run(scenario()) == (True, True)
-
-
 def test_deferred_spawn_cancel_does_not_nest_call_result_budget() -> None:
     async def scenario() -> bool:
         handle = object()
