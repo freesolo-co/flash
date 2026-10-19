@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import flash.server.routes.serving as serving
+import flash.server.routes.serving_smoke as serving_smoke
 from flash.serve.contract.errors import ServingError
 
 
@@ -57,8 +58,8 @@ class _Context:
         return self.receive, self.send
 
     def Process(self, **kwargs):
-        assert kwargs["target"] is serving._json_schema_validation_worker
-        assert kwargs["name"] == serving._JSON_SCHEMA_PROCESS_NAME
+        assert kwargs["target"] is serving_smoke._json_schema_validation_worker
+        assert kwargs["name"] == serving_smoke._JSON_SCHEMA_PROCESS_NAME
         assert kwargs["daemon"] is True
         return self.process
 
@@ -67,13 +68,13 @@ def test_bounded_regex_rejects_an_expired_global_deadline(monkeypatch) -> None:
     """An exhausted smoke budget must fail before regex evaluation can start."""
     monkeypatch.setattr(serving.time, "monotonic", lambda: 10.0)
     monkeypatch.setattr(
-        serving.safe_regex,
+        serving_smoke.safe_regex,
         "fullmatch",
         lambda *args, **kwargs: pytest.fail("expired budgets must not evaluate regexes"),
     )
 
     with pytest.raises(ServingError, match="deployment_smoke_timeout"):
-        serving._bounded_regex_fullmatch("a", "a", deadline=10.0, budget_s=2.0)
+        serving_smoke._bounded_regex_fullmatch("a", "a", deadline=10.0, budget_s=2.0)
 
 
 def test_bounded_regex_maps_a_global_timeout_to_the_smoke_budget(monkeypatch) -> None:
@@ -83,15 +84,15 @@ def test_bounded_regex_maps_a_global_timeout_to_the_smoke_budget(monkeypatch) ->
     def timeout(*args, **kwargs):
         raise TimeoutError("slow regex")
 
-    monkeypatch.setattr(serving.safe_regex, "fullmatch", timeout)
+    monkeypatch.setattr(serving_smoke.safe_regex, "fullmatch", timeout)
     with pytest.raises(ServingError, match="deployment_smoke_timeout"):
-        serving._bounded_regex_fullmatch("(a+)+$", "a!", deadline=10.01, budget_s=1.0)
+        serving_smoke._bounded_regex_fullmatch("(a+)+$", "a!", deadline=10.01, budget_s=1.0)
 
 
 def test_schema_error_sanitization_collapses_and_bounds_untrusted_text() -> None:
     """Schema diagnostics must be single-line and bounded before reaching users or logs."""
     exc = SimpleNamespace(message=("  unsafe\n\ttext  " * 100))
-    message = serving._sanitized_schema_error(exc)
+    message = serving_smoke._sanitized_schema_error(exc)
 
     assert "\n" not in message
     assert "\t" not in message
@@ -112,7 +113,7 @@ def test_json_schema_worker_reports_expected_outcomes(instance, schema, status) 
     """The worker must classify normal schema outcomes and always close its connection."""
     connection = _Connection()
 
-    serving._json_schema_validation_worker(connection, instance, schema)
+    serving_smoke._json_schema_validation_worker(connection, instance, schema)
 
     assert connection.closed is True
     assert len(connection.sent) == 1
@@ -126,8 +127,8 @@ def test_json_schema_worker_safely_classifies_unexpected_failures(monkeypatch) -
     def boom(_schema):
         raise RuntimeError("validator exploded")
 
-    monkeypatch.setattr(serving, "validator_for", boom)
-    serving._json_schema_validation_worker(connection, {}, {})
+    monkeypatch.setattr(serving_smoke, "validator_for", boom)
+    serving_smoke._json_schema_validation_worker(connection, {}, {})
 
     assert connection.sent == [("error", "RuntimeError: validator exploded")]
     assert connection.closed is True
@@ -137,7 +138,7 @@ def _install_context(monkeypatch, *, outcome=None, eof=False, start_error=None):
     receive = _Connection(outcome=outcome, eof=eof)
     process = _Process(start_error=start_error)
     context = _Context(receive, process)
-    monkeypatch.setattr(serving.multiprocessing, "get_context", lambda method: context)
+    monkeypatch.setattr(serving_smoke.multiprocessing, "get_context", lambda method: context)
     monkeypatch.setattr(serving.time, "monotonic", lambda: 10.0)
     return receive, context.send, process
 
@@ -147,7 +148,7 @@ def test_validate_json_schema_reports_process_start_failure(monkeypatch) -> None
     receive, send, process = _install_context(monkeypatch, start_error=RuntimeError("spawn denied"))
 
     with pytest.raises(ServingError, match="could not start isolated JSON schema validation"):
-        serving._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
+        serving_smoke._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
 
     assert receive.closed is True
     assert send.closed is True
@@ -161,10 +162,10 @@ def test_validate_json_schema_maps_start_failure_after_deadline(monkeypatch) -> 
     receive = _Connection()
     process = _Process(start_error=RuntimeError("late spawn"))
     context = _Context(receive, process)
-    monkeypatch.setattr(serving.multiprocessing, "get_context", lambda method: context)
+    monkeypatch.setattr(serving_smoke.multiprocessing, "get_context", lambda method: context)
 
     with pytest.raises(ServingError, match="deployment_smoke_timeout"):
-        serving._validate_json_schema({}, {}, deadline=10.5, budget_s=0.5)
+        serving_smoke._validate_json_schema({}, {}, deadline=10.5, budget_s=0.5)
 
     assert receive.closed is True
     assert context.send.closed is True
@@ -175,7 +176,7 @@ def test_validate_json_schema_treats_child_eof_as_safe_failure(monkeypatch) -> N
     receive, send, _process = _install_context(monkeypatch, eof=True)
 
     with pytest.raises(ServingError, match="wall-clock deadline"):
-        serving._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
+        serving_smoke._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
 
     assert receive.closed is True
     assert send.closed is True
@@ -195,7 +196,7 @@ def test_validate_json_schema_maps_child_statuses(monkeypatch, outcome, message)
     _install_context(monkeypatch, outcome=outcome)
 
     if message is None:
-        serving._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
+        serving_smoke._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
     else:
         with pytest.raises(ServingError, match=message):
-            serving._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)
+            serving_smoke._validate_json_schema({}, {}, deadline=20.0, budget_s=5.0)

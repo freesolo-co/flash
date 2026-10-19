@@ -29,7 +29,7 @@ def completed_metrics_for_remote(
     deadline_at: float,
     log,
 ) -> dict | None:
-    from flash.runner.supervise.lifecycle import (
+    from flash.runner.supervise.recovery import (
         _completed_attempt_metrics,
         _runpod_completed_metrics,
     )
@@ -59,7 +59,7 @@ def teardown_reconciled_remote(
 ) -> tuple[bool, bool]:
     """return whether recovery may continue and exact deletion was confirmed."""
     from flash.runner.accounting.reconciliation import _record_cleanup_remote
-    from flash.runner.supervise.lifecycle import _strict_teardown_handle, _worker_provably_gone
+    from flash.runner.supervise.recovery import _strict_teardown_handle, _worker_provably_gone
 
     if confirmed_teardown:
         return True, True

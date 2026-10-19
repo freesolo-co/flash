@@ -959,11 +959,18 @@ def test_launch_walks_regions_on_capacity_rejection(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     attempts = []
 
     def fake_launch(
-        *, region_name, instance_type_name, ssh_key_names, name, user_data, file_system_names=None
+        *,
+        region_name,
+        instance_type_name,
+        ssh_key_names,
+        name,
+        user_data,
+        file_system_names=None,
+        deadline_at=None,
     ):
         attempts.append(region_name)
         if len(attempts) < 3:
@@ -984,7 +991,7 @@ def test_launch_refreshes_capacity_once_when_all_taken(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     created = []
 
     def fake_launch(*, region_name, **kw):
@@ -997,7 +1004,7 @@ def test_launch_refreshes_capacity_once_when_all_taken(monkeypatch):
     monkeypatch.setattr(
         jobs,
         "usable_instances",
-        lambda gpu, force=False, gpu_count=1: [_inst(region="us-fresh-1")],
+        lambda gpu, force=False, gpu_count=1, *, deadline_at=None: [_inst(region="us-fresh-1")],
     )
     h = _launch(jobs, _spec(), instances=[_inst(region="us-east-1")], attempt=0)
     assert created == ["us-fresh-1"]
@@ -1008,7 +1015,7 @@ def test_launch_refuses_primary_creation_below_minimum_deadline_allowance(monkey
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(jobs.time, "time", lambda: 100.0)
     launched = []
     monkeypatch.setattr(
@@ -1143,8 +1150,10 @@ def test_lambda_failure_detail_is_bounded_and_redacts_credentials(monkeypatch):
 
     def reader(_repo, path, *_args, **_kwargs):
         if path.endswith("_boot.log"):
-            return lambda force=False: "boot failed Authorization: Bearer hf-private-token"
-        return lambda force=False: "worker failed token=hf-private-token"
+            return lambda force=False, *, deadline_at=None: (
+                "boot failed Authorization: Bearer hf-private-token"
+            )
+        return lambda force=False, *, deadline_at=None: "worker failed token=hf-private-token"
 
     monkeypatch.setattr(jobs, "_make_hf_file_reader", reader)
 
@@ -1258,7 +1267,7 @@ def test_launch_refuses_an_instance_type_below_the_run_disk_floor(monkeypatch):
     from flash.providers.core.base import UnsupportedGpuError
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     launched = []
     monkeypatch.setattr(lambda_api, "launch_instance", lambda **_k: launched.append(True) or "i-1")
 
@@ -1277,7 +1286,7 @@ def test_launch_accepts_a_disk_capable_or_unmeasured_instance_type(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(lambda_api, "launch_instance", lambda **_k: "i-1")
 
     assert _launch(jobs, _spec(disk_gb=200), instances=[_inst(disk_gb=512.0)], attempt=0)
@@ -1293,7 +1302,7 @@ def test_launch_refuses_a_disk_undersized_refreshed_candidate(monkeypatch):
     from flash.providers.core.base import UnsupportedGpuError
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     launched = []
 
     def fake_launch(*, region_name, **_kwargs):
@@ -1304,7 +1313,9 @@ def test_launch_refuses_a_disk_undersized_refreshed_candidate(monkeypatch):
     monkeypatch.setattr(
         jobs,
         "usable_instances",
-        lambda gpu, force=False, gpu_count=1: [_inst(region="us-fresh-1", disk_gb=100.0)],
+        lambda gpu, force=False, gpu_count=1, *, deadline_at=None: [
+            _inst(region="us-fresh-1", disk_gb=100.0)
+        ],
     )
 
     with pytest.raises(UnsupportedGpuError, match=r"gpu_1x_a10 \(100 GB\).*required 800 GB"):
@@ -1350,7 +1361,7 @@ def test_launch_never_rents_an_undersized_sku_from_a_mixed_candidate_list(monkey
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     launched: list[str] = []
 
     def fake_launch(*, region_name, **_kwargs):
@@ -1380,7 +1391,7 @@ def test_post_launch_interrupt_does_not_layer_a_run_label_reap_on_exact_cleanup(
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(lambda_api, "launch_instance", lambda **_k: "i-1")
     exact: list[str] = []
     reaped: list[str] = []
@@ -1414,7 +1425,7 @@ def test_interrupt_after_publication_returns_terminates_only_this_instance(
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(lambda_api, "launch_instance", lambda **_kwargs: "i-4242")
 
     # fire in the gap the finding names: the helper has RETURNED (so its own guarded frame is gone
@@ -1447,7 +1458,7 @@ def test_launch_raises_when_no_capacity(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(
         lambda_api,
         "launch_instance",
@@ -1455,7 +1466,9 @@ def test_launch_raises_when_no_capacity(monkeypatch):
             lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: no capacity")
         ),
     )
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, gpu_count=1: [])
+    monkeypatch.setattr(
+        jobs, "usable_instances", lambda gpu, force=False, gpu_count=1, *, deadline_at=None: []
+    )
     with pytest.raises(lambda_api.LambdaApiError, match="no capacity"):
         _launch(jobs, _spec(), instances=[_inst()], attempt=0)
     with pytest.raises(lambda_api.LambdaApiError, match="no Lambda capacity"):
@@ -1466,9 +1479,11 @@ def test_resolve_ssh_key_names(monkeypatch):
     from flash.providers.lambda_.client import api as lambda_api
     from flash.providers.lambda_.jobs import resolve_ssh_key_names
 
-    monkeypatch.setattr(lambda_api, "list_ssh_keys", lambda: [{"name": "jk"}, {"name": "other"}])
+    monkeypatch.setattr(
+        lambda_api, "list_ssh_keys", lambda *, deadline_at=None: [{"name": "jk"}, {"name": "other"}]
+    )
     assert resolve_ssh_key_names() == ["jk"]  # first registered key
-    monkeypatch.setattr(lambda_api, "list_ssh_keys", list)
+    monkeypatch.setattr(lambda_api, "list_ssh_keys", lambda *, deadline_at=None: [])
     with pytest.raises(lambda_api.LambdaApiError, match="requires an SSH key"):
         resolve_ssh_key_names()
 
@@ -1481,11 +1496,18 @@ def _wire_launch(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     calls = []
 
     def fake_launch(
-        *, region_name, instance_type_name, ssh_key_names, name, user_data, file_system_names=None
+        *,
+        region_name,
+        instance_type_name,
+        ssh_key_names,
+        name,
+        user_data,
+        file_system_names=None,
+        deadline_at=None,
     ):
         calls.append({"region": region_name, "user_data": user_data, "fs": file_system_names})
         return "i-cache"
@@ -1582,7 +1604,7 @@ def test_filesystem_attach_reject_walks_cached_regions_without_cold_create(monke
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(
         lambda_api, "ensure_filesystem", lambda n, r, deadline_at=None: f"/lambda/nfs/{n}"
     )  # FS ensured
@@ -1617,7 +1639,7 @@ def test_capacity_reject_does_not_trigger_cold_fs_retry(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(
         lambda_api, "ensure_filesystem", lambda n, r, deadline_at=None: f"/lambda/nfs/{n}"
     )
@@ -1651,7 +1673,7 @@ def test_preload_mode_skips_region_when_cache_unavailable(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(
         lambda_api,
         "ensure_filesystem",
@@ -1686,7 +1708,7 @@ def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(
         lambda_api, "ensure_filesystem", lambda n, r, deadline_at=None: f"/lambda/nfs/{n}"
     )  # cache OK
@@ -1703,7 +1725,7 @@ def test_preload_mode_does_not_refresh_to_a_different_region(monkeypatch):
     monkeypatch.setattr(
         jobs,
         "usable_instances",
-        lambda gpu, force=False, gpu_count=1: (
+        lambda gpu, force=False, gpu_count=1, *, deadline_at=None: (
             refresh_calls.append(force) or [_inst(region="us-fresh-9")]
         ),
     )
@@ -1739,7 +1761,7 @@ def test_cache_ensured_per_region_in_the_walk(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     ensured, attempts = [], []
     monkeypatch.setattr(
         lambda_api,
@@ -1796,7 +1818,7 @@ def _wire_poll(
     seq = iter(instances)
     last = {"inst": None}
 
-    def fake_get(instance_id):
+    def fake_get(instance_id, *, deadline_at=None):
         last["inst"] = next(seq, last["inst"])
         return last["inst"]
 
@@ -1805,8 +1827,8 @@ def _wire_poll(
     clock = itertools.count(start=10_000, step=step)
     monkeypatch.setattr(jobs.time, "time", lambda: float(next(clock)))
 
-    def factory(hf_repo, path, min_interval_s=45.0):
-        def read(force=False):
+    def factory(hf_repo, path, min_interval_s=45.0, *, deadline_at=None):
+        def read(force=False, *, deadline_at=None):
             if path.endswith("/DONE"):
                 return done() if callable(done) else done
             if "lambda_attempt" in path and path.endswith(".json"):  # not the _boot.log
@@ -2411,7 +2433,7 @@ def test_provider_initial_and_reattached_poll_use_same_absolute_deadline(monkeyp
 
     monkeypatch.setattr(jobs, "usable_instances", lambda _gpu, **_k: [_inst()])
     monkeypatch.setattr(jobs, "launch_and_submit", lambda *_a, **_k: _handle(started_ts=1.0))
-    monkeypatch.setattr(jobs, "heartbeat_reader_for", lambda _spec: None)
+    monkeypatch.setattr(jobs, "heartbeat_reader_for", lambda _spec, *, deadline_at=None: None)
     monkeypatch.setattr(jobs, "poll_lambda_job", fake_poll)
     monkeypatch.setattr(
         "flash.providers.lambda_.client.api.terminate_instance_confirmed", lambda instance_id: None
@@ -2500,7 +2522,11 @@ def _wire_runner(monkeypatch, poll_outcome):
         "terminate_instance_confirmed",
         lambda instance_id: terminated.append([instance_id]),
     )
-    monkeypatch.setattr(jobs, "usable_instances", lambda gpu, force=False, gpu_count=1: [_inst()])
+    monkeypatch.setattr(
+        jobs,
+        "usable_instances",
+        lambda gpu, force=False, gpu_count=1, *, deadline_at=None: [_inst()],
+    )
     monkeypatch.setattr(jobs, "launch_and_submit", lambda *a, **k: _handle())
 
     def fake_poll(*a, **k):
@@ -2666,7 +2692,7 @@ def test_terminate_run_instances_matches_forced_prefix(monkeypatch):
         {"id": "i-2", "name": "flash-other-run-a0"},  # different run -> keep
     ]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda *, deadline_at=None: instances)
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
@@ -2688,9 +2714,9 @@ def test_run_instances_remaining_uses_exact_labels_and_exact_lookup(monkeypatch)
         {"id": "i-other", "name": jobs.instance_label("flash-1000", 0)},
     ]
     lookups = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda *, strict: rows)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda *, strict, deadline_at=None: rows)
 
-    def lookup(instance_id, *, strict):
+    def lookup(instance_id, *, strict, deadline_at=None):
         lookups.append((instance_id, strict))
         return None if instance_id == "i-gone" else {"id": instance_id}
 
@@ -2709,7 +2735,7 @@ def test_run_instances_remaining_fails_closed_on_enumeration_lookup_or_identity(
 
     provider = LambdaProvider()
 
-    def listing_failure(*, strict):
+    def listing_failure(*, strict, deadline_at=None):
         raise lambda_api.LambdaApiError("listing unavailable")
 
     monkeypatch.setattr(lambda_api, "list_instances", listing_failure)
@@ -2719,10 +2745,10 @@ def test_run_instances_remaining_fails_closed_on_enumeration_lookup_or_identity(
     monkeypatch.setattr(
         lambda_api,
         "list_instances",
-        lambda *, strict: [{"id": "i-1", "name": jobs.instance_label("run1", 0)}],
+        lambda *, strict, deadline_at=None: [{"id": "i-1", "name": jobs.instance_label("run1", 0)}],
     )
 
-    def lookup_failure(instance_id, *, strict):
+    def lookup_failure(instance_id, *, strict, deadline_at=None):
         raise lambda_api.LambdaApiError("lookup unavailable")
 
     monkeypatch.setattr(lambda_api, "get_instance", lookup_failure)
@@ -2732,7 +2758,7 @@ def test_run_instances_remaining_fails_closed_on_enumeration_lookup_or_identity(
     monkeypatch.setattr(
         lambda_api,
         "list_instances",
-        lambda *, strict: [{"id": None, "name": jobs.instance_label("run1", 0)}],
+        lambda *, strict, deadline_at=None: [{"id": None, "name": jobs.instance_label("run1", 0)}],
     )
     with pytest.raises(lambda_api.LambdaApiError, match="no usable id"):
         provider.run_instances_remaining("run1")
@@ -2758,7 +2784,7 @@ def test_sweep_orphans_label_safety(monkeypatch):
         {"id": "i-4", "name": ""},  # unnamed -> NEVER touch
     ]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda *, deadline_at=None: instances)
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
@@ -2777,7 +2803,7 @@ def test_sweep_orphans_prefix_not_shielded_by_longer_run_id(monkeypatch):
         {"id": "i-2", "name": jobs.instance_label("flash-1000", 0)},  # orphan -> terminate
     ]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda *, deadline_at=None: instances)
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
@@ -2794,7 +2820,7 @@ def test_sweep_orphans_protects_unprefixed_active_run_id(monkeypatch):
         {"id": "i-2", "name": jobs.instance_label("orphan-run", 0)},  # no live run -> terminate
     ]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda *, deadline_at=None: instances)
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
@@ -2828,7 +2854,7 @@ def test_sweep_orphans_exempts_warm_preload_boxes(monkeypatch):
         {"id": "i-2", "name": "flash-1700-cccc-a0"},  # genuine orphan -> terminate
     ]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda *, deadline_at=None: instances)
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
@@ -2857,7 +2883,7 @@ def test_sweep_orphans_reaps_stale_preload_box(monkeypatch):
     stale = preload_instance_run_id("lambda", "us-west-1", stale_deadline, "deadbe")
     instances = [{"id": "i-9", "name": instance_label(stale, 0)}]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda *, deadline_at=None: instances)
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
@@ -2898,7 +2924,9 @@ def test_usable_instances_only_capacity_regions(monkeypatch):
     from flash.providers.lambda_.jobs import usable_instances
 
     monkeypatch.setattr(
-        lambda_api, "regions_with_capacity", lambda itype, force=False: ["us-east-1", "us-west-1"]
+        lambda_api,
+        "regions_with_capacity",
+        lambda itype, force=False, *, deadline_at=None: ["us-east-1", "us-west-1"],
     )
     monkeypatch.setattr(
         "flash.providers.lambda_.client.pricing.hourly_rate", lambda g, *, gpu_count=1, **_k: 1.29
@@ -2907,7 +2935,9 @@ def test_usable_instances_only_capacity_regions(monkeypatch):
     assert {i.region for i in out} == {"us-east-1", "us-west-1"}
     assert all(i.gpu == "A10" and i.instance_type == "gpu_1x_a10" for i in out)
     # no capacity -> empty (the allocator then skips the class)
-    monkeypatch.setattr(lambda_api, "regions_with_capacity", lambda itype, force=False: [])
+    monkeypatch.setattr(
+        lambda_api, "regions_with_capacity", lambda itype, force=False, *, deadline_at=None: []
+    )
     assert usable_instances("A10") == []
 
 
@@ -2966,11 +2996,13 @@ def test_ambiguous_launch_reconciles_and_stops(monkeypatch):
     from flash.providers.core.base import UnreconciledCreateError
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(
         lambda_api,
         "list_instances",
-        lambda: (_ for _ in ()).throw(lambda_api.LambdaApiError("listing unavailable")),
+        lambda *, deadline_at=None: (_ for _ in ()).throw(
+            lambda_api.LambdaApiError("listing unavailable")
+        ),
     )
     attempts = []
 
@@ -2999,7 +3031,7 @@ def test_launch_success_log_failure_does_not_leak_handle(monkeypatch):
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(lambda_api, "launch_instance", lambda **_k: "i-4242")
 
     def raising_say(_log):
@@ -3026,7 +3058,7 @@ def test_post_launch_baseexception_cleans_and_never_walks_regions(
 
     spec = _spec()
     launched = []
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
 
     def fake_launch(*, region_name, **_kwargs):
         launched.append(region_name)
@@ -3082,7 +3114,7 @@ def test_post_launch_preserves_original_baseexception_when_cleanup_raises(
     spec = _spec()
     launched = []
     original = interrupt_type("original interruption")
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(
         lambda_api, "launch_instance", lambda **_k: launched.append(True) or "i-4242"
     )
@@ -3127,7 +3159,7 @@ def test_launch_success_say_baseexception_does_not_trigger_run_wide_reap(
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(lambda_api, "launch_instance", lambda **_k: "i-4242")
 
     def raising_say(_log):
@@ -3164,7 +3196,7 @@ def test_interrupt_while_building_the_success_message_terminates_only_this_insta
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     monkeypatch.setattr(lambda_api, "launch_instance", lambda **_k: "i-4242")
 
     # interrupt DURING the message interpolation: __format__ runs while the guard is being set
@@ -3201,7 +3233,7 @@ def test_launch_rejected_by_the_apis_own_allowance_check_does_not_reap_the_run(m
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
 
     def allowance_exhausted(**_kwargs):
         raise RuntimeError(
@@ -3801,7 +3833,7 @@ def test_ambiguous_reject_keeps_the_guard_armed_when_the_announcement_raises(
     import flash.providers.lambda_.jobs as jobs
     from flash.providers.lambda_.client import api as lambda_api
 
-    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda: ["jk"])
+    monkeypatch.setattr(jobs, "resolve_ssh_key_names", lambda *, deadline_at=None: ["jk"])
     # a 500 is ambiguous: the create may have been accepted before the response was lost.
     monkeypatch.setattr(
         lambda_api,

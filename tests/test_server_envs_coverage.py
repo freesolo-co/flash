@@ -23,14 +23,21 @@ from typing import ClassVar
 import pytest
 
 import flash.runner.lifecycle.reporting as runner_reporting
+import flash.runner.lifecycle.status as run_status
+import flash.runner.results.checkpoints as run_checkpoints
 import flash.runner.supervise.transitions as runner_transitions
+import flash.serve.deployment.deploy as serving_deploy
+import flash.server.platform.deployment_state as deployment_state
+from flash.serve.contract.errors import RetryableServingUnavailable
 from flash.server.domain.registry import envs
 
 pytest.importorskip("fastapi")
+
 from fastapi import HTTPException
 
 import flash.server.routes.serving as serving
 import flash.server.routes.serving_completion as serving_completion
+import flash.server.routes.serving_revisions as serving_revisions
 import flash.server.routes.serving_smoke as serving_smoke
 from flash.content import multimodal
 from flash.engine.plan.recipe import RECIPE
@@ -252,7 +259,7 @@ def test_github_download_wrapper_uses_default_repo(monkeypatch):
 
 def test_deployment_state_and_public_deployment():
     original = {"a": 1, "state": "queued"}
-    out = serving._deployment_state(original, "ready", detail="done")
+    out = deployment_state._deployment_state(original, "ready", detail="done")
     assert out["state"] == "ready"
     assert out["detail"] == "done"
     assert out["a"] == 1
@@ -260,7 +267,7 @@ def test_deployment_state_and_public_deployment():
     # The input is not mutated in place.
     assert original == {"a": 1, "state": "queued"}
 
-    pub = serving._public_deployment(
+    pub = deployment_state._public_deployment(
         {
             "state": "ready",
             "previous_deployment": {"x": 1},
@@ -417,7 +424,7 @@ def test_chat_payload_rejects_images_training_would_refuse(messages, expected_de
     the count, role, mime, byte, and decoded-memory limits while serving enforced none of them.
     """
     with pytest.raises(HTTPException) as rejected:
-        serving._managed_chat_messages(messages)
+        serving_revisions._managed_chat_messages(messages)
     assert rejected.value.status_code == 400
     assert expected_detail in rejected.value.detail
 
@@ -431,7 +438,7 @@ def test_chat_payload_forwards_text_only_requests_byte_for_byte():
     """
     text_only = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
     before = copy.deepcopy(text_only)
-    forwarded = serving._managed_chat_messages(text_only)
+    forwarded = serving_revisions._managed_chat_messages(text_only)
     assert forwarded == before
     assert text_only == before
 
@@ -454,7 +461,7 @@ def test_chat_payload_forwards_images_in_the_shape_it_validated():
         }
     ]
     before = copy.deepcopy(aliased)
-    forwarded = serving._managed_chat_messages(aliased)
+    forwarded = serving_revisions._managed_chat_messages(aliased)
     assert [block["type"] for block in forwarded[0]["content"]] == ["text", "image_url"]
     assert forwarded[0]["content"][1]["image_url"]["url"] == uri
     # the caller's own object is never rewritten in place.
@@ -465,7 +472,7 @@ def test_chat_payload_preserves_image_order_when_canonicalizing():
     """four images arrive upstream in the order the caller sent them, with their exact bytes."""
     uris = [_png_data_uri(color=color) for color in ("red", "green", "blue", "yellow")]
     messages = [{"role": "user", "content": [_image_block(uri) for uri in uris]}]
-    forwarded = serving._managed_chat_messages(messages)
+    forwarded = serving_revisions._managed_chat_messages(messages)
     assert [block["image_url"]["url"] for block in forwarded[0]["content"]] == uris
 
 
@@ -480,28 +487,30 @@ def test_validate_hf_repo_id_accepts_valid_and_rejects_malformed():
 
 
 def test_resolve_deploy_step_branches(monkeypatch):
-    monkeypatch.setattr(serving._app, "list_checkpoints", lambda spec: [{"step": 20}, {"step": 40}])
+    monkeypatch.setattr(
+        run_checkpoints, "list_checkpoints", lambda spec: [{"step": 20}, {"step": 40}]
+    )
 
     # a permanent checkpoint id is mandatory at this boundary.
     with pytest.raises(HTTPException) as missing:
-        serving._resolve_deploy_step("run-1", object(), None)
+        serving_revisions._resolve_deploy_step("run-1", object(), None)
     assert missing.value.status_code == 400
     assert missing.value.detail == "checkpoint_id is required"
     # canonical final and step checkpoint ids resolve.
-    assert serving._resolve_deploy_step("run-1", object(), "run-1/final") is None
-    assert serving._resolve_deploy_step("run-1", object(), "run-1/step-20") == 20
-    assert serving._resolve_deploy_step("run-1", object(), "run-1/step-40") == 40
+    assert serving_revisions._resolve_deploy_step("run-1", object(), "run-1/final") is None
+    assert serving_revisions._resolve_deploy_step("run-1", object(), "run-1/step-20") == 20
+    assert serving_revisions._resolve_deploy_step("run-1", object(), "run-1/step-40") == 40
 
     # a canonical-but-unknown step is a 404 that lists what is available.
     with pytest.raises(HTTPException) as not_found:
-        serving._resolve_deploy_step("run-1", object(), "run-1/step-999")
+        serving_revisions._resolve_deploy_step("run-1", object(), "run-1/step-999")
     assert not_found.value.status_code == 404
     assert "20, 40" in not_found.value.detail
 
     # Bad step shapes are 400: bool, non-integer float, negative, and junk strings.
     for bad in (True, 20.5, -5, "-5", "abc", "1.5"):
         with pytest.raises(HTTPException) as exc:
-            serving._resolve_deploy_step("run-1", object(), bad)
+            serving_revisions._resolve_deploy_step("run-1", object(), bad)
         assert exc.value.status_code == 400, bad
 
 
@@ -539,7 +548,7 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
             raise FileNotFoundError(run_id)
         return statuses[run_id]
 
-    monkeypatch.setattr(serving._app, "get_status", fake_get_status)
+    monkeypatch.setattr(run_status, "get_status", fake_get_status)
     marked: list[tuple[str, dict]] = []
     reported = []
 
@@ -579,7 +588,7 @@ def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
         ),
     ]
     monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-settled"}])
-    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: statuses.pop(0))
+    monkeypatch.setattr(run_status, "get_status", lambda _run_id: statuses.pop(0))
     monkeypatch.setattr(
         runner_transitions,
         "mark_deployment_failed",
@@ -626,7 +635,7 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
             },
         ),
     }
-    monkeypatch.setattr(serving._app, "get_status", lambda run_id: statuses[run_id])
+    monkeypatch.setattr(run_status, "get_status", lambda run_id: statuses[run_id])
     marked: list[tuple[str, dict]] = []
 
     def mark_failed(run_id, failed):
@@ -657,7 +666,7 @@ def test_recover_deployments_reports_restored_ready_predecessor(monkeypatch):
         deployment={"state": "queued", "previous_deployment": previous},
     )
     monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-stale"}])
-    monkeypatch.setattr(serving._app, "get_status", lambda _run_id: status)
+    monkeypatch.setattr(run_status, "get_status", lambda _run_id: status)
 
     def mark_failed(run_id, failed):
         assert run_id == "r-stale"
@@ -741,7 +750,7 @@ def _smoke_expected_colour(run_id: str = "run-1") -> str:
 
 
 def _run_smoke(spec, *, budget_s: float = 600.0, advertised=None, adapter_targets_images=None):
-    return serving._run_deployment_smoke(
+    return serving_smoke._run_deployment_smoke(
         "run-1",
         spec,
         serving_model=_SMOKE_REVISION,
@@ -760,7 +769,7 @@ def _schema_validation_child_pids() -> set[int | None]:
     return {
         child.pid
         for child in multiprocessing.active_children()
-        if child.name == serving._JSON_SCHEMA_PROCESS_NAME
+        if child.name == serving_smoke._JSON_SCHEMA_PROCESS_NAME
     }
 
 
@@ -777,12 +786,12 @@ def test_real_image_capable_model_with_text_adapter_uses_fixed_prompt(monkeypatc
         calls.append(kwargs)
         return _smoke_response("The answer is 4")
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     out = _run_smoke(spec, budget_s=10.0, adapter_targets_images=False)
 
     assert out["verify_kind"] == "fixed_prompt"
     assert out["verify_turns"] == 1
-    assert calls[0]["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
+    assert calls[0]["messages"] == [{"role": "user", "content": serving_smoke._SMOKE_PROMPT}]
     assert calls[0]["expected_checkpoint"] == _SMOKE_REVISION
     assert calls[0]["timeout_s"] <= 10.0
     assert calls[0]["retry_unavailable"] is True
@@ -816,7 +825,7 @@ def test_image_deployment_smoke_uses_valid_trusted_image_without_persisting_it(m
         calls.append(kwargs)
         return _smoke_response(expected_colour)
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     out = _run_smoke(
         _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
         adapter_targets_images=True,
@@ -849,7 +858,7 @@ def test_smoke_uses_the_capability_set_deploy_gated_on_not_a_second_healthz(monk
 
     monkeypatch.setattr(deploy_mod, "_require_serving_capabilities", exploding_capabilities)
     response = _smoke_response(_smoke_expected_colour(), request_adapter=None)
-    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+    monkeypatch.setattr(serving_deploy, "chat", lambda **_kwargs: response)
 
     # the handed-down set still enforces the contract strictly...
     with pytest.raises(ServingError, match="omitted LoRA request adapter attestation"):
@@ -878,7 +887,7 @@ def test_lora_attestation_predicate_reads_only_the_handed_down_set():
 def test_image_deployment_smoke_rejects_missing_lora_request_attestation(monkeypatch):
     """A backend that ADVERTISES the attestation must actually send it."""
     response = _smoke_response(_smoke_expected_colour(), request_adapter=None)
-    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+    monkeypatch.setattr(serving_deploy, "chat", lambda **_kwargs: response)
     with pytest.raises(ServingError, match="omitted LoRA request adapter attestation"):
         _run_smoke(
             _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
@@ -895,7 +904,7 @@ def test_image_deployment_smoke_allows_missing_attestation_when_not_advertised(m
     the same shape of bug ``REVISION_PROVENANCE_CAPABILITY`` already had to fix once.
     """
     response = _smoke_response(_smoke_expected_colour(), request_adapter=None)
-    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+    monkeypatch.setattr(serving_deploy, "chat", lambda **_kwargs: response)
     out = _run_smoke(
         _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
         advertised=frozenset(),
@@ -911,7 +920,7 @@ def test_image_deployment_smoke_rejects_wrong_adapter_even_when_not_advertised(m
     which stays a hard failure whatever the backend advertises.
     """
     response = _smoke_response(_smoke_expected_colour(), request_adapter="run-1/step-20")
-    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+    monkeypatch.setattr(serving_deploy, "chat", lambda **_kwargs: response)
     with pytest.raises(ServingError, match="wrong LoRA request adapter"):
         _run_smoke(
             _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
@@ -922,7 +931,7 @@ def test_image_deployment_smoke_rejects_wrong_adapter_even_when_not_advertised(m
 
 def test_image_deployment_smoke_rejects_mismatched_lora_request_adapter(monkeypatch):
     response = _smoke_response(_smoke_expected_colour(), request_adapter="run-1/step-20")
-    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+    monkeypatch.setattr(serving_deploy, "chat", lambda **_kwargs: response)
 
     with pytest.raises(ServingError, match="wrong LoRA request adapter"):
         _run_smoke(
@@ -934,7 +943,7 @@ def test_image_deployment_smoke_rejects_mismatched_lora_request_adapter(monkeypa
 def test_image_deployment_smoke_still_rejects_wrong_provenance(monkeypatch):
     response = _smoke_response(_smoke_expected_colour())
     response["freesolo"]["checkpoint_id"] = "run-1/step-20"
-    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: response)
+    monkeypatch.setattr(serving_deploy, "chat", lambda **_kwargs: response)
 
     with pytest.raises(ServingError, match="wrong checkpoint"):
         _run_smoke(
@@ -955,7 +964,7 @@ def test_image_deployment_smoke_rejects_an_answer_that_is_not_the_shown_square(m
     verified. the sibling test proves the prompt names no candidate colour, so the only way to
     answer is to decode the image.
     """
-    monkeypatch.setattr(serving._app, "serve_chat", lambda **_kwargs: _smoke_response(answer))
+    monkeypatch.setattr(serving_deploy, "chat", lambda **_kwargs: _smoke_response(answer))
 
     with pytest.raises(ServingError, match="did not identify the trusted"):
         _run_smoke(
@@ -1000,7 +1009,7 @@ def test_image_deployment_smoke_rejects_the_other_trusted_colours(monkeypatch):
         response = _smoke_response(wrong)
         # bind the response per iteration: a bare closure over the loop variable would read
         # whatever the LAST iteration assigned, so every case would assert the same colour.
-        monkeypatch.setattr(serving._app, "serve_chat", lambda _r=response, **_kwargs: _r)
+        monkeypatch.setattr(serving_deploy, "chat", lambda _r=response, **_kwargs: _r)
         with pytest.raises(ServingError, match="did not identify the trusted"):
             _run_smoke(
                 _smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"),
@@ -1016,12 +1025,12 @@ def test_unavailable_adapter_modality_defaults_to_nonblocking_text_smoke(monkeyp
         calls.append(kwargs)
         return _smoke_response("The answer is 4")
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
 
     out = _run_smoke(_smoke_spec(thinking=False, model="Qwen/Qwen3.5-9B"))
 
     assert out["verify_kind"] == "fixed_prompt"
-    assert calls[0]["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
+    assert calls[0]["messages"] == [{"role": "user", "content": serving_smoke._SMOKE_PROMPT}]
 
 
 def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(monkeypatch):
@@ -1041,7 +1050,7 @@ def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(m
         validated.append((answer, constraint))
         return validate_structured_smoke(answer, constraint, **kwargs)
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     monkeypatch.setattr(serving_smoke, "_validate_structured_smoke", capture_validation)
     out = _run_smoke(
         _smoke_spec(
@@ -1055,7 +1064,7 @@ def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(m
     assert out["verify_kind"] == "fixed_image"
     assert out["verify_turns"] == 2
     assert calls[0]["messages"] == serving_smoke._smoke_image_challenge("run-1")[1]
-    assert calls[1]["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
+    assert calls[1]["messages"] == [{"role": "user", "content": serving_smoke._SMOKE_PROMPT}]
     assert validated == [('{"answer":"4"}', {"json_object": True})]
 
 
@@ -1081,7 +1090,7 @@ def test_image_structured_smoke_requires_attestation_on_second_request(
             return _smoke_response(_smoke_expected_colour())
         return _smoke_response('{"answer":"4"}', request_adapter=request_adapter)
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
 
     with pytest.raises(ServingError, match=error):
         _run_smoke(
@@ -1104,7 +1113,7 @@ def test_run_deployment_smoke_uses_thinking_completion_budget(monkeypatch):
         calls.append(kwargs)
         return _smoke_response('<think>reasoning</think>{"answer":"4"}')
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     _run_smoke(_smoke_spec(thinking=True, constraint={"json_object": True}))
 
     assert calls[0]["max_tokens"] == 1536
@@ -1120,7 +1129,7 @@ def test_run_deployment_smoke_does_not_cap_a_constrained_request(monkeypatch):
         calls.append(kwargs)
         return _smoke_response('<think>reasoning</think>{"answer":"4"}')
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     _run_smoke(
         _smoke_spec(
             thinking=True,
@@ -1155,7 +1164,7 @@ def test_run_deployment_smoke_keeps_non_thinking_paths_at_256(monkeypatch, spec)
         calls.append(kwargs)
         return _smoke_response("{}")
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     _run_smoke(spec)
 
     assert calls[0]["max_tokens"] == 256
@@ -1187,7 +1196,7 @@ def test_run_deployment_smoke_budgets_thinking_without_structured_outputs(
             reasoning_content="2+2 is 4",
         )
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     out = _run_smoke(spec)
 
     assert calls[0]["max_tokens"] == expected
@@ -1203,8 +1212,8 @@ def test_run_deployment_smoke_rejects_truncated_thinking_without_a_grammar(monke
     certify a truncated non-answer as a working deployment. finish_reason='length' on a thinking run
     is a failure whether or not a grammar is configured."""
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response("<think>2 plus 2 is</think>", "length"),
     )
 
@@ -1223,7 +1232,7 @@ def test_run_deployment_smoke_forwards_configured_stop_sequences(monkeypatch):
         calls.append(kwargs)
         return _smoke_response("<think>2+2 is 4</think><answer>4</answer>")
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     _run_smoke(
         _smoke_spec(
             algorithm="grpo",
@@ -1243,8 +1252,8 @@ def test_run_deployment_smoke_rejects_a_stop_that_fires_while_still_reasoning(mo
     on every thinking smoke, that checkpoint activates and then answers nothing on real requests.
     """
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         # finish_reason="stop": the delimiter fired, so this is NOT caught as truncation.
         lambda **_k: _smoke_response("<think>2 plus 2 is</think>   ", "stop"),
     )
@@ -1274,7 +1283,7 @@ def test_sft_smoke_budget_ignores_the_rollout_only_completion_knob(monkeypatch):
             reasoning_content="2+2 is 4",
         )
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     _run_smoke(
         _smoke_spec(
             algorithm="sft",
@@ -1298,7 +1307,7 @@ def test_run_deployment_smoke_sends_no_stop_when_none_configured(monkeypatch):
         calls.append(kwargs)
         return _smoke_response("The answer is 4")
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     _run_smoke(_smoke_spec(thinking=False))
 
     assert calls[0]["stop"] is None
@@ -1541,10 +1550,10 @@ def test_run_deployment_smoke_retries_recognized_cold_503(monkeypatch):
     def fake_serve_chat(**kwargs):
         calls.append(kwargs)
         if len(calls) == 1:
-            raise serving.RetryableServingUnavailable("adapter_loading", 0.25)
+            raise RetryableServingUnavailable("adapter_loading", 0.25)
         return _smoke_response("The answer is 4")
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     monkeypatch.setattr(serving.time, "sleep", sleeps.append)
 
     out = _run_smoke(_smoke_spec(thinking=False), budget_s=10.0)
@@ -1562,10 +1571,10 @@ def test_run_deployment_smoke_retries_capacity_unavailable_within_deadline(monke
     def fake_serve_chat(**kwargs):
         calls.append(kwargs)
         if len(calls) == 1:
-            raise serving.RetryableServingUnavailable("serving_capacity_unavailable", 1.0)
+            raise RetryableServingUnavailable("serving_capacity_unavailable", 1.0)
         return _smoke_response("The answer is 4")
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     monkeypatch.setattr(serving.time, "sleep", sleeps.append)
 
     out = _run_smoke(_smoke_spec(thinking=False), budget_s=3.0)
@@ -1583,13 +1592,13 @@ def test_run_deployment_smoke_retry_stays_inside_wall_clock_budget(monkeypatch):
 
     def fake_serve_chat(**kwargs):
         calls.append(kwargs)
-        raise serving.RetryableServingUnavailable("engine_unavailable", 10.0)
+        raise RetryableServingUnavailable("engine_unavailable", 10.0)
 
     def fake_sleep(delay):
         sleeps.append(delay)
         clock[0] += delay
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     monkeypatch.setattr(serving.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(serving.time, "sleep", fake_sleep)
 
@@ -1607,7 +1616,7 @@ def test_run_deployment_smoke_bounds_chat_by_wall_clock_deadline(monkeypatch):
         time.sleep(1.0)
         return _smoke_response("The answer is 4")
 
-    monkeypatch.setattr(serving._app, "serve_chat", slow_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", slow_serve_chat)
     started = time.monotonic()
     with pytest.raises(ServingError, match="deployment_smoke_timeout: bounded smoke exceeded"):
         _run_smoke(_smoke_spec(thinking=False), budget_s=0.05)
@@ -1616,8 +1625,8 @@ def test_run_deployment_smoke_bounds_chat_by_wall_clock_deadline(monkeypatch):
 
 def test_run_deployment_smoke_expired_budget_fails_before_generation(monkeypatch):
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **kwargs: pytest.fail("expired budget must not start a generation"),
     )
 
@@ -1630,12 +1639,12 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
 
     def fake_serve_chat(**kwargs):
         assert kwargs["run_id"] == _SMOKE_REVISION
-        assert kwargs["messages"] == [{"role": "user", "content": serving._SMOKE_PROMPT}]
+        assert kwargs["messages"] == [{"role": "user", "content": serving_smoke._SMOKE_PROMPT}]
         assert kwargs["temperature"] == 0.0
         assert 0 < kwargs["timeout_s"] <= 600.0
         return _smoke_response("The answer is 4")
 
-    monkeypatch.setattr(serving._app, "serve_chat", fake_serve_chat)
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
     out = _run_smoke(spec)
     assert out["verify_kind"] == "fixed_prompt"
     assert out["verify_turns"] == 1
@@ -1647,16 +1656,16 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
     # a thinking adapter stopped mid-reasoning has no answer. ``finish_reason="stop"`` bypasses the
     # truncation guard, so the closing-tag requirement must apply without structured outputs.
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response("<think>still reasoning"),
     )
     with pytest.raises(ServingError, match="never closed its reasoning"):
         _run_smoke(_smoke_spec(thinking=True, model="Qwen/Qwen3.5-9B"))
 
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response("<think>2+2 is 4</think>The answer is 4"),
     )
     thinking_out = _run_smoke(_smoke_spec(thinking=True))
@@ -1664,8 +1673,8 @@ def test_run_deployment_smoke_success_and_empty(monkeypatch):
     assert thinking_out["verify_sample"] == "The answer is 4"
 
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response("   ", "length"),
     )
     with pytest.raises(ServingError, match="no content"):
@@ -1682,8 +1691,8 @@ def test_unconstrained_thinking_smoke_rejects_a_reconstructed_empty_answer(monke
     unconstrained deployment could go live on a smoke that produced no answer at all.
     """
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response("<think>reasoned but ran out of budget</think>", "length"),
     )
 
@@ -1691,8 +1700,8 @@ def test_unconstrained_thinking_smoke_rejects_a_reconstructed_empty_answer(monke
         _run_smoke(_smoke_spec(thinking=True))
 
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response("<think>reasoned, then the stop sequence fired</think>"),
     )
 
@@ -1709,8 +1718,8 @@ def test_thinking_smoke_rejects_a_retained_close_tag_as_the_answer(monkeypatch):
     genuinely is the tag, and it also backs the public chat route where the text must survive.
     """
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response("<think>why</think></think>"),
     )
     with pytest.raises(ServingError, match="only a close tag"):
@@ -1724,7 +1733,7 @@ def test_thinking_smoke_accepts_a_tagless_answer_only_for_an_uncataloged_model(m
     the open-model policy produces. Such a run may answer with no `<think>` block at all, so the
     strict requirement would reject a correct answer and strand the trained adapter.
     """
-    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response("4"))
+    monkeypatch.setattr(serving_deploy, "chat", lambda **_k: _smoke_response("4"))
 
     strict = _smoke_spec(thinking=True, model="Qwen/Qwen3.5-9B")
     with pytest.raises(ServingError, match="never closed its reasoning"):
@@ -1740,7 +1749,7 @@ def test_thinking_smoke_accepts_a_tagless_answer_only_for_an_uncataloged_model(m
 
     # the relaxed branch still rejects a run that answered nothing, which is the defect the strict
     # requirement exists to catch. only the tag demand is lifted, not the answer demand.
-    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response("   "))
+    monkeypatch.setattr(serving_deploy, "chat", lambda **_k: _smoke_response("   "))
     with pytest.raises(ServingError, match="no content"):
         _run_smoke(unknown)
 
@@ -1749,8 +1758,8 @@ def test_unconstrained_thinking_smoke_accepts_an_answer_after_the_block(monkeypa
     # the companion direction: a reconstructed block WITH an answer after it still passes, so the
     # check above rejects answerlessness rather than reconstruction.
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response("<think>reasoned</think>The answer is 4"),
     )
 
@@ -1811,7 +1820,7 @@ def test_unconstrained_thinking_smoke_accepts_an_answer_after_the_block(monkeypa
 def test_thinking_structured_smoke_validates_only_answer_after_reasoning(
     monkeypatch, constraint, content, sample
 ):
-    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response(content))
+    monkeypatch.setattr(serving_deploy, "chat", lambda **_k: _smoke_response(content))
     out = _run_smoke(_smoke_spec(thinking=True, constraint=constraint))
     assert out["verify_sample"] == sample
     assert out["verify_finish_reason"] == "stop"
@@ -1841,8 +1850,8 @@ def test_structured_smoke_rejects_external_schema_ref_without_network(monkeypatc
     port = server.server_address[1]
     constraint = {"json": {"$ref": f"http://127.0.0.1:{port}/schema.json"}}
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response("<think>2+2</think>{}"),
     )
 
@@ -1864,8 +1873,8 @@ def test_structured_smoke_reports_missing_local_schema_fragment_neutrally(monkey
         }
     }
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response('<think>2+2</think>{"answer": "4"}'),
     )
 
@@ -1877,8 +1886,8 @@ def test_structured_smoke_reports_missing_local_schema_fragment_neutrally(monkey
 def test_direct_structured_regex_timeout_is_bounded(monkeypatch):
     answer = "a" * 10_000 + "!"
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
     )
 
@@ -1894,8 +1903,8 @@ def test_json_schema_validation_respects_global_smoke_deadline(monkeypatch):
     answer = json.dumps("a" * 10_000 + "!")
     schema = {"type": "string", "pattern": "(a+)+$"}
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_kwargs: _smoke_response(f"<think>x</think>{answer}"),
     )
 
@@ -1928,8 +1937,8 @@ def test_json_schema_pathological_regex_branch_times_out_before_fallback(monkeyp
     schema = {"anyOf": [failing_branch, {"const": instance}]}
     answer = json.dumps(instance)
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
     )
 
@@ -1948,8 +1957,8 @@ def test_json_schema_not_combinator_timeout_cannot_invert_to_success(monkeypatch
     schema = {"not": {"type": "string", "pattern": "(a+)+$"}}
     answer = json.dumps(bad_value)
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
     )
 
@@ -1973,8 +1982,8 @@ def test_json_schema_pattern_properties_unevaluated_timeout_is_killed(monkeypatc
     }
     answer = json.dumps(instance)
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
     )
 
@@ -1998,8 +2007,8 @@ def test_structured_json_rejects_nonfinite_constants(monkeypatch, constant, cons
         constraint = {"json_object": True}
         answer = f'{{"value": {constant}}}'
     monkeypatch.setattr(
-        serving._app,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: _smoke_response(f"<think>x</think>{answer}"),
     )
 
@@ -2052,7 +2061,7 @@ def test_thinking_structured_smoke_rejects_invalid_output(
             _smoke_response(content, finish_reason),
         ]
     )
-    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: next(responses))
+    monkeypatch.setattr(serving_deploy, "chat", lambda **_k: next(responses))
     with pytest.raises(ServingError, match=match):
         _run_smoke(
             _smoke_spec(
@@ -2066,7 +2075,7 @@ def test_thinking_structured_smoke_rejects_invalid_output(
 
 def test_nonthinking_structured_smoke_validates_whole_stripped_content(monkeypatch):
     content = "  <think>literal</think>4  "
-    monkeypatch.setattr(serving._app, "serve_chat", lambda **_k: _smoke_response(content))
+    monkeypatch.setattr(serving_deploy, "chat", lambda **_k: _smoke_response(content))
     out = _run_smoke(
         _smoke_spec(
             thinking=False,

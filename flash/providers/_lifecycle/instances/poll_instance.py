@@ -33,11 +33,10 @@ from flash.providers._lifecycle.instances.terminal_artifacts import (
     resolve_terminal_artifacts,
 )
 from flash.providers._lifecycle.net.deadline import (
-    deadline_kwargs,
     remaining_seconds,
     require_deadline_at,
 )
-from flash.providers.artifacts.hf import worker_flagged_retriable
+from flash.providers.artifacts.hf import TextArtifactReader, worker_flagged_retriable
 from flash.providers.core.base import PollResult
 
 # a strict success marker can precede the separately uploaded metrics.json under hf read-after-write
@@ -80,9 +79,9 @@ class InstancePollAdapter:
     launch_ts: float
 
     # Terminal-artifact readers (built from the provider's monkeypatchable ``_make_hf_file_reader``).
-    done_reader: Callable[..., str | None]
-    marker_reader: Callable[..., str | None]
-    metrics_reader: Callable[..., str | None]
+    done_reader: TextArtifactReader
+    marker_reader: TextArtifactReader
+    metrics_reader: TextArtifactReader
 
     # Instance status fetch + classification.
     fetch_instance: Callable[[], dict | None]  # resolves the api's get_instance at call time
@@ -126,10 +125,12 @@ class _TerminalArtifacts:
         self.last_hb_key = None
         self.deferred_deadline_failure: PollResult | None = None
 
-    def _read_artifact(self, reader, *, force: bool, read_deadline_at: float | None):
+    def _read_artifact(
+        self, reader: TextArtifactReader, *, force: bool, read_deadline_at: float | None
+    ) -> str | None:
         return reader(
             force=force,
-            **deadline_kwargs(reader, read_deadline_at),
+            deadline_at=read_deadline_at,
         )
 
     def _done_is_fresh(self, content: str) -> bool:

@@ -133,7 +133,6 @@ def test_job_handle_roundtrip_and_rejects_legacy_shapes():
 def test_strict_teardown_uses_valid_runpod_owner_without_inventory(monkeypatch):
     from flash.providers.core.base import JobHandle
     from flash.providers.runpod.client import api as runpod_api
-    from flash.runner.supervise import lifecycle
 
     fingerprint = "rpk-" + "a" * 64
     handle = JobHandle.from_dict(
@@ -169,7 +168,7 @@ def test_strict_teardown_uses_valid_runpod_owner_without_inventory(monkeypatch):
         lambda **_kwargs: pytest.fail("valid owner must not inventory other accounts"),
     )
 
-    assert lifecycle._strict_teardown_handle(handle, "run-direct") is True
+    assert runner_recovery._strict_teardown_handle(handle, "run-direct") is True
     assert cancelled == [("ep-direct", "job-direct")]
     assert deleted == [("ep-direct", "owner-key")]
 
@@ -186,7 +185,6 @@ def test_strict_teardown_uses_valid_runpod_owner_without_inventory(monkeypatch):
 def test_strict_teardown_discovers_runpod_owner_for_invalid_fingerprint(monkeypatch, fingerprint):
     from flash.providers.core.base import JobHandle
     from flash.providers.runpod.client import api as runpod_api
-    from flash.runner.supervise import lifecycle
 
     owner_fingerprint = "rpk-" + "b" * 64
     data = {
@@ -223,7 +221,7 @@ def test_strict_teardown_discovers_runpod_owner_for_invalid_fingerprint(monkeypa
 
     monkeypatch.setattr(runpod_api, "delete_endpoint_for_fingerprint", delete_endpoint)
 
-    assert lifecycle._strict_teardown_handle(handle, "run-discovered") is True
+    assert runner_recovery._strict_teardown_handle(handle, "run-discovered") is True
     assert deleted == [("ep-discovered", "discovered-owner-key")]
 
 
@@ -238,7 +236,6 @@ def test_strict_teardown_keeps_runpod_record_when_no_configured_account_owns_it(
     """
     from flash.providers.core.base import JobHandle
     from flash.providers.runpod.client import api as runpod_api
-    from flash.runner.supervise import lifecycle
 
     handle = JobHandle.from_dict(
         {
@@ -268,7 +265,7 @@ def test_strict_teardown_keeps_runpod_record_when_no_configured_account_owns_it(
     )
 
     with pytest.raises(RuntimeError, match="endpoint deletion could not be confirmed") as exc_info:
-        lifecycle._strict_teardown_handle(handle, "run-gone")
+        runner_recovery._strict_teardown_handle(handle, "run-gone")
     assert "no reachable owner account" in str(exc_info.value.__cause__)
 
 
@@ -276,7 +273,6 @@ def test_strict_teardown_keeps_runpod_record_when_no_configured_account_owns_it(
 def test_strict_teardown_rejects_unconfirmed_runpod_owner_discovery(monkeypatch, mode):
     from flash.providers.core.base import JobHandle
     from flash.providers.runpod.client import api as runpod_api
-    from flash.runner.supervise import lifecycle
 
     handle = JobHandle.from_dict(
         {
@@ -315,7 +311,7 @@ def test_strict_teardown_rejects_unconfirmed_runpod_owner_discovery(monkeypatch,
     )
 
     with pytest.raises(RuntimeError, match="endpoint deletion could not be confirmed") as exc_info:
-        lifecycle._strict_teardown_handle(handle, "run-ambiguous")
+        runner_recovery._strict_teardown_handle(handle, "run-ambiguous")
     assert "cleanup unconfirmed" in str(exc_info.value.__cause__)
 
 
@@ -2986,8 +2982,8 @@ def test_failure_detail_reader_is_attempt_scoped(monkeypatch, tmp_path):
 def test_failure_detail_reader_preserves_full_worker_artifacts(monkeypatch):
     from flash.providers.artifacts import hf as _hf_artifacts
 
-    def fake_reader(hf_repo, path_in_repo, min_interval_s):
-        def read(force=False):
+    def fake_reader(hf_repo, path_in_repo, min_interval_s, *, deadline_at=None):
+        def read(force=False, *, deadline_at=None):
             if path_in_repo.endswith("error_sft_attempt2.txt"):
                 return "ERROR-BEGIN\n" + ("e" * 5000) + "\nERROR-END"
             if path_in_repo.endswith("console_sft.txt"):
@@ -3014,9 +3010,9 @@ def test_failure_detail_reader_reads_only_the_current_attempt_console(monkeypatc
 
     requested: list[str] = []
 
-    def fake_reader(_hf_repo, path_in_repo, _min_interval_s):
+    def fake_reader(_hf_repo, path_in_repo, _min_interval_s, *, deadline_at=None):
         requested.append(path_in_repo)
-        return lambda force=False: (
+        return lambda force=False, *, deadline_at=None: (
             "last live bytes" if path_in_repo.endswith("console_sft_attempt2.txt") else None
         )
 
@@ -5252,7 +5248,6 @@ def test_attach_unparseable_spec_fails_closed_and_tears_down(monkeypatch):
         import json
 
         import flash.providers.runpod.serverless.endpoints as flash_train
-        import flash.runner.supervise.lifecycle as lifecycle
 
         remote = {
             "provider": "runpod",
@@ -5283,7 +5278,7 @@ def test_attach_unparseable_spec_fails_closed_and_tears_down(monkeypatch):
         torn_down = []
         terminated = []
         monkeypatch.setattr(
-            lifecycle,
+            runner_recovery,
             "_strict_teardown_handle",
             lambda handle, rid: torn_down.append((handle.data.get("endpoint_id"), rid)) or True,
         )
@@ -5654,16 +5649,15 @@ def test_attach_preserves_newer_remote_before_compare_and_clear(monkeypatch):
             "poll_job",
             lambda *a, **k: jobs.PollResult(False, failure="stalled", detail="stalled"),
         )
-        import flash.runner.supervise.lifecycle as lifecycle_mod
 
-        real_teardown = lifecycle_mod._strict_teardown_handle
+        real_teardown = runner_recovery._strict_teardown_handle
 
         def teardown_then_replace(handle, run_id=None):
             result = real_teardown(handle, run_id)
             assert runner_status._update("attach-newer-remote", "running", remote=newer_remote)
             return result
 
-        monkeypatch.setattr(lifecycle_mod, "_strict_teardown_handle", teardown_then_replace)
+        monkeypatch.setattr(runner_recovery, "_strict_teardown_handle", teardown_then_replace)
         gc_calls = []
         monkeypatch.setattr(
             runner_recovery, "_gc_run_endpoints", lambda _spec: gc_calls.append(True)
@@ -5961,7 +5955,6 @@ def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         import flash.runner.supervise.attach as attach_mod
-        import flash.runner.supervise.lifecycle as lifecycle_mod
 
         remote = _vast_recovery_remote()
         spec = _spec("vast-reconcile-deadline")
@@ -5977,7 +5970,7 @@ def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
         deadline = runner_deadlines._load_run_deadline_at(spec.run_id)
         monkeypatch.setattr(attach_mod.time, "time", lambda: deadline + 1.0)
         monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
-        monkeypatch.setattr(lifecycle_mod, "_completed_attempt_metrics", lambda *a, **k: None)
+        monkeypatch.setattr(runner_recovery, "_completed_attempt_metrics", lambda *a, **k: None)
         real_fail = runner_reconciliation._compare_and_fail_remote
         calls = []
 
@@ -6012,7 +6005,6 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         import flash.runner.supervise.attach as attach_mod
-        import flash.runner.supervise.lifecycle as lifecycle_mod
 
         remote = _vast_recovery_remote()
         spec = _spec("vast-reconcile-complete")
@@ -6029,7 +6021,7 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
         monkeypatch.setattr(attach_mod.time, "time", lambda: deadline + 1.0)
         monkeypatch.setattr(attach_mod, "_ATTACH_RECONCILE_INTERVAL_S", 0.0)
         monkeypatch.setattr(
-            lifecycle_mod,
+            runner_recovery,
             "_completed_attempt_metrics",
             lambda *a, **k: {"wall_seconds": 5.0},
         )
@@ -6058,7 +6050,6 @@ def test_attach_reconciler_caps_completed_adoption_retry_to_grace(monkeypatch):
         _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.execution.jobs as jobs
         import flash.runner.supervise.attach as attach_mod
-        import flash.runner.supervise.lifecycle as lifecycle_mod
 
         remote = _runpod_handle_dict(jobs, started_ts=1.0)
         spec = _spec("runpod-reconcile-adoption-grace")
@@ -6071,7 +6062,7 @@ def test_attach_reconciler_caps_completed_adoption_retry_to_grace(monkeypatch):
             )
         )
         deadline = 1_000.0
-        clock = {"now": deadline + lifecycle_mod._RECOVERY_MARKER_GRACE_S - 1.0}
+        clock = {"now": deadline + runner_recovery._RECOVERY_MARKER_GRACE_S - 1.0}
         sleeps = []
         monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: deadline)
         monkeypatch.setattr(attach_mod.time, "time", lambda: clock["now"])
@@ -6082,11 +6073,11 @@ def test_attach_reconciler_caps_completed_adoption_retry_to_grace(monkeypatch):
 
         monkeypatch.setattr(attach_mod.time, "sleep", advance)
         monkeypatch.setattr(
-            lifecycle_mod,
+            runner_recovery,
             "_runpod_completed_metrics",
             lambda *_args, **_kwargs: {"wall_seconds": 60.0},
         )
-        monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: False)
+        monkeypatch.setattr(runner_recovery, "_adopt_completed_attempt", lambda *_a, **_k: False)
 
         attach_mod._reconcile_attached_remote(
             spec.run_id,
@@ -6108,7 +6099,6 @@ def test_attach_reconciler_reprobes_completion_after_deadline_capped_sleep(monke
         _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.execution.jobs as jobs
         import flash.runner.supervise.attach as attach_mod
-        import flash.runner.supervise.lifecycle as lifecycle_mod
 
         remote = _runpod_handle_dict(jobs, started_ts=1.0)
         spec = _spec("runpod-reconcile-deadline-reprobe")
@@ -6137,10 +6127,10 @@ def test_attach_reconciler_reprobes_completion_after_deadline_capped_sleep(monke
                 return {"wall_seconds": 60.0}
             return None
 
-        monkeypatch.setattr(lifecycle_mod, "_runpod_completed_metrics", completed_metrics)
-        monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: True)
+        monkeypatch.setattr(runner_recovery, "_runpod_completed_metrics", completed_metrics)
+        monkeypatch.setattr(runner_recovery, "_adopt_completed_attempt", lambda *_a, **_k: True)
         monkeypatch.setattr(
-            lifecycle_mod,
+            runner_recovery,
             "_strict_teardown_handle",
             lambda *_args, **_kwargs: pytest.fail("completed attempt must not be torn down"),
         )
@@ -6167,7 +6157,6 @@ def test_attach_reconciler_rate_limits_failed_terminal_cas_past_grace(monkeypatc
         _fresh_orchestrator(tmp, monkeypatch)
         import flash.providers.runpod.execution.jobs as jobs
         import flash.runner.supervise.attach as attach_mod
-        import flash.runner.supervise.lifecycle as lifecycle_mod
 
         remote = _runpod_handle_dict(jobs, started_ts=1.0)
         spec = _spec("runpod-reconcile-cas-ratelimit")
@@ -6181,7 +6170,7 @@ def test_attach_reconciler_rate_limits_failed_terminal_cas_past_grace(monkeypatc
         )
         deadline = 1_000.0
         # start already past the recovery grace window so remaining grace is <= 0.
-        clock = {"now": deadline + lifecycle_mod._RECOVERY_MARKER_GRACE_S}
+        clock = {"now": deadline + runner_recovery._RECOVERY_MARKER_GRACE_S}
         sleeps = []
         monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: deadline)
         monkeypatch.setattr(attach_mod.time, "time", lambda: clock["now"])
@@ -6192,11 +6181,11 @@ def test_attach_reconciler_rate_limits_failed_terminal_cas_past_grace(monkeypatc
 
         monkeypatch.setattr(attach_mod.time, "sleep", advance)
         monkeypatch.setattr(
-            lifecycle_mod,
+            runner_recovery,
             "_runpod_completed_metrics",
             lambda *_args, **_kwargs: {"wall_seconds": 60.0},
         )
-        monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", lambda *_a, **_k: False)
+        monkeypatch.setattr(runner_recovery, "_adopt_completed_attempt", lambda *_a, **_k: False)
         # the reconciler imports _compare_and_fail_remote / _record_cleanup_remote from
         # flash.runner (== orch), so patch them there rather than on lifecycle.
         monkeypatch.setattr(runner_reconciliation, "_record_cleanup_remote", lambda *_a, **_k: True)
@@ -6241,7 +6230,6 @@ def test_an_adopted_instance_run_is_still_priced_for_every_card_it_occupied(monk
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_orchestrator(tmp, monkeypatch)
         import flash.runner.supervise.attach as attach_mod
-        import flash.runner.supervise.lifecycle as lifecycle_mod
 
         remote = _vast_recovery_remote()
         remote["allocated_gpu"] = "RTX 4090"
@@ -6259,10 +6247,10 @@ def test_an_adopted_instance_run_is_still_priced_for_every_card_it_occupied(monk
         monkeypatch.setattr(runner_deadlines, "_load_run_deadline_at", lambda _run_id: deadline)
         monkeypatch.setattr(attach_mod.time, "time", lambda: deadline)
         monkeypatch.setattr(attach_mod.time, "sleep", lambda _seconds: None)
-        monkeypatch.setattr(lifecycle_mod, "_runpod_completed_metrics", lambda *_a, **_k: None)
+        monkeypatch.setattr(runner_recovery, "_runpod_completed_metrics", lambda *_a, **_k: None)
         # what the worker actually wrote: a wall, and nothing about the allocation.
         monkeypatch.setattr(
-            lifecycle_mod,
+            runner_recovery,
             "_completed_attempt_metrics",
             lambda *_a, **_k: {"wall_seconds": 3600.0},
         )
@@ -6274,7 +6262,7 @@ def test_an_adopted_instance_run_is_still_priced_for_every_card_it_occupied(monk
             adopted.update(metrics)
             return True
 
-        monkeypatch.setattr(lifecycle_mod, "_adopt_completed_attempt", capture)
+        monkeypatch.setattr(runner_recovery, "_adopt_completed_attempt", capture)
 
         attach_mod._reconcile_attached_remote(
             spec.run_id,
@@ -6459,7 +6447,7 @@ def test_deploy_train_endpoint_retries_on_quota_error(monkeypatch):
     _patch_deploy_deps(monkeypatch, jobs)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
 
-    def fake_sweep(protected, min_idle_s=0.0, reap_warm=True):
+    def fake_sweep(protected, min_idle_s=0.0, reap_warm=True, *, deadline_at=None):
         swept["count"] += 1
         return 5
 
@@ -6492,7 +6480,7 @@ def test_deploy_train_endpoint_raises_after_max_quota_retries(monkeypatch):
     monkeypatch.setattr(
         runpod_resources,
         "_sweep_idle_flash_endpoints",
-        lambda protected, min_idle_s=0.0, reap_warm=True: 0,
+        lambda protected, min_idle_s=0.0, reap_warm=True, *, deadline_at=None: 0,
     )
 
     with pytest.raises(RuntimeError, match="workers quota"):
@@ -6527,7 +6515,7 @@ def test_deploy_fails_over_to_next_account_on_quota(monkeypatch):
     monkeypatch.setattr(
         runpod_resources,
         "_sweep_idle_flash_endpoints",
-        lambda protected, min_idle_s=0.0, reap_warm=True: 0,
+        lambda protected, min_idle_s=0.0, reap_warm=True, *, deadline_at=None: 0,
     )
 
     ep_id, _name, _fingerprint = job_execution.deploy_train_endpoint("A100", name_suffix="testrun")
@@ -6561,7 +6549,7 @@ def test_deploy_fails_over_to_next_account_on_balance(monkeypatch):
     _patch_deploy_deps(monkeypatch, jobs, set_key=False)
     _make_runpod_flash_mocks(monkeypatch, FakeRM)
 
-    def fake_sweep(protected, min_idle_s=0.0, reap_warm=True):
+    def fake_sweep(protected, min_idle_s=0.0, reap_warm=True, *, deadline_at=None):
         swept["count"] += 1
         return 0
 
@@ -6597,7 +6585,7 @@ def test_deploy_balance_error_single_account_raises_fast(monkeypatch):
     monkeypatch.setattr(
         runpod_resources,
         "_sweep_idle_flash_endpoints",
-        lambda protected, min_idle_s=0.0, reap_warm=True: 0,
+        lambda protected, min_idle_s=0.0, reap_warm=True, *, deadline_at=None: 0,
     )
 
     with pytest.raises(RuntimeError, match="account balance"):
@@ -6681,7 +6669,7 @@ def test_deploy_raises_when_all_accounts_exhausted_without_looping(monkeypatch):
     monkeypatch.setattr(
         runpod_resources,
         "_sweep_idle_flash_endpoints",
-        lambda protected, min_idle_s=0.0, reap_warm=True: 0,
+        lambda protected, min_idle_s=0.0, reap_warm=True, *, deadline_at=None: 0,
     )
 
     with pytest.raises(RuntimeError, match="workers quota"):
@@ -6728,7 +6716,7 @@ def test_deploy_failover_from_midpool_tries_every_remaining_account(monkeypatch)
     monkeypatch.setattr(
         runpod_resources,
         "_sweep_idle_flash_endpoints",
-        lambda protected, min_idle_s=0.0, reap_warm=True: 0,
+        lambda protected, min_idle_s=0.0, reap_warm=True, *, deadline_at=None: 0,
     )
 
     ep_id, _name, _fingerprint = job_execution.deploy_train_endpoint("A100", name_suffix="testrun")
@@ -6761,10 +6749,10 @@ def test_sweep_idle_flash_endpoints(monkeypatch):
         {"id": "ep-other", "name": "other-ep"},  # not flash-* → skip
     ]
 
-    def fake_list_by_key():
+    def fake_list_by_key(*, deadline_at=None):
         return {"k": endpoints}, []
 
-    def fake_health(eid, key):
+    def fake_health(eid, key, *, deadline_at=None):
         if eid in ("ep-live-idle", "ep-bare-idle"):
             return {
                 "workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
@@ -6819,7 +6807,7 @@ def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
         {"id": "ep-zero", "name": "flash-a100-zero"},  # fully scaled to zero
     ]
 
-    def health(eid, key):
+    def health(eid, key, *, deadline_at=None):
         if eid == "ep-warm":
             return {
                 "workers": {"running": 0, "ready": 1, "idle": 1, "initializing": 0},
@@ -6831,7 +6819,9 @@ def test_sweep_reap_warm_false_keeps_warm_endpoints(monkeypatch):
         }
 
     deleted = []
-    monkeypatch.setattr(runpod_api, "list_endpoints_by_key", lambda: ({"k": endpoints}, []))
+    monkeypatch.setattr(
+        runpod_api, "list_endpoints_by_key", lambda *, deadline_at=None: ({"k": endpoints}, [])
+    )
     monkeypatch.setattr(runpod_api, "endpoint_health_for_fingerprint", health)
     monkeypatch.setattr(
         runpod_api, "delete_endpoint_for_fingerprint", lambda eid, key: deleted.append(eid) or True
@@ -6858,12 +6848,12 @@ def test_sweep_idle_grace_requires_sustained_idleness(monkeypatch):
     monkeypatch.setattr(
         runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"k": [{"id": "ep-x", "name": "flash-a100-x"}]}, []),
+        lambda *, deadline_at=None: ({"k": [{"id": "ep-x", "name": "flash-a100-x"}]}, []),
     )
     monkeypatch.setattr(
         runpod_api,
         "endpoint_health_for_fingerprint",
-        lambda eid, key: {
+        lambda eid, key, *, deadline_at=None: {
             "workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
             "jobs": {"inQueue": 0, "inProgress": 0},
         },
@@ -6903,10 +6893,10 @@ def test_sweep_grace_resets_when_endpoint_becomes_busy(monkeypatch):
     monkeypatch.setattr(
         runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"k": [{"id": "ep-x", "name": "flash-a100-x"}]}, []),
+        lambda *, deadline_at=None: ({"k": [{"id": "ep-x", "name": "flash-a100-x"}]}, []),
     )
 
-    def health(eid, key):
+    def health(eid, key, *, deadline_at=None):
         w = {"running": 1 if state["busy"] else 0, "ready": 0, "idle": 0, "initializing": 0}
         j = {"inQueue": 0, "inProgress": 1 if state["busy"] else 0}
         return {"workers": w, "jobs": j}
@@ -6946,12 +6936,12 @@ def test_sweep_serializes_on_idle_since_lock(monkeypatch):
     monkeypatch.setattr(
         runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"k": [{"id": "e", "name": "flash-a100-x"}]}, []),
+        lambda *, deadline_at=None: ({"k": [{"id": "e", "name": "flash-a100-x"}]}, []),
     )
     monkeypatch.setattr(
         runpod_api,
         "endpoint_health_for_fingerprint",
-        lambda eid, key: {
+        lambda eid, key, *, deadline_at=None: {
             "workers": {"running": 0, "ready": 0, "idle": 0, "initializing": 0},
             "jobs": {"inQueue": 0, "inProgress": 0},
         },
@@ -6983,7 +6973,6 @@ def test_runpod_completed_metrics_undecodable_output_pending_within_grace(monkey
 
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import jobs
-    from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(
         runpod_api,
@@ -6998,10 +6987,10 @@ def test_runpod_completed_metrics_undecodable_output_pending_within_grace(monkey
     handle = _runpod_handle(jobs)
     now = _time.time()
     # within the grace window -> keep reconciling (raise pending), never return None
-    with pytest.raises(lifecycle._CompletedAttemptPending):
-        lifecycle._runpod_completed_metrics(handle, deadline_at=now + 10_000.0)
+    with pytest.raises(runner_recovery._CompletedAttemptPending):
+        runner_recovery._runpod_completed_metrics(handle, deadline_at=now + 10_000.0)
     # once the grace has expired -> give up (return None)
-    assert lifecycle._runpod_completed_metrics(handle, deadline_at=now - 10_000.0) is None
+    assert runner_recovery._runpod_completed_metrics(handle, deadline_at=now - 10_000.0) is None
 
 
 def test_runpod_completed_metrics_probes_after_expired_recovery_grace(monkeypatch):
@@ -7018,13 +7007,13 @@ def test_runpod_completed_metrics_probes_after_expired_recovery_grace(monkeypatc
         return {"status": "COMPLETED", "output": {"wall_seconds": 60.0}}
 
     monkeypatch.setattr(runpod_api, "job_status", completed_status)
-    metrics = lifecycle._runpod_completed_metrics(
+    metrics = runner_recovery._runpod_completed_metrics(
         _live_clock_handle(jobs),
-        deadline_at=now - lifecycle._RECOVERY_MARKER_GRACE_S - 1.0,
+        deadline_at=now - runner_recovery._RECOVERY_MARKER_GRACE_S - 1.0,
     )
 
     assert metrics == {"wall_seconds": 60.0}
-    assert probe_deadlines == [now + lifecycle._RUNPOD_STATUS_PROBE_TIMEOUT_S]
+    assert probe_deadlines == [now + runner_recovery._RUNPOD_STATUS_PROBE_TIMEOUT_S]
 
 
 def test_runpod_completed_metrics_caps_probe_deadline_when_wall_deadline_far_future(monkeypatch):
@@ -7046,14 +7035,14 @@ def test_runpod_completed_metrics_caps_probe_deadline_when_wall_deadline_far_fut
         return {"status": "COMPLETED", "output": {"wall_seconds": 60.0}}
 
     monkeypatch.setattr(runpod_api, "job_status", completed_status)
-    metrics = lifecycle._runpod_completed_metrics(
+    metrics = runner_recovery._runpod_completed_metrics(
         _live_clock_handle(jobs),
         deadline_at=now + 7_200.0,  # wall deadline hours in the future
     )
 
     assert metrics == {"wall_seconds": 60.0}
     # short fresh cap, NOT now + 7200 + grace (which would let an outage stall the reconciler)
-    assert probe_deadlines == [now + lifecycle._RUNPOD_STATUS_PROBE_TIMEOUT_S]
+    assert probe_deadlines == [now + runner_recovery._RUNPOD_STATUS_PROBE_TIMEOUT_S]
 
 
 def test_runpod_completed_metrics_readable_failure_not_pending(monkeypatch):
@@ -7065,7 +7054,6 @@ def test_runpod_completed_metrics_readable_failure_not_pending(monkeypatch):
 
     from flash.providers.runpod.client import api as runpod_api
     from flash.providers.runpod.execution import jobs
-    from flash.runner.supervise import lifecycle
 
     monkeypatch.setattr(
         runpod_api,
@@ -7078,7 +7066,7 @@ def test_runpod_completed_metrics_readable_failure_not_pending(monkeypatch):
     handle = _runpod_handle(jobs)
     now = _time.time()
     # even well within the grace window, a readable failure envelope is never pending
-    assert lifecycle._runpod_completed_metrics(handle, deadline_at=now + 10_000.0) is None
+    assert runner_recovery._runpod_completed_metrics(handle, deadline_at=now + 10_000.0) is None
 
 
 def test_deploy_train_endpoint_threads_gpu_count(monkeypatch):

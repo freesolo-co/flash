@@ -24,6 +24,24 @@ from flash.providers._lifecycle.instances.poll import _attempt_int
 from flash.runner.lifecycle import attempts, preparation, reporting, state
 from flash.runner.lifecycle.state import RunStatus
 
+# fields that may accompany a lifecycle transition. identity, the accepted spec/quote,
+# timestamps, and report sequencing are not caller-controlled updates. heartbeat and
+# deployment writes have their own operations; cancellation still carries billing diagnostics.
+_TRANSITION_FIELDS = frozenset(
+    {
+        "error",
+        "cost_usd",
+        "artifacts_dir",
+        "remote",
+        "effective_preparation",
+        "source_verified_attempt",
+        "lifecycle_started_attempt",
+        "lifecycle_progressed_attempt",
+        "billing_state",
+        "billing_error",
+    }
+)
+
 # every other collaborator is reached through `runner.` rather than bound here. `RUNS_DIR`,
 # `get_status`, `_update`, `effective_spec_from_status`, `_gpu_rate`, `_internal_spec_from_status`
 # and `_report_status` are all patched as attributes of `flash.runner` by the tests, and binding any
@@ -456,7 +474,19 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
     already in a terminal state (the sticky compare-and-set below). Callers that gate PAID work on a
     transition (e.g. the recovery path resuming ``_run_training``) must check this return so a run
     concurrently flipped terminal does not get resumed.
+
+    Raises ``ValueError`` for unknown states or fields outside ``_TRANSITION_FIELDS``, before
+    reading or writing the record. ``state`` must be supplied through ``new_state`` so keyword
+    updates cannot bypass terminal-stickiness. Validation also applies to rejected transitions
+    and explicit terminal overrides; ``False`` only signals a valid but stale transition.
     """
+    if not isinstance(new_state, str) or new_state not in state.RUN_STATES:
+        raise ValueError(
+            f"invalid run state: {new_state!r}; expected one of {sorted(state.RUN_STATES)}"
+        )
+    invalid_fields = updates.keys() - _TRANSITION_FIELDS
+    if invalid_fields:
+        raise ValueError(f"invalid status update fields: {sorted(invalid_fields)}")
     report_status: RunStatus | None = None
     with state._status_guard(run_id):
         status = get_status(run_id)

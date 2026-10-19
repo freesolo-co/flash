@@ -601,7 +601,6 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     from flash.providers.core import allocator
     from flash.providers.core.base import PollResult
     from flash.providers.runpod.execution import job_execution as rp_jobs
-    from flash.runner.supervise import lifecycle
 
     resolved_sha = "a" * 40
     resolved_refs = []
@@ -664,7 +663,7 @@ def test_sync_submit_persists_resolved_env_sha_before_provider_submission(orch, 
     )
     monkeypatch.setattr(runner_status, "_persist_metrics", lambda *a, **k: 0.0)
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda spec: None)
-    monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
+    monkeypatch.setattr(runner_recovery, "_register_checkpoints_best_effort", lambda *a, **k: None)
 
     public = _public_spec()
     # stub the static dataset estimate against the two revisions submission resolves above, not
@@ -962,7 +961,6 @@ def test_controller_staging_is_persisted_before_provider_submission(orch, monkey
     from flash.providers.core import allocator
     from flash.providers.core.base import PollResult
     from flash.providers.runpod.execution import job_execution as rp_jobs
-    from flash.runner.supervise import lifecycle
 
     resolved_sha = "e" * 40
     package = EnvironmentPackageSpec(
@@ -1016,7 +1014,7 @@ def test_controller_staging_is_persisted_before_provider_submission(orch, monkey
     )
     monkeypatch.setattr(runner_status, "_persist_metrics", lambda *a, **k: 0.0)
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda spec: None)
-    monkeypatch.setattr(lifecycle, "_register_checkpoints_best_effort", lambda *a, **k: None)
+    monkeypatch.setattr(runner_recovery, "_register_checkpoints_best_effort", lambda *a, **k: None)
 
     public = _public_spec(algorithm="grpo")
     runner_submit.submit_job(public)

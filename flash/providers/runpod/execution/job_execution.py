@@ -21,7 +21,6 @@ from flash.providers._lifecycle.instances.poll import (
 from flash.providers._lifecycle.net import worker as runpod_worker
 from flash.providers._lifecycle.net.deadline import (
     CREATE_ALLOWANCE_S,
-    deadline_kwargs,
     remaining_seconds,
     require_create_allowance,
     require_deadline_at,
@@ -94,7 +93,7 @@ def submit_attempt(
         name_suffix=suffix,
         disk_gb=spec.gpu.disk_gb,
         spec=spec,
-        **deadline_kwargs(deploy_train_endpoint, deadline_at),
+        deadline_at=deadline_at,
     )
     payload = {
         "hf_repo": spec.train.hf_repo,
@@ -115,7 +114,7 @@ def submit_attempt(
             endpoint_id,
             payload,
             key_fingerprint=key_fingerprint,
-            **deadline_kwargs(runpod_api.submit_job, deadline_at),
+            deadline_at=deadline_at,
         )
     except Exception as exc:
         # the queue post is non-idempotent: only a positively confirmed endpoint deletion makes
@@ -164,7 +163,7 @@ def submit_attempt(
         make_hf_heartbeat_reader(
             hf_repo,
             prefix,
-            **deadline_kwargs(make_hf_heartbeat_reader, deadline_at),
+            deadline_at=deadline_at,
         )
         if hf_repo
         else None
@@ -175,7 +174,7 @@ def submit_attempt(
             prefix,
             spec.phase,
             attempt=attempt_id,
-            **deadline_kwargs(make_hf_failure_detail_reader, deadline_at),
+            deadline_at=deadline_at,
         )
         if hf_repo
         else None
@@ -186,7 +185,7 @@ def submit_attempt(
         heartbeat_reader=reader,
         failure_detail_reader=failure_reader,
         current_attempt=attempt_id,
-        **deadline_kwargs(runpod_polling.poll_job, deadline_at),
+        deadline_at=deadline_at,
         # the count actually rented for this attempt, which allocation may have resolved to fewer
         # cards than the spec's ceiling named -- so read the effective spec, not the run's request.
         **stall_kwargs(on_last_gpu=on_last_gpu, gpu_count=gpu_count_of(spec)),
@@ -269,7 +268,7 @@ def _prepare_quota_retry(
         protected={runpod_resources.canonical_endpoint_name(name)},
         min_idle_s=0.0,
         reap_warm=False,
-        **deadline_kwargs(runpod_resources._sweep_idle_flash_endpoints, quota_deadline),
+        deadline_at=quota_deadline,
     )
     wait_s = 30 * quota_attempt
     if context.deadline_at is not None:

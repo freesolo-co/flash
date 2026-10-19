@@ -30,7 +30,6 @@ from flash.providers._lifecycle.instances.poll_instance import (
     poll_instance_job,
 )
 from flash.providers._lifecycle.net.deadline import (
-    deadline_kwargs,
     require_create_allowance,
     require_deadline_at,
 )
@@ -75,7 +74,7 @@ _DEAD_STATES = {"terminated", "terminating", "preempted", "unhealthy"}
 def resolve_ssh_key_names(*, deadline_at: float | None = None) -> list[str]:
     """Return the SSH key to attach at launch (required by Lambda even though we never SSH in)."""
     keys = lambda_api.list_ssh_keys(
-        **deadline_kwargs(lambda_api.list_ssh_keys, deadline_at),
+        deadline_at=deadline_at,
     )
     names = [k.get("name") for k in keys if k.get("name")]
     if not names:
@@ -112,7 +111,7 @@ def usable_instances(
         # from the 1x spelling would miss the real type and hide available capacity.
         catalog = lambda_api.list_instance_types(
             force=force,
-            **deadline_kwargs(lambda_api.list_instance_types, deadline_at),
+            deadline_at=deadline_at,
         )
     except Exception:
         catalog = None
@@ -126,14 +125,14 @@ def usable_instances(
         hourly_rate(
             gpu_class,
             gpu_count=count,
-            **deadline_kwargs(hourly_rate, deadline_at),
+            deadline_at=deadline_at,
         )
         / count
     )
     regions = lambda_api.regions_with_capacity(
         itype,
         force=force,
-        **deadline_kwargs(lambda_api.regions_with_capacity, deadline_at),
+        deadline_at=deadline_at,
     )
     if catalog is None and regions:
         # the capacity call fetches the same catalog, so a first fetch that exhausted its retries
@@ -142,7 +141,7 @@ def usable_instances(
         # permissive and would let it rent a SKU whose fixed storage is provably too small.
         with contextlib.suppress(Exception):
             catalog = lambda_api.list_instance_types(
-                **deadline_kwargs(lambda_api.list_instance_types, deadline_at),
+                deadline_at=deadline_at,
             )
     # carried on the candidate so the launch gate can refuse an undersized SKU without a second
     # catalog fetch; None (unreported storage) stays permissive.
@@ -213,7 +212,7 @@ def _build_launch_user_data(
         "source_snapshot": source_snapshot,
         "mode": mode,
         "models": models,
-        **deadline_kwargs(build_payload, absolute_deadline),
+        "deadline_at": absolute_deadline,
     }
     if cache_host_mount is not None:
         payload_kwargs["cache_host_mount"] = cache_host_mount
@@ -337,7 +336,7 @@ def _rent_instance(
         name=plan.name,
         user_data=user_data,
         file_system_names=file_system_names,
-        **deadline_kwargs(lambda_api.launch_instance, plan.absolute_deadline),
+        deadline_at=plan.absolute_deadline,
     )
     reap.owns(instance_id)
     try:
@@ -368,7 +367,7 @@ def _refresh_launch_candidates(
             # refresh the SHAPE already being launched: dropping the count here would
             # fall back to a 1-card type while the worker still starts n ranks.
             gpu_count=inst.gpu_count,
-            **deadline_kwargs(usable_instances, absolute_deadline),
+            deadline_at=absolute_deadline,
         )
         if candidate.region not in tried_regions
     ]
@@ -426,7 +425,7 @@ def _build_launch_plan(
         models=models,
         name=instance_label(spec.run_id, attempt),
         ssh_keys=resolve_ssh_key_names(
-            **deadline_kwargs(resolve_ssh_key_names, absolute_deadline),
+            deadline_at=absolute_deadline,
         ),
         cache_name=cache_name,
         cold_user_data=_build_launch_user_data(
@@ -458,7 +457,7 @@ def _region_launch_inputs(
         mount_point = lambda_api.ensure_filesystem(
             plan.cache_name,
             inst.region,
-            **deadline_kwargs(lambda_api.ensure_filesystem, plan.absolute_deadline),
+            deadline_at=plan.absolute_deadline,
         )
         # Rebuild user_data when the actual mount_point differs from the default (rare).
         region_user_data = (
@@ -643,7 +642,7 @@ def poll_lambda_job(
         hf_repo,
         f"{prefix}/lambda_attempt{handle.attempt}_boot.log",
         min_interval_s=60.0,
-        **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+        deadline_at=absolute_deadline,
     )
 
     def stamp_cost_and_notes(metrics, *, end_ts, launch_ts) -> None:
@@ -670,23 +669,23 @@ def poll_lambda_job(
         done_reader=_make_hf_file_reader(
             hf_repo,
             f"{prefix}/DONE",
-            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+            deadline_at=absolute_deadline,
         ),
         marker_reader=_make_hf_file_reader(
             hf_repo,
             f"{prefix}/lambda_attempt{handle.attempt}.json",
             min_interval_s=60.0,
-            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+            deadline_at=absolute_deadline,
         ),
         metrics_reader=_make_hf_file_reader(
             hf_repo,
             f"{prefix}/metrics.json",
-            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+            deadline_at=absolute_deadline,
         ),
         # Resolve get_instance on the api MODULE at call time so a monkeypatch bites.
         fetch_instance=lambda: lambda_api.get_instance(
             handle.instance_id,
-            **deadline_kwargs(lambda_api.get_instance, absolute_deadline),
+            deadline_at=absolute_deadline,
         ),
         poll_error_exceptions=(lambda_api.LambdaApiError,),
         status_field="status",
@@ -698,7 +697,7 @@ def poll_lambda_job(
         read_current_error=lambda: _make_hf_file_reader(
             hf_repo,
             f"{prefix}/{err_name}",
-            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+            deadline_at=absolute_deadline,
         )(force=True),
         stamp_cost_and_notes=stamp_cost_and_notes,
         failure_detail=lambda marker: _failure_detail(
@@ -722,7 +721,7 @@ def poll_lambda_job(
         stall_after_s=stall_after_s,
         first_liveness_s=first_liveness_s,
         load_timeout_s=LOAD_TIMEOUT_S,
-        **deadline_kwargs(poll_instance_job, absolute_deadline),
+        deadline_at=absolute_deadline,
     )
 
 
@@ -763,7 +762,7 @@ def submit_attempt_lambda(
     instances = usable_instances(
         spec.gpu.type,
         gpu_count=gpu_count_of(spec),
-        **deadline_kwargs(usable_instances, absolute_deadline),
+        deadline_at=absolute_deadline,
     )
     handle = launch_and_submit(
         spec,
@@ -772,21 +771,21 @@ def submit_attempt_lambda(
         log=log,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
-        **deadline_kwargs(launch_and_submit, absolute_deadline),
+        deadline_at=absolute_deadline,
     )
     try:
         if on_handle is not None:
             on_handle(handle.to_dict())
         reader = heartbeat_reader_for(
             spec,
-            **deadline_kwargs(heartbeat_reader_for, absolute_deadline),
+            deadline_at=absolute_deadline,
         )
         return poll_lambda_job(
             handle,
             spec,
             log=log,
             heartbeat_reader=reader,
-            **deadline_kwargs(poll_lambda_job, absolute_deadline),
+            deadline_at=absolute_deadline,
         )
     finally:
         _teardown_polled_instance(handle, spec.run_id)

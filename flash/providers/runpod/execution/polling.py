@@ -16,7 +16,6 @@ from flash.providers._lifecycle.instances.poll import (
     surface_heartbeat,
 )
 from flash.providers._lifecycle.net.deadline import (
-    deadline_kwargs,
     remaining_seconds,
     require_deadline_at,
 )
@@ -97,7 +96,7 @@ def _read_job_status(context: _PollContext) -> tuple[dict | None, PollResult | N
             context.handle.endpoint_id,
             context.handle.job_id,
             key_fingerprint=context.handle.key_fingerprint,
-            **deadline_kwargs(runpod_api.job_status, context.absolute_deadline),
+            deadline_at=context.absolute_deadline,
         )
         context.poll_errors.reset()
     except runpod_api.RunpodApiError as exc:
@@ -189,10 +188,7 @@ def _probe_worker_coming_up_at(context: _PollContext, now: float) -> float | Non
         health = runpod_api.endpoint_health_for_fingerprint(
             context.handle.endpoint_id,
             context.handle.key_fingerprint,
-            **deadline_kwargs(
-                runpod_api.endpoint_health_for_fingerprint,
-                context.absolute_deadline,
-            ),
+            deadline_at=context.absolute_deadline,
         )
     except Exception:
         return None
@@ -247,10 +243,7 @@ def _classify_queue_state(
         health = runpod_api.endpoint_health_for_fingerprint(
             context.handle.endpoint_id,
             context.handle.key_fingerprint,
-            **deadline_kwargs(
-                runpod_api.endpoint_health_for_fingerprint,
-                context.absolute_deadline,
-            ),
+            deadline_at=context.absolute_deadline,
         )
         workers = health.get("workers") or {}
         usable = workers.get("running") or workers.get("ready") or workers.get("idle")

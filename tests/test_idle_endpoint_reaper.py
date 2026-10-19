@@ -5,6 +5,7 @@ run-aware protected set + idle grace down to the provider sweep. (Server-side; n
 from __future__ import annotations
 
 import flash.providers.runpod.execution.resources as runpod_resources
+import flash.runner.lifecycle.status as run_status
 import flash.server.asgi.app as app_mod
 from flash.providers.core.base import canonical_gpu
 from flash.providers.runpod.serverless.naming import endpoint_name, run_suffix
@@ -41,7 +42,7 @@ def test_protected_names_cover_live_runs_only(monkeypatch):
         ),
     }
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: rows)
-    monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
+    monkeypatch.setattr(run_status, "get_status", lambda rid: statuses[rid])
 
     names = app_mod._protected_train_endpoint_targets()
 
@@ -72,7 +73,7 @@ def test_ordered_gpu_pin_is_protected_before_its_handle_is_persisted(monkeypatch
         )
     }
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: rows)
-    monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
+    monkeypatch.setattr(run_status, "get_status", lambda rid: statuses[rid])
 
     names = app_mod._protected_train_endpoint_targets()
 
@@ -92,7 +93,7 @@ def test_an_orphaned_fallback_endpoint_stays_in_the_reapers_scope(monkeypatch):
         )
     }
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: rows)
-    monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
+    monkeypatch.setattr(run_status, "get_status", lambda rid: statuses[rid])
 
     known = app_mod._known_train_endpoint_targets()
 
@@ -110,7 +111,7 @@ def test_reap_once_passes_protected_set_and_grace(monkeypatch):
     )
     captured: dict = {}
 
-    def fake_sweep(protected, min_idle_s=0.0, known=None):
+    def fake_sweep(protected, min_idle_s=0.0, known=None, *, deadline_at=None):
         captured["protected"] = protected
         captured["grace"] = min_idle_s
         captured["known"] = known
@@ -134,7 +135,7 @@ def test_protected_names_skip_unreadable_run(monkeypatch):
             raise FileNotFoundError(rid)
         return RunStatus(run_id="live", state="running", spec={"gpu": {"type": "A100"}})
 
-    monkeypatch.setattr(app_mod, "get_status", get_status)
+    monkeypatch.setattr(run_status, "get_status", get_status)
     names = app_mod._protected_train_endpoint_targets()
     assert _derived("A100", "live") in names
 
@@ -180,7 +181,7 @@ def test_active_run_ids_covers_live_runs_only(monkeypatch):
         "flash-deployed": RunStatus(run_id="flash-deployed", state="deployed", spec={}),
     }
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: rows)
-    monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
+    monkeypatch.setattr(run_status, "get_status", lambda rid: statuses[rid])
 
     assert app_mod._active_run_ids() == {"flash-run", "flash-prov"}
 
@@ -193,7 +194,7 @@ def test_active_run_ids_skips_unreadable_run(monkeypatch):
             raise FileNotFoundError(rid)
         return RunStatus(run_id="live", state="running", spec={})
 
-    monkeypatch.setattr(app_mod, "get_status", get_status)
+    monkeypatch.setattr(run_status, "get_status", get_status)
     assert app_mod._active_run_ids() == {"live"}
 
 
@@ -267,7 +268,7 @@ def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
         "flash-dead": RunStatus(run_id="flash-dead", state="done", spec={}),
     }
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": r} for r in statuses])
-    monkeypatch.setattr(app_mod, "get_status", lambda rid: statuses[rid])
+    monkeypatch.setattr(run_status, "get_status", lambda rid: statuses[rid])
     # Make the instance provider "configured" so the real one is dispatched (RunPod absent here).
     monkeypatch.setattr(
         "flash.providers.core.registry.available_providers", lambda: ("lambda",), raising=False
@@ -282,7 +283,7 @@ def test_sweep_end_to_end_reaps_orphans_protects_live_run(monkeypatch):
         {"id": "i-foreign", "name": "not-ours"},  # non-flash name -> never touch
     ]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: lam_instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda *, deadline_at=None: lam_instances)
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
@@ -306,7 +307,9 @@ def test_sweep_spares_other_control_planes_live_instances(monkeypatch):
     # This plane knows exactly ONE run (live). The other plane's run id is absent from our registry.
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "flash-mine"}])
     monkeypatch.setattr(
-        app_mod, "get_status", lambda rid: RunStatus(run_id="flash-mine", state="running", spec={})
+        run_status,
+        "get_status",
+        lambda rid: RunStatus(run_id="flash-mine", state="running", spec={}),
     )
     monkeypatch.setattr(
         "flash.providers.core.registry.available_providers", lambda: ("lambda",), raising=False
@@ -318,7 +321,7 @@ def test_sweep_spares_other_control_planes_live_instances(monkeypatch):
         {"id": "i-theirs", "name": lambda_jobs.instance_label("flash-theirs", 0)},
     ]
     terminated = []
-    monkeypatch.setattr(lambda_api, "list_instances", lambda: lam_instances)
+    monkeypatch.setattr(lambda_api, "list_instances", lambda *, deadline_at=None: lam_instances)
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
     )
@@ -340,7 +343,7 @@ def test_sweep_resolves_active_labels_after_listing(monkeypatch):
     fresh = jobs.instance_label("flash-fresh", 0)
     orphan = jobs.instance_label("flash-old", 0)
 
-    def fake_list():
+    def fake_list(*, deadline_at=None):
         events.append("list")
         return [{"id": "i-fresh", "name": fresh}, {"id": "i-orphan", "name": orphan}]
 
@@ -372,7 +375,9 @@ def test_sweep_skips_when_active_set_resolution_raises(monkeypatch):
     monkeypatch.setattr(
         lambda_api,
         "list_instances",
-        lambda: [{"id": "i-live", "name": jobs.instance_label("flash-live", 0)}],
+        lambda *, deadline_at=None: [
+            {"id": "i-live", "name": jobs.instance_label("flash-live", 0)}
+        ],
     )
     monkeypatch.setattr(
         lambda_api, "terminate_instances", lambda ids: terminated.extend(ids) or list(ids)
@@ -421,11 +426,13 @@ def test_sweep_reaps_responsive_account_when_one_pool_key_fails(monkeypatch):
     # fpA failed to list; fpB returned the orphan. (Accounts are identified by non-secret
     # fingerprints, never the raw key.)
     monkeypatch.setattr(
-        runpod_resources.runpod_api, "list_endpoints_by_key", lambda: ({"fpB": [orphan]}, ["fpA"])
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda *, deadline_at=None: ({"fpB": [orphan]}, ["fpA"]),
     )
     health_calls = []
 
-    def health(eid, fp):
+    def health(eid, fp, *, deadline_at=None):
         health_calls.append((eid, fp))
         return _idle_health()
 
@@ -456,12 +463,14 @@ def test_sweep_skips_endpoints_outside_known_scope(monkeypatch):
     mine = {"id": "ep-mine", "name": "live-flash-mine-idle-a0"}
     theirs = {"id": "ep-theirs", "name": "live-flash-theirs-idle-a0"}
     monkeypatch.setattr(
-        runpod_resources.runpod_api, "list_endpoints_by_key", lambda: ({"fpA": [mine, theirs]}, [])
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda *, deadline_at=None: ({"fpA": [mine, theirs]}, []),
     )
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "endpoint_health_for_fingerprint",
-        lambda eid, fp: _idle_health(),
+        lambda eid, fp, *, deadline_at=None: _idle_health(),
     )
     deletes = []
     monkeypatch.setattr(
@@ -495,12 +504,12 @@ def test_sweep_honours_an_exact_name_as_well_as_a_run_target(monkeypatch):
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "list_endpoints_by_key",
-        lambda: ({"fpA": [attempt, warm, other]}, []),
+        lambda *, deadline_at=None: ({"fpA": [attempt, warm, other]}, []),
     )
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "endpoint_health_for_fingerprint",
-        lambda eid, fp: _idle_health(),
+        lambda eid, fp, *, deadline_at=None: _idle_health(),
     )
     deletes = []
     monkeypatch.setattr(
@@ -530,12 +539,14 @@ def test_sweep_preserves_grace_for_unlisted_account(monkeypatch):
     )  # orphan on account A, observed idle long ago
     # This cycle account A fails to list; account B responds with nothing.
     monkeypatch.setattr(
-        runpod_resources.runpod_api, "list_endpoints_by_key", lambda: ({"fpB": []}, ["fpA"])
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda *, deadline_at=None: ({"fpB": []}, ["fpA"]),
     )
     monkeypatch.setattr(
         runpod_resources.runpod_api,
         "endpoint_health_for_fingerprint",
-        lambda eid, fp: _idle_health(),
+        lambda eid, fp, *, deadline_at=None: _idle_health(),
     )
     monkeypatch.setattr(
         runpod_resources.runpod_api, "delete_endpoint_for_fingerprint", lambda eid, fp: True
@@ -565,7 +576,9 @@ def test_sweep_partial_view_prunes_vanished_timer_for_responsive_account(monkeyp
     )  # owned by account A, which fails this cycle
     # B responds (no longer lists gone-b); A fails.
     monkeypatch.setattr(
-        runpod_resources.runpod_api, "list_endpoints_by_key", lambda: ({"fpB": []}, ["fpA"])
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda *, deadline_at=None: ({"fpB": []}, ["fpA"]),
     )
     monkeypatch.setattr(runpod_resources.logger, "warning", lambda *a, **k: None)
 
@@ -587,7 +600,9 @@ def test_sweep_full_view_prunes_vanished_grace_timer(monkeypatch):
     runpod_resources._idle_since.clear()
     runpod_resources._idle_since["ghost"] = (1.0, "fpA")  # endpoint that has since vanished
     monkeypatch.setattr(
-        runpod_resources.runpod_api, "list_endpoints_by_key", lambda: ({"fpA": []}, [])
+        runpod_resources.runpod_api,
+        "list_endpoints_by_key",
+        lambda *, deadline_at=None: ({"fpA": []}, []),
     )
     monkeypatch.setattr(runpod_resources.logger, "warning", lambda *a, **k: None)
 

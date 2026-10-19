@@ -101,6 +101,7 @@ def test_usable_offers_filters_and_order(monkeypatch):
         limit=64,
         num_gpus=1,
         extra_q=None,
+        deadline_at=None,
     ):
         captured["min_vram_mb"] = min_vram_mb
         captured["min_disk_gb"] = min_disk_gb
@@ -170,6 +171,7 @@ def test_usable_offers_search_page_spans_all_classes(monkeypatch):
         limit=64,
         num_gpus=1,
         extra_q=None,
+        deadline_at=None,
     ):
         captured["limit"] = limit
         captured["min_duration_seconds"] = min_duration_seconds

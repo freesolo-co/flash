@@ -7,6 +7,8 @@ import json
 from contextlib import contextmanager
 from typing import Any
 
+import flash.runner.lifecycle.submit as run_submission
+
 
 class PrecheckResponse:
     def __init__(self, status: int, body: object) -> None:
@@ -46,7 +48,6 @@ def sabotage_submission_boundaries(monkeypatch) -> list[str]:
     import flash.providers.runpod.client.api as runpod_api
     import flash.providers.vast.client.api as vast_api
     import flash.runner.lifecycle.state as runner_state
-    import flash.server.asgi.app as app_mod
     import flash.server.platform.db as db_mod
 
     events: list[str] = []
@@ -61,7 +62,7 @@ def sabotage_submission_boundaries(monkeypatch) -> list[str]:
     monkeypatch.setattr(db_mod, "record_run", block("ownership"))
     monkeypatch.setattr(db_mod, "delete_run", block("ownership cleanup"))
     monkeypatch.setattr(runner_state, "_save_status", block("persistence"))
-    monkeypatch.setattr(app_mod, "submit_job", block("submission"))
+    monkeypatch.setattr(run_submission, "submit_job", block("submission"))
     monkeypatch.setattr(allocator, "allocate", block("allocation"))
     monkeypatch.setattr(runpod_api, "submit_job", block("runpod create"))
     monkeypatch.setattr(lambda_api, "launch_instance", block("lambda create"))

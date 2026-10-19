@@ -19,7 +19,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flash._internal.logging import configure_logging, get_logger
 from flash.providers._lifecycle.instances.poll import preload_instance_run_id
-from flash.providers._lifecycle.net.deadline import deadline_kwargs
 from flash.providers.artifacts.hf import make_hf_text_reader
 
 # imported at the top rather than re-exported at the bottom: these are default argument
@@ -159,7 +158,7 @@ def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> tuple[list[list], bool
         try:
             candidates = lambda_jobs.usable_instances(
                 cls,
-                **deadline_kwargs(lambda_jobs.usable_instances, deadline),
+                deadline_at=deadline,
             )
         except Exception as exc:
             logger.warning("warm lambda: usable_instances(%s) failed (skipping): %s", cls, exc)
@@ -189,7 +188,7 @@ def _lambda_provisioned_regions() -> set[str]:
 
     try:
         fses = lambda_api.list_filesystems(
-            **deadline_kwargs(lambda_api.list_filesystems, time.time() + _LAMBDA_SNAPSHOT_BUDGET_S),
+            deadline_at=time.time() + _LAMBDA_SNAPSHOT_BUDGET_S,
         )
     except Exception as exc:
         logger.warning(
@@ -250,7 +249,7 @@ def _region_filesystem_is_listed(region: str, deadline: float) -> bool:
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
     fses = lambda_api.list_filesystems(
-        **deadline_kwargs(lambda_api.list_filesystems, deadline),
+        deadline_at=deadline,
     )
     return any(
         fs.get("name") == WEIGHT_CACHE_VOLUME_NAME
@@ -288,7 +287,7 @@ def _ensure_region_filesystem(region: str, deadline: float) -> str:
         lambda_api.ensure_filesystem(
             WEIGHT_CACHE_VOLUME_NAME,
             region,
-            **deadline_kwargs(lambda_api.ensure_filesystem, deadline),
+            deadline_at=deadline,
         )
         if _region_filesystem_is_listed(region, deadline):
             return "listed"

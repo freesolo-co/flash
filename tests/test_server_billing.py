@@ -15,6 +15,8 @@ import pytest
 import flash.runner.lifecycle.preparation as runner_preparation
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
+import flash.runner.lifecycle.submit as run_submission
+import flash.runner.supervise.recovery as attempt_recovery
 
 pytest.importorskip("fastapi")
 
@@ -848,12 +850,11 @@ def test_external_identity_with_internal_prefix_is_still_billed(api, monkeypatch
 
 def test_submit_failure_records_nothing(api, monkeypatch):
     """If submit_job fails, no run row is left behind and no billing reversal is needed."""
-    import flash.server.asgi.app as app_mod
 
     def failing_submit(spec, dry_run=False, background=True, **kwargs):
         raise RuntimeError("provider out of capacity")
 
-    monkeypatch.setattr(app_mod, "submit_job", failing_submit)
+    monkeypatch.setattr(run_submission, "submit_job", failing_submit)
 
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-r"))
     assert res.status_code == 400, res.text
@@ -863,7 +864,6 @@ def test_submit_failure_records_nothing(api, monkeypatch):
 
 def test_record_run_failure_does_not_submit(api, monkeypatch):
     """If ``db.record_run`` fails (e.g. SQLite locked/full), submit_job is not reached."""
-    import flash.server.asgi.app as app_mod
     import flash.server.platform.db as db_mod
 
     def failing_record(run_id, key_id):
@@ -872,7 +872,7 @@ def test_record_run_failure_does_not_submit(api, monkeypatch):
     monkeypatch.setattr(db_mod, "record_run", failing_record)
     # submit_job must NOT be reached if record_run already failed.
     monkeypatch.setattr(
-        app_mod,
+        run_submission,
         "submit_job",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("submit must not run")),
     )
@@ -887,7 +887,6 @@ _SFT_SPEC = {**SPEC, "algorithm": "sft", "train": {"epochs": 1, "max_examples": 
 
 def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
     from flash.runner.lifecycle.state import RunStatus
-    from flash.runner.supervise import lifecycle
 
     spec = _spec(monkeypatch)
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
@@ -913,7 +912,7 @@ def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
     monkeypatch.setattr("flash.server.billing.charges.charge_completed_run", fake_charge)
     log = io.StringIO()
 
-    lifecycle._charge_completed_run_by_id(spec.run_id, log)
+    attempt_recovery._charge_completed_run_by_id(spec.run_id, log)
 
     assert calls == [("fslo-internal", "run-1", 1.23)]
     status = runner_status.get_status("run-1")
@@ -925,7 +924,6 @@ def test_completion_hook_charges_final_cost(monkeypatch, tmp_path):
 
 def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
     from flash.runner.lifecycle.state import RunStatus
-    from flash.runner.supervise import lifecycle
 
     spec = _spec(monkeypatch)
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
@@ -945,7 +943,7 @@ def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
         lambda **_: (_ for _ in ()).throw(AssertionError("must not charge without internal key")),
     )
 
-    lifecycle._charge_completed_run_by_id(spec.run_id, io.StringIO())
+    attempt_recovery._charge_completed_run_by_id(spec.run_id, io.StringIO())
 
     status = runner_status.get_status("run-1")
     assert status.billing_state == "failed"
@@ -958,14 +956,12 @@ def test_completion_hook_records_missing_internal_key(monkeypatch, tmp_path):
 def test_route_blames_the_adapter_only_for_tagged_failures(api, monkeypatch):
     # a genuine adapter-resolution failure keeps the actionable 400 that names the source.
 
-    import flash.server.asgi.app as app_mod
-
     # raise the class off the reloaded module: the api fixture reloads flash.runner, so a symbol
     # imported at module scope here would be a different object than the route's.
     def _prepare(*args, **kwargs):
         raise runner_preparation.WarmStartPreparationError("private-owner/private-repo:sft/step-20")
 
-    monkeypatch.setattr(app_mod, "prepare_job", _prepare)
+    monkeypatch.setattr(run_submission, "prepare_job", _prepare)
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
 
     assert res.status_code == 400, res.text
@@ -978,12 +974,11 @@ def test_route_blames_the_adapter_only_for_tagged_failures(api, monkeypatch):
 def test_route_does_not_blame_the_adapter_for_unrelated_failures(api, monkeypatch):
     # prepare_job also performs gpu, budget, and environment checks. with init_from_adapter set,
     # unrelated failures must retain their own attribution.
-    import flash.server.asgi.app as app_mod
 
     def _prepare(*args, **kwargs):
         raise ValueError("no gpu class satisfies the requested memory")
 
-    monkeypatch.setattr(app_mod, "prepare_job", _prepare)
+    monkeypatch.setattr(run_submission, "prepare_job", _prepare)
     warm_start_spec = {
         **SPEC,
         "train": {**SPEC["train"], "init_from_adapter": "source-run/final"},

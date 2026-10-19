@@ -25,7 +25,7 @@ def test_vast_provider_delegates_credentials_pricing_gc_and_orphan_sweep(monkeyp
     monkeypatch.setattr(
         pricing,
         "hourly_rate",
-        lambda gpu: calls.append(("rate", gpu)) or 1.25,
+        lambda gpu, *, deadline_at=None: calls.append(("rate", gpu)) or 1.25,
     )
     monkeypatch.setattr(
         jobs,

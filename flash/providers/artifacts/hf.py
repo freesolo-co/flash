@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from logging import Logger
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.adapters.artifacts import attempt_scoped_artifact_name
@@ -36,7 +36,6 @@ from flash.engine.support.verl_checkpoint import (
 from flash.engine.support.verl_policy import FsdpGeneration
 from flash.providers._lifecycle.instances.poll import _attempt_int
 from flash.providers._lifecycle.net.deadline import (
-    deadline_kwargs,
     remaining_seconds,
     require_deadline_at,
 )
@@ -328,13 +327,19 @@ def verify_opd_replacement_safe(
     return revision, selected.inspection.width
 
 
+class TextArtifactReader(Protocol):
+    """Read one artifact, allowing a bounded caller to override the captured deadline."""
+
+    def __call__(self, force: bool = False, *, deadline_at: float | None = None) -> str | None: ...
+
+
 def make_hf_text_reader(
     hf_repo: str,
     path_in_repo: str,
     min_interval_s: float = 45.0,
     *,
     deadline_at: float | None = None,
-):
+) -> TextArtifactReader:
     """Rate-limited reader for an HF artifact; returns None until it exists or on any error."""
     deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     state = {"last": 0.0}
@@ -380,7 +385,7 @@ def make_hf_heartbeat_reader(
         hf_repo,
         f"{prefix}/heartbeat.json",
         min_interval_s,
-        **deadline_kwargs(make_hf_text_reader, deadline_at),
+        deadline_at=deadline_at,
     )
 
     def read(force: bool = False, *, deadline_at: float | None = deadline_at) -> dict | None:
@@ -402,7 +407,7 @@ def heartbeat_reader_for(spec, *, deadline_at: float | None = None):
         make_hf_heartbeat_reader(
             hf_repo,
             f"{spec.phase}/{spec.run_id}",
-            **deadline_kwargs(make_hf_heartbeat_reader, deadline_at),
+            deadline_at=deadline_at,
         )
         if hf_repo
         else None
@@ -435,19 +440,19 @@ def make_hf_failure_detail_reader(
         hf_repo,
         f"{prefix}/{err_name}",
         min_interval_s,
-        **deadline_kwargs(make_hf_text_reader, deadline_at),
+        deadline_at=deadline_at,
     )
     console_reader = make_hf_text_reader(
         hf_repo,
         f"{prefix}/console_{phase}.txt",
         min_interval_s,
-        **deadline_kwargs(make_hf_text_reader, deadline_at),
+        deadline_at=deadline_at,
     )
     live_console_reader = make_hf_text_reader(
         hf_repo,
         f"{prefix}/{live_console_name}",
         min_interval_s,
-        **deadline_kwargs(make_hf_text_reader, deadline_at),
+        deadline_at=deadline_at,
     )
 
     def read(force: bool = False) -> str | None:
