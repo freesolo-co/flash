@@ -352,7 +352,7 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     if not records:
         return attempted
     from flash.providers.core.base import JobHandle
-    from flash.runner.supervise.lifecycle import _strict_teardown_handle
+    from flash.runner.supervise.recovery import _strict_teardown_handle
 
     for record in records:
         identity = _remote_resource_identity(record) or _uncanonical_cleanup_remote_key(record)

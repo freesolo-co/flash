@@ -233,7 +233,7 @@ def _teardown_or_preserve_remote(run_id: str, remote: dict) -> bool:
     """
     from flash.providers.core.base import JobHandle
     from flash.runner.accounting.reconciliation import _record_cleanup_remote
-    from flash.runner.supervise.lifecycle import _strict_teardown_handle
+    from flash.runner.supervise.recovery import _strict_teardown_handle
 
     try:
         resource_deleted = _strict_teardown_handle(JobHandle.from_dict(remote), run_id)

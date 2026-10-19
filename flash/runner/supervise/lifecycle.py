@@ -8,6 +8,7 @@ import time
 
 from flash.core.spec import JobSpec, gpu_count_of
 from flash.runner.lifecycle.attempts import AttemptLaunchClaim
+from flash.runner.supervise import recovery as attempt_recovery
 
 _STAGED_ENVIRONMENT_RETRY_S = 5.0
 
@@ -317,27 +318,5 @@ def _run_training(
         flush=True,
     )
     if applied:
-        _charge_completed_run_by_id(spec.run_id, log)
-        _register_checkpoints_best_effort(spec, log)
-
-
-# re-exported at the bottom rather than imported at the top: `recovery` resolves the patched
-# helpers back through this module, so a top import would be circular. `supervise.deploy` and the
-# run-management tests both address these as attributes of THIS module, which is why they stay on
-# it after the move.
-from flash.runner.supervise.recovery import (  # noqa: E402,F401
-    _MODAL_STATUS_PROBE_TIMEOUT_S,
-    _RECOVERY_MARKER_GRACE_S,
-    _RECOVERY_METRICS_POLL_S,
-    _adopt_completed_attempt,
-    _apply_charge_with_state,
-    _await_completed_worker_metrics,
-    _canonical_provider_handle,
-    _charge_completed_run_by_id,
-    _completed_attempt_metrics,
-    _completed_worker_metrics,
-    _CompletedAttemptPending,
-    _register_checkpoints_best_effort,
-    _strict_teardown_handle,
-    _worker_provably_gone,
-)
+        attempt_recovery._charge_completed_run_by_id(spec.run_id, log)
+        attempt_recovery._register_checkpoints_best_effort(spec, log)

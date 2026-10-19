@@ -10,10 +10,16 @@ import subprocess
 import sys
 import threading
 import uuid
-from collections.abc import MutableMapping
+from argparse import Namespace
+from collections.abc import Callable, Coroutine, MutableMapping
+from dataclasses import dataclass
 from pathlib import Path
-from types import FrameType, SimpleNamespace
-from typing import Any, Protocol, Self
+from types import FrameType
+from typing import TYPE_CHECKING, Any, Protocol, Self
+
+if TYPE_CHECKING:
+    from flash.serve.app.manifest import ManifestAdapter, ServingManifest
+    from flash.serve.provisioning import ServingRuntimeSecrets
 
 from .progress import emit_boot_progress, emit_filesystem_usage
 
@@ -86,18 +92,6 @@ _ENGINE_RUNTIME_ENVIRONMENT = {
     "VLLM_MOE_USE_DEEP_GEMM": "0",
 }
 
-ServingRuntimeSecrets: Any = None
-MaterializationError: Any = None
-adapter_cache_path: Any = None
-base_weights_are_cached: Any = None
-base_weights_cache_path: Any = None
-decode_manifest_environment: Any = None
-hydrate_base_weights: Any = None
-hydrate_manifest: Any = None
-validate_manifest_cache: Any = None
-_prepare_cache_root: Any = None
-_serve: Any = None
-
 
 class LaunchError(RuntimeError):
     """the sanitized serving launcher rejected its startup inputs."""
@@ -137,65 +131,62 @@ class _SignalGuardHandoff(Protocol):
     def release_for_handoff(self) -> dict[int, Any]: ...
 
 
-def _load_project_boundaries() -> None:
-    global MaterializationError
-    global ServingRuntimeSecrets
-    global _prepare_cache_root
-    global _serve
-    global adapter_cache_path
-    global base_weights_are_cached
-    global base_weights_cache_path
-    global decode_manifest_environment
-    global hydrate_base_weights
-    global hydrate_manifest
-    global validate_manifest_cache
+class _HydrateCache(Protocol):
+    def __call__(self, manifest: ServingManifest, cache_root: str, *, token_fd: int) -> object: ...
 
-    from flash.serve.app.__main__ import _serve as loaded_serve
-    from flash.serve.app.materialize import (
-        MaterializationError as LoadedMaterializationError,
-    )
-    from flash.serve.app.materialize import (
-        _prepare_cache_root as loaded_prepare_cache_root,
-    )
-    from flash.serve.app.materialize import adapter_cache_path as loaded_adapter_cache_path
-    from flash.serve.app.materialize import (
-        base_weights_are_cached as loaded_base_weights_are_cached,
-    )
-    from flash.serve.app.materialize import (
-        base_weights_cache_path as loaded_base_weights_cache_path,
-    )
-    from flash.serve.app.materialize import hydrate_base_weights as loaded_hydrate_base_weights
-    from flash.serve.app.materialize import hydrate_manifest as loaded_hydrate_manifest
-    from flash.serve.app.materialize import (
-        validate_manifest_cache as loaded_validate_manifest_cache,
-    )
-    from flash.serve.provisioning import ServingRuntimeSecrets as LoadedServingRuntimeSecrets
-    from flash.serve.provisioning import (
-        decode_manifest_environment as loaded_decode_manifest_environment,
-    )
 
-    if MaterializationError is None:
-        MaterializationError = LoadedMaterializationError
-    if ServingRuntimeSecrets is None:
-        ServingRuntimeSecrets = LoadedServingRuntimeSecrets
-    if _prepare_cache_root is None:
-        _prepare_cache_root = loaded_prepare_cache_root
-    if _serve is None:
-        _serve = loaded_serve
-    if adapter_cache_path is None:
-        adapter_cache_path = loaded_adapter_cache_path
-    if base_weights_are_cached is None:
-        base_weights_are_cached = loaded_base_weights_are_cached
-    if base_weights_cache_path is None:
-        base_weights_cache_path = loaded_base_weights_cache_path
-    if decode_manifest_environment is None:
-        decode_manifest_environment = loaded_decode_manifest_environment
-    if hydrate_base_weights is None:
-        hydrate_base_weights = loaded_hydrate_base_weights
-    if hydrate_manifest is None:
-        hydrate_manifest = loaded_hydrate_manifest
-    if validate_manifest_cache is None:
-        validate_manifest_cache = loaded_validate_manifest_cache
+class _Serve(Protocol):
+    def __call__(
+        self,
+        args: Namespace,
+        manifest: ServingManifest,
+        *,
+        inference_token_fd: int,
+        on_signals_installed: Callable[[], dict[int, Any]],
+    ) -> Coroutine[Any, Any, None]: ...
+
+
+@dataclass(frozen=True)
+class CacheDependencies:
+    materialization_error: type[Exception]
+    adapter_cache_path: Callable[[str, ManifestAdapter], Path]
+    base_weights_are_cached: Callable[[ServingManifest, str], bool]
+    validate_manifest_cache: Callable[[ServingManifest, str], dict[str, Path]]
+    hydrate_base_weights: _HydrateCache
+    hydrate_manifest: _HydrateCache
+
+
+@dataclass(frozen=True)
+class LaunchDependencies:
+    cache: CacheDependencies
+    prepare_cache_root: Callable[[str], Path]
+    base_weights_cache_path: Callable[[str], Path]
+    decode_manifest: Callable[[str], ServingManifest]
+    runtime_secrets: Callable[[str, str | None], ServingRuntimeSecrets]
+    serve: _Serve
+
+
+def _load_project_boundaries() -> LaunchDependencies:
+    # Called only after bootstrap has removed secrets and installed startup signal handling.
+    from flash.serve.app import materialize
+    from flash.serve.app.__main__ import _serve
+    from flash.serve.provisioning import ServingRuntimeSecrets, decode_manifest_environment
+
+    return LaunchDependencies(
+        cache=CacheDependencies(
+            materialization_error=materialize.MaterializationError,
+            adapter_cache_path=materialize.adapter_cache_path,
+            base_weights_are_cached=materialize.base_weights_are_cached,
+            validate_manifest_cache=materialize.validate_manifest_cache,
+            hydrate_base_weights=materialize.hydrate_base_weights,
+            hydrate_manifest=materialize.hydrate_manifest,
+        ),
+        prepare_cache_root=materialize._prepare_cache_root,
+        base_weights_cache_path=materialize.base_weights_cache_path,
+        decode_manifest=decode_manifest_environment,
+        runtime_secrets=ServingRuntimeSecrets,
+        serve=_serve,
+    )
 
 
 def _required_environment(environment: MutableMapping[str, str], name: str) -> str:
@@ -295,7 +286,9 @@ class _StartupSignalGuard:
         self.restore()
 
 
-def _verify_external_bindings(manifest: Any, environment: MutableMapping[str, str]) -> None:
+def _verify_external_bindings(
+    manifest: ServingManifest, environment: MutableMapping[str, str]
+) -> None:
     manifest_id = _required_environment(environment, _MANIFEST_ID_ENV)
     image_digest = _required_environment(environment, _IMAGE_DIGEST_ENV)
     if manifest.manifest_id != manifest_id:
@@ -304,11 +297,13 @@ def _verify_external_bindings(manifest: Any, environment: MutableMapping[str, st
         raise LaunchError("serving image digest does not match its external binding")
 
 
-def _atomic_write_manifest(manifest: Any, cache_root: str) -> Path:
+def _atomic_write_manifest(
+    manifest: ServingManifest, cache_root: str, prepare_cache_root: Callable[[str], Path]
+) -> Path:
     # the walk below opens, creates and mode-probes every component of the cache root on the
     # provider's network volume, so it is the first place startup can block on remote storage.
     emit_boot_progress("cache-root-preparing", path=cache_root)
-    root = _prepare_cache_root(cache_root)
+    root = prepare_cache_root(cache_root)
     emit_boot_progress("cache-root-prepared", path=root)
     target = root / "serving-manifest.json"
     temporary_name = f".serving-manifest-{uuid.uuid4().hex}.tmp"
@@ -339,7 +334,11 @@ def _atomic_write_manifest(manifest: Any, cache_root: str) -> Path:
     return target
 
 
-def _cache_has_missing_adapter(manifest: Any, cache_root: str) -> bool:
+def _cache_has_missing_adapter(
+    manifest: ServingManifest,
+    cache_root: str,
+    adapter_cache_path: Callable[[str, ManifestAdapter], Path],
+) -> bool:
     for adapter in manifest.adapters:
         try:
             os.lstat(adapter_cache_path(cache_root, adapter))
@@ -422,7 +421,9 @@ def _open_secret_pipe(value: str):
         raise LaunchError("secret descriptor could not be populated") from errors[0]
 
 
-def _prepare_cache(manifest: Any, cache_root: str, artifact_token: str | None) -> None:
+def _prepare_cache(
+    manifest: ServingManifest, cache_root: str, artifact_token: str | None, cache: CacheDependencies
+) -> None:
     """make both the adapters and the base weights present before the engine starts.
 
     the served base model is a private repo, and the artifact token is deleted at the end of
@@ -434,13 +435,13 @@ def _prepare_cache(manifest: Any, cache_root: str, artifact_token: str | None) -
     emit_boot_progress("cache-validation-starting", path=cache_root)
     adapters_missing = True
     try:
-        validate_manifest_cache(manifest, cache_root)
+        cache.validate_manifest_cache(manifest, cache_root)
         adapters_missing = False
         emit_boot_progress("adapters-validated", count=len(manifest.adapters))
-    except MaterializationError as exc:
-        if not _cache_has_missing_adapter(manifest, cache_root):
+    except cache.materialization_error as exc:
+        if not _cache_has_missing_adapter(manifest, cache_root, cache.adapter_cache_path):
             raise LaunchError("serving cache validation failed") from exc
-    weights_missing = not base_weights_are_cached(manifest, cache_root)
+    weights_missing = not cache.base_weights_are_cached(manifest, cache_root)
     if not adapters_missing and not weights_missing:
         emit_boot_progress("cache-validated", result="hit")
         return
@@ -457,17 +458,21 @@ def _prepare_cache(manifest: Any, cache_root: str, artifact_token: str | None) -
     try:
         if weights_missing:
             with _open_secret_pipe(artifact_token) as token_fd:
-                hydrate_base_weights(manifest, cache_root, token_fd=token_fd)
+                cache.hydrate_base_weights(manifest, cache_root, token_fd=token_fd)
         if adapters_missing:
             with _open_secret_pipe(artifact_token) as token_fd:
-                hydrate_manifest(manifest, cache_root, token_fd=token_fd)
+                cache.hydrate_manifest(manifest, cache_root, token_fd=token_fd)
             emit_boot_progress("adapters-validated", count=len(manifest.adapters))
-    except MaterializationError as exc:
+    except cache.materialization_error as exc:
         raise LaunchError("serving cache hydration failed") from exc
     emit_boot_progress("hydration-complete", path=cache_root)
 
 
-def _bind_hub_cache(environment: MutableMapping[str, str], cache_root: str) -> None:
+def _bind_hub_cache(
+    environment: MutableMapping[str, str],
+    cache_root: str,
+    base_weights_cache_path: Callable[[str], Path],
+) -> None:
     """point huggingface_hub at the persistent volume for both hydration and engine start.
 
     hydration and vllm are separate processes, and vllm resolves the base model through the hub's
@@ -556,35 +561,31 @@ def _run_with_secrets(
     environment: MutableMapping[str, str],
     raw_inference: str,
     raw_artifact: str | None,
-) -> tuple[str, SimpleNamespace, Any]:
+    dependencies: LaunchDependencies,
+) -> tuple[str, Namespace, ServingManifest]:
     """hydrate while the artifact credential exists, then return only serving inputs."""
 
-    # first marker of the process. everything below it -- the cache-root walk in particular --
-    # touches the provider's network volume, so without a marker here a hang there is
-    # indistinguishable from a container that never ran python at all.
-    emit_boot_progress("launcher-entered")
-    _load_project_boundaries()
     try:
-        secrets = ServingRuntimeSecrets(raw_inference, raw_artifact)
+        secrets = dependencies.runtime_secrets(raw_inference, raw_artifact)
     except ValueError as exc:
         raise LaunchError("runtime secret input is invalid") from exc
     encoded_manifest = _required_environment(environment, _MANIFEST_ENV)
     try:
-        manifest = decode_manifest_environment(encoded_manifest)
+        manifest = dependencies.decode_manifest(encoded_manifest)
     except ValueError as exc:
         raise LaunchError("encoded serving manifest is invalid") from exc
     _verify_external_bindings(manifest, environment)
     cache_root = environment.get(_CACHE_ROOT_ENV, _DEFAULT_CACHE_ROOT)
     if type(cache_root) is not str or not cache_root:
         raise LaunchError("serving cache root is invalid")
-    _atomic_write_manifest(manifest, cache_root)
+    _atomic_write_manifest(manifest, cache_root, dependencies.prepare_cache_root)
     _apply_engine_runtime_environment(environment)
-    _bind_hub_cache(environment, cache_root)
+    _bind_hub_cache(environment, cache_root, dependencies.base_weights_cache_path)
     inference_token, artifact_token = secrets._reveal_for_launch()
-    _prepare_cache(manifest, cache_root, artifact_token)
+    _prepare_cache(manifest, cache_root, artifact_token, dependencies.cache)
     emit_filesystem_usage("cache-prepared", cache_root)
     _seal_hub_offline(environment)
-    args = SimpleNamespace(
+    args = Namespace(
         cache_root=cache_root,
         host=environment.get(_HOST_ENV, _DEFAULT_HOST),
         port=_port(environment),
@@ -592,18 +593,7 @@ def _run_with_secrets(
     return inference_token, args, manifest
 
 
-def _prepare_explicit_secrets(
-    environment: MutableMapping[str, str],
-    inference_token: str,
-    artifact_token: str | None,
-) -> tuple[str, SimpleNamespace, Any]:
-    inference = _validate_secret(inference_token, "inference token")
-    artifact = _validate_secret(artifact_token, "artifact token", optional=True)
-    assert inference is not None
-    return _run_with_secrets(environment, inference, artifact)
-
-
-def _run_prepared(prepared: list[Any], startup_signals: _StartupSignalGuard) -> None:
+def _run_prepared(prepared: list[Any], startup_signals: _StartupSignalGuard, serve: _Serve) -> None:
     inference_token = prepared.pop(0)
     args, manifest = prepared
     emit_boot_progress("entering-serve", host=args.host, port=args.port)
@@ -611,7 +601,7 @@ def _run_prepared(prepared: list[Any], startup_signals: _StartupSignalGuard) -> 
         # the descriptor owns the write now, so this frame must not retain the raw token while serving.
         del inference_token
         asyncio.run(
-            _serve(
+            serve(
                 args,
                 manifest,
                 inference_token_fd=inference_fd,
@@ -626,6 +616,7 @@ def run_launcher_with_secrets(
     *,
     environment: MutableMapping[str, str] | None = None,
     previous_signal_guard: _SignalGuardHandoff | None = None,
+    dependencies: LaunchDependencies | None = None,
 ) -> None:
     """accept bootstrap-popped secrets under a nested startup signal guard."""
 
@@ -637,14 +628,24 @@ def run_launcher_with_secrets(
             raise LaunchError("inference token holder is invalid")
         if type(artifact_token_holder) is not list or len(artifact_token_holder) != 1:
             raise LaunchError("artifact token holder is invalid")
-        inference_token = inference_token_holder.pop()
+        inference_token: str | None = inference_token_holder.pop()
         artifact_token = artifact_token_holder.pop()
-        prepared = list(_prepare_explicit_secrets(environment, inference_token, artifact_token))
+        inference_token = _validate_secret(inference_token, "inference token")
+        artifact_token = _validate_secret(artifact_token, "artifact token", optional=True)
+        assert inference_token is not None
+        # first marker of the process. everything below it -- the cache-root walk in particular --
+        # touches the provider's network volume, so without a marker here a hang there is
+        # indistinguishable from a container that never ran python at all.
+        emit_boot_progress("launcher-entered")
+        dependencies = _load_project_boundaries() if dependencies is None else dependencies
+        prepared = list(
+            _run_with_secrets(environment, inference_token, artifact_token, dependencies)
+        )
         # strings cannot be zeroed, so the only meaningful boundary is removing every live
         # bootstrap reference before the long-lived server frame exists.
         del inference_token
         del artifact_token
-        _run_prepared(prepared, startup_signals)
+        _run_prepared(prepared, startup_signals, dependencies.serve)
 
 
 def _scrub_child_environment(environment: MutableMapping[str, str]) -> dict[str, str]:
@@ -700,7 +701,8 @@ def start_launcher_process(
 
     environment = os.environ if environment is None else environment
     raw_inference, raw_artifact = _pop_runtime_secrets(environment)
-    _load_project_boundaries()
+    from flash.serve.provisioning import ServingRuntimeSecrets
+
     try:
         secrets = ServingRuntimeSecrets(raw_inference, raw_artifact)
     except ValueError as exc:

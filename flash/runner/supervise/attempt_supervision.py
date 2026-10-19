@@ -6,12 +6,13 @@ Split out of ``flash.runner.supervise.lifecycle`` to keep that module under the 
 from __future__ import annotations
 
 import contextlib
+import time
 from dataclasses import dataclass, field, replace
 
+import flash.runner.supervise.recovery as attempt_recovery
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
 from flash.runner.lifecycle.attempts import AttemptLaunchClaim
-from flash.runner.supervise import lifecycle as _lifecycle
 from flash.runner.supervise.retry_decision import (
     FailureObservation,
     _candidate_usable_vram_gb,
@@ -41,7 +42,7 @@ class _SubmitContext:
 
         for remote in self.seen_sandboxes.values():
             try:
-                if not _lifecycle._strict_teardown_handle(remote, self.spec.run_id):
+                if not attempt_recovery._strict_teardown_handle(remote, self.spec.run_id):
                     _record_cleanup_remote(self.spec.run_id, remote)
             except Exception:
                 _record_cleanup_remote(self.spec.run_id, remote)
@@ -126,7 +127,7 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     )
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
-    completed_metrics = _lifecycle._await_completed_worker_metrics(
+    completed_metrics = attempt_recovery._await_completed_worker_metrics(
         ctx.last_handle,
         _load_run_deadline_at(ctx.spec.run_id),
         check_cancelled=ctx.raise_if_cancelled,
@@ -136,14 +137,14 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     resource_deleted = False
     teardown_error: Exception | None = None
     try:
-        resource_deleted = _lifecycle._strict_teardown_handle(
+        resource_deleted = attempt_recovery._strict_teardown_handle(
             JobHandle.from_dict(ctx.last_handle), ctx.spec.run_id
         )
     except Exception as exc:
         teardown_error = exc
-    resource_kind = "endpoint" if ctx.last_handle.get("instance_id") else "instance"
-    resource_id = ctx.last_handle.get("instance_id") or ctx.last_handle.get("instance_id")
-    worker_gone = teardown_error is None or _lifecycle._worker_provably_gone(
+    resource_kind = "sandbox"
+    resource_id = ctx.last_handle.get("instance_id")
+    worker_gone = teardown_error is None or attempt_recovery._worker_provably_gone(
         ctx.spec.run_id, ctx.last_handle
     )
     if (
@@ -268,7 +269,7 @@ def _allocate_attempt(ctx: _SubmitContext, prepared):
             disk_gb=float(getattr(attempt_spec.gpu, "disk_gb", 0.0) or 0.0),
             max_wall_seconds=max(
                 float(getattr(attempt_spec.gpu, "max_wall_seconds", 0.0) or 0.0),
-                max(0.0, _load_run_deadline_at(ctx.spec.run_id) - _lifecycle.time.time()),
+                max(0.0, _load_run_deadline_at(ctx.spec.run_id) - time.time()),
             ),
             provider=getattr(attempt_spec.gpu, "provider", ""),
             providers=getattr(attempt_spec.gpu, "providers", ()),
@@ -378,7 +379,7 @@ def _retry_delay(ctx: _SubmitContext, infra_retry_ordinal: int | None) -> float:
 
     if infra_retry_ordinal is None:
         return 0
-    remaining = _load_run_deadline_at(ctx.spec.run_id) - _lifecycle.time.time()
+    remaining = _load_run_deadline_at(ctx.spec.run_id) - time.time()
     return min(10 * infra_retry_ordinal, remaining) if remaining > 0 else 0
 
 
@@ -396,7 +397,7 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
     from flash.runner.supervise.errors import _TerminalHandleRace
 
     def on_handle(handle: dict) -> None:
-        canonical = _lifecycle._canonical_provider_handle(handle)
+        canonical = attempt_recovery._canonical_provider_handle(handle)
         remote = canonical.to_dict()
         if canonical.provider != chosen.provider:
             raise RuntimeError("provider handle identity does not match the selected provider")
@@ -439,7 +440,7 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
             # active claim exists, and handleless recovery refuses a set remote.
             deleted = False
             with contextlib.suppress(Exception):
-                deleted = _lifecycle._strict_teardown_handle(remote, ctx.spec.run_id)
+                deleted = attempt_recovery._strict_teardown_handle(remote, ctx.spec.run_id)
             if not deleted:
                 with contextlib.suppress(Exception):
                     _record_cleanup_remote(ctx.spec.run_id, persisted)
@@ -451,7 +452,7 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
             return
         deleted = False
         with contextlib.suppress(Exception):
-            deleted = _lifecycle._strict_teardown_handle(remote, ctx.spec.run_id)
+            deleted = attempt_recovery._strict_teardown_handle(remote, ctx.spec.run_id)
         if deleted:
             ctx.last_handle.clear()
         else:
@@ -597,7 +598,9 @@ def _settle_terminal_remote(ctx: _SubmitContext) -> None:
     with contextlib.suppress(Exception):
         cleanup_recorded = _record_cleanup_remote(ctx.spec.run_id, remote)
     try:
-        deleted = _lifecycle._strict_teardown_handle(JobHandle.from_dict(remote), ctx.spec.run_id)
+        deleted = attempt_recovery._strict_teardown_handle(
+            JobHandle.from_dict(remote), ctx.spec.run_id
+        )
     except Exception:
         return
     if not deleted:
@@ -637,7 +640,7 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
     ctx.raise_if_cancelled()
-    completed_metrics = _lifecycle._await_completed_worker_metrics(
+    completed_metrics = attempt_recovery._await_completed_worker_metrics(
         ctx.last_handle,
         _load_run_deadline_at(ctx.spec.run_id),
         check_cancelled=ctx.raise_if_cancelled,
@@ -721,7 +724,7 @@ def run_attempts_supervised(
             if not retry:
                 break
             if retry_delay:
-                _lifecycle.time.sleep(retry_delay)
+                time.sleep(retry_delay)
         _settle_terminal_remote(ctx)
         ctx.gc_seen_sandboxes()
         raise RuntimeError(f"run {spec.run_id} failed after retries: {ctx.last_detail}")

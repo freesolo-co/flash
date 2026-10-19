@@ -11,6 +11,7 @@ import types
 import pytest
 
 import flash.server.asgi.app as app_mod
+import flash.server.platform.deployment_jobs as deployment_jobs
 
 
 def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> None:
@@ -29,42 +30,42 @@ def test_start_deployment_job_uses_a_daemon_background_thread(monkeypatch) -> No
             calls.append(("start",))
 
     monkeypatch.delenv("FLASH_DEPLOY_SYNC", raising=False)
-    monkeypatch.setattr(app_mod.threading, "Thread", FakeThread)
-    monkeypatch.setattr(app_mod.threading, "current_thread", lambda: current["thread"])
-    app_mod._open_deployment_jobs()
+    monkeypatch.setattr(deployment_jobs.threading, "Thread", FakeThread)
+    monkeypatch.setattr(deployment_jobs.threading, "current_thread", lambda: current["thread"])
+    deployment_jobs._open_deployment_jobs()
     observed = []
 
     def record(value, *, final):
         observed.append((value, final))
 
-    assert app_mod.start_deployment_job(record, "done", final=True) is False
+    assert deployment_jobs.start_deployment_job(record, "done", final=True) is False
     thread = current["thread"]
-    with app_mod._DEPLOYMENT_JOBS_LOCK:
-        assert thread in app_mod._DEPLOYMENT_JOBS
-        assert len(app_mod._DEPLOYMENT_JOBS) == 1
+    with deployment_jobs._DEPLOYMENT_JOBS_LOCK:
+        assert thread in deployment_jobs._DEPLOYMENT_JOBS
+        assert len(deployment_jobs._DEPLOYMENT_JOBS) == 1
 
     thread.target(*thread.args)
 
     assert observed == [("done", True)]
     assert calls == [
-        ("init", app_mod._run_deployment_job, (record, ("done",), {"final": True}), True),
+        ("init", deployment_jobs._run_deployment_job, (record, ("done",), {"final": True}), True),
         ("start",),
     ]
-    with app_mod._DEPLOYMENT_JOBS_LOCK:
-        assert not app_mod._DEPLOYMENT_JOBS
+    with deployment_jobs._DEPLOYMENT_JOBS_LOCK:
+        assert not deployment_jobs._DEPLOYMENT_JOBS
 
 
 @pytest.fixture
 def blocking_deployment_jobs(monkeypatch):
     """Start real capped deployment jobs that block until the test releases them."""
     monkeypatch.delenv("FLASH_DEPLOY_SYNC", raising=False)
-    app_mod._open_deployment_jobs()
+    deployment_jobs._open_deployment_jobs()
     release = threading.Event()
 
     def fill(count):
         started = 0
         for _ in range(count):
-            app_mod.start_deployment_job(release.wait, 60)
+            deployment_jobs.start_deployment_job(release.wait, 60)
             started += 1
         return started
 
@@ -72,43 +73,43 @@ def blocking_deployment_jobs(monkeypatch):
         yield release, fill
     finally:
         release.set()
-        app_mod._wait_for_deployment_jobs(30)
-        app_mod._open_deployment_jobs()
+        deployment_jobs._wait_for_deployment_jobs(30)
+        deployment_jobs._open_deployment_jobs()
 
 
 def test_start_deployment_job_rejects_past_the_active_capacity(blocking_deployment_jobs) -> None:
     """A deployment job holds its thread for minutes, so the live set must be bounded."""
     release, fill = blocking_deployment_jobs
-    cap = app_mod._MAX_ACTIVE_DEPLOYMENT_JOBS
+    cap = deployment_jobs._MAX_ACTIVE_DEPLOYMENT_JOBS
 
     assert fill(cap) == cap
-    with app_mod._DEPLOYMENT_JOBS_LOCK:
-        assert len(app_mod._DEPLOYMENT_JOBS) == cap
+    with deployment_jobs._DEPLOYMENT_JOBS_LOCK:
+        assert len(deployment_jobs._DEPLOYMENT_JOBS) == cap
 
-    with pytest.raises(app_mod.DeploymentJobStartError, match="capacity reached"):
-        app_mod.start_deployment_job(release.wait, 60)
+    with pytest.raises(deployment_jobs.DeploymentJobStartError, match="capacity reached"):
+        deployment_jobs.start_deployment_job(release.wait, 60)
 
-    with app_mod._DEPLOYMENT_JOBS_LOCK:
-        assert len(app_mod._DEPLOYMENT_JOBS) == cap
+    with deployment_jobs._DEPLOYMENT_JOBS_LOCK:
+        assert len(deployment_jobs._DEPLOYMENT_JOBS) == cap
 
 
 def test_drained_deployment_job_frees_its_capacity_slot(blocking_deployment_jobs) -> None:
     """Capacity is a live-set bound, not a lifetime quota: a finished job returns its slot."""
     release, fill = blocking_deployment_jobs
-    cap = app_mod._MAX_ACTIVE_DEPLOYMENT_JOBS
+    cap = deployment_jobs._MAX_ACTIVE_DEPLOYMENT_JOBS
 
     fill(cap)
-    with pytest.raises(app_mod.DeploymentJobStartError, match="capacity reached"):
-        app_mod.start_deployment_job(release.wait, 60)
+    with pytest.raises(deployment_jobs.DeploymentJobStartError, match="capacity reached"):
+        deployment_jobs.start_deployment_job(release.wait, 60)
 
     release.set()
-    assert app_mod._wait_for_deployment_jobs(30) is True
-    app_mod._open_deployment_jobs()
-    with app_mod._DEPLOYMENT_JOBS_LOCK:
-        assert not app_mod._DEPLOYMENT_JOBS
+    assert deployment_jobs._wait_for_deployment_jobs(30) is True
+    deployment_jobs._open_deployment_jobs()
+    with deployment_jobs._DEPLOYMENT_JOBS_LOCK:
+        assert not deployment_jobs._DEPLOYMENT_JOBS
 
     done = threading.Event()
-    assert app_mod.start_deployment_job(done.set) is False
+    assert deployment_jobs.start_deployment_job(done.set) is False
     assert done.wait(30) is True
 
 
@@ -116,11 +117,11 @@ def test_shutdown_rejection_outranks_the_capacity_rejection(blocking_deployment_
     """A draining plane reports shutdown, never a capacity message a caller would retry."""
     release, fill = blocking_deployment_jobs
 
-    fill(app_mod._MAX_ACTIVE_DEPLOYMENT_JOBS)
-    assert app_mod._wait_for_deployment_jobs(0.01) is False
+    fill(deployment_jobs._MAX_ACTIVE_DEPLOYMENT_JOBS)
+    assert deployment_jobs._wait_for_deployment_jobs(0.01) is False
 
-    with pytest.raises(app_mod.DeploymentJobStartError, match="shutting down"):
-        app_mod.start_deployment_job(release.wait, 60)
+    with pytest.raises(deployment_jobs.DeploymentJobStartError, match="shutting down"):
+        deployment_jobs.start_deployment_job(release.wait, 60)
 
 
 def _run_loop_once(monkeypatch, loop, worker):

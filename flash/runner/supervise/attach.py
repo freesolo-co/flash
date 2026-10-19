@@ -149,10 +149,7 @@ def _reconcile_completed_remote(
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
-    from flash.runner.supervise.lifecycle import (
-        _RECOVERY_MARKER_GRACE_S,
-        _adopt_completed_attempt,
-    )
+    from flash.runner.supervise.recovery import _RECOVERY_MARKER_GRACE_S, _adopt_completed_attempt
 
     try:
         if _adopt_completed_attempt(
@@ -208,10 +205,7 @@ def _reconcile_expired_remote(
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
-    from flash.runner.supervise.lifecycle import (
-        _adopt_completed_attempt,
-        _completed_attempt_metrics,
-    )
+    from flash.runner.supervise.recovery import _adopt_completed_attempt, _completed_attempt_metrics
 
     try:
         metrics = _completed_attempt_metrics(
@@ -300,10 +294,7 @@ def _reconcile_attached_remote(
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import get_status
-    from flash.runner.supervise.lifecycle import (
-        _RECOVERY_MARKER_GRACE_S,
-        _CompletedAttemptPending,
-    )
+    from flash.runner.supervise.recovery import _RECOVERY_MARKER_GRACE_S, _CompletedAttemptPending
 
     expected_identity = _remote_resource_identity(expected_remote)
     handle = JobHandle.from_dict(expected_remote)
@@ -540,7 +531,7 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
         _record_cleanup_remote,
     )
     from flash.runner.lifecycle.status import get_status
-    from flash.runner.supervise.lifecycle import _strict_teardown_handle
+    from flash.runner.supervise.recovery import _strict_teardown_handle
 
     # a parse failure cannot escape the daemon recovery thread while a worker may still bill.
     # fail closed using the exact persisted handle, without requiring a parsed spec.
@@ -584,7 +575,7 @@ def _handle_attach_wall_deadline(
     )
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.lifecycle.status import get_status
-    from flash.runner.supervise.lifecycle import (
+    from flash.runner.supervise.recovery import (
         _adopt_completed_attempt,
         _completed_attempt_metrics,
         _completed_worker_metrics,
@@ -669,7 +660,7 @@ def _handle_failed_attach_poll(
     from flash.runner.lifecycle.attempts import decide_attempt_failure
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.lifecycle.status import get_status
-    from flash.runner.supervise.lifecycle import (
+    from flash.runner.supervise.recovery import (
         _adopt_completed_attempt,
         _completed_worker_metrics,
         _strict_teardown_handle,
@@ -795,7 +786,7 @@ def _adopt_attached_poll_result(
     log,
 ) -> None:
     """Restore allocation metadata and adopt one successful provider result."""
-    from flash.runner.supervise.lifecycle import _adopt_completed_attempt
+    from flash.runner.supervise.recovery import _adopt_completed_attempt
 
     _carry_allocation_stamp(result.metrics, context.persisted_remote)
     if not _adopt_completed_attempt(
@@ -818,10 +809,7 @@ def _recover_confirmed_remote(
     log,
 ) -> RunStatus:
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
-    from flash.runner.supervise.lifecycle import (
-        _adopt_completed_attempt,
-        _CompletedAttemptPending,
-    )
+    from flash.runner.supervise.recovery import _adopt_completed_attempt, _CompletedAttemptPending
 
     metrics = _completed_metrics_for_remote(
         context.worker_spec,
@@ -866,8 +854,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import effective_spec_from_status, get_status
     from flash.runner.supervise.errors import _RunCancelled
-    from flash.runner.supervise.lifecycle import _CompletedAttemptPending
-    from flash.runner.supervise.recovery import _gc_run_sandboxes
+    from flash.runner.supervise.recovery import _CompletedAttemptPending, _gc_run_sandboxes
 
     cleanup_terminal = False
 

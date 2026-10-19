@@ -34,6 +34,7 @@ import pytest
 import flash.providers._lifecycle.net.worker as provider_worker
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.supervise.lifecycle as runner_lifecycle
+import flash.serve.deployment.deploy as serving_deploy
 
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
@@ -119,8 +120,8 @@ def make_client(tmp_path, monkeypatch):
 
     importlib.reload(app_mod)
     monkeypatch.setattr(
-        app_mod,
-        "serve_chat",
+        serving_deploy,
+        "chat",
         lambda **_k: {"choices": [{"message": {"content": "4"}, "finish_reason": "stop"}]},
     )
     # The Lambda key above (required by the startup preflight) also makes

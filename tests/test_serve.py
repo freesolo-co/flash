@@ -1483,3 +1483,50 @@ def test_serving_clients_bound_redirect_chains(monkeypatch):
         assert client.max_redirects == serving_transport._MAX_REDIRECTS
         with pytest.raises(httpx.TooManyRedirects):
             client.get("https://serve.example/v1/loop")
+
+
+@pytest.mark.parametrize("targets_images", [False, True])
+def test_readiness_receives_complete_facts_after_registry_readiness(
+    monkeypatch, tmp_path, stub_serving_registry, targets_images
+):
+    events = []
+    observed = []
+    real_metadata = d.adapter_check.adapter_artifact_metadata
+
+    def metadata(*args, **kwargs):
+        from dataclasses import replace
+
+        monkeypatch.setattr(
+            d,
+            "_wait_checkpoint_ready",
+            lambda org_id, checkpoint_id, subfolder, **kwargs: events.append(
+                ("ready", checkpoint_id)
+            ),
+        )
+        return replace(real_metadata(*args, **kwargs), targets_images=targets_images)
+
+    monkeypatch.setattr(d.adapter_check, "adapter_artifact_metadata", metadata)
+
+    def before_ready(facts: d.DeploymentReadinessFacts) -> None:
+        assert events[-1] == ("ready", "flash-7-abcd/final")
+        observed.append(facts)
+
+    _capture_registration_body(
+        monkeypatch,
+        tmp_path,
+        stub_serving_registry,
+        events=events,
+        run_id="flash-7-abcd",
+        model="Qwen/Qwen3.5-9B",
+        hf_repo="org/repo",
+        adapter_prefix="sft/flash-7-abcd",
+        before_ready=before_ready,
+    )
+    assert observed == [
+        d.DeploymentReadinessFacts(
+            checkpoint_id="flash-7-abcd/final",
+            expected_checkpoint="flash-7-abcd/final",
+            advertised_capabilities=frozenset(_IMMUTABLE_SERVING_CAPABILITIES),
+            adapter_targets_images=targets_images,
+        )
+    ]

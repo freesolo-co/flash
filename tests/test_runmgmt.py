@@ -2624,7 +2624,6 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     import io
 
     import flash.providers.artifacts.hf as hf_artifacts
-    import flash.runner.supervise.lifecycle as lifecycle
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
@@ -2644,10 +2643,10 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     )
     monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
     completion_checks = []
-    real_completed_metrics = lifecycle._completed_attempt_metrics
+    real_completed_metrics = runner_recovery._completed_attempt_metrics
 
-    def artifact_reader(_repo, path):
-        def read(force=False):
+    def artifact_reader(_repo, path, *, deadline_at=None):
+        def read(force=False, *, deadline_at=None):
             if path.endswith("/modal_attempt0.json"):
                 return (
                     '{"attempt":0,"error":"","ok":true,"retriable":false,'
@@ -2664,10 +2663,10 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
         return real_completed_metrics(*args, **kwargs)
 
     monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
-    monkeypatch.setattr(lifecycle, "_completed_attempt_metrics", completed_metrics)
+    monkeypatch.setattr(runner_recovery, "_completed_attempt_metrics", completed_metrics)
     monkeypatch.setattr(runner_recovery, "_gc_run_sandboxes", lambda _spec: None)
     monkeypatch.setattr(
-        lifecycle,
+        runner_recovery,
         "_strict_teardown_handle",
         lambda *_args, **_kwargs: pytest.fail(
             "completed attempt must not be torn down before adoption"
@@ -2701,7 +2700,6 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
     import io
 
     import flash.providers.artifacts.hf as hf_artifacts
-    import flash.runner.supervise.lifecycle as lifecycle
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
@@ -2727,8 +2725,8 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
     )
     monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
 
-    def artifact_reader(_repo, path):
-        def read(force=False):
+    def artifact_reader(_repo, path, *, deadline_at=None):
+        def read(force=False, *, deadline_at=None):
             if path.endswith("/modal_attempt0.json"):
                 return (
                     '{"attempt":0,"error":"","ok":true,"retriable":false,'
@@ -2742,14 +2740,14 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
         return read
 
     adopted = {}
-    real_adopt = lifecycle._adopt_completed_attempt
+    real_adopt = runner_recovery._adopt_completed_attempt
 
     def capture_adopt(run_id, adopt_spec, expected_remote, metrics, **kwargs):
         adopted.update(metrics)
         return real_adopt(run_id, adopt_spec, expected_remote, metrics, **kwargs)
 
     monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
-    monkeypatch.setattr(lifecycle, "_adopt_completed_attempt", capture_adopt)
+    monkeypatch.setattr(runner_recovery, "_adopt_completed_attempt", capture_adopt)
     monkeypatch.setattr(runner_recovery, "_gc_run_sandboxes", lambda _spec: None)
 
     status = runner_attach.attach_run(spec.run_id, log_stream=io.StringIO())
@@ -2789,10 +2787,9 @@ def test_attach_poll_success_carries_the_whole_allocation_stamp(monkeypatch):
     adopted = {}
     # `_adopt_attached_poll_result` imports the adopter from its owning module at call time, so the
     # patch has to land there rather than on a name bound into `attach`.
-    import flash.runner.supervise.lifecycle as lifecycle_mod
 
     monkeypatch.setattr(
-        lifecycle_mod,
+        runner_recovery,
         "_adopt_completed_attempt",
         lambda *_a, **_k: adopted.update(result.metrics) or True,
     )
@@ -2811,7 +2808,6 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
     import io
 
     import flash.runner.supervise.attach as attach
-    import flash.runner.supervise.lifecycle as lifecycle
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
@@ -2830,10 +2826,10 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
     )
     monkeypatch.setattr(runner_lifecycle.time, "time", lambda: 221.0)
     monkeypatch.setattr(
-        lifecycle,
+        runner_recovery,
         "_completed_attempt_metrics",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            lifecycle._CompletedAttemptPending("successful marker; waiting for metrics.json")
+            runner_recovery._CompletedAttemptPending("successful marker; waiting for metrics.json")
         ),
     )
     scheduled = []
@@ -2853,7 +2849,6 @@ def test_attach_success_marker_with_lagging_metrics_stays_pending(monkeypatch, t
 def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
     import io
 
-    import flash.runner.supervise.lifecycle as lifecycle
     from flash.core.spec import GpuSpec, JobSpec
     from flash.providers.core import registry as providers
 
@@ -2881,7 +2876,7 @@ def test_attach_expired_run_does_not_poll_or_resubmit(monkeypatch, tmp_path):
     gc_runs = []
     completion_checks = []
     monkeypatch.setattr(
-        lifecycle,
+        runner_recovery,
         "_completed_attempt_metrics",
         lambda *args, **kwargs: completion_checks.append((args, kwargs)) or None,
     )
@@ -2998,7 +2993,6 @@ def test_fail_blocked_recovery_adopts_completed_handleless_attempt(monkeypatch, 
 
 
 def test_fail_blocked_recovery_keeps_success_with_lagging_metrics_pending(monkeypatch, tmp_path):
-    import flash.runner.supervise.lifecycle as lifecycle
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
 
@@ -3016,7 +3010,7 @@ def test_fail_blocked_recovery_keeps_success_with_lagging_metrics_pending(monkey
         runtime,
         "_handleless_completed_metrics",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            lifecycle._CompletedAttemptPending("successful marker; waiting for metrics.json")
+            runner_recovery._CompletedAttemptPending("successful marker; waiting for metrics.json")
         ),
     )
 
@@ -3266,7 +3260,7 @@ def test_successful_supervision_settles_the_terminal_remote(monkeypatch, tmp_pat
 
     torn_down = []
     monkeypatch.setattr(
-        attempt_supervision._lifecycle,
+        runner_recovery,
         "_strict_teardown_handle",
         lambda handle, run_id: torn_down.append(run_id) or True,
     )
@@ -3498,7 +3492,7 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_model_was_removed(
         torn.append((dict(handle), run_id))
         return True
 
-    monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
+    monkeypatch.setattr("flash.runner.supervise.recovery._strict_teardown_handle", fake_teardown)
     attached: list[str] = []
     # recover_runs imports attach_run from flash.runner inside the function, so patch it there.
     monkeypatch.setattr(runner_attach, "attach_run", lambda rid: attached.append(rid))
@@ -3630,7 +3624,7 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
         torn.append("drain" if hasattr(handle, "provider") else "direct")
         return False  # unconfirmed, both times: this is the case that records for the drain
 
-    monkeypatch.setattr("flash.runner.supervise.lifecycle._strict_teardown_handle", fake_teardown)
+    monkeypatch.setattr("flash.runner.supervise.recovery._strict_teardown_handle", fake_teardown)
     monkeypatch.setattr(runner_attach, "attach_run", lambda rid: None)
     # persisting a cleanup record reports the new status, which blocks on its reporter thread. that
     # thread is real in production; here the fake below would stand in for it and never run.

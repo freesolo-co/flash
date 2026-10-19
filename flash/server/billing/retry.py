@@ -103,7 +103,7 @@ def retry_completion_charges_once(should_stop: Callable[[], bool] | None = None)
     """
     if not charge_retry_enabled():
         return 0
-    from flash.runner.supervise.lifecycle import _charge_completed_run_by_id
+    from flash.runner.supervise.recovery import _charge_completed_run_by_id
 
     charged = 0
     for run_id in list_run_ids():

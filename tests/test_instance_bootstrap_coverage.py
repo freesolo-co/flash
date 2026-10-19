@@ -24,7 +24,6 @@ import types
 import pytest
 
 from flash.providers._lifecycle.bootstrapping import bootstrap as b
-from flash.providers._lifecycle.net.deadline import deadline_kwargs
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 SOURCE_SNAPSHOT = valid_source_snapshot()
@@ -173,43 +172,6 @@ def test_require_deadline_at_rejects_unsafe_current_clock(monkeypatch):
         b.require_deadline_at(
             {"deadline_at": 150.0, "run_created_at": 50.0, "run_max_wall_seconds": 100.0}
         )
-
-
-def test_deadline_kwargs_forwards_supported_values_including_none():
-    def accepts_deadline(*, deadline_at):
-        return deadline_at
-
-    assert deadline_kwargs(accepts_deadline, 123.0) == {"deadline_at": 123.0}
-    assert deadline_kwargs(accepts_deadline, None) == {"deadline_at": None}
-
-
-def test_deadline_kwargs_omits_keyword_for_legacy_callable():
-    def legacy(value=None):
-        return value
-
-    assert deadline_kwargs(legacy, 123.0) == {}
-    assert deadline_kwargs(legacy, None) == {}
-
-
-def test_deadline_kwargs_forwards_to_variadic_callable():
-    def variadic(**kwargs):
-        return kwargs
-
-    assert deadline_kwargs(variadic, 123.0) == {"deadline_at": 123.0}
-    assert deadline_kwargs(variadic, None) == {"deadline_at": None}
-
-
-def test_deadline_kwargs_fails_closed_for_uninspectable_callable():
-    class _Uninspectable:
-        @property
-        def __signature__(self):
-            raise ValueError("signature unavailable")
-
-        def __call__(self, **kwargs):
-            return kwargs
-
-    assert deadline_kwargs(_Uninspectable(), 123.0) == {"deadline_at": 123.0}
-    assert deadline_kwargs(_Uninspectable(), None) == {"deadline_at": None}
 
 
 # ---------------------------------------------------------------------------

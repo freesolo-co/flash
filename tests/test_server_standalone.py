@@ -14,9 +14,12 @@ from typing import ClassVar
 import pytest
 
 import flash.runner.accounting.artifacts as runner_artifacts
+import flash.runner.supervise.recovery as attempt_recovery
 import flash.serve.contract.errors as serving_errors
 import flash.serve.contract.urls as serving_urls
+import flash.serve.deployment.deploy as serving_deploy
 import flash.serve.request.transport as serving_transport
+import flash.server.platform.deployment_state as deployment_state
 from flash.server.platform import auth
 
 
@@ -299,7 +302,6 @@ def test_standalone_does_not_charge_a_recovered_managed_run(monkeypatch, tmp_pat
     carries a managed-mode billing_context. Charging it would send the operator's key to
     FREESOLO_BASE_URL and bill an organization this plane has no relationship with, so the inline
     charge has to read the SHARED gate rather than the env var directly."""
-    from flash.runner.supervise import lifecycle
 
     charged: list[str] = []
 
@@ -327,7 +329,7 @@ def test_standalone_does_not_charge_a_recovered_managed_run(monkeypatch, tmp_pat
     log = (tmp_path / "run.log").open("w")
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
-    lifecycle._apply_charge_with_state("run-1", log, charge_call=_charge, noun="terminal")
+    attempt_recovery._apply_charge_with_state("run-1", log, charge_call=_charge, noun="terminal")
     assert charged == [], "standalone must not reach the Freesolo billing backend"
     assert recorded
     assert recorded[-1]["billing_state"] == "failed"
@@ -335,7 +337,7 @@ def test_standalone_does_not_charge_a_recovered_managed_run(monkeypatch, tmp_pat
 
     # managed mode with the same key still charges -- the gate narrows standalone only
     monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
-    lifecycle._apply_charge_with_state("run-1", log, charge_call=_charge, noun="terminal")
+    attempt_recovery._apply_charge_with_state("run-1", log, charge_call=_charge, noun="terminal")
     assert charged == ["called"]
     log.close()
 
@@ -1064,7 +1066,6 @@ def test_standalone_deploy_needs_no_org_while_managed_fails_closed(monkeypatch) 
 
 
 def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monkeypatch) -> None:
-    from flash.serve.deployment import deploy as serving_deploy
     from flash.server.platform.internal_client import run_serving_org_id
     from flash.server.routes import serving, serving_chat
 
@@ -1116,7 +1117,7 @@ def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monk
 
     monkeypatch.setattr(serving, "manageable_run", lambda *_args, **_kwargs: status)
     monkeypatch.setattr(
-        serving._app,
+        serving_deploy,
         "undeploy_adapter",
         lambda checkpoint_id, *, org_id: {
             "checkpoint_id": checkpoint_id,
@@ -1126,7 +1127,9 @@ def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monk
         },
     )
     monkeypatch.setattr(serving, "mark_undeployed", lambda *_args: status)
-    monkeypatch.setattr(serving, "_report_persisted_transition", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        deployment_state, "_report_persisted_transition", lambda *_args, **_kwargs: None
+    )
     undeployed = serving.undeploy(
         "run-standalone",
         "run-standalone/final",

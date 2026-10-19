@@ -26,6 +26,7 @@ import flash.engine.worker.runtime.state as worker_state
 import flash.engine.worker.train.opd.orchestration.failures as opd_failures
 import flash.engine.worker.train.rl.launch.checkpoints as rl_checkpoints
 import flash.runner.lifecycle.state as runner_state
+import flash.runner.supervise.recovery as attempt_recovery
 from flash.core.spec import JobSpec
 from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 from tests._helpers.source_snapshot import valid_source_snapshot
@@ -1001,10 +1002,10 @@ def test_await_completed_worker_metrics_checks_cancellation_before_sleep(monkeyp
     from flash.runner.supervise.errors import _RunCancelled
 
     monkeypatch.setattr(
-        lifecycle,
+        attempt_recovery,
         "_completed_worker_metrics",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            lifecycle._CompletedAttemptPending("output metrics not readable yet")
+            attempt_recovery._CompletedAttemptPending("output metrics not readable yet")
         ),
     )
     monkeypatch.setattr(
@@ -1019,7 +1020,7 @@ def test_await_completed_worker_metrics_checks_cancellation_before_sleep(monkeyp
         raise _RunCancelled("run was cancelled")
 
     with pytest.raises(_RunCancelled, match="was cancelled"):
-        lifecycle._await_completed_worker_metrics(
+        attempt_recovery._await_completed_worker_metrics(
             object(),
             lifecycle.time.time() + 1_000.0,
             check_cancelled=check_cancelled,
