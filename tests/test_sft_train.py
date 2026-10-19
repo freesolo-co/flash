@@ -239,6 +239,7 @@ def test_sft_pins_ulysses_off_because_sequence_parallelism_breaks_gdn():
     the WIRING (this site did not regress to the card count), and the constant proves the VALUE.
     Either alone would pass while the contract was broken.
     """
+    import inspect
 
     from flash.engine.worker.train.entry import sft_train_runner
     from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
@@ -440,6 +441,7 @@ def test_sft_launches_the_resolved_width_not_the_allocated_cards():
     to the allocated card count: verl would split the batch across every rank torchrun started, so
     the extra ranks would hit the batch_size=0 crash the resolver exists to prevent.
     """
+    import inspect
 
     from flash.engine.worker.train.entry import sft_train_runner
 
@@ -489,6 +491,7 @@ def test_remove_padding_is_unconditional():
     already computed, so a test driving it through a cfg dict asserts on its own fixture and stays
     green no matter what the derivation does.
     """
+    import inspect
 
     from flash.engine.worker.train.entry import sft_train
 
@@ -1935,6 +1938,7 @@ def test_reentrant_checkpointing_installs_vision_grads_only_when_multimodal(
 
 def test_sft_plugin_config_carries_multimodal_for_the_vision_hook():
     """the child cannot see the workload, so the parent must ship the multimodal flag."""
+    import inspect
 
     from flash.engine.worker.train.entry import sft_train_runner
 
@@ -3665,6 +3669,7 @@ def test_sft_line_handler_reads_metrics_through_the_shared_parser():
     which would otherwise serialize into the heartbeat as bare NaN.
     """
     import ast
+    import inspect
     import textwrap
 
     import flash.engine.worker.train.entry.sft_train as sv
@@ -3853,6 +3858,7 @@ def test_sft_ships_no_val_file_so_the_child_cannot_validate():
     inference forward this removes. So the override is asserted directly, and the worker source is
     asserted to name no val parquet at all.
     """
+    import inspect
 
     from flash.engine.worker.train.entry import sft_train
 
@@ -4180,6 +4186,7 @@ def test_sft_resume_guard_checks_the_launched_width_not_the_allocation():
     there would discard a checkpoint that matches the run about to start, and keep one that does
     not -- the exact inversion the guard exists to prevent.
     """
+    import inspect
 
     from flash.engine.worker.train.entry import sft_train_runner
 
@@ -4984,6 +4991,7 @@ def test_the_worker_disables_xet_as_its_very_first_action():
     Matching the call by name also survives the alternate spellings a substring grep would miss.
     """
     import ast
+    import inspect
     import textwrap
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(worker_entry._run_worker_mode)))
@@ -5052,6 +5060,7 @@ def test_sft_result_records_the_micro_batch_that_ran_not_the_one_requested():
     Asserted against the source because the writer's inputs are a live verl child; the point is
     which object the value is read FROM, and that is what the fix changes.
     """
+    import inspect
 
     from flash.engine.worker.train.entry import sft_train
 
