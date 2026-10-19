@@ -384,7 +384,7 @@ def test_model_specific_checkpoint_and_scheduler_choices() -> None:
     assert twenty_seven.modal_gpu_request == "H100!"
     assert twenty_seven.modal_live_qualified is True
     assert twenty_seven.modal_certified_image_digest == (
-        "sha256:b54fd0c4cc680b127338ee6ab474bcc5eec8a27b08b1c9fffd1200783ca8bf4f"
+        "sha256:51c7e61bb4dce9cd7bab58f08f85ac192b269f0174b785df9bc5df6fe458e6d3"
     )
     assert thirty_five.served_model == "Qwen/Qwen3.6-35B-A3B"
     assert thirty_five.modal_gpu_request == "H200"
