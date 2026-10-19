@@ -234,7 +234,7 @@ def _fail_blocked_recovery(
 ) -> bool:
     from flash.runner.accounting.reconciliation import _compare_and_fail_remote
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
-    from flash.runner.supervise.lifecycle import _adopt_completed_attempt, _CompletedAttemptPending
+    from flash.runner.supervise.recovery import _adopt_completed_attempt, _CompletedAttemptPending
 
     status = get_status(spec.run_id)
     if status.remote is None:
@@ -357,7 +357,7 @@ def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
 
 def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | None:
     from flash.runner.lifecycle.attempts import latest_reserved_attempt
-    from flash.runner.supervise.lifecycle import _completed_attempt_metrics
+    from flash.runner.supervise.recovery import _completed_attempt_metrics
 
     attempt = latest_reserved_attempt(spec.run_id)
     if attempt is None:
@@ -387,7 +387,7 @@ def _deferred_resubmit_loop(spec) -> None:
     from flash.runner.accounting.reconciliation import _compare_and_fail_remote
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.lifecycle.state import TERMINAL_STATES
-    from flash.runner.supervise.lifecycle import _adopt_completed_attempt
+    from flash.runner.supervise.recovery import _adopt_completed_attempt
 
     while True:
         try:
@@ -595,7 +595,7 @@ def _teardown_unrecoverable_remote(status) -> None:
     Best-effort and fully suppressed: recovery must finish for every other run regardless.
     """
     from flash.runner.accounting.reconciliation import _record_cleanup_remote
-    from flash.runner.supervise.lifecycle import _strict_teardown_handle
+    from flash.runner.supervise.recovery import _strict_teardown_handle
 
     remote = dict(status.remote or {})
     if not remote:

@@ -787,7 +787,7 @@ def test_deploy_adopts_instance_after_ambiguous_create(monkeypatch):
     monkeypatch.setattr(
         vast_api,
         "list_instances",
-        lambda: [{"id": 555, "label": label, "start_date": 1699999000.0}],
+        lambda *, deadline_at=None: [{"id": 555, "label": label, "start_date": 1699999000.0}],
     )
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
     h = _deploy(vast, _spec(), offers=offers, attempt=2)
@@ -841,7 +841,9 @@ def test_vast_failure_detail_is_bounded_and_redacts_credentials(monkeypatch):
     monkeypatch.setattr(
         vast,
         "_make_hf_file_reader",
-        lambda *_args, **_kwargs: lambda force=False: "worker failed with token=hf-private-token",
+        lambda *_args, **_kwargs: (
+            lambda force=False, *, deadline_at=None: "worker failed with token=hf-private-token"
+        ),
     )
     monkeypatch.setattr(
         vast_api,
@@ -889,7 +891,11 @@ def test_deploy_aborts_when_adopted_row_has_unparseable_id(monkeypatch):
     monkeypatch.setattr(vast_api, "create_instance", fake_create)
     # a row under our EXACT attempt label, but its id is non-numeric -> cannot be adopted as a handle
     label = "flash-1700000000-abcd1234-a2"
-    monkeypatch.setattr(vast_api, "list_instances", lambda: [{"id": "not-an-int", "label": label}])
+    monkeypatch.setattr(
+        vast_api,
+        "list_instances",
+        lambda *, deadline_at=None: [{"id": "not-an-int", "label": label}],
+    )
     destroyed_for = []
     monkeypatch.setattr(vast, "destroy_run_instances", lambda rid: destroyed_for.append(rid) or [])
     offers = [_offer(offer_id=1, machine_id=1), _offer(offer_id=2, machine_id=2)]
@@ -921,7 +927,7 @@ def test_deploy_adopts_only_exact_label_among_decoys(monkeypatch):
     monkeypatch.setattr(
         vast_api,
         "list_instances",
-        lambda: [
+        lambda *, deadline_at=None: [
             {"id": 111, "label": "flash-1700000000-abcd1234-a0"},  # same run, other attempt
             {"id": 222, "label": "flash-1700000000-abcd1234-a1"},  # same run, other attempt
             {"id": 333, "label": "flash-1700000000-abcd12345-a2"},  # similar-prefix run
@@ -954,7 +960,7 @@ def test_deploy_decoys_without_exact_match_abort_with_no_second_create(monkeypat
     monkeypatch.setattr(
         vast_api,
         "list_instances",
-        lambda: [
+        lambda *, deadline_at=None: [
             {"id": 111, "label": "flash-1700000000-abcd1234-a0"},
             {"id": 333, "label": "flash-1700000000-abcd12345-a2"},
         ],
@@ -1027,7 +1033,7 @@ def _wire_poll(
     seq = iter(instances)
     last = {"inst": None}
 
-    def fake_get(instance_id):
+    def fake_get(instance_id, *, deadline_at=None):
         last["inst"] = next(seq, last["inst"])
         return last["inst"]
 
@@ -1037,8 +1043,8 @@ def _wire_poll(
     clock = itertools.count(start=10_000, step=step)
     monkeypatch.setattr(vast.time, "time", lambda: float(next(clock)))
 
-    def factory(hf_repo, path, min_interval_s=45.0):
-        def read(force=False):
+    def factory(hf_repo, path, min_interval_s=45.0, *, deadline_at=None):
+        def read(force=False, *, deadline_at=None):
             if path.endswith("/DONE"):
                 return done() if callable(done) else done
             if "vast_attempt" in path and path.endswith(".json"):
@@ -1157,11 +1163,13 @@ def test_poll_malformed_status_read_is_poll_error(monkeypatch, exc):
     from flash.providers.vast import jobs as vast
     from flash.providers.vast.client import api as vast_api
 
-    def boom(instance_id):
+    def boom(instance_id, *, deadline_at=None):
         raise exc
 
     monkeypatch.setattr(vast_api, "get_instance", boom)
-    monkeypatch.setattr(vast, "_make_hf_file_reader", lambda *a, **k: lambda force=False: None)
+    monkeypatch.setattr(
+        vast, "_make_hf_file_reader", lambda *a, **k: lambda force=False, *, deadline_at=None: None
+    )
     monkeypatch.setattr(vast.time, "sleep", lambda s: None)
     monkeypatch.setattr(_poll.time, "sleep", lambda s: None)  # PollErrorTracker.record backoff
     clock = itertools.count(start=10_000, step=10.0)
@@ -1255,7 +1263,7 @@ def test_poll_status_outage_reads_terminal_done_before_poll_error(monkeypatch):
     )
     monkeypatch.setattr(_poll.time, "sleep", lambda s: None)  # PollErrorTracker.record backoff
 
-    def always_raise(instance_id):
+    def always_raise(instance_id, *, deadline_at=None):
         raise vast_api.VastApiError("status endpoint 503 (simulated outage)")
 
     monkeypatch.setattr(vast_api, "get_instance", always_raise)
@@ -1353,7 +1361,9 @@ def test_poll_deadline_observes_hf_artifacts_during_bounded_reread(monkeypatch, 
     monkeypatch.setattr(
         vast_api,
         "get_instance",
-        lambda _instance_id: pytest.fail("deadline polling must observe HF before provider status"),
+        lambda _instance_id, *, deadline_at=None: pytest.fail(
+            "deadline polling must observe HF before provider status"
+        ),
     )
     monkeypatch.setattr(vast.time, "time", lambda: 10_000.0)
     monkeypatch.setattr(vast.time, "sleep", lambda _seconds: None)
@@ -1464,7 +1474,7 @@ def test_poll_deadline_after_status_fetch_rereads_terminal_artifacts(monkeypatch
         metrics=json.dumps({"wall_seconds": 100, "cost_usd": 0.0}),
     )
 
-    def fetch_at_deadline(_instance_id):
+    def fetch_at_deadline(_instance_id, *, deadline_at=None):
         clock["now"] = 10_000.0
         return {"actual_status": "running"}
 
@@ -2493,7 +2503,7 @@ def test_submit_teardown_cleanup_baseexception_preserves_original_and_still_reap
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, offers, attempt=0, log=None, runtime_secrets=None, source_snapshot=None: (
+        lambda spec, offers, attempt=0, log=None, runtime_secrets=None, source_snapshot=None, *, deadline_at=None: (
             _handle()
         ),
     )
@@ -2528,7 +2538,7 @@ def test_submit_teardown_cleanup_baseexception_reraised_when_no_original(monkeyp
     monkeypatch.setattr(
         vast,
         "deploy_and_submit",
-        lambda spec, offers, attempt=0, log=None, runtime_secrets=None, source_snapshot=None: (
+        lambda spec, offers, attempt=0, log=None, runtime_secrets=None, source_snapshot=None, *, deadline_at=None: (
             _handle()
         ),
     )
@@ -2627,7 +2637,7 @@ def test_provider_initial_and_reattached_poll_use_same_absolute_deadline(monkeyp
 
     monkeypatch.setattr(vast, "usable_offers", lambda *_a, **_k: [_offer(offer_id=1)])
     monkeypatch.setattr(vast, "deploy_and_submit", lambda *_a, **_k: _handle(started_ts=1.0))
-    monkeypatch.setattr(vast, "heartbeat_reader_for", lambda _spec: None)
+    monkeypatch.setattr(vast, "heartbeat_reader_for", lambda _spec, *, deadline_at=None: None)
     monkeypatch.setattr(vast, "poll_vast_job", fake_poll)
     monkeypatch.setattr(vast_api, "destroy_instance", lambda _iid: True)
     provider = VastProvider()
@@ -2737,7 +2747,7 @@ def test_destroy_run_instances_matches_forced_prefix(monkeypatch):
         },  # a DIFFERENT run (prefix boundary) — must NOT match
         {"id": 3, "label": "someone-else"},  # not ours
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda *, deadline_at=None: instances)
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
     out = vast.destroy_run_instances("run1")  # raw id; run_label_prefix forces the flash- prefix
@@ -2758,13 +2768,15 @@ def test_run_instances_remaining_confirms_clear_and_raises_on_listing_failure(mo
         {"id": 10, "label": "flash-run10-a0"},  # different run (boundary) -> NOT ours
         {"id": 11, "label": "someone-else"},  # not ours
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda strict=False: instances)
+    monkeypatch.setattr(
+        vast_api, "list_instances", lambda strict=False, *, deadline_at=None: instances
+    )
     assert vast.run_instances_remaining("run1") == [9]
 
-    monkeypatch.setattr(vast_api, "list_instances", lambda strict=False: [])
+    monkeypatch.setattr(vast_api, "list_instances", lambda strict=False, *, deadline_at=None: [])
     assert vast.run_instances_remaining("run1") == []  # confirmed clear
 
-    def boom(strict=False):
+    def boom(strict=False, *, deadline_at=None):
         raise vast_api.VastApiError("list failed")
 
     monkeypatch.setattr(vast_api, "list_instances", boom)
@@ -2784,13 +2796,15 @@ def test_run_instances_remaining_raises_on_label_match_with_unparseable_id(monke
     monkeypatch.setattr(
         vast_api,
         "list_instances",
-        lambda strict=False: [{"id": "not-an-int", "label": "flash-run1-a0"}],
+        lambda strict=False, *, deadline_at=None: [{"id": "not-an-int", "label": "flash-run1-a0"}],
     )
     with pytest.raises(vast_api.VastApiError, match="unparseable id"):
         vast.run_instances_remaining("run1")
     # an unparseable id on a NON-matching label is irrelevant -> still a confirmed clear
     monkeypatch.setattr(
-        vast_api, "list_instances", lambda strict=False: [{"id": None, "label": "someone-else"}]
+        vast_api,
+        "list_instances",
+        lambda strict=False, *, deadline_at=None: [{"id": None, "label": "someone-else"}],
     )
     assert vast.run_instances_remaining("run1") == []
 
@@ -2808,7 +2822,7 @@ def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
         {"id": "not-an-int", "label": "flash-run1-a0"},  # non-intable -> skip, must NOT raise
         {"id": 7, "label": "flash-run1-a0"},  # good -> destroyed
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda *, deadline_at=None: instances)
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
 
@@ -2828,7 +2842,7 @@ def test_cleanup_loops_skip_non_intable_id_without_raising(monkeypatch):
         {"id": 3, "label": "flash-runA10-a0"},  # NOT runA (boundary) -> orphan, reaped
         {"id": 4, "label": "not-ours"},  # untouched
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda *, deadline_at=None: instances)
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
     out = vast.sweep_orphans(active_labels={"runA"})  # raw active id; prefix forced internally
@@ -2847,7 +2861,7 @@ def test_sweep_orphans_known_labels_multiplane_guard(monkeypatch):
         {"id": 1, "label": "flash-mine-a0"},  # known + not active -> reaped
         {"id": 2, "label": "flash-other-a0"},  # unknown to this plane -> left alone
     ]
-    monkeypatch.setattr(vast_api, "list_instances", lambda: instances)
+    monkeypatch.setattr(vast_api, "list_instances", lambda *, deadline_at=None: instances)
     destroyed = []
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: destroyed.append(iid) or True)
     out = vast.sweep_orphans(active_labels=set(), known_labels={"mine"})
@@ -2861,7 +2875,9 @@ def test_sweep_orphans_callable_sets_resolved_after_listing(monkeypatch):
     from flash.providers.vast import jobs as vast
     from flash.providers.vast.client import api as vast_api
 
-    monkeypatch.setattr(vast_api, "list_instances", lambda: [{"id": 1, "label": "flash-x-a0"}])
+    monkeypatch.setattr(
+        vast_api, "list_instances", lambda *, deadline_at=None: [{"id": 1, "label": "flash-x-a0"}]
+    )
     monkeypatch.setattr(vast_api, "destroy_instance", lambda iid: True)
     # protected by a callable-resolved active set
     assert vast.sweep_orphans(active_labels=lambda: {"x"}) == []

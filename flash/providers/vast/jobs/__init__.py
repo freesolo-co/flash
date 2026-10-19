@@ -28,7 +28,6 @@ from flash.providers._lifecycle.instances.poll_instance import (
     poll_instance_job,
 )
 from flash.providers._lifecycle.net.deadline import (
-    deadline_kwargs,
     remaining_seconds,
     require_create_allowance,
     require_deadline_at,
@@ -225,7 +224,7 @@ def usable_offers(
         limit=int(limit),
         num_gpus=cards,
         **search_kwargs,
-        **deadline_kwargs(vast_api.search_offers, deadline_at),
+        deadline_at=deadline_at,
     )
     out: list[VastOffer] = []
     for r in rows:
@@ -288,7 +287,7 @@ def _adopt_instance_by_label(
     lookup failure -> ``None`` (caller falls back; the orphan sweep is the backstop)."""
     try:
         for inst in vast_api.list_instances(
-            **deadline_kwargs(vast_api.list_instances, deadline_at),
+            deadline_at=deadline_at,
         ):
             if str(inst.get("label") or "") == label and inst.get("id"):
                 return inst
@@ -325,7 +324,7 @@ def _reconcile_ambiguous_create(
     logging error can never swallow the terminal raise (which would let the orchestrator retry)."""
     adopted = _adopt_instance_by_label(
         label,
-        **deadline_kwargs(_adopt_instance_by_label, deadline_at),
+        deadline_at=deadline_at,
     )
     # Coerce defensively: a truthy-but-unparseable id can't be adopted -> fall through to the abort.
     adopted_id = _coerce_instance_id(adopted.get("id")) if adopted is not None else None
@@ -419,7 +418,7 @@ def deploy_and_submit(
         attempt,
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
-        **deadline_kwargs(build_payload, absolute_deadline),
+        deadline_at=absolute_deadline,
     )
     label = instance_label(spec.run_id, attempt)
     onstart = build_onstart(payload)
@@ -446,7 +445,7 @@ def deploy_and_submit(
                     env={},
                     onstart=onstart,
                     label=label,
-                    **deadline_kwargs(vast_api.create_instance, absolute_deadline),
+                    deadline_at=absolute_deadline,
                 )
             except vast_api.VastApiError as e:
                 last_err = e
@@ -459,7 +458,7 @@ def deploy_and_submit(
                             attempt,
                             e,
                             say,
-                            **deadline_kwargs(_reconcile_ambiguous_create, absolute_deadline),
+                            deadline_at=absolute_deadline,
                         )
                     except UnreconciledCreateError:
                         create_attempted = False
@@ -497,7 +496,7 @@ def deploy_and_submit(
                             # refresh the SHAPE the allocator chose: dropping the count here would
                             # rent a single-card offer while the worker still starts n ranks.
                             num_gpus=gpu_count_of(spec),
-                            **deadline_kwargs(usable_offers, absolute_deadline),
+                            deadline_at=absolute_deadline,
                         )
                         if o.gpu in allowed
                     ][:5]
@@ -620,23 +619,23 @@ def poll_vast_job(
         done_reader=_make_hf_file_reader(
             hf_repo,
             f"{prefix}/DONE",
-            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+            deadline_at=absolute_deadline,
         ),
         marker_reader=_make_hf_file_reader(
             hf_repo,
             f"{prefix}/vast_attempt{handle.attempt}.json",
             min_interval_s=60.0,
-            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+            deadline_at=absolute_deadline,
         ),
         metrics_reader=_make_hf_file_reader(
             hf_repo,
             f"{prefix}/metrics.json",
-            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+            deadline_at=absolute_deadline,
         ),
         # Resolve get_instance / instance_logs on the api MODULE at call time so a monkeypatch bites.
         fetch_instance=lambda: vast_api.get_instance(
             handle.instance_id,
-            **deadline_kwargs(vast_api.get_instance, absolute_deadline),
+            deadline_at=absolute_deadline,
         ),
         # A malformed 200 body (truncated / non-JSON / invalid-UTF8) makes RestClient raise a decode /
         # incomplete-read error, NOT a VastApiError — the _http retry wrapper only catches OSError
@@ -655,13 +654,13 @@ def poll_vast_job(
         early_liveness_alive=lambda: bool(
             vast_api.instance_logs(
                 handle.instance_id,
-                **deadline_kwargs(vast_api.instance_logs, absolute_deadline),
+                deadline_at=absolute_deadline,
             )
         ),
         read_current_error=lambda: _make_hf_file_reader(
             hf_repo,
             f"{prefix}/{err_name}",
-            **deadline_kwargs(_make_hf_file_reader, absolute_deadline),
+            deadline_at=absolute_deadline,
         )(force=True),
         stamp_cost_and_notes=stamp_cost_and_notes,
         failure_detail=lambda marker: _failure_detail(
@@ -684,7 +683,7 @@ def poll_vast_job(
         stall_after_s=stall_after_s,
         first_liveness_s=first_liveness_s,
         load_timeout_s=LOAD_TIMEOUT_S,
-        **deadline_kwargs(poll_instance_job, absolute_deadline),
+        deadline_at=absolute_deadline,
     )
 
 
@@ -727,7 +726,7 @@ def submit_attempt_vast(
             # rent the SHAPE the allocator chose: the worker spawns gpu.count ranks, so a
             # single-card offer would oversubscribe one card with n ranks while billing for n.
             num_gpus=gpu_count_of(spec),
-            **deadline_kwargs(usable_offers, absolute_deadline),
+            deadline_at=absolute_deadline,
         )
         if o.gpu == spec.gpu.type
     ]
@@ -748,7 +747,7 @@ def submit_attempt_vast(
                 max_wall_seconds=_rent_duration_floor(spec, absolute_deadline),
                 gpu_type=spec.gpu.type,
                 num_gpus=gpu_count_of(spec),
-                **deadline_kwargs(usable_offers, absolute_deadline),
+                deadline_at=absolute_deadline,
             )
             if o.gpu == spec.gpu.type
         ]
@@ -778,20 +777,20 @@ def submit_attempt_vast(
             log=log,
             runtime_secrets=runtime_secrets,
             source_snapshot=source_snapshot,
-            **deadline_kwargs(deploy_and_submit, absolute_deadline),
+            deadline_at=absolute_deadline,
         )
         if on_handle is not None:
             on_handle(handle.to_dict())
         reader = heartbeat_reader_for(
             spec,
-            **deadline_kwargs(heartbeat_reader_for, absolute_deadline),
+            deadline_at=absolute_deadline,
         )
         result = poll_vast_job(
             handle,
             spec,
             log=log,
             heartbeat_reader=reader,
-            **deadline_kwargs(poll_vast_job, absolute_deadline),
+            deadline_at=absolute_deadline,
         )
         if not result.ok and _is_never_started_stall(result):
             # the machine took the rental and never produced a working worker. blacklist the HOST,

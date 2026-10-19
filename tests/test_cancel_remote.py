@@ -192,7 +192,6 @@ def test_cancel_run_revocation_failure_defers_until_after_fence_and_teardown(
     tmp_path, monkeypatch, failed_revocation_call
 ):
     from flash.core.spec import JobSpec
-    from flash.runner.supervise import lifecycle
     from flash.server.platform import db as server_db
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path))
@@ -226,7 +225,7 @@ def test_cancel_run_revocation_failure_defers_until_after_fence_and_teardown(
         teardown_calls.append((handle.provider, run_id, runner_status.get_status(run_id).state))
         return True
 
-    monkeypatch.setattr(lifecycle, "_strict_teardown_handle", teardown)
+    monkeypatch.setattr(runner_recovery, "_strict_teardown_handle", teardown)
     monkeypatch.setattr(runner_recovery, "_gc_run_endpoints", lambda _spec: None)
 
     with pytest.raises(RuntimeError, match=f"revocation failure {failed_revocation_call}"):
@@ -1488,7 +1487,9 @@ def _fake_sdk_with_orphan(monkeypatch, *, rest_find, rest_delete, resources=None
 
     target = endpoint_name(canonical_gpu("RTX 5090"), run_suffix("flash-q-1"))
     monkeypatch.setattr(
-        runpod_api, "list_endpoints_by_key", lambda: ({_RUNPOD_FINGERPRINT: rest_find(target)}, [])
+        runpod_api,
+        "list_endpoints_by_key",
+        lambda *, deadline_at=None: ({_RUNPOD_FINGERPRINT: rest_find(target)}, []),
     )
     monkeypatch.setattr(
         runpod_api,

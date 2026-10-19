@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
+import flash.serve.deployment.deploy as serving_deploy
 from flash.runner.lifecycle.status import effective_spec_from_status
 from flash.serve.contract.provenance import (
     CheckpointProvenance,
@@ -22,7 +23,6 @@ from flash.serve.request.openai import (
 )
 from flash.serve.request.tool_calls import qualified_tool_parser, validate_tool_stop_sequences
 from flash.serve.request.transport import RawChatStream, is_event_stream_content_type
-from flash.server.asgi import app as _app
 from flash.server.platform.deps import manageable_run
 from flash.server.platform.internal_client import run_serving_org_id
 from flash.server.routes.serving_revisions import (
@@ -188,7 +188,7 @@ def _forward_stream(
     provenance: CheckpointProvenance,
     org_id: str,
 ) -> _UpstreamStreamingResponse:
-    upstream: RawChatStream = _app.serve_chat_sse(
+    upstream: RawChatStream = serving_deploy.chat_sse(
         run_id=run_id,
         messages=messages,
         org_id=org_id,
@@ -277,7 +277,7 @@ def managed_chat(
                 provenance=provenance,
                 org_id=org_id,
             )
-        response = _app.serve_chat(
+        response = serving_deploy.chat(
             run_id=authorized_checkpoint,
             messages=messages,
             org_id=org_id,

@@ -6,6 +6,8 @@ import re
 
 from fastapi import HTTPException
 
+import flash.runner.results.checkpoints as run_checkpoints
+import flash.server.routes.serving_revisions as serving_revisions
 from flash.content.multimodal import messages_with_image_data_uris, normalize_prompt_images
 from flash.core.spec import JobSpec
 from flash.runner.lifecycle.state import adapter_prefix
@@ -13,7 +15,9 @@ from flash.runner.results.checkpoints import checkpoint_adapter_prefix
 from flash.runner.results.verified_revisions import read_verified_checkpoints
 from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
 from flash.serve.request.openai import OpenAIRequestError, parse_chat_request
-from flash.server.asgi import app as _app
+
+# Run states that have produced a downloadable adapter artifact.
+_DEPLOYABLE_STATES = {"done", "deployed"}
 
 _DEPLOYMENT_BUSY_STATES = {"queued", "smoke_testing"}
 _DEPLOYMENT_READY_STATES = {"ready"}
@@ -137,7 +141,7 @@ def _resolve_deploy_step(run_id: str, spec, checkpoint_id: object) -> int | None
     step = parsed[1]
     if step is None:
         return None
-    checkpoints = _app.list_checkpoints(spec)
+    checkpoints = run_checkpoints.list_checkpoints(spec)
     if any(candidate["step"] == step for candidate in checkpoints):
         return step
     available = ", ".join(str(candidate["step"]) for candidate in checkpoints) or "none"
@@ -163,7 +167,11 @@ def _resolve_deployable_target(
             status_code=409,
             detail=f"run {run_id} is 'dry_run'; dry-run runs cannot be {action}ed",
         )
-    if enforce_state and not is_checkpoint and status.state not in _app._DEPLOYABLE_STATES:
+    if (
+        enforce_state
+        and not is_checkpoint
+        and status.state not in serving_revisions._DEPLOYABLE_STATES
+    ):
         detail = (
             f"run {run_id} is {status.state!r}; only finished runs with trained adapter "
             f"artifacts can be {'deployed' if action == 'deploy' else 'exported'}"

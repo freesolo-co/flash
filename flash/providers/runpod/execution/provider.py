@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 from typing import Any
 
-from flash.providers._lifecycle.net.deadline import deadline_kwargs
 from flash.providers.core.base import (
     AllocationConstraints,
     Candidate,
@@ -91,7 +90,7 @@ class RunpodProvider:
             "attempt": attempt,
             "on_last_gpu": on_last_gpu,
             "source_snapshot": source_snapshot,
-            **deadline_kwargs(submit_attempt, _deadline_at),
+            "deadline_at": _deadline_at,
         }
         if runtime_secrets:
             kwargs["runtime_secrets"] = runtime_secrets
@@ -124,7 +123,7 @@ class RunpodProvider:
             make_hf_heartbeat_reader(
                 hf_repo,
                 prefix,
-                **deadline_kwargs(make_hf_heartbeat_reader, _deadline_at),
+                deadline_at=_deadline_at,
             )
             if hf_repo
             else None
@@ -135,7 +134,7 @@ class RunpodProvider:
                 prefix,
                 spec.phase,
                 attempt=rh.attempt,
-                **deadline_kwargs(make_hf_failure_detail_reader, _deadline_at),
+                deadline_at=_deadline_at,
             )
             if hf_repo
             else None
@@ -149,7 +148,7 @@ class RunpodProvider:
             heartbeat_reader=reader,
             failure_detail_reader=failure_reader,
             current_attempt=rh.attempt,
-            **deadline_kwargs(runpod_polling.poll_job, _deadline_at),
+            deadline_at=_deadline_at,
             # the card count comes from the spec rather than the handle's `allocated_gpu_count`:
             # attach polls the persisted EFFECTIVE worker spec, which submission already stamped
             # with the count allocation resolved, and the attach context pops that handle key off

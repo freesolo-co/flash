@@ -31,6 +31,7 @@ import flash.runner.lifecycle.preparation as runner_preparation
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 import flash.runner.supervise.lifecycle as runner_lifecycle
+import flash.runner.supervise.recovery as attempt_recovery
 from flash.core.spec import JobSpec
 from flash.envs.loading.staged import (
     ResolvedEnvironmentSource,
@@ -770,7 +771,6 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
 ) -> None:
     from flash.providers.core.base import PollResult
     from flash.runner.supervise import attach
-    from flash.runner.supervise import lifecycle as supervise_lifecycle
 
     package, _manifest, _archive, _manifest_path, _archive_path = _staged_files(tmp_path)
     public = _spec(package=None, resolved_sha="")
@@ -844,8 +844,8 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
             )
         ),
     )
-    monkeypatch.setattr(supervise_lifecycle, "_runpod_completed_metrics", lambda *_a, **_k: None)
-    monkeypatch.setattr(supervise_lifecycle, "_strict_teardown_handle", lambda *_a, **_k: True)
+    monkeypatch.setattr(attempt_recovery, "_runpod_completed_metrics", lambda *_a, **_k: None)
+    monkeypatch.setattr(attempt_recovery, "_strict_teardown_handle", lambda *_a, **_k: True)
     monkeypatch.setattr(runner_artifacts, "stage_environment_package", transient_stage)
     monkeypatch.setattr(runner_reconciliation, "_compare_and_clear_remote", record_clear)
     monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", record_fail)

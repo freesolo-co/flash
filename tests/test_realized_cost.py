@@ -10,6 +10,7 @@ import pytest
 import flash.runner.accounting.costs as runner_costs
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
+import flash.server.platform.runtime as server_runtime
 from flash.providers.core import realized
 from flash.providers.runpod.client.cost import shape_endpoint_cost
 from flash.server.domain.ops import reconcile
@@ -444,8 +445,6 @@ def _run_reconcile_loop_once(monkeypatch, reconcile_once_impl):
     SYNC callable run via asyncio.to_thread(...), so the stub is a plain sync function."""
     import asyncio
 
-    from flash.server.asgi import app as server_app
-
     # reconcile_once is imported function-locally inside the loop
     # (`from flash.server.domain.ops.reconcile import reconcile_once`), so patch it at the source module.
     monkeypatch.setattr(reconcile, "reconcile_once", reconcile_once_impl)
@@ -458,7 +457,7 @@ def _run_reconcile_loop_once(monkeypatch, reconcile_once_impl):
             raise _StopLoop
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    return asyncio.run(server_app._reconcile_cost_loop()), calls
+    return asyncio.run(server_runtime._reconcile_cost_loop()), calls
 
 
 def test_reconcile_cost_loop_swallows_sweep_error_and_continues(monkeypatch):
