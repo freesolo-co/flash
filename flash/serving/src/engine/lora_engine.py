@@ -302,8 +302,8 @@ class _LoraEngineImpl:
     async def _ensure_adapter_local_locked(self, record: Any) -> Path:
         # Download body; caller must already hold self._adapter_lock(record_key(record)).
         import anyio
-        from huggingface_hub import snapshot_download
 
+        from flash.serving.src.engine.hub import download_adapter, download_retry_delay
         from flash.serving.src.store.settings import ADAPTER_CACHE_DIR
 
         local_dir = _adapter_source_cache_dir(ADAPTER_CACHE_DIR, record)
@@ -341,7 +341,6 @@ class _LoraEngineImpl:
 
             local_dir.parent.mkdir(parents=True, exist_ok=True)
             repo_type = getattr(record, "repo_type", "model") or "model"
-            allow = [f"{subfolder}/**", f"{subfolder}/*"] if subfolder else None
             if _adapter_cache_ready(cached_path):
                 self._source_paths[source_ident] = cached_path
                 self.registry.set_local_path(record, cached_path)
@@ -353,13 +352,13 @@ class _LoraEngineImpl:
             for attempt in range(3):
                 try:
                     downloaded = await anyio.to_thread.run_sync(
-                        lambda: snapshot_download(
+                        lambda: download_adapter(
                             repo_id=record.repo_id,
                             repo_type=repo_type,
                             revision=record.artifact_revision,
                             local_dir=str(local_dir),
                             token=self.settings.hf_api_key,
-                            allow_patterns=allow,
+                            subfolder=subfolder,
                         )
                     )
                     downloaded_root = Path(downloaded)
@@ -380,7 +379,7 @@ class _LoraEngineImpl:
                     last_exc = exc
                     if attempt == 2:
                         break
-                    await asyncio.sleep(0.5 * (2**attempt))
+                    await asyncio.sleep(download_retry_delay(exc, attempt))
 
             assert last_exc is not None
             raise last_exc

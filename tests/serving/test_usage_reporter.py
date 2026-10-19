@@ -776,7 +776,7 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
         def set_local_path(self, record: Any, path: Path) -> None:
             self.paths[record.adapter_id] = path
 
-    monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
+    monkeypatch.setattr("flash.serving.src.engine.hub.download_adapter", _snapshot_download)
     monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     engine = object.__new__(modal_app_module._LoraEngineImpl)
@@ -806,10 +806,7 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
     assert len(calls) == 1
     assert calls[0]["repo_id"] == "org/run"
     assert calls[0]["repo_type"] == "dataset"
-    assert calls[0]["allow_patterns"] == [
-        "sft/run/seed0/adapter/**",
-        "sft/run/seed0/adapter/*",
-    ]
+    assert calls[0]["subfolder"] == "sft/run/seed0/adapter"
 
 
 def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monkeypatch, tmp_path):
@@ -833,7 +830,7 @@ def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monke
     def _snapshot_download(**_kwargs: Any) -> str:
         raise AssertionError("cached adapter should not call Hugging Face")
 
-    monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
+    monkeypatch.setattr("flash.serving.src.engine.hub.download_adapter", _snapshot_download)
     monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     record = AdapterRecord.model_validate(
@@ -896,7 +893,7 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
         (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
         return str(local_dir)
 
-    monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
+    monkeypatch.setattr("flash.serving.src.engine.hub.download_adapter", _snapshot_download)
     monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
 
     engine = object.__new__(modal_app_module._LoraEngineImpl)
