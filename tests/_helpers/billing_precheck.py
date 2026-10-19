@@ -74,8 +74,6 @@ def billing_api(
     user_prefix: str,
     identity_for_token,
 ):
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
-    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")

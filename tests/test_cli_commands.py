@@ -1254,8 +1254,7 @@ def test_gpus_tip_explains_automatic_default_and_type_pin(fake_client, capsys) -
     assert 'type = "<CLASS>"' in out
     assert "don't pin" not in out
     assert "cannot pin" not in out
-    assert "RunPod" not in out.lower()
-    assert "RunPod" not in out.lower()
+    assert "runpod" not in out.lower()
 
 
 def _train_config(tmp_path, *, extra_train: str = ""):
@@ -2331,7 +2330,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
         in training_text
     )
     assert "HF_TOKEN" in training_text
-    assert "RunPod" not in training_text.lower()
+    assert "runpod" not in training_text.lower()
     out = capsys.readouterr().out
     assert "evaluations.py" in out
     assert "dataset/train.jsonl" in out

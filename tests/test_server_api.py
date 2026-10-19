@@ -131,16 +131,11 @@ def _identity_for_token(token: str) -> dict[str, str]:
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
-    # Full operator config so the app's startup preflight passes (>= 2 RunPod accounts + Lambda +
-    # the shared tokens + the internal key); see tests/test_preflight.py for the gate.
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
-    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
+    # Modal credentials come from the offline fixture; supply the shared operator tokens.
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
-    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
 
     import flash.server.domain.registry.environment_registry as environment_registry_mod
     import flash.server.domain.registry.projects as projects_mod
@@ -1945,7 +1940,7 @@ def test_runtime_secret_validation_and_non_persistence(api):
         json={
             "spec": SPEC,
             "dry_run": True,
-            "runtime_secrets": {"RUNPOD_API_KEY": "must-stay-platform-side"},
+            "runtime_secrets": {"MODAL_TOKEN_SECRET": "must-stay-platform-side"},
         },
         headers=_bearer(key),
     )
@@ -3983,7 +3978,6 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
         shutdown_steps.append(("status_reports", close))
         return True
 
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
     monkeypatch.setattr(preflight, "check_run_preflight", lambda: None)
     monkeypatch.setattr(app_mod, "_open_deployment_jobs", lambda: None)
     monkeypatch.setattr(runner_reporting, "_open_status_reporter", lambda: None)

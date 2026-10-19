@@ -286,12 +286,12 @@ def test_a_whitespace_only_provider_key_reads_as_unconfigured(monkeypatch) -> No
     a plane advertise a substrate every allocation then fails on."""
     from flash.providers._lifecycle.net.auth import load_provider_key
 
-    monkeypatch.setenv("LAMBDA_API_KEY", "   \n ")
-    assert load_provider_key("LAMBDA_API_KEY") is None
-    monkeypatch.setenv("LAMBDA_API_KEY", "  real-key  ")
-    assert load_provider_key("LAMBDA_API_KEY") == "real-key"
-    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
-    assert load_provider_key("LAMBDA_API_KEY") is None
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "   \n ")
+    assert load_provider_key("MODAL_TOKEN_SECRET") is None
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "  real-key  ")
+    assert load_provider_key("MODAL_TOKEN_SECRET") == "real-key"
+    monkeypatch.delenv("MODAL_TOKEN_SECRET", raising=False)
+    assert load_provider_key("MODAL_TOKEN_SECRET") is None
 
 
 def test_standalone_does_not_charge_a_recovered_managed_run(monkeypatch, tmp_path) -> None:
@@ -502,9 +502,6 @@ def test_standalone_startup_requires_a_writable_artifact_namespace(monkeypatch) 
 
     monkeypatch.setenv("HF_TOKEN", "hf-operator-token")
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
-    monkeypatch.setenv("VAST_API_KEY", "vast-key")
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
     monkeypatch.delenv("FLASH_HF_NAMESPACE", raising=False)
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
@@ -533,9 +530,6 @@ def test_startup_rejects_an_artifact_namespace_that_cannot_form_a_repo_id(monkey
 
     monkeypatch.setenv("HF_TOKEN", "hf-operator-token")
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
-    monkeypatch.setenv("VAST_API_KEY", "vast-key")
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
 
     monkeypatch.setenv("FLASH_HF_NAMESPACE", "owner/repo")

@@ -37,7 +37,7 @@ from flash.serve.provisioning import ServingImage
 # against different execution bytes.
 SERVE_RUNTIME_FAMILY = "vllm-0.23.0-pr42120"
 _CERTIFIED_MODAL_IMAGE_DIGEST = (
-    "sha256:f193e587ec5fc18313dc90c2efef39bc5c2e288eae3a14f0d6c4a4e094b128f7"
+    "sha256:b54fd0c4cc680b127338ee6ab474bcc5eec8a27b08b1c9fffd1200783ca8bf4f"
 )
 
 
