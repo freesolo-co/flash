@@ -795,7 +795,7 @@ _EXIT_DRAIN_S = 5.0
 def _drain_stragglers_before_exit() -> None:
     """block briefly for the statuses this process still owes, because no later teardown will.
 
-    runpod starts a fresh worker subprocess per phase (endpoints.py `_train_body.run_mode`), so remembered stragglers
+    modal starts a fresh worker subprocess per phase (endpoints.py `_train_body.run_mode`), so remembered stragglers
     otherwise reparent to a handler that never waits for them. perform one final bounded, non-fatal
     wait at interpreter exit.
     """

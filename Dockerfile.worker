@@ -1,8 +1,8 @@
-# Flash prebuilt WORKER image — the full training stack baked in for RunPod workers.
+# Flash prebuilt WORKER image — the full training stack baked in for Modal workers.
 # the worker fetches one pinned source archive at runtime; the trusted verifier is baked here.
 #
 # this image name is defined in flash/providers/_lifecycle/net/worker.py. it must be
-# published to GHCR and the package set PUBLIC (no registry login is configured) so RunPod can
+# published to GHCR and the package set PUBLIC (no registry login is configured) so Modal can
 # pull it. Normally built by
 # .github/workflows/worker-image.yml (manual dispatch); to build/push by hand:
 #
@@ -62,8 +62,7 @@ RUN pip install --no-cache-dir \
     "flash-qla==0.1.2" \
     "tilelang==0.1.9" \
     "apache-tvm-ffi==0.1.9" \
-    "freesolo==0.4.2" \
-    "runpod==1.12.0"
+    "freesolo==0.4.2"
 # Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
 # miscomputed with Triton>=3.4 (fla #640) — the fix is fla's TILELANG backend (correct there), so
@@ -232,7 +231,7 @@ RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_
 # could never be produced. The rest of the stack is mandatory.
 RUN python -c "import importlib.metadata as M; \
 import torch, transformers, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
-fla, triton, freesolo, runpod, httpx; \
+fla, triton, freesolo, httpx; \
 import importlib; \
 fa_ok = False; \
 exec('try:\n import flash_attn\n fa_ok = True\nexcept Exception:\n fa_ok = False'); \
@@ -245,7 +244,7 @@ ver = lambda n: M.version(n); \
 print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)', '| flash_attn_3', 'present (Hopper FA3)' if fa3_ok else 'ABSENT (SDPA on Hopper)', '| flashinfer', 'present (B200 MoE/attn)' if fi_ok else 'ABSENT (Triton fused-MoE fallback)'); \
 [print('  ', d, ver(d)) for d in ['transformers','peft','vllm','flashinfer-python','datasets','huggingface-hub', \
 'accelerate','wandb','flash-linear-attention', \
-'freesolo','runpod','httpx']]"
+'freesolo','httpx']]"
 
 # ---------------------------------------------------------------------------------------------
 # verl venv (GRPO/OPD/SFT verl backends): ISOLATED from the main interpreter on purpose.
@@ -463,12 +462,7 @@ print('  entrypoints: main_ppo (grpo), main_ppo_sync (opd), sft_trainer (sft)');
 print('  qwen3.5 archs registered; mask_truncated_completions present'); \
 print('  gdn boundary resets: fla', M.version('flash-linear-attention'), 'and causal_conv1d installed and importable (capability itself is cuda-gated, asserted on the worker)')"
 
-# RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
-# from the real _train_body source in providers/runpod/serverless/endpoints.py (single source of truth;
-# _train_body is self-contained — every name is imported inside its body) and run it as the CMD so the
-# image is a self-contained RunPod Serverless worker. Build context is the repo root.
-COPY flash/providers/runpod/serverless/endpoints.py flash/snapshot/archive.py docker/make_rp_handler.py /tmp/rpgen/
-RUN cp /tmp/rpgen/archive.py /archive.py \
-    && python /tmp/rpgen/make_rp_handler.py /tmp/rpgen/endpoints.py /tmp/rpgen/archive.py /rp_handler.py \
-    && python -c "import ast; ast.parse(open('/rp_handler.py').read()); print('rp_handler OK')"
-CMD ["python", "-u", "/rp_handler.py"]
+# Modal injects the versioned bootstrap capsule and request-local secrets at launch.
+RUN mkdir -p /root/flash
+WORKDIR /root/flash
+CMD ["python", "-u", "/opt/flash/capsule.pyz", "bootstrap"]

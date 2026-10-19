@@ -15,7 +15,7 @@ from flash.serve.provisioning import InterruptedProvisioning
 
 DIGEST = "sha256:" + "a" * 64
 IMAGE = f"ghcr.io/freesolo-co/freesolo-flash-serve@{DIGEST}"
-CERTIFIED_DIGEST = "sha256:2bf27b51f6e4b7f0b2d805d96202579d94868e2c594b7c496777d350ad6936f6"
+CERTIFIED_DIGEST = "sha256:fc8ed231211562b3c67ca80ffbf7fb3e992aad6a42087a16c0dd26c1e249a758"
 CERTIFIED_IMAGE = f"ghcr.io/freesolo-co/freesolo-flash-serve@{CERTIFIED_DIGEST}"
 MODEL = "Qwen/Qwen3.5-9B"
 
@@ -829,8 +829,7 @@ def test_a_nonpositive_checkpoint_step_is_rejected_at_parse(bad: str) -> None:
 
 
 def test_provider_is_required_and_restricted_to_supported_providers() -> None:
-    # vast, lambda, kubernetes, and serverless runpod are explicitly out of scope, so an
-    # unsupported provider must be refused by the parser rather than reaching a provider call.
+    # Unsupported providers must be refused before reaching a provider call.
     with pytest.raises(SystemExit):
         _parse(
             [

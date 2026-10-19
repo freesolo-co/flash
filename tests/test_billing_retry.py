@@ -44,7 +44,7 @@ def _save_run(tmp_path, *, state="done", billing_state="pending", billing_contex
         state=state,
         spec=spec.to_dict(),
         cost_usd=1.23,
-        remote={"provider": "runpod", "allocated_gpu": "RTX 5090"},
+        remote={"provider": "modal", "allocated_gpu": "L40S"},
         billing_context={"org_id": "org-A"} if billing_context is None else billing_context,
         billing_state=billing_state,
     )
@@ -334,7 +334,7 @@ def _save_cancelled_run(*, cost_usd, billing_state="pending"):
             state="cancelled",
             spec=spec.to_dict(),
             cost_usd=cost_usd,
-            remote={"provider": "runpod", "allocated_gpu": "RTX 5090"},
+            remote={"provider": "modal", "allocated_gpu": "L40S"},
             billing_context={"org_id": "org-A"},
             billing_state=billing_state,
         )
@@ -568,19 +568,10 @@ def test_startup_runs_completion_charge_sweep(monkeypatch, tmp_path):
 
     from fastapi.testclient import TestClient
 
-    # Full operator config so the app's startup preflight passes (>= 2 RunPod accounts + Lambda +
-    # Hyperstack + the shared tokens + the internal key); mirrors tests/test_server_api.py.
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
-    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
     monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
-    # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
-    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make this self-contained).
-    import flash.providers.runpod.client.auth as runpod_keys
-
-    runpod_keys.reset()
 
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod
@@ -629,19 +620,10 @@ def test_startup_does_not_block_on_slow_charge_backlog(monkeypatch, tmp_path):
 
     from fastapi.testclient import TestClient
 
-    # Full operator config so the app's startup preflight passes (>= 2 RunPod accounts + Lambda +
-    # Hyperstack + the shared tokens + the internal key); mirrors tests/test_server_api.py.
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
-    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
     monkeypatch.setenv("HYPERSTACK_API_KEY", "hyp-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal")
-    # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
-    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make this self-contained).
-    import flash.providers.runpod.client.auth as runpod_keys
-
-    runpod_keys.reset()
 
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod

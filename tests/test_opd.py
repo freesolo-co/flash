@@ -1193,10 +1193,7 @@ def test_opd_35b_full_context_group1_is_rejected_because_it_only_fits_under_fp8(
     assert need >= math.ceil(bf16 * hr)
 
 
-def test_opd_fp8_kv_gate_does_not_downroute_below_the_fp8_ceiling():
-    """The fp8-KV discount must apply only when a run can ONLY land on a modern (cc >= 8.9) card. A
-    smaller OPD run that fits the 80 GB A100 (sm80, no fp8) must keep its bf16 KV sizing and its A100
-    route — never dropping onto a card that would not actually use fp8 (and would then OOM)."""
+def test_opd_fp8_kv_gate_keeps_conservative_sizing_below_the_fp8_ceiling():
     from flash.engine.plan.vram import model_required_vram_gb
     from flash.providers.core.base import (
         _FP8_KV_MIN_CAPABILITY,

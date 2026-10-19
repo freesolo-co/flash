@@ -23,11 +23,7 @@ from flash.providers.artifacts.hf import hf_call, hf_status_code
 from flash.providers.core.base import get_gpu_info
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
-# pinned literal (not __name__): keeps the logger stream named "flash.providers.runpod.train"
-# after this module moved out of flash/providers/runpod/train.py, so operator log filters stay stable.
-# the literal is an OPERATOR-FACING contract, not a module path: it must not track package renames,
-# or the log filters and dashboards it exists to protect break.
-logger = get_logger("flash.providers.runpod.train")
+logger = get_logger(__name__)
 
 
 WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
@@ -84,7 +80,7 @@ _REMOVED_OPTIMIZATION_ENV = frozenset(
 )
 
 
-_WEIGHT_CACHE_MOUNT = "/runpod-volume"
+_WEIGHT_CACHE_MOUNT = "/weight-cache"
 
 
 def weight_cache_env(mount: str = _WEIGHT_CACHE_MOUNT) -> dict[str, str]:
@@ -97,8 +93,8 @@ def weight_cache_env(mount: str = _WEIGHT_CACHE_MOUNT) -> dict[str, str]:
     return {"FLASH_WEIGHT_CACHE_DIR": f"{mount}/hf-cache/hub"}
 
 
-def strip_runpod_volume_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
-    """Remove the RunPod weight-cache redirect from an env bound for a non-RunPod worker (mutates)."""
+def strip_weight_cache_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
+    """Clear cache redirects before applying this attempt's mount configuration (mutates)."""
     for k in [k for k, v in env.items() if str(v).startswith(mount)]:
         env.pop(k, None)
     return env
@@ -129,7 +125,7 @@ def build_worker_env(
     )
     env: dict[str, str] = {
         "RUN_ID": spec.run_id,
-        "FLASH_ARM": "runpod",
+        "FLASH_ARM": "modal",
         "BENCH_HF_MODEL": spec.model,
         # one run owns exactly one seed, so it is read straight off the spec: a second seed
         # travelling beside it could only ever agree or be wrong.
@@ -147,7 +143,10 @@ def build_worker_env(
         if value:
             env[key] = value
     env["HF_REPO"] = spec.train.hf_repo
-    if getattr(spec.gpu, "network_volume", None):
+    if (
+        getattr(spec.gpu, "network_volume", None)
+        and os.environ.get("FLASH_WEIGHT_CACHE_DISABLED", "").strip() != "1"
+    ):
         env.update(weight_cache_env())
     # runtime secrets and declared env secrets may never clobber a control-plane-owned key:
     # the canonical seed, run id, hf repo, and arm are set above, and a runtime seed override

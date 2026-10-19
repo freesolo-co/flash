@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from flash.serve.control import ModalProviderHandle
+from flash.serve.control._urls import modal_public_url_matches
 from flash.serve.control.types import validate_modal_provider_id
 from flash.serve.provisioning.modal.execution.sdk import (
     ModalAppObservation,
@@ -51,7 +52,7 @@ def deployed_app_matches(plan: ModalCreatePlan, app: ModalAppObservation) -> boo
         and app.tags == plan.tags
         and _valid_provider_id(app.function_id, "function")
         and app.function_name == plan.function_name
-        and app.public_url == plan.expected_public_url
+        and modal_public_url_matches(app.public_url, plan.expected_public_url)
     )
 
 

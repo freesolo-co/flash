@@ -16,127 +16,41 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class GpuClass:
-    """One managed GPU class with its provider identity/metadata."""
+    """Validated training hardware and its exact Modal GPU request."""
 
     name: str
-    enum_member: str | None  # runpod_flash GpuType member name; None -> not on RunPod
+    modal_name: str
     vram_gb: int
-    short: str  # endpoint-name-safe token
+    short: str
     sm: str
     hourly_usd: float
-    # None -> 12.8. Blackwell (sm120/sm100) needs CUDA-13 to JIT PTX (no SASS shipped).
     min_cuda_modern: str | None = None
-    # Server REJECTS non-validated classes; client restricts to this pool by default.
     validated: bool = False
-    lambda_name: str | None = None  # None -> not on Lambda; priced from Lambda live rates
-    vast_name: str | None = None  # None -> not on Vast; priced from Vast live/static rates
-    vast_aliases: tuple[str, ...] = ()
+    max_count: int = 8
 
 
-# Hourly rates are RunPod secure-cloud on-demand snapshots.
+# GPU-only list prices from https://modal.com/pricing, retrieved 2026-10-18.
+# CPU/memory reservations are included by modal.pricing for allocation and billing estimates.
 GPU_CLASSES: tuple[GpuClass, ...] = (
-    GpuClass(
-        "RTX 4090",
-        "NVIDIA_GEFORCE_RTX_4090",
-        24,
-        "4090",
-        "sm89",
-        0.69,
-        validated=True,
-        vast_name="RTX 4090",
-    ),
-    GpuClass(
-        "RTX 5090",
-        "NVIDIA_GEFORCE_RTX_5090",
-        32,
-        "5090",
-        "sm120",
-        0.99,
-        min_cuda_modern="13.0",
-        validated=True,
-        vast_name="RTX 5090",
-    ),
-    # Lambda-only; RunPod has no A10. Allocator reaches it only after cheaper RunPod classes exhaust.
-    GpuClass("A10", None, 24, "a10", "sm86", 1.29, lambda_name="gpu_1x_a10", validated=True),
-    # Lambda-only 40 GB A100; fills the 32->80 GB gap on Lambda.
-    GpuClass(
-        "A100 SXM 40GB",
-        None,
-        40,
-        "a100sxm40",
-        "sm80",
-        1.99,
-        lambda_name="gpu_1x_a100_sxm4",
-        validated=True,
-        vast_name="A100 SXM4",
-        vast_aliases=("A100 PCIE",),
-    ),
-    GpuClass(
-        "A100 PCIe",
-        "NVIDIA_A100_80GB_PCIe",
-        80,
-        "a100pcie",
-        "sm80",
-        1.39,
-        validated=True,
-        vast_name="A100 PCIE",
-    ),
-    GpuClass(
-        "A100 SXM",
-        "NVIDIA_A100_SXM4_80GB",
-        80,
-        "a100sxm",
-        "sm80",
-        1.49,
-        validated=True,
-        vast_name="A100 SXM4",
-    ),
-    GpuClass(
-        "H100",
-        "NVIDIA_H100_80GB_HBM3",
-        80,
-        "h100",
-        "sm90",
-        3.29,
-        validated=True,
-        lambda_name="gpu_1x_h100_pcie",
-        vast_name="H100 SXM",
-        # Vast lists PCIe H100s separately as "H100 PCIE"; accept them as H100 capacity (same sm90 / 80
-        # GB; for our single-GPU runs the SXM-vs-PCIe interconnect gap doesn't apply). Priced live off
-        # the actual offer, so a cheaper PCIe board just makes the class more available.
-        vast_aliases=("H100 PCIE",),
-    ),
-    GpuClass(
-        "H200",
-        "NVIDIA_H200",
-        141,
-        "h200",
-        "sm90",
-        4.39,
-        validated=True,
-    ),
+    GpuClass("L4", "L4", 24, "l4", "sm89", 0.7992, validated=True),
+    GpuClass("A10", "A10", 24, "a10", "sm86", 1.1016, max_count=4, validated=True),
+    GpuClass("L40S", "L40S", 48, "l40s", "sm89", 1.9512, validated=True),
+    GpuClass("A100 SXM 40GB", "A100-40GB", 40, "a100sxm40", "sm80", 2.0988, validated=True),
+    GpuClass("A100 SXM", "A100-80GB", 80, "a100sxm", "sm80", 2.4984, validated=True),
+    GpuClass("H100", "H100!", 80, "h100", "sm90", 3.9492, validated=True),
+    GpuClass("H200", "H200", 141, "h200", "sm90", 4.5396, validated=True),
     GpuClass(
         "RTX Pro 6000",
-        "NVIDIA_RTX_PRO_6000_BLACKWELL_SERVER_EDITION",
+        "RTX-PRO-6000",
         96,
         "pro6000",
         "sm120",
-        2.09,
+        3.0312,
         min_cuda_modern="13.0",
+        max_count=1,
         validated=True,
     ),
-    # 180 GB usable (NVIDIA advertises 192 GB; size to the safe 180 per RunPod/Lambda listings).
-    GpuClass(
-        "B200",
-        "NVIDIA_B200",
-        180,
-        "b200",
-        "sm100",
-        5.89,
-        min_cuda_modern="13.0",
-        validated=True,
-        lambda_name="gpu_1x_b200_sxm6",
-    ),
+    GpuClass("B200", "B200", 180, "b200", "sm100", 6.2496, min_cuda_modern="13.0", validated=True),
 )
 
 GPU_INFO: dict[str, GpuClass] = {g.name: g for g in GPU_CLASSES}
@@ -190,7 +104,7 @@ def _alias_keys(name: str) -> set[str]:
 
 _ALIAS_TARGETS: dict[str, set[str]] = {}
 for _info in GPU_INFO.values():
-    for _provider_name in (_info.name, _info.vast_name, *_info.vast_aliases):
+    for _provider_name in (_info.name, _info.modal_name):
         if not _provider_name:
             continue
         for _k in _alias_keys(_provider_name):
@@ -199,27 +113,19 @@ _ALIASES: dict[str, str] = {
     key: next(iter(targets)) for key, targets in _ALIAS_TARGETS.items() if len(targets) == 1
 }
 # exact canonical names always resolve to themselves even if a provider spelling collides with them.
-_ALIASES.update({_info.name.lower(): _info.name for _info in GPU_INFO.values()})
-# full marketing names (nvidia-smi / runpod api) and historical aliases not covered by generic rules.
 _ALIASES.update(
     {
-        "nvidia geforce rtx 4090": "RTX 4090",
-        "nvidia geforce rtx 5090": "RTX 5090",
-        "nvidia a100 80gb pcie": "A100 PCIe",
-        "a100 80gb pcie": "A100 PCIe",
-        "a100-80g-pcie": "A100 PCIe",
-        "nvidia a100-sxm4-40gb": "A100 SXM 40GB",
-        "nvidia a100-sxm4-80gb": "A100 SXM",
-        "a100-sxm4-80gb": "A100 SXM",
-        "a100": "A100 PCIe",
+        "a100": "A100 SXM",
+        "a100-80gb": "A100 SXM",
+        "a100-40gb": "A100 SXM 40GB",
         "nvidia h100 80gb hbm3": "H100",
-        "h100 80gb hbm3": "H100",
-        "rtx pro 6000 blackwell": "RTX Pro 6000",
+        "nvidia h100 pcie": "H100",
+        "nvidia a100-sxm4-80gb": "A100 SXM",
+        "nvidia a100-sxm4-40gb": "A100 SXM 40GB",
         "nvidia rtx pro 6000 blackwell server edition": "RTX Pro 6000",
-        "nvidia b200": "B200",
+        "nvidia h200": "H200",
+        "rtx pro 6000 blackwell": "RTX Pro 6000",
         "b200 sxm6": "B200",
-        "nvidia b200 180gb": "B200",
-        "nvidia b200 sxm6": "B200",
     }
 )
 
@@ -248,16 +154,6 @@ class UnreconciledCreateError(RuntimeError):
     """
 
 
-class RunExhaustedProviderPoolError(RuntimeError):
-    """Every fitting offer for this class is one THIS run already rented and lost.
-
-    Distinct from an empty pool: the operator fix is another class or provider, not waiting. The
-    message is authored by Flash rather than quoted from a provider response, which is what lets
-    supervision surface it verbatim -- generic provider text is withheld from the run record
-    because it can quote a request that carried a credential.
-    """
-
-
 def canonical_gpu(name: str) -> str:
     """Normalize a friendly GPU name to a managed GPU class; raise otherwise."""
     key = (name or "").strip().lower()
@@ -270,56 +166,10 @@ def get_gpu_info(name: str) -> GpuClass:
     return GPU_INFO[canonical_gpu(name)]
 
 
-def gpu_classes_for(identity_attr: str) -> list[GpuClass]:
-    """Managed GPU classes a provider can provision: those whose per-provider identity field is set
-    (``enum_member`` for RunPod, ``lambda_name`` for Lambda, ``vast_name`` for Vast). One catalog query
-    shared by every provider's ``gpu_classes()`` so the "which classes do I offer" rule can't drift."""
-    return [g for g in GPU_INFO.values() if getattr(g, identity_attr)]
-
-
-def static_rates_for(identity_attr: str) -> dict[str, float]:
-    """Friendly GPU name -> static ``GpuClass.hourly_usd`` for the classes a provider offers (keyed by
-    the same per-provider identity field). The offline/fallback rate snapshot for RunPod and Vast;
-    Lambda keeps its own list-price map because its prices differ from this RunPod-snapshot field."""
-    return {
-        name: info.hourly_usd for name, info in GPU_INFO.items() if getattr(info, identity_attr)
-    }
-
-
-# Slack between a board's REPORTED VRAM and its class nominal (boards under-report: an A100 SXM4 40 GB
-# reports ~40960 MB, an A40 ~46068 MB / 48 GB). vast_gpu_for_offer allows a class whose nominal is at
-# most this far ABOVE the offer's reported RAM, so a real board still matches its class.
-_VRAM_MATCH_TOLERANCE_GB = 3.5
-
-
-def vast_gpu_for_offer(gpu_name: str, gpu_ram_mb: float) -> str | None:
-    """Map a Vast name and reported VRAM to a managed GPU class.
-
-    Unmanaged and pre-Ampere offers return None. Shared names resolve to the largest class whose
-    nominal VRAM the board covers.
-    """
-    fitting = [
-        g
-        for g in GPU_INFO.values()
-        if (g.vast_name == gpu_name or gpu_name in g.vast_aliases)
-        and g.vram_gb <= gpu_ram_mb / 1024 + _VRAM_MATCH_TOLERANCE_GB
-    ]
-    if not fitting:
-        return None
-    return max(fitting, key=lambda g: g.vram_gb).name
-
-
 def providers_for(name: str) -> tuple[str, ...]:
-    """Providers that can provision this GPU class."""
-    info = get_gpu_info(name)
-    out: list[str] = []
-    if info.enum_member:
-        out.append("runpod")
-    if info.lambda_name:
-        out.append("lambda")
-    if info.vast_name:
-        out.append("vast")
-    return tuple(out)
+    """The training substrate supporting this validated GPU class."""
+    get_gpu_info(name)
+    return ("modal",)
 
 
 def gpu_short(name: str) -> str:
@@ -471,7 +321,7 @@ def authored_gpu_ceiling(gpu_type: str, gpu_count: int | None) -> int | None:
 def _eligible_gpu_infos(gpu_names: tuple[str, ...] | None = None) -> tuple[GpuClass, ...]:
     """Return the validated structural pool used by offline sizing."""
     if gpu_names is None:
-        return tuple(g for g in GPU_CLASSES if g.enum_member and g.validated)
+        return tuple(g for g in GPU_CLASSES if g.modal_name and g.validated)
     names = set(gpu_names)
     return tuple(g for g in GPU_CLASSES if g.name in names and g.validated)
 
@@ -491,12 +341,11 @@ def gpu_capacity_shape(
     launches one rank was reported as providing 234.1 GB against a 230 GB need (so the rejection
     read as a fit), then pointed at a 4-card shape credited 252.8 GB that really delivers 191.6.
     """
-    count = largest_rentable_count(gpu_count)
-    launched = executed_width(count) if executed_width else count
-    shapes = [
-        (gpu, count, combined_vram_gb(gpu.vram_gb, launched))
-        for gpu in _eligible_gpu_infos(gpu_names)
-    ]
+    shapes = []
+    for gpu in _eligible_gpu_infos(gpu_names):
+        count = largest_rentable_count(min(gpu_count, gpu.max_count))
+        launched = executed_width(count) if executed_width else count
+        shapes.append((gpu, count, combined_vram_gb(gpu.vram_gb, launched)))
     if min_vram_gb is not None:
         shapes = [shape for shape in shapes if shape[2] >= min_vram_gb]
         return (
@@ -535,7 +384,7 @@ def smallest_fitting_gpu_count(
         count
         for count in rentable_gpu_counts(max_gpu_count)
         if any(
-            combined_vram_gb(gpu.vram_gb, launched(count)) >= min_vram_gb
+            count <= gpu.max_count and combined_vram_gb(gpu.vram_gb, launched(count)) >= min_vram_gb
             for gpu in _eligible_gpu_infos(gpu_names)
         )
     ]
@@ -558,12 +407,14 @@ def cheapest_gpu(
     cards = largest_rentable_count(gpu_count)
     launched = executed_width(cards) if executed_width else cards
     pool = [
-        g for g in _eligible_gpu_infos() if combined_vram_gb(g.vram_gb, launched) >= min_vram_gb
+        g
+        for g in _eligible_gpu_infos()
+        if cards <= g.max_count and combined_vram_gb(g.vram_gb, launched) >= min_vram_gb
     ]
     if not pool:
         shape = f" even as a {cards}-card combination" if cards > 1 else ""
         raise UnsupportedGpuError(f"no validated GPU class has >= {min_vram_gb} GB VRAM{shape}")
-    from flash.providers.runpod.client.pricing import hourly_rate
+    from flash.providers.modal.pricing import hourly_rate
 
     if cost_key is not None:
         return min(
@@ -835,9 +686,7 @@ class Allocation:
 
 @dataclass(frozen=True)
 class AllocationConstraints:
-    """Run-scoped extras a capacity/market-aware provider's ``live_candidates`` needs (Vast prices
-    against the run's disk/duration floors) — carried here so they don't leak into ``allocate``'s
-    signature per-provider. A provider ignores the fields it has no use for."""
+    """Modal training resource and lifecycle contract."""
 
     disk_gb: float = 0.0
     max_wall_seconds: float = 0.0
@@ -845,11 +694,6 @@ class AllocationConstraints:
     # Whole-run fit floor before the allocator reduces it to a per-card market query. Capacity-aware
     # providers use this to distinguish a missing rentable shape from a sold-out one.
     required_vram_gb: int = 0
-    # Ceiling on cards per machine the caller can use (1 = single-card only). Each provider reports
-    # the counts it can ACTUALLY rent on one box, which differ in kind: RunPod takes a count
-    # parameter, Lambda names the count in the instance type, Vast has it baked into the offer. The
-    # allocator owns the fit/cost policy and never assumes a count is rentable just because the
-    # single-card class exists.
     max_gpu_count: int = 1
 
 
@@ -878,10 +722,7 @@ class Provider(Protocol):
     def live_candidates(
         self, need_vram_gb: int, constraints: AllocationConstraints
     ) -> list[Candidate]:
-        """GPU-class candidates this provider can actually provision right now for a run needing >=
-        need_vram_gb VRAM. RunPod filters its static table and never raises; capacity/market-aware
-        providers (Lambda/Vast) query live availability and raise CapacityLookupError on a transient
-        lookup blip so allocate() can degrade to the others yet still tell 'no fit' from 'outage'."""
+        """GPU-class candidates this provider can actually provision right now for a run needing >="""
         ...
 
     def submit_attempt(
@@ -892,15 +733,13 @@ class Provider(Protocol):
         on_handle: Any = None,
         attempt: int = 0,
         runtime_secrets: dict[str, str] | None = None,
-        on_last_gpu: bool = False,
         source_snapshot: dict | None = None,
         _deadline_at: float | None = None,
     ) -> PollResult:
         """Deploy/rent -> submit -> persist handle (via ``on_handle``) -> poll one attempt to terminal.
 
         One run may execute several attempts, each on its own host or gpu class; this runs exactly
-        one of them. ``on_last_gpu``: no further gpu attempt follows, so capacity backstops may wait
-        longer.
+        one of them.
         """
         ...
 
@@ -926,11 +765,6 @@ class Provider(Protocol):
     def gc(self, spec: JobSpec) -> None:
         """Best-effort: reap any resource this run may have left registered."""
         ...
-
-    # NOTE: ``supports_weight_cache: bool`` is an OPTIONAL capability attr (read via
-    # ``getattr(prov, "supports_weight_cache", False)``, off this Protocol for the same isinstance
-    # reason as below): True for providers that attach the managed shared weight cache. The runner
-    # gates its one-shot cache-less retry fallback on it; every other provider defaults False.
 
     # ``run_instances_remaining(run_id)`` is optional and must stay off this runtime-checkable
     # protocol. callers use getattr in server/_runtime.py. ``[]`` confirms clear; non-empty means a

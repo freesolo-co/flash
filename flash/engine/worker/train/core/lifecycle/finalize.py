@@ -72,7 +72,7 @@ def write_train_meta(
         gpu=gpu_diagnostics(),
     )
     m = RunMetrics(
-        arm=os.environ.get("FLASH_ARM", "runpod"),
+        arm=os.environ.get("FLASH_ARM", "modal"),
         phase=phase,
         # Completed optimizer updates (opd passes step=opt_steps; sft/rl omit it -> None). _finalize
         # reads metrics.step to carry the true step onto the terminal `done` heartbeat.

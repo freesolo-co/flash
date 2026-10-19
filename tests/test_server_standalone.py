@@ -290,12 +290,12 @@ def test_a_whitespace_only_provider_key_reads_as_unconfigured(monkeypatch) -> No
     a plane advertise a substrate every allocation then fails on."""
     from flash.providers._lifecycle.net.auth import load_provider_key
 
-    monkeypatch.setenv("LAMBDA_API_KEY", "   \n ")
-    assert load_provider_key("LAMBDA_API_KEY") is None
-    monkeypatch.setenv("LAMBDA_API_KEY", "  real-key  ")
-    assert load_provider_key("LAMBDA_API_KEY") == "real-key"
-    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
-    assert load_provider_key("LAMBDA_API_KEY") is None
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "   \n ")
+    assert load_provider_key("MODAL_TOKEN_SECRET") is None
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "  real-key  ")
+    assert load_provider_key("MODAL_TOKEN_SECRET") == "real-key"
+    monkeypatch.delenv("MODAL_TOKEN_SECRET", raising=False)
+    assert load_provider_key("MODAL_TOKEN_SECRET") is None
 
 
 def test_standalone_does_not_charge_a_recovered_managed_run(monkeypatch, tmp_path) -> None:
@@ -505,9 +505,6 @@ def test_standalone_startup_requires_a_writable_artifact_namespace(monkeypatch) 
 
     monkeypatch.setenv("HF_TOKEN", "hf-operator-token")
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
-    monkeypatch.setenv("VAST_API_KEY", "vast-key")
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
     monkeypatch.delenv("FLASH_HF_NAMESPACE", raising=False)
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
@@ -536,9 +533,6 @@ def test_startup_rejects_an_artifact_namespace_that_cannot_form_a_repo_id(monkey
 
     monkeypatch.setenv("HF_TOKEN", "hf-operator-token")
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
-    monkeypatch.setenv("VAST_API_KEY", "vast-key")
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
 
     monkeypatch.setenv("FLASH_HF_NAMESPACE", "owner/repo")
@@ -648,17 +642,12 @@ def test_a_blank_github_token_is_not_shipped_to_the_worker(monkeypatch) -> None:
 
 
 def test_self_hosting_docs_do_not_promise_an_endpoint_concurrency_cap() -> None:
-    """Flash caps nothing here, so the docs must not imply it does.
-
-    The slot store that was meant to hold the account to 58 endpoints never enforced anything and
-    has been removed; RunPod's own account limit is the only ceiling. Promising a cap invites a
-    self-hoster to run bursts that RunPod, not Flash, ends up rejecting.
-    """
+    """Document Modal workspace quotas without promising a Flash concurrency cap."""
     import pathlib
 
     doc = (pathlib.Path(__file__).resolve().parent.parent / "SELF_HOSTING.md").read_text()
     assert "in-process semaphore, which is the correct" not in doc
-    assert "RunPod endpoint concurrency is not capped by Flash" in doc
+    assert "Modal workspace GPU quotas bound concurrent reservations" in doc
 
 
 def test_the_serving_repos_are_not_on_the_training_path() -> None:

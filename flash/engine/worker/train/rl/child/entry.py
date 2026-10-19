@@ -5,6 +5,11 @@ from __future__ import annotations
 import os
 import sys
 
+if __name__ in {"__main__", "flash_grpo_entry"}:
+    from flash_grpo_metrics import stream_metrics
+else:
+    from flash.engine.worker.train.rl.child.metrics import stream_metrics
+
 
 def main() -> None:
     import verl  # noqa: F401
@@ -17,7 +22,8 @@ def main() -> None:
         )
     from verl.trainer.main_ppo import main as grpo_main
 
-    grpo_main()
+    with stream_metrics(os.environ["VERL_FILE_LOGGER_PATH"]):
+        grpo_main()
 
 
 if __name__ == "__main__":

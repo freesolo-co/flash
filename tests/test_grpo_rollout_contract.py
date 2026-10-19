@@ -264,32 +264,6 @@ def test_cancellation_billing_does_not_zero_a_completed_legacy_run():
     assert 0 < charge < status.estimated_cost_usd
 
 
-def test_supported_grpo_shape_pricing_is_numerically_unchanged():
-    from flash.cost import estimate_cost
-
-    expected = {
-        2: 0.2334652531216931,
-        4: 0.2734888395767196,
-        8: 0.35353601248677247,
-        16: 0.5136303583068783,
-    }
-
-    actual = {
-        group_size: estimate_cost(
-            RunConfig(
-                "Qwen/Qwen3.5-9B",
-                "grpo",
-                10,
-                batch_size=4,
-                group_size=group_size,
-                gpu_type="A100 PCIe",
-            )
-        ).total_usd
-        for group_size in SUPPORTED_GRPO_GROUP_SIZES
-    }
-    assert actual == expected
-
-
 @pytest.mark.parametrize(
     ("prompts_per_step", "group_size", "message"),
     [
@@ -320,12 +294,12 @@ def test_supported_authored_groups_reach_allocation(group_size):
         spec.model,
         spec.algorithm,
         train=spec.train,
-        providers=("runpod",),
+        providers=("modal",),
         gpu_type="H100",
     )
 
     assert spec.train.group_size == group_size
-    assert allocation.provider == "runpod"
+    assert allocation.provider == "modal"
     assert allocation.gpu == "H100"
 
 
@@ -353,12 +327,12 @@ def test_persisted_legacy_shapes_reach_allocation(prompts_per_step, group_size):
         spec.model,
         spec.algorithm,
         train=spec.train,
-        providers=("runpod",),
+        providers=("modal",),
         gpu_type="H100",
         max_gpu_count=2,
     )
 
-    assert allocation.provider == "runpod"
+    assert allocation.provider == "modal"
     assert allocation.gpu == "H100"
     assert allocation.min_vram_gb == expected_vram
     if group_size == 32:

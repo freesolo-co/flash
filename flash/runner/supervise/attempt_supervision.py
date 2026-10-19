@@ -10,7 +10,6 @@ import time
 from dataclasses import dataclass, field, replace
 
 import flash.runner.supervise.recovery as attempt_recovery
-from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
 from flash.runner.lifecycle.attempts import AttemptLaunchClaim
 from flash.runner.supervise.retry_decision import (
@@ -31,17 +30,16 @@ class _SubmitContext:
     reserved_claim: AttemptLaunchClaim | None = None
     last_handle: dict = field(default_factory=dict)
     # tracks complete attempt-suffixed handles that registry-less gc cannot reconstruct by name.
-    seen_endpoints: dict[str, dict] = field(default_factory=dict)
+    seen_sandboxes: dict[str, dict] = field(default_factory=dict)
     last_detail: str | None = None
     current_claim: AttemptLaunchClaim | None = None
 
-    def gc_seen_endpoints(self) -> None:
-        # only runpod handles carry an endpoint_id, so this set is empty on a plane without it.
-        if not self.seen_endpoints:
+    def gc_seen_sandboxes(self) -> None:
+        if not self.seen_sandboxes:
             return
         from flash.runner.accounting.reconciliation import _record_cleanup_remote
 
-        for remote in self.seen_endpoints.values():
+        for remote in self.seen_sandboxes.values():
             try:
                 if not attempt_recovery._strict_teardown_handle(remote, self.spec.run_id):
                     _record_cleanup_remote(self.spec.run_id, remote)
@@ -53,9 +51,9 @@ class _SubmitContext:
         from flash.runner.supervise.errors import _RunCancelled
 
         # a handle whose `running` write loses the terminal-stickiness race never lands in
-        # status.remote, so only seen_endpoints (rN walk endpoints _gc_run_endpoints can't name)
+        # status.remote, so only seen_sandboxes (rN walk endpoints _gc_run_sandboxes can't name)
         # can free it.
-        self.gc_seen_endpoints()
+        self.gc_seen_sandboxes()
         return _RunCancelled(f"run {self.spec.run_id} was cancelled")
 
     def raise_if_cancelled(self) -> None:
@@ -67,10 +65,10 @@ class _SubmitContext:
         except FileNotFoundError:
             pass
 
-    def return_completed_runpod_metrics(self, metrics: dict) -> dict:
+    def return_completed_worker_metrics(self, metrics: dict) -> dict:
         self.raise_if_cancelled()
         _settle_terminal_remote(self)
-        self.gc_seen_endpoints()
+        self.gc_seen_sandboxes()
         if self.last_handle.get("allocated_gpu"):
             metrics.setdefault("allocated_gpu", self.last_handle["allocated_gpu"])
         if self.last_handle.get("provider"):
@@ -128,7 +126,7 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     )
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
-    completed_metrics = attempt_recovery._await_runpod_completed_metrics(
+    completed_metrics = attempt_recovery._await_completed_worker_metrics(
         ctx.last_handle,
         _load_run_deadline_at(ctx.spec.run_id),
         check_cancelled=ctx.raise_if_cancelled,
@@ -143,14 +141,14 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
         )
     except Exception as exc:
         teardown_error = exc
-    resource_kind = "endpoint" if ctx.last_handle.get("endpoint_id") else "instance"
-    resource_id = ctx.last_handle.get("endpoint_id") or ctx.last_handle.get("instance_id")
+    resource_kind = "sandbox"
+    resource_id = ctx.last_handle.get("instance_id")
     worker_gone = teardown_error is None or attempt_recovery._worker_provably_gone(
         ctx.spec.run_id, ctx.last_handle
     )
     if (
         worker_gone
-        and ctx.last_handle.get("provider") == "runpod"
+        and ctx.last_handle.get("provider") == "modal"
         and not resource_deleted
         and not _record_cleanup_remote(ctx.spec.run_id, ctx.last_handle)
     ):
@@ -176,11 +174,11 @@ def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
         )
         ctx.last_handle.clear()
         if resource_kind == "endpoint":
-            ctx.seen_endpoints.pop(resource_id, None)
+            ctx.seen_sandboxes.pop(resource_id, None)
         return None
     with contextlib.suppress(Exception):
         get_provider(ctx.last_handle["provider"]).gc(ctx.spec)
-    ctx.gc_seen_endpoints()
+    ctx.gc_seen_sandboxes()
     print(
         f"retry {attempt}: {ctx.last_handle.get('provider')} {resource_kind} {resource_id} "
         f"teardown unconfirmed ({type(teardown_error).__name__}); keeping the handle so the "
@@ -208,9 +206,12 @@ def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
 
 
 def _prepare_attempt(ctx: _SubmitContext):
+    from flash.providers.modal.auth import require_recorded_scope
     from flash.runner.lifecycle.attempts import reserve_verified_attempt_launch
     from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
+    from flash.runner.lifecycle.status import get_status
 
+    require_recorded_scope(get_status(ctx.spec.run_id))
     ctx.raise_if_cancelled()
     if ctx.last_handle:
         completed_metrics = _cleanup_previous_attempt(
@@ -221,7 +222,7 @@ def _prepare_attempt(ctx: _SubmitContext):
     try:
         attempt_spec = _spec_with_remaining_wall(ctx.spec, require_provider_minimum=True)
     except RuntimeError:
-        ctx.gc_seen_endpoints()
+        ctx.gc_seen_sandboxes()
         raise
     claim = ctx.reserved_claim
     ctx.reserved_claim = None
@@ -320,7 +321,7 @@ def _pinned_to_resume_width(allocation, resume_world_size: int | None):
 
 
 def _build_candidate_plan(ctx: _SubmitContext, prepared, allocation):
-    claim, attempt_spec, _, retry_state = prepared
+    claim, _, _, retry_state = prepared
     from flash.providers.core.allocator import allocation_summary
     from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
     from flash.runner.supervise.lifecycle import _spec_with_gpu
@@ -339,16 +340,6 @@ def _build_candidate_plan(ctx: _SubmitContext, prepared, allocation):
         ctx.last_detail = f"no candidate has more than {floor:g} GB usable vram"
         return None
 
-    cache_fallback_available = (
-        not retry_state.drop_weight_cache
-        and retry_state.cache_retries > 0
-        and _managed_cache_mounted(attempt_spec, chosen)
-    )
-    on_last_gpu = retry_state.on_last_gpu(
-        chosen,
-        candidates,
-        cache_fallback_available=cache_fallback_available,
-    )
     print(allocation_summary(allocation), file=ctx.log, flush=True)
     if (chosen.provider, chosen.gpu, getattr(chosen, "gpu_count", 1)) != (
         allocation.provider,
@@ -367,9 +358,9 @@ def _build_candidate_plan(ctx: _SubmitContext, prepared, allocation):
     try:
         run_spec = _spec_with_remaining_wall(effective_spec, require_provider_minimum=True)
     except RuntimeError:
-        ctx.gc_seen_endpoints()
+        ctx.gc_seen_sandboxes()
         raise
-    return candidates, chosen, on_last_gpu, effective_spec, run_spec
+    return candidates, chosen, effective_spec, run_spec
 
 
 def _retry_delay(ctx: _SubmitContext, infra_retry_ordinal: int | None) -> float:
@@ -384,7 +375,7 @@ def _retry_delay(ctx: _SubmitContext, infra_retry_ordinal: int | None) -> float:
 def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
     """Bind provider handle persistence to one immutable reservation and candidate."""
     claim = prepared[0]
-    _, chosen, on_last_gpu, _, _ = candidate_plan
+    _, chosen, _, _ = candidate_plan
     from flash.runner.accounting.reconciliation import (
         _expected_remote_matches,
         _preserve_cleanup_remote,
@@ -401,15 +392,14 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
             raise RuntimeError("provider handle identity does not match the selected provider")
         if remote["attempt"] != claim.attempt:
             raise RuntimeError("provider handle attempt does not match the reserved attempt")
-        if remote.get("endpoint_id"):
-            ctx.seen_endpoints[remote["endpoint_id"]] = dict(remote)
+        if remote.get("instance_id"):
+            ctx.seen_sandboxes[remote["instance_id"]] = dict(remote)
         persisted = {
             **remote,
             "launch_claim_token": claim.token,
             "allocated_gpu": chosen.gpu,
             "allocated_gpu_count": int(getattr(chosen, "gpu_count", 1) or 1),
             "allocated_usable_vram_gb": _candidate_usable_vram_gb(chosen),
-            "on_last_gpu": on_last_gpu,
         }
         try:
             claimed = persist_claimed_remote(ctx.spec.run_id, claim, persisted)
@@ -464,10 +454,9 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
 
 def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
     claim, _, attempt_runtime_secrets, _ = prepared
-    _, chosen, on_last_gpu, _, run_spec = candidate_plan
+    _, chosen, _, run_spec = candidate_plan
     from flash.providers.core.base import (
         PollResult,
-        RunExhaustedProviderPoolError,
         UnreconciledCreateError,
     )
     from flash.providers.core.registry import get_provider
@@ -487,7 +476,6 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
                 "log": ctx.log,
                 "on_handle": _handle_callback(ctx, prepared, candidate_plan),
                 "attempt": claim.attempt,
-                "on_last_gpu": on_last_gpu,
                 "source_snapshot": ctx.source_snapshot,
                 # bounded, not the raw run deadline: while a profile is unarmed the
                 # persisted one still carries the queue allowance, and the bootstrap
@@ -510,21 +498,6 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
                 ),
                 False,
             )
-        if isinstance(exc, RunExhaustedProviderPoolError):
-            # the one submit-side message worth reading, and the only one safe to read: Flash
-            # authors this string, so unlike a provider response body it cannot quote a request
-            # that carried a credential. without this the class name alone would make "this run
-            # burned the whole pool" indistinguishable from "the market is dry", which is exactly
-            # the distinction the error exists to draw. still sanitized and bounded, because the
-            # gpu class it interpolates comes from the spec.
-            return (
-                PollResult(
-                    False,
-                    failure="no_capacity",
-                    detail=sanitize_diagnostic(str(exc), limit=1000),
-                ),
-                True,
-            )
         # every other provider exception keeps its class name only. the text can quote a request
         # body, and this detail is persisted into the run record.
         return (
@@ -539,7 +512,7 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
 
 def _submit_candidate(ctx: _SubmitContext, prepared, candidate_plan):
     claim = prepared[0]
-    effective_spec = candidate_plan[3]
+    effective_spec = candidate_plan[2]
     from flash.runner.lifecycle.attempts import require_attempt_launch_current
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import get_status
@@ -576,7 +549,7 @@ def _run_attempt(ctx: _SubmitContext, prepared):
         )
         return result, None, allocation.candidates, True
     result, candidate_not_started = _submit_candidate(ctx, prepared, candidate_plan)
-    candidates, chosen, _, _, _ = candidate_plan
+    candidates, chosen, _, _ = candidate_plan
     return result, chosen, candidates, candidate_not_started
 
 
@@ -610,9 +583,9 @@ def _settle_terminal_remote(ctx: _SubmitContext) -> None:
     if not cleanup_cleared:
         with contextlib.suppress(Exception):
             _compare_and_confirm_remote_teardown(ctx.spec.run_id, remote)
-    endpoint_id = remote.get("endpoint_id")
-    if isinstance(endpoint_id, str):
-        ctx.seen_endpoints.pop(endpoint_id, None)
+    sandbox_id = remote.get("instance_id")
+    if isinstance(sandbox_id, str):
+        ctx.seen_sandboxes.pop(sandbox_id, None)
 
 
 def _return_success_metrics(ctx: _SubmitContext, outcome) -> dict:
@@ -623,8 +596,6 @@ def _return_success_metrics(ctx: _SubmitContext, outcome) -> dict:
     metrics = result.metrics
     if chosen is not None and isinstance(metrics, dict):
         metrics.setdefault("allocated_gpu", chosen.gpu)
-        # the provider that actually billed this run, so cost attribution prices the
-        # class on its substrate rather than assuming runpod's table.
         metrics.setdefault("allocated_provider", chosen.provider)
         # and how many cards of it. `hourly_rate(gpu_type)` is per card, so a fallback that
         # prices the wall once records a 2x/4x run at half or a quarter of its real spend.
@@ -640,13 +611,13 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
     ctx.raise_if_cancelled()
-    completed_metrics = attempt_recovery._await_runpod_completed_metrics(
+    completed_metrics = attempt_recovery._await_completed_worker_metrics(
         ctx.last_handle,
         _load_run_deadline_at(ctx.spec.run_id),
         check_cancelled=ctx.raise_if_cancelled,
     )
     if completed_metrics is not None:
-        return ctx.return_completed_runpod_metrics(completed_metrics), False, 0.0, False
+        return ctx.return_completed_worker_metrics(completed_metrics), False, 0.0, False
 
     ctx.last_detail = f"{result.failure}: {result.detail}"
     from flash.runner.lifecycle.attempts import decide_attempt_failure
@@ -708,11 +679,11 @@ def run_attempts_supervised(
         while True:
             prepared, completed_metrics = _prepare_attempt(ctx)
             if completed_metrics is not None:
-                return ctx.return_completed_runpod_metrics(completed_metrics)
+                return ctx.return_completed_worker_metrics(completed_metrics)
             outcome = _run_attempt(ctx, prepared)
             if outcome[0].ok:
                 metrics = _return_success_metrics(ctx, outcome)
-                ctx.gc_seen_endpoints()
+                ctx.gc_seen_sandboxes()
                 return metrics
             metrics, retry, retry_delay, lost_ownership = _handle_failure(ctx, prepared, outcome)
             if metrics is not None:
@@ -726,7 +697,7 @@ def run_attempts_supervised(
             if retry_delay:
                 time.sleep(retry_delay)
         _settle_terminal_remote(ctx)
-        ctx.gc_seen_endpoints()
+        ctx.gc_seen_sandboxes()
         raise RuntimeError(f"run {spec.run_id} failed after retries: {ctx.last_detail}")
     finally:
         claim = reserved_claim if ctx is None else ctx.current_claim or ctx.reserved_claim

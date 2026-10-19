@@ -7036,7 +7036,7 @@ def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
 
     # a spec whose card cannot hold the retained copy must stay on zero-3 even though the global
     # would have admitted it. reading JOB_SPEC here returns the B200 answer and fails.
-    tight = SimpleNamespace(gpu=SimpleNamespace(type="RTX 4090"), train=SimpleNamespace())
+    tight = SimpleNamespace(gpu=SimpleNamespace(type="L4"), train=SimpleNamespace())
     assert _build(tight)["reshard_after_forward"] is True
 
     # and with no spec at all the gate falls closed rather than silently reaching for the global.
@@ -8087,7 +8087,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
                     "max_examples": 1,
                     "credit_assignment": "per_episode",
                 },
-                "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
+                "gpu": {"type": "B200", "count": 1, "provider": "modal"},
             }
         )
 
@@ -8116,7 +8116,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
                 "max_examples": 1,
                 "credit_assignment": "per_episode",
             },
-            "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
+            "gpu": {"type": "B200", "count": 1, "provider": "modal"},
         }
     )
     assert build_worker_env(sft)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
@@ -8965,25 +8965,34 @@ def test_opd_child_records_the_core_marker_only_when_a_save_schedule_was_authore
         "install_deferred_lora_rollout_guard",
         lambda marker: armed.append("lora-rollout-guard"),
     )
-    monkeypatch.setattr(
-        opd_child.runtime,
-        "install_checkpoint_handler_filter",
-        lambda steps, total: armed.append(("checkpoint", tuple(steps), total)),
-    )
+    saved = []
 
-    opd_child.install(
-        {
-            "marker_file": str(marker_file),
-            "save_at_steps": list(save_at_steps),
-            "total_steps": 10,
-            "wandb": False,
-        }
-    )
+    class SyncPPOTrainer:
+        global_steps = 0
 
+        def _save_checkpoint(self):
+            saved.append(self.global_steps)
+            return self.global_steps
+
+    config = {
+        "marker_file": str(marker_file),
+        "save_at_steps": list(save_at_steps),
+        "total_steps": 10,
+        "wandb": False,
+    }
+    opd_child.install(config)
+    # The marker must attest the actual PPO save path, after the trainer import.
+    assert not marker_file.exists()
+    opd_child.install_checkpoint_schedule(SyncPPOTrainer, config)
+    opd_child.install_checkpoint_schedule(SyncPPOTrainer, config)
+    trainer = SyncPPOTrainer()
+    for step in range(1, 11):
+        trainer.global_steps = step
+        trainer._save_checkpoint()
+
+    assert saved == ([3, 10] if save_at_steps else list(range(1, 11)))
     recorded = marker_file.read_text().splitlines() if marker_file.exists() else []
     assert ("opd-core" in recorded) is expects_core
-    assert (("checkpoint", save_at_steps, 10) in armed) is expects_core
-    # the rollout guard is required regardless of the checkpoint schedule.
     assert "lora-rollout-guard" in armed
 
 
@@ -9785,6 +9794,13 @@ def test_build_opd_overrides_requires_a_sized_rollout_memory_budget():
     config.pop("gpu_mem_util")
     with pytest.raises(KeyError, match="gpu_mem_util"):
         build_opd_overrides(config)
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_opd_rollout_enables_vision_adapters_only_for_image_training(multimodal):
+    overrides = build_opd_overrides(_config(multimodal=multimodal))
+    flag = "+actor_rollout_ref.rollout.engine_kwargs.vllm.enable_tower_connector_lora=True"
+    assert (flag in overrides) is multimodal
 
 
 def test_build_opd_overrides_halves_agent_loop_workers_for_multimodal_runs():

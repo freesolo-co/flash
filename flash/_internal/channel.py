@@ -16,11 +16,6 @@ _DEFAULT_CLI_NAME = "flash-dev" if CHANNEL == "dev" else "flash"
 # banner.
 BRAND_NAME = _DEFAULT_CLI_NAME
 
-# every console script in [project.scripts] that enters the cli parser, per channel. `flash` is
-# only correct to PRINT when the operator actually reached us through it: the `server` and `dev`
-# extras install runpod-flash, which claims the same script name, so on such a host `flash` may be
-# RunPod's CLI. Printing `flash runs cancel <id>` there tells the operator to run a command that
-# exits 0 without cancelling, leaving a billed run alive.
 _CLI_SCRIPT_NAMES = (
     frozenset({"flash-dev", "flash-dev-cli"})
     if CHANNEL == "dev"
@@ -50,7 +45,7 @@ def _entered_via_dash_m() -> bool:
     That slot holds either ``flash.cli`` or ``-mflash.cli``: a short option may be written with its
     value attached, and ``python -mflash.cli`` is an ordinary invocation, not a curiosity. Reading
     only the separated form makes the attached one fall back to ``flash`` -- on precisely the host
-    where that name may be RunPod's CLI, which is the failure this function exists to prevent.
+    where that name may be another package's CLI, which is the failure this function exists to prevent.
     """
     if not sys.argv or sys.argv[0] != "-m":
         return False
@@ -139,7 +134,7 @@ def _invoked_cli_name() -> str:
 
     `python -m flash.cli` is the documented way OUT of the shadowing, so it is exactly the case
     that must not fall back to `flash`: an operator who reached us that way is on a host where
-    `flash` may be RunPod's CLI, and echoing `flash` back sends them to a command that exits 0
+    `flash` may be another package's CLI, and echoing `flash` back sends them to a command that exits 0
     without doing anything. Name the same escape hatch they used instead.
 
     Anything else -- a test runner, a renamed copy -- keeps the channel default, which is correct

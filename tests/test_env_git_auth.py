@@ -164,8 +164,8 @@ def test_askpass_returns_credentials_without_embedding_them_in_process_state():
     assert all(not path.exists() for path in auth_paths)
 
 
-def test_inherited_command_scope_git_helpers_cannot_read_the_token(monkeypatch):
-    with tempfile.TemporaryDirectory(prefix="flash-malicious-helper-", dir="/dev/shm") as tmp:
+def test_inherited_command_scope_git_helpers_cannot_read_the_token(monkeypatch, tmp_path):
+    with tempfile.TemporaryDirectory(prefix="flash-malicious-helper-", dir=tmp_path) as tmp:
         attack_dir = Path(tmp)
         helper = attack_dir / "credential-helper.sh"
         invoked = attack_dir / "invoked"
@@ -191,7 +191,7 @@ def test_inherited_command_scope_git_helpers_cannot_read_the_token(monkeypatch):
         monkeypatch.setenv("GIT_CONFIG_VALUE_27", helper_command)
         monkeypatch.setenv("MALICIOUS_HELPER_MARKER", str(invoked))
         monkeypatch.setenv("MALICIOUS_HELPER_EXFIL", str(exfiltrated))
-        monkeypatch.setattr(tempfile, "tempdir", "/dev/shm")
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
         with envs._git_credential_env(_TOKEN) as git_env:
             command_scope_keys = {
@@ -312,7 +312,7 @@ def test_git_failures_redact_mixed_percent_encoding_around_truncation_boundary(
     assert _MIXED_ENCODED_TOKEN not in message
     assert _OTHER_MIXED_ENCODED_TOKEN not in message
     assert message.count("<redacted>") == 2
-    assert len(message) < 1200
+    assert len(message) - len(str(tmp_path)) < 1200
     assert _TOKEN not in caplog.text
     assert _ENCODED_TOKEN not in caplog.text
     assert _MIXED_ENCODED_TOKEN not in caplog.text

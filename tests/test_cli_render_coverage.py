@@ -235,10 +235,10 @@ def test_kv_returns_empty_when_no_rows(styled_plain) -> None:
 def test_hide_provider_metadata_over_lists_and_bare_strings() -> None:
     # a bare provider name anywhere in the tree becomes "managed"; provider/flash_arm keys drop
     got = render._hide_provider_metadata(
-        ["runpod", {"provider": "vast", "flash_arm": "x", "keep": 1}, 5, "other"]
+        ["modal", {"provider": "modal", "flash_arm": "x", "keep": 1}, 5, "other"]
     )
     assert got == ["managed", {"keep": 1}, 5, "other"]
-    assert render._hide_provider_metadata("RunPod") == "managed"  # case-insensitive
+    assert render._hide_provider_metadata("Modal") == "managed"  # case-insensitive
 
 
 # --------------------------------------------------------------------------- timestamp / age
@@ -556,7 +556,7 @@ def test_runs_table_renders_an_ordered_gpu_pin_that_has_not_allocated_yet(styled
                 "spec": {
                     "model": "m",
                     "algorithm": "sft",
-                    "gpu": {"type": ["A100 PCIe", "A100 SXM"]},
+                    "gpu": {"type": ["H100", "A100 SXM"]},
                 },
                 "remote": {},
             },
@@ -569,7 +569,7 @@ def test_runs_table_renders_an_ordered_gpu_pin_that_has_not_allocated_yet(styled
             },
         ]
     )
-    assert "A100 PCIe | A100 SXM" in out
+    assert "H100 | A100 SXM" in out
     # the unrelated run is still listed, which is what the crash used to prevent.
     assert "flash-other" in out
     assert "H200" in out

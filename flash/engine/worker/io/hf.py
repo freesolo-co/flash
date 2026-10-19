@@ -291,6 +291,12 @@ def hf_resume_checkpoint(
                 detail = f" at revision {revision}" if revision else ""
                 raise RetriableInfraError(f"required resume checkpoint is missing{detail}")
             return None
+        from flash.engine.support.checkpoint_transport import restore_directory
+
+        with liveness_heartbeat("checkpoint_prefetching"):
+            for _step, name in candidates:
+                _require_hf_deadline_allowance()
+                restore_directory(os.path.join(base, name))
         latest = _highest_resume_candidate(base, candidates, prefer)
         path = os.path.join(base, latest)
         print(f"[resume] found streamed checkpoint: {path}")
@@ -516,12 +522,19 @@ def upload_resume_checkpoint(
                     if not resume_completed:
                         failure_stage = "resume"
                         _require_hf_deadline_allowance()
-                        hf_api().upload_folder(
-                            folder_path=ckpt_dir,
-                            path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
-                            repo_id=_worker_state.HF_REPO,
-                            repo_type="dataset",
-                        )
+                        from flash.engine.support.checkpoint_transport import upload_directory
+
+                        with upload_directory(ckpt_dir) as folder:
+                            _require_hf_deadline_allowance()
+                            hf_api().upload_folder(
+                                folder_path=folder,
+                                path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
+                                repo_id=_worker_state.HF_REPO,
+                                repo_type="dataset",
+                                # Replace this step atomically, including stale transport files
+                                # from an earlier publication of the same native checkpoint.
+                                delete_patterns="*",
+                            )
                         # prune only after the atomic folder commit lands, so the prior complete save
                         # survives every failed replacement upload.
                         _prune_stale_resume_checkpoints(step)

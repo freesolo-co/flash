@@ -30,6 +30,7 @@ from flash.adapters.lora_rank import (
     strict_declared_lora_ranks,
 )
 from flash.engine.worker.model.lora import _read_safetensors_tensor_metadata
+from flash.serve.runtime.hub import TOKENIZER_WEIGHT_PATTERNS
 
 from .manifest import ArtifactFile, ManifestAdapter, ServingManifest
 from .progress import emit_boot_progress
@@ -146,6 +147,12 @@ def base_weights_are_cached(
                 revision=revision,
                 cache_dir=cache_dir,
                 local_files_only=True,
+                **(
+                    {"ignore_patterns": list(TOKENIZER_WEIGHT_PATTERNS)}
+                    if (repo_id, revision)
+                    != (manifest.engine.served_model, manifest.engine.model_revision)
+                    else {}
+                ),
             )
         except Exception:
             return False
@@ -201,6 +208,14 @@ def hydrate_base_weights(
                     revision=revision,
                     token=token,
                     cache_dir=str(cache_dir),
+                    # A separate tokenizer revision needs configs and vocabulary, not
+                    # another full copy of the unquantized model's tensor shards.
+                    **(
+                        {"ignore_patterns": list(TOKENIZER_WEIGHT_PATTERNS)}
+                        if (repo_id, revision)
+                        != (manifest.engine.served_model, manifest.engine.model_revision)
+                        else {}
+                    ),
                 )
             except Exception:
                 # the repo id is manifest data and safe to name, but the exception can carry the

@@ -23,7 +23,7 @@ def _sft(**overrides):
         "seq_len": 1024,
         "batch_size": 8,
         "gpu_type": "H100",
-        "provider": "runpod",
+        "provider": "modal",
     }
     base.update(overrides)
     return RunConfig(**base)
@@ -83,7 +83,7 @@ def test_rollout_quotes_do_not_pay_the_sft_step_floor(method, monkeypatch):
         batch_size=8,
         group_size=4,
         gpu_type="B200",
-        provider="runpod",
+        provider="modal",
     )
     before = estimate_cost(config).train_seconds
     monkeypatch.setattr(analytical, "SFT_STEP_FLOOR_SECONDS", 9_999.0)

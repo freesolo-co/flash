@@ -728,7 +728,7 @@ def test_public_status_redacts_internal_storage_ref_on_valid_spec(stored_ref, ex
         "run_id": "child-run",
         "model": "Qwen/Qwen3.5-9B",
         "algorithm": "grpo",
-        "gpu": {"type": "RTX 4090"},
+        "gpu": {"type": "L4"},
         "train": {"init_from_adapter": stored_ref, "init_from_adapter_revision": _REVISION},
     }
     status = runner_state.RunStatus(run_id="child-run", state="running", spec=raw_spec)
@@ -776,7 +776,7 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
             "run_id": "child-run",
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
-            "gpu": {"type": "RTX 4090"},
+            "gpu": {"type": "L4"},
             "train": {"init_from_adapter": "source-run/final", "lora_rank": 8},
         }
     )
@@ -806,13 +806,13 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
         )
     )
     selected_dict = worker.to_internal_dict()
-    selected_dict["gpu"]["type"] = "RTX 5090"
+    selected_dict["gpu"]["type"] = "L40S"
     selected = JobSpec.from_dict(selected_dict)
 
     assert runner_submit._persist_effective_worker_spec(selected)
     stored = runner_status.get_status(public.run_id)
-    assert stored.effective_preparation["worker_spec"]["gpu"]["type"] == "RTX 5090"
-    assert runner_status.effective_spec_from_status(stored).gpu.type == "RTX 5090"
+    assert stored.effective_preparation["worker_spec"]["gpu"]["type"] == "L40S"
+    assert runner_status.effective_spec_from_status(stored).gpu.type == "L40S"
 
     cleaned = []
 
@@ -821,12 +821,11 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
             cleaned.append(spec)
 
     monkeypatch.setattr(providers, "get_provider", lambda name: Provider())
-    # runpod configured: its gc is the one reaping the rN-suffixed endpoints this test is about.
-    # (only runpod is available, so the assertion counts one gc, not three.)
-    monkeypatch.setattr(providers, "available_providers", lambda: ("runpod",))
-    runner_recovery._gc_run_endpoints(public)
+    # The single available Modal provider must receive the public run's cleanup request.
+    monkeypatch.setattr(providers, "available_providers", lambda: ("modal",))
+    runner_recovery._gc_run_sandboxes(public)
 
-    assert [spec.gpu.type for spec in cleaned] == ["RTX 5090"]
+    assert [spec.gpu.type for spec in cleaned] == ["L40S"]
 
 
 def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeypatch):
@@ -1296,7 +1295,7 @@ def test_recovery_reproduces_a_digest_taken_before_lora_alpha_was_public(monkeyp
             "run_id": "pre-alpha-run",
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
-            "gpu": {"type": "RTX 4090"},
+            "gpu": {"type": "L4"},
             "train": {"lora_rank": 32},
         }
     )
@@ -1382,7 +1381,7 @@ def test_persisting_a_pre_alpha_run_does_not_rewrite_its_digest_out_of_reach(mon
                 "run_id": "pre-alpha-persist",
                 "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
-                "gpu": {"type": "RTX 4090"},
+                "gpu": {"type": "L4"},
                 "train": {"lora_rank": 32},
             }
         ),
@@ -1452,7 +1451,7 @@ def test_digest_matches_the_shape_the_deployed_release_writes(monkeypatch, tmp_p
                 "run_id": "canonical-digest-run",
                 "model": "Qwen/Qwen3.5-9B",
                 "algorithm": "sft",
-                "gpu": {"type": "RTX 4090"},
+                "gpu": {"type": "L4"},
                 "train": {"lora_rank": 32},
             }
         ),

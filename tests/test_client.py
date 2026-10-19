@@ -660,6 +660,26 @@ def test_raw_read_timeout_maps_to_client_error(monkeypatch):
         client.health()
 
 
+def test_disconnected_submission_is_actionable_and_never_replayed(monkeypatch):
+    import http.client
+
+    calls = []
+
+    def disconnect(request, **kwargs):
+        calls.append(request.get_method())
+        raise http.client.RemoteDisconnected("Remote end closed connection")
+
+    monkeypatch.setattr("flash.client.http._urlopen_no_redirect", disconnect)
+    client = ApiClient("https://flash.example", "fslo-user-test")
+    with pytest.raises(ClientError, match="may have been accepted"):
+        client.publish_env(
+            name="qualification",
+            package_b64="QQ==",
+            project_id="11111111-1111-4111-8111-111111111111",
+        )
+    assert calls == ["POST"]
+
+
 def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
     client = ApiClient("http://flash.example", "fslo-user-test")
     calls: list[tuple[str, str, float | None]] = []

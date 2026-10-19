@@ -99,7 +99,7 @@ def _completed_status(monkeypatch, *, cost_usd: float = 12.345, org_id: str = "o
         state="done",
         spec=spec.to_dict(),
         cost_usd=cost_usd,
-        remote={"provider": "runpod", "allocated_gpu": "RTX 5090"},
+        remote={"provider": "modal", "allocated_gpu": "L40S"},
         billing_context={"org_id": org_id},
         billing_state="pending",
     )
@@ -140,8 +140,8 @@ def test_charge_posts_completed_run_cost_and_parses_response(monkeypatch):
     assert body["orgId"] == "org-A"
     assert body["runId"] == "run-1"
     assert body["costCents"] == 1235
-    assert body["gpu"] == "RTX 5090"
-    assert body["provider"] == "runpod"
+    assert body["gpu"] == "L40S"
+    assert body["provider"] == "modal"
     assert body["method"] == "grpo"
     assert body["model"] == "Qwen/Qwen3.5-9B"
     assert body["estimate"] == {
@@ -181,7 +181,7 @@ def test_charge_bills_cost_usd_for_a_cancelled_run(monkeypatch):
         state="cancelled",
         spec=spec.to_dict(),
         cost_usd=2.50,  # cancel path priced this at the actual steps run
-        remote={"provider": "runpod", "allocated_gpu": "RTX 5090"},
+        remote={"provider": "modal", "allocated_gpu": "L40S"},
         billing_context={"org_id": "org-A"},
         billing_state="pending",
     )

@@ -146,14 +146,6 @@ class RetryState:
             None,
         )
 
-    def on_last_gpu(self, chosen, candidates, *, cache_fallback_available: bool) -> bool:
-        if cache_fallback_available:
-            return False
-        if chosen is None or self.infra_used >= self.infra_retries:
-            return True
-        floor = _candidate_usable_vram_gb(chosen)
-        return not any(_candidate_usable_vram_gb(candidate) > floor for candidate in candidates)
-
 
 def _bounded_count(value: object, label: str, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
@@ -255,6 +247,7 @@ def _strictly_larger_candidates(candidates, usable_vram_floor: float):
 
 
 def _drop_weight_cache(spec: JobSpec) -> JobSpec:
+    """Remove only the shared cache for a retry; preserve custom volumes."""
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
     if spec.gpu.network_volume != WEIGHT_CACHE_VOLUME_NAME:
@@ -265,7 +258,9 @@ def _drop_weight_cache(spec: JobSpec) -> JobSpec:
 
 
 def _managed_cache_mounted(spec: JobSpec, chosen) -> bool:
-    if chosen is None:
+    import os
+
+    if chosen is None or os.environ.get("FLASH_WEIGHT_CACHE_DISABLED", "").strip() == "1":
         return False
     from flash.providers.core.registry import get_provider
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
@@ -330,6 +325,20 @@ def transition_failure(
             observation,
             attempt,
         )
+    if failure == "job_preempted":
+        # Preemption says nothing about memory demand. Advancing the OOM floor here
+        # made a healthy worker at the largest allowed shape impossible to resume.
+        if state.infra_used >= state.infra_retries:
+            plan = RetryPlan(False, "not retrying: infrastructure retry budget exhausted")
+        else:
+            ordinal = state.infra_used + 1
+            state = replace(state, infra_used=ordinal, cache_retry_shape=None)
+            plan = RetryPlan(
+                True,
+                "retrying after preemption (resume from last checkpoint)",
+                ordinal,
+            )
+        return _finish(state, plan, observation, attempt)
     floor = max(state.usable_vram_floor, _candidate_usable_vram_gb(chosen))
     state = replace(state, usable_vram_floor=floor, cache_retry_shape=None)
     if candidates is not None and not any(

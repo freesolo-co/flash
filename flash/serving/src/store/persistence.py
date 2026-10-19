@@ -121,7 +121,8 @@ def insert_adapter(record: AdapterRecord, settings: Settings) -> AdapterRecord:
     with httpx.Client(timeout=30.0) as client:
         response = client.post(
             url,
-            headers=supabase_headers(settings, "flash"),
+            # The binding RPC lives in public; its implementation writes flash's tables.
+            headers=supabase_headers(settings, "public"),
             json=payload,
         )
     if response.status_code == 409:

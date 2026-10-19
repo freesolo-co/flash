@@ -54,8 +54,8 @@ _STATUS_LOCK = threading.Lock()
 
 
 def artifacts_dir(spec: JobSpec) -> str:
-    """Run-scoped artifact root: results/runpod/<phase>/<run_id>."""
-    return os.path.join(RESULTS_DIR, "runpod", spec.phase, spec.run_id)
+    """Run-scoped artifact root: results/modal/<phase>/<run_id>."""
+    return os.path.join(RESULTS_DIR, "modal", spec.phase, spec.run_id)
 
 
 def adapter_prefix(spec: JobSpec) -> str:
@@ -148,12 +148,13 @@ class RunStatus:
     # exact torn-down provider handle retained until both delayed realized-cost reconciliation and any
     # pending customer charge complete. it is private and is not an active resource.
     realized_cost_remote: dict | None = None
-    # Instance providers (lambda/vast) configured WHEN THIS RUN WAS SUBMITTED — the set that could have
+    # Sandbox providers configured WHEN THIS RUN WAS SUBMITTED — the set that could have
     # owned a pre-handle non-idempotent create. Recovery's phantom guard (_confirm_run_clear) fails
     # closed for any of these that is no longer configurable (so it can't ENUMERATE to prove clear),
-    # scoped here so a plane that never configured Vast never blocks a handle-less recovery on it. None
+    # scoped here so a plane blocks recovery only for providers that could have launched this run. None
     # for runs created outside submit() / pre-feature records.
     submitted_instance_providers: list[str] | None = None
+    submitted_modal_scope: str | None = None
     # Realized provider cost (COGS), pulled from the provider's billing API after the run
     # finishes by the reconciliation job (flash/server/domain/ops/reconcile.py) and reported to the
     # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the flash.cost ESTIMATE

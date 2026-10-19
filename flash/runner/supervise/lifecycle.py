@@ -59,7 +59,7 @@ def _run_job(
     from flash.runner.lifecycle.state import RUNS_DIR, TERMINAL_STATES
     from flash.runner.lifecycle.status import _update, get_status
     from flash.runner.supervise.lifecycle import _run_job_inner
-    from flash.runner.supervise.recovery import _gc_run_endpoints
+    from flash.runner.supervise.recovery import _gc_run_sandboxes
 
     # setup runs inside the cleanup scope: a raise from the opd preflight, the status read, or the
     # provisioning update is caught by `_run_job_background`, which cannot consume the claim itself.
@@ -116,7 +116,7 @@ def _run_job(
         # skip when the run is still non-terminal: another live supervisor then owns the durable handle,
         # and reaping here would tear down its still-active provider resources.
         if get_status(spec.run_id).state in TERMINAL_STATES:
-            _gc_run_endpoints(spec)
+            _gc_run_sandboxes(spec)
 
 
 def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:
@@ -139,21 +139,6 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:
         gpu.pop("type_fallbacks", None)
     d["gpu"] = gpu
     # the auto marker records that gpu.count was omitted and survives shape resolution.
-    return JobSpec.from_dict(d)
-
-
-def _drop_weight_cache(spec: JobSpec) -> JobSpec:
-    """Spec with the SHARED weight-cache volume removed for an unrestricted cross-region retry.
-
-    Only drops the platform-managed shared cache (WEIGHT_CACHE_VOLUME_NAME); a custom per-org
-    network_volume is the user's own choice and is preserved across retries.
-    """
-    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
-
-    if getattr(spec.gpu, "network_volume", None) != WEIGHT_CACHE_VOLUME_NAME:
-        return spec
-    d = spec.to_internal_dict()
-    d["gpu"] = {**d["gpu"], "network_volume": None}
     return JobSpec.from_dict(d)
 
 

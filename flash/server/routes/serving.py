@@ -30,13 +30,14 @@ from flash.runner.supervise.transitions import (
     mark_undeployed,
 )
 from flash.serve.contract.errors import ServingError
+from flash.serve.deployment.readiness import DEPLOYMENT_TIMEOUT_SECONDS
 from flash.server.platform import auth, db
 from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key
 from flash.server.platform.internal_client import run_org_id, run_serving_org_id
 
 router = APIRouter()
 
-_DEPLOYMENT_STALE_SECONDS = 40 * 60
+_DEPLOYMENT_STALE_SECONDS = DEPLOYMENT_TIMEOUT_SECONDS
 
 
 def _deployment_attempt_is_stale(deployment: dict, *, now: float | None = None) -> bool:

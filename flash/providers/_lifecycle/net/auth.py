@@ -13,6 +13,6 @@ def load_provider_key(env_var: str) -> str | None:
     and the outbound API calls all agree about what "configured" means. Without the strip, a key
     that is only whitespace (a stray newline in an env file) makes the provider advertise itself,
     the preflight pass on it as the plane's only substrate, and every allocation then fail on an
-    unusable credential. Matches how the RunPod key pool and ``internal_key()`` normalize.
+    unusable credential. Matches how ``internal_key()`` normalize.
     """
     return (os.environ.get(env_var) or "").strip() or None

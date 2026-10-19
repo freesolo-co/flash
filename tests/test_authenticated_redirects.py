@@ -361,3 +361,17 @@ def test_sent_headers_collapses_case_colliding_entries_the_way_do_open_does() ->
     request.headers["authorization"] = "Bearer redirectable"
 
     assert sent_headers(request) == {"Authorization": "Bearer redirectable"}
+
+
+def test_received_http_status_survives_a_reset_while_reading_its_body(monkeypatch):
+    from flash.client.http import _api_error
+
+    error = urllib.error.HTTPError("https://example.test", 302, "Found", {}, None)
+
+    def reset():
+        raise ConnectionResetError("peer closed the error body")
+
+    monkeypatch.setattr(error, "read", reset)
+    translated = _api_error(error)
+    assert translated.status == 302
+    assert "302" in str(translated)

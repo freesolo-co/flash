@@ -127,10 +127,10 @@ def test_sizing_covers_fp32_adamw_for_sft_and_opd(model_id: str, algorithm: str)
 
 def test_9b_rank64_sft_is_sized_off_the_rtx_5090():
     """the exact configuration the paged-optimizer estimate mis-sized: 9B SFT at rank 64 (its catalog
-    cap) fits a 32 GB RTX 5090 only when the adapter is sized on the 8-bit paged optimizer. under
+    cap) fits a 32 GB L40S only when the adapter is sized on the 8-bit paged optimizer. under
     verl's AdamW it needs 33 GB, so a paged-based estimate would place a run on a card 1 GB short."""
     need = model_required_vram_gb("Qwen/Qwen3.5-9B", "sft", train={"lora_rank": 64})
-    assert need > 32, f"9B rank-64 SFT sized at {need} GB would still be placed on a 32 GB RTX 5090"
+    assert need > 32, f"9B rank-64 SFT sized at {need} GB would still be placed on a 32 GB L40S"
 
 
 def test_gdn_state_page_and_attention_kv_use_real_geometry():
@@ -173,7 +173,7 @@ def test_9b_grpo_stays_within_its_validated_placement_tier(monkeypatch):
         "lora_rank": 64,
     }
     need = model_required_vram_gb("Qwen/Qwen3.5-9B", "grpo", train=train)
-    monkeypatch.setattr(allocator, "available_providers", lambda: ("runpod",))
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("modal",))
     allocation = allocator.allocate("Qwen/Qwen3.5-9B", "grpo", train=train)
     quote = estimate_cost(
         RunConfig(
@@ -184,14 +184,14 @@ def test_9b_grpo_stays_within_its_validated_placement_tier(monkeypatch):
             completion_len=train["max_completion_tokens"],
             group_size=train["group_size"],
             lora_rank=train["lora_rank"],
-            provider="runpod",
+            provider="modal",
         )
     )
 
     assert 48 < need <= 80
     assert allocation.min_vram_gb == quote.required_vram_gb == need
     assert (allocation.gpu, allocation.gpu_count) == (quote.gpu, quote.gpu_count)
-    assert allocation.gpu == "A100 PCIe"
+    assert allocation.gpu == "A100 SXM"
 
 
 def test_grpo_estimator_grows_with_context_and_completion():

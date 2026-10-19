@@ -392,13 +392,6 @@ def _require_setup_project(args, *, api_url: str | None, api_key: str) -> Mappin
     return resolve_project(selected, api_key, api_url)
 
 
-# Guidance the starter .py docstrings carry, per plane kind. The templates hold placeholders
-# rather than one plane's wording plus a rewrite pass: matching prose back out after rendering
-# breaks silently the moment a template is reworded.
-# `CLI_NAME`, not a literal `flash`: the executable is `flash-cli` (or `python -m flash.cli`) when
-# `flash` on PATH belongs to RunPod, and the terminal-facing output below already renders it that
-# way. A generated file that says `flash env push` sends the user to the shadowing binary, which
-# exits 0 without publishing anything -- so the instructions look followed and nothing happened.
 _HOSTED_GUIDANCE = {
     "ENVIRONMENT_GUIDANCE": (
         "upload with\n"

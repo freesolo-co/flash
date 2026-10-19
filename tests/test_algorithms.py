@@ -117,7 +117,7 @@ def test_qwen35_9b_now_supports_grpo():
             "algorithm": "grpo",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {"epochs": 1, "max_examples": 1},
-            "gpu": {"type": "A100 PCIe"},
+            "gpu": {"type": "A100 SXM"},
         },
         run_id="x",
     )

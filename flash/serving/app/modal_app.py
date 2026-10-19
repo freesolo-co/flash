@@ -252,6 +252,9 @@ image = (
             # Production and development share HF_CACHE_VOLUME_NAME but Modal environment isolation
             # namespaces the volume, so the two deployments cannot read each other's entries.
             "VLLM_CACHE_ROOT": f"{HOSTING_CACHE_MOUNT}/vllm",
+            # FlashInfer derives its JIT workspace from this separate root, not VLLM_CACHE_ROOT.
+            # Persist compiled kernels across scale-to-zero restarts, as customer-owned serving does.
+            "FLASHINFER_WORKSPACE_BASE": f"{HOSTING_CACHE_MOUNT}/flashinfer",
             # Disable the HF Xet/CAS checkpoint-download path. It intermittently fails engine init
             # with "CAS Client Error: Format error: I/O error: error decoding response body"
             # (huggingface_hub xet_get inside vLLM download_weights_from_hf) and crash-looped 27B FP8

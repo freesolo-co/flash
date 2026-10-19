@@ -130,10 +130,30 @@ class UsageEvent:
 
     def rpc_payload(self) -> dict[str, Any]:
         principal = self.principal
+        # The durable RPC allowlists billing fields. Capacity observations belong in
+        # its persisted evidence envelope, so optional telemetry cannot reject usage.
+        capacity = {
+            key: value
+            for key, value in (
+                ("time_to_first_token_seconds", self.facts.time_to_first_token_seconds),
+                ("queue_wait_seconds", self.facts.queue_wait_seconds),
+                (
+                    "replica_in_flight_requests_at_admission",
+                    self.facts.replica_in_flight_requests_at_admission,
+                ),
+                ("replica_boot_duration_seconds", self.facts.replica_boot_duration_seconds),
+                ("replica_freshly_booted", self.facts.replica_freshly_booted),
+            )
+            if value is not None
+        }
+        evidence = dict(self.attestation_evidence)
+        if capacity:
+            evidence["capacity"] = capacity
         return {
             "request_id": self.identity.request_id,
             "correlation_id": self.identity.correlation_id,
             "traffic_principal_kind": principal.kind,
+            "traffic_source": "freesolo",
             "billing_attribution_explicit": principal.kind == "trusted_internal",
             "org_id": principal.orgId,
             "openai_completion_id": self.identity.openai_completion_id,
@@ -149,25 +169,11 @@ class UsageEvent:
             "tokenizer_identity": self.tokenizer_identity,
             "tokenizer_version": self.tokenizer_version,
             "generation_duration_seconds": self.facts.generation_duration_seconds,
-            **{
-                key: value
-                for key, value in (
-                    ("time_to_first_token_seconds", self.facts.time_to_first_token_seconds),
-                    ("queue_wait_seconds", self.facts.queue_wait_seconds),
-                    (
-                        "replica_in_flight_requests_at_admission",
-                        self.facts.replica_in_flight_requests_at_admission,
-                    ),
-                    ("replica_boot_duration_seconds", self.facts.replica_boot_duration_seconds),
-                    ("replica_freshly_booted", self.facts.replica_freshly_booted),
-                )
-                if value is not None
-            },
             "engine_replica_id": self.facts.engine_replica_id,
             "serving_deployment_id": self.deployment_id,
             "serving_release": self.serving_release,
             "captured_at": self.captured_at.astimezone(UTC).isoformat(),
-            "attestation_evidence": dict(self.attestation_evidence),
+            "attestation_evidence": evidence,
             "pricing_source": self.price.source,
             "price_version": self.price.version,
             "price_snapshot": dict(self.price.snapshot),

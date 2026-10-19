@@ -102,19 +102,7 @@ def vram_knob_advice(algorithm: str) -> str:
 
 
 def rents_arbitrary_card_counts(providers: Iterable[str]) -> bool:
-    """Whether some provider here sells a card count that no live catalog has to confirm.
-
-    Providers differ in KIND on this, as ``AllocationConstraints.max_gpu_count`` records: RunPod
-    takes the count as a launch parameter, so any rentable count is purchasable from the static
-    table alone, while Lambda names it in the instance type and Vast has it baked into the offer,
-    so an N-card shape only exists if their live catalog happens to list one. ``live_capacity`` is
-    the signal that separates the two -- a provider stocking from a live market is exactly the one
-    whose per-count SKUs cannot be confirmed offline. A new provider that sells fixed counts from a
-    static table would need its own flag rather than this proxy.
-
-    Used to decide whether a suggested width can be promised; the same attribute classifies an
-    empty candidate set as retryable capacity in ``allocator._raise_no_candidate_error``.
-    """
+    """Whether some provider here sells a card count that no live catalog has to confirm."""
     from flash.providers.core.registry import get_provider
 
     return any(not getattr(get_provider(name), "live_capacity", False) for name in providers)
@@ -123,21 +111,11 @@ def rents_arbitrary_card_counts(providers: Iterable[str]) -> bool:
 def widenable_gpu_names(
     gpu_names: tuple[str, ...] | None, providers: tuple[str, ...] | None
 ) -> tuple[str, ...] | None:
-    """``gpu_names`` reduced to classes a wider shape can actually be BOUGHT for.
-
-    A class survives when some provider still in play rents card counts freely
-    (see ``rents_arbitrary_card_counts``). ``providers`` is the set in play, which a pin narrows:
-    B200 is carried by RunPod and Lambda, but a Lambda-pinned run may not borrow RunPod's freedom
-    to rent any count. ``None`` means no pin, so every carrier of the class counts.
-
-    Separate from the pool that answers "what could hold this run" because the two questions differ:
-    a rejection still names the biggest class it found (``provides at most 180 GB (B200)``) even
-    when no wider shape of it is purchasable.
-    """
+    """``gpu_names`` reduced to classes a wider shape can actually be BOUGHT for."""
     pool = (
         gpu_names
         if gpu_names is not None
-        else tuple(g.name for g in GPU_CLASSES if g.enum_member and g.validated)
+        else tuple(g.name for g in GPU_CLASSES if g.modal_name and g.validated)
     )
     return tuple(
         name
@@ -188,21 +166,7 @@ def catalog_check_hint(
     validated: bool,
     executed_width=None,
 ) -> str:
-    """Name the width to ASK a fixed-count provider for, when no offline width can be proved.
-
-    `live_capacity` means the count must be confirmed dynamically -- not that the wider SKU is
-    absent. Lambda really does resolve `gpu_4x_h100_pcie` against its catalog and rejects a shape it
-    does not sell with its own precise error, so naming the width to try beats a bare shortfall the
-    user cannot act on. Withheld once the class is oversized at every rentable width, where no count
-    would help and the honest answer is the shortfall alone.
-
-    ``offerable`` is false when no configured provider carries this class at all, or when a freely
-    rented width was already provable: the obstacle is then the class or the other remedy, and
-    `--gpus N` either cannot succeed at any N or has already been named.
-
-    ``executed_width`` keeps the named count one the run would LAUNCH on -- asking a provider to
-    confirm a SKU whose extra cards never join the run is a wasted round trip.
-    """
+    """Name the width to ASK a fixed-count provider for, when no offline width can be proved."""
     if not offerable:
         return ""
     width = smallest_fitting_gpu_count(
@@ -235,16 +199,6 @@ def _unbuyable_width_message(
     the obstacle and the remedy together, and those two must agree -- an obstacle claiming nobody
     sells the shape reads as a contradiction above a remedy offering to rent exactly that shape.
     """
-    # the remedy differs by WHY only fixed-count providers are in play. dropping a pin helps
-    # only when the fleet BEHIND it still sells the wider shape; a pin on a Lambda-only plane
-    # drops to the same pool and the same rejection, so it gets the configure-a-provider advice
-    # exactly like the operator who pinned nothing at all.
-    #
-    # the ceiling is usually ALSO too small -- `requested_gpu_count` already failed -- so a
-    # remedy naming only the provider costs a second rejection that finally reveals `--gpus N`.
-    # but it is not always: the unpinned pool may carry a BIGGER class the pin hid (Vast tops
-    # out at 80 GB/card while RunPod has H200/B200), and then the same width fits and the raise
-    # clause would name a ceiling the user already set. only append it when it really rises.
     unpinned_width = smallest_fitting_gpu_count(
         need,
         max_gpu_count=max_gpu_count,
@@ -261,10 +215,6 @@ def _unbuyable_width_message(
             else "Drop the provider pin to let the allocator choose"
         )
     else:
-        # `live_capacity` means the count must be confirmed DYNAMICALLY -- not that the wider
-        # SKU is absent. Lambda really does resolve `gpu_4x_h100_pcie` against its catalog, and
-        # rejects a shape it does not sell with its own precise error. So naming the width to
-        # try and letting the catalog decide beats sending the user to switch providers.
         catalog_width = smallest_fitting_gpu_count(
             need,
             max_gpu_count=max_gpu_count,
@@ -274,9 +224,9 @@ def _unbuyable_width_message(
         # the identical fit check guarding this block guarantees a catalog width is present.
         remedy = (
             f"Raise the card ceiling with `--gpus {catalog_width}` to check it against their "
-            "catalog, or configure a provider that rents card counts directly (RunPod)"
+            "catalog, or configure a provider that rents card counts directly (Modal)"
             if catalog_width > requested_gpu_count
-            else "Configure a provider that rents card counts directly (RunPod)"
+            else "Configure a provider that rents card counts directly (Modal)"
         )
     # the obstacle must agree with the remedy printed right after it. whenever an unpinned width
     # exists, the PIN is what blocks the run -- saying "no available provider is confirmed to
@@ -289,8 +239,6 @@ def _unbuyable_width_message(
             "exists only if their live catalog lists one"
         )
     elif unpinned_width <= (requested_gpu_count or 0):
-        # dropping the pin reveals a BIGGER CARD at the count already authored (Vast tops out
-        # at 80 GB/card while RunPod has H200/B200), so no width has to change at all.
         obstacle = (
             "which no available provider is confirmed to sell at "
             f"{requested_gpu_count} {'card' if requested_gpu_count == 1 else 'cards'}: the "
@@ -323,19 +271,7 @@ def vram_fit_error_message(
     widenable_without_pin: tuple[str, ...] | None = None,
     executed_width=None,
 ) -> str:
-    """Build an actionable pinned-count or terminal vram rejection.
-
-    A ``--gpus N`` suggestion is only offered for a class whose shape at N cards can be purchased;
-    see ``widenable_gpu_names``. Otherwise the run falls through to the terminal message, which
-    states the shortfall without sending the user to buy a shape no provider in play sells.
-
-    ``widenable_without_pin`` is what the pool would widen to if the provider pin were dropped
-    (``widenable_gpu_names`` over the unpinned fleet), or ``None`` when nothing was pinned. It
-    decides whether "drop the pin" is a remedy at all, which ``providers`` cannot answer: a
-    one-provider set is a pin on some planes and the entire configured fleet on others, and a pin
-    on a plane that only ever had Lambda drops to the same pool and the same rejection. Only a
-    caller that kept the unpinned fleet knows the difference.
-    """
+    """Build an actionable pinned-count or terminal vram rejection."""
     algorithm = (algorithm or "").lower()
     widenable = widenable_gpu_names(gpu_names, providers)
     fitting_count = smallest_fitting_gpu_count(

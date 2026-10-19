@@ -793,3 +793,52 @@ def test_copied_flat_modules_have_no_importerror_fallback_to_flash():
                         and (child.module or "").startswith("flash.")
                     ]
                     assert not fallback_imports, path
+
+
+def test_required_checkpoint_survives_a_slow_publisher(monkeypatch, tmp_path):
+    import shutil
+    import threading
+
+    published = tmp_path / "published"
+    published.mkdir()
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    waiting = threading.Event()
+    released = threading.Event()
+
+    class Handler:
+        def save_checkpoint(self, step):
+            for old in checkpoints.iterdir():
+                shutil.rmtree(old)
+            (checkpoints / f"step-{step}").mkdir()
+            return step
+
+    module = types.ModuleType("verl.utils.checkpoint.checkpoint_handler")
+    module.CheckpointHandler = Handler
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    runtime.install_checkpoint_handler_filter((1, 5), 10)
+    runtime.install_checkpoint_publication_backpressure(str(published), (1, 5), 10)
+    handler = Handler()
+    assert handler.save_checkpoint(1) == 1
+    # Calls filtered out by the exact schedule must not wait for upload.
+    assert handler.save_checkpoint(2) is None
+    (published / "step-1").touch()
+    assert handler.save_checkpoint(5) == 5
+
+    def save_final():
+        waiting.set()
+        handler.save_checkpoint(10)
+        released.set()
+
+    thread = threading.Thread(target=save_final, daemon=True)
+    thread.start()
+    assert waiting.wait(1)
+    try:
+        assert not released.wait(0.2)
+        assert (checkpoints / "step-5").is_dir()
+        (published / "step-5").touch()
+        assert released.wait(2)
+        assert (checkpoints / "step-10").is_dir()
+    finally:
+        (published / "step-5").touch()
+        thread.join(2)

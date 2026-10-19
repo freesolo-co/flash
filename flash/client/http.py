@@ -150,7 +150,11 @@ def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
     A structured detail stays a dict so the caller can read its ``code``; anything else is the
     string it always was. ``str()`` it for a message, but branch on the object itself.
     """
-    body = exc.read()
+    try:
+        body = exc.read()
+    except (OSError, http.client.HTTPException):
+        # The status is authoritative even when the peer closes its error body early.
+        return str(exc)
     try:
         detail = json.loads(body).get("detail") or body.decode()
     except (ValueError, AttributeError):
@@ -339,6 +343,12 @@ class ApiClient:
             raise RequestTimeoutError(
                 f"request to the Flash service at {self.api_url} timed out; "
                 "check your network connection and FLASH_API_URL"
+            ) from exc
+        except http.client.RemoteDisconnected as exc:
+            raise ServiceUnreachableError(
+                f"the Flash service at {self.api_url} closed the connection without a response; "
+                "check service health and FLASH_API_URL. The request may have been accepted; "
+                "check its status before submitting it again"
             ) from exc
 
     def _decode_response(

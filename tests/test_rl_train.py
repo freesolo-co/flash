@@ -1425,6 +1425,13 @@ def test_build_verl_overrides_sizes_agent_loop_workers_to_the_rollout_batch():
     assert "actor_rollout_ref.rollout.agent.num_workers=8" in big
 
 
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_rollout_enables_vision_adapters_only_for_image_training(multimodal):
+    overrides = rl_verl.build_verl_overrides(_overrides_cfg(multimodal=multimodal))
+    flag = "+actor_rollout_ref.rollout.engine_kwargs.vllm.enable_tower_connector_lora=True"
+    assert (flag in overrides) is multimodal
+
+
 def test_build_verl_overrides_halves_agent_loop_workers_for_multimodal_runs():
     # every agent worker is a ray actor with its own processor copy. on an image run that is a
     # full image processor, and eight of them beside the vllm engine exhausted the worker
@@ -1445,9 +1452,6 @@ def test_build_verl_overrides_halves_agent_loop_workers_for_multimodal_runs():
 
 @pytest.mark.parametrize(("count", "expected"), [(None, 1), (1, 1), (2, 2), (8, 8)])
 def test_run_rl_train_sizes_the_run_from_the_spec_gpu_count(count, expected):
-    # the wiring, not just the builder: a spec that rents N cards must configure verl for N.
-    # gpu_count_of is the same reader the runpod rental path uses, so the rented shape and the
-    # trained shape cannot drift apart.
     from flash.core.spec import GpuSpec, JobSpec, gpu_count_of
 
     project = "11111111-1111-4111-8111-111111111111"
@@ -7874,7 +7878,11 @@ def test_the_verl_child_allowlist_keeps_the_kernel_choice_but_drops_credentials(
     from flash.engine.worker.train.entry.sft_train import _build_verl_child_env
 
     keep = {"FLA_TILELANG": "0", "CUDA_VISIBLE_DEVICES": "0", "HF_HOME": "/cache/hf"}
-    drop = {"HF_TOKEN": "hub-secret", "GITHUB_TOKEN": "gh-secret", "RUNPOD_API_KEY": "prov-secret"}
+    drop = {
+        "HF_TOKEN": "hub-secret",
+        "GITHUB_TOKEN": "gh-secret",
+        "MODAL_TOKEN_SECRET": "prov-secret",
+    }
     saved = {k: os.environ.get(k) for k in (*keep, *drop)}
     try:
         os.environ.update(keep)
