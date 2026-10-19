@@ -20,7 +20,6 @@ detail. See their docstrings before changing either.
 from __future__ import annotations
 
 import json
-import math
 import os
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
@@ -366,10 +365,6 @@ class TrainSpec:
     hf_repo: str = ""
     # None -> worker's tuned recipe default.
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
-    # sft only: none preserves a legacy persisted run's 16x optimizer. new configs freeze the
-    # recipe default at parse time; 1 uses equal adapter learning rates.
-    # legacy optimizer state must retain its learning-rate ratio on resume.
-    loraplus_ratio: float | None = field(default=None, metadata={"introduced_in": "1.2.131"})
     # sft only. the packaged-dataset estimate resolves this against the selected row count into
     # examples_per_update (packed) or pins the optimizer batch to 1 (unpacked). grpo/opd have no
     # profile, so they take prompts_per_step instead and reject this key: the two are not the same
@@ -388,8 +383,6 @@ class TrainSpec:
     temperature: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     max_completion_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
     kl_penalty_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
-    # legacy loss masking is decoded for resume; no new runs may opt into it.
-    entropy_quantile: float | None = field(default=None, metadata={"introduced_in": "1.0.15"})
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}
     )
@@ -405,17 +398,6 @@ class TrainSpec:
     )
 
     def __post_init__(self) -> None:
-        if self.loraplus_ratio is not None:
-            ratio = self.loraplus_ratio
-            if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
-                raise TypeError("train.loraplus_ratio must be a number")
-            try:
-                ratio = float(ratio)
-            except OverflowError as exc:
-                raise ValueError("train.loraplus_ratio must be a finite number >= 1") from exc
-            if not math.isfinite(ratio) or ratio < 1:
-                raise ValueError("train.loraplus_ratio must be a finite number >= 1")
-            object.__setattr__(self, "loraplus_ratio", ratio)
         if not self.lora_alpha:
             object.__setattr__(self, "lora_alpha", 2 * self.lora_rank)
         max_steps = parse_max_steps(self.max_steps)
@@ -583,8 +565,6 @@ class JobSpec:
     project: str = ""
 
     def __post_init__(self) -> None:
-        if self.train.loraplus_ratio is not None and self.algorithm != "sft":
-            raise ValueError("train.loraplus_ratio only applies to sft")
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
         for field_name in ("model_revision_auto", "model_revision_force_pin"):
@@ -700,9 +680,6 @@ class JobSpec:
         differently, so removing either pop would break existing digests.
         """
         data = asdict(self)
-        # preserve historical preparation digests when the new option was not authored.
-        if data["train"]["loraplus_ratio"] is None:
-            data["train"].pop("loraplus_ratio")
         # missing and unset are the same internal state. omitting the empty value preserves that state
         # without serializing it into an explicit empty preference, which every parser rejects.
         if not data["gpu"].get("providers"):
@@ -808,7 +785,6 @@ class JobSpec:
                 init_from_adapter_revision=str(train.get("init_from_adapter_revision") or ""),
                 hf_repo=str(train.get("hf_repo") or ""),
                 learning_rate=opt_float(train.get("learning_rate")),
-                loraplus_ratio=train.get("loraplus_ratio"),
                 batch_size=opt_int(train.get("batch_size")),
                 prompts_per_step=opt_int(train.get("prompts_per_step")),
                 max_context_tokens=opt_int(train.get("max_context_tokens")),
@@ -820,7 +796,6 @@ class JobSpec:
                 temperature=opt_float(train.get("temperature")),
                 max_completion_tokens=opt_int(train.get("max_completion_tokens")),
                 kl_penalty_coef=opt_float(train.get("kl_penalty_coef")),
-                entropy_quantile=opt_float(train.get("entropy_quantile")),
                 thinking_length_penalty_coef=opt_float(train.get("thinking_length_penalty_coef")),
                 teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=str_tuple(train.get("stop_sequences")),

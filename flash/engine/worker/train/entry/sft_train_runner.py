@@ -33,7 +33,6 @@ from flash.providers.core.base import rentable_gpu_counts
 
 RECIPE = _sft_train.RECIPE
 _MAX_ZERO_GRAD_STEPS = _sft_train._MAX_ZERO_GRAD_STEPS
-_LORAPLUS_READY_MARKER = _sft_train._LORAPLUS_READY_MARKER
 _VERL_OPTIMIZER_IMPL = _sft_train._VERL_OPTIMIZER_IMPL
 _VERL_OPTIMIZER_NAME = _sft_train._VERL_OPTIMIZER_NAME
 build_sft_overrides = _sft_train.build_sft_overrides
@@ -69,7 +68,6 @@ class _SftOptions:
     model_revision: str
     epochs: int
     learning_rate: float
-    loraplus_ratio: float
     effective_batch: int
     max_steps: int
     save_at_steps: tuple[int, ...]
@@ -146,8 +144,6 @@ class _SftProgress:
     observed_grad_norms: list[float]
     loss_curve: list[float]
     train_tokens: int
-    loraplus_applied: bool
-    loraplus_ratio: float
     wandb_link: dict[str, str | None]
     # what the child plugin must prove applied; verified at the first optimizer step and again at
     # child exit.
@@ -188,9 +184,6 @@ def _resolve_sft_options(spec) -> _SftOptions:
     model_id = spec.model if spec else RECIPE.hf_model_id
     model_revision = getattr(spec, "model_revision", "") if spec else ""
     train_spec = spec.train if spec else None
-    # new authored sft specs persist their ratio. an unset stored value predates the option and
-    # must retain the 16x optimizer groups used by its checkpoint, including across further retries.
-    default_loraplus_ratio = 16.0 if train_spec is not None else RECIPE.sft.loraplus_ratio
 
     def train_opt(name, default):
         value = getattr(train_spec, name, None) if train_spec else None
@@ -219,7 +212,6 @@ def _resolve_sft_options(spec) -> _SftOptions:
         model_revision=model_revision,
         epochs=int(train_opt("epochs", RECIPE.sft.num_epochs)),
         learning_rate=float(train_opt("learning_rate", RECIPE.sft.learning_rate)),
-        loraplus_ratio=float(train_opt("loraplus_ratio", default_loraplus_ratio)),
         effective_batch=int(train_opt("batch_size", RECIPE.sft.effective_batch)),
         max_steps=int(train_opt("max_steps", 0) or 0),
         save_at_steps=tuple(getattr(train_spec, "save_at_steps", ()) or ()),
@@ -593,8 +585,6 @@ def _write_sft_child_shims(
         {
             "marker_file": shim_markers,
             "seed": int(seed),
-            "loraplus_ratio": options.loraplus_ratio,
-            "loraplus_ready_marker": _LORAPLUS_READY_MARKER,
             "save_at_steps": list(options.save_at_steps),
             "total_steps": int(model.update_horizon),
             "reentrant_gradient_checkpointing": bool(model.reentrant_gradient_checkpointing),
@@ -788,12 +778,10 @@ def _prepare_sft_progress(
         observed_grad_norms=observed_grad_norms,
         loss_curve=[],
         train_tokens=train_tokens,
-        loraplus_applied=options.loraplus_ratio > 1 and resume_step >= model.update_horizon,
-        loraplus_ratio=options.loraplus_ratio,
         wandb_link={},
         shim_markers=child.shim_markers,
         expected_shims=child.expected_shims,
-        # like loraplus_applied above: a resume already at the horizon never launches the child,
+        # a resume already at the horizon never launches the child,
         # so there is no marker file to verify and nothing left for the shims to patch.
         shims_verified=resume_step >= model.update_horizon,
     )
@@ -835,25 +823,16 @@ def _consume_sft_marker_line(progress: _SftProgress, line: str) -> bool:
     """Fold a child log line's non-metric markers in; answer whether it is an optimizer step.
 
     False means the caller has nothing further to do with the line. A True answer additionally
-    asserts the lora+ shim landed before the first step, because a run that reaches an optimizer
-    update without it is training plain lora at the lora+ learning rate.
+    verifies the required runtime patches before accepting the first optimizer step.
     """
-    if _LORAPLUS_READY_MARKER in line:
-        progress.loraplus_applied = True
     link = _sft_train.parse_wandb_link(line)
     if link is not None:
         progress.wandb_link.update(link)
     if _sft_train.verl_step_number(line) is None:
         return False
-    # the marker set first: a skipped sitecustomize also loses the lora+ shim, and "no fragment
-    # ran at all" is the root cause worth reporting over its lora+ symptom.
     if progress.expected_shims and not progress.shims_verified:
         verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
         progress.shims_verified = True
-    if progress.loraplus_ratio > 1 and not progress.loraplus_applied:
-        raise RuntimeError(
-            "verl reached an optimizer step before the required lora+ shim succeeded"
-        )
     return True
 
 
@@ -914,12 +893,10 @@ def _finish_sft_child(
         raise RuntimeError(f"verl SFT subprocess exited with status {return_code}")
     # belt and braces behind the first-step check in _consume_sft_marker_line, for a child whose
     # step lines the parent never parsed. shims_verified starts True when the child is not
-    # launched at all (resume already at the horizon), exactly like loraplus_applied above.
+    # launched at all (resume already at the horizon).
     if progress.expected_shims and not progress.shims_verified:
         verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
         progress.shims_verified = True
-    if progress.loraplus_ratio > 1 and not progress.loraplus_applied:
-        raise RuntimeError("required lora+ shim did not emit its success marker")
     return train_wall, device_peak_gpu_gb
 
 

@@ -416,7 +416,6 @@ def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path)
         "dp_cards": 2,
         "reentrant_checkpointing": True,
         "multimodal": True,
-        "entropy_quantile": 0.2,
         "per_turn_credit": True,
         "stop_sequences": ["</answer>"],
         "image_pad_token_id": 151655,
@@ -444,7 +443,6 @@ def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path)
         "nonempty-response-mask",
         "exact-rollout-identity",
         "reentrant-checkpointing",
-        "entropy-quantile",
         "per-turn-credit",
         "stop-sequences",
         "image-pad-ban",
@@ -456,7 +454,7 @@ def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path)
     assert registered[0][2] == "verl.single_controller.base.worker"
     assert registered[1][2] == "verl.trainer.ppo.rollout_corr_helper"
     assert registered[1][3] is verl_patches.install_nonempty_response_mask
-    assert [entry[2] for entry in registered[6:9]] == [
+    assert [entry[2] for entry in registered[5:8]] == [
         "verl.experimental.agent_loop.agent_loop",
         "verl.experimental.agent_loop.agent_loop",
         "verl.experimental.agent_loop.agent_loop",
@@ -464,15 +462,12 @@ def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path)
     assert not Path(config["marker_file"]).exists()
 
 
-def test_parent_and_child_share_required_patch_registry_and_preserve_zero_entropy(
-    monkeypatch, tmp_path
-):
+def test_parent_and_child_share_required_patch_registry(monkeypatch, tmp_path):
     config = {
         "marker_file": str(tmp_path / "markers"),
         "dp_cards": 2,
         "reentrant_checkpointing": False,
         "multimodal": False,
-        "entropy_quantile": 0.0,
         "per_turn_credit": False,
         "stop_sequences": [],
         "image_pad_token_id": None,
@@ -488,8 +483,6 @@ def test_parent_and_child_share_required_patch_registry_and_preserve_zero_entrop
 
     def deferred(name, _marker_file, _target, _installer, *args, **_kwargs):
         installed.append(name)
-        if name == "entropy-quantile":
-            assert args == (0.0,)
 
     monkeypatch.setattr(child_runtime, "load_plugin_config_file", lambda _name: config)
     monkeypatch.setattr(child_runtime, "install_deferred_required", deferred)
@@ -514,7 +507,6 @@ def test_parent_and_child_share_required_patch_registry_and_preserve_zero_entrop
         "rank-device-assert",
         "nonempty-response-mask",
         "exact-rollout-identity",
-        "entropy-quantile",
         "multi-turn-loop",
         "lora-rollout-guard",
         "gdn-varlen",
@@ -680,123 +672,6 @@ def test_nonempty_response_mask_patch_is_required_and_marker_wired(monkeypatch, 
         child_runtime.LORA_ROLLOUT_GUARD_SHIM,
     ]
     assert not Path(config["marker_file"]).exists()
-
-
-def _install_entropy_test_modules(monkeypatch, observed):
-    class FakeTensor:
-        def __init__(self, values):
-            self.values = np.asarray(values)
-
-        def bool(self):
-            return FakeTensor(self.values.astype(bool))
-
-        def float(self):
-            return FakeTensor(self.values.astype(float))
-
-        def reshape(self, *shape):
-            return FakeTensor(self.values.reshape(*shape))
-
-        def numel(self):
-            return self.values.size
-
-        def clone(self):
-            return FakeTensor(self.values.copy())
-
-        def tolist(self):
-            return self.values.tolist()
-
-        def __getitem__(self, index):
-            if isinstance(index, FakeTensor):
-                index = index.values
-            return FakeTensor(self.values[index])
-
-        def __mul__(self, other):
-            values = other.values if isinstance(other, FakeTensor) else other
-            return FakeTensor(self.values * values)
-
-        def __ge__(self, other):
-            return FakeTensor(self.values >= other)
-
-        def __and__(self, other):
-            return FakeTensor(self.values & other.values)
-
-    distributed = types.ModuleType("torch.distributed")
-    distributed.is_available = lambda: False
-    distributed.is_initialized = lambda: False
-    distributed.get_world_size = lambda: 1
-    torch = types.ModuleType("torch")
-    torch.__path__ = []
-    torch.distributed = distributed
-    torch.bool = bool
-    torch.tensor = lambda values: FakeTensor(values)
-    torch.zeros_like = lambda tensor, dtype=None: FakeTensor(
-        np.zeros_like(tensor.values, dtype=bool)
-    )
-    torch.quantile = lambda tensor, threshold: float(np.quantile(tensor.values, threshold))
-    monkeypatch.setitem(sys.modules, "torch", torch)
-    monkeypatch.setitem(sys.modules, "torch.distributed", distributed)
-    losses = types.ModuleType("verl.workers.utils.losses")
-
-    def get_policy_loss_fn(_loss_mode):
-        def policy_loss(*_args, **kwargs):
-            observed["policy_mask"] = kwargs["response_mask"].clone()
-            return "policy"
-
-        return policy_loss
-
-    def ppo_loss(_config, _model_output, data, _dp_group=None):
-        observed["other_term_mask"] = data["response_mask"].clone()
-        return losses.get_policy_loss_fn("vanilla")(response_mask=data["response_mask"])
-
-    losses.get_policy_loss_fn = get_policy_loss_fn
-    losses.ppo_loss = ppo_loss
-    padding = types.ModuleType("verl.workers.utils.padding")
-    padding.no_padding_2_padding = lambda entropy, _data: entropy
-    utils = types.ModuleType("verl.workers.utils")
-    utils.losses = losses
-    modules = {
-        "verl": types.ModuleType("verl"),
-        "verl.workers": types.ModuleType("verl.workers"),
-        "verl.workers.utils": utils,
-        "verl.workers.utils.losses": losses,
-        "verl.workers.utils.padding": padding,
-    }
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
-    return torch, losses
-
-
-@pytest.mark.parametrize(
-    ("authored_quantile", "expected_threshold"),
-    [(0.2, 0.8), (0.0, 1.0)],
-)
-def test_entropy_installer_masks_only_policy_loss_and_preserves_authored_threshold(
-    monkeypatch, authored_quantile, expected_threshold
-):
-    observed = {}
-    torch, losses = _install_entropy_test_modules(monkeypatch, observed)
-    real_quantile = torch.quantile
-    thresholds = []
-
-    def quantile(values, threshold):
-        thresholds.append(float(threshold))
-        return real_quantile(values, threshold)
-
-    monkeypatch.setattr(torch, "quantile", quantile)
-    verl_patches.install_entropy_quantile(authored_quantile)
-    installed = losses.ppo_loss
-    response_mask = torch.tensor([[True, True, True, True]])
-    entropy = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
-
-    assert losses.ppo_loss(None, {"entropy": entropy}, {"response_mask": response_mask}) == "policy"
-    assert thresholds == pytest.approx([expected_threshold])
-    assert observed["policy_mask"].tolist() == [[False, False, False, True]]
-    assert observed["other_term_mask"].tolist() == [[True, True, True, True]]
-    assert response_mask.tolist() == [[True, True, True, True]]
-
-    verl_patches.install_entropy_quantile(authored_quantile)
-    assert losses.ppo_loss is installed
 
 
 def test_exact_save_installer_keeps_authored_and_final_steps_and_is_idempotent(
@@ -1319,7 +1194,6 @@ def _overrides_cfg(**over):
         "temperature": 1.0,
         "top_p": 0.95,
         "kl_coef": 0.0,
-        "entropy_quantile": None,
         "stop_sequences": (),
         "structured_outputs": None,
         "thinking": False,
@@ -1490,7 +1364,6 @@ def test_build_verl_training_cfg_resolves_expert_targets_from_the_catalog_id():
             "temperature": 1.0,
             "top_p": 0.95,
             "kl_coef": 0.0,
-            "entropy_quantile": None,
             "stop_sequences": (),
             "structured_outputs": None,
             "seed": 42,
@@ -1897,7 +1770,6 @@ def test_gpu_mem_util_sizing_reaches_the_launch_config():
             "temperature": 1.0,
             "top_p": 0.95,
             "kl_coef": 0.0,
-            "entropy_quantile": None,
             "stop_sequences": (),
             "structured_outputs": None,
             "seed": 42,
@@ -2156,7 +2028,6 @@ def test_sleep_unsupported_models_keep_the_rollout_engine_resident():
             "temperature": 1.0,
             "top_p": 0.95,
             "kl_coef": 0.0,
-            "entropy_quantile": None,
             "stop_sequences": (),
             "structured_outputs": None,
             "seed": 42,
@@ -2222,7 +2093,6 @@ def test_build_verl_training_cfg_derives_engine_len_and_budget():
         "temperature": 1.0,
         "top_p": 0.95,
         "kl_coef": 0.0,
-        "entropy_quantile": None,
         "stop_sequences": (),
         "structured_outputs": None,
         "seed": 42,
@@ -3773,25 +3643,6 @@ def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alon
         assert off_built.input_grads is False
 
 
-def test_entropy_quantile_overrides_enable_verl_entropy_and_stay_off_by_default():
-    # the shim reads model_output["entropy"], which verl only populates when calculate_entropy is
-    # set. flash's recipe has entropy_coeff 0, so nothing else would turn it on.
-    assert "actor_rollout_ref.actor.calculate_entropy=True" in rl_verl.build_verl_overrides(
-        _overrides_cfg(entropy_quantile=0.2)
-    )
-    assert "actor_rollout_ref.actor.calculate_entropy=True" not in rl_verl.build_verl_overrides(
-        _overrides_cfg()
-    )
-
-
-def test_resolve_grpo_inputs_no_longer_rejects_entropy_quantile():
-    # the guard this replaces raised on any entropy_quantile < 1.0. the shim implements the masking,
-    # so the resolver must pass the value through instead of failing the run.
-    source = inspect.getsource(rl_inputs._resolve_grpo_inputs)
-    assert "is not yet supported" not in source.split("entropy_quantile")[1].split("\n\n")[0]
-    assert '"entropy_quantile": entropy_quantile' in source
-
-
 def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
     # both wrap AgentLoopWorker._run_agent_loop. each guards itself with its own marker attribute,
     # and a shared marker would make whichever ran second silently no-op -- leaving either stop
@@ -4175,7 +4026,6 @@ def _notes_inp():
         "epochs": 2,
         "group_size": 4,
         "kl_coef": 0.0,
-        "entropy_quantile": None,
         "stop_sequences": (),
         "structured_outputs": None,
         "temperature": 1.0,
@@ -8191,7 +8041,6 @@ def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_
         "dp_cards": 1,
         "reentrant_checkpointing": True,
         "multimodal": False,
-        "entropy_quantile": 0.2,
         "per_turn_credit": False,
         "stop_sequences": ("</answer>",),
         "image_pad_token_id": None,
@@ -8210,7 +8059,6 @@ def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_
         "exact-rollout-identity",
         "reentrant-checkpointing",
         "text-lora-targeting",
-        "entropy-quantile",
         "stop-sequences",
         "exact-save-steps",
         "kl-ref-adapter",
@@ -8237,7 +8085,6 @@ def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_card
         "dp_cards": 2,
         "reentrant_checkpointing": True,
         "multimodal": False,
-        "entropy_quantile": None,
         "per_turn_credit": False,
         "stop_sequences": (),
         "image_pad_token_id": None,
@@ -8295,7 +8142,7 @@ def test_validate_rl_child_fails_a_run_whose_markers_are_missing(tmp_path):
     state.advantage_bounds[1] = (-0.5, 0.5)
     state.grad_norms[1] = 1.0
     marker = tmp_path / "applied_shims.txt"
-    marker.write_text("entropy-quantile\n")
+    marker.write_text("nonempty-response-mask\n")
     # the complete set passes and falls through to the gradient verdict.
     rl_runner._validate_rl_child(
         0,
@@ -8303,7 +8150,7 @@ def test_validate_rl_child_fails_a_run_whose_markers_are_missing(tmp_path):
         0,
         1,
         None,
-        files={"shim_markers": str(marker), "expected_shims": ["entropy-quantile"]},
+        files={"shim_markers": str(marker), "expected_shims": ["nonempty-response-mask"]},
     )
     with pytest.raises(RuntimeError, match="never proved"):
         rl_runner._validate_rl_child(
@@ -8314,7 +8161,7 @@ def test_validate_rl_child_fails_a_run_whose_markers_are_missing(tmp_path):
             None,
             files={
                 "shim_markers": str(marker),
-                "expected_shims": ["entropy-quantile", "kl-ref-adapter"],
+                "expected_shims": ["nonempty-response-mask", "kl-ref-adapter"],
             },
         )
 

@@ -827,7 +827,7 @@ def test_dry_run_rejects_overflowing_loraplus_ratio(api, monkeypatch, ratio) -> 
         json={"spec": spec, "dry_run": True},
     )
     assert response.status_code == 400, response.text
-    assert "train.loraplus_ratio is retired" in response.json()["detail"]
+    assert "unknown key(s): loraplus_ratio" in response.json()["detail"]
 
 
 def test_warmstart_dry_run_preserves_serving_preflight_error(api) -> None:

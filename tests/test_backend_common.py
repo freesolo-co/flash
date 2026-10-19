@@ -4598,15 +4598,17 @@ def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
 
 def test_verify_applied_shim_markers_raises_only_on_missing_names(tmp_path):
     marker_file = tmp_path / "applied_shims.txt"
-    marker_file.write_text("entropy-quantile\nkl-ref-adapter\n")
+    marker_file.write_text("nonempty-response-mask\nkl-ref-adapter\n")
     # complete (and over-complete: ray actors re-record) sets pass.
-    vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile"])
-    vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile", "kl-ref-adapter"])
+    vc.verify_applied_shim_markers(str(marker_file), ["nonempty-response-mask"])
+    vc.verify_applied_shim_markers(str(marker_file), ["nonempty-response-mask", "kl-ref-adapter"])
     with pytest.raises(RuntimeError, match=r"never proved.*\['stop-sequences'\]"):
-        vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile", "stop-sequences"])
+        vc.verify_applied_shim_markers(
+            str(marker_file), ["nonempty-response-mask", "stop-sequences"]
+        )
     # an absent file is every marker missing, not a pass.
     with pytest.raises(RuntimeError, match="never proved"):
-        vc.verify_applied_shim_markers(str(tmp_path / "missing.txt"), ["entropy-quantile"])
+        vc.verify_applied_shim_markers(str(tmp_path / "missing.txt"), ["nonempty-response-mask"])
 
 
 def _lora_rollout_server_module(loaded, *, lora_as_adapter=True):

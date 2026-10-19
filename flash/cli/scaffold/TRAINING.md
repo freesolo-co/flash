@@ -1816,5 +1816,6 @@ flash models export --adapter-id <run-id>/step-N --repository <you>/<repo>  # ex
 
 See the full reference at https://docs.freesolo.co.
 
-LoRA+ learning-rate ratios and entropy-quantile filtering are retired for new runs.
-Existing stored runs retain their original optimizer and loss settings when resumed.
+LoRA+ and entropy-quantile filtering have been removed, including their stored configuration
+fields and resume support. Configs and stored job payloads containing either removed field are
+rejected as unknown settings; no legacy optimizer or loss shim is installed.

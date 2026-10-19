@@ -25,7 +25,6 @@ from flash.core.spec import (
     parse_seed,
     require_project_id,
 )
-from flash.engine.plan.recipe import RECIPE
 from flash.providers.core.base import (
     UnsupportedGpuError,
     authored_gpu_ceiling,
@@ -265,11 +264,7 @@ TRAIN_SCHEMA_KEYS = frozenset(TRAIN_KEY_MIN_VERSIONS)
 
 def train_schema_metadata() -> dict[str, str]:
     """return the deterministic [train] field-to-release mapping."""
-    return {
-        key: TRAIN_KEY_MIN_VERSIONS[key]
-        for key in sorted(TRAIN_KEY_MIN_VERSIONS)
-        if key not in {"loraplus_ratio", "entropy_quantile"}
-    }
+    return {key: TRAIN_KEY_MIN_VERSIONS[key] for key in sorted(TRAIN_KEY_MIN_VERSIONS)}
 
 
 def validate_train_keys(keys: Collection[str]) -> None:
@@ -302,8 +297,6 @@ def validate_train_keys_for_algorithm(train_raw: Mapping[str, Any], algorithm: s
     every spec fail to reparse its own output and break resubmit, warm-start and server reparse.
     A null is the absence of an authored value, which is exactly what the user is being asked for.
     """
-    if train_raw.get("loraplus_ratio") is not None and algorithm != "sft":
-        raise ConfigError("train.loraplus_ratio only applies to sft")
     for key, allowed in _ALGORITHM_ONLY_TRAIN_KEYS.items():
         if train_raw.get(key) is None or algorithm in allowed:
             continue
@@ -406,14 +399,6 @@ def _validate_train_section(raw: dict[str, Any], algorithm: str) -> dict[str, An
         raise ConfigError("[train] must be a table")
     validate_train_keys(train_raw)
     validate_train_keys_for_algorithm(train_raw, algorithm)
-    # persisted jobs use JobSpec.from_dict and retain their original objective/optimizer.
-    # accept neutral serialized defaults so current specs still round-trip through this parser.
-    if train_raw.get("loraplus_ratio") not in (None, 1, 1.0) or isinstance(
-        train_raw.get("loraplus_ratio"), bool
-    ):
-        raise ConfigError("train.loraplus_ratio is retired; new SFT runs use standard LoRA (1.0)")
-    if train_raw.get("entropy_quantile") is not None:
-        raise ConfigError("train.entropy_quantile is retired; omit it for new runs")
     return train_raw
 
 
@@ -693,10 +678,6 @@ def spec_from_dict(
     )
     wandb_spec = _validate_wandb_section(raw)
 
-    loraplus_ratio = _train_float(train_raw, "loraplus_ratio", minimum=1.0)
-    if algorithm == "sft" and loraplus_ratio is None:
-        # freeze the new default; an absent persisted value identifies the legacy 16x optimizer.
-        loraplus_ratio = RECIPE.sft.loraplus_ratio
     try:
         train_spec = TrainSpec(
             epochs=_train_int(train_raw, "epochs", minimum=1),
@@ -705,7 +686,6 @@ def spec_from_dict(
             init_from_adapter=init_from_adapter,
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
-            loraplus_ratio=loraplus_ratio,
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
             prompts_per_step=_train_int(train_raw, "prompts_per_step", minimum=1),
             max_context_tokens=_train_int(train_raw, "max_context_tokens", minimum=1),
@@ -714,7 +694,6 @@ def spec_from_dict(
             temperature=_train_float(train_raw, "temperature", minimum=0.0),
             max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
             kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
-            entropy_quantile=_train_float(train_raw, "entropy_quantile", minimum=0.0, maximum=1.0),
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
@@ -788,7 +767,6 @@ _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
         "kl_penalty_coef": (
             "only applies to rollout algorithms (grpo, opd); SFT's objective has no KL term"
         ),
-        "entropy_quantile": "only applies to grpo; SFT has no rollout tokens to rank by entropy",
         "thinking_length_penalty_coef": (
             "only applies to grpo; it penalizes generated reasoning length, and SFT never generates"
         ),
@@ -803,10 +781,6 @@ _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
         ),
     },
     "opd": {
-        "entropy_quantile": (
-            "only applies to grpo; opd distils every sampled token against the teacher rather than "
-            "ranking tokens by entropy"
-        ),
         "thinking_length_penalty_coef": (
             "only applies to grpo; it shapes the grpo reward, and opd optimizes a distillation "
             "objective with no reward term"

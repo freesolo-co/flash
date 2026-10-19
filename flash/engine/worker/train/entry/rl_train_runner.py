@@ -384,7 +384,6 @@ def _write_rl_plugin_config(inp, files, *, gdn_reset_arch: str | None, loggers) 
         "dp_cards": int(inp["dp_cards"]),
         "reentrant_checkpointing": bool(inp["reentrant_checkpointing"]),
         "multimodal": bool(inp["multimodal"]),
-        "entropy_quantile": inp["entropy_quantile"],
         "per_turn_credit": bool(inp["per_turn_credit"]),
         "stop_sequences": list(inp["stop_sequences"]),
         "image_pad_token_id": inp["image_pad_token_id"],

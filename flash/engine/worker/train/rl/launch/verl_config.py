@@ -459,11 +459,6 @@ def build_verl_overrides(cfg: dict) -> list[str]:
     else:
         # flash default: dr-grpo with no kl term, so no reference policy.
         o.append("actor_rollout_ref.actor.use_kl_loss=False")
-    if cfg.get("entropy_quantile") is not None:
-        # the top-entropy shim thresholds on per-token entropy, which verl computes only when asked:
-        # calculate_entropy defaults to false and entropy_coeff is 0 on the flash recipe, so without
-        # this the shim would receive no entropy and raise rather than silently skip the masking.
-        o.append("actor_rollout_ref.actor.calculate_entropy=True")
     if cfg.get("fp8_kv"):
         # fp8 kv cache on ada/hopper+ (cc>=8.9), matching engine/vram.py's sizing; tis (above) covers
         # the extra rollout-vs-train mismatch fp8 introduces. '+' appends the key under the existing
@@ -658,7 +653,6 @@ def _build_verl_training_cfg(
         "temperature": inp["temperature"],
         "top_p": inp["top_p"],
         "kl_coef": inp["kl_coef"],
-        "entropy_quantile": inp["entropy_quantile"],
         "stop_sequences": inp["stop_sequences"],
         "structured_outputs": inp["structured_outputs"],
         "thinking": thinking,
@@ -796,7 +790,6 @@ def _build_verl_train_notes(
         "multi_turn_accounting": copy.deepcopy(multi_turn_accounting),
         "grpo_recipe": {
             "kl_coef": inp["kl_coef"],
-            "entropy_quantile": inp["entropy_quantile"],
             "stop_sequences": list(inp["stop_sequences"]),
             "structured_outputs": inp["structured_outputs"],
             "temperature": inp["temperature"],

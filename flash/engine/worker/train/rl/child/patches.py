@@ -7,7 +7,6 @@ if __name__ == "flash_grpo_patches":
 else:
     from flash.engine.worker.train.core.child import runtime
 
-_ENTROPY_QUANTILE_MARKER = "[flash-verl] top-entropy token masking active"
 _STOP_SEQUENCES_MARKER = "[flash-verl] rollout stop strings active"
 _STRUCTURED_OUTPUTS_MARKER = "[flash-verl] rollout structured outputs active"
 _EXACT_SAVE_STEPS_MARKER = "[flash-verl] exact save steps active"
@@ -613,76 +612,3 @@ def install_reentrant_checkpointing(*, multimodal: bool) -> None:
 
     build_module._flash_reentrant_grpo = True
     FSDPEngine._build_module = build_module
-
-
-def install_entropy_quantile(entropy_quantile: float) -> None:
-    import threading
-
-    import torch
-    import torch.distributed as dist
-    from verl.workers.utils import losses
-    from verl.workers.utils.padding import no_padding_2_padding
-
-    threshold = 1.0 - float(entropy_quantile)
-    original_ppo_loss = losses.ppo_loss
-    original_get_policy_loss_fn = losses.get_policy_loss_fn
-    if getattr(original_ppo_loss, "_flash_entropy_masked", False):
-        return
-    state = threading.local()
-
-    def high_entropy_mask(entropy, response_mask):
-        local = entropy[response_mask.bool()].float().reshape(-1)
-        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            sizes = [
-                torch.zeros(1, dtype=torch.long, device=local.device)
-                for _ in range(dist.get_world_size())
-            ]
-            dist.all_gather(
-                sizes,
-                torch.tensor([local.numel()], dtype=torch.long, device=local.device),
-            )
-            largest = int(max(int(size.item()) for size in sizes))
-            if largest == 0:
-                return torch.zeros_like(entropy, dtype=torch.bool)
-            padded = torch.full((largest,), -1e9, dtype=torch.float32, device=local.device)
-            padded[: local.numel()] = local
-            buckets = [torch.empty_like(padded) for _ in range(dist.get_world_size())]
-            dist.all_gather(buckets, padded)
-            gathered = torch.cat(buckets)
-            gathered = gathered[gathered != -1e9]
-        else:
-            gathered = local
-        if gathered.numel() == 0:
-            return torch.zeros_like(entropy, dtype=torch.bool)
-        cutoff = torch.quantile(gathered, threshold)
-        return ((entropy * response_mask.float()) >= cutoff) & response_mask.bool()
-
-    def masked_policy_loss_fn(loss_mode):
-        inner = original_get_policy_loss_fn(loss_mode)
-
-        def masked(*args, **kwargs):
-            entropy = getattr(state, "entropy", None)
-            response_mask = kwargs.get("response_mask")
-            if entropy is not None and response_mask is not None:
-                kwargs["response_mask"] = high_entropy_mask(entropy, response_mask)
-            return inner(*args, **kwargs)
-
-        return masked
-
-    def entropy_masked_ppo_loss(config, model_output, data, dp_group=None):
-        entropy = model_output.get("entropy")
-        if entropy is None:
-            raise RuntimeError(
-                "train.entropy_quantile needs per-token entropy, but verl produced none; "
-                "actor.calculate_entropy must be true."
-            )
-        state.entropy = no_padding_2_padding(entropy, data)
-        try:
-            return original_ppo_loss(config, model_output, data, dp_group)
-        finally:
-            state.entropy = None
-
-    entropy_masked_ppo_loss._flash_entropy_masked = True
-    losses.get_policy_loss_fn = masked_policy_loss_fn
-    losses.ppo_loss = entropy_masked_ppo_loss
-    print(_ENTROPY_QUANTILE_MARKER + f" quantile={entropy_quantile:g}", flush=True)

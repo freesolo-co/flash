@@ -163,7 +163,6 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
         "temperature": 0.7,
         "max_completion_tokens": 256,
         "kl_penalty_coef": 0.02,
-        "entropy_quantile": 0.2,
         "thinking_length_penalty_coef": 0.001,
     }
     grpo_knobs = {
@@ -244,48 +243,13 @@ def test_train_grpo_knobs_parse_and_roundtrip() -> None:
     assert spec.train.temperature == 0.7
     assert spec.train.max_completion_tokens == 256
     assert spec.train.kl_penalty_coef == 0.02
-    assert spec.train.entropy_quantile is None
     assert spec.train.thinking_length_penalty_coef == 0.001
     # survives the JSON round-trip the worker reconstructs from
     rt = JobSpec.from_dict(spec.to_dict()).train
     assert rt.group_size == 4
-    assert rt.entropy_quantile is None
     assert rt.thinking_length_penalty_coef == 0.001
     # GRPO knobs are NOT in environment.params (that goes verbatim to load_environment)
     assert spec.environment.params == {}
-
-
-def test_retired_entropy_toml_is_rejected_but_legacy_worker_override_survives(
-    tmp_path, monkeypatch
-) -> None:
-    from flash.schema import load_toml, spec_and_train_keys_from_file
-
-    config = tmp_path / "grpo.toml"
-    config.write_text(
-        "\n".join(
-            [
-                'model = "Qwen/Qwen3.5-9B"',
-                'algorithm = "grpo"',
-                "",
-                "[environment]",
-                'id = "owner/project/env"',
-                "",
-                "[train]",
-                "entropy_quantile = 0.2",
-            ]
-        )
-    )
-
-    with pytest.raises(ConfigError, match="entropy_quantile is retired"):
-        spec_and_train_keys_from_file(str(config), run_id="entropy")
-    spec = JobSpec.from_dict(load_toml(str(config)))
-    assert spec.train.entropy_quantile == 0.2
-
-    roundtripped = JobSpec.from_dict(spec.to_dict())
-    assert roundtripped.train.entropy_quantile == 0.2
-
-    monkeypatch.setattr(worker_state, "JOB_SPEC", roundtripped)
-    assert worker_grpo_config.grpo_overrides() == {"entropy_quantile": 0.2}
 
 
 def test_opt_int_float_reject_bools() -> None:
@@ -535,8 +499,6 @@ def test_optimizer_knob_validation_rejects_bad_values() -> None:
         {"learning_rate": -1e-5},
         {"temperature": -0.1},  # must be >= 0
         {"kl_penalty_coef": -1},
-        {"entropy_quantile": -0.01},
-        {"entropy_quantile": 1.01},
         {"prompts_per_step": 1.5},  # non-integer
         {"prompts_per_step": "16"},  # wrong type (string)
         {"learning_rate": [1]},  # wrong type (list) -> 400, not a 500 TypeError

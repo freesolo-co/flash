@@ -3,16 +3,12 @@
 `build_sft_overrides` turns a resolved config dict into the hydra argv verl's sft trainer takes, and
 the `_render_*`/`render_*` helpers emit the child-side python that goes with it: the dataset module
 that reads flash's parquet, and the sitecustomize that patches verl in-process (tf32, gdn varlen,
-exact dataloader order, LoRA+). It is all string and dict construction -- no torch, no subprocess.
+exact dataloader order). It is all string and dict construction -- no torch, no subprocess.
 
 Split out of `flash.engine.worker.train.entry.sft_train` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
-
-# printed by the LoRA+ shim once it has installed itself, and matched on the child's stdout by the
-# parent: the shim runs inside verl, so this line is the only proof the optimizer grouping took.
-_LORAPLUS_READY_MARKER = "FLASH_LORAPLUS_READY"
 
 # every key `build_sft_overrides` requires its input to carry. an override the child never receives
 # is a silently-defaulted hyperparameter, so a missing key raises rather than falling back.
@@ -72,7 +68,7 @@ def _hydra_val(value) -> str:
 
 # verl imports this optimizer by name in the torch-bearing worker process.
 # use fp32 adamw: bitsandbytes cannot update fsdp2 dtensors. fsdp1 is not an alternative because flattened
-# names make peft's lora+ grouping treat every parameter as one-dimensional and silently mis-group it.
+# parameters differ from the FSDP2 representation used by the worker.
 _VERL_OPTIMIZER_IMPL = "torch.optim"
 _VERL_OPTIMIZER_NAME = "AdamW"
 
