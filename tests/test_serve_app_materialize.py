@@ -1115,6 +1115,9 @@ def test_separate_tokenizer_hydration_excludes_tensor_weights(tmp_path):
     config_bytes, weights_bytes = _artifact_bytes(tmp_path)
     manifest = _manifest(config_bytes, weights_bytes)
     calls = []
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "tokenizer.json").write_text("{}")
 
     def download(**kwargs):
         calls.append(kwargs)
@@ -1123,7 +1126,10 @@ def test_separate_tokenizer_hydration_excludes_tensor_weights(tmp_path):
     hydrate_base_weights(
         manifest, tmp_path / "cache", token_fd=_token_fd(), snapshot_download_fn=download
     )
-    model, tokenizer = calls
+    assert base_weights_are_cached(manifest, tmp_path / "cache", snapshot_download_fn=download)
+    model, tokenizer, offline_model, offline_tokenizer = calls
+    assert "ignore_patterns" not in offline_model
+    assert offline_tokenizer["ignore_patterns"] == tokenizer["ignore_patterns"]
     assert "ignore_patterns" not in model
     patterns = tokenizer["ignore_patterns"]
     for name in ["model-00001-of-00018.safetensors", "pytorch_model.bin", "model.gguf"]:

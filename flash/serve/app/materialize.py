@@ -30,6 +30,7 @@ from flash.adapters.lora_rank import (
     strict_declared_lora_ranks,
 )
 from flash.engine.worker.model.lora import _read_safetensors_tensor_metadata
+from flash.serve.runtime.hub import TOKENIZER_WEIGHT_PATTERNS
 
 from .manifest import ArtifactFile, ManifestAdapter, ServingManifest
 from .progress import emit_boot_progress
@@ -42,17 +43,6 @@ _COPY_CHUNK_BYTES = 1024 * 1024
 # artifact token only exists during bootstrap, so the weights are pulled into the persistent
 # volume's hub cache while it is still available and every later start reads them from there.
 BASE_WEIGHTS_CACHE_DIRNAME = "hub"
-_TOKENIZER_WEIGHT_PATTERNS = (
-    "*.safetensors",
-    "pytorch_model*.bin",
-    "*.gguf",
-    "tf_model*.h5",
-    "flax_model*.msgpack",
-    "*.onnx",
-    "*.pt",
-    "*.pth",
-    "*.ot",
-)
 _DIRECTORY_FLAGS = (
     getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 )
@@ -157,6 +147,12 @@ def base_weights_are_cached(
                 revision=revision,
                 cache_dir=cache_dir,
                 local_files_only=True,
+                **(
+                    {"ignore_patterns": list(TOKENIZER_WEIGHT_PATTERNS)}
+                    if (repo_id, revision)
+                    != (manifest.engine.served_model, manifest.engine.model_revision)
+                    else {}
+                ),
             )
         except Exception:
             return False
@@ -215,7 +211,7 @@ def hydrate_base_weights(
                     # A separate tokenizer revision needs configs and vocabulary, not
                     # another full copy of the unquantized model's tensor shards.
                     **(
-                        {"ignore_patterns": list(_TOKENIZER_WEIGHT_PATTERNS)}
+                        {"ignore_patterns": list(TOKENIZER_WEIGHT_PATTERNS)}
                         if (repo_id, revision)
                         != (manifest.engine.served_model, manifest.engine.model_revision)
                         else {}

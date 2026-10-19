@@ -356,6 +356,22 @@ def test_secret_pipe_releases_its_source_after_the_consumer_reads() -> None:
         assert token_reference() is None
 
 
+def test_secret_pipe_does_not_close_a_reused_descriptor(tmp_path) -> None:
+    replacement = None
+    try:
+        with launch._open_secret_pipe(INFERENCE_TOKEN) as token_fd:
+            assert read_artifact_token_fd(token_fd) == INFERENCE_TOKEN
+            replacement = os.open(tmp_path / "download.lock", os.O_CREAT | os.O_RDWR, 0o600)
+            if replacement != token_fd:
+                os.dup2(replacement, token_fd)
+                os.close(replacement)
+                replacement = token_fd
+        os.write(replacement, b"still owned by the downloader")
+    finally:
+        if replacement is not None:
+            os.close(replacement)
+
+
 def test_secret_pipe_chains_the_original_write_failure(monkeypatch) -> None:
     failure = OSError("write failed")
 

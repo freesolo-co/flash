@@ -366,6 +366,7 @@ def _write_all(fd: int, value: str) -> None:
 def _open_secret_pipe(value: str):
     """yield a pipe reading end and wait up to five seconds for its writer on cleanup."""
     read_fd, write_fd = os.pipe()
+    read_identity = os.fstat(read_fd)
     errors: list[BaseException] = []
     value_holder = [value]
     del value
@@ -394,8 +395,12 @@ def _open_secret_pipe(value: str):
         operation_error = exc
         raise
     finally:
+        # Consumers close the descriptor after reading. A downloader may reuse its number
+        # before this context exits; only close an unread end that still belongs to this pipe.
         with contextlib.suppress(OSError):
-            os.close(read_fd)
+            current = os.fstat(read_fd)
+            if (current.st_dev, current.st_ino) == (read_identity.st_dev, read_identity.st_ino):
+                os.close(read_fd)
         if writer is None or (writer.ident is None and not writer.is_alive()):
             with contextlib.suppress(OSError):
                 os.close(write_fd)
