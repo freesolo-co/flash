@@ -36,7 +36,6 @@ import flash.server.platform.deployment_jobs as deployment_jobs
 import flash.server.platform.deployment_state as deployment_state
 import flash.server.platform.locks as deployment_locks
 import flash.server.platform.runtime as server_runtime
-import flash.server.routes.serving_completion as serving_completion
 from flash.server.platform import db as _db_mod
 from tests._helpers.chat_provenance import managed_chat_result as _managed_chat_result
 from tests._helpers.source_snapshot import valid_source_snapshot
@@ -44,7 +43,10 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 pytest.importorskip("fastapi")
+
 from fastapi.testclient import TestClient
+
+import flash.server.routes.serving_completion as serving_completion
 
 
 def _env_package_b64() -> str:

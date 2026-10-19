@@ -28,16 +28,17 @@ import flash.runner.results.checkpoints as run_checkpoints
 import flash.runner.supervise.transitions as runner_transitions
 import flash.serve.deployment.deploy as serving_deploy
 import flash.server.platform.deployment_state as deployment_state
-import flash.server.routes.serving_revisions as serving_revisions
-import flash.server.routes.serving_smoke as serving_smoke
 from flash.serve.contract.errors import RetryableServingUnavailable
 from flash.server.domain.registry import envs
 
 pytest.importorskip("fastapi")
+
 from fastapi import HTTPException
 
 import flash.server.routes.serving as serving
 import flash.server.routes.serving_completion as serving_completion
+import flash.server.routes.serving_revisions as serving_revisions
+import flash.server.routes.serving_smoke as serving_smoke
 from flash.content import multimodal
 from flash.engine.plan.recipe import RECIPE
 from flash.serve.contract.errors import ServingError
