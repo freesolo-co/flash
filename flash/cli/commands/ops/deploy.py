@@ -23,14 +23,10 @@ from flash.client import ApiError, ClientError, client_from_config
 _DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 # the only states in which the control plane will actually serve the revision, mirroring
 # flash/server/routes/serving.py. leaving the busy set is NOT the same as arriving here:
-# `revocation_failed` (a concurrent undeploy whose backend cleanup failed) and any state a newer
+# `cleanup_pending` (backend removal is unconfirmed) and any state a newer
 # plane introduces are both non-busy and non-servable, so `--wait` must fail closed on them
 # rather than let `deploy --wait && evaluate` proceed against nothing.
 _DEPLOYMENT_READY_STATES = frozenset({"ready", "deployed"})
-# an undeploy whose backend cleanup failed (flash/runner/supervise/transitions.py). local serving
-# authority is revoked, but the alias may still resolve to the old target -- neither servable nor
-# safely assumed idle.
-_REVOCATION_FAILED_STATE = "revocation_failed"
 _DEPLOY_POLL_SECONDS = 5.0
 # `--wait 0` still owes the caller its one read, and a read needs a positive timeout. keep that
 # bound short enough that "check once, do not block" stays true against a stalled plane: a longer
@@ -116,14 +112,6 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
             pass
         else:
             if current is None:
-                # absence may mean rollback, not deletion: `deployment_for` filters by checkpoint
-                # step while `mark_deployment_failed` restores the predecessor. inspect the run's
-                # other revision to preserve `last_deploy_error`. recompute the remaining budget and
-                # floor it at the zero-wait one-read bound so this classification can complete.
-                left = deadline - time.monotonic()
-                other = _rollback_record(client, run_id, max(left, _DEPLOY_ZERO_WAIT_READ_SECONDS))
-                if other is not None:
-                    return other
                 print(
                     f"warning: {run_id} is no longer an active deployment; "
                     f"run `{CLI_NAME} models deployments` to check what happened",
@@ -141,69 +129,13 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
     return latest
 
 
-def _rollback_record(client, run_id: str, timeout: float) -> dict | None:
-    """Return another listed revision after the requested one disappears.
-
-    A failed cross-step redeploy restores the predecessor with ``last_deploy_error``. Preserve its
-    real step and attempt stamp so ``_deployment_attempt_failed`` can report rollback accurately.
-    """
-    from flash.schema import parse_checkpoint_ref
-
-    parsed = parse_checkpoint_ref(run_id)
-    if parsed is None:
-        return None
-    base_run_id, _ = parsed
-    # do not exempt final-adapter requests: a failed final redeploy can restore a checkpoint that
-    # `deployment_for` excludes by step. `last_deploy_error`, not step direction, identifies rollback.
-    try:
-        entries = client.deployments(timeout=timeout)
-    except (ApiError, ClientError):
-        # this runs on the way out of a wait that has already ended; a failed lookup just means we
-        # fall back to the original "no longer active" message rather than failing the command.
-        return None
-    # deployment_for resolves one exact checkpoint and cannot enumerate a run's siblings. match on
-    # run grouping metadata only, then let the caller judge the exact checkpoint identity.
-    for entry in entries or ():
-        listed = entry.get("deployment") or {}
-        if base_run_id not in (listed.get("run_id"), entry.get("run_id")):
-            continue
-        if not listed.get("last_deploy_error"):
-            # without a recorded error there is nothing tying this revision to the requested one's
-            # disappearance, and reporting an unrelated deployment as this command's rollback would
-            # be the "settle on whichever revision is listed" defect the step filter exists to stop.
-            continue
-        if not listed.get("run_id") and entry.get("run_id"):
-            listed = {**listed, "run_id": entry["run_id"]}
-        return listed
-    return None
-
-
 def _deployment_attempt_failed(requested: dict, final: dict) -> bool:
-    """True when the requested revision is not the one now served.
-
-    ``mark_deployment_failed`` restores the previous ready record and writes only
-    ``last_deploy_error``. Compare attempt identity or ``deploy --wait`` can accept the old adapter.
-    """
-    if str(final.get("state") or "") == "failed":
-        return True
-    asked = requested.get("requested_at")
-    got = final.get("requested_at")
-    # a POST that already answered with a settled record ran the deployment synchronously
-    # (FLASH_DEPLOY_SYNC, flash/server/routes/serving.py), so it returned the FINISHED row and never
-    # exposed the queued attempt. `requested` and `final` are then the same row and their stamps
-    # match by construction -- a restored previous revision compares equal to itself and reads as
-    # success. the recorded error is the only evidence left, and a deploy that really succeeded
-    # writes a fresh record that carries none, so this cannot fire on one.
-    if str(requested.get("state") or "") not in _DEPLOYMENT_BUSY_STATES:
-        return bool(final.get("last_deploy_error"))
-    # a differing stamp means the record on the plane belongs to some other deploy request. that
-    # happens without any error at all: a concurrent `deploy` for the same run supersedes this one
-    # and reaches ready on ITS checkpoint, and reading only last_deploy_error would call that this
-    # command's success. compare the stamps whenever both sides carry one.
-    if asked is not None and got is not None:
-        return asked != got
-    # no attempt stamp to compare: a recorded error is the only signal left.
-    return bool(final.get("last_deploy_error"))
+    """A poll must finish the same checkpoint generation that the command requested."""
+    return (
+        final.get("state") not in _DEPLOYMENT_READY_STATES
+        or final.get("checkpoint_id") != requested.get("checkpoint_id")
+        or final.get("generation") != requested.get("generation")
+    )
 
 
 def cmd_deploy(args) -> int:
@@ -229,7 +161,7 @@ def cmd_deploy(args) -> int:
         dep = _await_deployment(client, args.run_id, dep, wait_seconds)
         # --wait promises the revision is servable on return, so require the plane to SAY it is
         # servable. "not busy" is a weaker claim that also covers a timeout, a vanished listing, an
-        # unpollable plane, `revocation_failed`, and any state a newer plane adds; a restored
+        # unpollable plane, `cleanup_pending`, and any state a newer plane adds; a restored
         # previous revision means the requested one never made it. exiting 0 on any of those lets
         # `deploy --wait && evaluate` run against the wrong adapter, or against none.
         not_ready = str(dep.get("state") or "") not in _DEPLOYMENT_READY_STATES
@@ -260,15 +192,6 @@ def cmd_deploy(args) -> int:
             status_note = (
                 f"deployment failed: {detail}; run `{CLI_NAME} models deployments` for details "
                 f"and retry `{CLI_NAME} models deploy {args.run_id}` after fixing the error."
-            )
-        elif waited_but_unservable and dep.get("last_deploy_error"):
-            # state reads `ready`, but it is the PREVIOUS revision: say so, or the reader trusts
-            # the word and never learns the requested checkpoint is not the one being served.
-            detail = str(dep.get("last_deploy_error"))
-            status_note = (
-                f"the requested revision did not become servable ({detail}); the previously "
-                f"deployed revision is still serving. retry "
-                f"`{CLI_NAME} models deploy {args.run_id}` after fixing the error."
             )
         elif waited_but_unservable:
             # the wait ended without the plane calling this revision servable, and there is no

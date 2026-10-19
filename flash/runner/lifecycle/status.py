@@ -57,6 +57,9 @@ def _runstatus_from_json(d: dict) -> RunStatus:
         from flash.snapshot.archive import parse_descriptor
 
         values["source_snapshot"] = parse_descriptor(d["source_snapshot"]).to_dict()
+    from flash.runner.results.deployments import validate_deployments
+
+    values["deployments"] = validate_deployments(values["run_id"], values.get("deployments", {}))
     return RunStatus(**values)
 
 

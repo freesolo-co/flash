@@ -54,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.port is None:
         args.port = _port_from_env()
     # The server logs at INFO unless FLASH_LOG_LEVEL says otherwise. Provider resolution,
-    # capability revocation, reaper startup, and degraded-configuration warnings are only
+    # capability removal, reaper startup, and degraded-configuration warnings are only
     # observable here, and without this call the `flash` logger keeps the NullHandler it gets at
     # import and emits none of them.
     configure_logging(default_level=logging.INFO)

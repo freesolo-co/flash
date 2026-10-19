@@ -37,6 +37,12 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- Managed runs now store one deployment record per checkpoint. Listing and polling expose each
+  checkpoint's state and verification result; undeploy changes only that checkpoint. Chat and
+  evaluation read readiness from those records. The separate verified-checkpoint ledger and
+  replacement-summary logic are removed. This requires a clean cutover and the companion
+  Freesolo checkpoint-inventory schema/backend deployment before updating Flash.
+
 - A Flash run is one seed and may execute several attempts. The provider seed argument threaded
   beside `spec.seed` is gone, so the spec is the only seed channel and no caller can supply a
   second one to disagree with it; `Provider.submit_run`/`poll` are now `submit_attempt`/
@@ -53,13 +59,13 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   customer-owned serving. Checkpoint bindings are write-once, exact undeploy preserves siblings,
   and customer-owned manifests use schema v2.
 - Active training now exposes exactly `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
-  `Qwen/Qwen3.6-35B-A3B`. Hosted serving remains active for 9B and 35B-A3B; hosted Qwen3.8 27B
-  remains inactive. Qwen3.8 uses the immutable BF16 revision
+  `Qwen/Qwen3.6-35B-A3B`. Hosted serving advertises and routes all three models on B200.
+  Qwen3.8 uses the immutable BF16 revision
   `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` and official native block-FP8 serving revision
   `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`, with the logical base and tokenizer provenance kept
   distinct from the served checkpoint. The Qwen3.5 0.8B, 2B, and 4B tiers and
   `Qwen/Qwen3.6-27B` cannot activate, while historical status, accepted billing retry,
-  cancellation, cleanup, hosted revocation, and exact identity-based undeploy remain available.
+  cancellation, cleanup, hosted deployment removal, and exact identity-based undeploy remain available.
   Qwen3.6 27B adapters are not compatible with Qwen3.8.
 - Customer-owned serving is now Modal-only and requires explicit `--provider modal`. Modal remains
   live-qualified for all three active models. The 27B and 35B-A3B qualifications stay bound to the

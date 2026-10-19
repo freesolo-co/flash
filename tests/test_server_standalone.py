@@ -21,6 +21,7 @@ import flash.serve.deployment.deploy as serving_deploy
 import flash.serve.request.transport as serving_transport
 import flash.server.platform.deployment_state as deployment_state
 from flash.server.platform import auth
+from tests._helpers.deployments import records
 
 
 @pytest.fixture(autouse=True)
@@ -1077,7 +1078,10 @@ def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monk
         spec={},
         billing_context=None,
         platform_context=None,
-        deployment={"state": "ready", "checkpoint_id": "run-standalone/final"},
+        deployments=records(
+            "run-standalone",
+            {"state": "ready", "checkpoint_id": "run-standalone/final", "verified_at": 1.0},
+        ),
     )
     assert auth.serving_org_id(None) == auth.STANDALONE_SERVING_ORG_ID
     assert run_serving_org_id(status) == auth.STANDALONE_SERVING_ORG_ID
@@ -1138,9 +1142,6 @@ def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monk
     assert undeployed["disabled_checkpoints"] == ["run-standalone/final"]
 
     monkeypatch.setattr(serving_chat, "manageable_run", lambda *_args, **_kwargs: status)
-    monkeypatch.setattr(
-        serving_chat, "_verified_checkpoints", lambda _status: {"run-standalone/final"}
-    )
     monkeypatch.setattr(
         serving_chat,
         "effective_spec_from_status",

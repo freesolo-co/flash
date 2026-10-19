@@ -138,7 +138,7 @@ class RunStatus:
     error: str | None = None
     artifacts_dir: str | None = None
     adapter_ref: str | None = None
-    deployment: dict | None = None
+    deployments: dict[str, dict] = field(default_factory=dict)
     remote: dict | None = None
     # private canonical attempt proofs stamped once when each lifecycle milestone is first observed.
     lifecycle_started_attempt: int | None = None
@@ -207,8 +207,9 @@ class RunStatus:
                 source_snapshot,
                 verified_attempt=self.source_verified_attempt,
             )
-        if isinstance(self.deployment, dict):
-            data["deployment"] = public_deployment(self.deployment)
+        data["deployments"] = {
+            key: public_deployment(record) for key, record in self.deployments.items()
+        }
         return data
 
 

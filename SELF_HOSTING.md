@@ -170,7 +170,7 @@ local disk, raise `FLASH_SQLITE_BUSY_TIMEOUT_SECONDS` (default 30).
 
 ### Logs
 
-`flash-server` logs at INFO. Provider resolution, capability revocation, reaper startup, and
+`flash-server` logs at INFO. Provider resolution, capability removal, reaper startup, and
 degraded-configuration warnings are reported there and nowhere else, so that is the first
 place to look when the plane misbehaves. `FLASH_LOG_LEVEL` turns it up (`DEBUG`) or down
 (`WARNING`), and `FLASH_LOG_FORMAT=json` emits one JSON object per line for a structured log

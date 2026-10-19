@@ -626,15 +626,22 @@ class ApiClient:
                 pass
             else:
                 last_state = str(status.get("state") or "unknown")
-                deployment = status.get("deployment") or {}
-                terminal = last_state in {"cancelled", "done", "failed", "dry_run"}
-                revocation_failed = (
-                    isinstance(deployment, dict) and deployment.get("state") == "revocation_failed"
+                deployment = next(
+                    (
+                        record
+                        for record in (status.get("deployments") or {}).values()
+                        if record.get("state") == "cleanup_pending"
+                    ),
+                    {},
                 )
-                if terminal and revocation_failed:
+                terminal = last_state in {"cancelled", "done", "failed", "dry_run"}
+                cleanup_pending = (
+                    isinstance(deployment, dict) and deployment.get("state") == "cleanup_pending"
+                )
+                if terminal and cleanup_pending:
                     error = deployment.get("error") or "unknown backend teardown error"
                     raise ClientError(
-                        "cancel request reached the control plane, but backend revocation is "
+                        "cancel request reached the control plane, but backend cleanup is "
                         f"unconfirmed: {error}; retry cancellation"
                     ) from cause
                 if terminal:
@@ -699,12 +706,12 @@ class ApiClient:
 
     def _serving_deployment(
         self,
-        base_run_id: str,
+        checkpoint_id: str,
         timeout: float | None,
         *,
         body_deadline: float | None = None,
     ) -> dict | None:
-        """The run's servable deployment record, or None when it has none.
+        """The exact checkpoint deployment record, or None when it has none.
 
         Read from the run-scoped route rather than the listing. `/v1/deployments` walks every run
         the key owns and loads each one's status before a caller picks a single record out, so on
@@ -718,10 +725,12 @@ class ApiClient:
         ``env_list``). ``--wait`` polling deliberately does not: it owns a deadline spanning many
         reads and recomputes each one's share.
         """
+        base_run_id, _ = _parse_adapter_target(checkpoint_id)
+        quoted = urllib.parse.quote(checkpoint_id, safe="")
         try:
             deployment = self._request(
                 "GET",
-                f"/v1/runs/{base_run_id}/deploy",
+                f"/v1/runs/{base_run_id}/deploy?checkpoint_id={quoted}",
                 timeout=timeout,
                 body_deadline=body_deadline,
             )
@@ -745,7 +754,9 @@ class ApiClient:
             deployment = {**deployment, "run_id": base_run_id}
         return deployment
 
-    def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
+    def deployment_for(
+        self, run_id: str, timeout: float | None = None, *, body_deadline: float | None = None
+    ) -> dict | None:
         """The deployment record for the checkpoint named in ``run_id``, or None.
 
         ``deploy`` returns as soon as the record is persisted, which is normally before the
@@ -756,33 +767,13 @@ class ApiClient:
         that: the default client timeout is 60s, so one stalled read inside a `--wait 5` would
         overshoot the bound the user asked for by an order of magnitude.
         """
-        base_run_id, _ = _parse_adapter_target(run_id)
-        deployment = self._serving_deployment(base_run_id, timeout)
+        deployment = self._serving_deployment(run_id, timeout, body_deadline=body_deadline)
         if deployment is None:
             return None
         # the exact checkpoint identity must match the caller's requested target.
         if deployment.get("checkpoint_id") != run_id:
             return None
         return deployment
-
-    def deployed_checkpoint(
-        self,
-        run_id: str,
-        timeout: float | None = None,
-        *,
-        body_deadline: float | None = None,
-    ) -> dict | None:
-        """Whatever checkpoint the run serves right now, whichever step that is.
-
-        The counterpart to ``deployment_for``, which answers the narrower "is MY revision live?"
-        and hides any other. A caller about to deploy needs the opposite: the record it is about
-        to displace is by definition the one the step filter drops.
-
-        ``body_deadline`` bounds the whole read in wall-clock time; ``timeout`` alone bounds each
-        socket operation, which a peer trickling bytes just inside it can extend without limit.
-        """
-        base_run_id, _ = _parse_adapter_target(run_id)
-        return self._serving_deployment(base_run_id, timeout, body_deadline=body_deadline)
 
     def chat(
         self,
