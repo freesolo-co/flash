@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from threading import Event
 
 import flash.runner.lifecycle.status as run_status
@@ -15,6 +14,7 @@ from flash.runner.results.deployments import owns_attempt
 from flash.serve.contract.errors import AdapterConfigMissing, ServingError
 from flash.serve.deployment.deploy import DeploymentReadinessFacts
 from flash.server.platform import db, deployment_state
+from flash.server.platform.internal_client import run_serving_org_id
 from flash.server.routes import serving_smoke
 from flash.server.routes.serving_revisions import (
     _DEPLOYABLE_STATES,
@@ -38,16 +38,11 @@ def recover_deployments() -> int:
             status = run_status.get_status(row["run_id"])
             for checkpoint_id, deployment in status.deployments.items():
                 state = deployment.get("state")
-                if state in _DEPLOYMENT_BUSY_STATES:
-                    failed = deployment_state._deployment_state(
-                        deployment,
-                        "failed",
-                        error="deployment lifecycle interrupted by control-plane restart",
-                        detail="deployment interrupted; redeploy the exact checkpoint",
-                        recovered_at=time.time(),
-                    )
-                    marked = runner_transitions.mark_deployment_failed(status.run_id, failed)
-                elif state in _DEPLOYMENT_READY_STATES and _spec_is_unservable(status):
+                if state in _DEPLOYMENT_BUSY_STATES or state == "cleanup_pending":
+                    _recover_interrupted_deployment(status, checkpoint_id)
+                    recovered += 1
+                    continue
+                if state in _DEPLOYMENT_READY_STATES and _spec_is_unservable(status):
                     marked = runner_transitions.mark_deployment_cleanup_pending(
                         status.run_id,
                         "deployment spec is no longer supported",
@@ -60,6 +55,17 @@ def recover_deployments() -> int:
         finally:
             lock.release()
     return recovered
+
+
+def _recover_interrupted_deployment(status, checkpoint_id: str) -> None:
+    error = ServingError("deployment lifecycle interrupted by control-plane restart")
+    pending = runner_transitions.mark_deployment_cleanup_pending(
+        status.run_id, str(error), checkpoint_id
+    )
+    deployment_state._report_persisted_transition(status, pending, persisted=True)
+    if _cleanup_failed_deployment(status.run_id, checkpoint_id, run_serving_org_id(status), error):
+        marked = runner_transitions.mark_undeployed(status.run_id, checkpoint_id)
+        deployment_state._report_persisted_transition(pending, marked, persisted=True)
 
 
 def replay_status_reports(stop: Event | None = None) -> int:
@@ -137,11 +143,15 @@ def _finish_deployment_unlocked(
         return
     current = dict(deployment)
     smoke_result: dict = {}
-    smoke_target: str | None = None
+    registration_started = False
+
+    def _before_register() -> None:
+        nonlocal registration_started
+        registration_started = True
 
     def _before_ready(facts: DeploymentReadinessFacts) -> None:
-        nonlocal current, smoke_target
-        smoke_target = facts.checkpoint_id
+        nonlocal current, registration_started
+        registration_started = True
         _assert_deployment_fence(run_id, deployment, is_checkpoint, prev_state)
         current = deployment_state._deployment_state(
             {**current, "checkpoint_id": facts.checkpoint_id, "openai_model": facts.checkpoint_id},
@@ -169,10 +179,12 @@ def _finish_deployment_unlocked(
         _assert_deployment_fence(run_id, deployment, is_checkpoint, prev_state)
 
     try:
-        dep = serving_deploy.deploy_adapter(**deploy_kwargs, before_ready=_before_ready)
+        dep = serving_deploy.deploy_adapter(
+            **deploy_kwargs, before_register=_before_register, before_ready=_before_ready
+        )
     except Exception as exc:
-        if smoke_target is not None and not _cleanup_failed_smoke(
-            run_id, smoke_target, str(deploy_kwargs["org_id"]), exc
+        if registration_started and not _cleanup_failed_deployment(
+            run_id, deployment["checkpoint_id"], str(deploy_kwargs["org_id"]), exc
         ):
             return
         _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
@@ -180,7 +192,7 @@ def _finish_deployment_unlocked(
 
     if not smoke_result:
         error = ServingError("deployment backend returned without checkpoint verification")
-        if _cleanup_failed_smoke(
+        if _cleanup_failed_deployment(
             run_id, deployment["checkpoint_id"], str(deploy_kwargs["org_id"]), error
         ):
             _record_deployment_failure(run_id, spec, error, current, deployment, is_checkpoint)
@@ -201,14 +213,16 @@ def _finish_deployment_unlocked(
         )
 
 
-def _cleanup_failed_smoke(
-    run_id: str, checkpoint_id: str, org_id: str, smoke_error: Exception
+def _cleanup_failed_deployment(
+    run_id: str, checkpoint_id: str, org_id: str, deployment_error: Exception
 ) -> bool:
     """disable an unverified hosted checkpoint, retaining a retryable state on cleanup failure."""
     try:
+        if not org_id:
+            raise ServingError("run has no organization scope for checkpoint cleanup")
         serving_deploy.undeploy_adapter(checkpoint_id, org_id=org_id)
     except Exception as exc:
-        error = f"{smoke_error}; checkpoint cleanup failed: {exc}"
+        error = f"{deployment_error}; checkpoint cleanup failed: {exc}"
         previous = run_status.get_status(run_id)
         marked = runner_transitions.mark_deployment_cleanup_pending(
             run_id, error, checkpoint_id=checkpoint_id

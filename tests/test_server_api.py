@@ -3414,72 +3414,34 @@ def test_deployment_job_shutdown_closes_producers(monkeypatch):
     deployment_jobs._open_deployment_jobs()
 
 
-def test_recover_deployments_recovers_busy_states_on_startup_regardless_of_age(
-    monkeypatch,
-):
-    """Startup recovery fails every busy record whose lock it can take, fresh ones included.
-
-    The per-run flock is the ownership proof: a live lifecycle holds it from the moment the
-    request persists `queued` until the deployment ends, so acquiring it means no owner survived.
-    Recovery used to also require the record to be 30 minutes old, which left a control plane that
-    restarted inside that window with a busy record nothing was working on -- and nothing to
-    revisit it, since recovery only runs at startup -- so every retry got 409 until the clock aged
-    it out.
-    """
-    from flash.server.routes import serving
-
+def test_recover_deployments_recovers_busy_states_on_startup_regardless_of_age(monkeypatch):
+    """An acquired run lock proves no lifecycle owner survived, regardless of record age."""
     now = time.time()
     statuses = {
-        "run-smoke_testing": SimpleNamespace(
-            run_id="run-smoke_testing",
+        name: SimpleNamespace(
+            run_id=name,
             state="done",
-            deployments=records(
-                "run-smoke_testing",
-                {
-                    "state": "smoke_testing",
-                    "updated_at": now - serving._DEPLOYMENT_STALE_SECONDS - 1,
-                },
-            ),
-        ),
-        "run-queued": SimpleNamespace(
-            run_id="run-queued",
-            state="done",
-            deployments=records("run-queued", {"state": "queued", "updated_at": now}),
-        ),
+            deployments=records(name, {"state": phase, "updated_at": updated}),
+        )
+        for name, phase, updated in (
+            ("run-smoke_testing", "smoke_testing", now - 3600),
+            ("run-queued", "queued", now),
+        )
     }
-    marked = []
-    reported = []
     monkeypatch.setattr(
-        serving.db,
-        "all_runs",
-        lambda: [{"run_id": status.run_id} for status in statuses.values()],
+        serving_completion.db, "all_runs", lambda: [{"run_id": name} for name in statuses]
     )
     monkeypatch.setattr(runner_status, "get_status", lambda run_id: statuses[run_id])
-
-    def mark_failed(run_id, deployment):
-        marked.append((run_id, deployment))
-        return SimpleNamespace(run_id=run_id, state="done", deployments=records(run_id, deployment))
-
-    monkeypatch.setattr(runner_transitions, "mark_deployment_failed", mark_failed)
+    recovered = []
     monkeypatch.setattr(
-        deployment_state,
-        "_report_persisted_transition",
-        lambda previous, current, *, persisted: reported.append(
-            (previous.run_id, only_deployment(current), persisted)
-        ),
+        serving_completion,
+        "_recover_interrupted_deployment",
+        lambda status, checkpoint_id: recovered.append((status.run_id, checkpoint_id)),
     )
-
-    # both current busy states are recovered, including the just-written queued record.
     assert serving_completion.recover_deployments() == 2
-    assert sorted(run_id for run_id, _deployment in marked) == [
-        "run-queued",
-        "run-smoke_testing",
-    ]
-    assert all(deployment["state"] == "failed" for _run_id, deployment in marked)
-    assert all("control-plane restart" in deployment["error"] for _run_id, deployment in marked)
-    assert sorted(run_id for run_id, _deployment, persisted in reported if persisted) == [
-        "run-queued",
-        "run-smoke_testing",
+    assert sorted(recovered) == [
+        ("run-queued", "run-queued/final"),
+        ("run-smoke_testing", "run-smoke_testing/final"),
     ]
 
 

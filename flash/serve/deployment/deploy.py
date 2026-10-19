@@ -137,6 +137,8 @@ def deploy_adapter(
     structured_outputs: str = "",
     org_id: str | None = None,
     checkpoint_step: int | None = None,
+    # mark possible remote side effects before sending the registration request.
+    before_register: Callable[[], None] | None = None,
     # Pass the immutable target and facts already fetched for this deployment to smoke testing.
     before_ready: Callable[[DeploymentReadinessFacts], None] | None = None,
 ) -> Deployment:
@@ -213,6 +215,8 @@ def deploy_adapter(
     body["org_id"] = normalized_org_id
     body["artifact_fingerprint"] = immutable_binding_fingerprint(body)
 
+    if before_register is not None:
+        before_register()
     try:
         registration = transport.serving_request(
             "POST",

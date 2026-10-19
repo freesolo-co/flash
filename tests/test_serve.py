@@ -1492,7 +1492,14 @@ def test_readiness_receives_complete_facts_after_registry_readiness(
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd",
         before_ready=before_ready,
+        before_register=lambda: events.append(("before_register", "flash-7-abcd/final")),
     )
+    assert events == [
+        ("GET", "https://serve.example/healthz"),
+        ("before_register", "flash-7-abcd/final"),
+        ("POST", "https://serve.example/adapters"),
+        ("ready", "flash-7-abcd/final"),
+    ]
     assert observed == [
         d.DeploymentReadinessFacts(
             checkpoint_id="flash-7-abcd/final",
