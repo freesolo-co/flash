@@ -60,7 +60,6 @@ def _cfg(**over):
         "lora_alpha": 32,
         "target_modules": "all-linear",
         "exclude_modules": None,
-        "fsdp_generation": 2,
         "ulysses_sp_size": 2,
         "lr": 1e-4,
         "warmup_ratio": 0.03,
@@ -2418,7 +2417,6 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(monkeypat
         str(local_dir),
         job_label="SFT",
         world_size=1,
-        expected_fsdp_generation=2,
     )
     # a checkpoint this attempt actually trained, which must still be exported and uploaded.
     (local_dir / "global_step_2" / "huggingface").mkdir(parents=True)
@@ -3147,7 +3145,7 @@ def test_a_resume_at_the_horizon_still_publishes_the_final_deployable(monkeypatc
     monkeypatch.setattr(
         sft_train,
         "_restore_verl_resume",
-        lambda local_dir, *, world_size, expected_fsdp_generation: 2,
+        lambda local_dir, *, world_size: 2,
     )
 
     def fake_training(command, *, env, on_step, on_line, heartbeat):
@@ -3692,7 +3690,6 @@ def test_sft_never_enables_liger_because_it_zeroes_the_lora_gradient():
         "lora_rank": 32,
         "lora_alpha": 64,
         "target_modules": "all-linear",
-        "fsdp_generation": 2,
         "lora_adapter_path": None,
         "ulysses_sp_size": 1,
         "lr": 1e-4,
@@ -4155,7 +4152,6 @@ def test_sft_resume_guard_checks_the_launched_width_not_the_allocation():
 
     src = inspect.getsource(sft_train_runner._prepare_sft_child)
     assert "world_size=world_size" in src
-    assert "expected_fsdp_generation=fsdp_generation" in src
     assert "world_size=options.gpu_count" not in src
 
     # and the resolved width must be established before the resume call that consumes it.

@@ -397,7 +397,6 @@ def _rl_resume(monkeypatch, tmp_path, src, *, world_size):
         rl_checkpoints._restore_verl_resume(
             str(local_dir),
             world_size=world_size,
-            expected_fsdp_generation=2,
         ),
         local_dir,
     )
@@ -440,12 +439,11 @@ def test_fsdp1_same_width_is_discarded(monkeypatch, tmp_path, capsys):
 
 
 @pytest.mark.parametrize(
-    ("expected_fsdp_generation", "checkpoint_fsdp_generation", "expected_loadable"),
-    [(1, 1, True), (1, 2, False), (2, 1, False), (2, 2, True)],
+    ("checkpoint_fsdp_generation", "expected_loadable"),
+    [(1, False), (2, True), (3, False)],
 )
-def test_native_resume_requires_the_exact_fsdp_generation(
+def test_native_resume_requires_fsdp2(
     tmp_path,
-    expected_fsdp_generation,
     checkpoint_fsdp_generation,
     expected_loadable,
 ):
@@ -463,7 +461,6 @@ def test_native_resume_requires_the_exact_fsdp_generation(
         inspect_resume_checkpoint(
             str(src),
             world_size=2,
-            expected_fsdp_generation=expected_fsdp_generation,
         ).loadable
         is expected_loadable
     )
@@ -607,16 +604,10 @@ def test_sft_flat_layout_is_guarded_too(monkeypatch, tmp_path, capsys):
     local_dir.mkdir()
     monkeypatch.setattr(worker_hf, "hf_resume_checkpoint", lambda *a, **k: str(src))
 
-    assert (
-        sft_train._restore_verl_resume(str(local_dir), world_size=2, expected_fsdp_generation=2)
-        == 9
-    )
+    assert sft_train._restore_verl_resume(str(local_dir), world_size=2) == 9
     shutil.rmtree(local_dir)
     local_dir.mkdir()
-    assert (
-        sft_train._restore_verl_resume(str(local_dir), world_size=4, expected_fsdp_generation=2)
-        == 0
-    )
+    assert sft_train._restore_verl_resume(str(local_dir), world_size=4) == 0
     assert not (local_dir / "global_step_9").exists()
     assert "[SFT] discarding resume checkpoint checkpoint-9" in capsys.readouterr().out
 
@@ -631,10 +622,7 @@ def test_sft_flat_layout_is_guarded_too(monkeypatch, tmp_path, capsys):
         nested=False,
     )
     monkeypatch.setattr(worker_hf, "hf_resume_checkpoint", lambda *a, **k: str(fsdp1))
-    assert (
-        sft_train._restore_verl_resume(str(local_dir), world_size=2, expected_fsdp_generation=2)
-        == 0
-    )
+    assert sft_train._restore_verl_resume(str(local_dir), world_size=2) == 0
     assert not (local_dir / "global_step_10").exists()
 
 
@@ -662,12 +650,7 @@ def test_sft_and_grpo_restore_use_the_canonical_worker_helper(monkeypatch, tmp_p
     monkeypatch.setattr(verl_checkpoints, "select_verl_resume_checkpoint", select)
     monkeypatch.setattr(verl_checkpoints, "stage_verl_resume", stage)
 
-    assert (
-        rl_checkpoints._restore_verl_resume(
-            str(tmp_path / "local"), world_size=1, expected_fsdp_generation=2
-        )
-        == 3
-    )
+    assert rl_checkpoints._restore_verl_resume(str(tmp_path / "local"), world_size=1) == 3
     assert seen["staged"] == (str(checkpoint), inspection)
 
 
@@ -703,7 +686,6 @@ def test_canonical_resume_selection_inspects_once_and_stages_the_same_verdict(
         verl_checkpoints.restore_verl_resume(
             str(tmp_path / "local"),
             world_size=2,
-            expected_fsdp_generation=2,
             job_label="SFT",
         )
         == 5
@@ -736,12 +718,9 @@ def test_resume_restore_fails_closed_when_selection_omits_its_inspection(
             return verl_checkpoints.restore_verl_resume(
                 str(tmp_path / "local"),
                 world_size=2,
-                expected_fsdp_generation=2,
                 job_label="SFT",
             )
-        return rl_checkpoints._restore_verl_resume(
-            str(tmp_path / "local"), world_size=2, expected_fsdp_generation=2
-        )
+        return rl_checkpoints._restore_verl_resume(str(tmp_path / "local"), world_size=2)
 
     with pytest.raises(RuntimeError, match="missing its inspection"):
         restore()
@@ -803,9 +782,7 @@ def test_grpo_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
         _fake_hf_resume_checkpoint_over(incompatible, compatible),
     )
 
-    step = rl_checkpoints._restore_verl_resume(
-        str(local_dir), world_size=2, expected_fsdp_generation=2
-    )
+    step = rl_checkpoints._restore_verl_resume(str(local_dir), world_size=2)
 
     assert step == 3
     assert counts == {str(incompatible): 1, str(compatible): 1}
@@ -828,12 +805,7 @@ def test_grpo_resume_skips_a_higher_loadable_checkpoint_with_a_malformed_manifes
         _fake_hf_resume_checkpoint_over(malformed, valid),
     )
 
-    assert (
-        rl_checkpoints._restore_verl_resume(
-            str(local_dir), world_size=2, expected_fsdp_generation=2
-        )
-        == 3
-    )
+    assert rl_checkpoints._restore_verl_resume(str(local_dir), world_size=2) == 3
     assert counts == {str(malformed): 1, str(valid): 1}
     assert (local_dir / "global_step_3" / "actor" / "model.safetensors").exists()
     assert not (local_dir / "global_step_7").exists()
@@ -856,10 +828,7 @@ def test_sft_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
         _fake_hf_resume_checkpoint_over(incompatible, compatible),
     )
 
-    assert (
-        sft_train._restore_verl_resume(str(local_dir), world_size=2, expected_fsdp_generation=2)
-        == 5
-    )
+    assert sft_train._restore_verl_resume(str(local_dir), world_size=2) == 5
     assert counts == {str(incompatible): 1, str(compatible): 1}
     assert (local_dir / "global_step_5" / "model.safetensors").exists()
     assert not (local_dir / "global_step_9").exists()
@@ -884,7 +853,6 @@ def test_opd_discards_a_mismatched_checkpoint_with_its_accounting(monkeypatch, t
         prompt_pool_fingerprint="a" * 64,
         update_horizon=8,
         world_size=1,
-        expected_fsdp_generation=2,
     )
 
     assert (step, state) == (0, None)
@@ -908,7 +876,6 @@ def test_opd_pinned_revision_topology_mismatch_fails_closed(monkeypatch, tmp_pat
             prompt_pool_fingerprint="a" * 64,
             update_horizon=8,
             world_size=1,
-            expected_fsdp_generation=2,
         )
     assert not (local_dir / "global_step_2").exists()
 
