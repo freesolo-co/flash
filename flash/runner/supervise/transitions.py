@@ -236,6 +236,35 @@ def mark_deployment_revocation_failed(
         return status
 
 
+def _retained_checkpoint_deployment(status: RunStatus, checkpoint_id: str) -> dict:
+    """rebuild checkpoint metadata without inheriting the removed checkpoint's smoke results."""
+    from flash.runner.lifecycle.state import _internal_spec_from_status
+
+    parsed = parse_checkpoint_ref(checkpoint_id)
+    if parsed is None or parsed[0] != status.run_id:
+        raise ValueError("retained checkpoint must belong to the run")
+    step = parsed[1]
+    spec = _internal_spec_from_status(status)
+    prefix = f"{spec.phase}/{status.run_id}"
+    if step is not None:
+        prefix += f"/checkpoints/step-{step}"
+    shared = {
+        key: value
+        for key, value in (status.deployment or {}).items()
+        if key in {"model", "endpoint_name", "openai_base_url"}
+    }
+    return {
+        **shared,
+        "run_id": status.run_id,
+        "state": "ready",
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_step": step,
+        "openai_model": checkpoint_id,
+        "adapter_hf_prefix": f"{prefix}/adapter",
+        "verify": True,
+    }
+
+
 def mark_undeployed(run_id: str, checkpoint_id: str | None = None) -> RunStatus:
     """record exact undeploy while preserving sibling checkpoint verification."""
 
@@ -261,14 +290,7 @@ def mark_undeployed(run_id: str, checkpoint_id: str | None = None) -> RunStatus:
                 for field in ("error", "retryable", "updated_at"):
                     deployment.pop(field, None)
                 if retained:
-                    checkpoint_id = min(retained)
-                    status.deployment = {
-                        **deployment,
-                        "state": "ready",
-                        "checkpoint_id": checkpoint_id,
-                    }
-                    if "openai_model" in deployment:
-                        status.deployment["openai_model"] = checkpoint_id
+                    status.deployment = _retained_checkpoint_deployment(status, min(retained))
                 else:
                     status.deployment = {**deployment, "state": "undeployed"}
                     if status.state == "deployed":

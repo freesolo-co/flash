@@ -2707,7 +2707,8 @@ def test_user_key_undeploy_returns_public_persisted_deployment(api, monkeypatch)
     assert body == api.get(f"/v1/runs/{run_id}/deploy", headers=_bearer(key)).json()
 
 
-def test_sibling_undeploy_returns_exact_removed_checkpoint(api, monkeypatch):
+@pytest.mark.parametrize("remove_summary", [False, True])
+def test_sibling_undeploy_returns_exact_removed_checkpoint(api, monkeypatch, remove_summary):
 
     key = _login()
     run_id = _make_run(api, key, "deployed")
@@ -2737,24 +2738,31 @@ def test_sibling_undeploy_returns_exact_removed_checkpoint(api, monkeypatch):
         },
     )
 
-    response = api.delete(f"/v1/runs/{run_id}/deploy?checkpoint_id={sibling}", headers=_bearer(key))
+    reports = []
+    monkeypatch.setattr(deployment_state, "_enqueue_deployment_report", reports.append)
+    target = current if remove_summary else sibling
+    retained = sibling if remove_summary else current
+    response = api.delete(f"/v1/runs/{run_id}/deploy?checkpoint_id={target}", headers=_bearer(key))
 
     assert response.status_code == 200, response.text
     body = response.json()
     assert body == {
         "run_id": run_id,
-        "checkpoint_step": 20,
-        "checkpoint_id": sibling,
+        "checkpoint_step": None if remove_summary else 20,
+        "checkpoint_id": target,
         "state": "undeployed",
         "verified_at": None,
-        "openai_model": sibling,
-        "disabled_checkpoints": [sibling],
+        "openai_model": target,
+        "disabled_checkpoints": [target],
         "serving_deregistered": False,
     }
     persisted = runner_status.get_status(run_id)
     assert persisted.state == "deployed"
     assert persisted.deployment["state"] == "ready"
-    assert persisted.deployment["checkpoint_id"] == current
+    assert persisted.deployment["checkpoint_id"] == retained
+    assert len(reports) == int(remove_summary)
+    if remove_summary:
+        assert reports[0].deployment == persisted.deployment
 
 
 @pytest.mark.parametrize(
@@ -5046,8 +5054,14 @@ def test_chat_sends_no_stop_when_run_configured_none(api, monkeypatch):
     assert seen["stop"] is None
 
 
-def test_failed_smoke_revision_cannot_be_exact_chatted(api, monkeypatch):
+@pytest.mark.parametrize(
+    ("cleanup_fails", "previously_verified"), [(False, False), (True, False), (False, True)]
+)
+def test_failed_smoke_cleans_only_unverified_checkpoint(
+    api, monkeypatch, cleanup_fails, previously_verified
+):
     from flash.serve.contract.errors import ServingError
+    from flash.server.platform.internal_client import run_serving_org_id
 
     key = _login()
     run_id = api.post(
@@ -5057,6 +5071,27 @@ def test_failed_smoke_revision_cannot_be_exact_chatted(api, monkeypatch):
     status.state = "done"
     runner_state._save_status(status)
     revision = f"{run_id}/final"
+    sibling = f"{run_id}/step-20"
+    runner_verified_revisions.add_verified_checkpoint(
+        run_id,
+        sibling,
+        expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
+    )
+    if previously_verified:
+        runner_verified_revisions.add_verified_checkpoint(
+            run_id,
+            revision,
+            expected_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
+        )
+    undeploys = []
+
+    def undeploy(checkpoint_id, *, org_id):
+        undeploys.append((checkpoint_id, org_id))
+        if cleanup_fails:
+            raise ServingError("backend unavailable")
+        return {"disabled_checkpoints": [checkpoint_id]}
+
+    monkeypatch.setattr(serving_deploy, "undeploy_adapter", undeploy)
 
     def fake_deploy(**kwargs):
         kwargs["before_ready"](
@@ -5076,13 +5111,24 @@ def test_failed_smoke_revision_cannot_be_exact_chatted(api, monkeypatch):
     )
 
     assert deployment.status_code == 200, deployment.text
-    assert deployment.json()["state"] == "failed"
-    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset()
+    assert deployment.json()["state"] == ("revocation_failed" if cleanup_fails else "failed")
+    if cleanup_fails:
+        assert deployment.json()["retryable"] is True
+        assert "checkpoint cleanup failed: backend unavailable" in deployment.json()["error"]
+    assert undeploys == ([] if previously_verified else [(revision, run_serving_org_id(status))])
+    expected_verified = {sibling, revision} if previously_verified else {sibling}
+    assert runner_verified_revisions.read_verified_checkpoints(run_id) == frozenset(
+        expected_verified
+    )
 
     monkeypatch.setattr(
         serving_deploy,
         "chat",
-        lambda **kwargs: pytest.fail("unverified checkpoint must not reach serving"),
+        lambda **kwargs: (
+            _managed_chat_result(revision, content="still verified")
+            if previously_verified
+            else pytest.fail("unverified checkpoint must not reach serving")
+        ),
     )
     response = api.post(
         f"/v1/runs/{run_id}/chat",
@@ -5093,8 +5139,12 @@ def test_failed_smoke_revision_cannot_be_exact_chatted(api, monkeypatch):
         headers=_bearer(key),
     )
 
-    assert response.status_code == 409
-    assert "has not passed a successful deployment smoke" in response.json()["detail"]
+    if previously_verified:
+        assert response.status_code == 200, response.text
+        assert response.json()["choices"][0]["message"]["content"] == "still verified"
+    else:
+        assert response.status_code == 409
+        assert "has not passed a successful deployment smoke" in response.json()["detail"]
 
 
 @pytest.mark.parametrize("deployment_state", ["undeployed", "revocation_failed"])

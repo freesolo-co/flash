@@ -396,18 +396,69 @@ def test_sibling_undeploy_preserves_deployed_summary_and_state(tmp_path, monkeyp
     assert verified_revisions.read_verified_checkpoints("run-sibling") == frozenset({current})
 
 
-def test_current_undeploy_promotes_remaining_verified_sibling(tmp_path, monkeypatch) -> None:
-    current, sibling = _save_ready_status(tmp_path, monkeypatch, "run-promote", "run-promote/final")
+@pytest.mark.parametrize(("removed_step", "retained_step"), [(None, 20), (40, 20), (20, None)])
+def test_current_undeploy_promotes_remaining_verified_sibling(
+    tmp_path, monkeypatch, removed_step, retained_step
+) -> None:
+    from flash.runner.lifecycle import state
+    from flash.runner.supervise.deploy import _is_preservable_checkpoint_deployment
+
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
+    run_id = "run-promote"
+    current = format_checkpoint_ref(run_id, removed_step)
+    sibling = format_checkpoint_ref(run_id, retained_step)
+    state._save_status(
+        RunStatus(
+            run_id=run_id,
+            state="deployed",
+            spec={"algorithm": "sft"},
+            deployment={
+                "state": "ready",
+                "checkpoint_id": current,
+                "checkpoint_step": removed_step,
+                "openai_model": current,
+                "adapter_hf_prefix": "removed/adapter",
+                "model": "Qwen/Qwen3.5-9B",
+                "openai_base_url": "https://serve.test/v1",
+                "verified_at": 1.0,
+                "verify_turns": 2,
+                "requested_at": 0.5,
+                "detail": "removed checkpoint smoke result",
+            },
+        )
+    )
+    for checkpoint_id in (current, sibling):
+        assert verified_revisions.add_verified_checkpoint(
+            run_id,
+            checkpoint_id,
+            expected_generation=verified_revisions.verified_checkpoint_generation(run_id),
+        )
 
     updated = transitions.mark_undeployed("run-promote", current)
 
     assert updated.state == "deployed"
-    assert updated.deployment == {
-        "state": "ready",
-        "checkpoint_id": sibling,
-        "verified_at": 1.0,
-    }
+    assert updated.deployment["checkpoint_id"] == sibling
+    assert updated.deployment["checkpoint_step"] == retained_step
+    assert updated.deployment["openai_model"] == sibling
+    suffix = "" if retained_step is None else f"/checkpoints/step-{retained_step}"
+    assert updated.deployment["adapter_hf_prefix"] == f"sft/{run_id}{suffix}/adapter"
+    assert updated.deployment["model"] == "Qwen/Qwen3.5-9B"
+    assert updated.deployment["openai_base_url"] == "https://serve.test/v1"
+    assert not {"verified_at", "verify_turns", "requested_at", "detail"} & updated.deployment.keys()
+    assert _is_preservable_checkpoint_deployment(run_id, updated.deployment)
     assert verified_revisions.read_verified_checkpoints("run-promote") == frozenset({sibling})
+
+
+def test_chat_recovery_hint_uses_canonical_final_checkpoint() -> None:
+    from fastapi import HTTPException
+
+    from flash.server.routes.serving_chat import _require_active_deployment
+
+    with pytest.raises(HTTPException) as raised:
+        _require_active_deployment("run-a", "done", {}, None)
+
+    assert raised.value.status_code == 409
+    assert "`flash models deploy run-a/final`" in raised.value.detail
 
 
 def test_checkpoint_registration_rejects_bare_managed_selector() -> None:

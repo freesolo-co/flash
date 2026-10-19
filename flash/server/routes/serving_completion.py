@@ -11,7 +11,10 @@ import flash.runner.supervise.transitions as runner_transitions
 import flash.serve.deployment.deploy as serving_deploy
 import flash.server.platform.locks as deployment_locks
 from flash.core.spec import JobSpec
-from flash.runner.results.verified_revisions import verified_checkpoint_generation
+from flash.runner.results.verified_revisions import (
+    read_verified_checkpoints,
+    verified_checkpoint_generation,
+)
 from flash.serve.contract.errors import AdapterConfigMissing, ServingError
 from flash.serve.deployment.deploy import DeploymentReadinessFacts
 from flash.server.platform import db, deployment_state
@@ -151,9 +154,12 @@ def _finish_deployment_unlocked(
         return
     current = dict(deployment)
     smoke_result: dict = {}
+    verified_before = read_verified_checkpoints(run_id)
+    smoke_target: str | None = None
 
     def _before_ready(facts: DeploymentReadinessFacts) -> None:
-        nonlocal current
+        nonlocal current, smoke_target
+        smoke_target = facts.checkpoint_id
         _assert_deployment_fence(run_id, deployment, is_checkpoint, prev_state)
         current = deployment_state._deployment_state(
             {**current, "checkpoint_id": facts.checkpoint_id, "openai_model": facts.checkpoint_id},
@@ -183,6 +189,12 @@ def _finish_deployment_unlocked(
     try:
         dep = serving_deploy.deploy_adapter(**deploy_kwargs, before_ready=_before_ready)
     except Exception as exc:
+        if (
+            smoke_target is not None
+            and smoke_target not in verified_before
+            and not _revoke_failed_smoke(run_id, smoke_target, str(deploy_kwargs["org_id"]), exc)
+        ):
+            return
         _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
         return
 
@@ -202,6 +214,23 @@ def _finish_deployment_unlocked(
             f"deploy[{run_id}]: checkpoint ready but deployment record changed concurrently",
             flush=True,
         )
+
+
+def _revoke_failed_smoke(
+    run_id: str, checkpoint_id: str, org_id: str, smoke_error: Exception
+) -> bool:
+    """disable an unverified hosted checkpoint, retaining a retryable state on cleanup failure."""
+    try:
+        serving_deploy.undeploy_adapter(checkpoint_id, org_id=org_id)
+    except Exception as exc:
+        error = f"{smoke_error}; checkpoint cleanup failed: {exc}"
+        previous = run_status.get_status(run_id)
+        marked = runner_transitions.mark_deployment_revocation_failed(
+            run_id, error, checkpoint_id=checkpoint_id
+        )
+        deployment_state._report_persisted_transition(previous, marked, persisted=True)
+        return False
+    return True
 
 
 def _record_deployment_failure(

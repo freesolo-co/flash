@@ -404,10 +404,7 @@ def undeploy(
                 },
             ) from exc
         marked = mark_undeployed(run_id, checkpoint_id)
-        persisted = isinstance(marked.deployment, dict) and (
-            marked.deployment.get("state") == "undeployed"
-        )
-        deployment_state._report_persisted_transition(status, marked, persisted=persisted)
+        deployment_state._report_persisted_transition(status, marked, persisted=True)
         deployment = (
             marked.deployment if isinstance(marked.deployment, dict) else {"state": "undeployed"}
         )

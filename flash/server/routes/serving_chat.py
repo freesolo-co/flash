@@ -163,7 +163,7 @@ def _require_active_deployment(
         )
     raise HTTPException(
         status_code=409,
-        detail=f"run {run_id} has no active deployment; `flash models deploy {run_id}` first",
+        detail=f"run {run_id} has no active deployment; `flash models deploy {run_id}/final` first",
     )
 
 
