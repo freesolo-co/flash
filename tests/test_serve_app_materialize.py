@@ -1107,3 +1107,35 @@ def test_same_length_shard_corruption_is_not_reported_as_cached(tmp_path: Path) 
     assert served.stat().st_size == original_size
 
     assert not base_weights_are_cached(manifest, cache, snapshot_download_fn=offline)
+
+
+def test_separate_tokenizer_hydration_excludes_tensor_weights(tmp_path):
+    import fnmatch
+
+    config_bytes, weights_bytes = _artifact_bytes(tmp_path)
+    manifest = _manifest(config_bytes, weights_bytes)
+    calls = []
+
+    def download(**kwargs):
+        calls.append(kwargs)
+        return str(tmp_path / "snapshot")
+
+    hydrate_base_weights(
+        manifest, tmp_path / "cache", token_fd=_token_fd(), snapshot_download_fn=download
+    )
+    model, tokenizer = calls
+    assert "ignore_patterns" not in model
+    patterns = tokenizer["ignore_patterns"]
+    for name in ["model-00001-of-00018.safetensors", "pytorch_model.bin", "model.gguf"]:
+        assert any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
+    for name in [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer.bin",
+        "vocab.json",
+        "merges.txt",
+        "chat_template.jinja",
+        "tokenization_custom.py",
+    ]:
+        assert not any(fnmatch.fnmatch(name, pattern) for pattern in patterns)

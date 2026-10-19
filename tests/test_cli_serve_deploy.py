@@ -15,7 +15,7 @@ from flash.serve.provisioning import InterruptedProvisioning
 
 DIGEST = "sha256:" + "a" * 64
 IMAGE = f"ghcr.io/freesolo-co/freesolo-flash-serve@{DIGEST}"
-CERTIFIED_DIGEST = "sha256:2bf27b51f6e4b7f0b2d805d96202579d94868e2c594b7c496777d350ad6936f6"
+CERTIFIED_DIGEST = "sha256:f193e587ec5fc18313dc90c2efef39bc5c2e288eae3a14f0d6c4a4e094b128f7"
 CERTIFIED_IMAGE = f"ghcr.io/freesolo-co/freesolo-flash-serve@{CERTIFIED_DIGEST}"
 MODEL = "Qwen/Qwen3.5-9B"
 

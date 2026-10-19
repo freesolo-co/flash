@@ -42,6 +42,17 @@ _COPY_CHUNK_BYTES = 1024 * 1024
 # artifact token only exists during bootstrap, so the weights are pulled into the persistent
 # volume's hub cache while it is still available and every later start reads them from there.
 BASE_WEIGHTS_CACHE_DIRNAME = "hub"
+_TOKENIZER_WEIGHT_PATTERNS = (
+    "*.safetensors",
+    "pytorch_model*.bin",
+    "*.gguf",
+    "tf_model*.h5",
+    "flax_model*.msgpack",
+    "*.onnx",
+    "*.pt",
+    "*.pth",
+    "*.ot",
+)
 _DIRECTORY_FLAGS = (
     getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 )
@@ -201,6 +212,14 @@ def hydrate_base_weights(
                     revision=revision,
                     token=token,
                     cache_dir=str(cache_dir),
+                    # A separate tokenizer revision needs configs and vocabulary, not
+                    # another full copy of the unquantized model's tensor shards.
+                    **(
+                        {"ignore_patterns": list(_TOKENIZER_WEIGHT_PATTERNS)}
+                        if (repo_id, revision)
+                        != (manifest.engine.served_model, manifest.engine.model_revision)
+                        else {}
+                    ),
                 )
             except Exception:
                 # the repo id is manifest data and safe to name, but the exception can carry the

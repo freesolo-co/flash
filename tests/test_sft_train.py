@@ -5432,3 +5432,47 @@ def test_resume_upload_unavailable_reports_the_oversized_member(tmp_path, capsys
     assert "largest member" in out, "the size that caused the failure must be reported"
     # the deepest file must be walked, not just the top level, or a sharded layout reports 0.
     assert "0.0 GB" in out
+
+
+@pytest.mark.parametrize("resume_step", [0, 1, 2])
+def test_sft_resume_keeps_mid_epoch_cursor_but_resets_exhausted_epoch(monkeypatch, resume_step):
+    class Trainer:
+        def __init__(self):
+            self.resume_global_step = resume_step
+            self.steps_per_epoch = 2
+            self.total_training_steps = 4
+            self.remaining = list(range(resume_step, 2))
+            self.train_dataloader = object()
+            self.ckpt_handler = SimpleNamespace(train_dataloader=self.train_dataloader)
+            self.rebuilds = 0
+
+        def _build_dataloader(self):
+            self.rebuilds += 1
+            self.train_dataloader = object()
+            self.remaining = [0, 1]
+
+        def fit(self):
+            # Match verl's next-epoch calculation with a restored stateful loader.
+            step = self.resume_global_step
+            seen = []
+            for epoch in range(step // self.steps_per_epoch, 2):
+                for item in self.remaining:
+                    seen.append((epoch, item))
+                    step += 1
+                self.remaining = [0, 1]
+            return step, seen
+
+    monkeypatch.setitem(sys.modules, "verl", _module("verl"))
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.trainer",
+        _module("verl.trainer", sft_trainer=_module("sft_trainer", SFTTrainer=Trainer)),
+    )
+    sft_plugin._install_epoch_boundary_resume()
+    sft_plugin._install_epoch_boundary_resume()
+    trainer = Trainer()
+    final_step, seen = trainer.fit()
+    assert final_step == 4
+    assert seen == [(step // 2, step % 2) for step in range(resume_step, 4)]
+    assert trainer.rebuilds == (1 if resume_step == 2 else 0)
+    assert trainer.ckpt_handler.train_dataloader is trainer.train_dataloader
