@@ -166,6 +166,9 @@ def test_insert_binds_immutable_checkpoint_and_returns_authoritative_row() -> No
 
     request = FakeClient.requests[0]
     assert request["url"].endswith("/rest/v1/rpc/bind_hosted_checkpoint")
+    # PostgREST resolves RPCs using Content-Profile, independently of the returned table.
+    assert request["headers"]["Content-Profile"] == "public"
+    assert request["headers"]["Accept-Profile"] == "public"
     assert request["json"] == {
         "p_org_id": ORG_ID,
         "p_run_id": RUN_ID,
