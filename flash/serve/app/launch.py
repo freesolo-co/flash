@@ -60,6 +60,7 @@ _SAFE_CHILD_COPIED_ENV_NAMES = frozenset(
         # the compiled-graph cache, so the child engine reuses the volume's graphs instead of
         # recompiling the model into ephemeral storage on every start.
         "VLLM_CACHE_ROOT",
+        "FLASHINFER_WORKSPACE_BASE",
     }
 )
 _FIXED_CHILD_ENVIRONMENT = {
@@ -481,14 +482,18 @@ def _bind_hub_cache(environment: MutableMapping[str, str], cache_root: str) -> N
     # the same reason as the engine settings above: it derives from the cache root the runtime
     # already knows, and a second provider must not have to rediscover it.
     vllm_cache = str(Path(cache_root) / _VLLM_CACHE_DIRNAME)
+    # FlashInfer maintains a separate version/architecture-keyed CUDA kernel cache.
+    flashinfer_cache = str(Path(cache_root) / "flashinfer")
     environment["HF_HOME"] = cache_root
     environment["HF_HUB_CACHE"] = hub_cache
     environment["VLLM_CACHE_ROOT"] = vllm_cache
+    environment["FLASHINFER_WORKSPACE_BASE"] = flashinfer_cache
     # the download path this image uses; xet intermittently fails engine init on a cold volume.
     environment["HF_HUB_DISABLE_XET"] = "1"
     os.environ["HF_HOME"] = cache_root
     os.environ["HF_HUB_CACHE"] = hub_cache
     os.environ["VLLM_CACHE_ROOT"] = vllm_cache
+    os.environ["FLASHINFER_WORKSPACE_BASE"] = flashinfer_cache
     os.environ["HF_HUB_DISABLE_XET"] = "1"
 
 
