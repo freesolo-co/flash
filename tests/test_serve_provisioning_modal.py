@@ -2020,6 +2020,69 @@ def test_teardown_never_deletes_resources_without_explicit_terminal_app_proof() 
     assert [name for name, _value in sdk.calls if name.startswith("delete_")] == []
 
 
+@pytest.mark.parametrize("terminal_state", ["stopped", "failed"])
+@pytest.mark.parametrize("running_containers", [None, 2])
+@pytest.mark.parametrize("drains", [False, True])
+@pytest.mark.parametrize("with_handle", [False, True])
+def test_teardown_waits_for_terminal_app_containers(
+    terminal_state, running_containers, drains, with_handle
+) -> None:
+    bundle = _bundle()
+    plan = build_modal_create_plan(bundle)
+
+    class DrainingSdk(_FakeSdk):
+        terminal_polls = 0
+
+        def stop_app(self, received_plan, app_id: str, *, deadline_at=None) -> None:
+            super().stop_app(received_plan, app_id, deadline_at=deadline_at)
+            self.apps = [
+                replace(self.apps[0], state=terminal_state, running_containers=running_containers)
+            ]
+
+        def observe(self, received_plan, *, app_id_hint=None, deadline_at=None):
+            if self.apps and self.apps[0].state == terminal_state:
+                self.terminal_polls += 1
+                if drains and self.terminal_polls >= 2:
+                    self.apps = [replace(self.apps[0], running_containers=0)]
+            return super().observe(received_plan, app_id_hint=app_id_hint)
+
+        def delete_secret(self, received_plan, secret_id: str, *, deadline_at=None) -> None:
+            assert self.apps[0].running_containers == 0
+            super().delete_secret(received_plan, secret_id, deadline_at=deadline_at)
+
+        def delete_volume(self, received_plan, volume_id: str, *, deadline_at=None) -> None:
+            assert self.apps[0].running_containers == 0
+            super().delete_volume(received_plan, volume_id, deadline_at=deadline_at)
+
+    sdk = DrainingSdk(plan)
+    handle = _seed_exact(sdk, artifact=True)
+    clock = _Clock()
+    result = teardown_modal_deployment(
+        bundle,
+        handle if with_handle else None,
+        ModalCredentials(PROVIDER_ID, PROVIDER_SECRET),
+        deadline_at=20.0,
+        sdk_factory=lambda _credentials, _plan, _deadline_at, _clock: sdk,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert sdk.terminal_polls >= 2
+    deletions = [name for name, _value in sdk.calls if name.startswith("delete_")]
+    if drains:
+        assert result.status == "absent"
+        assert 0 < clock.now < 20.0
+        assert deletions == ["delete_artifact", "delete_inference", "delete_volume"]
+        assert sdk.volumes == sdk.inference == sdk.artifact == []
+    else:
+        assert result.status == "outcome_unknown"
+        assert clock.now == 20.0
+        assert deletions == []
+        assert sdk.volumes
+        assert sdk.inference
+        assert sdk.artifact
+
+
 def test_teardown_accepts_terminal_app_with_retained_finalized_tags() -> None:
     bundle = _bundle()
     plan = build_modal_create_plan(bundle)

@@ -79,12 +79,16 @@ def terminal_app_matches(
     handle: ModalProviderHandle,
     app: ModalAppObservation,
 ) -> bool:
+    """match terminal ownership; callers must separately prove containers have drained."""
     return (
         _valid_provider_id(app.app_id, "app")
         and app.app_id == handle.app_id
         and app.app_name == plan.names.app_or_pod
         and app.state in {"stopped", "failed"}
-        and app.running_containers == 0
+        and (
+            app.running_containers is None
+            or (type(app.running_containers) is int and app.running_containers >= 0)
+        )
         and app.function_id is None
         and app.function_name is None
         and app.public_url is None
@@ -190,7 +194,10 @@ def _reclaim_app_matches(
         )
     return (
         app.state in {"stopped", "failed"}
-        and app.running_containers == 0
+        and (
+            app.running_containers is None
+            or (type(app.running_containers) is int and app.running_containers >= 0)
+        )
         and app.function_id is None
         and app.function_name is None
         and app.public_url is None

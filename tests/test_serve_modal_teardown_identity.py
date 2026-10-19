@@ -105,6 +105,29 @@ def test_teardown_ownership_still_requires_exact_app_id() -> None:
         exact_teardown_resources(plan, handle, _observation(plan, app_id=OTHER_APP_ID))
 
 
+@pytest.mark.parametrize("with_handle", [False, True])
+@pytest.mark.parametrize("running_containers", [None, 2])
+def test_draining_terminal_app_still_requires_exact_ownership(with_handle, running_containers):
+    plan, handle = _plan_and_handle()
+    observation = _observation(plan)
+    app = replace(
+        observation.apps[0],
+        state="stopped",
+        running_containers=running_containers,
+        function_id=None,
+        function_name=None,
+        public_url=None,
+    )
+    for changes in ({"app_id": OTHER_APP_ID}, {"app_name": "another-deployment"}):
+        with pytest.raises(ModalResourceConflict):
+            exact_teardown_resources(
+                plan,
+                handle if with_handle else None,
+                replace(observation, apps=(replace(app, **changes),)),
+                app_id_hint=None if with_handle else APP_ID,
+            )
+
+
 @pytest.mark.parametrize("regional", [False, True])
 def test_exact_endpoint_accepts_legacy_and_us_east_routing_urls(regional):
     from flash.serve.provisioning.modal.execution.operations import _validate_handle
