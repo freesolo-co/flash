@@ -9811,6 +9811,13 @@ def test_build_opd_overrides_requires_a_sized_rollout_memory_budget():
         build_opd_overrides(config)
 
 
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_opd_rollout_enables_vision_adapters_only_for_image_training(multimodal):
+    overrides = build_opd_overrides(_config(multimodal=multimodal))
+    flag = "+actor_rollout_ref.rollout.engine_kwargs.vllm.enable_tower_connector_lora=True"
+    assert (flag in overrides) is multimodal
+
+
 def test_build_opd_overrides_halves_agent_loop_workers_for_multimodal_runs():
     # same fan-out that exhausted the grpo worker container with `libgomp: Thread creation failed`:
     # every agent worker is a ray actor holding its own processor copy, and on an image run that is

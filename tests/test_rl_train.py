@@ -1552,6 +1552,13 @@ def test_build_verl_overrides_sizes_agent_loop_workers_to_the_rollout_batch():
     assert "actor_rollout_ref.rollout.agent.num_workers=8" in big
 
 
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_rollout_enables_vision_adapters_only_for_image_training(multimodal):
+    overrides = rl_verl.build_verl_overrides(_overrides_cfg(multimodal=multimodal))
+    flag = "+actor_rollout_ref.rollout.engine_kwargs.vllm.enable_tower_connector_lora=True"
+    assert (flag in overrides) is multimodal
+
+
 def test_build_verl_overrides_halves_agent_loop_workers_for_multimodal_runs():
     # every agent worker is a ray actor with its own processor copy. on an image run that is a
     # full image processor, and eight of them beside the vllm engine exhausted the worker

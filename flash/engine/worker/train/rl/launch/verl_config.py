@@ -470,6 +470,10 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         # the extra rollout-vs-train mismatch fp8 introduces. '+' appends the key under the existing
         # engine_kwargs.vllm struct (it is not a default field).
         o.append("+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=fp8")
+    if cfg.get("multimodal"):
+        # The actor trains vision adapters too. vLLM otherwise ignores those modules
+        # during rollouts, generating from a different policy than the actor updates.
+        o.append("+actor_rollout_ref.rollout.engine_kwargs.vllm.enable_tower_connector_lora=True")
     if cfg.get("enforce_eager"):
         # this card's vllm 0.19.1 graph capture degenerates (see resolve_rollout_enforce_eager).
         # rollout.enforce_eager is a real verl field, so this is a plain override, not a '+' append.

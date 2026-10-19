@@ -339,6 +339,11 @@ def build_opd_overrides(config: dict) -> list[str]:
         *_distillation_overrides(config),
         *_trainer_overrides(config),
     ]
+    if config.get("multimodal"):
+        # Match the image-trained actor's vision adapters when generating student rollouts.
+        overrides.append(
+            "+actor_rollout_ref.rollout.engine_kwargs.vllm.enable_tower_connector_lora=True"
+        )
     if config.get("multi_turn"):
         overrides.append(f"actor_rollout_ref.rollout.prompt_length={_hydra_val(max_tokens)}")
     structured_outputs = config.get("structured_outputs")
