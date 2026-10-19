@@ -34,7 +34,6 @@ def _install_multi_turn() -> None:
 
 def required_patch_specs(config: dict) -> tuple[tuple, ...]:
     """describe every fail-closed GRPO patch without importing its target modules."""
-    entropy_quantile = config.get("entropy_quantile")
     model_type = config.get("gdn_model_type")
     return (
         (
@@ -80,15 +79,6 @@ def required_patch_specs(config: dict) -> tuple[tuple, ...]:
             "verl.workers.engine.fsdp.transformer_impl",
             runtime.install_text_lora_targeting,
             (str(config.get("lora_language_prefix") or ""),),
-            {},
-        ),
-        (
-            "entropy-quantile",
-            entropy_quantile is not None and float(entropy_quantile) < 1.0,
-            "required",
-            "verl.workers.utils.losses",
-            patches.install_entropy_quantile,
-            (float(entropy_quantile) if entropy_quantile is not None else 1.0,),
             {},
         ),
         (

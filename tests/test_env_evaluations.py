@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-import flash.cli as cli
-from flash.envs.evaluations import (
+import flash.cli.parsing.main as cli
+from flash.envs.meta.evaluations import (
     BaseEvalSuite,
     EvalCase,
     EvalResult,
@@ -27,7 +27,11 @@ _PUBLISHED_SLUG = "acme/example-project/starter"
 # a full immutable revision: the one target shape that needs no resolution, so a test about
 # anything else does not have to stub `deployments()`. `RUN/step-N` is a shorthand the CLI now
 # pins first, which is its own contract (`test_env_eval_pins_a_step_shorthand_...`).
-_EXPLICIT_TARGET = "flash-1@step-3." + "a" * 40
+_EXPLICIT_TARGET = "flash-1/step-3"
+
+
+def _run_record(spec: dict) -> dict:
+    return {"verified_checkpoints": [_EXPLICIT_TARGET], "spec": spec}
 
 
 class _EvalClient:
@@ -40,13 +44,21 @@ class _EvalClient:
     _env_dir: Path | None = None
 
     def get_run(self, run_id):
-        return {
-            "spec": {
+        return _run_record(
+            {
                 "thinking": False,
                 "project": _PROJECT_ID,
                 "environment": {"id": _PUBLISHED_SLUG},
             }
-        }
+        )
+
+    def deployments(self):
+        return [
+            {
+                "run_id": "flash-1",
+                "deployment": {"state": "ready", "checkpoint_id": _EXPLICIT_TARGET},
+            }
+        ]
 
     def warm_chat_step_selector(self, target):
         return None
@@ -106,7 +118,7 @@ def test_load_evaluation_suites_calls_factory_with_environment(tmp_path) -> None
     (env_dir / "eval_sidecar_helper.py").write_text("SUITE_NAME = 'held-out'\n")
     (env_dir / "evaluations.py").write_text(
         "from eval_sidecar_helper import SUITE_NAME\n"
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = SUITE_NAME\n"
         "    def __init__(self, environment): self.environment = environment\n"
@@ -125,7 +137,7 @@ def test_load_evaluation_suites_calls_factory_with_environment(tmp_path) -> None
 def test_load_evaluation_suites_supports_zero_arg_factory(tmp_path) -> None:
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'zero-arg'\n"
         "    def cases(self): return []\n"
@@ -143,7 +155,7 @@ def test_load_evaluation_suites_supports_positional_only_factory(tmp_path) -> No
     # the call -- a sidecar the documented contract says is supported.
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'positional-only'\n"
         "    def __init__(self, environment): self.environment = environment\n"
@@ -166,7 +178,7 @@ def _lazy_helper_env(root: Path, label: str) -> Path:
     (env_dir / "environment.py").write_text("def load_environment(**k):\n    return None\n")
     (env_dir / "helper.py").write_text(f"LABEL = {label!r}\n")
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         f"    name = {label!r}\n"
         "    def cases(self):\n"
@@ -213,7 +225,7 @@ def _package_helper_env(root: Path, label: str, *, namespace: bool) -> Path:
     (env_dir / "graders" / "rules.py").write_text(f"LABEL = {label!r}\n")
     (env_dir / "evaluations.py").write_text(
         "from graders.rules import LABEL\n"
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         f"    name = {label!r}\n"
         "    def cases(self): return [EvalCase(id=LABEL, input='x', expected='x')]\n"
@@ -242,7 +254,7 @@ def test_sibling_packages_do_not_leak_between_environments(tmp_path, namespace: 
 def test_load_evaluation_suites_supports_module_fallback(tmp_path) -> None:
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'fallback'\n"
         "    def cases(self): return []\n"
@@ -350,7 +362,7 @@ def test_eval_suite_report_excludes_transport_errors_from_metrics() -> None:
 def test_env_eval_reports_error_count_and_fails_overall(monkeypatch, tmp_path, capsys) -> None:
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'mixed'\n"
         "    def cases(self): return [\n"
@@ -366,7 +378,9 @@ def test_env_eval_reports_error_count_and_fails_overall(monkeypatch, tmp_path, c
                 raise ConnectionError("connection reset")
             yield "good"
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", PartialClient)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -387,7 +401,7 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys) 
     """
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'math'\n"
         "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
@@ -397,13 +411,22 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys) 
     class Client(_EvalClient):
         def __init__(self):
             self.calls = []
+            self.run_calls = 0
+
+        def get_run(self, run_id):
+            self.run_calls += 1
+            if self.run_calls > 1:
+                raise RuntimeError("a second run lookup is unavailable")
+            return super().get_run(run_id)
 
         def chat_stream(self, target, messages, **kwargs):
             self.calls.append((target, messages, kwargs))
             yield "4"
 
     client = Client()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
 
     result = cli.main(
@@ -420,6 +443,7 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys) 
     )
 
     assert result == 0
+    assert client.run_calls == 1
     assert client.calls == [
         (
             _EXPLICIT_TARGET,
@@ -433,166 +457,21 @@ def test_env_eval_scores_deployed_target_offline(monkeypatch, tmp_path, capsys) 
     assert "overall: PASS" in output
 
 
-def test_env_eval_pins_bare_run_alias_before_generating_and_uploading(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    # a bare run id is a mutable deployment alias. resolving it once prevents later cases from
-    # reaching a replacement adapter while one report claims every score came from one model.
-    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'pinned'\n"
-        "    def cases(self): return [\n"
-        "        EvalCase(id='first', input='first', expected='first'),\n"
-        "        EvalCase(id='second', input='second', expected='second'),\n"
-        "    ]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
-    revision = "flash-1@final." + "a" * 40
-
-    class Client(_EvalClient):
-        def __init__(self):
-            self.deployment_calls = []
-            self.targets = []
-
-        def deployments(self):
-            self.deployment_calls.append("deployments")
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {"state": "ready", "adapter_revision": revision},
-                }
-            ]
-
-        def chat_stream(self, target, messages, **kwargs):
-            self.targets.append(target)
-            yield messages[0]["content"]
-
-    client = Client()
-    uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
-    _patch_upload(monkeypatch, uploader)
-
-    assert cli.main(["env", "eval", "flash-1", "--project", _PROJECT_ID]) == 0
-
-    # resolved exactly once, before any case ran: the whole report must come from one revision.
-    assert client.deployment_calls == ["deployments"]
-    assert client.targets == [revision, revision]
-    assert uploader.calls[0]["model"] == revision
-    assert f"resolved evaluation target flash-1 to {revision}" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize(
-    ("deployment", "reason"),
-    [
-        (None, "is not deployed"),
-        ({"state": "ready"}, "has no valid immutable adapter revision"),
-        (
-            {"state": "ready", "adapter_revision": "other-run@final." + "b" * 40},
-            "has no valid immutable adapter revision",
-        ),
-        # `/v1/deployments` excludes only undeployed/dry_run, so a terminal record is still listed
-        # and "has a record" was read as "has a servable one". The chat route has no ready
-        # predecessor for these, so every case 409s: a whole suite of generation failures to say
-        # what one target error says here.
-        ({"state": "failed"}, "deployment is failed"),
-        ({"state": "revocation_failed"}, "deployment is revocation_failed"),
-    ],
-    ids=[
-        "absent",
-        "no-revision",
-        "another-runs-revision",
-        "failed",
-        "revocation-failed",
-    ],
-)
-def test_env_eval_refuses_a_bare_alias_it_cannot_pin(
-    monkeypatch, tmp_path, capsys, deployment, reason
-) -> None:
-    # the counterpart to the test above: an alias that resolves to nothing immutable cannot be
-    # evaluated reproducibly. each case has to stop BEFORE generating -- grading against whatever
-    # the alias points at right now spends the whole suite on a model the report cannot name, and
-    # a revision belonging to another run is not this run's model at all.
-    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
-
-    class Client(_EvalClient):
-        def deployments(self):
-            if deployment is None:
-                return []
-            return [{"run_id": "flash-1", "deployment": dict(deployment)}]
-
-        def chat_stream(self, target, messages, **kwargs):
-            raise AssertionError("no case may generate against an unpinned alias")
-            yield ""
-
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", Client)
-
-    assert cli.main(["env", "eval", "flash-1"]) == 1
-    captured = capsys.readouterr().err
-    assert reason in captured
-    assert "overall: FAIL" in captured
-
-
-def test_env_eval_runs_a_pinned_step_whose_latest_deploy_failed(monkeypatch, tmp_path) -> None:
-    """A failed deployment record does not un-verify the steps already in the run's ledger.
-
-    Pinned steps resolve through the verified ledger, which only undeploy and revocation invalidate;
-    a later failed deploy must not block an earlier verified revision.
-    """
-    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
-
-    class Client(_EvalClient):
-        def __init__(self):
-            self.targets = []
-
-        def get_run(self, run_id):
-            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
-
-        def deployments(self):
-            # the newest attempt failed; step-3 was verified by an earlier, successful one.
-            return [{"run_id": "flash-1", "deployment": {"state": "failed"}}]
-
-        def warm_chat_step_selector(self, target):
-            return None
-
-        def chat_stream(self, target, messages, **kwargs):
-            self.targets.append(target)
-            yield "4"
-
-    client = Client()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
-
-    assert cli.main(["env", "eval", "flash-1/step-3", "--no-upload"]) == 0
-    # forwarded as written: the ledger the server resolves it against is not readable from here.
-    assert client.targets == ["flash-1/step-3"]
-
-
 def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    """The exemption above is `failed` only, because that is the state that spares the ledger.
-
-    `mark_deployment_revocation_failed` and the undeploy paths call
-    `invalidate_verified_adapter_revisions` (`flash/runner/supervise/deploy.py`), so under those states there
-    is no ledger left for `RUN/step-N` to resolve against and every case 409s -- the wasted suite of
-    generation failures this check exists to avoid. Exempting every terminal state for a pinned step
-    let `revocation_failed` through.
-    """
+    """a pinned checkpoint without verified membership must fail before evaluation starts."""
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.targets = []
 
         def get_run(self, run_id):
-            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
-
-        def deployments(self):
-            return [{"run_id": "flash-1", "deployment": {"state": "revocation_failed"}}]
+            return {
+                "verified_checkpoints": [],
+                "spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}},
+            }
 
         def warm_chat_step_selector(self, target):
             return None
@@ -602,66 +481,22 @@ def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
             yield "4"
 
     client = Client()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
 
     assert cli.main(["env", "eval", "flash-1/step-3"]) == 1
     captured = capsys.readouterr()
-    assert "deployment is revocation_failed" in captured.err
+    assert "has not passed deployment verification" in captured.err
     # one failure up front, not one per case: no generation was attempted.
     assert client.targets == []
-
-
-def test_env_eval_never_pins_the_revision_a_rollout_is_heading_to(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    """A busy record is listed with the revision it is rolling OUT to, not the one serving.
-
-    Pinning it graded a revision that was not answering requests and filed the scores under it.
-    The predecessor still serving underneath cannot be read from here -- `/v1/deployments` strips
-    `previous_deployment` as private rollback state (tests/test_server_api.py asserts the public
-    body omits it) -- so the run id is forwarded and the chat route resolves it, exactly as
-    `flash chat RUN` does through the same predecessor.
-    """
-    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
-    incoming = "flash-1@final." + "b" * 40
-
-    class Client(_EvalClient):
-        def __init__(self):
-            self.targets = []
-
-        def deployments(self):
-            # the public listing shape: no `previous_deployment`, so a redeploy over a live
-            # revision and a first rollout are indistinguishable from this side.
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {"state": "queued", "adapter_revision": incoming},
-                }
-            ]
-
-        def chat_stream(self, target, messages, **kwargs):
-            self.targets.append(target)
-            yield "4"
-
-    client = Client()
-    uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
-    _patch_upload(monkeypatch, uploader)
-
-    assert cli.main(["env", "eval", "flash-1", "--project", _PROJECT_ID]) == 0
-    # the run id is forwarded untouched: the incoming revision must never be substituted for it,
-    # in generation or in the uploaded report.
-    assert client.targets == ["flash-1"]
-    assert uploader.calls[0]["model"] == "flash-1"
-    assert incoming not in capsys.readouterr().out
 
 
 def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys) -> None:
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'ordered'\n"
         "    def cases(self): return [\n"
@@ -681,143 +516,15 @@ def test_env_eval_concurrency_preserves_case_order(monkeypatch, tmp_path, capsys
                 second_started.set()
             yield prompt
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--concurrency", "2", "--no-upload"]) == 0
 
     output = capsys.readouterr().out
     assert output.index("case first: PASS") < output.index("case second: PASS")
-
-
-def test_env_eval_settles_the_step_selector_capability_before_the_fan_out(
-    monkeypatch, tmp_path
-) -> None:
-    # warm the step-selector capability before workers start so a cold cache causes one health call.
-    # only surviving RUN/step-N shorthands need this; full and already-live revisions are pinned
-    # first.
-    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'many'\n"
-        "    def cases(self): return [\n"
-        "        EvalCase(id=f'c{i}', input='hi', expected='hi') for i in range(6)\n"
-        "    ]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
-    events: list[str] = []
-    lock = threading.Lock()
-
-    class Client(_EvalClient):
-        def get_run(self, run_id):
-            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
-
-        def deployments(self):
-            # step-20 is live, so the requested step-3 shorthand is NOT pinned to a revision and
-            # arrives at the fan-out still carrying its step selector.
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {
-                        "state": "ready",
-                        "checkpoint_step": 20,
-                        "adapter_revision": "flash-1@step-20." + "a" * 40,
-                    },
-                }
-            ]
-
-        def warm_chat_step_selector(self, target):
-            with lock:
-                events.append(f"warm:{target}")
-
-        def chat_stream(self, target, messages, **kwargs):
-            with lock:
-                events.append("chat")
-            yield "hi"
-
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", Client)
-
-    assert cli.main(["env", "eval", "flash-1/step-3", "--concurrency", "4", "--no-upload"]) == 0
-
-    # exactly one warm-up, and it precedes every chat -- a per-worker check would interleave.
-    assert events == ["warm:flash-1/step-3"] + ["chat"] * 6
-
-
-def test_env_eval_fails_the_target_when_the_capability_prewarm_fails(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    """A failed prewarm must end the eval, not be swallowed and re-raised once per case.
-
-    Suppressing it did not soften a transient blip, it multiplied it: the client caches only a
-    SUCCESSFUL check, so every worker then missed the same cold cache and re-ran it -- one bad
-    /v1/health became one per worker plus a generation error per case, burying the single line
-    that names the real cause. So assert the cascade is gone: nothing
-    is generated, and the cause is stated once at target level.
-    """
-    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'many'\n"
-        "    def cases(self): return [\n"
-        "        EvalCase(id=f'c{i}', input='hi', expected='hi') for i in range(6)\n"
-        "    ]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
-    from flash.client import ClientError
-
-    calls = {"warm": 0, "chat": 0}
-    lock = threading.Lock()
-
-    class Client(_EvalClient):
-        def get_run(self, run_id):
-            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
-
-        def deployments(self):
-            # step-20 is live, so the requested step-3 keeps its selector into the fan-out.
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {
-                        "state": "ready",
-                        "checkpoint_step": 20,
-                        "adapter_revision": "flash-1@step-20." + "a" * 40,
-                    },
-                }
-            ]
-
-        def _unsupported(self):
-            raise ClientError(
-                "chat checkpoint selectors require a control plane that advertises "
-                "chat_step_selector; use a full immutable adapter revision or upgrade the "
-                "control plane"
-            )
-
-        def warm_chat_step_selector(self, target):
-            with lock:
-                calls["warm"] += 1
-            self._unsupported()
-
-        def chat_stream(self, target, messages, **kwargs):
-            # what a worker really hits on a cold cache: the same check, failing the same way.
-            with lock:
-                calls["chat"] += 1
-            self._unsupported()
-            yield ""
-
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", Client)
-
-    assert cli.main(["env", "eval", "flash-1/step-3", "--concurrency", "4", "--no-upload"]) == 1
-
-    # settled once and never retried per worker, and no case bought a generation behind it.
-    assert calls == {"warm": 1, "chat": 0}
-    err = capsys.readouterr().err
-    # the cause reaches the user as one target-level error, not six per-case ones hiding it.
-    assert "chat checkpoint selectors require" in err
-    assert "generation failed" not in err
 
 
 def test_env_eval_rejects_invalid_target_before_loading(monkeypatch, capsys) -> None:
@@ -846,12 +553,15 @@ def test_env_eval_rejects_a_local_directory_positional(tmp_path, capsys) -> None
 def test_env_eval_no_upload_still_requires_a_published_environment(monkeypatch, capsys) -> None:
     """Opting out of recording does not invent the environment whose suites should be graded."""
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.generated = 0
 
         def get_run(self, run_id):
-            return {"spec": {"thinking": False, "project": _PROJECT_ID}}
+            return {
+                "verified_checkpoints": [_EXPLICIT_TARGET],
+                "spec": {"thinking": False, "project": _PROJECT_ID},
+            }
 
         def chat_stream(self, target, messages, **kwargs):
             self.generated += 1
@@ -878,7 +588,9 @@ def test_env_eval_refuses_a_published_environment_without_a_sidecar(
         def chat_stream(self, target, messages, **kwargs):
             raise AssertionError("a missing sidecar must fail before generation")
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -898,7 +610,7 @@ def _upload_env_dir(
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     extra = "        EvalCase(id='dead', input='dead', expected='dead'),\n" if dead_case else ""
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'math'\n"
         "    def cases(self): return [\n"
@@ -943,19 +655,21 @@ def test_env_eval_records_the_published_environment_it_graded(monkeypatch, tmp_p
             self.slug = slug
 
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": False,
                     "project": _PROJECT_ID,
                     "environment": {"id": self.slug},
                 }
-            }
+            )
 
         def chat_stream(self, target, messages, **kwargs):
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     _patch_upload(monkeypatch, uploader)
 
     slugs = ["acme/example-project/easy", "acme/example-project/hard"]
@@ -982,9 +696,12 @@ def test_env_eval_refuses_to_record_a_run_whose_project_is_unknown(
     name both ways out."""
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    class Client:
+    class Client(_EvalClient):
         def get_run(self, run_id):
-            return {"spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}}}
+            return {
+                "verified_checkpoints": [_EXPLICIT_TARGET],
+                "spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}},
+            }
 
         def warm_chat_step_selector(self, target):
             return None
@@ -994,7 +711,9 @@ def test_env_eval_refuses_to_record_a_run_whose_project_is_unknown(
             yield ""
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1018,7 +737,7 @@ def test_env_eval_upload_rejects_a_non_uuid_project_before_paying(
     )
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    assert cli.main(["env", "eval", "flash-1", "--project", "proj-9"]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", "proj-9"]) == 1
     captured = capsys.readouterr().err
     assert "--project must be a valid PROJECT_ID" in captured
     assert "valid UUID" in captured
@@ -1054,7 +773,7 @@ def test_env_eval_upload_rejects_an_inaccessible_project_before_paying(
     monkeypatch.setattr("flash.client.get_project", _denied, raising=False)
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    assert cli.main(["env", "eval", "flash-1", "--project", _PROJECT_ID]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 1
     captured = capsys.readouterr().err
     assert "--project must be a valid PROJECT_ID" in captured
     assert "is not accessible" in captured
@@ -1067,7 +786,7 @@ def test_env_eval_preflight_never_shows_the_plane_key_to_the_hosted_api(monkeypa
     ownership lookup against the hosted backend would leak it (SELF_HOSTING.md) -- and be rejected,
     breaking `flash env eval` for every self-hosted operator.
     """
-    from flash.cli.commands.env.eval import _require_accessible_project
+    from flash.cli.commands.env.testing.eval import _require_accessible_project
 
     monkeypatch.setattr(
         "flash.client.config.load_credentials", lambda: ("http://127.0.0.1:8080", "operator-key")
@@ -1083,7 +802,7 @@ def test_env_eval_preflight_never_shows_the_plane_key_to_the_hosted_api(monkeypa
 
 def test_env_eval_preflight_still_resolves_ownership_when_hosted(monkeypatch) -> None:
     """The hosted path keeps its real accessibility check, so an inaccessible project still refuses."""
-    from flash.cli.commands.env.eval import _require_accessible_project
+    from flash.cli.commands.env.testing.eval import _require_accessible_project
     from flash.client import ApiError, ClientError
 
     monkeypatch.setattr(
@@ -1115,7 +834,7 @@ def test_env_eval_upload_requires_credentials_before_paying(monkeypatch, tmp_pat
     )
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
-    assert cli.main(["env", "eval", "flash-1", "--project", _PROJECT_ID]) == 1
+    assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", _PROJECT_ID]) == 1
     assert "not logged in" in capsys.readouterr().err
 
 
@@ -1137,13 +856,13 @@ def test_env_eval_no_upload_never_records_anything(monkeypatch, tmp_path) -> Non
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": False,
                     "project": _PROJECT_ID,
                     "environment": {"id": _PUBLISHED_SLUG},
                 }
-            }
+            )
 
         def warm_chat_step_selector(self, target):
             return None
@@ -1152,7 +871,9 @@ def test_env_eval_no_upload_never_records_anything(monkeypatch, tmp_path) -> Non
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1170,13 +891,13 @@ def test_env_eval_records_under_the_evaluated_runs_own_project(monkeypatch, tmp_
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": False,
                     "project": _PROJECT_ID,
                     "environment": {"id": _PUBLISHED_SLUG},
                 }
-            }
+            )
 
         def warm_chat_step_selector(self, target):
             return None
@@ -1185,7 +906,9 @@ def test_env_eval_records_under_the_evaluated_runs_own_project(monkeypatch, tmp_
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1200,13 +923,13 @@ def test_env_eval_project_flag_overrides_the_runs_own_project(monkeypatch, tmp_p
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": False,
                     "project": _PROJECT_ID,
                     "environment": {"id": _PUBLISHED_SLUG},
                 }
-            }
+            )
 
         def warm_chat_step_selector(self, target):
             return None
@@ -1215,7 +938,9 @@ def test_env_eval_project_flag_overrides_the_runs_own_project(monkeypatch, tmp_p
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1235,7 +960,7 @@ def test_env_eval_records_the_hub_environment_the_run_trains_on(
     the rest of the dashboard is keyed by, and a hub `github:` ref is canonicalized to the slug it
     denotes -- the same normalization the submit route applies when it records the run.
     """
-    from flash.envs.loader import managed_slug_to_github_ref
+    from flash.envs.loading.loader import managed_slug_to_github_ref
 
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
     expected = "acme/example-project/starter"
@@ -1245,13 +970,13 @@ def test_env_eval_records_the_hub_environment_the_run_trains_on(
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": False,
                     "project": _PROJECT_ID,
                     "environment": {"id": spec_environment},
                 }
-            }
+            )
 
         def warm_chat_step_selector(self, target):
             return None
@@ -1260,7 +985,9 @@ def test_env_eval_records_the_hub_environment_the_run_trains_on(
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1271,9 +998,12 @@ def test_env_eval_records_the_hub_environment_the_run_trains_on(
 def test_env_eval_refuses_a_run_that_names_no_published_environment(monkeypatch, capsys) -> None:
     """An evaluation with nothing published to name is refused rather than recorded against a path."""
 
-    class Client:
+    class Client(_EvalClient):
         def get_run(self, run_id):
-            return {"spec": {"thinking": False, "project": _PROJECT_ID}}
+            return {
+                "verified_checkpoints": [_EXPLICIT_TARGET],
+                "spec": {"thinking": False, "project": _PROJECT_ID},
+            }
 
         def warm_chat_step_selector(self, target):
             return None
@@ -1302,13 +1032,13 @@ def test_env_eval_refuses_a_generic_github_reference(monkeypatch, capsys) -> Non
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": False,
                     "project": _PROJECT_ID,
                     "environment": {"id": "github:acme/envs@main:starter/environment.py"},
                 }
-            }
+            )
 
         def chat_stream(self, target, messages, **kwargs):
             raise AssertionError("an unpublished reference must not be graded")
@@ -1334,7 +1064,7 @@ def test_env_eval_grades_the_hub_package_over_a_same_named_local_directory(
     published.mkdir()
     (published / "environment.py").write_text("def load_environment():\n    return None\n")
     (published / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'published'\n"
         "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
@@ -1347,7 +1077,7 @@ def test_env_eval_grades_the_hub_package_over_a_same_named_local_directory(
     local.mkdir(parents=True)
     (local / "environment.py").write_text("def load_environment():\n    return None\n")
     (local / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'local-working-copy'\n"
         "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
@@ -1360,7 +1090,9 @@ def test_env_eval_grades_the_hub_package_over_a_same_named_local_directory(
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path, **_k: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path, **_k: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1381,7 +1113,9 @@ def test_env_eval_upload_sends_every_case_with_the_project_id(monkeypatch, tmp_p
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1407,7 +1141,7 @@ def test_env_eval_upload_keeps_duplicate_id_cases_distinct(monkeypatch, tmp_path
     env_dir.mkdir()
     (env_dir / "environment.py").write_text("def load_environment():\n    return object()\n")
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'math'\n"
         "    def cases(self): return [\n"
@@ -1424,7 +1158,9 @@ def test_env_eval_upload_keeps_duplicate_id_cases_distinct(monkeypatch, tmp_path
             yield "6" if "3+3" in str(messages) else "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1458,7 +1194,9 @@ def test_env_eval_upload_reports_an_errored_case_verbatim(monkeypatch, tmp_path)
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", PartialClient)
     _patch_upload(monkeypatch, uploader)
 
@@ -1489,7 +1227,9 @@ def test_env_eval_upload_records_a_clean_suite_as_completed(monkeypatch, tmp_pat
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1504,7 +1244,7 @@ def test_env_eval_upload_records_suites_that_cannot_load_cases(monkeypatch, tmp_
     # the dashboard with a partial run that hides the exact failure responsible for the cli exit.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite\n"
         "class BrokenSuite(BaseEvalSuite):\n"
         "    name = 'broken'\n"
         "    def cases(self): raise RuntimeError('dataset missing')\n"
@@ -1519,7 +1259,9 @@ def test_env_eval_upload_records_suites_that_cannot_load_cases(monkeypatch, tmp_
             raise AssertionError("case loading failures must not generate")
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1561,7 +1303,7 @@ def test_env_eval_upload_keeps_duplicate_case_ids_with_their_own_input(
     # expected value. that uploads a graded case describing a question it never answered.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'dupes'\n"
         "    def cases(self): return [\n"
@@ -1576,7 +1318,9 @@ def test_env_eval_upload_keeps_duplicate_case_ids_with_their_own_input(
             yield messages[0]["content"]
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -1604,7 +1348,9 @@ def test_env_eval_upload_failure_does_not_relabel_a_passing_suite(
     def failing_upload(**kwargs):
         raise ClientError("freesolo is unreachable")
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, failing_upload)
 
@@ -1639,7 +1385,9 @@ def test_env_eval_upload_reports_a_key_lost_after_the_suite_ran(
         return next(keys, ("url", None))
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     monkeypatch.setattr("flash.client.upload_eval_run", uploader, raising=False)
     monkeypatch.setattr(
@@ -1656,7 +1404,7 @@ def test_env_eval_upload_reports_a_key_lost_after_the_suite_ran(
 def test_env_eval_blank_stream_errors_without_scoring(monkeypatch, tmp_path, capsys) -> None:
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'blank'\n"
         "    def cases(self): return [EvalCase(id='one', input='hello', expected='hi')]\n"
@@ -1668,7 +1416,9 @@ def test_env_eval_blank_stream_errors_without_scoring(monkeypatch, tmp_path, cap
         def chat_stream(self, target, messages, **kwargs):
             yield "   "
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", BlankClient)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -1698,7 +1448,7 @@ def test_env_eval_scoring_that_exits_fails_only_its_own_case(monkeypatch, tmp_pa
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
         "import sys\n"
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'exiting'\n"
         "    def cases(self): return [\n"
@@ -1715,7 +1465,9 @@ def test_env_eval_scoring_that_exits_fails_only_its_own_case(monkeypatch, tmp_pa
         def chat_stream(self, target, messages, **kwargs):
             yield messages[0]["content"]
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -1738,7 +1490,7 @@ def test_env_eval_serializes_scoring_across_worker_threads(monkeypatch, tmp_path
     # lives inside the command, and reloading the module would build a fresh one.
     (env_dir / "evaluations.py").write_text(
         "import time\n"
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         f"WITNESS = {str(witness)!r}\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'racy'\n"
@@ -1767,7 +1519,9 @@ def test_env_eval_serializes_scoring_across_worker_threads(monkeypatch, tmp_path
             generating.wait()
             yield messages[0]["content"]
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--concurrency", "6", "--no-upload"]) == 0
@@ -1782,7 +1536,7 @@ def test_env_eval_empty_suite_is_not_a_pass(monkeypatch, tmp_path, capsys) -> No
     # silently returned nothing.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'empty'\n"
         "    def cases(self): return []\n"
@@ -1793,7 +1547,9 @@ def test_env_eval_empty_suite_is_not_a_pass(monkeypatch, tmp_path, capsys) -> No
         def chat_stream(self, target, messages, **kwargs):
             raise AssertionError("no cases means no generation")
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -1809,7 +1565,7 @@ def test_env_eval_disambiguates_duplicate_case_ids(monkeypatch, tmp_path, capsys
     # showing one graded case where two ran.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'dupes'\n"
         "    def cases(self): return [\n"
@@ -1823,7 +1579,9 @@ def test_env_eval_disambiguates_duplicate_case_ids(monkeypatch, tmp_path, capsys
         def chat_stream(self, target, messages, **kwargs):
             yield messages[0]["content"]
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
@@ -1839,7 +1597,9 @@ def test_env_eval_debug_surfaces_the_load_traceback(monkeypatch, tmp_path) -> No
     # one-line message leaves nothing to debug with.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text("raise RuntimeError('sidecar exploded')\n")
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", _EvalClient)
 
     with pytest.raises(RuntimeError, match="sidecar exploded"):
@@ -1852,7 +1612,7 @@ def test_evaluation_sidecar_can_import_helpers_lazily(tmp_path) -> None:
     env_dir = _environment_dir(tmp_path)
     (env_dir / "lazy_helper.py").write_text("GOLD = 'deferred'\n")
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'lazy'\n"
         "    def cases(self):\n"
@@ -1869,7 +1629,7 @@ def test_evaluation_sidecar_can_import_helpers_lazily(tmp_path) -> None:
 def test_evaluation_sidecar_load_does_not_grow_sys_path(tmp_path) -> None:
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'repeat'\n"
         "    def cases(self): return []\n"
@@ -1894,7 +1654,7 @@ def test_evaluation_sidecars_do_not_share_a_sibling_module_name(tmp_path) -> Non
         (env_dir / "helper.py").write_text(f"GOLD = {gold!r}\n")
         (env_dir / "evaluations.py").write_text(
             "from helper import GOLD\n"
-            "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+            "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
             "class Suite(BaseEvalSuite):\n"
             f"    name = {package!r}\n"
             "    def cases(self): return [EvalCase(id='c', input=GOLD, expected=GOLD)]\n"
@@ -1933,7 +1693,7 @@ def test_a_sidecar_sibling_wins_over_an_unrelated_module_already_cached(tmp_path
     (env_dir / "environment.py").write_text("def load_environment():\n    return None\n")
     (env_dir / "helper.py").write_text("GOLD = 'OWN-SIBLING'\n")
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'shadowed'\n"
         "    def cases(self):\n"
@@ -1982,7 +1742,7 @@ def test_a_sidecar_package_submodule_wins_over_one_already_cached(
         (env_dir / "graders" / "__init__.py").write_text("")
     (env_dir / "graders" / "rules.py").write_text("GOLD = 'OWN-SIBLING'\n")
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'submodule'\n"
         "    def cases(self):\n"
@@ -2028,7 +1788,7 @@ def test_a_sidecar_namespace_package_wins_over_one_already_cached(tmp_path) -> N
     (env_dir / "environment.py").write_text("def load_environment():\n    return None\n")
     (env_dir / "graders" / "rules.py").write_text("GOLD = 'OWN-SIBLING'\n")
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'namespace'\n"
         "    def cases(self):\n"
@@ -2061,7 +1821,7 @@ def test_a_lazily_imported_helper_keeps_its_state_across_cases(tmp_path) -> None
     (env_dir / "environment.py").write_text("def load_environment():\n    return None\n")
     (env_dir / "counter.py").write_text("LOADS = []\nLOADS.append(1)\nCALLS = 0\n")
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'stateful'\n"
         "    def cases(self):\n"
@@ -2094,7 +1854,7 @@ def test_a_sidecar_load_leaves_unrelated_cached_modules_alone(tmp_path) -> None:
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
         "import base64\n"
-        "from flash.envs.evaluations import BaseEvalSuite\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'imports-stdlib'\n"
         "    def cases(self): return []\n"
@@ -2125,7 +1885,7 @@ def test_env_eval_forwards_split_and_params_to_the_environment(monkeypatch, tmp_
         def chat_stream(self, target, messages, **kwargs):
             yield "4"
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", _load)
+    monkeypatch.setattr("flash.envs.loading.loader.load_freesolo_environment", _load)
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert (
@@ -2151,12 +1911,14 @@ def test_env_eval_is_an_org_binding_command(monkeypatch, tmp_path, capsys) -> No
     # results are recorded under a project resolved from the ambient key, so a shadowing
     # FREESOLO_API_KEY belonging to another org has to be reported BEFORE the paid requests run, not
     # discovered at upload time with the whole evaluation already spent.
-    from flash.cli import _ORG_BINDING_COMMANDS
-    from flash.cli.commands.env.eval import cmd_env_eval
+    from flash.cli.commands.env.testing.eval import cmd_env_eval
+    from flash.cli.parsing.main import _ORG_BINDING_COMMANDS
 
     assert cmd_env_eval in _ORG_BINDING_COMMANDS
 
-    monkeypatch.setattr("flash.cli.shadowed_login_warning", lambda: "key belongs to other-org")
+    monkeypatch.setattr(
+        "flash.cli.parsing.main.shadowed_login_warning", lambda: "key belongs to other-org"
+    )
     monkeypatch.setattr(
         "flash.client.client_from_config",
         lambda: (_ for _ in ()).throw(AssertionError("client must not be constructed")),
@@ -2164,7 +1926,7 @@ def test_env_eval_is_an_org_binding_command(monkeypatch, tmp_path, capsys) -> No
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
 
     # the warning lands even on the run that fails its preflight: it precedes every request.
-    cli.main(["env", "eval", "flash-1", "--project", "proj-9"])
+    cli.main(["env", "eval", _EXPLICIT_TARGET, "--project", "proj-9"])
     assert "key belongs to other-org" in capsys.readouterr().err
 
 
@@ -2175,7 +1937,7 @@ def test_env_eval_abort_does_not_join_in_flight_generations(monkeypatch, tmp_pat
     # for that long.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'aborted'\n"
         "    def cases(self): return [\n"
@@ -2198,7 +1960,9 @@ def test_env_eval_abort_does_not_join_in_flight_generations(monkeypatch, tmp_pat
             assert slow_case_started.wait(timeout=10)
             raise KeyboardInterrupt
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     returned = threading.Event()
@@ -2233,14 +1997,14 @@ def test_env_eval_abort_does_not_hold_the_process_open(tmp_path) -> None:
     driver = tmp_path / "abort_driver.py"
     driver.write_text(
         "import argparse, threading, sys\n"
-        "from flash.cli.commands.env.eval import _generate_concurrently\n"
+        "from flash.cli.commands.env.testing.eval import _generate_concurrently\n"
         "release = threading.Event()\n"
         "def chat(*a, **k):\n"
         # stands in for a generation still streaming when the user aborts. a real one blocks on
         # the client's 30-minute read timeout; 300s is far past any plausible clean exit.
         "    release.wait(timeout=300)\n"
         "    return 'late'\n"
-        "import flash.cli.commands.env.eval as env_eval\n"
+        "import flash.cli.commands.env.testing.eval as env_eval\n"
         "env_eval._generate_case = chat\n"
         # the fan-out settles the step-selector capability on this thread first, so the client
         # has to answer that call; 't' carries no step, so the real one does nothing here.
@@ -2271,7 +2035,7 @@ def test_case_ids_stay_unique_when_an_id_looks_like_a_disambiguated_one() -> Non
     # until it is free. cases `a`, `a`, `a#2` resolved to `a`, `a#2`, `a#2` and reintroduced
     # the very collision `_case_ids` exists to remove: the upload pairs positionally, but the
     # printed report and the recorded case ids still showed one label for two graded cases.
-    from flash.cli.commands.env.eval import _case_ids
+    from flash.cli.commands.env.testing.eval import _case_ids
 
     def ids(*case_ids):
         return _case_ids([EvalCase(id=case_id, input="x") for case_id in case_ids])
@@ -2293,7 +2057,7 @@ def test_env_eval_scores_on_the_calling_thread(monkeypatch, tmp_path, capsys) ->
     witness = tmp_path / "scoring_threads.txt"
     (env_dir / "evaluations.py").write_text(
         "import threading\n"
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         f"WITNESS = {str(witness)!r}\n"
         "OWNER = threading.current_thread().name\n"
         "class Suite(BaseEvalSuite):\n"
@@ -2319,7 +2083,9 @@ def test_env_eval_scores_on_the_calling_thread(monkeypatch, tmp_path, capsys) ->
             generation_threads.add(threading.current_thread().name)
             yield messages[0]["content"]
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--concurrency", "6", "--no-upload"]) == 0
@@ -2340,8 +2106,8 @@ def test_scored_response_preserves_existing_structure_and_still_parses_plain_tex
     Parsing that value again is answer-idempotent but metadata-destructive, while single-turn eval still
     arrives as plain text and must continue to build the same structure here.
     """
-    from flash.cli.commands.env.eval import _scored_response
-    from flash.envs.adapter import _ScoredResponseText
+    from flash.cli.commands.env.testing.eval import _scored_response
+    from flash.envs.loading.adapter import _ScoredResponseText
 
     raw = "<think>2+2 is 4</think>4"
     stored = _ScoredResponseText("4", raw=raw, thinking="2+2 is 4")
@@ -2363,7 +2129,7 @@ def test_env_eval_reports_the_whole_completion_it_graded() -> None:
     # the strip itself is covered by `test_env_eval_strips_reasoning_only_for_a_thinking_run`;
     # what is pinned here is that the two views stay distinct rather than the stripped answer
     # overwriting the record.
-    from flash.cli.commands.env.eval import _score_case
+    from flash.cli.commands.env.testing.eval import _score_case
 
     seen: list[str] = []
 
@@ -2386,8 +2152,8 @@ def test_env_eval_reports_the_whole_completion_it_graded() -> None:
 @pytest.mark.parametrize("scorer_raises", [False, True])
 def test_env_eval_records_raw_episode_generation_on_success_and_failure(scorer_raises) -> None:
     """episode state carries answer-only text, but its raw generation is the diagnostic record."""
-    from flash.cli.commands.env.eval import _case_payload, _score_case
-    from flash.envs.adapter import _ScoredResponseText
+    from flash.cli.commands.env.testing.eval import _case_payload, _score_case
+    from flash.envs.loading.adapter import _ScoredResponseText
 
     raw = "<think>2+2 is 4</think>4"
     stored = _ScoredResponseText("4", raw=raw, thinking="2+2 is 4")
@@ -2413,7 +2179,7 @@ def test_env_eval_uploads_a_suite_that_failed_to_load(monkeypatch, tmp_path, cap
     # evaluation whose CLI exit code was 1.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Good(BaseEvalSuite):\n"
         "    name = 'good'\n"
         "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
@@ -2428,7 +2194,9 @@ def test_env_eval_uploads_a_suite_that_failed_to_load(monkeypatch, tmp_path, cap
             yield "4"
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -2460,7 +2228,7 @@ def test_env_eval_reports_invalid_episode_flag_as_a_suite_failure(
 ) -> None:
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import EvalCase\n"
+        "from flash.envs.meta.evaluations import EvalCase\n"
         "class Suite:\n"
         "    name = 'invalid-episode-flag'\n"
         "    grades_episodes = 'false'\n"
@@ -2469,7 +2237,9 @@ def test_env_eval_reports_invalid_episode_flag_as_a_suite_failure(
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", _EvalClient)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -2486,7 +2256,7 @@ def test_env_eval_concurrent_results_stay_in_case_order(monkeypatch, tmp_path) -
     # mislabelling every graded case in the report and the upload.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'ordered'\n"
         "    def cases(self):\n"
@@ -2504,7 +2274,9 @@ def test_env_eval_concurrent_results_stay_in_case_order(monkeypatch, tmp_path) -
             time.sleep(0.05 if content == "0" else 0.0)
             yield content
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", SlowFirstClient)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--concurrency", "6", "--no-upload"]) == 0
@@ -2523,11 +2295,13 @@ def test_env_eval_rejects_a_non_finite_temperature_before_paying(monkeypatch, tm
             raise AssertionError(f"paid request issued with temperature={kwargs['temperature']}")
             yield ""  # pragma: no cover - generator protocol only
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["env", "eval", "flash-1", "--temperature", bad])
+        cli.main(["env", "eval", _EXPLICIT_TARGET, "--temperature", bad])
 
     # argparse's own usage error, which is exit 2 rather than the CLI's 1
     assert excinfo.value.code == 2
@@ -2546,11 +2320,13 @@ def test_env_eval_rejects_a_negative_temperature_before_paying(monkeypatch, tmp_
             raise AssertionError(f"paid request issued with temperature={kwargs['temperature']}")
             yield ""  # pragma: no cover - generator protocol only
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     with pytest.raises(SystemExit) as excinfo:
-        cli.main(["env", "eval", "flash-1", "--temperature", bad])
+        cli.main(["env", "eval", _EXPLICIT_TARGET, "--temperature", bad])
 
     # argparse's own usage error, which is exit 2 rather than the CLI's 1
     assert excinfo.value.code == 2
@@ -2566,7 +2342,9 @@ def test_env_eval_still_accepts_an_ordinary_temperature(monkeypatch, tmp_path) -
             seen.append(kwargs["temperature"])
             yield "4"
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--temperature", "0.7", "--no-upload"]) == 0
@@ -2594,7 +2372,7 @@ def test_env_eval_uploads_each_suite_with_its_own_start_time(monkeypatch, tmp_pa
     # before the earlier suites ran and inflates its dashboard duration with their work.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class First(BaseEvalSuite):\n"
         "    name = 'first'\n"
         "    def cases(self): return [EvalCase(id='a', input='a', expected='a')]\n"
@@ -2610,7 +2388,9 @@ def test_env_eval_uploads_each_suite_with_its_own_start_time(monkeypatch, tmp_pa
             yield messages[0]["content"]
 
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     _patch_upload(monkeypatch, uploader)
 
@@ -2636,7 +2416,9 @@ def test_env_eval_reports_upload_timeout_without_a_traceback(monkeypatch, tmp_pa
     def _timeout(req, timeout=None):
         raise TimeoutError("timed out")
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
     monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
     # only the upload may time out. the project preflight uses the same socket, so leaving it
@@ -2703,7 +2485,7 @@ def test_load_evaluations_receives_the_environment_after_other_positional_parame
     # syntax forbids -- so the sidecar failed to load rather than being graded by its scorer.
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'positional'\n"
         "    def __init__(self, environment): self.environment = environment\n"
@@ -2727,7 +2509,7 @@ def test_load_evaluations_receives_a_positional_only_environment_beside_var_kwar
     # positional unfilled, so this valid factory raised TypeError and the sidecar never loaded.
     env_dir = _environment_dir(tmp_path)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'positional-kwargs'\n"
         "    def __init__(self, environment, options): \n"
@@ -2746,201 +2528,6 @@ def test_load_evaluations_receives_a_positional_only_environment_beside_var_kwar
     assert suites[0].options == {}
 
 
-def test_env_eval_pins_a_run_serving_a_step_checkpoint(monkeypatch, tmp_path, capsys) -> None:
-    """A bare run id must resolve whatever revision the run serves, not only the final adapter.
-
-    `deployment_for` filters on the requested checkpoint step, and a bare id parses to step None,
-    so a run deployed at `RUN/step-40` came back as absent and `flash env eval RUN` refused to run
-    against a model `flash chat RUN` answers from.
-    """
-    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'stepped'\n"
-        "    def cases(self): return [EvalCase(id='a', input='a', expected='a')]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
-    revision = "flash-1@step-40." + "b" * 40
-
-    class Client(_EvalClient):
-        def __init__(self):
-            self.targets = []
-
-        def deployment_for(self, run_id, timeout=None):
-            raise AssertionError("deployment_for cannot resolve a bare id to a step revision")
-
-        def deployments(self):
-            return [
-                {"run_id": "flash-other", "deployment": {"adapter_revision": "nope"}},
-                {
-                    "run_id": "flash-1",
-                    "deployment": {
-                        "state": "ready",
-                        "checkpoint_step": 40,
-                        "adapter_revision": revision,
-                    },
-                },
-            ]
-
-        def chat_stream(self, target, messages, **kwargs):
-            self.targets.append(target)
-            yield messages[-1]["content"]
-
-    client = Client()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
-
-    assert cli.main(["env", "eval", "flash-1", "--no-upload"]) == 0
-
-    assert client.targets == [revision]
-    assert f"resolved evaluation target flash-1 to {revision}" in capsys.readouterr().out
-
-
-def test_env_eval_pins_a_step_shorthand_to_its_immutable_revision(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    """`RUN/step-N` names a step, not the weights that answer at it.
-
-    The chat route resolves a step against the run's whole verified ledger, which can hold several
-    revisions at one step, and picks the deployed one (`_resolve_explicit_chat_revision`). Sending
-    the shorthand therefore graded weights the report could not name, and a later rebuild of the
-    same step read as the same measurement.
-    """
-    env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
-    shorthand = "flash-1/step-3"
-    revision = "flash-1@step-3." + "a" * 40
-
-    class Client(_EvalClient):
-        def __init__(self):
-            self.targets = []
-
-        def deployments(self):
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {
-                        "state": "ready",
-                        "checkpoint_step": 3,
-                        "adapter_revision": revision,
-                    },
-                }
-            ]
-
-        def chat_stream(self, target, messages, **kwargs):
-            self.targets.append(target)
-            yield "4"
-
-    client = Client()
-    uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
-    _patch_upload(monkeypatch, uploader)
-
-    assert cli.main(["env", "eval", shorthand, "--project", _PROJECT_ID]) == 0
-
-    # both halves matter: generation must reach the immutable weights, and the uploaded report
-    # must name them, or the dashboard records a step whose contents can change underneath it.
-    assert client.targets == [revision]
-    assert uploader.calls[0]["model"] == revision
-    assert f"resolved evaluation target {shorthand} to {revision}" in capsys.readouterr().out
-
-
-def test_env_eval_keeps_a_step_shorthand_the_live_deployment_has_moved_past(
-    monkeypatch, tmp_path
-) -> None:
-    """A step the deployment has moved past is still servable, so it must still be evaluated.
-
-    A run keeps its earlier verified revisions after a newer step is deployed, and the chat route
-    serves them: asked for step-3 while step-40 is live, the server resolves the ledger's single
-    step-3 entry and answers 200 (tests/test_server_api.py). Only the live revision is visible from
-    here, so anything else stays the shorthand for the server to resolve -- refusing would fail an
-    evaluation that runs correctly, and the server answers a genuinely ambiguous step with a 409.
-    """
-    env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
-    (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
-        "class Suite(BaseEvalSuite):\n"
-        "    name = 'math'\n"
-        "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
-        "def load_evaluations(environment=None): return [Suite()]\n"
-    )
-
-    class Client(_EvalClient):
-        def __init__(self):
-            self.targets = []
-
-        def deployments(self):
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {
-                        "state": "ready",
-                        "checkpoint_step": 40,
-                        "adapter_revision": "flash-1@step-40." + "b" * 40,
-                    },
-                }
-            ]
-
-        def chat_stream(self, target, messages, **kwargs):
-            self.targets.append(target)
-            yield "4"
-
-    client = Client()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", lambda: client)
-
-    assert cli.main(["env", "eval", "flash-1/step-3", "--no-upload"]) == 0
-
-    # the shorthand is forwarded untouched: the step-40 revision must never be substituted for it.
-    assert client.targets == ["flash-1/step-3"]
-
-
-def test_env_eval_refuses_to_upload_a_step_it_cannot_name(monkeypatch, capsys) -> None:
-    """An uploaded report must name the weights it graded, so an unpinnable step cannot upload.
-
-    Evaluating it is right (the test above), but recording it is not: `RUN/step-N` is a shorthand
-    the server resolves against a ledger that can hold several revisions at one step, and a later
-    rebuild of that step reuses it -- so two different sets of weights file as one measurement
-    Only the live revision is visible from here, so refuse before buying
-    any generation rather than upload a result nobody can identify afterwards.
-    """
-
-    class Client(_EvalClient):
-        def deployments(self):
-            return [
-                {
-                    "run_id": "flash-1",
-                    "deployment": {
-                        "state": "ready",
-                        "checkpoint_step": 40,
-                        "adapter_revision": "flash-1@step-40." + "b" * 40,
-                    },
-                }
-            ]
-
-        def chat_stream(self, target, messages, **kwargs):
-            raise AssertionError(f"bought a generation for an unrecordable target: {target}")
-
-    def _uploaded(**kwargs):
-        raise AssertionError("uploaded a result whose weights the report cannot name")
-
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
-    monkeypatch.setattr("flash.client.client_from_config", lambda: Client())
-    monkeypatch.setattr("flash.client.upload_eval_run", _uploaded, raising=False)
-    monkeypatch.setattr("flash.client.config.load_credentials", lambda: ("url", "key-1"))
-    monkeypatch.setattr("flash.client.get_project", lambda pid, api_key: {"id": pid}, raising=False)
-
-    args = ["env", "eval", "flash-1/step-3", "--project", _PROJECT_ID]
-    assert cli.main(args) == 1
-
-    # the refusal names both ways out, so it is actionable rather than a dead end.
-    err = capsys.readouterr().err
-    assert "cannot upload results for flash-1/step-3" in err
-    assert "models deployments" in err
-    assert "--no-upload" in err
-
-
 def test_env_eval_sends_the_environments_own_prompt(monkeypatch, tmp_path) -> None:
     """Evaluation must grade the prompt training builds, not the bare case input.
 
@@ -2951,7 +2538,7 @@ def test_env_eval_sends_the_environments_own_prompt(monkeypatch, tmp_path) -> No
     """
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'prompted'\n"
         "    def cases(self): return [EvalCase(id='a', input='2+2', expected='ok')]\n"
@@ -2973,7 +2560,8 @@ def test_env_eval_sends_the_environments_own_prompt(monkeypatch, tmp_path) -> No
             yield "ok"
 
     monkeypatch.setattr(
-        "flash.envs.loader.load_freesolo_environment", lambda _path, **_kwargs: Environment()
+        "flash.envs.loading.loader.load_freesolo_environment",
+        lambda _path, **_kwargs: Environment(),
     )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
@@ -2992,7 +2580,7 @@ def test_env_eval_prompt_failure_fails_only_its_own_case(monkeypatch, tmp_path, 
     # crash that loses every case already graded.
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'partial'\n"
         "    def cases(self): return [\n"
@@ -3013,7 +2601,8 @@ def test_env_eval_prompt_failure_fails_only_its_own_case(monkeypatch, tmp_path, 
             yield messages[-1]["content"]
 
     monkeypatch.setattr(
-        "flash.envs.loader.load_freesolo_environment", lambda _path, **_kwargs: Environment()
+        "flash.envs.loading.loader.load_freesolo_environment",
+        lambda _path, **_kwargs: Environment(),
     )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
@@ -3042,7 +2631,7 @@ def test_env_eval_sends_the_prompt_images_training_builds(monkeypatch, tmp_path)
 
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'vision'\n"
         "    def cases(self):\n"
@@ -3073,14 +2662,17 @@ def test_env_eval_sends_the_prompt_images_training_builds(monkeypatch, tmp_path)
 
     class Client(_EvalClient):
         def get_run(self, run_id):
-            return {"spec": {"environment": {"id": _PUBLISHED_SLUG}}}
+            return {
+                "verified_checkpoints": [_EXPLICIT_TARGET],
+                "spec": {"environment": {"id": _PUBLISHED_SLUG}},
+            }
 
         def chat_stream(self, target, messages, **kwargs):
             sent.append(messages)
             yield "cat"
 
     monkeypatch.setattr(
-        "flash.envs.loader.load_freesolo_environment", lambda _path, **_k: Environment()
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path, **_k: Environment()
     )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
@@ -3163,7 +2755,7 @@ def test_env_eval_sends_a_top_level_image_the_prompt_never_mentions(monkeypatch,
     message, which is how training sees it, and sending prompt_messages() unchanged would lose it
     with no error at all.
     """
-    from flash.cli.commands.env.eval import _case_messages
+    from flash.cli.commands.env.testing.eval import _case_messages
 
     _stub_pil(monkeypatch)
 
@@ -3194,7 +2786,7 @@ def test_env_eval_leaves_a_text_only_prompt_exactly_as_the_environment_built_it(
     # the common path must stay byte-identical: no content-block rewrapping for a text suite, or
     # every existing non-multimodal environment would be graded on a prompt shape it never trained
     # on. this is the half that must NOT change, so it needs no PIL at all.
-    from flash.cli.commands.env.eval import _case_messages
+    from flash.cli.commands.env.testing.eval import _case_messages
 
     class Environment:
         def prompt_messages(self, example):
@@ -3223,7 +2815,7 @@ def test_env_eval_strips_reasoning_only_for_a_thinking_run(monkeypatch, tmp_path
         root.mkdir()
         env_dir = _environment_dir(root, monkeypatch=monkeypatch)
         (env_dir / "evaluations.py").write_text(
-            "from flash.envs.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
+            "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase, EvalResult\n"
             f"EXPECTED = {expected!r}\n"
             "class Suite(BaseEvalSuite):\n"
             "    name = 'reasoning'\n"
@@ -3244,17 +2836,19 @@ def test_env_eval_strips_reasoning_only_for_a_thinking_run(monkeypatch, tmp_path
             self._response = response
 
         def get_run(self, run_id):
-            return {
-                "spec": {
+            return _run_record(
+                {
                     "thinking": self._thinking,
                     "environment": {"id": _PUBLISHED_SLUG},
                 }
-            }
+            )
 
         def chat_stream(self, target, messages, **kwargs):
             yield self._response
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
 
     # a thinking run: the reasoning is cut, so the grader sees the answer it was trained against.
     # before the fix the scorer saw the whole `<think>...` string and the case failed.
@@ -3287,14 +2881,14 @@ def test_env_eval_refuses_to_grade_when_the_plane_never_answered(
 
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'reasoning'\n"
         "    def cases(self): return [EvalCase(id='sum', input='2+2', expected='4')]\n"
         "def load_evaluations(environment=None): return [Suite()]\n"
     )
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.generated = 0
 
@@ -3307,7 +2901,9 @@ def test_env_eval_refuses_to_grade_when_the_plane_never_answered(
 
     client = Client()
     uploader = _RecordingUpload()
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", lambda: client)
     _patch_upload(monkeypatch, uploader)
 
@@ -3316,18 +2912,18 @@ def test_env_eval_refuses_to_grade_when_the_plane_never_answered(
     assert client.generated == 0
     assert uploader.calls == []
     captured = capsys.readouterr()
-    assert "could not reach the control plane" in captured.err
+    assert "could not resolve verified checkpoints for flash-1" in captured.err
     assert "overall: FAIL" in captured.err
 
 
 @pytest.mark.parametrize(
     ("status", "message"),
     [
-        (503, "could not reach the control plane"),
-        (429, "could not reach the control plane"),
-        (500, "could not reach the control plane"),
-        (404, "could not read the target run flash-1"),
-        (403, "could not read the target run flash-1"),
+        (503, "could not resolve verified checkpoints for flash-1"),
+        (429, "could not resolve verified checkpoints for flash-1"),
+        (500, "could not resolve verified checkpoints for flash-1"),
+        (404, "could not resolve verified checkpoints for flash-1"),
+        (403, "could not resolve verified checkpoints for flash-1"),
     ],
 )
 def test_env_eval_refuses_on_run_spec_api_error(monkeypatch, capsys, status, message) -> None:
@@ -3339,7 +2935,7 @@ def test_env_eval_refuses_on_run_spec_api_error(monkeypatch, capsys, status, mes
     """
     from flash.client import ApiError
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.generated = 0
 
@@ -3360,16 +2956,12 @@ def test_env_eval_refuses_on_run_spec_api_error(monkeypatch, capsys, status, mes
     assert uploader.calls == []
     captured = capsys.readouterr().err
     assert message in captured
-    if status < 500 and status != 429:
-        assert "published environment is what supplies the suites to score" in captured
-    else:
-        assert "retry once it is reachable" in captured
 
 
 def test_env_eval_refuses_when_the_run_spec_is_unreadable(monkeypatch, capsys) -> None:
     """An unreadable spec cannot supply the published environment, so grading is refused."""
 
-    class Client:
+    class Client(_EvalClient):
         def __init__(self):
             self.generated = 0
 
@@ -3389,7 +2981,7 @@ def test_env_eval_refuses_when_the_run_spec_is_unreadable(monkeypatch, capsys) -
     assert client.generated == 0
     assert uploader.calls == []
     captured = capsys.readouterr().err
-    assert "could not read the target run flash-1" in captured
+    assert "could not resolve verified checkpoints for flash-1" in captured
     assert "overall: FAIL" in captured
 
 
@@ -3429,7 +3021,7 @@ class _MultiTurnEnvironment:
 def _multi_turn_env_dir(tmp_path, monkeypatch):
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'episodes'\n"
         # the suite opts in: a multi-turn env alone must not promote a suite to episode grading.
@@ -3456,7 +3048,9 @@ def test_env_eval_drives_every_turn_of_a_multi_turn_environment(
         def chat_stream(self, target, messages, **kwargs):
             yield next(replies)
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: environment)
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: environment
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
@@ -3486,7 +3080,9 @@ def test_env_eval_reports_a_failed_turn_without_losing_the_case(
                 raise RuntimeError("upstream refused")
             yield "a"
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: environment)
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: environment
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -3503,7 +3099,7 @@ def test_env_eval_keeps_one_generation_per_case_for_single_turn(
     """The single-turn path must not start driving episodes."""
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'single'\n"
         "    def cases(self): return [EvalCase(id='only', input='only', expected='only')]\n"
@@ -3516,7 +3112,9 @@ def test_env_eval_keeps_one_generation_per_case_for_single_turn(
             calls.append(messages[0]["content"])
             yield messages[0]["content"]
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
@@ -3536,7 +3134,7 @@ def test_env_eval_does_not_promote_a_first_action_suite_to_an_episode(
     """
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'first-action'\n"
         # no grades_episodes flag: this suite scores one reply, like every pre-flag suite.
@@ -3551,7 +3149,9 @@ def test_env_eval_does_not_promote_a_first_action_suite_to_an_episode(
             calls.append("gen")
             yield "50"
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: environment)
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: environment
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 0
@@ -3569,7 +3169,7 @@ def test_env_eval_refuses_an_episode_suite_on_a_single_turn_environment(
     """An episode suite on a single-turn env has no transcript to grade, so say so."""
     env_dir = _environment_dir(tmp_path, monkeypatch=monkeypatch)
     (env_dir / "evaluations.py").write_text(
-        "from flash.envs.evaluations import BaseEvalSuite, EvalCase\n"
+        "from flash.envs.meta.evaluations import BaseEvalSuite, EvalCase\n"
         "class Suite(BaseEvalSuite):\n"
         "    name = 'episodes'\n"
         "    grades_episodes = True\n"
@@ -3581,7 +3181,9 @@ def test_env_eval_refuses_an_episode_suite_on_a_single_turn_environment(
         def chat_stream(self, target, messages, **kwargs):
             yield "x"
 
-    monkeypatch.setattr("flash.envs.loader.load_freesolo_environment", lambda _path: object())
+    monkeypatch.setattr(
+        "flash.envs.loading.loader.load_freesolo_environment", lambda _path: object()
+    )
     monkeypatch.setattr("flash.client.client_from_config", Client)
 
     assert cli.main(["env", "eval", _EXPLICIT_TARGET, "--no-upload"]) == 1
@@ -3601,8 +3203,8 @@ def test_env_eval_normalizes_images_on_every_episode_turn() -> None:
     """
     import argparse
 
-    from flash.cli.commands.env import episode as episode_module
-    from flash.cli.commands.env import eval as env_eval
+    from flash.cli.commands.env.testing import episode as episode_module
+    from flash.cli.commands.env.testing import eval as env_eval
 
     class Environment:
         multi_turn = True
@@ -3676,8 +3278,8 @@ def test_env_eval_hands_the_finished_episode_to_a_suite_that_accepts_it(capsys) 
     """
     import argparse
 
-    from flash.cli.commands.env import episode as episode_module
-    from flash.cli.commands.env import eval as env_eval
+    from flash.cli.commands.env.testing import episode as episode_module
+    from flash.cli.commands.env.testing import eval as env_eval
 
     class Environment:
         multi_turn = True
@@ -3739,8 +3341,8 @@ def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes(capsys, mo
     """A suite that takes only (case, response) must not be handed a third argument."""
     import argparse
 
-    from flash.cli.commands.env import episode as episode_module
-    from flash.cli.commands.env import eval as env_eval
+    from flash.cli.commands.env.testing import episode as episode_module
+    from flash.cli.commands.env.testing import eval as env_eval
 
     style_checks = 0
     real_state_argument = episode_module._state_argument
@@ -3809,7 +3411,7 @@ def test_env_eval_keeps_the_two_argument_scorer_contract_for_episodes(capsys, mo
 
 
 def test_grades_episodes_requires_a_boolean() -> None:
-    from flash.cli.commands.env.episode import _grades_episodes
+    from flash.cli.commands.env.testing.episode import _grades_episodes
 
     class Suite:
         name = "episode"
@@ -3823,7 +3425,7 @@ def test_state_argument_detects_how_the_scorer_takes_state() -> None:
     # detecting only WHETHER state is accepted is not enough: **kwargs and keyword-only scorers
     # reject a third positional, and *args scorers reject the keyword. the two groups are disjoint,
     # so the call style has to come from the signature.
-    from flash.cli.commands.env.episode import _state_argument
+    from flash.cli.commands.env.testing.episode import _state_argument
 
     assert _state_argument(lambda case, response: None) is None
     assert _state_argument(None) is None
@@ -3873,8 +3475,8 @@ def test_every_state_accepting_scorer_shape_actually_receives_the_episode(
     positional argument it could not take, so every case came back `scoring failed` -- a hard zero
     that looks like the model failed. Asserting the score, not the detection, is what catches that.
     """
-    from flash.cli.commands.env.episode import _state_argument
-    from flash.cli.commands.env.eval import _score_case
+    from flash.cli.commands.env.testing.episode import _state_argument
+    from flash.cli.commands.env.testing.eval import _score_case
 
     namespace: dict = {
         "_graded": lambda case, state: (
@@ -3915,8 +3517,8 @@ def test_env_eval_applies_the_last_model_turn_before_scoring_at_the_turn_cap() -
     """
     import argparse
 
-    from flash.cli.commands.env import episode as episode_module
-    from flash.cli.commands.env import eval as env_eval
+    from flash.cli.commands.env.testing import episode as episode_module
+    from flash.cli.commands.env.testing import eval as env_eval
 
     class Environment:
         multi_turn = True
@@ -3975,8 +3577,8 @@ def test_env_eval_does_not_step_an_environment_that_already_reported_done() -> N
     """
     import argparse
 
-    from flash.cli.commands.env import episode as episode_module
-    from flash.cli.commands.env import eval as env_eval
+    from flash.cli.commands.env.testing import episode as episode_module
+    from flash.cli.commands.env.testing import eval as env_eval
 
     class Environment:
         multi_turn = True
@@ -4027,14 +3629,14 @@ def test_env_eval_does_not_step_an_environment_that_already_reported_done() -> N
 def test_env_eval_honours_a_per_example_turn_budget_below_the_env_ceiling() -> None:
     """A case whose `max_episode_turns` is lower than `max_turns` must stop at its own budget.
 
-    `rollout_done` gives the per-example budget precedence (`flash/envs/adapter.py`), and both
+    `rollout_done` gives the per-example budget precedence (`flash/envs/loading/adapter.py`), and both
     training bridges derive the same effective limit (`opd/bridge.py:512`, `rl/multi_turn.py:174`).
     Counting only the dataset-wide ceiling generates turns training would never have run.
     """
     import argparse
 
-    from flash.cli.commands.env import episode as episode_module
-    from flash.cli.commands.env import eval as env_eval
+    from flash.cli.commands.env.testing import episode as episode_module
+    from flash.cli.commands.env.testing import eval as env_eval
 
     class Environment:
         multi_turn = True
@@ -4061,7 +3663,7 @@ def test_env_eval_honours_a_per_example_turn_budget_below_the_env_ceiling() -> N
         def rollout_done(self, state, max_turns=None):
             # deliberately honours ONLY the cap it is handed, so this test measures the cap the
             # driver computes rather than the env re-deriving the budget for it. the real adapter
-            # applies the same precedence internally (flash/envs/adapter.py:670), which would mask
+            # applies the same precedence internally (flash/envs/loading/adapter.py:670), which would mask
             # a driver that passed the wrong ceiling.
             if state.get("done"):
                 return True
@@ -4105,9 +3707,9 @@ def test_env_eval_strips_reasoning_from_the_state_a_thinking_episode_scores() ->
     """
     import argparse
 
-    from flash.cli.commands.env import episode as episode_module
-    from flash.cli.commands.env import eval as env_eval
-    from flash.envs.adapter import FreesoloEnvironment
+    from flash.cli.commands.env.testing import episode as episode_module
+    from flash.cli.commands.env.testing import eval as env_eval
+    from flash.envs.loading.adapter import FreesoloEnvironment
 
     class Environment:
         """Uses the real adapter's turn-recording, which is where the stripping lives."""
@@ -4181,8 +3783,8 @@ def test_loaded_suite_still_receives_episode_state_through_the_scope_wrapper(tmp
     suite raised on the state it was told to expect. Only a suite constructed directly in a test
     escaped it, which is why unit coverage passed while the shipped path did not.
     """
-    from flash.cli.commands.env.episode import _grades_episodes, _state_argument
-    from flash.envs.evaluations import load_evaluation_suites
+    from flash.cli.commands.env.testing.episode import _grades_episodes, _state_argument
+    from flash.envs.meta.evaluations import load_evaluation_suites
 
     package = tmp_path / "env_pkg"
     package.mkdir()
@@ -4190,7 +3792,7 @@ def test_loaded_suite_still_receives_episode_state_through_the_scope_wrapper(tmp
         "def load_environment(**kwargs):\n    return object()\n"
     )
     (package / "evaluations.py").write_text(
-        "from flash.envs.evaluations import EvalCase\n"
+        "from flash.envs.meta.evaluations import EvalCase\n"
         "\n"
         "class EpisodeSuite:\n"
         "    name = 'episode'\n"

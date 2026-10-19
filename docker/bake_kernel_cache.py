@@ -13,8 +13,8 @@ following ``docker build --build-arg BUILD_KERNEL_CACHE=true`` bakes it into the
   3. poll HF for the out/STATUS marker (and pod liveness) until done or the deadline,
   4. download out/ into ``--out`` (build/kernel_cache), terminate the pod, delete the temp dataset.
 
-Env: RUNPOD_API_KEY, HF_TOKEN (write on the Freesolo-Co namespace). Exits non-zero unless a
-mega_cache.bin with matching arch metadata landed in ``--out``.
+Env: RUNPOD_API_KEY, HF_TOKEN (write on the Freesolo-Co namespace). Exits non-zero unless
+compiled kernels with matching arch metadata landed in ``--out``.
 """
 
 from __future__ import annotations
@@ -371,10 +371,11 @@ def _status_present(api, repo: str, retries: int = 1) -> bool:
 
 def _verify(out: str, sm: str) -> int:
     """Confirm the artifact actually landed and its metadata matches the requested arch."""
-    blob = os.path.join(out, "mega_cache.bin")
-    meta = os.path.join(out, "mega_cache.json")
-    if not os.path.isfile(blob):
-        log(f"FAIL: no mega_cache.bin in {out}; what the warmup actually produced:")
+    from flash.engine.worker.runtime.kernel_warmup import CACHE_META_FILENAME, has_raw_kernel_cache
+
+    meta = os.path.join(out, CACHE_META_FILENAME)
+    if not has_raw_kernel_cache(out):
+        log(f"FAIL: no compiled kernel artifacts in {out}; what the warmup actually produced:")
         for root, _, files in os.walk(out):
             for f in sorted(files):
                 p = os.path.join(root, f)
@@ -396,7 +397,7 @@ def _verify(out: str, sm: str) -> int:
     if got != sm:
         log(f"FAIL: baked arch {got!r} != requested {sm!r}")
         return 1
-    log(f"OK: mega_cache.bin ({os.path.getsize(blob)} bytes) for {sm}")
+    log(f"OK: compiled kernel artifacts for {sm}")
     return 0
 
 

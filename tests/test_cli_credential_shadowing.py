@@ -13,12 +13,14 @@ import argparse
 
 import pytest
 
-import flash.cli as cli
+import flash.cli.commands.ops.account as cli_account
+import flash.cli.parsing.main as cli
 import flash.client.config as client_config
-from flash.cli.commands import cmd_train, cmd_whoami
-from flash.cli.commands.env.eval import cmd_env_eval
-from flash.cli.commands.env.setup import cmd_env_setup
-from flash.cli.commands.traces import cmd_traces_export
+from flash.cli.commands.env.ops.setup import cmd_env_setup
+from flash.cli.commands.env.testing.eval import cmd_env_eval
+from flash.cli.commands.ops.account import cmd_whoami
+from flash.cli.commands.ops.traces import cmd_traces_export
+from flash.cli.commands.ops.train import cmd_train
 
 
 def _patch_saved_key(monkeypatch, saved: str | None) -> None:
@@ -143,7 +145,7 @@ def test_project_scaffolding_command_warns(monkeypatch, capsys, handler):
 
 def test_whoami_reports_the_key_source(monkeypatch, capsys):
     monkeypatch.setattr(
-        cli.commands,
+        cli_account,
         "load_credentials_with_source",
         lambda: ("https://flash.freesolo.co", "fslo-key", "FREESOLO_API_KEY"),
     )
@@ -152,7 +154,7 @@ def test_whoami_reports_the_key_source(monkeypatch, capsys):
         def me(self):
             return {"kind": "freesolo_api_key", "key_prefix": "fslo-ke", "email": "me@x.co"}
 
-    monkeypatch.setattr(cli.commands, "client_from_config", lambda: _FakeClient())
+    monkeypatch.setattr(cli_account, "client_from_config", lambda: _FakeClient())
 
     assert cmd_whoami(argparse.Namespace()) == 0
     out = capsys.readouterr().out

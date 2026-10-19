@@ -8,7 +8,7 @@ job payload from job["input"] and runs the training via `_train_body`.
 `_train_body` imports its trusted verifier from the sibling module baked into the image, then fetches
 the pinned Flash source archive from HF.
 
-Usage: python make_rp_handler.py <path-to-endpoints.py> <path-to-source-snapshot.py> <out-path>
+Usage: python make_rp_handler.py <path-to-endpoints.py> <path-to-archive.py> <out-path>
 """
 
 import ast
@@ -18,7 +18,7 @@ import sys
 def main() -> int:
     if len(sys.argv) != 4:
         raise SystemExit(
-            f"usage: {sys.argv[0]} <path-to-endpoints.py> <path-to-source-snapshot.py> <out-path>"
+            f"usage: {sys.argv[0]} <path-to-endpoints.py> <path-to-archive.py> <out-path>"
         )
     src_path, verifier_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
     with open(src_path, encoding="utf-8") as f:

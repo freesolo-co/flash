@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from flash.engine.worker.train.opd.multiturn_validation import validated_multiturn_response
+from flash.engine.worker.train.opd.multiturn.validation import validated_multiturn_response
 
 _EOS = 2
 

@@ -16,9 +16,9 @@ from __future__ import annotations
 import pytest
 
 from flash.core.catalog import MODELS
-from flash.engine.worker.train.opd.overrides import build_opd_overrides
+from flash.engine.worker.train.opd.orchestration.overrides import build_opd_overrides
 from flash.engine.worker.verl.parallelism import resolve_reshard_after_forward
-from flash.providers.base import (
+from flash.providers.core.sharding import (
     REPLICATED_PER_CARD_GB,
     SHARD_VRAM_EFFICIENCY,
     ZERO2_CHARGED_RESIDENCY,
@@ -115,7 +115,7 @@ def test_the_gate_is_off_on_a_single_rank():
     for params_b in _CATALOG_PARAMS_B:
         assert not zero2_enabled(180, 1, params_b, 10)
     assert resolve_reshard_after_forward(
-        model_id="Qwen/Qwen3.5-4B", algorithm="opd", gpu_type="RTX 5090", n_gpus=1
+        model_id="Qwen/Qwen3.5-9B", algorithm="opd", gpu_type="RTX 5090", n_gpus=1
     )
 
 
@@ -129,7 +129,7 @@ def test_an_unknown_card_falls_closed_to_zero3(gpu_type, n_gpus):
     A wrong ZeRO-2 answer OOMs a paid run; a wrong ZeRO-3 answer only forgoes a speedup.
     """
     assert resolve_reshard_after_forward(
-        model_id="Qwen/Qwen3.5-4B", algorithm="opd", gpu_type=gpu_type, n_gpus=n_gpus
+        model_id="Qwen/Qwen3.5-9B", algorithm="opd", gpu_type=gpu_type, n_gpus=n_gpus
     )
 
 
@@ -149,7 +149,7 @@ def test_a_shape_without_room_for_the_retained_copy_stays_on_zero3():
     """
     assert not zero2_enabled(24, 2, 4.7, 35)
     assert resolve_reshard_after_forward(
-        model_id="Qwen/Qwen3.5-4B", algorithm="grpo", gpu_type="RTX 4090", n_gpus=2
+        model_id="Qwen/Qwen3.5-9B", algorithm="grpo", gpu_type="RTX 4090", n_gpus=2
     )
 
 
@@ -161,7 +161,7 @@ def test_a_shape_with_room_takes_zero2():
     """
     assert zero2_enabled(80, 2, 0.9, 84)
     assert not resolve_reshard_after_forward(
-        model_id="Qwen/Qwen3.5-0.8B", algorithm="opd", gpu_type="A100 SXM", n_gpus=2
+        model_id="Qwen/Qwen3.5-9B", algorithm="opd", gpu_type="A100 SXM", n_gpus=2
     )
 
 
@@ -177,7 +177,7 @@ def test_the_gate_never_admits_more_than_a_card_physically_holds():
     completed.
     """
     from flash.engine.plan.vram import model_required_vram_gb
-    from flash.providers.base import get_gpu_info
+    from flash.providers.core.base import get_gpu_info
 
     impossible = []
     fired = 0
@@ -214,7 +214,7 @@ def test_the_worker_and_the_allocator_cannot_disagree():
     side alone.
     """
     from flash.engine.plan.vram import model_required_vram_gb
-    from flash.providers.base import get_gpu_info
+    from flash.providers.core.base import get_gpu_info
 
     checked = 0
     fired = 0

@@ -28,7 +28,7 @@ _SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}, "requ
 
 def _raw(structured_outputs=None, algorithm="grpo", **top):
     raw = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": algorithm,
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "train": {},
@@ -206,12 +206,12 @@ def test_describe_structured_outputs():
 def test_thinking_plus_constraint_notes_deferred_grammar_on_stderr(capsys):
     # thinking + a constraint is supported: the worker defers the grammar past </think>, so the CLI
     # notes the deferred behavior instead of warning about first-token constraint.
-    thinking_raw = _raw({"json": _SCHEMA}, model="Qwen/Qwen3.5-4B", thinking=True)
+    thinking_raw = _raw({"json": _SCHEMA}, model="Qwen/Qwen3.5-9B", thinking=True)
     spec_from_dict(thinking_raw, run_id="so-warn")
     err = capsys.readouterr().err
     assert "after the </think> reasoning phase" in err
     # a non-thinking constrained run says nothing about </think>
-    plain_raw = _raw({"json": _SCHEMA}, model="Qwen/Qwen3.5-4B", thinking=False)
+    plain_raw = _raw({"json": _SCHEMA}, model="Qwen/Qwen3.5-9B", thinking=False)
     spec_from_dict(plain_raw, run_id="so-warn2")
     assert "</think>" not in capsys.readouterr().err
 

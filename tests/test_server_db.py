@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import flash.runner.lifecycle.state as runner_state
 from flash.server.platform import db
 
 
@@ -405,18 +406,15 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
     # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
-    import flash.providers.runpod.auth as runpod_keys
+    import flash.providers.runpod.client.auth as runpod_keys
 
     runpod_keys.reset()
-
-    import flash.runner as runner
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod
 
-    importlib.reload(runner)
     importlib.reload(auth_mod)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
 
     token = "fslo_abc123_secret"
@@ -452,8 +450,8 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
 
     monkeypatch.setattr(auth_mod.urllib.request, "urlopen", fake_urlopen)
 
-    import flash.providers as providers_mod
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
+    from flash.providers.core import registry as providers_mod
 
     importlib.reload(app_mod)
     # The Lambda key above (required by the new preflight) makes configured_providers()

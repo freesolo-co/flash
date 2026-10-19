@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import re
 import threading
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.providers._lifecycle.worker import logger
-from flash.providers.base import canonical_gpu, gpu_short
+from flash.providers._lifecycle.net.worker import logger
+from flash.providers.core.base import canonical_gpu
+from flash.providers.runpod.serverless import naming
+from flash.providers.runpod.serverless.naming import endpoint_name
 
 # runpod_flash asyncio singleton is bound to one event loop; serialize all deploy/undeploy.
 FLASH_SDK_LOCK = threading.Lock()
@@ -63,9 +64,9 @@ def _train_body(input_data: dict) -> dict:
     from huggingface_hub import snapshot_download
 
     try:
-        import source_snapshot as _source_snapshot
+        import archive as _source_snapshot
     except ModuleNotFoundError:
-        from flash import source_snapshot as _source_snapshot
+        from flash.snapshot import archive as _source_snapshot
 
     class _TransientSourceFetchError(RuntimeError):
         flash_retriable = True
@@ -100,7 +101,7 @@ def _train_body(input_data: dict) -> dict:
         a multiline secret never appears whole in any single call: the child's stdout is sanitized one
         line at a time, so only a component line is ever seen. component lines keep the floor as a hard
         skip: a short one is punctuation such as "}", not a credential. mirrors
-        flash.providers._lifecycle.bootstrap_secrets._needles.
+        flash.providers._lifecycle.bootstrapping.secrets._needles.
         """
         import urllib.parse
 
@@ -541,7 +542,7 @@ def _train_body(input_data: dict) -> dict:
         _install_extra_pip()
         console_module = _load_exact_module(
             code_dir,
-            "flash/providers/_lifecycle/bootstrap_console.py",
+            "flash/providers/_lifecycle/bootstrapping/console.py",
             "_flash_downloaded_bootstrap_console",
         )
         artifact_module = _load_exact_module(
@@ -661,7 +662,7 @@ def _train_body(input_data: dict) -> dict:
             with open(console, "w", buffering=1) as cf:  # line-buffered so uploader sees each line
                 _require_deadline_allowance()
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "flash.engine.worker_entrypoint"],
+                    [sys.executable, "-m", "flash.engine.support.worker_entrypoint"],
                     cwd=code_dir,
                     env={**env, "RUN_MODE": mode},
                     stdout=subprocess.PIPE,
@@ -789,66 +790,23 @@ def _patch_runpod_backoff() -> None:
 
 def min_cuda_for(friendly_gpu: str) -> str:
     """Minimum host CUDA driver version for this GPU class (Blackwell requires >=13.0)."""
-    from flash.providers.base import min_cuda_modern
+    from flash.providers.core.base import min_cuda_modern
 
     return min_cuda_modern(friendly_gpu)
-
-
-def endpoint_name(friendly_gpu: str, suffix: str | None = None) -> str:
-    """Flash endpoint name for a GPU class, with a per-run suffix to avoid template name collisions."""
-    base = f"flash-{gpu_short(friendly_gpu)}"
-    if not suffix:
-        return base
-    safe = "".join(c for c in str(suffix) if c.isalnum() or c == "-").strip("-")[:24]
-    return f"{base}-{safe}" if safe else base
-
-
-def _run_suffix(run_id: str | None) -> str | None:
-    """Stable, collision-free per-run endpoint suffix: sha1(run_id)[:8] with a readable prefix.
-
-    Using only the last segment of run_id collides when run_ids end in a GPU name.
-    """
-    if not run_id:
-        return None
-    import hashlib
-    import re
-
-    h = hashlib.sha1(run_id.encode()).hexdigest()[:8]
-    prefix = re.sub(r"[^a-z0-9]", "", run_id.lower())[-12:]
-    return f"{prefix}{h}" if prefix else h
-
-
-def _endpoint_name_matches_run(name: str, target: str) -> bool:
-    canonical = str(name or "").removeprefix("live-")
-    return (
-        canonical == target
-        or re.fullmatch(re.escape(target) + r"r[1-9][0-9]*", canonical) is not None
-    )
-
-
-def _select_endpoint_resources(resources: dict, target: str) -> list[str]:
-    """Return exact base and canonical retry endpoint resource ids for one run."""
-    if not target:
-        return []
-    return [
-        uid
-        for uid, resource in (resources or {}).items()
-        if _endpoint_name_matches_run(getattr(resource, "name", ""), target)
-    ]
 
 
 def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dict]:
     """Delete the remote Flash endpoint(s) for a run via the RunPod API. Best-effort, never raises."""
     friendly = canonical_gpu(friendly_gpu)
-    target = endpoint_name(friendly, _run_suffix(run_id))
+    target = endpoint_name(friendly, naming.run_suffix(run_id))
     # Serialize isolation + lookup + undeploy: isolate_flash_state swaps process-wide globals,
     # and a concurrent call could swap the registry scope between our lookup and undeploy.
     with FLASH_SDK_LOCK:
         try:
-            from flash.providers.runpod.auth import ensure_auth
+            from flash.providers.runpod.client.auth import ensure_auth
 
             ensure_auth()
-            isolate_flash_state(_run_suffix(run_id))
+            isolate_flash_state(naming.run_suffix(run_id))
             from runpod_flash.core.resources.resource_manager import ResourceManager
         except Exception as exc:
             detail = sanitize_diagnostic(exc, limit=1000)
@@ -857,7 +815,7 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
         try:
             rm = ResourceManager()
             resources = rm.list_all_resources()
-            uids = _select_endpoint_resources(resources, target)
+            uids = naming.select_endpoint_resources(resources, target)
         except Exception as exc:
             detail = sanitize_diagnostic(exc, limit=1000)
             return [
@@ -916,14 +874,14 @@ def terminate_endpoint(friendly_gpu: str, run_id: str | None = None) -> list[dic
                 }
             ]
 
-    # registry-less cleanup must inspect every configured account and exact retry suffix.
+    # registry-less cleanup must inspect every configured account and every attempt of this run.
     try:
-        from flash.providers.runpod import api as runpod_api
+        from flash.providers.runpod.client import api as runpod_api
 
         by_fingerprint, failed_fingerprints = runpod_api.list_endpoints_by_key()
         for fingerprint, endpoints in by_fingerprint.items():
             for endpoint in endpoints:
-                if not _endpoint_name_matches_run(endpoint.get("name", ""), target):
+                if not naming.endpoint_name_matches_run(endpoint.get("name", ""), target):
                     continue
                 endpoint_id = endpoint.get("id")
                 if not endpoint_id or not runpod_api.delete_endpoint_for_fingerprint(

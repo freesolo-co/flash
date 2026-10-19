@@ -12,25 +12,28 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image, ImageOps
 
-from flash.serving.src import multimodal
-from flash.serving.src import serving_io as serving_io_module
-from flash.serving.src.engine_support import _num_prompt_tokens
-from flash.serving.src.lora_engine import _LoraEngineImpl
-from flash.serving.src.multimodal import (
+from flash.serve.contract.provenance import immutable_binding_fingerprint
+from flash.serving.src.engine.lora_engine import _LoraEngineImpl
+from flash.serving.src.engine.support import _num_prompt_tokens
+from flash.serving.src.http.router import AdapterRouter
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
+from flash.serving.src.http.router import build_serving_app as build_durable_serving_app
+from flash.serving.src.io import multimodal
+from flash.serving.src.io.multimodal import (
     MultimodalRequestError,
     has_image_blocks,
     normalize_chat_messages,
     prepare_multimodal_request,
 )
-from flash.serving.src.registry import AdapterRegistry
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest, internal_adapter_payload
+from flash.serving.src.store.registry import AdapterRegistry
+from tests.serving.conftest import RecordingUsageStore
 
-QWEN = "Qwen/Qwen3.5-0.8B"
-QWEN_2B = "Qwen/Qwen3.5-2B"
+QWEN = "Qwen/Qwen3.5-9B"
+QWEN_35B = "Qwen/Qwen3.6-35B-A3B"
 RUN_ID = "flash-1234567890-abcdef12"
 SHA = "a" * 40
-REVISION_ID = f"{RUN_ID}@step-20.{SHA}"
+REVISION_ID = f"{RUN_ID}/step-20"
 
 
 def _data_uri(
@@ -90,7 +93,7 @@ def _tool_history_messages(*, with_image: bool) -> list[dict[str, Any]]:
                     "type": "function",
                     "function": {
                         "name": "calculator",
-                        "arguments": {"expression": "2+2"},
+                        "arguments": '{"expression":"2+2"}',
                     },
                 }
             ],
@@ -481,10 +484,23 @@ class _Engine:
         assert image_data.getpixel((0, 0)) == (10, 20, 30)
         self.prompt_inputs.append(prompt_input)
         yield types.SimpleNamespace(
-            outputs=[types.SimpleNamespace(text="ok", finish_reason="stop", token_ids=[7, 8])],
+            outputs=[
+                types.SimpleNamespace(index=0, text="ok", finish_reason="stop", token_ids=[7, 8])
+            ],
             prompt_token_ids=list(range(17)),
             num_cached_tokens=0,
         )
+
+
+def _base_record() -> AdapterRecord:
+    return AdapterRecord(
+        adapter_id=QWEN,
+        repo_id=QWEN,
+        base_model=QWEN,
+        serve_base_model=True,
+        thinking=False,
+        status="ready",
+    )
 
 
 def _engine_impl(*, processor: Any = None) -> _LoraEngineImpl:
@@ -494,18 +510,7 @@ def _engine_impl(*, processor: Any = None) -> _LoraEngineImpl:
     engine.tokenizer = types.SimpleNamespace()
     engine.reasoning_parser = "qwen3"
     engine.registry = AdapterRegistry()
-    engine.registry.hydrate(
-        [
-            AdapterRecord(
-                adapter_id=QWEN,
-                repo_id=QWEN,
-                base_model=QWEN,
-                serve_base_model=True,
-                thinking=False,
-                status="ready",
-            )
-        ]
-    )
+    engine.registry.hydrate([_base_record()])
     engine._adapter_locks = {}
     engine._adapter_locks_guard = asyncio.Lock()
     engine._prompt_token_cache = OrderedDict()
@@ -547,7 +552,8 @@ def test_engine_processor_render_and_vllm_multimodal_input_shape() -> None:
                 "adapter_id": QWEN,
                 "messages": _messages(),
                 "chat_template_kwargs": {"enable_thinking": True, "custom": "value"},
-            }
+            },
+            internal_adapter_payload(_base_record()),
         )
     )
     assert result["prompt_tokens"] == 17
@@ -560,6 +566,7 @@ def test_engine_processor_render_and_vllm_multimodal_input_shape() -> None:
         "add_generation_prompt": True,
         "custom": "value",
         "enable_thinking": True,
+        "preserve_thinking": False,
     }
     prompt_input = engine.engine.prompt_inputs[0]
     assert prompt_input["prompt"] == "rendered multimodal prompt"
@@ -646,45 +653,35 @@ def test_stream_validation_and_first_engine_error_happen_before_ready() -> None:
     engine.engine = _OverflowEngine()
 
     async def first_event() -> Any:
-        return await anext(engine._stream_generate({"adapter_id": QWEN, "messages": _messages()}))
+        return await anext(
+            engine._stream_generate(
+                {"adapter_id": QWEN, "messages": _messages()},
+                internal_adapter_payload(_base_record()),
+            )
+        )
 
     with pytest.raises(ValueError, match="context length"):
         asyncio.run(first_event())
 
 
 def _revision(base_model: str) -> AdapterRecord:
-    return AdapterRecord.model_validate(
-        {
-            "adapter_id": REVISION_ID,
-            "repo_id": "org/run",
-            "org_id": "org-1",
-            "base_model": base_model,
-            "subfolder": "checkpoints/step-20",
-            "checkpoint": f"{RUN_ID}/step-20",
-            "status": "ready",
-            "thinking": False,
-            "metadata": {
-                "record_type": "revision",
-                "run_id": RUN_ID,
-                "checkpoint_step": 20,
-                "hf_revision": SHA,
-            },
-        }
-    )
-
-
-def _alias(revision: AdapterRecord) -> AdapterRecord:
-    return revision.model_copy(
-        update={
-            "adapter_id": RUN_ID,
-            "checkpoint": None,
-            "metadata": {
-                "record_type": "alias",
-                "run_id": RUN_ID,
-                "alias_of": revision.adapter_id,
-            },
-        }
-    )
+    values = {
+        "adapter_id": REVISION_ID,
+        "repo_id": "org/run",
+        "org_id": "org-1",
+        "base_model": base_model,
+        "subfolder": "checkpoints/step-20",
+        "checkpoint": REVISION_ID,
+        "status": "ready",
+        "thinking": False,
+        "run_id": RUN_ID,
+        "checkpoint_step": 20,
+        "artifact_revision": SHA,
+        "artifact_digest": "b" * 64,
+        "lora_rank": 16,
+    }
+    values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
+    return AdapterRecord.model_validate(values)
 
 
 class _Pool:
@@ -707,7 +704,7 @@ class _Pool:
             "adapter_id": payload.adapter_id,
             # a real engine attests the adapter it actually resolved, which for a revision is the
             # resolved record rather than whatever id the caller asked with.
-            **({"lora_request_adapter": record.adapter_id} if record.is_revision else {}),
+            **({"lora_request_adapter": record.adapter_id} if record.is_checkpoint else {}),
             "text": "ok",
             "finish_reason": "stop",
             "prompt_tokens": 7,
@@ -747,8 +744,8 @@ class _Pool:
         return None
 
 
-async def _allow(_token: str, _adapter_id: str) -> None:
-    return None
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
+    return "org-1"
 
 
 def _client(base_model: str) -> tuple[TestClient, _Pool]:
@@ -756,7 +753,7 @@ def _client(base_model: str) -> tuple[TestClient, _Pool]:
     pool = _Pool()
     app = build_serving_app(
         pool,
-        AdapterRouter([revision, _alias(revision)]),
+        AdapterRouter([revision]),
         chat_authorizer=_allow,
     )
     return TestClient(app, headers={"Authorization": "Bearer test"}), pool
@@ -774,42 +771,37 @@ def test_text_only_tool_history_skips_image_decoding(monkeypatch) -> None:
         raise AssertionError("text-only requests must not decode images")
 
     monkeypatch.setattr(multimodal, "_decode_images", unexpected_image_work)
-    client, pool = _client(QWEN_2B)
+    client, pool = _client(QWEN_35B)
     response = client.post(
         "/v1/chat/completions",
-        json={"model": RUN_ID, "messages": _tool_history_messages(with_image=False)},
+        json={"model": REVISION_ID, "messages": _tool_history_messages(with_image=False)},
     )
     assert response.status_code == 200
-    assert response.json()["model"] == RUN_ID
-    assert pool.calls == [(QWEN_2B, REVISION_ID, REVISION_ID)]
+    assert response.json()["model"] == REVISION_ID
+    assert pool.calls == [(QWEN_35B, REVISION_ID, REVISION_ID)]
 
 
-@pytest.mark.parametrize("model", [REVISION_ID, RUN_ID])
-def test_chat_immutable_id_and_alias_use_resolved_target_and_echo_requested_id(model: str) -> None:
+def test_chat_permanent_checkpoint_echoes_public_checkpoint_identity() -> None:
     client, pool = _client(QWEN)
     response = client.post(
         "/v1/chat/completions",
-        json={"model": model, "messages": _messages()},
+        json={"model": REVISION_ID, "messages": _messages()},
     )
     assert response.status_code == 200
-    assert response.json()["model"] == model
-    assert response.json()["freesolo"] == {
-        "adapter_revision": REVISION_ID,
-        "checkpoint": f"{RUN_ID}/step-20",
-        "hf_revision": SHA,
-    }
-    assert response.headers["X-Freesolo-Adapter-Revision"] == REVISION_ID
-    assert response.headers["X-Freesolo-Checkpoint"] == f"{RUN_ID}/step-20"
-    assert response.headers["X-Freesolo-HF-Revision"] == SHA
+    assert response.json()["model"] == REVISION_ID
+    assert response.json()["freesolo"] == {"checkpoint_id": REVISION_ID}
+    assert response.headers["X-Freesolo-Checkpoint"] == REVISION_ID
+    assert "X-Freesolo-Adapter-Revision" not in response.headers
+    assert "X-Freesolo-HF-Revision" not in response.headers
     assert pool.calls == [(QWEN, REVISION_ID, REVISION_ID)]
 
 
 @pytest.mark.parametrize(
     ("path", "body"),
     [
-        ("/generate", {"adapter_id": RUN_ID, "messages": _messages()}),
-        (f"/adapters/{RUN_ID}/generate", {"messages": _messages()}),
-        ("/v1/chat/completions", {"model": RUN_ID, "messages": _messages()}),
+        ("/generate", {"adapter_id": REVISION_ID, "messages": _messages()}),
+        (f"/adapters/{REVISION_ID}/generate", {"messages": _messages()}),
+        ("/v1/chat/completions", {"model": REVISION_ID, "messages": _messages()}),
     ],
 )
 def test_all_message_entry_points_validate_against_resolved_model(
@@ -820,9 +812,9 @@ def test_all_message_entry_points_validate_against_resolved_model(
     validated: list[dict[str, Any]] = []
     supports_args: list[str] = []
     limit_args: list[str] = []
-    real_validate = serving_io_module.normalize_chat_messages
-    real_supports = serving_io_module.supports_image_input
-    real_limit = serving_io_module.image_limit_for
+    real_validate = multimodal.normalize_chat_messages
+    real_supports = multimodal.supports_image_input
+    real_limit = multimodal.image_limit_for
 
     def spy_validate(messages: Any, **kwargs: Any) -> None:
         validated.append(kwargs)
@@ -836,22 +828,22 @@ def test_all_message_entry_points_validate_against_resolved_model(
         limit_args.append(base_model)
         return real_limit(base_model)
 
-    monkeypatch.setattr(serving_io_module, "normalize_chat_messages", spy_validate)
-    monkeypatch.setattr(serving_io_module, "supports_image_input", spy_supports)
-    monkeypatch.setattr(serving_io_module, "image_limit_for", spy_limit)
-    client, pool = _client(QWEN_2B)
+    monkeypatch.setattr(multimodal, "normalize_chat_messages", spy_validate)
+    monkeypatch.setattr(multimodal, "supports_image_input", spy_supports)
+    monkeypatch.setattr(multimodal, "image_limit_for", spy_limit)
+    client, pool = _client(QWEN_35B)
     response = client.post(path, json=body)
 
     assert response.status_code == 200
     # image capabilities were resolved from the resolved target model, not the requested id.
-    assert supports_args == [QWEN_2B]
-    assert limit_args == [QWEN_2B]
+    assert supports_args == [QWEN_35B]
+    assert limit_args == [QWEN_35B]
     # and multimodal validation was invoked exactly once with those resolved capabilities.
     assert validated == [
-        {"supports_images": real_supports(QWEN_2B), "image_limit": real_limit(QWEN_2B)}
+        {"supports_images": real_supports(QWEN_35B), "image_limit": real_limit(QWEN_35B)}
     ]
     assert len(pool.calls) == 1
-    assert pool.calls[0][0] == QWEN_2B
+    assert pool.calls[0][0] == QWEN_35B
 
 
 def test_bad_streaming_image_is_json_400_before_sse() -> None:
@@ -859,7 +851,7 @@ def test_bad_streaming_image_is_json_400_before_sse() -> None:
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": RUN_ID,
+            "model": REVISION_ID,
             "stream": True,
             "messages": _messages("https://example.com/image.png"),
         },
@@ -879,47 +871,11 @@ def test_context_overflow_is_json_400_before_sse() -> None:
     pool.stream_generate = overflow  # type: ignore[method-assign]
     response = client.post(
         "/v1/chat/completions",
-        json={"model": RUN_ID, "stream": True, "messages": _messages()},
+        json={"model": REVISION_ID, "stream": True, "messages": _messages()},
     )
     assert response.status_code == 400
     assert response.headers["content-type"].startswith("application/json")
     assert "context length exceeded" in response.json()["detail"]
-
-
-def test_legacy_record_stays_unresolvable() -> None:
-    legacy = AdapterRecord(
-        adapter_id="legacy",
-        repo_id="org/legacy",
-        org_id="org-1",
-        base_model=QWEN,
-        status="ready",
-        thinking=False,
-    )
-    pool = _Pool()
-    client = TestClient(
-        build_serving_app(pool, AdapterRouter([legacy]), chat_authorizer=_allow),
-        headers={"Authorization": "Bearer test"},
-    )
-    response = client.post(
-        "/v1/chat/completions",
-        json={"model": "legacy", "messages": _messages()},
-    )
-    assert response.status_code == 404
-    assert pool.calls == []
-
-
-def test_legacy_checkpoint_style_model_identifier_stays_rejected() -> None:
-    client, pool = _client(QWEN)
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "model": f"{RUN_ID}/step-20",
-            "messages": _messages(),
-        },
-    )
-    assert response.status_code == 400
-    assert "checkpoint identifier" in response.json()["detail"]
-    assert pool.calls == []
 
 
 def test_missing_attestation_on_a_revision_is_a_bad_gateway(monkeypatch) -> None:
@@ -987,24 +943,43 @@ def test_a_refused_attestation_is_never_metered(monkeypatch) -> None:
     # already been billed for a generation we then rejected with a 502. the check has to run
     # before metering, not after it.
     _unattesting_pool(monkeypatch)
-    reported: list[dict[str, Any]] = []
-
-    async def record_usage(payload: dict[str, Any]) -> None:
-        reported.append(payload)
-
-    revision = _revision(QWEN)
-    app = build_serving_app(
+    store = RecordingUsageStore()
+    revision = _revision(QWEN).model_copy(update={"thinking": False})
+    app = build_durable_serving_app(
         _Pool(),
-        AdapterRouter([revision, _alias(revision)]),
+        AdapterRouter([revision]),
         chat_authorizer=_allow,
-        usage_reporter=record_usage,
+        usage_store=store,
     )
     client = TestClient(app, headers={"Authorization": "Bearer test"})
 
     response = client.post("/generate", json={"adapter_id": REVISION_ID, "prompt": "hi"})
 
     assert response.status_code == 502
-    assert reported == []
+    assert store.captured == []
+    assert store.finalized == []
+    assert store.failed == []
+
+
+def test_mismatched_checkpoint_attestation_is_a_bad_gateway(monkeypatch) -> None:
+    original = _Pool.generate
+
+    async def wrong_checkpoint(self, base_model, payload, record, *, expected_checkpoint=None):
+        result = await original(
+            self, base_model, payload, record, expected_checkpoint=expected_checkpoint
+        )
+        result["checkpoint"] = "flash-9999999999-99999999/step-1"
+        return result
+
+    monkeypatch.setattr(_Pool, "generate", wrong_checkpoint)
+    client, _pool = _client(QWEN)
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": REVISION_ID, "messages": _messages()},
+    )
+    assert response.status_code == 502
+    assert "immutable checkpoint" in response.json()["detail"]
+    assert "X-Freesolo-Checkpoint" not in response.headers
 
 
 def test_mismatched_attestation_on_a_revision_is_a_bad_gateway(monkeypatch) -> None:
@@ -1016,7 +991,7 @@ def test_mismatched_attestation_on_a_revision_is_a_bad_gateway(monkeypatch) -> N
         result = await original(
             self, base_model, payload, record, expected_checkpoint=expected_checkpoint
         )
-        result["lora_request_adapter"] = "flash-9999999999-99999999@step-1.%s" % ("b" * 40)
+        result["lora_request_adapter"] = "flash-9999999999-99999999/step-1"
         return result
 
     monkeypatch.setattr(_Pool, "generate", wrong_adapter)
@@ -1040,19 +1015,6 @@ def test_revision_response_carries_the_attestation_header_and_hides_the_field() 
     assert "lora_request_adapter" not in response.text
 
 
-def test_alias_request_attests_the_revision_it_resolved_to() -> None:
-    # asking by run alias still resolves to a concrete revision, and that resolved revision is
-    # what got served - so it is attested. the header names the revision, not the alias the
-    # caller typed, which is the whole point: it says what ran, not what was asked for.
-    client, _pool = _client(QWEN)
-    response = client.post(
-        "/v1/chat/completions",
-        json={"model": RUN_ID, "messages": _messages()},
-    )
-    assert response.status_code == 200
-    assert response.headers["X-Freesolo-LoRA-Request-Adapter"] == REVISION_ID
-
-
 @pytest.mark.parametrize(
     ("messages", "expect"),
     [
@@ -1069,8 +1031,10 @@ def test_malformed_text_only_messages_are_rejected_before_gpu_dispatch(
     `GenerateRequest` only checks "list of dicts", and the engine hands the list straight to the
     chat template, so `{"role": "user"}` rendered as an empty prompt and still charged the caller.
     """
-    client, pool = _client(QWEN_2B)
-    response = client.post("/v1/chat/completions", json={"model": RUN_ID, "messages": messages})
+    client, pool = _client(QWEN_35B)
+    response = client.post(
+        "/v1/chat/completions", json={"model": REVISION_ID, "messages": messages}
+    )
     assert response.status_code == 400
     assert expect in response.text
     assert pool.calls == [], "a malformed request must never reach the gpu"
@@ -1082,11 +1046,11 @@ def test_developer_role_is_rewritten_to_system_for_text_only_requests() -> None:
     It was only rewritten when a request also carried list-form content, so a plain text chat
     reached the tokenizer with a role the template may reject -- after gpu dispatch.
     """
-    client, pool = _client(QWEN_2B)
+    client, pool = _client(QWEN_35B)
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": RUN_ID,
+            "model": REVISION_ID,
             "messages": [
                 {"role": "developer", "content": "be terse"},
                 {"role": "user", "content": "hi"},
@@ -1094,7 +1058,7 @@ def test_developer_role_is_rewritten_to_system_for_text_only_requests() -> None:
         },
     )
     assert response.status_code == 200
-    assert pool.calls == [(QWEN_2B, REVISION_ID, REVISION_ID)]
+    assert pool.calls == [(QWEN_35B, REVISION_ID, REVISION_ID)]
     sent = pool.payloads[-1].messages
     assert [m["role"] for m in sent] == ["system", "user"], (
         "the engine must template the normalized roles, not the original spelling"
@@ -1109,10 +1073,12 @@ def test_image_request_reaches_the_engine_with_its_sources_intact() -> None:
     it back would route to the image path and then fail there with "must contain exactly one image
     source" -- after the request had already been accepted.
     """
-    client, pool = _client(QWEN_2B)
-    response = client.post("/v1/chat/completions", json={"model": RUN_ID, "messages": _messages()})
+    client, pool = _client(QWEN_35B)
+    response = client.post(
+        "/v1/chat/completions", json={"model": REVISION_ID, "messages": _messages()}
+    )
     assert response.status_code == 200
-    assert pool.calls == [(QWEN_2B, REVISION_ID, REVISION_ID)]
+    assert pool.calls == [(QWEN_35B, REVISION_ID, REVISION_ID)]
     sent = pool.payloads[-1].messages
     blocks = sent[0]["content"]
     image_blocks = [b for b in blocks if b.get("type") in {"image_url", "input_image", "image"}]
@@ -1143,5 +1109,18 @@ def test_malformed_tool_calls_are_rejected_before_the_chat_template(tool_calls: 
 
 
 def test_a_usable_tool_call_history_still_passes() -> None:
-    messages = [{"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "f"}}]}]
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
     assert normalize_chat_messages(messages, supports_images=False, image_limit=4) == messages

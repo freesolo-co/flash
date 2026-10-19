@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
 
-from flash.serve.provisioning._common import InterruptedProvisioning
-from flash.serve.provisioning._modal_sdk import (
+from flash.serve.provisioning.common.records import InterruptedProvisioning
+from flash.serve.provisioning.modal.execution.sdk import (
     ModalSdkFailure,
     _call_mutation,
     _call_read,
@@ -33,6 +34,7 @@ def test_lazy_loader_binds_pinned_experimental_surface_without_provider_calls() 
 import importlib
 import importlib.metadata
 import socket
+import sys
 
 import modal
 
@@ -50,24 +52,31 @@ def forbidden_network_call(*args, **kwargs):
     raise AssertionError("network operation attempted")
 
 
-assert importlib.metadata.version("modal") == "1.5.4"
-assert not hasattr(modal, "experimental")
+assert importlib.metadata.version("modal") == sys.argv[1]
 modal.Client.from_credentials = forbidden_provider_call
 modal.Client.from_env = forbidden_provider_call
 socket.create_connection = forbidden_network_call
 
-from flash.serve.provisioning._modal_sdk import _load_modal_module
+from flash.serve.provisioning.modal.execution.sdk import _load_modal_module
 
 loaded = _load_modal_module()
 assert loaded is modal
 assert loaded.experimental is importlib.import_module("modal.experimental")
 for name in ("list_deployed_apps", "get_app_objects", "get_app_lifecycle", "stop_app"):
-    assert callable(getattr(loaded.experimental, name))
+    operation = getattr(loaded.experimental, name)
+    assert callable(operation)
+    assert callable(operation.aio)
 assert provider_calls == []
 assert network_calls == []
 """
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    modal_pin = next(
+        requirement
+        for requirement in project["project"]["optional-dependencies"]["server"]
+        if requirement.startswith("modal==")
+    )
     result = subprocess.run(
-        [sys.executable, "-c", program],
+        [sys.executable, "-c", program, modal_pin.removeprefix("modal==")],
         cwd=ROOT,
         capture_output=True,
         text=True,

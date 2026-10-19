@@ -18,26 +18,45 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flash._internal.logging import configure_logging, get_logger
-from flash.providers._lifecycle.deadline import deadline_kwargs
-from flash.providers._lifecycle.poll import preload_instance_run_id
+from flash.providers._lifecycle.instances.poll import preload_instance_run_id
 from flash.providers.artifacts.hf import make_hf_text_reader
 
 # imported at the top rather than re-exported at the bottom: these are default argument
 # values below, and a default evaluates when the `def` runs, long before a bottom import.
-from flash.providers.artifacts.preload_runpod import (
+# the rest of the runpod preload surface is re-exported here for the same reason, one step
+# further along: `main()` runs from the `__main__` guard, which sits ABOVE where these used to be
+# imported, so every CLI invocation died on `NameError: catalog_model_ids` while the library path
+# stayed green (importing the module executes the whole file, bottom import included). tests that
+# patch `weight_cache.<name>` keep working because the names still land in this module's namespace.
+from flash.providers.artifacts.preload_runpod import (  # noqa: F401
+    _NO_CAPACITY_GRACE_S,
     _PRELOAD_GPU,
     _PRELOAD_TIMEOUT_S,
+    _QUEUED,
+    _THROTTLED_GRACE_S,
+    _UNHEALTHY_GRACE_S,
+    NoCapacityError,
+    _any_worker,
+    _has_worker,
+    _only_unhealthy_workers,
+    _poll_until_done,
+    _preload_one_dc,
+    _throttled_workers,
+    _worker_counts,
+    catalog_model_ids,
+    teardown_lambda_filesystems,
+    teardown_weight_cache,
+    warm_weight_cache,
 )
-from flash.providers.base import UnreconciledCreateError
-from flash.providers.runpod import api as runpod_api  # noqa: F401
+from flash.providers.core.base import UnreconciledCreateError
+from flash.providers.runpod.client import api as runpod_api  # noqa: F401
 
 # several names below have no call site here since the runpod half moved to `.preload_runpod`,
 # but they are kept imported on purpose: the preload tests patch them on THIS module and that
 # half reads them back through it. an autofix that drops them as unused breaks those tests.
-from flash.providers.runpod.jobs import (  # noqa: F401
-    GraceTimer,
-    decode_output,
-    deploy_train_endpoint,
+from flash.providers.runpod.execution.job_execution import deploy_train_endpoint  # noqa: F401
+from flash.providers.runpod.execution.jobs import GraceTimer, decode_output  # noqa: F401
+from flash.providers.runpod.execution.resources import (  # noqa: F401
     weight_cache_datacenters,
     weight_cache_volume_name,
 )
@@ -91,7 +110,7 @@ def _preload_status_repo() -> str:
     unusable for a self-hoster whose token cannot write there -- with an error telling them to fix
     an ``HF_TOKEN`` that was already correct.
     """
-    from flash.runner import artifact_namespace
+    from flash.runner.accounting.artifacts import artifact_namespace
 
     return f"{artifact_namespace()}/{_PRELOAD_STATUS_REPO_NAME}"
 
@@ -139,7 +158,7 @@ def _lambda_warm_targets(lambda_jobs, gpu: str | None) -> tuple[list[list], bool
         try:
             candidates = lambda_jobs.usable_instances(
                 cls,
-                **deadline_kwargs(lambda_jobs.usable_instances, deadline),
+                deadline_at=deadline,
             )
         except Exception as exc:
             logger.warning("warm lambda: usable_instances(%s) failed (skipping): %s", cls, exc)
@@ -164,12 +183,12 @@ def _lambda_provisioned_regions() -> set[str]:
     for what is only a reporting nicety. Losing the snapshot degrades the summary; blocking on it
     delays warming.
     """
-    from flash.providers.lambda_ import api as lambda_api
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
     try:
         fses = lambda_api.list_filesystems(
-            **deadline_kwargs(lambda_api.list_filesystems, time.time() + _LAMBDA_SNAPSHOT_BUDGET_S),
+            deadline_at=time.time() + _LAMBDA_SNAPSHOT_BUDGET_S,
         )
     except Exception as exc:
         logger.warning(
@@ -195,11 +214,14 @@ def _ensure_status_repo(token: str | None) -> None:
 def _preload_instance_spec(gpu: str, run_id: str, wall_s: int = 1800):
     """Minimal download-only spec with cache volume attached and wall cap set to the warm timeout."""
     from flash.core.spec import JobSpec
-    from flash.runner import WEIGHT_CACHE_VOLUME_GB, WEIGHT_CACHE_VOLUME_NAME
+    from flash.runner.accounting.weight_cache import (
+        WEIGHT_CACHE_VOLUME_GB,
+        WEIGHT_CACHE_VOLUME_NAME,
+    )
 
     return JobSpec.from_dict(
         {
-            "model": "Qwen/Qwen3.5-0.8B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
             "run_id": run_id,
             "train": {
@@ -223,11 +245,11 @@ def _region_filesystem_is_listed(region: str, deadline: float) -> bool:
     call begins by listing and returns early on a match, so once the filesystem is listed no later
     caller can reach the non-idempotent create path for it.
     """
-    from flash.providers.lambda_ import api as lambda_api
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
     fses = lambda_api.list_filesystems(
-        **deadline_kwargs(lambda_api.list_filesystems, deadline),
+        deadline_at=deadline,
     )
     return any(
         fs.get("name") == WEIGHT_CACHE_VOLUME_NAME
@@ -254,8 +276,8 @@ def _ensure_region_filesystem(region: str, deadline: float) -> str:
       ``"doubtful"``    -- reached Lambda but cannot confirm; launching could pay for a second
                            filesystem forever, so the caller must skip the region.
     """
-    from flash.providers.lambda_ import api as lambda_api
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
     try:
         # Already listed: nothing to create, so skip the create path entirely rather than trusting it
@@ -265,7 +287,7 @@ def _ensure_region_filesystem(region: str, deadline: float) -> str:
         lambda_api.ensure_filesystem(
             WEIGHT_CACHE_VOLUME_NAME,
             region,
-            **deadline_kwargs(lambda_api.ensure_filesystem, deadline),
+            deadline_at=deadline,
         )
         if _region_filesystem_is_listed(region, deadline):
             return "listed"
@@ -348,7 +370,6 @@ def _warm_one_lambda_instance(
             try:
                 lambda_jobs.launch_and_submit(
                     spec,
-                    seed=spec.seed,
                     instances=[cand],
                     attempt=0,
                     mode="preload",
@@ -574,8 +595,8 @@ def provision_lambda_filesystems(name: str | None = None) -> list[str]:
 
     Best-effort: zero-capacity regions are covered by the launch-time ensure_filesystem backstop.
     """
-    from flash.providers.lambda_ import api as lambda_api
-    from flash.runner import WEIGHT_CACHE_VOLUME_NAME
+    from flash.providers.lambda_.client import api as lambda_api
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
     target = name or WEIGHT_CACHE_VOLUME_NAME
     done: list[str] = []
@@ -839,25 +860,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-# re-exported so the runpod preload surface stays reachable as `weight_cache.<name>`: the
-# preload tests patch and call all of these here, and `main` below dispatches to them.
-from flash.providers.artifacts.preload_runpod import (  # noqa: E402,F401
-    _NO_CAPACITY_GRACE_S,
-    _QUEUED,
-    _THROTTLED_GRACE_S,
-    _UNHEALTHY_GRACE_S,
-    NoCapacityError,
-    _any_worker,
-    _has_worker,
-    _only_unhealthy_workers,
-    _poll_until_done,
-    _preload_one_dc,
-    _throttled_workers,
-    _worker_counts,
-    catalog_model_ids,
-    teardown_lambda_filesystems,
-    teardown_weight_cache,
-    warm_weight_cache,
-)

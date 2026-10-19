@@ -146,7 +146,7 @@ def test_backoff_grows_and_is_bounded(no_sleep):
 
 
 def test_default_gpu_walk_covers_every_baked_arch():
-    from flash.providers._lifecycle.worker import BAKED_PER_SM_ARCHES
+    from flash.providers._lifecycle.net.worker import BAKED_PER_SM_ARCHES
 
     assert set(bake.GPU_WALK_BY_SM) == BAKED_PER_SM_ARCHES
     assert all(len(types) == len(set(types)) for types in bake.GPU_WALK_BY_SM.values())
@@ -163,3 +163,28 @@ def test_bake_goes_through_the_gpu_walk_helper():
     body = BAKE_SCRIPT.read_text().split("def main()")[1]
     assert "_create_pod_with_gpu_walk(" in body
     assert "runpod.create_pod(" not in body
+
+
+@pytest.mark.parametrize(
+    "artifact", ["triton/kernel.cubin", "triton/kernel.ptx", "inductor/kernel.so"]
+)
+def test_verify_accepts_real_raw_artifacts(tmp_path, artifact):
+    path = tmp_path / artifact
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(b"compiled")
+    (tmp_path / "mega_cache.json").write_text('{"sm": "sm100"}')
+    assert bake._verify(str(tmp_path), "sm100") == 0
+    assert bake._verify(str(tmp_path), "sm90") == 1
+
+
+def test_verify_rejects_metadata_and_lock_files_without_kernels(tmp_path):
+    (tmp_path / "triton").mkdir()
+    (tmp_path / "triton" / "kernel.lock").write_text("lock")
+    (tmp_path / "mega_cache.json").write_text('{"sm": "sm100"}')
+    assert bake._verify(str(tmp_path), "sm100") == 1
+
+
+def test_verify_rejects_legacy_blob_without_raw_kernels(tmp_path):
+    (tmp_path / "mega_cache.bin").write_bytes(b"legacy-blob")
+    (tmp_path / "mega_cache.json").write_text('{"sm": "sm100"}')
+    assert bake._verify(str(tmp_path), "sm100") == 1

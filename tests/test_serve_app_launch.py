@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import gc
 import hashlib
 import inspect
@@ -12,11 +13,13 @@ import time
 import types
 import uuid
 import weakref
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from flash.serve.app import launch
+from flash.serve.app import __main__ as app_main
+from flash.serve.app import launch, materialize
 from flash.serve.app.manifest import build_serving_manifest
 from flash.serve.app.materialize import MaterializationError, read_artifact_token_fd
 from flash.serve.provisioning import encode_manifest_environment
@@ -60,9 +63,9 @@ def _base_weights_present(monkeypatch):
     with their own stub, which takes precedence because monkeypatch applies in call order.
     """
 
-    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: True)
+    monkeypatch.setattr(materialize, "base_weights_are_cached", lambda *_a, **_k: True)
     monkeypatch.setattr(
-        launch,
+        materialize,
         "hydrate_base_weights",
         lambda *_a, **_k: pytest.fail("base weights were already present"),
     )
@@ -92,18 +95,34 @@ def test_launcher_uses_cache_first_without_reading_artifact_token(
 
     def validate(manifest, cache_root):
         calls.append("validate")
-        return {manifest.adapters[0].adapter_revision: Path(cache_root) / "cached"}
+        return {manifest.adapters[0].checkpoint_id: Path(cache_root) / "cached"}
 
     def hydrate(*_args, **_kwargs):
         raise AssertionError("cache-first restart must not hydrate")
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", validate)
-    monkeypatch.setattr(launch, "hydrate_manifest", hydrate)
-    monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
+    real_seal_hub_offline = launch._seal_hub_offline
+
+    def seal_hub_offline(environment):
+        calls.append("seal")
+        real_seal_hub_offline(environment)
+
+    monkeypatch.setattr(materialize, "validate_manifest_cache", validate)
+    monkeypatch.setattr(materialize, "hydrate_manifest", hydrate)
+    monkeypatch.setattr(
+        launch,
+        "emit_filesystem_usage",
+        lambda stage, cache_root: calls.append(f"usage:{stage}:{cache_root}"),
+    )
+    monkeypatch.setattr(launch, "_seal_hub_offline", seal_hub_offline)
+    monkeypatch.setattr(app_main, "_serve", _successful_serve(captured))
 
     _run_with_environment(environment)
 
-    assert calls == ["validate"]
+    assert calls == [
+        "validate",
+        f"usage:cache-prepared:{environment['FLASH_SERVING_CACHE_ROOT']}",
+        "seal",
+    ]
     assert captured["inference_token"] == INFERENCE_TOKEN
     assert "FLASH_INFERENCE_TOKEN" not in environment
     assert "FLASH_ARTIFACT_TOKEN" not in environment
@@ -139,8 +158,8 @@ def test_bootstrap_handoff_installs_inner_guard_before_restoring_outer(
             observed = True
             return previous_handlers
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
-    monkeypatch.setattr(launch, "_serve", _successful_serve({}))
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(app_main, "_serve", _successful_serve({}))
 
     launch.run_launcher_with_secrets(
         [INFERENCE_TOKEN],
@@ -160,8 +179,8 @@ def test_launcher_streams_secret_values_larger_than_pipe_capacity(
     large_token = "x" * (128 * 1024)
     environment["FLASH_INFERENCE_TOKEN"] = large_token
     captured: dict[str, object] = {}
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
-    monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(app_main, "_serve", _successful_serve(captured))
 
     _run_with_environment(environment)
 
@@ -182,8 +201,8 @@ def test_launcher_cache_miss_requires_artifact_token_before_serving(
         nonlocal serve_calls
         serve_calls += 1
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", missing)
-    monkeypatch.setattr(launch, "_serve", serve)
+    monkeypatch.setattr(materialize, "validate_manifest_cache", missing)
+    monkeypatch.setattr(app_main, "_serve", serve)
 
     with pytest.raises(launch.LaunchError, match="artifact token is required") as exc_info:
         _run_with_environment(environment)
@@ -209,9 +228,9 @@ def test_launcher_hydrates_missing_cache_through_closed_descriptor(
         captured["artifact_token"] = read_artifact_token_fd(token_fd)
         return {}
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", missing)
-    monkeypatch.setattr(launch, "hydrate_manifest", hydrate)
-    monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
+    monkeypatch.setattr(materialize, "validate_manifest_cache", missing)
+    monkeypatch.setattr(materialize, "hydrate_manifest", hydrate)
+    monkeypatch.setattr(app_main, "_serve", _successful_serve(captured))
 
     _run_with_environment(environment)
 
@@ -300,7 +319,6 @@ def _secret_reachability_probe(
 
         assert expected_frames <= frames.keys(), frames.keys()
         assert "_run_with_secrets" not in frames
-        assert "_prepare_explicit_secrets" not in frames
         for name, active in frames.items():
             for local_name, value in active.f_locals.items():
                 assert not _value_contains_secret(value, fingerprint, set()), (
@@ -321,7 +339,7 @@ def _unpredictable_artifact_token() -> tuple[str, bytes]:
     return token, hashlib.sha256(token.encode()).digest()
 
 
-def test_secret_descriptor_releases_its_source_after_the_consumer_reads() -> None:
+def test_secret_pipe_releases_its_source_after_the_consumer_reads() -> None:
     class WeakToken(str):
         __slots__ = ("__weakref__",)
 
@@ -329,7 +347,7 @@ def test_secret_descriptor_releases_its_source_after_the_consumer_reads() -> Non
     token = WeakToken(expected)
     token_reference = weakref.ref(token)
 
-    with launch._secret_descriptor(token) as token_fd:
+    with launch._open_secret_pipe(token) as token_fd:
         del token
         assert read_artifact_token_fd(token_fd) == expected
         deadline = time.monotonic() + 1
@@ -339,7 +357,7 @@ def test_secret_descriptor_releases_its_source_after_the_consumer_reads() -> Non
         assert token_reference() is None
 
 
-def test_secret_descriptor_chains_the_original_write_failure(monkeypatch) -> None:
+def test_secret_pipe_chains_the_original_write_failure(monkeypatch) -> None:
     failure = OSError("write failed")
 
     def fail_write(_fd: int, _value: str) -> None:
@@ -350,11 +368,195 @@ def test_secret_descriptor_chains_the_original_write_failure(monkeypatch) -> Non
         pytest.raises(
             launch.LaunchError, match=r"^secret descriptor could not be populated$"
         ) as exc_info,
-        launch._secret_descriptor(INFERENCE_TOKEN) as token_fd,
+        launch._open_secret_pipe(INFERENCE_TOKEN) as token_fd,
     ):
         assert os.read(token_fd, 1) == b""
 
     assert exc_info.value.__cause__ is failure
+
+
+def test_secret_pipe_error_retains_stuck_writer(monkeypatch) -> None:
+    real_pipe = os.pipe
+    read_fd, write_fd = real_pipe()
+    join_calls: list[float | None] = []
+
+    class StuckWriter:
+        ident = 1
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout: float | None = None) -> None:
+            join_calls.append(timeout)
+
+        def is_alive(self) -> bool:
+            return True
+
+    monkeypatch.setattr(launch.os, "pipe", lambda: (read_fd, write_fd))
+    monkeypatch.setattr(launch.threading, "Thread", StuckWriter)
+    try:
+        with (
+            pytest.raises(
+                launch.CredentialWriterShutdownUnconfirmed,
+                match=r"^credential writer shutdown could not be confirmed$",
+            ) as exc_info,
+            launch._open_secret_pipe(INFERENCE_TOKEN),
+        ):
+            pass
+    finally:
+        os.close(write_fd)
+
+    assert exc_info.value.writer.__class__ is StuckWriter
+    assert join_calls == [launch._CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS]
+    assert INFERENCE_TOKEN not in str(exc_info.value)
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(read_fd)
+
+
+def test_secret_pipe_join_failure_retains_thread_and_original_error(monkeypatch) -> None:
+    read_fd, write_fd = os.pipe()
+    body_failure = RuntimeError("body failed")
+
+    class BrokenJoinWriter:
+        ident = 1
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout: float | None = None) -> None:
+            assert timeout == launch._CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS
+            raise RuntimeError("join failed")
+
+        def is_alive(self) -> bool:
+            return True
+
+    def fail_body() -> None:
+        with launch._open_secret_pipe(INFERENCE_TOKEN):
+            raise body_failure
+
+    monkeypatch.setattr(launch.os, "pipe", lambda: (read_fd, write_fd))
+    monkeypatch.setattr(launch.threading, "Thread", BrokenJoinWriter)
+    try:
+        with pytest.raises(launch.CredentialWriterShutdownUnconfirmed) as exc_info:
+            fail_body()
+    finally:
+        os.close(write_fd)
+
+    assert exc_info.value.writer.__class__ is BrokenJoinWriter
+    assert exc_info.value.__cause__ is body_failure
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(read_fd)
+
+
+def test_secret_pipe_closes_both_descriptors_when_real_thread_start_fails(
+    monkeypatch,
+) -> None:
+    opened: tuple[int, int] | None = None
+    real_pipe = os.pipe
+    real_start = launch.threading.Thread.start
+
+    def tracked_pipe() -> tuple[int, int]:
+        nonlocal opened
+        opened = real_pipe()
+        return opened
+
+    def fail_start(_thread: launch.threading.Thread) -> None:
+        raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(launch.os, "pipe", tracked_pipe)
+    monkeypatch.setattr(launch.threading.Thread, "start", fail_start)
+
+    with (
+        pytest.raises(RuntimeError, match="thread start failed"),
+        launch._open_secret_pipe(INFERENCE_TOKEN),
+    ):
+        pytest.fail("body must not run")
+
+    monkeypatch.setattr(launch.threading.Thread, "start", real_start)
+    assert opened is not None
+    for fd in opened:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(fd)
+
+
+def test_secret_pipe_real_thread_cleanup_chains_the_body_failure(monkeypatch) -> None:
+    started = launch.threading.Event()
+    release = launch.threading.Event()
+    body_failure = RuntimeError("body failed")
+
+    def block_write(_fd: int, _value: str) -> None:
+        started.set()
+        release.wait()
+
+    def fail_body() -> None:
+        with launch._open_secret_pipe(INFERENCE_TOKEN):
+            assert started.wait(1)
+            raise body_failure
+
+    monkeypatch.setattr(launch, "_write_all", block_write)
+    monkeypatch.setattr(launch, "_CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(launch.CredentialWriterShutdownUnconfirmed) as exc_info:
+        fail_body()
+
+    writer = exc_info.value.writer
+    assert writer.is_alive()
+    assert exc_info.value.__cause__ is body_failure
+    release.set()
+    writer.join(timeout=1)
+    assert not writer.is_alive()
+    assert INFERENCE_TOKEN not in str(exc_info.value)
+
+
+def test_secret_pipe_cleanup_times_out_with_blocked_writer() -> None:
+    secret = f"subprocess-secret-{uuid.uuid4().hex}"
+    script = f"""
+import threading
+from flash.serve.app import launch
+
+started = threading.Event()
+release = threading.Event()
+
+
+def ignore_descriptor_closure(_fd, _value):
+    started.set()
+    release.wait()
+
+
+launch._write_all = ignore_descriptor_closure
+launch._CREDENTIAL_WRITER_STOP_TIMEOUT_SECONDS = 0.01
+try:
+    with launch._open_secret_pipe({secret!r}):
+        if not started.wait(1):
+            raise RuntimeError("credential writer did not start")
+except launch.CredentialWriterShutdownUnconfirmed as exc:
+    if not exc.writer.is_alive():
+        raise RuntimeError("stuck credential writer ownership was lost")
+    release.set()
+    exc.writer.join(timeout=1)
+    if exc.writer.is_alive():
+        raise RuntimeError("owned credential writer could not be released")
+else:
+    raise RuntimeError("stuck credential writer was accepted")
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert secret not in completed.stdout
+    assert secret not in completed.stderr
 
 
 def test_explicit_launcher_drops_the_artifact_token_before_the_server_loop(
@@ -363,9 +565,9 @@ def test_explicit_launcher_drops_the_artifact_token_before_the_server_loop(
     artifact_token, fingerprint = _unpredictable_artifact_token()
     environment = _environment(tmp_path, artifact=False)
     environment.pop("FLASH_INFERENCE_TOKEN")
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
     monkeypatch.setattr(
-        launch,
+        app_main,
         "_serve",
         _secret_reachability_probe(fingerprint, {"run_launcher_with_secrets", "_run_prepared"}),
     )
@@ -387,9 +589,9 @@ def test_root_bootstrap_drops_the_inference_token_before_the_server_loop(
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
     del inference_token
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
     monkeypatch.setattr(
-        launch,
+        app_main,
         "_serve",
         _secret_reachability_probe(
             fingerprint,
@@ -415,9 +617,9 @@ def test_root_bootstrap_drops_the_artifact_token_before_the_server_loop(
     environment["FLASH_ARTIFACT_TOKEN"] = artifact_token
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
     monkeypatch.setattr(
-        launch,
+        app_main,
         "_serve",
         _secret_reachability_probe(fingerprint, {"_run", "_run_prepared"}),
     )
@@ -448,10 +650,10 @@ def test_bootstrap_hydrates_base_weights_while_the_artifact_token_still_exists(
     def hydrate_weights(_manifest, _cache_root, *, token_fd: int):
         captured["weights_token"] = read_artifact_token_fd(token_fd)
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
-    monkeypatch.setattr(launch, "base_weights_are_cached", weights_absent)
-    monkeypatch.setattr(launch, "hydrate_base_weights", hydrate_weights)
-    monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(materialize, "base_weights_are_cached", weights_absent)
+    monkeypatch.setattr(materialize, "hydrate_base_weights", hydrate_weights)
+    monkeypatch.setattr(app_main, "_serve", _successful_serve(captured))
 
     _run_with_environment(environment)
 
@@ -472,9 +674,9 @@ def test_missing_base_weights_without_a_token_fail_before_the_engine_starts(
         nonlocal serve_calls
         serve_calls += 1
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
-    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: False)
-    monkeypatch.setattr(launch, "_serve", serve)
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(materialize, "base_weights_are_cached", lambda *_a, **_k: False)
+    monkeypatch.setattr(app_main, "_serve", serve)
 
     with pytest.raises(launch.LaunchError, match="artifact token is required"):
         _run_with_environment(environment)
@@ -491,14 +693,14 @@ def test_cached_base_weights_are_not_downloaded_again_on_a_warm_restart(
     environment = _environment(tmp_path, artifact=False)
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
-    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: True)
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(materialize, "base_weights_are_cached", lambda *_a, **_k: True)
     monkeypatch.setattr(
-        launch,
+        materialize,
         "hydrate_base_weights",
         lambda *_a, **_k: pytest.fail("a warm volume must not re-download the base weights"),
     )
-    monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
+    monkeypatch.setattr(app_main, "_serve", _successful_serve(captured))
 
     _run_with_environment(environment)
 
@@ -517,16 +719,16 @@ def test_hub_cache_is_bound_to_the_volume_for_the_engine_child(
     cache_root = environment["FLASH_SERVING_CACHE_ROOT"]
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
-    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: True)
-    monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(materialize, "base_weights_are_cached", lambda *_a, **_k: True)
+    monkeypatch.setattr(app_main, "_serve", _successful_serve(captured))
 
     _run_with_environment(environment)
 
     assert environment["HF_HOME"] == cache_root
-    assert environment["HF_HUB_CACHE"] == str(launch.base_weights_cache_path(cache_root))
+    assert environment["HF_HUB_CACHE"] == str(materialize.base_weights_cache_path(cache_root))
     scrubbed = launch._scrub_child_environment(environment)
-    assert scrubbed["HF_HUB_CACHE"] == str(launch.base_weights_cache_path(cache_root))
+    assert scrubbed["HF_HUB_CACHE"] == str(materialize.base_weights_cache_path(cache_root))
 
 
 def test_engine_runtime_environment_is_applied_on_every_provider(
@@ -542,9 +744,9 @@ def test_engine_runtime_environment_is_applied_on_every_provider(
     environment = _environment(tmp_path, artifact=False)
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
-    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: True)
-    monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(materialize, "base_weights_are_cached", lambda *_a, **_k: True)
+    monkeypatch.setattr(app_main, "_serve", _successful_serve(captured))
     monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
 
     _run_with_environment(environment)
@@ -566,9 +768,9 @@ def test_engine_runtime_environment_overrides_a_conflicting_inherited_value(
     environment["VLLM_WORKER_MULTIPROC_METHOD"] = "fork"
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
-    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: True)
-    monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(materialize, "base_weights_are_cached", lambda *_a, **_k: True)
+    monkeypatch.setattr(app_main, "_serve", _successful_serve(captured))
 
     _run_with_environment(environment)
 
@@ -586,9 +788,9 @@ def test_compile_cache_is_bound_to_the_volume_on_every_provider(
     environment = _environment(tmp_path, artifact=False)
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
-    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: True)
-    monkeypatch.setattr(launch, "_serve", _successful_serve(captured))
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(materialize, "base_weights_are_cached", lambda *_a, **_k: True)
+    monkeypatch.setattr(app_main, "_serve", _successful_serve(captured))
     monkeypatch.delenv("VLLM_CACHE_ROOT", raising=False)
 
     _run_with_environment(environment)
@@ -616,8 +818,8 @@ def test_engine_start_is_sealed_offline_only_after_hydration(
     captured: dict[str, object] = {}
 
     monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
-    monkeypatch.setattr(launch, "base_weights_are_cached", lambda *_a, **_k: False)
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(materialize, "base_weights_are_cached", lambda *_a, **_k: False)
 
     def hydrate(*_args, **_kwargs):
         # the flag disables outgoing traffic globally, so sealing before this point would break
@@ -634,9 +836,9 @@ def test_engine_start_is_sealed_offline_only_after_hydration(
         captured["constant"] = hub_constants.HF_HUB_OFFLINE
         captured["variable"] = os.environ.get("HF_HUB_OFFLINE")
 
-    monkeypatch.setattr(launch, "hydrate_base_weights", hydrate)
-    monkeypatch.setattr(launch, "hydrate_manifest", hydrate)
-    monkeypatch.setattr(launch, "_serve", serve)
+    monkeypatch.setattr(materialize, "hydrate_base_weights", hydrate)
+    monkeypatch.setattr(materialize, "hydrate_manifest", hydrate)
+    monkeypatch.setattr(app_main, "_serve", serve)
 
     _run_with_environment(environment)
 
@@ -667,9 +869,9 @@ def test_sigterm_during_hydration_aborts_and_closes_startup_state(
         nonlocal serve_calls
         serve_calls += 1
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", missing)
-    monkeypatch.setattr(launch, "hydrate_manifest", terminate_during_hydration)
-    monkeypatch.setattr(launch, "_serve", serve)
+    monkeypatch.setattr(materialize, "validate_manifest_cache", missing)
+    monkeypatch.setattr(materialize, "hydrate_manifest", terminate_during_hydration)
+    monkeypatch.setattr(app_main, "_serve", serve)
 
     with pytest.raises(launch.StartupTerminated, match="startup was terminated") as exc_info:
         _run_with_environment(environment)
@@ -703,8 +905,8 @@ def test_sigint_during_bootstrap_closes_inference_descriptor(
         assert on_signals_installed
         os.kill(os.getpid(), launch.signal.SIGINT)
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", lambda *_args: {})
-    monkeypatch.setattr(launch, "_serve", terminate_during_bootstrap)
+    monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
+    monkeypatch.setattr(app_main, "_serve", terminate_during_bootstrap)
 
     with pytest.raises(launch.StartupTerminated, match="startup was terminated") as exc_info:
         _run_with_environment(environment)
@@ -720,7 +922,8 @@ def test_sigterm_during_hydration_aborts_in_subprocess(tmp_path: Path) -> None:
     cache_root = tmp_path / "subprocess-cache"
     probe = f"""
 import os
-from flash.serve.app import launch
+from flash.serve.app import launch, materialize
+from flash.serve.app import __main__ as app_main
 from flash.serve.app.manifest import build_serving_manifest
 from flash.serve.app.materialize import MaterializationError
 from flash.serve.provisioning import encode_manifest_environment
@@ -735,7 +938,6 @@ environment = {{
     "FLASH_INFERENCE_TOKEN": "subprocess-inference-sentinel",
     "FLASH_ARTIFACT_TOKEN": "subprocess-artifact-sentinel",
 }}
-launch._load_project_boundaries()
 
 
 def missing(*_args):
@@ -750,12 +952,12 @@ async def serve(*_args, **_kwargs):
     raise AssertionError("serve must not run")
 
 
-launch.validate_manifest_cache = missing
-launch.hydrate_manifest = terminate
+materialize.validate_manifest_cache = missing
+materialize.hydrate_manifest = terminate
 # this probe is about the adapter hydration signal window, so the base weights are declared
 # present rather than reaching huggingface_hub from a subprocess with an empty cache.
-launch.base_weights_are_cached = lambda *_a, **_k: True
-launch._serve = serve
+materialize.base_weights_are_cached = lambda *_a, **_k: True
+app_main._serve = serve
 try:
     inference_token = environment.pop("FLASH_INFERENCE_TOKEN")
     artifact_token = environment.pop("FLASH_ARTIFACT_TOKEN", None)
@@ -785,7 +987,7 @@ def test_sigterm_after_bootstrap_before_uvicorn_capture_has_no_window(tmp_path: 
     probe = f"""
 import os
 from flash.serve.app import __main__ as app_main
-from flash.serve.app import launch
+from flash.serve.app import launch, materialize
 from flash.serve.app.manifest import build_serving_manifest
 from flash.serve.provisioning import encode_manifest_environment
 from tests.test_serve_app_manifest import _spec_and_inputs
@@ -817,14 +1019,12 @@ def create_app(*_args, **_kwargs):
     raise AssertionError("signal handler did not abort app construction")
 
 
-launch._load_project_boundaries()
-launch.validate_manifest_cache = lambda *_args: {{}}
+materialize.validate_manifest_cache = lambda *_args: {{}}
 # this probe is about the signal window between bootstrap and uvicorn, so the base weights are
 # declared present rather than reaching huggingface_hub from a subprocess with an empty cache.
-launch.base_weights_are_cached = lambda *_a, **_k: True
+materialize.base_weights_are_cached = lambda *_a, **_k: True
 app_main.bootstrap_serving = bootstrap
 app_main.create_app = create_app
-launch._serve = app_main._serve
 try:
     inference_token = environment.pop("FLASH_INFERENCE_TOKEN")
     artifact_token = environment.pop("FLASH_ARTIFACT_TOKEN", None)
@@ -849,14 +1049,9 @@ assert not list(__import__("pathlib").Path({str(cache_root)!r}).glob(".serving-m
 
 
 def test_launcher_does_not_rehydrate_a_present_corrupt_cache(monkeypatch, tmp_path: Path) -> None:
-    # launch.adapter_cache_path is a deferred global: it stays None until the boundaries load, so
-    # reaching through `launch` without this call only works when some earlier test in the same
-    # process happened to load them first. that ordering dependency made this test pass alone and
-    # fail under -n auto, which is the configuration ci runs.
-    launch._load_project_boundaries()
     environment = _environment(tmp_path)
     manifest = _manifest()
-    destination = launch.adapter_cache_path(tmp_path / "cache", manifest.adapters[0])
+    destination = materialize.adapter_cache_path(tmp_path / "cache", manifest.adapters[0])
     destination.mkdir(parents=True, mode=0o700)
     (tmp_path / "cache").chmod(0o700)
     (tmp_path / "cache" / "adapters").chmod(0o700)
@@ -870,8 +1065,8 @@ def test_launcher_does_not_rehydrate_a_present_corrupt_cache(monkeypatch, tmp_pa
         nonlocal hydrate_calls
         hydrate_calls += 1
 
-    monkeypatch.setattr(launch, "validate_manifest_cache", corrupt)
-    monkeypatch.setattr(launch, "hydrate_manifest", hydrate)
+    monkeypatch.setattr(materialize, "validate_manifest_cache", corrupt)
+    monkeypatch.setattr(materialize, "hydrate_manifest", hydrate)
 
     with pytest.raises(launch.LaunchError, match="cache validation failed"):
         _run_with_environment(environment)
@@ -885,7 +1080,7 @@ def test_launcher_rejects_external_binding_before_cache_or_serving(
     environment = _environment(tmp_path)
     environment["FLASH_SERVING_MANIFEST_ID"] = "0" * 64
     monkeypatch.setattr(
-        launch,
+        materialize,
         "validate_manifest_cache",
         lambda *_args: (_ for _ in ()).throw(AssertionError("cache must not be read")),
     )
@@ -901,7 +1096,7 @@ def test_atomic_manifest_write_replaces_complete_file_and_cleans_failure(
 ) -> None:
     manifest = _manifest()
     cache = tmp_path / "cache"
-    path = launch._atomic_write_manifest(manifest, str(cache))
+    path = launch._atomic_write_manifest(manifest, str(cache), materialize._prepare_cache_root)
     assert path.read_text() == manifest.canonical_json()
     assert path.stat().st_mode & 0o777 == 0o600
 
@@ -912,30 +1107,128 @@ def test_atomic_manifest_write_replaces_complete_file_and_cleans_failure(
 
     monkeypatch.setattr(launch.os, "replace", fail_replace)
     with pytest.raises(OSError, match="replace failed"):
-        launch._atomic_write_manifest(manifest, str(cache))
+        launch._atomic_write_manifest(manifest, str(cache), materialize._prepare_cache_root)
     assert list(cache.glob(".serving-manifest-*.tmp")) == []
     assert path.read_text() == manifest.canonical_json()
     monkeypatch.setattr(launch.os, "replace", real_replace)
 
 
 class _FakeProcess:
-    def __init__(self, *, resist_terminate: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        resist_terminate: bool = False,
+        exit_unconfirmed: bool = False,
+    ) -> None:
         self.terminated = False
         self.killed = False
         self.resist_terminate = resist_terminate
-        self.wait_calls: list[float | None] = []
+        self.exit_unconfirmed = exit_unconfirmed
+        self.wait_calls: list[float] = []
 
     def terminate(self) -> None:
         self.terminated = True
+
+    @property
+    def pid(self) -> int:
+        return 4321
 
     def kill(self) -> None:
         self.killed = True
 
     def wait(self, timeout: float | None = None) -> int:
+        assert timeout is not None, "launcher child waits must always have a deadline"
         self.wait_calls.append(timeout)
-        if self.resist_terminate and not self.killed:
+        if self.exit_unconfirmed or (self.resist_terminate and not self.killed):
             raise launch.subprocess.TimeoutExpired("launcher", timeout)
         return -9 if self.killed else -15
+
+
+def test_stop_launcher_process_confirms_normal_shutdown() -> None:
+    process = _FakeProcess()
+
+    launch.stop_launcher_process(process)
+
+    assert process.terminated is True
+    assert process.killed is False
+    assert process.wait_calls == [launch._CHILD_STOP_TIMEOUT_SECONDS]
+
+
+def test_stop_launcher_process_propagates_a_wait_failure_instead_of_escalating() -> None:
+    """only a timeout means the child is still running.
+
+    treating every wait failure as "still running" turns an interrupt or a waitpid error into a
+    kill and then into a false shutdown failure, reporting a survivor that already exited.
+    """
+
+    class _InterruptedWait:
+        pid = 9182
+
+        def __init__(self) -> None:
+            self.terminated = False
+            self.killed = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise KeyboardInterrupt
+
+    process = _InterruptedWait()
+
+    with pytest.raises(KeyboardInterrupt):
+        launch.stop_launcher_process(process)
+
+    assert process.killed is False, "a non-timeout wait failure must not escalate to a kill"
+
+
+def test_packaged_launcher_ownership_modules_have_no_unbounded_caller_wait() -> None:
+    """no wait on a launcher caller's own thread may run without a deadline.
+
+    the modal watcher body is the one exemption and it is named explicitly: it exists to outlive
+    the child on a daemon thread, so a deadline there would only be this same wait rewritten as a
+    retry loop, which is unbounded in every sense except syntax. every other wait blocks a caller
+    and must carry a real deadline.
+    """
+
+    root = Path(__file__).resolve().parents[1]
+    ownership_modules = (
+        root / "serve_launch.py",
+        root / "flash/serve/app/launch.py",
+        root / "flash/serve/provisioning/modal/planning/wrapper.py",
+    )
+    exempt_daemon_watchers = {"stop_parent_when_child_exits"}
+    waits: list[tuple[Path, ast.Call]] = []
+    for path in ownership_modules:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        exempt_lines = {
+            node.lineno
+            for function in ast.walk(tree)
+            if isinstance(function, ast.FunctionDef) and function.name in exempt_daemon_watchers
+            for node in ast.walk(function)
+            if hasattr(node, "lineno")
+        }
+        waits.extend(
+            (path, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"join", "wait"}
+            and node.lineno not in exempt_lines
+        )
+
+    assert waits
+    for path, wait in waits:
+        timeout = next(
+            (keyword.value for keyword in wait.keywords if keyword.arg == "timeout"), None
+        )
+        assert timeout is not None, f"unbounded ownership wait in {path}:{wait.lineno}"
+        assert not (isinstance(timeout, ast.Constant) and timeout.value is None), (
+            f"explicitly unbounded ownership wait in {path}:{wait.lineno}"
+        )
 
 
 def test_parent_helper_scrubs_environment_argv_and_closes_descriptors(tmp_path: Path) -> None:
@@ -1049,7 +1342,7 @@ def test_parent_helper_terminates_child_and_cleans_up_on_pipe_failure(
             os.fstat(fd)
 
 
-def test_parent_helper_kills_and_reaps_a_termination_resistant_child(
+def test_launcher_start_failure_force_kills_child_that_ignores_termination(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -1071,6 +1364,42 @@ def test_parent_helper_kills_and_reaps_a_termination_resistant_child(
         launch._CHILD_STOP_TIMEOUT_SECONDS,
         launch._CHILD_STOP_TIMEOUT_SECONDS,
     ]
+    assert INFERENCE_TOKEN not in str(exc_info.value)
+    assert ARTIFACT_TOKEN not in str(exc_info.value)
+
+
+def test_launcher_start_failure_reports_unconfirmed_exit_and_original_error(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    environment = _environment(tmp_path)
+    process = _FakeProcess(exit_unconfirmed=True)
+
+    monkeypatch.setattr(
+        launch,
+        "_write_all",
+        lambda *_args: (_ for _ in ()).throw(launch.LaunchError("pipe failed")),
+    )
+
+    with pytest.raises(
+        launch.LauncherShutdownUnconfirmed,
+        match=r"^launcher process exit could not be confirmed after terminate and kill deadlines$",
+    ) as exc_info:
+        launch.start_launcher_process(environment, popen_factory=lambda *_args, **_kwargs: process)
+
+    assert exc_info.value.pid == process.pid
+    assert not hasattr(exc_info.value, "process"), (
+        "the survivor's handle must not be carried: every catcher only re-raises, so nothing adopts it"
+    )
+    assert isinstance(exc_info.value.__cause__, launch.LaunchError)
+    assert str(exc_info.value.__cause__) == "pipe failed"
+    assert process.terminated is True
+    assert process.killed is True
+    assert process.wait_calls == [
+        launch._CHILD_STOP_TIMEOUT_SECONDS,
+        launch._CHILD_STOP_TIMEOUT_SECONDS,
+    ]
+    assert all(timeout is not None for timeout in process.wait_calls)
     assert INFERENCE_TOKEN not in str(exc_info.value)
     assert ARTIFACT_TOKEN not in str(exc_info.value)
 
@@ -1111,3 +1440,76 @@ def test_launcher_errors_and_output_never_include_plaintext_secrets(
     assert ARTIFACT_TOKEN not in rendered
     assert "FLASH_INFERENCE_TOKEN" not in environment
     assert "FLASH_ARTIFACT_TOKEN" not in environment
+
+
+def test_explicit_dependencies_are_scoped_to_each_launch(monkeypatch, tmp_path: Path) -> None:
+    original = launch._load_project_boundaries()
+    events = []
+    first = {}
+    second = {}
+
+    def validate_first(manifest, cache_root):
+        events.append("first")
+        return {}
+
+    def validate_second(manifest, cache_root):
+        events.append("second")
+        return {}
+
+    first_dependencies = replace(
+        original,
+        cache=replace(original.cache, validate_manifest_cache=validate_first),
+        serve=_successful_serve(first),
+    )
+    second_dependencies = replace(
+        original,
+        cache=replace(original.cache, validate_manifest_cache=validate_second),
+        serve=_successful_serve(second),
+    )
+    monkeypatch.setattr(
+        launch,
+        "_load_project_boundaries",
+        lambda: pytest.fail("explicit dependencies must be used for this launch"),
+    )
+    for dependencies, directory in (
+        (first_dependencies, tmp_path / "first"),
+        (second_dependencies, tmp_path / "second"),
+    ):
+        environment = _environment(directory, artifact=False)
+        token = environment.pop("FLASH_INFERENCE_TOKEN")
+        launch.run_launcher_with_secrets(
+            [token], [None], environment=environment, dependencies=dependencies
+        )
+
+    assert events == ["first", "second"]
+    assert first["inference_token"] == second["inference_token"] == INFERENCE_TOKEN
+    assert first["args"].cache_root != second["args"].cache_root
+
+
+def test_project_boundaries_load_after_secret_consumption_under_startup_guard(
+    monkeypatch, tmp_path: Path
+) -> None:
+    dependencies = launch._load_project_boundaries()
+    captured = {}
+    dependencies = replace(
+        dependencies,
+        cache=replace(dependencies.cache, validate_manifest_cache=lambda *_args: {}),
+        serve=_successful_serve(captured),
+    )
+    environment = _environment(tmp_path, artifact=False)
+    inference_holder = [environment.pop("FLASH_INFERENCE_TOKEN")]
+    artifact_holder = [None]
+    loads = []
+
+    def load_boundaries():
+        assert inference_holder == artifact_holder == []
+        for signum in (launch.signal.SIGTERM, launch.signal.SIGINT):
+            handler = launch.signal.getsignal(signum)
+            assert isinstance(handler.__self__, launch._StartupSignalGuard)
+        loads.append("loaded")
+        return dependencies
+
+    monkeypatch.setattr(launch, "_load_project_boundaries", load_boundaries)
+    launch.run_launcher_with_secrets(inference_holder, artifact_holder, environment=environment)
+    assert loads == ["loaded"]
+    assert captured["inference_token"] == INFERENCE_TOKEN

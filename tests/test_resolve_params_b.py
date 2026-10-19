@@ -9,10 +9,40 @@ def test_resolve_params_b_uses_catalog_params_b_float():
     # Curated catalog models return their numeric params_b stat directly (no HF fetch).
     from flash.engine.plan.vram import resolve_params_b
 
-    assert resolve_params_b("Qwen/Qwen3.5-0.8B") == 0.9
-    assert resolve_params_b("Qwen/Qwen3.5-4B") == 4.7
     assert resolve_params_b("Qwen/Qwen3.5-9B") == 9.7
-    assert resolve_params_b("Qwen/Qwen3.6-27B") == 27.0
+    assert resolve_params_b("Qwen/Qwen3.8-27B") == 27.781427952
+    assert resolve_params_b("Qwen/Qwen3.6-35B-A3B") == 35.0
+
+
+def test_qwen38_exact_parameter_count_reaches_vram_disk_and_cost() -> None:
+    from flash.core.catalog import resolve_model
+    from flash.cost import RunConfig, estimate_cost
+    from flash.cost.analytical import setup_seconds
+    from flash.providers.core.allocator import required_vram_gb
+
+    model = "Qwen/Qwen3.8-27B"
+    config = RunConfig(
+        model,
+        "sft",
+        10,
+        batch_size=4,
+        seq_len=1024,
+        sft_retained_examples=40,
+    )
+
+    assert (
+        required_vram_gb(
+            model,
+            "sft",
+            train={"batch_size": 4, "max_context_tokens": 1024, "lora_rank": 32},
+        )
+        == 80
+    )
+    assert resolve_model(model, "sft").min_disk_gb == 232
+    assert setup_seconds(config) == 583.9071397600001
+    quote = estimate_cost(config)
+    assert quote.total_usd == 0.045268060397964854
+    assert quote.required_vram_gb == 80
 
 
 def test_resolve_params_b_pinned_revision_reads_the_pinned_size(monkeypatch):

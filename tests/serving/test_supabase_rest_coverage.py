@@ -8,8 +8,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from flash.serving.src.settings import Settings
-from flash.serving.src.supabase_rest import raise_for_supabase, supabase_headers
+from flash.serving.src.store.settings import Settings
+from flash.serving.src.store.supabase_rest import raise_for_supabase, supabase_headers
 
 
 def test_supabase_headers_requires_service_role_key(monkeypatch: pytest.MonkeyPatch) -> None:
