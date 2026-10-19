@@ -30,14 +30,13 @@ from flash.engine.worker.train.entry.backend_common import parse_verl_metric, ve
 from flash.engine.worker.train.entry.sft_train import (
     _CHILD_ENV_PREFIXES,
     _MAX_ZERO_GRAD_STEPS,
-    _VERL_OPTIMIZER_IMPL,
-    _VERL_OPTIMIZER_NAME,
     _build_verl_child_env,
     _render_sft_dataset_module,
     _write_sft_parquet,
     build_sft_overrides,
 )
 from flash.engine.worker.train.sft.child import plugin as sft_plugin
+from flash.engine.worker.train.sft.setup.config import _VERL_OPTIMIZER_IMPL, _VERL_OPTIMIZER_NAME
 
 # distinct from `flash.__version__` on purpose: the worker resolves that to "0+unknown" (no flash
 # distribution is installed there), so a fixture built from it could not catch a worker that
@@ -63,9 +62,6 @@ def _cfg(**over):
         "ulysses_sp_size": 2,
         "lr": 1e-4,
         "warmup_ratio": 0.03,
-        "optimizer_impl": "bitsandbytes.optim",
-        "optimizer_name": "PagedAdamW8bit",
-        "optimizer_kwargs": {},
         "local_dir": "/w/ckpt",
         "save_freq": 50,
         "n_gpus_per_node": 2,
@@ -116,8 +112,8 @@ def test_overrides_match_verl_0_8_sft_and_fsdp_config_surface():
         "engine.ulysses_sequence_parallel_size": "2",
         "optim.lr": "0.0001",
         "optim.lr_warmup_steps_ratio": "0.03",
-        "optim.optimizer_impl": "bitsandbytes.optim",
-        "optim.optimizer": "PagedAdamW8bit",
+        "optim.optimizer_impl": "torch.optim",
+        "optim.optimizer": "AdamW",
         "optim.weight_decay": "0.0",
         "optim.betas": "[0.9,0.999]",
         "optim.override_optimizer_config": "{eps:0.00000001}",
@@ -539,21 +535,15 @@ def test_batch_is_the_isolation_lever_that_replaces_the_removed_flag(support, ex
     assert (expected_mode == "packed") is support[1]
 
 
-def test_optimizer_eps_merges_into_override_config():
-    overrides = _as_map(build_sft_overrides(_cfg(optimizer_kwargs={"amsgrad": True}, eps=1e-6)))
-    assert overrides["optim.override_optimizer_config"] == "{amsgrad:true,eps:0.000001}"
-
-
 def test_small_lr_renders_fixed_point_not_scientific():
     overrides = _as_map(build_sft_overrides(_cfg(lr=5e-5)))
     assert overrides["optim.lr"] == "0.00005"
 
 
-def test_steps_xor_epochs_is_enforced():
-    with pytest.raises(ValueError, match="exactly one"):
-        build_sft_overrides(_cfg(total_training_steps=120, total_epochs=3))
-    with pytest.raises(ValueError, match="exactly one"):
-        build_sft_overrides(_cfg(total_training_steps=None, total_epochs=None))
+@pytest.mark.parametrize("steps", [None, False, True, 0, -1, 1.5, "12"])
+def test_sft_requires_a_positive_integer_step_horizon(steps):
+    with pytest.raises(ValueError, match="positive integer"):
+        build_sft_overrides(_cfg(total_training_steps=steps))
 
 
 class _ExactTokenizer:
@@ -2885,6 +2875,43 @@ def test_sft_collapse_warning_stays_quiet_for_structured_singleturn_targets(monk
     assert "bare assistant target coerced" not in output
 
 
+def test_sft_retries_preserve_the_preparation_digest(monkeypatch):
+    from flash.core.spec import JobSpec
+    from flash.engine.worker.train.entry import sft_train_runner
+    from flash.runner.lifecycle.state import RunStatus
+    from flash.runner.lifecycle.status import reallocation_spec_from_status
+    from flash.runner.lifecycle.submit import _effective_preparation_snapshot
+    from flash.schema import spec_from_dict
+
+    _stub_sft_run(monkeypatch)
+    raw = {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "sft",
+        "project": "11111111-1111-4111-8111-111111111111",
+        "environment": {"id": "owner/project/env"},
+        "train": {"epochs": 1, "learning_rate": 1e-5},
+        "gpu": {"type": "H100", "count": 1},
+    }
+    spec = spec_from_dict(raw)
+    spec = replace(spec, run_id="retry-sft", model_revision="a" * 40, model_revision_auto=True)
+    snapshot = _effective_preparation_snapshot(spec, spec, None)
+    original_digest = snapshot["preparation_digest"]
+    status = RunStatus(
+        state="running",
+        run_id=spec.run_id,
+        spec=spec.to_dict(),
+        effective_preparation=json.loads(json.dumps(snapshot)),
+    )
+    for _attempt in range(2):
+        recovered = reallocation_spec_from_status(status)
+        worker = JobSpec.from_json(recovered.to_json())
+        sft_train_runner._resolve_sft_options(worker)
+        status.effective_preparation = _effective_preparation_snapshot(
+            JobSpec.from_dict(status.spec), worker, None, stored_public=status.spec
+        )
+        assert status.effective_preparation["preparation_digest"] == original_digest
+
+
 def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(monkeypatch):
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.engine.worker.train.entry import sft_train
@@ -3678,38 +3705,7 @@ def test_sft_never_enables_liger_because_it_zeroes_the_lora_gradient():
     """
     from flash.engine.worker.train.entry.sft_train import build_sft_overrides
 
-    base = {
-        "fused_ce_backend": "torch",
-        "train_files": "/w/train.parquet",
-        "train_batch_size": 8,
-        "max_length": 1024,
-        "micro_batch": 1,
-        "max_token_len_per_gpu": 1024,
-        "custom_dataset_path": "/w/ds.py",
-        "model_path": "Qwen/Qwen3.5-9B",
-        "lora_rank": 32,
-        "lora_alpha": 64,
-        "target_modules": "all-linear",
-        "lora_adapter_path": None,
-        "ulysses_sp_size": 1,
-        "lr": 1e-4,
-        "warmup_ratio": 0.03,
-        "weight_decay": 0.0,
-        "optimizer_impl": "bitsandbytes.optim",
-        "optimizer_name": "PagedAdamW8bit",
-        "optimizer_kwargs": None,
-        "local_dir": "/w/ckpt",
-        "save_freq": 50,
-        "n_gpus_per_node": 1,
-        "seed": 42,
-        "project_name": "p",
-        "experiment_name": "e",
-        "loop_epochs": 1,
-        "gradient_checkpointing": True,
-        "total_training_steps": None,
-        "total_epochs": 1,
-        "loggers": ["console"],
-    }
+    base = _cfg(fused_ce_backend="torch")
 
     # the default must be off: a caller that omits the key must not get liger.
     assert "model.use_liger=false" in build_sft_overrides(dict(base))

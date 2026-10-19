@@ -20,12 +20,9 @@ from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.http.router import build_serving_app as build_durable_serving_app
 from flash.serving.src.io.responses import (
-    _openai_structured_outputs,
-    _response_format_to_spec,
     _usage_block,
 )
 from flash.serving.src.io.schemas import AdapterRecord
-from flash.serving.src.io.structured_outputs import StructuredOutputsError
 
 QWEN = "Qwen/Qwen3.5-9B"
 
@@ -79,52 +76,6 @@ def test_usage_block_clamps_cached_and_survives_a_bad_value():
     assert bad["total_tokens"] == 12
     # None cached -> 0 -> omitted.
     assert "prompt_tokens_details" not in _usage_block(3, 3, None)
-
-
-def test_response_format_to_spec_translates_each_form():
-    # Non-dict returned unchanged (the GenerateRequest validator normalizes it downstream).
-    assert _response_format_to_spec("raw") == "raw"
-    assert _response_format_to_spec(["a"]) == ["a"]
-    # {"type": "text"} -> explicit "unconstrained".
-    assert _response_format_to_spec({"type": "text"}) == {}
-    assert _response_format_to_spec({"type": "json_object"}) == {"json_object": True}
-    schema = {"type": "object", "properties": {"name": {"type": "string"}}}
-    # Nested json_schema.schema and the flattened schema both map to {"json": schema}.
-    assert _response_format_to_spec({"type": "json_schema", "json_schema": {"schema": schema}}) == {
-        "json": schema
-    }
-    assert _response_format_to_spec({"type": "json_schema", "schema": schema}) == {"json": schema}
-
-
-def test_response_format_to_spec_rejects_malformed():
-    with pytest.raises(StructuredOutputsError, match="requires a schema"):
-        _response_format_to_spec({"type": "json_schema"})
-    with pytest.raises(StructuredOutputsError, match="unsupported response_format type"):
-        _response_format_to_spec({"type": "image_url"})
-
-
-def test_openai_structured_output_fields_are_mutually_exclusive():
-    with pytest.raises(
-        StructuredOutputsError,
-        match="structured_outputs and response_format cannot both be set",
-    ):
-        _openai_structured_outputs(
-            {
-                "structured_outputs": {"choice": ["a"]},
-                "response_format": {"type": "json_object"},
-            }
-        )
-    # response_format alone translates to the canonical spec.
-    assert _openai_structured_outputs({"response_format": {"type": "json_object"}}) == {
-        "json_object": True
-    }
-    # structured_outputs alone remains unchanged, including an explicit unconstrained marker.
-    assert _openai_structured_outputs({"structured_outputs": {"choice": ["a"]}}) == {
-        "choice": ["a"]
-    }
-    assert _openai_structured_outputs({"structured_outputs": {}}) == {}
-    # neither field is unconstrained by the request.
-    assert _openai_structured_outputs({"messages": []}) is None
 
 
 # --------------------------------------------------------------------------------------------

@@ -17,7 +17,6 @@ from flash.serving.src.accounting.usage import (
 )
 from flash.serving.src.accounting.usage_outbox import RequestIdentity, UsageOutboxError
 from flash.serving.src.engine import generation
-from flash.serving.src.engine import support as engine_support
 from flash.serving.src.http import inference_routes
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord, internal_adapter_payload
@@ -269,31 +268,6 @@ def test_stream_completed_generation_uses_monotonic_duration(
     assert b"data: [DONE]" in body
     assert len(store.finalized) == 1
     assert store.finalized[0].facts.generation_duration_seconds == pytest.approx(0.4)
-
-
-def test_support_usage_fields_use_monotonic_duration(monkeypatch: pytest.MonkeyPatch) -> None:
-    request_output = SimpleNamespace(prompt_token_ids=[11, 12], num_cached_tokens=0)
-
-    def wall_clock_forbidden() -> float:
-        raise AssertionError("elapsed inference duration read the wall clock")
-
-    monkeypatch.setattr(
-        engine_support,
-        "time",
-        SimpleNamespace(time=wall_clock_forbidden, monotonic=lambda: 10.25),
-    )
-
-    result = engine_support._stream_usage_fields(
-        request_output,
-        [21],
-        start=10.0,
-        request_id="fsgen-duration",
-        engine_replica_id="replica-1",
-        checkpoint="duration",
-        thinking=False,
-    )
-
-    assert result["inference_time_seconds"] == pytest.approx(0.25)
 
 
 @pytest.mark.parametrize(

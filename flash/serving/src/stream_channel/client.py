@@ -11,9 +11,6 @@ from typing import Any
 
 from flash.serving.src.stream_channel import _tasks
 from flash.serving.src.stream_channel._tasks import OrphanHandler
-from flash.serving.src.stream_channel._tasks import (
-    retain_background_task as _retain_background_task,
-)
 from flash.serving.src.stream_channel.protocol import (
     CALL_RESULT_SECONDS,
     CLEANUP_SECONDS,
@@ -67,13 +64,6 @@ async def _cancel_spawn_task_result(
         return
     with contextlib.suppress(Exception):
         await cancel(call)
-
-
-def _schedule_spawn_result_cancel(
-    task: asyncio.Task[Any],
-    cancel: Callable[[Any], Awaitable[None]],
-) -> None:
-    _retain_background_task(asyncio.create_task(_cancel_spawn_task_result(task, cancel)))
 
 
 def _spawn_orphan_handler(cancel: Callable[[Any], Awaitable[None]]) -> OrphanHandler:

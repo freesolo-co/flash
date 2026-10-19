@@ -310,24 +310,6 @@ def test_deployment_attempt_is_stale_branches():
     )
 
 
-def test_chat_messages_from_payload_validation():
-    assert serving_revisions._chat_messages_from_payload({}) == []
-    assert serving_revisions._chat_messages_from_payload({"messages": None}) == []
-
-    valid = [{"role": "user", "content": "hi"}]
-    assert serving_revisions._chat_messages_from_payload({"messages": valid}) is valid
-
-    with pytest.raises(HTTPException) as not_list:
-        serving_revisions._chat_messages_from_payload({"messages": "nope"})
-    assert not_list.value.status_code == 400
-    assert "messages must be a list" in not_list.value.detail
-
-    with pytest.raises(HTTPException) as bad_item:
-        serving_revisions._chat_messages_from_payload({"messages": [{"role": "user"}, "oops"]})
-    assert bad_item.value.status_code == 400
-    assert "messages[1]" in bad_item.value.detail
-
-
 def _png_data_uri(image_format: str = "PNG", color: str = "red") -> str:
     from PIL import Image
 
@@ -442,7 +424,7 @@ def test_chat_payload_rejects_images_training_would_refuse(messages, expected_de
     the count, role, mime, byte, and decoded-memory limits while serving enforced none of them.
     """
     with pytest.raises(HTTPException) as rejected:
-        serving_revisions._chat_messages_from_payload({"messages": messages})
+        serving_revisions._managed_chat_messages(messages)
     assert rejected.value.status_code == 400
     assert expected_detail in rejected.value.detail
 
@@ -456,7 +438,7 @@ def test_chat_payload_forwards_text_only_requests_byte_for_byte():
     """
     text_only = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
     before = copy.deepcopy(text_only)
-    forwarded = serving_revisions._chat_messages_from_payload({"messages": text_only})
+    forwarded = serving_revisions._managed_chat_messages(text_only)
     assert forwarded == before
     assert text_only == before
 
@@ -479,7 +461,7 @@ def test_chat_payload_forwards_images_in_the_shape_it_validated():
         }
     ]
     before = copy.deepcopy(aliased)
-    forwarded = serving_revisions._chat_messages_from_payload({"messages": aliased})
+    forwarded = serving_revisions._managed_chat_messages(aliased)
     assert [block["type"] for block in forwarded[0]["content"]] == ["text", "image_url"]
     assert forwarded[0]["content"][1]["image_url"]["url"] == uri
     # the caller's own object is never rewritten in place.
@@ -490,7 +472,7 @@ def test_chat_payload_preserves_image_order_when_canonicalizing():
     """four images arrive upstream in the order the caller sent them, with their exact bytes."""
     uris = [_png_data_uri(color=color) for color in ("red", "green", "blue", "yellow")]
     messages = [{"role": "user", "content": [_image_block(uri) for uri in uris]}]
-    forwarded = serving_revisions._chat_messages_from_payload({"messages": messages})
+    forwarded = serving_revisions._managed_chat_messages(messages)
     assert [block["image_url"]["url"] for block in forwarded[0]["content"]] == uris
 
 

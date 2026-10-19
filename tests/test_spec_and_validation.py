@@ -170,7 +170,6 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["structured_outputs"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["save_at_steps"] == "0.2.57"
     assert TRAIN_KEY_MIN_VERSIONS["credit_assignment"] == "1.0.2"
-    assert TRAIN_KEY_MIN_VERSIONS["entropy_quantile"] == "1.0.15"
     # re-introduced as a user knob after being managed-and-derived; gated on the release that
     # restored it, not on lora_rank's original 0.2.0.
     assert TRAIN_KEY_MIN_VERSIONS["lora_alpha"] == "1.1.35"
@@ -191,7 +190,6 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "structured_outputs",
             "save_at_steps",
             "credit_assignment",
-            "entropy_quantile",
             "lora_alpha",
             "prompts_per_step",
         }
@@ -327,7 +325,7 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     baseline = {"epochs", "hf_repo", "max_examples"}
 
     # historical snapshots remain exact to their commits, including fields now managed or removed.
-    # current adds save_at_steps, credit_assignment, entropy_quantile, and prompts_per_step; opd eos
+    # current adds save_at_steps, credit_assignment and prompts_per_step; opd eos
     # is removed. lora_alpha is in both: authorable then, managed in between, a user knob again now.
     # prompts_per_step is current-only: the rl half of the optimizer-batch split, which those
     # snapshots predate because back then batch_size still carried both meanings.
@@ -338,7 +336,6 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
     } == TRAIN_SCHEMA_KEYS - {
         "credit_assignment",
         "save_at_steps",
-        "entropy_quantile",
         "prompts_per_step",
     }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
@@ -840,13 +837,11 @@ _INAPPLICABLE_CASES = [
     ("sft", "temperature", 0.7),
     ("sft", "max_completion_tokens", 512),
     ("sft", "kl_penalty_coef", 0.5),
-    ("sft", "entropy_quantile", 0.5),
     ("sft", "thinking_length_penalty_coef", 0.1),
     ("sft", "teacher_model", "glm-5.2"),
     ("sft", "credit_assignment", "per_turn"),
     ("sft", "stop_sequences", ["END"]),
     ("sft", "structured_outputs", '{"type": "object"}'),
-    ("opd", "entropy_quantile", 0.5),
     ("opd", "thinking_length_penalty_coef", 0.1),
     ("opd", "credit_assignment", "per_turn"),
     ("grpo", "teacher_model", "glm-5.2"),
@@ -867,7 +862,6 @@ _APPLICABLE_CASES = [
     ("opd", "stop_sequences", ["END"]),
     ("grpo", "structured_outputs", '{"type": "object"}'),
     ("opd", "structured_outputs", '{"type": "object"}'),
-    ("grpo", "entropy_quantile", 0.5),
     ("grpo", "thinking_length_penalty_coef", 0.1),
     ("grpo", "credit_assignment", "per_turn"),
     ("opd", "teacher_model", "glm-5.2"),

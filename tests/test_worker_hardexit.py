@@ -239,7 +239,7 @@ def _patch_done_marker_worker(monkeypatch):
     monkeypatch.setattr(worker_perf, "_force_fla_triton_gdn_on_sm100", lambda: None)
     monkeypatch.setattr(worker_perf, "_ensure_fla_fastpath_on_hopper", lambda: None)
     monkeypatch.setattr(worker_perf, "_restrict_fla_gdn_autotune_on_blackwell", lambda: None)
-    monkeypatch.setattr(worker.kernel_warmup, "load_mega_cache", lambda: None)
+    monkeypatch.setattr(worker.kernel_warmup, "configure_kernel_cache", lambda: None)
     monkeypatch.setattr(sft_entry, "run_sft", lambda: events.append("handler"))
     return heartbeats, events
 

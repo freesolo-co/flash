@@ -12,7 +12,6 @@ color on with an explicit ``TERM``/``COLORTERM``/``COLORFGBG`` so they stay dete
 from __future__ import annotations
 
 import re
-import types
 
 import pytest
 
@@ -347,76 +346,9 @@ def test_object_panel_with_and_without_state(styled_plain) -> None:
     assert "done" not in no_state
 
 
-def test_cost_panel_grpo_with_teacher_and_wall_cap(styled_plain) -> None:
-    est = types.SimpleNamespace(
-        method="grpo",
-        model_id="Qwen/Qwen3.5-9B",
-        steps=100,
-        gpu="RTX 5090",
-        gpu_vram_gb=32,
-        # a stub standing in for CostEstimate has to carry the fields the panel reads; one card
-        # offers exactly itself, so offered_vram_gb matches gpu_vram_gb here and the joined width
-        # matches the billed count.
-        offered_vram_gb=32,
-        gpu_count=1,
-        joined_gpu_count=1,
-        required_vram_gb=24,
-        gpu_hourly_usd=0.99,
-        setup_seconds=300.0,
-        seconds_per_step=2.5,
-        train_seconds=1800.0,
-        wall_capped=True,
-        wall_clock_hours=0.6,
-        billable_hours=0.5,
-        teacher_api_usd=1.25,
-        total_usd=1.75,
-        notes=["heads up: capped"],
-    )
-    out = render.cost_panel(est)
-    assert "pre-flight cost estimate" in out
-    assert "vLLM init" in out  # grpo-only setup extra
-    assert "capped at wall-clock limit" in out  # wall_capped branch
-    assert "teacher api" in out
-    assert "$1.25" in out
-    assert "TOTAL" in out
-    assert "$1.75" in out
-    assert "heads up: capped" in out  # notes section rendered
-
-
 def test_server_backed_sft_total_uses_billing_round_half_up(styled_plain) -> None:
     assert f"{1.005:.2f}" == "1.00", "the fixture must expose half-even formatting"
     assert "$1.01" in render.sft_cost_panel([("run", "model  [SFT]")], 1.005)
-
-
-def test_cost_panel_sft_omits_optional_sections(styled_plain) -> None:
-    est = types.SimpleNamespace(
-        method="sft",
-        model_id="Qwen/Qwen3.5-9B",
-        steps=50,
-        gpu="RTX 4090",
-        gpu_vram_gb=24,
-        offered_vram_gb=24,
-        gpu_count=1,
-        joined_gpu_count=1,
-        required_vram_gb=20,
-        gpu_hourly_usd=0.50,
-        setup_seconds=120.0,
-        seconds_per_step=1.0,
-        train_seconds=600.0,
-        wall_capped=False,
-        wall_clock_hours=0.3,
-        billable_hours=0.25,
-        teacher_api_usd=0.0,
-        total_usd=0.30,
-        notes=[],
-    )
-    out = render.cost_panel(est)
-    assert "vLLM init" not in out  # sft has no vLLM init in setup
-    assert "teacher api" not in out  # zero teacher spend -> no row
-    assert "capped at wall-clock limit" not in out
-    assert "notes" not in out  # empty notes -> no notes section
-    assert "TOTAL" in out
-    assert "$0.30" in out
 
 
 # --------------------------------------------------------------------------- misc small cards

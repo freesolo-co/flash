@@ -213,14 +213,3 @@ def load_engine_config(
     overrides = engine_overrides_for(base_model)
     kwargs = engine_args_for(base_model, overrides, cfg)
     return processor, tokenizer, overrides, kwargs
-
-
-def pin_loras_default(overrides: dict[str, Any], cfg: Any) -> bool:
-    """Whether adapters should be pinned (non-evictable) for this base model.
-
-    Pinning makes an adapter non-evictable, so it only makes sense when the GPU hot pool covers the
-    whole deployable CPU pool. Otherwise >max_loras registered adapters must remain unpinned so
-    vLLM can LRU-swap them from max_cpu_loras on demand.
-    """
-    max_loras = int(overrides.get("max_loras", cfg.MAX_LORAS))
-    return bool(overrides.get("pin_loras", max_loras >= cfg.MAX_CPU_LORAS))

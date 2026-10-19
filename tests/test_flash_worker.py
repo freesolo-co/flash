@@ -1219,6 +1219,8 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     assert "grad_checkpointing_on(" in train_src
     assert "grpo_use_reentrant(" in train_src
     assert "_install_linear_scheduler" in plugin_src
+    # optimizer construction is owned by the upstream FSDP2 engine.
+    assert "_build_optimizer" not in plugin_src
 
 
 @pytest.fixture

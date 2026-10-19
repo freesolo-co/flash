@@ -180,16 +180,5 @@ def test_already_disabled_checkpoint_is_an_idempotent_noop(monkeypatch) -> None:
     assert result.stuck_ready == []
 
 
-def test_internal_run_cleanup_enumerates_exact_checkpoint_bindings(monkeypatch) -> None:
-    checkpoints = [_record(), _record(40)]
-    monkeypatch.setattr(
-        undeploy,
-        "list_authoritative_run",
-        lambda _org_id, _run_id: _async(checkpoints),
-    )
-
-    assert asyncio.run(undeploy.resolve_run_cleanup_targets("org-1", RUN_ID)) == checkpoints
-
-
 async def _async(value):
     return value

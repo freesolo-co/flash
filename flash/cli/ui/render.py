@@ -12,7 +12,6 @@ from flash.cost.currency import format_usd
 
 # one spelling of the VRAM clause for both quote renderers: the themed panel and
 # `CostEstimate.breakdown()` must not be able to describe the same shape differently.
-from flash.cost.types import vram_clause
 
 _ROWS = (
     ("email", "account"),
@@ -613,60 +612,6 @@ def exported(result: dict) -> str:
     return _safe(f"{ok('exported to HuggingFace')}\n{_kv(pairs)}")
 
 
-def cost_panel(est) -> str:
-    """Pre-flight cost estimate (the themed twin of CostEstimate.breakdown())."""
-    setup_extra = " + vLLM init" if est.method == "grpo" else ""
-    pairs = [
-        (
-            "run",
-            f"{_paint(est.model_id, _ACCENT2)}  {_dim(f'[{est.method.upper()}, {est.steps} steps]')}",
-        ),
-        (
-            "gpu",
-            (
-                f"{f'{est.gpu_count}x ' if est.gpu_count > 1 else ''}{est.gpu}  "
-                f"{_dim(f'({vram_clause(est.gpu_vram_gb, est.offered_vram_gb, est.joined_gpu_count)}; needs >= {est.required_vram_gb} GB)')}  "
-                f"@ {money(est.gpu_hourly_usd, 2)}/hr"
-                f"{' per card' if est.gpu_count > 1 else ''}"
-            ),
-        ),
-        (
-            "setup",
-            (
-                f"{est.setup_seconds / 60:.1f} min  "
-                f"{_dim(f'(cold start: boot + deps + model load{setup_extra}; not billed)')}"
-            ),
-        ),
-        ("per step", f"{est.seconds_per_step:.2f} s"),
-        (
-            "train",
-            f"{est.train_seconds / 60:.1f} min"
-            + (_paint("  [capped at wall-clock limit]", _RED) if est.wall_capped else ""),
-        ),
-        ("wall clock", f"{est.wall_clock_hours:.2f} h"),
-        ("billable", f"{est.billable_hours:.2f} h  {_dim('(training only)')}"),
-    ]
-    # opd teacher spend is itemized but not part of total_usd (billed by parasail on the managed
-    # key). Mirror CostEstimate.breakdown() so the styled panel doesn't silently drop it.
-    if getattr(est, "teacher_api_usd", 0) > 0:
-        pairs.append(
-            (
-                "teacher api",
-                (
-                    f"{money(est.teacher_api_usd, 2)}  "
-                    f"{_dim('(Parasail teacher token spend on the managed key; billed by Parasail, NOT in TOTAL)')}"
-                ),
-            )
-        )
-    panel = _kv(pairs)
-    total = f"  {_paint('TOTAL'.ljust(10), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} {_paint(format_usd(est.total_usd), _TEAL, '1')}"
-    out = f"{header('train', 'pre-flight cost estimate')}\n{panel}\n{_rule()}\n{total}"
-    if est.notes:
-        notes = "\n".join(f"  {_paint(_glyph('·', '-'), _FAINT)} {_dim(n)}" for n in est.notes)
-        out += f"\n\n{_dim('notes')}\n{notes}"
-    return _safe(out)
-
-
 def server_cost_panel(
     rows: list[tuple[str, str | None]], total_usd: float, description: str
 ) -> str:
@@ -682,9 +627,7 @@ def server_cost_panel(
 def sft_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
     """Profile-backed cost estimate (sft), whose inputs are measured rather than modelled.
 
-    Deliberately not cost_panel(): that panel's gpu/per-step/wall rows come from a local
-    CostEstimate, and this quote is frozen server-side, so those fields are not available here.
-    Rendering them would mean inventing the numbers the exact path exists to stop guessing.
+    The quote is frozen server-side; render only the rows supplied by its measured profile.
     """
     return server_cost_panel(rows, total_usd, "cost estimate (packaged dataset rows)")
 

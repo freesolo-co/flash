@@ -95,9 +95,6 @@ class AdapterRouter:
     def ready_adapters(self, *, org_id: str | None = None) -> list[AdapterRecord]:
         return [requested for requested, _ in self._resolved_ready(org_id=org_id)]
 
-    def ready_records(self, *, org_id: str | None = None) -> list[AdapterRecord]:
-        return self._registry.list_ready(org_id=org_id)
-
     def _resolved_ready(
         self, *, org_id: str | None = None
     ) -> list[tuple[AdapterRecord, AdapterRecord]]:

@@ -14,7 +14,6 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
 
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
@@ -77,7 +76,6 @@ from flash.engine.worker.train.rl.rollout.single_turn import (
     score_single_turn,
     score_single_turn_batch,
 )
-from flash.engine.worker.verl.process_census import GrpoProcessCensus
 
 
 class _GrpoSubprocessStream:
@@ -190,7 +188,6 @@ class _StepMetricState:
     last_dump_step: list[int] = field(default_factory=lambda: [-1])
     metrics_last: list[dict] = field(default_factory=list)
     step_timing: StepTiming = field(default_factory=StepTiming)
-    host_census: dict[str, Any] = field(default_factory=dict)
     rollout_identity_evidence: dict[str, list] = field(
         default_factory=lambda: {"steps": [], "validation": []}
     )
@@ -386,7 +383,6 @@ def _write_rl_plugin_config(inp, files, *, gdn_reset_arch: str | None, loggers) 
         "dp_cards": int(inp["dp_cards"]),
         "reentrant_checkpointing": bool(inp["reentrant_checkpointing"]),
         "multimodal": bool(inp["multimodal"]),
-        "entropy_quantile": inp["entropy_quantile"],
         "per_turn_credit": bool(inp["per_turn_credit"]),
         "stop_sequences": list(inp["stop_sequences"]),
         "image_pad_token_id": inp["image_pad_token_id"],
@@ -610,13 +606,6 @@ def _ingest_step_metrics(
         # a run constant rather than a verl metric, so it is stamped here from
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]
-        step_metrics.update(
-            {
-                f"host_census/{key}": value
-                for key, value in state.host_census.items()
-                if isinstance(value, int)
-            }
-        )
         append_step_metrics(state.metrics_last, step_metrics, limit=GRPO_METRIC_HISTORY_LIMIT)
         # the worker's error path reads this global, so a run that dies mid-training
         # still reports the steps it did complete (worker/__init__.py:_err_metrics).
@@ -634,7 +623,7 @@ def _ingest_step_metrics(
                 step=step_metrics["step"],
                 metrics_last=list(state.metrics_last),
                 **heartbeat_fields,
-                gpu=gpu_diagnostics(include_torch=False),
+                gpu=gpu_diagnostics(),
             )
             if heartbeat_committed:
                 state.sent_first_metrics = True
@@ -691,22 +680,14 @@ def _execute_rl_child(
     adopt_orphaned_descendants()
     resume_step = int((files or {}).get("resume_step", 0))
     state.resume_step = resume_step
-    census = GrpoProcessCensus(
-        os.getpid(),
-        expected_steps=range(resume_step + 1, int(inp["steps"]) + 1),
-    ).start()
-    try:
-        proc = subprocess.Popen(
-            [python_bin, "-m", "flash_grpo_entry", *overrides],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env_for_verl,
-            start_new_session=True,
-        )
-    except BaseException:
-        state.host_census = census.stop()
-        raise
+    proc = subprocess.Popen(
+        [python_bin, "-m", "flash_grpo_entry", *overrides],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env_for_verl,
+        start_new_session=True,
+    )
     child_tail = ChildOutputTail()
     silence_watchdog = VerlChildSilenceWatchdog(
         child_tail,
@@ -749,8 +730,6 @@ def _execute_rl_child(
                     shims_verified = True
                 # dump one sample completion per new step to the flash log (#607).
                 if progress["step"] != last_dump_step[0]:
-                    census.sample_step(progress["step"])
-                    state.host_census = census.summary()
                     # the generation boundary: verl logs this line once its step is scored, so
                     # everything the reward bridge buffered since the last one is that step's
                     # complete output. seal exact identities before publishing any step output.
@@ -781,15 +760,7 @@ def _execute_rl_child(
         child_stream.terminate()
         raise
     finally:
-        state.host_census = census.stop()
         if state.metrics_last:
-            state.metrics_last[-1].update(
-                {
-                    f"host_census/{key}": value
-                    for key, value in state.host_census.items()
-                    if isinstance(value, int)
-                }
-            )
             # multi-turn totals ride the same final metrics row. published in `finally` so a run
             # that dies mid-stream still reports the turns it did execute.
             bridge = getattr(reward_runtime, "multi_turn_bridge", None)

@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from flash.schema import parse_checkpoint_ref
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.schemas import AdapterRecord
-from flash.serving.src.store.access import _get_stored, _list_run_stored, _replace_stored_cas
+from flash.serving.src.store.access import _get_stored, _replace_stored_cas
 from flash.serving.src.store.persistence import PersistenceRecordError
 
 _CAS_ATTEMPTS = 3
@@ -137,18 +137,6 @@ async def get_authoritative(org_id: str, adapter_id: str) -> AdapterRecord | Non
         ) from exc
 
 
-async def list_authoritative_run(org_id: str, run_id: str) -> list[AdapterRecord]:
-    """internal administrative listing for exact checkpoint cleanup."""
-
-    try:
-        return await _list_run_stored(org_id, run_id)
-    except PersistenceRecordError as exc:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "adapter storage is unavailable",
-        ) from exc
-
-
 async def resolve_undeploy_target(
     router: AdapterRouter, org_id: str, checkpoint_id: str
 ) -> tuple[AdapterRecord | None, AdapterRecord | None]:
@@ -169,14 +157,6 @@ async def resolve_undeploy_target(
     if not record.is_checkpoint:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {checkpoint_id}")
     return None, record
-
-
-async def resolve_run_cleanup_targets(org_id: str, run_id: str) -> list[AdapterRecord]:
-    """enumerate exact tenant run checkpoints for internal administrative cleanup."""
-
-    return [
-        record for record in await list_authoritative_run(org_id, run_id) if record.is_checkpoint
-    ]
 
 
 def undeploy_body(

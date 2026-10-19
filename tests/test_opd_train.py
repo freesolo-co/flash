@@ -45,7 +45,6 @@ from flash.engine.worker.train.entry.sft_train import _seed_resume_lifecycle
 from flash.engine.worker.train.opd.bridging.batching import _TextTeacherBatcher
 from flash.engine.worker.train.opd.bridging.bridge import _TeacherAlignmentBridge
 from flash.engine.worker.train.opd.bridging.prompts import (
-    _processor_expanded_prompt_ids,
     _prompt_pool_fingerprint,
     _trim_response_and_forced,
     _validate_forced_mask,
@@ -1034,51 +1033,8 @@ def test_image_observation_env_text_prompt_omits_empty_processor_images(monkeypa
     prompt_rows, multimodal = _render_prompt_rows(
         SimpleNamespace(env=_DynamicImageEnv(), spec=None)
     )
-    messages = prompt_rows[0][1]
-    processor = _MockMultimodalProcessor()
-
-    prompt_ids = _processor_expanded_prompt_ids(
-        processor,
-        messages,
-        (),
-        None,
-        enable_thinking=False,
-    )
-
     assert multimodal is True
-    assert prompt_ids == (10, 11)
-    assert processor.rendered == messages
-    assert "images" not in processor.call_kwargs
-
-
-def test_processor_expanded_prompt_ids_enforce_visual_token_budget(tmp_path):
-    image_module = pytest.importorskip("PIL.Image")
-    dataset_dir = tmp_path / "dataset"
-    dataset_dir.mkdir()
-    image_path = dataset_dir / "image.png"
-    image_module.new("RGB", (2, 2), "red").save(image_path)
-    processor = _MockMultimodalProcessor()
-    messages = [
-        {
-            "role": "user",
-            "content": [{"type": "image"}, {"type": "text", "text": "describe"}],
-        }
-    ]
-
-    from flash.content.multimodal import normalize_image_source
-
-    prompt_ids = _processor_expanded_prompt_ids(
-        processor,
-        messages,
-        (normalize_image_source("dataset/image.png", tmp_path),),
-        str(tmp_path),
-        enable_thinking=False,
-    )
-
-    assert prompt_ids == (10, 151655, 151655, 11)
-    assert len(prompt_ids) > 3
-    assert processor.rendered[0]["content"][0]["image"].size == (2, 2)
-    assert [image.size for image in processor.images] == [(2, 2)]
+    assert prompt_rows[0][1] == [{"role": "user", "content": "describe"}]
 
 
 _IMAGE_DATA_URI = (
@@ -7920,15 +7876,35 @@ def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
     notes = notes[notes.index("_worker_finalize.write_train_meta(") :]
     # only single-turn text uses the serial batcher; multimodal and multi-turn use bridge threads.
     # report at most the samples one step can produce.
-    assert (
-        '"opd_teacher_batch_size": (\n'
-        "                    min(\n"
-        "                        OPD_TEACHER_SCORING_CONCURRENCY, max(1, prompts_per_step * knobs.group_size)\n"
-        "                    )\n"
-        "                    if not multimodal and not multi_turn\n"
-        "                    else None\n"
-        "                ),"
-    ) in notes
+    import ast
+
+    tree = ast.parse(inspect.getsource(run_opd_train))
+    expr = next(
+        value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        for key, value in zip(node.keys, node.values, strict=True)
+        if isinstance(key, ast.Constant) and key.value == "opd_teacher_batch_size"
+    )
+    code = compile(ast.Expression(expr), "teacher_batch_size", "eval")
+    for multimodal, multi_turn, expected in [
+        (False, False, 6),
+        (True, False, None),
+        (False, True, None),
+    ]:
+        assert (
+            eval(
+                code,
+                {
+                    "multimodal": multimodal,
+                    "multi_turn": multi_turn,
+                    "OPD_TEACHER_SCORING_CONCURRENCY": 32,
+                    "prompts_per_step": 3,
+                    "knobs": SimpleNamespace(group_size=2),
+                },
+            )
+            == expected
+        )
     assert ('"opd_teacher_workers": 1 if not multimodal and not multi_turn else None,') in notes
     # the engine length handed to vllm, not a hardcoded default: prompt filtering is carved out of
     # this same number, so a fabricated one would disagree with the budget the run actually used.

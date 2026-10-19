@@ -92,9 +92,7 @@ def _run_worker_mode() -> None:
             raise RuntimeError("worker run wall deadline exceeded")
         if done:
             print("Run already complete (DONE present); returning persisted metrics.")
-            heartbeat_io.heartbeat(
-                "already_done", gpu=worker_perf.gpu_diagnostics(include_torch=False)
-            )
+            heartbeat_io.heartbeat("already_done", gpu=worker_perf.gpu_diagnostics())
             # DONE is written only AFTER metrics.json uploads (required=True), so a failed read here
             # is a transient HF blip, never a missing file. Retry, then signal RETRIABLE (reschedule)
             # rather than SystemExit — a BaseException that bypasses the retriable-stamping handler
@@ -155,8 +153,8 @@ def _run_worker_mode() -> None:
     # AFTER the fla fast path (which may (re)install fla), BEFORE any model import / GDN
     # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).
     worker_perf._restrict_fla_gdn_autotune_on_blackwell()
-    heartbeat_io.heartbeat("boot", gpu=worker_perf.gpu_diagnostics(include_torch=False))
-    kernel_warmup.load_mega_cache()
+    heartbeat_io.heartbeat("boot", gpu=worker_perf.gpu_diagnostics())
+    kernel_warmup.configure_kernel_cache()
     try:
         handler()
     finally:

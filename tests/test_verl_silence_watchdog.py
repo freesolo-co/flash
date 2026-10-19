@@ -165,7 +165,7 @@ def test_off_thread_field_sampling_continues_while_heartbeat_upload_blocks(monke
     calls = []
     caller_threads = set()
 
-    def blocked_diagnostics(*, include_torch):
+    def blocked_diagnostics():
         diagnostics_entered.set()
         diagnostics_release.wait(timeout=1)
         return {}

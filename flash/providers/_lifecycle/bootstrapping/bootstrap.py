@@ -868,13 +868,6 @@ def _run_attempt(payload: dict) -> int:
     retriable = False
     deadline_watchdog = None
     try:
-        try:
-            import importlib.util
-
-            if importlib.util.find_spec("hf_transfer") is not None:
-                os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-        except Exception as exc:
-            print("hf_transfer setup skipped:", exc, flush=True)
         deadline = require_deadline_at(payload)
         if payload.get("mode") == "preload":
             deadline_watchdog = _arm_preload_wall_cap(payload)

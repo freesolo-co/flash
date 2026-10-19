@@ -25,7 +25,7 @@ from flash.serving.src.io.schemas import (
     ImmutableCheckpointRegistration,
     internal_adapter_payload,
 )
-from flash.serving.src.store.persistence import get_adapter, list_run_adapters
+from flash.serving.src.store.persistence import get_adapter
 from flash.serving.src.store.settings import Settings
 
 
@@ -149,11 +149,8 @@ def test_persistence_queries_use_org_and_checkpoint_composite(monkeypatch) -> No
         SUPABASE_SERVICE_ROLE_KEY="sb_secret_service_role",
     )
     assert get_adapter("org-a", "shared/final", settings) is None
-    assert list_run_adapters("org-a", "shared", settings) == []
     assert seen[0]["org_id"] == "eq.org-a"
     assert seen[0]["checkpoint_id"] == "eq.shared/final"
-    assert seen[1]["org_id"] == "eq.org-a"
-    assert seen[1]["run_id"] == "eq.shared"
 
 
 def test_artifact_digest_and_binding_fingerprint_are_distinct() -> None:

@@ -185,9 +185,9 @@ _LOGITS_BUDGET_GB = 6.0
 # 16 B/elem: fp32 logits+grad + bf16 logits+grad + CE temp. 8 B/elem under-counts (live OOM confirmed).
 _SFT_LOGITS_BYTES_PER_ELEM = 16.0
 _SFT_CHUNKED_NLL_TOKENS = VERL_FUSED_CE_CHUNK_TOKENS
-# shared thresholds for the independent liger and worker memory gates.
-_LIGER_MIN_PARAMS_B = 3.0
-_LIGER_LONG_CTX_TOKENS = 2048
+# thresholds for the worker gradient-checkpointing memory gate.
+_CHECKPOINT_MIN_PARAMS_B = 3.0
+_CHECKPOINT_LONG_CTX_TOKENS = 2048
 
 # these model types have validated dense-logit-free fused SFT loss; others retain plain NLL.
 # verl dispatches `qwen3_5` and `qwen3_5_moe` through its fused torch backend. liger remains off
@@ -357,7 +357,6 @@ def estimate_vram_gb(
     batch_size: int = 1,
     group_size: int = 8,
     thinking: bool = False,
-    use_vllm: bool = True,
     vocab: int = _VOCAB_DEFAULT,
     sleep_offload: bool = True,
     active_params_b: float | None = None,
@@ -379,34 +378,32 @@ def estimate_vram_gb(
     base = weights + _BASE_OVERHEAD_GB + lora_opt
     if algo == "grpo":
         # Sleep mode: peak = max(rollout, train). Resident: both live at once, peak = sum.
-        rollout = 0.0
-        if use_vllm:
-            if sleep_offload:
-                kv = _resident_kv_gb(
-                    eff_b,
-                    seq_len,
-                    group_size,
-                    fp8_kv=fp8_kv,
-                    model_info=model_info,
-                )
-                # mirror the sleep worker's 1.5x KV lift only for catalog geometry above `_KV_CAP`.
-                # keep the capped generic estimate, whose legacy formula overestimates long context
-                # and is calibrated to the measured train/OOM boundary.
-                arch_kv_known = (
-                    _architecture_kv_raw_gb(model_info, seq_len, group_size, fp8_kv) is not None
-                )
-                if arch_kv_known and kv > _KV_CAP:
-                    rollout = weights + max(_KV_CAP, 1.5 * kv)
-                else:
-                    rollout = weights + min(kv, _KV_CAP)
+        if sleep_offload:
+            kv = _resident_kv_gb(
+                eff_b,
+                seq_len,
+                group_size,
+                fp8_kv=fp8_kv,
+                model_info=model_info,
+            )
+            # mirror the sleep worker's 1.5x KV lift only for catalog geometry above `_KV_CAP`.
+            # keep the capped generic estimate, whose legacy formula overestimates long context
+            # and is calibrated to the measured train/OOM boundary.
+            arch_kv_known = (
+                _architecture_kv_raw_gb(model_info, seq_len, group_size, fp8_kv) is not None
+            )
+            if arch_kv_known and kv > _KV_CAP:
+                rollout = weights + max(_KV_CAP, 1.5 * kv)
             else:
-                rollout = weights + _resident_kv_gb(
-                    eff_b,
-                    seq_len,
-                    group_size,
-                    fp8_kv=fp8_kv,
-                    model_info=model_info,
-                )
+                rollout = weights + min(kv, _KV_CAP)
+        else:
+            rollout = weights + _resident_kv_gb(
+                eff_b,
+                seq_len,
+                group_size,
+                fp8_kv=fp8_kv,
+                model_info=model_info,
+            )
         group_factor = max(1.0, (max(1, group_size) / 4.0) ** 0.5)
         think_factor = 1.3 if thinking else 1.0
         activations = _TRAIN_COEF * (seq_len / 1024.0) * width * group_factor * think_factor
@@ -417,8 +414,7 @@ def estimate_vram_gb(
     if is_opd:
         # OPD always samples the student through a resident colocated vLLM engine, while the HF/PEFT
         # trainer model stays resident for the GKD loss forward/backward. Budget the second bf16
-        # weight copy plus a viable KV pool through the training step. ``use_vllm`` is intentionally
-        # ignored for OPD; it only exists for legacy GRPO sizing callers.
+        # weight copy plus a viable KV pool through the training step.
         rollout_concurrency = opd_rollout_concurrency(batch_size, group_size)
         rollout = weights + max(
             _KV_CAP,
@@ -652,7 +648,6 @@ def _model_vram_need(
     sft_fused_ce: bool | None,
     headroom: float,
     quant: str = "bf16",
-    use_vllm: bool = True,
     vocab: int = _VOCAB_DEFAULT,
     active_params_b: float | None = None,
     fp8_kv: bool = False,
@@ -669,7 +664,6 @@ def _model_vram_need(
         batch_size=batch_size,
         group_size=group_size,
         thinking=thinking,
-        use_vllm=use_vllm,
         vocab=vocab,
         active_params_b=active_params_b,
         fp8_kv=fp8_kv,
@@ -693,7 +687,6 @@ def _opd_fp8_adjust(
     sft_fused_ce: bool | None,
     headroom: float,
     quant: str = "bf16",
-    use_vllm: bool = True,
     vocab: int = _VOCAB_DEFAULT,
     active_params_b: float | None = None,
     model_info=None,
@@ -723,7 +716,6 @@ def _opd_fp8_adjust(
         sft_fused_ce=sft_fused_ce,
         headroom=headroom,
         quant=quant,
-        use_vllm=use_vllm,
         vocab=vocab,
         active_params_b=active_params_b,
         fp8_kv=True,
@@ -757,7 +749,6 @@ def _catalog_model_required_vram_gb(
     if model_revision:
         params_b, model_vocab = _validated_revision_geometry(model_id, model_revision, info)
     quant = getattr(info, "quant", "bf16") or "bf16"
-    use_vllm = True
     # pinned commits retain validated coarse geometry but use conservative generic architecture sizing.
     sizing_info = None if model_revision else info
     active_b = float(getattr(sizing_info, "active_params_b", 0.0) or 0.0)
@@ -773,7 +764,6 @@ def _catalog_model_required_vram_gb(
         sft_fused_ce=sft_fused_ce,
         headroom=headroom,
         quant=quant,
-        use_vllm=use_vllm,
         vocab=model_vocab,
         active_params_b=active_b,
         model_info=sizing_info,
@@ -792,7 +782,6 @@ def _catalog_model_required_vram_gb(
             sft_fused_ce=sft_fused_ce,
             headroom=headroom,
             quant=quant,
-            use_vllm=use_vllm,
             vocab=model_vocab,
             active_params_b=active_b,
             model_info=sizing_info,
@@ -818,7 +807,6 @@ def _catalog_model_required_vram_gb(
                     lora_rank=lora_rank,
                     group_size=group_size,
                     thinking=thinking,
-                    use_vllm=True,
                     vocab=model_vocab,
                     sleep_offload=False,
                     active_params_b=active_b,
@@ -839,7 +827,7 @@ def _catalog_model_required_vram_gb(
         else:
             floor += grpo_seq_escalation_gb(active_b or params_b, seq_len)
     need = max(need, floor)
-    if is_vllm_rollout and use_vllm:
+    if is_vllm_rollout:
         floor_gb = 24 if (params_b or 0.0) <= 1.0 else int(_VLLM_COLOCATE_FLOOR_GB)
         if is_opd and (params_b or 0.0) >= 2.0:
             floor_gb = max(floor_gb, int(_OPD_VLLM_COLOCATE_FLOOR_GB))

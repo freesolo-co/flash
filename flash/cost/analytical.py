@@ -132,7 +132,7 @@ WORKER_BOOT_S = 120.0  # container pull + start
 DEPS_INSTALL_S = 90.0  # pip/uv resolve + install
 MODEL_LOAD_BASE_S = 235.0  # fixed checkpoint deserialize + GPU placement + framework/CUDA init
 VLLM_INIT_S = 120.0
-DOWNLOAD_RATE_GBPS = 0.4  # effective hf snapshot download (hf_transfer), on top of the base load
+DOWNLOAD_RATE_GBPS = 0.4  # effective hf snapshot download, on top of the base load
 
 # synchronous required saves serialize the lora state and publish it. sft/grpo make two hf commits
 # per save (deployable adapter plus resume checkpoint); opd publishes a single deployable adapter.

@@ -51,22 +51,6 @@ def load_adapters(settings: Settings) -> list[AdapterRecord]:
     )
 
 
-def list_run_adapters(org_id: str, run_id: str, settings: Settings) -> list[AdapterRecord]:
-    """load every exact checkpoint for one tenant run, regardless of lifecycle status."""
-
-    if not settings.has_supabase:
-        return []
-    return _list_adapters(
-        settings,
-        {
-            "org_id": f"eq.{org_id}",
-            "run_id": f"eq.{run_id}",
-            "order": "checkpoint_id.asc",
-        },
-        "load hosted run checkpoints",
-    )
-
-
 def _list_adapters(
     settings: Settings,
     filters: dict[str, str],
@@ -196,39 +180,6 @@ def replace_adapter_cas(
     if len(records) > 1:
         raise PersistenceRecordError("conditional checkpoint update returned more than one row")
     return records[0] if records else None
-
-
-def _adapter_to_row(record: AdapterRecord, now: str) -> dict[str, Any]:
-    """serialize one exact checkpoint to the explicit hosted binding schema."""
-
-    if record.run_id is None or record.checkpoint is None:
-        raise PersistenceRecordError("checkpoint record is missing its permanent identity")
-    parsed = parse_checkpoint_ref(record.checkpoint)
-    if parsed is None or parsed[0] != record.run_id:
-        raise PersistenceRecordError("checkpoint record has an invalid permanent identity")
-    return {
-        "org_id": record.org_id,
-        "run_id": record.run_id,
-        "checkpoint": "final" if parsed[1] is None else f"step-{parsed[1]}",
-        "checkpoint_id": record.adapter_id,
-        "source_repo_type": record.repo_type,
-        "source_repository": record.repo_id,
-        "source_revision": record.artifact_revision,
-        "source_subfolder": record.subfolder,
-        "artifact_digest": record.artifact_digest,
-        "artifact_fingerprint": record.artifact_fingerprint,
-        "base_model": record.base_model,
-        "lora_config": {"rank": record.lora_rank},
-        "serving_defaults": {
-            "thinking": record.thinking,
-            "structured_outputs": record.structured_outputs,
-        },
-        "url": record.url,
-        "status": record.status,
-        "deployment_generation": record.deployment_generation,
-        "created_at": record.created_at or now,
-        "updated_at": now,
-    }
 
 
 def _bind_payload(record: AdapterRecord) -> dict[str, Any]:
