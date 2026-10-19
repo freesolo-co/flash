@@ -741,7 +741,14 @@ def _classify_recoverable_runs(
                     _append_run_log(status.run_id, detail)
                 from flash.providers.modal.provider import terminate_persisted_resources
 
-                terminate_persisted_resources(status.spec, status.run_id)
+                try:
+                    terminate_persisted_resources(status.spec, status.run_id)
+                except Exception:
+                    _log.warning(
+                        "cleanup failed for run %s; orphan sweep will retry",
+                        status.run_id,
+                        exc_info=True,
+                    )
                 continue
             # reap run-scoped resources from the parseable public spec before touching the private
             # warm-start snapshot. source drift or snapshot tampering must not strand an endpoint.

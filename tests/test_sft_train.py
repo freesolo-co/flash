@@ -5264,3 +5264,13 @@ def test_resume_releases_only_durable_deployable_checkpoint_gates(monkeypatch, t
     watcher.start()
     assert not pathlib.Path(watcher.published_dir, "step-1").exists()
     assert pathlib.Path(watcher.published_dir, "step-5").is_file()
+
+
+def test_resume_rejects_missing_required_save_before_restored_step(monkeypatch):
+    from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
+    from flash.engine.worker.train.entry import sft_train
+
+    monkeypatch.setattr(sft_train, "_durable_required_save_steps", lambda *a: {3})
+    watcher = types.SimpleNamespace(lifecycle=CheckpointLedger())
+    with pytest.raises(RuntimeError, match=r"cannot resume.*\[5\]"):
+        sft_train._seed_resume_lifecycle(watcher, (3, 5, 9), 7)

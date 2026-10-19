@@ -258,7 +258,9 @@ def _drop_weight_cache(spec: JobSpec) -> JobSpec:
 
 
 def _managed_cache_mounted(spec: JobSpec, chosen) -> bool:
-    if chosen is None:
+    import os
+
+    if chosen is None or os.environ.get("FLASH_WEIGHT_CACHE_DISABLED", "").strip() == "1":
         return False
     from flash.providers.core.registry import get_provider
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME

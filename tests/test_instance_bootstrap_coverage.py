@@ -966,6 +966,7 @@ def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeyp
             return None
 
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: None)
     monkeypatch.setattr(
         b,
         "arm_deadline_watchdog",
@@ -1479,6 +1480,7 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
         markers.append((kind, time.time(), uploader.is_alive()))
 
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: None)
     monkeypatch.setattr(b, "install_extra_pip", lambda _payload: None)
     monkeypatch.setattr(b, "fetch_code", lambda _payload: None)
     monkeypatch.setattr(b, "build_worker_env", lambda _payload: {})
@@ -1957,6 +1959,7 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
 
     monkeypatch.setattr(b.time, "time", lambda: 100.0)
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: events.append("started"))
     monkeypatch.setattr(
         b,
         "arm_deadline_watchdog",
@@ -1974,8 +1977,9 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
     monkeypatch.setattr(b, "write_attempt_marker", lambda *_args, **_kwargs: None)
 
     assert b.main() == 0
-    assert events[:4] == [
+    assert events[:5] == [
         ("watchdog", 500.0),
+        "started",
         "code",
         "install",
         ("training", 500.0),
@@ -2003,6 +2007,7 @@ def test_main_source_verification_failure_prevents_pip(monkeypatch):
 
     monkeypatch.setattr(b.time, "time", lambda: 100.0)
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: None)
     monkeypatch.setattr(b, "arm_deadline_watchdog", lambda *_args: (_Timer(), _Done()))
     monkeypatch.setattr(
         b,
@@ -2060,6 +2065,7 @@ def test_main_accepts_required_completion_artifacts_at_deadline(monkeypatch, bou
 
     monkeypatch.setattr(b.time, "time", lambda: clock["now"])
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: None)
     monkeypatch.setattr(b, "arm_deadline_watchdog", lambda deadline, _payload: (_Timer(), _Done()))
     monkeypatch.setattr(b, "install_extra_pip", lambda _payload: None)
     monkeypatch.setattr(b, "fetch_code", lambda _payload: None)

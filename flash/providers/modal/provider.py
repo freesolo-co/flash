@@ -96,7 +96,6 @@ class ModalProvider:
         ]
 
     def sweep_orphans(self, active_labels=None, known_labels=None):
-        from flash.providers._lifecycle.instances.instance import run_label_prefix
         from flash.providers.modal import api
 
         instances = api.list_instances()
@@ -104,7 +103,7 @@ class ModalProvider:
         known = known_labels() if callable(known_labels) else known_labels
         deleted = []
         for item in instances:
-            label = run_label_prefix(item["tags"].get("flash_run", ""))
+            label = item["tags"].get("flash_run", "")
             if (known is not None and label not in known) or (active and label in active):
                 continue
             api.terminate(item["id"])

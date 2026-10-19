@@ -816,6 +816,33 @@ def main() -> int:
             signal.signal(sig, handler)
 
 
+def _publish_started(payload: dict) -> None:
+    """Publish actual bootstrap start before source downloads and package installation."""
+    import tempfile
+
+    from huggingface_hub import HfApi
+
+    marker = {"run_id": payload["run_id"], "attempt": payload["attempt"], "ts": time.time()}
+    name = f"modal_started_attempt{payload['attempt']}.json"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as file:
+        json.dump(marker, file)
+        file.flush()
+        try:
+            _hf_call(
+                lambda: HfApi(token=(payload.get("env") or {}).get("HF_TOKEN")).upload_file(
+                    path_or_fileobj=file.name,
+                    path_in_repo=f"{payload['hf_prefix']}/{name}",
+                    repo_id=payload["hf_repo"],
+                    repo_type="dataset",
+                ),
+                "publish bootstrap start",
+                deadline_at=require_deadline_at(payload),
+                secrets=_payload_secrets(payload),
+            )
+        except Exception as exc:
+            raise RetriableBootstrapError("could not publish bootstrap start") from exc
+
+
 def _run_attempt(payload: dict) -> int:
     ok = False
     error = ""
@@ -824,6 +851,7 @@ def _run_attempt(payload: dict) -> int:
     try:
         deadline = require_deadline_at(payload)
         deadline_watchdog = arm_deadline_watchdog(deadline, payload)
+        _publish_started(payload)
         # fetch and verify the pinned archive before pip, downloaded imports, path mutation, or child.
         fetch_code(payload)
         install_extra_pip(payload)

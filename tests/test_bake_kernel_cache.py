@@ -52,3 +52,68 @@ def test_verify_rejects_legacy_blob_without_raw_kernels(tmp_path):
     (tmp_path / "mega_cache.bin").write_bytes(b"legacy-blob")
     (tmp_path / "mega_cache.json").write_text('{"sm": "sm100"}')
     assert bake_module()._verify(str(tmp_path), "sm100") == 1
+
+
+@pytest.mark.parametrize("upload_fails", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_cleanup_covers_input_upload_and_never_overrides_result(
+    monkeypatch, tmp_path, upload_fails, cleanup_fails
+):
+    import sys
+    from types import SimpleNamespace
+
+    import huggingface_hub
+
+    from flash.providers.modal import api
+
+    bake = bake_module()
+    deleted = []
+
+    def delete(**kwargs):
+        deleted.append(kwargs["repo_id"])
+        if cleanup_fails:
+            raise RuntimeError("cleanup outage")
+
+    hf = SimpleNamespace(
+        create_repo=lambda **kw: None,
+        update_repo_settings=lambda **kw: None,
+        upload_folder=lambda **kw: None,
+        delete_repo=delete,
+    )
+
+    def upload(**kwargs):
+        if upload_fails:
+            raise RuntimeError("input upload outage")
+
+    hf.upload_folder = upload
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda **kw: hf)
+    monkeypatch.setenv("HF_TOKEN", "test")
+    monkeypatch.setattr(api, "call", lambda *a, **kw: None)
+    monkeypatch.setattr(bake, "_status_present", lambda *a, **kw: True)
+    monkeypatch.setattr(bake, "_verify", lambda *a: 0)
+
+    def download(**kwargs):
+        (Path(kwargs["local_dir"]) / "out").mkdir()
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "bake",
+            "--arch",
+            "blackwell",
+            "--sm",
+            "sm100",
+            "--image",
+            "test/image",
+            "--out",
+            str(tmp_path / "out"),
+        ],
+    )
+    if upload_fails:
+        with pytest.raises(RuntimeError, match="input upload outage"):
+            bake.main()
+    else:
+        assert bake.main() == 0
+    assert len(deleted) == 1

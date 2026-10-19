@@ -70,7 +70,6 @@ def main() -> int:
         f"{os.environ.get('FLASH_HF_NAMESPACE', ARTIFACT_NAMESPACE)}/kernel-bake-{args.sm}-{suffix}"
     )
     entry = Path(__file__).with_name("bake_sandbox_entry.py")
-    _upload_flash_code(hf, repo, token)
 
     async def bake(modal, client):
         app = await modal.App.lookup.aio(
@@ -108,6 +107,7 @@ def main() -> int:
             await sandbox.terminate.aio(wait=True)
 
     try:
+        _upload_flash_code(hf, repo, token)
         modal_api.call(bake, timeout=args.deadline_min * 60 + 120)
         if not _status_present(hf, repo, retries=3):
             raise RuntimeError("kernel warmup finished without its completion marker")
@@ -124,7 +124,10 @@ def main() -> int:
             shutil.copytree(Path(temp) / "out", args.out, dirs_exist_ok=True)
         return _verify(args.out, args.sm)
     finally:
-        hf.delete_repo(repo_id=repo, repo_type="dataset")
+        try:
+            hf.delete_repo(repo_id=repo, repo_type="dataset")
+        except Exception:
+            log(f"WARNING: could not delete temporary repository {repo}; remove it manually")
 
 
 def _status_present(api, repo: str, retries: int = 1) -> bool:

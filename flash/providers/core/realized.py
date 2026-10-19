@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import math
+import time
 from dataclasses import dataclass, field
 
 
@@ -23,7 +23,7 @@ def realized_cost_for_remote(remote, *, start, end, run_end=None):
         return None
     result = _instance_realized_cost(remote, end=run_end if run_end is not None else end)
     if result is not None:
-        result.source["basis"] = "reserved_resource_estimate"
+        result.source["basis"] = "bootstrap_resource_estimate"
     return result
 
 
@@ -33,11 +33,10 @@ def _instance_realized_cost(remote: dict, *, end: float) -> RealizedCost | None:
     rid = remote.get("instance_id")
     if not rate or not rid:
         return None
-    launch = remote.get("started_ts")
-    if isinstance(launch, bool) or not isinstance(launch, (int, float)):
-        return None
-    launch = float(launch)
-    if not math.isfinite(launch) or launch <= 0:
+    from flash.providers.modal.startup import start_time_reader
+
+    launch = start_time_reader(remote, deadline_at=time.time() + 30)()
+    if launch is None:
         return None
     wall = max(0.0, float(end) - launch)
     usd = round(wall / 3600.0 * float(rate), 6)

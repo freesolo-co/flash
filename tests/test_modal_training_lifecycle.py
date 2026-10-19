@@ -165,3 +165,12 @@ def test_launch_keeps_original_owner_if_environment_changes_after_create(monkeyp
     submit(spec(), on_handle=lambda h: handles.append(h.to_dict()))
     assert handles[0]["scope"] == original_scope
     assert launch_state[-1] == ("terminate", "sb-job")
+
+
+def test_disabled_cache_cannot_authorize_cacheless_retry(monkeypatch):
+    from types import SimpleNamespace
+
+    from flash.runner.supervise.retry_decision import _managed_cache_mounted
+
+    monkeypatch.setenv("FLASH_WEIGHT_CACHE_DISABLED", "1")
+    assert not _managed_cache_mounted(spec(), SimpleNamespace(provider="modal"))

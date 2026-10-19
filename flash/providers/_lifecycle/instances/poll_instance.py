@@ -98,6 +98,7 @@ class InstancePollAdapter:
     failure_detail: Callable[[dict | None], str]  # (marker) -> best root-cause detail
     load_timeout_detail: Callable[[str, float], str]  # (status, elapsed_s) -> str
     first_liveness_detail: Callable[[float, float], str]  # (elapsed_s, first_liveness_s) -> str
+    load_timeout_failure: str = "stalled"
 
 
 class _TerminalArtifacts:
@@ -481,6 +482,10 @@ def _update_instance_state(
                 state.running_since = time.time()  # genuine ->running: start the liveness clock
         state.last_status = status
     if status == ctx.adapter.running_status:
+        started = (inst or {}).get("started_ts")
+        if type(started) in (int, float) and ctx.adapter.launch_ts <= started <= time.time():
+            state.running_since = started
+            state.last_progress = max(state.last_progress, started)
         state.became_running = True
         if state.observed_running_since is None:
             state.observed_running_since = time.time()
@@ -587,7 +592,7 @@ def _classify_load_timeout(
     ):
         return PollResult(
             False,
-            failure="stalled",
+            failure=ctx.adapter.load_timeout_failure,
             detail=ctx.adapter.load_timeout_detail(
                 status,
                 time.time() - ctx.adapter.launch_ts,

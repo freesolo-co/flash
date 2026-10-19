@@ -81,11 +81,13 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, deadline_
     identity["flash_source"] = hashlib.sha256(
         json.dumps(payload.get("source_snapshot"), sort_keys=True).encode()
     ).hexdigest()
+    create_started = False
     with tempfile.TemporaryDirectory(prefix="flash-modal-") as directory:
         archive = Path(directory) / "capsule.pyz"
         archive.write_bytes(capsule)
 
         async def launch(modal, client):
+            nonlocal create_started
             app = await modal.App.lookup.aio(
                 APP_NAME, environment_name=environment(), create_if_missing=True, client=client
             )
@@ -117,6 +119,7 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, deadline_
             secret = modal.Secret.from_dict({"FLASH_BOOTSTRAP_PAYLOAD": json.dumps(payload)})
             timeout = min(MAX_SANDBOX_SECONDS, max(1, int(deadline_at - time.time())))
             try:
+                create_started = True
                 sandbox = await modal.Sandbox.create.aio(
                     "python",
                     "-u",
@@ -155,6 +158,8 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, deadline_
         try:
             return call(launch, deadline_at=deadline_at, timeout=1800)
         except ModalApiError:
+            if not create_started:
+                raise
             raise UnreconciledCreateError(
                 "Modal launch outcome unknown; reconcile before retrying"
             ) from None
@@ -167,7 +172,7 @@ def get_instance(instance_id, *, deadline_at=None):
             code = await sandbox.poll.aio()
         except modal.exception.NotFoundError:
             return None
-        return {"status": "running" if code is None else "terminated", "returncode": code}
+        return {"status": "pending" if code is None else "terminated", "returncode": code}
 
     return call(read, deadline_at=deadline_at)
 

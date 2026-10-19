@@ -44,11 +44,14 @@ def warm_weight_cache(*, models=None, timeout_s=3600):
         raise ValueError("weight-cache warming accepts only trusted catalog base models")
     if not 1 <= timeout_s <= api.MAX_SANDBOX_SECONDS:
         raise ValueError("timeout must be between 1 and 86400 seconds")
+    from flash.core.catalog import MODELS
+
+    revisions = {model: MODELS[model].managed_revision or None for model in models}
     script = """import json, os
 from huggingface_hub import snapshot_download
 models = json.loads(os.environ['FLASH_CACHE_MODELS'])
-for model in models:
-    snapshot_download(model, cache_dir='/weight-cache/hf-cache/hub',
+for model, revision in models.items():
+    snapshot_download(model, revision=revision, cache_dir='/weight-cache/hf-cache/hub',
                       token=os.environ.get('HF_TOKEN'), ignore_patterns=['*.bin', '*.pt', '*.pth'])
 print(json.dumps({'status': 'ok', 'models': models}))
 """
@@ -80,7 +83,7 @@ print(json.dumps({'status': 'ok', 'models': models}))
                 modal.Secret.from_dict(
                     {
                         "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
-                        "FLASH_CACHE_MODELS": json.dumps(models),
+                        "FLASH_CACHE_MODELS": json.dumps(revisions),
                     }
                 )
             ],

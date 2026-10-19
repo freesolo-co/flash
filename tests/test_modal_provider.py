@@ -105,17 +105,17 @@ def test_orphan_sweep_rechecks_live_labels_after_listing(monkeypatch):
     active = set()
 
     def listing():
-        active.add("flash-live")
+        active.add("custom-live")
         return [
-            {"id": "sb-live", "tags": {"flash_run": "flash-live"}},
-            {"id": "sb-dead", "tags": {"flash_run": "flash-dead"}},
+            {"id": "sb-live", "tags": {"flash_run": "custom-live"}},
+            {"id": "sb-dead", "tags": {"flash_run": "long-" * 20}},
             {"id": "sb-foreign", "tags": {"flash_run": "flash-foreign"}},
         ]
 
     stopped = []
     monkeypatch.setattr(api, "list_instances", listing)
     monkeypatch.setattr(api, "terminate", stopped.append)
-    result = get_provider("modal").sweep_orphans(lambda: active, {"flash-live", "flash-dead"})
+    result = get_provider("modal").sweep_orphans(lambda: active, {"custom-live", "long-" * 20})
     assert result == stopped == ["sb-dead"]
 
 
@@ -282,3 +282,19 @@ def test_shutdown_has_a_bounded_budget_beyond_gpu_grace_period(monkeypatch):
     monkeypatch.setattr(api, "call", lambda operation, **kwargs: calls.append(kwargs))
     api.terminate("sb-stopping")
     assert api.API_TIMEOUT_SECONDS < calls[0]["timeout"] <= 180
+
+
+@pytest.mark.parametrize("after_create", [False, True])
+def test_transport_timeout_is_ambiguous_only_after_create(monkeypatch, sdk, after_create):
+    original_call = api.call
+
+    def timed_out(operation, **kwargs):
+        if after_create:
+            original_call(operation, **kwargs)
+        raise api.ModalApiError("timed out")
+
+    monkeypatch.setattr(api, "call", timed_out)
+    expected = UnreconciledCreateError if after_create else api.ModalApiError
+    with pytest.raises(expected):
+        launch()
+    assert len(sdk.created) == int(after_create)

@@ -7,7 +7,6 @@ import time
 from flash.providers._lifecycle.instances.instance import build_payload, instance_label
 from flash.providers._lifecycle.instances.poll import (
     FIRST_LIVENESS_S,
-    LOAD_TIMEOUT_S,
     SETUP_GRACE_S,
     STALL_AFTER_S,
 )
@@ -27,6 +26,7 @@ from flash.providers.modal import api
 from flash.providers.modal.auth import scope_fingerprint
 from flash.providers.modal.handles import ModalJobHandle, require_scope
 from flash.providers.modal.pricing import hourly_rate
+from flash.providers.modal.startup import start_time_reader
 
 
 def poll(handle, spec, *, log=None, deadline_at=None):
@@ -41,17 +41,34 @@ def poll(handle, spec, *, log=None, deadline_at=None):
             spec.train.hf_repo, f"{prefix}/{filename}", deadline_at=deadline_at, **kwargs
         )
 
-    console = reader(f"console_{spec.phase}.log")
+    console = reader(f"console_{spec.phase}_attempt{h.attempt}.txt")
+    read_start = start_time_reader(h.to_dict(), deadline_at=deadline_at)
+    worker_started = None
+
+    def fetch_instance():
+        nonlocal worker_started
+        worker_started = worker_started or read_start()
+        instance = api.get_instance(h.instance_id, deadline_at=deadline_at)
+        if instance is not None and instance["status"] == "pending" and worker_started is not None:
+            return {**instance, "status": "running", "started_ts": worker_started}
+        return instance
+
     error = reader(error_artifact_name(spec.phase, h.attempt))
 
     def stamp(metrics, *, end_ts, launch_ts):
-        metrics["cost_usd"] = round(max(0, end_ts - launch_ts) / 3600 * h.hourly_usd, 6)
+        started = worker_started or read_start()
+        if started is None:
+            metrics.pop("cost_usd", None)
+        else:
+            metrics["cost_usd"] = round(max(0, end_ts - started) / 3600 * h.hourly_usd, 6)
         notes = metrics.setdefault("notes", {})
         notes.update(
             provider="modal",
             modal_rate_usd_hr=h.hourly_usd,
             modal_sandbox_id=h.instance_id,
-            cost_basis="reserved_resource_estimate",
+            cost_basis="bootstrap_resource_estimate"
+            if started is not None
+            else "unknown_start_time",
         )
 
     adapter = InstancePollAdapter(
@@ -62,7 +79,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         done_reader=reader("DONE"),
         marker_reader=reader(f"modal_attempt{h.attempt}.json"),
         metrics_reader=reader("metrics.json"),
-        fetch_instance=lambda: api.get_instance(h.instance_id, deadline_at=deadline_at),
+        fetch_instance=fetch_instance,
         poll_error_exceptions=(api.ModalApiError,),
         status_field="status",
         running_status="running",
@@ -75,6 +92,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
             (marker or {}).get("error")
             or "Modal worker stopped without a successful terminal marker"
         ),
+        load_timeout_failure="no_capacity",
         load_timeout_detail=lambda status, elapsed: (
             f"Modal sandbox remained {status} for {int(elapsed)}s"
         ),
@@ -89,7 +107,8 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         setup_grace_s=SETUP_GRACE_S,
         stall_after_s=STALL_AFTER_S,
         first_liveness_s=FIRST_LIVENESS_S,
-        load_timeout_s=LOAD_TIMEOUT_S,
+        # Capacity waiting is bounded separately from a running worker's liveness timer.
+        load_timeout_s=1800.0,
         deadline_at=deadline_at,
     )
 

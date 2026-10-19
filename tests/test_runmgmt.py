@@ -3515,9 +3515,10 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_model_was_removed(
     assert "persisted spec cannot be activated" in (status.error or "")
 
 
+@pytest.mark.parametrize("cleanup_fails", [False, True])
 @pytest.mark.parametrize("retired_model", _RETIRED_MODELS)
 def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
-    monkeypatch, tmp_path, retired_model
+    monkeypatch, tmp_path, retired_model, cleanup_fails
 ):
     import flash.server.platform.runtime as runtime
     from flash.core.spec import JobSpec
@@ -3552,10 +3553,13 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
         lambda *_args, **_kwargs: pytest.fail("resubmit"),
     )
     terminated = []
-    monkeypatch.setattr(
-        "flash.providers.modal.provider.terminate_persisted_resources",
-        lambda raw_spec, run_id: terminated.append((raw_spec["model"], run_id)),
-    )
+
+    def cleanup(raw_spec, run_id):
+        terminated.append((raw_spec["model"], run_id))
+        if cleanup_fails:
+            raise RuntimeError("temporary Modal outage")
+
+    monkeypatch.setattr("flash.providers.modal.provider.terminate_persisted_resources", cleanup)
 
     class Thread:
         def __init__(self, *, target, args=(), daemon=False):
