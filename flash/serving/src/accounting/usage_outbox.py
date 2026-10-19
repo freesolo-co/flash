@@ -153,6 +153,7 @@ class UsageEvent:
             "request_id": self.identity.request_id,
             "correlation_id": self.identity.correlation_id,
             "traffic_principal_kind": principal.kind,
+            "traffic_source": "freesolo",
             "billing_attribution_explicit": principal.kind == "trusted_internal",
             "org_id": principal.orgId,
             "openai_completion_id": self.identity.openai_completion_id,

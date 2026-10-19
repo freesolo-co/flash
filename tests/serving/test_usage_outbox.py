@@ -310,6 +310,7 @@ def test_capacity_facts_use_durable_evidence_without_extending_billing_rpc() -> 
         "replica_freshly_booted": True,
     }
     assert not set(capacity).intersection(payload)
+    assert payload["traffic_source"] == "freesolo"
     assert payload["checkpoint_id"] == event.target.checkpoint_id
     assert payload["artifact_fingerprint"] == event.target.artifact_fingerprint
     assert payload["attestation_evidence"].items() >= event.attestation_evidence.items()
