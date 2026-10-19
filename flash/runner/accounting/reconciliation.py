@@ -412,10 +412,12 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     attempted = set()
     if not records:
         return attempted
+    from flash._internal.background import checkpoint
     from flash.providers.core.base import JobHandle
     from flash.runner.supervise.recovery import _strict_teardown_handle
 
     for record in records:
+        checkpoint()
         # a record that fails strict canonicalization still names a billable resource; the base
         # JobHandle validates only `provider`, and the runpod teardown resolves the deployed
         # 16-char fingerprint itself. skipping it here would leave that resource billing forever.

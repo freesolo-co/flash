@@ -921,7 +921,19 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
     monkeypatch.setattr(_runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
     monkeypatch.setattr(providers, "configured_providers", list)
 
+    import threading
+
+    failed = threading.Event()
+    original_fail = _runtime._fail_blocked_recovery
+
+    def observe_failure(*args, **kwargs):
+        result = original_fail(*args, **kwargs)
+        failed.set()
+        return result
+
+    monkeypatch.setattr(_runtime, "_fail_blocked_recovery", observe_failure)
     _runtime.recover_runs()
+    assert failed.wait(2), "admitted recovery must reject the unsafe OPD replacement"
 
     assert started == []
     status = runner_status.get_status(spec.run_id)

@@ -8,11 +8,12 @@ import os
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 import flash.runner.lifecycle.submit as run_submission
 import flash.runner.results.checkpoints as checkpoint_service
 import flash.server.platform.runtime as server_runtime
+from flash._internal.background import TaskAdmissionError
 from flash.engine.profiling.image_tokens import ImageGeometryUnavailable
 from flash.runner.lifecycle import status as runner_status
 from flash.runner.lifecycle.preparation import WarmStartPreparationError
@@ -269,7 +270,7 @@ def _submit_failure_http_error(exc: Exception) -> HTTPException:
     Everything reaching here is a bad request by default. Submit-time errors may opt into 503 with
     a truthy ``plane_fault`` attribute when the submitter cannot fix the failure by changing the spec.
     """
-    if isinstance(exc, SourceSnapshotPublicationError):
+    if isinstance(exc, (SourceSnapshotPublicationError, TaskAdmissionError)):
         return HTTPException(status_code=503, detail=str(exc))
     if (
         isinstance(exc, (ImageGeometryUnavailable, TeacherBrokerConfigurationError))
@@ -347,6 +348,7 @@ def _dispose_failed_submission(
 @router.post("/v1/runs")
 def create_run(
     payload: dict,
+    request: Request,
     key: Annotated[dict, Depends(require_key)],
     authorization: Annotated[str | None, Header()] = None,
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
@@ -433,6 +435,7 @@ def create_run(
             "background": True,
             "owner_key_id": key["id"],
             "prepared_job": prepared,
+            "supervisor": request.app.state.training_jobs,
         }
         if runtime_secrets:
             submit_kwargs["runtime_secrets"] = runtime_secrets
@@ -539,10 +542,14 @@ def run_worker_output(
 
 
 @router.post("/v1/runs/{run_id}/cancel")
-def cancel(run_id: str, key: Annotated[dict, Depends(require_key)]):
+def cancel(run_id: str, request: Request, key: Annotated[dict, Depends(require_key)]):
     owned_run(run_id, key)
     try:
-        return cancel_run(run_id).to_dict()
+        status = cancel_run(run_id)
+        if status.state == "cancelled":
+            for kind in ("run", "retry", "attach"):
+                request.app.state.training_jobs.cancel((kind, run_id))
+        return status.to_dict()
     except DeploymentRevocationError as exc:
         raise HTTPException(
             status_code=502,

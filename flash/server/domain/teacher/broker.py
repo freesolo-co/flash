@@ -13,6 +13,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any
 
+from flash._internal.background import TaskStopped
 from flash._internal.fileio import reject_duplicate_keys
 from flash.core.spec import PUBLIC_URL_ENV, TEACHER_CAPABILITY_ENV, JobSpec
 from flash.engine.plan.recipe import RECIPE, resolve_teacher
@@ -320,13 +321,19 @@ def teacher_attempt_transport(
         attempt=attempt,
         deadline_at=deadline_at,
     )
+    detached = False
     try:
         yield {
             PUBLIC_URL_ENV: public_url,
             TEACHER_CAPABILITY_ENV: capability,
         }
+    except TaskStopped:
+        # The persisted worker continues across a plane restart; the token retains its deadline.
+        detached = True
+        raise
     finally:
-        db.revoke_teacher_capability(capability)
+        if not detached:
+            db.revoke_teacher_capability(capability)
 
 
 _reject_duplicate_keys = reject_duplicate_keys(

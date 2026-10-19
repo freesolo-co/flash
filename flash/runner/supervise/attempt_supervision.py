@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field, replace
 
 import flash.runner.supervise.recovery as attempt_recovery
+from flash._internal.background import checkpoint, pause
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
 from flash.runner.lifecycle.attempts import AttemptLaunchClaim
@@ -706,6 +707,7 @@ def run_attempts_supervised(
         )
         _require_opd_configuration(ctx)
         while True:
+            checkpoint()
             prepared, completed_metrics = _prepare_attempt(ctx)
             if completed_metrics is not None:
                 return ctx.return_completed_runpod_metrics(completed_metrics)
@@ -724,7 +726,7 @@ def run_attempts_supervised(
             if not retry:
                 break
             if retry_delay:
-                time.sleep(retry_delay)
+                pause(retry_delay)
         _settle_terminal_remote(ctx)
         ctx.gc_seen_endpoints()
         raise RuntimeError(f"run {spec.run_id} failed after retries: {ctx.last_detail}")

@@ -5782,57 +5782,35 @@ def _vast_recovery_remote(instance_id=101, attempt=0):
     }
 
 
-def test_attach_reconciliation_thread_start_failure_releases_guard(monkeypatch):
+def test_attach_reconciliation_capacity_failure_leaves_no_local_guard(monkeypatch):
     import flash.runner.supervise.attach as attach_mod
+    from flash._internal.background import Limits, Supervisor
 
-    run_id = "attach-reconcile-thread-start"
-    remote = _vast_recovery_remote()
-    spec = _spec(run_id)
-    with attach_mod._ATTACH_RECONCILING_LOCK:
-        attach_mod._ATTACH_RECONCILING.discard(run_id)
-
-    class RaisingThread:
-        def __init__(self, *, target, daemon):
-            self.target = target
-
-        def start(self):
-            raise RuntimeError("thread start failed")
-
-    monkeypatch.setattr(attach_mod, "threading", SimpleNamespace(Thread=RaisingThread))
-    with pytest.raises(RuntimeError, match="thread start failed"):
-        attach_mod._schedule_attach_reconciliation(
-            run_id,
-            remote,
-            spec,
-            1,
-            _SOURCE_SNAPSHOT,
-            io.StringIO(),
-            "stalled: host vanished",
-        )
-    with attach_mod._ATTACH_RECONCILING_LOCK:
-        assert run_id not in attach_mod._ATTACH_RECONCILING
-
-    monkeypatch.setattr(attach_mod, "_reconcile_attached_remote", lambda *a, **k: None)
-
-    class ImmediateThread:
-        def __init__(self, *, target, daemon):
-            self.target = target
-
-        def start(self):
-            self.target()
-
-    monkeypatch.setattr(attach_mod, "threading", SimpleNamespace(Thread=ImmediateThread))
-    assert attach_mod._schedule_attach_reconciliation(
+    run_id = "attach-reconcile-full"
+    owner = Supervisor({"recovery": Limits(1, 1)})
+    args = (
         run_id,
-        remote,
-        spec,
+        _vast_recovery_remote(),
+        _spec(run_id),
         1,
-        "code/revision",
+        _SOURCE_SNAPSHOT,
         io.StringIO(),
         "stalled: host vanished",
     )
-    with attach_mod._ATTACH_RECONCILING_LOCK:
-        assert run_id not in attach_mod._ATTACH_RECONCILING
+    try:
+        with owner.bind(), owner.reserve("busy", "recovery"):
+            assert not attach_mod._schedule_attach_reconciliation(*args)
+            assert not owner.contains(("attach", run_id))
+        # Capacity is available again: a rejected observation must leave no separate dedup guard.
+        with owner.bind():
+            scheduled = []
+            monkeypatch.setattr(
+                owner, "submit", lambda key, lane, target, **kw: scheduled.append(key) or True
+            )
+            assert attach_mod._schedule_attach_reconciliation(*args)
+        assert scheduled == [("attach", run_id)]
+    finally:
+        owner.close(1)
 
 
 def test_attach_reconciliation_cleans_endpoint_after_background_completion(monkeypatch):
@@ -5861,14 +5839,11 @@ def test_attach_reconciliation_cleans_endpoint_after_background_completion(monke
             runner_recovery, "_gc_run_endpoints", lambda current: cleaned.append(current.run_id)
         )
 
-        class ImmediateThread:
-            def __init__(self, *, target, daemon):
-                self.target = target
+        from flash._internal.background import current_supervisor
 
-            def start(self):
-                self.target()
-
-        monkeypatch.setattr(attach_mod, "threading", SimpleNamespace(Thread=ImmediateThread))
+        monkeypatch.setattr(
+            current_supervisor(), "submit", lambda key, lane, target, **kwargs: target() or True
+        )
 
         assert attach_mod._schedule_attach_reconciliation(
             run_id,
@@ -5936,7 +5911,7 @@ def test_attach_reconciler_resumes_after_vast_strict_absence(monkeypatch):
 
         monkeypatch.setattr(runner_lifecycle, "_run_training", resume_training)
 
-        attach_mod._reconcile_attached_remote(
+        _drive_attach_retries(
             spec.run_id,
             remote,
             spec,
@@ -5982,7 +5957,7 @@ def test_attach_reconciler_deadline_retries_terminal_persistence(monkeypatch):
 
         monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", flaky_fail)
 
-        attach_mod._reconcile_attached_remote(
+        _drive_attach_retries(
             spec.run_id,
             remote,
             spec,
@@ -6026,7 +6001,7 @@ def test_attach_reconciler_adopts_completed_phantom_at_deadline(monkeypatch):
             lambda *a, **k: {"wall_seconds": 5.0},
         )
 
-        attach_mod._reconcile_attached_remote(
+        _drive_attach_retries(
             spec.run_id,
             remote,
             spec,
@@ -6079,7 +6054,7 @@ def test_attach_reconciler_caps_completed_adoption_retry_to_grace(monkeypatch):
         )
         monkeypatch.setattr(runner_recovery, "_adopt_completed_attempt", lambda *_a, **_k: False)
 
-        attach_mod._reconcile_attached_remote(
+        _drive_attach_retries(
             spec.run_id,
             remote,
             spec,
@@ -6135,7 +6110,7 @@ def test_attach_reconciler_reprobes_completion_after_deadline_capped_sleep(monke
             lambda *_args, **_kwargs: pytest.fail("completed attempt must not be torn down"),
         )
 
-        attach_mod._reconcile_attached_remote(
+        _drive_attach_retries(
             spec.run_id,
             remote,
             spec,
@@ -6201,7 +6176,7 @@ def test_attach_reconciler_rate_limits_failed_terminal_cas_past_grace(monkeypatc
 
         monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", flaky_fail)
 
-        attach_mod._reconcile_attached_remote(
+        _drive_attach_retries(
             spec.run_id,
             remote,
             spec,
@@ -6264,7 +6239,7 @@ def test_an_adopted_instance_run_is_still_priced_for_every_card_it_occupied(monk
 
         monkeypatch.setattr(runner_recovery, "_adopt_completed_attempt", capture)
 
-        attach_mod._reconcile_attached_remote(
+        _drive_attach_retries(
             spec.run_id,
             remote,
             spec,
@@ -6315,7 +6290,7 @@ def test_attach_reconciler_does_not_clobber_newer_remote(monkeypatch):
             lambda *a, **k: pytest.fail("stale reconciler must not fail the run"),
         )
 
-        attach_mod._reconcile_attached_remote(
+        _drive_attach_retries(
             spec.run_id,
             old_remote,
             spec,
@@ -7221,3 +7196,14 @@ def test_reattach_keeps_the_stall_grace_but_not_the_capacity_wording(monkeypatch
     PROVIDER.poll_attempt(JobHandle.from_dict({**base, "on_last_gpu": False}), spec)
     assert "on_last_gpu" not in captured, captured
     assert captured["queue_grace_s"] == 300.0, captured
+
+
+def _drive_attach_retries(*args):
+    from flash._internal.background import Retry
+
+    for _ in range(100):
+        result = runner_attach._reconcile_attached_remote(*args, resume_inline=True)
+        if not isinstance(result, Retry):
+            return result
+        time.sleep(result.delay)
+    pytest.fail("attached reconciliation did not converge in 100 observations")

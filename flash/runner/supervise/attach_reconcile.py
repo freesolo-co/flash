@@ -80,3 +80,16 @@ def teardown_reconciled_remote(
     except Exception:
         cleanup_preserved = False
     return cleanup_preserved, resource_deleted
+
+
+def retry_delay(run_id: str, interval_s: float) -> float:
+    """Keep the observation interval without sleeping past the run wall deadline."""
+    import time
+
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+
+    try:
+        return min(interval_s, max(0.0, _load_run_deadline_at(run_id) - time.time()))
+    except Exception:
+        # The observation itself owns failing an unreadable deadline.
+        return 0.0

@@ -6,6 +6,7 @@ import contextlib
 import os
 import time
 
+from flash._internal.background import checkpoint, pause
 from flash.core.spec import JobSpec, gpu_count_of
 from flash.runner.lifecycle.attempts import AttemptLaunchClaim
 from flash.runner.supervise import recovery as attempt_recovery
@@ -74,6 +75,7 @@ def _run_job(
         _update(spec.run_id, "provisioning")
         log_path = os.path.join(RUNS_DIR, f"{spec.run_id}.log")
         while True:
+            checkpoint()
             try:
                 _run_job_inner(
                     spec,
@@ -106,7 +108,7 @@ def _run_job(
                         file=log,
                         flush=True,
                     )
-                time.sleep(min(_STAGED_ENVIRONMENT_RETRY_S, remaining))
+                pause(min(_STAGED_ENVIRONMENT_RETRY_S, remaining))
     finally:
         # every exit before the supervised submit -- staging deadline exhaustion, a transient staging
         # failure that turned terminal, or any raise out of _run_job_inner -- leaves the reserved claim

@@ -199,6 +199,9 @@ Within `flash/engine/worker/`, trainers live under `train/`, split by algorithm 
 **copied** into the verl subprocess rather than imported — flash and verl pin incompatible
 torch/vllm versions, so neither can import the other.
 
+Training task admission, recovery scheduling, and shutdown are described in
+[Training background work](docs/training-background-work.md).
+
 ## Self-hosting
 
 Run your own control plane against your own GPU accounts, with no Freesolo backend involved.

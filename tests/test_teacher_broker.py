@@ -2351,3 +2351,28 @@ def test_preflight_is_a_noop_for_non_opd_algorithms(monkeypatch):
             run_id=f"run-{algorithm}-noop",
         )
         assert teacher_broker.preflight_validate_managed_teacher(spec) is None
+
+
+def test_application_shutdown_keeps_worker_teacher_capability(broker_db, monkeypatch):
+    from flash._internal.background import TaskStopped
+
+    monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
+    monkeypatch.setenv("PARASAIL_API_KEY", "control-plane-only-canary")
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-9B",
+        algorithm="opd",
+        run_id="run-1",
+        train=TrainSpec(max_examples=8, max_steps=1),
+    )
+    captured = {}
+
+    def detach():
+        with teacher_broker.teacher_attempt_transport(
+            spec, attempt=2, deadline_at=time.time() + 600
+        ) as runtime:
+            captured["token"] = runtime["FLASH_TEACHER_CAPABILITY"]
+            raise TaskStopped
+
+    with pytest.raises(TaskStopped):
+        detach()
+    assert db.teacher_capability_binding(captured["token"])["revoked_at"] is None

@@ -15,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from flash._internal.background import TaskStopped
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash._internal.logging import get_logger
 from flash.providers._lifecycle.instances.poll import (
@@ -749,7 +750,7 @@ def submit_attempt_lambda(
     source_snapshot: dict | None = None,
     deadline_at: float | None = None,
 ) -> PollResult:
-    """Launch, poll, and always terminate the instance (finally is the cost-safety primary)."""
+    """Launch and poll; only application shutdown may detach a durably recorded instance."""
     if spec.gpu.type not in GPU_INFO:
         raise lambda_api.LambdaApiError(
             f"submit_attempt_lambda needs a concrete gpu class, got {spec.gpu.type!r}"
@@ -773,9 +774,11 @@ def submit_attempt_lambda(
         source_snapshot=source_snapshot,
         deadline_at=absolute_deadline,
     )
+    persisted = detached = False
     try:
         if on_handle is not None:
             on_handle(handle.to_dict())
+            persisted = True
         reader = heartbeat_reader_for(
             spec,
             deadline_at=absolute_deadline,
@@ -787,8 +790,12 @@ def submit_attempt_lambda(
             heartbeat_reader=reader,
             deadline_at=absolute_deadline,
         )
+    except TaskStopped:
+        detached = persisted
+        raise
     finally:
-        _teardown_polled_instance(handle, spec.run_id)
+        if not detached:
+            _teardown_polled_instance(handle, spec.run_id)
 
 
 def terminate_run_instances(run_id: str) -> list[str]:

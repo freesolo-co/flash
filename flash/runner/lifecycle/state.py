@@ -180,6 +180,8 @@ class RunStatus:
     # full managed source descriptor, kept private because it carries the repository path.
     source_snapshot: dict | None = None
     source_verified_attempt: int | None = None
+    # Only the requirement is persisted, never request secret names or values.
+    requires_runtime_secrets: bool = False
 
     def to_dict(self) -> dict:
         """Return the public run status representation."""
@@ -187,6 +189,7 @@ class RunStatus:
 
         data = _status_storage_dict(self)
         data["spec"] = _public_status_spec(data.get("spec"))
+        data.pop("requires_runtime_secrets", None)
         data.pop("report_sequence", None)
         data.pop("lifecycle_started_attempt", None)
         data.pop("lifecycle_progressed_attempt", None)

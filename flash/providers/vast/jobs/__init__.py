@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Callable
 
+from flash._internal.background import TaskStopped
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash._internal.logging import get_logger
 from flash.providers._lifecycle.instances.poll import (
@@ -699,7 +700,8 @@ def submit_attempt_vast(
     """Vast equivalent of ``lambdalabs.jobs.submit_attempt_lambda``: rent, persist, poll, destroy.
 
     The ``finally`` destroy is the cost-safety primary: every exit path — success, failure, stall,
-    exception, KeyboardInterrupt — tears the paid instance down.
+    exception, KeyboardInterrupt — tears the paid instance down. Application shutdown alone
+    detaches a durably recorded worker for restart recovery.
     """
     # GPU_INFO is keyed by concrete GPU class; a policy word ("cheapest"/"auto") would KeyError opaquely.
     # The allocator resolves policy words to a concrete class upstream, so reaching here with one is a
@@ -769,6 +771,7 @@ def submit_attempt_vast(
             f"{len({o.machine_id for o in market})} machine(s) this run already rented and lost"
         )
     handle = None
+    persisted = detached = False
     try:
         handle = deploy_and_submit(
             spec,
@@ -781,6 +784,7 @@ def submit_attempt_vast(
         )
         if on_handle is not None:
             on_handle(handle.to_dict())
+            persisted = True
         reader = heartbeat_reader_for(
             spec,
             deadline_at=absolute_deadline,
@@ -802,8 +806,11 @@ def submit_attempt_vast(
             # anywhere, and retiring a working host for it starves the pool.
             _note_dead_machine(spec.run_id, getattr(handle, "machine_id", None))
         return result
+    except TaskStopped:
+        detached = persisted
+        raise
     finally:
-        if handle is not None:
+        if handle is not None and not detached:
             confirmed = False
             cleanup_exc: BaseException | None = None
             try:

@@ -3453,16 +3453,7 @@ def _fake_recovery_thread(monkeypatch, runtime):
     started = []
     monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
 
-    class Thread:
-        def __init__(self, *, target, args, daemon):
-            self.target = target
-            self.args = args
-            self.daemon = daemon
-
-        def start(self):
-            started.append(self.args)
-
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    monkeypatch.setattr(runner_lifecycle, "_run_job_background", lambda *args: started.append(args))
     return started
 
 
@@ -3496,46 +3487,25 @@ def test_two_handleless_observers_share_one_prelaunch_claim(monkeypatch, tmp_pat
     assert raw[runner_state._ACTIVE_LAUNCH_CLAIM_KEY] == claim.to_dict()
 
 
-def test_failed_thread_startup_releases_the_handleless_reservation(monkeypatch, tmp_path):
-    """A `Thread.start()` failure must consume the claim it reserved.
-
-    Nothing will ever run `_run_job_background`, so its `finally` cannot consume the claim. The
-    deferred recovery loop catches the exception and retries, and each later pass reads the
-    abandoned claim as live, deferring until the wall deadline instead of launching the run.
-    """
+def test_full_training_queue_does_not_reserve_handleless_launch(monkeypatch, tmp_path):
     import flash.server.platform.runtime as runtime
-    from flash.core.spec import GpuSpec, JobSpec
+    from flash._internal.background import Limits, Supervisor
+    from flash.core.spec import JobSpec
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
-    spec = JobSpec(
-        run_id="handleless-thread-start-fails",
-        model="Qwen/Qwen3.5-9B",
-        algorithm="sft",
-        gpu=GpuSpec(max_retries=1),
-    )
+    spec = JobSpec(run_id="full-training", model="Qwen/Qwen3.5-9B", algorithm="sft")
     status = provisioned_status(spec, state="provisioning")
     status.source_snapshot = _SOURCE_SNAPSHOT
     runner_state._save_status(status)
-
-    class Thread:
-        def __init__(self, **kwargs):
-            self.args = kwargs.get("args")
-
-        def start(self):
-            raise RuntimeError("can't start new thread")
-
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
-
-    with pytest.raises(RuntimeError):
-        runtime._start_handleless_resubmit(spec, "provisioning")
-
-    raw = runner_status._load_status_json(spec.run_id)
-    assert runner_state._ACTIVE_LAUNCH_CLAIM_KEY not in raw
-
-    # the next pass must be able to launch rather than deferring behind an abandoned claim.
-    started = _fake_recovery_thread(monkeypatch, runtime)
-    assert runtime._start_handleless_resubmit(spec, "provisioning") is True
-    assert len(started) == 1
+    owner = Supervisor({"training": Limits(1, 1)})
+    try:
+        with owner.bind(), owner.reserve(("run", "other"), "training"):
+            assert runtime._enqueue_resubmit(spec, "provisioning") is False
+        raw = runner_status._load_status_json(spec.run_id)
+        assert runner_state._ACTIVE_LAUNCH_CLAIM_KEY not in raw
+        assert raw[runner_state._NEXT_ATTEMPT_KEY] == 0
+    finally:
+        owner.close(1)
 
 
 def test_handleless_stale_claim_is_reclaimed_without_poll_error(monkeypatch, tmp_path):
@@ -3851,29 +3821,26 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
             raise OSError("status store unavailable")
         return real_get_status(run_id)
 
-    monkeypatch.setattr(runtime, "_start_handleless_resubmit", start_resubmit)
+    monkeypatch.setattr(runtime, "_enqueue_resubmit", start_resubmit)
     monkeypatch.setattr(runtime, "get_status", get_status)
     started = []
 
-    class Thread:
-        def __init__(self, *, target, args, daemon):
-            started.append((target, args, daemon))
+    from flash._internal.background import current_supervisor
 
-        def start(self):
-            return None
-
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    monkeypatch.setattr(
+        current_supervisor(),
+        "submit",
+        lambda key, lane, target, **kwargs: started.append((key, lane, target)) or True,
+    )
 
     runtime.recover_runs()
 
-    # recover_runs also backgrounds a _drain_cleanup_remotes_bg thread per known run (see
-    # recover_runs) so a slow/outage-hit provider teardown can't block the startup path; check
-    # for the resubmit-loop thread specifically rather than asserting the full thread list.
-    assert (runtime._deferred_resubmit_loop, (spec,), True) in started
-    drain_calls = [
-        args for target, args, _daemon in started if target.__name__ == "_drain_cleanup_remotes_bg"
-    ]
-    assert drain_calls == [(spec.run_id,)]
+    assert len(started) == 1
+    key, lane, target = started[0]
+    assert key == ("retry", spec.run_id)
+    assert lane == "recovery"
+    assert target.func is runtime._reconcile_handleless_run
+    assert target.args == (spec,)
 
 
 @pytest.mark.parametrize("retired_model", _RETIRED_MODELS)
@@ -3925,15 +3892,11 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_model_was_removed(
     # recover_runs imports attach_run from flash.runner inside the function, so patch it there.
     monkeypatch.setattr(runner_attach, "attach_run", lambda rid: attached.append(rid))
 
-    class Thread:
-        def __init__(self, *, target, args=(), daemon=False):
-            self._target, self._args = target, args
+    from flash._internal.background import current_supervisor
 
-        def start(self):
-            # only the cleanup drain is backgrounded here; attach_run must never be dispatched.
-            self._target(*self._args)
-
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    monkeypatch.setattr(
+        current_supervisor(), "submit", lambda key, lane, target, **kwargs: target() or True
+    )
 
     runtime.recover_runs()
 
@@ -3986,14 +3949,11 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
         lambda raw_spec, run_id: terminated.append((raw_spec["model"], run_id)),
     )
 
-    class Thread:
-        def __init__(self, *, target, args=(), daemon=False):
-            self._target, self._args = target, args
+    from flash._internal.background import current_supervisor
 
-        def start(self):
-            self._target(*self._args)
-
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    monkeypatch.setattr(
+        current_supervisor(), "submit", lambda key, lane, target, **kwargs: target() or True
+    )
 
     runtime.recover_runs()
 
@@ -4057,16 +4017,11 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
     # thread is real in production; here the fake below would stand in for it and never run.
     monkeypatch.setattr(runner_reporting, "_report_status", lambda status: None)
 
-    class Thread:
-        def __init__(self, *, target, args=(), daemon=False):
-            self._target, self._args = target, args
+    from flash._internal.background import current_supervisor
 
-        def start(self):
-            self._target(*self._args)
-
-    # patch the ATTRIBUTE recover_runs reads, not threading.Thread globally: the module-wide patch
-    # also replaced the status reporter's own worker thread, so nothing serviced its queue.
-    monkeypatch.setattr(runtime.threading, "Thread", Thread)
+    monkeypatch.setattr(
+        current_supervisor(), "submit", lambda key, lane, target, **kwargs: target() or True
+    )
 
     runtime.recover_runs()
 
@@ -4106,11 +4061,11 @@ def test_deferred_handleless_loop_resubmits_when_clear_before_deadline(monkeypat
     started = []
     monkeypatch.setattr(
         runtime,
-        "_start_handleless_resubmit",
+        "_enqueue_resubmit",
         lambda *args, **kwargs: started.append((args, kwargs)) or True,
     )
 
-    runtime._deferred_resubmit_loop(spec)
+    _drive_retries(lambda: runtime._reconcile_handleless_run(spec))
 
     assert started == [((spec, "provisioning"), {})]
     assert runner_status.get_status(spec.run_id).state == "provisioning"
@@ -4154,7 +4109,7 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
     monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", record_failure)
     monkeypatch.setattr(time_mod, "sleep", advance)
 
-    runtime._deferred_resubmit_loop(spec)
+    _drive_retries(lambda: runtime._reconcile_handleless_run(spec))
 
     status = runner_status.get_status(spec.run_id)
     assert failures == [130.0]
@@ -4183,9 +4138,9 @@ def test_deferred_handleless_loop_reconciles_after_resubmit_cas_loss(monkeypatch
         attempts.append((args, kwargs))
         return len(attempts) == 2
 
-    monkeypatch.setattr(runtime, "_start_handleless_resubmit", start_resubmit)
+    monkeypatch.setattr(runtime, "_enqueue_resubmit", start_resubmit)
 
-    runtime._deferred_resubmit_loop(spec)
+    _drive_retries(lambda: runtime._reconcile_handleless_run(spec))
 
     assert attempts == [((spec, "provisioning"), {}), ((spec, "provisioning"), {})]
     assert sleeps == [runtime._DEFERRED_RECOVERY_RETRY_S]
@@ -4224,7 +4179,7 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
 
     monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", flaky_fail)
 
-    runtime._deferred_resubmit_loop(spec)
+    _drive_retries(lambda: runtime._reconcile_handleless_run(spec))
 
     status = runner_status.get_status(spec.run_id)
     assert len(attempts) == 2
@@ -4312,7 +4267,7 @@ def test_deferred_handleless_legacy_run_without_attempt_metadata_fails_at_deadli
         lambda _seconds: pytest.fail("legacy recovery must converge without retrying"),
     )
 
-    runtime._deferred_resubmit_loop(spec)
+    _drive_retries(lambda: runtime._reconcile_handleless_run(spec))
 
     status = runner_status.get_status(spec.run_id)
     assert status.state == "failed"
@@ -4711,3 +4666,17 @@ def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     with pytest.raises(runner_errors._RunCancelled):
         lifecycle._run_training(spec, None, prior_cost=0.0, source_snapshot=_SOURCE_SNAPSHOT)
     assert submitted == []  # never charged a GPU for an already-terminal run
+
+
+def _drive_retries(call):
+    """Exercise scheduled observations against each test's deterministic sleep/clock."""
+    import time
+
+    from flash._internal.background import Retry
+
+    for _ in range(100):
+        result = call()
+        if not isinstance(result, Retry):
+            return result
+        time.sleep(result.delay)
+    pytest.fail("reconciliation did not converge in 100 observations")

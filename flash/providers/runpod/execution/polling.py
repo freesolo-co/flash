@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from flash._internal.background import checkpoint, pause
 from flash.providers._lifecycle.instances.poll import (
     PollErrorTracker,
     _attempt_int,
@@ -431,7 +432,7 @@ def _sleep_until_next_poll(context: _PollContext) -> None:
             return
         delay = min(delay, remaining)
     if delay > 0:
-        time.sleep(delay)
+        pause(delay)
 
 
 def poll_job(
@@ -506,6 +507,7 @@ def poll_job(
         ever_saw_worker=False,
     )
     while True:
+        checkpoint()
         terminal = _wall_deadline_result(context)
         if terminal is not None:
             return terminal

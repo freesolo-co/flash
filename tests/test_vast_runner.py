@@ -2887,3 +2887,15 @@ def test_sweep_orphans_callable_sets_resolved_after_listing(monkeypatch):
         raise RuntimeError("db down")
 
     assert vast.sweep_orphans(active_labels=boom) == []
+
+
+@pytest.mark.parametrize("persist_handle", [False, True])
+def test_application_shutdown_detaches_only_persisted_vast_worker(monkeypatch, persist_handle):
+    from flash._internal.background import TaskStopped
+
+    vast, destroyed = _wire_submit(monkeypatch, poll_raises=TaskStopped())
+    handles = []
+    with pytest.raises(TaskStopped):
+        _submit(vast, _spec(), on_handle=handles.append if persist_handle else None)
+    assert destroyed == ([] if persist_handle else [9999])
+    assert bool(handles) is persist_handle

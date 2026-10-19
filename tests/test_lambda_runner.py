@@ -3907,3 +3907,15 @@ def test_recovered_catalog_restores_disk_metadata_after_a_failed_first_fetch(mon
     instances = jobs.usable_instances("A10")
 
     assert [i.disk_gb for i in instances] == [200.0]  # recovered, not left unmeasured
+
+
+@pytest.mark.parametrize("persist_handle", [False, True])
+def test_application_shutdown_detaches_only_persisted_lambda_worker(monkeypatch, persist_handle):
+    from flash._internal.background import TaskStopped
+
+    jobs, terminated, _ = _wire_runner(monkeypatch, TaskStopped())
+    handles = []
+    with pytest.raises(TaskStopped):
+        _submit(jobs, _spec(), on_handle=handles.append if persist_handle else None)
+    assert terminated == ([] if persist_handle else [["i-9999"]])
+    assert bool(handles) is persist_handle

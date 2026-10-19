@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from flash._internal.background import checkpoint, pause
 from flash.providers._lifecycle.instances.poll import (
     BOOT_LOG_ABSENT_POLLS,
     FIRST_LIVENESS_OBSERVED_FLOOR_S,
@@ -654,7 +655,7 @@ def _sleep_until_next_poll(ctx: _PollContext) -> None:
             return
         delay = min(delay, remaining)
     if delay > 0:
-        time.sleep(delay)
+        pause(delay)
 
 
 def poll_instance_job(
@@ -689,6 +690,7 @@ def poll_instance_job(
     state = _initial_poll_state(ctx)
 
     while True:
+        checkpoint()
         result = _classify_deadline(ctx, state)
         if result is not None:
             return result
