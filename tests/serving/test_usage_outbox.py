@@ -285,7 +285,7 @@ def test_empty_or_omitted_token_ids_preserve_resolved_scalar_counts(
     assert facts.cached_tokens <= facts.prompt_tokens
 
 
-def test_capacity_facts_use_top_level_optional_rpc_fields() -> None:
+def test_capacity_facts_use_durable_evidence_without_extending_billing_rpc() -> None:
     event = _usage_event()
     event = replace(
         event,
@@ -301,12 +301,18 @@ def test_capacity_facts_use_top_level_optional_rpc_fields() -> None:
 
     payload = event.rpc_payload()
 
-    assert payload["time_to_first_token_seconds"] == 0.75
-    assert payload["queue_wait_seconds"] == 0.25
-    assert payload["replica_in_flight_requests_at_admission"] == 3
-    assert payload["replica_boot_duration_seconds"] == 91.5
-    assert payload["replica_freshly_booted"] is True
-    assert "capacity" not in payload["attestation_evidence"]
+    capacity = payload["attestation_evidence"]["capacity"]
+    assert capacity == {
+        "time_to_first_token_seconds": 0.75,
+        "queue_wait_seconds": 0.25,
+        "replica_in_flight_requests_at_admission": 3,
+        "replica_boot_duration_seconds": 91.5,
+        "replica_freshly_booted": True,
+    }
+    assert not set(capacity).intersection(payload)
+    assert payload["checkpoint_id"] == event.target.checkpoint_id
+    assert payload["artifact_fingerprint"] == event.target.artifact_fingerprint
+    assert payload["attestation_evidence"].items() >= event.attestation_evidence.items()
 
 
 def test_invalid_or_missing_capacity_facts_are_omitted_without_raising() -> None:
@@ -326,6 +332,8 @@ def test_invalid_or_missing_capacity_facts_are_omitted_without_raising() -> None
         }
     )
     payload = replace(_usage_event(), facts=facts).rpc_payload()
+
+    assert "capacity" not in payload["attestation_evidence"]
 
     assert "time_to_first_token_seconds" not in payload
     assert "queue_wait_seconds" not in payload
