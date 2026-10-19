@@ -16,7 +16,6 @@ import flash.engine.worker.verl.checkpoints as verl_checkpoints
 from flash._internal.fileio import reject_duplicate_keys
 from flash.adapters.artifacts import MAX_ATTEMPT_ID, has_loadable_adapter_weights
 from flash.engine.support.verl_checkpoint import FsdpCheckpointInspection
-from flash.engine.support.verl_policy import FsdpGeneration
 from flash.engine.worker.io.heartbeat import join_while_draining
 from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
 from flash.engine.worker.train.entry.backend_common import (
@@ -516,7 +515,6 @@ def _restore_verl_resume(
     local_dir: str,
     *,
     world_size: int,
-    expected_fsdp_generation: FsdpGeneration,
     required_steps: tuple[int, ...] = (),
 ) -> int:
     """stage this run's current-contract native checkpoint and its internal adapter store."""
@@ -551,7 +549,6 @@ def _restore_verl_resume(
 
     resume, inspection = verl_checkpoints.select_verl_resume_checkpoint(
         world_size=world_size,
-        expected_fsdp_generation=expected_fsdp_generation,
         accept=accept,
     )
     if not resume:
@@ -564,7 +561,6 @@ def _restore_verl_resume(
             local_dir,
             job_label="GRPO",
             world_size=world_size,
-            expected_fsdp_generation=expected_fsdp_generation,
             inspection=inspection,
         )
     referenced = accepted.get(resume)
@@ -579,7 +575,6 @@ def _restore_verl_resume(
         local_dir,
         job_label="GRPO",
         world_size=world_size,
-        expected_fsdp_generation=expected_fsdp_generation,
         inspection=inspection,
     )
 

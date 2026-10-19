@@ -21,7 +21,6 @@ from pathlib import Path
 import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.perf as _worker_perf
 import flash.engine.worker.runtime.state as _worker_state
-from flash.engine.support.verl_policy import FsdpGeneration
 from flash.engine.worker.train.entry.sft_train import (
     SHIM_FRAGMENT_FAILED_EXIT_CODE,
     _export_checkpoint_adapter,
@@ -378,7 +377,6 @@ def _restore_verl_resume(
     prompt_pool_fingerprint: str,
     update_horizon: int,
     world_size: int,
-    expected_fsdp_generation: FsdpGeneration,
 ) -> tuple[int, dict | None]:
     revision = _worker_state.OPD_RESUME_REVISION or None
     # no `prefer`: opd pins an exact commit via OPD_RESUME_REVISION with fail_closed, and
@@ -402,7 +400,6 @@ def _restore_verl_resume(
         inspection = inspect_resume_checkpoint(
             resume,
             world_size=world_size,
-            expected_fsdp_generation=expected_fsdp_generation,
         )
         if not inspection.loadable:
             raise RuntimeError(
@@ -410,12 +407,11 @@ def _restore_verl_resume(
                 f"checkpoint {os.path.basename(resume)}, rejected because "
                 f"{inspection.diagnostic()}. restarting from step 0 would violate the pinned-resume "
                 "contract, so this attempt refuses to train; relaunch from a compatible complete "
-                f"fsdp{expected_fsdp_generation} checkpoint."
+                "fsdp2 checkpoint."
             )
     elif not resume_topology_matches(
         resume,
         world_size=world_size,
-        expected_fsdp_generation=expected_fsdp_generation,
         job_label="OPD",
     ):
         return 0, None

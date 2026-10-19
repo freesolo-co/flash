@@ -17,7 +17,6 @@ import shutil
 import subprocess
 from collections.abc import Sequence
 
-from flash.engine.support.verl_policy import FsdpGeneration
 from flash.engine.worker.train.entry.backend_common import (
     CAUSAL_CONV1D_REQUIREMENT,
     FLA_REQUIREMENT,
@@ -865,10 +864,9 @@ def rollout_layered_summon_overrides(target_parameters: Sequence[str] | None) ->
     return ["actor_rollout_ref.rollout.layered_summon=true"]
 
 
-def actor_fsdp_strategy_overrides(fsdp_generation: FsdpGeneration) -> list[str]:
-    """render one explicit bare actor strategy override from the resolved private policy."""
-    strategy = "fsdp2" if fsdp_generation == 2 else "fsdp"
-    return [f"actor_rollout_ref.actor.strategy={strategy}"]
+def actor_fsdp_strategy_overrides() -> list[str]:
+    """use fsdp2 for every actor, independent of model and lora targets."""
+    return ["actor_rollout_ref.actor.strategy=fsdp2"]
 
 
 def rollout_mm_processor_cache_overrides() -> list[str]:

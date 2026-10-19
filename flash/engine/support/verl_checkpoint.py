@@ -8,7 +8,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from flash._internal.fileio import reject_duplicate_keys
-from flash.engine.support.verl_policy import FsdpGeneration
 
 VERL_FSDP_CONFIG_FILE = "fsdp_config.json"
 _MAX_NATIVE_FSDP_WORLD_SIZE = 8
@@ -78,7 +77,6 @@ def inspect_fsdp_checkpoint_manifest(
     stamp_raw: bytes | str | None,
     files: Iterable[FsdpManifestFile],
     *,
-    expected_generation: FsdpGeneration,
     expected_world_size: int | None,
 ) -> FsdpCheckpointInspection:
     """validate the exact canonical native shard set for one stamped actor directory."""
@@ -90,13 +88,11 @@ def inspect_fsdp_checkpoint_manifest(
             rejection_reason="invalid or missing fsdp stamp",
         )
     generation, width = stamp
-    if generation != expected_generation:
+    if generation != 2:
         return FsdpCheckpointInspection(
             loadable=False,
             width=width,
-            rejection_reason=(
-                f"fsdp generation mismatch (stamped {generation}, expected {expected_generation})"
-            ),
+            rejection_reason=f"fsdp generation mismatch (stamped {generation}, expected 2)",
         )
     if expected_world_size is not None and width != expected_world_size:
         return FsdpCheckpointInspection(
