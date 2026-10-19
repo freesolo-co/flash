@@ -568,9 +568,10 @@ def test_every_settled_event_carries_an_attributed_org() -> None:
     assert payload["checkpoint_id"] == record.adapter_id
     assert payload["public_model_id"] == record.adapter_id
     assert payload["pricing_source"] == FREESOLO_PRICING_SOURCE
-    # no marketplace-specific settlement surface survives on the wire.
+    # The billing RPC still requires the fixed first-party source discriminator.
+    assert payload["traffic_source"] == "freesolo"
+    # No marketplace-specific settlement surface survives on the wire.
     for absent in (
-        "traffic_source",
         "openrouter_request_id",
         "openrouter_generation_id",
         "upstream_id",
