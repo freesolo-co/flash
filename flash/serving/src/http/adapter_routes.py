@@ -46,13 +46,15 @@ async def list_adapters(request: Request) -> dict[str, Any]:
     return {"ok": True, "adapters": context.router.ready_adapters()}
 
 
-async def _claim_loading_generation(stored: AdapterRecord) -> tuple[AdapterRecord, bool]:
+async def _claim_loading_generation(
+    stored: AdapterRecord, *, serving_url: str
+) -> tuple[AdapterRecord, bool]:
     """Persist the exact generation before dispatching a disabled checkpoint load."""
 
     if stored.status == "ready" or stored.updated_at is None:
         return stored, False
     claimed = await _replace_stored_cas(
-        stored.model_copy(update={"deployment_generation": stored.updated_at}),
+        stored.model_copy(update={"deployment_generation": stored.updated_at, "url": serving_url}),
         expected_updated_at=stored.updated_at,
     )
     if claimed is not None:
@@ -78,7 +80,11 @@ async def add_adapter(
     checkpoint = registration.to_record()
 
     stored = await persist_checkpoint(checkpoint)
-    stored, claimed = await _claim_loading_generation(stored)
+    # Binding inserts immutable identity only. Persist this router's endpoint with the
+    # loading claim so promotion satisfies the database's ready-checkpoint URL constraint.
+    stored, claimed = await _claim_loading_generation(
+        stored, serving_url=str(request.url_for("chat_completions"))
+    )
 
     context.router.upsert(stored, revive=True)
 

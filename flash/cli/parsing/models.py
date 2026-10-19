@@ -13,6 +13,7 @@ from flash.cli.commands.ops.deploy import (
     cmd_export,
     cmd_undeploy,
 )
+from flash.serve.deployment.readiness import DEPLOYMENT_TIMEOUT_SECONDS
 
 
 def _wait_seconds(value: str) -> float:
@@ -63,11 +64,12 @@ def _add_deployment_commands(models_sub: argparse._SubParsersAction) -> None:
         "--wait",
         nargs="?",
         type=_wait_seconds,
-        const=2400.0,
+        const=float(DEPLOYMENT_TIMEOUT_SECONDS),
         default=None,
         metavar="SECONDS",
         help=(
-            "block until the requested revision is ready or failed (default timeout 2400s). "
+            "block until the requested revision is ready or failed "
+            f"(default timeout {DEPLOYMENT_TIMEOUT_SECONDS}s). "
             "without it, deploy returns while the revision is still queued"
         ),
     )

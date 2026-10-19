@@ -163,7 +163,7 @@ def test_attach_freezes_top_level_descriptor(monkeypatch, tmp_path) -> None:
         }
     )
     remote = {
-        "provider": "runpod",
+        "provider": "modal",
         "endpoint_id": "endpoint",
         "endpoint_name": "name",
         "key_fingerprint": "c" * 64,

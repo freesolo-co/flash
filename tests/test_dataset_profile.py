@@ -243,9 +243,10 @@ def test_decoder_conformance_worker_guard_ignores_distinct_separator_names(
 
 def test_decoder_conformance_worker_guard_rejects_second_install_in_the_same_run() -> None:
     dockerfile = (_ROOT / "Dockerfile.worker").read_text(encoding="utf-8")
+    expected = _managed_worker_freesolo_version()
     duplicate = dockerfile.replace(
-        '    "runpod==1.12.0"',
-        '    "runpod==1.12.0" && pip install "FreeSolo==9.9.9"',
+        f'"freesolo=={expected}"',
+        f'"freesolo=={expected}" && pip install "FreeSolo==9.9.9"',
         1,
     )
 
@@ -259,8 +260,8 @@ def test_decoder_conformance_worker_guard_rejects_same_line_duplicate() -> None:
     expected = _managed_worker_freesolo_version()
     dockerfile = (_ROOT / "Dockerfile.worker").read_text(encoding="utf-8")
     duplicate = dockerfile.replace(
-        f'    "freesolo=={expected}" \\\n',
-        f'    "freesolo=={expected}" "FreeSolo==9.9.9" \\\n',
+        f'"freesolo=={expected}"',
+        f'"freesolo=={expected}" "FreeSolo==9.9.9"',
         1,
     )
 
@@ -274,8 +275,8 @@ def test_decoder_conformance_worker_guard_rejects_same_line_malformed_requiremen
     expected = _managed_worker_freesolo_version()
     dockerfile = (_ROOT / "Dockerfile.worker").read_text(encoding="utf-8")
     malformed = dockerfile.replace(
-        f'    "freesolo=={expected}" \\\n',
-        f'    "freesolo=={expected}" "freesolo==" \\\n',
+        f'"freesolo=={expected}"',
+        f'"freesolo=={expected}" "freesolo=="',
         1,
     )
 

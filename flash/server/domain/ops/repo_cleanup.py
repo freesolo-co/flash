@@ -265,10 +265,6 @@ def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_Ru
                 if (repo, pfx) in live:
                     continue  # currently serving on some plane
                 if ts is None:
-                    # No commit date => LAST ACTIVITY is unknown. The run-id epoch is SUBMIT time, not
-                    # activity — a run submitted >7d ago can still be training (long RunPod queue) or
-                    # have fresh commits the Hub hasn't dated yet. Never delete on submit time; skip and
-                    # retry next cycle (fail closed, matching the module's "can't date -> leave alone").
                     continue
                 if (now - ts) <= max_age_s:
                     continue  # recently active (in-flight or just finished)

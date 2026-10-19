@@ -522,6 +522,8 @@ class VllmLoraRuntime:
     def _build_engine(self) -> Any:
         from vllm import AsyncEngineArgs, AsyncLLMEngine
 
+        from .hub import engine_tokenizer_path
+
         _require_reasoning_compatibility(
             AsyncEngineArgs,
             AsyncLLMEngine.generate,
@@ -529,7 +531,7 @@ class VllmLoraRuntime:
         )
         kwargs: dict[str, Any] = {
             "model": self.config.effective_served_model,
-            "tokenizer": self.config.effective_tokenizer_model,
+            "tokenizer": engine_tokenizer_path(self.config),
             "trust_remote_code": self.config.trust_remote_code,
             "enable_lora": True,
             "max_loras": self.config.max_loras,

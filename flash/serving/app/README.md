@@ -75,6 +75,12 @@ Required production wiring is `HF_TOKEN`, `FREESOLO_INTERNAL_KEY`,
 `PLATFORM_BACKEND_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, a nonblank
 `FREESOLO_DEPLOYMENT_ID`, and `SERVING_CUSTOM_DOMAIN=serve.freesolo.co`.
 
+Optional capacity observations (queue wait, streaming time to first token, replica
+concurrency, boot duration, and first-request status) persist under
+`attestation_evidence.capacity` in the usage outbox and settled usage row. They do
+not extend the billing RPC's strict top-level field contract. Missing observations
+are omitted; checkpoint identity and token accounting remain required.
+
 #### Promotion gate
 
 Set the repository Actions variable `SERVING_CANARY_ORG_ID` to an existing Freesolo-owned

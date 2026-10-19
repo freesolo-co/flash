@@ -65,7 +65,7 @@ def test_always_thinking_model_requires_flag(monkeypatch):
         thinking="always",
     )
     monkeypatch.setattr("flash.schema.resolve_model", lambda *a, **k: info)
-    monkeypatch.setattr("flash.schema.provisional_gpu", lambda *a, **k: "RTX 5090")
+    monkeypatch.setattr("flash.schema.provisional_gpu", lambda *a, **k: "L40S")
     # An always-thinker can't run with thinking OFF (the default); the rejection triggers on the
     # default-off as well as an explicit thinking=false.
     with pytest.raises(ConfigError) as ei:

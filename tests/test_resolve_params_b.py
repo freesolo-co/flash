@@ -41,7 +41,9 @@ def test_qwen38_exact_parameter_count_reaches_vram_disk_and_cost() -> None:
     assert resolve_model(model, "sft").min_disk_gb == 232
     assert setup_seconds(config) == 583.9071397600001
     quote = estimate_cost(config)
-    assert quote.total_usd == 0.045268060397964854
+    from flash.providers.modal.pricing import hourly_rate
+
+    assert quote.total_usd == quote.billable_hours * hourly_rate(quote.gpu)
     assert quote.required_vram_gb == 80
 
 

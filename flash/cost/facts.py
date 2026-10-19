@@ -6,32 +6,11 @@ from flash.core.catalog import MODELS, ModelInfo
 from flash.providers.core.base import GPU_INFO
 
 GPU_COMPUTE_TFLOPS: dict[str, float] = {
-    # A10: 125 TFLOPS dense bf16 tensor (NVIDIA spec); Lambda-only 24 GB class, else defaults to 100.
+    "L4": 121.0,
+    "L40S": 362.0,
     "A10": 125.0,
-    # MEASURED on a rented RunPod RTX 4090 (sm89, torch 2.10+cu128): 162.2-162.7 TFLOPS sustained
-    # on large square bf16 matmuls, against the 165 vendor spec -- within 1.5%, so the spec number
-    # is a fair proxy for this class and is kept.
-    "RTX 4090": 165.0,
-    "RTX 5090": 210.0,
-    # MEASURED on a rented RunPod A100 80GB PCIe (sm80, torch 2.10+cu128): 242-259 TFLOPS sustained
-    # across repeated trials at full clocks (1410 MHz) and 31C, i.e. neither thermal- nor
-    # power-limited. The 312 figure is the vendor dense-bf16 spec, which real matmul kernels do not
-    # reach; using it overstated A100 throughput by ~20% and made the class look faster (and so
-    # cheaper per job) than it is. Set to the measured sustained rate.
-    "A100 PCIe": 250.0,
-    # MEASURED on a rented RunPod A100-SXM4-80GB (sm80, torch 2.10+cu128): 263-265 TFLOPS across
-    # repeated trials. Same 108 SMs as the PCIe part but a 400 W envelope against 300 W, which is
-    # what the ~6% gain over the measured PCIe rate reflects. Both are far below the shared 312
-    # vendor spec.
     "A100 SXM": 264.0,
-    # A100 SXM 40GB: same SMs/tensor cores as the 80GB A100 SXM, less HBM only, so it inherits the
-    # measured SXM rate. Without an entry, 33-40 GB Lambda/Vast quotes fall back to _DEFAULT_TFLOPS.
     "A100 SXM 40GB": 264.0,
-    # MEASURED on a rented RunPod H100 PCIe (sm90, torch 2.10+cu128): 490-504 TFLOPS sustained
-    # across repeated trials at full clocks (1755 MHz), 310 W board. The 990 figure is the SXM
-    # part's spec; the PCIe board this class actually provisions delivers about half of it. Using
-    # 990 made H100 look twice as fast as it is and let it win nearly every ranking decision on
-    # throughput it cannot deliver. Set to the measured sustained rate.
     "H100": 500.0,
     # H200: same SM/tensor-core configuration as H100 with more HBM and a higher power envelope.
     # Scaled from the H100 measurement rather than the SXM spec. Not directly measured.
@@ -42,20 +21,11 @@ GPU_COMPUTE_TFLOPS: dict[str, float] = {
 }
 _DEFAULT_TFLOPS = 100.0
 
-# multi-card scaling depends on interconnect: RunPod's pinned SXM classes use NVLink; PCIe and
-# GeForce classes do not. unknowns are conservatively PCIe. Vast can mix board forms, so
-# `_PCIE_AMBIGUOUS_PROVIDERS` overrides membership; Lambda has no `gpu_count` path.
 _NVLINK_CLASSES: frozenset[str] = frozenset(
     {
-        # MEASURED: 2x A100-SXM4-80GB on RunPod reached 1.7675x (see MULTI_CARD_SCALING_NVLINK).
         "A100 SXM",
         # same sxm4 board and nvlink fabric as the 80gb part, less hbm only.
         "A100 SXM 40GB",
-        # runpod pins H100 to NVIDIA_H100_80GB_HBM3 (providers/base.py) -- the sxm part, with
-        # nvlink. the pcie and NVL boards in runpod's ADA_80_PRO pool are explicitly NEGATED by
-        # providers/runpod/gpus.py, so a multi-card H100 combination lands on sxm silicon. the
-        # measured-tflops comment on the H100 entry above refers to a single-gpu PCIe rental and
-        # says nothing about which board a multi-card run gets.
         "H100",
         # sxm parts with nvlink/nvswitch by form factor. INFERRED, not measured -- no multi-card
         # benchmark has been run on either class.
@@ -65,12 +35,7 @@ _NVLINK_CLASSES: frozenset[str] = frozenset(
 )
 
 
-# providers that sell a canonical class as a market rather than a pinned board, so an nvlink
-# class membership cannot be trusted for a multi-card combination there. vast lists pcie parts under
-# aliases that normalize into nvlink-classed entries and its offers carry no interconnect field.
-# runpod is absent because it pins an exact gpu id per class; lambda is absent because it has no
-# multi-card path at all, so no scaling question arises.
-_PCIE_AMBIGUOUS_PROVIDERS: frozenset[str] = frozenset({"vast"})
+_PCIE_AMBIGUOUS_PROVIDERS: frozenset[str] = frozenset()
 
 
 def gpu_tflops(name: str) -> float:
@@ -79,11 +44,7 @@ def gpu_tflops(name: str) -> float:
 
 
 def has_nvlink(name: str, provider: str = "") -> bool:
-    """Whether cards of class ``name`` are interconnected by nvlink rather than pcie.
-
-    Unknown classes are conservatively PCIe. Vast markets can include PCIe aliases, so report PCIe
-    for ambiguous providers rather than over-crediting topology.
-    """
+    """Whether cards of class ``name`` are interconnected by nvlink rather than pcie."""
     if name not in _NVLINK_CLASSES:
         return False
     return provider.strip().lower() not in _PCIE_AMBIGUOUS_PROVIDERS

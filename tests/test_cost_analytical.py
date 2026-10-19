@@ -48,7 +48,7 @@ def test_sft_train_tokens_price_actual_tokens_instead_of_padded_slots():
 
 
 def test_grpo_costs_more_than_sft():
-    gpu = "RTX 5090"
+    gpu = "L40S"
     # Per-step: GRPO (rollout + update) dominates SFT on the same card.
     assert seconds_per_step(RunConfig(MID, "grpo", 1), gpu) > seconds_per_step(
         RunConfig(MID, "sft", 1), gpu
@@ -137,8 +137,10 @@ def test_cold_start_calibrated_to_real_short_sft_run(monkeypatch):
         ),
     )
     e = estimate_cost(RunConfig(model_id, "sft", 26))
-    assert e.gpu == "RTX 4090"
-    assert e.gpu_hourly_usd == pytest.approx(0.69, abs=1e-3)
+    assert e.gpu == "L40S"
+    from flash.providers.modal.pricing import hourly_rate
+
+    assert e.gpu_hourly_usd == pytest.approx(hourly_rate(e.gpu))
     assert e.total_usd == pytest.approx(e.billable_hours * e.gpu_hourly_usd)
     assert e.total_usd < e.wall_clock_hours * e.gpu_hourly_usd
     assert e.setup_seconds > e.train_seconds
@@ -356,7 +358,7 @@ def test_opd_teacher_latency_uses_conservative_retry_and_turn_wave_policy(
         opd_max_turns=max_turns,
     )
 
-    _gpu_seconds, fixed_seconds = step_seconds_split(config, "RTX 5090")
+    _gpu_seconds, fixed_seconds = step_seconds_split(config, "L40S")
 
     # hand-write the policy request count, including retries and per-turn scoring, but derive waves
     # from the measured concurrency constant. using the production count helper would make this test
@@ -443,7 +445,7 @@ def test_offline_quote_and_allocator_agree_on_the_executed_sft_width():
         config = RunConfig("Qwen/Qwen3.8-27B", "sft", 10, **kwargs)
         gpu, need, count, _provider, rate = _offline_gpu_shape(config)
         candidate = Candidate(
-            provider="runpod",
+            provider="modal",
             gpu=gpu,
             hourly_usd=rate,
             vram_gb=GPU_INFO[gpu].vram_gb,

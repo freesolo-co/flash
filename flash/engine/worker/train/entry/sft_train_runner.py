@@ -583,6 +583,7 @@ def _write_sft_child_shims(
             "marker_file": shim_markers,
             "seed": int(seed),
             "save_at_steps": list(options.save_at_steps),
+            "checkpoint_published_dir": os.path.join(options.paths.export_root, "_published"),
             "total_steps": int(model.update_horizon),
             "reentrant_gradient_checkpointing": bool(model.reentrant_gradient_checkpointing),
             "lora_language_prefix": (

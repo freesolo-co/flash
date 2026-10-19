@@ -44,11 +44,9 @@ def precheck_http_error(status: int, *, detail: str = "private upstream detail")
 
 def sabotage_submission_boundaries(monkeypatch) -> list[str]:
     import flash.providers.core.allocator as allocator
-    import flash.providers.lambda_.client.api as lambda_api
-    import flash.providers.runpod.client.api as runpod_api
-    import flash.providers.vast.client.api as vast_api
     import flash.runner.lifecycle.state as runner_state
     import flash.server.platform.db as db_mod
+    from flash.providers.modal import api as modal_api
 
     events: list[str] = []
 
@@ -64,9 +62,7 @@ def sabotage_submission_boundaries(monkeypatch) -> list[str]:
     monkeypatch.setattr(runner_state, "_save_status", block("persistence"))
     monkeypatch.setattr(run_submission, "submit_job", block("submission"))
     monkeypatch.setattr(allocator, "allocate", block("allocation"))
-    monkeypatch.setattr(runpod_api, "submit_job", block("runpod create"))
-    monkeypatch.setattr(lambda_api, "launch_instance", block("lambda create"))
-    monkeypatch.setattr(vast_api, "create_instance", block("vast create"))
+    monkeypatch.setattr(modal_api, "create", block("modal create"))
     return events
 
 
@@ -79,20 +75,16 @@ def billing_api(
     user_prefix: str,
     identity_for_token,
 ):
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
-    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
 
     import flash.providers._lifecycle.net.worker as provider_worker
-    import flash.providers.runpod.client.auth as runpod_keys
     import flash.runner.lifecycle.state as runner_state
     import flash.runner.supervise.lifecycle as runner_lifecycle
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod
 
-    runpod_keys.reset()
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(provider_worker, "publish_source_snapshot", lambda _repo: source_snapshot)
     monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))

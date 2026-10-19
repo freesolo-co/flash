@@ -357,6 +357,22 @@ def test_secret_pipe_releases_its_source_after_the_consumer_reads() -> None:
         assert token_reference() is None
 
 
+def test_secret_pipe_does_not_close_a_reused_descriptor(tmp_path) -> None:
+    replacement = None
+    try:
+        with launch._open_secret_pipe(INFERENCE_TOKEN) as token_fd:
+            assert read_artifact_token_fd(token_fd) == INFERENCE_TOKEN
+            replacement = os.open(tmp_path / "download.lock", os.O_CREAT | os.O_RDWR, 0o600)
+            if replacement != token_fd:
+                os.dup2(replacement, token_fd)
+                os.close(replacement)
+                replacement = token_fd
+        os.write(replacement, b"still owned by the downloader")
+    finally:
+        if replacement is not None:
+            os.close(replacement)
+
+
 def test_secret_pipe_chains_the_original_write_failure(monkeypatch) -> None:
     failure = OSError("write failed")
 
@@ -737,10 +753,8 @@ def test_engine_runtime_environment_is_applied_on_every_provider(
 ) -> None:
     # vllm forks its EngineCore, and the serving process has already touched cuda by then, so
     # without the spawn start method the child dies with "Cannot re-initialize CUDA in forked
-    # subprocess" before anything binds a port. measured on a live runpod l4.
-    #
-    # these were previously set only by the modal image, so modal served and runpod did not. the
-    # launcher must set them itself, because it is the only piece both providers share.
+    # subprocess" before anything binds a port. The launcher must set this independently of
+    # defaults baked into the serving image.
     environment = _environment(tmp_path, artifact=False)
     captured: dict[str, object] = {}
 
@@ -778,30 +792,31 @@ def test_engine_runtime_environment_overrides_a_conflicting_inherited_value(
     assert launch._scrub_child_environment(environment)["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
 
 
+@pytest.mark.parametrize(
+    ("variable", "subdirectory"),
+    [("VLLM_CACHE_ROOT", "vllm"), ("FLASHINFER_WORKSPACE_BASE", "flashinfer")],
+)
 def test_compile_cache_is_bound_to_the_volume_on_every_provider(
     monkeypatch,
     tmp_path: Path,
+    variable: str,
+    subdirectory: str,
 ) -> None:
-    # vllm's compile cache defaults to ephemeral container storage, so an unset cache root makes
-    # every cold start recompile the model. it was set only by the modal image, like the engine
-    # settings above, so runpod recompiled on each start while modal reused the volume's graphs.
     environment = _environment(tmp_path, artifact=False)
+    environment[variable] = "/tmp/ephemeral-cache"
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(materialize, "validate_manifest_cache", lambda *_args: {})
     monkeypatch.setattr(materialize, "base_weights_are_cached", lambda *_a, **_k: True)
     monkeypatch.setattr(app_main, "_serve", _successful_serve(captured))
-    monkeypatch.delenv("VLLM_CACHE_ROOT", raising=False)
+    monkeypatch.setenv(variable, "/tmp/ephemeral-cache")
 
     _run_with_environment(environment)
 
-    expected = str(Path(environment["FLASH_SERVING_CACHE_ROOT"]) / "vllm")
-    # under the cache root, so the graphs land on the persistent volume rather than in the
-    # container. the engine runs in-process, so os.environ is the mapping that actually decides it.
-    assert os.environ["VLLM_CACHE_ROOT"] == expected
-    assert environment["VLLM_CACHE_ROOT"] == expected
-    # and the child must inherit it, or a forked engine recompiles into ephemeral storage anyway.
-    assert launch._scrub_child_environment(environment)["VLLM_CACHE_ROOT"] == expected
+    expected = str(Path(environment["FLASH_SERVING_CACHE_ROOT"]) / subdirectory)
+    assert os.environ[variable] == expected
+    assert environment[variable] == expected
+    assert launch._scrub_child_environment(environment)[variable] == expected
 
 
 def test_engine_start_is_sealed_offline_only_after_hydration(
@@ -1277,7 +1292,7 @@ def test_parent_helper_scrubs_environment_argv_and_closes_descriptors(tmp_path: 
     # the engine settings are not inherited from the ambient environment either: the child gets the
     # runtime's own fixed value, whatever the provider image happened to set. the launcher applies
     # these because without the spawn start method vllm's forked EngineCore cannot re-initialize
-    # cuda, which is what killed every runpod deployment while modal's image happened to set it.
+    # CUDA, so correctness cannot depend on a particular image's environment defaults.
     assert environment["VLLM_WORKER_MULTIPROC_METHOD"] == "arbitrary-module-control"
     assert captured["env"]["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
     assert captured["env"]["FLASH_SERVING_MANIFEST_ID"] == _manifest().manifest_id

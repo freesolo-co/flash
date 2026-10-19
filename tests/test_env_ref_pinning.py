@@ -31,7 +31,7 @@ def _staged_spec() -> JobSpec:
                 },
             },
             "train": {"hf_repo": "owner/runs", "max_examples": 8},
-            "gpu": {"type": "RTX 4090", "max_retries": 2},
+            "gpu": {"type": "L4", "max_retries": 2},
         }
     )
 

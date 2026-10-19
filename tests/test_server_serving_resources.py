@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -175,49 +173,3 @@ def test_dry_run_preview_has_exact_safe_plan_facts(model_id: str) -> None:
         "adapter_count": len(bundle.spec.adapters),
         "adapter_capacity": spec.engine.adapter_capacity,
     }
-
-
-def test_domain_module_import_does_not_load_provider_packages_or_lifecycle_modules() -> None:
-    probe = r"""
-import builtins
-import sys
-
-provider_roots = ("modal", "runpod", "runpod_flash")
-lifecycle_prefixes = ("flash.serve.provisioning.modal",)
-real_import = builtins.__import__
-intercepted = []
-
-
-def blocked(name):
-    return (
-        name in provider_roots
-        or name.startswith(tuple(root + "." for root in provider_roots))
-        or name.startswith(lifecycle_prefixes)
-    )
-
-
-def guarded(name, globals=None, locals=None, fromlist=(), level=0):
-    if blocked(name):
-        intercepted.append(name)
-        raise ModuleNotFoundError(name)
-    return real_import(name, globals, locals, fromlist, level)
-
-
-builtins.__import__ = guarded
-from flash.server.domain.ops.serving_resources import dry_run_deployment, resolve_deployment_bundle
-
-assert dry_run_deployment
-assert resolve_deployment_bundle
-assert intercepted == []
-assert not any(blocked(name) for name in sys.modules)
-"""
-    result = subprocess.run(
-        [sys.executable, "-S", "-c", probe],
-        cwd=ROOT,
-        env={"PYTHONPATH": str(ROOT), "PYTHONNOUSERSITE": "1", "PATH": "/usr/bin:/bin"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stderr

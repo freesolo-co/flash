@@ -24,15 +24,13 @@ def _get_status(run_id: str):
 def _gpu_rate(gpu_type: str, provider: str = "") -> float:
     """Static representative $/hr for cost projection.
 
-    Falls back to any configured provider that offers the class, so a plane without RunPod still
+    Falls back to the configured provider that offers the class, so recovery still
     prices its runs. Never raises: this feeds cost ANNOTATION on an already-finished run, so a
     provider-registry problem must degrade to the flat estimate rather than fail the metrics write.
     """
     try:
         from flash.providers.core.registry import available_providers, get_provider
 
-        # use the billing substrate first when known, then any other configured provider that offers
-        # the class, so a plane without runpod still prices its runs.
         names = [provider.strip().lower()] if provider.strip() else []
         names += [n for n in available_providers() if n not in names]
     except Exception:
@@ -61,15 +59,12 @@ def _pinned_offline_allocation(provider: str, gpu_type: str, gpu_count: int):
     if not gpu_type or gpu_count < 1:
         return None
     try:
-        from flash.providers.core.base import GPU_INFO, Allocation, canonical_gpu
+        from flash.providers.core.base import Allocation, canonical_gpu
 
         gpu = canonical_gpu(gpu_type)
-        if provider == "lambda":
-            from flash.providers.lambda_.client.pricing import static_hourly_rate
+        from flash.providers.modal.pricing import hourly_rate
 
-            hourly = static_hourly_rate(gpu)
-        else:
-            hourly = GPU_INFO[gpu].hourly_usd
+        hourly = hourly_rate(gpu)
         return Allocation(
             provider=provider,
             gpu=gpu,
@@ -110,9 +105,8 @@ def charge_usd_for_spec(
     """Return the estimated customer charge, prorated by completed steps when requested.
 
     ``provider`` overrides the pricing substrate for a training estimate. the persisted worker spec
-    of an auto-allocated run carries no provider, so its offline reprice would credit nvlink
-    scaling on a substrate (vast) that cannot deliver it; the cancel path passes the provider the
-    run actually rented so the estimate reproduces the accepted quote's work model. ``gpu_type``
+    of an auto-allocated run carries no provider; the cancel path passes the provider the run
+    actually rented so the estimate reproduces the accepted quote's work model. ``gpu_type``
     and ``gpu_count`` together pin the rented card shape the same way: the spec's count is only the
     ceiling the allocator searched under, so without the pin a 4-card rental could be repriced on
     the 1-card offline optimum.
@@ -239,9 +233,8 @@ def cancelled_charge_usd(
         # cancelled before any training step: nothing rented, nothing owed.
         return 0.0
     # the persisted worker spec of an auto-allocated run names no provider and carries the card
-    # count only as the ceiling the allocator searched under, so pricing it bare credits nvlink
-    # scaling a vast rental cannot deliver and can re-optimize a 4-card rental onto the 1-card
-    # offline optimum. either topology error is a factor on the per-step term only, so it does not
+    # count only as the ceiling the allocator searched under, so pricing it bare can re-optimize
+    # a 4-card rental onto the 1-card offline optimum. that changes the per-step term, so it does not
     # cancel out of partial / full whenever the estimate also carries fixed work (moe compile,
     # required saves) or a wall cap: both estimates are computed on the substrate and card shape
     # the run actually rented.

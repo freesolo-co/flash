@@ -104,14 +104,14 @@ def test_runs_and_status_hide_provider_names(monkeypatch) -> None:
             "model": "Qwen/Qwen3.5-4B",
             "algorithm": "grpo",
         },
-        "remote": {"allocated_gpu": "RTX 4090", "provider": "runpod", "flash_arm": "runpod"},
+        "remote": {"allocated_gpu": "L4", "provider": "modal", "flash_arm": "modal"},
     }
     runs = tables.runs_table([run])
     status = render.run_status(run)
-    assert "RTX 4090" in runs
-    assert "RTX 4090" in status
-    assert "runpod" not in runs.lower()
-    assert "runpod" not in status.lower()
+    assert "L4" in runs
+    assert "L4" in status
+    assert "modal" not in runs.lower()
+    assert "modal" not in status.lower()
     assert "provider" not in status.lower()
     assert "flash_arm" not in status.lower()
 
@@ -220,7 +220,7 @@ def test_styled_renderers_are_ascii_locale_safe(monkeypatch) -> None:
     monkeypatch.setattr(render.sys, "stdout", _AsciiStdout())
     outputs = [
         tables.models_table([{"id": "acme/x"}]),
-        tables.gpus_table([("RTX 5090", 32, 0.99)], "Tip: selection is automatic — no pinning"),
+        tables.gpus_table([("L40S", 32, 0.99)], "Tip: selection is automatic — no pinning"),
         tables.runs_table([{"run_id": "r", "state": "done", "spec": {}}]),
         tables.deployments_table([{"run_id": "r", "deployment": {"state": "ready"}}]),
         render.env_setup(

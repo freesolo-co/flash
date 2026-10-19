@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import math
+import time
 from dataclasses import dataclass, field
 
 
@@ -17,29 +17,14 @@ class RealizedCost:
     source: dict = field(default_factory=dict)  # audit: resource ids / raw refs
 
 
-def realized_cost_for_remote(
-    remote: dict | None, *, start: float, end: float, run_end: float | None = None
-) -> RealizedCost | None:
-    """Return realized cost from the persisted provider handle, or None if unattributable.
-
-    ``end`` is the settle-padded billing-query bound for RunPod; ``run_end`` is the true teardown
-    time for instance providers (Lambda/Vast) -- using ``end`` there would overbill by the settle
-    padding.
-    """
-    if not remote:
+def realized_cost_for_remote(remote, *, start, end, run_end=None):
+    """Reserved-resource estimate; Modal storage and network are not attributable here."""
+    if not remote or remote.get("provider") != "modal":
         return None
-    provider = remote.get("provider")
-    if provider == "runpod":
-        from flash.providers.runpod.client.cost import realized_cost as runpod_realized
-
-        return runpod_realized(remote.get("endpoint_id"), start=start, end=end)
-    from flash.providers.core.registry import INSTANCE_PROVIDERS
-
-    if provider in INSTANCE_PROVIDERS:
-        # Both instance-billed providers: realized COGS == wall-clock x the instance's flat $/hr
-        # (Vast's $/hr is the offer's live rate stamped on the handle as ``hourly_usd``).
-        return _instance_realized_cost(remote, end=run_end if run_end is not None else end)
-    return None
+    result = _instance_realized_cost(remote, end=run_end if run_end is not None else end)
+    if result is not None:
+        result.source["basis"] = "bootstrap_resource_estimate"
+    return result
 
 
 def _instance_realized_cost(remote: dict, *, end: float) -> RealizedCost | None:
@@ -48,11 +33,10 @@ def _instance_realized_cost(remote: dict, *, end: float) -> RealizedCost | None:
     rid = remote.get("instance_id")
     if not rate or not rid:
         return None
-    launch = remote.get("started_ts")
-    if isinstance(launch, bool) or not isinstance(launch, (int, float)):
-        return None
-    launch = float(launch)
-    if not math.isfinite(launch) or launch <= 0:
+    from flash.providers.modal.startup import start_time_reader
+
+    launch = start_time_reader(remote, deadline_at=time.time() + 30)()
+    if launch is None:
         return None
     wall = max(0.0, float(end) - launch)
     usd = round(wall / 3600.0 * float(rate), 6)

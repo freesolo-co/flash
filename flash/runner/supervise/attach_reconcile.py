@@ -31,10 +31,10 @@ def completed_metrics_for_remote(
 ) -> dict | None:
     from flash.runner.supervise.recovery import (
         _completed_attempt_metrics,
-        _runpod_completed_metrics,
+        _completed_worker_metrics,
     )
 
-    metrics = _runpod_completed_metrics(persisted_remote, deadline_at=deadline_at)
+    metrics = _completed_worker_metrics(persisted_remote, deadline_at=deadline_at)
     started_ts = persisted_remote.get("started_ts")
     if metrics is None and started_ts is not None:
         metrics = _completed_attempt_metrics(
@@ -73,7 +73,7 @@ def teardown_reconciled_remote(
         return False, resource_deleted
     if resource_deleted:
         return True, True
-    if handle.provider != "runpod":
+    if handle.provider != "modal":
         return True, False
     try:
         cleanup_preserved = _record_cleanup_remote(run_id, expected_remote)

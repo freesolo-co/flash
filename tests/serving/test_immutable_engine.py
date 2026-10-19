@@ -270,7 +270,7 @@ def test_snapshot_download_receives_exact_hub_sha(monkeypatch, tmp_path: Path) -
         (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
         return str(local_dir)
 
-    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot_download)
+    monkeypatch.setattr("flash.serving.src.engine.hub.download_adapter", snapshot_download)
     monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path)
 
     engine = _LoraEngineImpl()
@@ -288,10 +288,7 @@ def test_snapshot_download_receives_exact_hub_sha(monkeypatch, tmp_path: Path) -
     assert calls[0]["repo_id"] == "org/run"
     assert calls[0]["repo_type"] == "model"
     assert calls[0]["revision"] == "a" * 40
-    assert calls[0]["allow_patterns"] == [
-        "checkpoints/step-20/**",
-        "checkpoints/step-20/*",
-    ]
+    assert calls[0]["subfolder"] == "checkpoints/step-20"
 
 
 def test_runtime_containment_rejects_schema_bypass(monkeypatch, tmp_path: Path) -> None:
@@ -302,7 +299,7 @@ def test_runtime_containment_rejects_schema_bypass(monkeypatch, tmp_path: Path) 
         calls.append(kwargs)
         return str(tmp_path)
 
-    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot_download)
+    monkeypatch.setattr("flash.serving.src.engine.hub.download_adapter", snapshot_download)
     monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path)
 
     engine = _LoraEngineImpl()

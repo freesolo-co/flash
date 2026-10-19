@@ -454,13 +454,10 @@ def resume_upload_unavailable(step: int, checkpoint_dir: str, *, job_label: str)
     ``stop(require_complete=True)`` independently re-checks ``missing_deployables`` at the end of
     the run. so the deployable guarantee is enforced twice and neither path runs through here.
 
-    raising here instead destroyed finished work: a lora run of a large model writes one
-    ``model_world_size_*_rank_*.pt`` holding every base parameter (verl saves the whole state dict,
-    with no trainable-only filtering), which for a 27.59B model is ~55 GB in ONE file and exceeds
-    the artifact store's 50 GB per-file ceiling. that upload can never succeed at any retry count,
-    so a run whose steps had all converged and whose adapter was already durably published was
-    failed for state nothing was going to read. the frozen base weights in it are recoverable from
-    the public base checkpoint anyway -- the next attempt re-downloads them regardless.
+    native model shards can exceed the artifact store's per-file ceiling. the transport now
+    splits those files and verifies them on restore, but a failed upload must still preserve
+    a durably published adapter. a later attempt independently verifies restart state before
+    using it; this warning never claims an unconfirmed checkpoint is recoverable.
 
     grpo already treats this same upload as non-fatal (``rl/checkpoints.py``, "resume uploads are
     ungated internal retry state"); this makes sft and opd agree with it rather than inventing a

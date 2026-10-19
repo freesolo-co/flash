@@ -75,7 +75,7 @@ print('NODE DONE', flush=True)
         "attempt": 0,
         "phase": "sft",
         "seed": 17,
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "hf_repo": "test/repo",
         "hf_prefix": "sft/run-reentry",
         "env": {},
@@ -99,7 +99,7 @@ class HfApi:
     def __init__(self, **kwargs):
         pass
     def upload_file(self, path_or_fileobj, path_in_repo, **kwargs):
-        if path_in_repo.endswith('vast_attempt0.json'):
+        if path_in_repo.endswith('modal_attempt0.json'):
             if (root / 'fail-upload').exists():
                 raise RuntimeError('simulated artifact outage')
             marker = Path(path_or_fileobj).read_text()

@@ -114,6 +114,7 @@ class _VerlCheckpointWatcher:
         # sibling of export_root so it shares its filesystem: _staged_source hardlinks into it, and
         # os.link cannot cross a mount. holds one step at a time and is cleaned up after each publish.
         self.staging_root = os.path.join(export_root, "_staging")
+        self.published_dir = os.path.join(export_root, "_published")
         self.python_bin = python_bin
         self.model_id = model_id
         self.model_revision = model_revision
@@ -126,7 +127,15 @@ class _VerlCheckpointWatcher:
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
+        # Resumed steps already verified on HF must release the child's retention gate too.
+        for step in self.lifecycle.deployable_published_steps:
+            self._acknowledge_publication(step)
         self._thread.start()
+
+    def _acknowledge_publication(self, step: int) -> None:
+        os.makedirs(self.published_dir, exist_ok=True)
+        with open(os.path.join(self.published_dir, f"step-{step}"), "w"):
+            pass
 
     def raise_if_failed(self) -> None:
         if isinstance(self._error, (MergeDiskHeadroomError, MergeDiskExhaustedError)):
@@ -232,6 +241,8 @@ class _VerlCheckpointWatcher:
         staged_dir = self._staged_source(step, checkpoint_dir)
         try:
             self._publish_from(step, staged_dir)
+            if self.lifecycle.facts(step).deployable_published:
+                self._acknowledge_publication(step)
         finally:
             if staged_dir != checkpoint_dir:
                 # the links have served their purpose once the upload returns; the originals and the

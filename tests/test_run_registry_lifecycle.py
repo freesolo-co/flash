@@ -15,7 +15,7 @@ from flash.server.domain.registry import runs
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 _PROJECT_ID = "11111111-1111-4111-8111-111111111111"
-_RUNPOD_FINGERPRINT = "rpk-" + "0" * 64
+from tests._helpers.modal import modal_remote
 
 
 def _spec(*, algorithm: str = "sft") -> JobSpec:
@@ -32,15 +32,7 @@ def _spec(*, algorithm: str = "sft") -> JobSpec:
 
 
 def _remote(*, attempt: int = 0, endpoint_id: str = "endpoint-1") -> dict:
-    return {
-        "provider": "runpod",
-        "endpoint_id": endpoint_id,
-        "endpoint_name": f"{endpoint_id}-name",
-        "key_fingerprint": _RUNPOD_FINGERPRINT,
-        "job_id": "job-1",
-        "attempt": attempt,
-        "started_ts": 1.0,
-    }
+    return modal_remote(instance_id=endpoint_id, attempt=attempt)
 
 
 def _status(spec: JobSpec) -> RunStatus:
@@ -127,7 +119,7 @@ def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypat
     status.state = "done"
     status.lifecycle_started_attempt = 0
     status.lifecycle_progressed_attempt = 0
-    status.remote["allocated_gpu"] = "A100 PCIe"
+    status.remote["allocated_gpu"] = "A100 SXM"
     status.cleanup_confirmed_remote = status.remote
     status.realized_cost_remote = status.remote
     status.remote = None
@@ -137,7 +129,7 @@ def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypat
     assert "cleanup_confirmed_remote" not in status.to_dict()
     assert "realized_cost_remote" not in status.to_dict()
     report = _report(monkeypatch, status)
-    assert report["gpuType"] == "A100 PCIe"
+    assert report["gpuType"] == "A100 SXM"
     assert report["lifecycle"] == {
         "started": True,
         "progressed": True,

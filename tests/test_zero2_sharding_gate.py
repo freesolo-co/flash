@@ -115,7 +115,7 @@ def test_the_gate_is_off_on_a_single_rank():
     for params_b in _CATALOG_PARAMS_B:
         assert not zero2_enabled(180, 1, params_b, 10)
     assert resolve_reshard_after_forward(
-        model_id="Qwen/Qwen3.5-9B", algorithm="opd", gpu_type="RTX 5090", n_gpus=1
+        model_id="Qwen/Qwen3.5-9B", algorithm="opd", gpu_type="L40S", n_gpus=1
     )
 
 
@@ -136,7 +136,7 @@ def test_an_unknown_card_falls_closed_to_zero3(gpu_type, n_gpus):
 def test_an_unsizable_model_falls_closed_to_zero3():
     """An uncataloged id cannot be priced, so it cannot be granted the memory trade."""
     assert resolve_reshard_after_forward(
-        model_id="nobody/not-a-model", algorithm="opd", gpu_type="RTX 5090", n_gpus=2
+        model_id="nobody/not-a-model", algorithm="opd", gpu_type="L40S", n_gpus=2
     )
     assert not zero2_enabled(80, 2, 0.0, 41)
 
@@ -149,7 +149,7 @@ def test_a_shape_without_room_for_the_retained_copy_stays_on_zero3():
     """
     assert not zero2_enabled(24, 2, 4.7, 35)
     assert resolve_reshard_after_forward(
-        model_id="Qwen/Qwen3.5-9B", algorithm="grpo", gpu_type="RTX 4090", n_gpus=2
+        model_id="Qwen/Qwen3.5-9B", algorithm="grpo", gpu_type="L4", n_gpus=2
     )
 
 
@@ -185,7 +185,7 @@ def test_the_gate_never_admits_more_than_a_card_physically_holds():
         params_b = float(MODELS[model_id].params_b)
         for algorithm in ("grpo", "opd"):
             need = float(model_required_vram_gb(model_id, algorithm))
-            for gpu_type in ("RTX 4090", "RTX 5090", "A100 PCIe", "H200", "B200"):
+            for gpu_type in ("L4", "L40S", "A100 SXM", "H200", "B200"):
                 vram = int(get_gpu_info(gpu_type).vram_gb)
                 for n_gpus in _WIDTHS:
                     if not zero2_enabled(vram, n_gpus, params_b, need):
@@ -225,7 +225,7 @@ def test_the_worker_and_the_allocator_cannot_disagree():
         params_b = float(MODELS[model_id].params_b)
         for algorithm in ("grpo", "opd"):
             need = float(model_required_vram_gb(model_id, algorithm))
-            for gpu_type in ("RTX 4090", "RTX 5090", "A100 PCIe", "H200", "B200"):
+            for gpu_type in ("L4", "L40S", "A100 SXM", "H200", "B200"):
                 vram = int(get_gpu_info(gpu_type).vram_gb)
                 for n_gpus in _WIDTHS:
                     allocator_says = zero2_enabled(vram, n_gpus, params_b, need)

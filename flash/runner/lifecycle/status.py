@@ -414,7 +414,7 @@ def validate_terminal_source_metrics(
 
 
 def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
-    """Write metrics to results/runpod/<phase>/<run_id> and return the customer training cost.
+    """Write metrics to results/modal/<phase>/<run_id> and return the customer training cost.
 
     The run id keeps concurrent/sequential runs of the same phase from
     overwriting each other's artifacts. ``metrics["wall_seconds"]`` is the worker's training-loop
@@ -442,10 +442,7 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
         cost = float(raw_cost) if raw_cost is not None else None
     except (TypeError, ValueError):
         cost = None
-    # lambda and vast stamp a provider-authoritative cost, and a short run legitimately prices at
-    # zero. runpod never stamps the field, so a zero there is an unset placeholder that must still
-    # fall back to the wall rate.
-    provider_stamped = provider in {"lambda", "vast"} and cost is not None
+    provider_stamped = provider == "modal" and cost is not None
     if cost or provider_stamped:
         metrics = {**metrics, "cost_usd": cost}
     else:

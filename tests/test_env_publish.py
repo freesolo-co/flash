@@ -1143,7 +1143,7 @@ def test_record_training_run_posts_to_backend(monkeypatch):
                 "phase": "rl",
                 "environment": {"id": "acme/checkout-bot/my-env"},
                 "project": "11111111-1111-4111-8111-111111111111",
-                "gpu": {"type": "RTX 5090"},
+                "gpu": {"type": "L40S"},
             },
             platform_context={
                 "org_id": "org-1",
@@ -1222,7 +1222,7 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
         "algorithm": "sft",
         "environment": {"id": "acme/checkout-bot/my-env"},
         "project": "11111111-1111-4111-8111-111111111111",
-        "gpu": {"type": ["A100 PCIe", "A100 SXM"]},
+        "gpu": {"type": ["A100 SXM", "A100 SXM"]},
     }
     context = {"org_id": "org-1", "user_id": "user-1", "api_key_id": "key-1"}
 
@@ -1249,7 +1249,7 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
             platform_context=context,
         )
     )
-    assert json.loads(seen["body"])["gpuType"] == "A100 PCIe"
+    assert json.loads(seen["body"])["gpuType"] == "A100 SXM"
 
 
 def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):

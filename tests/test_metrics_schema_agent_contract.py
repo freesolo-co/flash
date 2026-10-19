@@ -72,7 +72,7 @@ def _run_metrics_with_notes(phase: str, notes: dict) -> dict:
     serialized to a dict, with the phase notes folded into `notes`. This mirrors the
     final metrics.json the control plane persists and the consumers read."""
     m = RunMetrics(
-        arm="runpod",
+        arm="modal",
         phase=phase,
         seed=0,
         model_id="Qwen/Qwen3.5-9B",

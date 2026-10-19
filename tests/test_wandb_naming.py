@@ -145,11 +145,11 @@ def test_runtime_secret_reads_wandb_and_declared_environment_secrets(tmp_path, m
     (tmp_path / ".env").write_text(
         "WANDB_API_KEY=wb-from-user-file\n"
         "SERPAPI_API_KEY=serp-from-user-file\n"
-        "RUNPOD_API_KEY=must-not-be-client-supplied\n"
+        "MODAL_TOKEN_SECRET=must-not-be-client-supplied\n"
     )
     monkeypatch.setenv("WANDB_API_KEY", "wb-from-user-file")
     monkeypatch.delenv("SERPAPI_API_KEY", raising=False)
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.delenv("MODAL_TOKEN_SECRET", raising=False)
 
     assert runtime_secrets_from_local_env(cfg) == {"WANDB_API_KEY": "wb-from-user-file"}
     assert runtime_secrets_from_local_env(cfg, keys=("SERPAPI_API_KEY",)) == {

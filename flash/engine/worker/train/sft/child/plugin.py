@@ -61,6 +61,27 @@ def _install_seeded_dataloader(seed: int) -> None:
     sft_trainer.SFTTrainer._build_dataloader = seeded_build_dataloader
 
 
+def _install_epoch_boundary_resume() -> None:
+    from verl.trainer import sft_trainer
+
+    original = sft_trainer.SFTTrainer.fit
+    if getattr(original, "_flash_epoch_boundary_resume", False):
+        return
+
+    def fit(self):
+        step = self.resume_global_step
+        if 0 < step < self.total_training_steps and step % self.steps_per_epoch == 0:
+            # The saved loader is exhausted, but verl starts at the NEXT epoch. Rebuild
+            # only at that boundary so its empty restored iterator cannot skip an epoch.
+            # Mid-epoch resumes keep their exact saved cursor and sampler state.
+            self._build_dataloader()
+            self.ckpt_handler.train_dataloader = self.train_dataloader
+        return original(self)
+
+    fit._flash_epoch_boundary_resume = True
+    sft_trainer.SFTTrainer.fit = fit
+
+
 def _install_linear_scheduler() -> None:
     from transformers import get_linear_schedule_with_warmup
     from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
@@ -102,10 +123,14 @@ def _install_core(config: dict) -> None:
     seed = int(config["seed"])
     _install_exact_dataloaders()
     _install_seeded_dataloader(seed)
+    _install_epoch_boundary_resume()
     _install_linear_scheduler()
     save_at_steps = tuple(config.get("save_at_steps", ()))
     if save_at_steps:
         runtime.install_checkpoint_handler_filter(save_at_steps, int(config["total_steps"]))
+        runtime.install_checkpoint_publication_backpressure(
+            config["checkpoint_published_dir"], save_at_steps, int(config["total_steps"])
+        )
     if config.get("reentrant_gradient_checkpointing"):
         _install_reentrant_checkpointing(multimodal=bool(config.get("multimodal")))
 

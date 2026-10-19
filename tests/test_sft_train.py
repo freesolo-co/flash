@@ -397,7 +397,7 @@ def test_sft_quote_credits_only_the_ranks_that_will_execute():
 
     def speedup(method: str, batch: int, cards: int) -> float:
         config = RunConfig(model_id="Qwen/Qwen3.5-9B", method=method, steps=10, batch_size=batch)
-        return analytical.method_card_speedup(config, cards, "H100", "runpod")
+        return analytical.method_card_speedup(config, cards, "H100", "modal")
 
     one_card = speedup("sft", 1, 1)
     # unpacked sft: 2 billed cards, 1 executing rank -> quoted like the single card it is.
@@ -2075,7 +2075,7 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypat
     monkeypatch.setenv("WANDB_API_KEY", "wandb-secret")
     monkeypatch.setenv("PARASAIL_API_KEY", "teacher-secret")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "control-secret")
-    monkeypatch.setenv("RUNPOD_API_KEY", "provider-secret")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "provider-secret")
     monkeypatch.setenv("HF_TOKEN", "hub-secret")
 
     without_wandb = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=False)
@@ -2087,7 +2087,7 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(monkeypat
     for secret in (
         "PARASAIL_API_KEY",
         "FREESOLO_INTERNAL_KEY",
-        "RUNPOD_API_KEY",
+        "MODAL_TOKEN_SECRET",
         "HF_TOKEN",
     ):
         assert secret not in without_wandb
@@ -2242,6 +2242,7 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_p
     # a required step is durable on both trees, and the ledger records each fact separately.
     assert watcher.lifecycle.facts(5).deployable_published
     assert watcher.lifecycle.facts(5).resume_uploaded
+    assert pathlib.Path(watcher.published_dir, "step-5").is_file()
     assert watcher.lifecycle.missing_deployables(watcher.required_steps) == []
 
 
@@ -2502,7 +2503,7 @@ def _stub_sft_run(
             params={},
             pip=(),
         ),
-        gpu=SimpleNamespace(type="RTX 4090", exact_type="", count=2),
+        gpu=SimpleNamespace(type="L4", exact_type="", count=2),
         train=SimpleNamespace(
             epochs=1,
             learning_rate=5e-5,
@@ -4120,7 +4121,7 @@ def test_sft_quote_credits_the_width_the_rows_allow_not_just_the_batch():
             batch_size=8,
             sft_retained_examples=rows,
         )
-        return analytical.method_card_speedup(config, 4, "H100", "runpod")
+        return analytical.method_card_speedup(config, 4, "H100", "modal")
 
     # the worker would launch 2 ranks on 10 rows and 4 on 16; the quote must agree with both.
     assert sft_data_parallel_cards(4, 8, 10) == 2
@@ -5134,6 +5135,7 @@ def test_a_required_save_whose_adapter_never_published_still_fails_the_run(monke
     watcher._publish(1, str(checkpoint_dir))
 
     assert watcher.lifecycle.missing_deployables(watcher.required_steps) == [1]
+    assert not pathlib.Path(watcher.published_dir, "step-1").exists()
     # stop() is where the run learns about it, and it must still raise.
     watcher.start()
     with pytest.raises(RuntimeError, match="required saves were not durably published"):
@@ -5162,6 +5164,50 @@ def test_resume_upload_unavailable_reports_the_oversized_member(tmp_path, capsys
     assert "0.0 GB" in out
 
 
+@pytest.mark.parametrize("resume_step", [0, 1, 2])
+def test_sft_resume_keeps_mid_epoch_cursor_but_resets_exhausted_epoch(monkeypatch, resume_step):
+    class Trainer:
+        def __init__(self):
+            self.resume_global_step = resume_step
+            self.steps_per_epoch = 2
+            self.total_training_steps = 4
+            self.remaining = list(range(resume_step, 2))
+            self.train_dataloader = object()
+            self.ckpt_handler = SimpleNamespace(train_dataloader=self.train_dataloader)
+            self.rebuilds = 0
+
+        def _build_dataloader(self):
+            self.rebuilds += 1
+            self.train_dataloader = object()
+            self.remaining = [0, 1]
+
+        def fit(self):
+            # Match verl's next-epoch calculation with a restored stateful loader.
+            step = self.resume_global_step
+            seen = []
+            for epoch in range(step // self.steps_per_epoch, 2):
+                for item in self.remaining:
+                    seen.append((epoch, item))
+                    step += 1
+                self.remaining = [0, 1]
+            return step, seen
+
+    monkeypatch.setitem(sys.modules, "verl", _module("verl"))
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.trainer",
+        _module("verl.trainer", sft_trainer=_module("sft_trainer", SFTTrainer=Trainer)),
+    )
+    sft_plugin._install_epoch_boundary_resume()
+    sft_plugin._install_epoch_boundary_resume()
+    trainer = Trainer()
+    final_step, seen = trainer.fit()
+    assert final_step == 4
+    assert seen == [(step // 2, step % 2) for step in range(resume_step, 4)]
+    assert trainer.rebuilds == (1 if resume_step == 2 else 0)
+    assert trainer.ckpt_handler.train_dataloader is trainer.train_dataloader
+
+
 def test_sft_core_keeps_verl_optimizer_and_installs_linear_scheduler(monkeypatch):
     class FakeEngine:
         def _build_optimizer(self, module):
@@ -5186,6 +5232,7 @@ def test_sft_core_keeps_verl_optimizer_and_installs_linear_scheduler(monkeypatch
     )
     monkeypatch.setattr(sft_plugin, "_install_exact_dataloaders", lambda: None)
     monkeypatch.setattr(sft_plugin, "_install_seeded_dataloader", lambda seed: None)
+    monkeypatch.setattr(sft_plugin, "_install_epoch_boundary_resume", lambda: None)
     # The core installer does not need the PEFT optimizer module.
     monkeypatch.setitem(sys.modules, "peft.optimizers", None)
     sft_plugin._install_core({"seed": 43})
@@ -5198,3 +5245,32 @@ def test_sft_core_keeps_verl_optimizer_and_installs_linear_scheduler(monkeypatch
     assert engine._build_optimizer(optimizer) is optimizer
     assert engine._build_lr_scheduler(optimizer) == "linear"
     assert scheduler_calls == [(optimizer, {"num_warmup_steps": 2, "num_training_steps": 20})]
+
+
+def test_resume_releases_only_durable_deployable_checkpoint_gates(monkeypatch, tmp_path):
+    from flash.engine.worker.train.entry import sft_train
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(tmp_path / "checkpoints"),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(1, 5),
+    )
+    watcher.lifecycle.mark_resume_uploaded(1)
+    watcher.lifecycle.mark_deployable_published(5)
+    monkeypatch.setattr(watcher._thread, "start", lambda: None)
+    watcher.start()
+    assert not pathlib.Path(watcher.published_dir, "step-1").exists()
+    assert pathlib.Path(watcher.published_dir, "step-5").is_file()
+
+
+def test_resume_rejects_missing_required_save_before_restored_step(monkeypatch):
+    from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
+    from flash.engine.worker.train.entry import sft_train
+
+    monkeypatch.setattr(sft_train, "_durable_required_save_steps", lambda *a: {3})
+    watcher = types.SimpleNamespace(lifecycle=CheckpointLedger())
+    with pytest.raises(RuntimeError, match=r"cannot resume.*\[5\]"):
+        sft_train._seed_resume_lifecycle(watcher, (3, 5, 9), 7)

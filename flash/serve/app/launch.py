@@ -66,6 +66,7 @@ _SAFE_CHILD_COPIED_ENV_NAMES = frozenset(
         # the compiled-graph cache, so the child engine reuses the volume's graphs instead of
         # recompiling the model into ephemeral storage on every start.
         "VLLM_CACHE_ROOT",
+        "FLASHINFER_WORKSPACE_BASE",
     }
 )
 _FIXED_CHILD_ENVIRONMENT = {
@@ -365,6 +366,7 @@ def _write_all(fd: int, value: str) -> None:
 def _open_secret_pipe(value: str):
     """yield a pipe reading end and wait up to five seconds for its writer on cleanup."""
     read_fd, write_fd = os.pipe()
+    read_identity = os.fstat(read_fd)
     errors: list[BaseException] = []
     value_holder = [value]
     del value
@@ -393,8 +395,12 @@ def _open_secret_pipe(value: str):
         operation_error = exc
         raise
     finally:
+        # Consumers close the descriptor after reading. A downloader may reuse its number
+        # before this context exits; only close an unread end that still belongs to this pipe.
         with contextlib.suppress(OSError):
-            os.close(read_fd)
+            current = os.fstat(read_fd)
+            if (current.st_dev, current.st_ino) == (read_identity.st_dev, read_identity.st_ino):
+                os.close(read_fd)
         if writer is None or (writer.ident is None and not writer.is_alive()):
             with contextlib.suppress(OSError):
                 os.close(write_fd)
@@ -481,14 +487,18 @@ def _bind_hub_cache(
     # the same reason as the engine settings above: it derives from the cache root the runtime
     # already knows, and a second provider must not have to rediscover it.
     vllm_cache = str(Path(cache_root) / _VLLM_CACHE_DIRNAME)
+    # FlashInfer maintains a separate version/architecture-keyed CUDA kernel cache.
+    flashinfer_cache = str(Path(cache_root) / "flashinfer")
     environment["HF_HOME"] = cache_root
     environment["HF_HUB_CACHE"] = hub_cache
     environment["VLLM_CACHE_ROOT"] = vllm_cache
+    environment["FLASHINFER_WORKSPACE_BASE"] = flashinfer_cache
     # the download path this image uses; xet intermittently fails engine init on a cold volume.
     environment["HF_HUB_DISABLE_XET"] = "1"
     os.environ["HF_HOME"] = cache_root
     os.environ["HF_HUB_CACHE"] = hub_cache
     os.environ["VLLM_CACHE_ROOT"] = vllm_cache
+    os.environ["FLASHINFER_WORKSPACE_BASE"] = flashinfer_cache
     os.environ["HF_HUB_DISABLE_XET"] = "1"
 
 

@@ -99,17 +99,11 @@ class _FakeUrlResponse:
 def make_client(tmp_path, monkeypatch):
     """Yields a factory building real ``ApiClient``s wired into one in-process
     control-plane app via a ``urllib`` -> ``TestClient`` shim."""
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
-    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
-    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
-    import flash.providers.runpod.client.auth as runpod_keys
 
-    runpod_keys.reset()
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod
 

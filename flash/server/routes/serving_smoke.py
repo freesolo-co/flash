@@ -39,6 +39,7 @@ from flash.serve.deployment.preflight import (
     validate_local_json_schema,
     validate_structured_output_patterns,
 )
+from flash.serve.deployment.readiness import DEPLOYMENT_SMOKE_TIMEOUT_SECONDS
 
 _SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
 _SMOKE_IMAGE_PROMPT = (
@@ -101,7 +102,7 @@ def _smoke_image_challenge(run_id: str) -> tuple[str, list[dict]]:
 
 # hard wall-clock budget for the trusted fixed-prompt generation and validation.
 # it remains below the deployment stale threshold.
-_SMOKE_BUDGET_SECONDS = 600.0
+_SMOKE_BUDGET_SECONDS = float(DEPLOYMENT_SMOKE_TIMEOUT_SECONDS)
 
 
 def _smoke_timeout_error(budget_s: float) -> ServingError:

@@ -25,7 +25,7 @@ SPEC_DICT = {
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/test-runs"},
-    "gpu": {"type": "RTX 5090"},
+    "gpu": {"type": "L40S"},
     "run_id": "flash-ckpt-1",
     "project": _PROJECT_ID,
 }
