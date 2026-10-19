@@ -125,7 +125,8 @@ def test_image_keeps_deepgemm_out_of_moe_backend_race() -> None:
     assert '"VLLM_MOE_USE_DEEP_GEMM": "0"' in MODAL_APP.read_text()
 
 
-def test_image_persists_vllm_compile_cache_on_the_volume() -> None:
+@pytest.mark.parametrize("cache_variable", ["VLLM_CACHE_ROOT", "FLASHINFER_WORKSPACE_BASE"])
+def test_image_persists_compile_caches_on_the_volume(cache_variable: str) -> None:
     # VLLM_CACHE_ROOT defaults to ~/.cache/vllm (vllm/envs.py) -- ephemeral container storage -- so
     # leaving it unset made every scale-from-zero recompile the model: vLLM writes torch.compile
     # artifacts under VLLM_CACHE_ROOT/torch_compile_cache/ (vllm/compilation/backends.py). It must
@@ -138,13 +139,13 @@ def test_image_persists_vllm_compile_cache_on_the_volume() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.Dict)
         for key, value in zip(node.keys, node.values, strict=False)
-        if isinstance(key, ast.Constant) and key.value == "VLLM_CACHE_ROOT"
+        if isinstance(key, ast.Constant) and key.value == cache_variable
         for node in [value]
     ]
-    assert roots, "VLLM_CACHE_ROOT must be set in the image env"
+    assert roots, f"{cache_variable} must be set in the image env"
     (root,) = roots
     # An f-string interpolating HOSTING_CACHE_MOUNT is the only accepted form, matching HF_HUB_CACHE.
-    assert isinstance(root, ast.JoinedStr), "VLLM_CACHE_ROOT must interpolate HOSTING_CACHE_MOUNT"
+    assert isinstance(root, ast.JoinedStr), f"{cache_variable} must interpolate HOSTING_CACHE_MOUNT"
     names = {
         node.id
         for part in root.values
@@ -153,7 +154,7 @@ def test_image_persists_vllm_compile_cache_on_the_volume() -> None:
         if isinstance(node, ast.Name)
     }
     assert "HOSTING_CACHE_MOUNT" in names, (
-        "VLLM_CACHE_ROOT must live under the persistent volume mount, or the compile cache is "
+        f"{cache_variable} must live under the persistent volume mount, or the compile cache is "
         "discarded on every cold start"
     )
 
