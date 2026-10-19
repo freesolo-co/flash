@@ -59,7 +59,7 @@ def test_late_completion_cannot_restore_revoked_checkpoint(run, action):
     if action == "undeploy":
         fenced = transitions.mark_undeployed(run, attempt["checkpoint_id"])
     else:
-        fenced = transitions.mark_deployment_revocation_failed(
+        fenced = transitions.mark_deployment_cleanup_pending(
             run, "pending", attempt["checkpoint_id"]
         )
     late = {**attempt, "state": "ready", "verified_at": 10.0}

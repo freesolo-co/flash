@@ -630,18 +630,18 @@ class ApiClient:
                     (
                         record
                         for record in (status.get("deployments") or {}).values()
-                        if record.get("state") == "revocation_failed"
+                        if record.get("state") == "cleanup_pending"
                     ),
                     {},
                 )
                 terminal = last_state in {"cancelled", "done", "failed", "dry_run"}
-                revocation_failed = (
-                    isinstance(deployment, dict) and deployment.get("state") == "revocation_failed"
+                cleanup_pending = (
+                    isinstance(deployment, dict) and deployment.get("state") == "cleanup_pending"
                 )
-                if terminal and revocation_failed:
+                if terminal and cleanup_pending:
                     error = deployment.get("error") or "unknown backend teardown error"
                     raise ClientError(
-                        "cancel request reached the control plane, but backend revocation is "
+                        "cancel request reached the control plane, but backend cleanup is "
                         f"unconfirmed: {error}; retry cancellation"
                     ) from cause
                 if terminal:

@@ -48,7 +48,7 @@ def recover_deployments() -> int:
                     )
                     marked = runner_transitions.mark_deployment_failed(status.run_id, failed)
                 elif state in _DEPLOYMENT_READY_STATES and _spec_is_unservable(status):
-                    marked = runner_transitions.mark_deployment_revocation_failed(
+                    marked = runner_transitions.mark_deployment_cleanup_pending(
                         status.run_id,
                         "deployment spec is no longer supported",
                         checkpoint_id,
@@ -171,7 +171,7 @@ def _finish_deployment_unlocked(
     try:
         dep = serving_deploy.deploy_adapter(**deploy_kwargs, before_ready=_before_ready)
     except Exception as exc:
-        if smoke_target is not None and not _revoke_failed_smoke(
+        if smoke_target is not None and not _cleanup_failed_smoke(
             run_id, smoke_target, str(deploy_kwargs["org_id"]), exc
         ):
             return
@@ -180,7 +180,7 @@ def _finish_deployment_unlocked(
 
     if not smoke_result:
         error = ServingError("deployment backend returned without checkpoint verification")
-        if _revoke_failed_smoke(
+        if _cleanup_failed_smoke(
             run_id, deployment["checkpoint_id"], str(deploy_kwargs["org_id"]), error
         ):
             _record_deployment_failure(run_id, spec, error, current, deployment, is_checkpoint)
@@ -201,7 +201,7 @@ def _finish_deployment_unlocked(
         )
 
 
-def _revoke_failed_smoke(
+def _cleanup_failed_smoke(
     run_id: str, checkpoint_id: str, org_id: str, smoke_error: Exception
 ) -> bool:
     """disable an unverified hosted checkpoint, retaining a retryable state on cleanup failure."""
@@ -210,7 +210,7 @@ def _revoke_failed_smoke(
     except Exception as exc:
         error = f"{smoke_error}; checkpoint cleanup failed: {exc}"
         previous = run_status.get_status(run_id)
-        marked = runner_transitions.mark_deployment_revocation_failed(
+        marked = runner_transitions.mark_deployment_cleanup_pending(
             run_id, error, checkpoint_id=checkpoint_id
         )
         deployment_state._report_persisted_transition(previous, marked, persisted=True)

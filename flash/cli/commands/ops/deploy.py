@@ -23,14 +23,10 @@ from flash.client import ApiError, ClientError, client_from_config
 _DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
 # the only states in which the control plane will actually serve the revision, mirroring
 # flash/server/routes/serving.py. leaving the busy set is NOT the same as arriving here:
-# `revocation_failed` (a concurrent undeploy whose backend cleanup failed) and any state a newer
+# `cleanup_pending` (backend removal is unconfirmed) and any state a newer
 # plane introduces are both non-busy and non-servable, so `--wait` must fail closed on them
 # rather than let `deploy --wait && evaluate` proceed against nothing.
 _DEPLOYMENT_READY_STATES = frozenset({"ready", "deployed"})
-# an undeploy whose backend cleanup failed (flash/runner/supervise/transitions.py). local serving
-# authority is revoked, but the alias may still resolve to the old target -- neither servable nor
-# safely assumed idle.
-_REVOCATION_FAILED_STATE = "revocation_failed"
 _DEPLOY_POLL_SECONDS = 5.0
 # `--wait 0` still owes the caller its one read, and a read needs a positive timeout. keep that
 # bound short enough that "check once, do not block" stays true against a stalled plane: a longer
@@ -165,7 +161,7 @@ def cmd_deploy(args) -> int:
         dep = _await_deployment(client, args.run_id, dep, wait_seconds)
         # --wait promises the revision is servable on return, so require the plane to SAY it is
         # servable. "not busy" is a weaker claim that also covers a timeout, a vanished listing, an
-        # unpollable plane, `revocation_failed`, and any state a newer plane adds; a restored
+        # unpollable plane, `cleanup_pending`, and any state a newer plane adds; a restored
         # previous revision means the requested one never made it. exiting 0 on any of those lets
         # `deploy --wait && evaluate` run against the wrong adapter, or against none.
         not_ready = str(dep.get("state") or "") not in _DEPLOYMENT_READY_STATES

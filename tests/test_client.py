@@ -704,7 +704,7 @@ def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
 
 
 @pytest.mark.parametrize("run_state", ["cancelled", "done", "failed", "dry_run"])
-def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatch, run_state):
+def test_cancel_timeout_raises_when_backend_cleanup_is_unconfirmed(monkeypatch, run_state):
     client = ApiClient("http://flash.example", "fslo-user-test")
 
     def request(method, path, body=None, timeout=None, progress=None, require=()):
@@ -716,7 +716,7 @@ def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatc
                 "state": run_state,
                 "deployments": {
                     "r1/final": {
-                        "state": "revocation_failed",
+                        "state": "cleanup_pending",
                         "retryable": True,
                         "error": "backend unavailable",
                     }
@@ -728,21 +728,25 @@ def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatc
 
     with pytest.raises(
         ClientError,
-        match="backend revocation is unconfirmed: backend unavailable; retry cancellation",
+        match="backend cleanup is unconfirmed: backend unavailable; retry cancellation",
     ):
         client.cancel_run("r1")
 
 
-def test_cancel_timeout_keeps_polling_nonterminal_revocation_failure(monkeypatch):
+def test_cancel_timeout_keeps_polling_nonterminal_cleanup_pending(monkeypatch):
     client = ApiClient("http://flash.example", "fslo-user-test")
     polls = iter(
         [
             {
                 "run_id": "r1",
                 "state": "running",
-                "deployment": {"state": "revocation_failed", "retryable": True},
+                "deployments": {"r1/final": {"state": "cleanup_pending", "retryable": True}},
             },
-            {"run_id": "r1", "state": "cancelled", "deployment": {"state": "undeployed"}},
+            {
+                "run_id": "r1",
+                "state": "cancelled",
+                "deployments": {"r1/final": {"state": "undeployed"}},
+            },
         ]
     )
 

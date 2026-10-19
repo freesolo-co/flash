@@ -128,13 +128,13 @@ def test_cancel_backend_success_local_commit_failure_is_not_backend_uncertainty(
     with pytest.raises(DeploymentStatePersistenceError) as excinfo:
         runner_deploy.cancel_run(run_id)
 
-    assert not isinstance(excinfo.value, runner_deploy.DeploymentRevocationError)
+    assert not isinstance(excinfo.value, runner_deploy.DeploymentCleanupError)
     assert excinfo.value.backend_outcome == "confirmed"
     assert "backend disablement was confirmed" in str(excinfo.value)
     assert backend_calls == [f"{run_id}/final"]
     failed = runner_status.get_status(run_id)
     assert failed.state == "cancelled"
-    assert only_deployment(failed)["state"] == "revocation_failed"
+    assert only_deployment(failed)["state"] == "cleanup_pending"
     assert deployment_fixtures.ready_checkpoints(run_id) == frozenset()
 
 
@@ -223,14 +223,14 @@ def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_p
     monkeypatch.setattr(deploy, "undeploy_adapter", fail_undeploy)
     monkeypatch.setattr(runner_recovery, "_gc_run_sandboxes", lambda _spec: None)
 
-    with pytest.raises(runner_deploy.DeploymentRevocationError) as excinfo:
+    with pytest.raises(runner_deploy.DeploymentCleanupError) as excinfo:
         runner_deploy.cancel_run(run_id)
 
     assert excinfo.value.retryable is True
     assert attempts == [revision]
     failed = runner_status.get_status(run_id)
     assert failed.state == "cancelled"
-    assert only_deployment(failed)["state"] == "revocation_failed"
+    assert only_deployment(failed)["state"] == "cleanup_pending"
     assert only_deployment(failed)["retryable"] is True
     assert deployment_fixtures.ready_checkpoints(run_id) == frozenset()
 
@@ -276,10 +276,10 @@ def test_cancel_preserves_ready_siblings_and_retries_each_unfinished_checkpoint(
 
     monkeypatch.setattr(deploy, "undeploy_adapter", revoke)
     monkeypatch.setattr(runner_recovery, "_gc_run_sandboxes", lambda _spec: None)
-    with pytest.raises(runner_deploy.DeploymentRevocationError, match="backend unavailable"):
+    with pytest.raises(runner_deploy.DeploymentCleanupError, match="backend unavailable"):
         runner_deploy.cancel_run(run_id)
     saved = runner_status.get_status(run_id)
     assert saved.deployments[ready["checkpoint_id"]] == ready
-    assert saved.deployments[f"{run_id}/step-40"]["state"] == "revocation_failed"
+    assert saved.deployments[f"{run_id}/step-40"]["state"] == "cleanup_pending"
     assert saved.deployments[f"{run_id}/step-60"]["state"] == "undeployed"
     assert set(attempts) == {f"{run_id}/step-40", f"{run_id}/step-60"}

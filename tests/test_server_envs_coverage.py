@@ -643,20 +643,20 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
     marked: list[tuple[str, dict]] = []
 
     def mark_failed(run_id, error, checkpoint_id):
-        failed = {"state": "revocation_failed", "checkpoint_id": checkpoint_id, "error": error}
+        failed = {"state": "cleanup_pending", "checkpoint_id": checkpoint_id, "error": error}
         marked.append((run_id, failed))
         return types.SimpleNamespace(
             run_id=run_id, state="done", deployments=records(run_id, failed)
         )
 
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    monkeypatch.setattr(runner_transitions, "mark_deployment_revocation_failed", mark_failed)
+    monkeypatch.setattr(runner_transitions, "mark_deployment_cleanup_pending", mark_failed)
     monkeypatch.setattr(runner_reporting, "_report_status", lambda status: None)
 
     assert serving_completion.recover_deployments() == 1
     assert [run_id for run_id, _failed in marked] == ["r-retired"]
     for _run_id, failed in marked:
-        assert failed["state"] == "revocation_failed"
+        assert failed["state"] == "cleanup_pending"
         # the reason names the actual cause, not the restart the busy branch reports.
         assert "no longer supported" in failed["error"]
 

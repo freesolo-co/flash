@@ -95,7 +95,7 @@ def mark_deployment_failed(run_id: str, deployment: dict) -> RunStatus:
         return _save_record(status, {**deployment, "state": "failed"})
 
 
-def _revoke_record(run_id: str, checkpoint_id: str, **fields) -> RunStatus:
+def _mark_checkpoint_inactive(run_id: str, checkpoint_id: str, **fields) -> RunStatus:
     from flash.runner.lifecycle.state import _status_guard
     from flash.runner.lifecycle.status import get_status
 
@@ -122,12 +122,13 @@ def _revoke_record(run_id: str, checkpoint_id: str, **fields) -> RunStatus:
         return _save_record(status, record)
 
 
-def mark_deployment_revocation_failed(run_id: str, error: str, checkpoint_id: str) -> RunStatus:
-    return _revoke_record(
-        run_id, checkpoint_id, state="revocation_failed", error=error, retryable=True
+def mark_deployment_cleanup_pending(run_id: str, error: str, checkpoint_id: str) -> RunStatus:
+    """Disable checkpoint serving while backend removal is pending or needs a retry."""
+    return _mark_checkpoint_inactive(
+        run_id, checkpoint_id, state="cleanup_pending", error=error, retryable=True
     )
 
 
 def mark_undeployed(run_id: str, checkpoint_id: str) -> RunStatus:
     """Keep an inactive generation fence for this checkpoint; leave every sibling intact."""
-    return _revoke_record(run_id, checkpoint_id, state="undeployed")
+    return _mark_checkpoint_inactive(run_id, checkpoint_id, state="undeployed")

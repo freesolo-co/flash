@@ -5111,7 +5111,7 @@ def test_failed_smoke_cleans_only_unverified_checkpoint(
 
     assert deployment.status_code == 200, deployment.text
     assert deployment.json()["state"] == (
-        "ready" if previously_verified else "revocation_failed" if cleanup_fails else "failed"
+        "ready" if previously_verified else "cleanup_pending" if cleanup_fails else "failed"
     )
     if cleanup_fails:
         assert deployment.json()["retryable"] is True
@@ -5146,7 +5146,7 @@ def test_failed_smoke_cleans_only_unverified_checkpoint(
         assert "has not passed a successful deployment smoke" in response.json()["detail"]
 
 
-@pytest.mark.parametrize("deployment_state", ["undeployed", "revocation_failed"])
+@pytest.mark.parametrize("deployment_state", ["undeployed", "cleanup_pending"])
 def test_redeploy_after_inactive_deployment_state_is_allowed(api, monkeypatch, deployment_state):
     from flash.serve.contract.errors import ServingError
 
@@ -5528,7 +5528,7 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
     resp = api.delete(f"/v1/runs/{run_id}/deploy?checkpoint_id={sibling}", headers=_bearer(key))
     assert resp.status_code == 502, resp.text
     detail = resp.json()["detail"]
-    assert detail["code"] == "deployment_revocation_failed"
+    assert detail["code"] == "deployment_cleanup_failed"
     assert detail["retryable"] is True
     assert "serving backend unreachable" in detail["message"]
     assert deployment_fixtures.ready_checkpoints(run_id) == frozenset({revision})

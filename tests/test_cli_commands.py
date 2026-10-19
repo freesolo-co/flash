@@ -4114,13 +4114,13 @@ def test_deploy_wait_does_not_start_a_read_after_the_deadline_expires(
         assert start + bound <= 0.1 + 0.001, reads
 
 
-@pytest.mark.parametrize("state", ["revocation_failed", "some_state_a_newer_plane_added"])
+@pytest.mark.parametrize("state", ["cleanup_pending", "some_state_a_newer_plane_added"])
 def test_deploy_wait_fails_closed_on_a_terminal_state_that_is_not_ready(
     fake_client, monkeypatch, capsys, state
 ) -> None:
     """Leaving the busy set is not the same as being servable.
 
-    `revocation_failed` is a real persisted state (a concurrent undeploy whose backend cleanup
+    `cleanup_pending` is a real persisted state (a concurrent undeploy whose backend cleanup
     failed), and an unknown state arrives on any client/server skew. Both are non-busy, so gating
     success on "not busy" exited 0 with nothing actually serving.
     """

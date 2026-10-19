@@ -14,17 +14,17 @@ from flash.runner.results.deployments import is_ready
 if TYPE_CHECKING:
     from flash.runner.lifecycle.state import RunStatus
 
-_REVOCATION_RETRY_STATE = "revocation_failed"
+_CLEANUP_PENDING_STATE = "cleanup_pending"
 _INACTIVE_DEPLOYMENT_STATES = frozenset({"undeployed", "dry_run"})
 
 
-class DeploymentRevocationError(RuntimeError):
-    """Backend revocation is unconfirmed after local serving authority was removed."""
+class DeploymentCleanupError(RuntimeError):
+    """Backend cleanup is unconfirmed after local serving authority was removed."""
 
     def __init__(self, run_id: str, error: str):
         super().__init__(
-            f"deployment_revocation_failed: local authorization for {run_id} was revoked, but "
-            f"backend disablement is unconfirmed: {error}; retry cancellation"
+            f"deployment_cleanup_failed: serving for {run_id} is disabled locally, but "
+            f"backend cleanup is unconfirmed: {error}; retry cancellation"
         )
         self.run_id = run_id
         self.retryable = True
@@ -47,7 +47,7 @@ class DeploymentStatePersistenceError(RuntimeError):
             )
         elif backend_outcome == "not_required":
             detail = (
-                "backend revocation was not required, but generation-only local persistence "
+                "backend cleanup was not required, but generation-only local persistence "
                 f"failed: {error}; retry cancellation to reconcile local state"
             )
         else:
@@ -61,7 +61,7 @@ class DeploymentStatePersistenceError(RuntimeError):
         self.retryable = True
 
 
-def _deployment_state_and_requires_revocation(
+def _deployment_state_and_requires_cleanup(
     deployment: object,
 ) -> tuple[str | None, bool]:
     if deployment is None:
@@ -253,15 +253,15 @@ def _fence_contended_deployment(run_id: str) -> None:
         status = get_status(run_id)
         changed = False
         for checkpoint_id, record in status.deployments.items():
-            _, active = _deployment_state_and_requires_revocation(record)
+            _, active = _deployment_state_and_requires_cleanup(record)
             if not active or is_ready(run_id, record):
                 continue
             status.deployments[checkpoint_id] = {
                 **record,
-                "state": "revocation_failed",
+                "state": "cleanup_pending",
                 "retryable": True,
                 "generation": generation(record) + 1,
-                "error": "backend revocation pending: cancellation fenced an in-progress deployment",
+                "error": "backend cleanup pending: cancellation fenced an in-progress deployment",
                 "updated_at": time.time(),
             }
             changed = True
@@ -275,31 +275,31 @@ def _fence_contended_deployment(run_id: str) -> None:
                 ) from exc
 
 
-def _revoke_serving(
+def _cleanup_serving(
     run_id: str,
     status,
     *,
     deployment: dict,
 ) -> tuple[Exception | None, tuple[Exception, _BackendOutcome] | None]:
-    """Revoke one unfinished checkpoint while preserving ready siblings.
+    """Clean up one unfinished checkpoint while preserving ready siblings.
 
     Returns ``(backend_error, persistence_error)`` rather than raising, so the caller can still bill
     and persist the cancellation before surfacing either. Local authority is fenced BEFORE the
     backend call, so a crash between the two leaves the run visibly un-serveable, not silently live.
     """
     from flash.runner.supervise.transitions import (
-        mark_deployment_revocation_failed,
+        mark_deployment_cleanup_pending,
         mark_undeployed,
     )
 
     checkpoint_id = deployment["checkpoint_id"]
-    already_fenced = deployment.get("state") == _REVOCATION_RETRY_STATE
+    already_fenced = deployment.get("state") == _CLEANUP_PENDING_STATE
     if not already_fenced:
         try:
-            mark_deployment_revocation_failed(
+            mark_deployment_cleanup_pending(
                 run_id,
-                "backend revocation pending: local serving authority was revoked before "
-                "backend disablement",
+                "backend cleanup pending: checkpoint serving was disabled locally before "
+                "backend cleanup",
                 checkpoint_id=checkpoint_id,
             )
         except Exception as exc:
@@ -316,7 +316,7 @@ def _revoke_serving(
         undeploy_adapter(checkpoint_id, org_id=org_id)
     except Exception as exc:
         with contextlib.suppress(Exception):
-            mark_deployment_revocation_failed(run_id, str(exc), checkpoint_id)
+            mark_deployment_cleanup_pending(run_id, str(exc), checkpoint_id)
         return exc, None
     try:
         mark_undeployed(run_id, checkpoint_id)
@@ -408,7 +408,7 @@ def cancel_run(run_id: str) -> RunStatus:
         confirmed_cleanup_identities = _drain_confirmed_cleanup(run_id)
         initial_status = get_status(run_id)
     initial_active = any(
-        _deployment_state_and_requires_revocation(record)[1]
+        _deployment_state_and_requires_cleanup(record)[1]
         for record in initial_status.deployments.values()
     )
     if initial_status.state in TERMINAL_STATES and not initial_active:
@@ -476,12 +476,12 @@ def cancel_run(run_id: str) -> RunStatus:
         backend_error: Exception | None = None
         persistence_error: tuple[Exception, _BackendOutcome] | None = None
         for record in status.deployments.values():
-            _, active = _deployment_state_and_requires_revocation(record)
+            _, active = _deployment_state_and_requires_cleanup(record)
             if not active or is_ready(run_id, record):
                 continue
             try:
-                revoke_error, persist_error = _revoke_serving(run_id, status, deployment=record)
-                backend_error = backend_error or revoke_error
+                cleanup_error, persist_error = _cleanup_serving(run_id, status, deployment=record)
+                backend_error = backend_error or cleanup_error
                 persistence_error = persistence_error or persist_error
             except DeploymentStatePersistenceError as exc:
                 persistence_error = persistence_error or (exc, exc.backend_outcome)
@@ -509,7 +509,7 @@ def cancel_run(run_id: str) -> RunStatus:
             register_checkpoints_best_effort(get_status(run_id))
 
         if backend_error is not None:
-            raise DeploymentRevocationError(run_id, str(backend_error)) from backend_error
+            raise DeploymentCleanupError(run_id, str(backend_error)) from backend_error
         if persistence_error is not None:
             error, backend_outcome = persistence_error
             raise DeploymentStatePersistenceError(

@@ -65,7 +65,7 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`, with the logical base and tokenizer provenance kept
   distinct from the served checkpoint. The Qwen3.5 0.8B, 2B, and 4B tiers and
   `Qwen/Qwen3.6-27B` cannot activate, while historical status, accepted billing retry,
-  cancellation, cleanup, hosted revocation, and exact identity-based undeploy remain available.
+  cancellation, cleanup, hosted deployment removal, and exact identity-based undeploy remain available.
   Qwen3.6 27B adapters are not compatible with Qwen3.8.
 - Customer-owned serving is now Modal-only and requires explicit `--provider modal`. Modal remains
   live-qualified for all three active models. The 27B and 35B-A3B qualifications stay bound to the

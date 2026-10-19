@@ -19,7 +19,7 @@ from flash.runner.lifecycle.preparation import WarmStartPreparationError
 from flash.runner.lifecycle.state import new_run_id, runs_file_path
 from flash.runner.lifecycle.submit import SourceSnapshotPublicationError
 from flash.runner.supervise.deploy import (
-    DeploymentRevocationError,
+    DeploymentCleanupError,
     DeploymentStatePersistenceError,
     cancel_run,
 )
@@ -539,11 +539,11 @@ def cancel(run_id: str, key: Annotated[dict, Depends(require_key)]):
     owned_run(run_id, key)
     try:
         return cancel_run(run_id).to_dict()
-    except DeploymentRevocationError as exc:
+    except DeploymentCleanupError as exc:
         raise HTTPException(
             status_code=502,
             detail={
-                "code": "deployment_revocation_failed",
+                "code": "deployment_cleanup_failed",
                 "run_id": run_id,
                 "retryable": True,
                 "message": str(exc),

@@ -24,9 +24,9 @@ from flash.core.spec import JobSpec, require_project_id
 from flash.runner.lifecycle.status import effective_spec_from_status
 from flash.runner.results.deployments import generation, is_ready, require_checkpoint
 from flash.runner.supervise.transitions import (
+    mark_deployment_cleanup_pending,
     mark_deployment_failed,
     mark_deployment_pending,
-    mark_deployment_revocation_failed,
     mark_undeployed,
 )
 from flash.serve.contract.errors import ServingError
@@ -401,18 +401,14 @@ def undeploy(
                 )
             result = serving_deploy.undeploy_adapter(checkpoint_id, org_id=org_id)
         except ServingError as exc:
-            marked = mark_deployment_revocation_failed(
-                run_id, str(exc), checkpoint_id=checkpoint_id
-            )
+            marked = mark_deployment_cleanup_pending(run_id, str(exc), checkpoint_id=checkpoint_id)
             record = marked.deployments.get(checkpoint_id, {})
-            persisted = record.get("state") == "revocation_failed" and record.get("error") == str(
-                exc
-            )
+            persisted = record.get("state") == "cleanup_pending" and record.get("error") == str(exc)
             deployment_state._report_persisted_transition(status, marked, persisted=persisted)
             raise HTTPException(
                 status_code=502,
                 detail={
-                    "code": "deployment_revocation_failed",
+                    "code": "deployment_cleanup_failed",
                     "run_id": run_id,
                     "retryable": True,
                     "message": str(exc),
