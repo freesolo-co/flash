@@ -499,7 +499,9 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
 def _resolve_training_settings(inp, caps):
     expected_steps = int(inp["steps"])
     # verl logs from its own interpreter; gate wandb on that env (see resolve_verl_loggers).
-    loggers = resolve_verl_loggers(caps)
+    # Actor stdout is asynchronous in Ray and can lose the last optimizer-step records at
+    # shutdown. The child entry streams Verl's unbuffered file logger through its own stdout.
+    loggers = ["file" if logger == "console" else logger for logger in resolve_verl_loggers(caps)]
     spec = _worker_state.JOB_SPEC
     project_name = (spec.wandb.project if spec and spec.wandb else None) or "flash"
     experiment_name = _worker_wandb_log.wandb_run_name()
@@ -568,6 +570,7 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
     env_for_verl["VERL_USE_EXTERNAL_MODULES"] = "flash_grpo_plugin"
     env_for_verl["FLASH_GRPO_PLUGIN_CONFIG_PATH"] = files["plugin_config_path"]
     env_for_verl["FLASH_VERL_REWARD_URL"] = reward_url
+    env_for_verl["VERL_FILE_LOGGER_PATH"] = os.path.join(files["shim_dir"], "step_metrics.jsonl")
     # where each rank records the gpu it opened. ray fans this env to every actor, which is what
     # makes the file a rendezvous point: the deferred plugin check compares ranks before a process
     # group exists.

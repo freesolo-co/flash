@@ -671,6 +671,7 @@ GRPO_CHILD_MODULES = (
     (os.path.join("train", "rl", "child", "multiturn.py"), "flash_grpo_multiturn.py"),
     (os.path.join("train", "rl", "child", "plugin.py"), "flash_grpo_plugin.py"),
     (os.path.join("train", "rl", "child", "entry.py"), "flash_grpo_entry.py"),
+    (os.path.join("train", "rl", "child", "metrics.py"), "flash_grpo_metrics.py"),
 )
 
 
