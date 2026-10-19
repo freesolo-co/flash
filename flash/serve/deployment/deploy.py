@@ -363,7 +363,12 @@ def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
         else:
             if math.isfinite(delay) and delay > 0:
                 return min(delay, READBACK_MAX_DELAY_SECONDS)
-    return min(READBACK_DELAY_SECONDS * (2**attempt), READBACK_MAX_DELAY_SECONDS)
+    if READBACK_DELAY_SECONDS == 0:
+        return 0.0
+    # Saturate before exponentiation: a long cold start can exceed 1024 polls.
+    if attempt >= math.log2(READBACK_MAX_DELAY_SECONDS / READBACK_DELAY_SECONDS):
+        return READBACK_MAX_DELAY_SECONDS
+    return READBACK_DELAY_SECONDS * (2**attempt)
 
 
 def _wait_checkpoint_ready(
@@ -372,7 +377,7 @@ def _wait_checkpoint_ready(
     subfolder: str,
     *,
     expected_identity: dict | None = None,
-    budget_s: float = readiness.REVISION_READY_MIN_BUDGET_SECONDS,
+    budget_s: float = readiness.REVISION_READY_MAX_BUDGET_SECONDS,
 ) -> dict:
     budget = max(0.0, float(budget_s))
     deadline = time.monotonic() + budget
