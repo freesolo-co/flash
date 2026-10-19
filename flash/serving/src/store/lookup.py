@@ -1,11 +1,10 @@
-"""Adapter lookup with a bounded background refresh.
+"""Checkpoint lifecycle reads and cached catalog lookup.
 
 Split out of router.py's app builder. Owns the reload bookkeeping the app factory used to hold as
 a bare dict: when the router last rehydrated, and the in-flight refresh task.
 
-A container that missed a (un)registration performed on another container still has to resolve the
-adapter, so a miss reloads once before 404-ing, and a hit reloads at most once per interval in the
-background.
+Persisted checkpoints are checked on every request: their artifact is immutable, but readiness
+can be revoked by another router. Catalog and offline routing retain bounded background refresh.
 """
 
 import asyncio
@@ -15,6 +14,7 @@ from typing import Any
 
 from fastapi import HTTPException, status
 
+from flash.schema import parse_checkpoint_ref
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.requests import _assert_supported_base_model
 from flash.serving.src.io.schemas import AdapterRecord
@@ -79,6 +79,16 @@ class AdapterLookup:
     def _is_stale(self) -> bool:
         return time.monotonic() - self._last_reload["at"] >= self._reload_interval_seconds
 
+    async def _current_record(self, org_id: str, adapter_id: str) -> AdapterRecord | None:
+        assert self._lookup_record is not None
+        try:
+            return await asyncio.to_thread(self._lookup_record, org_id, adapter_id)
+        except Exception as exc:
+            # A cached ready row cannot prove that an undeploy has not committed elsewhere.
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "adapter storage is unavailable"
+            ) from exc
+
     async def resolve(
         self,
         adapter_id: str,
@@ -87,6 +97,22 @@ class AdapterLookup:
         require_supported_base_model: bool = True,
     ) -> tuple[AdapterRecord, AdapterRecord]:
         resolved = self._router.resolve(adapter_id, org_id=org_id)
+        checkpoint_org = org_id if parse_checkpoint_ref(adapter_id) is not None else None
+        if checkpoint_org is None and resolved is not None and resolved[1].is_checkpoint:
+            checkpoint_org = resolved[1].org_id
+        if self._lookup_record is not None and checkpoint_org is not None:
+            current = await self._current_record(checkpoint_org, adapter_id)
+            if (
+                current is None
+                or not current.is_checkpoint
+                or current.org_id != checkpoint_org
+                or current.adapter_id != adapter_id
+                or current.status != "ready"
+            ):
+                raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+            if require_supported_base_model:
+                _assert_supported_base_model(current.base_model)
+            return current, current
         stale = resolved is not None and self._is_stale()
         if resolved is not None and self._reload_records is not None and stale:
             self._schedule_reload()
@@ -101,6 +127,16 @@ class AdapterLookup:
 
     async def get_exact(self, org_id: str, adapter_id: str) -> AdapterRecord:
         record = self._router.get(adapter_id, org_id=org_id)
+        if self._lookup_record is not None and parse_checkpoint_ref(adapter_id) is not None:
+            record = await self._current_record(org_id, adapter_id)
+            if (
+                record is None
+                or not record.is_checkpoint
+                or record.org_id != org_id
+                or record.adapter_id != adapter_id
+            ):
+                raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+            return record
         cached_ready = record is not None and record.status == "ready"
         if cached_ready and self._is_stale() and self._reload_records is not None:
             self._schedule_reload()
