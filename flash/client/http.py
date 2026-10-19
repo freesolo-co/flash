@@ -340,6 +340,12 @@ class ApiClient:
                 f"request to the Flash service at {self.api_url} timed out; "
                 "check your network connection and FLASH_API_URL"
             ) from exc
+        except http.client.RemoteDisconnected as exc:
+            raise ServiceUnreachableError(
+                f"the Flash service at {self.api_url} closed the connection without a response; "
+                "check service health and FLASH_API_URL. The request may have been accepted; "
+                "check its status before submitting it again"
+            ) from exc
 
     def _decode_response(
         self,
