@@ -46,8 +46,8 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   customer-owned serving. Checkpoint bindings are write-once, exact undeploy preserves siblings,
   and customer-owned manifests use schema v2.
 - Active training now exposes exactly `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
-  `Qwen/Qwen3.6-35B-A3B`. Hosted serving remains active for 9B and 35B-A3B; hosted Qwen3.8 27B
-  remains inactive. Qwen3.8 uses the immutable BF16 revision
+  `Qwen/Qwen3.6-35B-A3B`. Hosted serving advertises and routes all three models on B200.
+  Qwen3.8 uses the immutable BF16 revision
   `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` and official native block-FP8 serving revision
   `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`, with the logical base and tokenizer provenance kept
   distinct from the served checkpoint. The Qwen3.5 0.8B, 2B, and 4B tiers and
