@@ -64,7 +64,7 @@ def _managed_environment_slug(spec: dict[str, Any]) -> str | None:
         return None
 
 
-_DEPLOYMENT_FIELDS = frozenset(
+_DEPLOYMENT_REPORT_FIELDS = frozenset(
     {
         "state",
         "checkpoint_id",
@@ -75,26 +75,22 @@ _DEPLOYMENT_FIELDS = frozenset(
         "updated_at",
         "verified_at",
         "generation",
-        "verify_kind",
-        "verify_turns",
-        "verify_latency_s",
-        "verify_finish_reason",
         "verify_sample",
-        "verify_lora_request_adapter",
         "error",
     }
 )
 
 
-def _deployments_projection(status: Any) -> dict[str, dict]:
+def _deployment_report_payload(status: Any) -> dict[str, dict]:
+    """Build the checkpoint deployment records sent in the platform run report."""
     records = {}
     for checkpoint_id, deployment in status.deployments.items():
-        projected = {**deployment}
-        projected["endpoint"] = deployment.get("endpoint") or deployment.get("endpoint_name")
+        record = {**deployment}
+        record["endpoint"] = deployment.get("endpoint") or deployment.get("endpoint_name")
         records[checkpoint_id] = {
             key: value
-            for key, value in projected.items()
-            if key in _DEPLOYMENT_FIELDS and value is not None
+            for key, value in record.items()
+            if key in _DEPLOYMENT_REPORT_FIELDS and value is not None
         }
     return records
 
@@ -226,7 +222,7 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "artifactsDir": status.artifacts_dir,
         "error": status.error,
         "spec": spec,
-        "deployments": _deployments_projection(status),
+        "deployments": _deployment_report_payload(status),
         "lastHeartbeat": public_status.get("last_heartbeat"),
         "gpuStatus": status.gpu_status,
         "lifecycle": _lifecycle_projection(status, public_status),
