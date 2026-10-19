@@ -142,21 +142,6 @@ def _spec_with_gpu(spec: JobSpec, gpu_type: str, gpu_count: int = 0) -> JobSpec:
     return JobSpec.from_dict(d)
 
 
-def _drop_weight_cache(spec: JobSpec) -> JobSpec:
-    """Spec with the SHARED weight-cache volume removed for an unrestricted cross-region retry.
-
-    Only drops the platform-managed shared cache (WEIGHT_CACHE_VOLUME_NAME); a custom per-org
-    network_volume is the user's own choice and is preserved across retries.
-    """
-    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
-
-    if getattr(spec.gpu, "network_volume", None) != WEIGHT_CACHE_VOLUME_NAME:
-        return spec
-    d = spec.to_internal_dict()
-    d["gpu"] = {**d["gpu"], "network_volume": None}
-    return JobSpec.from_dict(d)
-
-
 def _run_attempts_supervised(
     spec: JobSpec,
     log,

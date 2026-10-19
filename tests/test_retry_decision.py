@@ -54,6 +54,11 @@ def test_candidate_bound_failures_select_only_strictly_larger_candidates(failure
     assert plan.retry
     assert survivors == (larger,)
     assert chosen is larger
+    assert retry_state.usable_vram_floor == 80
+    assert retry_state.oom_used == (1 if failure == "oom" else 0)
+    assert retry_state.infra_used == (0 if failure == "oom" else 1)
+    restored = RetryState.from_snapshot(_spec(), retry_state.to_snapshot())
+    assert restored.select_candidate((equal, larger)) == ((larger,), larger)
 
 
 def test_candidate_bound_failure_stops_when_only_equal_vram_remains():
@@ -126,14 +131,6 @@ def test_cache_retry_shape_does_not_fall_through_when_exact_shape_disappears():
 
     assert retry_state.select_candidate((larger,)) == ((larger,), None)
     assert retry_state.select_candidate((exact, larger)) == ((exact, larger), exact)
-
-
-def test_queue_grace_stays_ordinary_until_cache_fallback_is_consumed():
-    chosen = _candidate("modal", "H100", 80)
-    retry_state = RetryState(0, 1, 1)
-
-    assert not retry_state.on_last_gpu(chosen, (chosen,), cache_fallback_available=True)
-    assert retry_state.on_last_gpu(chosen, (chosen,), cache_fallback_available=False)
 
 
 def test_retry_floor_uses_executed_width_scale():

@@ -48,7 +48,6 @@ class ModalProvider:
         on_handle=None,
         attempt=0,
         runtime_secrets=None,
-        on_last_gpu=False,
         source_snapshot=None,
         _deadline_at=None,
     ):

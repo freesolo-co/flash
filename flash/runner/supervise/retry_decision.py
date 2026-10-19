@@ -146,14 +146,6 @@ class RetryState:
             None,
         )
 
-    def on_last_gpu(self, chosen, candidates, *, cache_fallback_available: bool) -> bool:
-        if cache_fallback_available:
-            return False
-        if chosen is None or self.infra_used >= self.infra_retries:
-            return True
-        floor = _candidate_usable_vram_gb(chosen)
-        return not any(_candidate_usable_vram_gb(candidate) > floor for candidate in candidates)
-
 
 def _bounded_count(value: object, label: str, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
@@ -255,6 +247,7 @@ def _strictly_larger_candidates(candidates, usable_vram_floor: float):
 
 
 def _drop_weight_cache(spec: JobSpec) -> JobSpec:
+    """Remove only the shared cache for a retry; preserve custom volumes."""
     from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_NAME
 
     if spec.gpu.network_volume != WEIGHT_CACHE_VOLUME_NAME:

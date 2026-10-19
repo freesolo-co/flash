@@ -10,7 +10,6 @@ import time
 from dataclasses import dataclass, field, replace
 
 import flash.runner.supervise.recovery as attempt_recovery
-from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import JobSpec
 from flash.runner.lifecycle.attempts import AttemptLaunchClaim
 from flash.runner.supervise.retry_decision import (
@@ -322,7 +321,7 @@ def _pinned_to_resume_width(allocation, resume_world_size: int | None):
 
 
 def _build_candidate_plan(ctx: _SubmitContext, prepared, allocation):
-    claim, attempt_spec, _, retry_state = prepared
+    claim, _, _, retry_state = prepared
     from flash.providers.core.allocator import allocation_summary
     from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
     from flash.runner.supervise.lifecycle import _spec_with_gpu
@@ -341,16 +340,6 @@ def _build_candidate_plan(ctx: _SubmitContext, prepared, allocation):
         ctx.last_detail = f"no candidate has more than {floor:g} GB usable vram"
         return None
 
-    cache_fallback_available = (
-        not retry_state.drop_weight_cache
-        and retry_state.cache_retries > 0
-        and _managed_cache_mounted(attempt_spec, chosen)
-    )
-    on_last_gpu = retry_state.on_last_gpu(
-        chosen,
-        candidates,
-        cache_fallback_available=cache_fallback_available,
-    )
     print(allocation_summary(allocation), file=ctx.log, flush=True)
     if (chosen.provider, chosen.gpu, getattr(chosen, "gpu_count", 1)) != (
         allocation.provider,
@@ -371,7 +360,7 @@ def _build_candidate_plan(ctx: _SubmitContext, prepared, allocation):
     except RuntimeError:
         ctx.gc_seen_sandboxes()
         raise
-    return candidates, chosen, on_last_gpu, effective_spec, run_spec
+    return candidates, chosen, effective_spec, run_spec
 
 
 def _retry_delay(ctx: _SubmitContext, infra_retry_ordinal: int | None) -> float:
@@ -386,7 +375,7 @@ def _retry_delay(ctx: _SubmitContext, infra_retry_ordinal: int | None) -> float:
 def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
     """Bind provider handle persistence to one immutable reservation and candidate."""
     claim = prepared[0]
-    _, chosen, on_last_gpu, _, _ = candidate_plan
+    _, chosen, _, _ = candidate_plan
     from flash.runner.accounting.reconciliation import (
         _expected_remote_matches,
         _preserve_cleanup_remote,
@@ -411,7 +400,6 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
             "allocated_gpu": chosen.gpu,
             "allocated_gpu_count": int(getattr(chosen, "gpu_count", 1) or 1),
             "allocated_usable_vram_gb": _candidate_usable_vram_gb(chosen),
-            "on_last_gpu": on_last_gpu,
         }
         try:
             claimed = persist_claimed_remote(ctx.spec.run_id, claim, persisted)
@@ -466,10 +454,9 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
 
 def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
     claim, _, attempt_runtime_secrets, _ = prepared
-    _, chosen, on_last_gpu, _, run_spec = candidate_plan
+    _, chosen, _, run_spec = candidate_plan
     from flash.providers.core.base import (
         PollResult,
-        RunExhaustedProviderPoolError,
         UnreconciledCreateError,
     )
     from flash.providers.core.registry import get_provider
@@ -489,7 +476,6 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
                 "log": ctx.log,
                 "on_handle": _handle_callback(ctx, prepared, candidate_plan),
                 "attempt": claim.attempt,
-                "on_last_gpu": on_last_gpu,
                 "source_snapshot": ctx.source_snapshot,
                 # bounded, not the raw run deadline: while a profile is unarmed the
                 # persisted one still carries the queue allowance, and the bootstrap
@@ -512,21 +498,6 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
                 ),
                 False,
             )
-        if isinstance(exc, RunExhaustedProviderPoolError):
-            # the one submit-side message worth reading, and the only one safe to read: Flash
-            # authors this string, so unlike a provider response body it cannot quote a request
-            # that carried a credential. without this the class name alone would make "this run
-            # burned the whole pool" indistinguishable from "the market is dry", which is exactly
-            # the distinction the error exists to draw. still sanitized and bounded, because the
-            # gpu class it interpolates comes from the spec.
-            return (
-                PollResult(
-                    False,
-                    failure="no_capacity",
-                    detail=sanitize_diagnostic(str(exc), limit=1000),
-                ),
-                True,
-            )
         # every other provider exception keeps its class name only. the text can quote a request
         # body, and this detail is persisted into the run record.
         return (
@@ -541,7 +512,7 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
 
 def _submit_candidate(ctx: _SubmitContext, prepared, candidate_plan):
     claim = prepared[0]
-    effective_spec = candidate_plan[3]
+    effective_spec = candidate_plan[2]
     from flash.runner.lifecycle.attempts import require_attempt_launch_current
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import get_status
@@ -578,7 +549,7 @@ def _run_attempt(ctx: _SubmitContext, prepared):
         )
         return result, None, allocation.candidates, True
     result, candidate_not_started = _submit_candidate(ctx, prepared, candidate_plan)
-    candidates, chosen, _, _, _ = candidate_plan
+    candidates, chosen, _, _ = candidate_plan
     return result, chosen, candidates, candidate_not_started
 
 
