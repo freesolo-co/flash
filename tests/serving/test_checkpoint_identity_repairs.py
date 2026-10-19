@@ -10,7 +10,6 @@ from fastapi.testclient import TestClient
 
 from flash.cli.commands.env.testing.eval import _resolve_evaluation_target
 from flash.runner.lifecycle.state import RunStatus
-from flash.runner.results import verified_revisions
 from flash.runner.supervise import transitions
 from flash.schema import format_checkpoint_ref
 from flash.serve.contract.provenance import immutable_binding_fingerprint
@@ -27,6 +26,7 @@ from flash.serving.src.io.schemas import (
 )
 from flash.serving.src.store.persistence import get_adapter
 from flash.serving.src.store.settings import Settings
+from tests._helpers import deployments as deployment_fixtures
 
 
 def _record(org_id: str, *, digest: str = "b" * 64) -> AdapterRecord:
@@ -207,17 +207,17 @@ def test_ambiguous_registration_matches_every_flat_immutable_field() -> None:
     assert not matches_revision_identity({**payload, "lora_rank": 32}, payload)
 
 
-def test_verified_sibling_remains_authorized_while_latest_deployment_failed() -> None:
-    checkpoint = format_checkpoint_ref("run-a", 20)
-    assert (
-        _authorized_chat_checkpoint(
-            "run-a",
-            {"state": "failed", "checkpoint_id": format_checkpoint_ref("run-a", 40)},
-            checkpoint,
-            {checkpoint},
-        )
-        == checkpoint
-    )
+def test_chat_requires_the_selected_checkpoint_record():
+    checkpoint = "run-a/step-20"
+    record = {
+        "state": "ready",
+        "checkpoint_id": checkpoint,
+        "checkpoint_step": 20,
+        "verified_at": 1.0,
+    }
+    assert _authorized_chat_checkpoint("run-a", record, checkpoint) == checkpoint
+    with pytest.raises(Exception, match="has not passed"):
+        _authorized_chat_checkpoint("run-a", record, "run-a/step-40")
 
 
 def test_evaluation_accepts_verified_sibling_without_latest_deployment_equality() -> None:
@@ -227,8 +227,15 @@ def test_evaluation_accepts_verified_sibling_without_latest_deployment_equality(
         @staticmethod
         def get_run(_run_id):
             return {
-                "verified_checkpoints": [checkpoint],
-                "deployment": {"state": "failed", "checkpoint_id": "run-a/step-40"},
+                "deployments": {
+                    checkpoint: {
+                        "state": "ready",
+                        "checkpoint_id": checkpoint,
+                        "checkpoint_step": 20,
+                        "verified_at": 1.0,
+                    },
+                    "run-a/step-40": {"state": "failed", "checkpoint_id": "run-a/step-40"},
+                },
             }
 
     target, run, error = _resolve_evaluation_target(
@@ -239,7 +246,7 @@ def test_evaluation_accepts_verified_sibling_without_latest_deployment_equality(
         RuntimeError,
     )
     assert target == checkpoint
-    assert run["verified_checkpoints"] == [checkpoint]
+    assert run["deployments"][checkpoint]["state"] == "ready"
     assert error is None
 
 
@@ -328,34 +335,33 @@ def _save_ready_status(tmp_path, monkeypatch, run_id: str, summary: str) -> tupl
             run_id=run_id,
             state="deployed",
             spec={"run_id": run_id},
-            deployment={"state": "ready", "checkpoint_id": summary, "verified_at": 1.0},
+            deployments=deployment_fixtures.records(
+                run_id, {"state": "ready", "checkpoint_id": summary, "verified_at": 1.0}
+            ),
         )
     )
     for checkpoint_id in (summary, sibling):
-        assert verified_revisions.add_verified_checkpoint(
-            run_id,
-            checkpoint_id,
-            expected_generation=verified_revisions.verified_checkpoint_generation(run_id),
-        )
+        assert deployment_fixtures.seed_ready_checkpoint(run_id, checkpoint_id)
     return summary, sibling
 
 
 def test_revocation_failure_removes_only_current_chat_authority(tmp_path, monkeypatch) -> None:
     current, sibling = _save_ready_status(tmp_path, monkeypatch, "run-revoke", "run-revoke/final")
 
-    failed = transitions.mark_deployment_revocation_failed("run-revoke", "backend unavailable")
+    failed = transitions.mark_deployment_revocation_failed(
+        "run-revoke", "backend unavailable", current
+    )
 
-    assert failed.deployment["state"] == "revocation_failed"
-    assert verified_revisions.read_verified_checkpoints("run-revoke") == frozenset({sibling})
+    assert failed.deployments[current]["state"] == "revocation_failed"
+    assert deployment_fixtures.ready_checkpoints("run-revoke") == frozenset({sibling})
     with pytest.raises(Exception, match="has not passed"):
         _authorized_chat_checkpoint(
             "run-revoke",
-            failed.deployment,
+            failed.deployments[current],
             current,
-            set(verified_revisions.read_verified_checkpoints("run-revoke")),
         )
     assert (
-        _authorized_chat_checkpoint("run-revoke", failed.deployment, sibling, {sibling}) == sibling
+        _authorized_chat_checkpoint("run-revoke", failed.deployments[sibling], sibling) == sibling
     )
 
 
@@ -368,18 +374,16 @@ def test_sibling_revocation_failure_removes_only_failed_checkpoint(tmp_path, mon
         "run-sibling-failure", "backend unavailable", checkpoint_id=sibling
     )
 
-    assert failed.deployment["state"] == "ready"
-    assert failed.deployment["checkpoint_id"] == current
-    assert "error" not in failed.deployment
-    assert verified_revisions.read_verified_checkpoints("run-sibling-failure") == frozenset(
-        {current}
-    )
+    assert failed.deployments[current]["state"] == "ready"
+    assert failed.deployments[current]["checkpoint_id"] == current
+    assert "error" not in failed.deployments[current]
+    assert deployment_fixtures.ready_checkpoints("run-sibling-failure") == frozenset({current})
     assert (
-        _authorized_chat_checkpoint("run-sibling-failure", failed.deployment, current, {current})
+        _authorized_chat_checkpoint("run-sibling-failure", failed.deployments[current], current)
         == current
     )
     retried = transitions.mark_undeployed("run-sibling-failure", sibling)
-    assert retried.deployment == failed.deployment
+    assert retried.deployments[current] == failed.deployments[current]
 
 
 def test_sibling_undeploy_preserves_deployed_summary_and_state(tmp_path, monkeypatch) -> None:
@@ -388,65 +392,34 @@ def test_sibling_undeploy_preserves_deployed_summary_and_state(tmp_path, monkeyp
     updated = transitions.mark_undeployed("run-sibling", sibling)
 
     assert updated.state == "deployed"
-    assert updated.deployment == {
+    assert updated.deployments[current] == {
         "state": "ready",
         "checkpoint_id": current,
+        "checkpoint_step": None,
         "verified_at": 1.0,
     }
-    assert verified_revisions.read_verified_checkpoints("run-sibling") == frozenset({current})
+    assert deployment_fixtures.ready_checkpoints("run-sibling") == frozenset({current})
 
 
 @pytest.mark.parametrize(("removed_step", "retained_step"), [(None, 20), (40, 20), (20, None)])
-def test_current_undeploy_promotes_remaining_verified_sibling(
+def test_undeploy_preserves_sibling_verification_and_identity(
     tmp_path, monkeypatch, removed_step, retained_step
-) -> None:
-    from flash.runner.lifecycle import state
-    from flash.runner.supervise.deploy import _is_preservable_checkpoint_deployment
+):
+    from flash.runner.lifecycle import state, status
 
     monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
-    run_id = "run-promote"
+    run_id = "run-preserve"
     current = format_checkpoint_ref(run_id, removed_step)
     sibling = format_checkpoint_ref(run_id, retained_step)
-    state._save_status(
-        RunStatus(
-            run_id=run_id,
-            state="deployed",
-            spec={"algorithm": "sft"},
-            deployment={
-                "state": "ready",
-                "checkpoint_id": current,
-                "checkpoint_step": removed_step,
-                "openai_model": current,
-                "adapter_hf_prefix": "removed/adapter",
-                "model": "Qwen/Qwen3.5-9B",
-                "openai_base_url": "https://serve.test/v1",
-                "verified_at": 1.0,
-                "verify_turns": 2,
-                "requested_at": 0.5,
-                "detail": "removed checkpoint smoke result",
-            },
-        )
-    )
-    for checkpoint_id in (current, sibling):
-        assert verified_revisions.add_verified_checkpoint(
-            run_id,
-            checkpoint_id,
-            expected_generation=verified_revisions.verified_checkpoint_generation(run_id),
-        )
-
-    updated = transitions.mark_undeployed("run-promote", current)
-
+    state._save_status(RunStatus(run_id=run_id, state="deployed", spec={}))
+    for target in (current, sibling):
+        deployment_fixtures.seed_ready_checkpoint(run_id, target)
+    before = status.get_status(run_id).deployments[sibling]
+    updated = transitions.mark_undeployed(run_id, current)
+    assert updated.deployments[sibling] == before
+    assert updated.deployments[current]["state"] == "undeployed"
     assert updated.state == "deployed"
-    assert updated.deployment["checkpoint_id"] == sibling
-    assert updated.deployment["checkpoint_step"] == retained_step
-    assert updated.deployment["openai_model"] == sibling
-    suffix = "" if retained_step is None else f"/checkpoints/step-{retained_step}"
-    assert updated.deployment["adapter_hf_prefix"] == f"sft/{run_id}{suffix}/adapter"
-    assert updated.deployment["model"] == "Qwen/Qwen3.5-9B"
-    assert updated.deployment["openai_base_url"] == "https://serve.test/v1"
-    assert not {"verified_at", "verify_turns", "requested_at", "detail"} & updated.deployment.keys()
-    assert _is_preservable_checkpoint_deployment(run_id, updated.deployment)
-    assert verified_revisions.read_verified_checkpoints("run-promote") == frozenset({sibling})
+    assert deployment_fixtures.ready_checkpoints(run_id) == frozenset({sibling})
 
 
 def test_chat_recovery_hint_uses_canonical_final_checkpoint() -> None:

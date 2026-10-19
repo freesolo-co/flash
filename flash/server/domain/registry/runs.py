@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from flash.core.spec import attributed_gpu_type, require_project_id
-from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
+from flash.schema import format_checkpoint_ref
 from flash.server.platform.internal_client import org_id_of, post_internal_json
 
 _LOG = logging.getLogger("flash.server.runs")
@@ -74,32 +74,29 @@ _DEPLOYMENT_FIELDS = frozenset(
         "requested_at",
         "updated_at",
         "verified_at",
-        "last_deploy_failed_at",
+        "generation",
+        "verify_kind",
+        "verify_turns",
+        "verify_latency_s",
+        "verify_finish_reason",
+        "verify_sample",
+        "verify_lora_request_adapter",
         "error",
-        "last_deploy_error",
     }
 )
 
 
-def _checkpoint_id(status: Any) -> str | None:
-    deployment = status.deployment if isinstance(status.deployment, dict) else {}
-    candidate = deployment.get("checkpoint_id")
-    parsed = parse_checkpoint_ref(candidate) if isinstance(candidate, str) else None
-    return candidate if parsed is not None and parsed[0] == status.run_id else None
-
-
-def _deployment_projection(status: Any) -> dict[str, Any] | None:
-    deployment = status.deployment if isinstance(status.deployment, dict) else None
-    checkpoint_id = _checkpoint_id(status)
-    if deployment is None or checkpoint_id is None:
-        return None
-    projected = {**deployment, "checkpoint_id": checkpoint_id}
-    projected["endpoint"] = deployment.get("endpoint") or deployment.get("endpoint_name")
-    return {
-        key: value
-        for key, value in projected.items()
-        if key in _DEPLOYMENT_FIELDS and value is not None
-    }
+def _deployments_projection(status: Any) -> dict[str, dict]:
+    records = {}
+    for checkpoint_id, deployment in status.deployments.items():
+        projected = {**deployment}
+        projected["endpoint"] = deployment.get("endpoint") or deployment.get("endpoint_name")
+        records[checkpoint_id] = {
+            key: value
+            for key, value in projected.items()
+            if key in _DEPLOYMENT_FIELDS and value is not None
+        }
+    return records
 
 
 def _matching_persisted_status(status: Any) -> dict[str, Any] | None:
@@ -226,11 +223,10 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "gpuType": attributed_gpu_type(status) or None,
         "costUsd": status.cost_usd,
         "realizedCostUsd": status.realized_cost_usd,
-        "checkpointId": _checkpoint_id(status),
         "artifactsDir": status.artifacts_dir,
         "error": status.error,
         "spec": spec,
-        "deployment": _deployment_projection(status),
+        "deployments": _deployments_projection(status),
         "lastHeartbeat": public_status.get("last_heartbeat"),
         "gpuStatus": status.gpu_status,
         "lifecycle": _lifecycle_projection(status, public_status),

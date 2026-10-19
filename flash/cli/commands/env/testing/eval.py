@@ -542,11 +542,14 @@ def _resolve_evaluation_target(
             raise
         _err(f"env eval failed: could not resolve verified checkpoints for {run_id}: {exc}")
         return args.target, None, _err("overall: FAIL")
-    verified = run.get("verified_checkpoints") if isinstance(run, dict) else None
-    if not isinstance(verified, list) or any(not isinstance(item, str) for item in verified):
+    from flash.runner.results.deployments import is_ready
+
+    deployments = run.get("deployments") if isinstance(run, dict) else None
+    if not isinstance(deployments, dict):
         _err(f"env eval failed: control plane returned invalid checkpoint authority for {run_id}")
         return args.target, None, _err("overall: FAIL")
-    if args.target not in verified:
+    record = deployments.get(args.target, {})
+    if not isinstance(record, dict) or not is_ready(run_id, record):
         _err(f"env eval failed: checkpoint {args.target} has not passed deployment verification")
         return args.target, None, _err("overall: FAIL")
     return args.target, run, None

@@ -33,6 +33,7 @@ import flash.runner.supervise.lifecycle as runner_lifecycle
 import flash.runner.supervise.recovery as runner_recovery
 from flash.core import catalog
 from flash.providers._lifecycle.net import worker as provider_worker
+from tests._helpers.deployments import records
 from tests._helpers.runner import provisioned_status
 from tests._helpers.source_snapshot import valid_source_snapshot
 
@@ -4904,10 +4905,13 @@ def test_cancel_with_invalid_preparation_uses_zero_failed_billing(monkeypatch, s
                     "launch_claim_token": "claim-0",
                     "started_ts": 1.0,
                 },
-                deployment={
-                    "state": "ready",
-                    "checkpoint_id": f"{public_spec.run_id}/final",
-                },
+                deployments=records(
+                    public_spec.run_id,
+                    {
+                        "state": "ready",
+                        "checkpoint_id": f"{public_spec.run_id}/final",
+                    },
+                ),
                 effective_preparation=snapshot,
             )
         )

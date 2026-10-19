@@ -30,6 +30,12 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Changed
 
+- Managed runs now store one deployment record per checkpoint. Listing and polling expose each
+  checkpoint's state and verification result; undeploy changes only that checkpoint. Chat and
+  evaluation read readiness from those records. The separate verified-checkpoint ledger and
+  replacement-summary logic are removed. This requires a clean cutover and the companion
+  Freesolo checkpoint-inventory schema/backend deployment before updating Flash.
+
 - A Flash run is one seed and may execute several attempts. The provider seed argument threaded
   beside `spec.seed` is gone, so the spec is the only seed channel and no caller can supply a
   second one to disagree with it; `Provider.submit_run`/`poll` are now `submit_attempt`/

@@ -10,7 +10,7 @@ from flash.content.multimodal import messages_with_image_data_uris, normalize_pr
 from flash.core.spec import JobSpec
 from flash.runner.lifecycle.state import adapter_prefix
 from flash.runner.results.checkpoints import checkpoint_adapter_prefix
-from flash.runner.results.verified_revisions import read_verified_checkpoints
+from flash.runner.results.deployments import is_ready
 from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
 
 # run states that have produced a downloadable adapter artifact.
@@ -20,31 +20,10 @@ _DEPLOYMENT_BUSY_STATES = {"queued", "smoke_testing"}
 _DEPLOYMENT_READY_STATES = {"ready"}
 
 
-def _verified_checkpoints(status) -> set[str]:
-    return set(read_verified_checkpoints(status.run_id))
-
-
-def _verified_step_index(checkpoints: set[str], run_id: str) -> dict[int | None, list[str]]:
-    index: dict[int | None, list[str]] = {}
-    for checkpoint_id in checkpoints:
-        parsed = parse_checkpoint_ref(checkpoint_id)
-        if parsed is not None and parsed[0] == run_id:
-            index.setdefault(parsed[1], []).append(checkpoint_id)
-    return index
-
-
-def _format_deployed_steps(index: dict[int | None, list[str]]) -> str:
-    labels = [str(step) for step in sorted(step for step in index if step is not None)]
-    if None in index:
-        labels.append("final")
-    return ", ".join(labels) or "none"
-
-
 def _authorized_chat_checkpoint(
     run_id: str,
     deployment: dict,
     checkpoint_id: object,
-    verified_checkpoints: set[str],
 ) -> str:
     if not isinstance(checkpoint_id, str) or parse_checkpoint_ref(checkpoint_id) is None:
         raise HTTPException(
@@ -58,13 +37,11 @@ def _authorized_chat_checkpoint(
             status_code=400,
             detail=f"checkpoint_id belongs to run {parsed[0]}, not {run_id}",
         )
-    if checkpoint_id not in verified_checkpoints:
+    if deployment.get("checkpoint_id") != checkpoint_id or not is_ready(run_id, deployment):
         raise HTTPException(
             status_code=409,
             detail=f"checkpoint {checkpoint_id} has not passed a successful deployment smoke",
         )
-    # verification is checkpoint-scoped. a newer sibling may queue or fail without revoking this
-    # ready checkpoint, so the mutable run-level deployment summary is not an authorization source.
     return checkpoint_id
 
 

@@ -14,6 +14,7 @@ import flash.server.platform.runtime as server_runtime
 from flash.providers.core import realized
 from flash.providers.runpod.client.cost import shape_endpoint_cost
 from flash.server.domain.ops import reconcile
+from tests._helpers.deployments import records
 
 
 # --------------------------------------------------------------------------- RunPod shaping
@@ -346,7 +347,7 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
             updated_at=now - 100,
             finished_at=now - 7200,
             remote=remote,
-            deployment={"state": "active"},
+            deployments=records("r-adv", {"state": "active"}),
         ),
         _run_deadline_at=created_at + float(spec.gpu.max_wall_seconds),
         _next_attempt=1,
@@ -362,7 +363,7 @@ def test_reconcile_run_does_not_revert_status_advanced_after_snapshot(tmp_path, 
     persisted = runner_status.get_status("r-adv")
     # Status preserved (NOT reverted to the stale `done`), cost fields written.
     assert persisted.state == "deployed"
-    assert persisted.deployment == {"state": "active"}
+    assert persisted.deployments["r-adv/final"]["state"] == "active"
     assert persisted.realized_cost_usd == 3.3
     assert persisted.reconciled_at == now
     assert persisted.realized_cost_remote is None

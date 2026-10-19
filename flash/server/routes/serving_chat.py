@@ -29,7 +29,6 @@ from flash.server.routes.serving_revisions import (
     _DEPLOYMENT_BUSY_STATES,
     _authorized_chat_checkpoint,
     _managed_chat_messages,
-    _verified_checkpoints,
 )
 
 _UPSTREAM_RESPONSE_HEADER_EXCLUSIONS = frozenset(
@@ -93,12 +92,12 @@ def _resolve_chat_request(
     except OpenAIRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     messages = _managed_chat_messages(request.messages)
-    deployment = status.deployment or {}
+    target = payload.get("checkpoint_id")
+    deployment = status.deployments.get(target, {}) if isinstance(target, str) else {}
     authorized_checkpoint = _authorized_chat_checkpoint(
         run_id,
         deployment,
         payload.get("checkpoint_id"),
-        _verified_checkpoints(status),
     )
     try:
         effective_spec = effective_spec_from_status(status)

@@ -24,8 +24,7 @@ def _deployed_chat_run(api):
     """A deployed run ready to chat, returned as (key, run_id)."""
     import flash.runner.lifecycle.state as runner_state
     import flash.runner.lifecycle.status as runner_status
-    import flash.runner.results.verified_revisions as runner_verified_revisions
-    import flash.runner.supervise.transitions as runner_transitions
+    from tests._helpers import deployments as deployment_fixtures
 
     key = _login()
     run_id = api.post(
@@ -35,7 +34,7 @@ def _deployed_chat_run(api):
     status.state = "done"
     runner_state._save_status(status)
     checkpoint_id = f"{run_id}/final"
-    runner_transitions.mark_deployed(
+    deployment_fixtures.complete_deployment(
         run_id,
         {
             "state": "ready",
@@ -43,6 +42,5 @@ def _deployed_chat_run(api):
             "checkpoint_id": checkpoint_id,
             "openai_model": checkpoint_id,
         },
-        verification_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
     return key, run_id
