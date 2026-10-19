@@ -128,6 +128,9 @@ def _install_core(config: dict) -> None:
     save_at_steps = tuple(config.get("save_at_steps", ()))
     if save_at_steps:
         runtime.install_checkpoint_handler_filter(save_at_steps, int(config["total_steps"]))
+        runtime.install_checkpoint_publication_backpressure(
+            config["checkpoint_published_dir"], save_at_steps, int(config["total_steps"])
+        )
     if config.get("reentrant_gradient_checkpointing"):
         _install_reentrant_checkpointing(multimodal=bool(config.get("multimodal")))
 

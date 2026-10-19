@@ -2252,6 +2252,7 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(monkeypatch, tmp_p
     # a required step is durable on both trees, and the ledger records each fact separately.
     assert watcher.lifecycle.facts(5).deployable_published
     assert watcher.lifecycle.facts(5).resume_uploaded
+    assert pathlib.Path(watcher.published_dir, "step-5").is_file()
     assert watcher.lifecycle.missing_deployables(watcher.required_steps) == []
 
 
@@ -5138,6 +5139,7 @@ def test_a_required_save_whose_adapter_never_published_still_fails_the_run(monke
     watcher._publish(1, str(checkpoint_dir))
 
     assert watcher.lifecycle.missing_deployables(watcher.required_steps) == [1]
+    assert not pathlib.Path(watcher.published_dir, "step-1").exists()
     # stop() is where the run learns about it, and it must still raise.
     watcher.start()
     with pytest.raises(RuntimeError, match="required saves were not durably published"):
@@ -5247,3 +5249,22 @@ def test_sft_core_keeps_verl_optimizer_and_installs_linear_scheduler(monkeypatch
     assert engine._build_optimizer(optimizer) is optimizer
     assert engine._build_lr_scheduler(optimizer) == "linear"
     assert scheduler_calls == [(optimizer, {"num_warmup_steps": 2, "num_training_steps": 20})]
+
+
+def test_resume_releases_only_durable_deployable_checkpoint_gates(monkeypatch, tmp_path):
+    from flash.engine.worker.train.entry import sft_train
+
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(tmp_path / "checkpoints"),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=(1, 5),
+    )
+    watcher.lifecycle.mark_resume_uploaded(1)
+    watcher.lifecycle.mark_deployable_published(5)
+    monkeypatch.setattr(watcher._thread, "start", lambda: None)
+    watcher.start()
+    assert not pathlib.Path(watcher.published_dir, "step-1").exists()
+    assert pathlib.Path(watcher.published_dir, "step-5").is_file()
