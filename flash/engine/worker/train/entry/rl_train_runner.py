@@ -309,7 +309,6 @@ def _prepare_rl_files(inp, prompts):
     resume_step = rl_checkpoints._restore_verl_resume(
         local_dir,
         world_size=int(inp["dp_cards"]),
-        expected_fsdp_generation=inp["fsdp_generation"],
         required_steps=tuple(inp["save_at_steps"]),
     )
     train_pq = os.path.join(workdir, "train.parquet")

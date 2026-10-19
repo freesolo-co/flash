@@ -115,7 +115,7 @@ def test_opd_native_manifest_accepts_complete_transported_model_only(tmp_path, m
     source = tmp_path / "native"
     actor = source / "actor"
     actor.mkdir(parents=True)
-    (actor / "fsdp_config.json").write_text(json.dumps({"FSDP_version": 1, "world_size": 1}))
+    (actor / "fsdp_config.json").write_text(json.dumps({"FSDP_version": 2, "world_size": 1}))
     for kind in ("model", "optim", "extra_state"):
         (actor / f"{kind}_world_size_1_rank_0.pt").write_bytes(
             b"x" * (500 if kind == "model" else 10)
@@ -148,7 +148,6 @@ def test_opd_native_manifest_accepts_complete_transported_model_only(tmp_path, m
             "run_id": "run",
             "revision": "pinned",
             "token": "token",
-            "expected_fsdp_generation": 1,
         }
         selected = hf._opd_resume_checkpoint(api, **kwargs)
         assert selected is not None

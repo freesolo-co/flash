@@ -33,7 +33,6 @@ from flash.engine.support.verl_checkpoint import (
     inspect_fsdp_checkpoint_manifest,
     parse_fsdp_stamp,
 )
-from flash.engine.support.verl_policy import FsdpGeneration
 from flash.providers._lifecycle.instances.poll import _attempt_int
 from flash.providers._lifecycle.net.deadline import (
     remaining_seconds,
@@ -120,7 +119,6 @@ def _opd_resume_checkpoint(
     run_id: str,
     revision: str,
     token: str | None,
-    expected_fsdp_generation: FsdpGeneration,
 ) -> _RemoteResumeCheckpoint | None:
     """Inspect the newest canonical OPD checkpoint at one pinned revision."""
     base = f"{phase}/{run_id}/checkpoint/"
@@ -208,7 +206,6 @@ def _opd_resume_checkpoint(
     inspection = inspect_fsdp_checkpoint_manifest(
         stamp_raw,
         [FsdpManifestFile(name, sizes.get(name)) for name in names],
-        expected_generation=expected_fsdp_generation,
         expected_world_size=None,
     )
     return _RemoteResumeCheckpoint(step, prefix, inspection)
@@ -258,7 +255,6 @@ def verify_opd_replacement_safe(
     next_attempt: int,
     contract_version: int,
     phase: str,
-    expected_fsdp_generation: FsdpGeneration,
 ) -> tuple[str, int | None] | None:
     """Return only when replacing an OPD run's worker is safe.
 
@@ -342,7 +338,6 @@ def verify_opd_replacement_safe(
         run_id=run_id,
         revision=revision,
         token=token,
-        expected_fsdp_generation=expected_fsdp_generation,
     )
     if selected is None:
         raise RuntimeError(

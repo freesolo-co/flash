@@ -8,9 +8,7 @@ import uuid
 from dataclasses import dataclass
 
 from flash.adapters.artifacts import MAX_ATTEMPT_ID
-from flash.adapters.fused_experts import lora_target_parameters
 from flash.core.spec import JobSpec
-from flash.engine.support.verl_policy import _resolve_fsdp_generation
 from flash.runner.lifecycle import claim_lock, state
 from flash.runner.lifecycle import status as status_ops
 from flash.teacher.retry_contract import require_opd_retry_contract_version
@@ -116,7 +114,7 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]
         hf_repo = spec.train.hf_repo
         phase = spec.phase
         seed = spec.seed
-        fsdp_generation = _resolve_fsdp_generation("opd", lora_target_parameters(spec.model))
+
     from flash.providers.artifacts.hf import verify_opd_replacement_safe
 
     verified = verify_opd_replacement_safe(
@@ -126,7 +124,6 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]
         next_attempt=next_attempt,
         contract_version=contract_version,
         phase=phase,
-        expected_fsdp_generation=fsdp_generation,
     )
     resume_revision, checkpoint_world_size = verified if verified is not None else (None, None)
     return next_attempt, resume_revision, checkpoint_world_size
