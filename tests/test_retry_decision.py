@@ -38,9 +38,7 @@ def _observe(failure: str, chosen=None, candidates=(), *, cache=False) -> Failur
     return FailureObservation(failure, chosen, candidates, cache)
 
 
-@pytest.mark.parametrize(
-    "failure", ["stalled", "job_preempted", "poll_error", "no_capacity", "oom"]
-)
+@pytest.mark.parametrize("failure", ["stalled", "poll_error", "no_capacity", "oom"])
 def test_candidate_bound_failures_select_only_strictly_larger_candidates(failure):
     small = _candidate("modal", "A100 SXM", 80)
     equal = _candidate("modal", "H100", 80)
@@ -224,3 +222,30 @@ def test_atomic_retry_cas_has_one_owner_and_reuses_persisted_plan(monkeypatch, t
     )
     assert persisted.last_decision is not None
     assert persisted.last_decision.failure == "stalled"
+
+
+def test_preemption_resumes_at_the_largest_shape_without_raising_the_oom_floor():
+    chosen = _candidate("modal", "H100", 80, 8)
+    original = replace(RetryState.initial_for_spec(_spec()), usable_vram_floor=40)
+    updated, plan = transition_failure(
+        original, _observe("job_preempted", chosen, (chosen,)), attempt=0
+    )
+    restored = RetryState.from_snapshot(_spec(), updated.to_snapshot())
+    assert plan.retry
+    assert plan.infra_retry_ordinal == 1
+    assert restored.usable_vram_floor == 40
+    assert restored.oom_used == 0
+    assert restored.select_candidate((chosen,)) == ((chosen,), chosen)
+
+
+@pytest.mark.parametrize("budget", [0, 2])
+def test_preemption_retries_are_bounded_even_when_the_same_shape_is_available(budget):
+    chosen = _candidate("modal", "H100", 80, 8)
+    retry_state = RetryState(budget, 2, 1)
+    for attempt in range(budget + 1):
+        retry_state, plan = transition_failure(
+            retry_state, _observe("job_preempted", chosen, (chosen,)), attempt=attempt
+        )
+        assert plan.retry is (attempt < budget)
+    assert retry_state.infra_used == budget
+    assert "budget exhausted" in plan.action

@@ -330,6 +330,20 @@ def transition_failure(
             observation,
             attempt,
         )
+    if failure == "job_preempted":
+        # Preemption says nothing about memory demand. Advancing the OOM floor here
+        # made a healthy worker at the largest allowed shape impossible to resume.
+        if state.infra_used >= state.infra_retries:
+            plan = RetryPlan(False, "not retrying: infrastructure retry budget exhausted")
+        else:
+            ordinal = state.infra_used + 1
+            state = replace(state, infra_used=ordinal, cache_retry_shape=None)
+            plan = RetryPlan(
+                True,
+                "retrying after preemption (resume from last checkpoint)",
+                ordinal,
+            )
+        return _finish(state, plan, observation, attempt)
     floor = max(state.usable_vram_floor, _candidate_usable_vram_gb(chosen))
     state = replace(state, usable_vram_floor=floor, cache_retry_shape=None)
     if candidates is not None and not any(
