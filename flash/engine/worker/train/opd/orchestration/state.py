@@ -48,7 +48,7 @@ class _WorkloadState:
     update_horizon: int
     prompt_pool_fingerprint: str
     workdir: str
-    shim_dir: str
+    runtime_dir: str
     local_dir: str
     export_root: str
     mutation_failure_path: str

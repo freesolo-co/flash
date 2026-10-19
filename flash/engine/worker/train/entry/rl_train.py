@@ -47,7 +47,7 @@ from flash.engine.worker.train.entry.rl_train_runner import (
     _step_timing_fields,
     _StepMetricState,
     _validate_rl_child,
-    _write_rl_plugin_config,
+    _write_rl_launch_config,
 )
 from flash.engine.worker.train.entry.sft_train import _cached_model_path
 from flash.engine.worker.train.rl.launch.verl_config import (
@@ -155,7 +155,7 @@ def _configure_rl_child(
     expected_steps, loggers, project_name, experiment_name, cc_ok = _resolve_training_settings(
         inp, caps
     )
-    _write_rl_plugin_config(
+    _write_rl_launch_config(
         inp,
         files,
         gdn_reset_arch=gdn_reset_arch,

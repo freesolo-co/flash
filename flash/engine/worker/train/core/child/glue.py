@@ -24,7 +24,7 @@ import warnings
 from typing import Any
 from uuid import uuid4
 
-from flash_reasoning_normalization import (
+from flash.content.reasoning_normalization import (
     messages_for_chat_template as _messages_for_chat_template,
 )
 

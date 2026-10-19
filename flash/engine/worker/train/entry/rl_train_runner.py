@@ -38,7 +38,6 @@ from flash.engine.worker.train.core.lifecycle.step_timing import StepTiming
 from flash.engine.worker.train.entry.backend_common import (
     _ORPHANED_PIPE_GRACE_S,
     _TEARDOWN_GRACE_S,
-    SHIM_FRAGMENT_FAILED_EXIT_CODE,
     ChildOutputTail,
     VerlChildSilenceWatchdog,
     _ChildExitWatchdog,
@@ -51,11 +50,10 @@ from flash.engine.worker.train.entry.backend_common import (
     parse_verl_step_metrics,
     parse_wandb_link,
     raise_for_classified_verl_exit,
-    render_sitecustomize_bootstrap,
+    readiness_file,
     resolve_verl_loggers,
-    shim_marker_file,
     stamp_adapter_dir_provenance,
-    verify_applied_shim_markers,
+    verify_runtime_ready,
     verl_device_capability,
     verl_step_number,
 )
@@ -63,15 +61,12 @@ from flash.engine.worker.train.entry.sft_train import (
     _build_verl_child_env,
     _NvidiaSmiPeakSampler,
 )
-from flash.engine.worker.train.rl.child.plugin import required_patch_names
 from flash.engine.worker.train.rl.rollout.identity import RolloutIdentityLedger
 from flash.engine.worker.train.rl.rollout.multi_turn import (
     MultiTurnBridge,
-    copy_grpo_child_modules,
     multi_turn_child_env,
     start_reward_server,
 )
-from flash.engine.worker.train.rl.rollout.reward_module import render_reward_module
 from flash.engine.worker.train.rl.rollout.single_turn import (
     score_single_turn,
     score_single_turn_batch,
@@ -258,7 +253,7 @@ def _prepare_rl_inputs():
     )
     # no setup_perf_backends() here: torch's tf32 flags are per-process state that a subprocess does
     # not inherit, and this process trains nothing -- verl does, out of process. the child opts in
-    # from its own sitecustomize instead (render_tf32_shim, wired into shim_source below).
+    # through its explicit process initializer.
 
     inp = rl_inputs._resolve_grpo_inputs()
     env, tok = inp["env"], inp["tok"]
@@ -331,22 +326,19 @@ def _prepare_rl_files(inp, prompts):
     )
     rl_verl_config.write_verl_grpo_parquet(rows, train_pq)
     rl_verl_config.write_verl_grpo_parquet(rows[: max(1, min(4, len(rows)))], val_pq)
-    with open(reward_py, "w") as f:
-        f.write(render_reward_module())
+    reward_py = os.path.join(os.path.dirname(__file__), "../rl/child/reward.py")
 
-    # runtime patches for the verl interpreter. a stale shim from a prior attempt would otherwise
-    # keep patching this one, so the file is rewritten every time.
-    shim_dir = os.path.join(workdir, "shim")
-    os.makedirs(shim_dir, exist_ok=True)
-    # the marker file the child's wrapped fragments append to. a stale one from a prior attempt
-    # would prove patches this attempt never applied, so it is removed alongside the rewrite.
-    shim_markers = shim_marker_file(shim_dir)
-    if os.path.exists(shim_markers):
-        os.remove(shim_markers)
+    # each launch owns its configuration and readiness record.
+    runtime_dir = os.path.join(workdir, "runtime")
+    os.makedirs(runtime_dir, exist_ok=True)
+    # remove the previous attempt's readiness record before constructing the trainer.
+    readiness_path = readiness_file(runtime_dir)
+    if os.path.exists(readiness_path):
+        os.remove(readiness_path)
     # where each rank records the gpu uuid it opened, so a collision is caught before nccl init.
     # removed for the same reason as the marker file: a stale one from a prior attempt would show
     # ranks claiming devices this attempt never touched, and read as a collision that is not there.
-    rank_device_claims = os.path.join(shim_dir, "rank_device_claims.txt")
+    rank_device_claims = os.path.join(runtime_dir, "rank_device_claims.txt")
     if os.path.exists(rank_device_claims):
         os.remove(rank_device_claims)
     return {
@@ -358,28 +350,20 @@ def _prepare_rl_files(inp, prompts):
         "train_pq": train_pq,
         "val_pq": val_pq,
         "reward_py": reward_py,
-        "shim_dir": shim_dir,
-        "shim_py": os.path.join(shim_dir, "sitecustomize.py"),
-        "shim_markers": shim_markers,
+        "runtime_dir": runtime_dir,
+        "readiness_path": readiness_path,
         "rank_device_claims": rank_device_claims,
-        "plugin_config_path": os.path.join(shim_dir, "flash_grpo_plugin_config.json"),
+        "launch_config_path": os.path.join(runtime_dir, "flash_grpo_launch_config.json"),
     }
 
 
-def _write_rl_shim(inp, files) -> None:
-    """write the minimal startup bootstrap and copy the complete GRPO plugin bundle."""
-    with open(files["shim_py"], "w", encoding="utf-8") as file:
-        file.write(render_sitecustomize_bootstrap())
-    copy_grpo_child_modules(files["shim_dir"])
-
-
-def _write_rl_plugin_config(inp, files, *, gdn_reset_arch: str | None, loggers) -> None:
-    """serialize the final GRPO plugin configuration after capability resolution."""
+def _write_rl_launch_config(inp, files, *, gdn_reset_arch: str | None, loggers) -> None:
+    """serialize the final GRPO runtime configuration after capability resolution."""
     targeting = resolve_lora_targeting(
         inp["model_id"], algorithm="grpo", multimodal=bool(inp["multimodal"])
     )
     config = {
-        "marker_file": files["shim_markers"],
+        "readiness_path": files["readiness_path"],
         "dp_cards": int(inp["dp_cards"]),
         "reentrant_checkpointing": bool(inp["reentrant_checkpointing"]),
         "multimodal": bool(inp["multimodal"]),
@@ -397,15 +381,14 @@ def _write_rl_plugin_config(inp, files, *, gdn_reset_arch: str | None, loggers) 
         "gdn_model_type": gdn_reset_arch,
         "wandb": "wandb" in loggers,
     }
-    expected = required_patch_names(config)
-    with open(files["plugin_config_path"], "w", encoding="utf-8") as handle:
+    expected = ("runtime-ready",)
+    with open(files["launch_config_path"], "w", encoding="utf-8") as handle:
         json.dump(config, handle, sort_keys=True, separators=(",", ":"))
-    files["expected_shims"] = expected
+    files["expected_components"] = expected
 
 
 def _prepare_rl_runtime(inp, env, tok, prompts):
     files = _prepare_rl_files(inp, prompts)
-    _write_rl_shim(inp, files)
     return files, _start_reward_runtime(inp, env, tok, prompts, files)
 
 
@@ -564,15 +547,11 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
     # allowlist the child env because ray fans it to every actor; scoring stays in the parent, so
     # the child needs no platform hf token, github token, or user secrets. FLA_ kernel settings
     # still cross through _CHILD_ENV_PREFIXES.
-    env_for_verl = _build_verl_child_env(
-        shim_dir=files["shim_dir"], wandb_enabled="wandb" in loggers
-    )
-    env_for_verl["VERL_USE_EXTERNAL_MODULES"] = "flash_grpo_plugin"
-    env_for_verl["FLASH_GRPO_PLUGIN_CONFIG_PATH"] = files["plugin_config_path"]
+    env_for_verl = _build_verl_child_env(wandb_enabled="wandb" in loggers)
     env_for_verl["FLASH_VERL_REWARD_URL"] = reward_url
-    env_for_verl["VERL_FILE_LOGGER_PATH"] = os.path.join(files["shim_dir"], "step_metrics.jsonl")
+    env_for_verl["VERL_FILE_LOGGER_PATH"] = os.path.join(files["runtime_dir"], "step_metrics.jsonl")
     # where each rank records the gpu it opened. ray fans this env to every actor, which is what
-    # makes the file a rendezvous point: the deferred plugin check compares ranks before a process
+    # makes the file a rendezvous point: the actor constructor compares ranks before a process
     # group exists.
     env_for_verl["FLASH_RANK_DEVICE_CLAIMS"] = files["rank_device_claims"]
     # the model is prefetched above; keep the subprocess off hf's rate-limited api.
@@ -681,7 +660,14 @@ def _execute_rl_child(
     resume_step = int((files or {}).get("resume_step", 0))
     state.resume_step = resume_step
     proc = subprocess.Popen(
-        [python_bin, "-m", "flash_grpo_entry", *overrides],
+        [
+            python_bin,
+            "-m",
+            "flash.engine.worker.train.rl.child.entry",
+            "--flash-config",
+            files["launch_config_path"],
+            *overrides,
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -708,9 +694,9 @@ def _execute_rl_child(
     # already-dumped step, which this loop skips, exactly as it skips any other repeat.
     if resume_step:
         last_dump_step[0] = resume_step
-    shim_markers = (files or {}).get("shim_markers")
-    expected_shims = (files or {}).get("expected_shims", ())
-    shims_verified = shim_markers is None
+    readiness_path = (files or {}).get("readiness_path")
+    expected_components = (files or {}).get("expected_components", ())
+    runtime_verified = readiness_path is None
     try:
         for line in child_stream:
             print(f"[verl] {line}", end="", flush=True)
@@ -721,13 +707,10 @@ def _execute_rl_child(
             if step_number is not None:
                 progress["step"] = step_number
                 silence_watchdog.observe_step(step_number)
-                # the first step line is the training-start boundary: sitecustomize import is long
-                # finished by then, so a marker still missing means this child is training with no
-                # flash patch at all, so fail now rather than after the whole run is paid for. not
-                # on the first output line: fragments print while later ones are still applying.
-                if not shims_verified:
-                    verify_applied_shim_markers(shim_markers, expected_shims)
-                    shims_verified = True
+                # a step is only valid after the selected trainer has finished initialization.
+                if not runtime_verified:
+                    verify_runtime_ready(readiness_path, expected_components)
+                    runtime_verified = True
                 # dump one sample completion per new step to the flash log (#607).
                 if progress["step"] != last_dump_step[0]:
                     # the generation boundary: verl logs this line once its step is scored, so
@@ -817,16 +800,6 @@ def _validate_rl_child(
     files=None,
     reward_runtime=None,
 ):
-    if rc == SHIM_FRAGMENT_FAILED_EXIT_CODE:
-        # the wrapped fragment printed its traceback and named itself before exiting; classify
-        # this as permanent, not retriable infra: the same interpreter fails identically on
-        # retry. a foreign FLASH_VERL_PYTHON or a drifted verl/transformers is the usual cause.
-        raise RuntimeError(
-            f"verl.trainer.main_ppo exited {rc}: a required flash runtime patch failed to apply "
-            "in the child interpreter (its traceback names the fragment in the flash log). the "
-            "verl/transformers stack at the child python is incompatible with this flash "
-            "version; rebuild the worker image or fix FLASH_VERL_PYTHON rather than retrying."
-        )
     if rc != 0:
         raise RuntimeError(
             f"verl.trainer.main_ppo exited {rc}; see the flash log for the traceback"
@@ -838,9 +811,9 @@ def _validate_rl_child(
         )
     # belt and braces behind the first-step check in _execute_rl_child: a run that exits 0 without
     # printing a step line (a resume already at the horizon) still may not pass unverified.
-    shim_markers = (files or {}).get("shim_markers")
-    if shim_markers is not None:
-        verify_applied_shim_markers(shim_markers, (files or {}).get("expected_shims", ()))
+    readiness_path = (files or {}).get("readiness_path")
+    if readiness_path is not None:
+        verify_runtime_ready(readiness_path, (files or {}).get("expected_components", ()))
     # the gradient verdict runs here, ahead of required-save completeness, because a zero-gradient
     # run withholds every required deployable by design. checking completeness first would report
     # the publication symptom instead of the missing actor update evidence that caused it.

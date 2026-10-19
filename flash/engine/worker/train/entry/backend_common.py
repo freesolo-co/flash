@@ -27,12 +27,12 @@ from typing import Self
 
 # verl 0.8.0 exactly, plus the truncation-mask, 3d position-id, and ulysses fused-label fixes, the
 # whole-adapter lora bucket sync, and the fused-linear grad-flag preservation.
-# it must stay on the 0.8.0 base: the opd plugin patches 0.8.0 internals and imports
+# it must stay on the 0.8.0 base: the OPD trainer extends the 0.8.0 interfaces and imports
 # verl.trainer.main_ppo_sync, which verl deleted after 0.8.0, and opd's exact-version gate reads the
 # version file this branch pins to the release value.
 VERL_REQUIREMENT_NAME = "verl"
 VERL_REQUIREMENT_URL = (
-    "git+https://github.com/freesolo-co/verl@f71a02ddb32a9c6a6915f7519bda6dede92e9dd0"
+    "git+https://github.com/freesolo-co/verl@716f204cf87d33ef3c272b070bc0b08a5f00ea27"
 )
 # the pin, as the venv stamp records it. the provisioning install asks for the [vllm] extra of this
 # same commit; the stamp stays extra-free so it identifies the verl a venv holds, not how it was
@@ -74,14 +74,14 @@ FLA_REQUIREMENT = (
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git"
     "@9c8e42e762fce087c27b673af4922795d9edb85e"
 )
-# the flashqla GDN backend lives in a separate wheel that fla 0.5.2 dispatches to; the child's
-# shim binds it on sm90 only (child_io.render_flash_qla_shim).
+# the pinned FLA dispatcher selects FlashQLA only when its native hardware and shape
+# verifier accepts the request; Flash does not replace the model's kernel callable.
 FLASH_QLA_REQUIREMENT = "flash-qla==0.1.2"
 CAUSAL_CONV1D_REQUIREMENT = "causal-conv1d==1.6.2.post1"
 
 # the SAME transformers range the main interpreter and Dockerfile.worker's verl-venv layer use.
 # this venv is the interpreter that TRAINS, and transformers owns the gdn modelling code the
-# boundary-reset shim patches (chunk_gated_delta_rule, the causal conv, and the kwargs they read),
+# boundary hook supplies (chunk_gated_delta_rule, the causal conv, and the kwargs they read),
 # so an unbounded resolve here means the training path silently rides a transformers line nothing
 # validated. bounding it to the range flash tests against is the whole reason. verl and vllm both
 # depend on transformers, so this has to be in the OVERRIDE file as well as the direct list -- a
@@ -961,21 +961,14 @@ from flash.engine.worker.verl.checkpoints import (  # noqa: E402,F401
 )
 from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     _VERL_METRIC_FIELDS,
-    FLASH_CUDART_STUB_MARKER,
-    FLASH_GDN_VARLEN_MARKER,
-    FLASH_TF32_MARKER,
     FLASH_WANDB_LINK_MARKER,
-    SHIM_FRAGMENT_FAILED_EXIT_CODE,
     append_step_metrics,
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
-    read_applied_shim_markers,
-    render_sitecustomize_bootstrap,
-    render_tf32_shim,
-    render_tilelang_cudart_shim,
-    shim_marker_file,
-    verify_applied_shim_markers,
+    read_ready_components,
+    readiness_file,
+    verify_runtime_ready,
     verl_step_number,
 )
 

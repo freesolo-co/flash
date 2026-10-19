@@ -9,7 +9,7 @@ scorer's own batched implementation.
 
 Parent-side only. The batchers live on the flash side of the verl process boundary (the child
 reaches them over the reward/teacher rpc bridges), so this module must never be imported by the
-copied child modules -- it is not part of what ``sitecustomize.py`` delivers.
+packaged child modules -- this batcher is owned by the parent worker.
 
 Callers differ in three ways, each a constructor argument rather than a fork in the code:
 

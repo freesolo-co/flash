@@ -312,16 +312,16 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # already resolved. verl and vllm both depend on transformers, so without the exact override a
 # transitive requirement can re-widen even an exact direct pin. the
 # venv is the interpreter that trains, and transformers owns the gdn modelling code the boundary-
-# reset shim patches (chunk_gated_delta_rule, the causal conv, and the kwargs they read). the main
+# reset hook supplies (chunk_gated_delta_rule, the causal conv, and the kwargs they read). the main
 # interpreter carrying an exact pin protects nothing in here (/opt/verl-venv is built without
-# --system-site-packages). changing this exact pin means re-validating the gdn shim against the new
+# --system-site-packages). changing this exact pin means re-validating the gdn hook against the new
 # version, not just bumping the number.
 #
 # This pin is NOT what makes the sanity block below pass. is_flash_linear_attention_available() and
 # is_causal_conv1d_available() are byte-identical in 5.12.1 and 5.14.1, and both begin with
 # is_torch_cuda_available() -- they answer False on this cpu builder at every version. An earlier
 # revision of this comment blamed a 5.13 import-path move; no such move exists.
-ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@f71a02ddb32a9c6a6915f7519bda6dede92e9dd0
+ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@716f204cf87d33ef3c272b070bc0b08a5f00ea27
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
 RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers==5.12.1" > /tmp/verl-overrides.txt \
     && uv venv --seed /opt/verl-venv \
@@ -378,7 +378,7 @@ RUN set -eu; \
 # causal_conv1d in the VERL VENV, which is where the model actually trains. The main interpreter's
 # copy above does not reach here: /opt/verl-venv is built without --system-site-packages, so the two
 # have disjoint paths. Together with fla's cu_seqlens (installed above) this is what makes the packed
-# GDN boundary resets real rather than decorative: engine.worker.backend_common's boundary shim hands
+# GDN boundary resets real rather than decorative: engine.worker.backend_common's boundary hook hands
 # the GDN layer cu_seq_lens_q + seq_idx, but transformers' pure-torch fallbacks take **kwargs and
 # silently DISCARD both, so a child missing these kernels trains across example boundaries while
 # looking patched. verl_child_can_reset_gdn_boundaries probes this venv for exactly that reason.
@@ -419,7 +419,7 @@ RUN python /tmp/cudartfix/extract_cudart_fix.py /tmp/cudartfix/capabilities.py /
 
 # Sanity: the verl venv must be able to LAUNCH, not merely install. This is the assert that would
 # have caught the shipped-but-unrunnable venv. Import the three entrypoints flash actually invokes
-# (rl_train -> main_ppo, opd_plugin -> main_ppo_sync, sft_train -> sft_trainer; note it is
+# (rl_train -> main_ppo, opd child trainer -> main_ppo_sync, sft_train -> sft_trainer; note it is
 # sft_trainer, NOT fsdp_sft_trainer, which does not exist in this pin), the vLLM rollout modules
 # where a version mismatch would surface, and the fork-only rollout field the GRPO path emits as a
 # hydra override. Also assert the Qwen3.5 archs are registered, since that is the entire reason this

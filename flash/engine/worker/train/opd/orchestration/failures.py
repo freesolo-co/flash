@@ -22,7 +22,6 @@ import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.perf as _worker_perf
 import flash.engine.worker.runtime.state as _worker_state
 from flash.engine.worker.train.entry.sft_train import (
-    SHIM_FRAGMENT_FAILED_EXIT_CODE,
     _export_checkpoint_adapter,
     _VerlCheckpointWatcher,
 )
@@ -223,15 +222,6 @@ def _raise_verl_failure(
         raise _worker_perf.RetriableInfraError("transient teacher bridge failure")
     if return_code == PERMANENT_TEACHER_EXIT:
         raise RuntimeError("permanent teacher bridge failure")
-    if return_code == SHIM_FRAGMENT_FAILED_EXIT_CODE:
-        # permanent, not retriable infra: the same interpreter fails the same fragment on retry.
-        raise RuntimeError(
-            f"verl OPD subprocess exited with status {return_code}: a required flash runtime "
-            "patch failed to apply in the child interpreter (its traceback names the fragment in "
-            "the flash log). "
-            "the verl/transformers stack at the child python is incompatible with this flash "
-            "version; rebuild the worker image or fix FLASH_VERL_PYTHON rather than retrying."
-        )
     if truncation_window is not None and truncation_window.indicates_completion_cap:
         raise RuntimeError(
             f"verl OPD subprocess exited with status {return_code}: flash OPD produced no "

@@ -5,32 +5,23 @@ talking to the parent's localhost bridge and about what to do when that conversa
 json request, classify the error, and drop a fallback file on disk so the parent can attribute the
 child's exit even when the bridge itself is what broke.
 
-Split out of the OPD child plugin to keep that module under the file-size limit. It deliberately
-does not import the plugin back: both files land flat in the child workdir, and a cycle there would
-fail at import time inside verl rather than here.
+The parent and packaged child share these transport and failure contracts.
 """
 
 from __future__ import annotations
 
 import contextlib
-import functools
 import http.client
 import json
 import os
 import tempfile
 import traceback
-import types
 import urllib.error
 import urllib.request
 
-if __name__ == "flash_opd_bridge":
-    from flash_child_diagnostics import neutralize_control_chars, sanitize_diagnostic
-else:
-    from flash._internal.diagnostics import neutralize_control_chars, sanitize_diagnostic
+from flash._internal.diagnostics import neutralize_control_chars, sanitize_diagnostic
 
-# duplicated rather than imported from the plugin: this module is copied flat into the child
-# workdir alongside it, and importing back would make the pair circular there. the parent reads
-# these same two numbers off the child's exit status, so they must stay in step.
+# these transport exit codes are shared with the parent reconciliation contract.
 _PERMANENT_TEACHER_EXIT = 86
 _TRANSIENT_TEACHER_EXIT = 87
 _FAILURE_FALLBACK_MAX_CHARS = 8192
@@ -39,23 +30,6 @@ _ROLLOUT_FAILURE_VERSION = 1
 _ROLLOUT_FAILURE_TYPE_MAX_CHARS = 200
 _ROLLOUT_FAILURE_MESSAGE_MAX_CHARS = 2000
 _ROLLOUT_FAILURE_TRACEBACK_MAX_CHARS = 5000
-
-
-def _plugin():
-    """The child plugin module, imported lazily because it re-exports this one.
-
-    Four names here are patched as attributes of `plugin` by the opd tests -- `_post_json`,
-    `_mutation_distributed`, `_publish_mutation_notice`, `_coordinate_first_mutation_notice` --
-    and every caller of theirs lives in this file. Resolving them through the plugin is what
-    keeps those patches effective; a direct call would bind this module's own function. The flat
-    name is the one that exists in the verl child workdir, where `flash` is not importable.
-    """
-    if __name__ == "flash_opd_bridge":
-        import flash_opd_plugin as plugin
-    else:
-        from flash.engine.worker.train.opd.child import plugin
-
-    return plugin
 
 
 class FlashTeacherBridgeError(RuntimeError):
@@ -443,7 +417,7 @@ def _unexpected_mutation_bridge_error(error: Exception) -> FlashTeacherBridgeErr
 def _publish_mutation_notice(url: str, token: str) -> None:
     payload = {"process_id": os.getpid()}
     try:
-        _plugin()._post_json(url, token, "/mutation", payload)
+        _post_json(url, token, "/mutation", payload)
         return
     except FlashTeacherBridgeError as error:
         if not error.delivery_unknown:
@@ -458,7 +432,7 @@ def _publish_mutation_notice(url: str, token: str) -> None:
         raise bridge_error from error
 
     try:
-        _plugin()._post_json(url, token, "/mutation", payload)
+        _post_json(url, token, "/mutation", payload)
     except FlashTeacherBridgeError as error:
         _write_mutation_failure_fallback(error.classification, str(error))
         raise
@@ -473,7 +447,7 @@ def _publish_mutation_notice(url: str, token: str) -> None:
 
 def _post_no_signal_resample(url: str, token: str) -> None:
     try:
-        _plugin()._post_json(url, token, "/no-signal/resample", {})
+        _post_json(url, token, "/no-signal/resample", {})
     except FlashTeacherBridgeError as error:
         _write_resample_failure_fallback(_fallback_classification(error), str(error))
         raise
@@ -488,7 +462,7 @@ def _post_no_signal_resample(url: str, token: str) -> None:
 def _post_no_signal_abandoned(url: str, token: str) -> dict:
     """Tell the bridge this step is abandoned; return its per-reason skip tally for the error text."""
     try:
-        response = _plugin()._post_json(url, token, "/no-signal/abandoned", {})
+        response = _post_json(url, token, "/no-signal/abandoned", {})
         return dict((response or {}).get("skip_counts") or {})
     except FlashTeacherBridgeError as error:
         _write_abandonment_failure_fallback(
@@ -506,7 +480,7 @@ def _post_no_signal_abandoned(url: str, token: str) -> dict:
 
 def _post_teacher_cycle_committed(url: str, token: str) -> None:
     try:
-        _plugin()._post_json(url, token, "/teacher-cycle/committed", {})
+        _post_json(url, token, "/teacher-cycle/committed", {})
         return
     except FlashTeacherBridgeError as error:
         if not error.delivery_unknown:
@@ -520,7 +494,7 @@ def _post_teacher_cycle_committed(url: str, token: str) -> None:
         raise
 
     try:
-        _plugin()._post_json(url, token, "/teacher-cycle/committed", {})
+        _post_json(url, token, "/teacher-cycle/committed", {})
     except FlashTeacherBridgeError as error:
         _write_cycle_commit_failure_fallback(
             _fallback_classification(error),
@@ -552,12 +526,12 @@ def _mutation_distributed():
 
 
 def _coordinate_first_mutation_notice(url: str, token: str) -> None:
-    distributed = _plugin()._mutation_distributed()
+    distributed = _mutation_distributed()
     distributed.barrier()
     outcome: list[tuple[str, str] | None] = [None]
     if distributed.get_rank() == 0:
         try:
-            _plugin()._publish_mutation_notice(url, token)
+            _publish_mutation_notice(url, token)
         except FlashTeacherBridgeError as error:
             outcome[0] = (error.classification, str(error))
     distributed.broadcast_object_list(outcome, src=0)
@@ -568,21 +542,13 @@ def _coordinate_first_mutation_notice(url: str, token: str) -> None:
 
 
 def _wrap_optimizer_with_mutation_notice(optimizer, url: str, token: str):
-    original_step = optimizer.step
     mutation_acknowledged = False
 
-    # torch's lr scheduler patches optimizer.step to assert step ordering, and that patch reads
-    # step_fn.__func__ and rebinds it with func.__get__(opt, opt.__class__). both only exist on a
-    # bound method, so assigning a plain function here fails with "'function' object has no
-    # attribute '__func__'" as soon as verl builds its warmup scheduler, before any gpu work
-    # happens. bind the wrapper to the instance so the descriptor protocol keeps working.
-    @functools.wraps(original_step)
-    def step_with_notice(_optimizer, *args, **kwargs):
+    def before_step(_optimizer, _args, _kwargs):
         nonlocal mutation_acknowledged
         if not mutation_acknowledged:
-            _plugin()._coordinate_first_mutation_notice(url, token)
+            _coordinate_first_mutation_notice(url, token)
             mutation_acknowledged = True
-        return original_step(*args, **kwargs)
 
-    optimizer.step = types.MethodType(step_with_notice, optimizer)
+    optimizer.register_step_pre_hook(before_step)
     return optimizer

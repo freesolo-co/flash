@@ -381,8 +381,8 @@ def test_grpo_child_env_reasserts_native_thread_policy_last(monkeypatch):
     env = rl_train_runner._build_rl_child_env(
         {"multi_turn": False},
         {
-            "shim_dir": "/tmp/shim",
-            "plugin_config_path": "/tmp/plugin.json",
+            "runtime_dir": "/tmp/runtime",
+            "launch_config_path": "/tmp/launch.json",
             "rank_device_claims": "/tmp/claims",
         },
         [],

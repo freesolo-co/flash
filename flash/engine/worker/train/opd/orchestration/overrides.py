@@ -18,10 +18,10 @@ from flash.engine.worker.train.entry.backend_common import (
     actor_fsdp_strategy_overrides,
     agent_loop_workers,
     ray_num_cpus,
+    readiness_file,
     rollout_layered_summon_overrides,
     rollout_mm_processor_cache_overrides,
     rollout_resident_overrides,
-    shim_marker_file,
     trainer_dtype_overrides,
 )
 from flash.engine.worker.train.entry.sft_train import _build_verl_child_env, _hydra_val
@@ -275,7 +275,7 @@ def _reward_overrides(config: dict) -> list[str]:
 
 def _distillation_overrides(config: dict) -> list[str]:
     return [
-        "distillation._target_=flash_opd_plugin.FlashRemoteDistillationConfig",
+        "distillation._target_=flash.engine.worker.train.opd.child.config.FlashRemoteDistillationConfig",
         "distillation.enabled=true",
         "distillation.n_gpus_per_node=0",
         "distillation.nnodes=0",
@@ -365,20 +365,22 @@ def build_opd_overrides(config: dict) -> list[str]:
     return overrides
 
 
-def _build_opd_plugin_config(
+def _build_opd_launch_config(
     *,
-    shim_dir: str,
+    runtime_dir: str,
     save_at_steps,
     total_steps: int,
     gdn_model_type: str | None,
     loggers,
     lora_language_prefix: str = "",
+    structured_outputs: dict | None = None,
 ) -> str:
-    """serialize the non-secret OPD runtime patch configuration."""
+    """serialize the non-secret OPD runtime configuration."""
     return json.dumps(
         {
-            "marker_file": shim_marker_file(shim_dir),
+            "readiness_path": readiness_file(runtime_dir),
             "no_signal_attempts": OPD_NO_SIGNAL_ATTEMPTS,
+            "structured_outputs": structured_outputs,
             "save_at_steps": list(save_at_steps),
             "total_steps": int(total_steps),
             **({"lora_language_prefix": lora_language_prefix} if lora_language_prefix else {}),
@@ -392,7 +394,7 @@ def _build_opd_plugin_config(
 
 def _build_opd_child_env(
     *,
-    shim_dir: str,
+    runtime_dir: str,
     wandb_enabled: bool,
     bridge_url: str,
     bridge_token: str,
@@ -411,12 +413,11 @@ def _build_opd_child_env(
     abandonment_failure_path: str = "",
     resample_failure_path: str = "",
     cycle_commit_failure_path: str = "",
-    plugin_config: str = "",
+    launch_config: str = "",
 ) -> dict[str, str]:
-    child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled)
+    child = _build_verl_child_env(wandb_enabled=wandb_enabled)
     child.update(
         {
-            "VERL_USE_EXTERNAL_MODULES": "flash_opd_plugin",
             "FLASH_OPD_BRIDGE_URL": bridge_url,
             "FLASH_OPD_BRIDGE_TOKEN": bridge_token,
             "FLASH_OPD_SEED": str(int(seed)),
@@ -462,8 +463,9 @@ def _build_opd_child_env(
                 "FLASH_OPD_THINKING": "1" if thinking else "0",
             }
         )
-    if plugin_config:
-        child["FLASH_OPD_PLUGIN_CONFIG"] = plugin_config
+    if launch_config:
+        with open(os.path.join(runtime_dir, "launch.json"), "w", encoding="utf-8") as handle:
+            handle.write(launch_config)
     return child
 
 
