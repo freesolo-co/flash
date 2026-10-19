@@ -753,10 +753,8 @@ def test_engine_runtime_environment_is_applied_on_every_provider(
 ) -> None:
     # vllm forks its EngineCore, and the serving process has already touched cuda by then, so
     # without the spawn start method the child dies with "Cannot re-initialize CUDA in forked
-    # subprocess" before anything binds a port. measured on a live runpod l4.
-    #
-    # these were previously set only by the modal image, so modal served and runpod did not. the
-    # launcher must set them itself, because it is the only piece both providers share.
+    # subprocess" before anything binds a port. The launcher must set this independently of
+    # defaults baked into the serving image.
     environment = _environment(tmp_path, artifact=False)
     captured: dict[str, object] = {}
 
@@ -1294,7 +1292,7 @@ def test_parent_helper_scrubs_environment_argv_and_closes_descriptors(tmp_path: 
     # the engine settings are not inherited from the ambient environment either: the child gets the
     # runtime's own fixed value, whatever the provider image happened to set. the launcher applies
     # these because without the spawn start method vllm's forked EngineCore cannot re-initialize
-    # cuda, which is what killed every runpod deployment while modal's image happened to set it.
+    # CUDA, so correctness cannot depend on a particular image's environment defaults.
     assert environment["VLLM_WORKER_MULTIPROC_METHOD"] == "arbitrary-module-control"
     assert captured["env"]["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
     assert captured["env"]["FLASH_SERVING_MANIFEST_ID"] == _manifest().manifest_id

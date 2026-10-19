@@ -829,8 +829,7 @@ def test_a_nonpositive_checkpoint_step_is_rejected_at_parse(bad: str) -> None:
 
 
 def test_provider_is_required_and_restricted_to_supported_providers() -> None:
-    # vast, lambda, kubernetes, and serverless runpod are explicitly out of scope, so an
-    # unsupported provider must be refused by the parser rather than reaching a provider call.
+    # Unsupported providers must be refused before reaching a provider call.
     with pytest.raises(SystemExit):
         _parse(
             [

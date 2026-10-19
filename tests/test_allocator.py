@@ -119,7 +119,7 @@ def test_offline_allocates_static_cheapest():
     from flash.providers.core import allocator
     from flash.providers.core.base import cheapest_gpu
 
-    # RunPod-only static rates: allocation matches cheapest_gpu.
+    # Modal static rates: allocation matches cheapest_gpu.
     a = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
     assert a.provider == "modal"
     assert a.gpu == cheapest_gpu(a.min_vram_gb)

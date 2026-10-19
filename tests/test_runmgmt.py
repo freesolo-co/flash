@@ -3242,10 +3242,8 @@ def test_handleless_opd_reservation_rejects_evidence_from_an_older_counter(monke
 def test_successful_supervision_settles_the_terminal_remote(monkeypatch, tmp_path):
     """A successful run must tear the provider handle down and clear the remote.
 
-    `gc_seen_sandboxes` only reaps RunPod `endpoint_id`s and never confirms teardown, so it cannot
-    stand in for settlement: a Lambda or Vast success would leave a live remote on the record, and
-    a crash before the run reaches `done` could then attach that dead handle and relaunch work that
-    already finished.
+    Best-effort garbage collection cannot replace confirmed settlement. A crash before the run
+    reaches `done` must not leave a remote handle that can relaunch already completed work.
     """
     from flash.core.spec import JobSpec
     from flash.runner.supervise import attempt_supervision
@@ -3974,8 +3972,7 @@ def test_handle_persistence_failure_still_tears_down_the_created_resource(monkey
         runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
         _next_attempt=0,
     )
-    # lambda, not runpod: a runpod handle carries an `endpoint_id`, so `gc_seen_sandboxes` already
-    # reaps it independently and would mask whether the callback rescued the resource at all.
+    # Exercise the callback's resource adoption independently of later garbage collection.
     candidate = Candidate("modal", "A100", 1.0, 40)
     monkeypatch.setattr(
         allocator,

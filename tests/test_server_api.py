@@ -5974,11 +5974,8 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
 
 
 def test_recover_runs_resubmits_when_no_capability_provider_recorded(monkeypatch, tmp_path):
-    # The fail-closed must stay SCOPED: a handle-less run on a plane that never configured Vast records
-    # no Vast in submitted_instance_providers, so it can't have left a Vast phantom and must still
-    # recover (resubmit) even though get_provider("modal") exposes the capability. Guards against the
-    # over-broad "any unconfigured capability provider blocks" regression that would strand RunPod/Lambda
-    # -only deployments.
+    # Only providers recorded as possible creates may block recovery. A capability exposed by a
+    # provider that was never used must not strand a handle-less run.
     import threading
 
     import flash.server.platform.db as db_mod

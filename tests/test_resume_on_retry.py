@@ -937,7 +937,7 @@ def _second_modal_handle(instance_id="sb-ep", job_id="j", attempt=0):
 
 @pytest.fixture
 def orch(monkeypatch, tmp_path):
-    """The runner package wired to a tmp run-store, with the inter-attempt RunPod teardown stubbed."""
+    """The runner package wired to a tmp run-store, with the inter-attempt Modal teardown stubbed."""
     from flash.providers.core import allocator
     from flash.providers.modal import api as modal_api
 

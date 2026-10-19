@@ -821,8 +821,7 @@ def test_selected_gpu_is_persisted_for_handleless_cleanup(monkeypatch, tmp_path)
             cleaned.append(spec)
 
     monkeypatch.setattr(providers, "get_provider", lambda name: Provider())
-    # runpod configured: its gc is the one reaping the rN-suffixed endpoints this test is about.
-    # (only runpod is available, so the assertion counts one gc, not three.)
+    # The single available Modal provider must receive the public run's cleanup request.
     monkeypatch.setattr(providers, "available_providers", lambda: ("modal",))
     runner_recovery._gc_run_sandboxes(public)
 
