@@ -367,6 +367,13 @@ def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_pat
 
     engine._ensure_adapter_local_locked = ensure_adapter_local
     engine._cached_lora_request_locked = cached_lora_request
+    engine._lora_entries = {("org-1", adapter_id): types.SimpleNamespace(state="reserved")}
+
+    async def add_lora(record, path):
+        assert record.adapter_id == adapter_id
+        assert path == resolved_path
+
+    engine._add_lora_locked = add_lora
     assert engine.registry.list_ready() == []
 
     lora_request, record = asyncio.run(engine._lora_request(adapter_id, record_dict))

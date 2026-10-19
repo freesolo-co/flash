@@ -12,7 +12,7 @@ from flash.serving.src.engine.support import (
     _adapter_source_cache_dir,
     _adapter_source_ident,
 )
-from flash.serving.src.io.schemas import AdapterRecord
+from flash.serving.src.io.schemas import AdapterRecord, internal_adapter_payload
 from flash.serving.src.store.registry import AdapterRegistry
 
 BASE_MODEL = "Qwen/Qwen3.5-9B"
@@ -206,7 +206,7 @@ def test_cached_lora_request_enforces_state_and_source_identity(tmp_path: Path) 
         engine._cached_lora_request_locked(record, tmp_path)
 
 
-def test_unregister_tombstones_missing_record_for_expected_generation() -> None:
+def test_cold_unregister_uses_durable_disable_time(monkeypatch) -> None:
     stale_record = _revision("a" * 40).model_copy(
         update={
             "updated_at": "2026-07-14T00:00:00+00:00",
@@ -224,6 +224,19 @@ def test_unregister_tombstones_missing_record_for_expected_generation() -> None:
         evicted.append(adapter_key)
 
     engine._evict_loaded_lora = _evict
+    disabled = stale_record.model_copy(
+        update={
+            "status": "disabled",
+            "deployment_generation": None,
+            "updated_at": "2026-07-14T00:01:00+00:00",
+        }
+    )
+
+    async def authoritative(org_id, adapter_id):
+        assert (org_id, adapter_id) == stale_record.storage_key
+        return disabled
+
+    monkeypatch.setattr("flash.serving.src.store.undeploy.get_authoritative", authoritative)
 
     result = asyncio.run(
         engine._unregister(stale_record.org_id, stale_record.adapter_id, "generation-old")
@@ -233,6 +246,15 @@ def test_unregister_tombstones_missing_record_for_expected_generation() -> None:
     assert evicted == [stale_record.storage_key]
     engine.registry.upsert(stale_record)
     assert engine.registry.get(stale_record.org_id, stale_record.adapter_id) is None
+    # even if the redeploy completed before this cleanup returned, its durable timestamp wins.
+    newer = stale_record.model_copy(
+        update={
+            "updated_at": "2026-07-14T00:02:00+00:00",
+            "deployment_generation": "generation-new",
+        }
+    )
+    engine.registry.upsert(newer)
+    assert engine.registry.get(newer.org_id, newer.adapter_id) == newer
 
 
 def test_snapshot_download_receives_exact_hub_sha(monkeypatch, tmp_path: Path) -> None:
@@ -294,3 +316,99 @@ def test_runtime_containment_rejects_schema_bypass(monkeypatch, tmp_path: Path) 
     with pytest.raises(ValueError, match="escapes its exact-SHA source cache"):
         asyncio.run(engine._ensure_adapter_local_locked(record))
     assert calls == []
+
+
+@pytest.mark.parametrize("status", ["ready", "disabled"])
+def test_cold_unregister_does_not_tombstone_new_deployment(monkeypatch, status):
+    record = _revision("a" * 40, status=status).model_copy(
+        update={"deployment_generation": "generation-new", "updated_at": "2026-07-14T00:00:00Z"}
+    )
+    engine = _LoraEngineImpl()
+    engine.base_model = BASE_MODEL
+    engine.registry = AdapterRegistry()
+    engine._adapter_locks = {}
+    engine._adapter_locks_guard = asyncio.Lock()
+
+    async def authoritative(org_id, adapter_id):
+        assert (org_id, adapter_id) == record.storage_key
+        return record
+
+    monkeypatch.setattr("flash.serving.src.store.undeploy.get_authoritative", authoritative)
+    result = asyncio.run(engine._unregister(record.org_id, record.adapter_id, "generation-old"))
+    assert result["skipped_stale_generation"] is True
+    ready = record.model_copy(update={"status": "ready"})
+    engine.registry.upsert(ready)
+    assert engine.registry.get(ready.org_id, ready.adapter_id) == ready
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_cold_unregister_without_authoritative_record_leaves_registry_untouched(
+    monkeypatch, unavailable
+):
+    record = _revision("a" * 40)
+    engine = _LoraEngineImpl()
+    engine.base_model = BASE_MODEL
+    engine.registry = AdapterRegistry()
+    engine._adapter_locks = {}
+    engine._adapter_locks_guard = asyncio.Lock()
+
+    async def authoritative(org_id, adapter_id):
+        if unavailable:
+            raise RuntimeError("storage unavailable")
+        return
+
+    monkeypatch.setattr("flash.serving.src.store.undeploy.get_authoritative", authoritative)
+    call = engine._unregister(record.org_id, record.adapter_id, "generation-old")
+    if unavailable:
+        with pytest.raises(RuntimeError, match="storage unavailable"):
+            asyncio.run(call)
+    else:
+        assert asyncio.run(call)["removed"] is None
+    engine.registry.upsert(record)
+    assert engine.registry.get(record.org_id, record.adapter_id) == record
+
+
+def test_request_loaded_adapter_is_registered_once_and_evicted_on_undeploy(tmp_path):
+    record = _revision("a" * 40).model_copy(update={"deployment_generation": "generation-one"})
+    engine = _LoraEngineImpl()
+    engine.base_model = BASE_MODEL
+    engine.registry = AdapterRegistry()
+    engine._adapter_locks = {}
+    engine._adapter_locks_guard = asyncio.Lock()
+    resident = set()
+    added = []
+    removed = []
+
+    class _Engine:
+        async def add_lora(self, request):
+            assert request.lora_int_id not in resident
+            resident.add(request.lora_int_id)
+            added.append(request.lora_int_id)
+            return True
+
+        async def remove_lora(self, int_id):
+            resident.remove(int_id)
+            removed.append(int_id)
+            return True
+
+    async def local_path(record):
+        return tmp_path
+
+    engine.engine = _Engine()
+    engine._ensure_adapter_local_locked = local_path
+
+    async def exercise():
+        payload = internal_adapter_payload(record)
+        first, _ = await engine._lora_request(record.adapter_id, payload)
+        assert first.lora_int_id in resident
+        second, _ = await engine._lora_request(record.adapter_id, payload)
+        assert second is first
+        await engine._unregister(record.org_id, record.adapter_id, "generation-one")
+        assert not resident
+        # the same immutable checkpoint can subsequently be deployed again.
+        await engine._register(payload, "generation-two")
+        assert resident == {first.lora_int_id}
+
+    asyncio.run(exercise())
+    assert len(added) == 2
+    assert removed == added[:1]

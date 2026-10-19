@@ -193,16 +193,15 @@ GPUs, so there's nothing to tune at deploy time:
   `max_num_seqs`, partial-prefill, async-scheduling, scheduling-policy, gdn-backend,
   scheduler-delay — neutral globally; only real-GPU-validated per-model caps remain in
   `model_config.py`), `performance_mode`, CUDA-graph-size, `stream_interval`, `specialize_active_lora`.
-- **Quantization: pre-quantized FP8 for the active dense tier, bf16 for the 35B MoE (memory-first).**
+- **Quantization: pre-quantized FP8 for the active dense tiers, bf16 for the 35B MoE (memory-first).**
   The active 9B uses Freesolo's compressed-tensors checkpoint with no online quantization. Qwen3.8-27B
-  is a **pending hosted candidate**, not an active hosted model. Its exact official E4M3 checkpoint
-  remains pinned at revision `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`, with `[128, 128]` weight
+  is also routed by the hosted catalog. Its official E4M3 checkpoint
+  is pinned at revision `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`, with `[128, 128]` weight
   blocks and the logical BF16 tokenizer/processor pinned to
-  `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, so the canary metadata remains testable without
-  advertising or routing the model. The 35B-A3B vision-language MoE is the
+  `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`. The 35B-A3B vision-language MoE is the
   **exception**: it serves the **official bf16
   base weights** on a B200 (`quantization=None`), because vLLM's fused-MoE LoRA path cannot run under
-  FP8 at the shape a full all-expert flash adapter needs (see the GPU tiers † footnote below).
+  FP8 at the shape a full all-expert flash adapter needs.
 
   vLLM auto-detects each checkpoint's declared quantization, so the engine passes no online
   `quantization`. `settings.KV_CACHE_DTYPE="fp8"` still halves the KV cache (E4M3, uncalibrated
@@ -215,7 +214,7 @@ GPUs, so there's nothing to tune at deploy time:
 
 - **The real memory lever — LoRA buffers:** vLLM PRE-ALLOCATES the GPU LoRA buffers at `max_loras ×
 max_lora_rank`, regardless of how many adapters load. Both are linear levers. The qualified 9B runs
-  **16 × 128** and the 35B MoE runs **6 × 64** bf16, both on B200. The pending 27B candidate uses **16 × 64**. Adapters trained above the effective rank are rejected at load; a base regularly serving
+  **16 × 128** and the 35B MoE runs **6 × 64** bf16, both on B200. The hosted 27B uses **16 × 64**. Adapters trained above the effective rank are rejected at load; a base regularly serving
   more distinct adapters than its hot limit pays a swap latency from the CPU pool unless its hot
   limit equals `MAX_CPU_LORAS`.
 
@@ -232,9 +231,9 @@ selection and customer-owned serving profiles are separate.
 | Base model | Checkpoint | GPU | Hot LoRA shape | Context |
 | --- | --- | --- | --- | --- |
 | Qwen3.5-9B | owned FP8 (`Freesolo-Co/*-FP8`) | B200 | 16 × 128 | 32768 |
+| Qwen3.8-27B | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | B200 | 16 × 64 | 32768 |
 | Qwen3.6-35B-A3B (MoE, VL) | official bf16 | B200 | 6 × 64 | 32768 |
 
-Qwen3.8-27B is a pending candidate and is not routed by the hosted catalog.
 CUDA graphs, prefix caching, FP8 KV, and the persistent compilation cache remain enabled.
 The 35B keeps bf16 weights because the FP8 fused-MoE kernel cannot load full-expert LoRA.
 The vision encoder remains loaded so adapters' vision-tower keys bind.

@@ -381,7 +381,12 @@ class _LoraEngineImpl:
             if not record.serve_base_model and not record.is_checkpoint:
                 raise ValueError(f"Unknown adapter id on {self.base_model}: {adapter_id}")
             path = await self._ensure_adapter_local_locked(record)
-            return self._cached_lora_request_locked(record, path), record
+            lora_request = self._cached_lora_request_locked(record, path)
+            # first-use loading must enter the same lifecycle as explicit registration so
+            # undeploy removes the adapter from vllm as well as our registry.
+            if self._entries()[adapter_key].state == "reserved":
+                await self._add_lora_locked(record, path)
+            return lora_request, record
 
     def _thinking_default(self, record: Any, payload: Any) -> bool:
         """The ``enable_thinking`` to render with. A trained LoRA forces its own value; a base-model
@@ -706,12 +711,21 @@ class _LoraEngineImpl:
         lock = await self._adapter_lock(adapter_key)
         async with lock:
             current = self.registry.get(org_id, adapter_id)
-            current_generation = current.deployment_generation if current is not None else None
-            stale = current is not None and (
-                current_generation is not None
-                if expected_generation is None
-                else current_generation != expected_generation
-            )
+            if current is None:
+                from flash.serving.src.store.undeploy import get_authoritative
+
+                current = await get_authoritative(org_id, adapter_id)
+                if current is None:
+                    return {"ok": True, "removed": None, "base_model": self.base_model}
+                # durable disable clears the generation. a ready or loading row means this
+                # cleanup lost to a redeploy, even if this replica has never seen the adapter.
+                stale = current.status == "ready" or current.deployment_generation is not None
+            else:
+                stale = (
+                    current.deployment_generation is not None
+                    if expected_generation is None
+                    else current.deployment_generation != expected_generation
+                )
             if stale:
                 return {
                     "ok": True,
@@ -719,6 +733,9 @@ class _LoraEngineImpl:
                     "skipped_stale_generation": True,
                     "base_model": self.base_model,
                 }
+            # use the disabled row's timestamp, not wall-clock cleanup time: a concurrent
+            # redeploy after the lookup must be able to supersede this tombstone.
+            self.registry.upsert(current)
             self.registry.remove(org_id, adapter_id)
             await self._evict_loaded_lora(adapter_key)
         return {"ok": True, "removed": adapter_id, "base_model": self.base_model}
