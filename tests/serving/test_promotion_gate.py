@@ -18,6 +18,7 @@ from flash.serving.promotion.canary import (
 from flash.serving.promotion.evidence import (
     ACCOUNTING_MALFORMED,
     ACCOUNTING_STALLED,
+    ACCOUNTING_UNSETTLED,
     HEALTH_SHA_MISMATCH,
     STREAM_NO_CONTENT,
     StreamEvidence,
@@ -33,7 +34,9 @@ SHA = "94210a323f9beaa713241e305f178b364848446d"
 DEPLOYMENT_ID = "12345-1"
 
 
-def _Snapshot(pending=0, leased=0, expired_leases=0, oldest_undelivered_age_seconds=None):
+def _Snapshot(
+    pending=0, leased=0, expired_leases=0, oldest_undelivered_age_seconds=None, canary_settled=True
+):
     """A backlog RPC body, shaped exactly as `serving_usage_backlog_snapshot` returns it.
 
     `pending`/`leased` are still sent by the RPC and still shaped here, because the point of the
@@ -41,6 +44,7 @@ def _Snapshot(pending=0, leased=0, expired_leases=0, oldest_undelivered_age_seco
     reads them; this helper keeps them so the body stays the real wire shape.
     """
     return {
+        "canary_settled": canary_settled,
         "states": {"pending": pending, "leased": leased},
         "expired_leases": expired_leases,
         "oldest_undelivered_age_seconds": oldest_undelivered_age_seconds,
@@ -86,8 +90,10 @@ def _evaluate(*, health, stream, accounting, **kwargs):
             return accounting()
         return accounting
 
-    async def no_sleep(_seconds: float) -> None:
-        return None
+    now = [0.0]
+
+    async def no_sleep(seconds: float) -> None:
+        now[0] += seconds
 
     verdict = asyncio.run(
         evaluate_promotion(
@@ -97,6 +103,7 @@ def _evaluate(*, health, stream, accounting, **kwargs):
             expected_sha=SHA,
             expected_deployment_id=DEPLOYMENT_ID,
             sleep=no_sleep,
+            clock=lambda: now[0],
             **kwargs,
         )
     )
@@ -159,8 +166,8 @@ def test_a_delivery_loop_that_stays_wedged_fails_within_the_deadline():
         poll_seconds=5,
     )
     assert verdict.reason == ACCOUNTING_STALLED
-    # bounded: three reads at t=0, 5, 10, then the deadline stops it.
-    assert calls.count("accounting") == 3
+    # no read may start at the deadline: only t=0 and t=5.
+    assert calls.count("accounting") == 2
 
 
 def test_a_transient_stall_that_recovers_is_given_time_to_clear():
@@ -382,3 +389,110 @@ def test_canary_budget_covers_the_full_router_deadline_with_network_headroom():
     assert CANARY_NETWORK_HEADROOM_SECONDS > 0
     assert plan.request.timeout_seconds == ROUTER_TIMEOUT_SECONDS + CANARY_NETWORK_HEADROOM_SECONDS
     assert plan.request.org_id == _gate_step_env()["SERVING_CANARY_ORG_ID"]
+
+
+def test_fresh_pending_canary_never_promotes_even_with_no_expired_leases():
+    verdict, calls = _evaluate(
+        health=_health(),
+        stream=_good_stream(),
+        accounting=_Snapshot(pending=1, oldest_undelivered_age_seconds=1, canary_settled=False),
+        accounting_deadline_seconds=10,
+    )
+    assert verdict.reason == ACCOUNTING_UNSETTLED
+    assert calls.count("accounting") == 2
+
+
+def test_promotion_waits_for_its_canary_to_settle():
+    snapshots = iter([_Snapshot(canary_settled=False), _Snapshot(canary_settled=True)])
+    verdict, calls = _evaluate(
+        health=_health(), stream=_good_stream(), accounting=lambda: next(snapshots)
+    )
+    assert verdict.ok
+    assert calls.count("accounting") == 2
+
+
+def test_rpc_latency_consumes_the_accounting_deadline():
+    now, reads, sleeps = [0.0], [], []
+
+    async def load():
+        reads.append(now[0])
+        now[0] += 7
+        return _Snapshot(canary_settled=False)
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    verdict = asyncio.run(
+        gate_module._await_accounting(
+            load, deadline_seconds=10, poll_seconds=5, sleep=sleep, clock=lambda: now[0]
+        )
+    )
+    assert verdict.reason == ACCOUNTING_UNSETTLED
+    assert reads == [0]
+    assert sleeps == [3]
+    assert now[0] == 10
+
+
+def test_settled_response_at_deadline_cannot_pass():
+    now = [0.0]
+
+    async def load():
+        now[0] = 10
+        return _Snapshot()
+
+    verdict = asyncio.run(
+        gate_module._await_accounting(
+            load, deadline_seconds=10, poll_seconds=5, sleep=asyncio.sleep, clock=lambda: now[0]
+        )
+    )
+    assert not verdict.ok
+
+
+def test_hung_accounting_read_is_cancelled_at_deadline():
+    cancelled = []
+
+    async def load():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
+
+    verdict = asyncio.run(
+        gate_module._await_accounting(
+            load, deadline_seconds=0.01, poll_seconds=5, sleep=asyncio.sleep
+        )
+    )
+    assert not verdict.ok
+    assert cancelled == [True]
+
+
+def test_accounting_rpc_is_scoped_to_the_canary_and_release():
+    import httpx
+
+    plan = gate_module._resolve("https://serve.example", _gate_step_env())
+    seen = []
+
+    def respond(request):
+        import json
+
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json=_Snapshot())
+
+    async def read():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            return await plan.read_backlog(client)
+
+    assert asyncio.run(read())["canary_settled"] is True
+    assert seen == [
+        (
+            "/rest/v1/rpc/serving_promotion_accounting_snapshot",
+            {
+                "p_org_id": plan.request.org_id,
+                "p_correlation_id": plan.request.correlation_id,
+                "p_serving_deployment_id": plan.expected_deployment_id,
+                "p_serving_release": plan.expected_sha,
+                "p_public_model_id": plan.request.model,
+            },
+        )
+    ]
