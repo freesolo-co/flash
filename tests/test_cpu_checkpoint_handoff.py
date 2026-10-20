@@ -1,5 +1,6 @@
 """A staged checkpoint cannot become successful before CPU publication."""
 
+import hashlib
 import json
 from dataclasses import replace
 
@@ -22,6 +23,9 @@ def staged(tmp_path, monkeypatch):
     monkeypatch.setenv("FLASH_MODAL_CPU_UPLOADS", "1")
     monkeypatch.setattr(cpu_handoff, "MOUNT", str(root))
     monkeypatch.setattr(state, "JOB_SPEC", job)
+    monkeypatch.setenv(
+        "FLASH_EXPECTED_SPEC_SHA256", hashlib.sha256(job.to_json().encode()).hexdigest()
+    )
     monkeypatch.setattr(state, "RUN_ID", job.run_id)
     monkeypatch.setattr(state, "ATTEMPT", 3)
     source = tmp_path / "checkpoint"
@@ -95,6 +99,7 @@ def test_old_handles_default_off_and_new_handles_round_trip():
     old = modal_remote()
     old.pop("cpu_uploads", None)
     assert not ModalJobHandle.from_dict(old).cpu_uploads
+    assert ModalJobHandle.from_dict(old).to_dict() == old
     new = {**old, "cpu_uploads": True}
     assert ModalJobHandle.from_dict(new).to_dict()["cpu_uploads"] is True
     with pytest.raises(ValueError, match="cpu_uploads"):
@@ -116,3 +121,26 @@ def test_cpu_mode_requires_explicit_last_step(monkeypatch):
     job = replace(job, train=replace(job.train, max_steps=None))
     with pytest.raises(ValueError, match="explicit"):
         checkpoint_upload.enabled(job)
+
+
+def test_bootstrap_withholds_attested_marker_for_handoff(tmp_path, monkeypatch):
+    from flash.providers._lifecycle.bootstrapping import bootstrap
+
+    root = tmp_path / "volume"
+    root.mkdir()
+    (root / "handoff.json").write_text("{}")
+    marker = tmp_path / "marker.json"
+    marker.write_text('{"ok":true}')
+    published = []
+    monkeypatch.setattr(bootstrap, "CHECKPOINT_HANDOFF_ROOT", str(root))
+    monkeypatch.setattr(
+        bootstrap, "hf_upload", lambda payload, path, name, **kw: published.append(name)
+    )
+    payload = {"attempt": 2, "flash_arm": "modal", "env": {"FLASH_MODAL_CPU_UPLOADS": "1"}}
+    # Initial publication and replay both go through this gate.
+    bootstrap._publish_terminal_marker(payload, str(marker), True)
+    bootstrap._publish_terminal_marker(payload, str(marker), True)
+    assert published == ["modal_gpu_attempt2.json"] * 2
+    assert (root / "terminal.json").read_bytes() == marker.read_bytes()
+    bootstrap._publish_terminal_marker(payload, str(marker), False)
+    assert published[-1] == "modal_attempt2.json"

@@ -65,7 +65,8 @@ def finish(handle, spec, *, deadline_at):
     environment = {
         "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
         "HF_HUB_DISABLE_XET": "1",
-        "FLASH_JOB_SPEC_JSON": spec.to_json(),
+        "FLASH_JOB_SPEC_PATH": f"{MOUNT}/spec.json",
+        "FLASH_EXPECTED_SPEC_SHA256": hashlib.sha256(spec.to_json().encode()).hexdigest(),
         "HF_REPO": handle.hf_repo,
         "RUN_ID": handle.run_id,
         "PHASE": handle.phase,
@@ -135,6 +136,8 @@ def cleanup(handle):
         sandbox = await _existing(modal, client, handle)
         if sandbox is not None:
             await sandbox.terminate.aio(wait=True)
+            if await sandbox.poll.aio() is None:
+                raise api.ModalApiError("CPU uploader termination was not confirmed")
         with contextlib.suppress(modal.exception.NotFoundError):
             await modal.Volume.objects.delete.aio(
                 volume_name(handle.scope, handle.name),

@@ -31,7 +31,7 @@ class ModalJobHandle(InstanceJobHandle):
             "phase": self.phase,
             "gpu_count": self.gpu_count,
             "scope": self.scope,
-            "cpu_uploads": self.cpu_uploads,
+            **({"cpu_uploads": True} if self.cpu_uploads else {}),
         }
 
     @staticmethod

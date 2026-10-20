@@ -42,6 +42,7 @@ else:
 
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
+CHECKPOINT_HANDOFF_ROOT = "/checkpoint-handoff"
 _CONSOLE_UPLOAD_INTERVAL_S = _bootstrap_console._CONSOLE_UPLOAD_INTERVAL_S
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
@@ -792,7 +793,7 @@ def _publish_terminal_marker(payload, p, ok):
         import shutil
         from pathlib import Path
 
-        handoff = Path("/checkpoint-handoff")
+        handoff = Path(CHECKPOINT_HANDOFF_ROOT)
         if (handoff / "handoff.json").is_file():
             shutil.copyfile(p, handoff / "terminal.json")
             marker_name = f"modal_gpu_attempt{attempt}.json"

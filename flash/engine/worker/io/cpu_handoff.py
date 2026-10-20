@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -38,6 +39,7 @@ def stage_final_checkpoint(step: int, directory: str) -> bool:
         shutil.copytree(
             code, root / "source" / "flash", ignore=shutil.ignore_patterns("__pycache__")
         )
+    (root / "spec.json").write_text(state.JOB_SPEC.to_json())
     target = root / "handoff.json"
     temporary = root / "handoff.json.tmp"
     temporary.write_text(json.dumps(descriptor))
@@ -56,6 +58,11 @@ def defer_completion(done_path: str) -> bool:
 
 
 def main() -> None:
+    spec_path = Path(MOUNT) / "spec.json"
+    if spec_path.is_symlink() or hashlib.sha256(
+        spec_path.read_bytes()
+    ).hexdigest() != os.environ.get("FLASH_EXPECTED_SPEC_SHA256"):
+        raise ValueError("CPU checkpoint job specification mismatch")
     from flash.engine.worker.io import hf
     from flash.engine.worker.runtime import state
 
