@@ -144,6 +144,11 @@ def submit_attempt(
     )
     import os
 
+    if "FLASH_HF_UPLOAD_THREADS" in os.environ:
+        from flash.engine.worker.io.transfer import upload_threads
+
+        payload["env"]["FLASH_HF_UPLOAD_THREADS"] = str(upload_threads())
+
     if spec.gpu.network_volume and os.environ.get("FLASH_WEIGHT_CACHE_DISABLED", "").strip() != "1":
         payload["cache_volume"] = spec.gpu.network_volume
         payload["env"]["FLASH_WEIGHT_CACHE_DIR"] = f"{api.CACHE_MOUNT}/hf-cache/hub"

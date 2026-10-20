@@ -13,3 +13,6 @@ and must be benchmarked with available disk headroom. Keep the worker and its
 weight-cache Volume in compatible placement; do not move data between regions
 just to increase concurrency. Measure upload time and egress before increasing
 the bound: more threads are not a guaranteed speedup.
+
+Set the option on the Modal controller to forward it into training workers;
+invalid values are rejected before GPU rental.
