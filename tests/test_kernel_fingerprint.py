@@ -321,7 +321,11 @@ def test_baked_arch_workflows_match_canonical_source():
     (fallback,) = [
         match.group(1)
         for line in bake_lines
-        if (match := re.fullmatch(r'\s*req="\$\{\{ inputs\.sms \|\| \'([^\']+)\' \}\}"\s*', line))
+        if (
+            match := re.fullmatch(
+                r"\s*REQUESTED_SMS:\s*\$\{\{ inputs\.sms \|\| '([^']+)' \}\}\s*", line
+            )
+        )
     ]
     fallback_arches = {arch.strip() for arch in fallback.split(",") if arch.strip()}
 

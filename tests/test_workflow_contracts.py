@@ -563,6 +563,7 @@ def test_dev_cache_pushes_only_detect_and_off_peak_runs_build():
     assert triggers["workflow_dispatch"]["inputs"]["deadline_minutes"]["default"] == 90
     assert "fromJSON(format(" in bake["with"]["deadline_minutes"]
     assert "inputs.deadline_minutes" in bake["with"]["deadline_minutes"]
+    assert "||" not in bake["with"]["deadline_minutes"]  # zero must fail validation, not become 90
     bake_workflow = _load(WORKFLOW_DIR / "bake-kernel-cache.yml")
     assert "deadline_minutes" in _triggers(bake_workflow)["workflow_call"]["inputs"]
     warm = next(

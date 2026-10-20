@@ -30,7 +30,7 @@ on:
         default: "sm80,sm86,sm89,sm90,sm120,sm100"
         required: false
       deadline_minutes:
-        description: "Maximum GPU runtime per architecture"
+        description: "Maximum GPU runtime per architecture (1–90 minutes)"
         type: number
         default: 90
         required: false
@@ -131,8 +131,16 @@ jobs:
       # Gate FIRST (no checkout needed) so skipped arches do no crane / checkout / build work.
       - name: Should bake ${{ matrix.sm }}?
         id: gate
+        env:
+          REQUESTED_SMS: ${{ inputs.sms || 'sm80,sm86,sm89,sm90,sm120,sm100' }}
+          BAKE_DEADLINE_MINUTES: ${{ inputs.deadline_minutes }}
         run: |
-          req="${{ inputs.sms || 'sm80,sm86,sm89,sm90,sm120,sm100' }}"
+          # Leave 30 minutes of the 120-minute job for setup, transfer and publication.
+          if ! [[ "$BAKE_DEADLINE_MINUTES" =~ ^([1-9]|[1-8][0-9]|90)$ ]]; then
+            echo "::error::deadline_minutes must be an integer from 1 to 90"
+            exit 1
+          fi
+          req="$REQUESTED_SMS"
           req="${req// /}"   # tolerate spaces, e.g. "sm80, sm86"
           case ",$req," in
             *,${{ matrix.sm }},*) echo "run=true" >> "$GITHUB_OUTPUT" ;;
@@ -171,17 +179,21 @@ jobs:
       - name: Resolve base + fingerprints
         id: base
         if: steps.gate.outputs.run == 'true'
+        env:
+          BASE_REF: ${{ inputs.base_ref || 'ghcr.io/freesolo-co/flash-worker:cu128' }}
+          FP_CACHE: ${{ inputs.fp_cache }}
+          FP_BASE: ${{ inputs.fp_base }}
+          BASE_REVISION: ${{ inputs.base_revision }}
         run: |
-          if [ -n "${{ inputs.fp_cache }}" ]; then
-            echo "ref=${{ inputs.base_ref }}" >> "$GITHUB_OUTPUT"
-            echo "fp_cache=${{ inputs.fp_cache }}" >> "$GITHUB_OUTPUT"
-            echo "fp_base=${{ inputs.fp_base }}" >> "$GITHUB_OUTPUT"
-            echo "revision=${{ inputs.base_revision }}" >> "$GITHUB_OUTPUT"
+          if [ -n "$FP_CACHE" ]; then
+            echo "ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+            echo "fp_cache=$FP_CACHE" >> "$GITHUB_OUTPUT"
+            echo "fp_base=$FP_BASE" >> "$GITHUB_OUTPUT"
+            echo "revision=$BASE_REVISION" >> "$GITHUB_OUTPUT"
           else
-            base="${{ inputs.base_ref || 'ghcr.io/freesolo-co/flash-worker:cu128' }}"
-            digest=$(crane digest "$base"); repo=${base%:*}
-            cfg=$(crane config "$repo@$digest")
-            echo "ref=$repo@$digest" >> "$GITHUB_OUTPUT"
+            ref=$(crane digest --full-ref "$BASE_REF")
+            cfg=$(crane config "$ref")
+            echo "ref=$ref" >> "$GITHUB_OUTPUT"
             echo "fp_cache=$(echo "$cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_cache"] // ""')" >> "$GITHUB_OUTPUT"
             echo "fp_base=$(echo "$cfg" | jq -r '.config.Labels["co.freesolo.flash.kernelcache.fp_base"] // ""')" >> "$GITHUB_OUTPUT"
             echo "revision=$(echo "$cfg" | jq -r '.config.Labels["org.opencontainers.image.revision"] // ""')" >> "$GITHUB_OUTPUT"
