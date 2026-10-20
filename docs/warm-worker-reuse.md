@@ -6,7 +6,8 @@ path and does not enable a production worker pool.
 
 A resident instance accepts one exact owner/runtime profile and one lease at a
 time. Before each lease it restores all model tensors from an immutable CPU
-snapshot, clears gradients, restores the training mode, reseeds RNGs, and creates
+snapshot, clears gradients, restores trainability and all buffers (including nonpersistent buffers),
+restores the training mode, reseeds RNGs, and creates
 new optimizer and scheduler instances. Frozen weights and mutable buffers are
 included: freezing gradients alone does not prevent in-place mutations. A failed
 or cancelled lease evicts the instance. The experiment compares every loss,
@@ -44,8 +45,11 @@ This PR should remain a draft until that integration is implemented and tested.
 The live two-H100 fixture passed: both the warm second lease and a fresh model
 produced exactly equal losses, model state, optimizer state and scheduler state.
 Owner mismatch was rejected and a failed lease could not be reused. The tiny
-fixture measured 2.10 seconds for construction plus three updates and 0.032
+fixture measured 1.81 seconds for construction plus three updates and 0.027
 seconds for reset plus three updates; these are fixture-only observations.
 
 Modal references: [Sandbox snapshots](https://modal.com/docs/guide/sandbox-snapshots)
 and [GPU memory snapshots](https://modal.com/docs/examples/gpu_snapshot).
+
+A second live pass deliberately corrupted a frozen base tensor and a parameter's
+trainability between leases. The reset still matched a fresh model exactly.

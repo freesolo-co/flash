@@ -36,6 +36,12 @@ class ResidentModel:
         self._initial = {
             name: value.detach().cpu().clone() for name, value in model.state_dict().items()
         }
+        self._requires_grad = {
+            name: value.requires_grad for name, value in model.named_parameters()
+        }
+        self._buffers = {
+            name: value.detach().cpu().clone() for name, value in model.named_buffers()
+        }
 
     def run(self, identity, train):
         import random
@@ -50,6 +56,18 @@ class ResidentModel:
         try:
             if not self._healthy:
                 raise RuntimeError("resident model must be rebuilt after a failed lease")
+            parameters = dict(self.model.named_parameters())
+            buffers = dict(self.model.named_buffers())
+            if (
+                parameters.keys() != self._requires_grad.keys()
+                or buffers.keys() != self._buffers.keys()
+            ):
+                raise RuntimeError("resident model structure changed during the prior lease")
+            for name, parameter in parameters.items():
+                parameter.requires_grad_(self._requires_grad[name])
+            with torch.no_grad():
+                for name, buffer in buffers.items():
+                    buffer.copy_(self._buffers[name])
             self.model.load_state_dict(self._initial, strict=True)
             self.model.zero_grad(set_to_none=True)
             self.model.train()
@@ -153,6 +171,10 @@ def main():
     resident = build()
     first = resident.run(identity, train)
     cold_seconds = time.monotonic() - started
+    # Deliberately corrupt a frozen base tensor and trainability metadata between leases.
+    with torch.no_grad():
+        next(p for p in resident.model.parameters() if not p.requires_grad).add_(1)
+    next(p for p in resident.model.parameters() if p.requires_grad).requires_grad_(False)
     started = time.monotonic()
     second = resident.run(identity, train)
     warm_seconds = time.monotonic() - started
