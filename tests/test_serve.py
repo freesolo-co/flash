@@ -109,7 +109,9 @@ def _stub_adapter_config(
             "_require_serving_capabilities",
             lambda **_kwargs: set(_IMMUTABLE_SERVING_CAPABILITIES),
         )
-    monkeypatch.setattr(deploy, "_wait_checkpoint_ready", lambda *a, **k: {})
+    monkeypatch.setattr(
+        deploy, "_wait_checkpoint_ready", lambda *a, **k: {"deployment_generation": "generation-a"}
+    )
     return seen
 
 
@@ -878,7 +880,7 @@ def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_
         assert org_id == "org-1"
         assert checkpoint_id == "run-1/final"
         budgets.append(kwargs.get("budget_s"))
-        return {}
+        return {"deployment_generation": "generation-a"}
 
     monkeypatch.setattr(d, "_wait_checkpoint_ready", wait_ready)
 
@@ -1470,8 +1472,8 @@ def test_readiness_receives_complete_facts_after_registry_readiness(
         monkeypatch.setattr(
             d,
             "_wait_checkpoint_ready",
-            lambda org_id, checkpoint_id, subfolder, **kwargs: events.append(
-                ("ready", checkpoint_id)
+            lambda org_id, checkpoint_id, subfolder, **kwargs: (
+                events.append(("ready", checkpoint_id)) or {"deployment_generation": "generation-a"}
             ),
         )
         return replace(real_metadata(*args, **kwargs), targets_images=targets_images)
@@ -1481,6 +1483,11 @@ def test_readiness_receives_complete_facts_after_registry_readiness(
     def before_ready(facts: d.DeploymentReadinessFacts) -> None:
         assert events[-1] == ("ready", "flash-7-abcd/final")
         observed.append(facts)
+        monkeypatch.setattr(
+            d,
+            "_registered_adapter",
+            lambda *a, **k: {"status": "ready", "deployment_generation": "generation-a"},
+        )
 
     _capture_registration_body(
         monkeypatch,

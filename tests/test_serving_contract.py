@@ -302,7 +302,11 @@ def test_deploy_registers_one_exact_checkpoint_without_activation(monkeypatch) -
         return _Response()
 
     monkeypatch.setattr(serving_transport, "serving_request", request)
-    monkeypatch.setattr(deploy_mod, "_wait_checkpoint_ready", lambda *a, **k: {})
+    monkeypatch.setattr(
+        deploy_mod,
+        "_wait_checkpoint_ready",
+        lambda *a, **k: {"deployment_generation": "generation-a"},
+    )
 
     result = deploy_mod.deploy_adapter(
         "flash-1",
@@ -487,3 +491,61 @@ def test_the_serving_extra_declares_every_module_scope_import_of_the_serving_app
             missing.setdefault(top, set()).add(str(path.relative_to(root)))
 
     assert not missing
+
+
+@pytest.mark.parametrize("observed_generation", ["generation-a", "generation-b", None])
+def test_deploy_verification_is_bound_to_the_loaded_generation(monkeypatch, observed_generation):
+    from types import SimpleNamespace
+
+    import flash.serve.deployment.deploy as deploy_mod
+
+    _stub_deploy_preconditions(monkeypatch, deploy_mod)
+    monkeypatch.setattr(
+        serving_transport, "serving_request", lambda *a, **k: SimpleNamespace(status_code=202)
+    )
+    monkeypatch.setattr(
+        deploy_mod,
+        "_wait_checkpoint_ready",
+        lambda *a, **k: {"deployment_generation": "generation-a"},
+    )
+    # The first lookup is before registration, the second is after smoke verification.
+    reads = iter([None, {"status": "ready", "deployment_generation": observed_generation}])
+    monkeypatch.setattr(deploy_mod, "_registered_adapter", lambda *a, **k: next(reads))
+    verified = []
+
+    def deploy():
+        return deploy_mod.deploy_adapter(
+            "flash-1",
+            "Qwen/Qwen3.5-9B",
+            "org/repo",
+            "sft/flash-1/final",
+            org_id="org-1",
+            before_ready=lambda facts: verified.append(facts.checkpoint_id),
+        )
+
+    if observed_generation == "generation-a":
+        assert deploy().to_dict()["deployment_generation"] == "generation-a"
+    else:
+        with pytest.raises(
+            deploy_mod.serving_errors.ServingError, match="changed during verification"
+        ):
+            deploy()
+    assert verified == ["flash-1/final"]
+
+
+def test_missing_generation_cannot_be_published_as_a_ready_deployment(monkeypatch):
+    from types import SimpleNamespace
+
+    import flash.serve.deployment.deploy as deploy_mod
+
+    _stub_deploy_preconditions(monkeypatch, deploy_mod)
+    monkeypatch.setattr(
+        serving_transport, "serving_request", lambda *a, **k: SimpleNamespace(status_code=202)
+    )
+    monkeypatch.setattr(deploy_mod, "_wait_checkpoint_ready", lambda *a, **k: {})
+    with pytest.raises(
+        deploy_mod.serving_errors.ServingError, match="missing its deployment generation"
+    ):
+        deploy_mod.deploy_adapter(
+            "flash-1", "Qwen/Qwen3.5-9B", "org/repo", "sft/flash-1/final", org_id="org-1"
+        )

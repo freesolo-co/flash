@@ -535,3 +535,28 @@ def test_engine_secret_contains_only_engine_credentials(modal_app_module, monkey
         modal_app_module.app.function.call_args.kwargs["secrets"]
         is modal_app_module.runtime_secrets
     )
+
+
+def test_checkpoint_authorization_is_rechecked_after_a_prior_success(modal_app_module, monkeypatch):
+    import asyncio
+
+    from fastapi import HTTPException
+
+    calls = _counting_client(
+        monkeypatch,
+        lambda n: (
+            _FakeResp(200, {"ok": True, "orgId": "org-1"})
+            if n == 1
+            else _FakeResp(404, {"detail": "not verified"})
+        ),
+    )
+    authorize = _new_authorizer(modal_app_module)
+
+    async def scenario():
+        assert await authorize("key", "run-1/final") == "org-1"
+        with pytest.raises(HTTPException) as error:
+            await authorize("key", "run-1/final")
+        assert error.value.status_code == 403
+
+    asyncio.run(scenario())
+    assert calls["n"] == 2

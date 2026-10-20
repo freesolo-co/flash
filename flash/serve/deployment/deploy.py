@@ -47,6 +47,10 @@ READBACK_MAX_DELAY_SECONDS = 2.0
 SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
 
 
+class DeploymentGenerationChanged(serving_errors.ServingError):
+    """Verification was superseded; cleanup must not remove the replacement generation."""
+
+
 @dataclass
 class Deployment:
     run_id: str
@@ -58,6 +62,7 @@ class Deployment:
     checkpoint_id: str | None = None
     checkpoint_step: int | None = None
     verified_at: float | None = None
+    deployment_generation: str | None = None
     state: str = "ready"
 
     def to_dict(self) -> dict:
@@ -238,13 +243,17 @@ def deploy_adapter(
             checkpoint_id,
         )
 
-    _wait_checkpoint_ready(
+    ready_record = _wait_checkpoint_ready(
         normalized_org_id,
         checkpoint_id,
         subfolder,
         expected_identity=body,
         budget_s=readiness.revision_ready_budget_seconds(model),
     )
+    serving_generation = ready_record.get("deployment_generation")
+    if not isinstance(serving_generation, str) or not serving_generation.strip():
+        raise serving_errors.ServingError("ready checkpoint is missing its deployment generation")
+    dep.deployment_generation = serving_generation
     if before_ready is not None:
         before_ready(
             DeploymentReadinessFacts(
@@ -254,6 +263,13 @@ def deploy_adapter(
                 adapter_targets_images=artifact_metadata.targets_images,
             )
         )
+        verified_record = _registered_adapter(normalized_org_id, checkpoint_id)
+        if (
+            verified_record is None
+            or verified_record.get("status") != "ready"
+            or verified_record.get("deployment_generation") != serving_generation
+        ):
+            raise DeploymentGenerationChanged("checkpoint deployment changed during verification")
     dep.state = "ready"
     dep.openai_model = checkpoint_id
     logger.info("deployed checkpoint %s", checkpoint_id)

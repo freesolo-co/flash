@@ -366,3 +366,5 @@ open `<think>` block for generation to close.
   }
 }
 ```
+
+Hosted checkpoint authorization requires Freesolo's verified deployment-generation gate. The control plane reports the exact loading generation that passed smoke verification; if it changes during verification, the old attempt cannot publish readiness or tear down the replacement. Checkpoint API-key requests recheck authorization instead of using the positive base-model authorization cache. Deploy this control-plane and serving-router change with Freesolo PR #784, after its database prerequisites; reverify existing checkpoints whose reports lack a generation before reopening customer traffic. Internal smoke requests remain authorized through the trusted internal path.

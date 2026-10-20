@@ -702,6 +702,12 @@ def _build_chat_authorizer(settings: Any) -> Any:
     ) -> "str | None":
         # do not retain raw user credentials as live dict keys beyond the request that supplied them.
         scope = scope or {}
+        from flash.schema import parse_checkpoint_ref
+
+        # A checkpoint can be disabled and reloaded within the positive-auth TTL.
+        # Always recheck its verified generation; base-model authorization remains cached.
+        if parse_checkpoint_ref(adapter_id) is not None:
+            return await _authorize_backend(api_key, adapter_id, scope)
         # The scope is part of the key, not just the payload. Every training container presents
         # the SAME platform internal key, so keying on (key, model) alone would let one job's
         # cached authorization answer another job's request -- and the cached value is the

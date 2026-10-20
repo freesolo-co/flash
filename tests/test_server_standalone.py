@@ -1099,7 +1099,11 @@ def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monk
         ),
     )
     monkeypatch.setattr(serving_deploy, "_require_serving_capabilities", lambda **_kwargs: set())
-    monkeypatch.setattr(serving_deploy, "_wait_checkpoint_ready", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        serving_deploy,
+        "_wait_checkpoint_ready",
+        lambda *_args, **_kwargs: {"deployment_generation": "generation-a"},
+    )
     monkeypatch.setattr(
         serving_deploy.transport,
         "serving_request",
