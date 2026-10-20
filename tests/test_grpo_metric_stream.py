@@ -51,6 +51,30 @@ def test_partial_write_is_reassembled_before_parsing(tmp_path):
     assert [verl_step_number(line) for line in received] == [1]
 
 
+def test_completion_after_eof_read_still_drains_the_final_write():
+    from flash.engine.worker.train.rl.child.metrics import _forward_metrics
+
+    stopped = threading.Event()
+    received = []
+    record = _record(1)
+
+    class ConcurrentAppend:
+        reads = 0
+
+        def read(self, size):
+            self.reads += 1
+            if self.reads == 1:
+                return record[:10]
+            if self.reads == 2:
+                # The reader saw EOF just before the final append and stop.
+                stopped.set()
+                return b""
+            return record[10:] if self.reads == 3 else b""
+
+    _forward_metrics(ConcurrentAppend(), stopped, received.append)
+    assert [verl_step_number(line) for line in received] == [1]
+
+
 @pytest.mark.parametrize("payload", [b'{"step":1', b"not-json\n", b'{"step":true,"data":{}}\n'])
 def test_corrupt_or_truncated_evidence_fails_closed(tmp_path, payload):
     path = tmp_path / "metrics.jsonl"

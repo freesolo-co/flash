@@ -42,13 +42,16 @@ def _metric_line(record: dict) -> str:
 def _forward_metrics(handle, stopped: threading.Event, emit) -> None:
     pending = b""
     while True:
+        # Observe completion before reading. A writer can append and stop between
+        # an EOF read and an event check; that EOF cannot prove the final drain.
+        draining = stopped.is_set()
         chunk = handle.read(65536)
         if chunk:
             pending += chunk
             while b"\n" in pending:
                 line, pending = pending.split(b"\n", 1)
                 emit(_metric_line(json.loads(line)))
-        elif stopped.is_set():
+        elif draining:
             if pending:
                 raise ValueError("truncated GRPO metric journal record")
             return
