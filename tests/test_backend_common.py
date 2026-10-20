@@ -382,7 +382,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "cp312" in vc.FLASH_ATTN_SPEC
     install = calls[1]
     assert vc.VERL_REQUIREMENT == (
-        "verl @ git+https://github.com/freesolo-co/verl@716f204cf87d33ef3c272b070bc0b08a5f00ea27"
+        "verl @ git+https://github.com/freesolo-co/verl@7647bb7f423b649df74ac71a244a2a3de9e1466a"
     )
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in install)
     # liger-kernel is deliberately NOT installed. a matched qwen3.5-9b a/b differing only in
@@ -492,10 +492,12 @@ def test_an_exhausted_wheel_install_hands_the_arm_back_instead_of_burning_it(mon
     assert not (tmp_path / "verl-venv" / "flash-verl-requirement").exists()
 
 
-def test_the_fallback_install_overrides_the_three_ceilings_it_violates(monkeypatch, tmp_path):
+def test_the_fallback_install_keeps_compatibility_overrides_and_exact_runtime_pins(
+    monkeypatch, tmp_path
+):
     """The pin set is deliberately unsatisfiable against declared metadata, so it needs --override.
 
-    A command-line pin remains a constraint; only `--override` ignores verl's incompatible vLLM
+    A command-line pin remains a constraint; only `--override` ignores incompatible dependency
     declaration. See Dockerfile.worker:253-258.
     """
     calls = []
@@ -508,8 +510,8 @@ def test_the_fallback_install_overrides_the_three_ceilings_it_violates(monkeypat
     assert "--override" in install
     override_file = install[install.index("--override") + 1]
     written = pathlib.Path(override_file).read_text()
-    # all three are required: dropping any one leaves the set unsatisfiable.
-    assert "vllm==0.19.1" in written  # verl[vllm] declares <=0.12.0
+    # runtime pins stay aligned; numpy and xgrammar override incompatible metadata.
+    assert "vllm==0.19.1" in written  # matches the company fork's declared runtime
     assert "numpy==2.2.6" in written  # verl + transferqueue declare numpy<2.0.0
     assert "xgrammar==0.1.25" in written  # vllm declares xgrammar>=0.1.32
 
@@ -529,7 +531,7 @@ def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch,
     install = calls[1]
     # the [vllm] extra, as Dockerfile.worker's VERL_SPEC asks for it, on the same commit.
     assert f"verl[vllm] @ {vc.VERL_REQUIREMENT_URL}" in install
-    # the extra's own ceiling is vllm<=0.12.0, which registers neither Qwen3.5 arch. pin past it.
+    # the explicit model/adapter runtime uses this exact vllm version.
     assert "vllm==0.19.1" in install
     for requirement in ("cachetools==7.1.7", "uvicorn==0.52.4", "fastapi==0.141.1"):
         assert requirement in install, (
@@ -1453,7 +1455,7 @@ def test_verl_pin_matches_the_version_opd_requires_exactly():
     # skip, and the whole-adapter lora bucket sync plus fused-linear grad preservation on top.
     _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
     _, _, commit = ref.rpartition("@")
-    assert commit == "716f204cf87d33ef3c272b070bc0b08a5f00ea27"
+    assert commit == "7647bb7f423b649df74ac71a244a2a3de9e1466a"
 
 
 def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypatch, tmp_path):

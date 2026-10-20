@@ -187,6 +187,30 @@ def test_model_options_are_owned_by_each_engine(monkeypatch, enabled):
     assert calls == expected
 
 
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+def test_every_engine_uses_explicit_model_construction(monkeypatch, algorithm):
+    calls = []
+    model = object()
+
+    def load(config, dtype, sequence_parallel_size):
+        calls.append((config, dtype, sequence_parallel_size))
+        return model
+
+    _modules(
+        monkeypatch,
+        {
+            "verl.workers.engine.fsdp.transformer_impl": {"FSDPEngineWithLMHead": object},
+            "verl.models.transformers.training_model": {"load_training_model": load},
+        },
+    )
+    recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.engine")
+    engine = recipe.FlashFSDPEngine.__new__(recipe.FlashFSDPEngine)
+    engine.model_config = SimpleNamespace(runtime_options={"algorithm": algorithm})
+    engine.ulysses_sequence_parallel_size = 1
+    assert engine._load_model("dtype") is model
+    assert calls == [(engine.model_config, "dtype", 1)]
+
+
 def test_sft_uses_linear_scheduler_without_replacing_upstream(monkeypatch):
     class BaseEngine:
         def _build_lr_scheduler(self, optimizer):

@@ -264,28 +264,17 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # fallback's install cost on every run; it is not what makes the backends runnable.
 #
 # vLLM is pinned to 0.19.1, matching the base stack above so the image carries ONE vLLM version.
-# That deliberately exceeds verl's declared vllm<=0.12.0 ceiling. The metadata-clean alternative
-# (0.11.2, which satisfies the ceiling and makes `uv pip check` green) was rejected on a model-
-# contract fact: Qwen/Qwen3.5-9B is flash's DEFAULT_MODEL and enables GRPO+OPD, both of which set
-# rollout.name=vllm, and 0.11.2 registers neither Qwen3_5ForConditionalGeneration nor
-# Qwen3_5MoeForConditionalGeneration, so it cannot run rollouts for the default model at all.
-# The ceiling is stale for the async rollout path regardless: verl 0.8.0's own stable Dockerfile
-# defaults to vllm 0.20.2, its Qwen3.5 GRPO examples require 0.18.0, and vllm_async_server.py
-# branches explicitly on 0.13+/0.17+/0.20+ behavior.
-#
-# Three metadata violations are DELIBERATE, and `uv pip check` stays red in here by design:
-#   verl + transferqueue declare numpy<2.0.0   -> vLLM 0.19.1 needs numpy>=2 (declarations are stale)
-#   verl declares vllm>=0.8.5,<=0.12.0         -> we ship 0.19.1 (see the ceiling discussion above)
-#   vllm declares xgrammar>=0.1.32             -> structured OPD gates on EXACTLY 0.1.25
+# The company fork now declares that exact vLLM version and Transformers >=5.12.1,<5.13.
+# Its explicit model and tensor-adapter implementations use those APIs.
+# The overrides still resolve incompatible metadata in the remaining dependency graph:
+#   verl + transferqueue declare numpy<2.0.0 -> vLLM 0.19.1 needs numpy>=2
+#   vllm declares xgrammar>=0.1.32           -> structured OPD requires exactly 0.1.25
 # xgrammar 0.1.25 was exercised against vLLM 0.19.1's own XgrammarBackend (schema compile, grammar
 # build, token-mask fill+apply) so the floor is not required to drive the API.
 #
-# Those three violations are why this uses `uv pip install --override` and NOT plain pip. pip has no
-# escape hatch for a deliberate metadata violation: it either resolves or it refuses, and here it
-# refuses with `ResolutionImpossible: Cannot install numpy==2.2.6 and verl` (verl 0.8.0 pins
-# numpy<2.0.0). uv's --override is the mechanism this pin set was validated with. All three violated
-# pins must appear in the override file: dropping the vllm line alone is still unsatisfiable
-# (verl[vllm] depends on vllm<=0.12.0 while we require 0.19.1).
+# numpy and xgrammar still need uv's --override to resolve conflicting dependency
+# metadata. Repeating exact vllm and transformers pins keeps the baked and fallback
+# training environments aligned. GPU qualification remains required for this runtime.
 #
 # `uv venv` rather than `python -m venv` because the pytorch base image ships no ensurepip, so
 # `python -m venv` fails outright ("The virtual environment was not created successfully because
@@ -321,7 +310,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # is_causal_conv1d_available() are byte-identical in 5.12.1 and 5.14.1, and both begin with
 # is_torch_cuda_available() -- they answer False on this cpu builder at every version. An earlier
 # revision of this comment blamed a 5.13 import-path move; no such move exists.
-ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@716f204cf87d33ef3c272b070bc0b08a5f00ea27
+ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@7647bb7f423b649df74ac71a244a2a3de9e1466a
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
 RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers==5.12.1" > /tmp/verl-overrides.txt \
     && uv venv --seed /opt/verl-venv \

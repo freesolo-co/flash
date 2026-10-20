@@ -32,7 +32,7 @@ from typing import Self
 # version file this branch pins to the release value.
 VERL_REQUIREMENT_NAME = "verl"
 VERL_REQUIREMENT_URL = (
-    "git+https://github.com/freesolo-co/verl@716f204cf87d33ef3c272b070bc0b08a5f00ea27"
+    "git+https://github.com/freesolo-co/verl@7647bb7f423b649df74ac71a244a2a3de9e1466a"
 )
 # the pin, as the venv stamp records it. the provisioning install asks for the [vllm] extra of this
 # same commit; the stamp stays extra-free so it identifies the verl a venv holds, not how it was
@@ -252,7 +252,7 @@ def model_max_position_embeddings(model_id: str, revision: str = "") -> int | No
 
 
 # verl ships two fused linear-CE backends and dispatches on `fused_kernel_options.impl_backend`
-# (models/transformers/monkey_patch.py). all three flash trainers used to pin `torch`, which is
+# (models/transformers/training_qwen3_5.py). all three flash trainers used to pin `torch`, which is
 # verl's own default (config/model/hf_model.yaml:67) -- a restated default rather than a choice.
 #
 # MEASURED, 4096x2560 hidden into a 248320 vocab, bf16, fwd+bwd, paired and alternating, 10 reps

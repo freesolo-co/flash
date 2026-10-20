@@ -24,7 +24,7 @@ def configure(options, overrides):
     from verl.runtime_interfaces import API_VERSION
     from verl.utils.device import auto_set_device
 
-    if API_VERSION != 1:
+    if API_VERSION != 2:
         raise RuntimeError("unsupported Verl trainer interface version")
     name = "sft_trainer_engine" if options.algorithm == "sft" else "ppo_trainer"
     with initialize_config_module(config_module="verl.trainer.config", version_base=None):

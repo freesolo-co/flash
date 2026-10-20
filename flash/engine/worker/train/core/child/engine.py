@@ -22,6 +22,13 @@ class FlashFSDPEngine(FSDPEngineWithLMHead):
         super().__init__(*args, **kwargs)
         self.runtime = RuntimeOptions.decode(self.model_config.runtime_options)
 
+    def _load_model(self, torch_dtype):
+        from verl.models.transformers.training_model import load_training_model
+
+        return load_training_model(
+            self.model_config, torch_dtype, self.ulysses_sequence_parallel_size
+        )
+
     def _build_module(self):
         module = super()._build_module()
         options = self.runtime
