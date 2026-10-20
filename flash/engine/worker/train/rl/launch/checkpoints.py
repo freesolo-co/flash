@@ -392,7 +392,15 @@ class _VerlResumeUploader:
         if not self._deployable_allowed():
             return False
         _validate_internal_adapter_dir(source, label=f"final step-{step}")
-        shutil.copytree(source, destination, dirs_exist_ok=True)
+        source_path, destination_path = os.path.realpath(source), os.path.realpath(destination)
+        if os.path.islink(destination) or os.path.commonpath([source_path, destination_path]) in {
+            source_path,
+            destination_path,
+        }:
+            raise RuntimeError("final adapter destination overlaps or redirects the staged export")
+        if os.path.exists(destination):
+            shutil.rmtree(destination)
+        shutil.copytree(source, destination)
         return True
 
     def _make_required_adapter_durable(self, step: int, adapter_dir: str) -> None:

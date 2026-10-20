@@ -1727,7 +1727,12 @@ def test_final_adapter_reuses_only_exact_validated_export(tmp_path):
     assert not uploader.reuse_final_adapter(4, str(destination))
     uploader.allow_deployable_publication()
     assert not uploader.reuse_final_adapter(5, str(destination))
+    destination.mkdir()
+    (destination / "stale.safetensors").write_bytes(b"old export")
     assert uploader.reuse_final_adapter(4, str(destination))
+    assert not (destination / "stale.safetensors").exists()
+    with pytest.raises(RuntimeError, match="overlaps"):
+        uploader.reuse_final_adapter(4, str(source))
     for path in source.iterdir():
         assert (destination / path.name).read_bytes() == path.read_bytes()
 
