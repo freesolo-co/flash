@@ -21,5 +21,8 @@ reconciled before deleting a Volume; do not delete storage underneath a live run
 
 Keep this opt-in until the full training/recovery matrix passes. A live L4-to-CPU
 fixture verified GPU exit, byte-identical checkpoint publication, terminal
-artifact ordering, and private-Volume cleanup. Full-size training checks are
-separate from that fixture.
+artifact ordering, and private-Volume cleanup. Full Qwen3.5-9B SFT and GRPO runs also completed publication after GPU exit.
+The SFT run resumed a step-4 native checkpoint and reproduced the uninterrupted
+final losses and all 496 adapter tensors exactly. These checks cover one H100
+and short fixtures; OPD and the larger multi-GPU model matrix remain unvalidated
+for this opt-in path.
