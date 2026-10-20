@@ -3,10 +3,26 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+
+# Every scalar consumed by the parent's step accounting. The complete record stays in
+# step_metrics.jsonl; only this bounded record crosses stdout alongside Ray's other writers.
+_METRIC_KEYS = (
+    "actor/pg_loss",
+    "actor/grad_norm",
+    "actor/kl_loss",
+    "actor/entropy",
+    "critic/rewards/mean",
+    "critic/advantages/min",
+    "critic/advantages/max",
+    "response_length/mean",
+    "response_length/clip_ratio",
+    "timing_s/step",
+)
 
 
 def _metric_line(record: dict) -> str:
@@ -16,7 +32,8 @@ def _metric_line(record: dict) -> str:
     fields = [f"step:{step}"]
     fields.extend(
         f"{key}:{value!r}"
-        for key, value in data.items()
+        for key in _METRIC_KEYS
+        if (value := data.get(key)) is not None
         if isinstance(value, (int, float)) and not isinstance(value, bool)
     )
     return " - ".join(fields)
@@ -50,8 +67,15 @@ def stream_metrics(path: str, *, emit=None):
     if emit is None:
 
         def emit(line):
-            sys.stdout.write(line + "\n")
-            sys.stdout.flush()
+            # Ray/tqdm may leave a colored warning or progress bar without a newline.
+            # A single write within PIPE_BUF cannot interleave with another pipe writer.
+            # TextIOWrapper writes of the full multi-kilobyte diagnostic row could split.
+            payload = ("\n" + line + "\n").encode()
+            fd = sys.stdout.fileno()
+            if len(payload) > os.fpathconf(fd, "PC_PIPE_BUF"):
+                raise ValueError("GRPO metric record exceeds the atomic pipe-write limit")
+            if os.write(fd, payload) != len(payload):
+                raise OSError("incomplete GRPO metric pipe write")
 
     journal = Path(path)
     journal.write_bytes(b"")  # A retry must never replay a previous attempt's evidence.
