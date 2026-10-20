@@ -52,9 +52,9 @@ inference_router = APIRouter()
 @inference_router.post("/generate", tags=["inference"])
 async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
     context = ServingContext.of(request)
-    authorization = await context.authorize_inference(request, payload.adapter_id)
+    authorization = await context.authorize_inference(request, payload.model_id)
     requested, target = await context.lookup.resolve(
-        payload.adapter_id, org_id=_authorization_org_id(authorization)
+        payload.model_id, org_id=_authorization_org_id(authorization)
     )
     traffic = require_attributed_traffic(authorization, target)
     context.reject_unsettleable_thinking(payload, target)
@@ -81,16 +81,16 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
     return _inference_json_response(result, target)
 
 
-@inference_router.post("/adapters/{adapter_id:path}/generate", tags=["inference"])
+@inference_router.post("/adapters/{model_id:path}/generate", tags=["inference"])
 async def generate_for_adapter(
-    adapter_id: str, payload: dict[str, Any], request: Request
+    model_id: str, payload: dict[str, Any], request: Request
 ) -> JSONResponse:
     context = ServingContext.of(request)
-    normalized_adapter_id = _path_adapter_id(adapter_id)
-    authorization = await context.authorize_inference(request, normalized_adapter_id)
-    req = _parse_generate({**payload, "adapter_id": normalized_adapter_id})
+    normalized_model_id = _path_model_id(model_id)
+    authorization = await context.authorize_inference(request, normalized_model_id)
+    req = _parse_generate({**payload, "adapter_id": normalized_model_id})
     requested, target = await context.lookup.resolve(
-        req.adapter_id, org_id=_authorization_org_id(authorization)
+        req.model_id, org_id=_authorization_org_id(authorization)
     )
     traffic = require_attributed_traffic(authorization, target)
     context.reject_unsettleable_thinking(req, target)
@@ -125,9 +125,9 @@ def _authorization_org_id(authorization: InferenceAuthorization) -> str | None:
     return authorization.org_id
 
 
-def _path_adapter_id(adapter_id: str) -> str:
+def _path_model_id(model_id: str) -> str:
     """return the stripped path adapter id, rejecting a blank one before the authorizer runs."""
-    stripped = adapter_id.strip()
+    stripped = model_id.strip()
     if not stripped:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "adapter_id must not be empty")
     return stripped
@@ -135,17 +135,17 @@ def _path_adapter_id(adapter_id: str) -> str:
 
 def _openai_adapter_id(payload: dict[str, Any]) -> str:
     """return the stripped adapter id required to authorize an openai-shaped request."""
-    adapter_id = payload.get("model")
-    if not isinstance(adapter_id, str) or not adapter_id.strip():
+    model_id = payload.get("model")
+    if not isinstance(model_id, str) or not model_id.strip():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "model must be the adapter id")
-    return adapter_id.strip()
+    return model_id.strip()
 
 
 @inference_router.post("/v1/chat/completions", tags=["openai"])
 async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     context = ServingContext.of(request)
-    adapter_id = _openai_adapter_id(payload)
-    authorization = await context.authorize_inference(request, adapter_id)
+    model_id = _openai_adapter_id(payload)
+    authorization = await context.authorize_inference(request, model_id)
     try:
         normalized = parse_chat_request(
             payload,
@@ -160,7 +160,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         )
         raise HTTPException(request_status, str(exc)) from exc
     requested, target = await context.lookup.resolve(
-        adapter_id, org_id=_authorization_org_id(authorization)
+        model_id, org_id=_authorization_org_id(authorization)
     )
     traffic = require_attributed_traffic(authorization, target)
     effective_thinking = target.thinking
@@ -178,7 +178,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         )
     except OpenAIRequestError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-    generate_fields = openai_generate_fields(normalized, adapter_id)
+    generate_fields = openai_generate_fields(normalized, model_id)
     generate_fields["chat_template_kwargs"] = {
         **normalized.chat_template_kwargs,
         "enable_thinking": effective_thinking,
@@ -199,7 +199,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
             req,
             requested,
             target,
-            adapter_id=adapter_id,
+            model_id=model_id,
             completion_id=completion_id,
             created=created,
             include_usage=include_usage,
@@ -233,7 +233,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     response = openai_chat_completion(
         completion_id=completion_id,
         created=created,
-        adapter_id=adapter_id,
+        model_id=model_id,
         generation=generation,
         provenance=provenance,
     )
@@ -288,7 +288,7 @@ async def _stream_chat_completion(
     requested: Any,
     target: Any,
     *,
-    adapter_id: str,
+    model_id: str,
     completion_id: str,
     created: int,
     include_usage: bool,
@@ -331,7 +331,7 @@ async def _stream_chat_completion(
             context.chat_stream(
                 record=requested,
                 events=events,
-                adapter_id=adapter_id,
+                model_id=model_id,
                 completion_id=completion_id,
                 created=created,
                 include_usage=include_usage,

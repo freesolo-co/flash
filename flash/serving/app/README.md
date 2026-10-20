@@ -325,6 +325,17 @@ activates. Raw `prompt` callers must provide the mode-specific state themselves:
 prompt must already contain a closing `</think>` marker, while a thinking raw prompt must leave an
 open `<think>` block for generation to close.
 
+Internal Python code uses `checkpoint_id` for permanent checkpoint bindings and `model_id`
+where a selector can also name a catalog base model. The existing HTTP/Modal JSON spelling
+`adapter_id` remains a serialization alias; this naming cleanup does not change API payloads
+or database columns.
+
+`artifact_digest` verifies the artifact files. `artifact_fingerprint` identifies their immutable
+binding to an organization, checkpoint, source revision, base model and serving configuration,
+including the content digest. The same files can have the same digest but different binding
+fingerprints. Fingerprint serialization retains its original keys so stored fingerprints remain
+valid; neither hash is an authentication credential.
+
 `POST /adapters`:
 
 ```json

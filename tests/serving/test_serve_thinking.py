@@ -86,7 +86,7 @@ def _engine(modal_app_module: Any, *, thinking: bool) -> Any:
 
 
 def _render(eng: Any, payload: GenerateRequest) -> str:
-    record = eng.registry.get("org-1", payload.adapter_id)
+    record = eng.registry.get("org-1", payload.model_id)
     assert record is not None
     return eng.tokenizer.decode(eng._tokenize_prompt(payload, thinking_default=record.thinking))
 
@@ -95,7 +95,7 @@ def test_no_think_adapter_default_path_has_no_open_think(modal_app_module):
     """A no-think adapter sampled with NO chat_template_kwargs must not render an open <think>."""
     eng = _engine(modal_app_module, thinking=False)
     payload = GenerateRequest(
-        adapter_id="r1/final", messages=[{"role": "user", "content": "ping"}]
+        model_id="r1/final", messages=[{"role": "user", "content": "ping"}]
     )  # no chat_template_kwargs at all
     rendered = _render(eng, payload)
     assert rendered.endswith(_CLOSED_THINK_SUFFIX)
@@ -105,7 +105,7 @@ def test_thinking_adapter_default_path_keeps_open_think(modal_app_module):
     """A thinking adapter (the default) on the same no-kwarg path still renders the <think> block,
     proving the per-adapter default is what's applied (not a blanket disable)."""
     eng = _engine(modal_app_module, thinking=True)
-    payload = GenerateRequest(adapter_id="r1/final", messages=[{"role": "user", "content": "ping"}])
+    payload = GenerateRequest(model_id="r1/final", messages=[{"role": "user", "content": "ping"}])
     rendered = _render(eng, payload)
     assert rendered.endswith(_OPEN_THINK_SUFFIX)
 
@@ -115,7 +115,7 @@ def test_caller_enable_thinking_does_not_override_adapter_default(modal_app_modu
     no-think mode even when the request explicitly asks for thinking."""
     eng = _engine(modal_app_module, thinking=False)
     payload = GenerateRequest(
-        adapter_id="r1/final",
+        model_id="r1/final",
         messages=[{"role": "user", "content": "ping"}],
         chat_template_kwargs={"enable_thinking": True},
     )
@@ -127,7 +127,7 @@ def test_null_enable_thinking_uses_adapter_default(modal_app_module):
     """An explicit ``enable_thinking: null`` is ignored so the adapter default still wins."""
     eng = _engine(modal_app_module, thinking=False)
     payload = GenerateRequest(
-        adapter_id="r1/final",
+        model_id="r1/final",
         messages=[{"role": "user", "content": "ping"}],
         chat_template_kwargs={"enable_thinking": None},
     )
@@ -142,6 +142,6 @@ def test_resolved_thinking_default_wins_over_registry(modal_app_module):
     one record's weights with another's thinking default. Here the registry says thinking=True but the
     caller threads thinking_default=False (the record the weights came from) -> no open <think>."""
     eng = _engine(modal_app_module, thinking=True)  # registry record: thinking ON
-    payload = GenerateRequest(adapter_id="r1/final", messages=[{"role": "user", "content": "ping"}])
+    payload = GenerateRequest(model_id="r1/final", messages=[{"role": "user", "content": "ping"}])
     rendered = eng.tokenizer.decode(eng._tokenize_prompt(payload, thinking_default=False))
     assert rendered.endswith(_CLOSED_THINK_SUFFIX)

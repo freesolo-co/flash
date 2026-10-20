@@ -254,7 +254,7 @@ def test_canary_attributes_a_base_model_to_the_configured_internal_organization(
     canary = _request()
     request = SimpleNamespace(headers=_headers(canary))
     target = AdapterRecord(
-        adapter_id=canary.model,
+        model_id=canary.model,
         base_model=canary.model,
         serve_base_model=True,
         org_id=None,

@@ -61,7 +61,7 @@ async def _claim_loading_generation(
         return claimed, True
     if stored.org_id is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "checkpoint requires org_id")
-    return (await get_authoritative(stored.org_id, stored.adapter_id) or stored), False
+    return (await get_authoritative(stored.org_id, stored.checkpoint_id) or stored), False
 
 
 @adapter_router.post("/adapters")
@@ -121,7 +121,7 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
     """Keep a failed promotion from orphaning its loaded gpu adapter."""
 
     try:
-        current = await get_authoritative(registration.org_id or "", registration.adapter_id)
+        current = await get_authoritative(registration.org_id or "", registration.checkpoint_id)
         if _is_same_generation_winner(current, registration):
             # another attempt from this shared lifecycle generation won the promotion. adopt its
             # durable row instead of unloading the gpu registration that now legitimately backs it.
@@ -141,7 +141,7 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
             )
             if fenced is None:
                 current = await get_authoritative(
-                    registration.org_id or "", registration.adapter_id
+                    registration.org_id or "", registration.checkpoint_id
                 )
                 if _is_same_generation_winner(current, registration):
                     context.router.upsert(current, revive=True)
@@ -149,7 +149,7 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
                 if _is_unfenced_original(current, registration):
                     print(
                         f"adapter registration reconciliation skipped for "
-                        f"{registration.adapter_id}: lifecycle generation could not be fenced",
+                        f"{registration.checkpoint_id}: lifecycle generation could not be fenced",
                         flush=True,
                     )
                     return
@@ -157,7 +157,7 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
                 context.router.upsert(fenced, revive=True)
     except HTTPException as exc:
         print(
-            f"adapter registration reconciliation skipped for {registration.adapter_id}: {exc!r}",
+            f"adapter registration reconciliation skipped for {registration.checkpoint_id}: {exc!r}",
             flush=True,
         )
         return
@@ -165,7 +165,7 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
     await context.unregister_safe(
         registration.base_model,
         registration.org_id or "",
-        registration.adapter_id,
+        registration.checkpoint_id,
         registration.deployment_generation,
     )
 
@@ -201,13 +201,13 @@ async def _register_revision(context: ServingContext, stored: AdapterRecord) -> 
     context.router.upsert(committed, revive=True)
 
 
-@adapter_router.get("/adapters/{adapter_id:path}")
-async def get_adapter(adapter_id: str, request: Request) -> dict[str, Any]:
+@adapter_router.get("/adapters/{checkpoint_id:path}")
+async def get_adapter(checkpoint_id: str, request: Request) -> dict[str, Any]:
     context = ServingContext.of(request)
     org_id = context.internal_org_id(request)
-    if parse_checkpoint_ref(adapter_id) is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
-    record = await context.lookup.get_exact(org_id, adapter_id)
+    if parse_checkpoint_ref(checkpoint_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {checkpoint_id}")
+    record = await context.lookup.get_exact(org_id, checkpoint_id)
     lifecycle_state = record.status
     if record.status == "disabled" and record.deployment_generation is not None:
         lifecycle_state = "loading"
@@ -221,9 +221,9 @@ async def get_adapter(adapter_id: str, request: Request) -> dict[str, Any]:
     }
 
 
-@adapter_router.delete("/adapters/{adapter_id:path}")
+@adapter_router.delete("/adapters/{checkpoint_id:path}")
 async def remove_adapter(
-    adapter_id: str,
+    checkpoint_id: str,
     request: Request,
     background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
@@ -231,14 +231,14 @@ async def remove_adapter(
     org_id = context.internal_org_id(request)
     await context.reload_if_configured()
 
-    base_record, checkpoint = await resolve_undeploy_target(context.router, org_id, adapter_id)
+    base_record, checkpoint = await resolve_undeploy_target(context.router, org_id, checkpoint_id)
     if checkpoint is None:
-        parsed = parse_checkpoint_ref(adapter_id)
+        parsed = parse_checkpoint_ref(checkpoint_id)
         assert parsed is not None
         return {
             "ok": True,
-            "removed": adapter_id,
-            "checkpoint_id": adapter_id,
+            "removed": checkpoint_id,
+            "checkpoint_id": checkpoint_id,
             "run_id": parsed[0],
             "disabled_checkpoints": [],
         }
@@ -249,7 +249,7 @@ async def remove_adapter(
         # engine's base weights out from under every other tenant on the way.
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
-            f"{adapter_id} is a base model, not a deployed adapter",
+            f"{checkpoint_id} is a base model, not a deployed adapter",
         )
 
     # phase 1: compare-and-swap every matched row to "disabled" in persistence first, collecting
@@ -270,15 +270,15 @@ async def remove_adapter(
                 context.unregister_safe,
                 cleanup_record.base_model,
                 org_id,
-                cleanup_record.adapter_id,
+                cleanup_record.checkpoint_id,
                 expected_generation,
             )
 
-    if failure_response := result.failure_response(adapter_id, background_tasks):
+    if failure_response := result.failure_response(checkpoint_id, background_tasks):
         return failure_response
 
     return undeploy_body(
-        adapter_id,
+        checkpoint_id,
         checkpoint.run_id or "",
         checkpoint.base_model,
         result.disabled_checkpoints,

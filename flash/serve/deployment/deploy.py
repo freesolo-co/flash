@@ -260,17 +260,17 @@ def deploy_adapter(
     return dep
 
 
-def _adapter_url(adapter_id: str) -> str:
-    return f"{serving_urls.serving_base_url()}/adapters/{quote(adapter_id, safe='')}"
+def _adapter_url(checkpoint_id: str) -> str:
+    return f"{serving_urls.serving_base_url()}/adapters/{quote(checkpoint_id, safe='')}"
 
 
 def _registered_adapter_response(
-    org_id: str, adapter_id: str, *, timeout_s: float | None = None
+    org_id: str, checkpoint_id: str, *, timeout_s: float | None = None
 ) -> tuple[dict | None, httpx.Response]:
     """Read one authoritative adapter record and retain its polling headers."""
     resp = transport.serving_request(
         "GET",
-        _adapter_url(adapter_id),
+        _adapter_url(checkpoint_id),
         ok_statuses=(404,),
         timeout_s=timeout_s,
         org_id=org_id,
@@ -281,24 +281,24 @@ def _registered_adapter_response(
         payload = resp.json()
     except ValueError as exc:
         raise serving_errors.ServingError(
-            f"serving returned invalid status JSON for adapter {adapter_id}"
+            f"serving returned invalid status JSON for adapter {checkpoint_id}"
         ) from exc
     if not isinstance(payload, dict):
         raise serving_errors.ServingError(
-            f"serving returned invalid status data for adapter {adapter_id}"
+            f"serving returned invalid status data for adapter {checkpoint_id}"
         )
     record = payload.get("adapter") if isinstance(payload.get("adapter"), dict) else payload
     if not isinstance(record, dict):
-        raise serving_errors.ServingError(f"serving returned no adapter record for {adapter_id}")
+        raise serving_errors.ServingError(f"serving returned no adapter record for {checkpoint_id}")
     return record, resp
 
 
 def _registered_adapter(
-    org_id: str, adapter_id: str, *, timeout_s: float | None = None
+    org_id: str, checkpoint_id: str, *, timeout_s: float | None = None
 ) -> dict | None:
     """read one tenant-scoped authoritative adapter record, including disabled records."""
 
-    record, _ = _registered_adapter_response(org_id, adapter_id, timeout_s=timeout_s)
+    record, _ = _registered_adapter_response(org_id, checkpoint_id, timeout_s=timeout_s)
     return record
 
 

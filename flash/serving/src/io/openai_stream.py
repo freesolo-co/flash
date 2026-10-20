@@ -68,14 +68,14 @@ async def _await_producer_shutdown(producer: asyncio.Task[None]) -> None:
 
 
 def _assistant_role_chunk(
-    completion_id: str, created: int, adapter_id: str, choice_count: int = 1
+    completion_id: str, created: int, model_id: str, choice_count: int = 1
 ) -> bytes:
     return _sse(
         {
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
-            "model": adapter_id,
+            "model": model_id,
             "choices": [
                 {
                     "index": index,
@@ -96,13 +96,13 @@ class _StreamOutput:
         *,
         completion_id: str,
         created: int,
-        adapter_id: str,
+        model_id: str,
     ) -> None:
         self._output = output
         self._disconnected = disconnected
         self._completion_id = completion_id
         self._created = created
-        self._adapter_id = adapter_id
+        self._adapter_id = model_id
         self._terminal_sent = False
 
     async def emit(
@@ -202,7 +202,7 @@ async def _produce_openai_chat_stream(
     *,
     record: AdapterRecord,
     events: AsyncIterator[dict[str, Any]],
-    adapter_id: str,
+    model_id: str,
     completion_id: str,
     created: int,
     include_usage: bool,
@@ -216,14 +216,14 @@ async def _produce_openai_chat_stream(
         disconnected,
         completion_id=completion_id,
         created=created,
-        adapter_id=adapter_id,
+        model_id=model_id,
     )
     splitters = {index: ReasoningDeltaSplitter(thinking=thinking) for index in range(choice_count)}
     terminals: dict[int, dict[str, Any]] = {}
     final: dict[str, Any] | None = None
     latest_usage: dict[str, Any] = {}
     terminal_persisted = False
-    guarded_events = terminating_on_engine_error(router, events, adapter_id)
+    guarded_events = terminating_on_engine_error(router, events, model_id)
     disconnect_wait = asyncio.create_task(disconnected.wait())
     try:
         try:
@@ -235,7 +235,7 @@ async def _produce_openai_chat_stream(
                 latest_usage = first
             guarded_events = _replay_first_event(first, guarded_events)
         await stream_output.emit(
-            _assistant_role_chunk(completion_id, created, adapter_id, choice_count)
+            _assistant_role_chunk(completion_id, created, model_id, choice_count)
         )
         while final is None:
             try:
@@ -297,7 +297,7 @@ async def _produce_openai_chat_stream(
         terminal_chunks = _terminal_chunks(
             completion_id,
             created,
-            adapter_id,
+            model_id,
             terminals,
             final,
             include_usage,
@@ -394,7 +394,7 @@ async def _finalize_usage(
 def _terminal_chunks(
     completion_id: str,
     created: int,
-    adapter_id: str,
+    model_id: str,
     terminals: dict[int, dict[str, Any]],
     final: dict[str, Any],
     include_usage: bool,
@@ -403,7 +403,7 @@ def _terminal_chunks(
         "id": completion_id,
         "object": "chat.completion.chunk",
         "created": created,
-        "model": adapter_id,
+        "model": model_id,
     }
     chunks = [
         {
@@ -438,7 +438,7 @@ async def openai_chat_stream(
     *,
     record: AdapterRecord,
     events: AsyncIterator[dict[str, Any]],
-    adapter_id: str,
+    model_id: str,
     completion_id: str,
     created: int,
     include_usage: bool,
@@ -457,7 +457,7 @@ async def openai_chat_stream(
             disconnected,
             record=record,
             events=events,
-            adapter_id=adapter_id,
+            model_id=model_id,
             completion_id=completion_id,
             created=created,
             include_usage=include_usage,

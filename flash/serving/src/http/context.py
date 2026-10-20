@@ -94,9 +94,7 @@ class ServingContext:
         self.assert_internal(request)
         return internal_org_id(request)
 
-    async def authorize_inference(
-        self, request: Request, adapter_id: str
-    ) -> InferenceAuthorization:
+    async def authorize_inference(self, request: Request, model_id: str) -> InferenceAuthorization:
         if is_trusted_internal(request, self.trusted_internal_keys):
             return TrustedInternalAuthorization(org_id=optional_internal_org_id(request))
         token = _bearer_token(request)
@@ -109,7 +107,7 @@ class ServingContext:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth is not configured"
             )
-        authorized = await self.chat_authorizer(token, adapter_id, training_scope_headers(request))
+        authorized = await self.chat_authorizer(token, model_id, training_scope_headers(request))
         if isinstance(authorized, AuthorizedTraffic):
             if authorized.principal.kind == "trusted_internal":
                 raise HTTPException(
@@ -156,7 +154,7 @@ class ServingContext:
         self,
         base_model: str,
         org_id: str,
-        adapter_id: str,
+        model_id: str,
         expected_generation: str | None,
     ) -> None:
         # gpu cleanup may cold-start a scaled-to-zero engine. the engine compares this deployment
@@ -164,10 +162,10 @@ class ServingContext:
         # same immutable revision id. durable routing is already disabled, but an exact eviction
         # failure must remain observable rather than making the successful api response imply it ran.
         try:
-            await self.pool.unregister(base_model, org_id, adapter_id, expected_generation)
+            await self.pool.unregister(base_model, org_id, model_id, expected_generation)
         except Exception as error:
             print(
-                f"hosted adapter gpu cleanup failed for {adapter_id} on {base_model}: {error!r}",
+                f"hosted adapter gpu cleanup failed for {model_id} on {base_model}: {error!r}",
                 flush=True,
             )
 
@@ -259,7 +257,7 @@ class ServingContext:
         *,
         record: AdapterRecord,
         events: AsyncIterator[dict[str, Any]],
-        adapter_id: str,
+        model_id: str,
         completion_id: str,
         created: int,
         include_usage: bool,
@@ -271,7 +269,7 @@ class ServingContext:
             self.router,
             record=record,
             events=events,
-            adapter_id=adapter_id,
+            model_id=model_id,
             completion_id=completion_id,
             created=created,
             include_usage=include_usage,

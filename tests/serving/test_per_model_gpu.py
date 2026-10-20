@@ -328,15 +328,15 @@ def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_pat
     from flash.serving.src.store.registry import AdapterRegistry
 
     run_id = "flash-1234567890-abcdef12"
-    adapter_id = f"{run_id}/step-1"
+    model_id = f"{run_id}/step-1"
     record_values = {
-        "adapter_id": adapter_id,
+        "adapter_id": model_id,
         "repo_id": "org/private-adapter",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "checkpoints/step-1/adapter",
         "repo_type": "dataset",
         "org_id": "org-1",
-        "checkpoint": adapter_id,
+        "checkpoint": model_id,
         "private": True,
         "thinking": False,
         "status": "ready",
@@ -357,30 +357,30 @@ def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_pat
     resolved_request = object()
 
     async def ensure_adapter_local(record):
-        assert record.adapter_id == adapter_id
+        assert record.model_id == model_id
         return resolved_path
 
     def cached_lora_request(record, path):
-        assert record.adapter_id == adapter_id
+        assert record.model_id == model_id
         assert path == resolved_path
         return resolved_request
 
     engine._ensure_adapter_local_locked = ensure_adapter_local
     engine._cached_lora_request_locked = cached_lora_request
-    engine._lora_entries = {("org-1", adapter_id): types.SimpleNamespace(state="reserved")}
+    engine._lora_entries = {("org-1", model_id): types.SimpleNamespace(state="reserved")}
 
     async def add_lora(record, path):
-        assert record.adapter_id == adapter_id
+        assert record.model_id == model_id
         assert path == resolved_path
 
     engine._add_lora_locked = add_lora
     assert engine.registry.list_ready() == []
 
-    lora_request, record = asyncio.run(engine._lora_request(adapter_id, record_dict))
+    lora_request, record = asyncio.run(engine._lora_request(model_id, record_dict))
 
     assert lora_request is resolved_request
-    assert record.adapter_id == adapter_id
-    assert engine.registry.get("org-1", adapter_id) == record
+    assert record.model_id == model_id
+    assert engine.registry.get("org-1", model_id) == record
 
 
 def test_lora_engine_import_does_not_require_pillow() -> None:

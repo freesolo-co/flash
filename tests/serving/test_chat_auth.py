@@ -68,7 +68,7 @@ class FakePool:
         self,
         base_model: str,
         org_id: str,
-        adapter_id: str,
+        model_id: str,
         expected_generation: str | None = None,
     ) -> None:  # pragma: no cover
         pass
@@ -81,8 +81,8 @@ class FakeAuthorizer:
         self.calls: list[tuple[str, str]] = []
         self._raises = raises
 
-    async def __call__(self, token: str, adapter_id: str, scope: dict | None = None) -> str:
-        self.calls.append((token, adapter_id))
+    async def __call__(self, token: str, model_id: str, scope: dict | None = None) -> str:
+        self.calls.append((token, model_id))
         if self._raises is not None:
             raise self._raises
         return "org-A"

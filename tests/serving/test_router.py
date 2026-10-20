@@ -80,7 +80,7 @@ class FakePool:
         self.resolved_records: dict[str, AdapterRecord] = {}
 
     def _resolved_record(self, record: AdapterRecord) -> AdapterRecord:
-        return self.resolved_records.get(record.adapter_id, record)
+        return self.resolved_records.get(record.model_id, record)
 
     def _active_checkpoint_ref(self, record: AdapterRecord) -> str:
         checkpoint = (record.checkpoint or "").strip()
@@ -89,8 +89,8 @@ class FakePool:
         subfolder = (record.subfolder or "").strip().strip("/")
         match = re.search(r"(?:^|/)checkpoints/(step-\d+)(?:/|$)", subfolder)
         if match:
-            return f"{record.adapter_id}/{match.group(1)}"
-        return record.adapter_id if subfolder else ""
+            return f"{record.model_id}/{match.group(1)}"
+        return record.model_id if subfolder else ""
 
     def _check_expected(self, record: AdapterRecord, expected_checkpoint: str | None) -> str:
         active = self._active_checkpoint_ref(record)
@@ -98,7 +98,7 @@ class FakePool:
             expected = expected_checkpoint.strip()
             raise ValueError(
                 "checkpoint mismatch: "
-                f"adapter {record.adapter_id} is serving checkpoint "
+                f"adapter {record.model_id} is serving checkpoint "
                 f"{active or '<none>'}, not the expected {expected or '<none>'}"
             )
         return active
@@ -113,7 +113,7 @@ class FakePool:
     ) -> dict:
         record = self._resolved_record(record)
         checkpoint = self._check_expected(record, expected_checkpoint)
-        self.generated.append((base_model, payload.adapter_id))
+        self.generated.append((base_model, payload.model_id))
         self.generated_records.append(record)
         self.template_kwargs.append(getattr(payload, "chat_template_kwargs", None))
         self.messages.append(getattr(payload, "messages", None))
@@ -123,7 +123,7 @@ class FakePool:
             {
                 # Snake_case, matching the real engine RPC contract (modal_app.py::_generate).
                 "ok": True,
-                "adapter_id": payload.adapter_id,
+                "adapter_id": payload.model_id,
                 "text": f"[{base_model}] reply",
                 "finish_reason": "stop",
                 "prompt_token_ids": [4, 5],
@@ -145,7 +145,7 @@ class FakePool:
         record = self._resolved_record(record)
         checkpoint = self._check_expected(record, expected_checkpoint)
         yield attest(record, {"type": "ready", "checkpoint": checkpoint})
-        self.generated.append((base_model, payload.adapter_id))
+        self.generated.append((base_model, payload.model_id))
         self.generated_records.append(record)
         self.messages.append(getattr(payload, "messages", None))
         self.structured.append(getattr(payload, "structured_outputs", None))
@@ -162,17 +162,17 @@ class FakePool:
         }
 
     async def register(self, base_model: str, record: AdapterRecord) -> None:
-        self.registered.append((base_model, record.adapter_id))
+        self.registered.append((base_model, record.model_id))
 
     async def unregister(
         self,
         base_model: str,
         org_id: str,
-        adapter_id: str,
+        model_id: str,
         expected_generation: str | None = None,
     ) -> None:
         del org_id, expected_generation
-        self.unregistered.append((base_model, adapter_id))
+        self.unregistered.append((base_model, model_id))
 
 
 @pytest.fixture
@@ -187,10 +187,9 @@ def app_setup():
 
 def test_unregister_safe_records_exact_gpu_cleanup_failure(capsys):
     class _FailingPool:
-        async def unregister(self, base_model, org_id, adapter_id, expected_generation):
+        async def unregister(self, base_model, org_id, model_id, expected_generation):
             raise RuntimeError(
-                f"exact eviction failed for {base_model} {org_id} {adapter_id} "
-                f"{expected_generation}"
+                f"exact eviction failed for {base_model} {org_id} {model_id} {expected_generation}"
             )
 
     context = object.__new__(ServingContext)
@@ -443,9 +442,9 @@ def test_thinking_logprobs_policy_runs_after_adapter_resolution(app_setup):
     original_resolve = context.lookup.resolve
     resolved = []
 
-    async def tracked_resolve(adapter_id, **kwargs):
-        result = await original_resolve(adapter_id, **kwargs)
-        resolved.append(result[1].adapter_id)
+    async def tracked_resolve(model_id, **kwargs):
+        result = await original_resolve(model_id, **kwargs)
+        resolved.append(result[1].model_id)
         return result
 
     context.lookup.resolve = tracked_resolve
@@ -500,7 +499,7 @@ def test_tool_choice_none_is_inactive_on_unqualified_thinking_route() -> None:
 
 def test_base_model_false_thinking_override_allows_logprobs() -> None:
     record = AdapterRecord(
-        adapter_id=QWEN,
+        model_id=QWEN,
         repo_id=QWEN,
         base_model=QWEN,
         serve_base_model=True,
@@ -965,7 +964,7 @@ def test_openai_stream_rejects_unattested_revision_and_closes_engine(attestation
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": revision.adapter_id,
+            "model": revision.model_id,
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         },
@@ -1034,8 +1033,8 @@ def test_openai_chat_stream_sets_anti_buffering_headers(app_setup):
 def test_openai_chat_rejects_non_boolean_stream_after_authorization(stream):
     authorizations: list[str] = []
 
-    async def _authorize(_token: str, adapter_id: str, _scope: dict | None = None) -> str:
-        authorizations.append(adapter_id)
+    async def _authorize(_token: str, model_id: str, _scope: dict | None = None) -> str:
+        authorizations.append(model_id)
         return "org-1"
 
     pool = FakePool()
@@ -1153,8 +1152,8 @@ def test_raced_undeploy_engine_valueerror_is_404(app_setup):
     _, pool, router = app_setup
 
     async def vanish(base_model, payload, record, **_kwargs):
-        router.remove(payload.adapter_id)  # concurrent undeploy after _lookup passed
-        raise ValueError(f"Unknown adapter id on {base_model}: {payload.adapter_id}")
+        router.remove(payload.model_id)  # concurrent undeploy after _lookup passed
+        raise ValueError(f"Unknown adapter id on {base_model}: {payload.model_id}")
 
     pool.generate = vanish
     client = _serve(pool, router, internal_key="sekret")
@@ -1239,7 +1238,7 @@ def test_base_model_delete_is_rejected_rather_than_faked() -> None:
     and evicted the shared engine's base weights out from under every other tenant on the way.
     """
     record = AdapterRecord(
-        adapter_id=QWEN,
+        model_id=QWEN,
         repo_id=QWEN,
         base_model=QWEN,
         serve_base_model=True,
@@ -1270,7 +1269,7 @@ def test_base_model_delete_is_rejected_rather_than_faked() -> None:
     with pytest.raises(HTTPException) as excinfo:
         asyncio.run(
             remove_adapter(
-                adapter_id=QWEN,
+                checkpoint_id=QWEN,
                 request=request,
                 background_tasks=background_tasks,
             )
@@ -1297,12 +1296,12 @@ class _MeteringPool(FakePool):
     ) -> dict:
         record = self._resolved_record(record)
         checkpoint = self._check_expected(record, expected_checkpoint)
-        self.generated.append((base_model, payload.adapter_id))
+        self.generated.append((base_model, payload.model_id))
         return attest(
             record,
             {
                 "ok": True,
-                "adapter_id": payload.adapter_id,
+                "adapter_id": payload.model_id,
                 "text": f"[{base_model}] reply",
                 "prompt_tokens": 7,
                 "completion_tokens": 3,
@@ -1362,12 +1361,12 @@ class _CachedMeteringPool(FakePool):
     ) -> dict:
         record = self._resolved_record(record)
         checkpoint = self._check_expected(record, expected_checkpoint)
-        self.generated.append((base_model, payload.adapter_id))
+        self.generated.append((base_model, payload.model_id))
         return attest(
             record,
             {
                 "ok": True,
-                "adapter_id": payload.adapter_id,
+                "adapter_id": payload.model_id,
                 "text": f"[{base_model}] reply",
                 "prompt_tokens": 10,
                 "completion_tokens": 3,
@@ -1390,7 +1389,7 @@ class _CachedMeteringPool(FakePool):
         record = self._resolved_record(record)
         checkpoint = self._check_expected(record, expected_checkpoint)
         yield attest(record, {"type": "ready", "checkpoint": checkpoint})
-        self.generated.append((base_model, payload.adapter_id))
+        self.generated.append((base_model, payload.model_id))
         yield {"type": "delta", "text": "hi"}
         yield {
             "type": "final",
@@ -1459,17 +1458,17 @@ def test_generate_forwards_record_for_lazy_engine_load(app_setup):
     captured: list = []
 
     async def _capture(base_model, payload, record, **_kwargs):
-        captured.append((base_model, record.adapter_id, record.repo_id))
+        captured.append((base_model, record.model_id, record.repo_id))
         return {
             "ok": True,
-            "adapter_id": payload.adapter_id,
+            "adapter_id": payload.model_id,
             "text": "x",
             "finish_reason": "stop",
             "token_ids": [],
             "inference_time_seconds": 0.0,
             # a checkpoint request is refused unless the engine attests exact identity
-            "lora_request_adapter": record.adapter_id,
-            "checkpoint": record.adapter_id,
+            "lora_request_adapter": record.model_id,
+            "checkpoint": record.model_id,
         }
 
     pool.generate = _capture

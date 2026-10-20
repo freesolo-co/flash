@@ -27,7 +27,7 @@ def checkpoint_key(org_id: str, checkpoint_id: str) -> CheckpointKey:
 def record_key(record: Any) -> CheckpointKey:
     """return the internal key for one checkpoint record."""
 
-    return checkpoint_key(record.org_id, record.adapter_id)
+    return checkpoint_key(record.org_id, record.checkpoint_id)
 
 
 def engine_adapter_name(org_id: str, checkpoint_id: str) -> str:
@@ -38,6 +38,9 @@ def engine_adapter_name(org_id: str, checkpoint_id: str) -> str:
     return f"fsckpt-{digest}"
 
 
+# These keys are the persisted fingerprint format. Keep the legacy wire spelling
+# even though checkpoint-only Python objects now expose checkpoint_id. Renaming
+# a hash input key would invalidate every existing fingerprint.
 _BINDING_FIELDS = (
     "org_id",
     "run_id",
@@ -61,7 +64,7 @@ def immutable_binding_projection(value: Mapping[str, Any] | Any) -> dict[str, An
     def get(name: str) -> Any:
         if isinstance(value, Mapping):
             return value.get(name)
-        return getattr(value, name, None)
+        return getattr(value, "checkpoint_id" if name == "adapter_id" else name, None)
 
     org_id = get("org_id")
     run_id = get("run_id")

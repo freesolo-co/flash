@@ -237,7 +237,7 @@ def _engine(
     eng.registry.hydrate(
         [
             AdapterRecord(
-                adapter_id="r1",
+                model_id="r1",
                 repo_id=base_model,
                 base_model=base_model,
                 serve_base_model=True,
@@ -253,8 +253,8 @@ def _engine(
     return eng
 
 
-def _forwarded_record(eng: Any, adapter_id: str) -> dict[str, Any]:
-    record = eng.registry.get(None, adapter_id)
+def _forwarded_record(eng: Any, model_id: str) -> dict[str, Any]:
+    record = eng.registry.get(None, model_id)
     assert record is not None
     return internal_adapter_payload(record)
 
@@ -422,7 +422,7 @@ def test_concurrent_requests_do_not_leak_reasoning_or_grammar_state(modal_app_mo
     eng = _engine(modal_app_module, thinking=True, default={"json": SCHEMA})
     eng.registry.upsert(
         AdapterRecord(
-            adapter_id="non-thinking",
+            model_id="non-thinking",
             repo_id=QWEN,
             base_model=QWEN,
             serve_base_model=True,
@@ -501,7 +501,7 @@ def test_thinking_constraint_requires_configured_parser(modal_app_module):
 def test_stream_generate_attests_the_resolved_checkpoint_before_deltas(modal_app_module):
     eng = _engine(modal_app_module)
     revision = checkpoint_record("run-1", QWEN)
-    checkpoint_id = revision.adapter_id
+    checkpoint_id = revision.model_id
 
     async def resolved_lora(_adapter_id, _record_dict=None):
         return (
@@ -684,7 +684,7 @@ def test_stream_generate_reports_repeated_delta_usage_totals(modal_app_module):
 def test_openai_sse_keeps_repeated_delta_text(modal_app_module):
     _, events = _repeated_delta_events(modal_app_module)
     record = AdapterRecord(
-        adapter_id="r1",
+        model_id="r1",
         repo_id=QWEN,
         base_model=QWEN,
         serve_base_model=True,
@@ -713,7 +713,7 @@ def test_openai_sse_keeps_repeated_delta_text(modal_app_module):
                 MagicMock(),
                 record=record,
                 events=event_stream(),
-                adapter_id="r1",
+                model_id="r1",
                 completion_id="completion-1",
                 created=1,
                 include_usage=True,
@@ -846,7 +846,7 @@ def test_invalid_stored_spec_raises_value_error_before_ready(modal_app_module):
     raise BEFORE the first ("ready") event so _prepare_stream's first-anext guard catches it."""
     eng = _engine(modal_app_module)
     bad = AdapterRecord.model_construct(
-        adapter_id="r1",
+        model_id="r1",
         repo_id=QWEN,
         base_model=QWEN,
         serve_base_model=True,
@@ -954,4 +954,4 @@ def test_openai_body_forwards_stop():
 def test_malformed_stop_is_rejected_rather_than_ignored(bad):
     """A bad `stop` is a 422, not a silently discarded field."""
     with pytest.raises(ValidationError):
-        GenerateRequest(adapter_id="r1", prompt="hi", stop=bad)
+        GenerateRequest(model_id="r1", prompt="hi", stop=bad)

@@ -67,5 +67,10 @@ def checkpoint_payload(*args: Any, **kwargs: Any) -> dict[str, Any]:
 def checkpoint_registration_payload(*args: Any, **kwargs: Any) -> dict[str, Any]:
     record = checkpoint_record(*args, **kwargs)
     forwarded = internal_adapter_payload(record)
-    registration = {name: forwarded[name] for name in ImmutableCheckpointRegistration.model_fields}
-    return ImmutableCheckpointRegistration.model_validate(registration).model_dump(mode="json")
+    registration = {
+        field.alias or name: forwarded[field.alias or name]
+        for name, field in ImmutableCheckpointRegistration.model_fields.items()
+    }
+    return ImmutableCheckpointRegistration.model_validate(registration).model_dump(
+        mode="json", by_alias=True
+    )

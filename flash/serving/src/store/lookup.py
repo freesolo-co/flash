@@ -79,10 +79,10 @@ class AdapterLookup:
     def _is_stale(self) -> bool:
         return time.monotonic() - self._last_reload["at"] >= self._reload_interval_seconds
 
-    async def _current_record(self, org_id: str, adapter_id: str) -> AdapterRecord | None:
+    async def _current_record(self, org_id: str, model_id: str) -> AdapterRecord | None:
         assert self._lookup_record is not None
         try:
-            return await asyncio.to_thread(self._lookup_record, org_id, adapter_id)
+            return await asyncio.to_thread(self._lookup_record, org_id, model_id)
         except Exception as exc:
             # A cached ready row cannot prove that an undeploy has not committed elsewhere.
             raise HTTPException(
@@ -91,25 +91,25 @@ class AdapterLookup:
 
     async def resolve(
         self,
-        adapter_id: str,
+        model_id: str,
         *,
         org_id: str | None,
         require_supported_base_model: bool = True,
     ) -> tuple[AdapterRecord, AdapterRecord]:
-        resolved = self._router.resolve(adapter_id, org_id=org_id)
-        checkpoint_org = org_id if parse_checkpoint_ref(adapter_id) is not None else None
+        resolved = self._router.resolve(model_id, org_id=org_id)
+        checkpoint_org = org_id if parse_checkpoint_ref(model_id) is not None else None
         if checkpoint_org is None and resolved is not None and resolved[1].is_checkpoint:
             checkpoint_org = resolved[1].org_id
         if self._lookup_record is not None and checkpoint_org is not None:
-            current = await self._current_record(checkpoint_org, adapter_id)
+            current = await self._current_record(checkpoint_org, model_id)
             if (
                 current is None
                 or not current.is_checkpoint
                 or current.org_id != checkpoint_org
-                or current.adapter_id != adapter_id
+                or current.model_id != model_id
                 or current.status != "ready"
             ):
-                raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+                raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {model_id}")
             if require_supported_base_model:
                 _assert_supported_base_model(current.base_model)
             return current, current
@@ -118,24 +118,24 @@ class AdapterLookup:
             self._schedule_reload()
         elif resolved is None and self._reload_records is not None:
             await self.reload()
-            resolved = self._router.resolve(adapter_id, org_id=org_id)
+            resolved = self._router.resolve(model_id, org_id=org_id)
         if resolved is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {model_id}")
         if require_supported_base_model:
             _assert_supported_base_model(resolved[1].base_model)
         return resolved
 
-    async def get_exact(self, org_id: str, adapter_id: str) -> AdapterRecord:
-        record = self._router.get(adapter_id, org_id=org_id)
-        if self._lookup_record is not None and parse_checkpoint_ref(adapter_id) is not None:
-            record = await self._current_record(org_id, adapter_id)
+    async def get_exact(self, org_id: str, model_id: str) -> AdapterRecord:
+        record = self._router.get(model_id, org_id=org_id)
+        if self._lookup_record is not None and parse_checkpoint_ref(model_id) is not None:
+            record = await self._current_record(org_id, model_id)
             if (
                 record is None
                 or not record.is_checkpoint
                 or record.org_id != org_id
-                or record.adapter_id != adapter_id
+                or record.model_id != model_id
             ):
-                raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+                raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {model_id}")
             return record
         cached_ready = record is not None and record.status == "ready"
         if cached_ready and self._is_stale() and self._reload_records is not None:
@@ -143,12 +143,12 @@ class AdapterLookup:
         if not cached_ready and self._lookup_record is not None:
             # lifecycle reads need disabled rows, but routing hydration must stay ready-only. fetch
             # this id without mutating the registry so visibility never makes it routable.
-            record = await asyncio.to_thread(self._lookup_record, org_id, adapter_id)
+            record = await asyncio.to_thread(self._lookup_record, org_id, model_id)
         elif not cached_ready and self._reload_records is not None:
             await self.reload()
-            record = self._router.get(adapter_id, org_id=org_id)
+            record = self._router.get(model_id, org_id=org_id)
         if record is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {model_id}")
         if not record.serve_base_model and not record.is_checkpoint:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {model_id}")
         return record

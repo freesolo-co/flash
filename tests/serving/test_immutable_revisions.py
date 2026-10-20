@@ -49,7 +49,7 @@ def test_first_registration_inserts_one_exact_checkpoint(monkeypatch) -> None:
         return None
 
     async def insert_or_read(record):
-        inserted.append(record.adapter_id)
+        inserted.append(record.model_id)
         return record, True
 
     monkeypatch.setattr(registration, "_get_stored", get_stored)
@@ -108,8 +108,8 @@ def test_router_resolves_only_ready_exact_checkpoints() -> None:
     disabled = _record(40)
     router = AdapterRouter([ready, disabled])
 
-    assert router.resolve(ready.adapter_id, org_id=ready.org_id) == (ready, ready)
-    assert router.resolve(disabled.adapter_id, org_id=disabled.org_id) is None
+    assert router.resolve(ready.model_id, org_id=ready.org_id) == (ready, ready)
+    assert router.resolve(disabled.model_id, org_id=disabled.org_id) is None
     assert router.resolve(RUN_ID) is None
 
 
@@ -137,14 +137,14 @@ def test_exact_undeploy_preserves_ready_sibling(monkeypatch) -> None:
             "deployment_generation": "generation-b",
         }
     )
-    rows = {target.adapter_id: target, sibling.adapter_id: sibling}
+    rows = {target.model_id: target, sibling.model_id: sibling}
 
     async def replace(record, *, expected_updated_at: str):
-        current = rows.get(record.adapter_id)
+        current = rows.get(record.model_id)
         assert current is not None
         assert current.updated_at == expected_updated_at
         stored = record.model_copy(update={"updated_at": "2026-08-26T00:00:02+00:00"})
-        rows[record.adapter_id] = stored
+        rows[record.model_id] = stored
         return stored
 
     async def authoritative(checkpoint_id: str):
@@ -153,10 +153,10 @@ def test_exact_undeploy_preserves_ready_sibling(monkeypatch) -> None:
     monkeypatch.setattr(undeploy, "_replace_stored_cas", replace)
     result = asyncio.run(undeploy.disable_matched([target], get_authoritative=authoritative))
 
-    assert result.disabled_checkpoints == [target.adapter_id]
-    assert rows[target.adapter_id].status == "disabled"
-    assert rows[sibling.adapter_id].status == "ready"
-    assert rows[sibling.adapter_id].deployment_generation == "generation-b"
+    assert result.disabled_checkpoints == [target.model_id]
+    assert rows[target.model_id].status == "disabled"
+    assert rows[sibling.model_id].status == "ready"
+    assert rows[sibling.model_id].deployment_generation == "generation-b"
 
 
 def test_already_disabled_checkpoint_is_an_idempotent_noop(monkeypatch) -> None:

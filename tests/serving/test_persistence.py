@@ -147,7 +147,7 @@ def test_load_uses_explicit_projected_columns_and_ready_filter() -> None:
     request = FakeClient.requests[0]
     assert request["params"]["select"] == PERSISTED_COLUMNS
     assert request["params"]["status"] == "eq.ready"
-    assert record.adapter_id == CHECKPOINT_ID
+    assert record.model_id == CHECKPOINT_ID
     assert record.org_id == ORG_ID
 
 

@@ -8,7 +8,7 @@ from tests.serving.checkpoint_fixtures import checkpoint_record
 
 
 def _record(
-    adapter_id: str,
+    model_id: str,
     *,
     updated_at: str | None = None,
     repo_id: str | None = None,
@@ -16,9 +16,9 @@ def _record(
     repo_type: str = "model",
 ) -> AdapterRecord:
     return checkpoint_record(
-        adapter_id,
+        model_id,
         "openai/gpt-oss-20b",
-        repo_id=repo_id or f"Freesolo-Co/{adapter_id}",
+        repo_id=repo_id or f"Freesolo-Co/{model_id}",
         updated_at=updated_at,
         subfolder=subfolder,
         repo_type=repo_type,
@@ -34,7 +34,7 @@ def test_registry_hydrates_lists_and_upserts_records() -> None:
     registry = AdapterRegistry()
     registry.hydrate([_record("b"), _record("a")])
 
-    assert [record.adapter_id for record in registry.list_ready()] == [_id("a"), _id("b")]
+    assert [record.model_id for record in registry.list_ready()] == [_id("a"), _id("b")]
 
     registry.upsert(_record("c"))
     assert registry.get("org-1", _id("c")) is not None

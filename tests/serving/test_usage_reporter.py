@@ -714,10 +714,10 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
             return False
 
         def local_path(self, record: Any) -> Path | None:
-            return self.paths.get(record.adapter_id)
+            return self.paths.get(record.model_id)
 
         def set_local_path(self, record: Any, path: Path) -> None:
-            self.paths[record.adapter_id] = path
+            self.paths[record.model_id] = path
 
     monkeypatch.setattr("flash.serving.src.engine.hub.download_adapter", _snapshot_download)
     monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path / "adapters")
@@ -745,7 +745,7 @@ def test_ensure_adapter_local_reuses_same_source_download(modal_app_module, monk
     second_path = asyncio.run(engine._ensure_adapter_local_locked(second))
 
     assert first_path == second_path
-    assert engine.registry.paths == {first.adapter_id: first_path, second.adapter_id: first_path}
+    assert engine.registry.paths == {first.model_id: first_path, second.model_id: first_path}
     assert len(calls) == 1
     assert calls[0]["repo_id"] == "org/run"
     assert calls[0]["repo_type"] == "dataset"
@@ -765,10 +765,10 @@ def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monke
             return False
 
         def local_path(self, record: Any) -> Path | None:
-            return self.paths.get(record.adapter_id)
+            return self.paths.get(record.model_id)
 
         def set_local_path(self, record: Any, path: Path) -> None:
-            self.paths[record.adapter_id] = path
+            self.paths[record.model_id] = path
 
     def _snapshot_download(**_kwargs: Any) -> str:
         raise AssertionError("cached adapter should not call Hugging Face")
@@ -795,7 +795,7 @@ def test_ensure_adapter_local_uses_existing_volume_cache(modal_app_module, monke
     path = asyncio.run(engine._ensure_adapter_local_locked(record))
 
     assert path == cached_path
-    assert engine.registry.paths == {record.adapter_id: cached_path}
+    assert engine.registry.paths == {record.model_id: cached_path}
 
 
 def test_ensure_adapter_local_redownloads_partial_volume_cache(
@@ -813,10 +813,10 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
             return False
 
         def local_path(self, record: Any) -> Path | None:
-            return self.paths.get(record.adapter_id)
+            return self.paths.get(record.model_id)
 
         def set_local_path(self, record: Any, path: Path) -> None:
-            self.paths[record.adapter_id] = path
+            self.paths[record.model_id] = path
 
     record = AdapterRecord.model_validate(
         _checkpoint_record("a", "org/run", subfolder="sft/run/seed0/adapter")
@@ -851,7 +851,7 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
     assert path == partial_adapter_path
     assert len(calls) == 1
     assert (path / "adapter_model.safetensors").read_bytes() == b"weights"
-    assert engine.registry.paths == {record.adapter_id: partial_adapter_path}
+    assert engine.registry.paths == {record.model_id: partial_adapter_path}
 
 
 def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkeypatch, tmp_path):
@@ -861,10 +861,10 @@ def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkey
     from flash.serving.src.io.schemas import AdapterRecord
     from flash.serving.src.store import registry as registry_mod
 
-    monkeypatch.setattr(registry_mod, "lora_int_id", lambda adapter_id: 42)
+    monkeypatch.setattr(registry_mod, "lora_int_id", lambda model_id: 42)
 
-    def _rec(adapter_id: str, repo: str) -> AdapterRecord:
-        return AdapterRecord.model_validate(_checkpoint_record(adapter_id, repo))
+    def _rec(model_id: str, repo: str) -> AdapterRecord:
+        return AdapterRecord.model_validate(_checkpoint_record(model_id, repo))
 
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     assert not hasattr(engine, "_lora_entries")
@@ -878,7 +878,7 @@ def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkey
     assert req_a.lora_int_id != req_b.lora_int_id
     # re-resolving an already-cached adapter returns the same request and id.
     assert engine._cached_lora_request_locked(record_a, tmp_path / "a") is req_a
-    key_a = (record_a.org_id, record_a.adapter_id)
+    key_a = (record_a.org_id, record_a.model_id)
     entry_a = engine._lora_entries[key_a]
     engine._lora_entries[key_a] = _LoraEntry(entry_a.source_ident, req_a, "unconfirmed")
     req_c = engine._cached_lora_request_locked(_rec("c", "org/c"), tmp_path / "c")

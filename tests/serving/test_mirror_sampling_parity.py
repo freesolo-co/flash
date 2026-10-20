@@ -216,7 +216,7 @@ def _engine(
     engine.registry.hydrate(
         [
             AdapterRecord(
-                adapter_id="adapter",
+                model_id="adapter",
                 repo_id=QWEN,
                 base_model=QWEN,
                 serve_base_model=True,
@@ -317,9 +317,9 @@ def test_hosted_tools_reject_effective_persisted_structured_default_after_resolu
     resolved: list[str] = []
     original_resolve = engine._lora_request
 
-    async def resolve(adapter_id: str, record_dict: dict[str, Any] | None = None):
-        result = await original_resolve(adapter_id, record_dict)
-        resolved.append(result[1].adapter_id)
+    async def resolve(model_id: str, record_dict: dict[str, Any] | None = None):
+        result = await original_resolve(model_id, record_dict)
+        resolved.append(result[1].model_id)
         return result
 
     engine._lora_request = resolve
@@ -708,7 +708,7 @@ def test_raw_generate_schema_forbids_openai_sampling_fields() -> None:
 
 def _record() -> AdapterRecord:
     return AdapterRecord(
-        adapter_id="adapter",
+        model_id="adapter",
         repo_id=QWEN,
         base_model=QWEN,
         serve_base_model=True,
@@ -742,7 +742,7 @@ def test_hosted_sse_emits_empty_content_with_logprobs() -> None:
                 AdapterRouter([record]),
                 record=record,
                 events=events(),
-                adapter_id="adapter",
+                model_id="adapter",
                 completion_id="chatcmpl-test",
                 created=123,
                 include_usage=False,
@@ -775,7 +775,7 @@ def test_hosted_sse_uses_hidden_usage_progress_without_serializing_it() -> None:
                 AdapterRouter([record]),
                 record=record,
                 events=events(),
-                adapter_id="adapter",
+                model_id="adapter",
                 completion_id="chatcmpl-test",
                 created=123,
                 include_usage=False,
@@ -815,7 +815,7 @@ def test_hosted_sse_has_independent_reasoning_and_post_settlement_terminals() ->
                 AdapterRouter([record]),
                 record=record,
                 events=events(),
-                adapter_id="adapter",
+                model_id="adapter",
                 completion_id="chatcmpl-test",
                 created=123,
                 include_usage=True,
@@ -886,7 +886,7 @@ def test_disconnected_terminal_does_not_block_on_a_full_output_queue() -> None:
             AdapterRouter([record]),
             record=record,
             events=events(),
-            adapter_id="adapter",
+            model_id="adapter",
             completion_id="chatcmpl-test",
             created=123,
             include_usage=True,
@@ -954,7 +954,7 @@ def test_hosted_sse_treats_final_as_terminal_and_closes_a_stalled_source() -> No
                     AdapterRouter([record]),
                     record=record,
                     events=source,
-                    adapter_id="adapter",
+                    model_id="adapter",
                     completion_id="chatcmpl-test",
                     created=123,
                     include_usage=True,

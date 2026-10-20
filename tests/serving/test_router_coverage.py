@@ -31,9 +31,9 @@ async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> s
     return "org-1"
 
 
-def _rec(adapter_id: str, base_model: str = QWEN, **overrides) -> AdapterRecord:
-    run_id = adapter_id.split("/", 1)[0]
-    checkpoint_id = adapter_id if "/" in adapter_id else f"{run_id}/final"
+def _rec(model_id: str, base_model: str = QWEN, **overrides) -> AdapterRecord:
+    run_id = model_id.split("/", 1)[0]
+    checkpoint_id = model_id if "/" in model_id else f"{run_id}/final"
     checkpoint = checkpoint_id.split("/", 1)[1]
     data = {
         "adapter_id": checkpoint_id,
@@ -150,7 +150,7 @@ class FakePool:
     async def register(self, base_model, record) -> None:
         pass
 
-    async def unregister(self, base_model, adapter_id, expected_generation=None) -> None:
+    async def unregister(self, base_model, model_id, expected_generation=None) -> None:
         pass
 
 

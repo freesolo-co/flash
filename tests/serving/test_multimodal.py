@@ -494,7 +494,7 @@ class _Engine:
 
 def _base_record() -> AdapterRecord:
     return AdapterRecord(
-        adapter_id=QWEN,
+        model_id=QWEN,
         repo_id=QWEN,
         base_model=QWEN,
         serve_base_model=True,
@@ -582,7 +582,7 @@ def test_image_requests_bypass_text_prompt_cache() -> None:
         raise AssertionError("text prompt path must be bypassed")
 
     engine._prompt_input = _fail
-    payload = GenerateRequest(adapter_id=QWEN, messages=_messages())
+    payload = GenerateRequest(model_id=QWEN, messages=_messages())
     prompt_input = asyncio.run(engine._prepare_prompt_input(payload, thinking_default=False))
     try:
         assert prompt_input["prompt"] == "rendered multimodal prompt"
@@ -592,7 +592,7 @@ def test_image_requests_bypass_text_prompt_cache() -> None:
 
 def test_image_capable_engine_without_processor_rejects_request() -> None:
     engine = _engine_impl(processor=None)
-    payload = GenerateRequest(adapter_id=QWEN, messages=_messages())
+    payload = GenerateRequest(model_id=QWEN, messages=_messages())
     with pytest.raises(MultimodalRequestError, match="initialized processor"):
         asyncio.run(engine._prepare_prompt_input(payload, thinking_default=False))
 
@@ -625,7 +625,7 @@ def test_image_prompt_failure_closes_decoded_images() -> None:
         tracked.extend(wrapped)
         return template_messages, wrapped
 
-    payload = GenerateRequest(adapter_id=QWEN, messages=_messages())
+    payload = GenerateRequest(model_id=QWEN, messages=_messages())
     # _prepare_prompt_input imports prepare_multimodal_request lazily FROM src.multimodal on every
     # call, so patching the source module is what the engine actually resolves.
     with mock.patch.object(multimodal, "prepare_multimodal_request", _tracking_prepare):
@@ -698,13 +698,13 @@ class _Pool:
         expected_checkpoint: str | None = None,
     ) -> dict[str, Any]:
         del expected_checkpoint
-        self.calls.append((base_model, payload.adapter_id, record.adapter_id))
+        self.calls.append((base_model, payload.model_id, record.model_id))
         self.payloads.append(payload)
         return {
-            "adapter_id": payload.adapter_id,
+            "adapter_id": payload.model_id,
             # a real engine attests the adapter it actually resolved, which for a revision is the
             # resolved record rather than whatever id the caller asked with.
-            **({"lora_request_adapter": record.adapter_id} if record.is_checkpoint else {}),
+            **({"lora_request_adapter": record.model_id} if record.is_checkpoint else {}),
             "text": "ok",
             "finish_reason": "stop",
             "prompt_tokens": 7,
@@ -721,7 +721,7 @@ class _Pool:
         expected_checkpoint: str | None = None,
     ):
         del expected_checkpoint
-        self.calls.append((base_model, payload.adapter_id, record.adapter_id))
+        self.calls.append((base_model, payload.model_id, record.model_id))
         self.payloads.append(payload)
         yield {"type": "ready", "checkpoint": record.checkpoint}
         yield {

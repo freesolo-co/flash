@@ -398,10 +398,10 @@ def _build_engine(
         async def unregister(
             self,
             org_id: str,
-            adapter_id: str,
+            model_id: str,
             expected_generation: str | None = None,
         ) -> dict[str, Any]:
-            return await self._unregister(org_id, adapter_id, expected_generation)
+            return await self._unregister(org_id, model_id, expected_generation)
 
         @modal.method()
         def health(self) -> dict[str, Any]:
@@ -526,11 +526,11 @@ class _ModalEnginePool:
         self,
         base_model: str,
         org_id: str,
-        adapter_id: str,
+        model_id: str,
         expected_generation: str | None = None,
     ) -> None:
         engine = _engine_cls_for(base_model)(base_model=base_model)
-        await engine.unregister.remote.aio(org_id, adapter_id, expected_generation)
+        await engine.unregister.remote.aio(org_id, model_id, expected_generation)
 
 
 def _build_usage_outbox(settings: Any) -> Any:
@@ -545,7 +545,7 @@ def _build_usage_outbox(settings: Any) -> Any:
 
 # Short-TTL positive-authorization cache + single-flight for the serving->backend authorize call.
 # That call runs on EVERY external chat request; an eval fires many requests with the SAME
-# (api_key, adapter_id), so without this a thundering herd of identical auth lookups stampedes the
+# (api_key, model_id), so without this a thundering herd of identical auth lookups stampedes the
 # backend's Supabase auth path — it 5xx's under the load, which the caller sees as a serving error
 # (the intermittent HTTP 502 burst observed under concurrent evals). Coalescing concurrent identical
 # lookups into ONE backend call and reusing a SUCCESSFUL result for a short window removes that
@@ -619,7 +619,7 @@ def _authorize_response_org(resp: Any) -> "str | None":
 def _build_chat_authorizer(settings: Any) -> Any:
     """Build the serving->backend chat authorizer, or None when not configured.
 
-    Returns an async ``authorize(api_key, adapter_id)`` that POSTs to the backend's
+    Returns an async ``authorize(api_key, model_id)`` that POSTs to the backend's
     ``/api/serving/authorize`` (authenticated with the shared internal key) and raises an
     ``HTTPException`` (401/402/403/503) when the Freesolo API key's org does not own the adapter or
     the backend can't be reached. Shares one persistent ``httpx.AsyncClient`` to keep the backend
@@ -647,19 +647,19 @@ def _build_chat_authorizer(settings: Any) -> Any:
 
     _client = httpx.AsyncClient(timeout=10.0, headers={"Authorization": f"Bearer {key}"})
 
-    # (api_key_sha256, adapter_id) -> (expires_at_monotonic, org_id); populated only on a successful
+    # (api_key_sha256, model_id) -> (expires_at_monotonic, org_id); populated only on a successful
     # authorization. Per-router-container in-memory (each container reduces its own backend load).
     _cache: dict[tuple[str, str, str], tuple[float, str | None]] = {}
     # In-flight single-flight tasks so concurrent identical misses share ONE backend call.
     _inflight: dict[tuple[str, str, str], asyncio.Task[str | None]] = {}
 
     async def _authorize_backend(
-        api_key: str, adapter_id: str, scope: "dict[str, str]"
+        api_key: str, model_id: str, scope: "dict[str, str]"
     ) -> "str | None":
         try:
             resp = await _client.post(
                 url,
-                json={"apiKey": api_key, "modelId": adapter_id},
+                json={"apiKey": api_key, "modelId": model_id},
                 # A training container authenticates with the platform internal key rather
                 # than a customer key, so the backend cannot resolve it via
                 # authenticate_api_key. It identifies the calling job from these headers and
@@ -683,10 +683,10 @@ def _build_chat_authorizer(settings: Any) -> Any:
                 _cache.pop(k, None)
 
     async def _authorize_and_cache(
-        ck: tuple[str, str, str], api_key: str, adapter_id: str, scope: "dict[str, str]"
+        ck: tuple[str, str, str], api_key: str, model_id: str, scope: "dict[str, str]"
     ) -> "str | None":
         try:
-            org = await _authorize_backend(api_key, adapter_id, scope)
+            org = await _authorize_backend(api_key, model_id, scope)
         finally:
             # Drop the single-flight slot regardless of outcome so a failed lookup re-checks next
             # time (failures are never cached) and a success can be re-driven once the cache expires.
@@ -698,7 +698,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
         return org
 
     async def authorize(
-        api_key: str, adapter_id: str, scope: "dict[str, str] | None" = None
+        api_key: str, model_id: str, scope: "dict[str, str] | None" = None
     ) -> "str | None":
         # do not retain raw user credentials as live dict keys beyond the request that supplied them.
         scope = scope or {}
@@ -709,7 +709,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
         scope_digest = hashlib.sha256(
             "\x00".join(f"{k}={scope[k]}" for k in sorted(scope)).encode("utf-8")
         ).hexdigest()
-        ck = (hashlib.sha256(api_key.encode("utf-8")).hexdigest(), adapter_id, scope_digest)
+        ck = (hashlib.sha256(api_key.encode("utf-8")).hexdigest(), model_id, scope_digest)
         cached = _cache.get(ck)
         now = time.monotonic()
         if cached is not None:
@@ -718,7 +718,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
             _cache.pop(ck, None)
         task = _inflight.get(ck)
         if task is None:
-            task = asyncio.ensure_future(_authorize_and_cache(ck, api_key, adapter_id, scope))
+            task = asyncio.ensure_future(_authorize_and_cache(ck, api_key, model_id, scope))
             # Retrieve the task's outcome even if every awaiter is cancelled (all identical clients
             # disconnect), so an orphaned single-flight failure doesn't warn "exception never retrieved".
             task.add_done_callback(lambda t: t.cancelled() or t.exception())
@@ -742,7 +742,7 @@ def _base_model_records() -> list:
 
     return [
         AdapterRecord(
-            adapter_id=m,
+            model_id=m,
             repo_id=m,
             base_model=m,
             serve_base_model=True,
@@ -786,7 +786,7 @@ def router():
         deployment_id=settings.deployment_id,
         # Reload on a routing miss so a stale router still resolves a just-registered adapter.
         reload_records=lambda: load_adapters(settings) + _base_model_records(),
-        lookup_record=lambda org_id, adapter_id: get_adapter(org_id, adapter_id, settings),
+        lookup_record=lambda org_id, model_id: get_adapter(org_id, model_id, settings),
         reload_interval_seconds=cfg.RELOAD_INTERVAL_SECONDS,
         # durable capture is required in configured serving deployments.
         usage_store=_build_usage_outbox(settings),

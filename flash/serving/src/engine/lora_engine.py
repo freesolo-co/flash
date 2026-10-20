@@ -350,9 +350,9 @@ class _LoraEngineImpl:
         return cached_lora_request(self, record, path)
 
     async def _lora_request(
-        self, adapter_id: str, record_dict: dict[str, Any] | None = None
+        self, model_id: str, record_dict: dict[str, Any] | None = None
     ) -> tuple[Any, Any]:
-        """Resolve (LoRARequest, record) for ``adapter_id`` under the adapter lock.
+        """Resolve (LoRARequest, record) for ``model_id`` under the adapter lock.
 
         Returns the RESOLVED record alongside the request so the caller can bind the prompt's
         thinking default to the SAME record the weights came from — a later registry re-read could
@@ -364,7 +364,7 @@ class _LoraEngineImpl:
         if record_dict is None:
             raise ValueError("tenant-scoped adapter resolution requires the forwarded record")
         forwarded = AdapterRecord.model_validate(record_dict)
-        if forwarded.adapter_id != adapter_id:
+        if forwarded.model_id != model_id:
             raise ValueError("forwarded adapter record does not match the requested checkpoint")
         if forwarded.serve_base_model:
             self.registry.upsert(forwarded)
@@ -376,9 +376,9 @@ class _LoraEngineImpl:
             self.registry.upsert(forwarded)
             record = self.registry.get(*adapter_key)
             if record is None or record.status != "ready":
-                raise ValueError(f"Unknown adapter id on {self.base_model}: {adapter_id}")
+                raise ValueError(f"Unknown adapter id on {self.base_model}: {model_id}")
             if not record.serve_base_model and not record.is_checkpoint:
-                raise ValueError(f"Unknown adapter id on {self.base_model}: {adapter_id}")
+                raise ValueError(f"Unknown adapter id on {self.base_model}: {model_id}")
             path = await self._ensure_adapter_local_locked(record)
             lora_request = self._cached_lora_request_locked(record, path)
             # first-use loading must enter the same lifecycle as explicit registration so
@@ -619,7 +619,7 @@ class _LoraEngineImpl:
         )
         if record.serve_base_model:
             self.registry.upsert(record, revive=True)
-            return {"ok": True, "adapter_id": record.adapter_id, "base_model": self.base_model}
+            return {"ok": True, "adapter_id": record.model_id, "base_model": self.base_model}
         if not record.is_checkpoint:
             raise ValueError("only immutable checkpoints can be registered")
         lock = await self._adapter_lock(record_key(record))
@@ -627,7 +627,7 @@ class _LoraEngineImpl:
             path = await self._ensure_adapter_local_locked(record)
             await self._add_lora_locked(record, path)
             self.registry.upsert(record, revive=True)
-        return {"ok": True, "adapter_id": record.adapter_id, "base_model": self.base_model}
+        return {"ok": True, "adapter_id": record.model_id, "base_model": self.base_model}
 
     @staticmethod
     def _lora_request_attestation(record: Any, lora_request: Any) -> str | None:
@@ -643,7 +643,7 @@ class _LoraEngineImpl:
             raise RuntimeError("immutable adapter resolved without a LoRARequest")
         if lora_request.lora_name != engine_adapter_name(*record_key(record)):
             raise RuntimeError("immutable adapter resolved to a mismatched LoRARequest")
-        return record.adapter_id
+        return record.model_id
 
     def _enforce_expected_checkpoint(self, record: Any, expected_checkpoint: str | None) -> str:
         return enforce_expected_checkpoint(record, expected_checkpoint)
@@ -702,18 +702,18 @@ class _LoraEngineImpl:
     async def _unregister(
         self,
         org_id: str,
-        adapter_id: str,
+        model_id: str,
         expected_generation: str | None = None,
     ) -> dict[str, Any]:
         # undeploy under the tenant-scoped lock so sibling organizations cannot interfere.
-        adapter_key = (org_id, adapter_id)
+        adapter_key = (org_id, model_id)
         lock = await self._adapter_lock(adapter_key)
         async with lock:
-            current = self.registry.get(org_id, adapter_id)
+            current = self.registry.get(org_id, model_id)
             if current is None:
                 from flash.serving.src.store.undeploy import get_authoritative
 
-                current = await get_authoritative(org_id, adapter_id)
+                current = await get_authoritative(org_id, model_id)
                 if current is None:
                     return {"ok": True, "removed": None, "base_model": self.base_model}
                 # durable disable clears the generation. a ready or loading row means this
@@ -735,9 +735,9 @@ class _LoraEngineImpl:
             # use the disabled row's timestamp, not wall-clock cleanup time: a concurrent
             # redeploy after the lookup must be able to supersede this tombstone.
             self.registry.upsert(current)
-            self.registry.remove(org_id, adapter_id)
+            self.registry.remove(org_id, model_id)
             await self._evict_loaded_lora(adapter_key)
-        return {"ok": True, "removed": adapter_id, "base_model": self.base_model}
+        return {"ok": True, "removed": model_id, "base_model": self.base_model}
 
     def _health(self) -> dict[str, Any]:
         cuda_available: bool | None = None

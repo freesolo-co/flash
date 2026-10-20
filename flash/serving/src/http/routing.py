@@ -47,7 +47,7 @@ class EnginePool(Protocol):
         self,
         base_model: str,
         org_id: str,
-        adapter_id: str,
+        model_id: str,
         expected_generation: str | None = None,
     ) -> None:
         raise NotImplementedError
@@ -67,20 +67,20 @@ class AdapterRouter:
     def upsert(self, record: AdapterRecord, *, revive: bool = False) -> AdapterRecord:
         return self._registry.upsert(record, revive=revive)
 
-    def get(self, adapter_id: str, *, org_id: str | None = None) -> AdapterRecord | None:
-        return self._registry.get(org_id, adapter_id)
+    def get(self, model_id: str, *, org_id: str | None = None) -> AdapterRecord | None:
+        return self._registry.get(org_id, model_id)
 
-    def has(self, adapter_id: str, *, org_id: str | None = None) -> bool:
-        return self._registry.has(org_id, adapter_id)
+    def has(self, model_id: str, *, org_id: str | None = None) -> bool:
+        return self._registry.has(org_id, model_id)
 
-    def remove(self, adapter_id: str, *, org_id: str | None = None) -> AdapterRecord | None:
-        return self._registry.remove(org_id, adapter_id)
+    def remove(self, model_id: str, *, org_id: str | None = None) -> AdapterRecord | None:
+        return self._registry.remove(org_id, model_id)
 
     def resolve(
-        self, adapter_id: str, *, org_id: str | None = None
+        self, model_id: str, *, org_id: str | None = None
     ) -> tuple[AdapterRecord, AdapterRecord] | None:
-        lookup_org = org_id if parse_checkpoint_ref(adapter_id) is not None else None
-        requested = self._registry.get(lookup_org, adapter_id)
+        lookup_org = org_id if parse_checkpoint_ref(model_id) is not None else None
+        requested = self._registry.get(lookup_org, model_id)
         if requested is None or requested.status != "ready":
             return None
         if requested.serve_base_model:
@@ -100,7 +100,7 @@ class AdapterRouter:
     ) -> list[tuple[AdapterRecord, AdapterRecord]]:
         resolved: list[tuple[AdapterRecord, AdapterRecord]] = []
         for record in self._registry.list_ready(org_id=org_id):
-            pair = self.resolve(record.adapter_id, org_id=record.org_id)
+            pair = self.resolve(record.model_id, org_id=record.org_id)
             if pair is not None:
                 resolved.append(pair)
         return resolved

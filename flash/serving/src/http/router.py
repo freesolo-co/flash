@@ -71,7 +71,7 @@ def build_serving_app(
     partially wired hosted deployment to unmetered serving.
 
     External chat/inference auth is ALWAYS enforced. ``chat_authorizer`` authorizes a user request:
-    it is called with ``(freesolo_api_key, adapter_id)`` and must raise an ``HTTPException`` (401/403)
+    it is called with ``(freesolo_api_key, model_id)`` and must raise an ``HTTPException`` (401/403)
     when the key's org does not own the adapter (a base-model serve is authorized for any valid key).
     It returns the caller's org id, which bills a base-model serve to the caller (no adapter owner).
     Trusted server-to-server callers presenting the shared internal key bypass it. If no

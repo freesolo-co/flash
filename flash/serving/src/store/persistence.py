@@ -79,7 +79,7 @@ def _list_adapters(
             offset += len(rows)
 
 
-def get_adapter(org_id: str, adapter_id: str, settings: Settings) -> AdapterRecord | None:
+def get_adapter(org_id: str, checkpoint_id: str, settings: Settings) -> AdapterRecord | None:
     if not settings.has_supabase:
         return None
     with httpx.Client(timeout=30.0) as client:
@@ -88,7 +88,7 @@ def get_adapter(org_id: str, adapter_id: str, settings: Settings) -> AdapterReco
             params={
                 "select": PERSISTED_COLUMNS,
                 "org_id": f"eq.{org_id}",
-                "checkpoint_id": f"eq.{adapter_id}",
+                "checkpoint_id": f"eq.{checkpoint_id}",
                 "limit": "1",
             },
             headers=supabase_headers(settings, "flash"),
@@ -103,7 +103,7 @@ def insert_adapter(record: AdapterRecord, settings: Settings) -> AdapterRecord:
     if not settings.has_supabase:
         return PersistedAdapterRecord.model_validate(
             {
-                **record.model_dump(mode="json"),
+                **record.model_dump(mode="json", by_alias=True),
                 "org_id": record.org_id,
                 "created_at": record.created_at or now,
                 "updated_at": record.updated_at or now,
@@ -148,7 +148,7 @@ def replace_adapter_cas(
     if not settings.has_supabase:
         return PersistedAdapterRecord.model_validate(
             {
-                **record.model_dump(mode="json"),
+                **record.model_dump(mode="json", by_alias=True),
                 "org_id": record.org_id,
                 "updated_at": now,
                 "deployment_generation": record.deployment_generation,
@@ -166,7 +166,7 @@ def replace_adapter_cas(
             params={
                 "select": PERSISTED_COLUMNS,
                 "org_id": f"eq.{record.org_id}",
-                "checkpoint_id": f"eq.{record.adapter_id}",
+                "checkpoint_id": f"eq.{record.checkpoint_id}",
                 "updated_at": f"eq.{expected_updated_at}",
             },
             headers={**supabase_headers(settings, "flash"), "Prefer": "return=representation"},
@@ -189,7 +189,7 @@ def _bind_payload(record: AdapterRecord) -> dict[str, Any]:
     return {
         "p_org_id": record.org_id,
         "p_run_id": record.run_id,
-        "p_checkpoint_id": record.adapter_id,
+        "p_checkpoint_id": record.checkpoint_id,
         "p_source_repo_type": record.repo_type,
         "p_source_repository": record.repo_id,
         "p_source_revision": record.artifact_revision,
