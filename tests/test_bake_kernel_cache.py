@@ -93,7 +93,16 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
     monkeypatch.setattr(bake, "_verify", lambda *a: 0)
 
     def download(**kwargs):
-        (Path(kwargs["local_dir"]) / "out").mkdir()
+        import io
+        import tarfile
+
+        out = Path(kwargs["local_dir"]) / "out"
+        out.mkdir()
+        (out / "bake-warmup.log").write_bytes(b"current bake")
+        with tarfile.open(out / "kernel_cache.tar.gz", "w:gz") as archive:
+            entry = tarfile.TarInfo("bake-warmup.log")
+            entry.size = len(b"old image log")
+            archive.addfile(entry, io.BytesIO(b"old image log"))
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
     monkeypatch.setattr(
@@ -116,6 +125,8 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
             bake.main()
     else:
         assert bake.main() == 0
+        assert (tmp_path / "out/bake-warmup.log").read_bytes() == b"current bake"
+        assert (tmp_path / "out/warmup.log").read_bytes() == b"current bake"
     assert len(deleted) == 1
 
 
