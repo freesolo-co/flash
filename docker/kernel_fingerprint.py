@@ -197,7 +197,10 @@ def collect_inputs(
         # Training kernels are baked in the isolated interpreter; changes to its dependency
         # block must invalidate the bake even if the parent stack is unchanged.
         "verl_stack": _search(
-            r"(ARG VERL_SPEC=.*?&& rm -f /tmp/verl-overrides.txt)", dockerfile, "Verl stack", flags=re.S
+            r"(ARG VERL_SPEC=.*?&& rm -f /tmp/verl-overrides.txt)",
+            dockerfile,
+            "Verl stack",
+            flags=re.S,
         ),
         "bake_entry_sha256": _sha256_file(root / "docker" / "bake_sandbox_entry.py"),
         "kernel_warmup_sha256": _sha256_file(
