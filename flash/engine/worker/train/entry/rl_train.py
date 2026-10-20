@@ -253,15 +253,19 @@ def run_rl_train():
     # both and raises RetriableInfraError so the run can move to a healthy worker.
     model_path_for_verl = _cached_model_path(inp["model_id"], inp["model_revision"])
 
-    def probe_capabilities():
-        python_bin = resolve_verl_python(
-            rl_workdir(), install_wandb=bool(os.environ.get("WANDB_API_KEY"))
-        )
-        gdn_hybrid = model_is_gdn_hybrid(inp["model_id"], inp["model_revision"])
-        gdn_module = gdn_probe_module(inp["model_id"], inp["model_revision"]) if gdn_hybrid else ""
-        return python_bin, gdn_hybrid, gdn_module, probe_verl_capabilities(python_bin, gdn_module)
-
     with liveness_heartbeat("rl_configuring"):
+
+        def probe_capabilities():
+            python_bin = resolve_verl_python(
+                rl_workdir(), install_wandb=bool(os.environ.get("WANDB_API_KEY"))
+            )
+            gdn_hybrid = model_is_gdn_hybrid(inp["model_id"], inp["model_revision"])
+            gdn_module = (
+                gdn_probe_module(inp["model_id"], inp["model_revision"]) if gdn_hybrid else ""
+            )
+            caps = probe_verl_capabilities(python_bin, gdn_module)
+            return python_bin, gdn_hybrid, gdn_module, caps
+
         files, reward_runtime, resolved = _prepare_rl_runtime(
             inp, env, tok, prompts, capability_probe=probe_capabilities
         )
