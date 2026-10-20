@@ -62,3 +62,29 @@ def test_corrupt_compact_state_is_rejected(mutation):
         manifest["omitted"] *= 2
     with pytest.raises(RuntimeError):
         restore_state(Model(), state, manifest, model_id="test/model", revision=REVISION)
+
+
+def test_modal_controller_forwards_compact_option_before_rental(monkeypatch):
+    import time
+
+    from flash.providers.modal import api, jobs
+    from tests._helpers.source_snapshot import valid_source_snapshot
+    from tests.test_modal_training_lifecycle import spec
+
+    monkeypatch.setenv("FLASH_COMPACT_CHECKPOINTS", "1")
+    monkeypatch.setattr("flash.runtime_capsule.build_capsule", lambda _: (b"capsule", {}))
+
+    def capture(**kwargs):
+        assert kwargs["payload"]["env"]["FLASH_COMPACT_CHECKPOINTS"] == "1"
+        raise RuntimeError("captured before rental")
+
+    monkeypatch.setattr(api, "create", capture)
+    with pytest.raises(RuntimeError, match="captured before rental"):
+        jobs.submit_attempt(
+            spec(), source_snapshot=valid_source_snapshot(), deadline_at=time.time() + 60
+        )
+    monkeypatch.setenv("FLASH_COMPACT_CHECKPOINTS", "invalid")
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        jobs.submit_attempt(
+            spec(), source_snapshot=valid_source_snapshot(), deadline_at=time.time() + 60
+        )
