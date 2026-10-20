@@ -722,8 +722,8 @@ class ApiClient:
         ``body_deadline`` additionally bounds the read in WALL-CLOCK time. ``timeout`` alone is a
         per-socket-operation bound, so a peer that trickles bytes just inside it can hold the read
         open indefinitely; a caller that must return within a fixed budget has to pass both (see
-        ``env_list``). ``--wait`` polling deliberately does not: it owns a deadline spanning many
-        reads and recomputes each one's share.
+        ``env_list``). ``--wait`` polling recomputes the remaining share of its total deadline
+        and passes it as both bounds for every read.
         """
         base_run_id, _ = _parse_adapter_target(checkpoint_id)
         quoted = urllib.parse.quote(checkpoint_id, safe="")

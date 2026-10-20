@@ -1416,3 +1416,19 @@ def test_spec_payload_sends_an_omitted_gpu_count_as_omitted() -> None:
         reparsed = spec_from_dict(spec_payload(pinned))
         assert reparsed.gpu_count_auto is False, f"{authored} must stay a hard pin"
         assert reparsed.gpu.count == expected_count
+
+
+@pytest.mark.wallclock
+@pytest.mark.parametrize("wait_seconds", [0.0, 0.5])
+def test_cli_deploy_wait_bounds_the_entire_trickling_poll(wait_seconds):
+    from flash.cli.commands.ops.deploy import _await_deployment
+
+    body = b'{"run_id":"flash-1","checkpoint_id":"flash-1/final","state":"ready"}'
+    queued = {"checkpoint_id": "flash-1/final", "state": "queued"}
+    with _trickling_server(body, gap=0.1) as url:
+        client = ApiClient(url, "fslo-user-test", timeout=60)
+        start = time.monotonic()
+        result = _await_deployment(client, "flash-1/final", queued, wait_seconds)
+        elapsed = time.monotonic() - start
+    assert result == queued
+    assert elapsed < 3.0, f"CLI poll exceeded its complete-body budget: {elapsed:.2f}s"
