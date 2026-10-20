@@ -680,6 +680,9 @@ def test_recovery_removes_only_unfinished_checkpoint_and_reports_inventory(monke
     reported = []
     monkeypatch.setattr(runner_reporting, "_report_status", reported.append)
     assert serving_completion.recover_deployments() == 1
+    from threading import Event
+
+    serving_completion.cleanup_recovered_deployments(Event())
     assert len(reported) == 2
     assert reported[-1].deployments["r-stale/final"] == before
     assert reported[-1].deployments["r-stale/step-20"]["state"] == "undeployed"

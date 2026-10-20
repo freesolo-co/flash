@@ -51,13 +51,13 @@ def _wait_for_deployment_jobs(timeout: float) -> bool:
         jobs[0].join(remaining)
 
 
-def start_deployment_job(target, *args, **kwargs) -> bool:
+def start_deployment_job(target, *args, background: bool = False, **kwargs) -> bool:
     """Start a deployment lifecycle job.
 
     Returns True when the job ran synchronously (test mode), False when it was started in a
     background thread.
     """
-    if os.environ.get("FLASH_DEPLOY_SYNC") == "1":
+    if not background and os.environ.get("FLASH_DEPLOY_SYNC") == "1":
         target(*args, **kwargs)
         return True
     thread = threading.Thread(

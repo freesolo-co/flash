@@ -1508,3 +1508,29 @@ def test_readiness_receives_complete_facts_after_registry_readiness(
             adapter_targets_images=targets_images,
         )
     ]
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 409, 422])
+def test_registration_post_rejection_is_distinct_from_readiness_failure(
+    monkeypatch, tmp_path, status_code
+):
+    import flash.serve.deployment.deploy as d
+
+    _stub_adapter_config(monkeypatch, tmp_path, rank=32)
+    monkeypatch.setattr(d, "resolve_artifact_revision", lambda _repo: "a" * 40)
+    monkeypatch.setattr(d, "_registered_adapter", lambda *_args, **_kwargs: None)
+
+    def reject(method, *args, **kwargs):
+        assert method == "POST"
+        raise serving_errors.ServingError("rejected", status_code=status_code)
+
+    monkeypatch.setattr(serving_transport, "serving_request", reject)
+    with pytest.raises(serving_errors.RegistrationRejected) as caught:
+        d.deploy_adapter(
+            run_id="run-rejected",
+            model="Qwen/Qwen3.5-9B",
+            hf_repo="org/repo",
+            adapter_prefix="sft/run-rejected/seed0",
+            org_id="org-1",
+        )
+    assert caught.value.status_code == status_code

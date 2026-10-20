@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from threading import Event
 
 import flash.runner.lifecycle.status as run_status
@@ -11,7 +12,7 @@ import flash.serve.deployment.deploy as serving_deploy
 import flash.server.platform.locks as deployment_locks
 from flash.core.spec import JobSpec
 from flash.runner.results.deployments import owns_attempt
-from flash.serve.contract.errors import AdapterConfigMissing, ServingError
+from flash.serve.contract.errors import AdapterConfigMissing, RegistrationRejected, ServingError
 from flash.serve.deployment.deploy import DeploymentReadinessFacts
 from flash.server.platform import db, deployment_state
 from flash.server.platform.internal_client import run_serving_org_id
@@ -63,9 +64,42 @@ def _recover_interrupted_deployment(status, checkpoint_id: str) -> None:
         status.run_id, str(error), checkpoint_id
     )
     deployment_state._report_persisted_transition(status, pending, persisted=True)
-    if _cleanup_failed_deployment(status.run_id, checkpoint_id, run_serving_org_id(status), error):
-        marked = runner_transitions.mark_undeployed(status.run_id, checkpoint_id)
-        deployment_state._report_persisted_transition(pending, marked, persisted=True)
+
+
+def cleanup_recovered_deployments(stop: Event, *, budget_seconds: float = 30.0) -> int:
+    """retry fenced cleanup in one owned worker, leaving unfinished records retryable."""
+    deadline = time.monotonic() + budget_seconds
+    cleaned = 0
+    for row in db.all_runs():
+        if stop.is_set() or time.monotonic() >= deadline:
+            break
+        run_id = row["run_id"]
+        lock = deployment_locks._deploy_lock(run_id)
+        if not lock.acquire(blocking=False):
+            continue
+        try:
+            try:
+                status = run_status.get_status(run_id)
+            except FileNotFoundError:
+                continue
+            for checkpoint_id, deployment in status.deployments.items():
+                remaining = deadline - time.monotonic()
+                if stop.is_set() or remaining <= 0:
+                    return cleaned
+                if deployment.get("state") != "cleanup_pending":
+                    continue
+                org_id = deployment.get("serving_org_id") or run_serving_org_id(status)
+                error = ServingError(deployment.get("error") or "interrupted deployment")
+                if _cleanup_failed_deployment(
+                    run_id, checkpoint_id, org_id, error, timeout_s=min(5.0, remaining)
+                ):
+                    marked = runner_transitions.mark_undeployed(run_id, checkpoint_id)
+                    deployment_state._report_persisted_transition(status, marked, persisted=True)
+                    status = marked
+                    cleaned += 1
+        finally:
+            lock.release()
+    return cleaned
 
 
 def replay_status_reports(stop: Event | None = None) -> int:
@@ -183,8 +217,12 @@ def _finish_deployment_unlocked(
             **deploy_kwargs, before_register=_before_register, before_ready=_before_ready
         )
     except Exception as exc:
-        if registration_started and not _cleanup_failed_deployment(
-            run_id, deployment["checkpoint_id"], str(deploy_kwargs["org_id"]), exc
+        if (
+            registration_started
+            and not isinstance(exc, RegistrationRejected)
+            and not _cleanup_failed_deployment(
+                run_id, deployment["checkpoint_id"], str(deploy_kwargs["org_id"]), exc
+            )
         ):
             return
         _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
@@ -214,13 +252,19 @@ def _finish_deployment_unlocked(
 
 
 def _cleanup_failed_deployment(
-    run_id: str, checkpoint_id: str, org_id: str, deployment_error: Exception
+    run_id: str,
+    checkpoint_id: str,
+    org_id: str,
+    deployment_error: Exception,
+    *,
+    timeout_s: float | None = None,
 ) -> bool:
     """disable an unverified hosted checkpoint, retaining a retryable state on cleanup failure."""
     try:
         if not org_id:
             raise ServingError("run has no organization scope for checkpoint cleanup")
-        serving_deploy.undeploy_adapter(checkpoint_id, org_id=org_id)
+        kwargs = {"timeout_s": timeout_s} if timeout_s is not None else {}
+        serving_deploy.undeploy_adapter(checkpoint_id, org_id=org_id, **kwargs)
     except Exception as exc:
         error = f"{deployment_error}; checkpoint cleanup failed: {exc}"
         previous = run_status.get_status(run_id)

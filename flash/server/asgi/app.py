@@ -126,7 +126,14 @@ def create_app():
         deployment_jobs._open_deployment_jobs()
         _open_status_reporter()
         server_runtime.recover_runs()
-        serving_completion.recover_deployments()
+        recovered_deployments = serving_completion.recover_deployments()
+        startup_cleanup_stop = threading.Event()
+        if recovered_deployments:
+            deployment_jobs.start_deployment_job(
+                serving_completion.cleanup_recovered_deployments,
+                startup_cleanup_stop,
+                background=True,
+            )
         # replay one persisted status at a time in the background. synchronous per-item delivery
         # prevents a historical backlog from filling the shared reporter ahead of live updates.
         startup_report_stop = threading.Event()
@@ -175,6 +182,7 @@ def create_app():
         try:
             yield
         finally:
+            startup_cleanup_stop.set()
             startup_report_stop.set()
             startup_report_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):

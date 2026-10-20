@@ -1,16 +1,18 @@
 """Incomplete hosted registrations are revoked without disturbing verified siblings."""
 
+from threading import Event
+
 import pytest
 
 from flash.runner.lifecycle import state, status
 from flash.runner.supervise import transitions
-from flash.serve.contract.errors import ServingError
+from flash.serve.contract.errors import RegistrationRejected, ServingError
 from flash.serve.deployment import deploy
 from flash.server.platform import deployment_state
 from flash.server.platform.internal_client import run_serving_org_id
 from flash.server.routes import serving_completion
 from tests._helpers.deployments import seed_ready_checkpoint
-from tests.test_server_api import _bearer, _login, _make_run
+from tests.test_server_api import _bearer, _identity_for_token, _login, _make_run
 from tests.test_server_api import api as api
 
 
@@ -33,7 +35,7 @@ def test_failure_before_smoke_cleans_only_attempted_registration(
             "checkpoint readiness timed out" if registration_started else "bad artifact"
         )
 
-    def undeploy(target, *, org_id):
+    def undeploy(target, *, org_id, timeout_s=None):
         undeploys.append((target, org_id))
         if cleanup_fails:
             raise ServingError("cleanup unavailable")
@@ -82,7 +84,7 @@ def test_recovery_fences_and_removes_unfinished_registration(
     reports, undeploys = [], []
     monkeypatch.setattr(deployment_state, "_enqueue_deployment_report", reports.append)
 
-    def undeploy(target, *, org_id):
+    def undeploy(target, *, org_id, timeout_s=None):
         undeploys.append((target, org_id))
         fenced = status.get_status(run_id).deployments[target]
         assert fenced["state"] == "cleanup_pending"
@@ -95,6 +97,8 @@ def test_recovery_fences_and_removes_unfinished_registration(
 
     monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
     assert serving_completion.recover_deployments() == 1
+    assert undeploys == []
+    serving_completion.cleanup_recovered_deployments(Event())
     saved = status.get_status(run_id)
     assert saved.deployments[sibling] == current.deployments[sibling]
     assert saved.deployments[checkpoint_id]["state"] == (
@@ -106,6 +110,7 @@ def test_recovery_fences_and_removes_unfinished_registration(
         assert saved.deployments[checkpoint_id]["retryable"] is True
         cleanup_fails = False
         assert serving_completion.recover_deployments() == 1
+        serving_completion.cleanup_recovered_deployments(Event())
         assert status.get_status(run_id).deployments[checkpoint_id]["state"] == "undeployed"
     assert serving_completion.recover_deployments() == 0
 
@@ -129,6 +134,94 @@ def test_recovery_without_org_retains_cleanup_pending(api, monkeypatch):
         deploy, "undeploy_adapter", lambda *_args, **_kwargs: pytest.fail("unscoped cleanup")
     )
     assert serving_completion.recover_deployments() == 1
+    serving_completion.cleanup_recovered_deployments(Event())
     record = status.get_status(run_id).deployments[checkpoint_id]
     assert record["state"] == "cleanup_pending"
     assert "no organization scope" in record["error"]
+
+
+@pytest.mark.parametrize("error_type", [RegistrationRejected, ServingError])
+@pytest.mark.parametrize("status_code", [401, 403, 409, 422])
+def test_only_registration_rejection_skips_cleanup(api, monkeypatch, error_type, status_code):
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    deleted = []
+
+    def fail(**kwargs):
+        kwargs["before_register"]()
+        raise error_type("rejected", status_code=status_code)
+
+    monkeypatch.setattr(deploy, "deploy_adapter", fail)
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target, **_: deleted.append(target))
+    response = api.post(
+        f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": f"{run_id}/final"}, headers=_bearer(key)
+    )
+    assert response.status_code == 200
+    assert response.json()["state"] == "failed"
+    assert deleted == ([] if error_type is RegistrationRejected else [f"{run_id}/final"])
+
+
+def test_recovery_uses_persisted_registration_org(api, monkeypatch):
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    original = status.get_status(run_id)
+    original.billing_context = {}
+    original.platform_context = {}
+    state._save_status(original)
+
+    def fail(**kwargs):
+        kwargs["before_register"]()
+        raise ServingError("ambiguous POST")
+
+    def unavailable(*args, **kwargs):
+        raise ServingError("offline")
+
+    monkeypatch.setattr(deploy, "deploy_adapter", fail)
+    monkeypatch.setattr(deploy, "undeploy_adapter", unavailable)
+    response = api.post(
+        f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": f"{run_id}/final"}, headers=_bearer(key)
+    )
+    assert response.status_code == 200
+    record = status.get_status(run_id).deployments[f"{run_id}/final"]
+    assert record["serving_org_id"] == _identity_for_token(key)["org_id"]
+    monkeypatch.setattr(serving_completion, "run_serving_org_id", lambda _: "wrong-current-org")
+    deleted = []
+    monkeypatch.setattr(
+        deploy, "undeploy_adapter", lambda target, **kw: deleted.append((target, kw))
+    )
+    serving_completion.recover_deployments()
+    serving_completion.cleanup_recovered_deployments(Event())
+    assert deleted == [(f"{run_id}/final", {"org_id": record["serving_org_id"], "timeout_s": 5.0})]
+
+
+def test_recovery_worker_respects_stop_and_budget(api, monkeypatch):
+    monkeypatch.setattr(serving_completion.db, "all_runs", lambda: [{"run_id": "missing"}])
+    monkeypatch.setattr(
+        serving_completion.run_status, "get_status", lambda _: pytest.fail("read past budget")
+    )
+    stop = Event()
+    stop.set()
+    assert serving_completion.cleanup_recovered_deployments(stop) == 0
+    assert serving_completion.cleanup_recovered_deployments(Event(), budget_seconds=0) == 0
+
+
+@pytest.fixture
+def blocked_recovery(monkeypatch):
+    started, release = Event(), Event()
+
+    def cleanup(stop):
+        started.set()
+        while not release.is_set() and not stop.wait(0.01):
+            pass
+
+    monkeypatch.setattr(serving_completion, "recover_deployments", lambda: 1)
+    monkeypatch.setattr(serving_completion, "cleanup_recovered_deployments", cleanup)
+    try:
+        yield started
+    finally:
+        release.set()
+
+
+def test_startup_serves_requests_while_remote_cleanup_is_blocked(blocked_recovery, api):
+    assert blocked_recovery.wait(2)
+    assert api.get("/v1/me", headers=_bearer(_login())).status_code == 200

@@ -229,8 +229,10 @@ def deploy_adapter(
                 f"serving returned unexpected adapter registration status {registration.status_code}"
             )
     except serving_errors.ServingError as exc:
-        if exc.status_code is not None and exc.status_code < 500:
-            raise
+        if exc.status_code is not None and 400 <= exc.status_code < 500 and exc.status_code != 408:
+            raise serving_errors.RegistrationRejected(
+                str(exc), status_code=exc.status_code, retry_after=exc.retry_after
+            ) from exc
         try:
             record = _registered_adapter(normalized_org_id, checkpoint_id)
         except serving_errors.ServingError as read_exc:
@@ -512,13 +514,14 @@ def _wait_checkpoint_ready(
     )
 
 
-def undeploy_adapter(checkpoint_id: str, *, org_id: str) -> dict:
+def undeploy_adapter(checkpoint_id: str, *, org_id: str, timeout_s: float | None = None) -> dict:
     """disable one exact permanent checkpoint."""
     response = transport.serving_request(
         "DELETE",
         _adapter_url(checkpoint_id),
         ok_statuses=(404,),
         org_id=org_id,
+        timeout_s=timeout_s,
     )
     if response.status_code == 404:
         return {
