@@ -20,6 +20,11 @@ name: flash worker kernel-cache (per-arch)
 on:
   workflow_dispatch:
     inputs:
+      base_ref:
+        description: "Existing worker base image to bake (labels pin its source and fingerprints)"
+        type: string
+        default: "ghcr.io/freesolo-co/flash-worker:cu128"
+        required: false
       sms:
         description: "comma-separated sm list to bake; default is all validated arches"
         default: "sm80,sm86,sm89,sm90,sm120,sm100"

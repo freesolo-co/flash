@@ -156,7 +156,7 @@ jobs:
     uses: ./.github/workflows/bake-kernel-cache.yml
     with:
       sms: ${{ needs.detect.outputs.sms }}
-      deadline_minutes: ${{ inputs.deadline_minutes || 90 }}
+      deadline_minutes: ${{ fromJSON(format('{0}', inputs.deadline_minutes || 90)) }}
       fp_cache: ${{ needs.build-base.outputs.fp_cache }}
       fp_base: ${{ needs.build-base.outputs.fp_base }}
       base_ref: ${{ needs.build-base.outputs.base_ref }}
