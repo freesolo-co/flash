@@ -163,14 +163,19 @@ def test_hopper_bakes_the_explicit_training_backend(monkeypatch):
 
 
 def test_flashinfer_prefill_bake_loads_the_pinned_rollout_library(monkeypatch):
+    from flash.engine.worker.train.core.child import flashinfer_cache
+
     calls = []
     module = types.SimpleNamespace(get_gdn_prefill_module=lambda: calls.append("load"))
     monkeypatch.setitem(sys.modules, "flashinfer.gdn_prefill", module)
+    monkeypatch.setitem(sys.modules, "flashinfer.jit", types.SimpleNamespace(env=object()))
+    monkeypatch.setattr(flashinfer_cache, "activate", lambda _: calls.append("activate"))
+    monkeypatch.setattr(flashinfer_cache, "publish", lambda *_: calls.append("publish"))
     torch = types.SimpleNamespace(
         cuda=types.SimpleNamespace(synchronize=lambda: calls.append("sync"))
     )
     assert kernel_warmup.warm_flashinfer_gdn(torch)
-    assert calls == ["load", "sync"]
+    assert calls == ["activate", "load", "sync", "publish"]
 
 
 def test_hopper_bake_requires_rollout_prefill_coverage(monkeypatch, tmp_path):

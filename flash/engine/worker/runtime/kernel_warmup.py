@@ -192,9 +192,14 @@ def warm_flashinfer_gdn(torch) -> bool:
     """Compile vLLM's Hopper GDN prefill library in the pinned training interpreter."""
     try:
         from flashinfer.gdn_prefill import get_gdn_prefill_module
+        from flashinfer.jit import env
 
+        from flash.engine.worker.train.core.child import flashinfer_cache
+
+        flashinfer_cache.activate(env)
         get_gdn_prefill_module()
         torch.cuda.synchronize()
+        flashinfer_cache.publish(env, torch)
         _log("flashinfer GDN prefill library compiled and loaded")
         return True
     except Exception as error:

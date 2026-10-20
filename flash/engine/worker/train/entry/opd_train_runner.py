@@ -304,6 +304,7 @@ def _write_child_shims(
     parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     copies = (
         ("train/core/child/runtime.py", "flash_verl_runtime.py"),
+        ("train/core/child/flashinfer_cache.py", "flash_verl_flashinfer.py"),
         (
             "../../content/reasoning_normalization.py",
             "flash_reasoning_normalization.py",
