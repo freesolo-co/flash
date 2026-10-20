@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from flash.engine.worker.train.rl.child.metrics import stream_metrics
+from flash.engine.worker.train.rl.child.metrics import _forward_metrics, stream_metrics
 from flash.engine.worker.verl.child_io import parse_verl_step_metrics, verl_step_number
 
 
@@ -46,6 +46,30 @@ def test_partial_write_is_reassembled_before_parsing(tmp_path):
         record = _record(1)
         writer.write(record[:10])
         writer.write(record[10:])
+    assert [verl_step_number(line) for line in received] == [1]
+
+
+@pytest.mark.parametrize("prefix_length", [0, 10])
+def test_stop_after_stale_eof_still_drains_final_write(tmp_path, prefix_length):
+    path = tmp_path / "metrics.jsonl"
+    record = _record(1)
+    path.write_bytes(record[:prefix_length])
+    stopped = threading.Event()
+    received = []
+
+    with path.open("rb") as reader, path.open("ab", buffering=0) as writer:
+
+        class FinishAfterEof:
+            def read(self, size):
+                chunk = reader.read(size)
+                if not chunk and not stopped.is_set():
+                    # The producer completes between the read and the stop check.
+                    writer.write(record[prefix_length:])
+                    stopped.set()
+                return chunk
+
+        _forward_metrics(FinishAfterEof(), stopped, received.append)
+
     assert [verl_step_number(line) for line in received] == [1]
 
 
