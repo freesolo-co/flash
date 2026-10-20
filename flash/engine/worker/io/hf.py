@@ -79,9 +79,9 @@ def _disable_xet_upload_staging() -> None:
 
 
 def hf_api():
-    from huggingface_hub import HfApi
+    from flash.engine.worker.io.transfer import upload_api
 
-    return HfApi(token=os.environ.get("HF_TOKEN"))
+    return upload_api(token=os.environ.get("HF_TOKEN"))
 
 
 def hf_prefix() -> str:
