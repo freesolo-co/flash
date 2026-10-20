@@ -782,12 +782,21 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
     state = AttemptState(_code_dir(payload), payload)
     marker = state.save(marker)
     p = state.publication_path(marker)
-    hf_upload(
-        payload,
-        p,
-        f"{_arm(payload)}_attempt{attempt}.json",
-        enforce_deadline=False,
-    )
+    _publish_terminal_marker(payload, p, ok)
+
+
+def _publish_terminal_marker(payload, p, ok):
+    attempt = payload["attempt"]
+    marker_name = f"{_arm(payload)}_attempt{attempt}.json"
+    if ok and (payload.get("env") or {}).get("FLASH_MODAL_CPU_UPLOADS") == "1":
+        import shutil
+        from pathlib import Path
+
+        handoff = Path("/checkpoint-handoff")
+        if (handoff / "handoff.json").is_file():
+            shutil.copyfile(p, handoff / "terminal.json")
+            marker_name = f"modal_gpu_attempt{attempt}.json"
+    hf_upload(payload, p, marker_name, enforce_deadline=False)
 
 
 def main() -> int:
@@ -803,12 +812,7 @@ def main() -> int:
             marker = state.read()
             if marker is not None:
                 print("bootstrap: replaying the persisted terminal result", flush=True)
-                hf_upload(
-                    payload,
-                    state.publication_path(marker),
-                    f"{_arm(payload)}_attempt{payload['attempt']}.json",
-                    enforce_deadline=False,
-                )
+                _publish_terminal_marker(payload, state.publication_path(marker), marker["ok"])
                 return 0 if marker["ok"] else 1
             return _run_attempt(payload)
     finally:
