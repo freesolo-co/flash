@@ -1711,3 +1711,67 @@ def test_zero_gradient_is_reported_before_a_withheld_required_save(tmp_path, mon
     verdict = source.index("_check_grpo_had_a_gradient(")
     completeness = source.index("resume_uploader.raise_if_incomplete()")
     assert verdict < completeness
+
+
+def test_final_adapter_reuses_only_exact_validated_export(tmp_path):
+    uploader = rl_checkpoints._VerlResumeUploader(
+        str(tmp_path),
+        resume_step=0,
+        metric_evidence=_always_ready_metric_evidence(),
+    )
+    source = tmp_path / "export"
+    _write_internal_adapter(source)
+    uploader.staged_adapters[4] = str(source)
+    uploader.lifecycle.mark_deployable_published(4)
+    destination = tmp_path / "final"
+    assert not uploader.reuse_final_adapter(4, str(destination))
+    uploader.allow_deployable_publication()
+    assert not uploader.reuse_final_adapter(5, str(destination))
+    assert uploader.reuse_final_adapter(4, str(destination))
+    for path in source.iterdir():
+        assert (destination / path.name).read_bytes() == path.read_bytes()
+
+
+def test_final_adapter_reuse_rejects_uploader_failure(tmp_path):
+    uploader = rl_checkpoints._VerlResumeUploader(
+        str(tmp_path),
+        resume_step=0,
+        metric_evidence=_always_ready_metric_evidence(),
+    )
+    uploader._error = RuntimeError("upload failed")
+    with pytest.raises(RuntimeError, match="resume uploader failed"):
+        uploader.reuse_final_adapter(4, str(tmp_path / "final"))
+
+
+def test_final_adapter_reuse_rejects_malformed_export(tmp_path):
+    uploader = rl_checkpoints._VerlResumeUploader(
+        str(tmp_path),
+        resume_step=0,
+        metric_evidence=_always_ready_metric_evidence(),
+    )
+    source = tmp_path / "export"
+    source.mkdir()
+    uploader.staged_adapters[4] = str(source)
+    uploader.lifecycle.mark_deployable_published(4)
+    uploader.allow_deployable_publication()
+    with pytest.raises(RuntimeError, match="missing adapter config or weights"):
+        uploader.reuse_final_adapter(4, str(tmp_path / "final"))
+
+
+def test_finalization_does_not_merge_a_reused_export(monkeypatch):
+    class Uploader:
+        def reuse_final_adapter(self, step, destination):
+            assert (step, destination) == (4, "/final")
+            return True
+
+    monkeypatch.setattr(
+        rl_runner, "export_peft_adapter", lambda *a, **kw: pytest.fail("duplicate merge")
+    )
+    rl_runner._export_final_adapter(
+        "/actor",
+        "/final",
+        {},
+        "python",
+        resume_uploader=Uploader(),
+        steps_run=4,
+    )
