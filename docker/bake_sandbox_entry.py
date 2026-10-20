@@ -14,6 +14,7 @@ It is invoked by the CI helper via the sandbox command. Env:
 """
 
 import io
+import json
 import os
 import subprocess
 import tarfile
@@ -82,8 +83,21 @@ def main() -> int:
     # capture the warmup output into /out so it ships back with the cache -- lets the CI helper show
     # which warm steps ran and why a bake failed to produce compiled kernel files.
     os.makedirs("/out", exist_ok=True)
+    started = time.monotonic()
     with open("/out/warmup.log", "wb") as lf:
         rc = subprocess.call(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT)
+    first_seconds = time.monotonic() - started
+    validation = {"first_process_seconds": first_seconds, "first_exit_code": rc}
+    if rc == 0:
+        # Import and execute from a fresh process: an in-memory JIT hit cannot prove that
+        # another training process can load the baked on-disk artifacts.
+        started = time.monotonic()
+        with open("/out/warmup.log", "ab") as lf:
+            lf.write(b"\n[bake] fresh-process cache reload validation\n")
+            rc = subprocess.call(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT)
+        validation.update(reload_process_seconds=time.monotonic() - started, reload_exit_code=rc)
+    with open("/opt/flash/kernelcache/cache_validation.json", "w") as output:
+        json.dump(validation, output)
     print(f"[bake] kernel_warmup rc={rc}", flush=True)
     # Hub repositories reject nested .cache paths (FlashInfer uses one). Transport the exact
     # directory layout as an archive, compiled at its final image path, without a second tree copy.

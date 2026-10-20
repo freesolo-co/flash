@@ -109,6 +109,20 @@ def warm_flash_attn(torch, *, head_dim: int = 256) -> bool:
     return warmed
 
 
+def _training_gdn_kernel(torch):
+    """Bake the same explicit Hopper backend the child plugin binds at training time."""
+    if torch.cuda.get_device_capability(0)[0] == 9:
+        from flash.engine.worker.train.core.child.runtime import _flash_qla_impl
+
+        implementation = _flash_qla_impl()
+        if implementation is not None:
+            _log("warming the training flash-qla backend on Hopper")
+            return implementation
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
+    return chunk_gated_delta_rule
+
+
 def warm_fla_gdn(torch, *, heads: int = 32, head_dim: int = 128) -> bool:
     """Compile flash-linear-attention's Gated-DeltaNet chunk kernels (Qwen3.5/3.6 hybrid path)."""
     try:
@@ -134,7 +148,7 @@ def warm_fla_gdn(torch, *, heads: int = 32, head_dim: int = 128) -> bool:
             _restrict_fla_gdn_autotune_on_blackwell()
         except Exception as e:
             _log(f"blackwell fla autotune restriction skipped: {e}")
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        chunk_gated_delta_rule = _training_gdn_kernel(torch)
 
         b, h, t, d = 1, heads, 256, head_dim
         q = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
