@@ -8,6 +8,8 @@ order, masks, packing boundaries, and optimizer accumulation stay unchanged.
 
 Flash already enables Verl's dynamic token batching and remove-padding paths.
 This change improves their producer pipeline; it does not raise token budgets or
-change grouping to chase throughput. Live epoch and interrupted-loader recovery
-validation must pass before promotion, since prefetch must not skip or replay
-training examples after a checkpoint.
+change grouping to chase throughput. The pinned worker-image live test covered three epochs of 31 rows with two
+persistent workers and an interrupted, mid-epoch loader restore: no rows were
+skipped or replayed. A full Qwen3.5-9B SFT run crossed two epochs; restoring its
+step-4 checkpoint reproduced the uninterrupted final losses and all 496 adapter
+tensors exactly. These are correctness checks, not a throughput benchmark.
