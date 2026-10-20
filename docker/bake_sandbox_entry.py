@@ -98,7 +98,7 @@ def main() -> int:
         )
         api.upload_file(
             path_or_fileobj="/out/warmup.log",
-            path_in_repo="out/warmup.log",
+            path_in_repo="out/bake-warmup.log",
             repo_id=repo,
             repo_type="dataset",
         )

@@ -127,6 +127,11 @@ def main() -> int:
             if archive.exists():
                 _extract_cache_archive(archive, Path(args.out))
                 archive.unlink()
+            # The base image can contain an older warmup.log inside its cache tree. Keep the
+            # current subprocess log authoritative after archive extraction.
+            log_path = Path(args.out) / "bake-warmup.log"
+            if log_path.exists():
+                shutil.copy2(log_path, Path(args.out) / "warmup.log")
         return _verify(args.out, args.sm)
     finally:
         try:

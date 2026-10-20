@@ -167,6 +167,7 @@ def warm_fla_gdn(torch, *, heads: int = 32, head_dim: int = 128) -> bool:
             _log("flash-linear-attention GDN varlen (cu_seqlens) fwd/bwd compiled")
         except Exception as e:
             _log(f"fla GDN varlen warm skipped: {e}")
+            return False
         return True
     except Exception as e:
         _log(f"fla GDN warm skipped: {e}")
@@ -287,7 +288,7 @@ def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
     has_kernels = has_raw_kernel_cache(out_dir)
     meta_saved = save_cache_metadata(torch, out_dir, requested_arch=arch, warmed=warmed)
     _log(f"done in {time.time() - t0:.1f}s (raw_kernels={has_kernels}, metadata={meta_saved})")
-    return 0 if warmed and meta_saved and has_kernels else 1
+    return 0 if warmed == 2 and meta_saved and has_kernels else 1
 
 
 def main() -> int:
