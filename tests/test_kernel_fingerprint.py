@@ -370,5 +370,5 @@ def test_training_interpreter_pins_and_bake_entry_invalidate_cache():
     cache, base = kf.collect_inputs(ROOT)
     assert "vllm==0.19.1" in cache["verl_stack"]
     before = kf.compute_fingerprints(cache, base)[0]
-    for key in ("verl_stack", "bake_entry_sha256"):
+    for key in ("verl_stack", "bake_entry_sha256", "flashinfer_aot_sha256"):
         assert kf.compute_fingerprints({**cache, key: cache[key] + "changed"}, base)[0] != before

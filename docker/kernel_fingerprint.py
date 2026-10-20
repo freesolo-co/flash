@@ -31,11 +31,11 @@ correctness, and the alternatives over-fire the paid GPU bake):
     text change; a future cache-affecting RANGE would reintroduce that gap. (fp_base DOES hash the
     whole Dockerfile.worker, so arbitrary base edits -- apt/ENV/CMD/cache-dir -- still trigger a
     free re-layer; only a cache-affecting change that isn't a parsed pin slips through.)
-  * fp_cache hashes runtime/kernel_warmup.py but not its transitive cache-production deps (perf's Hopper
-    fla/tilelang setup, docker/bake_pod_entry.py's pod-side install/invoke). The kernel-DETERMINING
+  * fp_cache hashes the warmup, bake entry and AOT helper, but not all transitive inputs such as
+    perf's Hopper fla/tilelang setup. The kernel-DETERMINING
     versions (tilelang/tvm-ffi/fla) ARE captured here; that code is otherwise stable or fetched fresh
     at runtime, so a change there only risks a stale (mostly sm90) cache that cold-JITs. Hashing all
-    of perf / bake_pod_entry would re-warm 5 GPUs on every unrelated edit.
+    of perf would re-warm 5 GPUs on every unrelated edit.
 
 stdlib only, no flash/torch import, so it runs under a bare python3 in CI (no uv sync needed).
 """
@@ -205,6 +205,9 @@ def collect_inputs(
         "bake_entry_sha256": _sha256_file(root / "docker" / "bake_sandbox_entry.py"),
         "kernel_warmup_sha256": _sha256_file(
             root / "flash" / "engine" / "worker" / "runtime" / "kernel_warmup.py"
+        ),
+        "flashinfer_aot_sha256": _sha256_file(
+            root / "flash/engine/worker/train/core/child/flashinfer_cache.py"
         ),
     }
 
