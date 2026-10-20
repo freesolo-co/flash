@@ -160,3 +160,27 @@ def test_hopper_bakes_the_explicit_training_backend(monkeypatch):
         cuda=types.SimpleNamespace(get_device_capability=lambda _: (9, 0))
     )
     assert kernel_warmup._training_gdn_kernel(torch) is implementation
+
+
+def test_flashinfer_prefill_bake_loads_the_pinned_rollout_library(monkeypatch):
+    calls = []
+    module = types.SimpleNamespace(get_gdn_prefill_module=lambda: calls.append("load"))
+    monkeypatch.setitem(sys.modules, "flashinfer.gdn_prefill", module)
+    torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(synchronize=lambda: calls.append("sync"))
+    )
+    assert kernel_warmup.warm_flashinfer_gdn(torch)
+    assert calls == ["load", "sync"]
+
+
+def test_hopper_bake_requires_rollout_prefill_coverage(monkeypatch, tmp_path):
+    torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(get_device_capability=lambda _: (9, 0)),
+    )
+    monkeypatch.setattr(kernel_warmup, "_require_gpu", lambda: torch)
+    monkeypatch.setattr(kernel_warmup, "warm_flash_attn", lambda _: True)
+    monkeypatch.setattr(kernel_warmup, "warm_fla_gdn", lambda _: True)
+    monkeypatch.setattr(kernel_warmup, "warm_flashinfer_gdn", lambda _: False)
+    monkeypatch.setattr(kernel_warmup, "has_raw_kernel_cache", lambda _: True)
+    monkeypatch.setattr(kernel_warmup, "save_cache_metadata", lambda *a, **k: True)
+    assert kernel_warmup.warmup(str(tmp_path)) == 1

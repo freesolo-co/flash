@@ -188,6 +188,20 @@ def warm_fla_gdn(torch, *, heads: int = 32, head_dim: int = 128) -> bool:
         return False
 
 
+def warm_flashinfer_gdn(torch) -> bool:
+    """Compile vLLM's Hopper GDN prefill library in the pinned training interpreter."""
+    try:
+        from flashinfer.gdn_prefill import get_gdn_prefill_module
+
+        get_gdn_prefill_module()
+        torch.cuda.synchronize()
+        _log("flashinfer GDN prefill library compiled and loaded")
+        return True
+    except Exception as error:
+        _log(f"flashinfer GDN prefill warm failed: {error}")
+        return False
+
+
 def has_raw_kernel_cache(out_dir: str) -> bool:
     """Require compiled artifacts, not just empty directories or lock files."""
     return any(
@@ -292,17 +306,15 @@ def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
                 "re-run on a matching GPU."
             )
             return 1
-    warmed = sum(
-        [
-            warm_flash_attn(torch),
-            warm_fla_gdn(torch),
-        ]
-    )
-    _log(f"{warmed}/2 kernel groups warmed in {time.time() - t0:.1f}s")
+    groups = [warm_flash_attn, warm_fla_gdn]
+    if torch.cuda.get_device_capability(0)[0] == 9:
+        groups.append(warm_flashinfer_gdn)
+    warmed = sum(group(torch) for group in groups)
+    _log(f"{warmed}/{len(groups)} kernel groups warmed in {time.time() - t0:.1f}s")
     has_kernels = has_raw_kernel_cache(out_dir)
     meta_saved = save_cache_metadata(torch, out_dir, requested_arch=arch, warmed=warmed)
     _log(f"done in {time.time() - t0:.1f}s (raw_kernels={has_kernels}, metadata={meta_saved})")
-    return 0 if warmed == 2 and meta_saved and has_kernels else 1
+    return 0 if warmed == len(groups) and meta_saved and has_kernels else 1
 
 
 def main() -> int:
