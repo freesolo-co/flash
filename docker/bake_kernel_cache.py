@@ -91,8 +91,8 @@ def main() -> int:
             name=f"bake-{args.sm}-{suffix}",
             gpu=GPU_BY_SM[args.sm],
             timeout=args.deadline_min * 60,
-            cpu=4,
-            memory=32768,
+            cpu=(4, 8),
+            memory=(32768, 65536),
             secrets=[
                 modal.Secret.from_dict(
                     {"BAKE_HF_REPO": repo, "BAKE_ARCH": args.arch, "HF_TOKEN": token}

@@ -24,6 +24,11 @@ on:
         description: "comma-separated sm list to bake; default is all validated arches"
         default: "sm80,sm86,sm89,sm90,sm120,sm100"
         required: false
+      deadline_minutes:
+        description: "Maximum GPU runtime per architecture"
+        type: number
+        default: 90
+        required: false
       target_tag_prefix:
         description: "target image tag before the -sm suffix"
         default: "cu128"
@@ -33,6 +38,10 @@ on:
   # warm runs inside the exact :cu128 the per-arch tag will sit on.
   workflow_call:
     inputs:
+      deadline_minutes:
+        type: number
+        default: 90
+        required: false
       sms:
         type: string
         required: true
@@ -208,10 +217,12 @@ jobs:
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           BASE_IMAGE: ${{ steps.base.outputs.ref }}
+          BAKE_DEADLINE_MINUTES: ${{ inputs.deadline_minutes }}
         run: |
           uv run python docker/bake_kernel_cache.py \
             --arch "${{ matrix.arch }}" --sm "${{ matrix.sm }}" \
             --image "$BASE_IMAGE" \
+            --deadline-min "$BAKE_DEADLINE_MINUTES" \
             --out build/kernel_cache
 
       - name: Free disk space
