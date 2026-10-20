@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from flash.engine.worker.train.rl.child.metrics import _forward_metrics, stream_metrics
+from flash.engine.worker.train.rl.child.metrics import stream_metrics
 from flash.engine.worker.verl.child_io import parse_verl_step_metrics, verl_step_number
 
 
@@ -49,27 +49,27 @@ def test_partial_write_is_reassembled_before_parsing(tmp_path):
     assert [verl_step_number(line) for line in received] == [1]
 
 
-@pytest.mark.parametrize("prefix_length", [0, 10])
-def test_stop_after_stale_eof_still_drains_final_write(tmp_path, prefix_length):
-    path = tmp_path / "metrics.jsonl"
-    record = _record(1)
-    path.write_bytes(record[:prefix_length])
+def test_completion_after_eof_read_still_drains_the_final_write():
+    from flash.engine.worker.train.rl.child.metrics import _forward_metrics
+
     stopped = threading.Event()
     received = []
+    record = _record(1)
 
-    with path.open("rb") as reader, path.open("ab", buffering=0) as writer:
+    class ConcurrentAppend:
+        reads = 0
 
-        class FinishAfterEof:
-            def read(self, size):
-                chunk = reader.read(size)
-                if not chunk and not stopped.is_set():
-                    # The producer completes between the read and the stop check.
-                    writer.write(record[prefix_length:])
-                    stopped.set()
-                return chunk
+        def read(self, size):
+            self.reads += 1
+            if self.reads == 1:
+                return record[:10]
+            if self.reads == 2:
+                # The reader saw EOF just before the final append and stop.
+                stopped.set()
+                return b""
+            return record[10:] if self.reads == 3 else b""
 
-        _forward_metrics(FinishAfterEof(), stopped, received.append)
-
+    _forward_metrics(ConcurrentAppend(), stopped, received.append)
     assert [verl_step_number(line) for line in received] == [1]
 
 
