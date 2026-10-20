@@ -48,6 +48,7 @@ from flash.engine.worker.train.entry.rl_train_runner import (
     _StepMetricState,
     _validate_rl_child,
     _write_rl_plugin_config,
+    rl_workdir,
 )
 from flash.engine.worker.train.entry.sft_train import _cached_model_path
 from flash.engine.worker.train.rl.launch.verl_config import (
@@ -251,26 +252,22 @@ def run_rl_train():
     # miss pinned revisions or cache symlinks and fail after gpu rental. _cached_model_path handles
     # both and raises RetriableInfraError so the run can move to a healthy worker.
     model_path_for_verl = _cached_model_path(inp["model_id"], inp["model_revision"])
-    files, reward_runtime = _prepare_rl_runtime(inp, env, tok, prompts)
 
+    def probe_capabilities():
+        python_bin = resolve_verl_python(
+            rl_workdir(), install_wandb=bool(os.environ.get("WANDB_API_KEY"))
+        )
+        gdn_hybrid = model_is_gdn_hybrid(inp["model_id"], inp["model_revision"])
+        gdn_module = gdn_probe_module(inp["model_id"], inp["model_revision"]) if gdn_hybrid else ""
+        return python_bin, gdn_hybrid, gdn_module, probe_verl_capabilities(python_bin, gdn_module)
+
+    with liveness_heartbeat("rl_configuring"):
+        files, reward_runtime, resolved = _prepare_rl_runtime(
+            inp, env, tok, prompts, capability_probe=probe_capabilities
+        )
+    python_bin, gdn_hybrid, gdn_module, caps = resolved
     resume_uploader, gpu_sampler, device_peak_gpu_gb = _initialize_teardown_state()
     try:
-        # provisioning and the cold verl capability probe can take minutes without step output. keep
-        # liveness running so the stall watchdog does not fail healthy setup (#442). there is no
-        # monotonic progress counter here, only the keepalive.
-        with liveness_heartbeat("rl_configuring"):
-            python_bin = resolve_verl_python(
-                files["workdir"], install_wandb=bool(os.environ.get("WANDB_API_KEY"))
-            )
-            # gdn boundary resets need the child to have fla + causal_conv1d. resolve the model here
-            # because the answer requires a hub/cache read the child must not repeat.
-            gdn_hybrid = model_is_gdn_hybrid(inp["model_id"], inp["model_revision"])
-            gdn_module = (
-                gdn_probe_module(inp["model_id"], inp["model_revision"]) if gdn_hybrid else ""
-            )
-            # one child answers every independent capability question. each used to cost its own
-            # interpreter, and the torch/verl import -- not the question -- was the price.
-            caps = probe_verl_capabilities(python_bin, gdn_module)
         configured = _configure_rl_child(
             inp=inp,
             files=files,

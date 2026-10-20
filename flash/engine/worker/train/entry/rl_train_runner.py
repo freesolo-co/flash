@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
@@ -290,7 +291,7 @@ def _prepare_rl_files(inp, prompts):
         str(ex.get("answer", "") or "") if isinstance(ex, dict) else "" for ex in rollout_examples
     ]
 
-    workdir = f"/tmp/rl_train_seed{_worker_state.SEED}"
+    workdir = rl_workdir()
     os.makedirs(workdir, exist_ok=True)
     local_dir = os.path.join(workdir, "ckpt")
     # a retry reuses the pod workdir; stale global_step_N dirs from a prior attempt would satisfy
@@ -403,10 +404,20 @@ def _write_rl_plugin_config(inp, files, *, gdn_reset_arch: str | None, loggers) 
     files["expected_shims"] = expected
 
 
-def _prepare_rl_runtime(inp, env, tok, prompts):
-    files = _prepare_rl_files(inp, prompts)
-    _write_rl_shim(inp, files)
-    return files, _start_reward_runtime(inp, env, tok, prompts, files)
+def rl_workdir() -> str:
+    return f"/tmp/rl_train_seed{_worker_state.SEED}"
+
+
+def _prepare_rl_runtime(inp, env, tok, prompts, *, capability_probe):
+    # Both tasks write disjoint subdirectories. No reward server, child process, or CUDA model
+    # is started until both succeed. The executor joins on failure, so no setup thread escapes.
+    os.makedirs(rl_workdir(), exist_ok=True)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="flash-rl-probe") as pool:
+        capabilities = pool.submit(capability_probe)
+        files = _prepare_rl_files(inp, prompts)
+        _write_rl_shim(inp, files)
+        resolved = capabilities.result()
+    return files, _start_reward_runtime(inp, env, tok, prompts, files), resolved
 
 
 def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
