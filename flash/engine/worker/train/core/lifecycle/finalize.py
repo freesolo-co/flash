@@ -43,7 +43,10 @@ def write_train_meta(
     step=None,
     heartbeat_fields=None,
 ):
+    from flash.engine.worker.runtime import timings
+
     env = worker_state.require_active_env()
+    notes = {**(notes or {}), "stage_timings": timings.snapshot()}
     meta = sanitize_worker_metrics(
         {
             "phase": phase,

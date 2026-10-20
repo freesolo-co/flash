@@ -703,9 +703,15 @@ def liveness_heartbeat(
 
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
+    started = time.monotonic()
+    completed = False
     try:
         yield
+        completed = True
     finally:
+        from flash.engine.worker.runtime import timings
+
+        timings.record(str(stage), time.monotonic() - started, failed=not completed)
         done.set()
         t.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
         if field_sampler is not None:

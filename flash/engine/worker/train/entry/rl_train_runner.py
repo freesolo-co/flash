@@ -191,6 +191,8 @@ class _StepMetricState:
     rollout_identity_evidence: dict[str, list] = field(
         default_factory=lambda: {"steps": [], "validation": []}
     )
+    child_started_at: float | None = None
+    first_update_seconds: float | None = None
     sent_first_metrics: bool = False
     sent_first_timing: bool = False
 
@@ -603,6 +605,17 @@ def _ingest_step_metrics(
 ) -> None:
     step_metrics = parse_verl_step_metrics(line)
     step_number = verl_step_number(line)
+    if (
+        step_metrics is not None
+        and step_number is not None
+        and step_number > state.resume_step
+        and state.child_started_at is not None
+        and state.first_update_seconds is None
+    ):
+        from flash.engine.worker.runtime import timings
+
+        state.first_update_seconds = time.monotonic() - state.child_started_at
+        timings.record("grpo_child_to_first_update", state.first_update_seconds)
     pg_loss = parse_verl_metric(line, "actor/pg_loss") if step_number is not None else None
     if step_metrics is not None:
         state.step_timing.record_duration(parse_verl_metric(line, "timing_s/step"))
@@ -680,6 +693,7 @@ def _execute_rl_child(
     adopt_orphaned_descendants()
     resume_step = int((files or {}).get("resume_step", 0))
     state.resume_step = resume_step
+    state.child_started_at = time.monotonic()
     proc = subprocess.Popen(
         [python_bin, "-m", "flash_grpo_entry", *overrides],
         stdout=subprocess.PIPE,
