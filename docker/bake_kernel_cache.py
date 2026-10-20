@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shutil
+import tarfile
 import time
 import uuid
 
@@ -122,12 +123,34 @@ def main() -> int:
                 token=token,
             )
             shutil.copytree(Path(temp) / "out", args.out, dirs_exist_ok=True)
+            archive = Path(args.out) / "kernel_cache.tar.gz"
+            if archive.exists():
+                _extract_cache_archive(archive, Path(args.out))
+                archive.unlink()
         return _verify(args.out, args.sm)
     finally:
         try:
             hf.delete_repo(repo_id=repo, repo_type="dataset")
         except Exception:
             log(f"WARNING: could not delete temporary repository {repo}; remove it manually")
+
+
+def _extract_cache_archive(archive_path, destination) -> None:
+    """Restore cache layout without allowing archive links or paths outside the output tree."""
+    from pathlib import Path
+
+    root = Path(destination).resolve()
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = archive.getmembers()
+        total = 0
+        for member in members:
+            target = (root / member.name).resolve()
+            if not target.is_relative_to(root) or not (member.isfile() or member.isdir()):
+                raise ValueError("invalid kernel cache archive member")
+            total += member.size
+            if total > 32 * 1024**3:
+                raise ValueError("kernel cache archive exceeds 32 GiB")
+        archive.extractall(root, members=members, filter="data")
 
 
 def _status_present(api, repo: str, retries: int = 1) -> bool:

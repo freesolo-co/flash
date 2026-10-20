@@ -15,12 +15,13 @@ It is invoked by the CI helper via the sandbox command. Env:
 
 import io
 import os
-import shutil
 import subprocess
+import tarfile
 import time
 
 
 def main() -> int:
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
     from huggingface_hub import HfApi, snapshot_download
 
     repo = os.environ["BAKE_HF_REPO"]
@@ -84,17 +85,26 @@ def main() -> int:
     with open("/out/warmup.log", "wb") as lf:
         rc = subprocess.call(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT)
     print(f"[bake] kernel_warmup rc={rc}", flush=True)
-    # Compile at the final image path: extension build files can contain absolute paths.
-    shutil.copytree("/opt/flash/kernelcache", "/out", dirs_exist_ok=True)
-
-    # ship the whole cache tree back (metadata + raw triton/inductor dirs).
-    if os.path.isdir("/out"):
-        try:
-            api.upload_folder(
-                folder_path="/out", path_in_repo="out", repo_id=repo, repo_type="dataset"
-            )
-        except Exception as e:
-            print(f"[bake] artifact upload failed: {e}", flush=True)
+    # Hub repositories reject nested .cache paths (FlashInfer uses one). Transport the exact
+    # directory layout as an archive, compiled at its final image path, without a second tree copy.
+    try:
+        with tarfile.open("/tmp/kernel_cache.tar.gz", "w:gz", compresslevel=1) as archive:
+            archive.add("/opt/flash/kernelcache", arcname=".")
+        api.upload_file(
+            path_or_fileobj="/tmp/kernel_cache.tar.gz",
+            path_in_repo="out/kernel_cache.tar.gz",
+            repo_id=repo,
+            repo_type="dataset",
+        )
+        api.upload_file(
+            path_or_fileobj="/out/warmup.log",
+            path_in_repo="out/warmup.log",
+            repo_id=repo,
+            repo_type="dataset",
+        )
+    except Exception as e:
+        rc = 1
+        print(f"[bake] artifact upload failed: {e}", flush=True)
     # STATUS marker LAST: its presence is the helper's completion signal.
     api.upload_file(
         path_or_fileobj=io.BytesIO(f"rc={rc}\narch={arch}\n".encode()),

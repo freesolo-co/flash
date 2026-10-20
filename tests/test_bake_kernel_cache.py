@@ -117,3 +117,30 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
     else:
         assert bake.main() == 0
     assert len(deleted) == 1
+
+
+@pytest.mark.parametrize("name", ["../escape", "/absolute"])
+def test_cache_archive_rejects_escaping_paths(tmp_path, name):
+    import io
+    import tarfile
+
+    path = tmp_path / "cache.tar.gz"
+    with tarfile.open(path, "w:gz") as archive:
+        entry = tarfile.TarInfo(name)
+        entry.size = 1
+        archive.addfile(entry, io.BytesIO(b"x"))
+    with pytest.raises(ValueError, match="invalid kernel cache"):
+        bake_module()._extract_cache_archive(path, tmp_path / "out")
+
+
+def test_cache_archive_preserves_hidden_backend_directories(tmp_path):
+    import io
+    import tarfile
+
+    path = tmp_path / "cache.tar.gz"
+    with tarfile.open(path, "w:gz") as archive:
+        entry = tarfile.TarInfo("flashinfer/.cache/kernel.so")
+        entry.size = 8
+        archive.addfile(entry, io.BytesIO(b"compiled"))
+    bake_module()._extract_cache_archive(path, tmp_path / "out")
+    assert (tmp_path / "out/flashinfer/.cache/kernel.so").read_bytes() == b"compiled"
