@@ -65,6 +65,7 @@ def finish(handle, spec, *, deadline_at):
     environment = {
         "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
         "HF_HUB_DISABLE_XET": "1",
+        "FLASH_HF_UPLOAD_THREADS": os.environ.get("FLASH_HF_UPLOAD_THREADS", "8"),
         "FLASH_JOB_SPEC_PATH": f"{MOUNT}/spec.json",
         "FLASH_EXPECTED_SPEC_SHA256": hashlib.sha256(spec.to_json().encode()).hexdigest(),
         "HF_REPO": handle.hf_repo,
