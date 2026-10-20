@@ -15,8 +15,8 @@ It is invoked by the CI helper via the sandbox command. Env:
 
 import io
 import os
+import shutil
 import subprocess
-import sys
 import time
 
 
@@ -65,7 +65,16 @@ def main() -> int:
     )
 
     env = {**os.environ, "PYTHONPATH": "/runcode/code"}
-    cmd = [sys.executable, "-m", "flash.engine.worker.runtime.kernel_warmup", "--out", "/out"]
+    python_bin = os.environ.get("FLASH_VERL_PYTHON", "/opt/verl-venv/bin/python")
+    if not os.path.isfile(python_bin):
+        raise RuntimeError(f"training interpreter missing: {python_bin}")
+    cmd = [
+        python_bin,
+        "-m",
+        "flash.engine.worker.runtime.kernel_warmup",
+        "--out",
+        "/opt/flash/kernelcache",
+    ]
     if arch:
         cmd += ["--arch", arch]
     print(f"[bake] running: {' '.join(cmd)}", flush=True)
@@ -75,6 +84,8 @@ def main() -> int:
     with open("/out/warmup.log", "wb") as lf:
         rc = subprocess.call(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT)
     print(f"[bake] kernel_warmup rc={rc}", flush=True)
+    # Compile at the final image path: extension build files can contain absolute paths.
+    shutil.copytree("/opt/flash/kernelcache", "/out", dirs_exist_ok=True)
 
     # ship the whole cache tree back (metadata + raw triton/inductor dirs).
     if os.path.isdir("/out"):

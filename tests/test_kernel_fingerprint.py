@@ -364,3 +364,11 @@ def test_parsing_fails_loud_on_a_broken_stack():
         kf._pip_stack_specs("FROM scratch\n# no pip install block here\n")
     with pytest.raises(ValueError, match="could not parse"):
         kf._search(r"NOPE=(\S+)", "nothing here", "a missing thing")
+
+
+def test_training_interpreter_pins_and_bake_entry_invalidate_cache():
+    cache, base = kf.collect_inputs(ROOT)
+    assert "vllm==0.19.1" in cache["verl_stack"]
+    before = kf.compute_fingerprints(cache, base)[0]
+    for key in ("verl_stack", "bake_entry_sha256"):
+        assert kf.compute_fingerprints({**cache, key: cache[key] + "changed"}, base)[0] != before

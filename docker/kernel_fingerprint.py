@@ -194,6 +194,12 @@ def collect_inputs(
         "fla": fla,
         "tilelang": _need("tilelang"),
         "tvm_ffi": _need("apache-tvm-ffi"),
+        # Training kernels are baked in the isolated interpreter; changes to its dependency
+        # block must invalidate the bake even if the parent stack is unchanged.
+        "verl_stack": _search(
+            r"(ARG VERL_SPEC=.*?&& uv cache clean)", dockerfile, "Verl stack", flags=re.S
+        ),
+        "bake_entry_sha256": _sha256_file(root / "docker" / "bake_sandbox_entry.py"),
         "kernel_warmup_sha256": _sha256_file(
             root / "flash" / "engine" / "worker" / "runtime" / "kernel_warmup.py"
         ),

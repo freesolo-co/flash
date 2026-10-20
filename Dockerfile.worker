@@ -36,6 +36,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # the default home workspace and re-JITs instead of using the baked cache.
 ENV TRITON_CACHE_DIR=/opt/flash/kernelcache/triton \
     TORCHINDUCTOR_CACHE_DIR=/opt/flash/kernelcache/inductor \
+    TILELANG_CACHE_DIR=/opt/flash/kernelcache/tilelang \
+    TORCH_EXTENSIONS_DIR=/opt/flash/kernelcache/torch_extensions \
     FLASHINFER_CUBIN_DIR=/opt/flash/kernelcache/flashinfer_cubin \
     FLASHINFER_CACHE_DIR=/opt/flash/kernelcache/flashinfer \
     FLASHINFER_WORKSPACE_BASE=/opt/flash/kernelcache/flashinfer

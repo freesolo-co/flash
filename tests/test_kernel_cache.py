@@ -3,6 +3,8 @@ import os
 import sys
 import types
 
+import pytest
+
 from flash.engine.worker.runtime import kernel_warmup
 
 
@@ -122,3 +124,28 @@ def test_worker_rejects_unreadable_bake_metadata(monkeypatch, tmp_path):
 
     assert kernel_warmup.configure_kernel_cache() is False
     assert os.environ["TRITON_CACHE_DIR"] != str(tmp_path / "triton")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("torch", "old"), ("cuda", "11.8"), ("python", "3.9")]
+)
+def test_baked_runtime_mismatch_redirects_every_backend(monkeypatch, tmp_path, field, value):
+    kernel_warmup._point_backends_at(str(tmp_path))
+    (tmp_path / "tilelang" / "kernel.so").write_bytes(b"compiled")
+    kernel_warmup.save_cache_metadata(_FakeTorch, str(tmp_path), requested_arch="8.9", warmed=2)
+    path = tmp_path / kernel_warmup.CACHE_META_FILENAME
+    metadata = json.loads(path.read_text())
+    metadata[field] = value
+    path.write_text(json.dumps(metadata))
+    monkeypatch.setattr(kernel_warmup, "DEFAULT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setitem(sys.modules, "torch", _FakeTorch)
+    assert not kernel_warmup.configure_kernel_cache()
+    for name in kernel_warmup.KERNEL_CACHE_ENV_SUBDIRS:
+        assert not os.environ[name].startswith(str(tmp_path))
+
+
+def test_tilelang_artifacts_are_part_of_bake(tmp_path):
+    cache = tmp_path / "tilelang"
+    cache.mkdir()
+    (cache / "kernel.so").write_bytes(b"compiled")
+    assert kernel_warmup.has_raw_kernel_cache(str(tmp_path))
