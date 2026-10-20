@@ -16,6 +16,16 @@ def _gpu_count_override(value: str) -> str:
         raise argparse.ArgumentTypeError(f"expected a number of gpus, got {value!r}") from None
 
 
+def _save_every_override(value: str) -> str:
+    try:
+        interval = int(value)
+        if interval < 1:
+            raise ValueError
+    except ValueError:
+        raise argparse.ArgumentTypeError("checkpoint interval must be a positive integer") from None
+    return f"train.save_every={interval}"
+
+
 def _add_train_commands(sub: argparse._SubParsersAction) -> None:
     """`train`: config composition, overrides, cost preflight."""
     train = sub.add_parser("train", help="submit a managed training run from a TOML config")
@@ -45,6 +55,18 @@ def _add_train_commands(sub: argparse._SubParsersAction) -> None:
             "optional card ceiling; sets [gpu] count (1-8). omit it with an unpinned gpu type to "
             "auto-size the smallest fitting geometry; an authored value pins the ceiling, and only "
             "(1, 2, 4, 8) are ever provisioned"
+        ),
+    )
+    train.add_argument(
+        "--save-every",
+        dest="overrides",
+        action="append",
+        type=_save_every_override,
+        metavar="N",
+        help=(
+            "save a recovery checkpoint every N optimizer updates; larger intervals reduce "
+            "upload work but may lose more progress on interruption. Sets train.save_every; "
+            "an existing train.save_at_steps list still takes precedence"
         ),
     )
     train.add_argument("--dry-run", action="store_true")

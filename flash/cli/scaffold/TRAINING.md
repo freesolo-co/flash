@@ -901,6 +901,14 @@ init_from_adapter = "<source-run-id>/final"
 # metadata are authoritative, and setting either alongside init_from_adapter is rejected
 ```
 
+Checkpoint frequency is a user choice. Set `[train] save_every = 100` in TOML or
+run `flash train run.toml --save-every 100`. This interval counts optimizer updates,
+not examples or microbatches. Larger values reduce checkpoint/export/upload overhead;
+a retry may replay up to that interval of work. Final adapters are still exported.
+For a short run, an interval at least as large as `max_steps` avoids intermediate
+periodic saves. Exact `save_at_steps` takes precedence and is never silently discarded;
+use `--set 'train.save_at_steps=[]'` explicitly to return to periodic saves.
+
 SFT, GRPO, and OPD all accept **epoch-driven** configs (`epochs`). For GRPO/OPD,
 an epoch is one pass over the retained prompt pool after `max_examples` and prompt-budget filtering;
 optimizer-step counts are derived from those epochs. A positive `[train] max_steps` replaces that
