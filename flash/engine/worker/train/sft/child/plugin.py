@@ -138,6 +138,7 @@ def _install_core(config: dict) -> None:
 def install() -> None:
     config = runtime.load_plugin_config("FLASH_SFT_PLUGIN_CONFIG")
     marker_file = str(config["marker_file"])
+    runtime.install_compact_checkpoints(marker_file)
     runtime.install_required("sft-core", marker_file, _install_core, config)
     language_prefix = str(config.get("lora_language_prefix") or "")
     if language_prefix:

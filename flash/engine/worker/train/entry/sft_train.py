@@ -233,6 +233,10 @@ def _build_verl_child_env(*, shim_dir: str, wandb_enabled: bool) -> dict[str, st
         os.environ.get("PYTHONPATH", "") if "PYTHONPATH" not in applied_secret_names else ""
     )
     child["PYTHONPATH"] = os.pathsep.join(item for item in (shim_dir, parent_pythonpath) if item)
+    child["FLASH_COMPACT_CHECKPOINTS"] = os.environ.get("FLASH_COMPACT_CHECKPOINTS", "0")
+    if _worker_state.JOB_SPEC is not None:
+        child["FLASH_CHECKPOINT_MODEL_ID"] = _worker_state.JOB_SPEC.model
+        child["FLASH_CHECKPOINT_MODEL_REVISION"] = _worker_state.JOB_SPEC.model_revision
     child["PYTHONUNBUFFERED"] = "1"
     child["HYDRA_FULL_ERROR"] = "1"
     child["HF_HUB_OFFLINE"] = "1"
