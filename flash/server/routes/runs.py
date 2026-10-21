@@ -497,11 +497,11 @@ def run_logs(
     log_path = runs_file_path(run_id, ".log")
     chunk, end = "", max(0, offset)
     if os.path.exists(log_path):
-        with open(log_path) as f:
+        with open(log_path, "rb") as f:
             try:
                 f.seek(end)
-                chunk = f.read()
-            except (ValueError, OSError) as exc:
+                chunk = f.read().decode("utf-8", errors="replace")
+            except (ValueError, OSError, OverflowError) as exc:
                 raise HTTPException(
                     status_code=400, detail=f"invalid log offset {offset}: {exc}"
                 ) from exc

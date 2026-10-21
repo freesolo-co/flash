@@ -53,7 +53,15 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
                 "(or FREESOLO_API_KEY)"
             ) from exc
         raise _api_error(exc) from exc
+    except TimeoutError as exc:
+        raise RequestTimeoutError(
+            f"key verification at {displayable_url(base)} timed out after 30s"
+        ) from exc
     except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise RequestTimeoutError(
+                f"key verification at {displayable_url(base)} timed out after 30s"
+            ) from exc
         raise ClientError(
             f"cannot reach the freesolo backend at {displayable_url(base)} ({exc.reason}); "
             "check your network connection and FREESOLO_BASE_URL"

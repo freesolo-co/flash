@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from threading import Event
 
@@ -24,6 +25,8 @@ from flash.server.routes.serving_revisions import (
     _DEPLOYMENT_READY_STATES,
     _spec_is_unservable,
 )
+
+_log = logging.getLogger(__name__)
 
 
 def recover_deployments() -> int:
@@ -101,6 +104,10 @@ def cleanup_pending_deployments(stop: Event) -> bool:
                     status = marked
                 else:
                     pending = True
+        except Exception:
+            # A broken status record or failed write must not starve other runs.
+            _log.exception("deployment cleanup failed for run %s; retrying", run_id)
+            pending = True
         finally:
             lock.release()
     return pending
@@ -110,7 +117,12 @@ def run_deployment_cleanup_worker(stop: Event) -> None:
     """Retry failures with backoff and poll for new cleanup work until shutdown."""
     delay = 1.0
     while not stop.is_set():
-        pending = cleanup_pending_deployments(stop)
+        try:
+            pending = cleanup_pending_deployments(stop)
+        except Exception:
+            # The scan itself can fail (for example while reading the run database).
+            _log.exception("deployment cleanup scan failed; retrying")
+            pending = True
         if stop.wait(delay if pending else 30.0):
             break
         delay = min(30.0, delay * 2) if pending else 1.0

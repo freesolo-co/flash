@@ -105,11 +105,19 @@ def _post_billing(*, token: str, path: str, body: dict) -> dict:
         raise BillingError(exc.code, _http_error_detail(exc)) from exc
     except OSError as exc:
         raise BillingError(503, f"billing service unavailable: {exc}") from exc
+    except http.client.HTTPException as exc:
+        raise BillingError(502, "billing service returned an incomplete response") from exc
     try:
-        return json.loads(raw or b"{}")
+        payload = json.loads(raw)
     except ValueError as exc:
         # The backend responded but the body isn't JSON -- a bad gateway, not an outage.
         raise BillingError(502, f"billing service returned an invalid response: {exc}") from exc
+    # A successful HTTP exchange alone is not a charge acknowledgement. Keep malformed
+    # responses retryable instead of persisting `charged` and permanently skipping recovery.
+    amount = payload.get("amountCents") if isinstance(payload, dict) else None
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+        raise BillingError(502, "billing service returned an invalid charge acknowledgement")
+    return payload
 
 
 _TRANSIENT_PRECHECK_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})

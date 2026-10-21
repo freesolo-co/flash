@@ -624,9 +624,14 @@ class ApiClient:
     def _poll_cancel_status(self, run_id: str, *, cause: RequestTimeoutError) -> dict:
         deadline = time.monotonic() + 120.0
         last_state = "unknown"
-        while True:
+        while (remaining := deadline - time.monotonic()) > 0:
             try:
-                status = self.get_run(run_id)
+                status = self._request(
+                    "GET",
+                    f"/v1/runs/{run_id}",
+                    timeout=min(self.timeout, remaining),
+                    body_deadline=remaining,
+                )
             except ClientError:
                 pass
             else:
@@ -651,12 +656,13 @@ class ApiClient:
                     ) from cause
                 if terminal:
                     return status
-            if time.monotonic() >= deadline:
-                raise ClientError(
-                    f"cancel request timed out before confirmation; latest state={last_state!r}. "
-                    f"Run `{CLI_NAME} runs status {run_id}` to check the authoritative state before retrying."
-                ) from cause
-            time.sleep(2.0)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(2.0, remaining))
+        raise ClientError(
+            f"cancel request timed out before confirmation; latest state={last_state!r}. "
+            f"Run `{CLI_NAME} runs status {run_id}` to check the authoritative state before retrying."
+        ) from cause
 
     def checkpoints(self, run_id: str) -> list[dict]:
         """Deployable per-step RL checkpoints for a run (serve one with `flash models deploy RUN/step-N`)."""

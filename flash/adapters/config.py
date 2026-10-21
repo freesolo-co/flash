@@ -58,7 +58,7 @@ def parse_declared_adapter_config(raw: bytes, *, source: str) -> DeclaredAdapter
     if peft_type != "LORA":
         raise AdapterConfigError(f"{source} peft_type must be LORA, not {peft_type!r}")
     task_type = config.get("task_type")
-    if task_type not in {None, "CAUSAL_LM"}:
+    if task_type is not None and task_type != "CAUSAL_LM":
         raise AdapterConfigError(
             f"{source} task_type must be absent or CAUSAL_LM, not {task_type!r}"
         )
