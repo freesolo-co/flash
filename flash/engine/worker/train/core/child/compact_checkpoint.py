@@ -2,7 +2,7 @@
 
 Optimizer, scheduler, RNG, trainable parameters, and persistent buffers keep their native formats.
 The pinned base is already loaded before Verl restores a checkpoint. Load hooks fill only the
-explicitly omitted frozen keys from that base, then let the original strict loader validate all keys.
+explicitly omitted frozen keys from that base and validate the complete key set before native loading.
 """
 
 from __future__ import annotations

@@ -8,8 +8,8 @@ format toggle.
 Trainable LoRA tensors, persistent buffers, optimizer state, scheduler state, RNG,
 and the existing data-loader checkpoint remain intact. A rank-local manifest
 identifies omitted keys and the exact base. During recovery, the already loaded
-pinned base supplies only those frozen keys; native strict loading still checks
-the complete state. A different base, missing trainable, missing buffer, or changed
+pinned base supplies only those frozen keys. Flash validates the complete key
+set, and native loading checks tensor shapes. A different base, missing trainable, missing buffer, or changed
 model structure is rejected. Existing full-state checkpoints remain readable.
 
 This removes repeated base bytes from disk/upload. It does not promise to remove
