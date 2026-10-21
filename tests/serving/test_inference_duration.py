@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from flash.serving.src.accounting.usage import (
+    AuthorizedTraffic,
     build_usage_session,
     new_generation_id,
     principal_for_external_org,
@@ -164,12 +165,15 @@ def _revision() -> AdapterRecord:
             "artifact_digest": hashlib.sha256(b"duration-artifact").hexdigest(),
             "artifact_fingerprint": hashlib.sha256(b"duration-binding").hexdigest(),
             "lora_rank": 16,
+            "deployment_generation": "generation-a",
         }
     )
 
 
-async def _authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-    return "org-1"
+async def _authorize(
+    _token: str, _adapter_id: str, _scope: dict | None = None
+) -> AuthorizedTraffic:
+    return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
 
 def _client(record: AdapterRecord, store: RecordingUsageStore) -> TestClient:

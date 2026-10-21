@@ -170,6 +170,10 @@ def _finish_deployment_unlocked(
 
     try:
         dep = serving_deploy.deploy_adapter(**deploy_kwargs, before_ready=_before_ready)
+    except serving_deploy.DeploymentGenerationUnconfirmed as exc:
+        # Ownership changed or could not be checked. Do not delete a possible replacement.
+        _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
+        return
     except Exception as exc:
         if smoke_target is not None and not _cleanup_failed_smoke(
             run_id, smoke_target, str(deploy_kwargs["org_id"]), exc

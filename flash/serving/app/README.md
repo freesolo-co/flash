@@ -378,3 +378,5 @@ stored fingerprints require the [offline cutover](../../../docs/checkpoint-field
   }
 }
 ```
+
+Hosted checkpoint authorization requires Freesolo's verified deployment-generation gate. The control plane reports the exact loading generation that passed smoke verification; if it changes or cannot be confirmed after verification, the attempt fails without publishing readiness or tearing down a possible replacement. Checkpoint API-key requests recheck authorization instead of using the positive base-model authorization cache. Deploy this control-plane and serving-router change with Freesolo PR #784, after its database prerequisites; reverify existing checkpoints whose reports lack a generation before reopening customer traffic. Such records are unready for managed chat; the normal deploy operation queues fresh verification instead of returning the old ready record. Internal smoke requests remain authorized through the trusted internal path.

@@ -47,6 +47,10 @@ READBACK_MAX_DELAY_SECONDS = 2.0
 SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
 
 
+class DeploymentGenerationUnconfirmed(serving_errors.ServingError):
+    """Loading generation ownership is unconfirmed; unfenced cleanup is unsafe."""
+
+
 @dataclass
 class Deployment:
     run_id: str
@@ -58,6 +62,7 @@ class Deployment:
     checkpoint_id: str | None = None
     checkpoint_step: int | None = None
     verified_at: float | None = None
+    deployment_generation: str | None = None
     state: str = "ready"
 
     def to_dict(self) -> dict:
@@ -238,13 +243,17 @@ def deploy_adapter(
             checkpoint_id,
         )
 
-    _wait_checkpoint_ready(
+    ready_record = _wait_checkpoint_ready(
         normalized_org_id,
         checkpoint_id,
         subfolder,
         expected_identity=body,
         budget_s=readiness.revision_ready_budget_seconds(model),
     )
+    serving_generation = ready_record.get("deployment_generation")
+    if not isinstance(serving_generation, str) or not serving_generation.strip():
+        raise serving_errors.ServingError("ready checkpoint is missing its deployment generation")
+    dep.deployment_generation = serving_generation
     if before_ready is not None:
         before_ready(
             DeploymentReadinessFacts(
@@ -254,10 +263,28 @@ def deploy_adapter(
                 adapter_targets_images=artifact_metadata.targets_images,
             )
         )
+        _confirm_deployment_generation(normalized_org_id, checkpoint_id, serving_generation)
     dep.state = "ready"
     dep.openai_model = checkpoint_id
     logger.info("deployed checkpoint %s", checkpoint_id)
     return dep
+
+
+def _confirm_deployment_generation(org_id: str, checkpoint_id: str, generation: str) -> None:
+    try:
+        record = _registered_adapter(org_id, checkpoint_id)
+    except serving_errors.ServingError as exc:
+        # A failed read cannot prove this attempt still owns the loaded adapter.
+        # Preserve any replacement rather than deleting by checkpoint ID alone.
+        raise DeploymentGenerationUnconfirmed(
+            f"could not confirm checkpoint deployment after verification: {exc}"
+        ) from exc
+    if (
+        record is None
+        or record.get("status") != "ready"
+        or record.get("deployment_generation") != generation
+    ):
+        raise DeploymentGenerationUnconfirmed("checkpoint deployment changed during verification")
 
 
 def _adapter_url(checkpoint_id: str) -> str:

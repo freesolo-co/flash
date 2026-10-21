@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from PIL import Image, ImageOps
 
 from flash.serve.contract.provenance import immutable_binding_fingerprint
+from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl
 from flash.serving.src.engine.support import _num_prompt_tokens
 from flash.serving.src.http.router import AdapterRouter
@@ -679,6 +680,7 @@ def _revision(base_model: str) -> AdapterRecord:
         "artifact_revision": SHA,
         "artifact_digest": "b" * 64,
         "lora_rank": 16,
+        "deployment_generation": "generation-a",
     }
     values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
     return AdapterRecord.model_validate(values)
@@ -744,8 +746,8 @@ class _Pool:
         return None
 
 
-async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-    return "org-1"
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> AuthorizedTraffic:
+    return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
 
 def _client(base_model: str) -> tuple[TestClient, _Pool]:

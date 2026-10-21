@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
@@ -9,7 +10,7 @@ import threading
 
 import pytest
 
-from flash.engine.worker.train.rl.child.metrics import stream_metrics
+from flash.engine.worker.train.rl.child.metrics import _forward_metrics, stream_metrics
 from flash.engine.worker.verl.child_io import parse_verl_step_metrics, verl_step_number
 
 
@@ -176,7 +177,7 @@ def test_metric_records_survive_concurrent_large_colored_stdout_writes():
     script = r"""
 import json, os, tempfile, threading, time
 from pathlib import Path
-from flash.engine.worker.train.rl.child.metrics import stream_metrics
+from flash.engine.worker.train.rl.child.metrics import _forward_metrics, stream_metrics
 
 def warnings():
     for _ in range(100):
@@ -203,3 +204,26 @@ with tempfile.TemporaryDirectory() as folder:
     ]
     assert [row["step"] for row in rows] == list(range(1, 129))
     assert all(row["grad_norm"] == 0.25 for row in rows)
+
+
+@pytest.mark.parametrize("payload", [_record(1), b"not-json\n", b'{"step":1'])
+def test_shutdown_between_empty_read_and_stop_check_still_drains(payload):
+    stopped = threading.Event()
+    received = []
+
+    class FinalWriteAfterEmptyRead(io.BytesIO):
+        def read(self, size=-1):
+            if not stopped.is_set():
+                # The first read saw EOF, but the writer appended its final record
+                # and signalled shutdown before the reader checked the stop event.
+                stopped.set()
+                return b""
+            return super().read(size)
+
+    with FinalWriteAfterEmptyRead(payload) as handle:
+        if payload == _record(1):
+            _forward_metrics(handle, stopped, received.append)
+            assert [verl_step_number(line) for line in received] == [1]
+        else:
+            with pytest.raises(ValueError, match=r"Expecting value|truncated GRPO metric journal"):
+                _forward_metrics(handle, stopped, received.append)

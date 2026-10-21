@@ -13,7 +13,9 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from flash.schema import parse_checkpoint_ref
 from flash.serve.contract.provenance import immutable_binding_fingerprint
+from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord, internal_adapter_payload
 from tests.serving.conftest import RecordingUsageStore, attest
@@ -36,6 +38,7 @@ def _lora_rec(run_id: str = "qa") -> AdapterRecord:
         "artifact_revision": "a" * 40,
         "artifact_digest": "b" * 64,
         "lora_rank": 16,
+        "deployment_generation": "generation-a",
     }
     values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
     return AdapterRecord.model_validate(values)
@@ -88,6 +91,8 @@ class FakeAuthorizer:
 
     async def __call__(self, token, model_id, scope=None):
         self.calls.append((token, model_id))
+        if parse_checkpoint_ref(model_id) is not None:
+            return AuthorizedTraffic(principal_for_external_org(self._org), "generation-a")
         return self._org
 
 
