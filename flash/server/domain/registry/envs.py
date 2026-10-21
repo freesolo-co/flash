@@ -198,7 +198,7 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
                 tar.extract(member, dest)
     except tarfile.TarError as exc:
         raise EnvPublishError(f"env package is not a valid .tar.gz archive: {exc}") from exc
-    except OSError as exc:
+    except (OSError, EOFError) as exc:
         raise EnvPublishError(f"env package could not be extracted: {exc}") from exc
 
 
@@ -606,7 +606,7 @@ def _validate_slug(slug: str) -> tuple[str, str, str]:
     if len(parts) != 3 or not all(parts):
         raise EnvPublishError("env id must be 'namespace/project/name'")
     for segment in parts:
-        if segment in {".", ".."} or not _SLUG_SEGMENT_RE.match(segment):
+        if segment in {".", ".."} or not _SLUG_SEGMENT_RE.fullmatch(segment):
             raise EnvPublishError(f"invalid env id segment: {segment!r}")
     namespace, project, name = parts
     # delete runs git rm against the hub checkout, so block repo-control top-level paths here.

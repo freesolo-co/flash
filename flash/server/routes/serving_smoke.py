@@ -263,9 +263,9 @@ def _strict_json_loads(value: str):
 
 def _smoke_provenance(result: dict, checkpoint_id: str, checkpoint: str) -> tuple[str, object]:
     choice = (result.get("choices") or [{}])[0]
-    content = str((choice.get("message") or {}).get("content") or "")
+    content = (choice.get("message") or {}).get("content")
     finish = choice.get("finish_reason")
-    if not content.strip():
+    if not isinstance(content, str) or not content.strip():
         raise ServingError(f"smoke generation returned no content (finish_reason={finish!r})")
     provenance = result.get("freesolo")
     if not isinstance(provenance, dict) or provenance.get("checkpoint_id") != checkpoint_id:

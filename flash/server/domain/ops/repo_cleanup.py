@@ -210,28 +210,16 @@ def _hold_run_lock(run_id: str):
     return lock
 
 
-def _prefix_written_within(api, repo_id: str, prefix: str, now: float, max_age_s: float) -> bool:
-    """True if any file under ``prefix`` was committed within ``max_age_s`` (=> recently active, spare
-    it). Closes the window between enumeration and delete: a warm-start touch, a late checkpoint, or a
-    redeploy read-back that landed after enumeration must spare the prefix. Raises on an API error (the
-    caller then skips this target to stay safe). If the listing carries no commit dates (older
-    ``huggingface_hub``), returns ``False`` — the enumeration age gate already qualified it."""
-    _throttle_tree_list()
-    entries = api.list_repo_tree(
-        repo_id=repo_id, repo_type="dataset", path_in_repo=prefix, recursive=True, expand=True
+def _run_artifacts_recently_used(
+    api, repo_id: str, prefix: str, now: float, max_age_s: float
+) -> bool:
+    """Recheck both run writes and warm-start references immediately before deletion."""
+    prefixes, referenced_at, _unknown = _scan_repo(api, repo_id)
+    written_at = prefixes.get(prefix, (0, None))[1]
+    return any(
+        timestamp is not None and now - timestamp <= max_age_s
+        for timestamp in (written_at, referenced_at)
     )
-    newest: float | None = None
-    for entry in entries:
-        commit = getattr(entry, "last_commit", None)
-        date = getattr(commit, "date", None) if commit is not None else None
-        if date is None:
-            continue
-        ts = date.timestamp()
-        if newest is None or ts > newest:
-            newest = ts
-    if newest is None:
-        return False
-    return (now - newest) < max_age_s
 
 
 def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_RunTarget]:
@@ -340,9 +328,9 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
             # recursive HF list — so the live-set re-confirm below is the LAST thing before the delete
             # and its confirm->delete window is ~microseconds, not a full HF round-trip.
             try:
-                if _prefix_written_within(api, target.repo_id, target.prefix, now, max_age_s):
+                if _run_artifacts_recently_used(api, target.repo_id, target.prefix, now, max_age_s):
                     logger.warning(
-                        "repo GC: %s was written since enumeration (now within age); skipping",
+                        "repo GC: %s was written or referenced since enumeration; skipping",
                         target.prefix,
                     )
                     continue

@@ -49,7 +49,7 @@ def parse_strict_json(raw: bytes | bytearray) -> dict[str, Any]:
         )
     except TeacherBrokerError:
         raise
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise TeacherBrokerError("invalid_json", status_code=400) from exc
     if not isinstance(value, dict):
         raise TeacherBrokerError("request_must_be_object", status_code=400)

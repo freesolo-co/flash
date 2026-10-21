@@ -81,7 +81,7 @@ def _resolve_chat_request(
     key: dict[str, Any],
     x_freesolo_org_id: str | None,
     x_freesolo_project_id: str | None,
-) -> tuple[Any, list[dict[str, Any]], Any, str]:
+) -> tuple[Any, list[dict[str, Any]], Any, str, str]:
     status = require_manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
     try:
         request = parse_chat_request(

@@ -527,7 +527,7 @@ def test_one_delete_failure_does_not_abort_sweep(monkeypatch):
 def test_restat_spares_prefix_written_since_enumeration(monkeypatch):
     _wire(monkeypatch)
     monkeypatch.setattr(
-        rc, "_prefix_written_within", lambda *a, **k: True
+        rc, "_run_artifacts_recently_used", lambda *a, **k: True
     )  # a fresh write appeared
     api = FakeApi({_managed("e"): [_adapter("sft/flash-1-old/w", OLD)]})
     assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
@@ -540,13 +540,13 @@ def test_restat_skips_target_when_it_errors(monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("HF blip")
 
-    monkeypatch.setattr(rc, "_prefix_written_within", _boom)
+    monkeypatch.setattr(rc, "_run_artifacts_recently_used", _boom)
     api = FakeApi({_managed("e"): [_adapter("sft/flash-1-old/w", OLD)]})
     assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0  # skipped to stay safe
     assert api.deleted == []
 
 
-def test_prefix_written_within_reads_newest_commit():
+def test_run_artifacts_recently_used_reads_newest_commit():
     api = FakeApi(
         {
             _managed("e"): [
@@ -556,20 +556,24 @@ def test_prefix_written_within_reads_newest_commit():
         }
     )
     assert (
-        rc._prefix_written_within(api, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS)
+        rc._run_artifacts_recently_used(
+            api, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS
+        )
         is True
     )
 
 
-def test_prefix_written_within_false_when_all_old_or_undated():
+def test_run_artifacts_recently_used_false_when_all_old_or_undated():
     api = FakeApi({_managed("e"): [_adapter("sft/flash-1-a/w", 30)]})
     assert (
-        rc._prefix_written_within(api, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS)
+        rc._run_artifacts_recently_used(
+            api, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS
+        )
         is False
     )
     undated = FakeApi({_managed("e"): [_adapter("sft/flash-1-a/w", None)]})
     assert (
-        rc._prefix_written_within(
+        rc._run_artifacts_recently_used(
             undated, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS
         )
         is False
@@ -619,3 +623,19 @@ def test_hold_run_lock_is_nonblocking_and_mutually_exclusive():
     reacquired = _deploy_lock("flash-lock-a").acquire(blocking=False)  # released -> free again
     assert reacquired is True
     _deploy_lock("flash-lock-a").release()
+
+
+def test_restat_spares_source_referenced_after_enumeration(monkeypatch):
+    _wire(monkeypatch)
+    repo = _managed("source")
+
+    class ReferencedDuringScan(FakeApi):
+        def list_repo_tree(self, **kwargs):
+            entries = super().list_repo_tree(**kwargs)
+            if not kwargs.get("path_in_repo"):
+                self._repos[repo].append(_adapter("referenced_by/flash-new-child", 0))
+            return entries
+
+    api = ReferencedDuringScan({repo: [_adapter("sft/flash-1-old/w", OLD)]})
+    assert rc.run_scheduled_cleanup(api=api) == 0
+    assert api.deleted == []
