@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -25,12 +26,11 @@ import pytest
 from huggingface_hub.errors import HfHubHTTPError, RemoteEntryNotFoundError
 
 import flash.engine.worker.entry.opd as opd_entry
-import flash.engine.worker.entry.sft as sft_entry
 import flash.engine.worker.entry.worker as worker
 import flash.engine.worker.io.heartbeat as heartbeat_io
 import flash.engine.worker.io.hf as hf_io
 import flash.engine.worker.perf as worker_perf
-import flash.engine.worker.runtime.state as worker_state
+import flash.engine.worker.train.entry.sft_train as sft_entry
 from flash.engine.support.worker_entrypoint import WORKER_FAILURE_LINE
 
 
@@ -42,11 +42,13 @@ class _HardExit(BaseException):
         self.code = code
 
 
-def _patch_common(monkeypatch, fake_exit):
+def _patch_common(monkeypatch, fake_exit, *, worker_context):
     monkeypatch.setattr(worker.os, "_exit", fake_exit)
-    monkeypatch.setattr(worker_state, "HF_REPO", "")  # skip the idempotency DONE check
-    monkeypatch.setattr(worker_state, "RUN_MODE", "sft")
-    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="")
+    )  # skip the idempotency DONE check
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, run_mode="sft"))
+    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *a, context=None, **k: None)
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
     # main() runs the real boot steps before the handler; this test exercises the hard-exit flow,
     # so stub out the Hopper fla fast-path setup.
@@ -81,7 +83,7 @@ def test_managed_entrypoint_emits_one_safe_failure_line(tmp_path):
     result = _run_safe_entrypoint(
         tmp_path,
         "import flash.engine.worker.entry.worker as worker\n"
-        "def fail():\n"
+        "def fail(*, context):\n"
         f"    raise RuntimeError({secret!r})\n"
         "worker.main = fail\n",
     )
@@ -108,7 +110,7 @@ def test_direct_worker_module_emits_one_normal_traceback(tmp_path):
     secret = "direct-worker-diagnostic"
     (tmp_path / "sitecustomize.py").write_text(
         "import flash.engine.worker.entry.worker as worker\n"
-        "def fail():\n"
+        "def fail(*, context):\n"
         f"    raise RuntimeError({secret!r})\n"
         "worker.main = fail\n"
     )
@@ -129,18 +131,18 @@ def test_direct_worker_module_emits_one_normal_traceback(tmp_path):
     assert secret in combined
 
 
-def test_worker_hard_exits_zero_on_success(monkeypatch):
+def test_worker_hard_exits_zero_on_success(worker_context, monkeypatch):
     ran = {"v": False}
 
     def fake_exit(code=0):
         raise _HardExit(code)
 
-    _patch_common(monkeypatch, fake_exit)
-    monkeypatch.setattr(sft_entry, "run_sft", lambda: ran.__setitem__("v", True))
+    _patch_common(monkeypatch, fake_exit, worker_context=worker_context)
+    monkeypatch.setattr(sft_entry, "run_sft_train", lambda *, context: ran.__setitem__("v", True))
 
     raised = None
     try:
-        worker.main()
+        worker.main(context=worker_context)
     except _HardExit as e:
         raised = e
     assert ran["v"] is True, "handler must run"
@@ -148,7 +150,7 @@ def test_worker_hard_exits_zero_on_success(monkeypatch):
     assert raised.code == 0, "must exit 0 on success"
 
 
-def test_worker_dispatches_sft_adapter_continuation_to_the_handler(monkeypatch):
+def test_worker_dispatches_sft_adapter_continuation_to_the_handler(worker_context, monkeypatch):
     """A warm-started SFT run must reach run_sft, not be refused at dispatch.
 
     ``sft_train._warmstart_adapter_path`` downloads and validates the source adapter and
@@ -162,20 +164,23 @@ def test_worker_dispatches_sft_adapter_continuation_to_the_handler(monkeypatch):
     def fake_exit(code=0):
         raise _HardExit(code)
 
-    _patch_common(monkeypatch, fake_exit)
+    _patch_common(monkeypatch, fake_exit, worker_context=worker_context)
     monkeypatch.setattr(
-        worker_state,
-        "JOB_SPEC",
-        JobSpec(
-            algorithm="sft",
-            train=TrainSpec(init_from_adapter="owner/runs:sft/source-run"),
+        worker_context,
+        "config",
+        replace(
+            worker_context.config,
+            spec=JobSpec(
+                algorithm="sft",
+                train=TrainSpec(init_from_adapter="owner/runs:sft/source-run"),
+            ),
         ),
     )
-    monkeypatch.setattr(sft_entry, "run_sft", lambda: ran.__setitem__("v", True))
+    monkeypatch.setattr(sft_entry, "run_sft_train", lambda *, context: ran.__setitem__("v", True))
 
     raised = None
     try:
-        worker.main()
+        worker.main(context=worker_context)
     except _HardExit as e:
         raised = e
     assert ran["v"] is True, "a warm-started sft run must invoke run_sft"
@@ -183,20 +188,22 @@ def test_worker_dispatches_sft_adapter_continuation_to_the_handler(monkeypatch):
     assert raised.code == 0
 
 
-def test_worker_dispatches_opd_run_mode(monkeypatch):
+def test_worker_dispatches_opd_run_mode(worker_context, monkeypatch):
     """RUN_MODE=='opd' must dispatch to run_opd (the third algorithm's worker handler)."""
     ran = {"v": False}
 
     def fake_exit(code=0):
         raise _HardExit(code)
 
-    _patch_common(monkeypatch, fake_exit)
-    monkeypatch.setattr(worker_state, "RUN_MODE", "opd")
-    monkeypatch.setattr(opd_entry, "run_opd", lambda: ran.__setitem__("v", True))
+    _patch_common(monkeypatch, fake_exit, worker_context=worker_context)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, run_mode="opd"))
+    monkeypatch.setattr(
+        opd_entry, "run_opd", lambda context=None, **_context: ran.__setitem__("v", True)
+    )
 
     raised = None
     try:
-        worker.main()
+        worker.main(context=worker_context)
     except _HardExit as e:
         raised = e
     assert ran["v"] is True, "RUN_MODE=opd must invoke run_opd"
@@ -217,7 +224,7 @@ def _hub_download_error(error_type, status_code):
     return error_type("hub read failed", response=response)
 
 
-def _patch_done_marker_worker(monkeypatch):
+def _patch_done_marker_worker(monkeypatch, *, worker_context):
     heartbeats = []
     events = []
 
@@ -225,27 +232,37 @@ def _patch_done_marker_worker(monkeypatch):
         raise _HardExit(code)
 
     monkeypatch.setattr(worker.os, "_exit", fake_exit)
-    monkeypatch.setattr(worker_state, "HF_REPO", "owner/run-dataset")
-    monkeypatch.setattr(worker_state, "RUN_MODE", "sft")
-    monkeypatch.setattr(worker_state, "_cleanup_active_env_package", lambda: None)
-    monkeypatch.setattr(hf_io, "hf_prefix", lambda: "sft/run-id")
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="owner/run-dataset")
+    )
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, run_mode="sft"))
+    monkeypatch.setattr(worker_context, "close", lambda: None)
+    monkeypatch.setattr(hf_io, "hf_prefix", lambda context=None, **_context: "sft/run-id")
     monkeypatch.setattr(hf_io, "error_artifact_name", lambda *a, **k: "error.txt")
-    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *a, **k: None)
-    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *a, **k: heartbeats.append((a, k)))
+    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *a, context=None, **k: None)
+    monkeypatch.setattr(
+        heartbeat_io, "heartbeat", lambda *a, context=None, **k: heartbeats.append((a, k))
+    )
     monkeypatch.setattr(worker.backend_common, "collect_ray_failure_logs", lambda **k: "")
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **k: {})
-    monkeypatch.setattr(worker, "_preflight_gpu_occupancy_for_spec", lambda: events.append("gpu"))
+    monkeypatch.setattr(
+        worker,
+        "_preflight_gpu_occupancy_for_spec",
+        lambda context=None, **_context: events.append("gpu"),
+    )
     monkeypatch.setattr(worker_perf, "_force_fla_triton_gdn_on_sm100", lambda: None)
     monkeypatch.setattr(worker_perf, "_ensure_fla_fastpath_on_hopper", lambda: None)
     monkeypatch.setattr(worker_perf, "_restrict_fla_gdn_autotune_on_blackwell", lambda: None)
     monkeypatch.setattr(worker.kernel_warmup, "configure_kernel_cache", lambda: None)
-    monkeypatch.setattr(sft_entry, "run_sft", lambda: events.append("handler"))
+    monkeypatch.setattr(sft_entry, "run_sft_train", lambda *, context: events.append("handler"))
     return heartbeats, events
 
 
-def test_done_marker_present_restores_metrics_without_gpu_or_handler(monkeypatch, tmp_path):
-    heartbeats, events = _patch_done_marker_worker(monkeypatch)
+def test_done_marker_present_restores_metrics_without_gpu_or_handler(
+    worker_context, monkeypatch, tmp_path
+):
+    heartbeats, events = _patch_done_marker_worker(monkeypatch, worker_context=worker_context)
     done_marker = tmp_path / "DONE"
     done_marker.write_text("done")
     metrics = tmp_path / "metrics.json"
@@ -263,7 +280,7 @@ def test_done_marker_present_restores_metrics_without_gpu_or_handler(monkeypatch
     )
 
     with pytest.raises(_HardExit) as exc_info:
-        worker.main()
+        worker.main(context=worker_context)
 
     assert exc_info.value.code == 0
     assert downloads == ["sft/run-id/DONE", "sft/run-id/metrics.json"]
@@ -272,8 +289,8 @@ def test_done_marker_present_restores_metrics_without_gpu_or_handler(monkeypatch
     assert any(args == ("already_done",) for args, _kwargs in heartbeats)
 
 
-def test_exact_remote_done_entry_absence_reaches_gpu_and_handler(monkeypatch):
-    _heartbeats, events = _patch_done_marker_worker(monkeypatch)
+def test_exact_remote_done_entry_absence_reaches_gpu_and_handler(worker_context, monkeypatch):
+    _heartbeats, events = _patch_done_marker_worker(monkeypatch, worker_context=worker_context)
     absence = _hub_download_error(RemoteEntryNotFoundError, 404)
     monkeypatch.setattr(
         huggingface_hub,
@@ -282,14 +299,14 @@ def test_exact_remote_done_entry_absence_reaches_gpu_and_handler(monkeypatch):
     )
 
     with pytest.raises(_HardExit) as exc_info:
-        worker.main()
+        worker.main(context=worker_context)
 
     assert exc_info.value.code == 0
     assert events == ["gpu", "handler"]
 
 
-def test_done_marker_transient_failure_wraps_before_gpu(monkeypatch):
-    heartbeats, events = _patch_done_marker_worker(monkeypatch)
+def test_done_marker_transient_failure_wraps_before_gpu(worker_context, monkeypatch):
+    heartbeats, events = _patch_done_marker_worker(monkeypatch, worker_context=worker_context)
     transient = httpx.ReadTimeout(
         "timed out",
         request=httpx.Request("GET", "https://huggingface.co"),
@@ -301,7 +318,7 @@ def test_done_marker_transient_failure_wraps_before_gpu(monkeypatch):
     )
 
     with pytest.raises(worker_perf.RetriableInfraError) as exc_info:
-        worker.main()
+        worker.main(context=worker_context)
 
     assert exc_info.value.__cause__ is transient
     assert events == []
@@ -317,8 +334,10 @@ def test_done_marker_transient_failure_wraps_before_gpu(monkeypatch):
         pytest.param(lambda: RuntimeError("unexpected failure"), id="unexpected"),
     ],
 )
-def test_done_marker_terminal_failures_fail_closed_before_gpu(monkeypatch, error_factory):
-    heartbeats, events = _patch_done_marker_worker(monkeypatch)
+def test_done_marker_terminal_failures_fail_closed_before_gpu(
+    worker_context, monkeypatch, error_factory
+):
+    heartbeats, events = _patch_done_marker_worker(monkeypatch, worker_context=worker_context)
     error = error_factory()
     monkeypatch.setattr(
         huggingface_hub,
@@ -327,18 +346,18 @@ def test_done_marker_terminal_failures_fail_closed_before_gpu(monkeypatch, error
     )
 
     with pytest.raises(type(error)):
-        worker.main()
+        worker.main(context=worker_context)
 
     assert events == []
     error_heartbeats = [kwargs for _args, kwargs in heartbeats if "retriable" in kwargs]
     assert error_heartbeats[-1]["retriable"] is False
 
 
-def test_done_marker_remote_absence_subclass_is_terminal_before_gpu(monkeypatch):
+def test_done_marker_remote_absence_subclass_is_terminal_before_gpu(worker_context, monkeypatch):
     class SyntheticRemoteEntryNotFoundError(RemoteEntryNotFoundError):
         pass
 
-    heartbeats, events = _patch_done_marker_worker(monkeypatch)
+    heartbeats, events = _patch_done_marker_worker(monkeypatch, worker_context=worker_context)
     error = _hub_download_error(SyntheticRemoteEntryNotFoundError, 404)
     monkeypatch.setattr(
         huggingface_hub,
@@ -347,14 +366,16 @@ def test_done_marker_remote_absence_subclass_is_terminal_before_gpu(monkeypatch)
     )
 
     with pytest.raises(SyntheticRemoteEntryNotFoundError):
-        worker.main()
+        worker.main(context=worker_context)
 
     assert events == []
     error_heartbeats = [kwargs for _args, kwargs in heartbeats if "retriable" in kwargs]
     assert error_heartbeats[-1]["retriable"] is False
 
 
-def test_idempotency_replay_metrics_read_failure_is_retriable(monkeypatch, tmp_path):
+def test_idempotency_replay_metrics_read_failure_is_retriable(
+    worker_context, monkeypatch, tmp_path
+):
     """DONE present but a transient HF read of the persisted metrics.json must surface as a RETRIABLE
     RetriableInfraError (so the run reschedules and a fresh worker re-enters the idempotency path) —
     NOT a SystemExit, which is a BaseException that bypasses the retriable-stamping handler and would
@@ -367,13 +388,15 @@ def test_idempotency_replay_metrics_read_failure_is_retriable(monkeypatch, tmp_p
         raise _HardExit(code)
 
     monkeypatch.setattr(worker.os, "_exit", fake_exit)
-    monkeypatch.setattr(worker_state, "HF_REPO", "owner/run-dataset")
-    monkeypatch.setattr(hf_io, "hf_prefix", lambda: "seed0")
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="owner/run-dataset")
+    )
+    monkeypatch.setattr(hf_io, "hf_prefix", lambda context=None, **_context: "seed0")
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **k: {})
     monkeypatch.setattr(hf_io, "error_artifact_name", lambda *a, **k: "error.txt")
-    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *a, **k: None)
+    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *a, context=None, **k: None)
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *a, **k: hb.append((a, k)))
+    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *a, context=None, **k: hb.append((a, k)))
 
     done_marker = tmp_path / "DONE"
     done_marker.write_text("")
@@ -386,25 +409,29 @@ def test_idempotency_replay_metrics_read_failure_is_retriable(monkeypatch, tmp_p
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
 
     with pytest.raises(worker_perf.RetriableInfraError):
-        worker.main()
+        worker.main(context=worker_context)
     assert exited["v"] is False, "must not hard-exit when the replay read failed"
     err_hbs = [k for _a, k in hb if k.get("retriable") is True]
     assert err_hbs, "the error heartbeat must be stamped retriable=True so the run reschedules"
 
 
-def test_idempotency_metrics_reread_backoff_stops_at_run_deadline(monkeypatch, tmp_path):
+def test_idempotency_metrics_reread_backoff_stops_at_run_deadline(
+    worker_context, monkeypatch, tmp_path
+):
     clock = {"now": 100.0}
     sleeps = []
     downloads = []
 
-    monkeypatch.setenv("FLASH_RUN_DEADLINE_AT", "101.0")
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, deadline_at=101.0))
     monkeypatch.setattr(worker.os, "_exit", lambda code=0: (_ for _ in ()).throw(_HardExit(code)))
-    monkeypatch.setattr(worker_state, "HF_REPO", "owner/run-dataset")
-    monkeypatch.setattr(hf_io, "hf_prefix", lambda: "seed0")
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="owner/run-dataset")
+    )
+    monkeypatch.setattr(hf_io, "hf_prefix", lambda context=None, **_context: "seed0")
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **_kwargs: {})
     monkeypatch.setattr(hf_io, "error_artifact_name", lambda *_args, **_kwargs: "error.txt")
-    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *_args, context=None, **_kwargs: None)
+    monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *_args, context=None, **_kwargs: None)
     monkeypatch.setattr(worker.time, "time", lambda: clock["now"])
 
     def sleep(seconds):
@@ -424,30 +451,30 @@ def test_idempotency_metrics_reread_backoff_stops_at_run_deadline(monkeypatch, t
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
 
     with pytest.raises(worker_perf.RetriableInfraError) as exc_info:
-        worker.main()
+        worker.main(context=worker_context)
 
     assert downloads == ["seed0/DONE", "seed0/metrics.json"]
     assert sleeps == [1.0]
     assert "private" not in str(exc_info.value)
 
 
-def test_worker_does_not_hard_exit_on_failure(monkeypatch):
+def test_worker_does_not_hard_exit_on_failure(worker_context, monkeypatch):
     called = {"exit": False}
 
     def fake_exit(code=0):
         called["exit"] = True
         raise _HardExit(code)
 
-    _patch_common(monkeypatch, fake_exit)
+    _patch_common(monkeypatch, fake_exit, worker_context=worker_context)
 
-    def boom():
+    def boom(*, context):
         raise ValueError("train blew up")
 
-    monkeypatch.setattr(sft_entry, "run_sft", boom)
+    monkeypatch.setattr(sft_entry, "run_sft_train", boom)
 
     raised_value_error = False
     try:
-        worker.main()
+        worker.main(context=worker_context)
     except ValueError:
         raised_value_error = True
     except _HardExit:

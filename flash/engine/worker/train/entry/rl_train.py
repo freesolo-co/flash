@@ -13,12 +13,12 @@ import os
 
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
-import flash.engine.worker.runtime.state as _worker_state
 import flash.engine.worker.train.core.lifecycle.finalize as _worker_finalize
 from flash.engine.plan.steps import final_save_due
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
 from flash.engine.worker.model.packing import model_is_gdn_hybrid
 from flash.engine.worker.perf import gpu_diagnostics
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.entry.backend_common import (
     VERL_REQUIREMENT,
     fused_ce_backend,
@@ -75,6 +75,7 @@ def _write_terminal_metadata(
     experiment_name,
     reward_runtime,
     gdn_hybrid,
+    context: WorkerContext,
 ):
     metrics_last = state.metrics_last
     _worker_heartbeat.heartbeat(
@@ -83,6 +84,7 @@ def _write_terminal_metadata(
         step=steps_run,
         gpu=gpu_diagnostics(),
         metrics_last=list(metrics_last),
+        context=context,
     )
     _worker_finalize.write_train_meta(
         phase="rl",
@@ -131,12 +133,23 @@ def _write_terminal_metadata(
                 if reward_runtime.multi_turn_bridge is not None
                 else None
             ),
+            context=context,
         ),
+        context=context,
     )
 
 
 def _configure_rl_child(
-    *, inp, files, model_path_for_verl, t_start, python_bin, gdn_hybrid, gdn_module, caps
+    *,
+    inp,
+    files,
+    model_path_for_verl,
+    t_start,
+    python_bin,
+    gdn_hybrid,
+    gdn_module,
+    caps,
+    context: WorkerContext,
 ):
     # masking truncated completions is a fork-only rollout field. FLASH_VERL_PYTHON can point at a
     # stock verl, and hydra would compose the unknown key only to abort in dataclass conversion.
@@ -153,7 +166,7 @@ def _configure_rl_child(
     # verl's fsdp engine, so the final plugin config must carry the proven model type or stop here.
     gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
     expected_steps, loggers, project_name, experiment_name, cc_ok = _resolve_training_settings(
-        inp, caps
+        inp, caps, context=context
     )
     _write_rl_plugin_config(
         inp,
@@ -181,7 +194,7 @@ def _configure_rl_child(
         train_files=files["train_pq"],
         val_files=files["val_pq"],
         model_path=model_path_for_verl,
-        thinking=bool(_worker_state.THINKING),
+        thinking=bool(context.config.thinking),
         loggers=loggers,
         fp8_kv=fp8_kv,
         enforce_eager=enforce_eager,
@@ -191,10 +204,10 @@ def _configure_rl_child(
         local_dir=files["local_dir"],
         project_name=project_name,
         experiment_name=experiment_name,
-        gpu_type=(_worker_state.JOB_SPEC.gpu.type if _worker_state.JOB_SPEC else ""),
+        gpu_type=(context.config.spec.gpu.type if context.config.spec else ""),
         # the authored knobs the allocator sized this run's shape from, so the zero-2 gate the
         # worker applies is the same one the allocator admitted the shape under.
-        train_spec=(_worker_state.JOB_SPEC.train if _worker_state.JOB_SPEC else None),
+        train_spec=(context.config.spec.train if context.config.spec else None),
         # the ranks verl will actually run, not the cards rented: with ulysses pinned off every rank
         # is a dp rank, and verl chunks the step's sequences across them with an exact-divisibility
         # assert. a wider launch than the sequences divide aborts at step 0 on a paid box. resolved
@@ -204,7 +217,7 @@ def _configure_rl_child(
         # parent -- see fused_ce_backend.
         ce_backend=fused_ce_backend(caps),
     )
-    setup_seconds, t_train = _announce_training(t_start, cfg)
+    setup_seconds, t_train = _announce_training(t_start, cfg, context=context)
     return {
         "expected_steps": expected_steps,
         "loggers": loggers,
@@ -240,25 +253,78 @@ def _shutdown_rl_runtime(resume_uploader, gpu_sampler, reward_runtime) -> float 
     return device_peak_gpu_gb
 
 
-def run_rl_train():
+def _publish_rl_result(
+    files,
+    configured,
+    expected_steps,
+    metrics_last,
+    env_for_verl,
+    inp,
+    python_bin,
+    resume_uploader,
+    preprocessor,
+    *,
+    context: WorkerContext,
+):
+    actor_dir, adapter_dir, steps_run, train_wall = _prepare_final_adapter(
+        files["local_dir"], configured["t_train"], context=context
+    )
+    if steps_run < expected_steps:
+        raise RuntimeError(
+            f"grpo completed {steps_run}/{expected_steps} requested optimizer updates"
+        )
+    with liveness_heartbeat(
+        "rl_finalizing",
+        progress=lambda: steps_run,
+        fields=lambda: {"metrics_last": list(metrics_last)},
+        progress_step=True,
+        keepalive=True,
+        context=context,
+    ):
+        _worker_hf.hf_upload_file(
+            env_for_verl["VERL_FILE_LOGGER_PATH"],
+            "step_metrics.jsonl",
+            required=True,
+            context=context,
+        )
+        _export_final_adapter(
+            actor_dir,
+            adapter_dir,
+            inp,
+            python_bin,
+            resume_uploader=resume_uploader,
+            steps_run=steps_run,
+        )
+        preprocessor.save_pretrained(adapter_dir)
+        _worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True, context=context)
+        # preserve the final checkpoint only when exact save steps are not configured: with
+        # save_at_steps set the customer asked for those steps and nothing else.
+        if final_save_due(steps_run, inp["save_at_steps"]):
+            _worker_hf.publish_deployable_checkpoint(adapter_dir, steps_run, context=context)
+    return adapter_dir, steps_run, train_wall
+
+
+def run_rl_train(*, context: WorkerContext):
     """grpo training on verl, output-compatible with run_rl. see module docstring for scope."""
     # env load, prompt render and tokenization run for minutes on a large split and emit nothing of
     # their own; without the wrap the provider sees silence from rl_start until rl_train_start.
     # (the warm-start adapter pull nested inside carries its own rl_adapter_loading wrap.)
-    with liveness_heartbeat("rl_data_loading"):
-        t_start, inp, env, tok, preprocessor, prompts, download_seconds = _prepare_rl_inputs()
+    with liveness_heartbeat("rl_data_loading", context=context):
+        t_start, inp, env, tok, preprocessor, prompts, download_seconds = _prepare_rl_inputs(
+            context=context
+        )
     # verl resolves model.path with HF_HUB_OFFLINE=1, so pass a real snapshot directory. bare ids can
     # miss pinned revisions or cache symlinks and fail after gpu rental. _cached_model_path handles
     # both and raises RetriableInfraError so the run can move to a healthy worker.
     model_path_for_verl = _cached_model_path(inp["model_id"], inp["model_revision"])
-    files, reward_runtime = _prepare_rl_runtime(inp, env, tok, prompts)
+    files, reward_runtime = _prepare_rl_runtime(inp, env, tok, prompts, context=context)
 
     resume_uploader, gpu_sampler, device_peak_gpu_gb = _initialize_teardown_state()
     try:
         # provisioning and the cold verl capability probe can take minutes without step output. keep
         # liveness running so the stall watchdog does not fail healthy setup (#442). there is no
         # monotonic progress counter here, only the keepalive.
-        with liveness_heartbeat("rl_configuring"):
+        with liveness_heartbeat("rl_configuring", context=context):
             python_bin = resolve_verl_python(
                 files["workdir"], install_wandb=bool(os.environ.get("WANDB_API_KEY"))
             )
@@ -280,9 +346,10 @@ def run_rl_train():
             gdn_hybrid=gdn_hybrid,
             gdn_module=gdn_module,
             caps=caps,
+            context=context,
         )
         expected_steps, loggers = configured["expected_steps"], configured["loggers"]
-        _worker_heartbeat.heartbeat("rl_step", step=0, initial=True)
+        _worker_heartbeat.heartbeat("rl_step", step=0, initial=True, context=context)
         state = _StepMetricState(resume_step=int(files["resume_step"]))
         resume_uploader = _start_resume_uploader(
             local_dir=files["local_dir"],
@@ -293,8 +360,11 @@ def run_rl_train():
             preprocessor=preprocessor,
             metric_evidence=state,
             final_step=expected_steps,
+            context=context,
         )
-        env_for_verl = _build_rl_child_env(inp, files, loggers, reward_runtime.reward_url)
+        env_for_verl = _build_rl_child_env(
+            inp, files, loggers, reward_runtime.reward_url, context=context
+        )
         metrics_last = state.metrics_last
 
         def _progress():
@@ -304,7 +374,7 @@ def run_rl_train():
             """return reward observability and measured pace for one heartbeat."""
             return {
                 **reward_runtime.observability.heartbeat_fields(),
-                **_step_timing_fields(inp, state),
+                **_step_timing_fields(inp, state, context=context),
             }
 
         with liveness_heartbeat(
@@ -313,6 +383,7 @@ def run_rl_train():
             fields=lambda: {"metrics_last": list(metrics_last), **_reward_observability()},
             progress_step=True,
             sample_off_thread=True,
+            context=context,
         ):
             rc = _execute_rl_child(
                 python_bin=python_bin,
@@ -323,6 +394,7 @@ def run_rl_train():
                 reward_runtime=reward_runtime,
                 _reward_observability=_reward_observability,
                 files=files,
+                context=context,
             )
         _validate_rl_child(
             rc,
@@ -336,37 +408,18 @@ def run_rl_train():
     finally:
         device_peak_gpu_gb = _shutdown_rl_runtime(resume_uploader, gpu_sampler, reward_runtime)
 
-    actor_dir, adapter_dir, steps_run, train_wall = _prepare_final_adapter(
-        files["local_dir"], configured["t_train"]
+    adapter_dir, steps_run, train_wall = _publish_rl_result(
+        files,
+        configured,
+        expected_steps,
+        metrics_last,
+        env_for_verl,
+        inp,
+        python_bin,
+        resume_uploader,
+        preprocessor,
+        context=context,
     )
-    if steps_run < expected_steps:
-        raise RuntimeError(
-            f"grpo completed {steps_run}/{expected_steps} requested optimizer updates"
-        )
-    with liveness_heartbeat(
-        "rl_finalizing",
-        progress=lambda: steps_run,
-        fields=lambda: {"metrics_last": list(metrics_last)},
-        progress_step=True,
-        keepalive=True,
-    ):
-        _worker_hf.hf_upload_file(
-            env_for_verl["VERL_FILE_LOGGER_PATH"], "step_metrics.jsonl", required=True
-        )
-        _export_final_adapter(
-            actor_dir,
-            adapter_dir,
-            inp,
-            python_bin,
-            resume_uploader=resume_uploader,
-            steps_run=steps_run,
-        )
-        preprocessor.save_pretrained(adapter_dir)
-        _worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True)
-        # preserve the final checkpoint only when exact save steps are not configured: with
-        # save_at_steps set the customer asked for those steps and nothing else.
-        if final_save_due(steps_run, inp["save_at_steps"]):
-            _worker_hf.publish_deployable_checkpoint(adapter_dir, steps_run)
     _write_terminal_metadata(
         inp=inp,
         prompts=prompts,
@@ -384,4 +437,5 @@ def run_rl_train():
         experiment_name=configured["experiment_name"],
         reward_runtime=reward_runtime,
         gdn_hybrid=gdn_hybrid,
+        context=context,
     )

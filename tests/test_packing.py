@@ -170,7 +170,7 @@ def test_completion_mask_from_ids_empty_full():
 def test_pretokenize_completion_only_drops_empty_and_keeps_lockstep():
     # The SFT pre-tokenizer batches both tokenizations, builds the masks, and drops rows with no
     # completion target — keeping texts and pretok in lockstep so downstream token accounting matches.
-    from flash.engine.worker.entry.sft import _pretokenize_completion_only
+    from flash.engine.profiling.sft_rows import _pretokenize_completion_only
 
     tok = _FakeTok(eos="!")
     # every row carries the full source transcript and template kwargs the masker requires; these
@@ -210,7 +210,7 @@ def test_pretokenize_drops_content_free_completion():
     # A completion whose only masked token is special (an empty assistant turn -> just EOS/turn-closer)
     # has no REAL target and must be dropped — not train the model to emit EOS immediately. "Special" is
     # the tokenizer's own all_special_ids, so the check is template-agnostic.
-    from flash.engine.worker.entry.sft import _pretokenize_completion_only
+    from flash.engine.profiling.sft_rows import _pretokenize_completion_only
 
     class _TokWithSpecials(_FakeTok):
         all_special_ids = (1, ord("!"))  # BOS + EOS marked special

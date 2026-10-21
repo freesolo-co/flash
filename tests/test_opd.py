@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import sys
 import types
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
-import flash.engine.worker.runtime.state as worker_state
 from flash.engine.worker.teacher.client import TeacherClient
 from flash.engine.worker.teacher.tokenizer_align import (
     StudentToken,
@@ -591,7 +591,7 @@ def test_opd_accepts_short_hybrid_mamba_context_with_conditional_worker_floor(
     assert spec.train.max_context_tokens == max_context_tokens
 
 
-def test_opd_rejects_tool_environments(monkeypatch):
+def test_opd_rejects_tool_environments(worker_context, monkeypatch):
     """opd owns its vLLM rollout loop instead of TRL's native tool-call loop, so a tool-calling env
     must still fail fast. Pure multi-turn (episode) envs ARE supported now — see
     test_opd_multi_turn_distills_every_assistant_turn."""
@@ -600,10 +600,10 @@ def test_opd_rejects_tool_environments(monkeypatch):
     from flash.engine.worker.entry import opd as opd_mod
 
     env = SimpleNamespace(is_tool_env=True)
-    monkeypatch.setattr(worker_state, "SEED", 0)
-    monkeypatch.setattr(worker_state, "require_active_env", lambda e=env: e)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, seed=0))
+    monkeypatch.setattr(worker_context, "require_active_env", lambda e=env: e)
     with pytest.raises(RuntimeError, match="tool-calling"):
-        opd_mod.run_opd()
+        opd_mod.run_opd(context=worker_context)
 
 
 def test_opd_validates_dynamic_image_compatibility_before_gpu_wait():
@@ -713,7 +713,7 @@ def test_opd_liveness_stages_are_throttled_at_setup_cadence():
     assert "sft_pretokenizing" in _HB_SETUP_LIVENESS_STAGES
 
 
-def test_liveness_heartbeat_merges_fields_into_every_emission(monkeypatch):
+def test_liveness_heartbeat_merges_fields_into_every_emission(worker_context, monkeypatch):
     """Regression (heartbeat.py): the liveness thread emits stage=<stage> with NO step,
     and because it shares the opd_step upload-throttle slot it can win the slot and overwrite the
     main thread's stepped heartbeat -- actual_steps_run then sees a training-stage heartbeat with no
@@ -727,12 +727,16 @@ def test_liveness_heartbeat_merges_fields_into_every_emission(monkeypatch):
     hb = importlib.import_module("flash.engine.worker.io.heartbeat")
 
     emitted: list[tuple[str, dict]] = []
-    monkeypatch.setattr(hb, "heartbeat", lambda stage, **kw: emitted.append((stage, kw)))
-    monkeypatch.setattr(hb, "_HB_LAST_PROGRESS_TS", 0.0)
+    monkeypatch.setattr(
+        hb, "heartbeat", lambda stage, context=None, **kw: emitted.append((stage, kw))
+    )
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_progress_ts", 0.0)
     monkeypatch.setattr(hb.worker_perf, "gpu_diagnostics", lambda *a, **k: {})
     monkeypatch.setattr(hb, "_LIVENESS_TICK_S", 0.001)
 
-    with hb.liveness_heartbeat("opd_step", progress=lambda: 1, fields=lambda: {"step": 7}):
+    with hb.liveness_heartbeat(
+        "opd_step", progress=lambda: 1, fields=lambda: {"step": 7}, context=worker_context
+    ):
         deadline = time.time() + 2.0
         while not emitted and time.time() < deadline:
             time.sleep(0.005)
@@ -880,27 +884,34 @@ class _ThinkingRenderTok:
         return self.enabled if enable_thinking else self.disabled
 
 
-def test_thinking_prefill_accepts_terminal_opener_at_shared_boundary(monkeypatch):
+def test_thinking_prefill_accepts_terminal_opener_at_shared_boundary(worker_context, monkeypatch):
     from flash.engine.worker.entry import opd as opd_mod
 
     tok = _ThinkingRenderTok("A:\n", "A:\n<think>\n")
-    monkeypatch.setattr(worker_state, "THINKING", False)
-    assert opd_mod._thinking_prefill_text(tok) == ""
-    monkeypatch.setattr(worker_state, "THINKING", True)
-    assert opd_mod._thinking_prefill_text(tok) == "<think>\n"
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
+    assert opd_mod._thinking_prefill_text(tok, context=worker_context) == ""
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=True))
+    assert opd_mod._thinking_prefill_text(tok, context=worker_context) == "<think>\n"
 
 
 @pytest.mark.parametrize("disabled", ["A:\n<think></think>", "A:\n<think>\n\n</think>\n\n"])
-def test_thinking_prefill_accepts_one_terminal_whitespace_only_closed_block(monkeypatch, disabled):
+def test_thinking_prefill_accepts_one_terminal_whitespace_only_closed_block(
+    worker_context, monkeypatch, disabled
+):
     from flash.engine.worker.entry import opd as opd_mod
 
-    monkeypatch.setattr(worker_state, "THINKING", True)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=True))
     assert (
-        opd_mod._thinking_prefill_text(_ThinkingRenderTok(disabled, "A:\n<think>\n")) == "<think>\n"
+        opd_mod._thinking_prefill_text(
+            _ThinkingRenderTok(disabled, "A:\n<think>\n"), context=worker_context
+        )
+        == "<think>\n"
     )
 
 
-def test_thinking_prefill_accepts_pinned_qwen38_render_with_system_difference(monkeypatch):
+def test_thinking_prefill_accepts_pinned_qwen38_render_with_system_difference(
+    worker_context, monkeypatch
+):
     """the pinned qwen3.8 template adds a thinking-only system instruction before the shared turn."""
     from flash.engine.worker.entry import opd as opd_mod
 
@@ -912,8 +923,13 @@ def test_thinking_prefill_accepts_pinned_qwen38_render_with_system_difference(mo
         "clarity in the final answer.<|im_end|>\n"
         "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<think>\n"
     )
-    monkeypatch.setattr(worker_state, "THINKING", True)
-    assert opd_mod._thinking_prefill_text(_ThinkingRenderTok(disabled, enabled)) == "<think>\n"
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=True))
+    assert (
+        opd_mod._thinking_prefill_text(
+            _ThinkingRenderTok(disabled, enabled), context=worker_context
+        )
+        == "<think>\n"
+    )
 
 
 @pytest.mark.parametrize(
@@ -933,11 +949,18 @@ def test_thinking_prefill_accepts_pinned_qwen38_render_with_system_difference(mo
         "no-nonwhitespace-shared-suffix",
     ],
 )
-def test_thinking_prefill_fails_closed_for_unsafe_template_shapes(monkeypatch, disabled, enabled):
+def test_thinking_prefill_fails_closed_for_unsafe_template_shapes(
+    worker_context, monkeypatch, disabled, enabled
+):
     from flash.engine.worker.entry import opd as opd_mod
 
-    monkeypatch.setattr(worker_state, "THINKING", True)
-    assert opd_mod._thinking_prefill_text(_ThinkingRenderTok(disabled, enabled)) == ""
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=True))
+    assert (
+        opd_mod._thinking_prefill_text(
+            _ThinkingRenderTok(disabled, enabled), context=worker_context
+        )
+        == ""
+    )
 
 
 def test_student_tokens_absorb_dropped_leading_space_sentencepiece():
@@ -985,7 +1008,7 @@ def test_groupwise_alignment_cursor_walk_groups_denser_student_span():
     assert groupwise_alignment(student, teacher) == [([0, 1], -1.0), ([2], -2.0)]
 
 
-def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
+def test_opd_all_over_budget_prompts_fail_before_loading_student(worker_context, monkeypatch):
     """Regression (opd.py): when every prompt exceeds the context budget the run fails
     deterministically — and that guard must fire BEFORE _student_model (which for a VL warm-start
     downloads the base and MERGES the SFT into it) AND before prefetch_model (the tens-of-GB base
@@ -1014,29 +1037,37 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
         prompt_messages=lambda ex: [{"role": "user", "content": ex["q"]}],
     )
     prefetched: list = []
-    monkeypatch.setattr(worker_state, "require_active_env", lambda: env)
+    monkeypatch.setattr(worker_context, "require_active_env", lambda: env)
     monkeypatch.setattr(
-        worker_state,
-        "JOB_SPEC",
-        SimpleNamespace(
-            train=SimpleNamespace(init_from_adapter=""),
-            model="fake/model",
-            model_revision="",
-            gpu=SimpleNamespace(type=None),
+        worker_context,
+        "config",
+        replace(
+            worker_context.config,
+            spec=SimpleNamespace(
+                train=SimpleNamespace(init_from_adapter=""),
+                model="fake/model",
+                model_revision="",
+                gpu=SimpleNamespace(type=None),
+            ),
         ),
     )
-    monkeypatch.setattr(worker_state, "THINKING", False)
-    monkeypatch.setattr(worker_state, "SEED", 0)
-    monkeypatch.setattr(worker_state, "OPD_RESUME_REVISION", "")
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, seed=0))
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, opd_resume_revision="")
+    )
     monkeypatch.setattr(
         worker_hf,
         "prefetch_model",
-        lambda mid, revision="": (prefetched.append((mid, revision)), 0.0)[1],
+        lambda mid, revision="", context=None, **_context: (
+            prefetched.append((mid, revision)),
+            0.0,
+        )[1],
     )
     monkeypatch.setattr(
         opd_entry,
         "_resolve_opd_knobs",
-        lambda: opd_entry.OpdKnobs(
+        lambda context=None, **_context: opd_entry.OpdKnobs(
             teacher_model="glm-5.2",
             epochs=1,
             learning_rate=1e-4,
@@ -1052,14 +1083,16 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
         ),
     )
 
-    def _boom(*a, **k):
+    def _boom(*a, context=None, **k):
         raise AssertionError("model loading was reached before the all-over-budget guard fired")
 
     monkeypatch.setattr(opd_mod, "_load_opd_model", _boom)
     monkeypatch.setattr(opd_mod, "_probe_gpu_in_subprocess", lambda *a, **k: None)
     monkeypatch.setattr(opd_mod._worker_perf, "gpu_diagnostics", lambda *a, **k: {})
-    monkeypatch.setattr(opd_mod._worker_heartbeat, "heartbeat", lambda *a, **k: None)
-    monkeypatch.setattr(opd_train_runner._worker_heartbeat, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(opd_mod._worker_heartbeat, "heartbeat", lambda *a, context=None, **k: None)
+    monkeypatch.setattr(
+        opd_train_runner._worker_heartbeat, "heartbeat", lambda *a, context=None, **k: None
+    )
 
     import transformers
 
@@ -1072,7 +1105,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(monkeypatch):
 
     # the all-over-budget guard must fire before the model-load assertion can run.
     with pytest.raises(RuntimeError, match="every prompt exceeds"):
-        opd_mod.run_opd_train()
+        opd_mod.run_opd_train(context=worker_context)
     # ...and the base-weight prefetch must have been deferred: an all-over-budget dataset fails
     # without paying for the tens-of-GB snapshot download.
     assert prefetched == [], "prefetch_model must not run when every prompt is over budget"
@@ -1596,7 +1629,7 @@ def test_opd_teacher_price_table_covers_exact_parasail_catalog():
 # --------------------------------------------------------------------------------------------------
 # teacher client (mocked HTTP)
 # --------------------------------------------------------------------------------------------------
-def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
+def test_resolve_opd_knobs_rejects_zero_kl_penalty(worker_context, monkeypatch):
     """Regression (opd.py:64): kl_penalty_coef scales the gkd objective, so an explicit 0
     (allowed by the shared schema for GRPO) makes every OPD backward a zero gradient while opt_steps
     still advances -> a fully-untrained adapter is published/charged. _resolve_opd_knobs must reject 0;
@@ -1611,20 +1644,24 @@ def test_resolve_opd_knobs_rejects_zero_kl_penalty(monkeypatch):
             return None
 
     monkeypatch.setattr(
-        worker_state, "JOB_SPEC", SimpleNamespace(train=_Train(kl_penalty_coef=0.0))
+        worker_context,
+        "config",
+        replace(worker_context.config, spec=SimpleNamespace(train=_Train(kl_penalty_coef=0.0))),
     )
-    monkeypatch.setattr(worker_state, "THINKING", False)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
     with pytest.raises(RuntimeError, match="kl_penalty_coef must be > 0"):
-        opd_mod._resolve_opd_knobs()
+        opd_mod._resolve_opd_knobs(context=worker_context)
 
     # unset (None) -> positive recipe default, no raise.
     monkeypatch.setattr(
-        worker_state, "JOB_SPEC", SimpleNamespace(train=_Train(kl_penalty_coef=None))
+        worker_context,
+        "config",
+        replace(worker_context.config, spec=SimpleNamespace(train=_Train(kl_penalty_coef=None))),
     )
-    assert opd_mod._resolve_opd_knobs().kl_coef > 0.0
+    assert opd_mod._resolve_opd_knobs(context=worker_context).kl_coef > 0.0
 
 
-def test_resolve_opd_knobs_trains_the_authored_prompts_per_step(monkeypatch):
+def test_resolve_opd_knobs_trains_the_authored_prompts_per_step(worker_context, monkeypatch):
     """Regression (opd.py:86): the worker read the optimizer batch from ``batch_size``.
 
     opd REJECTS ``batch_size`` at parse time, so an opd spec carries the batch only under
@@ -1650,9 +1687,11 @@ def test_resolve_opd_knobs_trains_the_authored_prompts_per_step(monkeypatch):
             },
             run_id="pps",
         )
-        monkeypatch.setattr(worker_state, "JOB_SPEC", spec)
-        monkeypatch.setattr(worker_state, "THINKING", False)
-        return opd_mod._resolve_opd_knobs()
+        monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=spec))
+        monkeypatch.setattr(
+            worker_context, "config", replace(worker_context.config, thinking=False)
+        )
+        return opd_mod._resolve_opd_knobs(context=worker_context)
 
     assert _knobs(prompts_per_step=32).prompts_per_step == 32
     assert _knobs(prompts_per_step=1).prompts_per_step == 1
@@ -1660,7 +1699,7 @@ def test_resolve_opd_knobs_trains_the_authored_prompts_per_step(monkeypatch):
     assert _knobs().prompts_per_step == RECIPE.opd.prompts_per_step
 
 
-def test_resolve_opd_knobs_maps_alias_to_parasail_model(monkeypatch):
+def test_resolve_opd_knobs_maps_alias_to_parasail_model(worker_context, monkeypatch):
     from flash.engine.worker.entry import opd as opd_mod
 
     class _Train:  # any [train] field not set returns None (falls back to the recipe default)
@@ -1672,10 +1711,16 @@ def test_resolve_opd_knobs_maps_alias_to_parasail_model(monkeypatch):
 
     def _knobs(teacher):
         monkeypatch.setattr(
-            worker_state, "JOB_SPEC", SimpleNamespace(train=_Train(teacher_model=teacher))
+            worker_context,
+            "config",
+            replace(
+                worker_context.config, spec=SimpleNamespace(train=_Train(teacher_model=teacher))
+            ),
         )
-        monkeypatch.setattr(worker_state, "THINKING", False)
-        return opd_mod._resolve_opd_knobs()
+        monkeypatch.setattr(
+            worker_context, "config", replace(worker_context.config, thinking=False)
+        )
+        return opd_mod._resolve_opd_knobs(context=worker_context)
 
     assert _knobs("kimi-k3").teacher_model == "parasail-kimi-k3-fast"
     assert _knobs("qwen3.5-397b-a17b").teacher_model == "parasail-qwen35-397b-a17b"
@@ -1737,9 +1782,8 @@ def test_opd_spec_json_round_trip():
     assert "PARASAIL_API_KEY" not in restored.environment.secrets
 
 
-def test_opd_worker_resolves_the_authored_prompt_batch(monkeypatch):
+def test_opd_worker_resolves_the_authored_prompt_batch(worker_context, monkeypatch):
     """The paid worker must train on the authored batch, not silently on the recipe default."""
-    import flash.engine.worker.runtime.state as worker_state
     from flash.engine.plan.recipe import RECIPE
     from flash.engine.worker.entry import opd as opd_entry
     from flash.schema import spec_from_dict
@@ -1755,9 +1799,9 @@ def test_opd_worker_resolves_the_authored_prompt_batch(monkeypatch):
         },
         run_id="x",
     )
-    monkeypatch.setattr(worker_state, "JOB_SPEC", spec)
-    monkeypatch.setattr(worker_state, "THINKING", False)
-    assert opd_entry._resolve_opd_knobs().prompts_per_step == authored
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=spec))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
+    assert opd_entry._resolve_opd_knobs(context=worker_context).prompts_per_step == authored
 
 
 def test_opd_cost_is_step_priced_and_bills_teacher_tokens():
@@ -1824,7 +1868,7 @@ class _TinyLM:
         return self
 
 
-def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(monkeypatch):
+def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(worker_context, monkeypatch):
     """Image-bearing OPD with a text teacher must fail before paid GPU work."""
     teacher_model = "glm-5.2"
     fake_torch = types.ModuleType("torch")
@@ -1851,20 +1895,23 @@ def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(monkeypatch):
         stop_sequences=(),
         structured_outputs="",
     )
-    monkeypatch.setattr(worker_state, "SEED", 0)
-    monkeypatch.setattr(worker_state, "THINKING", False)
-    monkeypatch.setattr(worker_state, "require_active_env", lambda: env)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, seed=0))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
+    monkeypatch.setattr(worker_context, "require_active_env", lambda: env)
     monkeypatch.setattr(
-        worker_state,
-        "JOB_SPEC",
-        SimpleNamespace(
-            train=train,
-            model="Qwen/Qwen3.5-9B",
-            model_revision="",
-            gpu=SimpleNamespace(type=None),
+        worker_context,
+        "config",
+        replace(
+            worker_context.config,
+            spec=SimpleNamespace(
+                train=train,
+                model="Qwen/Qwen3.5-9B",
+                model_revision="",
+                gpu=SimpleNamespace(type=None),
+            ),
         ),
     )
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, context=None, **kwargs: None)
     monkeypatch.setattr(
         teacher_mod,
         "TeacherClient",
@@ -1884,4 +1931,4 @@ def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(monkeypatch):
     # propagate. The type carries no behavioral difference -- `_worker_failure_flags` branches only on
     # RetriableInfraError/GitHubRateLimitError and CUDA OOM, so both are fatal and non-retriable.
     with pytest.raises(ValueError, match=r"selected teacher 'glm-5\.2' cannot see images"):
-        opd_mod.run_opd_train()
+        opd_mod.run_opd_train(context=worker_context)

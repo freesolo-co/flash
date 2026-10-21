@@ -9,7 +9,7 @@ WORKER_FAILURE_LINE = "managed worker failed; inspect worker artifacts"
 
 def main() -> int:
     try:
-        from flash.engine.worker.entry.worker import main as worker_main
+        from flash.engine.worker.entry.worker import main_from_env as worker_main
 
         worker_main()
     except BaseException:

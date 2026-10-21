@@ -8,7 +8,6 @@ micro-batch default kicks in.
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
 
@@ -208,7 +207,7 @@ def test_thinking_text_unit():
     assert worker_decoding.thinking_text("<think>still going 42") == "still going 42"
 
 
-def test_thinking_budget_selection(monkeypatch):
+def test_thinking_budget_selection(worker_context, monkeypatch):
     # A JobSpec with an env id makes the worker resolve ACTIVE_ENV at import; stub the loader so
     # this CPU dry-run doesn't load the Freesolo env. We only exercise THINKING resolution here.
     # (the per-device micro-batch half of this test went with trl: verl bounds the backward pass by
@@ -218,8 +217,8 @@ def test_thinking_budget_selection(monkeypatch):
     saved = _set_thinking_worker_env()
 
     try:
-        importlib.reload(worker_state)
-        assert worker_state.THINKING is True
+        worker_context = worker_state.WorkerContext.from_env()
+        assert worker_context.config.thinking is True
     finally:
         _restore_env(saved)
     # thinking off: a JobSpec with thinking=false -> original (larger) micro-batch
@@ -232,16 +231,14 @@ def test_thinking_budget_selection(monkeypatch):
         }
     )
     try:
-        importlib.reload(worker_state)
-        assert worker_state.THINKING is False
+        worker_context = worker_state.WorkerContext.from_env()
+        assert worker_context.config.thinking is False
     finally:
         os.environ.pop("FLASH_JOB_SPEC_JSON", None)
-        importlib.reload(worker_state)
+        worker_context = worker_state.WorkerContext.from_env()
 
 
 def test_grpo_prompts_per_step_caps_to_available_dataset():
-
-    importlib.reload(worker_state)
     assert worker_grpo_config.resolve_grpo_prompts_per_step(requested=64, available_prompts=3) == 3
     assert worker_grpo_config.resolve_grpo_prompts_per_step(requested=2, available_prompts=10) == 2
     with pytest.raises(ValueError, match="at least one retained training prompt"):

@@ -8,10 +8,11 @@ the job-spec JSON the worker reads), NOT environment variables; the WANDB_API_KE
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 import flash.engine.worker.io.wandb_log as worker_wandb
-import flash.engine.worker.runtime.state as worker_state
 from flash.core.spec import JobSpec, WandbSpec
 from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
 
@@ -120,21 +121,25 @@ def test_set_override_preserves_numeric_looking_wandb_label(tmp_path, label):
     assert spec.wandb.run_name == label
 
 
-def test_worker_run_name_uses_spec_wandb(monkeypatch):
+def test_worker_run_name_uses_spec_wandb(worker_context, monkeypatch):
     # Primary path: the worker reads the run name from the typed spec (no env var).
 
     monkeypatch.delenv("WANDB_NAME", raising=False)
-    monkeypatch.setattr(worker_state, "JOB_SPEC", JobSpec(wandb=WandbSpec(run_name="from-spec")))
-    assert worker_wandb.wandb_run_name() == "from-spec"
+    monkeypatch.setattr(
+        worker_context,
+        "config",
+        replace(worker_context.config, spec=JobSpec(wandb=WandbSpec(run_name="from-spec"))),
+    )
+    assert worker_wandb.wandb_run_name(context=worker_context) == "from-spec"
 
 
-def test_worker_run_name_is_toml_only_ignores_env(monkeypatch):
+def test_worker_run_name_is_toml_only_ignores_env(worker_context, monkeypatch):
     # WANDB_NAME is fully gone: even if the env var is set, the run name comes only from the
     # [wandb] config (here unset -> the stable default). No env-var override path.
 
-    monkeypatch.setattr(worker_state, "JOB_SPEC", None)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=None))
     monkeypatch.setenv("WANDB_NAME", "should-be-ignored")
-    assert worker_wandb.wandb_run_name().startswith("flash-")
+    assert worker_wandb.wandb_run_name(context=worker_context).startswith("flash-")
 
 
 def test_runtime_secret_reads_wandb_and_declared_environment_secrets(tmp_path, monkeypatch):

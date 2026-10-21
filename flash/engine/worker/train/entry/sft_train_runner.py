@@ -20,11 +20,11 @@ import flash.engine.worker.io.wandb_log as _worker_wandb
 import flash.engine.worker.model.adapter as _worker_adapter
 import flash.engine.worker.perf as _worker_perf
 import flash.engine.worker.runtime.rng as _worker_rng
-import flash.engine.worker.runtime.state as _worker_state
 from flash.adapters.fused_experts import lora_target_parameters
 from flash.adapters.targets import resolve_lora_targeting
 from flash.core.catalog import get_model
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
 from flash.engine.worker.train.entry import sft_train as _sft_train
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
@@ -165,15 +165,15 @@ class _SftOutputs:
     device_peak_gpu_gb: float
 
 
-def _resolve_sft_options(spec) -> _SftOptions:
-    spec = spec or _worker_state.JOB_SPEC
-    env = _worker_state.require_active_env()
+def _resolve_sft_options(spec, *, context: WorkerContext) -> _SftOptions:
+    spec = spec or context.config.spec
+    env = context.require_active_env()
     # the child trainer is seeded through its shim, but the environment's dataset/completion calls
     # run HERE in the parent. without this the documented top-level seed no longer reproduces sft
     # targets for any env whose row construction uses python/numpy randomness.
-    _sft_train.seed_training_rngs(_worker_state.SEED)
+    _sft_train.seed_training_rngs(context.config.seed)
     started_at = time.time()
-    _worker_heartbeat.heartbeat("sft_start", gpu=_worker_perf.gpu_diagnostics())
+    _worker_heartbeat.heartbeat("sft_start", gpu=_worker_perf.gpu_diagnostics(), context=context)
     gpu_probe = _sft_train._probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
@@ -187,7 +187,7 @@ def _resolve_sft_options(spec) -> _SftOptions:
         return value if value is not None else default
 
     workdir = os.path.join(
-        "/tmp", "flash-sft-verl", _worker_state.RUN_ID, f"seed-{_worker_state.SEED}"
+        "/tmp", "flash-sft-verl", context.config.run_id, f"seed-{context.config.seed}"
     )
     shutil.rmtree(workdir, ignore_errors=True)
     os.makedirs(workdir, exist_ok=True)
@@ -218,7 +218,7 @@ def _resolve_sft_options(spec) -> _SftOptions:
     )
 
 
-def _prepare_sft_data(options: _SftOptions) -> _SftData:
+def _prepare_sft_data(options: _SftOptions, *, context: WorkerContext) -> _SftData:
     from flash.engine.profiling.workload_profile import require_matching_sft_profile
 
     # carried on the spec, not read from `flash.__version__` here: the worker runs the plane's
@@ -301,7 +301,7 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
             "from raw output; reasoning blocks or multi-turn structure may have been lost. encode "
             "full target trajectories as message lists in output"
         )
-    if _worker_state.THINKING and not any("<think>" in text for text in sampled_texts[:256]):
+    if context.config.thinking and not any("<think>" in text for text in sampled_texts[:256]):
         print(
             "WARN: thinking mode is ON but no sampled SFT target contains a <think> trace; "
             "training on non-reasoning targets teaches the model to skip thinking"
@@ -331,24 +331,29 @@ def _prepare_sft_data(options: _SftOptions) -> _SftData:
     )
 
 
-def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
+def _prepare_sft_model(
+    options: _SftOptions, data: _SftData, *, context: WorkerContext
+) -> _SftModelSetup:
     from flash.core.catalog import MODELS
     from flash.engine.plan.vram import sft_chunked_nll_enabled
 
-    download_seconds = _worker_hf.prefetch_model(options.model_id, revision=options.model_revision)
+    download_seconds = _worker_hf.prefetch_model(
+        options.model_id, revision=options.model_revision, context=context
+    )
     setup_seconds = time.time() - options.started_at
     _worker_heartbeat.heartbeat(
         "sft_model_load",
         setup_seconds=setup_seconds,
         gpu=_worker_perf.gpu_diagnostics(),
+        context=context,
     )
     # everything below reads adapter/tokenizer/architecture config from the hub or cache, which is
     # minutes on a cold mount and emits nothing of its own. without this the run's last ping is the
     # one-shot above, so `runs status` freezes on sft_model_load for the whole span and a healthy
     # cold cache is indistinguishable from a dead worker -- the exact ambiguity the stage was added
     # to resolve. same stage name, so the provider's setup-grace classification is unchanged.
-    with liveness_heartbeat("sft_model_load"):
-        lora_config = _worker_adapter.make_lora(options.model_id)
+    with liveness_heartbeat("sft_model_load", context=context):
+        lora_config = _worker_adapter.make_lora(options.model_id, context=context)
         targeting = resolve_lora_targeting(
             options.model_id, algorithm="sft", multimodal=data.multimodal
         )
@@ -362,6 +367,7 @@ def _prepare_sft_model(options: _SftOptions, data: _SftData) -> _SftModelSetup:
             lora_rank,
             int(lora_config.lora_alpha),
             targeting,
+            context=context,
         )
         vocab_size = _sft_train._resolve_sft_vocab_size(options.model_id, options.model_revision)
         # hoisted into the span: on a PINNED revision this falls through to a live AutoConfig read
@@ -539,7 +545,7 @@ def _resolve_sft_width_and_micro_batch(
 
 
 def _resolve_sft_run_identity(
-    options: _SftOptions, capabilities: _SftCapabilities
+    options: _SftOptions, capabilities: _SftCapabilities, *, context: WorkerContext
 ) -> tuple[list[str], str, str]:
     """The child's ``(loggers, project_name, experiment_name)``."""
     # verl logs from the verl interpreter, so gate wandb on THAT env (see resolve_verl_loggers).
@@ -547,7 +553,7 @@ def _resolve_sft_run_identity(
     project_name = (
         options.spec.wandb.project if options.spec and options.spec.wandb else None
     ) or "flash"
-    return loggers, project_name, _worker_wandb.wandb_run_name()
+    return loggers, project_name, _worker_wandb.wandb_run_name(context=context)
 
 
 def _write_sft_child_shims(
@@ -613,9 +619,13 @@ def _prepare_sft_child(
     capabilities: _SftCapabilities,
     use_remove_padding: bool,
     gdn_reset_arch: str | None,
+    *,
+    context: WorkerContext,
 ) -> _SftChild:
     model_path = _sft_train._cached_model_path(options.model_id, options.model_revision)
-    loggers, project_name, experiment_name = _resolve_sft_run_identity(options, capabilities)
+    loggers, project_name, experiment_name = _resolve_sft_run_identity(
+        options, capabilities, context=context
+    )
     shim_dir = os.path.join(options.paths.workdir, "shim")
     os.makedirs(shim_dir, exist_ok=True)
     custom_dataset_path = os.path.join(shim_dir, "flash_verl_sft_dataset.py")
@@ -648,7 +658,7 @@ def _prepare_sft_child(
         "local_dir": options.paths.local_dir,
         "save_freq": model.save_freq,
         "n_gpus_per_node": world_size,
-        "seed": _worker_rng.backend_seed(_worker_state.SEED),
+        "seed": _worker_rng.backend_seed(context.config.seed),
         "project_name": project_name,
         "experiment_name": experiment_name,
         "loop_epochs": model.loop_epochs,
@@ -685,6 +695,7 @@ def _prepare_sft_child(
     resume_step = _sft_train._restore_verl_resume(
         options.paths.local_dir,
         world_size=world_size,
+        context=context,
     )
     watcher = _sft_train._VerlCheckpointWatcher(
         local_dir=options.paths.local_dir,
@@ -696,18 +707,18 @@ def _prepare_sft_child(
         required_steps=options.save_at_steps,
         final_step=model.update_horizon,
         preprocessor=data.processor,
+        context=context,
     )
     # the staged resume checkpoint is already a pending global_step_N on disk, so an unseeded
     # watcher re-merges it and re-uploads full state hf already has, holding the resume-upload
     # lock while the first genuinely new checkpoint waits behind it.
-    _sft_train._seed_resume_lifecycle(watcher, options.save_at_steps, resume_step)
+    _sft_train._seed_resume_lifecycle(watcher, options.save_at_steps, resume_step, context=context)
     if resume_step >= model.update_horizon:
         missing = watcher.lifecycle.missing_deployables(watcher.required_steps)
         if missing:
             raise RuntimeError(f"required saves were not durably published: {missing}")
     child_env = _sft_train._build_verl_child_env(
-        shim_dir=shim_dir,
-        wandb_enabled="wandb" in loggers,
+        shim_dir=shim_dir, wandb_enabled="wandb" in loggers, context=context
     )
     child_env["VERL_USE_EXTERNAL_MODULES"] = "flash_sft_plugin"
     child_env["FLASH_SFT_PLUGIN_CONFIG"] = plugin_config
@@ -779,7 +790,8 @@ def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, child: _SftChil
 
 
 class _SftProgressCallbacks:
-    def __init__(self, progress: _SftProgress):
+    def __init__(self, progress: _SftProgress, *, context: WorkerContext):
+        self.context = context
         self.progress = progress
 
     def on_step(self, step: int) -> None:
@@ -791,16 +803,23 @@ class _SftProgressCallbacks:
             "learning_rate": self.progress.values["lr"],
         }
         _worker_heartbeat.heartbeat(
-            "sft_step", **{key: value for key, value in payload.items() if value is not None}
+            "sft_step",
+            **{key: value for key, value in payload.items() if value is not None},
+            context=self.context,
         )
 
     def child_heartbeat(self) -> None:
         _worker_heartbeat.heartbeat(
-            "sft_step", liveness=True, step=int(self.progress.values["step"] or 0)
+            "sft_step",
+            liveness=True,
+            step=int(self.progress.values["step"] or 0),
+            context=self.context,
         )
 
 
-def _invoke_sft_child(child: _SftChild, callbacks: _SftProgressCallbacks, on_line) -> int:
+def _invoke_sft_child(
+    child: _SftChild, callbacks: _SftProgressCallbacks, on_line, *, context: WorkerContext
+) -> int:
     return _sft_train.run_verl_training(
         child.command,
         env=child.child_env,
