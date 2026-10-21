@@ -358,11 +358,9 @@ def _save_ready_status(tmp_path, monkeypatch, run_id: str, summary: str) -> tupl
 def test_cleanup_pending_removes_only_current_chat_authority(tmp_path, monkeypatch) -> None:
     current, sibling = _save_ready_status(tmp_path, monkeypatch, "run-revoke", "run-revoke/final")
 
-    failed = transitions.mark_deployment_cleanup_pending(
-        "run-revoke", "backend unavailable", current
-    )
+    failed = transitions.mark_deployment_undeploying("run-revoke", "backend unavailable", current)
 
-    assert failed.deployments[current]["state"] == "cleanup_pending"
+    assert failed.deployments[current]["state"] == "undeploying"
     assert deployment_fixtures.ready_checkpoints("run-revoke") == frozenset({sibling})
     with pytest.raises(Exception, match="has not passed"):
         _authorized_chat_checkpoint(
@@ -380,7 +378,7 @@ def test_sibling_cleanup_pending_removes_only_failed_checkpoint(tmp_path, monkey
         tmp_path, monkeypatch, "run-sibling-failure", "run-sibling-failure/final"
     )
 
-    failed = transitions.mark_deployment_cleanup_pending(
+    failed = transitions.mark_deployment_undeploying(
         "run-sibling-failure", "backend unavailable", checkpoint_id=sibling
     )
 

@@ -6,7 +6,8 @@ import math
 
 from flash.schema import parse_checkpoint_ref
 
-BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
+DEPLOYMENT_STATES = frozenset({"deploying", "ready", "undeploying", "undeployed", "failed"})
+BUSY_STATES = frozenset({"deploying"})
 
 
 def require_checkpoint(run_id: str, checkpoint_id: str) -> int | None:
@@ -32,6 +33,8 @@ def validate_deployments(run_id: str, records: dict) -> dict:
             raise ValueError("deployment key and checkpoint_id must match")
         if isinstance(record.get("checkpoint_step"), bool) or record.get("checkpoint_step") != step:
             raise ValueError("deployment checkpoint_step does not match checkpoint_id")
+        if record.get("state") not in DEPLOYMENT_STATES:
+            raise ValueError("invalid checkpoint deployment state")
         generation(record)
     return records
 

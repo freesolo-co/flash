@@ -16,7 +16,7 @@ from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
 # run states that have produced a downloadable adapter artifact.
 _DEPLOYABLE_STATES = {"done", "deployed"}
 
-_DEPLOYMENT_BUSY_STATES = {"queued", "smoke_testing"}
+_DEPLOYMENT_BUSY_STATES = {"deploying"}
 _DEPLOYMENT_READY_STATES = {"ready"}
 
 

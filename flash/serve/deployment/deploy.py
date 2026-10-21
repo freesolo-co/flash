@@ -164,7 +164,7 @@ def deploy_adapter(
         run_id,
         model,
         adapter_prefix,
-        state="dry_run" if dry_run else "queued",
+        state="dry_run" if dry_run else "deploying",
         checkpoint_step=checkpoint_step,
     )
     if dry_run:

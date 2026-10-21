@@ -499,7 +499,7 @@ flash models export --adapter-id <run-id>/final --repository <you>/<repo>  # cop
 ```
 
 > **`flash models deploy` returns before the revision is servable.** It returns
-> `state: queued`, and while the new revision reconciles, `flash models deployments` can
+> `state: deploying`, and while the new revision reconciles, `flash models deployments` can
 > still show `ready` for the **previous** one. An eval harness that polls for `ready` and
 > starts immediately will hit an endpoint that rejects its requests with _"deployment is
 > reconciling"_ — and if the harness records per-row errors but still prints an aggregate,

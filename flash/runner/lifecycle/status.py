@@ -62,6 +62,28 @@ def _runstatus_from_json(d: dict) -> RunStatus:
         values["source_snapshot"] = parse_descriptor(d["source_snapshot"]).to_dict()
     from flash.runner.results.deployments import validate_deployments
 
+    # Upgrade persisted pre-cutover records without losing cleanup obligations.
+    previous_states = {
+        "queued": "deploying",
+        "smoke_testing": "deploying",
+        "reconciling": "deploying",
+        "cleanup_pending": "undeploying",
+        "revocation_failed": "undeploying",
+    }
+    records = values.get("deployments", {})
+    if isinstance(records, dict):
+        records = {
+            key: dict(record) if isinstance(record, dict) else record
+            for key, record in records.items()
+        }
+        values["deployments"] = records
+        for record in records.values():
+            if not isinstance(record, dict):
+                continue
+            if record.get("state") == "smoke_testing":
+                record.setdefault("verification_started_at", record.get("updated_at") or 1)
+            if record.get("state") in previous_states:
+                record["state"] = previous_states[record["state"]]
     values["deployments"] = validate_deployments(values["run_id"], values.get("deployments", {}))
     return RunStatus(**values)
 

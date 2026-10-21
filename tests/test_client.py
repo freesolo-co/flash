@@ -716,7 +716,7 @@ def test_cancel_timeout_raises_when_backend_cleanup_is_unconfirmed(monkeypatch, 
                 "state": run_state,
                 "deployments": {
                     "r1/final": {
-                        "state": "cleanup_pending",
+                        "state": "undeploying",
                         "retryable": True,
                         "error": "backend unavailable",
                     }
@@ -740,7 +740,7 @@ def test_cancel_timeout_keeps_polling_nonterminal_cleanup_pending(monkeypatch):
             {
                 "run_id": "r1",
                 "state": "running",
-                "deployments": {"r1/final": {"state": "cleanup_pending", "retryable": True}},
+                "deployments": {"r1/final": {"state": "undeploying", "retryable": True}},
             },
             {
                 "run_id": "r1",
@@ -858,13 +858,13 @@ def test_deployment_for_reads_the_run_scoped_route_not_the_listing(monkeypatch):
     calls = _deployment_reader(
         monkeypatch,
         client,
-        {"state": "queued", "checkpoint_id": "flash-1/final"},
+        {"state": "deploying", "checkpoint_id": "flash-1/final"},
     )
 
     # the id is carried onto the returned record: `models deploy --wait` prints this in place of
     # the POST body, so dropping it renders an empty run field and omits it from the json.
     assert client.deployment_for("flash-1/final") == {
-        "state": "queued",
+        "state": "deploying",
         "checkpoint_id": "flash-1/final",
         "run_id": "flash-1",
     }
@@ -1433,7 +1433,7 @@ def test_cli_deploy_wait_bounds_the_entire_trickling_poll(wait_seconds):
     from flash.cli.commands.ops.deploy import _await_deployment
 
     body = b'{"run_id":"flash-1","checkpoint_id":"flash-1/final","state":"ready"}'
-    queued = {"checkpoint_id": "flash-1/final", "state": "queued"}
+    queued = {"checkpoint_id": "flash-1/final", "state": "deploying"}
     with _trickling_server(body, gap=0.1) as url:
         client = ApiClient(url, "fslo-user-test", timeout=60)
         start = time.monotonic()
@@ -1450,7 +1450,7 @@ def test_cli_deploy_wait_bounds_trickling_status_and_headers(wait_seconds, phase
     from flash.cli.commands.ops.deploy import _await_deployment
 
     body = b'{"checkpoint_id":"flash-1/final","state":"ready"}'
-    queued = {"checkpoint_id": "flash-1/final", "state": "queued"}
+    queued = {"checkpoint_id": "flash-1/final", "state": "deploying"}
     with _trickling_server(body, gap=0.1, phase=phase) as url:
         start = time.monotonic()
         result = _await_deployment(
@@ -1468,7 +1468,7 @@ def test_cli_deploy_wait_bounds_trickling_error_bodies(wait_seconds, status):
     from flash.cli.commands.ops.deploy import _await_deployment
 
     body = b'{"detail":"proxy error response arriving slowly"}'
-    queued = {"checkpoint_id": "flash-1/final", "state": "queued"}
+    queued = {"checkpoint_id": "flash-1/final", "state": "deploying"}
     with _trickling_server(body, gap=0.1, status=status) as url:
         start = time.monotonic()
         result = _await_deployment(

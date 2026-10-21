@@ -23,7 +23,7 @@ def _save_record(status: RunStatus, record: dict) -> RunStatus:
     validate_deployments(status.run_id, {record["checkpoint_id"]: record})
     status.deployments[record["checkpoint_id"]] = record
     if (
-        record["state"] in {"failed", "cleanup_pending", "undeployed"}
+        record["state"] in {"failed", "undeploying", "undeployed"}
         and status.state == "deployed"
         and not any(is_ready(status.run_id, d) for d in status.deployments.values())
     ):
@@ -123,14 +123,14 @@ def _mark_checkpoint_inactive(run_id: str, checkpoint_id: str, **fields) -> RunS
         return _save_record(status, record)
 
 
-def mark_deployment_cleanup_pending(
+def mark_deployment_undeploying(
     run_id: str, error: str, checkpoint_id: str, *, cleanup_error: str | None = None
 ) -> RunStatus:
     """Disable checkpoint serving while backend removal is pending or needs a retry."""
     return _mark_checkpoint_inactive(
         run_id,
         checkpoint_id,
-        state="cleanup_pending",
+        state="undeploying",
         deployment_error=error,
         cleanup_error=cleanup_error,
         error=f"{error}; checkpoint cleanup failed: {cleanup_error}" if cleanup_error else error,
