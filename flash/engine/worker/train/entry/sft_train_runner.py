@@ -567,8 +567,10 @@ def _write_sft_child_shims(
     parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(_sft_train.__file__)))
     copies = (
         ("train/core/child/runtime.py", "flash_verl_runtime.py"),
+        ("train/core/child/compact_checkpoint.py", "flash_compact_checkpoint.py"),
         ("train/sft/child/plugin.py", "flash_sft_plugin.py"),
         ("train/sft/child/entry.py", "flash_sft_entry.py"),
+        ("train/core/child/flashinfer_cache.py", "flash_verl_flashinfer.py"),
     )
     for source, target in copies:
         shutil.copy2(os.path.join(parent_dir, *source.split("/")), os.path.join(shim_dir, target))

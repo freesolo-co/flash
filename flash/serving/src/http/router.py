@@ -18,7 +18,11 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
+from flash.serve.contract.protocol import (
+    MAX_CHAT_REQUEST_BYTES,
+    REQUIRED_SERVING_CAPABILITIES,
+)
+from flash.serving.src.accounting.usage import AuthorizedTraffic
 from flash.serving.src.accounting.usage_outbox import OfflineUsageStore, UsageStore
 from flash.serving.src.http.adapter_routes import adapter_router
 from flash.serving.src.http.body_limit import RequestBodyLimitMiddleware
@@ -32,7 +36,7 @@ THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY = "thinking_structured_outputs_d
 _CLEANUP_TIMEOUT_SECONDS = 10.0
 
 _CAPABILITIES = (
-    "permanent_checkpoint_identity",
+    *sorted(REQUIRED_SERVING_CAPABILITIES),
     THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY,
 )
 
@@ -57,7 +61,8 @@ def build_serving_app(
     lookup_record: Callable[[str, str], AdapterRecord | None] | None = None,
     reload_interval_seconds: float = 30.0,
     usage_store: UsageStore,
-    chat_authorizer: Callable[[str, str, dict[str, str]], Awaitable["str | None"]] | None = None,
+    chat_authorizer: Callable[[str, str, dict[str, str]], Awaitable[str | AuthorizedTraffic | None]]
+    | None = None,
 ):
     """Front-door FastAPI app. ``reload_records`` re-reads persisted ready adapters so a router
     that missed a (un)registration on another container still resolves it: reload once on a miss
@@ -71,9 +76,10 @@ def build_serving_app(
     partially wired hosted deployment to unmetered serving.
 
     External chat/inference auth is ALWAYS enforced. ``chat_authorizer`` authorizes a user request:
-    it is called with ``(freesolo_api_key, adapter_id)`` and must raise an ``HTTPException`` (401/403)
+    it is called with ``(freesolo_api_key, model_id)`` and must raise an ``HTTPException`` (401/403)
     when the key's org does not own the adapter (a base-model serve is authorized for any valid key).
-    It returns the caller's org id, which bills a base-model serve to the caller (no adapter owner).
+    It returns AuthorizedTraffic with the billing org and approved checkpoint generation.
+    Base-model authorizers may also return just the billing org id.
     Trusted server-to-server callers presenting the shared internal key bypass it. If no
     ``chat_authorizer`` is wired, a non-internal request fails closed (503) — prod always wires it.
     """

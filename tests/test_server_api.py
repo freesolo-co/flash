@@ -3513,6 +3513,37 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
     assert deployments[0]["deployment"]["state"] == "queued"
 
 
+@pytest.mark.parametrize("serving_generation", [None, "", "   ", 7, "generation-a"])
+def test_redeploy_reverifies_legacy_ready_records(api, monkeypatch, serving_generation):
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    checkpoint_id = f"{run_id}/final"
+    status = runner_status.get_status(run_id)
+    record = {"checkpoint_id": checkpoint_id, "state": "ready", "verified_at": 123.0}
+    if serving_generation is not None:
+        record["deployment_generation"] = serving_generation
+    status.deployments = records(run_id, record)
+    runner_state._save_status(status)
+    starts = []
+
+    def start(_target, **kwargs):
+        starts.append(kwargs)
+        kwargs["deploy_lock"].release()
+        return False
+
+    monkeypatch.setattr(deployment_jobs, "start_deployment_job", start)
+    response = api.post(
+        f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": checkpoint_id}, headers=_bearer(key)
+    )
+    assert response.status_code == 200, response.text
+    already_verified = serving_generation == "generation-a"
+    assert response.json()["state"] == ("ready" if already_verified else "queued")
+    assert len(starts) == (0 if already_verified else 1)
+    if starts:
+        assert starts[0]["deployment"]["checkpoint_id"] == checkpoint_id
+        assert starts[0]["deployment"]["verified_at"] is None
+
+
 def test_concurrent_deploy_returns_409_without_queueing_duplicate(api, monkeypatch):
     import threading
 
@@ -5134,14 +5165,20 @@ def test_redeploy_after_inactive_deployment_state_is_allowed(api, monkeypatch, d
 
 
 def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
+    from dataclasses import replace
+
+    from flash.core.spec import JobSpec
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
     status = runner_status.get_status(run_id)
+    worker = runner_status.effective_spec_from_status(status)
+    status.effective_preparation = runner_submit._effective_preparation_snapshot(
+        JobSpec.from_dict(status.spec), replace(worker, gpu=replace(worker.gpu, type="H200")), None
+    )
     status.state = "done"
-    status.spec["gpu"]["type"] = "H200"
     # keep the internal worker-spec carrier: hf_repo + run_id (adapter identity) are platform-managed
     # and stripped from the public spec, so deploy resolves them from effective_preparation.
     runner_state._save_status(status)
@@ -5166,12 +5203,13 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
 def test_deploy_works_the_same_whether_or_not_gpu_count_was_authored(api, monkeypatch):
     """Deploy must not depend on whether the author wrote gpu.count.
 
-    `gpu_count_auto` was briefly added to the digest-verified set in `effective_spec_from_status`.
-    The digest covers the whole public spec including `gpu.type`, which the allocator legitimately
-    rewrites onto the stored status when a run is provisioned -- so gating on the marker made an
-    ordinary provisioned run fail integrity validation at deploy. An omitted count is the DEFAULT,
-    so that was nearly every run. These two specs differ only in that one authors `gpu.count = 1`.
+    Allocation records the rented GPU in the private worker snapshot and preserves the
+    authored public spec. Both forms must deploy with the automatically pinned base revision.
     """
+
+    from dataclasses import replace
+
+    from flash.core.spec import JobSpec
 
     def fake_start(target, *args, **kwargs):
         kwargs["deploy_lock"].release()
@@ -5186,9 +5224,13 @@ def test_deploy_works_the_same_whether_or_not_gpu_count_was_authored(api, monkey
             "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
         ).json()["run_id"]
         status = runner_status.get_status(run_id)
+        worker = runner_status.effective_spec_from_status(status)
+        status.effective_preparation = runner_submit._effective_preparation_snapshot(
+            JobSpec.from_dict(status.spec),
+            replace(worker, gpu=replace(worker.gpu, type="H200")),
+            None,
+        )
         status.state = "done"
-        # the allocator writes the class it actually rented onto the public status.
-        status.spec["gpu"]["type"] = "H200"
         runner_state._save_status(status)
 
         resp = api.post(
@@ -7267,6 +7309,7 @@ class _FakeDeployment:
     def to_dict(self):
         return {
             "state": "ready",
+            "deployment_generation": "generation-a",
             "run_id": "X",
             "adapter_hf_prefix": f"{self.adapter_prefix}/adapter",
         }

@@ -22,6 +22,12 @@ def _save_record(status: RunStatus, record: dict) -> RunStatus:
 
     validate_deployments(status.run_id, {record["checkpoint_id"]: record})
     status.deployments[record["checkpoint_id"]] = record
+    if (
+        record["state"] in {"failed", "cleanup_pending", "undeployed"}
+        and status.state == "deployed"
+        and not any(is_ready(status.run_id, d) for d in status.deployments.values())
+    ):
+        status.state = "done"
     status.updated_at = time.time()
     _save_status_unlocked(status)
     return status
@@ -114,11 +120,6 @@ def _mark_checkpoint_inactive(run_id: str, checkpoint_id: str, **fields) -> RunS
             "generation": generation(current) + 1,
             "updated_at": time.time(),
         }
-        status.deployments[checkpoint_id] = record
-        if status.state == "deployed" and not any(
-            is_ready(run_id, d) for d in status.deployments.values()
-        ):
-            status.state = "done"
         return _save_record(status, record)
 
 

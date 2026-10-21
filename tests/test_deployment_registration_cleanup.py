@@ -92,7 +92,12 @@ def test_recovery_fences_and_removes_unfinished_registration(
         fenced = status.get_status(run_id).deployments[target]
         assert fenced["state"] == "cleanup_pending"
         assert fenced["generation"] >= attempt["generation"] + (initial_state != "cleanup_pending")
-        late = {**attempt, "state": "ready", "verified_at": 123.0}
+        late = {
+            **attempt,
+            "state": "ready",
+            "verified_at": 123.0,
+            "deployment_generation": "generation-a",
+        }
         assert transitions.mark_checkpoint_deployed(run_id, late).deployments[target] == fenced
         if cleanup_fails:
             raise ServingError("cleanup unavailable")

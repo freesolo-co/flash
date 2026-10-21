@@ -262,15 +262,15 @@ The one-off quantization job that produced them is not kept in this repo.
 - `GET /healthz` — `{ok, base_models: [...], unsupported_base_models?: [...], gpus: <count>, gpu_by_model: {base: tier}, gpu_tiers: [...], adapters: <count>}` (`gpu*` fields cover supported catalog base models; unsupported hydrated models are listed separately)
 - `GET /adapters`
 - `POST /adapters` with `X-Freesolo-Internal-Key` and an immutable revision registration (optional `structured_outputs` default — see below)
-- `POST /generate` with `adapter_id`
-- `POST /adapters/{adapter_id}/generate`
+- `POST /generate` with `model_id`
+- `POST /adapters/{model_id}/generate`
 - `POST /v1/chat/completions` where `model` is the adapter id
 
 ### Checkpoint headers (all three inference endpoints)
 
 Concurrent checkpoint deploys mutate the single serving surface for an adapter
 id (a redeploy overwrites the record's checkpoint), so every inference endpoint
-(`/generate`, `/adapters/{adapter_id}/generate`, `/v1/chat/completions`,
+(`/generate`, `/adapters/{model_id}/generate`, `/v1/chat/completions`,
 streaming included) supports a checkpoint contract:
 
 - **`X-Freesolo-Checkpoint` (response header)** — echoes the checkpoint that
@@ -325,11 +325,23 @@ activates. Raw `prompt` callers must provide the mode-specific state themselves:
 prompt must already contain a closing `</think>` marker, while a thinking raw prompt must leave an
 open `<think>` block for generation to close.
 
+Registration, fingerprint inputs, records, raw generation requests/responses, and Modal
+dispatch all use `model_id`. Registration requires an exact checkpoint; inference also permits
+a catalog base model. `adapter_id` is not accepted as an alias. OpenAI requests continue to use `model`.
+Database columns already use `checkpoint_id`.
+
+In hosted serving, `artifact_digest` hashes adapter configuration and repository file metadata;
+it contributes to cache identity, but is not a post-download checksum of the weight bytes.
+`artifact_fingerprint` identifies the immutable binding to an organization, checkpoint, source
+revision, base model and serving configuration, including that digest. Neither hash is an
+authentication credential. The fingerprint now hashes the `model_id` key, so previously
+stored fingerprints require the [offline cutover](../../../docs/checkpoint-field-cutover.md).
+
 `POST /adapters`:
 
 ```json
 {
-  "adapter_id": "people-search/step-20",
+  "model_id": "people-search/step-20",
   "repo_id": "Freesolo-Co/people-search-lora",
   "repo_type": "model",
   "base_model": "Qwen/Qwen3.5-9B",
@@ -350,7 +362,7 @@ open `<think>` block for generation to close.
 
 ```json
 {
-  "adapter_id": "people-search/step-20",
+  "model_id": "people-search/step-20",
   "messages": [
     { "role": "user", "content": "Find senior search engineers in SF" }
   ],
@@ -366,3 +378,5 @@ open `<think>` block for generation to close.
   }
 }
 ```
+
+Hosted checkpoint authorization requires Freesolo's verified deployment-generation gate. The control plane reports the exact loading generation that passed smoke verification; if it changes or cannot be confirmed after verification, the attempt fails without publishing readiness or tearing down a possible replacement. Checkpoint API-key requests recheck authorization instead of using the positive base-model authorization cache. Deploy this control-plane and serving-router change with Freesolo PR #784, after its database prerequisites; reverify existing checkpoints whose reports lack a generation before reopening customer traffic. Such records are unready for managed chat; the normal deploy operation queues fresh verification instead of returning the old ready record. Internal smoke requests remain authorized through the trusted internal path.

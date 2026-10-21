@@ -36,7 +36,7 @@ def _settings() -> Settings:
 
 def _record_values(**overrides: object) -> dict[str, object]:
     values: dict[str, object] = {
-        "adapter_id": CHECKPOINT_ID,
+        "model_id": CHECKPOINT_ID,
         "repo_id": "org/run",
         "org_id": ORG_ID,
         "url": "https://huggingface.co/org/run",
@@ -147,7 +147,7 @@ def test_load_uses_explicit_projected_columns_and_ready_filter() -> None:
     request = FakeClient.requests[0]
     assert request["params"]["select"] == PERSISTED_COLUMNS
     assert request["params"]["status"] == "eq.ready"
-    assert record.adapter_id == CHECKPOINT_ID
+    assert record.model_id == CHECKPOINT_ID
     assert record.org_id == ORG_ID
 
 
@@ -257,7 +257,7 @@ def test_cas_miss_returns_none() -> None:
 
 
 def test_hydration_skips_legacy_rows_and_targeted_reads_reject_them() -> None:
-    legacy = {"adapter_id": "legacy-alias", "metadata": {"run_id": RUN_ID}}
+    legacy = {"model_id": "legacy-alias", "metadata": {"run_id": RUN_ID}}
     FakeClient.get_rows = [legacy]
     assert load_adapters(_settings()) == []
 

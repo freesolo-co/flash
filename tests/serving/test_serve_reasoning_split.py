@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from flash.serve.app.openai import ReasoningDeltaSplitter, split_reasoning
+from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
@@ -26,8 +27,8 @@ from tests.serving.conftest import attest
 QWEN = "Qwen/Qwen3.5-9B"
 
 
-async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-    return "org-1"
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> AuthorizedTraffic:
+    return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
 
 def _rec(run_id: str, *, thinking: bool = True) -> AdapterRecord:
@@ -46,7 +47,7 @@ class _NoReadyPool:
             {
                 "type": "delta",
                 "text": "write </think> verbatim",
-                "checkpoint": record.adapter_id,
+                "checkpoint": record.model_id,
             },
         )
         yield self.first_event
@@ -58,7 +59,7 @@ class _NoReadyPool:
     async def register(self, base_model, record) -> None:
         pass
 
-    async def unregister(self, base_model, org_id, adapter_id, expected_generation=None) -> None:
+    async def unregister(self, base_model, org_id, model_id, expected_generation=None) -> None:
         pass
 
 
@@ -78,14 +79,14 @@ class _Pool:
                 "text": self._text,
                 "finish_reason": "stop",
                 "thinking": self._thinking,
-                "checkpoint": record.adapter_id,
+                "checkpoint": record.model_id,
             },
         )
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
         yield attest(
             record,
-            {"type": "ready", "checkpoint": record.adapter_id, "thinking": self._thinking},
+            {"type": "ready", "checkpoint": record.model_id, "thinking": self._thinking},
         )
         for delta in self._deltas:
             yield {"type": "delta", "text": delta}
@@ -94,7 +95,7 @@ class _Pool:
     async def register(self, base_model, record) -> None:
         pass
 
-    async def unregister(self, base_model, org_id, adapter_id, expected_generation=None) -> None:
+    async def unregister(self, base_model, org_id, model_id, expected_generation=None) -> None:
         pass
 
 

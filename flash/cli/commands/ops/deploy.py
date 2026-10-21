@@ -98,7 +98,7 @@ def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> 
             # -- which is just the zero-wait one-shot -- takes the fixed bound; every other read
             # honours the remainder exactly.
             budget = remaining if remaining > 0 else _DEPLOY_ZERO_WAIT_READ_SECONDS
-            current = client.deployment_for(run_id, timeout=budget)
+            current = client.deployment_for(run_id, timeout=budget, body_deadline=budget)
         except ApiError as exc:
             if exc.status in _PERMANENT_POLL_STATUSES:
                 # retrying will not fix a rejected key or a run this key cannot see. without this

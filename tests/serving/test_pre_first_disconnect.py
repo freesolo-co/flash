@@ -33,7 +33,7 @@ def _record() -> AdapterRecord:
     checkpoint_id = f"{run_id}/final"
     return AdapterRecord.model_validate(
         {
-            "adapter_id": checkpoint_id,
+            "model_id": checkpoint_id,
             "repo_id": "org/run-a",
             "org_id": "org-1",
             "base_model": QWEN,
@@ -46,6 +46,7 @@ def _record() -> AdapterRecord:
             "artifact_digest": hashlib.sha256(b"run-a-artifact").hexdigest(),
             "artifact_fingerprint": hashlib.sha256(b"run-a-binding").hexdigest(),
             "lora_rank": 16,
+            "deployment_generation": "generation-a",
         }
     )
 
@@ -88,7 +89,7 @@ def _ready(record: AdapterRecord, generation_id: str) -> dict[str, Any]:
         "reasoning_tokens": 0,
         "request_id": generation_id,
         "engine_replica_id": "replica-1",
-        "lora_request_adapter": record.adapter_id,
+        "lora_request_adapter": record.model_id,
     }
 
 
@@ -109,7 +110,7 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
             lookup = Lookup()
 
             async def authorize_inference(self, *_args):
-                return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
+                return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
             def reject_unsettleable_thinking(self, *_args) -> None:
                 return None
@@ -133,16 +134,16 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
         request = _request(receive)
         if route == "generate":
             awaitable = inference_routes.generate(
-                GenerateRequest(adapter_id=record.adapter_id, prompt="hi"), request
+                GenerateRequest(model_id=record.model_id, prompt="hi"), request
             )
         elif route == "generate_for_adapter":
             awaitable = inference_routes.generate_for_adapter(
-                record.adapter_id, {"prompt": "hi"}, request
+                record.model_id, {"prompt": "hi"}, request
             )
         else:
             awaitable = inference_routes.chat_completions(
                 {
-                    "model": record.adapter_id,
+                    "model": record.model_id,
                     "messages": [{"role": "user", "content": "hi"}],
                 },
                 request,
@@ -183,7 +184,7 @@ def test_non_streaming_disconnect_after_engine_completion_finishes_finalization_
 
         class Context(ServingContext):
             async def authorize_inference(self, *_args):
-                return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
+                return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
         context = Context(
             object(),  # type: ignore[arg-type]
@@ -213,16 +214,16 @@ def test_non_streaming_disconnect_after_engine_completion_finishes_finalization_
         request = _request(receive)
         if route == "generate":
             awaitable = inference_routes.generate(
-                GenerateRequest(adapter_id=record.adapter_id, prompt="hi"), request
+                GenerateRequest(model_id=record.model_id, prompt="hi"), request
             )
         elif route == "generate_for_adapter":
             awaitable = inference_routes.generate_for_adapter(
-                record.adapter_id, {"prompt": "hi"}, request
+                record.model_id, {"prompt": "hi"}, request
             )
         else:
             awaitable = inference_routes.chat_completions(
                 {
-                    "model": record.adapter_id,
+                    "model": record.model_id,
                     "messages": [{"role": "user", "content": "hi"}],
                 },
                 request,
@@ -296,7 +297,7 @@ def _identity() -> RequestIdentity:
 
 
 def _traffic() -> AuthorizedTraffic:
-    return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
+    return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
 
 def test_disconnect_before_first_event_closes_engine_without_starting_response_body() -> None:
@@ -331,10 +332,10 @@ def test_disconnect_before_first_event_closes_engine_without_starting_response_b
             _stream_chat_completion(
                 context,
                 _request(receive),
-                GenerateRequest(adapter_id=record.adapter_id, prompt="hi"),
+                GenerateRequest(model_id=record.model_id, prompt="hi"),
                 record,
                 record,
-                adapter_id=record.adapter_id,
+                model_id=record.model_id,
                 completion_id="chatcmpl-disconnect",
                 created=123,
                 include_usage=True,
@@ -419,7 +420,7 @@ def test_post_first_validation_failure_closes_engine_iterator(failure: str) -> N
             await prepare_stream(
                 Pool(),
                 AdapterRouter([record]),
-                GenerateRequest(adapter_id=record.adapter_id, prompt="hi"),
+                GenerateRequest(model_id=record.model_id, prompt="hi"),
                 record,
                 record,
                 generation_id=generation_id,
@@ -450,10 +451,10 @@ def test_completed_preparation_wins_same_tick_disconnect() -> None:
         response = await _stream_chat_completion(
             context,
             request,
-            GenerateRequest(adapter_id=record.adapter_id, prompt="hi"),
+            GenerateRequest(model_id=record.model_id, prompt="hi"),
             record,
             record,
-            adapter_id=record.adapter_id,
+            model_id=record.model_id,
             completion_id="chatcmpl-race",
             created=123,
             include_usage=True,

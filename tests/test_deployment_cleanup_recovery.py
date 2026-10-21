@@ -35,7 +35,7 @@ def test_restart_uses_durable_registration_intent(api, monkeypatch, stage):
         "org_id": "org-test",
         "run_id": run_id,
         "checkpoint_step": None,
-        "adapter_id": target,
+        "model_id": target,
         "artifact_digest": "expected-artifact",
     }
 
@@ -90,7 +90,12 @@ def test_restart_uses_durable_registration_intent(api, monkeypatch, stage):
             else "undeployed"
         )
     assert recovered.deployments[sibling] == snapshot[0].deployments[sibling]
-    late = {**snapshot[0].deployments[target], "state": "ready", "verified_at": 123.0}
+    late = {
+        **snapshot[0].deployments[target],
+        "state": "ready",
+        "verified_at": 123.0,
+        "deployment_generation": "generation-a",
+    }
     assert (
         transitions.mark_checkpoint_deployed(run_id, late).deployments[target]
         == recovered.deployments[target]

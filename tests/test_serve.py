@@ -21,7 +21,7 @@ import flash.serve.request.transport as serving_transport
 from flash.serve.contract.errors import ServingError
 from flash.serve.contract.provenance import immutable_binding_fingerprint
 
-_IMMUTABLE_SERVING_CAPABILITIES = {"permanent_checkpoint_identity"}
+_IMMUTABLE_SERVING_CAPABILITIES = {"serving_contract_v2"}
 
 
 @pytest.fixture(autouse=True)
@@ -109,7 +109,9 @@ def _stub_adapter_config(
             "_require_serving_capabilities",
             lambda **_kwargs: set(_IMMUTABLE_SERVING_CAPABILITIES),
         )
-    monkeypatch.setattr(deploy, "_wait_checkpoint_ready", lambda *a, **k: {})
+    monkeypatch.setattr(
+        deploy, "_wait_checkpoint_ready", lambda *a, **k: {"deployment_generation": "generation-a"}
+    )
     return seen
 
 
@@ -145,7 +147,7 @@ def _capture_registration_body(
     deploy_kwargs.setdefault("org_id", "org-1")
     stub_serving_registry(
         {
-            "adapter_id": f"{run_id}/final",
+            "checkpoint_id": f"{run_id}/final",
             "subfolder": f"{deploy_kwargs['adapter_prefix']}/adapter",
         }
     )
@@ -561,7 +563,7 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
     )
     assert seen["url"] == "https://serve.example/adapters"
     expected = {
-        "adapter_id": "flash-7-abcd/final",
+        "model_id": "flash-7-abcd/final",
         "repo_id": "org/repo",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "sft/flash-7-abcd/seed0/adapter",
@@ -660,7 +662,7 @@ def test_deploy_registers_structured_outputs_for_thinking_after_capability_probe
 @pytest.mark.parametrize(
     ("health_case", "match"),
     [
-        ("missing_checkpoint_identity", "permanent_checkpoint_identity"),
+        ("missing_checkpoint_identity", "serving_contract_v2"),
         ("missing_thinking_structured", "thinking_structured_outputs_deferred_v1"),
         ("malformed", "must return a list field named capabilities"),
         ("invalid_json", "did not return valid JSON"),
@@ -694,7 +696,7 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
                 d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY
             }
             missing = {
-                "missing_checkpoint_identity": "permanent_checkpoint_identity",
+                "missing_checkpoint_identity": "serving_contract_v2",
                 "missing_thinking_structured": d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY,
             }.get(health_case)
             return {"capabilities": sorted(capabilities - ({missing} if missing else set()))}
@@ -732,7 +734,7 @@ def test_wait_checkpoint_ready_retries_transient_read_errors(monkeypatch):
 
     revision = "run-1/final"
     ready = {
-        "adapter_id": revision,
+        "model_id": revision,
         "subfolder": "sft/run-1/seed0/adapter",
         "metadata": {"lifecycle_state": "ready"},
     }
@@ -878,7 +880,7 @@ def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_
         assert org_id == "org-1"
         assert checkpoint_id == "run-1/final"
         budgets.append(kwargs.get("budget_s"))
-        return {}
+        return {"deployment_generation": "generation-a"}
 
     monkeypatch.setattr(d, "_wait_checkpoint_ready", wait_ready)
 
@@ -1131,7 +1133,7 @@ def test_deploy_ready_read_returned_at_deadline_never_succeeds(monkeypatch, tmp_
 
     def registered(org_id, adapter_id, *, timeout_s=None):
         assert org_id == "org-1"
-        assert adapter_id == registration_body["adapter_id"]
+        assert adapter_id == registration_body["model_id"]
         # the deploy funds this read from the model's own scaled budget, not the bare floor.
         assert timeout_s == serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
         clock[0] += timeout_s
@@ -1198,7 +1200,7 @@ def test_deploy_requires_and_forwards_org_id(monkeypatch, tmp_path, stub_serving
     monkeypatch.setattr(httpx, "post", fake_post)
     # deploy reads the registry back before reporting ready
     stub_serving_registry(
-        {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
+        {"checkpoint_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
     )
 
     d.deploy_adapter(
@@ -1242,7 +1244,7 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
     monkeypatch.setattr(httpx, "post", fake_post)
     # deploy reads the registry back before reporting ready
     stub_serving_registry(
-        {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
+        {"checkpoint_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
     )
 
     d.deploy_adapter(
@@ -1470,8 +1472,8 @@ def test_readiness_receives_complete_facts_after_registry_readiness(
         monkeypatch.setattr(
             d,
             "_wait_checkpoint_ready",
-            lambda org_id, checkpoint_id, subfolder, **kwargs: events.append(
-                ("ready", checkpoint_id)
+            lambda org_id, checkpoint_id, subfolder, **kwargs: (
+                events.append(("ready", checkpoint_id)) or {"deployment_generation": "generation-a"}
             ),
         )
         return replace(real_metadata(*args, **kwargs), targets_images=targets_images)
@@ -1481,6 +1483,11 @@ def test_readiness_receives_complete_facts_after_registry_readiness(
     def before_ready(facts: d.DeploymentReadinessFacts) -> None:
         assert events[-1] == ("ready", "flash-7-abcd/final")
         observed.append(facts)
+        monkeypatch.setattr(
+            d,
+            "_registered_adapter",
+            lambda *a, **k: {"status": "ready", "deployment_generation": "generation-a"},
+        )
 
     _capture_registration_body(
         monkeypatch,
@@ -1492,7 +1499,7 @@ def test_readiness_receives_complete_facts_after_registry_readiness(
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd",
         before_ready=before_ready,
-        before_register=lambda identity: events.append(("before_register", identity["adapter_id"])),
+        before_register=lambda identity: events.append(("before_register", identity["model_id"])),
     )
     assert events == [
         ("GET", "https://serve.example/healthz"),

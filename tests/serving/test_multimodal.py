@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from PIL import Image, ImageOps
 
 from flash.serve.contract.provenance import immutable_binding_fingerprint
+from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl
 from flash.serving.src.engine.support import _num_prompt_tokens
 from flash.serving.src.http.router import AdapterRouter
@@ -494,7 +495,7 @@ class _Engine:
 
 def _base_record() -> AdapterRecord:
     return AdapterRecord(
-        adapter_id=QWEN,
+        model_id=QWEN,
         repo_id=QWEN,
         base_model=QWEN,
         serve_base_model=True,
@@ -549,7 +550,7 @@ def test_engine_processor_render_and_vllm_multimodal_input_shape() -> None:
     result = asyncio.run(
         engine._generate(
             {
-                "adapter_id": QWEN,
+                "model_id": QWEN,
                 "messages": _messages(),
                 "chat_template_kwargs": {"enable_thinking": True, "custom": "value"},
             },
@@ -582,7 +583,7 @@ def test_image_requests_bypass_text_prompt_cache() -> None:
         raise AssertionError("text prompt path must be bypassed")
 
     engine._prompt_input = _fail
-    payload = GenerateRequest(adapter_id=QWEN, messages=_messages())
+    payload = GenerateRequest(model_id=QWEN, messages=_messages())
     prompt_input = asyncio.run(engine._prepare_prompt_input(payload, thinking_default=False))
     try:
         assert prompt_input["prompt"] == "rendered multimodal prompt"
@@ -592,7 +593,7 @@ def test_image_requests_bypass_text_prompt_cache() -> None:
 
 def test_image_capable_engine_without_processor_rejects_request() -> None:
     engine = _engine_impl(processor=None)
-    payload = GenerateRequest(adapter_id=QWEN, messages=_messages())
+    payload = GenerateRequest(model_id=QWEN, messages=_messages())
     with pytest.raises(MultimodalRequestError, match="initialized processor"):
         asyncio.run(engine._prepare_prompt_input(payload, thinking_default=False))
 
@@ -625,7 +626,7 @@ def test_image_prompt_failure_closes_decoded_images() -> None:
         tracked.extend(wrapped)
         return template_messages, wrapped
 
-    payload = GenerateRequest(adapter_id=QWEN, messages=_messages())
+    payload = GenerateRequest(model_id=QWEN, messages=_messages())
     # _prepare_prompt_input imports prepare_multimodal_request lazily FROM src.multimodal on every
     # call, so patching the source module is what the engine actually resolves.
     with mock.patch.object(multimodal, "prepare_multimodal_request", _tracking_prepare):
@@ -655,7 +656,7 @@ def test_stream_validation_and_first_engine_error_happen_before_ready() -> None:
     async def first_event() -> Any:
         return await anext(
             engine._stream_generate(
-                {"adapter_id": QWEN, "messages": _messages()},
+                {"model_id": QWEN, "messages": _messages()},
                 internal_adapter_payload(_base_record()),
             )
         )
@@ -666,7 +667,7 @@ def test_stream_validation_and_first_engine_error_happen_before_ready() -> None:
 
 def _revision(base_model: str) -> AdapterRecord:
     values = {
-        "adapter_id": REVISION_ID,
+        "model_id": REVISION_ID,
         "repo_id": "org/run",
         "org_id": "org-1",
         "base_model": base_model,
@@ -679,6 +680,7 @@ def _revision(base_model: str) -> AdapterRecord:
         "artifact_revision": SHA,
         "artifact_digest": "b" * 64,
         "lora_rank": 16,
+        "deployment_generation": "generation-a",
     }
     values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
     return AdapterRecord.model_validate(values)
@@ -698,13 +700,13 @@ class _Pool:
         expected_checkpoint: str | None = None,
     ) -> dict[str, Any]:
         del expected_checkpoint
-        self.calls.append((base_model, payload.adapter_id, record.adapter_id))
+        self.calls.append((base_model, payload.model_id, record.model_id))
         self.payloads.append(payload)
         return {
-            "adapter_id": payload.adapter_id,
+            "model_id": payload.model_id,
             # a real engine attests the adapter it actually resolved, which for a revision is the
             # resolved record rather than whatever id the caller asked with.
-            **({"lora_request_adapter": record.adapter_id} if record.is_checkpoint else {}),
+            **({"lora_request_adapter": record.model_id} if record.is_checkpoint else {}),
             "text": "ok",
             "finish_reason": "stop",
             "prompt_tokens": 7,
@@ -721,7 +723,7 @@ class _Pool:
         expected_checkpoint: str | None = None,
     ):
         del expected_checkpoint
-        self.calls.append((base_model, payload.adapter_id, record.adapter_id))
+        self.calls.append((base_model, payload.model_id, record.model_id))
         self.payloads.append(payload)
         yield {"type": "ready", "checkpoint": record.checkpoint}
         yield {
@@ -744,8 +746,8 @@ class _Pool:
         return None
 
 
-async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-    return "org-1"
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> AuthorizedTraffic:
+    return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
 
 def _client(base_model: str) -> tuple[TestClient, _Pool]:
@@ -799,7 +801,7 @@ def test_chat_permanent_checkpoint_echoes_public_checkpoint_identity() -> None:
 @pytest.mark.parametrize(
     ("path", "body"),
     [
-        ("/generate", {"adapter_id": REVISION_ID, "messages": _messages()}),
+        ("/generate", {"model_id": REVISION_ID, "messages": _messages()}),
         (f"/adapters/{REVISION_ID}/generate", {"messages": _messages()}),
         ("/v1/chat/completions", {"model": REVISION_ID, "messages": _messages()}),
     ],
@@ -919,7 +921,7 @@ def _unattesting_pool(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("path", "body"),
     [
-        ("/generate", {"adapter_id": REVISION_ID, "prompt": "hi"}),
+        ("/generate", {"model_id": REVISION_ID, "prompt": "hi"}),
         (f"/adapters/{REVISION_ID}/generate", {"prompt": "hi"}),
     ],
 )
@@ -953,7 +955,7 @@ def test_a_refused_attestation_is_never_metered(monkeypatch) -> None:
     )
     client = TestClient(app, headers={"Authorization": "Bearer test"})
 
-    response = client.post("/generate", json={"adapter_id": REVISION_ID, "prompt": "hi"})
+    response = client.post("/generate", json={"model_id": REVISION_ID, "prompt": "hi"})
 
     assert response.status_code == 502
     assert store.captured == []

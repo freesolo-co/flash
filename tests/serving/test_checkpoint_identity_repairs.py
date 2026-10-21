@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import quote
 
 import httpx
@@ -16,6 +17,7 @@ from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serve.contract.responses import matches_revision_identity
 from flash.server.routes import serving_smoke
 from flash.server.routes.serving_revisions import _authorized_chat_checkpoint
+from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.engine.support import active_checkpoint_ref
 from flash.serving.src.http.router import build_offline_serving_app
 from flash.serving.src.http.routing import AdapterRouter
@@ -31,7 +33,7 @@ from tests._helpers import deployments as deployment_fixtures
 
 def _record(org_id: str, *, digest: str = "b" * 64) -> AdapterRecord:
     values = {
-        "adapter_id": "shared/final",
+        "model_id": "shared/final",
         "repo_id": f"{org_id}/run",
         "base_model": "Qwen/Qwen3.5-9B",
         "org_id": org_id,
@@ -61,8 +63,8 @@ class _Pool:
             "inference_time_seconds": 0.01,
             "request_id": "fsgen-" + "0" * 32,
             "engine_replica_id": "test",
-            "checkpoint": record.adapter_id,
-            "lora_request_adapter": record.adapter_id,
+            "checkpoint": record.model_id,
+            "lora_request_adapter": record.model_id,
         }
 
     async def stream_generate(self, *_args, **_kwargs):
@@ -77,7 +79,7 @@ class _Pool:
 
 
 def _client(*records: AdapterRecord) -> TestClient:
-    by_key = {(record.org_id, record.adapter_id): record for record in records}
+    by_key = {(record.org_id, record.model_id): record for record in records}
     app = build_offline_serving_app(
         _Pool(),
         AdapterRouter(list(records)),
@@ -97,10 +99,10 @@ def _headers(org_id: str) -> dict[str, str]:
 def test_exact_routes_capture_raw_and_encoded_slashes_and_absence_is_idempotent() -> None:
     record = _record("org-a")
     client = _client(record)
-    for target in (record.adapter_id, quote(record.adapter_id, safe="")):
+    for target in (record.model_id, quote(record.model_id, safe="")):
         response = client.get(f"/adapters/{target}", headers=_headers("org-a"))
         assert response.status_code == 200
-        assert response.json()["adapter"]["adapter_id"] == record.adapter_id
+        assert response.json()["adapter"]["model_id"] == record.model_id
         generated = client.post(
             f"/adapters/{target}/generate",
             json={"prompt": "hi"},
@@ -118,9 +120,9 @@ def test_same_public_checkpoint_isolated_by_organization() -> None:
     first = _record("org-a")
     second = _record("org-b", digest="c" * 64)
     router = AdapterRouter([first, second])
-    assert router.resolve(first.adapter_id, org_id="org-a") == (first, first)
-    assert router.resolve(second.adapter_id, org_id="org-b") == (second, second)
-    assert router.resolve(first.adapter_id, org_id="org-c") is None
+    assert router.resolve(first.model_id, org_id="org-a") == (first, first)
+    assert router.resolve(second.model_id, org_id="org-b") == (second, second)
+    assert router.resolve(first.model_id, org_id="org-c") is None
 
 
 def test_persistence_queries_use_org_and_checkpoint_composite(monkeypatch) -> None:
@@ -159,17 +161,20 @@ def test_artifact_digest_and_binding_fingerprint_are_distinct() -> None:
     changed = record.model_copy(update={"base_model": "Qwen/Qwen3.5-4B"})
     assert immutable_binding_fingerprint(changed) != record.artifact_fingerprint
     payload = internal_adapter_payload(record)
-    registration = {name: payload[name] for name in ImmutableCheckpointRegistration.model_fields}
+    registration = {
+        field.alias or name: payload[field.alias or name]
+        for name, field in ImmutableCheckpointRegistration.model_fields.items()
+    }
     with pytest.raises(ValueError, match="immutable binding"):
         ImmutableCheckpointRegistration.model_validate(
             {**registration, "artifact_fingerprint": "d" * 64}
         )
 
 
-@pytest.mark.parametrize("alias", ["checkpoint_id", "checkpoint"])
+@pytest.mark.parametrize("alias", ["adapter_id", "checkpoint_id", "checkpoint"])
 def test_binding_fingerprint_rejects_identity_aliases(alias: str) -> None:
     payload = internal_adapter_payload(_record("org-a"))
-    payload[alias] = payload.pop("adapter_id")
+    payload[alias] = payload.pop("model_id")
 
     with pytest.raises(ValueError, match="inconsistent permanent identity"):
         immutable_binding_fingerprint(payload)
@@ -203,8 +208,9 @@ def test_ambiguous_registration_matches_every_flat_immutable_field() -> None:
         "artifact_fingerprint": record.artifact_fingerprint,
         "lora_rank": record.lora_rank,
     }
-    assert matches_revision_identity(payload, payload)
-    assert not matches_revision_identity({**payload, "lora_rank": 32}, payload)
+    expected = payload.copy()
+    assert matches_revision_identity(payload, expected)
+    assert not matches_revision_identity({**payload, "lora_rank": 32}, expected)
 
 
 def test_chat_requires_the_selected_checkpoint_record():
@@ -214,6 +220,7 @@ def test_chat_requires_the_selected_checkpoint_record():
         "checkpoint_id": checkpoint,
         "checkpoint_step": 20,
         "verified_at": 1.0,
+        "deployment_generation": "generation-a",
     }
     assert _authorized_chat_checkpoint("run-a", record, checkpoint) == checkpoint
     with pytest.raises(Exception, match="has not passed"):
@@ -233,6 +240,7 @@ def test_evaluation_accepts_verified_sibling_without_latest_deployment_equality(
                         "checkpoint_id": checkpoint,
                         "checkpoint_step": 20,
                         "verified_at": 1.0,
+                        "deployment_generation": "generation-a",
                     },
                     "run-a/step-40": {"state": "failed", "checkpoint_id": "run-a/step-40"},
                 },
@@ -262,7 +270,7 @@ def test_hosted_authorizer_uses_freesolo_model_id_schema(monkeypatch) -> None:
 
         @staticmethod
         def json():
-            return {"orgId": "org-a"}
+            return {"orgId": "org-a", "deploymentGeneration": "generation-a"}
 
     class _Client:
         def __init__(self, *_args, **_kwargs):
@@ -279,7 +287,9 @@ def test_hosted_authorizer_uses_freesolo_model_id_schema(monkeypatch) -> None:
     authorize = modal_app._build_chat_authorizer(
         SimpleNamespace(backend_url="https://backend.example", internal_key="internal")
     )
-    assert asyncio.run(authorize("fs-key", "run-a/final")) == "org-a"
+    assert asyncio.run(authorize("fs-key", "run-a/final")) == AuthorizedTraffic(
+        principal_for_external_org("org-a"), "generation-a"
+    )
     assert seen == {"apiKey": "fs-key", "modelId": "run-a/final"}
 
 
@@ -397,6 +407,7 @@ def test_sibling_undeploy_preserves_deployed_summary_and_state(tmp_path, monkeyp
         "checkpoint_id": current,
         "checkpoint_step": None,
         "verified_at": 1.0,
+        "deployment_generation": "generation-a",
     }
     assert deployment_fixtures.ready_checkpoints("run-sibling") == frozenset({current})
 
@@ -439,7 +450,7 @@ def test_checkpoint_registration_rejects_bare_managed_selector() -> None:
     response = client.post(
         "/adapters",
         json={
-            "adapter_id": "run-a",
+            "model_id": "run-a",
             "repo_id": "org/run-a",
             "base_model": "Qwen/Qwen3.5-9B",
             "org_id": "org-a",
@@ -455,3 +466,38 @@ def test_checkpoint_registration_rejects_bare_managed_selector() -> None:
         headers=_headers("org-a"),
     )
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize("generation", ["generation-a", "generation-b", None])
+@pytest.mark.parametrize(
+    "route", ["/generate", "/adapters/shared/final/generate", "/v1/chat/completions"]
+)
+def test_external_request_uses_only_the_authorized_generation(generation, route):
+    record = _record("org-a").model_copy(update={"deployment_generation": "generation-a"})
+    current = record
+
+    async def authorize(*_args):
+        nonlocal current
+        # A redeploy can finish after authorization and before the fresh routing lookup.
+        current = record.model_copy(update={"deployment_generation": generation})
+        return AuthorizedTraffic(principal_for_external_org("org-a"), "generation-a")
+
+    pool = _Pool()
+    pool.generate = AsyncMock(wraps=pool.generate)
+    client = TestClient(
+        build_offline_serving_app(
+            pool,
+            AdapterRouter([record]),
+            chat_authorizer=authorize,
+            lookup_record=lambda *_args: current,
+        )
+    )
+    payload = (
+        {"model": record.model_id, "messages": [{"role": "user", "content": "hi"}]}
+        if route == "/v1/chat/completions"
+        else {"model_id": record.model_id, "prompt": "hi"}
+    )
+    response = client.post(route, json=payload, headers={"Authorization": "Bearer user-key"})
+
+    assert response.status_code == (200 if generation == "generation-a" else 503)
+    assert pool.generate.await_count == (1 if generation == "generation-a" else 0)

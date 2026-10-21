@@ -1057,16 +1057,25 @@ def test_deployed_checkpoint_takes_a_wall_clock_deadline(monkeypatch):
 
 
 @contextlib.contextmanager
-def _trickling_server(body: bytes, gap: float):
+def _trickling_server(body: bytes, gap: float, *, status: int = 200, phase: str = "body"):
     """A server that dribbles one byte at a time, like a slow proxy relaying a response."""
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            for byte in body:
+            status_line = f"HTTP/1.1 {status} Test response\r\n".encode()
+            headers = (
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            )
+            if phase == "status":
+                prefix, slow = b"", status_line + headers + body
+            elif phase == "headers":
+                prefix, slow = status_line, headers + body
+            else:
+                prefix, slow = status_line + headers, body
+            self.wfile.write(prefix)
+            self.wfile.flush()
+            for byte in slow:
                 try:
                     self.wfile.write(bytes([byte]))
                     self.wfile.flush()
@@ -1416,3 +1425,68 @@ def test_spec_payload_sends_an_omitted_gpu_count_as_omitted() -> None:
         reparsed = spec_from_dict(spec_payload(pinned))
         assert reparsed.gpu_count_auto is False, f"{authored} must stay a hard pin"
         assert reparsed.gpu.count == expected_count
+
+
+@pytest.mark.wallclock
+@pytest.mark.parametrize("wait_seconds", [0.0, 0.5])
+def test_cli_deploy_wait_bounds_the_entire_trickling_poll(wait_seconds):
+    from flash.cli.commands.ops.deploy import _await_deployment
+
+    body = b'{"run_id":"flash-1","checkpoint_id":"flash-1/final","state":"ready"}'
+    queued = {"checkpoint_id": "flash-1/final", "state": "queued"}
+    with _trickling_server(body, gap=0.1) as url:
+        client = ApiClient(url, "fslo-user-test", timeout=60)
+        start = time.monotonic()
+        result = _await_deployment(client, "flash-1/final", queued, wait_seconds)
+        elapsed = time.monotonic() - start
+    assert result == queued
+    assert elapsed < 3.0, f"CLI poll exceeded its complete-body budget: {elapsed:.2f}s"
+
+
+@pytest.mark.wallclock
+@pytest.mark.parametrize("wait_seconds", [0.0, 0.5])
+@pytest.mark.parametrize("phase", ["status", "headers"])
+def test_cli_deploy_wait_bounds_trickling_status_and_headers(wait_seconds, phase):
+    from flash.cli.commands.ops.deploy import _await_deployment
+
+    body = b'{"checkpoint_id":"flash-1/final","state":"ready"}'
+    queued = {"checkpoint_id": "flash-1/final", "state": "queued"}
+    with _trickling_server(body, gap=0.1, phase=phase) as url:
+        start = time.monotonic()
+        result = _await_deployment(
+            ApiClient(url, "test-key"), "flash-1/final", queued, wait_seconds
+        )
+        elapsed = time.monotonic() - start
+    assert result == queued
+    assert elapsed < 1.75, f"{phase} exceeded the poll deadline: {elapsed:.2f}s"
+
+
+@pytest.mark.wallclock
+@pytest.mark.parametrize("wait_seconds", [0.0, 0.5])
+@pytest.mark.parametrize("status", [401, 403, 404, 503])
+def test_cli_deploy_wait_bounds_trickling_error_bodies(wait_seconds, status):
+    from flash.cli.commands.ops.deploy import _await_deployment
+
+    body = b'{"detail":"proxy error response arriving slowly"}'
+    queued = {"checkpoint_id": "flash-1/final", "state": "queued"}
+    with _trickling_server(body, gap=0.1, status=status) as url:
+        start = time.monotonic()
+        result = _await_deployment(
+            ApiClient(url, "test-key"), "flash-1/final", queued, wait_seconds
+        )
+        elapsed = time.monotonic() - start
+    assert result == queued
+    assert elapsed < 1.75, f"HTTP {status} exceeded the poll deadline: {elapsed:.2f}s"
+
+
+@pytest.mark.wallclock
+@pytest.mark.parametrize("status", [401, 503])
+def test_error_body_deadline_preserves_http_status(status):
+    body = b'{"detail":"proxy error response arriving slowly"}'
+    with _trickling_server(body, gap=0.1, status=status) as url:
+        start = time.monotonic()
+        with pytest.raises(ApiError) as exc:
+            ApiClient(url, "test-key").deployment_for("flash-1/final", timeout=5, body_deadline=0.5)
+        elapsed = time.monotonic() - start
+    assert exc.value.status == status
+    assert elapsed < 1.25

@@ -52,7 +52,9 @@ def normalize_adapter_subfolder(value: str | None) -> str | None:
 class AdapterRecord(BaseModel):
     """one base model or one exact run-backed checkpoint used by hosted serving."""
 
-    adapter_id: str
+    model_config = ConfigDict(extra="forbid")
+
+    model_id: str
     repo_id: str
     base_model: str
     subfolder: str | None = None
@@ -80,7 +82,7 @@ class AdapterRecord(BaseModel):
     def normalize_structured_outputs_default(cls, value: Any) -> dict[str, Any] | None:
         return normalize_structured_outputs(value) or None
 
-    @field_validator("adapter_id", "repo_id", "base_model")
+    @field_validator("model_id", "repo_id", "base_model")
     @classmethod
     def require_non_empty(cls, value: str) -> str:
         return _require_non_empty(value)
@@ -114,7 +116,7 @@ class AdapterRecord(BaseModel):
         if self.run_id is None or self.org_id is None:
             raise ValueError("checkpoint records require run_id and org_id")
         expected = format_checkpoint_ref(self.run_id, self.checkpoint_step)
-        if self.adapter_id != expected or self.checkpoint != expected:
+        if self.model_id != expected or self.checkpoint != expected:
             raise ValueError("checkpoint identity does not match run_id and checkpoint_step")
         if (
             self.artifact_revision is None
@@ -135,7 +137,7 @@ class AdapterRecord(BaseModel):
 
     @property
     def is_checkpoint(self) -> bool:
-        return not self.serve_base_model and parse_checkpoint_ref(self.adapter_id) is not None
+        return not self.serve_base_model and parse_checkpoint_ref(self.model_id) is not None
 
     @property
     def storage_key(self) -> CheckpointKey:
@@ -150,7 +152,7 @@ class ImmutableCheckpointRegistration(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    adapter_id: str
+    model_id: str
     repo_id: str
     base_model: str
     subfolder: str | None = None
@@ -168,7 +170,7 @@ class ImmutableCheckpointRegistration(BaseModel):
     artifact_fingerprint: str
     lora_rank: int
 
-    @field_validator("adapter_id", "repo_id", "base_model", "org_id", "checkpoint")
+    @field_validator("model_id", "repo_id", "base_model", "org_id", "checkpoint")
     @classmethod
     def require_non_empty(cls, value: str) -> str:
         return _require_non_empty(value)
@@ -186,10 +188,8 @@ class ImmutableCheckpointRegistration(BaseModel):
     @model_validator(mode="after")
     def validate_identity(self) -> ImmutableCheckpointRegistration:
         expected = format_checkpoint_ref(self.run_id, self.checkpoint_step)
-        if self.adapter_id != expected or self.checkpoint != expected:
-            raise ValueError(
-                "adapter_id and checkpoint must equal the canonical checkpoint identity"
-            )
+        if self.model_id != expected or self.checkpoint != expected:
+            raise ValueError("model_id and checkpoint must equal the canonical checkpoint identity")
         if re.fullmatch(r"[0-9a-f]{40}", self.artifact_revision) is None:
             raise ValueError("artifact_revision must be a canonical 40-character commit sha")
         for name in ("artifact_digest", "artifact_fingerprint"):
@@ -216,6 +216,8 @@ class PersistedAdapterRecord(AdapterRecord):
     def validate_persisted_identity(self) -> PersistedAdapterRecord:
         if self.serve_base_model:
             raise ValueError("base-model records must not be persisted")
+        if self.artifact_fingerprint != self.immutable_fingerprint():
+            raise ValueError("stored artifact_fingerprint requires the checkpoint-field cutover")
         if not self.updated_at:
             raise ValueError("persisted checkpoint records require updated_at")
         return self
@@ -238,7 +240,7 @@ def internal_adapter_payload(record: AdapterRecord) -> dict[str, Any]:
 class GenerateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    adapter_id: str
+    model_id: str
     # the cpu front door overwrites this before every production dispatch. direct offline engine
     # tests may omit it, in which case the engine supplies a test-only id before calling vllm.
     generation_id: str | None = None
@@ -326,9 +328,9 @@ class GenerateRequest(BaseModel):
             raise ValueError("generation_id must be 1-512 characters")
         return stripped
 
-    @field_validator("adapter_id")
+    @field_validator("model_id")
     @classmethod
-    def strip_adapter_id(cls, value: str) -> str:
+    def strip_model_id(cls, value: str) -> str:
         # normalize once so every entry point authorizes and routes the same nonempty selector.
         # checkpoint-only control and managed-run boundaries enforce permanent checkpoint grammar;
         # the serving router distinguishes those records from supported base-model records.

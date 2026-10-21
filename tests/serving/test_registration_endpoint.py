@@ -52,5 +52,5 @@ def test_registration_persists_router_endpoint_before_ready(monkeypatch):
         record.url == "https://serving.example.test/v1/chat/completions" for record in updates
     )
     assert stored.status == "ready"
-    assert router.get(stored.adapter_id, org_id=stored.org_id).url == stored.url
-    assert pool.registered == [(QWEN, stored.adapter_id)]
+    assert router.get(stored.model_id, org_id=stored.org_id).url == stored.url
+    assert pool.registered == [(QWEN, stored.model_id)]

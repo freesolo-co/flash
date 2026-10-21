@@ -164,6 +164,7 @@ def required_patch_names(config: dict) -> list[str]:
 def install() -> None:
     config = runtime.load_plugin_config_file("FLASH_GRPO_PLUGIN_CONFIG_PATH")
     marker_file = str(config["marker_file"])
+    runtime.install_compact_checkpoints(marker_file)
     for name, enabled, kind, target, installer, args, kwargs in required_patch_specs(config):
         if not enabled:
             continue

@@ -258,5 +258,5 @@ def attest(record: Any, result: dict[str, Any]) -> dict[str, Any]:
     the suite routes through here rather than hand-rolling the field.
     """
     if getattr(record, "is_checkpoint", False):
-        result["lora_request_adapter"] = record.adapter_id
+        result["lora_request_adapter"] = record.model_id
     return result

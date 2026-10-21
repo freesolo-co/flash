@@ -29,6 +29,12 @@ def _install_exact_dataloaders() -> None:
 
         def exact_loader_init(self, *args, **kwargs):
             kwargs["drop_last"] = False
+            # Rows are pretokenized with frozen masks; keep the same bounded worker pool
+            # feeding packed batches between epochs instead of re-importing torch each epoch.
+            # PyTorch rejects persistent workers when num_workers is zero.
+            if int(kwargs.get("num_workers", 0)) > 0:
+                kwargs["persistent_workers"] = True
+                kwargs["prefetch_factor"] = 2
             return loader_init(self, *args, **kwargs)
 
         exact_loader_init._flash_exact_loader = True
@@ -138,6 +144,7 @@ def _install_core(config: dict) -> None:
 def install() -> None:
     config = runtime.load_plugin_config("FLASH_SFT_PLUGIN_CONFIG")
     marker_file = str(config["marker_file"])
+    runtime.install_compact_checkpoints(marker_file)
     runtime.install_required("sft-core", marker_file, _install_core, config)
     language_prefix = str(config.get("lora_language_prefix") or "")
     if language_prefix:

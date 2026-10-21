@@ -194,7 +194,15 @@ except Exception as _flash_cudart_exc:
 
 def render_sitecustomize_bootstrap() -> str:
     """render the minimal process-start bootstrap shared by all verl children."""
-    return render_tf32_shim() + render_tilelang_cudart_shim()
+    return (
+        render_tf32_shim()
+        + render_tilelang_cudart_shim()
+        + """
+import flash_verl_runtime as _flash_cache_runtime
+import flash_verl_flashinfer as _flash_cache_loader
+_flash_cache_loader.install(_flash_cache_runtime)
+"""
+    )
 
 
 from flash.engine.worker.train.core.child.runtime import (  # noqa: E402,F401
@@ -275,6 +283,7 @@ def parse_wandb_link(line: str) -> dict | None:
 # metrics and kept the zero-grad guard from ever arming. excluding / as well as word characters
 # still refuses "global_step:" and a path's ".../step:".
 _VERL_STEP_LEFT_EDGE = r"(?:^|[^\w/])"
+_VERL_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 # the gate the trainers share, via verl_step_number below: any step-tagged line.
 _VERL_STEP_GATE_RE = re.compile(_VERL_STEP_LEFT_EDGE + r"step:(\d+)(?:\s|$)")
@@ -325,6 +334,7 @@ def parse_verl_metric(line: str, verl_key: str) -> float | None:
     (response_length_non_aborted/mean vs response_length/mean) cannot cross-match, and accepts the
     numpy>=2 ``np.float64(...)`` spelling (see _NUMPY_SCALAR_RE).
     """
+    line = _VERL_ANSI_ESCAPE_RE.sub("", line)
     hit = re.search(rf"(?:^|[\s-]){re.escape(verl_key)}:(\S+)", line)
     return None if hit is None else _metric_value(hit.group(1))
 
@@ -337,7 +347,9 @@ def verl_step_number(line: str) -> int | None:
     verl paths read one stdout format -- VERL-134 was one format change that had to be fixed at
     three copies at once, and a path whose copy was missed drops steps silently rather than failing.
     """
-    match = _VERL_STEP_GATE_RE.search(line)
+    # Ray warnings can end with an ANSI reset and no newline. Its final 'm' is a word
+    # character, so matching the raw stream silently loses an adjacent optimizer step.
+    match = _VERL_STEP_GATE_RE.search(_VERL_ANSI_ESCAPE_RE.sub("", line))
     return None if match is None else int(match.group(1))
 
 
@@ -347,6 +359,7 @@ def parse_verl_step_metrics(line: str) -> dict | None:
     malformed multi-rank output must not fail a paid run. return None for validation-only lines with no
     renderable metric, or they can occupy a deduplicated step and displace its training record.
     """
+    line = _VERL_ANSI_ESCAPE_RE.sub("", line)
     match = _VERL_STEP_RE.search(line)
     if match is None:
         return None

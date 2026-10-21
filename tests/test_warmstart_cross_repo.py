@@ -586,12 +586,16 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
     import flash.cost.spec as cost_spec
     import flash.runner.results.checkpoints as checkpoints
     from flash.core.spec import JobSpec
+    from tests._helpers.profile import stub_revision_geometry
 
+    stub_revision_geometry(monkeypatch)
     source = JobSpec.from_dict(
         {
             "run_id": "source-run",
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "sft",
+            "model_revision": _REVISION,
+            "model_revision_auto": True,
             "train": {"hf_repo": "owner/source-runs", "max_context_tokens": 8192},
         }
     )

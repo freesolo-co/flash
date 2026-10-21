@@ -641,3 +641,23 @@ def install_deferred_lora_rollout_guard(marker_file: str) -> None:
         patch=_patch_lora_rollout,
         required=True,
     )
+
+
+def install_compact_checkpoints(marker_file: str) -> None:
+    if __name__ == "flash_verl_runtime":
+        from flash_compact_checkpoint import install
+    else:
+        from flash.engine.worker.train.core.child.compact_checkpoint import install
+
+    def apply():
+        import importlib
+
+        install(
+            importlib.import_module("verl.utils.checkpoint.fsdp_checkpoint_manager"),
+            model_id=os.environ.get("FLASH_CHECKPOINT_MODEL_ID", ""),
+            revision=os.environ.get("FLASH_CHECKPOINT_MODEL_REVISION", ""),
+        )
+
+    install_deferred_required(
+        "compact-checkpoint", marker_file, "verl.utils.checkpoint.fsdp_checkpoint_manager", apply
+    )
