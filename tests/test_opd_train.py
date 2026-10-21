@@ -7450,11 +7450,13 @@ def test_image_token_suppression_is_gated_on_structured_image_blocks():
     assert _resolve_image_token_id(SimpleNamespace(), fallback) == 42
 
 
-def test_opd_launch_config_is_serialized_with_the_child_environment(tmp_path):
+@pytest.mark.parametrize("reentrant", [False, True])
+def test_opd_launch_config_is_serialized_with_the_child_environment(tmp_path, reentrant):
     launch_config = _build_opd_launch_config(
         runtime_dir=str(tmp_path),
         save_at_steps=(3, 7),
         total_steps=9,
+        reentrant_checkpointing=reentrant,
         gdn_model_type="qwen3_5",
         loggers=["console", "wandb"],
         structured_outputs={"choice": ["yes"]},
@@ -7465,6 +7467,7 @@ def test_opd_launch_config_is_serialized_with_the_child_environment(tmp_path):
         "save_at_steps": [3, 7],
         "total_steps": 9,
         "gdn_model_type": "qwen3_5",
+        "reentrant_checkpointing": reentrant,
         "wandb": True,
         "structured_outputs": {"choice": ["yes"]},
     }

@@ -648,6 +648,7 @@ def _build_child_env(
             ),
             structured_outputs=request.structured_outputs,
             gdn_model_type=runtime.gdn_reset_arch,
+            reentrant_checkpointing=_worker_perf.grpo_use_reentrant(request.model_id),
             loggers=runtime.loggers,
         ),
     )
