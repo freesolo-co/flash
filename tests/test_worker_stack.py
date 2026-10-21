@@ -1129,7 +1129,7 @@ def test_verl_venv_pins_transformers_to_the_main_interpreters_version():
     )
 
     venv_block = dockerfile[dockerfile.index("uv venv --seed /opt/verl-venv") :]
-    venv_block = venv_block[: venv_block.index("uv cache clean")]
+    venv_block = venv_block[: venv_block.index("rm -f /tmp/verl-overrides.txt")]
     assert f'"{main_pin.group(1)}"' in venv_block, (
         "the verl venv install list must also name the same exact transformers pin directly"
     )
