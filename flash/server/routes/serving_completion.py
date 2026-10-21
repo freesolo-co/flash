@@ -28,49 +28,37 @@ from flash.server.routes.serving_revisions import (
 def recover_deployments() -> int:
     recovered = 0
     for row in db.all_runs():
-        try:
-            status = run_status.get_status(row["run_id"])
-        except FileNotFoundError:
-            continue
         lock = deployment_locks._deploy_lock(row["run_id"])
         if not lock.acquire(blocking=False):
             continue
         try:
-            status = run_status.get_status(row["run_id"])
+            try:
+                status = run_status.get_status(row["run_id"])
+            except FileNotFoundError:
+                continue
             for checkpoint_id, deployment in status.deployments.items():
                 state = deployment.get("state")
-                if state in _DEPLOYMENT_BUSY_STATES or state == "cleanup_pending":
-                    _recover_interrupted_deployment(status, checkpoint_id)
-                    recovered += 1
+                if state == "cleanup_pending":
+                    recovered += 1  # Already fenced; preserve the original failure.
                     continue
-                if state in _DEPLOYMENT_READY_STATES and _spec_is_unservable(status):
-                    marked = runner_transitions.mark_deployment_cleanup_pending(
-                        status.run_id,
-                        "deployment spec is no longer supported",
-                        checkpoint_id,
-                    )
+                if state in _DEPLOYMENT_BUSY_STATES:
+                    error = "deployment lifecycle interrupted by control-plane restart"
+                elif state in _DEPLOYMENT_READY_STATES and _spec_is_unservable(status):
+                    error = "deployment spec is no longer supported"
                 else:
                     continue
+                if state == "queued" and "registration_identity" not in deployment:
+                    failed = deployment_state._deployment_state(deployment, "failed", error=error)
+                    marked = runner_transitions.mark_deployment_failed(status.run_id, failed)
+                else:
+                    marked = runner_transitions.mark_deployment_cleanup_pending(
+                        status.run_id, error, checkpoint_id
+                    )
                 deployment_state._report_persisted_transition(status, marked, persisted=True)
                 recovered += 1
         finally:
             lock.release()
     return recovered
-
-
-def _recover_interrupted_deployment(status, checkpoint_id: str) -> None:
-    deployment = status.deployments[checkpoint_id]
-    if deployment.get("state") == "cleanup_pending":
-        return  # Already fenced; preserve the original failure across restarts.
-    error = ServingError("deployment lifecycle interrupted by control-plane restart")
-    if deployment.get("state") == "queued" and not deployment.get("registration_started"):
-        failed = deployment_state._deployment_state(deployment, "failed", error=str(error))
-        pending = runner_transitions.mark_deployment_failed(status.run_id, failed)
-    else:
-        pending = runner_transitions.mark_deployment_cleanup_pending(
-            status.run_id, str(error), checkpoint_id
-        )
-    deployment_state._report_persisted_transition(status, pending, persisted=True)
 
 
 def cleanup_recovered_deployments(stop: Event) -> bool:
@@ -203,7 +191,7 @@ def _finish_deployment_unlocked(
     def _before_register(identity: dict) -> None:
         nonlocal current
         _assert_deployment_fence(run_id, deployment, is_checkpoint, prev_state)
-        registering = {**current, "registration_started": True, "registration_identity": identity}
+        registering = {**current, "registration_identity": identity}
         marked = runner_transitions.mark_deployment_pending(
             run_id, registering, owner_deployment=deployment
         )
@@ -213,13 +201,12 @@ def _finish_deployment_unlocked(
 
     def _before_ready(facts: DeploymentReadinessFacts) -> None:
         nonlocal current
-        current["registration_started"] = True
-        _assert_deployment_fence(run_id, deployment, is_checkpoint, prev_state)
         current = deployment_state._deployment_state(
             {**current, "checkpoint_id": facts.checkpoint_id, "openai_model": facts.checkpoint_id},
             "smoke_testing",
             detail="running bounded fixed-prompt smoke",
         )
+        _assert_deployment_fence(run_id, deployment, is_checkpoint, prev_state)
         previous = run_status.get_status(run_id)
         marked = runner_transitions.mark_deployment_pending(
             run_id, current, owner_deployment=deployment
@@ -250,7 +237,7 @@ def _finish_deployment_unlocked(
         return
     except Exception as exc:
         if (
-            current.get("registration_started")
+            ("registration_identity" in current or current.get("state") == "smoke_testing")
             and not isinstance(exc, RegistrationRejected)
             and not _cleanup_failed_deployment(
                 run_id, deployment["checkpoint_id"], str(deploy_kwargs["org_id"]), exc

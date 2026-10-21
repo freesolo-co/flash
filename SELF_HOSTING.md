@@ -282,19 +282,13 @@ provider resources using the pre-migration release before starting this Modal-on
 Historical provider handles are not converted into Modal identities. Existing Hugging Face
 checkpoints and adapters remain usable; the provider migration does not rewrite those artifacts.
 
-This is a clean control-plane cutover, not an in-place migration of persisted run records.
-Before replacing the old controller, export any artifacts you need through that release and
-back up its run state. Keep the old records with the matching release for historical access;
-the new controller does not provide deploy, export, warm-start, or recovery compatibility for
-legacy run envelopes. Removed training fields (including LoRA+ and entropy settings), bare
-warm-start references, retired provider/GPU names, and retired model IDs are not translated.
-Draining active jobs does not make their stored specs compatible with the new controller.
-
-Artifact preservation means the Hugging Face files remain available with their original base
-model identity; it does not make a retired model supported by the current training or serving
-catalog. Follow the coordinated checkpoint schema cutover and explicitly rebind and verify
-supported checkpoints before serving them. Old verification ledgers and launch ownership
-records must not be treated as current readiness or worker ownership.
+This requires a clean control-plane cutover. Export needed artifacts and back up run state
+using the old release; retain it with the old records for historical access. Draining jobs does
+not make legacy specs compatible: removed training fields, bare warm-start references, retired
+provider/GPU names, and model IDs are not translated for deploy, export, warm-start, or recovery.
+Hugging Face artifacts retain their original base model identity; preservation does not imply
+current catalog support. Follow the checkpoint schema cutover, then rebind and verify supported
+checkpoints. Old verification and launch ownership records are not current readiness or ownership.
 
 ## What `FLASH_STANDALONE=1` does
 

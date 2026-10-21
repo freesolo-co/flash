@@ -3434,9 +3434,18 @@ def test_recover_deployments_recovers_busy_states_on_startup_regardless_of_age(m
     monkeypatch.setattr(runner_status, "get_status", lambda run_id: statuses[run_id])
     recovered = []
     monkeypatch.setattr(
-        serving_completion,
-        "_recover_interrupted_deployment",
-        lambda status, checkpoint_id: recovered.append((status.run_id, checkpoint_id)),
+        runner_transitions,
+        "mark_deployment_failed",
+        lambda run_id, record: (
+            recovered.append((run_id, record["checkpoint_id"])) or statuses[run_id]
+        ),
+    )
+    monkeypatch.setattr(
+        runner_transitions,
+        "mark_deployment_cleanup_pending",
+        lambda run_id, error, checkpoint_id: (
+            recovered.append((run_id, checkpoint_id)) or statuses[run_id]
+        ),
     )
     assert serving_completion.recover_deployments() == 2
     assert sorted(recovered) == [

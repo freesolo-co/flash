@@ -551,9 +551,11 @@ def test_recover_deployments_selects_busy_and_skips_missing(monkeypatch):
     monkeypatch.setattr(run_status, "get_status", fake_get_status)
     recovered = []
     monkeypatch.setattr(
-        serving_completion,
-        "_recover_interrupted_deployment",
-        lambda status, checkpoint_id: recovered.append((status.run_id, checkpoint_id)),
+        runner_transitions,
+        "mark_deployment_failed",
+        lambda run_id, record: (
+            recovered.append((run_id, record["checkpoint_id"])) or statuses[run_id]
+        ),
     )
 
     from flash.server.platform.locks import _RunLock
@@ -574,26 +576,19 @@ def test_recover_deployments_selects_busy_and_skips_missing(monkeypatch):
 
 
 def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
-    statuses = [
-        types.SimpleNamespace(
-            run_id="r-settled", deployments=records("r-settled", {"state": "queued"})
-        ),
-        types.SimpleNamespace(
-            run_id="r-settled",
-            deployments=records("r-settled", {"state": "ready"}),
-            spec={"run_id": "r-settled", "model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
-        ),
-    ]
-    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-settled"}])
-    monkeypatch.setattr(run_status, "get_status", lambda _run_id: statuses.pop(0))
-    monkeypatch.setattr(
-        runner_transitions,
-        "mark_deployment_failed",
-        lambda *_args: pytest.fail("a deployment that settled under the lock must not be failed"),
-    )
+    lock = serving_completion.deployment_locks._deploy_lock("r-settled")
 
+    def get_status(run_id):
+        assert not lock.acquire(blocking=False), "status must only be read under the lock"
+        return types.SimpleNamespace(
+            run_id=run_id,
+            deployments=records(run_id, {"state": "ready"}),
+            spec={"run_id": run_id, "model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
+        )
+
+    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-settled"}])
+    monkeypatch.setattr(run_status, "get_status", get_status)
     assert serving_completion.recover_deployments() == 0
-    assert statuses == []
 
 
 def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(monkeypatch):
@@ -667,7 +662,7 @@ def test_recovery_removes_only_unfinished_checkpoint_and_reports_inventory(monke
             "checkpoint_id": "r-stale/step-20",
             "checkpoint_step": 20,
             "state": "queued",
-            "registration_started": True,
+            "registration_identity": {},
             "generation": 1,
             "requested_at": 1.0,
         },
