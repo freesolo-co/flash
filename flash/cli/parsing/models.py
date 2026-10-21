@@ -70,7 +70,7 @@ def _add_deployment_commands(models_sub: argparse._SubParsersAction) -> None:
         help=(
             "block until the requested revision is ready or failed "
             f"(default timeout {DEPLOYMENT_TIMEOUT_SECONDS}s). "
-            "without it, deploy returns while the revision is still queued"
+            "without it, deploy returns while the revision is still deploying"
         ),
     )
     deploy.set_defaults(func=cmd_deploy)

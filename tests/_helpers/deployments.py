@@ -58,7 +58,7 @@ def complete_deployment(run_id, record, expect_state=None):
         "deployment_generation": record.get("deployment_generation", "generation-a"),
         "requested_at": record.get("requested_at", 1.0),
     }
-    transitions.mark_deployment_pending(run_id, {**record, "state": "queued"}, expect_state)
+    transitions.mark_deployment_pending(run_id, {**record, "state": "deploying"}, expect_state)
     return transitions.mark_checkpoint_deployed(
         run_id, {**record, "verified_at": record.get("verified_at", 1.0)}, expect_state
     )

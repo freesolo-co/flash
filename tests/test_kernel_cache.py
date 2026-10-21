@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import sys
@@ -188,3 +189,68 @@ def test_hopper_bake_requires_rollout_prefill_coverage(monkeypatch, tmp_path):
     monkeypatch.setattr(kernel_warmup, "has_raw_kernel_cache", lambda _: True)
     monkeypatch.setattr(kernel_warmup, "save_cache_metadata", lambda *a, **k: True)
     assert kernel_warmup.warmup(str(tmp_path)) == 1
+
+
+@pytest.mark.parametrize("backend", [None, "triton", "tilelang", "flashinfer", "torch"])
+def test_reload_rejects_compilation_even_if_the_backend_swallows_the_error(
+    monkeypatch, tmp_path, backend
+):
+    class Source:
+        def make_ir(self):
+            pytest.fail("unexpected compilation")
+
+    class TileKernel:
+        def _compile_and_create_adapter(self):
+            pytest.fail("unexpected compilation")
+
+    class FlashKernel:
+        def build(self):
+            pytest.fail("unexpected compilation")
+
+    cpp = types.SimpleNamespace(_run_ninja_build=lambda: pytest.fail("unexpected compilation"))
+    monkeypatch.setitem(sys.modules, "torch.utils", types.SimpleNamespace(cpp_extension=cpp))
+    monkeypatch.setitem(
+        sys.modules,
+        "triton.compiler.compiler",
+        types.SimpleNamespace(ASTSource=Source, IRSource=Source),
+    )
+    monkeypatch.setitem(sys.modules, "tilelang.jit", types.SimpleNamespace(JITKernel=TileKernel))
+    monkeypatch.setitem(
+        sys.modules, "flashinfer.jit.core", types.SimpleNamespace(JitSpec=FlashKernel)
+    )
+    torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(get_device_capability=lambda _: (9, 0))
+    )
+    monkeypatch.setattr(kernel_warmup, "_require_gpu", lambda: torch)
+    original = Source.make_ir
+
+    def warm(_torch):
+        if backend is not None:
+            calls = {
+                "triton": Source().make_ir,
+                "tilelang": TileKernel()._compile_and_create_adapter,
+                "flashinfer": FlashKernel().build,
+                "torch": cpp._run_ninja_build,
+            }
+            # A backend fallback must not turn a cache miss into a passing bake.
+            with contextlib.suppress(RuntimeError):
+                calls[backend]()
+        return True
+
+    monkeypatch.setattr(kernel_warmup, "warm_flash_attn", lambda _: True)
+    monkeypatch.setattr(kernel_warmup, "warm_fla_gdn", warm)
+    monkeypatch.setattr(kernel_warmup, "warm_flashinfer_gdn", lambda _: True)
+    monkeypatch.setattr(
+        kernel_warmup, "save_cache_metadata", lambda *a, **k: pytest.fail("overwrote bake metadata")
+    )
+    (tmp_path / "mega_cache.json").write_text('{"sm": "sm90"}')
+    (tmp_path / "triton").mkdir()
+    (tmp_path / "triton/kernel.cubin").write_bytes(b"compiled")
+    assert kernel_warmup.warmup(str(tmp_path), verify_cache=True) == int(backend is not None)
+    proof = json.loads((tmp_path / "cache_reload.json").read_text())
+    assert proof == {
+        "compilation_forbidden": True,
+        "compile_attempts": int(backend is not None),
+        "passed": backend is None,
+    }
+    assert Source.make_ir is original

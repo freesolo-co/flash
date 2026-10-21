@@ -9,7 +9,7 @@ from flash.server.routes import serving_completion as completion
 
 @pytest.mark.parametrize("readback", ["replacement", "timeout", "unavailable"])
 def test_unconfirmed_verification_does_not_undeploy_the_new_generation(monkeypatch, readback):
-    deployment = {"checkpoint_id": "run-1/final", "generation": 1, "state": "queued"}
+    deployment = {"checkpoint_id": "run-1/final", "generation": 1, "state": "deploying"}
     state = SimpleNamespace(deployments={"run-1/final": deployment})
     monkeypatch.setattr(completion.JobSpec, "from_dict", lambda _: SimpleNamespace())
     monkeypatch.setattr(completion.run_status, "get_status", lambda _: state)
@@ -54,7 +54,7 @@ def test_unconfirmed_verification_does_not_undeploy_the_new_generation(monkeypat
             "superseded attempt must not publish readiness or delete its replacement"
         )
 
-    monkeypatch.setattr(completion, "_cleanup_failed_smoke", forbidden)
+    monkeypatch.setattr(completion, "_cleanup_failed_deployment", forbidden)
     monkeypatch.setattr(completion, "_commit_ready_deployment", forbidden)
     completion._finish_deployment_unlocked(
         run_id="run-1",

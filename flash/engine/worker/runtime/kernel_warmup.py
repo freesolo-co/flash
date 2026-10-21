@@ -6,6 +6,7 @@ Import-safe without torch (every heavy import is inside a function). CLI: ``pyth
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -282,7 +283,41 @@ def configure_kernel_cache() -> bool:
         return _reject(f"cache setup failed ({e})")
 
 
-def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
+@contextlib.contextmanager
+def _cached_kernels_only(torch):
+    """Reject cache misses at the pinned backends' compilation entrypoints."""
+    from torch.utils import cpp_extension
+    from triton.compiler.compiler import ASTSource, IRSource
+
+    targets = [
+        (ASTSource, "make_ir"),
+        (IRSource, "make_ir"),
+        (cpp_extension, "_run_ninja_build"),
+    ]
+    if torch.cuda.get_device_capability(0)[0] == 9:
+        from flashinfer.jit.core import JitSpec
+        from tilelang.jit import JITKernel
+
+        targets.extend([(JITKernel, "_compile_and_create_adapter"), (JitSpec, "build")])
+    originals = [(owner, name, getattr(owner, name)) for owner, name in targets]
+    attempts = []
+
+    def reject(*args, **kwargs):
+        attempts.append(True)
+        raise RuntimeError("kernel cache miss: compilation is forbidden during reload validation")
+
+    try:
+        for owner, name, _original in originals:
+            setattr(owner, name, reject)
+        yield attempts
+    finally:
+        for owner, name, original in originals:
+            setattr(owner, name, original)
+
+
+def warmup(
+    out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None, *, verify_cache: bool = False
+) -> int:
     """Warm real training kernels and persist raw caches plus architecture metadata."""
     t0 = time.time()
     _point_backends_at(out_dir)
@@ -307,12 +342,29 @@ def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
     groups = [warm_flash_attn, warm_fla_gdn]
     if torch.cuda.get_device_capability(0)[0] == 9:
         groups.append(warm_flashinfer_gdn)
-    warmed = sum(group(torch) for group in groups)
+    guard = _cached_kernels_only(torch) if verify_cache else contextlib.nullcontext([])
+    with guard as compile_attempts:
+        warmed = sum(group(torch) for group in groups)
     _log(f"{warmed}/{len(groups)} kernel groups warmed in {time.time() - t0:.1f}s")
     has_kernels = has_raw_kernel_cache(out_dir)
-    meta_saved = save_cache_metadata(torch, out_dir, requested_arch=arch, warmed=warmed)
+    meta_saved = (
+        os.path.isfile(os.path.join(out_dir, CACHE_META_FILENAME))
+        if verify_cache
+        else (save_cache_metadata(torch, out_dir, requested_arch=arch, warmed=warmed))
+    )
+    passed = warmed == len(groups) and meta_saved and has_kernels and not compile_attempts
+    if verify_cache:
+        with open(os.path.join(out_dir, "cache_reload.json"), "w") as output:
+            json.dump(
+                {
+                    "compilation_forbidden": True,
+                    "compile_attempts": len(compile_attempts),
+                    "passed": passed,
+                },
+                output,
+            )
     _log(f"done in {time.time() - t0:.1f}s (raw_kernels={has_kernels}, metadata={meta_saved})")
-    return 0 if warmed == len(groups) and meta_saved and has_kernels else 1
+    return 0 if passed else 1
 
 
 def main() -> int:
@@ -327,8 +379,11 @@ def main() -> int:
         default=DEFAULT_CACHE_DIR,
         help=f"cache output dir (default: {DEFAULT_CACHE_DIR}); the bake produces raw kernel caches and architecture metadata",
     )
+    ap.add_argument(
+        "--verify-cache", action="store_true", help="reject compilation on cache reload"
+    )
     args = ap.parse_args()
-    return warmup(out_dir=args.out, arch=args.arch)
+    return warmup(out_dir=args.out, arch=args.arch, verify_cache=args.verify_cache)
 
 
 if __name__ == "__main__":

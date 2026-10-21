@@ -130,6 +130,12 @@ def create_app():
             server_runtime.recover_runs()
             dispatch(server_runtime.recover_pending_runs)
         serving_completion.recover_deployments()
+        deployment_cleanup_stop = threading.Event()
+        deployment_jobs.start_deployment_job(
+            serving_completion.retry_deployment_cleanup,
+            deployment_cleanup_stop,
+            background=True,
+        )
         # replay one persisted status at a time in the background. synchronous per-item delivery
         # prevents a historical backlog from filling the shared reporter ahead of live updates.
         startup_report_stop = threading.Event()
@@ -171,6 +177,7 @@ def create_app():
         try:
             yield
         finally:
+            deployment_cleanup_stop.set()
             app.state.training_jobs.close()
             startup_report_stop.set()
             startup_report_task.cancel()

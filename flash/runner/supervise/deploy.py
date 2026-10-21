@@ -14,7 +14,7 @@ from flash.runner.results.deployments import is_ready
 if TYPE_CHECKING:
     from flash.runner.lifecycle.state import RunStatus
 
-_CLEANUP_PENDING_STATE = "cleanup_pending"
+_UNDEPLOYING_STATE = "undeploying"
 _INACTIVE_DEPLOYMENT_STATES = frozenset({"undeployed", "dry_run"})
 
 
@@ -243,7 +243,7 @@ def _fence_contended_deployment(run_id: str) -> None:
                 continue
             status.deployments[checkpoint_id] = {
                 **record,
-                "state": "cleanup_pending",
+                "state": "undeploying",
                 "retryable": True,
                 "generation": generation(record) + 1,
                 "error": "backend cleanup pending: cancellation fenced an in-progress deployment",
@@ -273,15 +273,15 @@ def _cleanup_serving(
     backend call, so a crash between the two leaves the run visibly un-serveable, not silently live.
     """
     from flash.runner.supervise.transitions import (
-        mark_deployment_cleanup_pending,
+        mark_deployment_undeploying,
         mark_undeployed,
     )
 
     checkpoint_id = deployment["checkpoint_id"]
-    already_fenced = deployment.get("state") == _CLEANUP_PENDING_STATE
+    already_fenced = deployment.get("state") == _UNDEPLOYING_STATE
     if not already_fenced:
         try:
-            mark_deployment_cleanup_pending(
+            mark_deployment_undeploying(
                 run_id,
                 "backend cleanup pending: checkpoint serving was disabled locally before "
                 "backend cleanup",
@@ -301,7 +301,7 @@ def _cleanup_serving(
         undeploy_adapter(checkpoint_id, org_id=org_id)
     except Exception as exc:
         with contextlib.suppress(Exception):
-            mark_deployment_cleanup_pending(run_id, str(exc), checkpoint_id)
+            mark_deployment_undeploying(run_id, str(exc), checkpoint_id)
         return exc, None
     try:
         mark_undeployed(run_id, checkpoint_id)

@@ -2752,8 +2752,8 @@ def test_sibling_undeploy_returns_exact_removed_checkpoint(api, monkeypatch, rem
     assert persisted.state == "deployed"
     assert persisted.deployments[retained]["state"] == "ready"
     assert persisted.deployments[retained]["checkpoint_id"] == retained
-    assert len(reports) == 1
-    assert reports[0].deployments == persisted.deployments
+    assert len(reports) == 2
+    assert reports[-1].deployments == persisted.deployments
 
 
 @pytest.mark.parametrize(
@@ -3122,6 +3122,9 @@ def test_public_run_routes_redact_private_deployment_fields(api, monkeypatch):
             "endpoint_name": "https://serve.example",
             "openai_base_url": "https://serve.example/v1",
             "checkpoint_id": revision,
+            "registration_identity": {"repo_id": "private/repo", "artifact_digest": "digest"},
+            "serving_org_id": "private-org",
+            "verification_started_at": 123.0,
         },
     )
     runner_state._save_status(status)
@@ -3135,9 +3138,20 @@ def test_public_run_routes_redact_private_deployment_fields(api, monkeypatch):
     for body in responses:
         deployment = body["deployments"][revision] if "deployments" in body else body["deployment"]
         assert deployment["openai_base_url"] == "https://serve.example/v1"
-        assert "previous_deployment" not in deployment
+        assert "registration_identity" not in deployment
+        assert "serving_org_id" not in deployment
+        assert "verification_started_at" not in deployment
+
+    for suffix in ("", f"?checkpoint_id={revision}"):
+        body = api.get(f"/v1/runs/{run_id}/deploy{suffix}", headers=_bearer(key)).json()
+        deployment = body["deployments"][revision] if "deployments" in body else body
+        assert "registration_identity" not in deployment
+        assert "serving_org_id" not in deployment
+        assert "verification_started_at" not in deployment
 
     persisted = only_deployment(runner_status.get_status(run_id))
+    assert persisted["registration_identity"]["repo_id"] == "private/repo"
+    assert persisted["serving_org_id"] == "private-org"
     assert persisted["openai_base_url"] == "https://serve.example/v1"
     assert deployment_fixtures.ready_checkpoints(run_id) == frozenset({revision})
 
@@ -3148,6 +3162,8 @@ def test_public_run_routes_redact_private_deployment_fields(api, monkeypatch):
 
     assert cancelled.status_code == 200, cancelled.text
     assert cancelled.json()["state"] == "undeployed"
+    assert "registration_identity" not in cancelled.json()
+    assert "serving_org_id" not in cancelled.json()
     assert deployment_fixtures.ready_checkpoints(run_id) == frozenset()
     assert api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"] == []
 
@@ -3318,6 +3334,7 @@ def test_deployment_transitions_report_persisted_states_and_skip_dry_run(api, mo
 
     def fake_deploy(**kwargs):
         if not kwargs["dry_run"]:
+            kwargs["before_register"]({"repo_id": "private/repo"})
             kwargs["before_ready"](
                 serving_deploy.DeploymentReadinessFacts(revision, revision, frozenset(), False)
             )
@@ -3343,8 +3360,8 @@ def test_deployment_transitions_report_persisted_states_and_skip_dry_run(api, mo
     )
     assert response.status_code == 200, response.text
     assert [only_deployment(status)["state"] for status in calls] == [
-        "queued",
-        "smoke_testing",
+        "deploying",
+        "deploying",
         "ready",
     ]
     # this fixture's SPEC is a text-only grpo run, so no multimodal targeting is recorded and the
@@ -3353,6 +3370,16 @@ def test_deployment_transitions_report_persisted_states_and_skip_dry_run(api, mo
     # image path -- so the text smoke records no attested revision.
     assert only_deployment(calls[-1])["verify_kind"] == "fixed_prompt"
     assert "verify_lora_request_adapter" not in only_deployment(calls[-1])
+
+    persisted = runner_status.get_status(run_id).deployments[revision]
+    assert persisted["registration_identity"] == {"repo_id": "private/repo"}
+    assert persisted["serving_org_id"] == _identity_for_token(key)["org_id"]
+    assert "registration_identity" not in response.json()
+    assert "serving_org_id" not in response.json()
+    for report in calls:
+        public = report.to_dict()["deployments"][revision]
+        assert "registration_identity" not in public
+        assert "serving_org_id" not in public
 
 
 def test_deployment_reporting_skips_failed_cas_and_reports_failure(api, monkeypatch):
@@ -3389,7 +3416,7 @@ def test_deployment_reporting_skips_failed_cas_and_reports_failure(api, monkeypa
         f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": f"{run_id}/final"}, headers=_bearer(key)
     )
     assert failed.status_code == 200, failed.text
-    assert [only_deployment(status)["state"] for status in calls] == ["queued", "failed"]
+    assert [only_deployment(status)["state"] for status in calls] == ["deploying", "failed"]
 
 
 def test_deployment_job_shutdown_closes_producers(monkeypatch):
@@ -3414,72 +3441,43 @@ def test_deployment_job_shutdown_closes_producers(monkeypatch):
     deployment_jobs._open_deployment_jobs()
 
 
-def test_recover_deployments_recovers_busy_states_on_startup_regardless_of_age(
-    monkeypatch,
-):
-    """Startup recovery fails every busy record whose lock it can take, fresh ones included.
-
-    The per-run flock is the ownership proof: a live lifecycle holds it from the moment the
-    request persists `queued` until the deployment ends, so acquiring it means no owner survived.
-    Recovery used to also require the record to be 30 minutes old, which left a control plane that
-    restarted inside that window with a busy record nothing was working on -- and nothing to
-    revisit it, since recovery only runs at startup -- so every retry got 409 until the clock aged
-    it out.
-    """
-    from flash.server.routes import serving
-
+def test_recover_deployments_recovers_busy_states_on_startup_regardless_of_age(monkeypatch):
+    """An acquired run lock proves no lifecycle owner survived, regardless of record age."""
     now = time.time()
     statuses = {
-        "run-smoke_testing": SimpleNamespace(
-            run_id="run-smoke_testing",
+        name: SimpleNamespace(
+            run_id=name,
             state="done",
-            deployments=records(
-                "run-smoke_testing",
-                {
-                    "state": "smoke_testing",
-                    "updated_at": now - serving._DEPLOYMENT_STALE_SECONDS - 1,
-                },
-            ),
-        ),
-        "run-queued": SimpleNamespace(
-            run_id="run-queued",
-            state="done",
-            deployments=records("run-queued", {"state": "queued", "updated_at": now}),
-        ),
+            deployments=records(name, {"state": phase, "updated_at": updated}),
+        )
+        for name, phase, updated in (
+            ("run-smoke_testing", "deploying", now - 3600),
+            ("run-queued", "deploying", now),
+        )
     }
-    marked = []
-    reported = []
     monkeypatch.setattr(
-        serving.db,
-        "all_runs",
-        lambda: [{"run_id": status.run_id} for status in statuses.values()],
+        serving_completion.db, "all_runs", lambda: [{"run_id": name} for name in statuses]
     )
     monkeypatch.setattr(runner_status, "get_status", lambda run_id: statuses[run_id])
-
-    def mark_failed(run_id, deployment):
-        marked.append((run_id, deployment))
-        return SimpleNamespace(run_id=run_id, state="done", deployments=records(run_id, deployment))
-
-    monkeypatch.setattr(runner_transitions, "mark_deployment_failed", mark_failed)
+    recovered = []
     monkeypatch.setattr(
-        deployment_state,
-        "_report_persisted_transition",
-        lambda previous, current, *, persisted: reported.append(
-            (previous.run_id, only_deployment(current), persisted)
+        runner_transitions,
+        "mark_deployment_failed",
+        lambda run_id, record: (
+            recovered.append((run_id, record["checkpoint_id"])) or statuses[run_id]
         ),
     )
-
-    # both current busy states are recovered, including the just-written queued record.
+    monkeypatch.setattr(
+        runner_transitions,
+        "mark_deployment_undeploying",
+        lambda run_id, error, checkpoint_id: (
+            recovered.append((run_id, checkpoint_id)) or statuses[run_id]
+        ),
+    )
     assert serving_completion.recover_deployments() == 2
-    assert sorted(run_id for run_id, _deployment in marked) == [
-        "run-queued",
-        "run-smoke_testing",
-    ]
-    assert all(deployment["state"] == "failed" for _run_id, deployment in marked)
-    assert all("control-plane restart" in deployment["error"] for _run_id, deployment in marked)
-    assert sorted(run_id for run_id, _deployment, persisted in reported if persisted) == [
-        "run-queued",
-        "run-smoke_testing",
+    assert sorted(recovered) == [
+        ("run-queued", "run-queued/final"),
+        ("run-smoke_testing", "run-smoke_testing/final"),
     ]
 
 
@@ -3535,7 +3533,7 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
         f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": f"{run_id}/final"}, headers=_bearer(key)
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["state"] == "queued"
+    assert resp.json()["state"] == "deploying"
     assert resp.json()["verify"] is True
     assert len(started) == 1
     deployment_target, deployment_args, deployment_kwargs = started[0]
@@ -3543,12 +3541,12 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
     assert deployment_args == ()
     assert deployment_kwargs["run_id"] == run_id
     assert deployment_kwargs["deploy_kwargs"]["adapter_prefix"].endswith(run_id)
-    assert [only_deployment(status)["state"] for status in reported] == ["queued"]
+    assert [only_deployment(status)["state"] for status in reported] == ["deploying"]
 
     deployment = only_deployment(runner_status.get_status(run_id))
-    assert deployment["state"] == "queued"
+    assert deployment["state"] == "deploying"
     deployments = api.get("/v1/deployments", headers=_bearer(key)).json()["deployments"]
-    assert deployments[0]["deployment"]["state"] == "queued"
+    assert deployments[0]["deployment"]["state"] == "deploying"
 
 
 @pytest.mark.parametrize("serving_generation", [None, "", "   ", 7, "generation-a"])
@@ -3575,7 +3573,7 @@ def test_redeploy_reverifies_legacy_ready_records(api, monkeypatch, serving_gene
     )
     assert response.status_code == 200, response.text
     already_verified = serving_generation == "generation-a"
-    assert response.json()["state"] == ("ready" if already_verified else "queued")
+    assert response.json()["state"] == ("ready" if already_verified else "deploying")
     assert len(starts) == (0 if already_verified else 1)
     if starts:
         assert starts[0]["deployment"]["checkpoint_id"] == checkpoint_id
@@ -3608,7 +3606,7 @@ def test_concurrent_deploy_returns_409_without_queueing_duplicate(api, monkeypat
         f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": f"{run_id}/final"}, headers=_bearer(key)
     )
     assert first.status_code == 200, first.text
-    assert first.json()["state"] == "queued"
+    assert first.json()["state"] == "deploying"
     assert len(starts) == 1
 
     responses = []
@@ -3645,7 +3643,7 @@ def test_concurrent_deploy_returns_409_without_queueing_duplicate(api, monkeypat
     assert len(responses) == 1
     assert responses[0].status_code == 409, responses[0].text
     assert responses[0].json()["detail"] == (
-        f"run {run_id} already has a deployment in queued state; "
+        f"run {run_id} already has a deployment in deploying state; "
         "run `flash models deployments` to check progress"
     )
     assert len(starts) == 1
@@ -3757,9 +3755,9 @@ def test_deploy_holds_lock_through_background_job_handoff(api, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert recovered == [0]
-    assert observed_states == ["queued"]
+    assert observed_states == ["deploying"]
     assert phases == ["lifecycle-started"]
-    assert only_deployment(runner_status.get_status(run_id))["state"] == "queued"
+    assert only_deployment(runner_status.get_status(run_id))["state"] == "deploying"
 
 
 def test_deploy_start_failure_persists_terminal_failure(api, monkeypatch):
@@ -3790,7 +3788,7 @@ def test_deploy_start_failure_persists_terminal_failure(api, monkeypatch):
     assert deployment["state"] == "failed"
     assert deployment["retryable"] is True
     assert "shutting down" in deployment["error"]
-    assert [only_deployment(item)["state"] for item in reported] == ["queued", "failed"]
+    assert [only_deployment(item)["state"] for item in reported] == ["deploying", "failed"]
 
 
 def test_sync_deploy_execution_error_keeps_specific_persisted_outcome(api, monkeypatch):
@@ -3984,6 +3982,7 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
 
     replay_started = Event()
     shutdown_steps = []
+    cleanup_stops = []
 
     def fail_replay(_stop):
         replay_started.set()
@@ -3999,6 +3998,11 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
 
     monkeypatch.setattr(preflight, "check_run_preflight", lambda: None)
     monkeypatch.setattr(deployment_jobs, "_open_deployment_jobs", lambda: None)
+    monkeypatch.setattr(
+        deployment_jobs,
+        "start_deployment_job",
+        lambda target, stop, **kwargs: cleanup_stops.append(stop) or False,
+    )
     monkeypatch.setattr(runner_reporting, "_open_status_reporter", lambda: None)
     monkeypatch.setattr(server_runtime, "recover_runs", lambda: None)
     monkeypatch.setattr(serving_completion, "recover_deployments", lambda: 0)
@@ -4013,6 +4017,8 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
         assert replay_started.wait(1)
 
     assert shutdown_steps == ["deployment_jobs", ("status_reports", True)]
+    assert len(cleanup_stops) == 1
+    assert cleanup_stops[0].is_set()
 
 
 def test_status_report_sequence_is_persisted_and_private(api):
@@ -5140,7 +5146,7 @@ def test_failed_smoke_cleans_only_unverified_checkpoint(
 
     assert deployment.status_code == 200, deployment.text
     assert deployment.json()["state"] == (
-        "ready" if previously_verified else "cleanup_pending" if cleanup_fails else "failed"
+        "ready" if previously_verified else "undeploying" if cleanup_fails else "failed"
     )
     if cleanup_fails:
         assert deployment.json()["retryable"] is True
@@ -5175,7 +5181,7 @@ def test_failed_smoke_cleans_only_unverified_checkpoint(
         assert "has not passed a successful deployment smoke" in response.json()["detail"]
 
 
-@pytest.mark.parametrize("deployment_state", ["undeployed", "cleanup_pending"])
+@pytest.mark.parametrize("deployment_state", ["undeployed", "undeploying"])
 def test_redeploy_after_inactive_deployment_state_is_allowed(api, monkeypatch, deployment_state):
     from flash.serve.contract.errors import ServingError
 
@@ -5231,7 +5237,7 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
         f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": f"{run_id}/final"}, headers=_bearer(key)
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["state"] == "queued"
+    assert resp.json()["state"] == "deploying"
     assert "gpu" not in resp.json()
     assert "gpu_name" not in seen["deploy_kwargs"]
 
@@ -5561,6 +5567,9 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
         deployment_fixtures.seed_ready_checkpoint(run_id, checkpoint_id)
 
     def boom(_run_id, **_):
+        inventory = runner_status.get_status(run_id).deployments
+        assert inventory[sibling]["state"] == "undeploying"
+        assert inventory[revision]["state"] == "ready"
         raise ServingError("serving backend unreachable: could not delete endpoint")
 
     monkeypatch.setattr(serving_deploy, "undeploy_adapter", boom)
@@ -5592,8 +5601,8 @@ def test_undeploy_without_prior_record_persists_exact_tombstone(api, monkeypatch
     assert response.status_code == 200
     record = runner_status.get_status(run_id).deployments[revision]
     assert record["state"] == "undeployed"
-    assert record["generation"] == 1
-    assert len(reports) == 1
+    assert record["generation"] == 2
+    assert len(reports) == 2
 
 
 def test_mark_deployed_allows_done_but_not_cancelled(monkeypatch, tmp_path):
@@ -6313,8 +6322,11 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
     import threading
 
     import flash.adapters.lora_rank as rank_mod
+    import flash.providers.modal.checkpoint_upload as checkpoint_upload
     import flash.server.platform.db as db_mod
 
+    # This test models a fully reaped launch, including its persistent handoff storage.
+    monkeypatch.setattr(checkpoint_upload, "run_volumes", lambda _run_id: [])
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))

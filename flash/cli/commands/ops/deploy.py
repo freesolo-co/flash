@@ -20,13 +20,13 @@ from flash.client import ApiError, ClientError, client_from_config
 # the states a deployment sits in before the requested revision is actually servable, mirroring
 # the set the control plane transitions through. anything else ends the wait: ready, failed, or a
 # state this client does not know, which must not spin until the timeout.
-_DEPLOYMENT_BUSY_STATES = frozenset({"queued", "smoke_testing", "reconciling"})
+_DEPLOYMENT_BUSY_STATES = frozenset({"deploying"})
 # the only states in which the control plane will actually serve the revision, mirroring
 # flash/server/routes/serving.py. leaving the busy set is NOT the same as arriving here:
-# `cleanup_pending` (backend removal is unconfirmed) and any state a newer
+# `undeploying` (backend removal is unconfirmed) and any state a newer
 # plane introduces are both non-busy and non-servable, so `--wait` must fail closed on them
 # rather than let `deploy --wait && evaluate` proceed against nothing.
-_DEPLOYMENT_READY_STATES = frozenset({"ready", "deployed"})
+_DEPLOYMENT_READY_STATES = frozenset({"ready"})
 _DEPLOY_POLL_SECONDS = 5.0
 # `--wait 0` still owes the caller its one read, and a read needs a positive timeout. keep that
 # bound short enough that "check once, do not block" stays true against a stalled plane: a longer
@@ -48,7 +48,7 @@ _PERMANENT_POLL_STATUSES = frozenset({401, 403})
 def _await_deployment(client, run_id: str, deployment: dict, timeout: float) -> dict:
     """Poll until the requested revision leaves the busy states, or the timeout expires.
 
-    POST deploy returns as soon as the record is persisted, normally in ``queued`` while the
+    POST deploy returns as soon as the record is persisted, normally in ``deploying`` while the
     previous revision is still the ready one. A caller that starts evaluating on that return
     talks to a reconciling endpoint and mostly gets errors. Polling here makes the returned
     record mean what it appears to mean.
@@ -161,7 +161,7 @@ def cmd_deploy(args) -> int:
         dep = _await_deployment(client, args.run_id, dep, wait_seconds)
         # --wait promises the revision is servable on return, so require the plane to SAY it is
         # servable. "not busy" is a weaker claim that also covers a timeout, a vanished listing, an
-        # unpollable plane, `cleanup_pending`, and any state a newer plane adds; a restored
+        # unpollable plane, `undeploying`, and any state a newer plane adds; a restored
         # previous revision means the requested one never made it. exiting 0 on any of those lets
         # `deploy --wait && evaluate` run against the wrong adapter, or against none.
         not_ready = str(dep.get("state") or "") not in _DEPLOYMENT_READY_STATES
