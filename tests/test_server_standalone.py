@@ -1136,6 +1136,7 @@ def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monk
             "org_id": org_id,
         },
     )
+    monkeypatch.setattr(serving, "mark_deployment_undeploying", lambda *_args, **_kwargs: status)
     monkeypatch.setattr(serving, "mark_undeployed", lambda *_args: status)
     monkeypatch.setattr(
         deployment_state, "_report_persisted_transition", lambda *_args, **_kwargs: None
