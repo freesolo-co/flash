@@ -85,7 +85,7 @@ class FlashTaskRunner:
                 tracking = getattr(trainer, "logger", None)
                 if tracking is not None:
                     tracking.finish(exit_code=0 if succeeded else 1)
-                if trainer is not None:
+                if getattr(trainer, "_dump_executor", None) is not None:
                     trainer._shutdown_dump_executor()
             finally:
                 tq.close()

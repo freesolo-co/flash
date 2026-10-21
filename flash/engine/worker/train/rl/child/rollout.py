@@ -20,7 +20,29 @@ from flash.engine.worker.train.rl.child.reward import compute_score
 
 class FlashGrpoManager(AgentLoopManagerTQ):
     def generate_sequences(self, prompts):
-        tu.assign_non_tensor_data(prompts, "flash_validate", bool(prompts.get("validate", False)))
+        validate = bool(tu.get(prompts, "validate", False))
+        tu.assign_non_tensor_data(prompts, "flash_validate", validate)
+        step = int(tu.get(prompts, "global_steps"))
+        count = int(self.config.actor_rollout_ref.rollout.n)
+        identities = [
+            _identity_from_trajectory(
+                {
+                    "step": step,
+                    "sample_index": int(index),
+                    "rollout_n": ordinal,
+                    "validate": validate,
+                }
+            )
+            for index in prompts["index"]
+            for ordinal in range(count)
+        ]
+        # the ledger requires the entire expected set before any worker can report a reward.
+        post_json(
+            os.environ["FLASH_VERL_REWARD_URL"],
+            "/identity/register",
+            {"identities": identities},
+            error_style="reward",
+        )
         return super().generate_sequences(prompts)
 
 
@@ -45,10 +67,6 @@ class FlashGrpoPolicy:
         extra["flash_rollout_identity"] = identity
         extra.setdefault("index", identity["sample_index"])
         kwargs = dict(kwargs, extra_info=extra, flash_rollout_identity=identity)
-        url = os.environ["FLASH_VERL_REWARD_URL"]
-        await asyncio.to_thread(
-            post_json, url, "/identity/register", {"identities": [identity]}, error_style="reward"
-        )
         params = dict(sampling_params)
         if runtime.stop_sequences:
             params["stop"] = list(runtime.stop_sequences)

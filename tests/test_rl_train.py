@@ -1054,9 +1054,9 @@ def test_one_optimizer_step_consumes_exactly_the_requested_unique_prompts():
         assert f"actor_rollout_ref.rollout.n={group}" in o
 
 
-def test_build_verl_overrides_sets_truncation_mask_when_enabled():
+def test_truncation_policy_is_not_an_upstream_hydra_override():
     o = rl_verl.build_verl_overrides(_overrides_cfg(mask_truncated_completions=True))
-    # `++` (append-or-override), because the key exists in the fork's rollout.yaml but not stock's.
+    # the packaged agent consumes this policy from the Flash launch JSON.
     assert not any("mask_truncated_completions" in override for override in o)
 
 
@@ -7353,6 +7353,7 @@ def test_launch_config_puts_the_rank_device_assert_first_when_the_run_spans_card
         "reentrant_checkpointing": True,
         "multimodal": False,
         "per_turn_credit": False,
+        "mask_truncated_completions": True,
         "stop_sequences": (),
         "image_pad_token_id": None,
         "structured_outputs": None,
@@ -7367,6 +7368,7 @@ def test_launch_config_puts_the_rank_device_assert_first_when_the_run_spans_card
     assert files["expected_components"] == ("runtime-ready",)
     config = json.loads(Path(files["launch_config_path"]).read_text())
     assert config["dp_cards"] == 2
+    assert config["mask_truncated_completions"] is True
 
 
 def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():

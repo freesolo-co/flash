@@ -444,7 +444,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 overrides,
                 # the [vllm] extra, matching Dockerfile.worker's VERL_SPEC. verl's bare
                 # install_requires omits vllm, and every entrypoint flash launches needs it:
-                # main_ppo/main_ppo_sync set rollout.name=vllm.
+                # the packaged RL agents use the upstream vllm server adapter.
                 f"{VERL_REQUIREMENT_NAME}[vllm] @ {VERL_REQUIREMENT_URL}",
                 "vllm==0.19.1",
                 "numpy==2.2.6",

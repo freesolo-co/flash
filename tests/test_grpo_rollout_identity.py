@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import hashlib
 import inspect
 import sys
@@ -9,7 +8,6 @@ import threading
 import types
 from types import SimpleNamespace
 
-import cloudpickle
 import pytest
 
 from flash.engine.worker.train.rl.child import reward as reward_module
@@ -307,307 +305,6 @@ def test_identity_parser_rejects_malformed_identity(value, message):
         parse_rollout_identity(value)
 
 
-def _fake_agent_loop_module(original_run, worker_generate, manager_generate, trajectory_info):
-    agent_loop = types.ModuleType("verl.experimental.agent_loop.agent_loop")
-    agent_loop.asyncio = asyncio
-    agent_loop.auto_await = lambda function: function
-    agent_loop.get_trajectory_info = trajectory_info
-    agent_loop.AgentLoopWorker = type(
-        "AgentLoopWorker",
-        (),
-        {
-            "_run_agent_loop": original_run,
-            "generate_sequences": worker_generate,
-        },
-    )
-    agent_loop.AgentLoopManager = type(
-        "AgentLoopManager",
-        (),
-        {"generate_sequences": manager_generate},
-    )
-    experimental = types.ModuleType("verl.experimental")
-    package = types.ModuleType("verl.experimental.agent_loop")
-    package.agent_loop = agent_loop
-    verl = types.ModuleType("verl")
-    verl.experimental = experimental
-    experimental.agent_loop = package
-    return verl, experimental, package, agent_loop
-
-
-def _install_fake_modules(monkeypatch, modules):
-    for name, module in zip(
-        (
-            "verl",
-            "verl.experimental",
-            "verl.experimental.agent_loop",
-            "verl.experimental.agent_loop.agent_loop",
-        ),
-        modules,
-        strict=True,
-    ):
-        monkeypatch.setitem(sys.modules, name, module)
-
-
-def test_manager_registers_exact_set_before_dispatch_and_sidecars_global_ordinals(monkeypatch):
-    events = []
-    ledger = RolloutIdentityLedger(2, 2)
-
-    async def trajectory_info(step, indexes, validate):
-        ordinals: dict[int, int] = {}
-        result = []
-        for index in indexes:
-            ordinal = ordinals.get(index, 0)
-            ordinals[index] = ordinal + 1
-            result.append(
-                {
-                    "step": step,
-                    "sample_index": index,
-                    "rollout_n": ordinal,
-                    "validate": validate,
-                }
-            )
-        return result
-
-    async def original_run(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
-        identity = kwargs["flash_rollout_identity"]
-        events.append(("reward", dict(identity)))
-        ledger.record(identity, kwargs["extra_info"]["index"])
-        return identity
-
-    async def worker_generate(self, batch, *, trajectory_info=None):
-        trajectories = trajectory_info
-        values = []
-        for trajectory, index in zip(
-            trajectories, batch.non_tensor_batch["index"].tolist(), strict=True
-        ):
-            values.append(
-                await self._run_agent_loop(
-                    {},
-                    trajectory,
-                    agent_name="single_turn_agent",
-                    extra_info={"index": index},
-                )
-            )
-        return SimpleNamespace(
-            values=values,
-            meta_info={
-                "metrics": [
-                    {
-                        "generate_sequences": 0.0,
-                        "tool_calls": 0.0,
-                        "compute_score": 0.0,
-                        "num_preempted": 0,
-                    }
-                    for _value in values
-                ]
-            },
-        )
-
-    async def manager_generate(self, prompts):
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
-        return await asyncio.gather(
-            *[
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
-            ]
-        )
-
-    monkeypatch.setitem(worker_generate.__globals__, "get_trajectory_info", trajectory_info)
-    modules = _fake_agent_loop_module(
-        original_run,
-        worker_generate,
-        manager_generate,
-        trajectory_info,
-    )
-    _install_fake_modules(monkeypatch, modules)
-
-    bridge = types.ModuleType("flash_grpo_multiturn")
-
-    def post_json(_url, path, payload, *, error_style):
-        assert path == "/identity/register"
-        assert error_style == "reward"
-        events.append(("register", [dict(value) for value in payload["identities"]]))
-        step = ledger.register(payload["identities"])
-        return {"optimizer_step": step, "registered": len(payload["identities"])}
-
-    bridge.post_json = post_json
-    monkeypatch.setitem(sys.modules, "flash_grpo_multiturn", bridge)
-    monkeypatch.setenv("FLASH_VERL_REWARD_URL", "http://127.0.0.1:1")
-
-    class Indexes(list):
-        def tolist(self):
-            return list(self)
-
-    class Batch:
-        def __init__(self, indexes):
-            self.non_tensor_batch = {"index": Indexes(indexes)}
-            self.meta_info = {"global_steps": 17, "validate": False}
-
-        def __len__(self):
-            return len(self.non_tensor_batch["index"])
-
-        def chunk(self, count):
-            assert count == len(self)
-            return [Batch([index]) for index in self.non_tensor_batch["index"]]
-
-    class Combined:
-        def __init__(self, outputs):
-            self.values = [value for output in outputs for value in output.values]
-            self.meta_info = {}
-
-    modules[-1].DataProto = SimpleNamespace(concat=lambda outputs: Combined(outputs))
-    recipe = _load_recipe(monkeypatch, modules, bridge.post_json)
-
-    workers = []
-    for _index in range(4):
-        worker = _new_worker(recipe.FlashGrpoWorker)
-        remote = SimpleNamespace(
-            remote=lambda batch, identities, worker=worker: (
-                worker.generate_sequences_with_flash_identities(batch, identities)
-            )
-        )
-        workers.append(SimpleNamespace(generate_sequences_with_flash_identities=remote))
-    manager = recipe.FlashGrpoManager.__new__(recipe.FlashGrpoManager)
-    manager.agent_loop_workers = workers
-    manager._performance_metrics = lambda metrics, output: {"rows": len(output.values)}
-
-    output = asyncio.run(manager.generate_sequences(Batch([10, 10, 11, 11])))
-
-    assert events[0][0] == "register"
-    expected = _expected(17, (10, 11), 2)
-    assert events[0][1] == expected
-    assert [value for kind, value in events if kind == "reward"] == expected
-    assert output.values == expected
-    ledger.seal(17)
-    ledger.finalize({17})
-
-
-def test_patched_actor_serializes_and_concurrent_calls_keep_identity_task_local(monkeypatch):
-    async def trajectory_info(step, indexes, validate):
-        return [
-            {
-                "step": step,
-                "sample_index": index,
-                "rollout_n": ordinal,
-                "validate": validate,
-            }
-            for ordinal, index in enumerate(indexes)
-        ]
-
-    async def original_run(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
-        assert sampling_params == {}
-        assert agent_name == "single_turn_agent"
-        assert trace is True
-        assert kwargs["extra_info"]["flash_rollout_identity"] == kwargs["flash_rollout_identity"]
-        return kwargs["flash_rollout_identity"]
-
-    async def worker_generate(self, batch, *, trajectory_info=None):
-        await self.enter()
-        assert trajectory_info is not None
-        return [
-            await self._run_agent_loop(
-                {},
-                trajectory,
-                agent_name="single_turn_agent",
-                extra_info={"index": index},
-            )
-            for trajectory, index in zip(
-                trajectory_info, batch.non_tensor_batch["index"].tolist(), strict=True
-            )
-        ]
-
-    async def manager_generate(self, prompts):
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
-        return await asyncio.gather(
-            *[
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
-            ]
-        )
-
-    monkeypatch.setitem(worker_generate.__globals__, "get_trajectory_info", trajectory_info)
-    modules = _fake_agent_loop_module(
-        original_run,
-        worker_generate,
-        manager_generate,
-        trajectory_info,
-    )
-    _install_fake_modules(monkeypatch, modules)
-    bridge = types.ModuleType("flash_grpo_multiturn")
-    bridge.post_json = lambda *_args, **_kwargs: {}
-    monkeypatch.setitem(sys.modules, "flash_grpo_multiturn", bridge)
-
-    recipe = _load_recipe(monkeypatch, modules, bridge.post_json)
-    actor_class = recipe.FlashGrpoWorker
-    cloudpickle.dumps(actor_class)
-    closure = inspect.getclosurevars(actor_class.generate_sequences_with_flash_identities)
-    assert set(closure.nonlocals) == {"__class__"}
-    for value in closure.nonlocals.values():
-        cloudpickle.dumps(value)
-
-    bad_sidecar = contextvars.ContextVar("flash_rollout_identity_sidecar")
-
-    async def nonserializable_capture():
-        return bad_sidecar.get(None)
-
-    with pytest.raises(TypeError, match="ContextVar"):
-        cloudpickle.dumps(nonserializable_capture)
-
-    class Indexes(list):
-        def tolist(self):
-            return list(self)
-
-    class Batch:
-        def __init__(self, step, index):
-            self.non_tensor_batch = {"index": Indexes([index])}
-            self.meta_info = {"global_steps": step, "validate": False}
-
-    Batch.__len__ = lambda self: len(self.non_tensor_batch["index"])
-
-    async def exercise_concurrent_calls():
-        worker = _new_worker(actor_class)
-        both_entered = asyncio.Event()
-        release = asyncio.Event()
-        entered = 0
-
-        async def enter():
-            nonlocal entered
-            entered += 1
-            if entered == 2:
-                both_entered.set()
-            await both_entered.wait()
-            await release.wait()
-
-        worker.enter = enter
-        first_identity = _identity(12, 4, 7)
-        second_identity = _identity(99, 8, 3)
-        first = asyncio.create_task(
-            worker.generate_sequences_with_flash_identities(Batch(12, 4), [first_identity])
-        )
-        second = asyncio.create_task(
-            worker.generate_sequences_with_flash_identities(Batch(99, 8), [second_identity])
-        )
-        await both_entered.wait()
-        release.set()
-        outputs = await asyncio.gather(first, second)
-        return outputs, first_identity, second_identity
-
-    outputs, first_identity, second_identity = asyncio.run(exercise_concurrent_calls())
-    assert outputs == [[first_identity], [second_identity]]
-
-    async def proceed():
-        return None
-
-    worker = _new_worker(actor_class)
-    worker.enter = proceed
-    with pytest.raises(RuntimeError, match="length does not match"):
-        asyncio.run(worker.generate_sequences_with_flash_identities(Batch(12, 4), []))
-    with pytest.raises(RuntimeError, match="index mismatch"):
-        asyncio.run(
-            worker.generate_sequences_with_flash_identities(Batch(12, 4), [_identity(12, 8, 7)])
-        )
-
-
 def test_single_turn_reward_server_registration_and_scoring_use_same_identity(monkeypatch):
     from flash.engine.worker.train.rl.child.multiturn import post_json
     from flash.engine.worker.train.rl.rollout.multi_turn import start_reward_server
@@ -731,74 +428,149 @@ def test_single_turn_reward_bridge_carries_identity_without_rewriting_it(monkeyp
     assert identity == _identity(2, 3, 1)
 
 
-def _load_recipe(monkeypatch, modules, post):
-    import importlib
-
-    from flash.engine.worker.train.rl.child import multiturn
-
-    agent = modules[-1]
-    agent.AgentLoopBase = type("AgentLoopBase", (), {})
-    agent.AgentLoopOutput = type("AgentLoopOutput", (), {})
-    agent.register = lambda name: lambda cls: cls
-    modules[0].DataProto = getattr(agent, "DataProto", SimpleNamespace())
-    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(remote=lambda cls: cls))
-    monkeypatch.setattr(multiturn, "post_json", post)
-    name = "flash.engine.worker.train.rl.child.rollout"
-    monkeypatch.delitem(sys.modules, name, raising=False)
-    return importlib.import_module(name)
-
-
-def _new_worker(cls):
+def _agent_recipe(monkeypatch, run, dispatch=None):
     from flash.engine.worker.train.core.child.options import RuntimeOptions
+    from tests.test_verl_child_plugins import _import_recipe, _modules
 
-    worker = cls.__new__(cls)
-    worker.runtime = RuntimeOptions(algorithm="grpo", total_steps=20, readiness_path="unused")
-    return worker
+    _modules(
+        monkeypatch,
+        {
+            "verl.experimental.agent_loop.agent_loop": {
+                "AgentLoopBase": object,
+                "AgentLoopOutput": SimpleNamespace,
+                "register": lambda name: lambda cls: cls,
+            },
+            "verl.experimental.agent_loop.single_turn_agent_loop": {
+                "SingleTurnAgentLoop": type("SingleTurnAgentLoop", (), {"run": run}),
+            },
+            "verl.trainer.ppo.v1.agent_loop_tq": {
+                "AgentLoopManagerTQ": type(
+                    "AgentLoopManagerTQ", (), {"generate_sequences": dispatch}
+                ),
+            },
+            "verl.utils": {
+                "tensordict_utils": SimpleNamespace(
+                    get=lambda batch, key, default=None: batch.get(key, default),
+                    assign_non_tensor_data=lambda batch, key, value: batch.update({key: value}),
+                )
+            },
+        },
+    )
+    recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.rl.child.rollout")
+    config = SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(
+            model=SimpleNamespace(runtime_options=RuntimeOptions("grpo", 20, "unused").encode()),
+            rollout=SimpleNamespace(n=2),
+        )
+    )
+    monkeypatch.setenv("FLASH_VERL_REWARD_URL", "http://unused")
+    return recipe, config
+
+
+def _agent(recipe, config):
+    from flash.engine.worker.train.core.child.observations import ObservedRolloutClient
+
+    agent = recipe.FlashGrpoSingleTurnAgentLoop.__new__(recipe.FlashGrpoSingleTurnAgentLoop)
+    agent.config = config
+    agent.observations = ObservedRolloutClient(None)
+    return agent
+
+
+def test_manager_registers_exact_set_before_dispatch_with_native_session_ordinals(monkeypatch):
+    ledger = RolloutIdentityLedger(2, 2)
+    events = []
+
+    async def run(self, params, **kwargs):
+        identity = kwargs["flash_rollout_identity"]
+        ledger.record(identity, kwargs["index"])
+        events.append(("reward", identity))
+        return SimpleNamespace(reward_score=1.0, extra_fields={})
+
+    def dispatch(self, prompts):
+        async def generate():
+            return await asyncio.gather(
+                *[
+                    _agent(recipe, config).run(
+                        {}, global_steps=prompts["global_steps"], index=index, session_id=ordinal
+                    )
+                    for index in prompts["index"]
+                    for ordinal in range(2)
+                ]
+            )
+
+        return asyncio.run(generate())
+
+    recipe, config = _agent_recipe(monkeypatch, run, dispatch)
+
+    def register(url, path, payload, **kwargs):
+        assert path == "/identity/register"
+        ledger.register(payload["identities"])
+        events.append(("registered", payload["identities"]))
+
+    monkeypatch.setattr(recipe, "post_json", register)
+    manager = recipe.FlashGrpoManager.__new__(recipe.FlashGrpoManager)
+    manager.config = config
+    manager.generate_sequences({"index": [10, 11], "global_steps": 17})
+    expected = _expected(17, (10, 11), 2)
+    assert events[0] == ("registered", expected)
+    assert [value for kind, value in events if kind == "reward"] == expected
+    ledger.seal(17)
+    ledger.finalize({17})
+
+
+def test_concurrent_agent_calls_keep_identity_task_local(monkeypatch):
+    async def run(self, params, **kwargs):
+        await asyncio.sleep(0)
+        return SimpleNamespace(
+            reward_score=1.0, extra_fields={"identity": kwargs["flash_rollout_identity"]}
+        )
+
+    recipe, config = _agent_recipe(monkeypatch, run)
+    agent = _agent(recipe, config)
+
+    async def generate():
+        return await asyncio.gather(
+            agent.run({}, global_steps=12, index=4, session_id=7),
+            agent.run({}, global_steps=99, index=8, session_id=3),
+        )
+
+    outputs = asyncio.run(generate())
+    assert [output.extra_fields["identity"] for output in outputs] == [
+        _identity(12, 4, 7),
+        _identity(99, 8, 3),
+    ]
 
 
 def test_sampling_policy_preserves_identity_and_combines_stops_image_ban_and_constraints(
     monkeypatch,
 ):
-    from dataclasses import replace
-
     calls = []
 
-    async def original_run(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
-        calls.append((sampling_params, trajectory, kwargs))
-        return "output"
+    async def run(self, params, **kwargs):
+        calls.append((params, kwargs))
+        return SimpleNamespace(reward_score=1.0, extra_fields={})
 
-    modules = _fake_agent_loop_module(original_run, None, None, None)
-    _install_fake_modules(monkeypatch, modules)
-    params_module = types.ModuleType("vllm.sampling_params")
-    params_module.StructuredOutputsParams = lambda **kwargs: kwargs
-    monkeypatch.setitem(sys.modules, "vllm.sampling_params", params_module)
-    recipe = _load_recipe(monkeypatch, modules, lambda *args, **kwargs: None)
-    worker = _new_worker(recipe.FlashGrpoWorker)
-    worker.runtime = replace(
-        worker.runtime,
-        stop_sequences=("END",),
+    recipe, config = _agent_recipe(monkeypatch, run)
+    module = types.ModuleType("vllm.sampling_params")
+    module.StructuredOutputsParams = lambda **kwargs: kwargs
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", module)
+    config.actor_rollout_ref.model.runtime_options.update(
+        stop_sequences=["END"],
         image_pad_token_id=99,
         structured_outputs={"choice": ["yes"]},
     )
     params = {"temperature": 0.6, "logit_bias": {10: 1.0}}
     extra = {"index": 3}
-    trajectory = {"step": 2, "sample_index": 3, "rollout_n": 1, "validate": False}
-    assert (
-        asyncio.run(
-            worker._run_agent_loop(
-                params, trajectory, agent_name="single_turn_agent", extra_info=extra
-            )
-        )
-        == "output"
+    asyncio.run(
+        _agent(recipe, config).run(params, global_steps=2, index=3, session_id=1, extra_info=extra)
     )
-    actual, same_trajectory, forwarded = calls[0]
+    actual, forwarded = calls[0]
     assert actual == {
         "temperature": 0.6,
         "logit_bias": {10: 1.0, 99: -100.0},
         "stop": ["END"],
         "structured_outputs": {"choice": ["yes"]},
     }
-    assert same_trajectory is trajectory
     assert forwarded["extra_info"]["flash_rollout_identity"] == _identity(2, 3, 1)
     assert params == {"temperature": 0.6, "logit_bias": {10: 1.0}}
     assert extra == {"index": 3}

@@ -24,7 +24,7 @@ The SFT trainer owns its dataset order, partial batches, boundary resume, checkp
 
 GRPO and OPD share the upstream V1 synchronous trainer lifecycle and TransferQueue replay implementation. Flash bounds replay waiting and rejects failed prompt groups before consuming them. The common task runner initializes TransferQueue, trainers, and agent managers, publishes readiness, then runs training and closes tracking and queue resources.
 
-GRPO agents register rollout identities before scoring, apply per-turn credit, and carry model-version observations across turns. Truncation masking is a Flash runtime option, not an extra upstream dataclass field. Trainability is checked before advantages and again before actor updates because rollout correction can reject additional tokens.
+The GRPO manager registers the complete expected identity set before dispatch. Agents carry those identities into scoring and collect model-version observations across turns; the trainer applies per-turn credit. Truncation masking is a Flash runtime option, not an extra upstream dataclass field. Trainability is checked before advantages and again before actor updates because rollout correction can reject additional tokens.
 
 OPD agents score through the existing remote teacher bridge. The trainer does not allocate a local teacher GPU pool. Teacher facts travel through upstream's native agent output serialization; no-signal batches retain bounded replacement and teacher-cycle acknowledgment before mutation. Native upstream policy forwards remain enabled; the former fork's dead-compute optimization is not carried over.
 
@@ -34,7 +34,7 @@ The four agent classes are declared in packaged `core/child/agents.yaml`. Upstre
 
 ## Validation
 
-The offline suite covers launch policy, source verification, tracking outcome, SFT data order/resume/checkpointing, exact LoRA targeting, GDN boundaries, GRPO identities and credit, and OPD failure/replay/mutation ordering. `tests/test_upstream_verl_contract.py` additionally runs against the actual pinned package: all three production configurations, trainer and agent imports, OPD pool ownership, native replay, and ragged GRPO credit serialization. It skips when Verl is not installed.
+The offline suite covers launch policy, source verification, tracking outcome, SFT data order/resume/checkpointing, exact LoRA targeting, GDN boundaries, GRPO identities and credit, and OPD failure/replay/mutation ordering. `tests/test_upstream_verl_contract.py` additionally runs against the actual pinned package: all three production configurations, trainer and agent imports, OPD pool ownership, native replay, ragged GRPO credit serialization, whole-batch identity registration, exact truncation masking, OPD teacher-fact serialization, and task-runner cleanup. It skips when Verl is not installed.
 
 Run that contract suite in an environment with the exact VCS requirement from `backend_common.py`, Transformers 5.12.1, and the worker dependencies installed. The default development environment intentionally does not install the GPU trainer stack.
 

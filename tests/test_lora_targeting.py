@@ -279,6 +279,9 @@ def _install_fake_verl_engine(
         "verl.workers.engine.fsdp": types.ModuleType("verl.workers.engine.fsdp"),
         "verl.workers.engine.fsdp.transformer_impl": impl,
     }
+    modules["verl.workers.engine"].EngineRegistry = SimpleNamespace(
+        register=lambda **kwargs: lambda cls: cls
+    )
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(child_runtime, "_text_lora_module_types", lambda: (_FakeLinear,))
@@ -487,6 +490,7 @@ def test_sft_grpo_and_opd_serialize_text_targeting_only_for_text_jobs(tmp_path):
             "reentrant_checkpointing": False,
             "multimodal": not text_only,
             "per_turn_credit": False,
+            "mask_truncated_completions": True,
             "stop_sequences": [],
             "image_pad_token_id": None,
             "structured_outputs": None,

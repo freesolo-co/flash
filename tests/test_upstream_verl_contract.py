@@ -164,3 +164,190 @@ def test_native_replay_returns_whole_groups_or_fails_before_consuming(monkeypatc
         batch, _ = buffer.sample(1, "train", 1)
         assert set(batch.keys) == {"prompt_0_0", "prompt_1_0"}
         assert clears == [{"partition_id": "train", "keys": ["prompt"]}]
+
+
+@pytest.mark.parametrize("failure", [None, "init", "fit"])
+def test_task_runner_closes_resources_without_masking_startup_failure(monkeypatch, failure):
+    import transfer_queue as tq
+
+    from flash.engine.worker.train.core.child import trainer as recipe
+
+    events = []
+
+    class Trainer:
+        def __init__(self, config):
+            pass
+
+        def init(self):
+            if failure == "init":
+                raise ValueError("init failed")
+            self._dump_executor = object()
+            events.append("initialized")
+
+        def get_llm_client(self):
+            return None
+
+        get_teacher_client = get_llm_client
+        get_reward_handles = get_llm_client
+
+        def fit(self, manager):
+            self.logger = SimpleNamespace(
+                finish=lambda exit_code: events.append(("finish", exit_code))
+            )
+            if failure == "fit":
+                raise ValueError("fit failed")
+            events.append("trained")
+
+        def _shutdown_dump_executor(self):
+            events.append("drained")
+
+    original_import = recipe.importlib.import_module
+
+    def import_module(name):
+        if name == "flash.engine.worker.train.opd.child.trainer":
+            return SimpleNamespace(FlashPPOTrainer=Trainer)
+        if name == "flash.engine.worker.train.opd.child.rollout":
+            return SimpleNamespace(
+                FlashOpdManager=SimpleNamespace(create=lambda **kwargs: events.append("manager"))
+            )
+        return original_import(name)
+
+    config = _config("opd")
+    monkeypatch.setattr(recipe.importlib, "import_module", import_module)
+    monkeypatch.setattr(recipe, "_init_transfer_queue", lambda *args: events.append("queue"))
+    monkeypatch.setattr(recipe, "publish_ready", lambda options: events.append("ready"))
+    monkeypatch.setattr(tq, "close", lambda: events.append("closed"))
+    if failure:
+        with pytest.raises(ValueError, match=f"{failure} failed"):
+            recipe.FlashTaskRunner().run(config)
+    else:
+        recipe.FlashTaskRunner().run(config)
+    assert events[-1] == "closed"
+    if failure == "init":
+        assert events == ["queue", "closed"]
+    else:
+        assert events[:4] == ["queue", "initialized", "manager", "ready"]
+        assert ("finish", int(failure is not None)) in events
+        assert events[-2] == "drained"
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "stop"])
+def test_grpo_agent_carries_identity_and_masks_only_truncation(monkeypatch, finish_reason):
+    import asyncio
+
+    from verl.experimental.agent_loop.agent_loop import AgentLoopOutput
+
+    from flash.engine.worker.train.core.child.observations import ObservedRolloutClient
+    from flash.engine.worker.train.rl.child import rollout as recipe
+
+    events = []
+    output = AgentLoopOutput(
+        prompt_ids=[1],
+        response_ids=[2, 3],
+        response_mask=[1, 1],
+        extra_fields={"finish_reason": finish_reason},
+        metrics={},
+    )
+
+    class BaseAgent:
+        async def run(self, params, **kwargs):
+            assert kwargs["extra_info"]["flash_rollout_identity"]["rollout_ordinal"] == 2
+            events.append("generated")
+            return output
+
+    class Agent(recipe.FlashGrpoPolicy, BaseAgent):
+        pass
+
+    agent = Agent.__new__(Agent)
+    agent.config = _config("grpo")
+    agent.config.actor_rollout_ref.model.runtime_options.mask_truncated_completions = True
+    agent.observations = ObservedRolloutClient(None)
+    agent.tokenizer = SimpleNamespace(decode=lambda *args, **kwargs: "completion")
+    monkeypatch.setenv("FLASH_VERL_REWARD_URL", "http://unused")
+    monkeypatch.setattr(recipe, "post_json", lambda *args, **kwargs: events.append("registered"))
+
+    def score(*args):
+        events.append("scored")
+        return 1.0
+
+    monkeypatch.setattr(recipe, "compute_score", score)
+    actual = asyncio.run(agent.run({}, global_steps=1, index=3, session_id=2))
+    assert events == ["generated", "scored"]
+    assert actual.response_mask == ([0, 0] if finish_reason == "length" else [1, 1])
+    assert actual.reward_score == 1.0
+
+
+def test_opd_teacher_facts_survive_native_agent_serialization(monkeypatch):
+    import asyncio
+
+    import torch
+    from verl.experimental.agent_loop.agent_loop import AgentLoopOutput
+
+    from flash.engine.worker.train.opd.child.teacher import compute_flash_teacher_logprobs
+
+    ids = torch.tensor([[-1], [0], [1]], dtype=torch.int32)
+    logs = torch.tensor([[0.0], [-0.4], [-0.6]])
+    calls = []
+
+    async def score(**kwargs):
+        calls.append(kwargs)
+        return ids, logs
+
+    agent = SimpleNamespace(
+        distillation_enabled=True,
+        teacher_key="index",
+        teacher_server_manager=SimpleNamespace(compute_teacher_logprobs_single=score),
+    )
+    output = AgentLoopOutput(
+        prompt_ids=[1], response_ids=[2, 3], response_mask=[1, 1], reward_score=0.0, metrics={}
+    )
+    monkeypatch.delenv("FLASH_OPD_STRUCTURED_OUTPUTS", raising=False)
+    asyncio.run(compute_flash_teacher_logprobs(agent, output, [1], [2, 3], False, {"index": 7}))
+    asyncio.run(compute_flash_teacher_logprobs(agent, output, [1], [2, 3], False, {"index": 7}))
+    assert len(calls) == 1
+    assert calls[0]["routing_key"] == 7
+    fields = output.as_dict()
+    torch.testing.assert_close(fields["teacher_ids"], ids)
+    torch.testing.assert_close(fields["teacher_logprobs"], logs)
+    assert fields["rm_scores"].tolist() == [0.0, 0.0]
+
+
+def test_grpo_manager_registers_whole_tensordict_batch_before_native_dispatch(monkeypatch):
+    from tensordict import NonTensorData, NonTensorStack, TensorDict
+    from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ
+
+    from flash.engine.worker.train.rl.child import rollout as recipe
+    from flash.engine.worker.train.rl.rollout.identity import RolloutIdentityLedger
+
+    ledger = RolloutIdentityLedger(2, 2)
+    registered = []
+
+    def register(url, path, payload, **kwargs):
+        ledger.register(payload["identities"])
+        registered.extend(payload["identities"])
+
+    def dispatch(self, prompts):
+        assert len(registered) == 4
+        for identity in registered:
+            ledger.record(identity, identity["sample_index"])
+        return "dispatched"
+
+    config = _config("grpo")
+    config.actor_rollout_ref.rollout.n = 2
+    manager = recipe.FlashGrpoManager.__new__(recipe.FlashGrpoManager)
+    manager.config = config
+    prompts = TensorDict(
+        {"index": NonTensorStack(10, 11), "global_steps": NonTensorData(17)}, batch_size=2
+    )
+    monkeypatch.setenv("FLASH_VERL_REWARD_URL", "http://unused")
+    monkeypatch.setattr(recipe, "post_json", register)
+    monkeypatch.setattr(AgentLoopManagerTQ, "generate_sequences", dispatch)
+    assert manager.generate_sequences(prompts) == "dispatched"
+    assert [(item["sample_index"], item["rollout_ordinal"]) for item in registered] == [
+        (10, 0),
+        (10, 1),
+        (11, 0),
+        (11, 1),
+    ]
+    ledger.seal(17)
+    ledger.finalize({17})
