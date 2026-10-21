@@ -26,8 +26,8 @@ import flash.engine.worker.perf as worker_perf
 import flash.engine.worker.runtime.kernel_warmup as worker_kernel_warmup
 import flash.engine.worker.runtime.state as worker_state
 import flash.runner.accounting.artifacts as runner_artifacts
+import flash.runner.lifecycle.cleanup as runner_cleanup
 import flash.runner.lifecycle.preparation as runner_preparation
-import flash.runner.lifecycle.resource_cleanup as runner_cleanup
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 import flash.runner.supervise.lifecycle as runner_lifecycle

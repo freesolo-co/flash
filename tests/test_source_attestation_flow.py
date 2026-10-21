@@ -5,8 +5,8 @@ import copy
 import pytest
 
 import flash.runner.accounting.costs as runner_costs
+import flash.runner.lifecycle.cleanup as runner_cleanup
 import flash.runner.lifecycle.reporting as runner_reporting
-import flash.runner.lifecycle.resource_cleanup as runner_cleanup
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 from flash.snapshot.archive import (

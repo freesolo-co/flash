@@ -210,8 +210,8 @@ def _fail_blocked_recovery(
     *,
     expected_remote: dict | None = None,
 ) -> bool:
+    from flash.runner.lifecycle.cleanup import _compare_and_fail_remote
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
-    from flash.runner.lifecycle.resource_cleanup import _compare_and_fail_remote
     from flash.runner.supervise.recovery import _adopt_completed_attempt, _CompletedAttemptPending
 
     status = get_status(spec.run_id)
@@ -362,8 +362,8 @@ def _deferred_resubmit_loop(spec) -> None:
     """Reconcile a handle-less maybe-live instance through the run wall deadline."""
     import time
 
+    from flash.runner.lifecycle.cleanup import _compare_and_fail_remote
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
-    from flash.runner.lifecycle.resource_cleanup import _compare_and_fail_remote
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.supervise.recovery import _adopt_completed_attempt
 
@@ -572,7 +572,7 @@ def _teardown_unrecoverable_remote(status) -> None:
     runs off the persisted handle alone, so it works for exactly the spec the parse rejected.
     Best-effort and fully suppressed: recovery must finish for every other run regardless.
     """
-    from flash.runner.lifecycle.resource_cleanup import _record_cleanup_remote
+    from flash.runner.lifecycle.cleanup import _record_cleanup_remote
     from flash.runner.supervise.recovery import _strict_teardown_handle
 
     remote = dict(status.remote or {})
@@ -610,7 +610,7 @@ def recover_runs() -> None:
 
 
 def _drain_cleanup_remotes_bg(run_id: str) -> None:
-    from flash.runner.lifecycle.resource_cleanup import _drain_cleanup_remotes
+    from flash.runner.lifecycle.cleanup import _drain_cleanup_remotes
 
     with contextlib.suppress(Exception):
         _drain_cleanup_remotes(run_id)

@@ -37,7 +37,7 @@ class _SubmitContext:
     def gc_seen_sandboxes(self) -> None:
         if not self.seen_sandboxes:
             return
-        from flash.runner.lifecycle.resource_cleanup import reconcile_cleanup
+        from flash.runner.lifecycle.cleanup import reconcile_cleanup
 
         for remote in self.seen_sandboxes.values():
             outcome = reconcile_cleanup(self.spec.run_id, remote)
@@ -116,8 +116,8 @@ def _require_opd_configuration(ctx: _SubmitContext) -> None:
 def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     if not ctx.last_handle:
         return None
+    from flash.runner.lifecycle.cleanup import _compare_and_clear_remote, reconcile_cleanup
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
-    from flash.runner.lifecycle.resource_cleanup import _compare_and_clear_remote, reconcile_cleanup
 
     metrics = attempt_recovery._await_completed_worker_metrics(
         ctx.last_handle,
@@ -328,7 +328,7 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
     claim = prepared[0]
     _, chosen, _, _ = candidate_plan
     from flash.runner.lifecycle.attempts import persist_claimed_remote
-    from flash.runner.lifecycle.resource_cleanup import (
+    from flash.runner.lifecycle.cleanup import (
         _expected_remote_matches,
         _preserve_cleanup_remote,
         _record_cleanup_remote,
@@ -506,7 +506,7 @@ def _run_attempt(ctx: _SubmitContext, prepared):
 
 def _settle_terminal_remote(ctx: _SubmitContext) -> None:
     """settle through the same resource policy used by restart and cancellation."""
-    from flash.runner.lifecycle.resource_cleanup import reconcile_cleanup
+    from flash.runner.lifecycle.cleanup import reconcile_cleanup
 
     if ctx.last_handle and reconcile_cleanup(ctx.spec.run_id, ctx.last_handle).resource_deleted:
         ctx.seen_sandboxes.pop(ctx.last_handle.get("instance_id"), None)

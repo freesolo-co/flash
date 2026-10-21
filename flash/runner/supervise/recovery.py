@@ -173,7 +173,7 @@ def _adopt_completed_attempt(
     log,
 ) -> bool:
     """Finalize a phantom-completed attempt through the expected-remote CAS."""
-    from flash.runner.lifecycle.resource_cleanup import _compare_and_complete_remote
+    from flash.runner.lifecycle.cleanup import _compare_and_complete_remote
 
     applied = _compare_and_complete_remote(run_id, expected_remote, spec, metrics)
     if applied:
@@ -301,7 +301,7 @@ def _apply_charge_with_state(run_id: str, log, *, charge_call, noun: str) -> Non
 
 def _gc_run_sandboxes(spec: JobSpec) -> None:
     """Best-effort teardown of every endpoint a run may have registered."""
-    from flash.runner.lifecycle.resource_cleanup import (
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_confirm_remote_teardown,
         _drain_cleanup_remotes,
         _remote_resource_identity,
@@ -327,7 +327,7 @@ def _gc_run_sandboxes(spec: JobSpec) -> None:
             if resource_deleted:
                 _compare_and_confirm_remote_teardown(spec.run_id, status.remote)
             elif status.remote.get("provider") == "modal":
-                from flash.runner.lifecycle.resource_cleanup import _record_cleanup_remote
+                from flash.runner.lifecycle.cleanup import _record_cleanup_remote
 
                 _record_cleanup_remote(spec.run_id, status.remote)
         except Exception:

@@ -13,10 +13,10 @@ import flash.engine.worker.entry.worker as worker_entry
 import flash.runner.accounting.artifacts as runner_artifacts
 import flash.runner.accounting.costs as runner_costs
 import flash.runner.lifecycle.attempts as runner_attempts
+import flash.runner.lifecycle.cleanup as runner_cleanup
 import flash.runner.lifecycle.deadlines as runner_deadlines
 import flash.runner.lifecycle.preparation as runner_preparation
 import flash.runner.lifecycle.reporting as runner_reporting
-import flash.runner.lifecycle.resource_cleanup as runner_cleanup
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 import flash.runner.lifecycle.submit as runner_submit
@@ -1616,7 +1616,7 @@ def test_replacement_reservation_clears_the_consumed_teardown_marker(monkeypatch
     and the run is left in `provisioning` with no handleless pass scheduled.
     """
     from flash.core.spec import JobSpec
-    from flash.runner.lifecycle.resource_cleanup import _compare_and_confirm_remote_teardown
+    from flash.runner.lifecycle.cleanup import _compare_and_confirm_remote_teardown
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="consumed-teardown-marker", model="Qwen/Qwen3.5-4B", algorithm="sft")

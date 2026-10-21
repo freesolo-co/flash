@@ -19,9 +19,9 @@ from types import SimpleNamespace
 import pytest
 
 import flash.core.spec as runner_spec
+import flash.runner.lifecycle.cleanup as runner_cleanup
 import flash.runner.lifecycle.preparation as runner_preparation
 import flash.runner.lifecycle.reporting as runner_reporting
-import flash.runner.lifecycle.resource_cleanup as runner_cleanup
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 import flash.runner.lifecycle.submit as runner_submit

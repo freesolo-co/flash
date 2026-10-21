@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from flash.core.spec import JobSpec
 from flash.envs.loading.staged import StagedEnvironmentTransientError
 from flash.providers._lifecycle.instances.poll import _attempt_int
-from flash.runner.lifecycle.resource_cleanup import reconcile_cleanup
+from flash.runner.lifecycle.cleanup import reconcile_cleanup
 from flash.runner.supervise.recovery import (
     carry_allocation_stamp as _carry_allocation_stamp,
 )
@@ -51,11 +51,11 @@ def _resume_after_confirmed_teardown(
     from flash.runner.accounting.artifacts import stage_environment_package
     from flash.runner.lifecycle import state as lifecycle_state
     from flash.runner.lifecycle.attempts import reserve_verified_attempt_launch
-    from flash.runner.lifecycle.deadlines import _load_run_deadline_at, _spec_with_remaining_wall
-    from flash.runner.lifecycle.resource_cleanup import (
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at, _spec_with_remaining_wall
     from flash.runner.lifecycle.status import (
         _load_status_json,
         get_status,
@@ -143,7 +143,7 @@ def _reconcile_completed_remote(
     log,
 ) -> bool:
     """Retry completed-attempt adoption and decide whether reconciliation is finished."""
-    from flash.runner.lifecycle.resource_cleanup import (
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
@@ -199,7 +199,7 @@ def _reconcile_expired_remote(
     failure: str,
 ) -> bool:
     """Adopt late metrics or fail an attempt whose wall deadline has elapsed."""
-    from flash.runner.lifecycle.resource_cleanup import (
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
@@ -285,11 +285,11 @@ def _reconcile_attached_remote(
     failure: str,
 ) -> None:
     from flash.providers.core.base import JobHandle
-    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
-    from flash.runner.lifecycle.resource_cleanup import (
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_fail_remote,
         _remote_resource_identity,
     )
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.recovery import _RECOVERY_MARKER_GRACE_S, _CompletedAttemptPending
@@ -508,7 +508,7 @@ def _build_attach_context(
 def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log) -> RunStatus:
     """Tear down and fail a run whose persisted public spec cannot be parsed."""
     from flash.providers.core.base import JobHandle
-    from flash.runner.lifecycle.resource_cleanup import (
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_confirm_remote_teardown,
         _compare_and_fail_remote,
         _record_cleanup_remote,
@@ -551,10 +551,10 @@ def _handle_attach_wall_deadline(
     exc: RuntimeError,
 ) -> RunStatus:
     """Adopt finished work or fail and tear down an attempt whose wall time is exhausted."""
-    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
-    from flash.runner.lifecycle.resource_cleanup import (
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_fail_remote,
     )
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.recovery import (
         _adopt_completed_attempt,
@@ -691,7 +691,7 @@ def _handle_failed_attach_poll(
     cleanup = reconcile_cleanup(run_id, context.persisted_remote)
     if cleanup.replacement_safe:
         if not plan.retry:
-            from flash.runner.lifecycle.resource_cleanup import _compare_and_fail_remote
+            from flash.runner.lifecycle.cleanup import _compare_and_fail_remote
 
             _compare_and_fail_remote(run_id, context.persisted_remote, failure)
             return get_status(run_id)
@@ -793,11 +793,11 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     """Re-attach to a run's remote job from any process (after a client crash/restart)."""
     import sys
 
-    from flash.runner.lifecycle.deadlines import _load_run_deadline_at, _spec_with_remaining_wall
-    from flash.runner.lifecycle.resource_cleanup import (
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at, _spec_with_remaining_wall
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import effective_spec_from_status, get_status
     from flash.runner.supervise.errors import _RunCancelled
