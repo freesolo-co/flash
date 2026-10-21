@@ -321,7 +321,7 @@ def _strict_json(raw: bytes) -> Any:
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=reject_non_finite_json_constant,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ValueError("invalid json") from exc
 
 

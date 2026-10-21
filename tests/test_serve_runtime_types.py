@@ -221,6 +221,8 @@ def test_engine_config_rejects_inexact_public_scalar_types(kwargs) -> None:
         ("temperature", float("nan")),
         ("temperature", float("inf")),
         ("temperature", "0"),
+        pytest.param("temperature", 10**400, id="temperature-overflow"),
+        pytest.param("top_p", 10**400, id="top-p-overflow"),
         ("top_p", float("nan")),
         ("top_p", True),
         ("thinking", "false"),

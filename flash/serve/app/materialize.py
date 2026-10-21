@@ -376,10 +376,10 @@ def locked_manifest_cache(
     if type(manifest) is not ServingManifest:
         raise MaterializationError("cache validation requires an exact ServingManifest")
     root = _prepare_cache_root(cache_root)
-    adapters = tuple(sorted(manifest.adapters, key=lambda adapter: adapter.aggregate_sha256))
+    digests = sorted({adapter.aggregate_sha256 for adapter in manifest.adapters})
     with contextlib.ExitStack() as locks:
-        for adapter in adapters:
-            lock_path = root / ".locks" / f"{adapter.aggregate_sha256}.lock"
+        for digest in digests:
+            lock_path = root / ".locks" / f"{digest}.lock"
             locks.enter_context(_digest_lock(lock_path))
         paths = {
             adapter.checkpoint_id: adapter_cache_path(root, adapter)
@@ -713,8 +713,9 @@ def _copy_regular_file(source: Path, destination: Path) -> None:
     write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     write_flags |= getattr(os, "O_NOFOLLOW", 0)
     source_fd = os.open(source, read_flags)
-    destination_fd = os.open(destination, write_flags, 0o600)
+    destination_fd = None
     try:
+        destination_fd = os.open(destination, write_flags, 0o600)
         source_before = os.fstat(source_fd)
         if not stat.S_ISREG(source_before.st_mode):
             raise MaterializationError("downloaded artifact entry is not a regular file")
@@ -728,7 +729,8 @@ def _copy_regular_file(source: Path, destination: Path) -> None:
         if _stable_file_identity(os.fstat(source_fd)) != _stable_file_identity(source_before):
             raise MaterializationError("downloaded artifact changed while it was copied")
     finally:
-        os.close(destination_fd)
+        if destination_fd is not None:
+            os.close(destination_fd)
         os.close(source_fd)
 
 

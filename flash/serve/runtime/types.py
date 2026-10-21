@@ -204,7 +204,10 @@ def _normalize_stop(value: Any, name: str) -> tuple[str, ...]:
 def _require_finite_number(value: Any, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise RuntimeConfigurationError(f"{name} must be a finite number")
-    normalized = float(value)
+    try:
+        normalized = float(value)
+    except OverflowError as exc:
+        raise RuntimeConfigurationError(f"{name} must be a finite number") from exc
     if not math.isfinite(normalized):
         raise RuntimeConfigurationError(f"{name} must be a finite number")
     return normalized
