@@ -1008,6 +1008,7 @@ def test_authorized_checkpoint_requires_one_explicit_verified_target() -> None:
         "checkpoint_id": checkpoint_id,
         "checkpoint_step": 7,
         "verified_at": 1.0,
+        "deployment_generation": "generation-a",
         "openai_model": checkpoint_id,
     }
 

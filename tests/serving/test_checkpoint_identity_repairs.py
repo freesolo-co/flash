@@ -218,6 +218,7 @@ def test_chat_requires_the_selected_checkpoint_record():
         "checkpoint_id": checkpoint,
         "checkpoint_step": 20,
         "verified_at": 1.0,
+        "deployment_generation": "generation-a",
     }
     assert _authorized_chat_checkpoint("run-a", record, checkpoint) == checkpoint
     with pytest.raises(Exception, match="has not passed"):
@@ -237,6 +238,7 @@ def test_evaluation_accepts_verified_sibling_without_latest_deployment_equality(
                         "checkpoint_id": checkpoint,
                         "checkpoint_step": 20,
                         "verified_at": 1.0,
+                        "deployment_generation": "generation-a",
                     },
                     "run-a/step-40": {"state": "failed", "checkpoint_id": "run-a/step-40"},
                 },
@@ -401,6 +403,7 @@ def test_sibling_undeploy_preserves_deployed_summary_and_state(tmp_path, monkeyp
         "checkpoint_id": current,
         "checkpoint_step": None,
         "verified_at": 1.0,
+        "deployment_generation": "generation-a",
     }
     assert deployment_fixtures.ready_checkpoints("run-sibling") == frozenset({current})
 
