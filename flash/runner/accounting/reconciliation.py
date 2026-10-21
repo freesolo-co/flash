@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import time
+from dataclasses import dataclass
 
 from flash.core.spec import JobSpec
 from flash.runner.accounting import costs
@@ -12,6 +13,39 @@ from flash.runner.lifecycle import status as status_ops
 from flash.runner.lifecycle.state import RunStatus
 
 _RESOURCE_ID_FIELDS = ("instance_id",)
+
+
+@dataclass(frozen=True)
+class CleanupOutcome:
+    """resource evidence; launch claims and run intent still gate replacement."""
+
+    worker_stopped: bool
+    resource_deleted: bool
+    obligation_recorded: bool
+
+    @property
+    def replacement_safe(self) -> bool:
+        return self.resource_deleted or (self.worker_stopped and self.obligation_recorded)
+
+
+def reconcile_cleanup(run_id: str, remote: dict) -> CleanupOutcome:
+    """attempt exact teardown and retain every unconfirmed resource for retry."""
+    from flash.runner.supervise.recovery import _strict_teardown_handle, _worker_provably_gone
+
+    recorded = False
+    with contextlib.suppress(Exception):
+        recorded = _record_cleanup_remote(run_id, remote)
+    try:
+        deleted = _strict_teardown_handle(remote, run_id)
+        stopped = True
+    except Exception:
+        deleted = False
+        stopped = _worker_provably_gone(run_id, remote)
+    if deleted:
+        with contextlib.suppress(Exception):
+            if not _compare_and_remove_cleanup_remote(run_id, remote):
+                _compare_and_confirm_remote_teardown(run_id, remote)
+    return CleanupOutcome(stopped, deleted, recorded)
 
 
 def _remote_resource_identity(remote: object) -> tuple | None:

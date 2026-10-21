@@ -185,28 +185,13 @@ def _drain_confirmed_cleanup(run_id: str) -> set[tuple]:
 
 
 def _teardown_or_preserve_remote(run_id: str, remote: dict) -> bool:
-    """Tear one remote down. Returns whether it is safe to clear from the status.
+    """cancellation clears a resource only after confirmed deletion."""
+    from flash.runner.accounting.reconciliation import reconcile_cleanup
 
-    An unconfirmed teardown is NOT safe to clear: the target is recorded for the cleanup drain
-    instead, so a leaked box stays addressable. Failing to record either is a hard error, since
-    that would lose the only handle to a billing resource.
-    """
-    from flash.providers.core.base import JobHandle
-    from flash.runner.accounting.reconciliation import _record_cleanup_remote
-    from flash.runner.supervise.recovery import _strict_teardown_handle
-
-    try:
-        resource_deleted = _strict_teardown_handle(JobHandle.from_dict(remote), run_id)
-    except Exception:
-        if not _record_cleanup_remote(run_id, remote):
-            raise RuntimeError(
-                f"run {run_id} teardown was unconfirmed and its exact cleanup target "
-                "could not be preserved"
-            ) from None
-        return False
-    if not resource_deleted and not _record_cleanup_remote(run_id, remote):
-        raise RuntimeError(f"run {run_id} leaked endpoint cleanup target could not be preserved")
-    return True
+    cleanup = reconcile_cleanup(run_id, remote)
+    if not cleanup.resource_deleted and not cleanup.obligation_recorded:
+        raise RuntimeError(f"run {run_id} unconfirmed cleanup target could not be preserved")
+    return cleanup.resource_deleted
 
 
 def _teardown_persisted_remotes(

@@ -37,14 +37,12 @@ class _SubmitContext:
     def gc_seen_sandboxes(self) -> None:
         if not self.seen_sandboxes:
             return
-        from flash.runner.accounting.reconciliation import _record_cleanup_remote
+        from flash.runner.accounting.reconciliation import reconcile_cleanup
 
         for remote in self.seen_sandboxes.values():
-            try:
-                if not attempt_recovery._strict_teardown_handle(remote, self.spec.run_id):
-                    _record_cleanup_remote(self.spec.run_id, remote)
-            except Exception:
-                _record_cleanup_remote(self.spec.run_id, remote)
+            outcome = reconcile_cleanup(self.spec.run_id, remote)
+            if not outcome.resource_deleted and not outcome.obligation_recorded:
+                raise RuntimeError("unconfirmed cleanup target could not be persisted")
 
     def cancel(self):
         """Reap this run's tracked endpoints before unwinding on cancel."""
@@ -118,79 +116,32 @@ def _require_opd_configuration(ctx: _SubmitContext) -> None:
 def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     if not ctx.last_handle:
         return None
-    from flash.providers.core.base import JobHandle
-    from flash.providers.core.registry import get_provider
-    from flash.runner.accounting.reconciliation import (
-        _compare_and_clear_remote,
-        _record_cleanup_remote,
-    )
+    from flash.runner.accounting.reconciliation import _compare_and_clear_remote, reconcile_cleanup
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
-    completed_metrics = attempt_recovery._await_completed_worker_metrics(
+    metrics = attempt_recovery._await_completed_worker_metrics(
         ctx.last_handle,
         _load_run_deadline_at(ctx.spec.run_id),
         check_cancelled=ctx.raise_if_cancelled,
     )
-    if completed_metrics is not None:
-        return completed_metrics
-    resource_deleted = False
-    teardown_error: Exception | None = None
-    try:
-        resource_deleted = attempt_recovery._strict_teardown_handle(
-            JobHandle.from_dict(ctx.last_handle), ctx.spec.run_id
-        )
-    except Exception as exc:
-        teardown_error = exc
-    resource_kind = "sandbox"
-    resource_id = ctx.last_handle.get("instance_id")
-    worker_gone = teardown_error is None or attempt_recovery._worker_provably_gone(
-        ctx.spec.run_id, ctx.last_handle
-    )
-    if (
-        worker_gone
-        and ctx.last_handle.get("provider") == "modal"
-        and not resource_deleted
-        and not _record_cleanup_remote(ctx.spec.run_id, ctx.last_handle)
-    ):
+    if metrics is not None:
+        return metrics
+    cleanup = reconcile_cleanup(ctx.spec.run_id, ctx.last_handle)
+    if not cleanup.replacement_safe:
         raise RuntimeError(
-            f"run {ctx.spec.run_id}: terminal worker's leaked endpoint cleanup target could not be persisted"
+            f"run {ctx.spec.run_id}: previous attempt teardown could not be confirmed or "
+            "its cleanup target could not be persisted; refusing double-provisioning"
         )
-    if worker_gone:
-        if not _compare_and_clear_remote(ctx.spec.run_id, ctx.last_handle):
-            raise RuntimeError(
-                f"run {ctx.spec.run_id}: previous attempt's persisted remote changed before clear; "
-                "aborting replacement to avoid double-provisioning"
-            )
-        message = (
-            "terminated"
-            if resource_deleted
-            else "teardown unconfirmed but worker terminal; proceeding, leaked resource persisted for cleanup"
+    if not _compare_and_clear_remote(ctx.spec.run_id, ctx.last_handle):
+        raise RuntimeError(
+            f"run {ctx.spec.run_id}: previous attempt's persisted remote changed before clear; "
+            "aborting replacement to avoid double-provisioning"
         )
-        print(
-            f"retry {attempt}: {ctx.last_handle.get('provider')} {resource_kind} "
-            f"{resource_id} {message}",
-            file=ctx.log,
-            flush=True,
-        )
-        ctx.last_handle.clear()
-        if resource_kind == "endpoint":
-            ctx.seen_sandboxes.pop(resource_id, None)
-        return None
-    with contextlib.suppress(Exception):
-        get_provider(ctx.last_handle["provider"]).gc(ctx.spec)
-    ctx.gc_seen_sandboxes()
-    print(
-        f"retry {attempt}: {ctx.last_handle.get('provider')} {resource_kind} {resource_id} "
-        f"teardown unconfirmed ({type(teardown_error).__name__}); keeping the handle so the "
-        "possibly-billing resource stays reachable for cleanup",
-        file=ctx.log,
-        flush=True,
-    )
-    raise RuntimeError(
-        f"run {ctx.spec.run_id}: previous attempt's {ctx.last_handle.get('provider')} {resource_kind} "
-        f"{resource_id} teardown could not be confirmed; failing to avoid "
-        "double-provisioning a second worker over a possibly-live resource"
-    )
+    print(f"retry {attempt}: previous worker stopped; cleanup={cleanup}", file=ctx.log, flush=True)
+    if cleanup.resource_deleted:
+        ctx.seen_sandboxes.pop(ctx.last_handle.get("instance_id"), None)
+    ctx.last_handle.clear()
+    return None
 
 
 def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
@@ -554,38 +505,11 @@ def _run_attempt(ctx: _SubmitContext, prepared):
 
 
 def _settle_terminal_remote(ctx: _SubmitContext) -> None:
-    """track and clear an attempt only after exact teardown is confirmed."""
-    if not ctx.last_handle:
-        return
-    from flash.providers.core.base import JobHandle
-    from flash.runner.accounting.reconciliation import (
-        _compare_and_confirm_remote_teardown,
-        _compare_and_remove_cleanup_remote,
-        _record_cleanup_remote,
-    )
+    """settle through the same resource policy used by restart and cancellation."""
+    from flash.runner.accounting.reconciliation import reconcile_cleanup
 
-    remote = dict(ctx.last_handle)
-    cleanup_recorded = False
-    with contextlib.suppress(Exception):
-        cleanup_recorded = _record_cleanup_remote(ctx.spec.run_id, remote)
-    try:
-        deleted = attempt_recovery._strict_teardown_handle(
-            JobHandle.from_dict(remote), ctx.spec.run_id
-        )
-    except Exception:
-        return
-    if not deleted:
-        return
-    cleanup_cleared = False
-    if cleanup_recorded:
-        with contextlib.suppress(Exception):
-            cleanup_cleared = _compare_and_remove_cleanup_remote(ctx.spec.run_id, remote)
-    if not cleanup_cleared:
-        with contextlib.suppress(Exception):
-            _compare_and_confirm_remote_teardown(ctx.spec.run_id, remote)
-    sandbox_id = remote.get("instance_id")
-    if isinstance(sandbox_id, str):
-        ctx.seen_sandboxes.pop(sandbox_id, None)
+    if ctx.last_handle and reconcile_cleanup(ctx.spec.run_id, ctx.last_handle).resource_deleted:
+        ctx.seen_sandboxes.pop(ctx.last_handle.get("instance_id"), None)
 
 
 def _return_success_metrics(ctx: _SubmitContext, outcome) -> dict:
