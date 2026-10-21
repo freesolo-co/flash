@@ -570,8 +570,10 @@ def _run_child(
     train_started_at = time.time()
     return_code = 0
     training_completed = runtime.resume_step >= workload.update_horizon
-    watcher.start()
+    watcher_started = False
     try:
+        watcher.start()
+        watcher_started = True
         if runtime.resume_step < workload.update_horizon:
             progress_state.start_training()
             with _worker_heartbeat.liveness_heartbeat(
@@ -596,14 +598,15 @@ def _run_child(
         # that died before printing its last step will never record it, so tell the gate the run
         # is over first -- otherwise `watcher.stop` waits out the accounting timeout and reports a
         # bookkeeping stall in place of the exit that actually ended the run.
-        if not training_completed:
-            progress_state.fail(
-                f"verl child exited with code {return_code}"
-                if return_code
-                else "verl child ended without completing training"
-            )
         try:
-            watcher.stop(require_complete=training_completed)
+            if not training_completed:
+                progress_state.fail(
+                    f"verl child exited with code {return_code}"
+                    if return_code
+                    else "verl child ended without completing training"
+                )
+            if watcher_started:
+                watcher.stop(require_complete=training_completed)
         finally:
             # the sampler polls nvidia-smi on a thread of its own. stop it even when either the
             # child callback or watcher cleanup raises, because this worker outlives the run.

@@ -659,8 +659,6 @@ def liveness_heartbeat(
         if sample_off_thread and fields is not None
         else None
     )
-    if field_sampler is not None:
-        field_sampler.start()
 
     def _loop() -> None:
         if threading.current_thread() is spawner:
@@ -701,15 +699,24 @@ def liveness_heartbeat(
                 _dump_thread_stacks(f"{stage}: no progress for >{_STALL_DUMP_S:.0f}s")
                 dumped = True
 
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
+    t = None
+    sampler_started = False
     try:
+        if field_sampler is not None:
+            field_sampler.start()
+            sampler_started = True
+        thread = threading.Thread(target=_loop, daemon=True)
+        thread.start()
+        t = thread
         yield
     finally:
         done.set()
-        t.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
-        if field_sampler is not None:
-            field_sampler.join()
+        try:
+            if t is not None:
+                t.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
+        finally:
+            if sampler_started:
+                field_sampler.join()
 
 
 # checkpoint drain time scales with model size and network throughput; a fixed timeout killed a
