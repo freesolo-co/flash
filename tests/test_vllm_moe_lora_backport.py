@@ -286,14 +286,14 @@ def test_semantic_verifier_rejects_clear_moved_outside_finally(tmp_path: Path) -
             if lora_ctx is not None:
                 lora_ctx.original_hidden_states = None
 
-        return self._publish_training_completion(
+        return self._finalize(
 """
     replacement = """        finally:
             pass
         if lora_ctx is not None:
             lora_ctx.original_hidden_states = None
 
-        return self._publish_training_completion(
+        return self._finalize(
 """
     assert source.count(old) == 1
     transformed[path] = source.replace(old, replacement).encode()
