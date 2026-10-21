@@ -81,6 +81,8 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, deadline_
     identity["flash_source"] = hashlib.sha256(
         json.dumps(payload.get("source_snapshot"), sort_keys=True).encode()
     ).hexdigest()
+    if payload.get("handoff_volume"):
+        identity["flash_handoff"] = payload["handoff_volume"]
     create_started = False
     with tempfile.TemporaryDirectory(prefix="flash-modal-") as directory:
         archive = Path(directory) / "capsule.pyz"
@@ -112,6 +114,15 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, deadline_
             if payload["env"].get("FLASH_WEIGHT_CACHE_DIR"):
                 volumes[CACHE_MOUNT] = modal.Volume.from_name(
                     payload.get("cache_volume", CACHE_NAME),
+                    environment_name=environment(),
+                    create_if_missing=True,
+                    client=client,
+                )
+            if payload.get("handoff_volume"):
+                from flash.engine.worker.io.cpu_handoff import MOUNT
+
+                volumes[MOUNT] = modal.Volume.from_name(
+                    payload["handoff_volume"],
                     environment_name=environment(),
                     create_if_missing=True,
                     client=client,

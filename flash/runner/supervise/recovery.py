@@ -5,7 +5,7 @@ cannot ask it how it finished, so the outcome has to be reconstructed from what 
 the output directory still say. `_completed_attempt_metrics` is that reconstruction; the strict
 teardown and charge helpers below are what a settled attempt then triggers.
 
-Split out of `flash.runner.supervise.lifecycle` to keep that module under the file-size limit.
+Completion evidence and adoption are shared by live supervision and restart recovery.
 """
 
 from __future__ import annotations
@@ -337,3 +337,43 @@ def _gc_run_sandboxes(spec: JobSpec) -> None:
     for _prov in available_providers():
         with contextlib.suppress(Exception):
             get_provider(_prov).gc(spec)
+
+
+def carry_allocation_stamp(metrics: dict, remote: dict | None) -> None:
+    """carry the persisted allocation stamp onto adopted metrics."""
+    if not isinstance(metrics, dict) or not isinstance(remote, dict):
+        return
+    allocated_gpu = remote.get("allocated_gpu")
+    if allocated_gpu:
+        metrics.setdefault("allocated_gpu", allocated_gpu)
+    allocated_count = remote.get("allocated_gpu_count")
+    if allocated_count:
+        metrics.setdefault("allocated_gpu_count", int(allocated_count))
+    provider = remote.get("provider")
+    if provider:
+        metrics.setdefault("allocated_provider", provider)
+
+
+def completed_metrics_for_remote(
+    worker_spec: JobSpec,
+    persisted_remote: dict,
+    *,
+    provider: str,
+    attempt: int,
+    deadline_at: float,
+    log,
+) -> dict | None:
+    metrics = _completed_worker_metrics(persisted_remote, deadline_at=deadline_at)
+    started_ts = persisted_remote.get("started_ts")
+    if metrics is None and started_ts is not None:
+        metrics = _completed_attempt_metrics(
+            worker_spec,
+            provider=provider,
+            attempt=attempt,
+            launch_floor=float(started_ts),
+            deadline_at=deadline_at,
+            log=log,
+        )
+    if metrics is not None:
+        carry_allocation_stamp(metrics, persisted_remote)
+    return metrics

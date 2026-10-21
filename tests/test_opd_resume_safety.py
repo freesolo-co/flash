@@ -1292,7 +1292,7 @@ def test_retry_allocation_is_pinned_to_the_resume_checkpoint_width(
 ):
     """a pinned resume admits only candidates that execute at the checkpoint width."""
     from flash.providers.core.base import Allocation, Candidate
-    from flash.runner.supervise.attempt_supervision import _pinned_to_resume_width
+    from flash.runner.supervise.execution import _pinned_to_resume_width
 
     candidates = (
         Candidate("modal", "h100", 1.0, 80, 4, 2),
@@ -1332,7 +1332,7 @@ def test_pinned_resume_stop_diagnostic_names_executed_checkpoint_width():
     from flash.core.spec import JobSpec
     from flash.providers.core.base import Allocation, Candidate
     from flash.runner.lifecycle.attempts import AttemptLaunchClaim
-    from flash.runner.supervise.attempt_supervision import (
+    from flash.runner.supervise.execution import (
         _build_candidate_plan,
         _pinned_to_resume_width,
     )
@@ -1388,7 +1388,7 @@ def test_retry_allocation_falls_back_for_unusable_executed_width(
 ):
     """absent and malformed executed widths fall back to the rented card count."""
     from flash.providers.core.base import Allocation, Candidate
-    from flash.runner.supervise.attempt_supervision import _pinned_to_resume_width
+    from flash.runner.supervise.execution import _pinned_to_resume_width
 
     if executed_present:
         candidate = Candidate("modal", "h100", 1.0, 80, 4, executed_gpu_count)

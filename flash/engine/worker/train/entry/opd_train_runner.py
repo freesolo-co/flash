@@ -649,6 +649,7 @@ def _build_checkpoint_watcher(
         model_id=request.model_id,
         model_revision=request.model_revision,
         required_steps=request.knobs.save_at_steps,
+        final_step=workload.update_horizon,
         exclude_modules=workload.exclude_modules,
         preprocessor=runtime.bridge.processor,
         seed=int(_worker_state.SEED),
