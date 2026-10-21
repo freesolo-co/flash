@@ -12,19 +12,19 @@ import tarfile
 import threading
 import time
 import urllib.error
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
-import flash.engine.worker.entry.sft as worker_sft
 import flash.engine.worker.entry.worker as worker_entry
 import flash.engine.worker.io.heartbeat as worker_heartbeat
 import flash.engine.worker.io.hf as worker_hf
 import flash.engine.worker.perf as worker_perf
 import flash.engine.worker.runtime.kernel_warmup as worker_kernel_warmup
-import flash.engine.worker.runtime.state as worker_state
+import flash.engine.worker.train.entry.sft_train as worker_sft
 import flash.runner.accounting.artifacts as runner_artifacts
 import flash.runner.accounting.reconciliation as runner_reconciliation
 import flash.runner.lifecycle.preparation as runner_preparation
@@ -870,7 +870,7 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
 
 @pytest.mark.parametrize("handler_fails", [False, True])
 def test_worker_cleans_materialized_package_after_training_handler(
-    monkeypatch, tmp_path, handler_fails
+    worker_context, monkeypatch, tmp_path, handler_fails
 ) -> None:
     from flash.envs.loading.staged import StagedEnvironmentMaterialization
 
@@ -881,25 +881,27 @@ def test_worker_cleans_materialized_package_after_training_handler(
     root.mkdir()
     entrypoint = root / "environment.py"
     entrypoint.write_text("VALUE = 1\n", encoding="utf-8")
-    worker_state.ACTIVE_ENV_PACKAGE = StagedEnvironmentMaterialization(root, entrypoint)
+    worker_context.active_env_package = StagedEnvironmentMaterialization(root, entrypoint)
 
-    def handler() -> None:
+    def handler(*, context) -> None:
         assert root.is_dir()
         if handler_fails:
             raise RuntimeError("training failed")
 
-    monkeypatch.setattr(worker_state, "RUN_MODE", "sft")
-    monkeypatch.setattr(worker_state, "JOB_SPEC", None)
-    monkeypatch.setattr(worker_state, "HF_REPO", "")
-    monkeypatch.setattr(worker_sft, "run_sft", handler)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, run_mode="sft"))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=None))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, hf_repo=""))
+    monkeypatch.setattr(worker_sft, "run_sft_train", handler)
     monkeypatch.setattr(worker_hf, "_disable_xet_upload_staging", lambda: None)
-    monkeypatch.setattr(worker_state, "_remaining_worker_wall_seconds", lambda: None)
-    monkeypatch.setattr(worker_entry, "_preflight_gpu_occupancy_for_spec", lambda: None)
+    monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: None)
+    monkeypatch.setattr(
+        worker_entry, "_preflight_gpu_occupancy_for_spec", lambda context=None, **_context: None
+    )
     monkeypatch.setattr(worker_perf, "_force_fla_triton_gdn_on_sm100", lambda: None)
     monkeypatch.setattr(worker_perf, "_ensure_fla_fastpath_on_hopper", lambda: None)
     monkeypatch.setattr(worker_perf, "_restrict_fla_gdn_autotune_on_blackwell", lambda: None)
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **_kwargs: {})
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *_args, context=None, **_kwargs: None)
     monkeypatch.setattr(worker_kernel_warmup, "configure_kernel_cache", lambda: None)
     monkeypatch.setattr(
         worker_entry.os,
@@ -909,8 +911,8 @@ def test_worker_cleans_materialized_package_after_training_handler(
 
     expected = RuntimeError if handler_fails else WorkerExited
     with pytest.raises(expected):
-        worker_entry._run_worker_mode()
-    assert worker_state.ACTIVE_ENV_PACKAGE is None
+        worker_entry._run_worker_mode(context=worker_context)
+    assert worker_context.active_env_package is None
     assert not root.exists()
 
 

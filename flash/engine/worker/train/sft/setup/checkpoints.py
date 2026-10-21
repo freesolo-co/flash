@@ -16,6 +16,7 @@ import time
 
 import flash.engine.worker.io.hf as _worker_hf
 from flash.engine.worker.io.heartbeat import join_while_draining
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
 from flash.engine.worker.train.entry.backend_common import (
     completed_checkpoint_step,
@@ -109,7 +110,9 @@ class _VerlCheckpointWatcher:
         final_step: int | None = None,
         exclude_modules: str | None = None,
         preprocessor=None,
+        context: WorkerContext,
     ) -> None:
+        self.context = context
         self.local_dir = local_dir
         self.export_root = export_root
         # sibling of export_root so it shares its filesystem: _staged_source hardlinks into it, and
@@ -151,7 +154,7 @@ class _VerlCheckpointWatcher:
         # is never killed (VERL-131). a watcher that died mid-publish is already not alive, so the
         # join returns at once and raise_if_failed surfaces its real exception rather than a
         # generic "did not stop".
-        join_while_draining(self._thread, "verl checkpoint watcher")
+        join_while_draining(self._thread, "verl checkpoint watcher", context=self.context)
         self.raise_if_failed()
         if require_complete:
             # the published adapters, not the steps this watcher handled: a required save is owed a
@@ -281,11 +284,15 @@ class _VerlCheckpointWatcher:
             )
             self.lifecycle.mark_staged(step)
             published = _worker_hf.publish_deployable_checkpoint(
-                adapter_dir, step, required=step in self.required_steps, _provenance_ready=True
+                adapter_dir,
+                step,
+                required=step in self.required_steps,
+                _provenance_ready=True,
+                context=self.context,
             )
             self.lifecycle.record_publication(step, published)
             uploaded = _worker_hf.upload_resume_checkpoint(
-                step, checkpoint_dir, final_step=self.final_step
+                step, checkpoint_dir, final_step=self.final_step, context=self.context
             )
             self.lifecycle.record_publication(step, uploaded)
         finally:

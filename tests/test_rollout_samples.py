@@ -171,33 +171,41 @@ def test_select_rollout_samples_rejects_unknown_scalar() -> None:
         select_rollout_samples([("p", "c", 1.0)], generated_at_step=1, scalar="entropy")
 
 
-def test_heartbeat_reports_failed_then_successful_forced_delivery(monkeypatch) -> None:
+def test_heartbeat_reports_failed_then_successful_forced_delivery(
+    worker_context, monkeypatch
+) -> None:
 
     outcomes = iter([False, True])
-    monkeypatch.setattr(worker_hf, "hf_upload_file", lambda *args, **kwargs: next(outcomes))
-    monkeypatch.setattr(worker_heartbeat, "_HB_TERMINAL_ONLY", False)
+    monkeypatch.setattr(
+        worker_hf, "hf_upload_file", lambda *args, context=None, **kwargs: next(outcomes)
+    )
+    monkeypatch.setattr(worker_context.heartbeat_state, "terminal_only", False)
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
     monkeypatch.setattr(worker_heartbeat, "_HB_FORCE_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 0.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_FORCED_UPLOAD", 0.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_COMMITTED_STEP", 0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_SEQ", 0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_UPLOADED_SEQ", 0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_PROGRESS_TS", 0.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_forced_upload", 0.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_committed_step", 0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "progress_seq", 0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "progress_uploaded_seq", 0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_progress_ts", 0.0)
 
-    assert worker_heartbeat.heartbeat("rl_step", step=1, force=True) is False
-    assert worker_heartbeat.heartbeat("rl_step", step=1, force=True) is True
+    assert (
+        worker_heartbeat.heartbeat("rl_step", step=1, force=True, context=worker_context) is False
+    )
+    assert worker_heartbeat.heartbeat("rl_step", step=1, force=True, context=worker_context) is True
 
 
-def test_throttled_heartbeat_omits_samples_from_console(monkeypatch, capsys) -> None:
+def test_throttled_heartbeat_omits_samples_from_console(
+    worker_context, monkeypatch, capsys
+) -> None:
 
-    monkeypatch.setattr(worker_heartbeat, "_HB_TERMINAL_ONLY", False)
+    monkeypatch.setattr(worker_context.heartbeat_state, "terminal_only", False)
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 1000.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_COMMITTED_STEP", 1)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_PROGRESS_TS", 0.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_SEQ", 0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_UPLOADED_SEQ", 0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 1000.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_committed_step", 1)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_progress_ts", 0.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "progress_seq", 0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "progress_uploaded_seq", 0)
     heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
     monkeypatch.setattr(heartbeat_module.time, "time", lambda: 1001.0)
 
@@ -212,6 +220,7 @@ def test_throttled_heartbeat_omits_samples_from_console(monkeypatch, capsys) -> 
                 "generated_at_step": 2,
             }
         ],
+        context=worker_context,
     )
 
     console = capsys.readouterr().out

@@ -1,16 +1,13 @@
-"""SFT entry point and the dataset helpers the verl worker shares.
+"""Pure SFT row selection, tokenization, and model geometry.
 
-``run_sft`` delegates to ``sft_train.run_sft_train``, which owns tokenization, packing, and training.
-What stays here is what that worker imports rather than reimplements: example selection, the
-completion-only pretokenizer, model-arch dims, the token accounting used to detect an under-run, and
-the image-completion rejection.
+Shared by static profiling and worker preparation without run initialization.
 """
 
 from __future__ import annotations
 
 import random
 
-import flash.engine.worker.io.hf as _worker_hf
+from flash.engine.profiling.tokenizer import model_revision_kwargs
 from flash.engine.worker.model.chatml_mask import assistant_only_mask
 from flash.engine.worker.model.packing import (
     completion_mask_from_ids,
@@ -100,7 +97,7 @@ def _model_arch_dims(model_id: str, revision: str = "") -> tuple[int, int]:
         cfg = AutoConfig.from_pretrained(
             model_id,
             trust_remote_code=True,
-            **_worker_hf.model_revision_kwargs(revision),
+            **model_revision_kwargs(revision),
         )
         tc = getattr(cfg, "text_config", None) or cfg
         layers = int(
@@ -195,10 +192,3 @@ def _reject_image_completion(
             IMAGE_PAD_TOKEN,
             template_kwargs=template_kwargs or {},
         )
-
-
-def run_sft():
-    """Run SFT. verl is the only backend; this module keeps the dataset helpers it shares."""
-    from flash.engine.worker.train.entry.sft_train import run_sft_train
-
-    run_sft_train()

@@ -8,6 +8,7 @@ import pytest
 
 from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.profiling.reasoning_render import reasoning_marker_prefix
+from flash.engine.profiling.sft_rows import select_sft_examples
 from flash.engine.profiling.sft_workload import (
     prepare_sft_workload,
     sft_tokens_for_updates,
@@ -16,7 +17,6 @@ from flash.engine.profiling.workload_profile import (
     sft_profile_input_digest,
     unpacked_batch_warning,
 )
-from flash.engine.worker.entry.sft import select_sft_examples
 
 
 class FakeTokenizer:

@@ -19,6 +19,12 @@ from flash.engine.profiling.sft_image_rows import (
     estimate_sft_image_row,
     process_sft_image_row,
 )
+from flash.engine.profiling.sft_rows import (
+    _pretokenize_completion_only,
+    _reject_image_completion,
+    has_real_target,
+    select_sft_examples,
+)
 from flash.engine.profiling.workload_profile import (
     SftWorkloadProfile,
     horizon_row_count,
@@ -32,12 +38,6 @@ from flash.engine.profiling.workload_profile import (
     strip_reasoning_markers,
     unpacked_batch_warning,
     with_marked_reasoning,
-)
-from flash.engine.worker.entry.sft import (
-    _pretokenize_completion_only,
-    _reject_image_completion,
-    has_real_target,
-    select_sft_examples,
 )
 from flash.engine.worker.model.packing import (
     gdn_packing_contract_available,

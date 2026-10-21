@@ -1,4 +1,4 @@
-from flash.engine.worker.entry.worker import main
+from flash.engine.worker.entry.worker import main_from_env
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main_from_env()

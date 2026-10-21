@@ -1,17 +1,25 @@
-"""run-scoped worker state and active environment ownership."""
+"""explicit per-attempt configuration and worker resource ownership."""
 
 from __future__ import annotations
 
 import math
 import os
+import threading
 import time
+from _thread import LockType
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
-from flash.core.spec import FIXED_SEED, load_job_spec_from_env
+from flash.core.spec import FIXED_SEED, JobSpec
 from flash.envs.loading.staged import (
     StagedEnvironmentMaterialization,
     load_staged_freesolo_environment,
 )
 from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
+
+if TYPE_CHECKING:
+    from flash.engine.worker.io.heartbeat import HeartbeatState
 
 
 def _resolve_worker_seed(job_spec, env_seed: str | None) -> int:
@@ -24,99 +32,100 @@ def _resolve_worker_seed(job_spec, env_seed: str | None) -> int:
     return seed if 0 <= seed <= 2**63 - 1 else FIXED_SEED
 
 
-def _parse_attempt_env() -> int:
-    raw = os.environ.get("ATTEMPT")
-    if raw is None:
-        return 0
-    if not raw or any(char < "0" or char > "9" for char in raw):
-        raise RuntimeError("managed worker ATTEMPT must be an unsigned decimal integer")
-    return int(raw)
+@dataclass(frozen=True)
+class WorkerConfig:
+    spec: JobSpec | None = None
+    hf_repo: str = ""
+    run_id: str = "local"
+    run_mode: str = "sft"
+    attempt: int = 0
+    seed: int = FIXED_SEED
+    phase: str = "sft"
+    thinking: bool = False
+    opd_resume_revision: str = ""
+    deadline_at: float | None = None
 
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str]) -> WorkerConfig:
+        env = dict(environ)
+        raw = env.get("FLASH_JOB_SPEC_JSON")
+        if not raw and env.get("FLASH_JOB_SPEC_PATH"):
+            from pathlib import Path
 
-HF_REPO = os.environ.get("HF_REPO", "")
-RUN_ID = os.environ.get("RUN_ID", "local")
-RUN_MODE = os.environ.get("RUN_MODE", "sft")
-ATTEMPT = _parse_attempt_env()
-# captured at import, which is before this attempt can have started ray. any ray session older than
-# this belongs to a PREVIOUS attempt on the same reused pod (/tmp survives a retry), and reporting
-# one as this attempt's evidence would send the next diagnosis after a failure that never happened.
-WORKER_START_TIME = time.time()
-JOB_SPEC = load_job_spec_from_env()
-SEED = _resolve_worker_seed(JOB_SPEC, os.environ.get("SEED"))
-PHASE = os.environ.get(
-    "PHASE",
-    JOB_SPEC.phase if JOB_SPEC else (RUN_MODE if RUN_MODE in ("sft", "rl", "opd") else "sft"),
-)
-OPD_RESUME_REVISION = os.environ.get(OPD_RESUME_REVISION_ENV, "").strip()
-THINKING = JOB_SPEC.thinking if JOB_SPEC else False
-
-
-def _remaining_worker_wall_seconds() -> float | None:
-    raw_deadline = os.environ.get("FLASH_RUN_DEADLINE_AT")
-    if raw_deadline is None:
-        return None
-    try:
-        deadline = float(raw_deadline)
-    except (TypeError, ValueError):
-        raise RuntimeError("worker run wall deadline is invalid") from None
-    now = time.time()
-    if deadline <= 0 or now <= 0 or not math.isfinite(deadline) or not math.isfinite(now):
-        raise RuntimeError("worker run wall deadline is invalid")
-    return max(0.0, deadline - now)
-
-
-def _load_active_env():
-    """Load the run's Freesolo environment from the JobSpec; require an explicit env."""
-    if JOB_SPEC is None:
-        return None
-    env_id = JOB_SPEC.environment.id
-    if not env_id:
-        raise RuntimeError(
-            "JobSpec sets no environment: provide [environment] id "
-            "(a Freesolo environment id like 'your-org/your-project/your-env', returned by "
-            "`flash env push --project <project-uuid> --name <name>`)."
+            raw = Path(env["FLASH_JOB_SPEC_PATH"]).read_text()
+        spec = JobSpec.from_json(raw) if raw else None
+        attempt = env.get("ATTEMPT", "0")
+        if not attempt or any(char < "0" or char > "9" for char in attempt):
+            raise RuntimeError("managed worker ATTEMPT must be an unsigned decimal integer")
+        raw_deadline = env.get("FLASH_RUN_DEADLINE_AT")
+        try:
+            deadline = float(raw_deadline) if raw_deadline is not None else None
+            if deadline is not None and (deadline <= 0 or not math.isfinite(deadline)):
+                raise ValueError
+        except (ValueError, TypeError):
+            raise RuntimeError("worker run wall deadline is invalid") from None
+        mode = env.get("RUN_MODE", "sft")
+        return cls(
+            spec=spec,
+            hf_repo=env.get("HF_REPO", ""),
+            run_id=env.get("RUN_ID", "local"),
+            run_mode=mode,
+            attempt=int(attempt),
+            seed=_resolve_worker_seed(spec, env.get("SEED")),
+            phase=env.get("PHASE", spec.phase if spec else mode),
+            thinking=bool(spec and spec.thinking),
+            opd_resume_revision=env.get(OPD_RESUME_REVISION_ENV, "").strip(),
+            deadline_at=deadline,
         )
-    global ACTIVE_ENV_PACKAGE
-    env, ACTIVE_ENV_PACKAGE = load_staged_freesolo_environment(
-        JOB_SPEC.environment,
-        JOB_SPEC.environment.params,
-        hf_repo=JOB_SPEC.train.hf_repo,
-    )
-    from flash.content.multimodal import validate_image_observation_environment
-
-    # this capability classifies a future dynamic-image environment only. full per-turn media wiring
-    # remains separate; the guard makes an incompatible model or opd teacher fail before model work.
-    validate_image_observation_environment(env, JOB_SPEC)
-    # tell the env whether this run samples <think> blocks, so the multi-turn scoring path strips
-    # reasoning exactly like the single-turn path does (see FreesoloEnvironment.record_model_turn).
-    if hasattr(env, "thinking"):
-        env.thinking = bool(JOB_SPEC.thinking)
-    return env
 
 
-ACTIVE_ENV = None
-ACTIVE_ENV_PACKAGE: StagedEnvironmentMaterialization | None = None
+@dataclass
+class WorkerContext:
+    config: WorkerConfig
+    active_env: Any = None
+    active_env_package: StagedEnvironmentMaterialization | None = None
+    started_at: float = field(default_factory=time.time)
+    resume_upload_lock: LockType = field(default_factory=threading.Lock)
+    heartbeat_state: HeartbeatState = field(init=False)
 
+    def __post_init__(self):
+        from flash.engine.worker.io.heartbeat import HeartbeatState
 
-def _cleanup_active_env_package() -> None:
-    global ACTIVE_ENV_PACKAGE
-    if ACTIVE_ENV_PACKAGE is None:
-        return
-    ACTIVE_ENV_PACKAGE.cleanup()
-    ACTIVE_ENV_PACKAGE = None
+        self.heartbeat_state = HeartbeatState()
 
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> WorkerContext:
+        return cls(WorkerConfig.from_env(os.environ if environ is None else environ))
 
-def require_active_env():
-    """Return the run's loaded environment, raising a clear error if none is loaded."""
-    global ACTIVE_ENV
-    if ACTIVE_ENV is None:
-        ACTIVE_ENV = _load_active_env()
-    if ACTIVE_ENV is None:
-        raise RuntimeError(
-            "no environment is loaded: this worker was started without a JobSpec "
-            "(FLASH_JOB_SPEC_JSON / FLASH_JOB_SPEC_PATH is unset). A train/eval run must "
-            "carry a JobSpec naming [environment] id "
-            "(a Freesolo environment id like 'your-org/your-project/your-env', returned by "
-            "`flash env push --project <project-uuid> --name <name>`)."
+    def remaining_wall_seconds(self) -> float | None:
+        if self.config.deadline_at is None:
+            return None
+        return max(0.0, self.config.deadline_at - time.time())
+
+    def require_active_env(self):
+        if self.active_env is not None:
+            return self.active_env
+        spec = self.config.spec
+        if spec is None or not spec.environment.id:
+            raise RuntimeError("worker requires a JobSpec naming [environment] id")
+        env, package = load_staged_freesolo_environment(
+            spec.environment, spec.environment.params, hf_repo=spec.train.hf_repo
         )
-    return ACTIVE_ENV
+        self.active_env_package = package
+        from flash.content.multimodal import validate_image_observation_environment
+
+        try:
+            validate_image_observation_environment(env, spec)
+            if hasattr(env, "thinking"):
+                env.thinking = bool(spec.thinking)
+        except BaseException:
+            self.close()
+            raise
+        self.active_env = env
+        return env
+
+    def close(self) -> None:
+        package, self.active_env_package = self.active_env_package, None
+        self.active_env = None
+        if package is not None:
+            package.cleanup()

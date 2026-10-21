@@ -9,9 +9,9 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass
 
-import flash.engine.worker.runtime.state as _worker_state
 from flash.engine.plan.recipe import RECIPE, resolve_teacher
 from flash.engine.plan.vram import opd_completion_len
+from flash.engine.worker.runtime.state import WorkerContext
 
 
 @dataclass(frozen=True)
@@ -44,10 +44,10 @@ class OpdKnobs:
     structured_outputs: str = ""
 
 
-def _resolve_opd_knobs() -> OpdKnobs:
+def _resolve_opd_knobs(*, context: WorkerContext) -> OpdKnobs:
     """Resolve every opd knob from the JobSpec's [train] table, falling back to RECIPE.opd."""
     d = RECIPE.opd
-    t = _worker_state.JOB_SPEC.train if _worker_state.JOB_SPEC else None
+    t = context.config.spec.train if context.config.spec else None
 
     def opt(name, default):
         v = getattr(t, name, None) if t else None
@@ -82,7 +82,7 @@ def _resolve_opd_knobs() -> OpdKnobs:
             else d.sampling_temperature
         ),
         top_p=d.sampling_top_p,
-        max_completion=opd_completion_len(opt("max_completion_tokens", 0), _worker_state.THINKING),
+        max_completion=opd_completion_len(opt("max_completion_tokens", 0), context.config.thinking),
         # reads prompts_per_step, NOT batch_size: opd rejects batch_size at parse time, so an opd
         # spec carries the optimizer batch only under this key. reading the old name found None on
         # every run and trained the recipe default no matter what the user authored.
@@ -98,9 +98,9 @@ def _resolve_opd_knobs() -> OpdKnobs:
     )
 
 
-def _thinking_prefill_text(tok) -> str:
+def _thinking_prefill_text(tok, *, context: WorkerContext) -> str:
     """return the exact terminal Qwen reasoning opener, or fail closed."""
-    if not _worker_state.THINKING:
+    if not context.config.thinking:
         return ""
     expected = "<think>\n"
     probe = [{"role": "user", "content": ""}]
@@ -159,8 +159,8 @@ def _drop_fully_forced_groups(groups, forced):
     ]
 
 
-def run_opd():
+def run_opd(*, context: WorkerContext):
     """Run OPD. verl is the only backend; this module keeps the knob and prompt helpers it shares."""
     from flash.engine.worker.train.entry.opd_train import run_opd_train
 
-    run_opd_train()
+    run_opd_train(context=context)
