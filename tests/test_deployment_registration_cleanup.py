@@ -1,7 +1,6 @@
 """Incomplete hosted registrations are revoked without disturbing verified siblings."""
 
 from threading import Event
-from types import SimpleNamespace
 
 import pytest
 
@@ -203,15 +202,14 @@ def test_recovery_uses_persisted_registration_org(api, monkeypatch):
     assert deleted == [(f"{run_id}/final", {"org_id": record["serving_org_id"], "timeout_s": 5.0})]
 
 
-def test_recovery_worker_respects_stop_and_budget(api, monkeypatch):
+def test_recovery_worker_respects_stop(api, monkeypatch):
     monkeypatch.setattr(serving_completion.db, "all_runs", lambda: [{"run_id": "missing"}])
     monkeypatch.setattr(
-        serving_completion.run_status, "get_status", lambda _: pytest.fail("read past budget")
+        serving_completion.run_status, "get_status", lambda _: pytest.fail("read after shutdown")
     )
     stop = Event()
     stop.set()
-    assert serving_completion.cleanup_recovered_deployments(stop) == 0
-    assert serving_completion.cleanup_recovered_deployments(Event(), budget_seconds=0) == 0
+    assert serving_completion.cleanup_recovered_deployments(stop) is False
 
 
 @pytest.fixture
@@ -276,7 +274,7 @@ def test_ambiguous_registration_preserves_mismatched_binding(
     assert status.get_status(run_id).deployments[sibling] == before
 
 
-@pytest.mark.parametrize("interruption", ["failure", "budget", "locked"])
+@pytest.mark.parametrize("interruption", ["failure", "locked"])
 def test_cleanup_worker_retries_without_another_restart(api, monkeypatch, interruption):
     key = _login()
     run_id = _make_run(api, key, "done")
@@ -284,8 +282,6 @@ def test_cleanup_worker_retries_without_another_restart(api, monkeypatch, interr
     for target in targets:
         seed_ready_checkpoint(run_id, target)
         transitions.mark_deployment_cleanup_pending(run_id, "interrupted", target)
-    clock = SimpleNamespace(now=0.0)
-    monkeypatch.setattr(serving_completion, "time", SimpleNamespace(monotonic=lambda: clock.now))
     deleted, waits = [], []
     stop = Event()
     lock = serving_completion.deployment_locks._deploy_lock(run_id)
@@ -295,11 +291,8 @@ def test_cleanup_worker_retries_without_another_restart(api, monkeypatch, interr
     def undeploy(target, **kwargs):
         assert 0 < kwargs["timeout_s"] <= 5
         deleted.append(target)
-        if len(deleted) == 1:
-            if interruption == "failure":
-                raise ServingError("temporarily unavailable")
-            if interruption == "budget":
-                clock.now += 30
+        if len(deleted) == 1 and interruption == "failure":
+            raise ServingError("temporarily unavailable")
 
     def wait(delay):
         waits.append(delay)
@@ -311,39 +304,13 @@ def test_cleanup_worker_retries_without_another_restart(api, monkeypatch, interr
     monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
     monkeypatch.setattr(stop, "wait", wait)
     try:
-        assert serving_completion.retry_deployment_cleanup(stop) == 2
+        serving_completion.retry_deployment_cleanup(stop)
     finally:
         if interruption == "locked" and not waits:
             lock.release()
     assert waits == [1.0]
     assert len(deleted) == (3 if interruption == "failure" else 2)
     assert all(status.get_status(run_id).deployments[t]["state"] == "undeployed" for t in targets)
-
-
-def test_cleanup_retry_backoff_is_bounded_and_stoppable(api, monkeypatch):
-    key = _login()
-    run_id = _make_run(api, key, "done")
-    target = f"{run_id}/final"
-    seed_ready_checkpoint(run_id, target)
-    transitions.mark_deployment_cleanup_pending(run_id, "interrupted", target)
-    stop, waits, attempts = Event(), [], []
-
-    def unavailable(*args, **kwargs):
-        attempts.append(args)
-        raise ServingError("offline")
-
-    def wait(delay):
-        waits.append(delay)
-        if len(waits) == 7:
-            stop.set()
-        return stop.is_set()
-
-    monkeypatch.setattr(deploy, "undeploy_adapter", unavailable)
-    monkeypatch.setattr(stop, "wait", wait)
-    assert serving_completion.retry_deployment_cleanup(stop) == 0
-    assert waits == [1, 2, 4, 8, 16, 30, 30]
-    assert len(attempts) == len(waits)
-    assert status.get_status(run_id).deployments[target]["state"] == "cleanup_pending"
 
 
 def test_cleanup_retry_rechecks_state_after_backoff(api, monkeypatch):
@@ -364,6 +331,6 @@ def test_cleanup_retry_rechecks_state_after_backoff(api, monkeypatch):
 
     monkeypatch.setattr(deploy, "undeploy_adapter", unavailable)
     monkeypatch.setattr(stop, "wait", wait)
-    assert serving_completion.retry_deployment_cleanup(stop) == 0
+    serving_completion.retry_deployment_cleanup(stop)
     assert deleted == [target]
     assert status.get_status(run_id).deployments[target]["state"] == "ready"

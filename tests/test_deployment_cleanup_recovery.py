@@ -131,7 +131,9 @@ def test_registration_does_not_start_if_intent_cannot_be_persisted(api, monkeypa
 
 
 @pytest.mark.parametrize("multiple_runs", [False, True])
-def test_cleanup_rotates_past_repeated_timeouts(api, monkeypatch, multiple_runs):
+def test_cleanup_reaches_later_checkpoints_despite_repeated_timeouts(
+    api, monkeypatch, multiple_runs
+):
     key = _login()
     run_id = _make_run(api, key, "done")
     targets = []
@@ -156,18 +158,16 @@ def test_cleanup_rotates_past_repeated_timeouts(api, monkeypatch, multiple_runs)
 
     def wait(delay):
         waits.append(delay)
-        if len(waits) == 1:
-            assert last_target not in deleted
-        else:
-            assert last_target in deleted, "later checkpoints were starved by earlier failures"
-            stop.set()
-        return stop.is_set()
+        assert last_target in deleted, "later checkpoints were starved by earlier failures"
+        assert clock.now >= 35, "the old whole-pass budget must not skip the seventh checkpoint"
+        stop.set()
+        return True
 
     monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
     monkeypatch.setattr(stop, "wait", wait)
-    assert serving_completion.retry_deployment_cleanup(stop) == 1
+    serving_completion.retry_deployment_cleanup(stop)
     assert status.get_status(last_run).deployments[last_target]["state"] == "undeployed"
-    assert len(waits) == 2
+    assert waits == [1.0]
 
 
 @pytest.mark.parametrize("legacy_composite", [False, True])
@@ -184,13 +184,14 @@ def test_cleanup_retry_keeps_original_cause_and_only_latest_failure(
         current.deployments[target].pop("deployment_error")
         current.deployments[target]["error"] += "; checkpoint cleanup failed: old" * 20
         state._save_status(current)
-    stop, attempts = Event(), []
+    stop, attempts, waits = Event(), [], []
 
     def unavailable(*args, **kwargs):
         attempts.append(args)
         raise ServingError(f"offline-{len(attempts)}")
 
     def wait(delay):
+        waits.append(delay)
         record = status.get_status(run_id).deployments[target]
         assert record["deployment_error"] == "readiness timed out"
         assert record["cleanup_error"] == f"offline-{len(attempts)}"
@@ -207,7 +208,9 @@ def test_cleanup_retry_keeps_original_cause_and_only_latest_failure(
 
     monkeypatch.setattr(deploy, "undeploy_adapter", unavailable)
     monkeypatch.setattr(stop, "wait", wait)
-    assert serving_completion.retry_deployment_cleanup(stop) == 0
+    serving_completion.retry_deployment_cleanup(stop)
+    assert waits == [1, 2, 4, 8, 16] + [30] * 45
+    assert len(attempts) == 50
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **kw: None)
     serving_completion.cleanup_recovered_deployments(Event())
     record = status.get_status(run_id).deployments[target]

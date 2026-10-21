@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import time
-from bisect import bisect_right
-from dataclasses import dataclass
 from threading import Event
 
 import flash.runner.lifecycle.status as run_status
@@ -75,90 +73,55 @@ def _recover_interrupted_deployment(status, checkpoint_id: str) -> None:
     deployment_state._report_persisted_transition(status, pending, persisted=True)
 
 
-@dataclass
-class _CleanupCursor:
-    after: tuple[str, str] | None = None
-
-
-def cleanup_recovered_deployments(
-    stop: Event, *, budget_seconds: float = 30.0, cursor: _CleanupCursor | None = None
-) -> int:
-    """Run one bounded cleanup pass, leaving unfinished records retryable."""
-    deadline = time.monotonic() + budget_seconds
-    cleaned = 0
-    if stop.is_set() or budget_seconds <= 0:
-        return cleaned
-    targets = _pending_cleanup_targets(stop)
-    if cursor is not None and cursor.after is not None:
-        start = bisect_right(targets, cursor.after)
-        targets = targets[start:] + targets[:start]
-    for run_id, checkpoint_id in targets:
-        if stop.is_set() or time.monotonic() >= deadline:
+def cleanup_recovered_deployments(stop: Event) -> bool:
+    """Try every pending checkpoint once; return whether another pass is needed."""
+    pending = False
+    for row in db.all_runs():
+        if stop.is_set():
             break
-        if cursor is not None:
-            cursor.after = (run_id, checkpoint_id)
+        run_id = row["run_id"]
         lock = deployment_locks._deploy_lock(run_id)
         if not lock.acquire(blocking=False):
+            pending = True
             continue
         try:
             try:
                 status = run_status.get_status(run_id)
             except FileNotFoundError:
                 continue
-            deployment = status.deployments.get(checkpoint_id, {})
-            remaining = deadline - time.monotonic()
-            if stop.is_set() or remaining <= 0:
-                return cleaned
-            if deployment.get("state") != "cleanup_pending":
-                continue
-            org_id = deployment.get("serving_org_id") or run_serving_org_id(status)
-            # Older records stored only the composite error; discard their repeated suffixes once.
-            cause = (
-                deployment.get("deployment_error")
-                or str(deployment.get("error") or "interrupted deployment").split(
-                    "; checkpoint cleanup failed:", 1
-                )[0]
-            )
-            if _cleanup_failed_deployment(
-                run_id, checkpoint_id, org_id, ServingError(cause), timeout_s=min(5.0, remaining)
-            ):
-                marked = runner_transitions.mark_undeployed(run_id, checkpoint_id)
-                deployment_state._report_persisted_transition(status, marked, persisted=True)
-                cleaned += 1
+            for checkpoint_id, deployment in status.deployments.items():
+                if stop.is_set():
+                    return pending
+                if deployment.get("state") != "cleanup_pending":
+                    continue
+                org_id = deployment.get("serving_org_id") or run_serving_org_id(status)
+                # Normalize composite errors from records written before causes were separated.
+                cause = (
+                    deployment.get("deployment_error")
+                    or str(deployment.get("error") or "interrupted deployment").split(
+                        "; checkpoint cleanup failed:", 1
+                    )[0]
+                )
+                if _cleanup_failed_deployment(
+                    run_id, checkpoint_id, org_id, ServingError(cause), timeout_s=5.0
+                ):
+                    marked = runner_transitions.mark_undeployed(run_id, checkpoint_id)
+                    deployment_state._report_persisted_transition(status, marked, persisted=True)
+                    status = marked
+                else:
+                    pending = True
         finally:
             lock.release()
-    return cleaned
+    return pending
 
 
-def retry_deployment_cleanup(stop: Event) -> int:
-    """Retry bounded passes in the owned worker until cleanup finishes or shutdown begins."""
-    cleaned = 0
+def retry_deployment_cleanup(stop: Event) -> None:
+    """Retry full passes with interruptible backoff; each checkpoint has a five-second budget."""
     delay = 1.0
-    cursor = _CleanupCursor()
-    while not stop.is_set():
-        cleaned += cleanup_recovered_deployments(stop, cursor=cursor)
-        if not _pending_cleanup_targets(stop) or stop.wait(delay):
+    while not stop.is_set() and cleanup_recovered_deployments(stop):
+        if stop.wait(delay):
             break
         delay = min(30.0, delay * 2)
-    return cleaned
-
-
-def _pending_cleanup_targets(stop: Event) -> list[tuple[str, str]]:
-    # This scan only schedules another pass; that pass rechecks state under each run lock.
-    targets = []
-    for row in db.all_runs():
-        if stop.is_set():
-            break
-        try:
-            status = run_status.get_status(row["run_id"])
-        except FileNotFoundError:
-            continue
-        targets.extend(
-            (status.run_id, checkpoint_id)
-            for checkpoint_id, record in status.deployments.items()
-            if record.get("state") == "cleanup_pending"
-        )
-    return sorted(targets)
 
 
 def replay_status_reports(stop: Event | None = None) -> int:
@@ -236,10 +199,9 @@ def _finish_deployment_unlocked(
         return
     current = dict(deployment)
     smoke_result: dict = {}
-    registration_started = False
 
     def _before_register(identity: dict) -> None:
-        nonlocal current, registration_started
+        nonlocal current
         _assert_deployment_fence(run_id, deployment, is_checkpoint, prev_state)
         registering = {**current, "registration_started": True, "registration_identity": identity}
         marked = runner_transitions.mark_deployment_pending(
@@ -248,11 +210,10 @@ def _finish_deployment_unlocked(
         if marked.deployments.get(deployment["checkpoint_id"]) != registering:
             raise ServingError("deployment attempt changed before registration")
         current = registering
-        registration_started = True
 
     def _before_ready(facts: DeploymentReadinessFacts) -> None:
-        nonlocal current, registration_started
-        registration_started = True
+        nonlocal current
+        current["registration_started"] = True
         _assert_deployment_fence(run_id, deployment, is_checkpoint, prev_state)
         current = deployment_state._deployment_state(
             {**current, "checkpoint_id": facts.checkpoint_id, "openai_model": facts.checkpoint_id},
@@ -289,7 +250,7 @@ def _finish_deployment_unlocked(
         return
     except Exception as exc:
         if (
-            registration_started
+            current.get("registration_started")
             and not isinstance(exc, RegistrationRejected)
             and not _cleanup_failed_deployment(
                 run_id, deployment["checkpoint_id"], str(deploy_kwargs["org_id"]), exc
