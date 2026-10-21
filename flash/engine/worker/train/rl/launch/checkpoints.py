@@ -421,10 +421,10 @@ class _VerlResumeUploader:
         self._internal_adapter_attempts[step] = self._attempt
 
     def _publish_staged(self, step: int, adapter_dir: str) -> None:
-        _worker_hf.publish_deployable_checkpoint(
+        result = _worker_hf.publish_deployable_checkpoint(
             adapter_dir, step, required=True, _provenance_ready=True
         )
-        self.lifecycle.mark_deployable_published(step)
+        self.lifecycle.record_publication(step, result)
 
     def _publish_ready(self) -> None:
         if not self._deployable_allowed():
@@ -513,14 +513,10 @@ class _VerlResumeUploader:
                             first_positive_grad_step=positive_step,
                         )
                         try:
-                            _worker_hf.upload_resume_checkpoint(
-                                step,
-                                path,
-                                final_step=self.final_step,
-                                after_upload=lambda step=step: self.lifecycle.mark_resume_uploaded(
-                                    step
-                                ),
+                            result = _worker_hf.upload_resume_checkpoint(
+                                step, path, final_step=self.final_step
                             )
+                            self.lifecycle.record_publication(step, result)
                         except Exception as error:
                             print(
                                 f"[rl-verl] resume checkpoint upload failed at step {step}: {error}",

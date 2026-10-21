@@ -55,7 +55,11 @@ def test_handoff_rejects_links_before_copy(staged):
 def test_cpu_failure_cannot_publish_done_or_success(staged, monkeypatch):
     _root, source = staged
     cpu_handoff.stage_final_checkpoint(2, str(source), final_step=2)
-    monkeypatch.setattr(hf, "upload_resume_checkpoint", lambda *a, **k: False)
+    monkeypatch.setattr(
+        hf,
+        "upload_resume_checkpoint",
+        lambda *a, **k: hf.PublicationResult(upload_error="test failure"),
+    )
     monkeypatch.setattr(hf, "hf_upload_file", lambda *a, **k: pytest.fail("premature completion"))
     with pytest.raises(RuntimeError, match="publication failed"):
         cpu_handoff.main()
@@ -69,7 +73,12 @@ def test_cpu_commit_precedes_metrics_done_and_attested_success(staged, monkeypat
     (root / "terminal.json").write_text('{"ok":true}')
     events = []
     monkeypatch.setattr(
-        hf, "upload_resume_checkpoint", lambda *a, **k: events.append("native") or True
+        hf,
+        "upload_resume_checkpoint",
+        lambda *a, **k: (
+            events.append("native")
+            or hf.PublicationResult(resume=hf.ArtifactCommit("native", "revision"))
+        ),
     )
     monkeypatch.setattr(hf, "hf_upload_file", lambda path, name, **k: events.append(name))
     cpu_handoff.main()
@@ -160,3 +169,28 @@ def test_bootstrap_withholds_attested_marker_for_handoff(tmp_path, monkeypatch):
     assert (root / "terminal.json").read_bytes() == marker.read_bytes()
     bootstrap._publish_terminal_marker(payload, str(marker), False)
     assert published[-1] == "modal_attempt2.json"
+
+
+def test_final_staging_does_not_claim_a_remote_commit(staged, monkeypatch):
+    from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
+
+    _root, source = staged
+    monkeypatch.setattr(state, "HF_REPO", "owner/artifacts")
+    monkeypatch.setattr(hf, "hf_api", lambda: pytest.fail("GPU must not upload final native state"))
+    result = hf.upload_resume_checkpoint(2, str(source), final_step=2, emit_heartbeat=False)
+    assert result.resume_staged
+    assert result.resume is None
+    ledger = CheckpointLedger()
+    ledger.record_publication(2, result)
+    assert not ledger.facts(2).resume_uploaded
+
+
+def test_staged_result_cannot_authorize_cpu_completion(staged, monkeypatch):
+    _root, source = staged
+    cpu_handoff.stage_final_checkpoint(2, str(source), final_step=2)
+    monkeypatch.setattr(
+        hf, "upload_resume_checkpoint", lambda *a, **k: hf.PublicationResult(resume_staged=True)
+    )
+    monkeypatch.setattr(hf, "hf_upload_file", lambda *a, **k: pytest.fail("premature completion"))
+    with pytest.raises(RuntimeError, match="publication failed"):
+        cpu_handoff.main()

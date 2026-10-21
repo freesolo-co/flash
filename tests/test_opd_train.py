@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import flash.engine.worker.io.hf as _publication
 import flash.engine.worker.io.hf as worker_hf
 import flash.engine.worker.train.entry.opd_train_runner as opd_train_runner
 import flash.engine.worker.train.opd.bridging.batching as opd_batching
@@ -3917,9 +3918,11 @@ def test_opd_checkpoint_watcher_forwards_processor_to_every_export(monkeypatch, 
     monkeypatch.setattr(
         opd_failures._worker_hf,
         "upload_resume_checkpoint",
-        lambda _step, _path, **kwargs: (kwargs["before_upload"](), kwargs["after_upload"](), True)[
-            2
-        ],
+        lambda _step, _path, **kwargs: (
+            _publication.PublicationResult(
+                resume=_publication.ArtifactCommit("test-commit", "test-revision")
+            ),
+        )[0],
     )
     watcher = _OpdVerlCheckpointWatcher(
         local_dir=str(tmp_path),
@@ -4026,12 +4029,18 @@ def test_the_watcher_claims_every_step_but_publishes_only_required_ones(monkeypa
     monkeypatch.setattr(
         worker,
         "publish_deployable_checkpoint",
-        lambda adapter, step, **kwargs: published.append(step) or "sub",
+        lambda adapter, step, **kwargs: _publication.PublicationResult(
+            deployable=_publication.ArtifactCommit(published.append(step) or "sub", "test-revision")
+        ),
     )
     monkeypatch.setattr(
         worker,
         "upload_resume_checkpoint",
-        lambda step, path, **kwargs: (kwargs["before_upload"](), kwargs["after_upload"](), True)[2],
+        lambda step, path, **kwargs: (
+            _publication.PublicationResult(
+                resume=_publication.ArtifactCommit("test-commit", "test-revision")
+            ),
+        )[0],
     )
 
     watcher = _OpdVerlCheckpointWatcher(
@@ -4083,13 +4092,19 @@ def test_an_opd_backlog_stages_a_retry_contract_for_every_step(monkeypatch, tmp_
         "upload_resume_checkpoint",
         lambda step, path, **kwargs: (
             uploaded.append(step),
-            kwargs["before_upload"](),
-            kwargs["after_upload"](),
-            True,
-        )[3],
+            _publication.PublicationResult(
+                resume=_publication.ArtifactCommit("test-commit", "test-revision")
+            ),
+        )[1],
     )
     monkeypatch.setattr(
-        worker, "publish_deployable_checkpoint", lambda *a, **kw: pytest.fail("no required steps")
+        worker,
+        "publish_deployable_checkpoint",
+        lambda *a, **kw: _publication.PublicationResult(
+            deployable=_publication.ArtifactCommit(
+                pytest.fail("no required steps"), "test-revision"
+            )
+        ),
     )
 
     watcher = _OpdVerlCheckpointWatcher(
