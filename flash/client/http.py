@@ -144,16 +144,19 @@ def has_freesolo_backend(api_url: str) -> bool:
     return bool(backend) and not is_freesolo_hosted_url(backend)
 
 
-def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
+def _detail_from_http_error(
+    exc: urllib.error.HTTPError, *, deadline: float | None = None
+) -> object:
     """Extract the server's ``detail`` from an HTTPError body, as parsed.
 
     A structured detail stays a dict so the caller can read its ``code``; anything else is the
     string it always was. ``str()`` it for a message, but branch on the object itself.
     """
     try:
-        body = exc.read()
-    except (OSError, http.client.HTTPException):
-        # The status is authoritative even when the peer closes its error body early.
+        with contextlib.closing(exc):
+            body = _read_response_body(exc, deadline=deadline)
+    except (OSError, http.client.HTTPException, ClientError):
+        # Preserve the status when the error body is incomplete or exceeds its deadline.
         return str(exc)
     try:
         detail = json.loads(body).get("detail") or body.decode()
@@ -322,12 +325,14 @@ class ApiClient:
         )
 
     @contextlib.contextmanager
-    def _translate_http_errors(self) -> Iterator[None]:
+    def _translate_http_errors(self, *, deadline: float | None = None) -> Iterator[None]:
         """Map urllib transport errors to ApiError/ClientError; other exceptions propagate."""
         try:
             yield
         except urllib.error.HTTPError as exc:
-            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
+            detail = self._auth_error_detail(
+                exc.code, _detail_from_http_error(exc, deadline=deadline)
+            )
             raise ApiError(exc.code, str(detail), detail=detail) from exc
         except urllib.error.URLError as exc:
             if isinstance(getattr(exc, "reason", None), TimeoutError):
@@ -432,9 +437,9 @@ class ApiClient:
         )
         deadline = time.monotonic() + body_deadline if body_deadline is not None else None
         with (
-            self._translate_http_errors(),
+            self._translate_http_errors(deadline=deadline),
             _urlopen_no_redirect(
-                req, timeout=_capped_timeout(timeout or self.timeout, deadline)
+                req, timeout=_capped_timeout(timeout or self.timeout, deadline), deadline=deadline
             ) as resp,
         ):
             raw = _read_response_body(
@@ -719,11 +724,11 @@ class ApiClient:
         expire scanning unrelated runs while the requested revision is already ready
         `/v1/runs/{run_id}/deploy` resolves the one run directly.
 
-        ``body_deadline`` additionally bounds the read in WALL-CLOCK time. ``timeout`` alone is a
-        per-socket-operation bound, so a peer that trickles bytes just inside it can hold the read
-        open indefinitely; a caller that must return within a fixed budget has to pass both (see
-        ``env_list``). ``--wait`` polling deliberately does not: it owns a deadline spanning many
-        reads and recomputes each one's share.
+        ``body_deadline`` additionally bounds status, headers and body in WALL-CLOCK time.
+        ``timeout`` alone is a per-socket-operation bound, so a peer that trickles bytes
+        just inside it can hold the read open indefinitely; a caller that must return within a fixed budget has to pass both (see
+        ``env_list``). ``--wait`` polling recomputes the remaining share of its total deadline
+        and passes it as both bounds for every read.
         """
         base_run_id, _ = _parse_adapter_target(checkpoint_id)
         quoted = urllib.parse.quote(checkpoint_id, safe="")

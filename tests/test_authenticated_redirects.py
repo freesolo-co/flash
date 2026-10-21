@@ -107,10 +107,11 @@ def redirect_servers():
     "call",
     [
         lambda client: client.health(),
+        lambda client: client.deployment_for("run-a/final", timeout=5, body_deadline=5),
         lambda client: client._request_bytes("GET", "/bytes"),
         lambda client: list(client.chat_stream("run-a/final", [])),
     ],
-    ids=["json", "bytes", "chat-stream"],
+    ids=["json", "deadline-json", "bytes", "chat-stream"],
 )
 def test_api_client_paths_keep_api_error_classification_and_do_not_reach_redirect_sink(
     redirect_servers, call
