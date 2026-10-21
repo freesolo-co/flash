@@ -164,6 +164,7 @@ def _queued_deployment_record(
         "queued",
         detail="deployment queued",
         verify=True,
+        registration_started=False,
         requested_at=time.time(),
     )
     dep_dict["generation"] = generation(current_deployment) + 1

@@ -667,6 +667,7 @@ def test_recovery_removes_only_unfinished_checkpoint_and_reports_inventory(monke
             "checkpoint_id": "r-stale/step-20",
             "checkpoint_step": 20,
             "state": "queued",
+            "registration_started": True,
             "generation": 1,
             "requested_at": 1.0,
         },

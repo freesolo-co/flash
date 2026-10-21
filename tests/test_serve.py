@@ -1492,7 +1492,7 @@ def test_readiness_receives_complete_facts_after_registry_readiness(
         hf_repo="org/repo",
         adapter_prefix="sft/flash-7-abcd",
         before_ready=before_ready,
-        before_register=lambda: events.append(("before_register", "flash-7-abcd/final")),
+        before_register=lambda identity: events.append(("before_register", identity["adapter_id"])),
     )
     assert events == [
         ("GET", "https://serve.example/healthz"),

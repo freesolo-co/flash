@@ -32,7 +32,7 @@ def test_failure_before_smoke_cleans_only_attempted_registration(
 
     def fail_deploy(**kwargs):
         if registration_started:
-            kwargs["before_register"]()
+            kwargs["before_register"]({})
         raise ServingError(
             "checkpoint readiness timed out" if registration_started else "bad artifact"
         )
@@ -78,6 +78,7 @@ def test_recovery_fences_and_removes_unfinished_registration(
         "checkpoint_step": 20,
         "generation": 1,
         "state": initial_state,
+        "registration_started": True,
         "requested_at": 1.0,
     }
     current.deployments[checkpoint_id] = attempt
@@ -90,7 +91,7 @@ def test_recovery_fences_and_removes_unfinished_registration(
         undeploys.append((target, org_id))
         fenced = status.get_status(run_id).deployments[target]
         assert fenced["state"] == "cleanup_pending"
-        assert fenced["generation"] > attempt["generation"]
+        assert fenced["generation"] >= attempt["generation"] + (initial_state != "cleanup_pending")
         late = {**attempt, "state": "ready", "verified_at": 123.0}
         assert transitions.mark_checkpoint_deployed(run_id, late).deployments[target] == fenced
         if cleanup_fails:
@@ -128,6 +129,7 @@ def test_recovery_without_org_retains_cleanup_pending(api, monkeypatch):
             "checkpoint_step": None,
             "generation": 1,
             "state": "queued",
+            "registration_started": True,
         },
     )
     monkeypatch.setattr(serving_completion.db, "all_runs", lambda: [{"run_id": run_id}])
@@ -150,7 +152,7 @@ def test_only_registration_rejection_skips_cleanup(api, monkeypatch, error_type,
     deleted = []
 
     def fail(**kwargs):
-        kwargs["before_register"]()
+        kwargs["before_register"]({})
         raise error_type("rejected", status_code=status_code)
 
     monkeypatch.setattr(deploy, "deploy_adapter", fail)
@@ -172,7 +174,7 @@ def test_recovery_uses_persisted_registration_org(api, monkeypatch):
     state._save_status(original)
 
     def fail(**kwargs):
-        kwargs["before_register"]()
+        kwargs["before_register"]({})
         raise ServingError("ambiguous POST")
 
     def unavailable(*args, **kwargs):
@@ -249,6 +251,9 @@ def test_ambiguous_registration_preserves_mismatched_binding(
 
     def ambiguous(method, url, **kwargs):
         assert method == "POST"
+        persisted = status.get_status(run_id).deployments[checkpoint_id]
+        assert persisted["registration_started"] is True
+        assert persisted["registration_identity"] == kwargs["json"]
         existing.update({**kwargs["json"], "artifact_digest": "another-artifact"})
         raise ServingError("registration response lost", status_code=status_code)
 
